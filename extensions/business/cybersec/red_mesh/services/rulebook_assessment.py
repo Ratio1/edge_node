@@ -43,6 +43,20 @@ _IPV4_RE = re.compile(
 _SECRET_ASSIGNMENT_RE = re.compile(
   r"(?i)\b(password|passwd|secret|token|api[_-]?key|bearer)\s*[:=]\s*[^\s&,'\"}]+"
 )
+_BEARER_TOKEN_RE = re.compile(
+  r"(?i)\b(?:authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]{8,}"
+)
+_JWT_RE = re.compile(
+  r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}(?![A-Za-z0-9_-])"
+)
+_PEM_PRIVATE_KEY_RE = re.compile(
+  r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
+  re.IGNORECASE | re.DOTALL,
+)
+_UNLABELLED_TOKEN_RE = re.compile(
+  r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-]))"
+  r"(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}"
+)
 
 _CLOSED_TRIAGE_STATUSES = {"false_positive", "remediated"}
 _GAP_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM"}
@@ -241,7 +255,11 @@ def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
   def _replace_ip(match):
     return stable_hmac_pseudonym(match.group(0), hmac_secret, prefix="ip")
 
+  text = _PEM_PRIVATE_KEY_RE.sub("<redacted-private-key>", text)
+  text = _BEARER_TOKEN_RE.sub("Authorization: Bearer <redacted>", text)
+  text = _JWT_RE.sub("<redacted-jwt>", text)
   text = _SECRET_ASSIGNMENT_RE.sub(_replace_secret, text)
+  text = _UNLABELLED_TOKEN_RE.sub("<redacted-token>", text)
   text = _IPV4_RE.sub(_replace_ip, text)
   text = " ".join(text.split())
   return text[:max_len]
@@ -584,6 +602,9 @@ def _review_view(review, *, hmac_secret):
   if review is None:
     return {"review_state": "draft", "answers": {}}
   payload = review.to_dict()
+  payload.pop("last_reopen_idempotency_key", None)
+  payload.pop("last_reopen_from_revision", None)
+  payload.pop("last_reopen_actor", None)
   payload["note"] = _safe_text(payload.get("note") or "", hmac_secret=hmac_secret, max_len=1000)
   for answer in (payload.get("answers") or {}).values():
     if isinstance(answer, dict):
@@ -1025,6 +1046,15 @@ def _submission_error(code, job_id, profile_id, message, *, retryable=False, **e
   )
 
 
+def _unsupported_submission_registry_error(job_id, profile_id):
+  return _submission_error(
+    "submission_contract_unsupported",
+    job_id,
+    profile_id,
+    "Submission registry contract version is not supported by this backend.",
+  )
+
+
 def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
   profile = _profile(profile_id)
   if not profile:
@@ -1209,23 +1239,26 @@ def save_rulebook_review_draft(
   )
   if err:
     return err
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not isinstance(job_specs, dict):
-    return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
-    return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
-  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
-  if unsupported:
-    return {**unsupported, "error": "model_test_not_supported"}
   try:
     validated_answers = _validate_review_answers(profile, answers)
   except ValueError as exc:
     return _error("invalid_review_answer", job_id, profile_id=profile["profile_id"], message=str(exc))
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
+    job_specs = owner._get_job_from_cstore(job_id)
+    if not isinstance(job_specs, dict):
+      return _error("job_not_found", job_id, profile_id=profile["profile_id"])
+    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+      return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
+    unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
+    if unsupported:
+      return {**unsupported, "error": "model_test_not_supported"}
     repo = _job_repo(owner)
     previous = repo.get_rulebook_review_model(job_id, profile["profile_id"])
-    registry = _submission_registry(repo, job_id, profile["profile_id"]).to_dict()
+    try:
+      registry = _submission_registry(repo, job_id, profile["profile_id"]).to_dict()
+    except ValueError:
+      return _unsupported_submission_registry_error(job_id, profile["profile_id"])
     if registry.get("pending"):
       return _submission_error(
         "submission_in_progress",
@@ -1317,6 +1350,53 @@ def _submission_fingerprint(assessment):
   return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _build_submission_snapshot(
+  owner,
+  job_id,
+  profile,
+  *,
+  pass_nr,
+  revision,
+  submitted_at,
+  actor,
+  review_revision,
+):
+  submission_meta = {
+    "contract_version": RULEBOOK_SUBMISSION_CONTRACT_VERSION,
+    "revision": revision,
+    "submitted_at": submitted_at,
+    "actor": actor,
+    "pass_nr": pass_nr,
+    "profile_id": profile["profile_id"],
+    "profile_version": profile["profile_version"],
+    "review_revision": review_revision,
+  }
+  built = build_rulebook_assessment(
+    owner,
+    job_id,
+    profile_id=profile["profile_id"],
+    pass_nr=pass_nr,
+    include_review=True,
+    artifact_kind="review_submission",
+    submission=submission_meta,
+  )
+  if built.get("status") != "ok":
+    return built
+  assessment = built["assessment"]
+  assessment["generated_at"] = _utc_timestamp(submitted_at)
+  assessment["review_state"].update({
+    "review_state": "submitted",
+    "reviewer": actor,
+    "updated_at": submitted_at,
+    "review_revision": review_revision,
+  })
+  return {
+    "status": "ok",
+    "assessment": assessment,
+    "fingerprint": _submission_fingerprint(assessment),
+  }
+
+
 def _registry_with(registry, *, submissions=None, pending=None, keep_pending=False):
   payload = registry.to_dict() if isinstance(registry, RulebookSubmissionRegistry) else dict(registry)
   if submissions is not None:
@@ -1387,14 +1467,6 @@ def submit_rulebook_review(
       "The rulebook profile changed. Reload before submitting.",
       current_profile_version=profile["profile_version"],
     )
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not isinstance(job_specs, dict):
-    return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
-    return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
-  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
-  if unsupported:
-    return {**unsupported, "error": "model_test_not_supported"}
   hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
   actor = _safe_text(actor or "", hmac_secret=hmac_secret, max_len=200)
   if not actor:
@@ -1406,9 +1478,20 @@ def submit_rulebook_review(
     )
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
+    job_specs = owner._get_job_from_cstore(job_id)
+    if not isinstance(job_specs, dict):
+      return _error("job_not_found", job_id, profile_id=profile["profile_id"])
+    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+      return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
+    unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
+    if unsupported:
+      return {**unsupported, "error": "model_test_not_supported"}
     repo = _job_repo(owner)
     review = repo.get_rulebook_review_model(job_id, profile["profile_id"])
-    registry = _submission_registry(repo, job_id, profile["profile_id"])
+    try:
+      registry = _submission_registry(repo, job_id, profile["profile_id"])
+    except ValueError:
+      return _unsupported_submission_registry_error(job_id, profile["profile_id"])
     registry_payload = registry.to_dict()
     existing_pending = registry_payload.get("pending")
 
@@ -1423,6 +1506,25 @@ def submit_rulebook_review(
         and reference.get("profile_version") == profile["profile_version"]
         and reference.get("actor") == actor
       ):
+        replay_snapshot = _build_submission_snapshot(
+          owner,
+          job_id,
+          profile,
+          pass_nr=int(reference["pass_nr"]),
+          revision=int(reference["revision"]),
+          submitted_at=float(reference["submitted_at"]),
+          actor=actor,
+          review_revision=expected_revision,
+        )
+        if replay_snapshot.get("status") != "ok":
+          return replay_snapshot
+        if replay_snapshot["fingerprint"] != reference.get("fingerprint"):
+          return _submission_error(
+            "submission_idempotency_conflict",
+            job_id,
+            profile["profile_id"],
+            "The idempotency key was already used for different submission inputs.",
+          )
         result = get_rulebook_review(owner, job_id, profile["profile_id"])
         result.update({"submission": _submission_reference_view(
           reference,
@@ -1499,36 +1601,20 @@ def submit_rulebook_review(
     now = _owner_time(owner)
     target_revision = int((pending or {}).get("target_revision") or (registry.latest_revision + 1))
     submitted_at = float((pending or {}).get("created_at") or now)
-    submission_meta = {
-      "contract_version": RULEBOOK_SUBMISSION_CONTRACT_VERSION,
-      "revision": target_revision,
-      "submitted_at": submitted_at,
-      "actor": actor,
-      "pass_nr": latest_pass,
-      "profile_id": profile["profile_id"],
-      "profile_version": profile["profile_version"],
-      "review_revision": expected_revision,
-    }
-    built = build_rulebook_assessment(
+    built = _build_submission_snapshot(
       owner,
       job_id,
-      profile_id=profile["profile_id"],
+      profile,
       pass_nr=latest_pass,
-      include_review=True,
-      artifact_kind="review_submission",
-      submission=submission_meta,
+      revision=target_revision,
+      submitted_at=submitted_at,
+      actor=actor,
+      review_revision=expected_revision,
     )
     if built.get("status") != "ok":
       return built
     assessment = built["assessment"]
-    assessment["generated_at"] = _utc_timestamp(submitted_at)
-    assessment["review_state"].update({
-      "review_state": "submitted",
-      "reviewer": actor,
-      "updated_at": submitted_at,
-      "review_revision": expected_revision,
-    })
-    fingerprint = _submission_fingerprint(assessment)
+    fingerprint = built["fingerprint"]
 
     if pending:
       if pending.get("fingerprint") != fingerprint:
@@ -1707,6 +1793,7 @@ def reopen_rulebook_review(
   job_id,
   profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
   expected_review_revision=None,
+  idempotency_key="",
   actor="",
 ):
   profile = _profile(profile_id)
@@ -1719,23 +1806,34 @@ def reopen_rulebook_review(
   )
   if err:
     return err
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not isinstance(job_specs, dict):
-    return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
-    return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
-  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
-  if unsupported:
-    return {**unsupported, "error": "model_test_not_supported"}
+  idempotency_key = str(idempotency_key or "").strip()
+  if not idempotency_key or len(idempotency_key) > 200:
+    return _submission_error(
+      "reopen_idempotency_conflict",
+      job_id,
+      profile["profile_id"],
+      "A bounded reopen idempotency key is required.",
+    )
   hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
   actor = _safe_text(actor or "", hmac_secret=hmac_secret, max_len=200)
   if not actor:
     return _submission_error("invalid_review_actor", job_id, profile["profile_id"], "A server-derived actor is required.")
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
+    job_specs = owner._get_job_from_cstore(job_id)
+    if not isinstance(job_specs, dict):
+      return _error("job_not_found", job_id, profile_id=profile["profile_id"])
+    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+      return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
+    unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
+    if unsupported:
+      return {**unsupported, "error": "model_test_not_supported"}
     repo = _job_repo(owner)
     review = repo.get_rulebook_review_model(job_id, profile["profile_id"])
-    registry = _submission_registry(repo, job_id, profile["profile_id"])
+    try:
+      registry = _submission_registry(repo, job_id, profile["profile_id"])
+    except ValueError:
+      return _unsupported_submission_registry_error(job_id, profile["profile_id"])
     registry_payload = registry.to_dict()
     if registry_payload.get("pending"):
       return _submission_error(
@@ -1746,6 +1844,21 @@ def reopen_rulebook_review(
         retryable=True,
       )
     current_revision = review.review_revision if review else 0
+    if review and review.last_reopen_idempotency_key == idempotency_key:
+      if (
+        review.review_state == "draft"
+        and review.last_reopen_from_revision == expected_revision
+        and review.last_reopen_actor == actor
+      ):
+        result = get_rulebook_review(owner, job_id, profile["profile_id"])
+        result["idempotent_replay"] = True
+        return result
+      return _submission_error(
+        "reopen_idempotency_conflict",
+        job_id,
+        profile["profile_id"],
+        "The reopen idempotency key was already used for different inputs.",
+      )
     if expected_revision != current_revision:
       return _submission_error(
         "review_revision_conflict",
@@ -1780,6 +1893,9 @@ def reopen_rulebook_review(
       answers=review.to_dict().get("answers") or {},
       updated_at=now,
       review_revision=current_revision + 1,
+      last_reopen_idempotency_key=idempotency_key,
+      last_reopen_from_revision=current_revision,
+      last_reopen_actor=actor,
     )
     try:
       _put_review_with_audit(
@@ -1800,52 +1916,27 @@ def reopen_rulebook_review(
         "Unable to reopen the submitted review.",
         retryable=True,
       )
-  return get_rulebook_review(owner, job_id, profile["profile_id"])
+  result = get_rulebook_review(owner, job_id, profile["profile_id"])
+  result["idempotent_replay"] = False
+  return result
 
 
-def update_rulebook_review(
+def _update_rulebook_review_locked(
   owner,
   job_id,
-  profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
-  answers=None,
-  reviewer="",
-  note="",
-  review_state="draft",
+  profile,
+  job_specs,
+  validated_answers,
+  reviewer,
+  note,
+  review_state,
 ):
-  profile = _profile(profile_id)
-  if not profile:
-    return _error("invalid_profile", job_id, profile_id=profile_id)
-  if review_state not in VALID_RULEBOOK_REVIEW_STATES:
-    return _error("invalid_review_answer", job_id, profile_id=profile_id, message="Unsupported review_state.")
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not isinstance(job_specs, dict):
-    return _error("job_not_found", job_id, profile_id=profile_id)
-  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
-  if unsupported:
-    return {
-      **unsupported,
-      "error": "model_test_not_supported",
-      "error_class": unsupported.get("error_class") or unsupported.get("error"),
-    }
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
-    return _error(
-      "job_not_finalized",
-      job_id,
-      profile_id=profile["profile_id"],
-      job_status=job_specs.get("job_status"),
-    )
-
   repo = _job_repo(owner)
   previous = repo.get_rulebook_review_model(job_id, profile["profile_id"])
   try:
     registry = _submission_registry(repo, job_id, profile["profile_id"]).to_dict()
   except ValueError:
-    return _submission_error(
-      "submission_contract_unsupported",
-      job_id,
-      profile["profile_id"],
-      "Submission registry contract version is not supported by this backend.",
-    )
+    return _unsupported_submission_registry_error(job_id, profile["profile_id"])
   if registry.get("pending") or registry.get("submissions") or _legacy_submission_reference(job_specs, profile, previous):
     return _submission_error(
       "review_already_submitted",
@@ -1853,12 +1944,6 @@ def update_rulebook_review(
       profile["profile_id"],
       "Use the explicit reopen operation before changing a submitted review.",
     )
-
-  try:
-    validated_answers = _validate_review_answers(profile, answers)
-  except ValueError as exc:
-    return _error("invalid_review_answer", job_id, profile_id=profile_id, message=str(exc))
-
   now = float(getattr(owner, "time", _time.time)())
   hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
   reviewer = _safe_text(reviewer or "", hmac_secret=hmac_secret, max_len=200)
@@ -1920,3 +2005,51 @@ def update_rulebook_review(
     "review": review_payload,
     "audit": audit_payload,
   }
+
+
+def update_rulebook_review(
+  owner,
+  job_id,
+  profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
+  answers=None,
+  reviewer="",
+  note="",
+  review_state="draft",
+):
+  profile = _profile(profile_id)
+  if not profile:
+    return _error("invalid_profile", job_id, profile_id=profile_id)
+  if review_state not in VALID_RULEBOOK_REVIEW_STATES:
+    return _error("invalid_review_answer", job_id, profile_id=profile_id, message="Unsupported review_state.")
+  try:
+    validated_answers = _validate_review_answers(profile, answers)
+  except ValueError as exc:
+    return _error("invalid_review_answer", job_id, profile_id=profile_id, message=str(exc))
+  with _submission_lock(owner, job_id, profile["profile_id"]):
+    job_specs = owner._get_job_from_cstore(job_id)
+    if not isinstance(job_specs, dict):
+      return _error("job_not_found", job_id, profile_id=profile_id)
+    unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
+    if unsupported:
+      return {
+        **unsupported,
+        "error": "model_test_not_supported",
+        "error_class": unsupported.get("error_class") or unsupported.get("error"),
+      }
+    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+      return _error(
+        "job_not_finalized",
+        job_id,
+        profile_id=profile["profile_id"],
+        job_status=job_specs.get("job_status"),
+      )
+    return _update_rulebook_review_locked(
+      owner,
+      job_id,
+      profile,
+      job_specs,
+      validated_answers,
+      reviewer,
+      note,
+      review_state,
+    )

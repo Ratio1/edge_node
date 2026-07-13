@@ -68,6 +68,9 @@ class RulebookReviewState:
   answers: dict = None
   updated_at: float = 0.0
   review_revision: int = 0
+  last_reopen_idempotency_key: str = ""
+  last_reopen_from_revision: int = 0
+  last_reopen_actor: str = ""
 
   def to_dict(self) -> dict:
     return _strip_none({
@@ -90,6 +93,9 @@ class RulebookReviewState:
       answers=_coerce_answers(payload.get("answers")),
       updated_at=float(payload.get("updated_at", 0.0) or 0.0),
       review_revision=max(0, int(payload.get("review_revision", 0) or 0)),
+      last_reopen_idempotency_key=str(payload.get("last_reopen_idempotency_key") or "")[:200],
+      last_reopen_from_revision=max(0, int(payload.get("last_reopen_from_revision", 0) or 0)),
+      last_reopen_actor=str(payload.get("last_reopen_actor") or "")[:200],
     )
 
 

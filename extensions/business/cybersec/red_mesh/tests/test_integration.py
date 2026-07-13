@@ -2136,6 +2136,53 @@ class TestPurgeAllJobs(unittest.TestCase):
     # no force-purge R1FS calls
     plugin.r1fs.delete_file.assert_not_called()
 
+  def test_purge_all_deletes_orphan_submission_cids_before_sweeping_registry(self):
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin({})
+    submission_hkey = "test-instance:rulebook_review:submissions"
+    plugin._hashes[submission_hkey] = {
+      "orphan-job:nis2.eu_baseline.v1": {
+        "contract_version": "1.0.0",
+        "latest_revision": 1,
+        "submissions": [{"revision": 1, "cid": "cid-orphan-submission"}],
+      },
+    }
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+    plugin.r1fs.get_json.return_value = None
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(result["cids_deleted"], 1)
+    plugin.r1fs.delete_file.assert_called_once()
+    self.assertEqual(plugin._hashes[submission_hkey], {})
+
+  def test_force_purge_retains_rows_when_submission_cid_is_shared(self):
+    Plugin = self._get_plugin_class()
+    jobs = {"job-bad": {"job_id": "job-bad", "job_status": "legacy"}}
+    plugin = self._make_plugin(jobs)
+    submission_hkey = "test-instance:rulebook_review:submissions"
+    plugin._hashes[submission_hkey] = {
+      "job-bad:nis2.eu_baseline.v1": {
+        "submissions": [{"revision": 1, "cid": "cid-shared-submission"}],
+      },
+      "orphan-peer:nis2.eu_baseline.v1": {
+        "submissions": [{"revision": 1, "cid": "cid-shared-submission"}],
+      },
+    }
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+    plugin.stop_and_delete_job.side_effect = RuntimeError("legacy parse failure")
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertIn("job-bad", plugin._hashes["test-instance"])
+    self.assertIn("job-bad:nis2.eu_baseline.v1", plugin._hashes[submission_hkey])
+    self.assertIn("orphan-peer:nis2.eu_baseline.v1", plugin._hashes[submission_hkey])
+    self.assertNotIn("cid-shared-submission", {call.args[0] for call in plugin.r1fs.delete_file.call_args_list})
+
   def test_confirm_required(self):
     """Endpoint refuses to purge without confirm=True."""
     Plugin = self._get_plugin_class()

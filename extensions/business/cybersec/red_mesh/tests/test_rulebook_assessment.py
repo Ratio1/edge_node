@@ -417,6 +417,32 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertEqual(snapshot["submission"]["revision"], 1)
     self.assertEqual(snapshot["review_state"]["review_state"], "submitted")
 
+  def test_committed_idempotency_replay_conflicts_when_assessment_inputs_change(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=_complete_review_answers(), actor="alice", expected_review_revision=0,
+    )
+    submitted = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="submission-triage", actor="alice",
+    )
+    owner.records[(f"{owner.cfg_instance_id}:triage", "job-1:finding-auth-1")] = {
+      "job_id": "job-1",
+      "finding_id": "finding-auth-1",
+      "status": "false_positive",
+      "actor": "analyst",
+      "updated_at": owner.time(),
+    }
+
+    replay = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="submission-triage", actor="alice",
+    )
+
+    self.assertEqual(submitted["status"], "ok")
+    self.assertEqual(replay["error"], "submission_idempotency_conflict")
+    self.assertEqual(owner.r1fs.add_json.call_count, 1)
+
   def test_submission_requires_complete_answers_and_comments(self):
     owner = _Owner()
     answers = _complete_review_answers()
@@ -599,7 +625,8 @@ class TestRulebookAssessment(unittest.TestCase):
       expected_profile_version="1.0.0", idempotency_key="revision-1", actor="alice",
     )
     reopened = reopen_rulebook_review(
-      owner, "job-1", expected_review_revision=saved["review_revision"], actor="alice",
+      owner, "job-1", expected_review_revision=saved["review_revision"],
+      idempotency_key="reopen-revision-1", actor="alice",
     )
     second = submit_rulebook_review(
       owner, "job-1", expected_review_revision=reopened["review_revision"], expected_pass_nr=3,
@@ -614,6 +641,34 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertEqual([item["revision"] for item in history], [2, 1])
     self.assertNotEqual(history[0]["cid"], history[1]["cid"])
 
+  def test_reopen_replays_same_operation_key_after_response_loss(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=_complete_review_answers(), actor="alice", expected_review_revision=0,
+    )
+    submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="reopen-source", actor="alice",
+    )
+
+    first = reopen_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"],
+      idempotency_key="reopen-operation", actor="alice",
+    )
+    replay = reopen_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"],
+      idempotency_key="reopen-operation", actor="alice",
+    )
+    conflict = reopen_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"],
+      idempotency_key="reopen-operation", actor="mallory",
+    )
+
+    self.assertEqual(first["review_revision"], 2)
+    self.assertTrue(replay["idempotent_replay"])
+    self.assertEqual(replay["review_revision"], 2)
+    self.assertEqual(conflict["error"], "reopen_idempotency_conflict")
+
   def test_two_revision_submission_smoke_retrieves_then_purges_every_snapshot(self):
     owner = _Owner(job_specs=_sample_job_specs())
     owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
@@ -627,7 +682,8 @@ class TestRulebookAssessment(unittest.TestCase):
       expected_profile_version="1.0.0", idempotency_key="smoke-revision-1", actor="alice",
     )
     reopened = reopen_rulebook_review(
-      owner, "job-1", expected_review_revision=saved["review_revision"], actor="alice",
+      owner, "job-1", expected_review_revision=saved["review_revision"],
+      idempotency_key="smoke-reopen-revision-1", actor="alice",
     )
     second = submit_rulebook_review(
       owner, "job-1", expected_review_revision=reopened["review_revision"], expected_pass_nr=3,
@@ -690,6 +746,58 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertNotIn("10.0.0.4", serialized)
     self.assertIn("<redacted>", serialized)
     self.assertIn("ip:", serialized)
+
+  def test_formal_submission_redacts_bearer_jwt_pem_and_unlabelled_tokens(self):
+    owner = _Owner()
+    answers = _complete_review_answers()
+    answers["nis2.bcm.business_continuity"] = {
+      "value": "unknown",
+      "note": (
+        "Authorization: Bearer sk_live_1234567890abcdef "
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature1234 "
+        "-----BEGIN PRIVATE KEY-----\nprivatekeymaterial123456\n-----END PRIVATE KEY----- "
+        "a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4"
+      ),
+    }
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=answers, actor="alice", expected_review_revision=0,
+    )
+    submitted = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="credential-redaction", actor="alice",
+    )
+
+    serialized = json.dumps(owner.artifacts[submitted["submission"]["cid"]], sort_keys=True)
+    self.assertNotIn("sk_live_1234567890abcdef", serialized)
+    self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", serialized)
+    self.assertNotIn("privatekeymaterial123456", serialized)
+    self.assertNotIn("a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4", serialized)
+    self.assertIn("<redacted", serialized)
+
+  def test_future_registry_contract_returns_stable_upgrade_error_for_writes(self):
+    owner = _Owner()
+    hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
+    owner.records[(hkey, f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}")] = {
+      "contract_version": "2.0.0",
+      "latest_revision": 0,
+      "submissions": [],
+    }
+
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers={}, actor="alice", expected_review_revision=0,
+    )
+    submitted = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=0, expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="future-submit", actor="alice",
+    )
+    reopened = reopen_rulebook_review(
+      owner, "job-1", expected_review_revision=0,
+      idempotency_key="future-reopen", actor="alice",
+    )
+
+    self.assertEqual(saved["error"], "submission_contract_unsupported")
+    self.assertEqual(submitted["error"], "submission_contract_unsupported")
+    self.assertEqual(reopened["error"], "submission_contract_unsupported")
 
   def test_legacy_reviewed_records_surface_revision_zero_or_migration(self):
     owner = _Owner()
@@ -910,6 +1018,26 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertEqual(result["cids_deleted"], 0)
     self.assertNotIn("QmSharedSubmission", owner.artifact_repo.deleted)
     self.assertIsNotNone(owner.records[(owner.cfg_instance_id, "job-1")])
+
+  def test_purge_keeps_cstore_when_formal_cid_remains_retrievable(self):
+    owner = _Owner(job_specs=_sample_job_specs(job_cid=""))
+    owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
+    hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
+    review_key = f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}"
+    owner.records[(hkey, review_key)] = {
+      "contract_version": "1.0.0",
+      "latest_revision": 1,
+      "submissions": [{"revision": 1, "cid": "QmRetainedSubmission"}],
+    }
+    owner.artifacts["QmRetainedSubmission"] = {"artifact_kind": "review_submission"}
+    owner.artifact_repo.delete = MagicMock(return_value=True)
+
+    result = purge_job(owner, "job-1")
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["cids_failed"], 1)
+    self.assertIsNotNone(owner.records[(owner.cfg_instance_id, "job-1")])
+    self.assertIsNotNone(owner.records[(hkey, review_key)])
 
 
 if __name__ == "__main__":
