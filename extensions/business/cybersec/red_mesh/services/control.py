@@ -225,7 +225,7 @@ def purge_job(owner, job_id: str):
   deleted, failed = 0, 0
   for cid in cids:
     try:
-      success = artifacts.delete(cid, show_logs=True, raise_on_error=False)
+      success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
       if success:
         deleted += 1
         owner.P(f"[PURGE] Deleted CID {cid}")
@@ -339,7 +339,7 @@ def _force_purge_job(owner, job_id, raw_payload, errors):
   artifacts = _artifact_repo(owner)
   for cid in cids:
     try:
-      success = artifacts.delete(cid, show_logs=True, raise_on_error=False)
+      success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
       if success:
         cids_deleted += 1
         owner.P(f"[PURGE_ALL_FORCE] Deleted CID {cid} for {job_id}")

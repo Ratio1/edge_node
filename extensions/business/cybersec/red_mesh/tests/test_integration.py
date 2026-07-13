@@ -1610,11 +1610,14 @@ class TestPhase14Purge(unittest.TestCase):
     }
     plugin.r1fs.get_json.return_value = archive
     plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.side_effect = [
-      {},
-      {"job-1:f-1": {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk"}},
-      {"job-1:f-1": [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 1.0}]},
-    ]
+    plugin.chainstore_hgetall.side_effect = lambda *, hkey: {
+      "test-instance:triage": {
+        "job-1:f-1": {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk"},
+      },
+      "test-instance:triage:audit": {
+        "job-1:f-1": [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 1.0}],
+      },
+    }.get(hkey, {})
 
     # Normalize returns the specs as-is
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
@@ -1654,11 +1657,14 @@ class TestPhase14Purge(unittest.TestCase):
     plugin.chainstore_hget.return_value = job_specs
     plugin.r1fs.get_json.return_value = {"passes": []}
     plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.side_effect = [
-      {},
-      {"job-1:f-1": {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk"}},
-      {"job-1:f-1": [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 1.0}]},
-    ]
+    plugin.chainstore_hgetall.side_effect = lambda *, hkey: {
+      "test-instance:triage": {
+        "job-1:f-1": {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk"},
+      },
+      "test-instance:triage:audit": {
+        "job-1:f-1": [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 1.0}],
+      },
+    }.get(hkey, {})
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
     result = Plugin.purge_job(plugin, "job-1")

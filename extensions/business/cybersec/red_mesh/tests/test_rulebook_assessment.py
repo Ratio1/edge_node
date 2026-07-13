@@ -165,7 +165,7 @@ class _FakeArtifactRepo:
   def put_json(self, payload, *, show_logs=False):
     return self.owner.r1fs.add_json(payload, show_logs=show_logs)
 
-  def delete(self, cid, *, show_logs=False, raise_on_error=False):
+  def delete(self, cid, *, show_logs=False, raise_on_error=False, purge=False):
     self.deleted.append(cid)
     self.owner.artifacts.pop(cid, None)
     return True
