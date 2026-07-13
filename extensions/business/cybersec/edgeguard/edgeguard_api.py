@@ -1,7 +1,9 @@
 """EdgeGuard playground API plugin.
 
-The API exposes model metadata, guarded generation, local validation, and
-request-scoped Neo4j connection/query helpers for the colleague playground.
+The API exposes model metadata, prompt contract metadata, deterministic Cypher
+validation, and request-scoped Neo4j connection/query helpers for the
+colleague playground. Text-to-Cypher generation is owned by the playground
+server route, which calls model-specific LLM_INFERENCE_API workers directly.
 """
 
 from __future__ import annotations
@@ -19,33 +21,14 @@ import requests
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 from .edgeguard_cypher_guard import (
+  DEFAULT_SCHEMA_RETRY_LIMIT,
+  EDGEGUARD_SCHEMA,
   SCHEMA_VERSION,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,
+  build_direct_cypher_system_prompt,
+  build_schema_correction_prompt,
   canonical_schema_surface,
-)
-from .edgeguard_llm_agent_api import (
-  EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
-  EDGEGUARD_MODEL_ARTIFACT_SHA256,
-  EDGEGUARD_CORPUS,
-  EDGEGUARD_DATASET,
-  EDGEGUARD_MODEL_DISPLAY_NAME,
-  EDGEGUARD_MODEL_FILE,
-  EDGEGUARD_MODEL_REPO,
-  EDGEGUARD_ROBUSTNESS_LABEL_COVERAGE,
-  EDGEGUARD_ROBUSTNESS_RELATIONSHIP_COVERAGE,
-  EDGEGUARD_ROBUSTNESS_SUBGRAPH_ACCEPTED,
-  EDGEGUARD_RUNTIME_HARNESS_VERSION,
-  EDGEGUARD_RUNTIME_LIVE_GATE_RESULT,
-  EDGEGUARD_SOURCE_ADAPTER,
-  EDGEGUARD_SOURCE_ADAPTER_SHA256,
-  EDGEGUARD_TEST_LABEL_COVERAGE,
-  EDGEGUARD_TEST_RELATIONSHIP_COVERAGE,
-  STATUS_ACCEPTED,
-  STATUS_ERROR,
-  STATUS_OK,
-  STATUS_REJECTED,
-  STATUS_TIMEOUT,
 )
 
 try:
@@ -130,6 +113,66 @@ CAVEAT_TYPES = {
   "redaction_scope",
 }
 PRIORITY_VALUES = {"low", "medium", "high"}
+
+STATUS_OK = "ok"
+STATUS_ERROR = "error"
+STATUS_ACCEPTED = "accepted"
+STATUS_REJECTED = "rejected"
+STATUS_TIMEOUT = "timeout"
+
+EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
+
+FINETUNED_MODEL_KEY = "finetuned_v0_10"
+BASE_MODEL_KEY = "base_qwen3_4b"
+FINETUNED_PROMPT_PROFILE_ID = "edgeguard_direct_cypher_v0_10"
+BASE_PROMPT_PROFILE_ID = "edgeguard_base_schema_grounded_v0_10"
+
+EDGEGUARD_MODEL_REPO = "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf"
+EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf"
+EDGEGUARD_MODEL_DISPLAY_NAME = "EdgeGuard Cypher Qwen3 4B v0.10 Graph-Intent GGUF"
+EDGEGUARD_MODEL_ARTIFACT_SHA256 = "7f7ed0f4d3341d36204d17343a07e3b6d99ec135a4ce67da66ad09b8eba2a91b"
+EDGEGUARD_SOURCE_ADAPTER_SHA256 = "419161efd86e63cb62c368fd18c6da84c923923d13774f7b6ea57f1196f65fba"
+EDGEGUARD_RUNTIME_HARNESS_VERSION = "EGM-029 v0.10"
+EDGEGUARD_RUNTIME_LIVE_GATE_RESULT = "v0.9 baseline 44 / 45 = 97.78%"
+EDGEGUARD_DATASET = "qwen-prompt-cypher-v0.10-graph-intent-coverage-v1"
+EDGEGUARD_SOURCE_ADAPTER = "EGM-029 v0.10 graph-intent from v0.9"
+EDGEGUARD_ROBUSTNESS_LABEL_COVERAGE = "96.06% (+16.54pp vs v0.9)"
+EDGEGUARD_ROBUSTNESS_RELATIONSHIP_COVERAGE = "85.83% (+7.87pp vs v0.9)"
+EDGEGUARD_ROBUSTNESS_SUBGRAPH_ACCEPTED = "100% (+7.09pp vs v0.9)"
+EDGEGUARD_TEST_LABEL_COVERAGE = "97.50% (+16.25pp vs v0.9)"
+EDGEGUARD_TEST_RELATIONSHIP_COVERAGE = "76.25% (+5.00pp vs v0.9)"
+EDGEGUARD_CORPUS = "3,588 accepted graph rows (2,868 train / 360 validation / 360 test)"
+
+EDGEGUARD_MODEL_CATALOG = [
+  {
+    "model_key": FINETUNED_MODEL_KEY,
+    "display_name": "Finetuned v0.10",
+    "description": "Private Ratio1 EdgeGuard text-to-Cypher Qwen3 4B v0.10 GGUF.",
+    "model_repo": EDGEGUARD_MODEL_REPO,
+    "model_file": EDGEGUARD_MODEL_FILE,
+    "format": "GGUF",
+    "quantization": "Q4_K_M",
+    "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+    "artifact_sha256": EDGEGUARD_MODEL_ARTIFACT_SHA256,
+    "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
+    "prompt_contract": "one read-only Cypher query string only",
+    "source": "private_ratio1",
+  },
+  {
+    "model_key": BASE_MODEL_KEY,
+    "display_name": "Base Qwen3 4B",
+    "description": "Public base Qwen3 4B Instruct GGUF for side-by-side prompt comparison.",
+    "model_repo": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
+    "model_file": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
+    "format": "GGUF",
+    "quantization": "Q4_K_M",
+    "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+    "artifact_sha256": None,
+    "prompt_profile_id": BASE_PROMPT_PROFILE_ID,
+    "prompt_contract": "schema-grounded read-only Cypher query string only",
+    "source": "public_huggingface",
+  },
+]
 
 CASE_EXPLANATION_RESPONSE_SCHEMA = {
   "type": "object",
@@ -937,13 +980,6 @@ _CONFIG = {
   "API_TITLE": "EdgeGuard API",
   "API_SUMMARY": "Guarded EdgeGuard text-to-Cypher and playground Neo4j API.",
 
-  "EDGEGUARD_LLM_AGENT_URL": None,
-  "EDGEGUARD_LLM_AGENT_HOST": "127.0.0.1",
-  "EDGEGUARD_LLM_AGENT_PORT": None,
-  "EDGEGUARD_LLM_AGENT_PATH": "/generate",
-  "EDGEGUARD_LLM_AGENT_TOKEN": None,
-  "EDGEGUARD_LLM_AGENT_TOKEN_ENV": "EDGEGUARD_LLM_AGENT_TOKEN",
-
   "EDGEGUARD_EXPLANATION_MODEL_URL": None,
   "EDGEGUARD_EXPLANATION_MODEL_HOST": "127.0.0.1",
   "EDGEGUARD_EXPLANATION_MODEL_PORT": None,
@@ -978,10 +1014,6 @@ class EdgeguardApiPlugin(BasePlugin):
     self._request_count = 0
     self._error_count = 0
     self._last_request_time = None
-    self._agent_token = self._resolve_secret(
-      explicit=self.cfg_edgeguard_llm_agent_token,
-      env_name=self.cfg_edgeguard_llm_agent_token_env,
-    )
     self._explanation_token = self._resolve_secret(
       explicit=self.cfg_edgeguard_explanation_model_token,
       env_name=self.cfg_edgeguard_explanation_model_token_env,
@@ -1019,29 +1051,6 @@ class EdgeguardApiPlugin(BasePlugin):
     if isinstance(value, str) and value.strip():
       return value.strip()
     return None
-
-  def _agent_url(self, path: Optional[str] = None) -> Optional[str]:
-    endpoint = path if path is not None else self.cfg_edgeguard_llm_agent_path
-    endpoint = str(endpoint or "/generate").strip()
-    if not endpoint.startswith("/"):
-      endpoint = "/" + endpoint
-    configured_url = self.cfg_edgeguard_llm_agent_url
-    if configured_url:
-      url = str(configured_url).rstrip("/")
-      if url.endswith(endpoint):
-        return url
-      return url + endpoint
-    host = self.cfg_edgeguard_llm_agent_host
-    port = self.cfg_edgeguard_llm_agent_port
-    if not host or not port:
-      return None
-    return f"http://{host}:{int(port)}{endpoint}"
-
-  def _headers(self) -> Dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    if self._agent_token:
-      headers["Authorization"] = f"Bearer {self._agent_token}"
-    return headers
 
   def _explanation_headers(self) -> Dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -1211,7 +1220,6 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="GET")
   def health(self) -> Dict[str, Any]:
-    agent_url = self._agent_url()
     explanation_url, explanation_error = self._explanation_url()
     return {
       "status": STATUS_OK,
@@ -1220,8 +1228,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "graph_explanation_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
       "model_repo": EDGEGUARD_MODEL_REPO,
       "model_file": EDGEGUARD_MODEL_FILE,
-      "agent_url": self._redact_url(agent_url),
-      "agent_configured": bool(agent_url),
+      "generation_orchestrator": "playground_server_route",
       "explanation_model_url": self._redact_url(explanation_url),
       "explanation_model_configured": bool(explanation_url),
       "explanation_model_config_error": explanation_error,
@@ -1235,8 +1242,53 @@ class EdgeguardApiPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="GET")
+  def models(self) -> Dict[str, Any]:
+    return {
+      "schema_version": "edgeguard.model_catalog.v1",
+      "default_model_key": FINETUNED_MODEL_KEY,
+      "models": EDGEGUARD_MODEL_CATALOG,
+    }
+
+  @BasePlugin.endpoint(method="GET")
+  def prompt_contract(self) -> Dict[str, Any]:
+    direct_system_prompt = build_direct_cypher_system_prompt()
+    correction_prompt = build_schema_correction_prompt(
+      original_user_prompt="{normalized_request}",
+      rejected_cypher="{candidate_cypher}",
+      validation_feedback="{validation_feedback}",
+      retry_index=1,
+      retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
+    )
+    return {
+      "schema_version": "edgeguard.prompt_contract.v1",
+      "cypher_schema_version": SCHEMA_VERSION,
+      "schema_surface": canonical_schema_surface(),
+      "temporal_policy": EDGEGUARD_SCHEMA["unsupported"]["temporal_predicates"],
+      "retry_default": DEFAULT_SCHEMA_RETRY_LIMIT,
+      "profiles": [
+        {
+          "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
+          "model_key": FINETUNED_MODEL_KEY,
+          "template_version": "edgeguard-direct-cypher-v0.10",
+          "system_prompt_sha256": _sha256_text(direct_system_prompt),
+          "correction_prompt_sha256": _sha256_text(correction_prompt),
+          "expected_output": "one read-only Cypher query string only",
+        },
+        {
+          "prompt_profile_id": BASE_PROMPT_PROFILE_ID,
+          "model_key": BASE_MODEL_KEY,
+          "template_version": "edgeguard-base-schema-grounded-v0.10",
+          "system_prompt_sha256": None,
+          "correction_prompt_sha256": _sha256_text(correction_prompt),
+          "expected_output": "one schema-grounded read-only Cypher query string only",
+        },
+      ],
+    }
+
+  @BasePlugin.endpoint(method="GET")
   def model(self) -> Dict[str, Any]:
     return {
+      "model_key": FINETUNED_MODEL_KEY,
       "display_name": EDGEGUARD_MODEL_DISPLAY_NAME,
       "model_repo": EDGEGUARD_MODEL_REPO,
       "model_file": EDGEGUARD_MODEL_FILE,
@@ -1247,9 +1299,11 @@ class EdgeguardApiPlugin(BasePlugin):
       "artifact_sha256": EDGEGUARD_MODEL_ARTIFACT_SHA256,
       "schema_version": SCHEMA_VERSION,
       "schema": canonical_schema_surface(),
+      "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
       "guard": {
         "read_only_static": True,
         "schema_compatible": True,
+        "generation_validation_owner": "playground_server_route_via_check_cypher",
         "execution_revalidates": True,
         "live_empty_result_broadening": bool(self.cfg_live_empty_result_broadening),
         "live_empty_result_broadening_strategy": "first_allowed_label_first_allowed_relationship_type",
@@ -1301,70 +1355,6 @@ class EdgeguardApiPlugin(BasePlugin):
       "status": STATUS_ACCEPTED if analysis["accepted"] else STATUS_REJECTED,
       **analysis,
     }
-
-  @BasePlugin.endpoint(method="POST")
-  def generate(
-    self,
-    request: str,
-    retry_limit: Optional[int] = None,
-    temperature: Optional[float] = None,
-    max_tokens: Optional[int] = None,
-    top_p: Optional[float] = None,
-    **kwargs,
-  ) -> Dict[str, Any]:
-    self._request_count += 1
-    self._last_request_time = self.time()
-    agent_url = self._agent_url()
-    if not agent_url:
-      self._error_count += 1
-      return {
-        "status": "config_error",
-        "accepted": False,
-        "error": "EdgeGuard LLM agent port or URL not configured",
-      }
-    payload = {
-      "request": request,
-      "retry_limit": retry_limit,
-      "temperature": temperature,
-      "max_tokens": max_tokens,
-      "top_p": top_p,
-    }
-    try:
-      response = requests.post(
-        agent_url,
-        headers=self._headers(),
-        json=payload,
-        timeout=self.cfg_request_timeout_seconds,
-      )
-      if response.status_code != 200:
-        self._error_count += 1
-        return {
-          "status": STATUS_ERROR,
-          "accepted": False,
-          "error": f"EdgeGuard LLM agent returned status {response.status_code}",
-        }
-      result = response.json()
-      accepted_cypher = result.get("accepted_cypher")
-      if result.get("accepted") and accepted_cypher:
-        analysis = analyze_generated_cypher(accepted_cypher)
-        if not analysis["accepted"]:
-          self._error_count += 1
-          result["status"] = STATUS_REJECTED
-          result["accepted"] = False
-          result["accepted_cypher"] = None
-          result["api_revalidation"] = analysis
-          result["validation_feedback"] = analysis["validation_feedback"]
-      return result
-    except requests.exceptions.Timeout:
-      self._error_count += 1
-      return {"status": "timeout", "accepted": False, "error": "EdgeGuard LLM agent request timed out"}
-    except requests.exceptions.RequestException as exc:
-      self._error_count += 1
-      return {"status": STATUS_ERROR, "accepted": False, "error": str(exc)}
-    except Exception as exc:
-      self._error_count += 1
-      self.P(f"Unexpected EdgeGuard API generation error: {exc}\n{traceback.format_exc()}", color='r')
-      return {"status": STATUS_ERROR, "accepted": False, "error": f"Unexpected error: {exc}"}
 
   def _normalize_neo4j_uri(self, uri: str, scheme: str = "bolt+s") -> tuple[Optional[str], Optional[str]]:
     if not isinstance(uri, str) or not uri.strip():

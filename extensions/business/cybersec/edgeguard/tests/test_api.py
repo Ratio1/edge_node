@@ -31,10 +31,7 @@ mock_plugin_modules()
 
 from extensions.business.cybersec.edgeguard.edgeguard_api import EdgeguardApiPlugin  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_packet_and_explanation  # noqa: E402
-from extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api import (  # noqa: E402
-  EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
-  EdgeguardLlmAgentApiPlugin,
-)
+from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
 
 
 class _Response:
@@ -167,50 +164,8 @@ def _provider_response_for_packet(packet, caveat_types=None):
   })
 
 
-def _make_agent(**overrides):
-  plugin = EdgeguardLlmAgentApiPlugin.__new__(EdgeguardLlmAgentApiPlugin)
-  plugin.cfg_local_llm_api_url = overrides.get("local_llm_api_url")
-  plugin.cfg_local_llm_api_host = overrides.get("local_llm_api_host", "127.0.0.1")
-  plugin.cfg_local_llm_api_port = overrides.get("local_llm_api_port", 5090)
-  plugin.cfg_local_llm_api_path = overrides.get("local_llm_api_path", "/create_chat_completion")
-  plugin.cfg_local_llm_api_token = overrides.get("local_llm_api_token")
-  plugin.cfg_local_llm_api_token_env = overrides.get("local_llm_api_token_env", "LLM_API_TOKEN")
-  plugin.cfg_local_llm_model = overrides.get(
-    "local_llm_model",
-    "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
-  )
-  plugin.cfg_default_temperature = overrides.get("default_temperature", 0.0)
-  plugin.cfg_default_max_tokens = overrides.get("default_max_tokens", 512)
-  plugin.cfg_default_top_p = overrides.get("default_top_p", 1.0)
-  plugin.cfg_schema_retry_limit = overrides.get("schema_retry_limit", 2)
-  plugin.cfg_max_request_chars = overrides.get("max_request_chars", 4000)
-  plugin.cfg_request_timeout_seconds = overrides.get("request_timeout_seconds", 120)
-  plugin.cfg_edgeguard_verbose = 0
-  plugin.os_environ = overrides.get("os_environ", {})
-  plugin._local_api_token = overrides.get("local_api_token")
-  plugin._request_count = 0
-  plugin._error_count = 0
-  plugin._last_request_time = None
-  plugin.time = lambda: 1000
-  plugin.P = lambda *_args, **_kwargs: None
-  plugin.Pd = lambda *_args, **_kwargs: None
-  plugin.log = MagicMock()
-  plugin.log.get_localhost_ip.return_value = "127.0.0.1"
-  plugin.port = overrides.get("port", 5060)
-  plugin.cfg_port = overrides.get("cfg_port", 5060)
-  plugin.semaphore_env = {}
-  plugin.semaphore_set_env = lambda key, value: plugin.semaphore_env.__setitem__(key, str(value))
-  return plugin
-
-
 def _make_api(**overrides):
   plugin = EdgeguardApiPlugin.__new__(EdgeguardApiPlugin)
-  plugin.cfg_edgeguard_llm_agent_url = overrides.get("edgeguard_llm_agent_url")
-  plugin.cfg_edgeguard_llm_agent_host = overrides.get("edgeguard_llm_agent_host", "127.0.0.1")
-  plugin.cfg_edgeguard_llm_agent_port = overrides.get("edgeguard_llm_agent_port", 5060)
-  plugin.cfg_edgeguard_llm_agent_path = overrides.get("edgeguard_llm_agent_path", "/generate")
-  plugin.cfg_edgeguard_llm_agent_token = overrides.get("edgeguard_llm_agent_token")
-  plugin.cfg_edgeguard_llm_agent_token_env = overrides.get("edgeguard_llm_agent_token_env", "EDGEGUARD_LLM_AGENT_TOKEN")
   plugin.cfg_edgeguard_explanation_model_url = overrides.get("edgeguard_explanation_model_url")
   plugin.cfg_edgeguard_explanation_model_host = overrides.get("edgeguard_explanation_model_host", "127.0.0.1")
   plugin.cfg_edgeguard_explanation_model_port = overrides.get("edgeguard_explanation_model_port", 5090)
@@ -229,7 +184,6 @@ def _make_api(**overrides):
   plugin.cfg_request_timeout_seconds = overrides.get("request_timeout_seconds", 120)
   plugin.cfg_edgeguard_verbose = 0
   plugin.os_environ = overrides.get("os_environ", {})
-  plugin._agent_token = overrides.get("agent_token")
   plugin._explanation_token = overrides.get("explanation_token")
   plugin._request_count = 0
   plugin._error_count = 0
@@ -246,166 +200,12 @@ def _make_api(**overrides):
   return plugin
 
 
-class EdgeGuardAgentTests(unittest.TestCase):
-  def test_edgeguard_api_timeout_defaults_share_long_generation_budget(self):
+class EdgeGuardApiTests(unittest.TestCase):
+  def test_edgeguard_api_timeout_defaults_keep_long_generation_budget_for_ui_route(self):
     self.assertEqual(EDGEGUARD_REQUEST_TIMEOUT_SECONDS, 600)
-    self.assertEqual(EdgeguardLlmAgentApiPlugin.CONFIG["REQUEST_TIMEOUT"], 600)
-    self.assertEqual(EdgeguardLlmAgentApiPlugin.CONFIG["REQUEST_TIMEOUT_SECONDS"], 600)
     self.assertEqual(EdgeguardApiPlugin.CONFIG["REQUEST_TIMEOUT"], 600)
     self.assertEqual(EdgeguardApiPlugin.CONFIG["REQUEST_TIMEOUT_SECONDS"], 600)
 
-  def test_agent_exports_api_url_for_semaphore_consumers(self):
-    plugin = _make_agent(port=5060)
-
-    plugin._setup_semaphore_env()
-
-    self.assertEqual(plugin.semaphore_env["API_HOST"], "127.0.0.1")
-    self.assertEqual(plugin.semaphore_env["API_PORT"], "5060")
-    self.assertEqual(plugin.semaphore_env["API_URL"], "http://127.0.0.1:5060")
-
-  def test_agent_accepts_valid_first_output(self):
-    plugin = _make_agent()
-    payload = {
-      "model": "edgeguard_qwen_4b",
-      "choices": [{
-        "message": {
-          "content": "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
-        },
-      }],
-    }
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
-      return_value=_Response(payload=payload),
-    ) as mocked_post:
-      result = plugin.generate(request="Show indicators")
-
-    self.assertTrue(result["accepted"])
-    self.assertEqual(result["status"], "accepted")
-    self.assertEqual(len(result["attempts"]), 1)
-    self.assertEqual(
-      result["accepted_cypher"],
-      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
-    )
-    call_payload = mocked_post.call_args.kwargs["json"]
-    self.assertEqual(call_payload["temperature"], 0.0)
-    self.assertIn("Allowed EdgeGuard Cypher schema", call_payload["messages"][0]["content"])
-
-  def test_agent_normalizes_user_literals_before_model_call(self):
-    plugin = _make_agent()
-    payload = {
-      "model": "edgeguard_qwen_4b",
-      "choices": [{
-        "message": {
-          "content": "MATCH (c:CVE) WHERE c.cve_id = 'CVE-2024-12345' RETURN c LIMIT 5",
-        },
-      }],
-    }
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
-      return_value=_Response(payload=payload),
-    ) as mocked_post:
-      result = plugin.generate(request="Find cve-2024-12345 from hxxp://bad[.]test")
-
-    self.assertTrue(result["accepted"])
-    call_payload = mocked_post.call_args.kwargs["json"]
-    self.assertEqual(
-      call_payload["messages"][1]["content"],
-      "Find CVE-2024-12345 from http://bad.test",
-    )
-
-  def test_agent_unwraps_local_inference_api_result_envelope(self):
-    plugin = _make_agent()
-    payload = {
-      "result": {
-        "REQUEST_ID": "req-1",
-        "MODEL_NAME": "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
-        "TEXT_RESPONSE": "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
-      },
-    }
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
-      return_value=_Response(payload=payload),
-    ):
-      result = plugin.generate(request="Show internet-facing hosts and their IP addresses")
-
-    self.assertTrue(result["accepted"])
-    self.assertEqual(result["status"], "accepted")
-    self.assertEqual(
-      result["accepted_cypher"],
-      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
-    )
-
-  def test_agent_propagates_local_inference_failure_envelope(self):
-    plugin = _make_agent()
-    payload = {
-      "result": {
-        "request_id": "req-1",
-        "status": "failed",
-        "error": "Local LLM returned an invalid empty response.",
-      },
-    }
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
-      return_value=_Response(payload=payload),
-    ):
-      result = plugin.generate(request="Show indicators")
-
-    self.assertFalse(result["accepted"])
-    self.assertEqual(result["status"], "error")
-    self.assertEqual(result["error"], "Local LLM returned an invalid empty response.")
-
-  def test_agent_retries_after_schema_rejection(self):
-    plugin = _make_agent()
-    responses = [
-      _Response(payload={
-        "choices": [{
-          "message": {
-            "content": "MATCH (i:InternetFacing) WHERE i.cve IS NOT NULL RETURN i.hostname AS hostname",
-          },
-        }],
-      }),
-      _Response(payload={
-        "choices": [{
-          "message": {
-            "content": "MATCH (v:Vulnerability) RETURN v.cve_id AS cve_id, v.severity AS severity LIMIT 10",
-          },
-        }],
-      }),
-    ]
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
-      side_effect=responses,
-    ) as mocked_post:
-      result = plugin.generate(request="Show internet-facing assets with critical vulnerabilities")
-
-    self.assertTrue(result["accepted"])
-    self.assertEqual(len(result["attempts"]), 2)
-    self.assertEqual(result["attempts"][1]["kind"], "schema_correction")
-    retry_prompt = mocked_post.call_args_list[1].kwargs["json"]["messages"][1]["content"]
-    self.assertIn("Unknown labels: InternetFacing", retry_prompt)
-
-  def test_agent_rejects_after_retry_limit(self):
-    plugin = _make_agent(schema_retry_limit=1)
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
-      return_value=_Response(payload={
-        "choices": [{"message": {"content": "Here is the query: MATCH (i:Indicator) RETURN i.value"}}],
-      }),
-    ):
-      result = plugin.generate(request="Show indicators")
-
-    self.assertFalse(result["accepted"])
-    self.assertEqual(result["status"], "rejected")
-    self.assertEqual(len(result["attempts"]), 2)
-
-
-class EdgeGuardApiTests(unittest.TestCase):
   def test_api_exports_api_url_for_semaphore_consumers(self):
     plugin = _make_api(port=5055)
 
@@ -423,11 +223,15 @@ class EdgeGuardApiTests(unittest.TestCase):
       {"SERVING_PROCESS": "llama_cpp_edgeguard_qwen_4b"},
     )
 
+  def test_edgeguard_api_no_longer_exposes_generation_endpoint(self):
+    self.assertFalse(hasattr(EdgeguardApiPlugin, "generate"))
+
   def test_api_model_metadata_uses_v010_graph_intent_artifact(self):
     plugin = _make_api()
 
     model = plugin.model()
 
+    self.assertEqual(model["model_key"], "finetuned_v0_10")
     self.assertEqual(model["display_name"], "EdgeGuard Cypher Qwen3 4B v0.10 Graph-Intent GGUF")
     self.assertEqual(model["model_repo"], "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf")
     self.assertEqual(model["model_file"], "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf")
@@ -438,25 +242,40 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(model["quality"]["planner_failures"], 0)
     self.assertTrue(model["runtime_harness"]["empty_result_broadening"])
 
-  def test_api_revalidates_agent_accepted_cypher(self):
+  def test_api_models_returns_finetuned_and_base_catalog_without_backend_urls(self):
     plugin = _make_api()
-    agent_payload = {
-      "status": "accepted",
-      "accepted": True,
-      "accepted_cypher": "MATCH (i:InternetFacing) RETURN i.hostname AS hostname",
-      "attempts": [],
-    }
 
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.post",
-      return_value=_Response(payload=agent_payload),
-    ):
-      result = plugin.generate(request="Show hosts")
+    catalog = plugin.models()
 
-    self.assertFalse(result["accepted"])
-    self.assertEqual(result["status"], "rejected")
-    self.assertIsNone(result["accepted_cypher"])
-    self.assertIn("api_revalidation", result)
+    self.assertEqual(catalog["schema_version"], "edgeguard.model_catalog.v1")
+    self.assertEqual(catalog["default_model_key"], "finetuned_v0_10")
+    keys = {item["model_key"] for item in catalog["models"]}
+    self.assertEqual(keys, {"finetuned_v0_10", "base_qwen3_4b"})
+    flattened = json.dumps(catalog)
+    self.assertNotIn("http://", flattened)
+    self.assertNotIn("https://127.0.0.1", flattened)
+    self.assertNotIn("localhost", flattened)
+
+  def test_api_prompt_contract_exposes_schema_surface_and_profile_metadata(self):
+    plugin = _make_api()
+
+    contract = plugin.prompt_contract()
+
+    self.assertEqual(contract["schema_version"], "edgeguard.prompt_contract.v1")
+    self.assertEqual(contract["cypher_schema_version"], "edgeguard-cypher-schema-v0.10")
+    self.assertEqual(contract["retry_default"], 2)
+    self.assertIn("labels", contract["schema_surface"])
+    self.assertIn("allowed_properties", contract["temporal_policy"])
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertEqual(
+      profiles["finetuned_v0_10"]["prompt_profile_id"],
+      "edgeguard_direct_cypher_v0_10",
+    )
+    self.assertEqual(
+      profiles["base_qwen3_4b"]["prompt_profile_id"],
+      "edgeguard_base_schema_grounded_v0_10",
+    )
+    self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
 
   def test_api_validate_accepts_schema_query(self):
     plugin = _make_api()

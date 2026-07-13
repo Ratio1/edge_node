@@ -12,7 +12,6 @@ class EdgeGuardNativeApiSemaphoreContractTests(unittest.TestCase):
 
   def test_edgeguard_native_emitters_preserve_legacy_aliases_on_top_of_fastapi_defaults(self):
     for relative_path, class_name in [
-      ("extensions/business/cybersec/edgeguard/edgeguard_llm_agent_api.py", "EdgeguardLlmAgentApiPlugin"),
       ("extensions/business/cybersec/edgeguard/edgeguard_api.py", "EdgeguardApiPlugin"),
     ]:
       source = self._read(relative_path)
@@ -34,6 +33,8 @@ class EdgeGuardNativeApiSemaphoreContractTests(unittest.TestCase):
     self.assertIn('"type": "shmem"', source)
     self.assertIn('"path": ["edgeguard_api", "API_URL"]', source)
     self.assertNotIn('"EDGEGUARD_API_BASE_URL": "http://127.0.0.1:5055"', source)
+    self.assertNotIn('"SIGNATURE": "EDGEGUARD_LLM_AGENT_API"', source)
+    self.assertNotIn("EDGEGUARD_LLM_AGENT_PORT", source)
 
 
 if __name__ == "__main__":

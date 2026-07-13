@@ -702,14 +702,14 @@ Entry format:
 - Summary: EdgeGuard playground stream config can override serving-profile model defaults.
 - Criticality: Operational deployment risk for EdgeGuard model cutovers; source constants and `/model` metadata can report a new target while the active inference stream still loads an older GGUF from persisted stream parameters.
 - Details: During the EGM-029 v0.10 retarget, source defaults and `/model` metadata showed the v0.10 repo/file, but a live generation payload still identified the v0.9 GGUF until the active stream config `STARTUP_AI_ENGINE_PARAMS` was updated. For future cutovers, update both source defaults and the active stream configuration, then verify the returned generation `model` field, not only `/health` or `/model`.
-- Verification: `curl -fsS http://127.0.0.1:5055/model`; `curl -fsS http://127.0.0.1:5055/generate` with an accepted prompt and inspection of the response `model` field.
-- Links: `extensions/business/cybersec/red_mesh/edgeguard_llm_agent_api.py`, `extensions/serving/default_inference/nlp/llama_cpp_edgeguard_qwen_4b.py`
+- Verification: `curl -fsS http://127.0.0.1:5055/model`; generate through the playground server route and inspect the returned attempt `model` field after it calls the model-specific `LLM_INFERENCE_API`.
+- Links: `extensions/business/cybersec/edgeguard/edgeguard_api.py`, `extensions/serving/default_inference/nlp/llama_cpp_edgeguard_qwen_4b.py`
 
 - ID: `ML-20260710-001`
 - Timestamp: `2026-07-10T04:15:31Z`
 - Type: `change`
 - Summary: Moved EdgeGuard cybersec runtime code into a dedicated `extensions/business/cybersec/edgeguard/` package.
-- Criticality: Module-boundary and plugin-discovery change for EdgeGuard API, LLM-agent, guard, playground config, and tests.
-- Details: EdgeGuard-specific modules and tests now live outside `red_mesh`; the business plugin filenames intentionally remain `edgeguard_api.py` and `edgeguard_llm_agent_api.py` because the plugin loader derives module names from `SIGNATURE` values such as `EDGEGUARD_API`. The serving profile remains under `extensions/serving/default_inference/nlp/` because it is discovered through the AI engine serving-process registry.
+- Criticality: Module-boundary and plugin-discovery change for EdgeGuard API, guard, playground config, and tests.
+- Details: EdgeGuard-specific modules and tests now live outside `red_mesh`; generation is no longer owned by an EdgeGuard LLM-agent plugin or `EDGEGUARD_API /generate`. The playground server route calls model-specific `LLM_INFERENCE_API` workers directly, and `EDGEGUARD_API` stays as the safety facade for model metadata, prompt contract metadata, `/check_cypher`, Neo4j execution, and graph explanation. The serving profile remains under `extensions/serving/default_inference/nlp/` because it is discovered through the AI engine serving-process registry.
 - Verification: `python3 -m unittest extensions.business.cybersec.edgeguard.tests.test_api extensions.business.cybersec.edgeguard.tests.test_cypher_guard extensions.business.cybersec.edgeguard.tests.test_native_api_semaphore_contract extensions.business.cybersec.red_mesh.test_native_api_semaphore_contract extensions.business.edge_inference_api.test_llm_inference_api`; `python3 -m py_compile ...`; `git diff --check`; `importlib.util.find_spec(...)` for the moved EdgeGuard modules.
-- Links: `extensions/business/cybersec/edgeguard/edgeguard_api.py`, `extensions/business/cybersec/edgeguard/edgeguard_llm_agent_api.py`, `extensions/business/cybersec/edgeguard/edgeguard_cypher_guard.py`, `extensions/business/cybersec/edgeguard/edgeguard_playground.md`
+- Links: `extensions/business/cybersec/edgeguard/edgeguard_api.py`, `extensions/business/cybersec/edgeguard/edgeguard_cypher_guard.py`, `extensions/business/cybersec/edgeguard/edgeguard_playground.md`, `extensions/serving/default_inference/nlp/llama_cpp_edgeguard_qwen_4b.py`

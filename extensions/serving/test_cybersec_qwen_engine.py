@@ -1,4 +1,5 @@
 import json
+import sys
 import tempfile
 import types
 import unittest
@@ -19,6 +20,7 @@ class _FakeBaseServingProcess:
 
   def __init__(self):
     self.cache_dir = "/tmp/edge-node-test-cache"
+    self.hf_token = None
     self.log = types.SimpleNamespace(gpu_info=lambda: [])
     self.messages = []
     self.cfg_generation_seed = 123
@@ -103,6 +105,20 @@ def _load_llama_cpp_base_class():
   return namespace["LlamaCppBaseServingProcess"]
 
 
+def _load_ai_engine_utils():
+  source_path = ROOT / "naeural_core" / "naeural_core" / "serving" / "ai_engines" / "utils.py"
+  source = source_path.read_text(encoding="utf-8")
+  source = source.replace("from naeural_core.serving.ai_engines import AI_ENGINES\n", "")
+  namespace = {
+    "AI_ENGINES": AI_ENGINES,
+    "__name__": "loaded_ai_engine_utils",
+  }
+  exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
+  return types.SimpleNamespace(
+    get_serving_process_given_ai_engine=namespace["get_serving_process_given_ai_engine"],
+  )
+
+
 def _make_llama_cpp_process(**overrides):
   _FakeLlama.calls = []
   process = _load_llama_cpp_base_class()()
@@ -128,7 +144,23 @@ class CyberSecQwenEngineTests(unittest.TestCase):
       AI_ENGINES["cybersec_qwen_4b"]["SERVING_PROCESS"],
       "llama_cpp_cybersec_qwen_4b",
     )
+    self.assertEqual(
+      AI_ENGINES["edgeguard_qwen_4b"]["SERVING_PROCESS"],
+      "llama_cpp_edgeguard_qwen_4b",
+    )
     self.assertNotIn("llama_cpp", AI_ENGINES)
+
+  def test_edgeguard_base_worker_can_use_serving_process_directly(self):
+    utils = _load_ai_engine_utils()
+
+    self.assertEqual(
+      utils.get_serving_process_given_ai_engine("llama_cpp_edgeguard_qwen_4b"),
+      "llama_cpp_edgeguard_qwen_4b",
+    )
+    self.assertEqual(
+      utils.get_serving_process_given_ai_engine("llama_cpp_edgeguard_qwen_4b?edgeguard-base-qwen3-4b"),
+      ("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
+    )
 
   def test_serving_config_is_cpu_bounded_q4_model(self):
     loaded = _load_cybersec_qwen_class()
@@ -165,15 +197,26 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
   def test_llama_cpp_base_blank_model_path_uses_repo_loading(self):
     process = _make_llama_cpp_process(cfg_model_path="  ")
+    downloaded_path = "/tmp/edge-node-test-cache/model.gguf"
+    fake_hf_module = types.SimpleNamespace(
+      HfApi=lambda token=None: types.SimpleNamespace(list_repo_files=lambda repo_id, token=None: ["model.gguf"]),
+      hf_hub_download=lambda **_kwargs: downloaded_path,
+    )
+    previous_hf_module = sys.modules.get("huggingface_hub")
+    sys.modules["huggingface_hub"] = fake_hf_module
 
-    process._load_model()
+    try:
+      process._load_model()
+    finally:
+      if previous_hf_module is None:
+        sys.modules.pop("huggingface_hub", None)
+      else:
+        sys.modules["huggingface_hub"] = previous_hf_module
 
     self.assertEqual(len(_FakeLlama.calls), 1)
     call_type, kwargs = _FakeLlama.calls[0]
-    self.assertEqual(call_type, "remote")
-    self.assertEqual(kwargs["repo_id"], "org/repo")
-    self.assertEqual(kwargs["filename"], "model.gguf")
-    self.assertEqual(kwargs["cache_dir"], "/tmp/edge-node-test-cache")
+    self.assertEqual(call_type, "local")
+    self.assertEqual(kwargs["model_path"], downloaded_path)
     self.assertEqual(process.safe_load_model_args["model_id"], "org/repo")
     self.assertEqual(process.safe_load_model_args["model_str_id"], "org/repo/model.gguf")
 
