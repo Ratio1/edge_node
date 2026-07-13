@@ -610,6 +610,11 @@ def _existing_same_pass_artifact(owner, job_id, profile_id, pass_nr):
   assessment = _artifact_repo(owner).get_json(artifact_cid)
   if not isinstance(assessment, dict):
     return None
+  if (
+    assessment.get("schema_version") != RULEBOOK_ASSESSMENT_SCHEMA_VERSION
+    or assessment.get("artifact_kind") != "generated_assessment"
+  ):
+    return None
   return meta, assessment
 
 
@@ -625,6 +630,7 @@ def _history_with_previous(existing_meta, new_meta):
       "pass_nr": existing_meta.get("latest_pass_nr", existing_meta.get("pass_nr")),
       "profile_version": existing_meta.get("profile_version"),
       "schema_version": existing_meta.get("schema_version"),
+      "artifact_kind": existing_meta.get("artifact_kind"),
       "last_generated_at": existing_meta.get("last_generated_at"),
       "status_counts": existing_meta.get("status_counts"),
       "review_state": existing_meta.get("review_state"),
@@ -653,6 +659,7 @@ def _success_meta(result, artifact_cid):
   return {
     "schema": RULEBOOK_ASSESSMENT_SCHEMA,
     "schema_version": RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+    "artifact_kind": "generated_assessment",
     "profile_id": result["profile_id"],
     "profile_version": result["profile_version"],
     "artifact_cid": artifact_cid,
@@ -682,7 +689,16 @@ def _failed_meta(owner, job_id, profile_id, payload):
   return meta
 
 
-def build_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None):
+def build_rulebook_assessment(
+  owner,
+  job_id,
+  profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
+  pass_nr=None,
+  *,
+  include_review=True,
+  artifact_kind="generated_assessment",
+  submission=None,
+):
   profile = _profile(profile_id)
   if not profile:
     return _error("invalid_profile", job_id, profile_id=profile_id)
@@ -697,7 +713,7 @@ def build_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE
   target_value = (redaction_values or [job_id or "unknown"])[0]
   target_pseudonym = stable_hmac_pseudonym(target_value, hmac_secret, prefix="target")
   triage_map = _job_repo(owner).list_job_triage(job_id)
-  review = _job_repo(owner).get_rulebook_review_model(job_id, profile["profile_id"])
+  review = _job_repo(owner).get_rulebook_review_model(job_id, profile["profile_id"]) if include_review else None
 
   checks = []
   for check in profile["checks"]:
@@ -714,6 +730,7 @@ def build_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE
   assessment = {
     "schema": RULEBOOK_ASSESSMENT_SCHEMA,
     "schema_version": RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+    "artifact_kind": artifact_kind,
     "job_id": job_id,
     "generated_at": _utc_timestamp(),
     "profile": {
@@ -745,6 +762,8 @@ def build_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE
       "A clean technical scan does not prove organization-wide control operation.",
     ],
   }
+  if isinstance(submission, dict):
+    assessment["submission"] = dict(submission)
   return {
     "status": "ok",
     "job_id": job_id,
@@ -757,7 +776,13 @@ def build_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE
 
 
 def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None, persist=True, force=True):
-  result = build_rulebook_assessment(owner, job_id, profile_id=profile_id, pass_nr=pass_nr)
+  result = build_rulebook_assessment(
+    owner,
+    job_id,
+    profile_id=profile_id,
+    pass_nr=pass_nr,
+    include_review=not persist,
+  )
   if result.get("status") != "ok":
     profile = _profile(profile_id)
     if profile and persist:

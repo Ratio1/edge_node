@@ -20,6 +20,14 @@ def _install_pymisp_stub():
 _install_pymisp_stub()
 
 from extensions.business.cybersec.red_mesh.services.control import purge_job
+from extensions.business.cybersec.red_mesh.models import (
+  RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+  RULEBOOK_SUBMISSION_CONTRACT_VERSION,
+  RulebookPendingSubmission,
+  RulebookSubmissionReference,
+  RulebookSubmissionRegistry,
+)
+from extensions.business.cybersec.red_mesh.repositories import JobStateRepository
 from extensions.business.cybersec.red_mesh.services.rulebook_assessment import (
   DEFAULT_RULEBOOK_PROFILE_ID,
   build_rulebook_assessment,
@@ -222,6 +230,8 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertEqual(meta["history"], [])
     assessment = owner.artifacts["QmRulebook1"]
     self.assertEqual(assessment["schema"], "redmesh.rulebook_assessment.v1")
+    self.assertEqual(assessment["schema_version"], "1.1.0")
+    self.assertEqual(assessment["artifact_kind"], "generated_assessment")
     self.assertEqual(assessment["profile"]["profile_id"], DEFAULT_RULEBOOK_PROFILE_ID)
     self.assertGreater(assessment["status_counts"]["gap"], 0)
 
@@ -241,6 +251,80 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertEqual(status["artifact_cid"], "QmRulebook1")
     self.assertEqual(status["run_state"], "succeeded")
 
+  def test_persisted_generated_assessment_excludes_mutable_draft_review(self):
+    owner = _Owner()
+    update_rulebook_review(
+      owner,
+      "job-1",
+      answers={"nis2.bcm.business_continuity": {"value": "yes", "note": "private draft comment"}},
+      reviewer="draft-reviewer",
+      review_state="draft",
+    )
+
+    preview = generate_rulebook_assessment(owner, "job-1", persist=False)
+    persisted = generate_rulebook_assessment(owner, "job-1", persist=True)
+
+    self.assertEqual(
+      preview["assessment"]["checks"][2]["review_answer"]["note"],
+      "private draft comment",
+    )
+    artifact = owner.artifacts[persisted["artifact_cid"]]
+    self.assertEqual(artifact["review_state"], {"review_state": "draft", "answers": {}})
+    serialized = json.dumps(artifact, sort_keys=True)
+    self.assertNotIn("private draft comment", serialized)
+    self.assertNotIn("draft-reviewer", serialized)
+
+  def test_submission_models_and_registry_round_trip(self):
+    reference = RulebookSubmissionReference(
+      revision=1,
+      cid="QmSubmission1",
+      submitted_at=1770000400.0,
+      actor="alice",
+      pass_nr=3,
+      profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
+      profile_version="1.0.0",
+      schema_version=RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+      review_revision=2,
+      idempotency_key="submission-1",
+      fingerprint="a" * 64,
+    )
+    pending = RulebookPendingSubmission(
+      target_revision=2,
+      expected_review_revision=3,
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      actor="alice",
+      idempotency_key="submission-2",
+      fingerprint="b" * 64,
+    )
+    registry = RulebookSubmissionRegistry(
+      submissions=[reference],
+      pending=pending,
+    )
+
+    payload = registry.to_dict()
+    restored = RulebookSubmissionRegistry.from_dict(payload).to_dict()
+
+    self.assertEqual(restored["contract_version"], RULEBOOK_SUBMISSION_CONTRACT_VERSION)
+    self.assertEqual(restored["latest_revision"], 1)
+    self.assertEqual(restored["submissions"][0]["cid"], "QmSubmission1")
+    self.assertEqual(restored["pending"]["target_revision"], 2)
+
+  def test_submission_registry_uses_dedicated_cstore_hash(self):
+    owner = _Owner()
+    repo = JobStateRepository(owner)
+    registry = RulebookSubmissionRegistry(submissions=[])
+
+    stored = repo.put_rulebook_submission_registry("job-1", DEFAULT_RULEBOOK_PROFILE_ID, registry)
+    loaded = repo.get_rulebook_submission_registry_model("job-1", DEFAULT_RULEBOOK_PROFILE_ID)
+
+    key = f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}"
+    self.assertEqual(
+      owner.records[(f"{owner.cfg_instance_id}:rulebook_review:submissions", key)],
+      stored,
+    )
+    self.assertEqual(loaded.to_dict(), stored)
+
   def test_ensure_is_idempotent_for_existing_same_pass_and_force_regenerates(self):
     owner = _Owner()
 
@@ -257,6 +341,29 @@ class TestRulebookAssessment(unittest.TestCase):
     meta = owner.job_specs["rulebook_assessments"][DEFAULT_RULEBOOK_PROFILE_ID]
     self.assertEqual(meta["artifact_cid"], "QmRulebook2")
     self.assertEqual(meta["history"][0]["artifact_cid"], "QmRulebook1")
+
+  def test_ensure_replaces_legacy_same_pass_artifact_before_reuse(self):
+    owner = _Owner(job_specs=_sample_job_specs(rulebook_assessments={
+      DEFAULT_RULEBOOK_PROFILE_ID: {
+        "artifact_cid": "QmLegacyRulebook",
+        "pass_nr": 3,
+        "latest_pass_nr": 3,
+        "run_state": "succeeded",
+        "schema_version": "1.0.0",
+      },
+    }))
+    owner.artifacts["QmLegacyRulebook"] = {
+      "schema": "redmesh.rulebook_assessment.v1",
+      "schema_version": "1.0.0",
+      "review_state": {"answers": {"q": {"note": "legacy draft"}}},
+    }
+
+    result = ensure_rulebook_assessment(owner, "job-1")
+
+    self.assertFalse(result.get("cached", False))
+    self.assertNotEqual(result["artifact_cid"], "QmLegacyRulebook")
+    self.assertEqual(owner.artifacts[result["artifact_cid"]]["artifact_kind"], "generated_assessment")
+    self.assertNotIn("legacy draft", json.dumps(owner.artifacts[result["artifact_cid"]]))
 
   def test_running_job_with_completed_pass_report_is_eligible(self):
     owner = _Owner(job_specs=_sample_job_specs(
