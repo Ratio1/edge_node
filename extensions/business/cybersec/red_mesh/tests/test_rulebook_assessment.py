@@ -167,6 +167,7 @@ class _FakeArtifactRepo:
 
   def delete(self, cid, *, show_logs=False, raise_on_error=False):
     self.deleted.append(cid)
+    self.owner.artifacts.pop(cid, None)
     return True
 
 
@@ -612,6 +613,46 @@ class TestRulebookAssessment(unittest.TestCase):
     history = get_rulebook_review(owner, "job-1")["submissions"]
     self.assertEqual([item["revision"] for item in history], [2, 1])
     self.assertNotEqual(history[0]["cid"], history[1]["cid"])
+
+  def test_two_revision_submission_smoke_retrieves_then_purges_every_snapshot(self):
+    owner = _Owner(job_specs=_sample_job_specs())
+    owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
+    review_key = f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}"
+
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=_complete_review_answers(), actor="alice", expected_review_revision=0,
+    )
+    first = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="smoke-revision-1", actor="alice",
+    )
+    reopened = reopen_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], actor="alice",
+    )
+    second = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=reopened["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="smoke-revision-2", actor="bob",
+    )
+
+    first_cid = first["submission"]["cid"]
+    second_cid = second["submission"]["cid"]
+    self.assertEqual(owner.artifact_repo.get_json(first_cid)["submission"]["revision"], 1)
+    self.assertEqual(owner.artifact_repo.get_json(second_cid)["submission"]["revision"], 2)
+    self.assertEqual(
+      [item["cid"] for item in get_rulebook_review(owner, "job-1")["submissions"]],
+      [second_cid, first_cid],
+    )
+
+    result = purge_job(owner, "job-1")
+
+    self.assertEqual(result["status"], "success")
+    self.assertIsNone(owner.artifact_repo.get_json(first_cid))
+    self.assertIsNone(owner.artifact_repo.get_json(second_cid))
+    self.assertIn(first_cid, owner.artifact_repo.deleted)
+    self.assertIn(second_cid, owner.artifact_repo.deleted)
+    self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review", review_key)])
+    self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review:audit", review_key)])
+    self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review:submissions", review_key)])
 
   def test_newer_scan_evidence_marks_prior_submission_stale(self):
     owner = _Owner()
