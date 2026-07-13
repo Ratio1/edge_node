@@ -41,6 +41,7 @@ from extensions.business.cybersec.red_mesh.services.rulebook_assessment import (
   submit_rulebook_review,
   update_rulebook_review,
 )
+from extensions.business.cybersec.red_mesh.services.triage import update_finding_triage
 
 
 def _sample_findings():
@@ -511,6 +512,26 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertEqual(recovered["effective_review_state"], "submitted")
     self.assertEqual(recovered["submission"]["revision"], 1)
 
+  def test_pending_submission_fences_finding_triage_until_retry(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=_complete_review_answers(), actor="alice", expected_review_revision=0,
+    )
+    owner.r1fs.add_json.side_effect = None
+    owner.r1fs.add_json.return_value = None
+    failed = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="pending-triage", actor="alice",
+    )
+
+    triage = update_finding_triage(
+      owner, "job-1", "finding-auth-1", "false_positive", actor="analyst",
+    )
+
+    self.assertEqual(failed["error"], "submission_persist_failed")
+    self.assertEqual(triage["error"], "submission_in_progress")
+    self.assertIsNone(owner.records.get((f"{owner.cfg_instance_id}:triage", "job-1:finding-auth-1")))
+
   def test_partial_final_registry_write_recovers_without_second_r1fs_write(self):
     owner = _Owner()
     saved = save_rulebook_review_draft(
@@ -669,6 +690,33 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertEqual(replay["review_revision"], 2)
     self.assertEqual(conflict["error"], "reopen_idempotency_conflict")
 
+  def test_legacy_write_remains_compatible_after_native_review_is_reopened(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=_complete_review_answers(), actor="alice", expected_review_revision=0,
+    )
+    submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="rollback-source", actor="alice",
+    )
+    reopened = reopen_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"],
+      idempotency_key="rollback-reopen", actor="alice",
+    )
+
+    legacy_saved = update_rulebook_review(
+      owner,
+      "job-1",
+      answers={"nis2.bcm.business_continuity": {"value": "yes", "note": "edited after rollback"}},
+      reviewer="legacy-navigator",
+      review_state="draft",
+    )
+
+    self.assertEqual(reopened["effective_review_state"], "draft")
+    self.assertEqual(legacy_saved["status"], "ok")
+    self.assertEqual(legacy_saved["review"]["review_revision"], 3)
+    self.assertEqual(len(get_rulebook_review(owner, "job-1")["submissions"]), 1)
+
   def test_two_revision_submission_smoke_retrieves_then_purges_every_snapshot(self):
     owner = _Owner(job_specs=_sample_job_specs())
     owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
@@ -749,6 +797,8 @@ class TestRulebookAssessment(unittest.TestCase):
 
   def test_formal_submission_redacts_bearer_jwt_pem_and_unlabelled_tokens(self):
     owner = _Owner()
+    evidence_cid = "QmbuqxraU9uNEYcwiKnMZacSNrRwaGpUXctewuiL5HNF94"
+    evidence_sha256 = "0123456789abcdef" * 4
     answers = _complete_review_answers()
     answers["nis2.bcm.business_continuity"] = {
       "value": "unknown",
@@ -756,7 +806,9 @@ class TestRulebookAssessment(unittest.TestCase):
         "Authorization: Bearer sk_live_1234567890abcdef "
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature1234 "
         "-----BEGIN PRIVATE KEY-----\nprivatekeymaterial123456\n-----END PRIVATE KEY----- "
-        "a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4"
+        "a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4 "
+        "AKIA1234567890ABCDEF glpat-1234567890abcdefghij "
+        f"evidence {evidence_cid} sha256 {evidence_sha256}"
       ),
     }
     saved = save_rulebook_review_draft(
@@ -772,6 +824,10 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", serialized)
     self.assertNotIn("privatekeymaterial123456", serialized)
     self.assertNotIn("a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4", serialized)
+    self.assertNotIn("AKIA1234567890ABCDEF", serialized)
+    self.assertNotIn("glpat-1234567890abcdefghij", serialized)
+    self.assertIn(evidence_cid, serialized)
+    self.assertIn(evidence_sha256, serialized)
     self.assertIn("<redacted", serialized)
 
   def test_future_registry_contract_returns_stable_upgrade_error_for_writes(self):

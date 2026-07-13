@@ -314,12 +314,22 @@ def _collect_rulebook_submission_cids(payload):
 
 
 def _force_purge_job(owner, job_id, raw_payload, errors):
+  from .rulebook_assessment import _submission_lock, list_rulebook_profiles
+
+  with ExitStack() as stack:
+    for profile in sorted(list_rulebook_profiles(), key=lambda item: item["profile_id"]):
+      stack.enter_context(_submission_lock(owner, job_id, profile["profile_id"]))
+    return _force_purge_job_locked(owner, job_id, raw_payload, errors)
+
+
+def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   """
   Best-effort wipe of a job whose record could not be parsed/purged by
   ``stop_and_delete_job``. Returns (cids_deleted, cids_failed).
 
-  Scans the raw payload for ``*_cid`` fields, attempts R1FS deletion, then
-  tombstones the CStore record and matching live/triage rows regardless.
+  Scans the raw payload for ``*_cid`` fields and attempts R1FS deletion.
+  Formal submission pointers remain retryable unless their CIDs are verified absent;
+  other legacy artifacts retain the existing best-effort force-wipe behavior.
   """
   cids = {c for c in _collect_cids_from_raw(raw_payload) if isinstance(c, str)}
   submission_hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
@@ -329,9 +339,9 @@ def _force_purge_job(owner, job_id, raw_payload, errors):
     submission_rows = {}
     errors.append({"job_id": job_id, "scope": submission_hkey, "message": f"{type(exc).__name__}: {exc}"})
   shared_submission_cids = set()
+  job_submission_cids = set()
   if isinstance(submission_rows, dict):
     prefix = f"{job_id}:"
-    job_submission_cids = set()
     other_submission_cids = set()
     for key, registry in submission_rows.items():
       if isinstance(key, str) and key.startswith(prefix):
@@ -359,23 +369,36 @@ def _force_purge_job(owner, job_id, raw_payload, errors):
       "message": f"retained shared submission CIDs: {sorted(shared_submission_cids)}",
     })
   artifacts = _artifact_repo(owner)
+  failed_submission_cids = set(shared_submission_cids)
   for cid in cids:
     try:
       success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
+      if success and cid in job_submission_cids:
+        try:
+          success = artifacts.get_json(cid) is None
+        except Exception as exc:
+          success = False
+          errors.append({"job_id": job_id, "scope": "r1fs", "message": f"{type(exc).__name__}: {exc}"})
+        if not success:
+          failed_submission_cids.add(cid)
       if success:
         cids_deleted += 1
         owner.P(f"[PURGE_ALL_FORCE] Deleted CID {cid} for {job_id}")
       else:
         cids_failed += 1
+        if cid in job_submission_cids:
+          failed_submission_cids.add(cid)
         owner.P(f"[PURGE_ALL_FORCE] delete returned False for CID {cid} ({job_id})", color='y')
     except Exception as exc:
       cids_failed += 1
+      if cid in job_submission_cids:
+        failed_submission_cids.add(cid)
       owner.P(f"[PURGE_ALL_FORCE] Failed to delete CID {cid} ({job_id}): {exc}", color='r')
       errors.append({"job_id": job_id, "scope": "r1fs", "message": f"{type(exc).__name__}: {exc}"})
 
-  if shared_submission_cids:
+  if failed_submission_cids:
     owner.P(
-      f"[PURGE_ALL_FORCE] Retaining CStore rows for {job_id}; shared submission CIDs require retry.",
+      f"[PURGE_ALL_FORCE] Retaining CStore rows for {job_id}; formal submission CIDs require retry.",
       color='r',
     )
     return cids_deleted, cids_failed

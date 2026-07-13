@@ -2183,6 +2183,29 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertIn("orphan-peer:nis2.eu_baseline.v1", plugin._hashes[submission_hkey])
     self.assertNotIn("cid-shared-submission", {call.args[0] for call in plugin.r1fs.delete_file.call_args_list})
 
+  def test_force_purge_retains_rows_when_formal_cid_remains_retrievable(self):
+    Plugin = self._get_plugin_class()
+    jobs = {"job-bad": {"job_id": "job-bad", "job_status": "legacy"}}
+    plugin = self._make_plugin(jobs)
+    submission_hkey = "test-instance:rulebook_review:submissions"
+    submission_key = "job-bad:nis2.eu_baseline.v1"
+    plugin._hashes[submission_hkey] = {
+      submission_key: {
+        "submissions": [{"revision": 1, "cid": "cid-retained-submission"}],
+      },
+    }
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+    plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
+    plugin.stop_and_delete_job.side_effect = RuntimeError("legacy parse failure")
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertGreaterEqual(result["cids_failed"], 1)
+    self.assertIn("job-bad", plugin._hashes["test-instance"])
+    self.assertIn(submission_key, plugin._hashes[submission_hkey])
+
   def test_confirm_required(self):
     """Endpoint refuses to purge without confirm=True."""
     Plugin = self._get_plugin_class()

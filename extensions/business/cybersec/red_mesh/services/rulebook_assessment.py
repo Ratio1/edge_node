@@ -53,6 +53,22 @@ _PEM_PRIVATE_KEY_RE = re.compile(
   r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
   re.IGNORECASE | re.DOTALL,
 )
+_PROVIDER_TOKEN_RE = re.compile(
+  r"(?<![A-Za-z0-9_-])(?:"
+  r"(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[A-Z0-9]{16}"
+  r"|glpat-[A-Za-z0-9_-]{20,}"
+  r"|gh[pousr]_[A-Za-z0-9]{20,}"
+  r"|sk_(?:live|test)_[A-Za-z0-9]{16,}"
+  r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+  r")(?![A-Za-z0-9_-])"
+)
+_PUBLIC_REFERENCE_RE = re.compile(
+  r"(?<![A-Za-z0-9])(?:"
+  r"Qm[1-9A-HJ-NP-Za-km-z]{44}"
+  r"|b[a-z2-7]{20,}"
+  r"|[A-Fa-f0-9]{64}"
+  r")(?![A-Za-z0-9])"
+)
 _UNLABELLED_TOKEN_RE = re.compile(
   r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-]))"
   r"(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}"
@@ -259,7 +275,18 @@ def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
   text = _BEARER_TOKEN_RE.sub("Authorization: Bearer <redacted>", text)
   text = _JWT_RE.sub("<redacted-jwt>", text)
   text = _SECRET_ASSIGNMENT_RE.sub(_replace_secret, text)
+  text = _PROVIDER_TOKEN_RE.sub("<redacted-provider-token>", text)
+  public_references = []
+
+  def _preserve_public_reference(match):
+    marker = f"publicrefmarker{len(public_references)}"
+    public_references.append((marker, match.group(0)))
+    return marker
+
+  text = _PUBLIC_REFERENCE_RE.sub(_preserve_public_reference, text)
   text = _UNLABELLED_TOKEN_RE.sub("<redacted-token>", text)
+  for marker, public_reference in public_references:
+    text = text.replace(marker, public_reference)
   text = _IPV4_RE.sub(_replace_ip, text)
   text = " ".join(text.split())
   return text[:max_len]
@@ -1937,7 +1964,11 @@ def _update_rulebook_review_locked(
     registry = _submission_registry(repo, job_id, profile["profile_id"]).to_dict()
   except ValueError:
     return _unsupported_submission_registry_error(job_id, profile["profile_id"])
-  if registry.get("pending") or registry.get("submissions") or _legacy_submission_reference(job_specs, profile, previous):
+  formal_history_blocks_legacy_write = bool(
+    registry.get("submissions")
+    and (previous is None or previous.review_state != "draft")
+  )
+  if registry.get("pending") or formal_history_blocks_legacy_write or _legacy_submission_reference(job_specs, profile, previous):
     return _submission_error(
       "review_already_submitted",
       job_id,
