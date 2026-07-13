@@ -359,6 +359,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
     except Exception as exc:
       errors.append({"job_id": job_id, "scope": owner.cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
     cids.update(job_submission_cids - shared_submission_cids)
+    cids.difference_update(shared_submission_cids)
   cids = sorted(cids)
   cids_deleted = 0
   cids_failed = len(shared_submission_cids)

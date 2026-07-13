@@ -66,12 +66,15 @@ _PUBLIC_REFERENCE_RE = re.compile(
   r"(?<![A-Za-z0-9])(?:"
   r"Qm[1-9A-HJ-NP-Za-km-z]{44}"
   r"|b[a-z2-7]{20,}"
-  r"|[A-Fa-f0-9]{64}"
+  r"|sha256:[A-Fa-f0-9]{64}"
   r")(?![A-Za-z0-9])"
 )
 _UNLABELLED_TOKEN_RE = re.compile(
   r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-]))"
   r"(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}"
+)
+_UNLABELLED_HEX_RE = re.compile(
+  r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32,128}(?![A-Fa-f0-9])"
 )
 
 _CLOSED_TRIAGE_STATUSES = {"false_positive", "remediated"}
@@ -284,6 +287,7 @@ def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
     return marker
 
   text = _PUBLIC_REFERENCE_RE.sub(_preserve_public_reference, text)
+  text = _UNLABELLED_HEX_RE.sub("<redacted-hex-token>", text)
   text = _UNLABELLED_TOKEN_RE.sub("<redacted-token>", text)
   for marker, public_reference in public_references:
     text = text.replace(marker, public_reference)
@@ -1966,7 +1970,11 @@ def _update_rulebook_review_locked(
     return _unsupported_submission_registry_error(job_id, profile["profile_id"])
   formal_history_blocks_legacy_write = bool(
     registry.get("submissions")
-    and (previous is None or previous.review_state != "draft")
+    and (
+      previous is None
+      or previous.review_state != "draft"
+      or review_state != "draft"
+    )
   )
   if registry.get("pending") or formal_history_blocks_legacy_write or _legacy_submission_reference(job_specs, profile, previous):
     return _submission_error(

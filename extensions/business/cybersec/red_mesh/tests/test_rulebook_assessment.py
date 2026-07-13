@@ -711,10 +711,18 @@ class TestRulebookAssessment(unittest.TestCase):
       reviewer="legacy-navigator",
       review_state="draft",
     )
+    legacy_reviewed = update_rulebook_review(
+      owner,
+      "job-1",
+      answers={},
+      reviewer="legacy-navigator",
+      review_state="reviewed",
+    )
 
     self.assertEqual(reopened["effective_review_state"], "draft")
     self.assertEqual(legacy_saved["status"], "ok")
     self.assertEqual(legacy_saved["review"]["review_revision"], 3)
+    self.assertEqual(legacy_reviewed["error"], "review_already_submitted")
     self.assertEqual(len(get_rulebook_review(owner, "job-1")["submissions"]), 1)
 
   def test_two_revision_submission_smoke_retrieves_then_purges_every_snapshot(self):
@@ -808,7 +816,7 @@ class TestRulebookAssessment(unittest.TestCase):
         "-----BEGIN PRIVATE KEY-----\nprivatekeymaterial123456\n-----END PRIVATE KEY----- "
         "a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4 "
         "AKIA1234567890ABCDEF glpat-1234567890abcdefghij "
-        f"evidence {evidence_cid} sha256 {evidence_sha256}"
+        f"evidence {evidence_cid} sha256:{evidence_sha256}"
       ),
     }
     saved = save_rulebook_review_draft(
@@ -829,6 +837,26 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertIn(evidence_cid, serialized)
     self.assertIn(evidence_sha256, serialized)
     self.assertIn("<redacted", serialized)
+
+  def test_unlabelled_64_hex_secret_is_redacted(self):
+    owner = _Owner()
+    secret = "deadbeef" * 8
+    answers = _complete_review_answers()
+    answers["nis2.bcm.business_continuity"] = {
+      "value": "unknown",
+      "note": f"unlabelled value {secret}",
+    }
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=answers, actor="alice", expected_review_revision=0,
+    )
+    submitted = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="hex-secret-redaction", actor="alice",
+    )
+
+    serialized = json.dumps(owner.artifacts[submitted["submission"]["cid"]], sort_keys=True)
+    self.assertNotIn(secret, serialized)
+    self.assertIn("<redacted-hex-token>", serialized)
 
   def test_future_registry_contract_returns_stable_upgrade_error_for_writes(self):
     owner = _Owner()
