@@ -27,6 +27,8 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertNotIn("naeural_test", compose_text)
     self.assertNotIn("naeural/ctrl", compose_text)
     self.assertIn("starts an inner Docker daemon", compose_text)
+    self.assertNotIn("EE_ENABLE_DEBUG_FASTAPI_PAUSE_CYCLE", compose_text)
+    self.assertNotIn('"127.0.0.1:3201:3001"', compose_text)
     self.assertIn("privileged: true", compose_text)
     self.assertNotIn("EE_EVM_NET: testnet", compose_text)
     self.assertNotIn("EE_EVM_NET: mainnet", compose_text)
@@ -254,7 +256,18 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("main(additional_packages=[])", comms_entrypoint)
     self.assertIn("local LLM serving", comms_entrypoint)
     self.assertIn("ct.ADMIN_PIPELINE = _COMMS_ADMIN_PIPELINE", comms_entrypoint)
+    self.assertIn("EE_ENABLE_DEBUG_FASTAPI_PAUSE_CYCLE", comms_entrypoint)
+    self.assertIn('"DEBUG_FASTAPI_PAUSE_CYCLE"', comms_entrypoint)
     self.assertIn("OracleSync", comms_entrypoint)
+
+  def test_debug_fastapi_pause_cycle_is_an_explicit_compose_override(self):
+    override = (
+      REPO_ROOT / "docker-compose" / "debug-fastapi-pause-cycle.yaml"
+    ).read_text()
+
+    self.assertIn('EE_ENABLE_DEBUG_FASTAPI_PAUSE_CYCLE: "1"', override)
+    self.assertIn('"127.0.0.1:3201:3001"', override)
+    self.assertIn("R1_PAUSE_E2E_NETWORK", override)
 
 
 if __name__ == "__main__":

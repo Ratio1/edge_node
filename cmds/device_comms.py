@@ -44,6 +44,11 @@ _COMMS_ADMIN_PIPELINE = {
   "NETMON_API_PROBE": {},
 }
 
+if _env_flag("EE_ENABLE_DEBUG_FASTAPI_PAUSE_CYCLE"):
+  _COMMS_ADMIN_PIPELINE["DEBUG_FASTAPI_PAUSE_CYCLE"] = {
+    "PAUSE_SECONDS": _env_int("EE_DEBUG_FASTAPI_PAUSE_SECONDS", 5),
+  }
+
 if _env_flag("EE_ENABLE_LOCAL_ORACLE_SYNC"):
   # OracleSync is intentionally opt-in for the comms testbed. The default
   # NetMon/QoS tests must stay isolated from blockchain/R1FS behavior, while

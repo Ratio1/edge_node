@@ -1,0 +1,11 @@
+services:
+  ratio1_comm_node_01:
+    environment:
+      EE_ENABLE_DEBUG_FASTAPI_PAUSE_CYCLE: "1"
+      EE_DEBUG_FASTAPI_PAUSE_SECONDS: "${EE_DEBUG_FASTAPI_PAUSE_SECONDS:-5}"
+    ports:
+      - "127.0.0.1:3201:3001"
+
+networks:
+  comms_local:
+    name: "${R1_PAUSE_E2E_NETWORK:-r1_pause_e2e}"
