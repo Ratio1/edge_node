@@ -7,7 +7,7 @@ generation orchestrator:
 
 - `LLM_INFERENCE_API` finetuned worker for the private Ratio1 EdgeGuard v0.10 GGUF
 - `LLM_INFERENCE_API` base worker for the public Qwen3 4B Instruct GGUF
-- `LLM_INFERENCE_API` experimental worker for the public CyberSecQwen 4B GGUF
+- `LLM_INFERENCE_API` worker for the public CyberSecQwen 4B GGUF
 - `EDGEGUARD_API` as the UI-facing safety facade for health, model catalog, prompt contract
   metadata, deterministic `/check_cypher`, Neo4j execution, and graph explanation
 - `WORKER_APP_RUNNER` for the Next.js UI repo
@@ -55,7 +55,7 @@ runtime contract is the plain `edgeguard_qwen_4b` alias plus `MODEL_INSTANCE_ID`
 `("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")` and routes results back to
 `("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")`.
 
-The public CyberSecQwen experimental worker uses the existing dedicated serving engine and downloads
+The public CyberSecQwen worker uses the existing dedicated serving engine and downloads
 the GGUF into its normal Hugging Face runtime cache during startup:
 
 ```text
@@ -148,7 +148,7 @@ Use one stream per model worker:
 }
 ```
 
-Keep the experimental worker in its own stream and balancing pool:
+Keep the CyberSecQwen worker in its own stream and balancing pool:
 
 ```json
 {

@@ -178,8 +178,8 @@ EDGEGUARD_MODEL_CATALOG = [
 
 CYBERSEC_MODEL_CATALOG_ENTRY = {
   "model_key": CYBERSEC_MODEL_KEY,
-  "display_name": "CyberSecQwen 4B · Experimental",
-  "description": "Public security-specialized Qwen 4B GGUF for experimental prompt comparison.",
+  "display_name": "CyberSecQwen 4B",
+  "description": "Public security-specialized Qwen 4B GGUF for prompt comparison.",
   "model_repo": "mradermacher/CyberSecQwen-4B-GGUF",
   "model_file": "CyberSecQwen-4B.Q4_K_M.gguf",
   "format": "GGUF",
@@ -188,7 +188,7 @@ CYBERSEC_MODEL_CATALOG_ENTRY = {
   "artifact_sha256": "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
   "prompt_profile_id": CYBERSEC_PROMPT_PROFILE_ID,
   "prompt_contract": "schema-grounded read-only Cypher query string only",
-  "source": "public_huggingface_experimental",
+  "source": "public_huggingface",
 }
 
 CASE_EXPLANATION_RESPONSE_SCHEMA = {
@@ -1016,8 +1016,6 @@ _CONFIG = {
   "REQUEST_TIMEOUT": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "REQUEST_TIMEOUT_SECONDS": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "EDGEGUARD_VERBOSE": 10,
-  "ENABLE_CYBERSEC_EXPERIMENTAL_MODEL": False,
-
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -1261,13 +1259,10 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="GET")
   def models(self) -> Dict[str, Any]:
-    models = list(EDGEGUARD_MODEL_CATALOG)
-    if self.cfg_enable_cybersec_experimental_model:
-      models.append(CYBERSEC_MODEL_CATALOG_ENTRY)
     return {
       "schema_version": "edgeguard.model_catalog.v1",
       "default_model_key": FINETUNED_MODEL_KEY,
-      "models": models,
+      "models": [*EDGEGUARD_MODEL_CATALOG, CYBERSEC_MODEL_CATALOG_ENTRY],
     }
 
   @BasePlugin.endpoint(method="GET")
@@ -1297,16 +1292,15 @@ class EdgeguardApiPlugin(BasePlugin):
         "correction_prompt_sha256": _sha256_text(correction_prompt),
         "expected_output": "one schema-grounded read-only Cypher query string only",
       },
-    ]
-    if self.cfg_enable_cybersec_experimental_model:
-      profiles.append({
+      {
         "prompt_profile_id": CYBERSEC_PROMPT_PROFILE_ID,
         "model_key": CYBERSEC_MODEL_KEY,
         "template_version": "edgeguard-cybersec-schema-grounded-v0.10",
         "system_prompt_sha256": None,
         "correction_prompt_sha256": _sha256_text(correction_prompt),
         "expected_output": "one schema-grounded read-only Cypher query string only",
-      })
+      },
+    ]
     return {
       "schema_version": "edgeguard.prompt_contract.v1",
       "cypher_schema_version": SCHEMA_VERSION,
