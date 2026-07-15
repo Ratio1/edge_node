@@ -1103,7 +1103,7 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertNotIn("QmSharedSubmission", owner.artifact_repo.deleted)
     self.assertIsNotNone(owner.records[(owner.cfg_instance_id, "job-1")])
 
-  def test_purge_keeps_cstore_when_formal_cid_remains_retrievable(self):
+  def test_purge_clears_cstore_after_relay_acknowledges_formal_cid_delete(self):
     owner = _Owner(job_specs=_sample_job_specs(job_cid=""))
     owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
     hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
@@ -1115,13 +1115,17 @@ class TestRulebookAssessment(unittest.TestCase):
     }
     owner.artifacts["QmRetainedSubmission"] = {"artifact_kind": "review_submission"}
     owner.artifact_repo.delete = MagicMock(return_value=True)
+    owner.artifact_repo.get_json = MagicMock(return_value={"artifact_kind": "review_submission"})
 
     result = purge_job(owner, "job-1")
 
-    self.assertEqual(result["status"], "partial")
-    self.assertEqual(result["cids_failed"], 1)
-    self.assertIsNotNone(owner.records[(owner.cfg_instance_id, "job-1")])
-    self.assertIsNotNone(owner.records[(hkey, review_key)])
+    self.assertEqual(result["status"], "success")
+    owner.artifact_repo.delete.assert_any_call(
+      "QmRetainedSubmission", show_logs=True, raise_on_error=False, purge=True,
+    )
+    self.assertIsNone(owner.records[(owner.cfg_instance_id, "job-1")])
+    self.assertIsNone(owner.records[(hkey, review_key)])
+    owner.artifact_repo.get_json.assert_not_called()
 
 
 if __name__ == "__main__":

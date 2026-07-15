@@ -3453,6 +3453,16 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin._get_job_from_cstore = lambda job_id: Plugin._get_job_from_cstore(plugin, job_id)
     return plugin
 
+  def test_get_report_does_not_pin_retrieved_cid(self):
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
+
+    result = Plugin.get_report(plugin, "QmReportCID")
+
+    self.assertEqual(result["report"]["artifact_kind"], "review_submission")
+    plugin.r1fs.get_json.assert_called_once_with("QmReportCID", pin=False)
+
   def test_get_job_archive_finalized(self):
     """get_job_archive for finalized job returns archive with matching job_id."""
     Plugin = self._get_plugin_class()

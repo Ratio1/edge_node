@@ -2149,14 +2149,43 @@ class TestPurgeAllJobs(unittest.TestCase):
     }
     plugin.r1fs = MagicMock()
     plugin.r1fs.delete_file.return_value = True
-    plugin.r1fs.get_json.return_value = None
+    plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
 
     result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["cids_deleted"], 1)
     plugin.r1fs.delete_file.assert_called_once()
+    plugin.r1fs.get_json.assert_not_called()
     self.assertEqual(plugin._hashes[submission_hkey], {})
+
+  def test_purge_all_protects_orphan_cid_referenced_by_failed_job_record(self):
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-partial": {
+        "job_id": "job-partial",
+        "job_status": "RUNNING",
+        "legacy_submission_cid": "cid-shared-submission",
+      },
+    }
+    plugin = self._make_plugin(jobs)
+    submission_hkey = "test-instance:rulebook_review:submissions"
+    orphan_key = "orphan-job:nis2.eu_baseline.v1"
+    plugin._hashes[submission_hkey] = {
+      orphan_key: {"submissions": [{"revision": 1, "cid": "cid-shared-submission"}]},
+    }
+    plugin.stop_and_delete_job.return_value = {
+      "status": "partial",
+      "cids_deleted": 0,
+      "cids_failed": 1,
+    }
+    plugin.r1fs = MagicMock()
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertIn(orphan_key, plugin._hashes[submission_hkey])
+    plugin.r1fs.delete_file.assert_not_called()
 
   def test_force_purge_retains_rows_when_submission_cid_is_shared(self):
     Plugin = self._get_plugin_class()
@@ -2183,7 +2212,63 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertIn("orphan-peer:nis2.eu_baseline.v1", plugin._hashes[submission_hkey])
     self.assertNotIn("cid-shared-submission", {call.args[0] for call in plugin.r1fs.delete_file.call_args_list})
 
-  def test_force_purge_retains_rows_when_formal_cid_remains_retrievable(self):
+  def test_force_purge_retains_rows_when_submission_registry_read_fails(self):
+    from extensions.business.cybersec.red_mesh.services.control import _force_purge_job
+
+    jobs = {"job-bad": {"job_id": "job-bad", "job_status": "legacy"}}
+    plugin = self._make_plugin(jobs)
+    submission_hkey = "test-instance:rulebook_review:submissions"
+    submission_key = "job-bad:nis2.eu_baseline.v1"
+    plugin._hashes[submission_hkey] = {
+      submission_key: {"submissions": [{"revision": 1, "cid": "cid-retained-submission"}]},
+    }
+    original_hgetall = plugin.chainstore_hgetall.side_effect
+
+    def _fail_submission_read(*, hkey):
+      if hkey == submission_hkey:
+        raise RuntimeError("submission registry unavailable")
+      return original_hgetall(hkey=hkey)
+
+    plugin.chainstore_hgetall.side_effect = _fail_submission_read
+    plugin.r1fs = MagicMock()
+    errors = []
+
+    cids_deleted, cids_failed = _force_purge_job(plugin, "job-bad", jobs["job-bad"], errors)
+
+    self.assertEqual((cids_deleted, cids_failed), (0, 1))
+    self.assertIn("job-bad", plugin._hashes["test-instance"])
+    self.assertIn(submission_key, plugin._hashes[submission_hkey])
+    plugin.r1fs.delete_file.assert_not_called()
+
+  def test_force_purge_retains_rows_when_shared_cid_discovery_fails(self):
+    from extensions.business.cybersec.red_mesh.services.control import _force_purge_job
+
+    jobs = {"job-bad": {"job_id": "job-bad", "job_status": "legacy"}}
+    plugin = self._make_plugin(jobs)
+    submission_hkey = "test-instance:rulebook_review:submissions"
+    submission_key = "job-bad:nis2.eu_baseline.v1"
+    plugin._hashes[submission_hkey] = {
+      submission_key: {"submissions": [{"revision": 1, "cid": "cid-retained-submission"}]},
+    }
+    original_hgetall = plugin.chainstore_hgetall.side_effect
+
+    def _fail_job_registry_read(*, hkey):
+      if hkey == "test-instance":
+        raise RuntimeError("job registry unavailable")
+      return original_hgetall(hkey=hkey)
+
+    plugin.chainstore_hgetall.side_effect = _fail_job_registry_read
+    plugin.r1fs = MagicMock()
+    errors = []
+
+    cids_deleted, cids_failed = _force_purge_job(plugin, "job-bad", jobs["job-bad"], errors)
+
+    self.assertEqual((cids_deleted, cids_failed), (0, 1))
+    self.assertIn("job-bad", plugin._hashes["test-instance"])
+    self.assertIn(submission_key, plugin._hashes[submission_hkey])
+    plugin.r1fs.delete_file.assert_not_called()
+
+  def test_force_purge_clears_rows_after_relay_acknowledges_formal_cid_delete(self):
     Plugin = self._get_plugin_class()
     jobs = {"job-bad": {"job_id": "job-bad", "job_status": "legacy"}}
     plugin = self._make_plugin(jobs)
@@ -2202,9 +2287,10 @@ class TestPurgeAllJobs(unittest.TestCase):
     result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["status"], "partial")
-    self.assertGreaterEqual(result["cids_failed"], 1)
-    self.assertIn("job-bad", plugin._hashes["test-instance"])
-    self.assertIn(submission_key, plugin._hashes[submission_hkey])
+    self.assertEqual(result["cids_failed"], 0)
+    self.assertNotIn("job-bad", plugin._hashes["test-instance"])
+    self.assertNotIn(submission_key, plugin._hashes[submission_hkey])
+    plugin.r1fs.get_json.assert_not_called()
 
   def test_confirm_required(self):
     """Endpoint refuses to purge without confirm=True."""

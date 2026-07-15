@@ -235,19 +235,11 @@ def _purge_job_locked(owner, job_id: str):
   owner.P(f"[PURGE] Total CIDs collected: {len(cids)}: {sorted(cids)}")
 
   deleted, failed = 0, 0
+  # R1FS deletion acknowledges local/relay unpin and garbage-collection requests.
+  # The relay sweep can take up to 24 hours, and reading here can rehydrate the CID.
   for cid in cids:
     try:
       success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
-      if success and cid in formal_submission_cids:
-        try:
-          remaining = artifacts.get_json(cid)
-        except Exception as exc:
-          success = False
-          owner.P(f"[PURGE] Could not verify deletion of formal CID {cid}: {exc}", color='r')
-        else:
-          if remaining is not None:
-            success = False
-            owner.P(f"[PURGE] Formal CID {cid} remains retrievable after deletion.", color='r')
       if success:
         deleted += 1
         owner.P(f"[PURGE] Deleted CID {cid}")
@@ -328,7 +320,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   ``stop_and_delete_job``. Returns (cids_deleted, cids_failed).
 
   Scans the raw payload for ``*_cid`` fields and attempts R1FS deletion.
-  Formal submission pointers remain retryable unless their CIDs are verified absent;
+  Formal submission pointers remain retryable unless R1FS acknowledges deletion;
   other legacy artifacts retain the existing best-effort force-wipe behavior.
   """
   cids = {c for c in _collect_cids_from_raw(raw_payload) if isinstance(c, str)}
@@ -336,30 +328,38 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   try:
     submission_rows = owner.chainstore_hgetall(hkey=submission_hkey) or {}
   except Exception as exc:
-    submission_rows = {}
     errors.append({"job_id": job_id, "scope": submission_hkey, "message": f"{type(exc).__name__}: {exc}"})
+    owner.P(f"[PURGE_ALL_FORCE] Could not inspect submission registry for {job_id}; retaining rows.", color='r')
+    return 0, 1
+  if not isinstance(submission_rows, dict):
+    errors.append({"job_id": job_id, "scope": submission_hkey, "message": "unexpected non-dict submission registry"})
+    owner.P(f"[PURGE_ALL_FORCE] Invalid submission registry for {job_id}; retaining rows.", color='r')
+    return 0, 1
   shared_submission_cids = set()
   job_submission_cids = set()
-  if isinstance(submission_rows, dict):
-    prefix = f"{job_id}:"
-    other_submission_cids = set()
-    for key, registry in submission_rows.items():
-      if isinstance(key, str) and key.startswith(prefix):
-        job_submission_cids.update(_collect_rulebook_submission_cids(registry))
-      elif isinstance(key, str):
-        other_submission_cids.update(_collect_rulebook_submission_cids(registry))
-    shared_submission_cids = job_submission_cids & other_submission_cids
+  prefix = f"{job_id}:"
+  other_submission_cids = set()
+  for key, registry in submission_rows.items():
+    if isinstance(key, str) and key.startswith(prefix):
+      job_submission_cids.update(_collect_rulebook_submission_cids(registry))
+    elif isinstance(key, str):
+      other_submission_cids.update(_collect_rulebook_submission_cids(registry))
+  shared_submission_cids = job_submission_cids & other_submission_cids
+  if job_submission_cids:
     try:
       all_jobs = _job_repo(owner).list_jobs() or {}
-      if isinstance(all_jobs, dict):
-        for other_job_id, other_payload in all_jobs.items():
-          if other_job_id != job_id and isinstance(other_payload, dict):
-            other_submission_cids.update(_collect_cids_from_raw(other_payload))
+      if not isinstance(all_jobs, dict):
+        raise TypeError("unexpected non-dict job registry")
+      for other_job_id, other_payload in all_jobs.items():
+        if other_job_id != job_id and isinstance(other_payload, dict):
+          other_submission_cids.update(_collect_cids_from_raw(other_payload))
       shared_submission_cids = job_submission_cids & other_submission_cids
     except Exception as exc:
       errors.append({"job_id": job_id, "scope": owner.cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
-    cids.update(job_submission_cids - shared_submission_cids)
-    cids.difference_update(shared_submission_cids)
+      owner.P(f"[PURGE_ALL_FORCE] Could not inspect shared CID references for {job_id}; retaining rows.", color='r')
+      return 0, len(job_submission_cids)
+  cids.update(job_submission_cids - shared_submission_cids)
+  cids.difference_update(shared_submission_cids)
   cids = sorted(cids)
   cids_deleted = 0
   cids_failed = len(shared_submission_cids)
@@ -374,14 +374,6 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   for cid in cids:
     try:
       success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
-      if success and cid in job_submission_cids:
-        try:
-          success = artifacts.get_json(cid) is None
-        except Exception as exc:
-          success = False
-          errors.append({"job_id": job_id, "scope": "r1fs", "message": f"{type(exc).__name__}: {exc}"})
-        if not success:
-          failed_submission_cids.add(cid)
       if success:
         cids_deleted += 1
         owner.P(f"[PURGE_ALL_FORCE] Deleted CID {cid} for {job_id}")
@@ -561,72 +553,134 @@ def purge_all_jobs(owner):
   def _sweep_submission_hash():
     nonlocal cids_deleted, cids_failed
 
-    rows = owner.chainstore_hgetall(hkey=rulebook_review_submissions_hkey)
-    if not isinstance(rows, dict):
+    from .rulebook_assessment import _submission_lock, list_rulebook_profiles
+
+    try:
+      initial_rows = owner.chainstore_hgetall(hkey=rulebook_review_submissions_hkey)
+    except Exception as exc:
+      cids_failed += 1
+      failed_job_ids.update(raw_jobs)
+      errors.append({
+        "job_id": "",
+        "scope": rulebook_review_submissions_hkey,
+        "message": f"{type(exc).__name__}: {exc}",
+      })
       return 0
-    protected_cids = set()
-    for key, value in rows.items():
-      if _job_id_from_compound_key(key) in failed_job_ids:
-        protected_cids.update(_collect_rulebook_submission_cids(value))
+    if not isinstance(initial_rows, dict):
+      cids_failed += 1
+      failed_job_ids.update(raw_jobs)
+      errors.append({
+        "job_id": "",
+        "scope": rulebook_review_submissions_hkey,
+        "message": "unexpected non-dict submission registry",
+      })
+      return 0
+
+    initial_keys = list(initial_rows)
+    lock_targets = set()
+    for key in initial_keys:
+      job_id_prefix = _job_id_from_compound_key(key)
+      if job_id_prefix and isinstance(key, str) and ":" in key:
+        lock_targets.add((job_id_prefix, key.split(":", 1)[1]))
+    profile_ids = {
+      profile["profile_id"]
+      for profile in list_rulebook_profiles()
+      if isinstance(profile, dict) and isinstance(profile.get("profile_id"), str)
+    }
+    for failed_job_id in failed_job_ids:
+      for profile_id in profile_ids:
+        lock_targets.add((failed_job_id, profile_id))
 
     rows_deleted = 0
     deletion_results = {}
     artifacts = _artifact_repo(owner)
-    for key, value in list(rows.items()):
-      job_id_prefix = _job_id_from_compound_key(key)
-      if not job_id_prefix or job_id_prefix in failed_job_ids or not isinstance(value, dict):
-        continue
-      row_cids = _collect_rulebook_submission_cids(value)
-      shared_cids = row_cids & protected_cids
-      if shared_cids:
-        failed_job_ids.add(job_id_prefix)
-        cids_failed += len(shared_cids)
-        errors.append({
-          "job_id": job_id_prefix,
-          "scope": rulebook_review_submissions_hkey,
-          "message": f"retained orphan registry with shared CIDs: {sorted(shared_cids)}",
-        })
-        continue
-
-      row_failed = False
-      for cid in sorted(row_cids):
-        success = deletion_results.get(cid)
-        if success is None:
-          try:
-            success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
-            if success:
-              success = artifacts.get_json(cid) is None
-          except Exception as exc:
-            success = False
-            errors.append({
-              "job_id": job_id_prefix,
-              "scope": "r1fs",
-              "message": f"{type(exc).__name__}: {exc}",
-            })
-          deletion_results[cid] = success
-          if success:
-            cids_deleted += 1
-          else:
-            cids_failed += 1
-        if not success:
-          row_failed = True
-      if row_failed:
-        failed_job_ids.add(job_id_prefix)
-        errors.append({
-          "job_id": job_id_prefix,
-          "scope": rulebook_review_submissions_hkey,
-          "message": "orphan submission CIDs remain retrievable or could not be deleted",
-        })
-        continue
+    with ExitStack() as stack:
+      for lock_job_id, lock_profile_id in sorted(lock_targets):
+        stack.enter_context(_submission_lock(owner, lock_job_id, lock_profile_id))
       try:
-        owner.chainstore_hset(hkey=rulebook_review_submissions_hkey, key=key, value=None)
-        rows_deleted += 1
+        rows = owner.chainstore_hgetall(hkey=rulebook_review_submissions_hkey)
       except Exception as exc:
+        cids_failed += 1
+        failed_job_ids.update(raw_jobs)
         errors.append({
-          "job_id": job_id_prefix,
+          "job_id": "",
           "scope": rulebook_review_submissions_hkey,
           "message": f"{type(exc).__name__}: {exc}",
         })
+        return 0
+      if not isinstance(rows, dict):
+        cids_failed += 1
+        failed_job_ids.update(raw_jobs)
+        errors.append({
+          "job_id": "",
+          "scope": rulebook_review_submissions_hkey,
+          "message": "unexpected non-dict submission registry",
+        })
+        return 0
+
+      protected_cids = set()
+      for failed_job_id in failed_job_ids:
+        raw_failed_job = raw_jobs.get(failed_job_id)
+        if isinstance(raw_failed_job, dict):
+          protected_cids.update(_collect_cids_from_raw(raw_failed_job))
+      for key, value in rows.items():
+        if _job_id_from_compound_key(key) in failed_job_ids:
+          protected_cids.update(_collect_rulebook_submission_cids(value))
+
+      for key in initial_keys:
+        value = rows.get(key)
+        job_id_prefix = _job_id_from_compound_key(key)
+        if not job_id_prefix or job_id_prefix in failed_job_ids or not isinstance(value, dict):
+          continue
+        row_cids = _collect_rulebook_submission_cids(value)
+        shared_cids = row_cids & protected_cids
+        if shared_cids:
+          failed_job_ids.add(job_id_prefix)
+          cids_failed += len(shared_cids)
+          errors.append({
+            "job_id": job_id_prefix,
+            "scope": rulebook_review_submissions_hkey,
+            "message": f"retained orphan registry with shared CIDs: {sorted(shared_cids)}",
+          })
+          continue
+
+        row_failed = False
+        for cid in sorted(row_cids):
+          success = deletion_results.get(cid)
+          if success is None:
+            try:
+              success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
+            except Exception as exc:
+              success = False
+              errors.append({
+                "job_id": job_id_prefix,
+                "scope": "r1fs",
+                "message": f"{type(exc).__name__}: {exc}",
+              })
+            deletion_results[cid] = success
+            if success:
+              cids_deleted += 1
+            else:
+              cids_failed += 1
+          if not success:
+            row_failed = True
+        if row_failed:
+          failed_job_ids.add(job_id_prefix)
+          errors.append({
+            "job_id": job_id_prefix,
+            "scope": rulebook_review_submissions_hkey,
+            "message": "orphan submission CID deletion was not acknowledged",
+          })
+          continue
+        try:
+          owner.chainstore_hset(hkey=rulebook_review_submissions_hkey, key=key, value=None)
+          rows_deleted += 1
+        except Exception as exc:
+          errors.append({
+            "job_id": job_id_prefix,
+            "scope": rulebook_review_submissions_hkey,
+            "message": f"{type(exc).__name__}: {exc}",
+          })
     return rows_deleted
 
   _sweep_hash(live_hkey, dict)
