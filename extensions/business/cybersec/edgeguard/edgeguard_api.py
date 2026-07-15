@@ -124,8 +124,10 @@ EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
 
 FINETUNED_MODEL_KEY = "finetuned_v0_10"
 BASE_MODEL_KEY = "base_qwen3_4b"
+CYBERSEC_MODEL_KEY = "cybersec_qwen_4b"
 FINETUNED_PROMPT_PROFILE_ID = "edgeguard_direct_cypher_v0_10"
 BASE_PROMPT_PROFILE_ID = "edgeguard_base_schema_grounded_v0_10"
+CYBERSEC_PROMPT_PROFILE_ID = "edgeguard_cybersec_schema_grounded_v0_10"
 
 EDGEGUARD_MODEL_REPO = "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf"
 EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf"
@@ -173,6 +175,21 @@ EDGEGUARD_MODEL_CATALOG = [
     "source": "public_huggingface",
   },
 ]
+
+CYBERSEC_MODEL_CATALOG_ENTRY = {
+  "model_key": CYBERSEC_MODEL_KEY,
+  "display_name": "CyberSecQwen 4B · Experimental",
+  "description": "Public security-specialized Qwen 4B GGUF for experimental prompt comparison.",
+  "model_repo": "mradermacher/CyberSecQwen-4B-GGUF",
+  "model_file": "CyberSecQwen-4B.Q4_K_M.gguf",
+  "format": "GGUF",
+  "quantization": "Q4_K_M",
+  "base_model": "lablab-ai-amd-developer-hackathon/CyberSecQwen-4B",
+  "artifact_sha256": "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
+  "prompt_profile_id": CYBERSEC_PROMPT_PROFILE_ID,
+  "prompt_contract": "schema-grounded read-only Cypher query string only",
+  "source": "public_huggingface_experimental",
+}
 
 CASE_EXPLANATION_RESPONSE_SCHEMA = {
   "type": "object",
@@ -999,6 +1016,7 @@ _CONFIG = {
   "REQUEST_TIMEOUT": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "REQUEST_TIMEOUT_SECONDS": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "EDGEGUARD_VERBOSE": 10,
+  "ENABLE_CYBERSEC_EXPERIMENTAL_MODEL": False,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -1243,10 +1261,13 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="GET")
   def models(self) -> Dict[str, Any]:
+    models = list(EDGEGUARD_MODEL_CATALOG)
+    if self.cfg_enable_cybersec_experimental_model:
+      models.append(CYBERSEC_MODEL_CATALOG_ENTRY)
     return {
       "schema_version": "edgeguard.model_catalog.v1",
       "default_model_key": FINETUNED_MODEL_KEY,
-      "models": EDGEGUARD_MODEL_CATALOG,
+      "models": models,
     }
 
   @BasePlugin.endpoint(method="GET")
@@ -1259,30 +1280,40 @@ class EdgeguardApiPlugin(BasePlugin):
       retry_index=1,
       retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
     )
+    profiles = [
+      {
+        "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
+        "model_key": FINETUNED_MODEL_KEY,
+        "template_version": "edgeguard-direct-cypher-v0.10",
+        "system_prompt_sha256": _sha256_text(direct_system_prompt),
+        "correction_prompt_sha256": _sha256_text(correction_prompt),
+        "expected_output": "one read-only Cypher query string only",
+      },
+      {
+        "prompt_profile_id": BASE_PROMPT_PROFILE_ID,
+        "model_key": BASE_MODEL_KEY,
+        "template_version": "edgeguard-base-schema-grounded-v0.10",
+        "system_prompt_sha256": None,
+        "correction_prompt_sha256": _sha256_text(correction_prompt),
+        "expected_output": "one schema-grounded read-only Cypher query string only",
+      },
+    ]
+    if self.cfg_enable_cybersec_experimental_model:
+      profiles.append({
+        "prompt_profile_id": CYBERSEC_PROMPT_PROFILE_ID,
+        "model_key": CYBERSEC_MODEL_KEY,
+        "template_version": "edgeguard-cybersec-schema-grounded-v0.10",
+        "system_prompt_sha256": None,
+        "correction_prompt_sha256": _sha256_text(correction_prompt),
+        "expected_output": "one schema-grounded read-only Cypher query string only",
+      })
     return {
       "schema_version": "edgeguard.prompt_contract.v1",
       "cypher_schema_version": SCHEMA_VERSION,
       "schema_surface": canonical_schema_surface(),
       "temporal_policy": EDGEGUARD_SCHEMA["unsupported"]["temporal_predicates"],
       "retry_default": DEFAULT_SCHEMA_RETRY_LIMIT,
-      "profiles": [
-        {
-          "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
-          "model_key": FINETUNED_MODEL_KEY,
-          "template_version": "edgeguard-direct-cypher-v0.10",
-          "system_prompt_sha256": _sha256_text(direct_system_prompt),
-          "correction_prompt_sha256": _sha256_text(correction_prompt),
-          "expected_output": "one read-only Cypher query string only",
-        },
-        {
-          "prompt_profile_id": BASE_PROMPT_PROFILE_ID,
-          "model_key": BASE_MODEL_KEY,
-          "template_version": "edgeguard-base-schema-grounded-v0.10",
-          "system_prompt_sha256": None,
-          "correction_prompt_sha256": _sha256_text(correction_prompt),
-          "expected_output": "one schema-grounded read-only Cypher query string only",
-        },
-      ],
+      "profiles": profiles,
     }
 
   @BasePlugin.endpoint(method="GET")

@@ -183,6 +183,10 @@ def _make_api(**overrides):
   plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", True)
   plugin.cfg_request_timeout_seconds = overrides.get("request_timeout_seconds", 120)
   plugin.cfg_edgeguard_verbose = 0
+  plugin.cfg_enable_cybersec_experimental_model = overrides.get(
+    "enable_cybersec_experimental_model",
+    False,
+  )
   plugin.os_environ = overrides.get("os_environ", {})
   plugin._explanation_token = overrides.get("explanation_token")
   plugin._request_count = 0
@@ -256,6 +260,26 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertNotIn("https://127.0.0.1", flattened)
     self.assertNotIn("localhost", flattened)
 
+  def test_api_models_adds_cybersecqwen_only_after_experimental_gate(self):
+    plugin = _make_api(enable_cybersec_experimental_model=True)
+
+    catalog = plugin.models()
+
+    self.assertEqual(catalog["default_model_key"], "finetuned_v0_10")
+    self.assertEqual(
+      [item["model_key"] for item in catalog["models"]],
+      ["finetuned_v0_10", "base_qwen3_4b", "cybersec_qwen_4b"],
+    )
+    cybersec = catalog["models"][2]
+    self.assertEqual(cybersec["display_name"], "CyberSecQwen 4B · Experimental")
+    self.assertEqual(cybersec["model_repo"], "mradermacher/CyberSecQwen-4B-GGUF")
+    self.assertEqual(cybersec["model_file"], "CyberSecQwen-4B.Q4_K_M.gguf")
+    self.assertEqual(
+      cybersec["artifact_sha256"],
+      "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
+    )
+    self.assertNotIn("http://", json.dumps(catalog))
+
   def test_api_prompt_contract_exposes_schema_surface_and_profile_metadata(self):
     plugin = _make_api()
 
@@ -276,6 +300,22 @@ class EdgeGuardApiTests(unittest.TestCase):
       "edgeguard_base_schema_grounded_v0_10",
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
+
+  def test_api_prompt_contract_adds_explicit_cybersecqwen_profile_after_gate(self):
+    plugin = _make_api(enable_cybersec_experimental_model=True)
+
+    contract = plugin.prompt_contract()
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+
+    self.assertEqual(set(profiles), {"finetuned_v0_10", "base_qwen3_4b", "cybersec_qwen_4b"})
+    self.assertEqual(
+      profiles["cybersec_qwen_4b"]["prompt_profile_id"],
+      "edgeguard_cybersec_schema_grounded_v0_10",
+    )
+    self.assertEqual(
+      profiles["cybersec_qwen_4b"]["template_version"],
+      "edgeguard-cybersec-schema-grounded-v0.10",
+    )
 
   def test_api_validate_accepts_schema_query(self):
     plugin = _make_api()
