@@ -2338,6 +2338,55 @@ class TestPhase2PassFinalization(unittest.TestCase):
     archived_job_specs = plugin._build_job_archive.call_args[0][1]
     self.assertEqual(len(archived_job_specs["pass_reports"]), 1)
 
+  def test_finalization_runs_nis2_ensure_after_pass_report(self):
+    """Completed pass finalization triggers default-on NIS2 assessment ensure."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.finalization.ensure_rulebook_assessment",
+      return_value={"status": "ok", "artifact_cid": "QmRulebook", "pass_nr": 1},
+    ) as ensure_mock:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    ensure_mock.assert_called_once_with(plugin, job_specs["job_id"], pass_nr=1)
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_nis2_ensure_failure_does_not_block_finalization(self):
+    """NIS2 generation is best-effort and must not fail the scan."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.finalization.ensure_rulebook_assessment",
+      return_value={"status": "error", "error": "artifact_write_failed"},
+    ) as ensure_mock:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    ensure_mock.assert_called_once_with(plugin, job_specs["job_id"], pass_nr=1)
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_continuous_pass_runs_nis2_ensure_before_next_pass_schedule(self):
+    """Continuous jobs refresh NIS2 readiness against each completed pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.finalization.ensure_rulebook_assessment",
+      return_value={"status": "ok", "artifact_cid": "QmRulebook", "pass_nr": 1},
+    ) as ensure_mock:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    ensure_mock.assert_called_once_with(plugin, job_specs["job_id"], pass_nr=1)
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertIsNotNone(job_specs["next_pass_at"])
+    plugin._build_job_archive.assert_not_called()
+
   def test_aggregated_report_write_failure(self):
     """R1FS fails for aggregated → pass finalization skipped, no partial state."""
     PentesterApi01Plugin = self._get_plugin_class()
@@ -3403,6 +3452,16 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin._get_all_network_jobs = lambda: Plugin._get_all_network_jobs(plugin)
     plugin._get_job_from_cstore = lambda job_id: Plugin._get_job_from_cstore(plugin, job_id)
     return plugin
+
+  def test_get_report_does_not_pin_retrieved_cid(self):
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
+
+    result = Plugin.get_report(plugin, "QmReportCID")
+
+    self.assertEqual(result["report"]["artifact_kind"], "review_submission")
+    plugin.r1fs.get_json.assert_called_once_with("QmReportCID", pin=False)
 
   def test_get_job_archive_finalized(self):
     """get_job_archive for finalized job returns archive with matching job_id."""

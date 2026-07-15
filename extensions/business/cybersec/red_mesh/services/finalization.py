@@ -28,6 +28,7 @@ from .event_hooks import (
   emit_finding_event,
   emit_lifecycle_event,
 )
+from .rulebook_assessment import ensure_rulebook_assessment
 from .scan_strategy import coerce_scan_type, get_scan_strategy
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
 
@@ -127,6 +128,26 @@ def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, mess
   _write_job_record(owner, job_key, job_specs, context="attestation_failed")
   owner._build_job_archive(job_key, job_specs)
   owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
+
+
+def _ensure_rulebook_assessment_after_pass(owner, job_specs, *, job_id, pass_nr):
+  try:
+    result = ensure_rulebook_assessment(owner, job_id, pass_nr=pass_nr)
+  except Exception as exc:
+    owner.P(f"[NIS2] Rulebook assessment ensure failed for job {job_id} pass {pass_nr}: {exc}", color='y')
+    return job_specs
+
+  if not isinstance(result, dict) or result.get("status") != "ok":
+    error = result.get("error") if isinstance(result, dict) else "unknown_error"
+    owner.P(f"[NIS2] Rulebook assessment not generated for job {job_id} pass {pass_nr}: {error}", color='y')
+    return job_specs
+
+  owner.P(
+    f"[NIS2] Rulebook assessment ready for job {job_id} pass {pass_nr}: "
+    f"{result.get('artifact_cid') or 'cached'}"
+  )
+  refreshed = owner._get_job_from_cstore(job_id)
+  return refreshed if isinstance(refreshed, dict) else job_specs
 
 
 def maybe_finalize_pass(owner):
@@ -421,6 +442,7 @@ def maybe_finalize_pass(owner):
 
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
+      job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
 
       if required_attestation_failed:
         _mark_attestation_failed(

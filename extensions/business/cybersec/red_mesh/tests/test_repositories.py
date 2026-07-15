@@ -301,6 +301,21 @@ class TestArtifactRepository(unittest.TestCase):
     self.assertFalse(repo.delete(""))
     owner.r1fs.delete_file.assert_not_called()
 
+  def test_artifact_repository_purge_removes_remote_pin_and_local_cache(self):
+    owner = self._make_owner()
+    repo = ArtifactRepository(owner)
+
+    repo.delete("QmCID", show_logs=True, purge=True)
+
+    owner.r1fs.delete_file.assert_called_once_with(
+      "QmCID",
+      unpin_remote=True,
+      run_gc=True,
+      cleanup_local_files=True,
+      show_logs=True,
+      raise_on_error=False,
+    )
+
   def test_artifact_repository_supports_typed_models(self):
     owner = self._make_owner()
     repo = ArtifactRepository(owner)

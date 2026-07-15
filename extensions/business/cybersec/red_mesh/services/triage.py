@@ -1,4 +1,5 @@
 from copy import deepcopy
+from contextlib import ExitStack
 
 from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
@@ -65,6 +66,26 @@ def get_job_triage(owner, job_id: str, finding_id: str = ""):
 
 
 def update_finding_triage(owner, job_id: str, finding_id: str, status: str, note: str = "", actor: str = "", review_at: float = 0):
+  from .rulebook_assessment import _submission_lock, list_rulebook_profiles
+
+  with ExitStack() as stack:
+    profiles = sorted(list_rulebook_profiles(), key=lambda item: item["profile_id"])
+    for profile in profiles:
+      stack.enter_context(_submission_lock(owner, job_id, profile["profile_id"]))
+    repo = _job_repo(owner)
+    for profile in profiles:
+      registry = repo.get_rulebook_submission_registry(job_id, profile["profile_id"])
+      if isinstance(registry, dict) and registry.get("pending"):
+        return {
+          "error": "submission_in_progress",
+          "message": "Finding triage cannot change while a formal review submission is pending.",
+          "job_id": job_id,
+          "finding_id": finding_id,
+        }
+    return _update_finding_triage_locked(owner, job_id, finding_id, status, note, actor, review_at)
+
+
+def _update_finding_triage_locked(owner, job_id: str, finding_id: str, status: str, note: str = "", actor: str = "", review_at: float = 0):
   if status not in VALID_TRIAGE_STATUSES:
     return {
       "error": "validation_error",
