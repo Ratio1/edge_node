@@ -20,6 +20,11 @@ model-specific LLM worker, builds the prompt, calls `POST /predict_async`, polls
 Use request balancing only among replicas of the same model. Do not place the base and finetuned
 workers in one balancing group.
 
+Run the finetuned and base workers in separate loopback streams. Do not put both
+`LLM_INFERENCE_API` instances in one stream: the edge-node serving aggregator builds model inputs
+from stream-captured data, and live smoke showed same-stream LLM workers can see each other's
+`JEEVES_CONTENT` request IDs.
+
 ## Model Workers
 
 The finetuned worker serves the private EGM-029 v0.10 graph-intent continuation:
@@ -30,18 +35,24 @@ MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf
 AI_ENGINE=edgeguard_qwen_4b
 ```
 
-The base comparison worker reuses the same llama.cpp serving process directly instead of adding a
-new AI-engine alias:
+The base comparison worker reuses the existing EdgeGuard llama.cpp AI-engine alias with a distinct
+startup model instance id instead of adding a new AI-engine alias:
 
 ```text
 MODEL_NAME=MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF
 MODEL_FILENAME=Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-AI_ENGINE=llama_cpp_edgeguard_qwen_4b?edgeguard-base-qwen3-4b
+AI_ENGINE=edgeguard_qwen_4b
+STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-base-qwen3-4b
 ```
 
-The edge-node loader treats an unknown `AI_ENGINE` value as a serving-process name, and the
-`?edgeguard-base-qwen3-4b` suffix gives the base worker a distinct model instance id. This keeps the
-runtime explicit without registering a duplicate `edgeguard_base_qwen3_4b` alias.
+Do not use a raw serving-process value
+(`llama_cpp_edgeguard_qwen_4b?edgeguard-base-qwen3-4b`) or an `AI_ENGINE` suffix
+(`edgeguard_qwen_4b?edgeguard-base-qwen3-4b`) for this worker. Live smoke showed both can register
+details under a key that does not match the core inference router's reverse lookup. The stable
+runtime contract is the plain `edgeguard_qwen_4b` alias plus `MODEL_INSTANCE_ID` in
+`STARTUP_AI_ENGINE_PARAMS`, which makes the serving handle
+`("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")` and routes results back to
+`("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")`.
 
 Set the private Hugging Face token as a runtime secret for the finetuned worker; do not put it in a
 pipeline JSON committed to git.
@@ -71,9 +82,11 @@ returns explicit `live_retry` metadata so the UI can show that the returned grap
 
 ## Minimal Pipeline Sketch
 
+Use one stream per model worker:
+
 ```json
 {
-  "NAME": "edgeguard_playground_api",
+  "NAME": "edgeguard_llm_finetuned_api",
   "TYPE": "Loopback",
   "PLUGINS": [
     {
@@ -89,10 +102,24 @@ returns explicit `live_retry` metadata so the UI can show that the returned grap
             "MODEL_INSTANCE_ID": "edgeguard-finetuned-v0-10",
             "HF_TOKEN": "$HF_TOKEN"
           }
-        },
+        }
+      ]
+    }
+  ]
+}
+```
+
+```json
+{
+  "NAME": "edgeguard_llm_base_api",
+  "TYPE": "Loopback",
+  "PLUGINS": [
+    {
+      "SIGNATURE": "LLM_INFERENCE_API",
+      "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_llm_base_qwen3_4b",
-          "AI_ENGINE": "llama_cpp_edgeguard_qwen_4b?edgeguard-base-qwen3-4b",
+          "AI_ENGINE": "edgeguard_qwen_4b",
           "PORT": 5091,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
@@ -101,7 +128,18 @@ returns explicit `live_retry` metadata so the UI can show that the returned grap
           }
         }
       ]
-    },
+    }
+  ]
+}
+```
+
+Keep the safety API and UI runner outside those LLM streams:
+
+```json
+{
+  "NAME": "edgeguard_playground_api",
+  "TYPE": "Loopback",
+  "PLUGINS": [
     {
       "SIGNATURE": "EDGEGUARD_API",
       "INSTANCES": [
@@ -115,7 +153,16 @@ returns explicit `live_retry` metadata so the UI can show that the returned grap
           "LIVE_EMPTY_RESULT_BROADENING": true
         }
       ]
-    },
+    }
+  ]
+}
+```
+
+```json
+{
+  "NAME": "edgeguard_playground_ui",
+  "TYPE": "Loopback",
+  "PLUGINS": [
     {
       "SIGNATURE": "WORKER_APP_RUNNER",
       "INSTANCES": [
@@ -123,33 +170,6 @@ returns explicit `live_retry` metadata so the UI can show that the returned grap
           "INSTANCE_ID": "edgeguard_playground_ui",
           "SEMAPHORED_KEYS": ["edgeguard_api"],
           "PORT": 3010,
-          "BUILD_AND_RUN_COMMANDS": [
-            "npm install",
-            "npm run build",
-            "npm run start -- --hostname 0.0.0.0 --port 3010"
-          ],
-          "VCS_DATA": {
-            "PROVIDER": "github",
-            "USERNAME": "toderian",
-            "TOKEN": "$EDGEGUARD_PLAYGROUND_UI_GH_TOKEN",
-            "REPO_URL": "git@github.com:Ratio1/edgeguard-playground-ui.git",
-            "BRANCH": "main",
-            "POLL_INTERVAL": 60
-          },
-          "AUTOUPDATE": true,
-          "EXPOSED_PORTS": {
-            "3010": {
-              "is_main_port": true,
-              "host_port": null,
-              "tunnel": {
-                "enabled": true,
-                "engine": "cloudflare",
-                "token": "$EDGEGUARD_PLAYGROUND_UI_CF_TOKEN",
-                "protocol": "http"
-              }
-            }
-          },
-          "TUNNEL_ENGINE_ENABLED": true,
           "DYNAMIC_ENV": {
             "EDGEGUARD_API_BASE_URL": [
               {
@@ -159,14 +179,8 @@ returns explicit `live_retry` metadata so the UI can show that the returned grap
             ]
           },
           "ENV": {
-            "EDGEGUARD_PLAYGROUND_PASSWORD": "$EDGEGUARD_PLAYGROUND_PASSWORD",
-            "EDGEGUARD_SESSION_SECRET": "$EDGEGUARD_SESSION_SECRET",
-            "EDGEGUARD_API_TOKEN": "$EDGEGUARD_API_TOKEN",
             "EDGEGUARD_LLM_FINETUNED_URLS": "http://127.0.0.1:5090",
             "EDGEGUARD_LLM_BASE_URLS": "http://127.0.0.1:5091"
-          },
-          "HEALTH_CHECK": {
-            "PATH": "/api/health"
           }
         }
       ]
@@ -174,6 +188,10 @@ returns explicit `live_retry` metadata so the UI can show that the returned grap
   ]
 }
 ```
+
+The `WORKER_APP_RUNNER` stream injects the two model-specific URLs above as server-only environment
+variables. The deployment-specific repository, build, tunnel, and secret settings are intentionally
+omitted from this minimal contract sketch.
 
 The UI must not hardcode `EDGEGUARD_API_BASE_URL` when deployed in edge-node. `EDGEGUARD_API`
 publishes `API_URL` through semaphore key `edgeguard_api`; `WORKER_APP_RUNNER` waits for that

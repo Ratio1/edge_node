@@ -116,6 +116,7 @@ def _load_ai_engine_utils():
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
   return types.SimpleNamespace(
     get_serving_process_given_ai_engine=namespace["get_serving_process_given_ai_engine"],
+    get_ai_engine_given_serving_process=namespace["get_ai_engine_given_serving_process"],
   )
 
 
@@ -150,16 +151,22 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     )
     self.assertNotIn("llama_cpp", AI_ENGINES)
 
-  def test_edgeguard_base_worker_can_use_serving_process_directly(self):
+  def test_edgeguard_model_instance_id_keeps_dual_workers_distinct(self):
     utils = _load_ai_engine_utils()
 
     self.assertEqual(
-      utils.get_serving_process_given_ai_engine("llama_cpp_edgeguard_qwen_4b"),
+      utils.get_serving_process_given_ai_engine("edgeguard_qwen_4b"),
       "llama_cpp_edgeguard_qwen_4b",
     )
     self.assertEqual(
-      utils.get_serving_process_given_ai_engine("llama_cpp_edgeguard_qwen_4b?edgeguard-base-qwen3-4b"),
+      utils.get_serving_process_given_ai_engine(("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")),
       ("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
+    )
+    self.assertEqual(
+      utils.get_ai_engine_given_serving_process(
+        ("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
+      ),
+      ("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
     )
 
   def test_serving_config_is_cpu_bounded_q4_model(self):
