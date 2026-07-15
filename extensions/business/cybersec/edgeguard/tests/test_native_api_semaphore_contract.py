@@ -36,6 +36,18 @@ class EdgeGuardNativeApiSemaphoreContractTests(unittest.TestCase):
     self.assertNotIn('"SIGNATURE": "EDGEGUARD_LLM_AGENT_API"', source)
     self.assertNotIn("EDGEGUARD_LLM_AGENT_PORT", source)
 
+  def test_edgeguard_playground_documents_isolated_hub_download_for_cybersecqwen(self):
+    source = self._read("extensions/business/cybersec/edgeguard/edgeguard_playground.md")
+
+    self.assertIn('"NAME": "edgeguard_llm_cybersec_api"', source)
+    self.assertIn('"AI_ENGINE": "cybersec_qwen_4b"', source)
+    self.assertIn('"PORT": 5092', source)
+    self.assertIn('"MODEL_NAME": "mradermacher/CyberSecQwen-4B-GGUF"', source)
+    self.assertIn('"MODEL_FILENAME": "CyberSecQwen-4B.Q4_K_M.gguf"', source)
+    self.assertIn('"MODEL_INSTANCE_ID": "edgeguard-cybersec-qwen-4b"', source)
+    self.assertIn('"EDGEGUARD_LLM_CYBERSEC_URLS": "http://127.0.0.1:5092"', source)
+    self.assertIn("Do not configure\n`MODEL_PATH`", source)
+
 
 if __name__ == "__main__":
   unittest.main()

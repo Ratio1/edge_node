@@ -7,6 +7,7 @@ generation orchestrator:
 
 - `LLM_INFERENCE_API` finetuned worker for the private Ratio1 EdgeGuard v0.10 GGUF
 - `LLM_INFERENCE_API` base worker for the public Qwen3 4B Instruct GGUF
+- `LLM_INFERENCE_API` experimental worker for the public CyberSecQwen 4B GGUF
 - `EDGEGUARD_API` as the UI-facing safety facade for health, model catalog, prompt contract
   metadata, deterministic `/check_cypher`, Neo4j execution, and graph explanation
 - `WORKER_APP_RUNNER` for the Next.js UI repo
@@ -20,7 +21,7 @@ model-specific LLM worker, builds the prompt, calls `POST /predict_async`, polls
 Use request balancing only among replicas of the same model. Do not place the base and finetuned
 workers in one balancing group.
 
-Run the finetuned and base workers in separate loopback streams. Do not put both
+Run all model workers in separate loopback streams. Do not put multiple models
 `LLM_INFERENCE_API` instances in one stream: the edge-node serving aggregator builds model inputs
 from stream-captured data, and live smoke showed same-stream LLM workers can see each other's
 `JEEVES_CONTENT` request IDs.
@@ -53,6 +54,20 @@ runtime contract is the plain `edgeguard_qwen_4b` alias plus `MODEL_INSTANCE_ID`
 `STARTUP_AI_ENGINE_PARAMS`, which makes the serving handle
 `("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")` and routes results back to
 `("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")`.
+
+The public CyberSecQwen experimental worker uses the existing dedicated serving engine and downloads
+the GGUF into its normal Hugging Face runtime cache during startup:
+
+```text
+MODEL_NAME=mradermacher/CyberSecQwen-4B-GGUF
+MODEL_FILENAME=CyberSecQwen-4B.Q4_K_M.gguf
+AI_ENGINE=cybersec_qwen_4b
+STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-cybersec-qwen-4b
+```
+
+`MODEL_NAME` and `MODEL_FILENAME` are the only artifact-source overrides. Do not configure
+`MODEL_PATH`, a repository-local/LFS artifact, or a preseeded model file. `AI_ENGINE`, `PORT`, and
+`MODEL_INSTANCE_ID` are routing identity rather than artifact-source configuration.
 
 Set the private Hugging Face token as a runtime secret for the finetuned worker; do not put it in a
 pipeline JSON committed to git.
@@ -133,6 +148,32 @@ Use one stream per model worker:
 }
 ```
 
+Keep the experimental worker in its own stream and balancing pool:
+
+```json
+{
+  "NAME": "edgeguard_llm_cybersec_api",
+  "TYPE": "Loopback",
+  "PLUGINS": [
+    {
+      "SIGNATURE": "LLM_INFERENCE_API",
+      "INSTANCES": [
+        {
+          "INSTANCE_ID": "edgeguard_llm_cybersec_qwen_4b",
+          "AI_ENGINE": "cybersec_qwen_4b",
+          "PORT": 5092,
+          "STARTUP_AI_ENGINE_PARAMS": {
+            "MODEL_NAME": "mradermacher/CyberSecQwen-4B-GGUF",
+            "MODEL_FILENAME": "CyberSecQwen-4B.Q4_K_M.gguf",
+            "MODEL_INSTANCE_ID": "edgeguard-cybersec-qwen-4b"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
 Keep the safety API and UI runner outside those LLM streams:
 
 ```json
@@ -180,7 +221,8 @@ Keep the safety API and UI runner outside those LLM streams:
           },
           "ENV": {
             "EDGEGUARD_LLM_FINETUNED_URLS": "http://127.0.0.1:5090",
-            "EDGEGUARD_LLM_BASE_URLS": "http://127.0.0.1:5091"
+            "EDGEGUARD_LLM_BASE_URLS": "http://127.0.0.1:5091",
+            "EDGEGUARD_LLM_CYBERSEC_URLS": "http://127.0.0.1:5092"
           }
         }
       ]
@@ -189,7 +231,7 @@ Keep the safety API and UI runner outside those LLM streams:
 }
 ```
 
-The `WORKER_APP_RUNNER` stream injects the two model-specific URLs above as server-only environment
+The `WORKER_APP_RUNNER` stream injects the three model-specific URLs above as server-only environment
 variables. The deployment-specific repository, build, tunnel, and secret settings are intentionally
 omitted from this minimal contract sketch.
 
