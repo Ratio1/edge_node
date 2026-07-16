@@ -1,5 +1,6 @@
 import hashlib
 import json
+import requests
 import unittest
 import sys
 from unittest.mock import MagicMock, patch
@@ -95,6 +96,41 @@ def _graph_record():
   fake_record = MagicMock()
   fake_record.data.return_value = {"p": path}
   return fake_record
+
+
+def _serialized_execution(executed_cypher, *, broadened=False, primary_row_count=1):
+  return {
+    "executed_cypher": executed_cypher,
+    "primary_row_count": primary_row_count,
+    "row_count": 1,
+    "truncated": False,
+    "broadened": broadened,
+    "graph": {
+      "nodes": [
+        {
+          "id": "4:indicator-raw-id",
+          "labels": ["Indicator"],
+          "properties": {"value": "example.org", "type": "domain", "raw_payload": "drop me"},
+          "caption": "untrusted caption",
+        },
+        {
+          "id": "4:source-raw-id",
+          "labels": ["Source"],
+          "properties": {"name": "AlienVault OTX"},
+          "caption": "untrusted source caption",
+        },
+      ],
+      "relationships": [{
+        "id": "5:relationship-raw-id",
+        "type": "SOURCED_FROM",
+        "startNodeId": "4:indicator-raw-id",
+        "endNodeId": "4:source-raw-id",
+        "properties": {"confidence": "medium"},
+        "caption": "untrusted relationship caption",
+      }],
+      "truncated": False,
+    },
+  }
 
 
 def _explanation_for_packet(packet, caveat_types=None):
@@ -561,6 +597,205 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(call_payload["response_format"]["type"], "json_schema")
     self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation.v1")
 
+  def test_prepare_graph_explanation_returns_credential_free_primary_and_broadening_plan(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+
+    result = plugin.prepare_graph_explanation(
+      cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
+      explanation_rows=25,
+      enable_empty_result_broadening=True,
+    )
+
+    self.assertEqual(result["status"], "accepted")
+    self.assertEqual(
+      result["executed_cypher"],
+      "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
+    )
+    self.assertEqual(
+      result["broadening"]["cypher"],
+      "MATCH p=(n:Indicator)-[:SOURCED_FROM]-() RETURN p LIMIT 25",
+    )
+    self.assertEqual(result["limit_policy"], {
+      "generated_limit": 10,
+      "executed_limit": 25,
+      "server_max_rows": 100,
+      "limit_adjusted": True,
+    })
+    flattened = json.dumps(result)
+    for forbidden in ("username", "password", "neo4j-bolt.edgeguard.org"):
+      self.assertNotIn(forbidden, flattened)
+
+  def test_prepare_graph_explanation_rejects_before_execution_when_provider_is_unconfigured(self):
+    plugin = _make_api(edgeguard_explanation_model_port=None)
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      result = plugin.prepare_graph_explanation(
+        cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
+      )
+
+    self.assertEqual(result["status"], "config_error")
+    mocked_driver.assert_not_called()
+
+  def test_prepare_graph_explanation_rejects_forwarded_credentials(self):
+    plugin = _make_api()
+
+    result = plugin.prepare_graph_explanation(
+      cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
+      username="neo4j",
+      password="test-password",
+    )
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+
+    authorization = plugin.prepare_graph_explanation(
+      cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
+      authorization="Bearer should-not-cross",
+    )
+    self.assertEqual(authorization["status"], "rejected")
+    self.assertIn("credential_field_not_allowed", {item["code"] for item in authorization["validation_errors"]})
+
+    mixed_case = plugin.prepare_graph_explanation(
+      cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
+      Authorization="Bearer should-not-cross",
+    )
+    self.assertEqual(mixed_case["status"], "rejected")
+    self.assertNotIn("should-not-cross", json.dumps(mixed_case))
+
+  def test_explain_graph_ingests_bounded_evidence_remaps_ids_redacts_and_never_opens_driver(self):
+    plugin = _make_api(
+      edgeguard_explanation_model_port=5091,
+      edgeguard_explanation_model="base_qwen3_4b",
+    )
+    cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
+    execution_result = _serialized_execution(cypher)
+
+    def provider_side_effect(*_args, **kwargs):
+      packet = _packet_from_provider_kwargs(kwargs)
+      return _provider_response_for_packet(packet, caveat_types=[])
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+        side_effect=provider_side_effect,
+      ):
+        result = plugin.explain_graph(
+          cypher=cypher,
+          request="Which source supports this indicator?",
+          execution_result=execution_result,
+          enable_empty_result_broadening=True,
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["explained"])
+    mocked_driver.assert_not_called()
+    packet = result["packet"]
+    packet_json = json.dumps(packet)
+    self.assertNotIn("4:indicator-raw-id", packet_json)
+    self.assertNotIn("5:relationship-raw-id", packet_json)
+    self.assertNotIn("raw_payload", packet_json)
+    self.assertNotIn("untrusted caption", packet_json)
+    self.assertEqual(result["packet_meta"]["dropped_forbidden_properties"], 1)
+    self.assertTrue(all(node["id"].startswith("n:") for node in packet["graph"]["nodes"]))
+    self.assertTrue(all(rel["id"].startswith("r:") for rel in packet["graph"]["relationships"]))
+
+  def test_explain_graph_evidence_mode_rejects_forwarded_connection_fields(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      result = plugin.explain_graph(
+        cypher=cypher,
+        uri="neo4j-bolt.edgeguard.org",
+        username="neo4j",
+        password="test-password",
+        scheme="bolt+s",
+        execution_result=_serialized_execution(cypher),
+      )
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+    mocked_driver.assert_not_called()
+
+  def test_explain_graph_evidence_mode_rejects_inconsistent_query_and_broadening_flags(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
+    execution_result = _serialized_execution("MATCH (i:Indicator) RETURN i LIMIT 1")
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      mismatch = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
+      broadened = plugin.prepare_graph_explanation(
+        cypher=cypher,
+        enable_empty_result_broadening=True,
+      )["broadening"]["cypher"]
+      bad_broadening = plugin.explain_graph(
+        cypher=cypher,
+        enable_empty_result_broadening=True,
+        execution_result=_serialized_execution(broadened, broadened=True, primary_row_count=1),
+      )
+
+    self.assertIn("executed_cypher_mismatch", {item["code"] for item in mismatch["validation_errors"]})
+    self.assertIn("broadening_primary_not_empty", {item["code"] for item in bad_broadening["validation_errors"]})
+    mocked_driver.assert_not_called()
+
+  def test_explain_graph_evidence_mode_rejects_malformed_and_oversized_graphs(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    malformed = _serialized_execution(cypher)
+    malformed["graph"]["relationships"][0]["endNodeId"] = "missing-node"
+    oversized = _serialized_execution(cypher)
+    oversized["graph"]["nodes"] = [
+      {"id": f"node-{index}", "labels": ["Indicator"], "properties": {}, "caption": "node"}
+      for index in range(161)
+    ]
+    oversized["graph"]["relationships"] = []
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      malformed_result = plugin.explain_graph(cypher=cypher, execution_result=malformed)
+      oversized_result = plugin.explain_graph(cypher=cypher, execution_result=oversized)
+
+    self.assertIn(
+      "serialized_relationship_endpoint_missing",
+      {item["code"] for item in malformed_result["validation_errors"]},
+    )
+    self.assertIn("graph_node_limit", {item["code"] for item in oversized_result["validation_errors"]})
+    mocked_driver.assert_not_called()
+
+  def test_explain_graph_evidence_mode_rejects_nested_properties_and_recursive_credentials(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    nested = _serialized_execution(cypher)
+    nested["graph"]["nodes"][0]["properties"] = {"details": {"nested": True}}
+    credential = _serialized_execution(cypher)
+    credential["graph"]["nodes"][0]["properties"] = {"username": "should-not-cross"}
+
+    nested_result = plugin.explain_graph(cypher=cypher, execution_result=nested)
+    credential_result = plugin.explain_graph(cypher=cypher, execution_result=credential)
+
+    self.assertIn(
+      "invalid_serialized_property_value",
+      {item["code"] for item in nested_result["validation_errors"]},
+    )
+    self.assertIn(
+      "credential_field_not_allowed",
+      {item["code"] for item in credential_result["validation_errors"]},
+    )
+
+  def test_explain_graph_evidence_mode_rejects_all_top_level_credential_aliases(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      for field in ("authorization", "credential", "credentials", "Authorization", "Credentials"):
+        result = plugin.explain_graph(
+          cypher=cypher,
+          execution_result=_serialized_execution(cypher),
+          **{field: "should-not-cross"},
+        )
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+      mocked_driver.assert_not_called()
+
   def test_explain_graph_rejects_invalid_cypher_before_provider_or_driver(self):
     plugin = _make_api()
 
@@ -598,6 +833,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_explanation_model_call_disables_environment_proxies(self):
     plugin = _make_api()
+    plugin.Pd = MagicMock()
     packet = {
       "schema_version": "edgeguard.graph_evidence_packet.v1",
       "request": "Explain graph.",
@@ -639,8 +875,50 @@ class EdgeGuardApiTests(unittest.TestCase):
       result = plugin._call_explanation_model(packet)
 
     self.assertEqual(result["status"], "accepted")
+    self.assertEqual(result["provider"], "local")
+    self.assertEqual(result["model"], "qwen2.5-1.5b-instruct")
     self.assertIs(fake_session.trust_env, False)
     fake_session.post.assert_called_once()
+    self.assertNotIn("127.0.0.1", " ".join(str(call) for call in plugin.Pd.call_args_list))
+
+  def test_explanation_model_failures_do_not_expose_provider_internals(self):
+    plugin = _make_api()
+    plugin.P = MagicMock()
+    packet = {"schema_version": "edgeguard.graph_evidence_packet.v1"}
+    provider_internal = "http://127.0.0.1:5091/create_chat_completion?token=secret"
+    fake_session = MagicMock()
+    fake_session.post.return_value = _Response(payload={
+      "status": "error",
+      "error": f"failed at {provider_internal}",
+      "provider": provider_internal,
+    })
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=fake_session):
+      provider_error = plugin._call_explanation_model(packet)
+      fake_session.post.side_effect = requests.exceptions.ConnectionError(provider_internal)
+      request_error = plugin._call_explanation_model(packet)
+      fake_session.post.side_effect = RuntimeError(provider_internal)
+      unexpected_error = plugin._call_explanation_model(packet)
+
+    for result in (provider_error, request_error, unexpected_error):
+      self.assertNotIn(provider_internal, json.dumps(result))
+      self.assertNotIn("token=secret", json.dumps(result))
+    self.assertEqual(provider_error["provider"], "local")
+    self.assertEqual(request_error["error"], "EdgeGuard explanation model request failed")
+    self.assertEqual(unexpected_error["error"], "Unexpected explanation model failure")
+    self.assertNotIn(provider_internal, " ".join(str(call) for call in plugin.P.call_args_list))
+
+  def test_health_does_not_expose_explanation_provider_location(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+
+    health = plugin.health()
+
+    self.assertTrue(health["explanation_model_configured"])
+    self.assertTrue(health["explanation_model_config_valid"])
+    flattened = json.dumps(health)
+    self.assertNotIn("explanation_model_url", health)
+    self.assertNotIn("127.0.0.1", flattened)
+    self.assertNotIn("5091", flattened)
 
   def test_explain_graph_broadens_empty_result_and_validates_caveat(self):
     plugin = _make_api()

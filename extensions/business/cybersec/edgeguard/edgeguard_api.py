@@ -8,7 +8,6 @@ server route, which calls model-specific LLM_INFERENCE_API workers directly.
 
 from __future__ import annotations
 
-import traceback
 import hashlib
 import json
 import re
@@ -46,6 +45,14 @@ GRAPH_PACKET_REDACTION_POLICY = "edgeguard_graph_packet_private_v1"
 GRAPH_EXPLANATION_PROMPT_VERSION = "edgeguard-graph-explanation-v0.3"
 EXPLANATION_DEFAULT_ROWS = 25
 EXPLANATION_SERVER_MAX_ROWS = 100
+EXPLANATION_MAX_GRAPH_NODES = 160
+EXPLANATION_MAX_GRAPH_RELATIONSHIPS = 240
+EXPLANATION_MAX_RAW_ID_CHARS = 240
+EXPLANATION_MAX_LABELS = 8
+EXPLANATION_MAX_PROPERTIES = 64
+EXPLANATION_MAX_PROPERTY_KEY_CHARS = 120
+EXPLANATION_MAX_PROPERTY_BYTES = 131_072
+EXPLANATION_MAX_EXECUTION_RESULT_BYTES = 524_288
 LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)\b", re.IGNORECASE)
 IDENT_RE = re.compile(r"[^A-Za-z0-9_]+")
 EVIDENCE_ID_RE = re.compile(r"\b[nr]:[A-Za-z0-9_.:-]+\b")
@@ -377,6 +384,54 @@ def _normalize_explanation_cypher_limit(
   return executed_cypher, generated_limit, executed_limit, generated_limit != executed_limit
 
 
+def _prepare_graph_explanation_plan(
+  cypher: str,
+  requested_limit: Optional[int] = None,
+  broadening_enabled: bool = False,
+) -> Dict[str, Any]:
+  analysis = analyze_generated_cypher(cypher)
+  if not analysis["accepted"]:
+    return {
+      "status": STATUS_REJECTED,
+      "ok": False,
+      "validation": analysis,
+      "error": "Cypher rejected by EdgeGuard guard; graph explanation was not prepared.",
+    }
+  try:
+    primary_cypher, generated_limit, executed_limit, limit_adjusted = _normalize_explanation_cypher_limit(
+      analysis["accepted_cypher"],
+      requested_limit=requested_limit,
+    )
+  except Exception as exc:
+    return {
+      "status": STATUS_ERROR,
+      "ok": False,
+      "validation": analysis,
+      "error": f"Invalid explanation row limit: {exc}",
+    }
+
+  broadening = build_empty_result_broadening_cypher(analysis["accepted_cypher"]) if broadening_enabled else None
+  broadening_cypher = _replace_last_limit(broadening["cypher"], executed_limit) if broadening else None
+  return {
+    "status": STATUS_ACCEPTED,
+    "ok": True,
+    "accepted_cypher": analysis["accepted_cypher"],
+    "executed_cypher": primary_cypher,
+    "limit_policy": {
+      "generated_limit": generated_limit,
+      "executed_limit": executed_limit,
+      "server_max_rows": EXPLANATION_SERVER_MAX_ROWS,
+      "limit_adjusted": bool(limit_adjusted),
+    },
+    "broadening": {
+      "enabled": bool(broadening_enabled),
+      "cypher": broadening_cypher,
+      "strategy": broadening.get("strategy") if broadening else None,
+    },
+    "validation": analysis,
+  }
+
+
 def _is_scalar(value: Any) -> bool:
   return value is None or isinstance(value, (str, int, float, bool))
 
@@ -587,6 +642,252 @@ def _build_graph_evidence_packet(
     "relationship_count": len(state.relationships),
   }
   return packet, meta
+
+
+def _serialized_graph_error(code: str, detail: str) -> tuple[None, None, list[Dict[str, str]]]:
+  return None, None, [_contract_error(code, detail)]
+
+
+def _forbidden_execution_field(value: Any) -> Optional[str]:
+  if isinstance(value, dict):
+    for key, item in value.items():
+      key_text = str(key).lower()
+      if key_text in {"uri", "username", "password", "scheme", "authorization", "credential", "credentials"}:
+        return str(key)
+      nested = _forbidden_execution_field(item)
+      if nested:
+        return nested
+  elif isinstance(value, list):
+    for item in value:
+      nested = _forbidden_execution_field(item)
+      if nested:
+        return nested
+  return None
+
+
+def _validate_serialized_properties(properties: Any, where: str) -> Optional[Dict[str, str]]:
+  if not isinstance(properties, dict):
+    return _contract_error("invalid_serialized_properties", f"{where}: properties must be an object")
+  if len(properties) > EXPLANATION_MAX_PROPERTIES:
+    return _contract_error("serialized_property_limit", f"{where}: properties exceed the 64-key cap")
+  try:
+    property_bytes = len(json.dumps(properties, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+  except (TypeError, ValueError):
+    return _contract_error("invalid_serialized_properties", f"{where}: properties must be JSON serializable")
+  if property_bytes > EXPLANATION_MAX_PROPERTY_BYTES:
+    return _contract_error("serialized_property_bytes", f"{where}: properties exceed the byte cap")
+  for key, value in properties.items():
+    if not isinstance(key, str) or not key or len(key) > EXPLANATION_MAX_PROPERTY_KEY_CHARS:
+      return _contract_error("invalid_serialized_property_key", f"{where}: property key is invalid")
+    if _is_scalar(value):
+      continue
+    if isinstance(value, list) and len(value) <= 20 and all(_is_scalar(item) for item in value):
+      continue
+    return _contract_error("invalid_serialized_property_value", f"{where}.{key}: nested values are not allowed")
+  return None
+
+
+def _build_graph_evidence_packet_from_execution(
+  *,
+  request: str,
+  plan: Dict[str, Any],
+  execution_result: Any,
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], list[Dict[str, str]]]:
+  if not isinstance(execution_result, dict):
+    return _serialized_graph_error("invalid_execution_result", "execution_result must be an object")
+  forbidden_field = _forbidden_execution_field(execution_result)
+  if forbidden_field:
+    return _serialized_graph_error(
+      "credential_field_not_allowed",
+      f"execution_result must not contain connection or credential field {forbidden_field}",
+    )
+  try:
+    execution_result_bytes = len(
+      json.dumps(execution_result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+  except (TypeError, ValueError):
+    return _serialized_graph_error("invalid_execution_result", "execution_result must be JSON serializable")
+  if execution_result_bytes > EXPLANATION_MAX_EXECUTION_RESULT_BYTES:
+    return _serialized_graph_error("execution_result_size", "execution_result exceeds the byte cap")
+  allowed_execution_keys = {
+    "executed_cypher",
+    "primary_row_count",
+    "row_count",
+    "truncated",
+    "broadened",
+    "graph",
+  }
+  unexpected = sorted(set(execution_result).difference(allowed_execution_keys))
+  if unexpected:
+    return _serialized_graph_error(
+      "execution_result_additional_property",
+      f"execution_result contains unexpected fields: {', '.join(unexpected)}",
+    )
+
+  executed_cypher = execution_result.get("executed_cypher")
+  primary_row_count = execution_result.get("primary_row_count")
+  row_count = execution_result.get("row_count")
+  truncated = execution_result.get("truncated")
+  broadened = execution_result.get("broadened")
+  graph = execution_result.get("graph")
+  if not isinstance(executed_cypher, str) or not executed_cypher.strip():
+    return _serialized_graph_error("invalid_executed_cypher", "executed_cypher must be a non-empty string")
+  if not isinstance(primary_row_count, int) or isinstance(primary_row_count, bool):
+    return _serialized_graph_error("invalid_primary_row_count", "primary_row_count must be an integer")
+  if not isinstance(row_count, int) or isinstance(row_count, bool):
+    return _serialized_graph_error("invalid_row_count", "row_count must be an integer")
+  executed_limit = plan["limit_policy"]["executed_limit"]
+  if not 0 <= primary_row_count <= executed_limit or not 0 <= row_count <= executed_limit:
+    return _serialized_graph_error("invalid_row_count", "row counts must be within the prepared execution limit")
+  if not isinstance(truncated, bool) or not isinstance(broadened, bool):
+    return _serialized_graph_error("invalid_execution_flags", "truncated and broadened must be booleans")
+
+  expected_cypher = plan["broadening"]["cypher"] if broadened else plan["executed_cypher"]
+  if broadened and not expected_cypher:
+    return _serialized_graph_error("broadening_not_prepared", "broadened evidence requires a prepared broadening query")
+  if executed_cypher != expected_cypher:
+    return _serialized_graph_error("executed_cypher_mismatch", "executed_cypher does not match the recomputed plan")
+  if broadened and primary_row_count != 0:
+    return _serialized_graph_error("broadening_primary_not_empty", "broadened evidence requires primary_row_count=0")
+  if not broadened and primary_row_count != row_count:
+    return _serialized_graph_error(
+      "primary_row_count_mismatch",
+      "primary_row_count must equal row_count when broadening was not applied",
+    )
+
+  if not isinstance(graph, dict) or set(graph).difference({"nodes", "relationships", "truncated"}):
+    return _serialized_graph_error("invalid_serialized_graph", "graph must contain only nodes, relationships, and truncated")
+  nodes = graph.get("nodes")
+  relationships = graph.get("relationships")
+  graph_truncated = graph.get("truncated")
+  if not isinstance(nodes, list) or not isinstance(relationships, list) or not isinstance(graph_truncated, bool):
+    return _serialized_graph_error("invalid_serialized_graph", "graph nodes/relationships must be lists and truncated a boolean")
+  if len(nodes) > EXPLANATION_MAX_GRAPH_NODES:
+    return _serialized_graph_error("graph_node_limit", "serialized graph exceeds the 160-node cap")
+  if len(relationships) > EXPLANATION_MAX_GRAPH_RELATIONSHIPS:
+    return _serialized_graph_error("graph_relationship_limit", "serialized graph exceeds the 240-relationship cap")
+
+  state = _GraphPacketState()
+  raw_node_ids: Dict[str, str] = {}
+  errors: list[Dict[str, str]] = []
+  for index, node in enumerate(nodes):
+    if not isinstance(node, dict) or set(node).difference({"id", "labels", "properties", "caption", "placeholder"}):
+      errors.append(_contract_error("invalid_serialized_node", f"node[{index}] has an invalid shape"))
+      continue
+    raw_id = node.get("id")
+    labels = node.get("labels")
+    properties = node.get("properties")
+    caption = node.get("caption")
+    if not isinstance(raw_id, str) or not raw_id or len(raw_id) > EXPLANATION_MAX_RAW_ID_CHARS:
+      errors.append(_contract_error("invalid_serialized_node_id", f"node[{index}] has an invalid id"))
+      continue
+    if raw_id in raw_node_ids:
+      errors.append(_contract_error("duplicate_serialized_node_id", f"duplicate node id at node[{index}]"))
+      continue
+    if (
+      not isinstance(labels, list)
+      or not 1 <= len(labels) <= EXPLANATION_MAX_LABELS
+      or not all(isinstance(label, str) and 0 < len(label) <= 80 for label in labels)
+    ):
+      errors.append(_contract_error("invalid_serialized_labels", f"node[{index}] labels are invalid"))
+      continue
+    property_error = _validate_serialized_properties(properties, f"node[{index}]")
+    if property_error or not isinstance(caption, str) or len(caption) > 500:
+      if property_error:
+        errors.append(property_error)
+        continue
+      errors.append(_contract_error("invalid_serialized_node", f"node[{index}] properties or caption are invalid"))
+      continue
+    packet_id = _evidence_id("n", f"serialized-node:{raw_id}")
+    raw_node_ids[raw_id] = packet_id
+    clean_labels = sorted({_safe_identifier(label, "Entity") for label in labels})
+    clean_properties = _sanitize_packet_properties(properties, state)
+    safe_caption = _node_caption(clean_labels, clean_properties)
+    state.nodes[packet_id] = {
+      "id": packet_id,
+      "labels": clean_labels,
+      "caption": safe_caption,
+      "properties": clean_properties,
+    }
+
+  raw_relationship_ids: set[str] = set()
+  for index, relationship in enumerate(relationships):
+    if not isinstance(relationship, dict) or set(relationship).difference(
+      {"id", "type", "startNodeId", "endNodeId", "properties", "caption"}
+    ):
+      errors.append(_contract_error("invalid_serialized_relationship", f"relationship[{index}] has an invalid shape"))
+      continue
+    raw_id = relationship.get("id")
+    rel_type = relationship.get("type")
+    start_raw = relationship.get("startNodeId")
+    end_raw = relationship.get("endNodeId")
+    properties = relationship.get("properties")
+    caption = relationship.get("caption")
+    if not isinstance(raw_id, str) or not raw_id or len(raw_id) > EXPLANATION_MAX_RAW_ID_CHARS:
+      errors.append(_contract_error("invalid_serialized_relationship_id", f"relationship[{index}] has an invalid id"))
+      continue
+    if raw_id in raw_relationship_ids:
+      errors.append(_contract_error("duplicate_serialized_relationship_id", f"duplicate relationship id at relationship[{index}]"))
+      continue
+    raw_relationship_ids.add(raw_id)
+    if not isinstance(rel_type, str) or not rel_type or len(rel_type) > 80:
+      errors.append(_contract_error("invalid_serialized_relationship_type", f"relationship[{index}] type is invalid"))
+      continue
+    if start_raw not in raw_node_ids or end_raw not in raw_node_ids:
+      errors.append(_contract_error("serialized_relationship_endpoint_missing", f"relationship[{index}] endpoint is missing"))
+      continue
+    property_error = _validate_serialized_properties(properties, f"relationship[{index}]")
+    if property_error or not isinstance(caption, str) or len(caption) > 500:
+      if property_error:
+        errors.append(property_error)
+        continue
+      errors.append(_contract_error("invalid_serialized_relationship", f"relationship[{index}] properties or caption are invalid"))
+      continue
+    packet_id = _evidence_id("r", f"serialized-relationship:{raw_id}")
+    clean_type = _safe_identifier(rel_type.upper(), "RELATED_TO")
+    state.relationships[packet_id] = {
+      "id": packet_id,
+      "type": clean_type,
+      "startNodeId": raw_node_ids[start_raw],
+      "endNodeId": raw_node_ids[end_raw],
+      "caption": clean_type,
+      "properties": _sanitize_packet_properties(properties, state),
+    }
+  if errors:
+    return None, None, errors
+
+  packet_truncated = bool(truncated or graph_truncated)
+  packet = {
+    "schema_version": GRAPH_PACKET_SCHEMA_VERSION,
+    "request": _compact_text(request or "Explain the returned investigation graph.", 2000),
+    "accepted_cypher": plan["accepted_cypher"],
+    "executed_cypher": executed_cypher,
+    "limit_policy": dict(plan["limit_policy"]),
+    "execution": {
+      "status": "executed" if row_count else "empty",
+      "row_count": row_count,
+      "truncated": packet_truncated,
+      "broadened": broadened,
+      "live_retry_reason": "executed_no_rows" if broadened else None,
+    },
+    "graph": {
+      "nodes": list(state.nodes.values()),
+      "relationships": list(state.relationships.values()),
+      "truncated": packet_truncated,
+    },
+    "redaction": {
+      "policy": GRAPH_PACKET_REDACTION_POLICY,
+      "contains_customer_evidence": False,
+      "contains_raw_misp_payload": False,
+    },
+  }
+  meta = {
+    "dropped_forbidden_properties": state.dropped_forbidden_properties,
+    "truncated_properties": state.truncated_properties,
+    "node_count": len(state.nodes),
+    "relationship_count": len(state.relationships),
+  }
+  return packet, meta, []
 
 
 def _validate_property_map(path: str, properties: Any, errors: list[Dict[str, str]]) -> None:
@@ -1240,7 +1541,7 @@ class EdgeguardApiPlugin(BasePlugin):
     if err:
       return {"status": "config_error", "error": err}
     try:
-      self.Pd(f"Calling EdgeGuard explanation model API: {self._redact_url(url)}")
+      self.Pd("Calling configured localhost EdgeGuard explanation model API")
       session = requests.Session()
       session.trust_env = False
       response = session.post(
@@ -1257,10 +1558,15 @@ class EdgeguardApiPlugin(BasePlugin):
         }
       data = response.json()
       if isinstance(data, dict) and data.get("status") in {STATUS_ERROR, STATUS_TIMEOUT, "failed", "config_error"}:
+        provider_status = data.get("status")
         return {
-          "status": STATUS_ERROR,
-          "error": data.get("error") or data.get("result") or "EdgeGuard explanation model failed",
-          "provider": data.get("provider", "local"),
+          "status": STATUS_TIMEOUT if provider_status == STATUS_TIMEOUT else STATUS_ERROR,
+          "error": (
+            "EdgeGuard explanation model request timed out"
+            if provider_status == STATUS_TIMEOUT
+            else "EdgeGuard explanation model failed"
+          ),
+          "provider": "local",
         }
       content = self._extract_assistant_content(data)
       if content is None:
@@ -1295,16 +1601,16 @@ class EdgeguardApiPlugin(BasePlugin):
       return {
         "status": STATUS_ACCEPTED,
         "explanation": explanation,
-        "provider": data.get("provider", "local") if isinstance(data, dict) else "local",
-        "model": data.get("model") if isinstance(data, dict) else self.cfg_edgeguard_explanation_model,
+        "provider": "local",
+        "model": self.cfg_edgeguard_explanation_model,
       }
     except requests.exceptions.Timeout:
       return {"status": STATUS_TIMEOUT, "error": "EdgeGuard explanation model request timed out"}
-    except requests.exceptions.RequestException as exc:
-      return {"status": STATUS_ERROR, "error": str(exc)}
-    except Exception as exc:
-      self.P(f"Unexpected EdgeGuard explanation model error: {exc}\n{traceback.format_exc()}", color='r')
-      return {"status": STATUS_ERROR, "error": f"Unexpected explanation model error: {exc}"}
+    except requests.exceptions.RequestException:
+      return {"status": STATUS_ERROR, "error": "EdgeGuard explanation model request failed"}
+    except Exception:
+      self.P("Unexpected EdgeGuard explanation model failure", color='r')
+      return {"status": STATUS_ERROR, "error": "Unexpected explanation model failure"}
 
   @BasePlugin.endpoint(method="GET")
   def health(self) -> Dict[str, Any]:
@@ -1317,9 +1623,8 @@ class EdgeguardApiPlugin(BasePlugin):
       "model_repo": EDGEGUARD_MODEL_REPO,
       "model_file": EDGEGUARD_MODEL_FILE,
       "generation_orchestrator": "playground_server_route",
-      "explanation_model_url": self._redact_url(explanation_url),
       "explanation_model_configured": bool(explanation_url),
-      "explanation_model_config_error": explanation_error,
+      "explanation_model_config_valid": explanation_error is None,
       "neo4j_driver_available": GraphDatabase is not None,
       "live_empty_result_broadening": bool(self.cfg_live_empty_result_broadening),
       "metrics": {
@@ -1420,6 +1725,8 @@ class EdgeguardApiPlugin(BasePlugin):
         "provider_default": "local-only",
         "default_rows": int(self.cfg_edgeguard_explanation_default_rows),
         "server_max_rows": int(self.cfg_edgeguard_explanation_max_rows),
+        "execution_mode": "prepared_execution_evidence",
+        "legacy_direct_driver_mode": "deprecated_compatibility_only",
         "quality": "EGM-030 Phase 1 lower-bound baseline only; not promoted for fine-tuning.",
       },
       "fine_tuning": {
@@ -1662,17 +1969,146 @@ class EdgeguardApiPlugin(BasePlugin):
       self._close_neo4j_driver(driver)
 
   @BasePlugin.endpoint(method="POST")
-  def explain_graph(
+  def prepare_graph_explanation(
     self,
-    uri: str,
-    username: str,
-    password: str,
     cypher: str,
-    request: str = "Explain the returned investigation graph.",
-    scheme: str = "bolt+s",
     explanation_rows: Optional[int] = None,
     max_rows: Optional[int] = None,
     enable_empty_result_broadening: Optional[bool] = None,
+    **kwargs,
+  ) -> Dict[str, Any]:
+    forwarded = sorted(str(name) for name in kwargs)
+    if forwarded:
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "error": "Graph explanation preparation does not accept Neo4j connection fields.",
+        "validation_errors": [
+          _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
+        ],
+      }
+    requested_limit = explanation_rows if explanation_rows is not None else max_rows
+    broadening_enabled = (
+      bool(self.cfg_live_empty_result_broadening)
+      if enable_empty_result_broadening is None
+      else bool(enable_empty_result_broadening)
+    )
+    plan = _prepare_graph_explanation_plan(cypher, requested_limit, broadening_enabled)
+    if not plan.get("ok"):
+      return plan
+    _explanation_url, explanation_err = self._explanation_url()
+    if explanation_err:
+      return {
+        "status": "config_error",
+        "ok": False,
+        "validation": plan.get("validation"),
+        "error": explanation_err,
+      }
+    return plan
+
+  def _explain_prepared_execution(
+    self,
+    *,
+    plan: Dict[str, Any],
+    execution_result: Any,
+    request: str,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    top_p: Optional[float],
+  ) -> Dict[str, Any]:
+    packet, packet_meta, ingestion_errors = _build_graph_evidence_packet_from_execution(
+      request=request,
+      plan=plan,
+      execution_result=execution_result,
+    )
+    if ingestion_errors:
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Execution evidence failed deterministic validation",
+        "validation_errors": ingestion_errors,
+        "validation": plan.get("validation"),
+      }
+    packet_errors, _context = _validate_graph_evidence_packet(packet)
+    if packet_errors:
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": True,
+        "explained": False,
+        "error": "GraphEvidencePacket failed deterministic validation",
+        "validation_errors": packet_errors,
+        "packet": packet,
+        "packet_meta": packet_meta,
+        "validation": plan.get("validation"),
+      }
+    broadened = bool(execution_result.get("broadened"))
+    live_retry = self._empty_result_broadening_state(
+      enabled=bool(plan["broadening"]["enabled"]),
+      attempted=broadened,
+      applied=broadened,
+      reason="executed_no_rows" if broadened else None,
+      strategy=plan["broadening"].get("strategy") if broadened else None,
+      broadening_cypher=plan["broadening"].get("cypher") if broadened else None,
+    )
+    if not packet["graph"]["nodes"]:
+      return {
+        "status": "empty_graph",
+        "ok": False,
+        "executed": True,
+        "explained": False,
+        "error": "No graph evidence nodes were returned for explanation.",
+        "packet": packet,
+        "packet_meta": packet_meta,
+        "validation": plan.get("validation"),
+        "live_retry": live_retry,
+      }
+    explanation_result = self._call_explanation_model(packet, temperature, max_tokens, top_p)
+    if explanation_result.get("status") != STATUS_ACCEPTED:
+      return {
+        "status": explanation_result.get("status", STATUS_ERROR),
+        "ok": False,
+        "executed": True,
+        "explained": False,
+        "error": explanation_result.get("error", "EdgeGuard graph explanation failed"),
+        "validation_errors": explanation_result.get("validation_errors", []),
+        "packet": packet,
+        "packet_meta": packet_meta,
+        "validation": plan.get("validation"),
+        "live_retry": live_retry,
+        "provider": explanation_result.get("provider"),
+        "provider_status": explanation_result.get("provider_status"),
+        "explanation": explanation_result.get("explanation"),
+      }
+    return {
+      "status": STATUS_OK,
+      "ok": True,
+      "executed": True,
+      "explained": True,
+      "packet": packet,
+      "packet_meta": packet_meta,
+      "explanation": explanation_result["explanation"],
+      "validation": plan.get("validation"),
+      "live_retry": live_retry,
+      "provider": explanation_result.get("provider"),
+      "model": explanation_result.get("model"),
+    }
+
+  @BasePlugin.endpoint(method="POST")
+  def explain_graph(
+    self,
+    cypher: str,
+    uri: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    request: str = "Explain the returned investigation graph.",
+    scheme: Optional[str] = None,
+    explanation_rows: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    enable_empty_result_broadening: Optional[bool] = None,
+    execution_result: Optional[Dict[str, Any]] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
@@ -1699,7 +2135,46 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": explanation_err,
       }
 
-    normalized_uri, err = self._normalize_neo4j_uri(uri, scheme)
+    requested_limit = explanation_rows if explanation_rows is not None else max_rows
+    broadening_enabled = (
+      bool(self.cfg_live_empty_result_broadening)
+      if enable_empty_result_broadening is None
+      else bool(enable_empty_result_broadening)
+    )
+    if execution_result is not None:
+      connection_fields = {
+        "uri": uri,
+        "username": username,
+        "password": password,
+        "scheme": scheme,
+      }
+      forwarded = [name for name, value in connection_fields.items() if value not in (None, "")]
+      forwarded.extend(str(name) for name in kwargs)
+      if forwarded:
+        return {
+          "status": STATUS_REJECTED,
+          "ok": False,
+          "executed": False,
+          "explained": False,
+          "error": "Execution evidence mode does not accept Neo4j connection fields.",
+          "validation_errors": [
+            _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
+          ],
+          "validation": analysis,
+        }
+      plan = _prepare_graph_explanation_plan(cypher, requested_limit, broadening_enabled)
+      if not plan.get("ok"):
+        return {**plan, "executed": False, "explained": False}
+      return self._explain_prepared_execution(
+        plan=plan,
+        execution_result=execution_result,
+        request=request,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+      )
+
+    normalized_uri, err = self._normalize_neo4j_uri(uri, scheme or "bolt+s")
     if err:
       return {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}
     if not username or not password:
@@ -1715,7 +2190,6 @@ class EdgeguardApiPlugin(BasePlugin):
       unavailable.update({"executed": False, "explained": False})
       return unavailable
 
-    requested_limit = explanation_rows if explanation_rows is not None else max_rows
     try:
       executed_cypher, generated_limit, executed_limit, limit_adjusted = _normalize_explanation_cypher_limit(
         analysis["accepted_cypher"],
@@ -1730,11 +2204,6 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": f"Invalid explanation row limit: {exc}",
       }
 
-    broadening_enabled = (
-      bool(self.cfg_live_empty_result_broadening)
-      if enable_empty_result_broadening is None
-      else bool(enable_empty_result_broadening)
-    )
     driver = None
     try:
       driver = self._neo4j_driver(normalized_uri, username, password)
@@ -1842,6 +2311,8 @@ class EdgeguardApiPlugin(BasePlugin):
         "provider": explanation_result.get("provider"),
         "model": explanation_result.get("model"),
         "explanation_model_url": self._redact_url(explanation_url),
+        "mode": "legacy_direct_driver",
+        "deprecated": True,
       }
     except Exception as exc:
       return {

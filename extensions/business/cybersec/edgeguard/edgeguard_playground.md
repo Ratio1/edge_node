@@ -9,7 +9,8 @@ generation orchestrator:
 - `LLM_INFERENCE_API` base worker for the public Qwen3 4B Instruct GGUF
 - `LLM_INFERENCE_API` worker for the public CyberSecQwen 4B GGUF
 - `EDGEGUARD_API` as the UI-facing safety facade for health, model catalog, prompt contract
-  metadata, deterministic `/check_cypher`, Neo4j execution, and graph explanation
+  metadata, deterministic `/check_cypher`, graph-explanation plan preparation, evidence-packet
+  construction/redaction, prompting, and explanation validation
 - `WORKER_APP_RUNNER` for the Next.js UI repo
 
 There is no `EDGEGUARD_LLM_AGENT_API` layer and no `EDGEGUARD_API /generate` endpoint in this
@@ -81,7 +82,12 @@ pipeline JSON committed to git.
 - `GET /prompt_contract` with schema version, schema surface, temporal policy, retry default, and
   prompt template versions/hashes
 - `POST /check_cypher` for deterministic query-only, read-only, schema-compatible validation
-- Neo4j query/explanation endpoints that revalidate accepted Cypher before execution
+- `POST /prepare_graph_explanation`, which revalidates accepted Cypher and returns a credential-free
+  primary query, limit policy, and optional deterministic broadening query
+- evidence-mode `POST /explain_graph`, which recomputes that plan, validates a bounded serialized
+  graph, assigns packet-local IDs, redacts properties, and never opens a Neo4j driver
+- deprecated direct-driver Neo4j query/explanation compatibility endpoints; the playground does not
+  use them for graph explanation
 
 Accepted generated output is still one read-only Cypher query string only:
 
@@ -90,10 +96,12 @@ Accepted generated output is still one read-only Cypher query string only:
 - only the allowed EdgeGuard labels, relationship types, and properties
 - at most two schema-correction retries by default
 
-When an accepted generated query executes successfully but returns zero rows, `EDGEGUARD_API` can
-apply the empty-result broadening fallback: it derives one bounded graph query from the first
-allowed label and relationship type already present in the accepted Cypher, executes that query, and
-returns explicit `live_retry` metadata so the UI can show that the returned graph was broadened.
+When an accepted generated query executes successfully but returns zero rows, `EDGEGUARD_API`
+prepares an optional empty-result broadening fallback from the first allowed label and relationship
+type already present in the accepted Cypher. The authenticated Next.js route owns Bolt-over-WSS
+execution and may execute that prepared broadening query only after a successful empty primary
+result. It sends bounded graph evidence, never credentials, back to `EDGEGUARD_API`, which verifies
+the query/count/flag pairing and returns explicit `live_retry` metadata.
 
 ## Minimal Pipeline Sketch
 
@@ -242,8 +250,10 @@ semaphore and injects the resolved value through `DYNAMIC_ENV` before starting t
 The LLM worker URLs are server-only Worker App Runner environment variables. They are not returned
 by `EDGEGUARD_API`, not exposed to the browser, and not written to local query history.
 
-Neo4j execution requires the `neo4j` Python driver in the runtime image. If the driver is missing,
-`EDGEGUARD_API` reports Neo4j execution as unavailable and does not attempt to connect.
+Graph explanation through the playground does not require the Neo4j Python driver in edge-node. The
+authenticated Next.js route uses its existing `neo4j-driver` Bolt-over-WSS transport and forwards
+only bounded execution evidence. The edge-node Python driver remains relevant only to deprecated
+direct-driver compatibility endpoints.
 
 ## Required Secrets
 
