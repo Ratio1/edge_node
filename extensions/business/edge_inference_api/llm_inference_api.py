@@ -741,13 +741,20 @@ class LLMInferenceApiPlugin(BasePlugin):
         return False
       if request_id not in self._requests:
         return False
+      error_message = "Local LLM returned an invalid empty response."
+      if inference.get("ERROR_CODE") == "context_window_exceeded":
+        error_message = "Model context window exceeded."
       return self._fail_request(
         request_id=request_id,
-        error_message="Local LLM returned an invalid empty response.",
+        error_message=error_message,
       )
 
     def filter_valid_inference(self, inference):
       if not isinstance(inference, dict):
+        return False
+      if inference.get("ERROR_CODE") == "context_window_exceeded":
+        self.P("Rejected LLM inference because the model context window was exceeded.")
+        self._fail_invalid_empty_inference(inference)
         return False
       if not inference.get("IS_VALID", True):
         if not self._has_text_result(inference=inference):

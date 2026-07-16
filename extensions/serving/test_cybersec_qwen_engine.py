@@ -38,6 +38,22 @@ class _FakeBaseServingProcess:
     }
     return load_model_method()
 
+  @staticmethod
+  def _post_process(preds_batch):
+    return [
+      {
+        "IS_VALID": True,
+        "text": text,
+        "FULL_OUTPUT": full_output,
+        **additional,
+      }
+      for text, full_output, additional in zip(
+        preds_batch["text"],
+        preds_batch["FULL_OUTPUT"],
+        preds_batch["ADDITIONAL"],
+      )
+    ]
+
 
 class _FakeLlama:
   calls = []
@@ -98,7 +114,14 @@ def _load_llama_cpp_base_class():
     "BaseServingProcess": _FakeBaseServingProcess,
     "Llama": _FakeLlama,
     "llama_cpp_lib": _FakeLlamaCppLib,
-    "LlmCT": types.SimpleNamespace(ROLE_KEY="role", DATA_KEY="content"),
+    "LlmCT": types.SimpleNamespace(
+      ROLE_KEY="role",
+      DATA_KEY="content",
+      PRMP="prompt",
+      TEXT="text",
+      ADDITIONAL="ADDITIONAL",
+      FULL_OUTPUT="FULL_OUTPUT",
+    ),
     "__name__": "loaded_llama_cpp_base",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
@@ -237,6 +260,43 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
     self.assertIn("missing.gguf", str(raised.exception))
     self.assertNotIn(tmpdir, str(raised.exception))
+
+  def test_llama_cpp_context_overflow_returns_structured_failure_without_retry(self):
+    process = _make_llama_cpp_process()
+    process._tps = []
+    process.time = lambda: 1.0
+    process.maybe_process_text = lambda text, _method: text
+    process.check_condition = lambda _text, _condition: True
+    process.model = types.SimpleNamespace()
+    calls = []
+
+    def overflow(**_kwargs):
+      calls.append(True)
+      raise ValueError("Requested tokens (17893) exceed context window of 4096")
+
+    process.model.create_chat_completion = overflow
+    result = process._predict([
+      [{"max_tokens": 1600}],
+      [[{"role": "user", "content": "large packet"}]],
+      [{"REQUEST_ID": "req-context"}],
+      [None],
+      [None],
+      [0],
+      1,
+    ])
+
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(result["text"], [""])
+    self.assertEqual(
+      result["FULL_OUTPUT"][0]["error"]["code"],
+      "context_window_exceeded",
+    )
+    self.assertEqual(result["FULL_OUTPUT"][0]["error"]["requested_tokens"], 17893)
+    self.assertEqual(result["FULL_OUTPUT"][0]["error"]["context_window"], 4096)
+    processed = process._post_process(result)
+    self.assertFalse(processed[0]["IS_VALID"])
+    self.assertEqual(processed[0]["ERROR_CODE"], "context_window_exceeded")
+    self.assertEqual(processed[0]["ERROR"], "Model context window exceeded.")
 
 
 if __name__ == "__main__":

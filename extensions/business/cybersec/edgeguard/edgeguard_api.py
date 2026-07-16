@@ -53,6 +53,7 @@ EXPLANATION_MAX_PROPERTIES = 64
 EXPLANATION_MAX_PROPERTY_KEY_CHARS = 120
 EXPLANATION_MAX_PROPERTY_BYTES = 131_072
 EXPLANATION_MAX_EXECUTION_RESULT_BYTES = 524_288
+EXPLANATION_MAX_PROMPT_USER_BYTES = 3_300
 LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)\b", re.IGNORECASE)
 IDENT_RE = re.compile(r"[^A-Za-z0-9_]+")
 EVIDENCE_ID_RE = re.compile(r"\b[nr]:[A-Za-z0-9_.:-]+\b")
@@ -1340,8 +1341,145 @@ def _graph_explanation_evidence_context(packet: Dict[str, Any]) -> Dict[str, Any
   }
 
 
+def _compact_prompt_properties(properties: Any) -> Dict[str, Any]:
+  if not isinstance(properties, dict):
+    return {}
+  preferred = [
+    *CAPTION_KEYS,
+    *sorted(SEVERITY_EVIDENCE_KEYS),
+    "confidence",
+    "timestamp",
+    "created_at",
+    "updated_at",
+  ]
+  ordered_keys = list(dict.fromkeys([
+    *(key for key in preferred if key in properties),
+    *sorted(str(key) for key in properties if str(key) not in preferred),
+  ]))
+  compact: Dict[str, Any] = {}
+  for key in ordered_keys[:8]:
+    value = properties.get(key)
+    if isinstance(value, str):
+      compact[key] = _compact_text(value, 160)
+    elif _is_scalar(value):
+      compact[key] = value
+    elif isinstance(value, list):
+      compact[key] = [
+        _compact_text(item, 80) if isinstance(item, str) else item
+        for item in value[:5]
+        if _is_scalar(item)
+      ]
+  return compact
+
+
+def _compact_prompt_node(node: Dict[str, Any]) -> Dict[str, Any]:
+  return {
+    "id": node.get("id"),
+    "labels": list(node.get("labels") or [])[:EXPLANATION_MAX_LABELS],
+    "caption": _compact_text(node.get("caption") or "Entity", 160),
+    "properties": _compact_prompt_properties(node.get("properties")),
+  }
+
+
+def _compact_prompt_relationship(relationship: Dict[str, Any]) -> Dict[str, Any]:
+  return {
+    "id": relationship.get("id"),
+    "type": relationship.get("type"),
+    "startNodeId": relationship.get("startNodeId"),
+    "endNodeId": relationship.get("endNodeId"),
+    "caption": _compact_text(relationship.get("caption") or relationship.get("type") or "RELATED_TO", 160),
+    "properties": _compact_prompt_properties(relationship.get("properties")),
+  }
+
+
+def _prompt_packet_projection(
+  packet: Dict[str, Any],
+  nodes: list[Dict[str, Any]],
+  relationships: list[Dict[str, Any]],
+  *,
+  truncated: bool,
+) -> Dict[str, Any]:
+  execution = dict(packet.get("execution") or {})
+  execution["truncated"] = bool(execution.get("truncated") or truncated)
+  graph = {
+    "nodes": nodes,
+    "relationships": relationships,
+    "truncated": bool((packet.get("graph") or {}).get("truncated") or truncated),
+  }
+  return {
+    **packet,
+    "request": _compact_text(packet.get("request") or "Explain the returned investigation graph.", 500),
+    "accepted_cypher": _compact_text(packet.get("accepted_cypher") or "", 500),
+    "executed_cypher": _compact_text(packet.get("executed_cypher") or "", 500),
+    "execution": execution,
+    "graph": graph,
+  }
+
+
+def _graph_explanation_user_content(packet: Dict[str, Any]) -> str:
+  return json.dumps({
+    "prompt_version": GRAPH_EXPLANATION_PROMPT_VERSION,
+    "user_question": _compact_text(packet.get("request") or "Explain the returned investigation graph.", 500),
+    **_graph_explanation_evidence_context(packet),
+    "graph_evidence_packet": packet,
+  }, sort_keys=True)
+
+
+def _project_graph_evidence_for_prompt(packet: Dict[str, Any]) -> Dict[str, Any]:
+  graph = packet.get("graph") if isinstance(packet.get("graph"), dict) else {}
+  original_nodes = [node for node in graph.get("nodes") or [] if isinstance(node, dict)]
+  original_relationships = [
+    relationship for relationship in graph.get("relationships") or [] if isinstance(relationship, dict)
+  ]
+  compact_nodes = {node.get("id"): _compact_prompt_node(node) for node in original_nodes}
+  compact_relationships = [_compact_prompt_relationship(relationship) for relationship in original_relationships]
+  selected_node_ids: set[str] = set()
+  selected_relationship_ids: set[str] = set()
+
+  def candidate(node_ids: set[str], relationship_ids: set[str]) -> Dict[str, Any]:
+    nodes = [compact_nodes[node.get("id")] for node in original_nodes if node.get("id") in node_ids]
+    relationships = [
+      relationship
+      for relationship in compact_relationships
+      if relationship.get("id") in relationship_ids
+    ]
+    return _prompt_packet_projection(packet, nodes, relationships, truncated=True)
+
+  def fits(node_ids: set[str], relationship_ids: set[str]) -> bool:
+    projected = candidate(node_ids, relationship_ids)
+    return len(_graph_explanation_user_content(projected).encode("utf-8")) <= EXPLANATION_MAX_PROMPT_USER_BYTES
+
+  for relationship in compact_relationships:
+    next_nodes = selected_node_ids | {relationship.get("startNodeId"), relationship.get("endNodeId")}
+    next_relationships = selected_relationship_ids | {relationship.get("id")}
+    if fits(next_nodes, next_relationships):
+      selected_node_ids = next_nodes
+      selected_relationship_ids = next_relationships
+  for node in original_nodes:
+    node_id = node.get("id")
+    if node_id not in selected_node_ids and fits(selected_node_ids | {node_id}, selected_relationship_ids):
+      selected_node_ids.add(node_id)
+
+  projection = candidate(selected_node_ids, selected_relationship_ids)
+  all_evidence_selected = (
+    len(selected_node_ids) == len(original_nodes)
+    and len(selected_relationship_ids) == len(original_relationships)
+  )
+  compacted = any(
+    compact_nodes.get(node.get("id")) != node for node in original_nodes
+  ) or any(
+    compact_relationship != original_relationship
+    for compact_relationship, original_relationship in zip(compact_relationships, original_relationships)
+  )
+  if all_evidence_selected and not compacted:
+    unmodified = _prompt_packet_projection(packet, original_nodes, original_relationships, truncated=False)
+    if len(_graph_explanation_user_content(unmodified).encode("utf-8")) <= EXPLANATION_MAX_PROMPT_USER_BYTES:
+      return unmodified
+  return projection
+
+
 def _build_case_explanation_messages(packet: Dict[str, Any]) -> list[Dict[str, str]]:
-  evidence_context = _graph_explanation_evidence_context(packet)
+  prompt_packet = _project_graph_evidence_for_prompt(packet)
   return [
     {
       "role": "system",
@@ -1349,12 +1487,7 @@ def _build_case_explanation_messages(packet: Dict[str, Any]) -> list[Dict[str, s
     },
     {
       "role": "user",
-      "content": json.dumps({
-        "prompt_version": GRAPH_EXPLANATION_PROMPT_VERSION,
-        "user_question": packet.get("request"),
-        **evidence_context,
-        "graph_evidence_packet": packet,
-      }, sort_keys=True),
+      "content": _graph_explanation_user_content(prompt_packet),
     },
   ]
 
@@ -1505,6 +1638,16 @@ class EdgeguardApiPlugin(BasePlugin):
         return value
     return None
 
+  def _extract_provider_failure(self, response: Any) -> Optional[Dict[str, Any]]:
+    current = response
+    for _depth in range(4):
+      if not isinstance(current, dict):
+        return None
+      if current.get("status") in {STATUS_ERROR, STATUS_TIMEOUT, "failed", "config_error"}:
+        return current
+      current = current.get("result")
+    return None
+
   def _build_explanation_payload(
     self,
     packet: Dict[str, Any],
@@ -1557,8 +1700,18 @@ class EdgeguardApiPlugin(BasePlugin):
           "provider_status": response.status_code,
         }
       data = response.json()
-      if isinstance(data, dict) and data.get("status") in {STATUS_ERROR, STATUS_TIMEOUT, "failed", "config_error"}:
-        provider_status = data.get("status")
+      provider_result = self._extract_provider_failure(data)
+      if provider_result is not None:
+        provider_status = provider_result.get("status")
+        if provider_result.get("error") == "Model context window exceeded.":
+          return {
+            "status": STATUS_REJECTED,
+            "error": "Graph explanation evidence exceeds the model context window.",
+            "validation_errors": [
+              _contract_error("context_window_exceeded", "Reduce the returned graph or explanation row limit.")
+            ],
+            "provider": "local",
+          }
         return {
           "status": STATUS_TIMEOUT if provider_status == STATUS_TIMEOUT else STATUS_ERROR,
           "error": (

@@ -39,6 +39,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanat
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_packet_and_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
 
 
 class _Response:
@@ -407,6 +408,66 @@ class EdgeGuardApiTests(unittest.TestCase):
       "Always include a graph_scope caveat",
     ):
       self.assertIn(restriction, instructions)
+
+  def test_graph_explanation_prompt_projects_large_graph_into_context_budget(self):
+    nodes = [{
+      "id": f"n:indicator-{index}",
+      "labels": ["Indicator"],
+      "caption": f"indicator-{index}",
+      "properties": {
+        "value": f"indicator-{index}.example.org",
+        "description": "x" * 500,
+        "extra": "y" * 500,
+      },
+    } for index in range(100)]
+    relationships = [{
+      "id": f"r:related-{index}",
+      "type": "RELATED_TO",
+      "startNodeId": f"n:indicator-{index}",
+      "endNodeId": f"n:indicator-{index + 1}",
+      "caption": "RELATED_TO",
+      "properties": {"description": "z" * 500},
+    } for index in range(99)]
+    packet = {
+      "schema_version": "edgeguard.graph_evidence_packet.v1",
+      "request": "How are these indicators connected?",
+      "accepted_cypher": "MATCH p=(i:Indicator)-[*1..2]-(j:Indicator) RETURN p LIMIT 100",
+      "executed_cypher": "MATCH p=(i:Indicator)-[*1..2]-(j:Indicator) RETURN p LIMIT 100",
+      "limit_policy": {
+        "generated_limit": 100,
+        "executed_limit": 100,
+        "server_max_rows": 100,
+        "limit_adjusted": False,
+      },
+      "execution": {
+        "status": "executed",
+        "row_count": 100,
+        "truncated": False,
+        "broadened": False,
+        "live_retry_reason": None,
+      },
+      "graph": {"nodes": nodes, "relationships": relationships, "truncated": False},
+      "redaction": {
+        "policy": "edgeguard_graph_packet_private_v1",
+        "contains_customer_evidence": False,
+        "contains_raw_misp_payload": False,
+      },
+    }
+
+    user_content = _build_case_explanation_messages(packet)[1]["content"]
+    prompt_context = json.loads(user_content)
+    prompt_packet = prompt_context["graph_evidence_packet"]
+    selected_node_ids = {node["id"] for node in prompt_packet["graph"]["nodes"]}
+
+    self.assertLessEqual(len(user_content.encode("utf-8")), EXPLANATION_MAX_PROMPT_USER_BYTES)
+    self.assertLess(len(selected_node_ids), len(nodes))
+    self.assertTrue(prompt_packet["graph"]["truncated"])
+    self.assertTrue(prompt_packet["execution"]["truncated"])
+    self.assertTrue(prompt_context["caveat_requirements"]["truncation"])
+    self.assertTrue(prompt_packet["graph"]["relationships"])
+    for relationship in prompt_packet["graph"]["relationships"]:
+      self.assertIn(relationship["startNodeId"], selected_node_ids)
+      self.assertIn(relationship["endNodeId"], selected_node_ids)
 
   def test_graph_explanation_prompt_hash_is_canonical_and_packet_independent(self):
     first = _build_case_explanation_messages({"request": "Question one", "graph": {}})[0]["content"]
@@ -907,6 +968,47 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(request_error["error"], "EdgeGuard explanation model request failed")
     self.assertEqual(unexpected_error["error"], "Unexpected explanation model failure")
     self.assertNotIn(provider_internal, " ".join(str(call) for call in plugin.P.call_args_list))
+
+  def test_explanation_model_context_overflow_returns_specific_safe_rejection(self):
+    plugin = _make_api()
+    fake_session = MagicMock()
+    fake_session.post.return_value = _Response(payload={
+      "result": {
+        "result": {
+          "status": "failed",
+          "error": "Model context window exceeded.",
+        },
+      },
+    })
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=fake_session):
+      result = plugin._call_explanation_model({"schema_version": "edgeguard.graph_evidence_packet.v1"})
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertEqual(result["error"], "Graph explanation evidence exceeds the model context window.")
+    self.assertEqual(result["validation_errors"], [{
+      "code": "context_window_exceeded",
+      "detail": "Reduce the returned graph or explanation row limit.",
+    }])
+
+  def test_explanation_model_nested_timeout_returns_specific_safe_timeout(self):
+    plugin = _make_api()
+    fake_session = MagicMock()
+    fake_session.post.return_value = _Response(payload={
+      "result": {
+        "result": {
+          "status": "timeout",
+          "error": "private provider timeout detail",
+        },
+      },
+    })
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=fake_session):
+      result = plugin._call_explanation_model({"schema_version": "edgeguard.graph_evidence_packet.v1"})
+
+    self.assertEqual(result["status"], "timeout")
+    self.assertEqual(result["error"], "EdgeGuard explanation model request timed out")
+    self.assertNotIn("private provider timeout detail", json.dumps(result))
 
   def test_health_does_not_expose_explanation_provider_location(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)

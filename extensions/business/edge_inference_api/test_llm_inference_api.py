@@ -189,6 +189,33 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(failed["request_id"], "req-9")
     self.assertEqual(failed["error_message"], "Local LLM returned an invalid empty response.")
 
+  def test_filter_valid_inference_fails_context_overflow_with_safe_specific_error(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin._requests = {"req-context": {"status": "pending"}}  # pylint: disable=protected-access
+    failed = {}
+    plugin._fail_request = lambda request_id, error_message: failed.update({  # pylint: disable=protected-access
+      "request_id": request_id,
+      "error_message": error_message,
+    }) or True
+    inference = {
+      "text": "",
+      "IS_VALID": False,
+      "ERROR_CODE": "context_window_exceeded",
+      "ERROR": "Model context window exceeded.",
+      "FULL_OUTPUT": {
+        "error": {
+          "code": "context_window_exceeded",
+          "message": "Model context window exceeded.",
+        },
+      },
+    }
+
+    self.assertFalse(plugin.filter_valid_inference(inference))
+    self.assertEqual(failed, {
+      "request_id": "req-context",
+      "error_message": "Model context window exceeded.",
+    })
+
 
 if __name__ == "__main__":
   unittest.main()

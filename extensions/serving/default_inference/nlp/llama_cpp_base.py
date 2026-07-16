@@ -2,6 +2,7 @@
 TODO: example pipeline with additional explanations
 """
 import os
+import re
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -15,6 +16,11 @@ __VER__ = "0.1.0"
 MODEL_N_CTX_MIN_VALUE = 512
 MODEL_N_CTX_DEFAULT_VALUE = 4096
 MODEL_N_BATCH_DEFAULT_VALUE = 512
+CONTEXT_WINDOW_ERROR_CODE = "context_window_exceeded"
+CONTEXT_WINDOW_ERROR_MESSAGE = "Model context window exceeded."
+CONTEXT_WINDOW_ERROR_RE = re.compile(
+  r"Requested tokens \((\d+)\) exceed context window of (\d+)",
+)
 
 
 _CONFIG = {
@@ -415,14 +421,28 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         messages = messages_lst[idx_orig]
         predict_kwargs = predict_kwargs_lst[idx_orig]
         t1 = self.time()
-        out = self.model.create_chat_completion(
-          messages=messages,
-          **predict_kwargs
-        )
+        try:
+          out = self.model.create_chat_completion(
+            messages=messages,
+            **predict_kwargs
+          )
+        except ValueError as exc:
+          context_match = CONTEXT_WINDOW_ERROR_RE.search(str(exc))
+          if context_match is None:
+            raise
+          out = {
+            "error": {
+              "code": CONTEXT_WINDOW_ERROR_CODE,
+              "message": CONTEXT_WINDOW_ERROR_MESSAGE,
+              "requested_tokens": int(context_match.group(1)),
+              "context_window": int(context_match.group(2)),
+            },
+          }
         elapsed = self.time() - t1
         timings.append(elapsed)
-        reply = out["choices"][0]["message"]["content"]
-        num_tokens_generated = out["usage"]["completion_tokens"]
+        inference_error = out.get("error") if isinstance(out, dict) else None
+        reply = "" if inference_error else out["choices"][0]["message"]["content"]
+        num_tokens_generated = 0 if inference_error else out["usage"]["completion_tokens"]
         total_generated_tokens += num_tokens_generated
         reply_lst.append(reply)
         full_output_lst.append(out)
@@ -439,6 +459,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         process_method = results[idx_orig][2]
         current_text = reply_lst[idx_curr]
         full_output = full_output_lst[idx_curr]
+        if isinstance(full_output, dict) and isinstance(full_output.get("error"), dict):
+          results[idx_orig] = (idx_orig, valid_condition, process_method, current_text, full_output)
+          continue
         self.P(f"Checking condition for object {idx_orig}:\nvalid:`{valid_condition}`|process:`{process_method}`|text:\n{current_text}")
         current_text = self.maybe_process_text(current_text, process_method)
         self.P(f"Processed text:\n{current_text}")
@@ -479,4 +502,15 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
   def _post_process(self, preds_batch):
     # This method can be missing here, but is present in case
     # of future customizations.
-    return super(LlamaCppBaseServingProcess, self)._post_process(preds_batch)
+    results = super(LlamaCppBaseServingProcess, self)._post_process(preds_batch)
+    for result in results:
+      full_output = result.get(LlmCT.FULL_OUTPUT) if isinstance(result, dict) else None
+      inference_error = full_output.get("error") if isinstance(full_output, dict) else None
+      if not isinstance(inference_error, dict):
+        continue
+      if inference_error.get("code") != CONTEXT_WINDOW_ERROR_CODE:
+        continue
+      result["IS_VALID"] = False
+      result["ERROR_CODE"] = CONTEXT_WINDOW_ERROR_CODE
+      result["ERROR"] = CONTEXT_WINDOW_ERROR_MESSAGE
+    return results
