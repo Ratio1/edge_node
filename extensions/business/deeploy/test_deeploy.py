@@ -338,7 +338,7 @@ class _DeeployStub(DeeployManagerApiPlugin):
         (dct_status, str_status, response_keys)
     """
     response_keys = {"node1": ["k1"]}
-    return {}, DEEPLOY_STATUS.PENDING, response_keys
+    return {}, DEEPLOY_STATUS.PENDING, response_keys, None
 
 
 class DeeployPostponedTests(unittest.TestCase):
@@ -398,9 +398,13 @@ class DeeployPostponedTests(unittest.TestCase):
       'confirm': {},
     }
     self.plugin._now = 5
+    rolled_back = []
+    self.plugin.rollback_staged_job_pipeline_and_secrets = lambda state: rolled_back.append(state)
+    self.plugin._DeeployManagerApiPlugin__pending_deploy_requests[pending_id]['staging'] = {"cid": "staged"}
     res = self.plugin.solve_postponed_deploy_request(pending_id)
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.TIMEOUT)
     self.assertEqual(res[DEEPLOY_KEYS.APP_ID], "app1")
+    self.assertEqual(rolled_back, [{"cid": "staged"}])
 
   def test_solve_postponed_scale_up_timeout(self):
     """
@@ -470,9 +474,13 @@ class DeeployPostponedTests(unittest.TestCase):
     }
     self.plugin._chainstore["k1"] = {"ok": True}
     self.plugin._chainstore["k2"] = {"ok": True}
+    committed = []
+    self.plugin.commit_staged_job_pipeline_and_secrets = lambda state: committed.append(state)
+    self.plugin._DeeployManagerApiPlugin__pending_deploy_requests[pending_id]['staging'] = {"cid": "staged"}
     res = self.plugin.solve_postponed_deploy_request(pending_id)
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
     self.assertEqual(self.plugin.bc.submitted, [(77, ["eth_nodeA"])])
+    self.assertEqual(committed, [{"cid": "staged"}])
 
   def test_solve_postponed_missing_pending(self):
     """
@@ -548,7 +556,7 @@ class DeeployEndpointTests(unittest.TestCase):
     Ensure scale_up_job_workers returns command-delivered when no keys exist.
     """
     def scale_up_job(new_nodes, update_nodes, job_id, owner, running_apps_for_job, wait_for_responses=True):
-      return {}, DEEPLOY_STATUS.PENDING, {}
+      return {}, DEEPLOY_STATUS.PENDING, {}, None
     self.plugin.scale_up_job = scale_up_job
     req = {
       DEEPLOY_KEYS.JOB_ID: 10,

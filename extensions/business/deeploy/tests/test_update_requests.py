@@ -96,6 +96,33 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       node_addr_to_eth_addr=lambda node: node,
       submit_node_update=lambda **kwargs: called.__setitem__("bc_update", called["bc_update"] + 1),
     )
+
+    def build_pipeline_config(**kwargs):
+      config = {
+        "NAME": kwargs["name"],
+        "TYPE": kwargs["stream_type"],
+      }
+      if kwargs.get("url") is not None:
+        config["URL"] = kwargs["url"]
+      if kwargs.get("plugins") is not None:
+        config["PLUGINS"] = copy.deepcopy(kwargs["plugins"])
+      ignored = {"name", "stream_type", "url", "plugins"}
+      config.update({
+        key.upper(): copy.deepcopy(value)
+        for key, value in kwargs.items()
+        if key not in ignored
+      })
+      return config
+
+    plugin.cmdapi_build_pipeline_config = build_pipeline_config
+    plugin._load_dauth_job_secret_bundle = lambda job_id: None
+    plugin.stage_job_pipeline_and_secrets = lambda pipeline, job_id, secret_bundle: {
+      "job_id": str(job_id),
+      "pipeline": copy.deepcopy(pipeline),
+      "secret_bundle": copy.deepcopy(secret_bundle),
+    }
+    plugin.commit_staged_job_pipeline_and_secrets = lambda state: True
+    plugin.rollback_staged_job_pipeline_and_secrets = lambda state: True
     plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
 
     def check_and_deploy_pipelines(**kwargs):
@@ -3243,6 +3270,54 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(created["PER_NODE_TARGET_NODES"], expected_nodes)
     self.assertEqual(updated["CHAINSTORE_PEERS"], expected_nodes)
     self.assertEqual(updated["PER_NODE_TARGET_NODES"], expected_nodes)
+
+  def test_scale_up_prepare_preserves_offline_persisted_targets(self):
+    plugin = make_deeploy_plugin()
+    plugin.defaultdict = defaultdict
+    plugin.time = lambda: 1000
+    base_pipeline = {
+      "app_id": "app-1",
+      "pipeline_type": "Void",
+      "url": "",
+      "pipeline_params": {},
+      "deeploy_specs": {
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["online-node", "offline-node"],
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      },
+      "plugins": [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{"INSTANCE_ID": "stale", "ENV": {}}],
+      }],
+    }
+    running_apps = {
+      "online-node": {
+        "app-1": {
+          "plugins": {
+            "CONTAINER_APP_RUNNER": [{
+              "instance": "existing",
+              "instance_conf": {"CHAINSTORE_RESPONSE_KEY": "response"},
+            }],
+          },
+        },
+      },
+    }
+
+    create_pipelines, update_pipelines, _ = plugin.prepare_create_update_pipelines(
+      base_pipeline=base_pipeline,
+      new_nodes=["new-node"],
+      update_nodes=["online-node"],
+      running_apps_for_job=running_apps,
+    )
+
+    expected = ["online-node", "offline-node", "new-node"]
+    self.assertEqual(
+      create_pipelines["new-node"]["deeploy_specs"][DEEPLOY_KEYS.CURRENT_TARGET_NODES],
+      expected,
+    )
+    self.assertEqual(
+      update_pipelines["online-node"]["deeploy_specs"][DEEPLOY_KEYS.CURRENT_TARGET_NODES],
+      expected,
+    )
 
 
 if __name__ == "__main__":

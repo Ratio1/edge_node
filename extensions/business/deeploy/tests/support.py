@@ -170,6 +170,42 @@ def make_deeploy_plugin():
   plugin.Pd = lambda *args, **kwargs: None
   plugin.json_dumps = lambda obj, **kwargs: str(obj)
 
+  def build_pipeline_config(**kwargs):
+    config = {
+      "NAME": kwargs["name"],
+      "TYPE": kwargs["stream_type"],
+    }
+    if kwargs.get("url") is not None:
+      config["URL"] = kwargs["url"]
+    if kwargs.get("plugins") is not None:
+      config["PLUGINS"] = copy.deepcopy(kwargs["plugins"])
+    ignored = {"name", "stream_type", "url", "plugins", "node_address", "send_immediately"}
+    config.update({
+      key.upper(): copy.deepcopy(value)
+      for key, value in kwargs.items()
+      if key not in ignored
+    })
+    return config
+
+  plugin.cmdapi_build_pipeline_config = build_pipeline_config
+
+  def dispatch_pipeline_config(config, node_address=None):
+    config = copy.deepcopy(config)
+    name = config.pop("NAME")
+    pipeline_type = config.pop("TYPE")
+    url = config.pop("URL", None)
+    plugins = config.pop("PLUGINS", None)
+    return plugin.cmdapi_start_pipeline_by_params(
+      name=name,
+      pipeline_type=pipeline_type,
+      node_address=node_address,
+      url=url,
+      plugins=plugins,
+      **{key.lower(): value for key, value in config.items()},
+    )
+
+  plugin.cmdapi_start_pipeline = dispatch_pipeline_config
+
   uuid_counter = {'value': 0}
 
   def uuid(size=6):
