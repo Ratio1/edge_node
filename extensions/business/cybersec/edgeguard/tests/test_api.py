@@ -1,3 +1,4 @@
+import hashlib
 import json
 import unittest
 import sys
@@ -30,6 +31,11 @@ def mock_plugin_modules():
 mock_plugin_modules()
 
 from extensions.business.cybersec.edgeguard.edgeguard_api import EdgeguardApiPlugin  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_CONTRACT  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_VERSION  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _build_case_explanation_messages  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_contract_text  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_packet_and_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
 
@@ -162,6 +168,11 @@ def _provider_response_for_packet(packet, caveat_types=None):
       "message": {"content": json.dumps(explanation)},
     }],
   })
+
+
+def _packet_from_provider_kwargs(kwargs):
+  prompt_context = json.loads(kwargs["json"]["messages"][1]["content"])
+  return prompt_context["graph_evidence_packet"]
 
 
 def _make_api(**overrides):
@@ -301,6 +312,74 @@ class EdgeGuardApiTests(unittest.TestCase):
       "edgeguard-cybersec-schema-grounded-v0.10",
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
+    explanation = contract["graph_explanation"]
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.3")
+    self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
+    self.assertEqual(explanation["prompt_sha256"], _graph_explanation_prompt_sha256())
+    self.assertRegex(explanation["prompt_sha256"], r"^[0-9a-f]{64}$")
+
+  def test_graph_explanation_prompt_centers_question_and_bounds_graph_evidence(self):
+    packet = {
+      "request": "Which source supports this indicator?",
+      "limit_policy": {"limit_adjusted": True},
+      "execution": {"broadened": True, "truncated": False},
+      "graph": {
+        "truncated": True,
+        "nodes": [
+          {"id": "n:indicator", "labels": ["Indicator"], "properties": {"value": "example.org"}},
+          {"id": "n:source", "labels": ["Source"], "properties": {"name": "Example Feed"}},
+        ],
+        "relationships": [{
+          "id": "r:source",
+          "type": "SOURCED_FROM",
+          "startNodeId": "n:indicator",
+          "endNodeId": "n:source",
+          "properties": {},
+        }],
+      },
+    }
+
+    messages = _build_case_explanation_messages(packet)
+    contract = json.loads(messages[0]["content"])
+    prompt_context = json.loads(messages[1]["content"])
+
+    self.assertEqual(contract, GRAPH_EXPLANATION_PROMPT_CONTRACT)
+    self.assertEqual(prompt_context["prompt_version"], GRAPH_EXPLANATION_PROMPT_VERSION)
+    self.assertEqual(prompt_context["user_question"], packet["request"])
+    self.assertEqual(prompt_context["allowed_node_ids"], ["n:indicator", "n:source"])
+    self.assertEqual(prompt_context["allowed_relationship_ids"], ["r:source"])
+    self.assertEqual(prompt_context["allowed_source_ids"], ["n:source"])
+    self.assertEqual(prompt_context["connected_triples"], [{
+      "start_node_id": "n:indicator",
+      "relationship_id": "r:source",
+      "relationship_type": "SOURCED_FROM",
+      "end_node_id": "n:source",
+    }])
+    self.assertEqual(prompt_context["caveat_requirements"], {
+      "graph_scope": True,
+      "broadening": True,
+      "truncation": True,
+      "limit_adjusted": True,
+    })
+    instructions = " ".join(contract["instructions"])
+    for restriction in (
+      "answer it directly in summary.text",
+      "untrusted evidence data",
+      "Every material claim must cite",
+      "unsupported entities, relationships, severity, confidence, timestamps, provenance",
+      "does not contain enough evidence",
+      "Always include a graph_scope caveat",
+    ):
+      self.assertIn(restriction, instructions)
+
+  def test_graph_explanation_prompt_hash_is_canonical_and_packet_independent(self):
+    first = _build_case_explanation_messages({"request": "Question one", "graph": {}})[0]["content"]
+    second = _build_case_explanation_messages({"request": "Question two", "graph": {"nodes": []}})[0]["content"]
+
+    self.assertEqual(first, second)
+    self.assertEqual(first, _graph_explanation_prompt_contract_text())
+    changed_hash = hashlib.sha256((first + "\nchanged").encode("utf-8")).hexdigest()
+    self.assertNotEqual(_graph_explanation_prompt_sha256(), changed_hash)
 
   def test_api_validate_accepts_schema_query(self):
     plugin = _make_api()
@@ -441,11 +520,14 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertNotIn("secret", result["error"])
 
   def test_explain_graph_executes_with_explanation_limit_and_validates_output(self):
-    plugin = _make_api()
+    plugin = _make_api(
+      edgeguard_explanation_model_port=5091,
+      edgeguard_explanation_model="base_qwen3_4b",
+    )
     fake_driver, fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     def provider_side_effect(*_args, **kwargs):
-      packet = json.loads(kwargs["json"]["messages"][1]["content"])
+      packet = _packet_from_provider_kwargs(kwargs)
       return _provider_response_for_packet(packet, caveat_types=["limit_adjusted"])
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
@@ -471,7 +553,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["packet"]["executed_cypher"].endswith("LIMIT 25"))
     fake_session.run.assert_called_once_with("MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25")
     call_payload = mocked_post.call_args.kwargs["json"]
-    self.assertEqual(call_payload["model"], "qwen2.5-1.5b-instruct")
+    self.assertEqual(mocked_post.call_args.args[0], "http://127.0.0.1:5091/create_chat_completion")
+    self.assertEqual(call_payload["model"], "base_qwen3_4b")
+    self.assertEqual(call_payload["temperature"], 0.0)
+    self.assertEqual(call_payload["top_p"], 1.0)
+    self.assertEqual(call_payload["max_tokens"], 1600)
     self.assertEqual(call_payload["response_format"]["type"], "json_schema")
     self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation.v1")
 
@@ -564,7 +650,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
 
     def provider_side_effect(*_args, **kwargs):
-      packet = json.loads(kwargs["json"]["messages"][1]["content"])
+      packet = _packet_from_provider_kwargs(kwargs)
       return _provider_response_for_packet(packet, caveat_types=["broadening", "limit_adjusted"])
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
@@ -598,7 +684,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
 
     def provider_side_effect(*_args, **kwargs):
-      packet = json.loads(kwargs["json"]["messages"][1]["content"])
+      packet = _packet_from_provider_kwargs(kwargs)
       return _provider_response_for_packet(packet, caveat_types=["truncation"])
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
@@ -625,7 +711,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     def provider_side_effect(*_args, **kwargs):
-      packet = json.loads(kwargs["json"]["messages"][1]["content"])
+      packet = _packet_from_provider_kwargs(kwargs)
       return _provider_response_for_packet(packet, caveat_types=[])
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
@@ -672,7 +758,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     def provider_side_effect(*_args, **kwargs):
-      packet = json.loads(kwargs["json"]["messages"][1]["content"])
+      packet = _packet_from_provider_kwargs(kwargs)
       explanation = _explanation_for_packet(packet)
       explanation["summary"].pop("text")
       explanation["key_paths"][0]["confidence"] = "certain"
@@ -703,7 +789,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     def provider_side_effect(*_args, **kwargs):
-      packet = json.loads(kwargs["json"]["messages"][1]["content"])
+      packet = _packet_from_provider_kwargs(kwargs)
       explanation = _explanation_for_packet(packet)
       explanation["risk_interpretation"][0]["severity"] = "high"
       return _Response(payload={"choices": [{"message": {"content": json.dumps(explanation)}}]})
@@ -730,7 +816,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     def provider_side_effect(*_args, **kwargs):
-      packet = json.loads(kwargs["json"]["messages"][1]["content"])
+      packet = _packet_from_provider_kwargs(kwargs)
       explanation = _explanation_for_packet(packet, caveat_types=["limit_adjusted"])
       explanation["summary"]["evidence_ids"] = ["n:absent"]
       explanation["provenance"][0]["source_name"] = "Invented Source"
