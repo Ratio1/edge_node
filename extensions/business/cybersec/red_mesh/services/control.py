@@ -1,3 +1,5 @@
+from contextlib import ExitStack
+
 from ..constants import (
   JOB_STATUS_FINALIZED,
   JOB_STATUS_RUNNING,
@@ -101,6 +103,16 @@ def stop_and_delete_job(owner, job_id: str):
 
 
 def purge_job(owner, job_id: str):
+  """Serialize purge with every supported rulebook review mutation for the job."""
+  from .rulebook_assessment import _submission_lock, list_rulebook_profiles
+
+  with ExitStack() as stack:
+    for profile in sorted(list_rulebook_profiles(), key=lambda item: item["profile_id"]):
+      stack.enter_context(_submission_lock(owner, job_id, profile["profile_id"]))
+    return _purge_job_locked(owner, job_id)
+
+
+def _purge_job_locked(owner, job_id: str):
   """
   Purge a job: delete all R1FS artifacts, clean up live progress keys,
   then tombstone the CStore entry.
@@ -151,6 +163,59 @@ def purge_job(owner, job_id: str):
   for addr, w in workers.items():
     _track(w.get("report_cid"), f"workers[{addr}].report_cid")
 
+  rulebook_assessments = job_specs.get("rulebook_assessments")
+  if isinstance(rulebook_assessments, dict):
+    for profile_id, meta in rulebook_assessments.items():
+      if isinstance(meta, dict):
+        _track(meta.get("artifact_cid"), f"rulebook_assessments[{profile_id}].artifact_cid")
+        for hi, historical in enumerate(meta.get("history") or []):
+          if isinstance(historical, dict):
+            _track(historical.get("artifact_cid"), f"rulebook_assessments[{profile_id}].history[{hi}].artifact_cid")
+
+  submission_hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
+  submission_key_prefix = f"{job_id}:"
+  all_submission_rows = owner.chainstore_hgetall(hkey=submission_hkey) or {}
+  formal_submission_cids = set()
+  if isinstance(all_submission_rows, dict):
+    for key, registry in all_submission_rows.items():
+      if not isinstance(key, str) or not key.startswith(submission_key_prefix) or not isinstance(registry, dict):
+        continue
+      for reference in registry.get("submissions") or []:
+        if isinstance(reference, dict) and isinstance(reference.get("cid"), str) and reference.get("cid"):
+          formal_submission_cids.add(reference["cid"])
+          _track(reference["cid"], f"rulebook_review_submissions[{key}].submissions")
+      pending = registry.get("pending")
+      if isinstance(pending, dict) and isinstance(pending.get("cid"), str) and pending.get("cid"):
+        formal_submission_cids.add(pending["cid"])
+        _track(pending["cid"], f"rulebook_review_submissions[{key}].pending")
+
+    other_job_cids = set()
+    for key, registry in all_submission_rows.items():
+      if not isinstance(key, str) or key.startswith(submission_key_prefix) or not isinstance(registry, dict):
+        continue
+      for reference in registry.get("submissions") or []:
+        if isinstance(reference, dict) and isinstance(reference.get("cid"), str) and reference.get("cid"):
+          other_job_cids.add(reference["cid"])
+      pending = registry.get("pending")
+      if isinstance(pending, dict) and isinstance(pending.get("cid"), str) and pending.get("cid"):
+        other_job_cids.add(pending["cid"])
+    all_jobs = _job_repo(owner).list_jobs() or {}
+    if isinstance(all_jobs, dict):
+      for other_job_id, other_payload in all_jobs.items():
+        if other_job_id != job_id and isinstance(other_payload, dict):
+          other_job_cids.update(_collect_cids_from_raw(other_payload))
+    shared_cids = formal_submission_cids & other_job_cids
+    if shared_cids:
+      owner.P(f"[PURGE] Shared submission CIDs retained: {sorted(shared_cids)}", color='r')
+      return {
+        "status": "partial",
+        "job_id": job_id,
+        "cids_deleted": 0,
+        "cids_failed": len(shared_cids),
+        "cids_total": len(cids),
+        "message": "Submission artifacts are referenced by another job; CStore was kept for retry.",
+      }
+
   for ri, ref in enumerate(job_specs.get("pass_reports", [])):
     report_cid = ref.get("report_cid")
     if report_cid:
@@ -170,9 +235,11 @@ def purge_job(owner, job_id: str):
   owner.P(f"[PURGE] Total CIDs collected: {len(cids)}: {sorted(cids)}")
 
   deleted, failed = 0, 0
+  # R1FS deletion acknowledges local/relay unpin and garbage-collection requests.
+  # The relay sweep can take up to 24 hours, and reading here can rehydrate the CID.
   for cid in cids:
     try:
-      success = artifacts.delete(cid, show_logs=True, raise_on_error=False)
+      success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
       if success:
         deleted += 1
         owner.P(f"[PURGE] Deleted CID {cid}")
@@ -202,6 +269,7 @@ def purge_job(owner, job_id: str):
         _job_repo(owner).delete_live_progress(key)
 
   _job_repo(owner).delete_job_triage(job_id)
+  _job_repo(owner).delete_job_rulebook_reviews(job_id)
   _delete_job_record(owner, job_id)
 
   owner.P(f"Purged job {job_id}: {deleted}/{len(cids)} CIDs deleted.")
@@ -223,36 +291,122 @@ def _collect_cids_from_raw(payload):
       yield from _collect_cids_from_raw(item)
 
 
+def _collect_rulebook_submission_cids(payload):
+  if not isinstance(payload, dict):
+    return set()
+  cids = {
+    reference.get("cid")
+    for reference in payload.get("submissions") or []
+    if isinstance(reference, dict) and isinstance(reference.get("cid"), str) and reference.get("cid")
+  }
+  pending = payload.get("pending")
+  if isinstance(pending, dict) and isinstance(pending.get("cid"), str) and pending.get("cid"):
+    cids.add(pending["cid"])
+  return cids
+
+
 def _force_purge_job(owner, job_id, raw_payload, errors):
+  from .rulebook_assessment import _submission_lock, list_rulebook_profiles
+
+  with ExitStack() as stack:
+    for profile in sorted(list_rulebook_profiles(), key=lambda item: item["profile_id"]):
+      stack.enter_context(_submission_lock(owner, job_id, profile["profile_id"]))
+    return _force_purge_job_locked(owner, job_id, raw_payload, errors)
+
+
+def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   """
   Best-effort wipe of a job whose record could not be parsed/purged by
   ``stop_and_delete_job``. Returns (cids_deleted, cids_failed).
 
-  Scans the raw payload for ``*_cid`` fields, attempts R1FS deletion, then
-  tombstones the CStore record and matching live/triage rows regardless.
+  Scans the raw payload for ``*_cid`` fields and attempts R1FS deletion.
+  Formal submission pointers remain retryable unless R1FS acknowledges deletion;
+  other legacy artifacts retain the existing best-effort force-wipe behavior.
   """
-  cids = sorted({c for c in _collect_cids_from_raw(raw_payload) if isinstance(c, str)})
+  cids = {c for c in _collect_cids_from_raw(raw_payload) if isinstance(c, str)}
+  submission_hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
+  try:
+    submission_rows = owner.chainstore_hgetall(hkey=submission_hkey) or {}
+  except Exception as exc:
+    errors.append({"job_id": job_id, "scope": submission_hkey, "message": f"{type(exc).__name__}: {exc}"})
+    owner.P(f"[PURGE_ALL_FORCE] Could not inspect submission registry for {job_id}; retaining rows.", color='r')
+    return 0, 1
+  if not isinstance(submission_rows, dict):
+    errors.append({"job_id": job_id, "scope": submission_hkey, "message": "unexpected non-dict submission registry"})
+    owner.P(f"[PURGE_ALL_FORCE] Invalid submission registry for {job_id}; retaining rows.", color='r')
+    return 0, 1
+  shared_submission_cids = set()
+  job_submission_cids = set()
+  prefix = f"{job_id}:"
+  other_submission_cids = set()
+  for key, registry in submission_rows.items():
+    if isinstance(key, str) and key.startswith(prefix):
+      job_submission_cids.update(_collect_rulebook_submission_cids(registry))
+    elif isinstance(key, str):
+      other_submission_cids.update(_collect_rulebook_submission_cids(registry))
+  shared_submission_cids = job_submission_cids & other_submission_cids
+  if job_submission_cids:
+    try:
+      all_jobs = _job_repo(owner).list_jobs() or {}
+      if not isinstance(all_jobs, dict):
+        raise TypeError("unexpected non-dict job registry")
+      for other_job_id, other_payload in all_jobs.items():
+        if other_job_id != job_id and isinstance(other_payload, dict):
+          other_submission_cids.update(_collect_cids_from_raw(other_payload))
+      shared_submission_cids = job_submission_cids & other_submission_cids
+    except Exception as exc:
+      errors.append({"job_id": job_id, "scope": owner.cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
+      owner.P(f"[PURGE_ALL_FORCE] Could not inspect shared CID references for {job_id}; retaining rows.", color='r')
+      return 0, len(job_submission_cids)
+  cids.update(job_submission_cids - shared_submission_cids)
+  cids.difference_update(shared_submission_cids)
+  cids = sorted(cids)
   cids_deleted = 0
-  cids_failed = 0
+  cids_failed = len(shared_submission_cids)
+  if shared_submission_cids:
+    errors.append({
+      "job_id": job_id,
+      "scope": submission_hkey,
+      "message": f"retained shared submission CIDs: {sorted(shared_submission_cids)}",
+    })
   artifacts = _artifact_repo(owner)
+  failed_submission_cids = set(shared_submission_cids)
   for cid in cids:
     try:
-      success = artifacts.delete(cid, show_logs=True, raise_on_error=False)
+      success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
       if success:
         cids_deleted += 1
         owner.P(f"[PURGE_ALL_FORCE] Deleted CID {cid} for {job_id}")
       else:
         cids_failed += 1
+        if cid in job_submission_cids:
+          failed_submission_cids.add(cid)
         owner.P(f"[PURGE_ALL_FORCE] delete returned False for CID {cid} ({job_id})", color='y')
     except Exception as exc:
       cids_failed += 1
+      if cid in job_submission_cids:
+        failed_submission_cids.add(cid)
       owner.P(f"[PURGE_ALL_FORCE] Failed to delete CID {cid} ({job_id}): {exc}", color='r')
       errors.append({"job_id": job_id, "scope": "r1fs", "message": f"{type(exc).__name__}: {exc}"})
+
+  if failed_submission_cids:
+    owner.P(
+      f"[PURGE_ALL_FORCE] Retaining CStore rows for {job_id}; formal submission CIDs require retry.",
+      color='r',
+    )
+    return cids_deleted, cids_failed
 
   cfg_instance_id = owner.cfg_instance_id
   prefix = f"{job_id}:"
 
-  for hkey in (f"{cfg_instance_id}:live", f"{cfg_instance_id}:triage", f"{cfg_instance_id}:triage:audit"):
+  for hkey in (
+    f"{cfg_instance_id}:live",
+    f"{cfg_instance_id}:triage",
+    f"{cfg_instance_id}:triage:audit",
+    f"{cfg_instance_id}:rulebook_review",
+    f"{cfg_instance_id}:rulebook_review:audit",
+    f"{cfg_instance_id}:rulebook_review:submissions",
+  ):
     try:
       rows = owner.chainstore_hgetall(hkey=hkey)
     except Exception as exc:
@@ -320,6 +474,8 @@ def purge_all_jobs(owner):
       cids_failed += fc_failed
       jobs_failed += 1
       jobs_force_purged += 1
+      if fc_failed:
+        failed_job_ids.add(job_id)
       continue
 
     if not isinstance(result, dict):
@@ -329,6 +485,8 @@ def purge_all_jobs(owner):
       cids_failed += fc_failed
       jobs_failed += 1
       jobs_force_purged += 1
+      if fc_failed:
+        failed_job_ids.add(job_id)
       continue
 
     status = result.get("status")
@@ -354,11 +512,16 @@ def purge_all_jobs(owner):
       cids_failed += fc_failed
       jobs_failed += 1
       jobs_force_purged += 1
+      if fc_failed:
+        failed_job_ids.add(job_id)
 
   cfg_instance_id = owner.cfg_instance_id
   live_hkey = f"{cfg_instance_id}:live"
   triage_hkey = f"{cfg_instance_id}:triage"
   triage_audit_hkey = f"{cfg_instance_id}:triage:audit"
+  rulebook_review_hkey = f"{cfg_instance_id}:rulebook_review"
+  rulebook_review_audit_hkey = f"{cfg_instance_id}:rulebook_review:audit"
+  rulebook_review_submissions_hkey = f"{cfg_instance_id}:rulebook_review:submissions"
   integrations_hkey = f"{cfg_instance_id}:integrations"
 
   def _job_id_from_compound_key(key):
@@ -387,9 +550,145 @@ def purge_all_jobs(owner):
         errors.append({"job_id": job_id_prefix or "", "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
     return rows_deleted
 
+  def _sweep_submission_hash():
+    nonlocal cids_deleted, cids_failed
+
+    from .rulebook_assessment import _submission_lock, list_rulebook_profiles
+
+    try:
+      initial_rows = owner.chainstore_hgetall(hkey=rulebook_review_submissions_hkey)
+    except Exception as exc:
+      cids_failed += 1
+      failed_job_ids.update(raw_jobs)
+      errors.append({
+        "job_id": "",
+        "scope": rulebook_review_submissions_hkey,
+        "message": f"{type(exc).__name__}: {exc}",
+      })
+      return 0
+    if not isinstance(initial_rows, dict):
+      cids_failed += 1
+      failed_job_ids.update(raw_jobs)
+      errors.append({
+        "job_id": "",
+        "scope": rulebook_review_submissions_hkey,
+        "message": "unexpected non-dict submission registry",
+      })
+      return 0
+
+    initial_keys = list(initial_rows)
+    lock_targets = set()
+    for key in initial_keys:
+      job_id_prefix = _job_id_from_compound_key(key)
+      if job_id_prefix and isinstance(key, str) and ":" in key:
+        lock_targets.add((job_id_prefix, key.split(":", 1)[1]))
+    profile_ids = {
+      profile["profile_id"]
+      for profile in list_rulebook_profiles()
+      if isinstance(profile, dict) and isinstance(profile.get("profile_id"), str)
+    }
+    for failed_job_id in failed_job_ids:
+      for profile_id in profile_ids:
+        lock_targets.add((failed_job_id, profile_id))
+
+    rows_deleted = 0
+    deletion_results = {}
+    artifacts = _artifact_repo(owner)
+    with ExitStack() as stack:
+      for lock_job_id, lock_profile_id in sorted(lock_targets):
+        stack.enter_context(_submission_lock(owner, lock_job_id, lock_profile_id))
+      try:
+        rows = owner.chainstore_hgetall(hkey=rulebook_review_submissions_hkey)
+      except Exception as exc:
+        cids_failed += 1
+        failed_job_ids.update(raw_jobs)
+        errors.append({
+          "job_id": "",
+          "scope": rulebook_review_submissions_hkey,
+          "message": f"{type(exc).__name__}: {exc}",
+        })
+        return 0
+      if not isinstance(rows, dict):
+        cids_failed += 1
+        failed_job_ids.update(raw_jobs)
+        errors.append({
+          "job_id": "",
+          "scope": rulebook_review_submissions_hkey,
+          "message": "unexpected non-dict submission registry",
+        })
+        return 0
+
+      protected_cids = set()
+      for failed_job_id in failed_job_ids:
+        raw_failed_job = raw_jobs.get(failed_job_id)
+        if isinstance(raw_failed_job, dict):
+          protected_cids.update(_collect_cids_from_raw(raw_failed_job))
+      for key, value in rows.items():
+        if _job_id_from_compound_key(key) in failed_job_ids:
+          protected_cids.update(_collect_rulebook_submission_cids(value))
+
+      for key in initial_keys:
+        value = rows.get(key)
+        job_id_prefix = _job_id_from_compound_key(key)
+        if not job_id_prefix or job_id_prefix in failed_job_ids or not isinstance(value, dict):
+          continue
+        row_cids = _collect_rulebook_submission_cids(value)
+        shared_cids = row_cids & protected_cids
+        if shared_cids:
+          failed_job_ids.add(job_id_prefix)
+          cids_failed += len(shared_cids)
+          errors.append({
+            "job_id": job_id_prefix,
+            "scope": rulebook_review_submissions_hkey,
+            "message": f"retained orphan registry with shared CIDs: {sorted(shared_cids)}",
+          })
+          continue
+
+        row_failed = False
+        for cid in sorted(row_cids):
+          success = deletion_results.get(cid)
+          if success is None:
+            try:
+              success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
+            except Exception as exc:
+              success = False
+              errors.append({
+                "job_id": job_id_prefix,
+                "scope": "r1fs",
+                "message": f"{type(exc).__name__}: {exc}",
+              })
+            deletion_results[cid] = success
+            if success:
+              cids_deleted += 1
+            else:
+              cids_failed += 1
+          if not success:
+            row_failed = True
+        if row_failed:
+          failed_job_ids.add(job_id_prefix)
+          errors.append({
+            "job_id": job_id_prefix,
+            "scope": rulebook_review_submissions_hkey,
+            "message": "orphan submission CID deletion was not acknowledged",
+          })
+          continue
+        try:
+          owner.chainstore_hset(hkey=rulebook_review_submissions_hkey, key=key, value=None)
+          rows_deleted += 1
+        except Exception as exc:
+          errors.append({
+            "job_id": job_id_prefix,
+            "scope": rulebook_review_submissions_hkey,
+            "message": f"{type(exc).__name__}: {exc}",
+          })
+    return rows_deleted
+
   _sweep_hash(live_hkey, dict)
   _sweep_hash(triage_hkey, dict)
   _sweep_hash(triage_audit_hkey, list)
+  _sweep_hash(rulebook_review_hkey, dict)
+  _sweep_hash(rulebook_review_audit_hkey, list)
+  _sweep_submission_hash()
   integration_status_rows_deleted = 0
   if jobs_failed == 0 and cids_failed == 0:
     integration_status_rows_deleted = _sweep_hash(integrations_hkey, dict)
