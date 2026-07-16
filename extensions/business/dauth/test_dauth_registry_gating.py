@@ -6,6 +6,8 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
+from ratio1.const.base import dAuth
+
 from extensions.business.dauth.dauth_mixin import (
   DAUTH_JOB_SECRETS_CSTORE_HKEY,
   DEEPLOY_JOBS_CSTORE_HKEY,
@@ -227,6 +229,9 @@ class _FakeBC:
   def get_eth_oracles(self):
     return [self.node_eth.get(node, "0xORACLE") for node in self.protocol_oracles]
 
+  def get_dauth_oracles(self):
+    return list(self.protocol_oracles), ["Oracle"] * len(self.protocol_oracles)
+
   def node_address_to_eth_address(self, node_address):
     return self.node_eth[node_address]
 
@@ -421,6 +426,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
         },
       },
     }
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
 
     response = plugin.process_dauth_add_secrets_request(body)
 
@@ -432,6 +438,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       {
         "job_id": "7",
         "job_secrets": body["job_secrets"],
+        "pipeline_cid": "cid-7",
       },
     )
 
@@ -499,6 +506,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     plugin = _make_dauth_harness()
     bundle = {
       "job_id": "7",
+      "pipeline_cid": "cid-7",
       "job_secrets": {
         "plugins": {
           "CONTAINER_APP_RUNNER": [{
@@ -538,6 +546,118 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     self.assertEqual(
       plugin.bc.encrypt_calls,
       [(json.dumps(bundle), "node-runner")],
+    )
+
+  def test_get_secrets_rejects_bundle_bound_to_another_pipeline_generation(self):
+    plugin = _make_dauth_harness()
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
+      "job_id": "7",
+      "pipeline_cid": "cid-old",
+      "job_secrets": {"plugins": {}},
+    }
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-new"
+    plugin._r1fs_data["cid-new"] = {
+      "DEEPLOY_SPECS": {"current_target_nodes": ["node-runner"]},
+    }
+
+    with self.assertRaisesRegex(ValueError, "generation mismatch"):
+      plugin.process_dauth_get_secret_request({
+        "EE_SENDER": "node-runner",
+        "EE_ETH_SENDER": "0xRUNNER",
+        "nonce": REQUEST_NONCE,
+        "job_id": "7",
+      })
+
+  def test_get_secrets_safely_binds_complete_legacy_bundle(self):
+    plugin = _make_dauth_harness()
+    legacy_bundle = {
+      "job_id": "7",
+      "job_secrets": {
+        "PLUGINS": [{"INSTANCES": [{"ENV": {
+          "TOKEN": "secret",
+          "REMOVED_TOKEN": "must-not-return",
+        }}]}],
+        "REMOVED_SECTION": {"PASSWORD": "must-not-return"},
+      },
+    }
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = legacy_bundle
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
+    plugin._r1fs_data["cid-7"] = {
+      "PLUGINS": [{
+        "INSTANCES": [{"ENV": {"TOKEN": dAuth.DAUTH_SECRET_PLACEHOLDER}}],
+      }],
+      "DEEPLOY_SPECS": {"current_target_nodes": ["node-runner"]},
+    }
+
+    response = plugin.process_dauth_get_secret_request({
+      "EE_SENDER": "node-runner",
+      "EE_ETH_SENDER": "0xRUNNER",
+      "nonce": REQUEST_NONCE,
+      "job_id": "7",
+    })
+
+    self.assertEqual(response["nonce"], REQUEST_NONCE)
+    self.assertEqual(response["encrypted_secret_bundle"], "encrypted-secret-bundle")
+    self.assertNotIn("secret_bundle", response)
+    encrypted_bundle = json.loads(plugin.bc.encrypt_calls[-1][0])
+    self.assertEqual(encrypted_bundle["pipeline_cid"], "cid-7")
+    migrated_job_secrets = encrypted_bundle["job_secrets"]
+    self.assertEqual(
+      migrated_job_secrets,
+      {"PLUGINS": [{"INSTANCES": [{"ENV": {"TOKEN": "secret"}}]}]},
+    )
+    self.assertEqual(
+      plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")]["pipeline_cid"],
+      "cid-7",
+    )
+
+  def test_get_secrets_rejects_incomplete_legacy_bundle(self):
+    plugin = _make_dauth_harness()
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
+      "job_id": "7",
+      "job_secrets": {"PLUGINS": [{"INSTANCES": [{"ENV": {}}]}]},
+    }
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
+    plugin._r1fs_data["cid-7"] = {
+      "PLUGINS": [{
+        "INSTANCES": [{"ENV": {"TOKEN": dAuth.DAUTH_SECRET_PLACEHOLDER}}],
+      }],
+      "DEEPLOY_SPECS": {"current_target_nodes": ["node-runner"]},
+    }
+
+    with self.assertRaisesRegex(ValueError, "incomplete"):
+      plugin.process_dauth_get_secret_request({
+        "EE_SENDER": "node-runner",
+        "EE_ETH_SENDER": "0xRUNNER",
+        "nonce": REQUEST_NONCE,
+        "job_id": "7",
+      })
+
+  def test_get_secrets_does_not_bind_legacy_bundle_without_current_placeholders(self):
+    plugin = _make_dauth_harness()
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
+      "job_id": "7",
+      "job_secrets": {"PLUGINS": [{"INSTANCES": [{"ENV": {
+        "REMOVED_TOKEN": "must-not-return",
+      }}]}]},
+    }
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
+    plugin._r1fs_data["cid-7"] = {
+      "PLUGINS": [{"INSTANCES": [{"ENV": {"PUBLIC": "value"}}]}],
+      "DEEPLOY_SPECS": {"current_target_nodes": ["node-runner"]},
+    }
+
+    with self.assertRaisesRegex(ValueError, "incomplete"):
+      plugin.process_dauth_get_secret_request({
+        "EE_SENDER": "node-runner",
+        "EE_ETH_SENDER": "0xRUNNER",
+        "nonce": REQUEST_NONCE,
+        "job_id": "7",
+      })
+
+    self.assertNotIn(
+      "pipeline_cid",
+      plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")],
     )
 
   def test_get_secrets_rejects_node_not_running_job(self):

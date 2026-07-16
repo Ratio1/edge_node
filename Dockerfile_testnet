@@ -75,7 +75,7 @@ ENV EE_DEBUG_R1FS=true
 # ENV EE_DEVICE=cuda:0
 
 RUN uv pip install --system --no-cache -r requirements.txt
-RUN uv pip install --system --no-cache --no-deps naeural-core
+RUN uv pip install --system --no-cache --no-deps 'naeural-core>=7.7.318'
 #RUN pip install --no-cache-dir -r requirements.txt
 #RUN pip install --no-cache-dir --no-deps naeural-core
 

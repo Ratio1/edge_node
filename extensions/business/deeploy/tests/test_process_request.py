@@ -110,6 +110,40 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
     })
     return True
 
+  def cmdapi_build_pipeline_config(self, **kwargs):
+    config = {
+      "NAME": kwargs["name"],
+      "TYPE": kwargs["stream_type"],
+    }
+    if kwargs.get("url") is not None:
+      config["URL"] = kwargs["url"]
+    if kwargs.get("plugins") is not None:
+      config["PLUGINS"] = copy.deepcopy(kwargs["plugins"])
+    ignored = {"name", "stream_type", "url", "plugins"}
+    config.update({
+      key.upper(): copy.deepcopy(value)
+      for key, value in kwargs.items()
+      if key not in ignored
+    })
+    return config
+
+  def _load_dauth_job_secret_bundle(self, job_id):
+    return None
+
+  def stage_job_pipeline_and_secrets(self, pipeline, job_id, secret_bundle):
+    self.chainstore_hset(
+      hkey=DEEPLOY_DAUTH_JOB_SECRETS_HKEY,
+      key=str(job_id),
+      value=secret_bundle,
+    )
+    return {"job_id": str(job_id), "pipeline": copy.deepcopy(pipeline)}
+
+  def commit_staged_job_pipeline_and_secrets(self, state):
+    return True
+
+  def rollback_staged_job_pipeline_and_secrets(self, state):
+    return True
+
 
 class DeeployProcessRequestTests(unittest.TestCase):
 
