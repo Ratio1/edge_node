@@ -1066,7 +1066,7 @@ def _validate_text_field(value: Any, where: str, errors: list[Dict[str, str]], m
 
 
 def _validate_enum(value: Any, allowed: set[str], where: str, errors: list[Dict[str, str]]) -> None:
-  if value not in allowed:
+  if not isinstance(value, str) or value not in allowed:
     errors.append(_contract_error("schema_enum", f"{where}: value must be one of {sorted(allowed)}"))
 
 
@@ -1078,12 +1078,12 @@ def _evidence_errors(ids: Any, context: Dict[str, Any], where: str) -> list[Dict
     errors.append(_contract_error("schema_max_items", f"{where}: evidence IDs exceed 40 items"))
   seen = set()
   for evidence in ids:
-    if evidence in seen:
-      errors.append(_contract_error("duplicate_evidence_id", f"{where}: duplicate evidence id {evidence}"))
-    seen.add(evidence)
     if not isinstance(evidence, str) or not EVIDENCE_ID_RE.fullmatch(evidence):
       errors.append(_contract_error("invalid_evidence_id", f"{where}: {evidence!r} is not a valid evidence id"))
       continue
+    if evidence in seen:
+      errors.append(_contract_error("duplicate_evidence_id", f"{where}: duplicate evidence id {evidence}"))
+    seen.add(evidence)
     if evidence not in context["evidence_ids"]:
       errors.append(_contract_error("unknown_evidence_id", f"{where}: {evidence} is not present in the packet"))
   return errors
@@ -1117,6 +1117,7 @@ def _validate_path_connectivity(path_ids: Any, context: Dict[str, Any], where: s
     errors.append(_contract_error("invalid_path_ids", f"{where}: path_evidence_ids must be a list"))
     return
   path_node_ids = {item for item in path_ids if isinstance(item, str) and item.startswith("n:")}
+  adjacency = {node_id: set() for node_id in path_node_ids}
   for item in path_ids:
     if not isinstance(item, str) or not item.startswith("r:"):
       continue
@@ -1126,6 +1127,22 @@ def _validate_path_connectivity(path_ids: Any, context: Dict[str, Any], where: s
       or relationship.get("endNodeId") not in path_node_ids
     ):
       errors.append(_contract_error("path_relationship_not_connected", f"{where}: {item} endpoints are not both in the path"))
+    elif relationship:
+      start_id = relationship.get("startNodeId")
+      end_id = relationship.get("endNodeId")
+      adjacency[start_id].add(end_id)
+      adjacency[end_id].add(start_id)
+  if len(path_node_ids) > 1:
+    pending = [next(iter(path_node_ids))]
+    connected = set()
+    while pending:
+      node_id = pending.pop()
+      if node_id in connected:
+        continue
+      connected.add(node_id)
+      pending.extend(adjacency[node_id].difference(connected))
+    if connected != path_node_ids:
+      errors.append(_contract_error("path_relationship_not_connected", f"{where}: cited path has disconnected components"))
 
 
 def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> list[Dict[str, str]]:
@@ -1179,7 +1196,8 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     role = finding.get("role")
     if not isinstance(role, str) or not ROLE_RE.match(role):
       errors.append(_contract_error("schema_pattern", f"entity_findings[{index}].role: invalid role label"))
-    if finding.get("entity_id") not in context["node_ids"]:
+    entity_id = finding.get("entity_id")
+    if not isinstance(entity_id, str) or entity_id not in context["node_ids"]:
       errors.append(_contract_error("entity_not_found", f"entity_findings[{index}]: entity_id must reference a packet node"))
     ids = finding.get("evidence_ids")
     errors.extend(_evidence_errors(ids, context, f"entity_findings[{index}]"))
@@ -1199,7 +1217,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     errors.extend(_evidence_errors(ids, context, f"risk_interpretation[{index}]"))
     if not ids:
       errors.append(_contract_error("material_claim_missing_evidence", f"risk_interpretation[{index}] must cite evidence"))
-    if risk.get("severity") in {"high", "critical"}:
+    if isinstance(risk.get("severity"), str) and risk.get("severity") in {"high", "critical"}:
       cited_ids = set(ids if isinstance(ids, list) else [])
       if not cited_ids.intersection(context["severity_evidence_ids"]):
         errors.append(_contract_error("severity_escalation_unsupported", f"risk_interpretation[{index}]: severity lacks severity evidence"))
@@ -1213,11 +1231,14 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     _validate_text_field(provenance.get("source_name"), f"provenance[{index}].source_name", errors, max_chars=160)
     _validate_text_field(provenance.get("caveat"), f"provenance[{index}].caveat", errors)
     source_node_id = provenance.get("source_node_id")
-    if source_node_id not in context["node_ids"]:
+    if not isinstance(source_node_id, str) or source_node_id not in context["node_ids"]:
       errors.append(_contract_error("source_not_found", f"provenance[{index}]: source_node_id is absent"))
     elif source_node_id not in context["source_names"]:
       errors.append(_contract_error("source_label_missing", f"provenance[{index}]: source_node_id must reference a Source node"))
-    elif provenance.get("source_name") not in context["source_names"][source_node_id]:
+    elif (
+      not isinstance(provenance.get("source_name"), str)
+      or provenance.get("source_name") not in context["source_names"][source_node_id]
+    ):
       errors.append(_contract_error("invented_source_name", f"provenance[{index}]: source_name does not match packet source node"))
     supports = provenance.get("supports")
     errors.extend(_evidence_errors(supports, context, f"provenance[{index}]"))
@@ -1836,7 +1857,6 @@ class EdgeguardApiPlugin(BasePlugin):
           "status": STATUS_REJECTED,
           "error": "EdgeGuard explanation failed deterministic validation",
           "validation_errors": errors,
-          "explanation": draft,
         }
       return {
         "status": STATUS_ACCEPTED,

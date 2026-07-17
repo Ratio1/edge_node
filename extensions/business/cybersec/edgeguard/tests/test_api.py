@@ -643,7 +643,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(prompt_packet["graph"]["truncated"])
     self.assertIn("truncation", {item["type"] for item in explanation["caveats"]})
 
-  def test_case_explanation_draft_rejects_disconnected_path_without_repair(self):
+  def test_case_explanation_draft_rejects_path_with_missing_endpoint_without_repair(self):
     packet = _case_explanation_packet()
     draft = {
       "summary": {
@@ -662,6 +662,86 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertIsNone(explanation)
     self.assertIn("path_relationship_not_connected", {item["code"] for item in errors})
+
+  def test_case_explanation_draft_rejects_disconnected_path_components(self):
+    packet = _case_explanation_packet()
+    packet["graph"]["nodes"].extend([
+      {
+        "id": "n:indicator-2",
+        "labels": ["Indicator"],
+        "caption": "second.example.org",
+        "properties": {"value": "second.example.org"},
+      },
+      {
+        "id": "n:source-2",
+        "labels": ["Source"],
+        "caption": "Second Feed",
+        "properties": {"name": "Second Feed"},
+      },
+    ])
+    packet["graph"]["relationships"].append({
+      "id": "r:source-2",
+      "type": "SOURCED_FROM",
+      "startNodeId": "n:indicator-2",
+      "endNodeId": "n:source-2",
+      "caption": "SOURCED_FROM",
+      "properties": {},
+    })
+    draft = {
+      "summary": {
+        "text": "The packet contains two separate indicator-source relationships.",
+        "evidence_ids": [
+          "n:indicator",
+          "r:source",
+          "n:source",
+          "n:indicator-2",
+          "r:source-2",
+          "n:source-2",
+        ],
+      },
+      "key_paths": [{
+        "title": "Two disconnected components",
+        "path_evidence_ids": [
+          "n:indicator",
+          "r:source",
+          "n:source",
+          "n:indicator-2",
+          "r:source-2",
+          "n:source-2",
+        ],
+        "interpretation": "These relationships do not form one connected path.",
+        "confidence": "medium",
+      }],
+    }
+
+    explanation, errors = _construct_case_explanation(draft, packet, packet)
+
+    self.assertIsNone(explanation)
+    self.assertIn("path_relationship_not_connected", {item["code"] for item in errors})
+
+  def test_case_explanation_draft_rejects_malformed_nested_types_without_exception(self):
+    packet = _case_explanation_packet()
+    mutations = {
+      "evidence_id_object": lambda draft: draft["summary"].update({"evidence_ids": [{"id": "n:indicator"}]}),
+      "confidence_array": lambda draft: draft["key_paths"][0].update({"confidence": []}),
+      "severity_object": lambda draft: draft["risk_interpretation"][0].update({"severity": {}}),
+      "source_name_array": lambda draft: draft["provenance"][0].update({"source_name": []}),
+      "priority_object": lambda draft: draft["next_pivots"][0].update({"priority": {}}),
+    }
+
+    for label, mutate in mutations.items():
+      with self.subTest(label=label):
+        draft = _draft_for_packet(packet)
+        mutate(draft)
+        explanation, errors = _construct_case_explanation(draft, packet, packet)
+        self.assertIsNone(explanation)
+        self.assertTrue(errors)
+        self.assertTrue({item["code"] for item in errors}.intersection({
+          "invalid_evidence_id",
+          "schema_enum",
+          "schema_type",
+          "invented_source_name",
+        }))
 
   def test_api_validate_accepts_schema_query(self):
     plugin = _make_api()
