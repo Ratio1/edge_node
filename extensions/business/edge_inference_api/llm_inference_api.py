@@ -728,13 +728,13 @@ class LLMInferenceApiPlugin(BasePlugin):
 
     def _has_text_result(self, inference):
       text_value = inference.get(LlmCT.TEXT, None)
-      if isinstance(text_value, str) and len(text_value) > 0:
+      if isinstance(text_value, str) and len(text_value.strip()) > 0:
         return True
       full_output = inference.get(LlmCT.FULL_OUTPUT, None)
       if isinstance(full_output, list) and len(full_output) == 1:
         full_output = full_output[0]
       if not isinstance(full_output, dict):
-        return isinstance(full_output, str) and len(full_output) > 0
+        return False
       choices = full_output.get("choices")
       if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         return False
@@ -742,10 +742,10 @@ class LLMInferenceApiPlugin(BasePlugin):
       message = first.get("message")
       if isinstance(message, dict):
         content = message.get("content")
-        if isinstance(content, str) and len(content) > 0:
+        if isinstance(content, str) and len(content.strip()) > 0:
           return True
       text = first.get("text")
-      return isinstance(text, str) and len(text) > 0
+      return isinstance(text, str) and len(text.strip()) > 0
 
     def _fail_invalid_empty_inference(self, inference):
       request_id = self._extract_request_id_from_inference(inference)

@@ -1885,6 +1885,7 @@ class EdgeguardApiPlugin(BasePlugin):
           completion["content"] = branch["TEXT_RESPONSE"]
         if completion["content"] is not None:
           return completion
+    for branch in reversed(branches):
       direct_content = extract_direct_content(branch)
       if direct_content is not None:
         return {

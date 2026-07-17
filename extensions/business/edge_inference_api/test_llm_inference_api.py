@@ -203,7 +203,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(plugin._requests["req-live"]["status"], "pending")  # pylint: disable=protected-access
 
   def test_filter_valid_inference_ignores_all_empty_full_output_placeholders(self):
-    for placeholder in ({}, [], ""):
+    for placeholder in ({}, [], "", "irrelevant-placeholder"):
       with self.subTest(placeholder=placeholder):
         plugin = LLMInferenceApiPlugin()
         plugin._requests = {"req-live": {"status": "pending"}}  # pylint: disable=protected-access
@@ -213,6 +213,23 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
           "FULL_OUTPUT": placeholder,
           "IS_VALID": False,
         }
+
+        self.assertFalse(plugin.filter_valid_inference(inference))
+        self.assertEqual(plugin._requests["req-live"]["status"], "pending")  # pylint: disable=protected-access
+
+  def test_filter_valid_inference_ignores_whitespace_only_content(self):
+    for inference in (
+      {"text": "   ", "IS_VALID": False},
+      {
+        "text": "",
+        "FULL_OUTPUT": {"choices": [{"message": {"content": "\n\t"}}]},
+        "IS_VALID": False,
+      },
+    ):
+      with self.subTest(inference=inference):
+        plugin = LLMInferenceApiPlugin()
+        plugin._requests = {"req-live": {"status": "pending"}}  # pylint: disable=protected-access
+        plugin._fail_request = lambda *_args, **_kwargs: self.fail("placeholder must not fail pending request")
 
         self.assertFalse(plugin.filter_valid_inference(inference))
         self.assertEqual(plugin._requests["req-live"]["status"], "pending")  # pylint: disable=protected-access

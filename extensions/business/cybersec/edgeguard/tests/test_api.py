@@ -1646,6 +1646,38 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"malformed_json"})
     self.assertNotIn("raw_output", result)
 
+  def test_explanation_provider_full_output_precedes_deeper_direct_content(self):
+    plugin = _make_api()
+    packet = _case_explanation_packet()
+    partial = '{"summary":{"text":"partial-secret"'
+    response = _Response(payload={
+      "result": {
+        "FULL_OUTPUT": {
+          "choices": [{
+            "message": {"content": partial},
+            "finish_reason": "length",
+          }],
+          "usage": {"completion_tokens": 512},
+        },
+        "result": {
+          "choices": [{
+            "message": {"content": json.dumps(_draft_for_packet(packet))},
+            "finish_reason": "stop",
+          }],
+          "usage": {"completion_tokens": 32},
+        },
+      },
+    })
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=response,
+    ):
+      result = plugin._call_explanation_model(packet)
+
+    self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
+    self.assertNotIn("partial-secret", json.dumps(result))
+
   def test_explain_graph_preserves_paired_truncation_transport_envelope(self):
     plugin = _make_api()
     cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
