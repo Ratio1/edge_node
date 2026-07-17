@@ -78,7 +78,6 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "deeploy_specs": deeploy_specs or {"job_id": 11},
     }
     plugin._get_pipeline_from_cstore = lambda job_id: None
-    plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: None
     plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
 
     called = {"delete": 0, "deploy": 0, "deploy_kwargs": None, "queued": 0, "bc_update": 0}
@@ -821,7 +820,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
 
-  def test_process_update_materializes_omitted_live_plugins_before_redeploy(self):
+  def test_process_update_omits_unrequested_live_plugins_from_redeploy(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -878,17 +877,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["deploy"], 1)
     redeploy_inputs = called["deploy_kwargs"]["inputs"]
     redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
-    self.assertEqual(len(redeploy_plugins), 2)
+    self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(
       {entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] for entry in redeploy_plugins},
-      {"api-instance", "worker-instance"},
+      {"api-instance"},
     )
-    worker = next(
-      entry for entry in redeploy_plugins
-      if entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] == "worker-instance"
-    )
-    self.assertEqual(worker["IMAGE"], "repo/worker:1.0")
-    self.assertEqual(worker[DEEPLOY_KEYS.PLUGIN_NAME], "worker")
     prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
     self.assertIsNotNone(prepared_plan)
     prepared_instances = [
@@ -898,7 +891,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     ]
     self.assertEqual(
       {instance[plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID] for instance in prepared_instances},
-      {"api-instance", "worker-instance"},
+      {"api-instance"},
     )
     prepared_api = next(
       instance for instance in prepared_instances
@@ -906,7 +899,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
     self.assertEqual(prepared_api["PROCESS_DELAY"], 10)
 
-  def test_process_update_validates_materialized_replacement_payload_before_delete(self):
+  def test_process_update_validates_requested_replacement_payload_before_delete(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -948,7 +941,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         for entry in plugins
       ]
       validation_calls.append((context, plugin_ids, inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)))
-      self.assertEqual(set(plugin_ids), {"api-instance", "worker-instance"})
+      self.assertEqual(set(plugin_ids), {"api-instance"})
       self.assertEqual(inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE), "stack")
 
     def check_payment_and_owner(inputs, *args, **kwargs):
@@ -1026,6 +1019,16 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
             },
           ],
         },
+        {
+          plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+          plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+            {
+              plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "omitted-invalid-instance",
+              DEEPLOY_KEYS.PLUGIN_NAME: "omitted-invalid",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          ],
+        },
       ],
     }
     plugin._check_nodes_availability = lambda inputs: ["new-node-1"]
@@ -1062,6 +1065,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["bc_update"], 1)
     self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["new-node-1"])
     redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+    self.assertEqual(len(redeploy_plugins), 1)
+    self.assertEqual(
+      redeploy_plugins[0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "current-instance",
+    )
     self.assertEqual(redeploy_plugins[0]["IMAGE"], "repo/app:2.0")
 
   def test_process_update_rejects_job_app_type_change_before_payment_or_delete(self):
@@ -1122,7 +1130,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["deploy"], 0)
     self.assertEqual(called["queued"], 0)
 
-  def test_process_update_rejects_invalid_materialized_omitted_plugin_before_payment_and_delete(self):
+  def test_process_update_ignores_invalid_omitted_live_plugin_config(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -1181,13 +1189,20 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       async_mode=True,
     )
 
-    self.assertIn("'IMAGE' field is required", response[DEEPLOY_KEYS.ERROR])
-    self.assertEqual(payment_calls, [])
-    self.assertEqual(node_calls, [])
-    self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(len(payment_calls), 1)
+    self.assertEqual(len(node_calls), 1)
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(
+      [
+        entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID]
+        for entry in called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+      ],
+      ["api-instance"],
+    )
 
-  def test_process_update_rejects_ambiguous_containerized_replacement_type_before_delete(self):
+  def test_process_update_detects_type_from_requested_replacement_only(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -1241,10 +1256,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       async_mode=True,
     )
 
-    self.assertIn("omitted job_app_type", response[DEEPLOY_KEYS.ERROR])
-    self.assertIn("containerized replacement payload", response[DEEPLOY_KEYS.ERROR])
-    self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(
+      called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS][0]["IMAGE"],
+      "repo/api:2.0",
+    )
 
   def test_process_update_does_not_append_consumed_no_id_update_as_new_plugin(self):
     plugin, called = self._make_process_update_plugin(
@@ -1293,7 +1311,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(redeploy_plugins[0][DEEPLOY_KEYS.PLUGIN_NAME], "legacy")
     self.assertEqual(redeploy_plugins[0]["PROCESS_DELAY"], 10)
 
-  def test_process_update_dedupes_nameless_no_id_legacy_plugin_across_nodes(self):
+  def test_process_update_does_not_restore_nameless_legacy_plugins_across_nodes(self):
     discovered_instances = [
       {
         DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
@@ -1369,21 +1387,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["deploy"], 1)
 
     redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
-    self.assertEqual(len(redeploy_plugins), 2)
-    api = next(
-      entry for entry in redeploy_plugins
-      if entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) == "api-instance"
-    )
-    legacy = next(
-      entry for entry in redeploy_plugins
-      if entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) != "api-instance"
-    )
+    self.assertEqual(len(redeploy_plugins), 1)
+    api = redeploy_plugins[0]
     self.assertEqual(api["PROCESS_DELAY"], 10)
-    self.assertEqual(legacy["PROCESS_DELAY"], 5)
-    self.assertNotIn(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID, legacy)
-    self.assertNotIn(DEEPLOY_KEYS.PLUGIN_NAME, legacy)
 
-  def test_process_update_preserves_same_node_nameless_no_id_legacy_multiplicity(self):
+  def test_process_update_does_not_restore_same_node_nameless_legacy_plugins(self):
     discovered_instances = [
       {
         DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
@@ -1448,18 +1456,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["deploy"], 1)
 
     redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
-    self.assertEqual(len(redeploy_plugins), 3)
-    legacy_plugins = [
-      entry for entry in redeploy_plugins
-      if entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) != "api-instance"
-    ]
-    self.assertEqual(len(legacy_plugins), 2)
-    for legacy in legacy_plugins:
-      self.assertEqual(legacy["PROCESS_DELAY"], 5)
-      self.assertNotIn(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID, legacy)
-      self.assertNotIn(DEEPLOY_KEYS.PLUGIN_NAME, legacy)
+    self.assertEqual(len(redeploy_plugins), 1)
+    self.assertEqual(redeploy_plugins[0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID], "api-instance")
+    self.assertEqual(redeploy_plugins[0]["PROCESS_DELAY"], 10)
 
-  def test_process_update_materializes_one_logical_plugin_set_for_multinode_redeploy(self):
+  def test_process_update_uses_requested_plugin_set_for_multinode_redeploy(self):
     discovered_instances = [
       {
         DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
@@ -1543,52 +1544,129 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     redeploy_inputs = called["deploy_kwargs"]["inputs"]
     redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
-    self.assertEqual(len(redeploy_plugins), 2)
+    self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(
       {entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] for entry in redeploy_plugins},
-      {"api-instance", "worker-instance"},
+      {"api-instance"},
     )
 
-    api = next(
-      entry for entry in redeploy_plugins
-      if entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] == "api-instance"
-    )
-    worker = next(
-      entry for entry in redeploy_plugins
-      if entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] == "worker-instance"
-    )
+    api = redeploy_plugins[0]
     self.assertEqual(api["PROCESS_DELAY"], 10)
-    self.assertEqual(worker["IMAGE"], "repo/worker:1.0")
-    self.assertEqual(worker[DEEPLOY_KEYS.PLUGIN_NAME], "worker")
 
-  def test_process_update_rejects_corrupt_duplicate_live_instance_id_before_delete(self):
+  def test_process_update_warns_on_live_replica_drift_and_uses_requested_config(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
           DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "shared-instance",
-          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "WORKER_APP_RUNNER",
           DEEPLOY_PLUGIN_DATA.NODE: "node-1",
           DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
             "instance_conf": {
-              DEEPLOY_KEYS.PLUGIN_NAME: "api",
-              "PROCESS_DELAY": 5,
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "node:22",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+              "ENV": {"API_TOKEN": "live-secret-a", "MODE": "replica-a"},
             },
           },
         },
         {
           DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "shared-instance",
-          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "WORKER_APP_RUNNER",
           DEEPLOY_PLUGIN_DATA.NODE: "node-2",
           DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
             "instance_conf": {
               DEEPLOY_KEYS.PLUGIN_NAME: "worker",
-              "PROCESS_DELAY": 10,
+              "IMAGE": "node:22",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+              "ENV": {"API_TOKEN": "live-secret-b", "MODE": "replica-b"},
             },
           },
         },
       ],
       nodes=["node-1", "node-2"],
     )
+    log_lines = []
+    plugin.P = lambda message, **kwargs: log_lines.append(message)
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1", "node-2"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 2,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "WORKER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "shared-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+            "IMAGE": "node:22",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            "ENV": {"API_TOKEN": "requested-secret", "MODE": "requested"},
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    for node_plugins in prepared_plan["node_plugins_by_addr"].values():
+      instance = node_plugins[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+      self.assertEqual(instance["ENV"]["API_TOKEN"], "requested-secret")
+      self.assertEqual(instance["ENV"]["MODE"], "requested")
+      self.assertNotIn(instance["ENV"]["API_TOKEN"], {"live-secret-a", "live-secret-b"})
+      self.assertNotIn(instance["ENV"]["MODE"], {"replica-a", "replica-b"})
+
+    drift_logs = [line for line in log_lines if "live replica config drift" in line]
+    self.assertEqual(len(drift_logs), 1)
+    warning = drift_logs[0]
+    self.assertIn("job_id=11", warning)
+    self.assertIn("app_id=app-123", warning)
+    self.assertIn("plugin_instance_id=shared-instance", warning)
+    self.assertIn("node-1", warning)
+    self.assertIn("node-2", warning)
+    self.assertIn("WORKER_APP_RUNNER", warning)
+    self.assertIn("worker", warning)
+    self.assertIn("$.ENV.API_TOKEN", warning)
+    self.assertIn("$.ENV.MODE", warning)
+    for value in (
+      "live-secret-a",
+      "live-secret-b",
+      "requested-secret",
+      "replica-a",
+      "replica-b",
+      "requested",
+    ):
+      self.assertNotIn(value, warning)
+
+  def test_process_update_emits_no_drift_warning_for_identical_replicas(self):
+    discovered_instances = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "shared-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: node,
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 5,
+          },
+        },
+      }
+      for node in ("node-1", "node-2")
+    ]
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=["node-1", "node-2"],
+    )
+    log_lines = []
+    plugin.P = lambda message, **kwargs: log_lines.append(message)
 
     response = plugin._process_pipeline_request(
       {
@@ -1605,7 +1683,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
             DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
             DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "shared-instance",
             DEEPLOY_KEYS.PLUGIN_NAME: "api",
-            "PROCESS_DELAY": 5,
+            "PROCESS_DELAY": 10,
           },
         ],
       },
@@ -1613,14 +1691,153 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       async_mode=True,
     )
 
-    self.assertIn("Corrupt live discovery", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertFalse(any("live replica config drift" in line for line in log_lines))
+
+  def test_process_update_rejects_instance_id_signature_mismatch_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "shared-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "ANOTHER_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "shared-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("cannot be reused with signature", response[DEEPLOY_KEYS.ERROR])
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
+
+  def test_process_update_generates_id_for_new_plugin_without_id(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "existing-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "existing",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "existing-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "existing",
+            "PROCESS_DELAY": 10,
+          },
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_NAME: "new-plugin",
+            "PROCESS_DELAY": 15,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    instances = prepared_plan["node_plugins_by_addr"]["node-1"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES]
+    by_name = {instance[DEEPLOY_KEYS.PLUGIN_NAME]: instance for instance in instances}
+    self.assertEqual(
+      by_name["existing"][plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID],
+      "existing-instance",
+    )
+    self.assertEqual(
+      by_name["new-plugin"][plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID],
+      "A_SIMPLE_PLUG_xxxxxx",
+    )
+
+  def test_live_replica_drift_warning_is_bounded_and_value_free(self):
+    plugin = make_deeploy_plugin()
+    log_lines = []
+    plugin.P = lambda message, **kwargs: log_lines.append(message)
+    long_segment = "X" * 200
+    discovered_instances = []
+    for idx in range(12):
+      for node_idx in range(2):
+        discovered_instances.append({
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: f"instance-{idx}",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: f"node-{idx}-{node_idx}\nforged",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: f"plugin-{idx}",
+              f"{long_segment}-{idx}": f"secret-value-{idx}-{node_idx}",
+            },
+          },
+        })
+
+    warned = plugin._warn_on_live_plugin_config_drift(
+      discovered_instances,
+      job_id=11,
+      app_id="app-123",
+    )
+
+    self.assertEqual(warned, 10)
+    self.assertEqual(len(log_lines), 11)
+    self.assertTrue(all(len(line) <= 2000 for line in log_lines))
+    self.assertTrue(all("\n" not in line for line in log_lines))
+    self.assertIn("omitted_groups=2", log_lines[-1])
+    joined = "\n".join(log_lines)
+    for idx in range(12):
+      self.assertNotIn(f"secret-value-{idx}-0", joined)
+      self.assertNotIn(f"secret-value-{idx}-1", joined)
 
   def test_process_update_rejects_ambiguous_nameless_no_id_update_before_delete(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "legacy-instance-a",
           DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
           DEEPLOY_PLUGIN_DATA.NODE: "node-1",
           DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
@@ -1630,6 +1847,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
           },
         },
         {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "legacy-instance-b",
           DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
           DEEPLOY_PLUGIN_DATA.NODE: "node-1",
           DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
