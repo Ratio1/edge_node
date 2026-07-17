@@ -39,6 +39,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _construct_case
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_contract_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation_draft_bounds  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_graph_evidence_packet  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_packet_and_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
@@ -248,6 +249,8 @@ def _draft_for_packet(packet):
   draft = _explanation_for_packet(packet)
   draft.pop("schema_version")
   draft.pop("caveats")
+  draft["entity_findings"] = []
+  draft["missing_context"] = []
   return draft
 
 
@@ -267,6 +270,21 @@ def _provider_response_for_packet(packet, caveat_types=None):
     "choices": [{
       "message": {"content": json.dumps(explanation)},
     }],
+  })
+
+
+def _nested_provider_response(content, *, finish_reason="stop", completion_tokens=32):
+  return _Response(payload={
+    "result": {
+      "TEXT_RESPONSE": content,
+      "FULL_OUTPUT": {
+        "choices": [{
+          "message": {"content": content},
+          "finish_reason": finish_reason,
+        }],
+        "usage": {"completion_tokens": completion_tokens},
+      },
+    },
   })
 
 
@@ -416,8 +434,8 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
-    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.4")
-    self.assertEqual(explanation["draft_schema_version"], "edgeguard.case_explanation_draft.v1")
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.5")
+    self.assertEqual(explanation["draft_schema_version"], "edgeguard.case_explanation_draft.v2")
     self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
     self.assertEqual(explanation["prompt_sha256"], _graph_explanation_prompt_sha256())
     self.assertRegex(explanation["prompt_sha256"], r"^[0-9a-f]{64}$")
@@ -473,7 +491,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "unsupported entities, relationships, severity, confidence, timestamps, provenance",
       "does not contain enough evidence",
       "Do not emit schema_version or caveats",
-      "one concise CaseExplanationDraft JSON object",
+      "one bounded CaseExplanationDraft JSON object",
     ):
       self.assertIn(restriction, instructions)
 
@@ -619,6 +637,81 @@ class EdgeGuardApiTests(unittest.TestCase):
         )
         self.assertIsNone(explanation)
         self.assertIn("schema_additional_property", {item["code"] for item in errors})
+
+  def test_case_explanation_draft_v2_enforces_summary_and_global_bounds(self):
+    summary = {"text": " ".join(["word"] * 80), "evidence_ids": [f"n:{index}" for index in range(8)]}
+    at_limit = {
+      "summary": summary,
+      "entity_findings": [{}, {}],
+      "provenance": [{}, {}],
+    }
+
+    self.assertNotIn(
+      "draft_word_limit",
+      {item["code"] for item in _validate_case_explanation_draft_bounds(at_limit)},
+    )
+    self.assertNotIn(
+      "draft_optional_object_limit",
+      {item["code"] for item in _validate_case_explanation_draft_bounds(at_limit)},
+    )
+
+    over_limit = json.loads(json.dumps(at_limit))
+    over_limit["summary"]["text"] += " extra"
+    over_limit["summary"]["evidence_ids"].append("n:8")
+    over_limit["risk_interpretation"] = [{}]
+    codes = {item["code"] for item in _validate_case_explanation_draft_bounds(over_limit)}
+
+    self.assertIn("draft_word_limit", codes)
+    self.assertIn("draft_evidence_limit", codes)
+    self.assertIn("draft_optional_object_limit", codes)
+
+  def test_case_explanation_draft_v2_enforces_every_section_cardinality(self):
+    maxima = {
+      "key_paths": 1,
+      "entity_findings": 2,
+      "risk_interpretation": 1,
+      "provenance": 2,
+      "missing_context": 1,
+      "next_pivots": 1,
+    }
+    for section, maximum in maxima.items():
+      with self.subTest(section=section):
+        at_limit = {"summary": {}, section: [{} for _index in range(maximum)]}
+        over_limit = {"summary": {}, section: [{} for _index in range(maximum + 1)]}
+        self.assertNotIn(
+          "draft_cardinality_limit",
+          {item["code"] for item in _validate_case_explanation_draft_bounds(at_limit)},
+        )
+        self.assertIn(
+          "draft_cardinality_limit",
+          {item["code"] for item in _validate_case_explanation_draft_bounds(over_limit)},
+        )
+
+  def test_case_explanation_draft_v2_enforces_combined_narrative_and_claim_evidence_bounds(self):
+    sections = {
+      "key_paths": (("title", "interpretation"), 40, "path_evidence_ids"),
+      "entity_findings": (("finding",), 40, "evidence_ids"),
+      "risk_interpretation": (("claim", "limits"), 30, "evidence_ids"),
+      "provenance": (("source_name", "caveat"), 30, "supports"),
+      "missing_context": (("gap", "suggested_check"), 30, None),
+      "next_pivots": (("question", "suggested_query_intent"), 25, None),
+    }
+    for section, (fields, maximum, evidence_field) in sections.items():
+      with self.subTest(section=section):
+        item = {field: "" for field in fields}
+        item[fields[0]] = " ".join(["word"] * maximum)
+        if evidence_field:
+          item[evidence_field] = [f"n:{index}" for index in range(6)]
+        at_limit = {"summary": {}, section: [item]}
+        self.assertEqual(_validate_case_explanation_draft_bounds(at_limit), [])
+
+        item[fields[0]] += " extra"
+        if evidence_field:
+          item[evidence_field].append("n:6")
+        codes = {entry["code"] for entry in _validate_case_explanation_draft_bounds(at_limit)}
+        self.assertIn("draft_word_limit", codes)
+        if evidence_field:
+          self.assertIn("draft_evidence_limit", codes)
 
   def test_case_explanation_projection_truncation_is_disclosed(self):
     packet = _case_explanation_packet()
@@ -940,10 +1033,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(call_payload["model"], "base_qwen3_4b")
     self.assertEqual(call_payload["temperature"], 0.0)
     self.assertEqual(call_payload["top_p"], 1.0)
-    self.assertEqual(call_payload["max_tokens"], 256)
+    self.assertEqual(call_payload["max_tokens"], 512)
     self.assertEqual(call_payload["response_format"], {"type": "json_object"})
     self.assertNotIn("schema", call_payload["response_format"])
-    self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation_draft.v1")
+    self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation_draft.v2")
 
   def test_explanation_payload_caps_output_and_honors_smaller_positive_limit(self):
     plugin = _make_api(edgeguard_explanation_max_tokens=1600)
@@ -955,11 +1048,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     non_positive_payload = plugin._build_explanation_payload(packet, max_tokens=0)
     negative_payload = plugin._build_explanation_payload(packet, max_tokens=-1)
 
-    self.assertEqual(default_payload["max_tokens"], 256)
+    self.assertEqual(default_payload["max_tokens"], 512)
     self.assertEqual(smaller_payload["max_tokens"], 64)
-    self.assertEqual(larger_payload["max_tokens"], 256)
-    self.assertEqual(non_positive_payload["max_tokens"], 256)
-    self.assertEqual(negative_payload["max_tokens"], 256)
+    self.assertEqual(larger_payload["max_tokens"], 512)
+    self.assertEqual(non_positive_payload["max_tokens"], 512)
+    self.assertEqual(negative_payload["max_tokens"], 512)
     for payload in (default_payload, smaller_payload, larger_payload, non_positive_payload, negative_payload):
       self.assertEqual(payload["response_format"], {"type": "json_object"})
 
@@ -1445,6 +1538,75 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertEqual(result["status"], "rejected")
     self.assertIn("malformed_json", {item["code"] for item in result["validation_errors"]})
+    self.assertNotIn("raw_output", result)
+
+  def test_explanation_provider_length_finish_rejects_before_parsing_without_raw_output(self):
+    plugin = _make_api()
+    packet = _case_explanation_packet()
+    partial = '{"summary":{"text":"partial-secret"'
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=_nested_provider_response(partial, finish_reason="length", completion_tokens=512),
+    ):
+      result = plugin._call_explanation_model(packet)
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
+    self.assertEqual(result["error"], "Graph explanation output was truncated at the safe token limit.")
+    self.assertNotIn("partial-secret", json.dumps(result))
+    self.assertNotIn("raw_output", result)
+
+  def test_explanation_provider_usage_at_effective_cap_rejects_malformed_output_as_truncated(self):
+    plugin = _make_api()
+    packet = _case_explanation_packet()
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=_nested_provider_response("{", finish_reason="stop", completion_tokens=64),
+    ) as mocked_post:
+      result = plugin._call_explanation_model(packet, max_tokens=64)
+
+    self.assertEqual(mocked_post.call_args.kwargs["json"]["max_tokens"], 64)
+    self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
+    self.assertNotIn("raw_output", result)
+
+  def test_explanation_provider_normal_stop_accepts_valid_json_at_token_cap(self):
+    plugin = _make_api()
+    packet = _case_explanation_packet()
+    draft = _draft_for_packet(packet)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=_nested_provider_response(
+        json.dumps(draft),
+        finish_reason="stop",
+        completion_tokens=512,
+      ),
+    ):
+      result = plugin._call_explanation_model(packet)
+
+    self.assertEqual(result["status"], "accepted")
+    self.assertEqual(result["explanation"]["schema_version"], "edgeguard.case_explanation.v1")
+
+  def test_explanation_provider_malformed_below_cap_stays_distinct(self):
+    plugin = _make_api()
+    packet = _case_explanation_packet()
+
+    responses = {
+      "below_cap": _nested_provider_response("{", finish_reason="stop", completion_tokens=511),
+      "missing_metadata": _Response(payload={"result": {"TEXT_RESPONSE": "{"}}),
+    }
+    for label, provider_response in responses.items():
+      with self.subTest(label=label):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+          return_value=provider_response,
+        ):
+          result = plugin._call_explanation_model(packet)
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual({item["code"] for item in result["validation_errors"]}, {"malformed_json"})
+        self.assertNotIn("raw_output", result)
 
   def test_explain_graph_rejects_nested_schema_invalid_output(self):
     plugin = _make_api()

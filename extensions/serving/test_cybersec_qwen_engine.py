@@ -298,6 +298,37 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(processed[0]["ERROR_CODE"], "context_window_exceeded")
     self.assertEqual(processed[0]["ERROR"], "Model context window exceeded.")
 
+  def test_llama_cpp_generation_logs_only_content_free_diagnostics(self):
+    process = _make_llama_cpp_process()
+    process._tps = []
+    process.time = lambda: 1.0
+    process.maybe_process_text = lambda text, _method: text
+    process.check_condition = lambda _text, _condition: True
+    partial_output = "partial-secret-model-output"
+    process.model = types.SimpleNamespace(
+      create_chat_completion=lambda **_kwargs: {
+        "choices": [{
+          "message": {"content": partial_output},
+          "finish_reason": "length",
+        }],
+        "usage": {"completion_tokens": 512},
+      },
+    )
+
+    result = process._predict([
+      [{"max_tokens": 512}],
+      [[{"role": "user", "content": "bounded prompt"}]],
+      [{"REQUEST_ID": "req-length"}],
+      [None],
+      [None],
+      [0],
+      1,
+    ])
+
+    self.assertEqual(result["text"], [partial_output])
+    self.assertFalse(any(partial_output in message for message in process.messages))
+    self.assertTrue(any("text_chars=" in message for message in process.messages))
+
 
 if __name__ == "__main__":
   unittest.main()

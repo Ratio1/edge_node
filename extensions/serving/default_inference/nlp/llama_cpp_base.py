@@ -462,9 +462,12 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         if isinstance(full_output, dict) and isinstance(full_output.get("error"), dict):
           results[idx_orig] = (idx_orig, valid_condition, process_method, current_text, full_output)
           continue
-        self.P(f"Checking condition for object {idx_orig}:\nvalid:`{valid_condition}`|process:`{process_method}`|text:\n{current_text}")
+        self.P(
+          f"Checking condition for object {idx_orig}: "
+          f"valid=`{valid_condition}` process=`{process_method}` text_chars={len(current_text)}"
+        )
         current_text = self.maybe_process_text(current_text, process_method)
-        self.P(f"Processed text:\n{current_text}")
+        self.P(f"Processed object {idx_orig}: text_chars={len(current_text)}")
         valid_text = (
             len(current_text) > 0
             and (
