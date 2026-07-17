@@ -1218,7 +1218,11 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     if not ids:
       errors.append(_contract_error("material_claim_missing_evidence", f"risk_interpretation[{index}] must cite evidence"))
     if isinstance(risk.get("severity"), str) and risk.get("severity") in {"high", "critical"}:
-      cited_ids = set(ids if isinstance(ids, list) else [])
+      cited_ids = {
+        evidence_id
+        for evidence_id in (ids if isinstance(ids, list) else [])
+        if isinstance(evidence_id, str)
+      }
       if not cited_ids.intersection(context["severity_evidence_ids"]):
         errors.append(_contract_error("severity_escalation_unsupported", f"risk_interpretation[{index}]: severity lacks severity evidence"))
 

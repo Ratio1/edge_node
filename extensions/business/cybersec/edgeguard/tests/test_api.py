@@ -725,6 +725,10 @@ class EdgeGuardApiTests(unittest.TestCase):
       "evidence_id_object": lambda draft: draft["summary"].update({"evidence_ids": [{"id": "n:indicator"}]}),
       "confidence_array": lambda draft: draft["key_paths"][0].update({"confidence": []}),
       "severity_object": lambda draft: draft["risk_interpretation"][0].update({"severity": {}}),
+      "high_severity_evidence_object": lambda draft: draft["risk_interpretation"][0].update({
+        "severity": "high",
+        "evidence_ids": [{"id": "n:indicator"}],
+      }),
       "source_name_array": lambda draft: draft["provenance"][0].update({"source_name": []}),
       "priority_object": lambda draft: draft["next_pivots"][0].update({"priority": {}}),
     }
@@ -1516,6 +1520,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("unknown_evidence_id", codes)
     self.assertIn("invented_source_name", codes)
     self.assertIn("unsafe_pivot", codes)
+    self.assertIsNone(result.get("explanation"))
 
   def test_explain_graph_returns_provider_error_after_packet_build(self):
     plugin = _make_api()
