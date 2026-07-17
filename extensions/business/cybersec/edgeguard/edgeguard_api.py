@@ -84,7 +84,7 @@ NODE_ID_RE = re.compile(r"^n:[A-Za-z0-9_.:-]+$")
 RELATIONSHIP_ID_RE = re.compile(r"^r:[A-Za-z0-9_.:-]+$")
 SAFE_INTENT_RE = re.compile(r"^[a-z][a-z0-9_:-]{2,119}$")
 ROLE_RE = re.compile(r"^[a-z][a-z0-9_:-]{0,79}$")
-WORD_RE = re.compile(r"\b[^\W_]+(?:['’-][^\W_]+)*\b", re.UNICODE)
+WORD_RE = re.compile(r"\b[^\W_]+(?:['’ʼ\-\u2010-\u2015][^\W_]+)*\b", re.UNICODE)
 WRITE_OR_ADMIN_RE = re.compile(
   r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|ALTER|LOAD\s+CSV|"
   r"FOREACH|GRANT|DENY|REVOKE|CALL\s+[A-Za-z0-9_]+\s*\.|"
@@ -1858,6 +1858,19 @@ class EdgeguardApiPlugin(BasePlugin):
         "completion_tokens": completion_tokens,
       }
 
+    def extract_direct_content(value: Any) -> Optional[str]:
+      if not isinstance(value, dict):
+        return None
+      choices = value.get("choices")
+      if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        first = choices[0]
+        message = first.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+          return message["content"]
+        if isinstance(first.get("text"), str):
+          return first["text"]
+      return None
+
     branches = []
     current = response
     for _depth in range(4):
@@ -1872,9 +1885,13 @@ class EdgeguardApiPlugin(BasePlugin):
           completion["content"] = branch["TEXT_RESPONSE"]
         if completion["content"] is not None:
           return completion
-      completion = parse_envelope(branch)
-      if completion is not None and completion["content"] is not None:
-        return completion
+      direct_content = extract_direct_content(branch)
+      if direct_content is not None:
+        return {
+          "content": direct_content,
+          "finish_reason": None,
+          "completion_tokens": None,
+        }
       for key in ("TEXT_RESPONSE", "text", "content", "response"):
         if isinstance(branch.get(key), str):
           return {
@@ -2497,6 +2514,19 @@ class EdgeguardApiPlugin(BasePlugin):
       }
     explanation_result = self._call_explanation_model(packet, temperature, max_tokens, top_p)
     if explanation_result.get("status") != STATUS_ACCEPTED:
+      validation_errors = explanation_result.get("validation_errors", [])
+      if any(item.get("code") == "output_truncated" for item in validation_errors):
+        return {
+          "status_code": 500,
+          "result": {
+            "status": STATUS_REJECTED,
+            "ok": False,
+            "executed": True,
+            "explained": False,
+            "error": EXPLANATION_TRUNCATED_MESSAGE,
+            "validation_errors": validation_errors,
+          },
+        }
       return {
         "status": explanation_result.get("status", STATUS_ERROR),
         "ok": False,
@@ -2713,6 +2743,19 @@ class EdgeguardApiPlugin(BasePlugin):
 
       explanation_result = self._call_explanation_model(packet, temperature, max_tokens, top_p)
       if explanation_result.get("status") != STATUS_ACCEPTED:
+        validation_errors = explanation_result.get("validation_errors", [])
+        if any(item.get("code") == "output_truncated" for item in validation_errors):
+          return {
+            "status_code": 500,
+            "result": {
+              "status": STATUS_REJECTED,
+              "ok": False,
+              "executed": True,
+              "explained": False,
+              "error": EXPLANATION_TRUNCATED_MESSAGE,
+              "validation_errors": validation_errors,
+            },
+          }
         return {
           "status": explanation_result.get("status", STATUS_ERROR),
           "ok": False,

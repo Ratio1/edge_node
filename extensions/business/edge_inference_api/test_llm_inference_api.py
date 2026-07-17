@@ -202,6 +202,48 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertFalse(plugin.filter_valid_inference(inference))
     self.assertEqual(plugin._requests["req-live"]["status"], "pending")  # pylint: disable=protected-access
 
+  def test_filter_valid_inference_ignores_all_empty_full_output_placeholders(self):
+    for placeholder in ({}, [], ""):
+      with self.subTest(placeholder=placeholder):
+        plugin = LLMInferenceApiPlugin()
+        plugin._requests = {"req-live": {"status": "pending"}}  # pylint: disable=protected-access
+        plugin._fail_request = lambda *_args, **_kwargs: self.fail("placeholder must not fail pending request")
+        inference = {
+          "text": "",
+          "FULL_OUTPUT": placeholder,
+          "IS_VALID": False,
+        }
+
+        self.assertFalse(plugin.filter_valid_inference(inference))
+        self.assertEqual(plugin._requests["req-live"]["status"], "pending")  # pylint: disable=protected-access
+
+  def test_filter_valid_inference_never_logs_model_output(self):
+    sentinel = "partial-secret-sentinel"
+    plugin = LLMInferenceApiPlugin()
+    plugin._requests = {  # pylint: disable=protected-access
+      "req-a": {"status": "pending"},
+      "req-b": {"status": "pending"},
+    }
+    logs = []
+    plugin.P = lambda message, *_args, **_kwargs: logs.append(str(message))
+
+    self.assertFalse(plugin.filter_valid_inference({
+      "text": sentinel,
+      "IS_VALID": True,
+    }))
+    self.assertFalse(plugin.filter_valid_inference({
+      "REQUEST_ID": "unknown",
+      "text": sentinel,
+      "IS_VALID": True,
+    }))
+    self.assertFalse(plugin.filter_valid_inference({
+      "text": sentinel,
+      "IS_VALID": False,
+      "FULL_OUTPUT": {},
+    }))
+
+    self.assertNotIn(sentinel, "\n".join(logs))
+
   def test_filter_valid_inference_fails_context_overflow_with_safe_specific_error(self):
     plugin = LLMInferenceApiPlugin()
     plugin._requests = {"req-context": {"status": "pending"}}  # pylint: disable=protected-access

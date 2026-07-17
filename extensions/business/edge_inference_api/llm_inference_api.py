@@ -731,7 +731,21 @@ class LLMInferenceApiPlugin(BasePlugin):
       if isinstance(text_value, str) and len(text_value) > 0:
         return True
       full_output = inference.get(LlmCT.FULL_OUTPUT, None)
-      return full_output is not None
+      if isinstance(full_output, list) and len(full_output) == 1:
+        full_output = full_output[0]
+      if not isinstance(full_output, dict):
+        return isinstance(full_output, str) and len(full_output) > 0
+      choices = full_output.get("choices")
+      if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+      first = choices[0]
+      message = first.get("message")
+      if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str) and len(content) > 0:
+          return True
+      text = first.get("text")
+      return isinstance(text, str) and len(text) > 0
 
     def _fail_invalid_empty_inference(self, inference):
       request_id = self._extract_request_id_from_inference(inference)
@@ -756,7 +770,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         return False
       if not inference.get("IS_VALID", True):
         if not self._has_text_result(inference=inference):
-          self.P(f"Rejected invalid LLM inference without text output: {self.shorten_str(inference)}")
+          self.P("Rejected invalid LLM inference without text output.")
           self._fail_invalid_empty_inference(inference)
           return False
         self.P("Accepting text-bearing LLM inference despite IS_VALID=False.")
@@ -764,7 +778,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       if request_id is None:
         request_id = self._get_single_pending_request_id()
         if request_id is None:
-          self.P(f"Rejected LLM inference without request id: {self.shorten_str(inference)}")
+          self.P("Rejected text-bearing LLM inference without an unambiguous request id.")
           return False
         self.P(f"Mapped request-id-less LLM inference to pending request {request_id}.")
       inference[LlmCT.REQUEST_ID] = request_id
@@ -778,7 +792,7 @@ class LLMInferenceApiPlugin(BasePlugin):
           )
           inference[LlmCT.REQUEST_ID] = fallback_request_id
           return True
-        self.P(f"Rejected LLM inference for unknown request id {request_id}: {self.shorten_str(inference)}")
+        self.P(f"Rejected text-bearing LLM inference for unknown request id {request_id}.")
       return is_known
 
     def inference_to_response(self, inference, model_name, input_data=None):

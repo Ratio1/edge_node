@@ -665,6 +665,24 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("draft_evidence_limit", codes)
     self.assertIn("draft_optional_object_limit", codes)
 
+  def test_case_explanation_draft_v2_counts_unicode_hyphenated_compounds_as_words(self):
+    at_limit = {
+      "summary": {
+        "text": " ".join(["non\u2011breaking"] * 80),
+        "evidence_ids": [],
+      },
+    }
+    self.assertNotIn(
+      "draft_word_limit",
+      {item["code"] for item in _validate_case_explanation_draft_bounds(at_limit)},
+    )
+
+    at_limit["summary"]["text"] += " extra"
+    self.assertIn(
+      "draft_word_limit",
+      {item["code"] for item in _validate_case_explanation_draft_bounds(at_limit)},
+    )
+
   def test_case_explanation_draft_v2_enforces_every_section_cardinality(self):
     maxima = {
       "key_paths": 1,
@@ -1607,6 +1625,52 @@ class EdgeGuardApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "rejected")
         self.assertEqual({item["code"] for item in result["validation_errors"]}, {"malformed_json"})
         self.assertNotIn("raw_output", result)
+
+  def test_explanation_provider_ignores_outer_termination_metadata(self):
+    plugin = _make_api()
+    packet = _case_explanation_packet()
+    response = _Response(payload={
+      "choices": [{
+        "message": {"content": "{"},
+        "finish_reason": "length",
+      }],
+      "usage": {"completion_tokens": 512},
+    })
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=response,
+    ):
+      result = plugin._call_explanation_model(packet)
+
+    self.assertEqual({item["code"] for item in result["validation_errors"]}, {"malformed_json"})
+    self.assertNotIn("raw_output", result)
+
+  def test_explain_graph_preserves_paired_truncation_transport_envelope(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
+
+    with patch.object(plugin, "_call_explanation_model", return_value={
+      "status": "rejected",
+      "error": "Graph explanation output was truncated at the safe token limit.",
+      "validation_errors": [{
+        "code": "output_truncated",
+        "message": "Graph explanation output was truncated at the safe token limit.",
+      }],
+    }):
+      result = plugin.explain_graph(
+        cypher=cypher,
+        request="Which source supports this indicator?",
+        execution_result=_serialized_execution(cypher),
+      )
+
+    self.assertEqual(result["status_code"], 500)
+    self.assertEqual(result["result"]["error"], "Graph explanation output was truncated at the safe token limit.")
+    self.assertEqual(
+      {item["code"] for item in result["result"]["validation_errors"]},
+      {"output_truncated"},
+    )
+    self.assertNotIn("packet", result["result"])
 
   def test_explain_graph_rejects_nested_schema_invalid_output(self):
     plugin = _make_api()
