@@ -35,11 +35,15 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EdgeguardApiPlu
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_CONTRACT  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_VERSION  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _build_case_explanation_messages  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _construct_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_contract_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_graph_evidence_packet  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_packet_and_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
 
 
 class _Response:
@@ -134,6 +138,58 @@ def _serialized_execution(executed_cypher, *, broadened=False, primary_row_count
   }
 
 
+def _case_explanation_packet():
+  return {
+    "schema_version": "edgeguard.graph_evidence_packet.v1",
+    "request": "Which source supports this indicator?",
+    "accepted_cypher": "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
+    "executed_cypher": "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
+    "limit_policy": {
+      "generated_limit": 25,
+      "executed_limit": 25,
+      "server_max_rows": 100,
+      "limit_adjusted": False,
+    },
+    "execution": {
+      "status": "executed",
+      "row_count": 1,
+      "truncated": False,
+      "broadened": False,
+      "live_retry_reason": None,
+    },
+    "graph": {
+      "nodes": [
+        {
+          "id": "n:indicator",
+          "labels": ["Indicator"],
+          "caption": "example.org",
+          "properties": {"value": "example.org"},
+        },
+        {
+          "id": "n:source",
+          "labels": ["Source"],
+          "caption": "AlienVault OTX",
+          "properties": {"name": "AlienVault OTX"},
+        },
+      ],
+      "relationships": [{
+        "id": "r:source",
+        "type": "SOURCED_FROM",
+        "startNodeId": "n:indicator",
+        "endNodeId": "n:source",
+        "caption": "SOURCED_FROM",
+        "properties": {},
+      }],
+      "truncated": False,
+    },
+    "redaction": {
+      "policy": "edgeguard_graph_packet_private_v1",
+      "contains_customer_evidence": False,
+      "contains_raw_misp_payload": False,
+    },
+  }
+
+
 def _explanation_for_packet(packet, caveat_types=None):
   caveat_types = list(caveat_types or [])
   nodes = packet["graph"]["nodes"]
@@ -188,6 +244,13 @@ def _explanation_for_packet(packet, caveat_types=None):
   }
 
 
+def _draft_for_packet(packet):
+  draft = _explanation_for_packet(packet)
+  draft.pop("schema_version")
+  draft.pop("caveats")
+  return draft
+
+
 def _driver_with_results(*results):
   fake_session = MagicMock()
   fake_session.__enter__.return_value = fake_session
@@ -198,7 +261,7 @@ def _driver_with_results(*results):
 
 
 def _provider_response_for_packet(packet, caveat_types=None):
-  explanation = _explanation_for_packet(packet, caveat_types=caveat_types)
+  explanation = _draft_for_packet(packet)
   return _Response(payload={
     "model": "qwen2.5-1.5b-instruct",
     "choices": [{
@@ -223,7 +286,10 @@ def _make_api(**overrides):
   plugin.cfg_edgeguard_explanation_model = overrides.get("edgeguard_explanation_model", "qwen2.5-1.5b-instruct")
   plugin.cfg_edgeguard_explanation_default_rows = overrides.get("edgeguard_explanation_default_rows", 25)
   plugin.cfg_edgeguard_explanation_max_rows = overrides.get("edgeguard_explanation_max_rows", 100)
-  plugin.cfg_edgeguard_explanation_max_tokens = overrides.get("edgeguard_explanation_max_tokens", 1600)
+  plugin.cfg_edgeguard_explanation_max_tokens = overrides.get(
+    "edgeguard_explanation_max_tokens",
+    EXPLANATION_MAX_OUTPUT_TOKENS,
+  )
   plugin.cfg_edgeguard_explanation_temperature = overrides.get("edgeguard_explanation_temperature", 0.0)
   plugin.cfg_edgeguard_explanation_top_p = overrides.get("edgeguard_explanation_top_p", 1.0)
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
@@ -350,7 +416,8 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
-    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.3")
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.4")
+    self.assertEqual(explanation["draft_schema_version"], "edgeguard.case_explanation_draft.v1")
     self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
     self.assertEqual(explanation["prompt_sha256"], _graph_explanation_prompt_sha256())
     self.assertRegex(explanation["prompt_sha256"], r"^[0-9a-f]{64}$")
@@ -392,7 +459,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "relationship_type": "SOURCED_FROM",
       "end_node_id": "n:source",
     }])
-    self.assertEqual(prompt_context["caveat_requirements"], {
+    self.assertEqual(prompt_context["server_caveat_flags"], {
       "graph_scope": True,
       "broadening": True,
       "truncation": True,
@@ -405,7 +472,8 @@ class EdgeGuardApiTests(unittest.TestCase):
       "Every material claim must cite",
       "unsupported entities, relationships, severity, confidence, timestamps, provenance",
       "does not contain enough evidence",
-      "Always include a graph_scope caveat",
+      "Do not emit schema_version or caveats",
+      "one concise CaseExplanationDraft JSON object",
     ):
       self.assertIn(restriction, instructions)
 
@@ -463,7 +531,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertLess(len(selected_node_ids), len(nodes))
     self.assertTrue(prompt_packet["graph"]["truncated"])
     self.assertTrue(prompt_packet["execution"]["truncated"])
-    self.assertTrue(prompt_context["caveat_requirements"]["truncation"])
+    self.assertTrue(prompt_context["server_caveat_flags"]["truncation"])
     self.assertTrue(prompt_packet["graph"]["relationships"])
     for relationship in prompt_packet["graph"]["relationships"]:
       self.assertIn(relationship["startNodeId"], selected_node_ids)
@@ -477,6 +545,123 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(first, _graph_explanation_prompt_contract_text())
     changed_hash = hashlib.sha256((first + "\nchanged").encode("utf-8")).hexdigest()
     self.assertNotEqual(_graph_explanation_prompt_sha256(), changed_hash)
+
+  def test_case_explanation_draft_defaults_optional_sections_and_adds_deterministic_caveats(self):
+    packet = _case_explanation_packet()
+    effective_packet = json.loads(json.dumps(packet))
+    effective_packet["limit_policy"].update({
+      "generated_limit": 10,
+      "executed_limit": 25,
+      "limit_adjusted": True,
+    })
+    effective_packet["execution"].update({
+      "broadened": True,
+      "truncated": True,
+      "live_retry_reason": "executed_no_rows",
+    })
+    effective_packet["graph"]["truncated"] = True
+    draft = {
+      "summary": {
+        "text": "AlienVault OTX supports the returned indicator.",
+        "evidence_ids": ["n:indicator", "r:source", "n:source"],
+      },
+    }
+
+    explanation, errors = _construct_case_explanation(draft, packet, effective_packet)
+
+    self.assertEqual(errors, [])
+    self.assertEqual(explanation["schema_version"], "edgeguard.case_explanation.v1")
+    for section in (
+      "key_paths",
+      "entity_findings",
+      "risk_interpretation",
+      "provenance",
+      "missing_context",
+      "next_pivots",
+    ):
+      self.assertEqual(explanation[section], [])
+    self.assertEqual(explanation["caveats"], [
+      {
+        "type": "graph_scope",
+        "message": "This explanation is limited to the graph evidence returned for the submitted query.",
+        "evidence_ids": [],
+      },
+      {
+        "type": "broadening",
+        "message": "The original query returned no rows, so deterministic broadening supplied this graph evidence.",
+        "evidence_ids": [],
+      },
+      {
+        "type": "truncation",
+        "message": "The graph evidence was truncated or projected to fit explanation limits.",
+        "evidence_ids": [],
+      },
+      {
+        "type": "limit_adjusted",
+        "message": "The requested query limit was adjusted by the server explanation row policy.",
+        "evidence_ids": [],
+      },
+    ])
+
+  def test_case_explanation_draft_rejects_server_owned_and_unexpected_keys(self):
+    packet = _case_explanation_packet()
+    summary = {
+      "text": "The packet links the indicator to a source.",
+      "evidence_ids": ["n:indicator", "r:source", "n:source"],
+    }
+
+    for forbidden in ("schema_version", "caveats", "unexpected"):
+      with self.subTest(forbidden=forbidden):
+        explanation, errors = _construct_case_explanation(
+          {"summary": summary, forbidden: []},
+          packet,
+          packet,
+        )
+        self.assertIsNone(explanation)
+        self.assertIn("schema_additional_property", {item["code"] for item in errors})
+
+  def test_case_explanation_projection_truncation_is_disclosed(self):
+    packet = _case_explanation_packet()
+    for index in range(60):
+      packet["graph"]["nodes"].append({
+        "id": f"n:extra-{index}",
+        "labels": ["Indicator"],
+        "caption": f"extra-{index}",
+        "properties": {"value": f"extra-{index}.example.org", "description": "x" * 500},
+      })
+    prompt_packet = json.loads(_build_case_explanation_messages(packet)[1]["content"])["graph_evidence_packet"]
+    draft = {
+      "summary": {
+        "text": "The returned graph includes the requested indicator.",
+        "evidence_ids": ["n:indicator"],
+      },
+    }
+
+    explanation, errors = _construct_case_explanation(draft, packet, prompt_packet)
+
+    self.assertEqual(errors, [])
+    self.assertTrue(prompt_packet["graph"]["truncated"])
+    self.assertIn("truncation", {item["type"] for item in explanation["caveats"]})
+
+  def test_case_explanation_draft_rejects_disconnected_path_without_repair(self):
+    packet = _case_explanation_packet()
+    draft = {
+      "summary": {
+        "text": "The packet links the indicator to a source.",
+        "evidence_ids": ["n:indicator", "r:source", "n:source"],
+      },
+      "key_paths": [{
+        "title": "Disconnected path",
+        "path_evidence_ids": ["n:indicator", "r:source"],
+        "interpretation": "The path omits the relationship endpoint.",
+        "confidence": "medium",
+      }],
+    }
+
+    explanation, errors = _construct_case_explanation(draft, packet, packet)
+
+    self.assertIsNone(explanation)
+    self.assertIn("path_relationship_not_connected", {item["code"] for item in errors})
 
   def test_api_validate_accepts_schema_query(self):
     plugin = _make_api()
@@ -654,9 +839,28 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(call_payload["model"], "base_qwen3_4b")
     self.assertEqual(call_payload["temperature"], 0.0)
     self.assertEqual(call_payload["top_p"], 1.0)
-    self.assertEqual(call_payload["max_tokens"], 1600)
-    self.assertEqual(call_payload["response_format"]["type"], "json_schema")
-    self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation.v1")
+    self.assertEqual(call_payload["max_tokens"], 256)
+    self.assertEqual(call_payload["response_format"], {"type": "json_object"})
+    self.assertNotIn("schema", call_payload["response_format"])
+    self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation_draft.v1")
+
+  def test_explanation_payload_caps_output_and_honors_smaller_positive_limit(self):
+    plugin = _make_api(edgeguard_explanation_max_tokens=1600)
+    packet = {"request": "Explain this graph.", "graph": {"nodes": [], "relationships": []}}
+
+    default_payload = plugin._build_explanation_payload(packet)
+    smaller_payload = plugin._build_explanation_payload(packet, max_tokens=64)
+    larger_payload = plugin._build_explanation_payload(packet, max_tokens=1024)
+    non_positive_payload = plugin._build_explanation_payload(packet, max_tokens=0)
+    negative_payload = plugin._build_explanation_payload(packet, max_tokens=-1)
+
+    self.assertEqual(default_payload["max_tokens"], 256)
+    self.assertEqual(smaller_payload["max_tokens"], 64)
+    self.assertEqual(larger_payload["max_tokens"], 256)
+    self.assertEqual(non_positive_payload["max_tokens"], 256)
+    self.assertEqual(negative_payload["max_tokens"], 256)
+    for payload in (default_payload, smaller_payload, larger_payload, non_positive_payload, negative_payload):
+      self.assertEqual(payload["response_format"], {"type": "json_object"})
 
   def test_prepare_graph_explanation_returns_credential_free_primary_and_broadening_plan(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
@@ -1086,7 +1290,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["packet"]["graph"]["truncated"])
     self.assertEqual(result["packet"]["execution"]["row_count"], 25)
 
-  def test_explain_graph_rejects_missing_required_caveat(self):
+  def test_canonical_validator_still_rejects_missing_required_caveat(self):
     plugin = _make_api()
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
@@ -1108,9 +1312,17 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
           )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertFalse(result["explained"])
-    self.assertIn("missing_required_caveat", {item["code"] for item in result["validation_errors"]})
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["explained"])
+    explanation = result["explanation"]
+    self.assertIn("limit_adjusted", {item["type"] for item in explanation["caveats"]})
+    explanation["caveats"] = [
+      caveat for caveat in explanation["caveats"] if caveat["type"] != "limit_adjusted"
+    ]
+    packet_errors, context = _validate_graph_evidence_packet(result["packet"])
+    self.assertEqual(packet_errors, [])
+    validation_errors = _validate_case_explanation(explanation, context)
+    self.assertIn("missing_required_caveat", {item["code"] for item in validation_errors})
 
   def test_explain_graph_rejects_malformed_json_output(self):
     plugin = _make_api()
@@ -1139,7 +1351,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     def provider_side_effect(*_args, **kwargs):
       packet = _packet_from_provider_kwargs(kwargs)
-      explanation = _explanation_for_packet(packet)
+      explanation = _draft_for_packet(packet)
       explanation["summary"].pop("text")
       explanation["key_paths"][0]["confidence"] = "certain"
       explanation["next_pivots"][0]["priority"] = "urgent"
@@ -1170,7 +1382,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     def provider_side_effect(*_args, **kwargs):
       packet = _packet_from_provider_kwargs(kwargs)
-      explanation = _explanation_for_packet(packet)
+      explanation = _draft_for_packet(packet)
       explanation["risk_interpretation"][0]["severity"] = "high"
       return _Response(payload={"choices": [{"message": {"content": json.dumps(explanation)}}]})
 
@@ -1197,7 +1409,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     def provider_side_effect(*_args, **kwargs):
       packet = _packet_from_provider_kwargs(kwargs)
-      explanation = _explanation_for_packet(packet, caveat_types=["limit_adjusted"])
+      explanation = _draft_for_packet(packet)
       explanation["summary"]["evidence_ids"] = ["n:absent"]
       explanation["provenance"][0]["source_name"] = "Invented Source"
       explanation["next_pivots"][0]["question"] = "CALL apoc.load.json to fetch more data"
