@@ -736,8 +736,6 @@ class LLMInferenceApiPlugin(BasePlugin):
     def _fail_invalid_empty_inference(self, inference):
       request_id = self._extract_request_id_from_inference(inference)
       if request_id is None:
-        request_id = self._get_single_pending_request_id()
-      if request_id is None:
         return False
       if request_id not in self._requests:
         return False

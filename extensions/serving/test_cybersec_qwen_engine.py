@@ -329,6 +329,12 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertFalse(any(partial_output in message for message in process.messages))
     self.assertTrue(any("text_chars=" in message for message in process.messages))
 
+    base_source = (
+      ROOT / "extensions" / "serving" / "base" / "base_llm_serving.py"
+    ).read_text(encoding="utf-8")
+    self.assertNotIn("shorten_str(text_lst)", base_source)
+    self.assertIn("text_chars=", base_source)
+
 
 if __name__ == "__main__":
   unittest.main()

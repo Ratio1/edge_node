@@ -181,6 +181,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
       "error_message": error_message,
     }) or True
     inference = {
+      "REQUEST_ID": "req-9",
       "text": "",
       "IS_VALID": False,
     }
@@ -188,6 +189,18 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertFalse(plugin.filter_valid_inference(inference))
     self.assertEqual(failed["request_id"], "req-9")
     self.assertEqual(failed["error_message"], "Local LLM returned an invalid empty response.")
+
+  def test_filter_valid_inference_ignores_request_id_less_empty_placeholder(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin._requests = {"req-live": {"status": "pending"}}  # pylint: disable=protected-access
+    plugin._fail_request = lambda *_args, **_kwargs: self.fail("placeholder must not fail pending request")
+    inference = {
+      "text": "",
+      "IS_VALID": False,
+    }
+
+    self.assertFalse(plugin.filter_valid_inference(inference))
+    self.assertEqual(plugin._requests["req-live"]["status"], "pending")  # pylint: disable=protected-access
 
   def test_filter_valid_inference_fails_context_overflow_with_safe_specific_error(self):
     plugin = LLMInferenceApiPlugin()
@@ -198,6 +211,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
       "error_message": error_message,
     }) or True
     inference = {
+      "REQUEST_ID": "req-context",
       "text": "",
       "IS_VALID": False,
       "ERROR_CODE": "context_window_exceeded",
