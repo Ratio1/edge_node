@@ -747,6 +747,23 @@ class EdgeGuardApiTests(unittest.TestCase):
           "invented_source_name",
         }))
 
+  def test_case_explanation_draft_rejects_scalar_optional_sections_without_exception(self):
+    packet = _case_explanation_packet()
+    for section in (
+      "key_paths",
+      "entity_findings",
+      "risk_interpretation",
+      "provenance",
+      "missing_context",
+      "next_pivots",
+    ):
+      with self.subTest(section=section):
+        draft = _draft_for_packet(packet)
+        draft[section] = 17
+        explanation, errors = _construct_case_explanation(draft, packet, packet)
+        self.assertIsNone(explanation)
+        self.assertIn("schema_type", {item["code"] for item in errors})
+
   def test_api_validate_accepts_schema_query(self):
     plugin = _make_api()
 

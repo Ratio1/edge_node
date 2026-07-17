@@ -1105,6 +1105,10 @@ def _text_values(value: Any) -> list[str]:
   return []
 
 
+def _list_or_empty(value: Any) -> list[Any]:
+  return value if isinstance(value, list) else []
+
+
 def _validate_text_embedded_ids(explanation: Dict[str, Any], context: Dict[str, Any], errors: list[Dict[str, str]]) -> None:
   for text in _text_values(explanation):
     for item in EVIDENCE_ID_RE.findall(text):
@@ -1171,7 +1175,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     if not isinstance(explanation.get(section), list):
       errors.append(_contract_error("schema_type", f"{section}: must be a list"))
 
-  for index, path in enumerate(explanation.get("key_paths") or []):
+  for index, path in enumerate(_list_or_empty(explanation.get("key_paths"))):
     if not isinstance(path, dict):
       errors.append(_contract_error("invalid_key_path", f"key_paths[{index}] must be an object"))
       continue
@@ -1186,7 +1190,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
       errors.append(_contract_error("material_claim_missing_evidence", f"key_paths[{index}] must cite evidence"))
     _validate_path_connectivity(ids, context, f"key_paths[{index}]", errors)
 
-  for index, finding in enumerate(explanation.get("entity_findings") or []):
+  for index, finding in enumerate(_list_or_empty(explanation.get("entity_findings"))):
     if not isinstance(finding, dict):
       errors.append(_contract_error("invalid_entity_finding", f"entity_findings[{index}] must be an object"))
       continue
@@ -1204,7 +1208,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     if not ids:
       errors.append(_contract_error("material_claim_missing_evidence", f"entity_findings[{index}] must cite evidence"))
 
-  for index, risk in enumerate(explanation.get("risk_interpretation") or []):
+  for index, risk in enumerate(_list_or_empty(explanation.get("risk_interpretation"))):
     if not isinstance(risk, dict):
       errors.append(_contract_error("invalid_risk_interpretation", f"risk_interpretation[{index}] must be an object"))
       continue
@@ -1226,7 +1230,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
       if not cited_ids.intersection(context["severity_evidence_ids"]):
         errors.append(_contract_error("severity_escalation_unsupported", f"risk_interpretation[{index}]: severity lacks severity evidence"))
 
-  for index, provenance in enumerate(explanation.get("provenance") or []):
+  for index, provenance in enumerate(_list_or_empty(explanation.get("provenance"))):
     if not isinstance(provenance, dict):
       errors.append(_contract_error("invalid_provenance", f"provenance[{index}] must be an object"))
       continue
@@ -1251,7 +1255,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
 
   caveat_types = {
     caveat.get("type")
-    for caveat in (explanation.get("caveats") or [])
+    for caveat in _list_or_empty(explanation.get("caveats"))
     if isinstance(caveat, dict)
   }
   required_caveats = set()
@@ -1264,7 +1268,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
   for caveat_type in sorted(required_caveats):
     if caveat_type not in caveat_types:
       errors.append(_contract_error("missing_required_caveat", f"missing required caveat type {caveat_type}"))
-  for index, caveat in enumerate(explanation.get("caveats") or []):
+  for index, caveat in enumerate(_list_or_empty(explanation.get("caveats"))):
     if not isinstance(caveat, dict):
       errors.append(_contract_error("invalid_caveat", f"caveats[{index}] must be an object"))
       continue
@@ -1274,7 +1278,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     _validate_text_field(caveat.get("message"), f"caveats[{index}].message", errors)
     errors.extend(_evidence_errors(caveat.get("evidence_ids"), context, f"caveats[{index}]"))
 
-  for index, missing in enumerate(explanation.get("missing_context") or []):
+  for index, missing in enumerate(_list_or_empty(explanation.get("missing_context"))):
     if not isinstance(missing, dict):
       errors.append(_contract_error("invalid_missing_context", f"missing_context[{index}] must be an object"))
       continue
@@ -1285,7 +1289,7 @@ def _validate_case_explanation(explanation: Any, context: Dict[str, Any]) -> lis
     if WRITE_OR_ADMIN_RE.search(str(missing.get("suggested_check", ""))):
       errors.append(_contract_error("unsafe_pivot", f"missing_context[{index}]: suggested_check contains write/admin/procedure language"))
 
-  for index, pivot in enumerate(explanation.get("next_pivots") or []):
+  for index, pivot in enumerate(_list_or_empty(explanation.get("next_pivots"))):
     if not isinstance(pivot, dict):
       errors.append(_contract_error("invalid_next_pivot", f"next_pivots[{index}] must be an object"))
       continue
