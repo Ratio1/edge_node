@@ -2586,206 +2586,211 @@ class _DeeployMixin:
         return True
     return False
 
-  def _materialize_update_plugins_for_redeploy(self, inputs, discovered_plugin_instances):
+  def _validate_update_plugin_identities(self, inputs, discovered_plugin_instances):
     """
-    Build a full plugin request array for delete/redeploy updates.
+    Validate explicit requested plugin IDs against discovered live identities.
 
-    Update preflight can reconstruct omitted live plugin configs from discovery.
-    The post-delete create path only sees inputs, so partial update requests must
-    be expanded before deletion to keep the deployed replacement equivalent to
-    the validated update payload.
+    Plugins without an ID are new instances. Legacy existing plugins have their
+    IDs backfilled before this method is called.
     """
-    requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
-    materialized_plugins = []
+    requested_by_instance_id, _, _ = self._organize_requested_plugins(inputs)
+    discovered_by_instance_id = self.defaultdict(list)
+    for plugin in discovered_plugin_instances or []:
+      instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if instance_id:
+        discovered_by_instance_id[str(instance_id)].append(plugin)
 
+    for instance_id, requested_plugin in requested_by_instance_id.items():
+      discovered = discovered_by_instance_id.get(instance_id, [])
+      if not discovered:
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.PLUGINS3}: Unknown plugin instance_id(s) in update request: "
+          f"{[instance_id]}"
+        )
+
+      requested_signature = (
+        requested_plugin.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+        or requested_plugin.get("signature")
+      )
+      normalized_requested_signature = (
+        requested_signature.upper()
+        if isinstance(requested_signature, str)
+        else requested_signature
+      )
+      observed_signatures = {
+        signature.upper() if isinstance(signature, str) else signature
+        for signature in (
+          plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
+          for plugin in discovered
+        )
+        if signature
+      }
+      if observed_signatures != {normalized_requested_signature}:
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.PLUGINS3}: Plugin instance_id '{instance_id}' cannot be reused "
+          f"with signature '{requested_signature}'."
+        )
+    return True
+
+  @staticmethod
+  def _bounded_drift_log_values(values, max_items=8, max_length=80):
+    bounded = []
+    for value in sorted({str(item) for item in values if item is not None}):
+      cleaned = "".join(char if char.isprintable() else "?" for char in value)
+      if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length - 3] + "..."
+      bounded.append(cleaned)
+      if len(bounded) >= max_items:
+        break
+    return bounded
+
+  @staticmethod
+  def _bounded_drift_log_message(message, max_length=2000):
+    if len(message) <= max_length:
+      return message
+    suffix = "...[truncated]"
+    return message[:max_length - len(suffix)] + suffix
+
+  @classmethod
+  def _differing_config_paths(cls, configs, max_paths=20, max_depth=8):
+    if len(configs) < 2:
+      return []
+
+    missing = object()
+    differing_paths = []
+
+    def add_path(parts):
+      if len(differing_paths) >= max_paths:
+        return
+      if not parts:
+        differing_paths.append("$")
+        return
+      formatted = "$"
+      for part in parts:
+        if isinstance(part, int):
+          formatted += f"[{part}]"
+          continue
+        segment = "".join(char if char.isprintable() else "?" for char in str(part))
+        if len(segment) > 64:
+          segment = segment[:61] + "..."
+        formatted += f".{segment}"
+      differing_paths.append(formatted)
+
+    def walk(values, parts, depth):
+      if len(differing_paths) >= max_paths:
+        return
+      first = values[0]
+      if all(value == first for value in values[1:]):
+        return
+      if depth >= max_depth or missing in values:
+        add_path(parts)
+        return
+      if all(isinstance(value, dict) for value in values):
+        keys = sorted(
+          {key for value in values for key in value},
+          key=lambda key: str(key),
+        )
+        for key in keys:
+          walk([value.get(key, missing) for value in values], parts + [key], depth + 1)
+        return
+      if all(isinstance(value, list) for value in values):
+        lengths = {len(value) for value in values}
+        if len(lengths) != 1:
+          add_path(parts)
+          return
+        for idx in range(len(values[0])):
+          walk([value[idx] for value in values], parts + [idx], depth + 1)
+        return
+      add_path(parts)
+
+    walk(configs, [], 0)
+    return differing_paths
+
+  def _warn_on_live_plugin_config_drift(
+    self,
+    discovered_plugin_instances,
+    job_id=None,
+    app_id=None,
+    max_groups=10,
+  ):
+    """
+    Warn about differing live replica configs without logging config values.
+
+    Discovery is an oracle signal only. Drift never changes or blocks the
+    request-authoritative replacement payload.
+    """
     instance_id_key = self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID
     chainstore_response_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
     chainstore_peers_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS
-    discovered_records = []
-    discovered_by_key = {}
-    config_occurrences_by_node = {}
-    nameless_record_counts = self.defaultdict(int)
+    grouped = self.defaultdict(list)
 
-    def get_plugin_name_from_conf(discovered_plugin, extracted_config):
-      return (
-        extracted_config.get(DEEPLOY_KEYS.PLUGIN_NAME)
-        or discovered_plugin.get(DEEPLOY_KEYS.PLUGIN_NAME)
-      )
-
-    def get_discovered_materialization_key(discovered_plugin, signature, instance_id, extracted_config):
-      normalized_sig = signature.upper() if isinstance(signature, str) else signature
-      if instance_id:
-        return (normalized_sig, "instance_id", str(instance_id))
-
-      plugin_name = get_plugin_name_from_conf(discovered_plugin, extracted_config)
-      if plugin_name:
-        return (normalized_sig, "plugin_name", str(plugin_name))
-
-      config_hash = compact_canonical_sha256(extracted_config)
-      node = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.NODE, "")
-      occurrence_bucket = (node, normalized_sig, config_hash)
-      occurrence_idx = config_occurrences_by_node.get(occurrence_bucket, 0)
-      config_occurrences_by_node[occurrence_bucket] = occurrence_idx + 1
-      return (normalized_sig, "config", config_hash, occurrence_idx)
-
-    for plugin in discovered_plugin_instances:
+    for plugin in discovered_plugin_instances or []:
       signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
-      if not signature:
-        continue
-
-      normalized_signature = signature.upper() if isinstance(signature, str) else signature
       instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
-      if instance_id:
-        instance_id = str(instance_id)
+      if not instance_id:
+        continue
       extracted_config = self._extract_discovered_plugin_conf(
         plugin,
         instance_id_key=instance_id_key,
         chainstore_response_key=chainstore_response_key,
         chainstore_peers_key=chainstore_peers_key,
       )
-      plugin_name = get_plugin_name_from_conf(plugin, extracted_config)
-      config_hash = compact_canonical_sha256(extracted_config)
-      materialization_key = get_discovered_materialization_key(
-        plugin,
-        signature,
-        instance_id,
-        extracted_config,
-      )
-
-      compatibility_key = (normalized_signature, str(plugin_name or ""), config_hash)
-      existing_record = discovered_by_key.get(materialization_key)
-      if existing_record is not None:
-        if existing_record["compatibility_key"] != compatibility_key:
-          raise ValueError(
-            f"{DEEPLOY_ERRORS.PLUGINS3}: Corrupt live discovery for plugin identity "
-            f"{materialization_key}. Incompatible plugin instances were reported."
-          )
-        continue
-
-      record = {
-        "key": materialization_key,
-        "compatibility_key": compatibility_key,
+      grouped[str(instance_id)].append({
+        "node": plugin.get(DEEPLOY_PLUGIN_DATA.NODE),
         "signature": signature,
-        "normalized_signature": normalized_signature,
-        "instance_id": instance_id,
-        "plugin_name": str(plugin_name) if plugin_name else None,
+        "plugin_name": (
+          extracted_config.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          or plugin.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        ),
         "config": extracted_config,
-        "config_hash": config_hash,
-      }
-      discovered_by_key[materialization_key] = record
-      discovered_records.append(record)
+      })
 
-    for record in discovered_records:
-      if record["instance_id"] or record["plugin_name"]:
+    warned_groups = 0
+    drift_group_count = 0
+    for instance_id, replicas in sorted(grouped.items()):
+      differing_paths = self._differing_config_paths(
+        [replica["config"] for replica in replicas],
+      )
+      if not differing_paths:
         continue
-      nameless_match_key = (record["normalized_signature"], record["config_hash"])
-      nameless_record_counts[nameless_match_key] += 1
-
-    def candidate_has_instance_id(candidate):
-      return bool(
-        candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-        or candidate.get("instance_id")
-        or candidate.get(instance_id_key)
+      drift_group_count += 1
+      if warned_groups >= max_groups:
+        continue
+      warned_groups += 1
+      nodes = self._bounded_drift_log_values(replica["node"] for replica in replicas)
+      signatures = self._bounded_drift_log_values(replica["signature"] for replica in replicas)
+      plugin_names = self._bounded_drift_log_values(replica["plugin_name"] for replica in replicas)
+      safe_instance_id = self._bounded_drift_log_values([instance_id], max_items=1)[0]
+      safe_job_id = self._bounded_drift_log_values([job_id], max_items=1)
+      safe_app_id = self._bounded_drift_log_values([app_id], max_items=1)
+      warning = (
+        "Deeploy live replica config drift: "
+        f"job_id={safe_job_id[0] if safe_job_id else None}, "
+        f"app_id={safe_app_id[0] if safe_app_id else None}, "
+        f"plugin_instance_id={safe_instance_id}, "
+        f"nodes={nodes}, observed_signatures={signatures}, "
+        f"observed_plugin_names={plugin_names}, differing_paths={differing_paths}. "
+        "The submitted update remains authoritative."
+      )
+      self.P(
+        self._bounded_drift_log_message(warning),
+        color='y',
       )
 
-    def consume_signature_candidate(record):
-      candidate_list = requested_by_signature.get(record["normalized_signature"], [])
-      if not candidate_list:
-        return None
-
-      if record["plugin_name"]:
-        candidates = [
-          candidate for candidate in candidate_list
-          if not candidate_has_instance_id(candidate)
-          and candidate.get(DEEPLOY_KEYS.PLUGIN_NAME) == record["plugin_name"]
-        ]
-        if len(candidates) > 1:
-          raise ValueError(
-            f"{DEEPLOY_ERRORS.PLUGINS3}: Ambiguous update request for plugin_name "
-            f"'{record['plugin_name']}'."
-          )
-      else:
-        match_key = (record["normalized_signature"], record["config_hash"])
-        candidates = []
-        for candidate in candidate_list:
-          if candidate_has_instance_id(candidate) or candidate.get(DEEPLOY_KEYS.PLUGIN_NAME):
-            continue
-          requested_conf = self._extract_plugin_request_conf(
-            candidate,
-            instance_id_key=instance_id_key,
-            chainstore_response_key=chainstore_response_key,
-            chainstore_peers_key=chainstore_peers_key,
-          )
-          if self._plugin_update_request_matches_identity(
-            requested_conf,
-            discovered_plugin_name=record["plugin_name"],
-            discovered_config_hash=record["config_hash"],
-          ):
-            candidates.append(candidate)
-
-        if candidates and nameless_record_counts[match_key] > 1:
-          self._raise_ambiguous_plugin_update_match(
-            requested_name=None,
-            signature=record["signature"],
-          )
-
-      self._validate_single_plugin_update_match(
-        candidates,
-        requested_name=record["plugin_name"],
-        signature=record["signature"],
+    if drift_group_count > max_groups:
+      safe_job_id = self._bounded_drift_log_values([job_id], max_items=1)
+      safe_app_id = self._bounded_drift_log_values([app_id], max_items=1)
+      summary = (
+        "Additional Deeploy live replica drift groups omitted from logs: "
+        f"job_id={safe_job_id[0] if safe_job_id else None}, "
+        f"app_id={safe_app_id[0] if safe_app_id else None}, "
+        f"omitted_groups={drift_group_count - max_groups}."
       )
-
-      if not candidates:
-        return None
-
-      plugin_config = candidates[0]
-      for idx, candidate in enumerate(candidate_list):
-        if candidate is plugin_config:
-          candidate_list.pop(idx)
-          break
-      self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
-      return plugin_config
-
-    for record in discovered_records:
-      instance_id = record["instance_id"]
-      plugin_config = None
-
-      if instance_id:
-        plugin_config = requested_by_instance_id.pop(instance_id, None)
-        candidate_list = requested_by_signature.get(record["normalized_signature"], [])
-        if plugin_config and candidate_list:
-          for idx, candidate in enumerate(candidate_list):
-            if candidate is plugin_config:
-              candidate_list.pop(idx)
-              break
-      else:
-        plugin_config = consume_signature_candidate(record)
-
-      if plugin_config:
-        plugin_entry = self.deepcopy(plugin_config)
-        plugin_entry.pop("signature", None)
-      else:
-        plugin_entry = self.deepcopy(record["config"])
-
-      plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = record["signature"]
-      if instance_id:
-        plugin_entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
-      materialized_plugins.append(plugin_entry)
-
-    if requested_by_instance_id:
-      missing_ids = list(requested_by_instance_id.keys())
-      raise ValueError(
-        f"{DEEPLOY_ERRORS.PLUGINS3}: Unknown plugin instance_id(s) in update request: {missing_ids}"
+      self.P(
+        self._bounded_drift_log_message(summary),
+        color='y',
       )
-
-    for plugin_config in new_plugin_configs:
-      plugin_entry = self.deepcopy(plugin_config)
-      if DEEPLOY_KEYS.PLUGIN_SIGNATURE not in plugin_entry and plugin_entry.get("signature"):
-        plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = plugin_entry.get("signature")
-      plugin_entry.pop("signature", None)
-      materialized_plugins.append(plugin_entry)
-
-    return materialized_plugins
+    return warned_groups
 
   def deeploy_check_payment_and_job_owner(self, inputs, owner, is_create, debug=False):
     """

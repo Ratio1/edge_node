@@ -777,9 +777,8 @@ class DeeployManagerApiPlugin(
         current_nodes = pipeline_context["nodes"]
         deeploy_specs_for_update = pipeline_context["deeploy_specs"]
         self.P(
-          "Discovered plugin instances: {}".format(
-            self.json_dumps(self._redact_per_node_config_for_log(discovered_plugin_instances))
-          )
+          f"Discovered {len(discovered_plugin_instances)} live plugin instance record(s) "
+          f"for update job_id={job_id}, app_id={app_id}."
         )
 
         requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None)
@@ -841,6 +840,15 @@ class DeeployManagerApiPlugin(
           app_id=app_id,
           job_id=job_id,
         )
+        self._validate_update_plugin_identities(
+          inputs,
+          discovered_plugin_instances=discovered_plugin_instances,
+        )
+        self._warn_on_live_plugin_config_drift(
+          discovered_plugin_instances,
+          job_id=job_id,
+          app_id=app_id,
+        )
 
         if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
           msg = (
@@ -873,15 +881,9 @@ class DeeployManagerApiPlugin(
 
         plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
         if isinstance(plugins_array, list):
-          materialized_plugins = self._materialize_update_plugins_for_redeploy(
-            inputs,
-            discovered_plugin_instances,
-          )
-          inputs[DEEPLOY_KEYS.PLUGINS] = materialized_plugins
-          inputs.plugins = materialized_plugins
-          # Validate the exact replacement payload, including omitted live plugins
-          # that were materialized from discovery, before any payment/node/delete work.
-          self._validate_plugins_array(materialized_plugins)
+          # The submitted plugins array is the complete desired replacement.
+          # Discovery is used only for identity safety and drift diagnostics.
+          self._validate_plugins_array(plugins_array)
 
           if not has_request_job_app_type:
             replacement_job_app_type = deeploy_specs_payload.get(DEEPLOY_KEYS.JOB_APP_TYPE)
@@ -896,7 +898,7 @@ class DeeployManagerApiPlugin(
                 isinstance(plugin_entry, dict) and
                 isinstance(plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE), str) and
                 plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE).upper() in CONTAINERIZED_APPS_SIGNATURES
-                for plugin_entry in materialized_plugins
+                for plugin_entry in plugins_array
               )
               if job_app_type == JOB_APP_TYPES.NATIVE and has_containerized_replacement:
                 msg = (
@@ -1538,11 +1540,12 @@ class DeeployManagerApiPlugin(
 
       **Plugin instances:**
         plugins : list
-            Array of plugin instance configurations. Each object represents ONE plugin instance:
+            Complete desired replacement set. Each object represents ONE plugin instance:
             - plugin_signature : str (required)
             - instance_id : str (required when updating an existing plugin instance)
             - **instance-specific parameters** (payload merged into the instance configuration)
               - Omit instance_id to attach a brand new plugin instance; supported for native apps only
+            - Omit a live plugin from this array to remove it from the replacement deployment
 
       **Legacy format:**
         plugin_signature : str
@@ -1558,7 +1561,7 @@ class DeeployManagerApiPlugin(
     -----
     - Existing pipelines are stopped and redeployed in place; requests must reference the active node set.
     - Updates are applied to existing plugin instances on the same nodes
-    - For multi-plugin pipelines, all plugins are updated with new configurations
+    - The plugins array is a full replacement, not a partial patch; omitted live plugins are removed
     - Resource validation applies the same as create operations
     - The simplified plugins array format is the same as create_pipeline
     - New plugin instances can be introduced by omitting `instance_id` (native job type only)
