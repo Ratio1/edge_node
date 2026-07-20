@@ -20,9 +20,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from jinja2 import Environment, FileSystemLoader
-
-
 REPO_ROOT = Path(__file__).resolve().parents[5]
 FRAMEWORK_PACKAGE = REPO_ROOT / "naeural_core" / "naeural_core"
 IPC_MANAGER_PATH = FRAMEWORK_PACKAGE / "utils" / "uvicorn_fast_api_ipc_manager.py"
@@ -31,6 +28,14 @@ FASTAPI_PLUGIN_PATH = (
 )
 FASTAPI_UTILS_PATH = FRAMEWORK_PACKAGE / "utils" / "fastapi_utils.py"
 TOKEN = "0123456789abcdef0123456789abcdef"
+NATIVE_RUNTIME_SOURCE_AVAILABLE = all(
+  path.is_file()
+  for path in (
+    IPC_MANAGER_PATH,
+    FASTAPI_PLUGIN_PATH,
+    FASTAPI_UTILS_PATH,
+  )
+)
 
 
 def _load_module(name, path):
@@ -94,8 +99,14 @@ def _load_native_runtime():
         sys.modules[name] = module
 
 
-NativeFastApiPlugin, NativePostponedRequest = _load_native_runtime()
-ipc_manager = _load_module("_rm040_ipc_manager", IPC_MANAGER_PATH)
+if NATIVE_RUNTIME_SOURCE_AVAILABLE:
+  NativeFastApiPlugin, NativePostponedRequest = _load_native_runtime()
+  ipc_manager = _load_module("_rm040_ipc_manager", IPC_MANAGER_PATH)
+else:
+  # Edge source checkouts do not vendor the Ratio1 runtime. The integration
+  # fixture is exercised when a sibling runtime source checkout is available.
+  NativeFastApiPlugin, NativePostponedRequest = object, None
+  ipc_manager = None
 
 from .conftest import mock_plugin_modules
 
@@ -109,7 +120,9 @@ from extensions.business.cybersec.red_mesh.pentester_api_01 import (
 
 
 class _SchedulerHarness(NativeFastApiPlugin):
-  def P(self, *_args, **_kwargs):
+  def P(self, *args, **_kwargs):
+    if hasattr(self, "_test_messages") and args:
+      self._test_messages.append(str(args[0]))
     return None
 
   def on_response(self, _method, _response):
@@ -153,6 +166,10 @@ class _Owner:
     return NativePostponedRequest(solver_method, dict(method_kwargs or {}))
 
 
+@unittest.skipUnless(
+  NATIVE_RUNTIME_SOURCE_AVAILABLE,
+  "native Ratio1 runtime source fixture is unavailable",
+)
 class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
   @staticmethod
   def _find_free_port():
@@ -175,6 +192,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     }
 
   def _render_server(self, destination, manager_port, manager_auth):
+    from jinja2 import Environment, FileSystemLoader
+
     analyze_parameters = list(
       inspect.signature(PentesterApi01Plugin.analyze_job).parameters.values()
     )[2:]
@@ -336,6 +355,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     harness.cfg_log_requests = False
     harness.cfg_response_format = "WRAPPED"
     harness.cfg_fair_scheduling = True
+    harness._test_messages = []
 
     stop_dispatcher = threading.Event()
 
@@ -369,8 +389,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
       "report_cid": "QmExpected",
       "target": "example.test",
       "num_workers": 1,
-      "deadline_at": time.monotonic() + 4,
-      "next_check_at": 0.0,
+      "deadline_monotonic": time.monotonic() + 4,
+      "next_check_monotonic": 0.0,
       "discard_result": False,
       "work": object(),
     }
@@ -429,10 +449,15 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             payload={"job_id": "job-1"},
           ))
 
+        def _prepare(_plugin, job_id):
+          if job_id == "explode":
+            raise RuntimeError(f"native admission failure {TOKEN}")
+          return dict(state), None
+
         with patch.dict(os.environ, {"REDMESH_ANALYZE_TOKEN": TOKEN}, clear=False), patch.object(
           PentesterApi01Plugin,
           "_prepare_manual_analysis",
-          return_value=(dict(state), None),
+          side_effect=_prepare,
         ), patch.object(
           PentesterApi01Plugin,
           "_finalize_manual_analysis",
@@ -449,6 +474,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
           )
           self.assertEqual(missing_status, 401, missing_body)
           self.assertLess(missing_elapsed, 1.0)
+          self.assertEqual(missing_body["detail"], "Not authenticated")
 
           denied_status, denied_body, denied_elapsed = self._request(
             port,
@@ -463,6 +489,22 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             denied_body["detail"]["error"],
             "analysis_auth_denied",
           )
+
+          failed_status, failed_body, failed_elapsed = self._request(
+            port,
+            "POST",
+            "/analyze_job",
+            token=TOKEN,
+            payload={"job_id": "explode"},
+          )
+          self.assertEqual(failed_status, 503, failed_body)
+          self.assertLess(failed_elapsed, 1.0)
+          self.assertEqual(
+            failed_body["detail"]["error"],
+            "analysis_executor_failed",
+          )
+          self.assertNotIn(TOKEN, json.dumps(failed_body))
+          self.assertNotIn(TOKEN, "\n".join(harness._test_messages))
 
           analysis_thread = threading.Thread(target=_request_analysis, daemon=True)
           analysis_thread.start()
