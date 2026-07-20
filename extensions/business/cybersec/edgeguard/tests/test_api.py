@@ -32,6 +32,7 @@ def mock_plugin_modules():
 mock_plugin_modules()
 
 from extensions.business.cybersec.edgeguard.edgeguard_api import EdgeguardApiPlugin  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import CASE_EXPLANATION_DRAFT_SCHEMA  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_CONTRACT  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_VERSION  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _build_case_explanation_messages  # noqa: E402
@@ -460,7 +461,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
-    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.5")
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.6")
     self.assertEqual(explanation["draft_schema_version"], "edgeguard.case_explanation_draft.v2")
     self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
     self.assertEqual(explanation["prompt_sha256"], _graph_explanation_prompt_sha256())
@@ -492,6 +493,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     prompt_context = json.loads(messages[1]["content"])
 
     self.assertEqual(contract, GRAPH_EXPLANATION_PROMPT_CONTRACT)
+    self.assertEqual(contract["draft_schema"], CASE_EXPLANATION_DRAFT_SCHEMA)
+    self.assertIs(
+      GRAPH_EXPLANATION_PROMPT_CONTRACT["draft_schema"],
+      CASE_EXPLANATION_DRAFT_SCHEMA,
+    )
     self.assertEqual(prompt_context["prompt_version"], GRAPH_EXPLANATION_PROMPT_VERSION)
     self.assertEqual(prompt_context["user_question"], packet["request"])
     self.assertEqual(prompt_context["allowed_node_ids"], ["n:indicator", "n:source"])
@@ -518,8 +524,57 @@ class EdgeGuardApiTests(unittest.TestCase):
       "does not contain enough evidence",
       "Do not emit schema_version or caveats",
       "one bounded CaseExplanationDraft JSON object",
+      "sum of all six optional arrays must be at most 4 objects",
+      "Per-section limits are ceilings, not quotas",
+      "Omit unused optional sections",
     ):
       self.assertIn(restriction, instructions)
+
+  def test_case_explanation_draft_schema_is_exact_compact_and_grammar_safe(self):
+    expected_properties = {
+      "summary": {"text", "evidence_ids"},
+      "key_paths": {"title", "path_evidence_ids", "interpretation", "confidence"},
+      "entity_findings": {"entity_id", "role", "finding", "evidence_ids"},
+      "risk_interpretation": {"claim", "severity", "evidence_ids", "limits"},
+      "provenance": {"source_node_id", "source_name", "supports", "caveat"},
+      "missing_context": {"gap", "suggested_check"},
+      "next_pivots": {"question", "suggested_query_intent", "priority"},
+    }
+    expected_max_items = {
+      "key_paths": 1,
+      "entity_findings": 2,
+      "risk_interpretation": 1,
+      "provenance": 2,
+      "missing_context": 1,
+      "next_pivots": 1,
+    }
+
+    self.assertEqual(set(CASE_EXPLANATION_DRAFT_SCHEMA["properties"]), set(expected_properties))
+    self.assertEqual(CASE_EXPLANATION_DRAFT_SCHEMA["required"], ["summary"])
+    self.assertIs(CASE_EXPLANATION_DRAFT_SCHEMA["additionalProperties"], False)
+
+    for field, properties in expected_properties.items():
+      with self.subTest(field=field):
+        field_schema = CASE_EXPLANATION_DRAFT_SCHEMA["properties"][field]
+        object_schema = field_schema if field == "summary" else field_schema["items"]
+        self.assertEqual(set(object_schema["properties"]), properties)
+        self.assertEqual(set(object_schema["required"]), properties)
+        self.assertIs(object_schema["additionalProperties"], False)
+        if field != "summary":
+          self.assertEqual(field_schema["maxItems"], expected_max_items[field])
+
+    unsupported = {"$ref", "oneOf", "anyOf", "allOf", "if", "then", "else", "not"}
+
+    def walk(value):
+      if isinstance(value, dict):
+        self.assertFalse(unsupported.intersection(value))
+        for item in value.values():
+          walk(item)
+      elif isinstance(value, list):
+        for item in value:
+          walk(item)
+
+    walk(CASE_EXPLANATION_DRAFT_SCHEMA)
 
   def test_graph_explanation_prompt_projects_large_graph_into_context_budget(self):
     nodes = [{
@@ -690,6 +745,44 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("draft_word_limit", codes)
     self.assertIn("draft_evidence_limit", codes)
     self.assertIn("draft_optional_object_limit", codes)
+
+  def test_case_explanation_draft_v2_accepts_four_rich_objects_and_rejects_five(self):
+    packet = _case_explanation_packet()
+    four_object_draft = _draft_for_packet(packet)
+
+    explanation, errors = _construct_case_explanation(
+      four_object_draft,
+      packet,
+      packet,
+    )
+
+    self.assertEqual(errors, [])
+    self.assertEqual(explanation["schema_version"], "edgeguard.case_explanation.v1")
+    self.assertEqual(
+      sum(len(explanation[section]) for section in (
+        "key_paths",
+        "entity_findings",
+        "risk_interpretation",
+        "provenance",
+        "missing_context",
+        "next_pivots",
+      )),
+      4,
+    )
+
+    five_object_draft = json.loads(json.dumps(four_object_draft))
+    five_object_draft["entity_findings"] = _explanation_for_packet(packet)["entity_findings"]
+    rejected, rejection_errors = _construct_case_explanation(
+      five_object_draft,
+      packet,
+      packet,
+    )
+
+    self.assertIsNone(rejected)
+    self.assertIn(
+      "draft_optional_object_limit",
+      {item["code"] for item in rejection_errors},
+    )
 
   def test_case_explanation_draft_v2_counts_unicode_hyphenated_compounds_as_words(self):
     at_limit = {
@@ -1078,8 +1171,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(call_payload["temperature"], 0.0)
     self.assertEqual(call_payload["top_p"], 1.0)
     self.assertEqual(call_payload["max_tokens"], 1024)
-    self.assertEqual(call_payload["response_format"], {"type": "json_object"})
-    self.assertNotIn("schema", call_payload["response_format"])
+    self.assertEqual(call_payload["response_format"], {
+      "type": "json_object",
+      "schema": CASE_EXPLANATION_DRAFT_SCHEMA,
+    })
     self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation_draft.v2")
 
   def test_explanation_payload_caps_output_and_honors_smaller_positive_limit(self):
@@ -1098,7 +1193,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(non_positive_payload["max_tokens"], 1024)
     self.assertEqual(negative_payload["max_tokens"], 1024)
     for payload in (default_payload, smaller_payload, larger_payload, non_positive_payload, negative_payload):
-      self.assertEqual(payload["response_format"], {"type": "json_object"})
+      self.assertEqual(payload["response_format"], {
+        "type": "json_object",
+        "schema": CASE_EXPLANATION_DRAFT_SCHEMA,
+      })
 
   def test_prepare_graph_explanation_returns_credential_free_primary_and_broadening_plan(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
