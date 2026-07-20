@@ -346,6 +346,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def health(self):
       result = super(LLMInferenceApiPlugin, self).health()
       result["serving_ready"] = self._is_serving_ready()
+      result["benchmark_mode_enabled"] = getattr(self, "cfg_benchmark_mode_enabled", False) is True
       return result
 
     # Override only to attach balanced endpoint metadata to the inherited handler.

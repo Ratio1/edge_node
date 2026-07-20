@@ -79,6 +79,9 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     plugin.get_serving_processes = lambda: ["expected-server"]
     plugin.global_shmem = {"serving_manager": type("Manager", (), {"is_avail": lambda _self, name: name == "expected-server"})()}
     self.assertIs(plugin.health()["serving_ready"], True)
+    self.assertIs(plugin.health()["benchmark_mode_enabled"], False)
+    plugin.cfg_benchmark_mode_enabled = True
+    self.assertIs(plugin.health()["benchmark_mode_enabled"], True)
     plugin.global_shmem = {}
     self.assertIs(plugin.health()["serving_ready"], False)
 
