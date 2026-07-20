@@ -341,6 +341,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -381,6 +382,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format=response_format,
         metadata=metadata,
         authorization=authorization,
+        benchmark_mode=benchmark_mode,
         **kwargs
       )
 
@@ -398,6 +400,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         request_id: Optional[str] = None,
+        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -442,6 +445,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         request_id=request_id,
+        benchmark_mode=benchmark_mode,
         **kwargs
       )
 
@@ -456,6 +460,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -496,6 +501,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format=response_format,
         metadata=metadata,
         authorization=authorization,
+        benchmark_mode=benchmark_mode,
         **kwargs
       )
 
@@ -510,6 +516,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -550,6 +557,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format=response_format,
         metadata=metadata,
         authorization=authorization,
+        benchmark_mode=benchmark_mode,
         **kwargs
       )
   """END API ENDPOINTS"""

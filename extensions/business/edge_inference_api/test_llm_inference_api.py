@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from pathlib import Path
 
@@ -70,6 +71,22 @@ LLMInferenceApiPlugin = _load_plugin_class()
 
 
 class LLMInferenceApiPluginTests(unittest.TestCase):
+  def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):
+    for method_name in ("predict", "predict_async", "create_chat_completion", "create_chat_completion_async"):
+      parameter = inspect.signature(getattr(LLMInferenceApiPlugin, method_name)).parameters["benchmark_mode"]
+      self.assertIs(parameter.default, False)
+
+  def test_benchmark_mode_reaches_uppercase_worker_payload(self):
+    plugin = LLMInferenceApiPlugin()
+    parameters = plugin.process_predict_params(
+      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
+      benchmark_mode=True,
+    )
+    payload = plugin.compute_payload_kwargs_from_predict_params(
+      "req-benchmark", {"parameters": parameters},
+    )
+    self.assertIs(payload["JEEVES_CONTENT"]["BENCHMARK_MODE"], True)
+
   def test_payload_uses_llm_serving_uppercase_contract(self):
     plugin = LLMInferenceApiPlugin()
 
