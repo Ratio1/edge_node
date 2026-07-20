@@ -1381,16 +1381,31 @@ class EdgeGuardApiTests(unittest.TestCase):
       'MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
       "MATCH (n:Indicator) CALL db.propertyKeys() YIELD propertyKey RETURN n, propertyKey LIMIT 5",
       "MATCH (n:Indicator) RETURN count(*) LIMIT 5",
+      "MATCH (i:Indicator), (m:Malware) RETURN i, m{.*} AS mapping LIMIT 5",
+      (
+        "MATCH (i:Indicator), (m:Malware) "
+        "RETURN i, m{name:{name:1}, .*} AS mapping LIMIT 5"
+      ),
+      (
+        "MATCH (i:Indicator), (m:Malware) "
+        "RETURN i, apoc.convert.toJson(m) AS mapping LIMIT 5"
+      ),
     ]
 
     for cypher in queries:
       with self.subTest(cypher=cypher):
-        result = plugin.prepare_graph_explanation(cypher=cypher)
+        with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+          with patch(
+            "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post"
+          ) as mocked_post:
+            result = plugin.prepare_graph_explanation(cypher=cypher)
         self.assertEqual(result["status"], "rejected")
         self.assertIn(
           "unsafe_result_projection",
           {item["code"] for item in result["validation_errors"]},
         )
+        mocked_driver.assert_not_called()
+        mocked_post.assert_not_called()
 
   def test_legacy_explanation_applies_projection_checks_before_opening_driver(self):
     plugin = _make_api()
@@ -1955,6 +1970,22 @@ class EdgeGuardApiTests(unittest.TestCase):
     outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
     self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
     self.assertNotIn("port or URL", outcome_log)
+
+  def test_explanation_model_rejects_unselected_output_mode_without_provider_call(self):
+    plugin = _make_api(edgeguard_explanation_output_mode=None)
+    plugin.P = MagicMock()
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post"
+    ) as mocked_post:
+      result = _call_model(plugin, _case_explanation_packet())
+
+    self.assertEqual(result["status"], "error")
+    self.assertEqual(result["diagnostics"]["stage"], "configuration")
+    self.assertEqual(result["diagnostics"]["reason"], "output_mode_not_selected")
+    mocked_post.assert_not_called()
+    outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
 
   def test_malformed_explanation_model_configuration_emits_one_safe_outcome(self):
     plugin = _make_api(

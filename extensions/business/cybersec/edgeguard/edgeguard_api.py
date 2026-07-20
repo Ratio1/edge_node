@@ -105,7 +105,7 @@ DURATION_RE = re.compile(
   r"(?:(-?(?:0\.[0-9]{9}|(?:[1-9]|[1-5][0-9])(?:\.[0-9]{9})?))S)?$"
 )
 EXPLANATION_DIAGNOSTIC_STAGE_REASONS = {
-  "configuration": {"model_not_configured"},
+  "configuration": {"model_not_configured", "output_mode_not_selected"},
   "provider": {
     "provider_http_error",
     "provider_timeout",
@@ -189,6 +189,23 @@ CAVEAT_TYPES = {
   "redaction_scope",
 }
 PRIORITY_VALUES = {"low", "medium", "high"}
+SAFE_RESULT_FUNCTIONS = {
+  "avg",
+  "coalesce",
+  "collect",
+  "count",
+  "head",
+  "labels",
+  "last",
+  "max",
+  "min",
+  "size",
+  "sum",
+  "tofloat",
+  "tointeger",
+  "tostring",
+  "type",
+}
 
 CASE_EXPLANATION_DRAFT_SCHEMA = {
   "type": "object",
@@ -761,6 +778,19 @@ def _prepare_graph_explanation_plan(
         )
       ],
     }
+  if re.search(r"\.\s*\*", accepted_cypher):
+    return {
+      "status": STATUS_REJECTED,
+      "ok": False,
+      "validation": analysis,
+      "error": "Cypher result projection is not safe for complete-result explanation.",
+      "validation_errors": [
+        _contract_error(
+          "unsafe_result_projection",
+          "wildcard map projection cannot establish allowlisted property provenance",
+        )
+      ],
+    }
   if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\[", accepted_cypher):
     return {
       "status": STATUS_REJECTED,
@@ -792,6 +822,32 @@ def _prepare_graph_explanation_plan(
         _contract_error(
           "unsafe_result_projection",
           f"property {forbidden_projection} is excluded by the explanation security policy",
+        )
+      ],
+    }
+  return_clause = _top_level_return_clause(accepted_cypher) or ""
+  result_functions = re.findall(
+    r"\b([A-Za-z_][A-Za-z0-9_.]*)\s*\(",
+    return_clause,
+  )
+  unsafe_function = next(
+    (
+      function
+      for function in result_functions
+      if "." in function or function.lower() not in SAFE_RESULT_FUNCTIONS
+    ),
+    None,
+  )
+  if unsafe_function:
+    return {
+      "status": STATUS_REJECTED,
+      "ok": False,
+      "validation": analysis,
+      "error": "Cypher result projection is not safe for complete-result explanation.",
+      "validation_errors": [
+        _contract_error(
+          "unsafe_result_projection",
+          f"result-producing function {unsafe_function} is not allowlisted",
         )
       ],
     }
@@ -2609,7 +2665,7 @@ _CONFIG = {
   "EDGEGUARD_EXPLANATION_MAX_TOKENS": EXPLANATION_MAX_OUTPUT_TOKENS,
   "EDGEGUARD_EXPLANATION_TEMPERATURE": 0.0,
   "EDGEGUARD_EXPLANATION_TOP_P": 1.0,
-  "EDGEGUARD_EXPLANATION_OUTPUT_MODE": EXPLANATION_OUTPUT_MODE_JSON_OBJECT,
+  "EDGEGUARD_EXPLANATION_OUTPUT_MODE": None,
 
   "NEO4J_MAX_ROWS": 100,
   "NEO4J_QUERY_TIMEOUT_SECONDS": 30,
@@ -2972,6 +3028,20 @@ class EdgeguardApiPlugin(BasePlugin):
         effective_max_tokens=effective_max_tokens,
       )
 
+    selected_output_mode = (
+      output_mode
+      if output_mode is not None
+      else self.cfg_edgeguard_explanation_output_mode
+    )
+    if selected_output_mode not in EXPLANATION_OUTPUT_MODES:
+      return finish(
+        {
+          "status": STATUS_ERROR,
+          "error": "EdgeGuard explanation output mode is not selected",
+        },
+        "configuration",
+        "output_mode_not_selected",
+      )
     try:
       url, err = self._explanation_url()
     except Exception:
@@ -2990,7 +3060,7 @@ class EdgeguardApiPlugin(BasePlugin):
         temperature,
         max_tokens,
         top_p,
-        output_mode=output_mode,
+        output_mode=selected_output_mode,
       )
       effective_max_tokens = payload["max_tokens"]
       self.Pd("Calling configured localhost EdgeGuard explanation model API")
