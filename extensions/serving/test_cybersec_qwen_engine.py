@@ -117,6 +117,15 @@ def _load_llama_cpp_base_class():
     "LlmCT": types.SimpleNamespace(
       ROLE_KEY="role",
       DATA_KEY="content",
+      REQUEST_ID="REQUEST_ID",
+      MESSAGES="MESSAGES",
+      TEMPERATURE="TEMPERATURE",
+      TOP_P="TOP_P",
+      MAX_TOKENS="MAX_TOKENS",
+      CONTEXT="CONTEXT",
+      VALID_CONDITION="VALID_CONDITION",
+      PROCESS_METHOD="PROCESS_METHOD",
+      RESPONSE_FORMAT="RESPONSE_FORMAT",
       PRMP="prompt",
       TEXT="text",
       ADDITIONAL="ADDITIONAL",
@@ -260,6 +269,28 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
     self.assertIn("missing.gguf", str(raised.exception))
     self.assertNotIn(tmpdir, str(raised.exception))
+
+  def test_llama_cpp_base_preserves_explicit_zero_temperature(self):
+    process = _make_llama_cpp_process()
+    process.cfg_default_temperature = 0.7
+    process.cfg_default_top_p = 0.9
+    process.cfg_default_max_tokens = 1024
+    process.cfg_repetition_penalty = 1.0
+    process.check_relevant_input = lambda _input: True
+    process.maybe_add_context_to_messages = lambda messages, context: messages
+    process.get_default_response_format = lambda: {"type": "text"}
+    process.process_predict_kwargs = lambda kwargs: kwargs
+
+    preprocessed = process._pre_process({
+      "DATA": [{
+        "JEEVES_CONTENT": {
+          "MESSAGES": [{"role": "user", "content": "Explain"}],
+          "TEMPERATURE": 0.0,
+        },
+      }],
+    })
+
+    self.assertEqual(preprocessed[0][0]["temperature"], 0.0)
 
   def test_llama_cpp_context_overflow_returns_structured_failure_without_retry(self):
     process = _make_llama_cpp_process()

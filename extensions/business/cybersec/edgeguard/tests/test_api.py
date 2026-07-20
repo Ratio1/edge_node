@@ -38,6 +38,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _build_case_exp
 from extensions.business.cybersec.edgeguard.edgeguard_api import _construct_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_contract_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_user_content  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _sha256_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation_draft_bounds  # noqa: E402
@@ -46,6 +47,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_packe
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
 
 
 class _Response:
@@ -137,6 +139,18 @@ def _serialized_execution(executed_cypher, *, broadened=False, primary_row_count
       }],
       "truncated": False,
     },
+    "query_result_evidence": {
+      "schema_version": "edgeguard.query_result_evidence.v1",
+      "columns": ["indicator", "source", "relationship"],
+      "rows": [{
+        "ordinal": 0,
+        "values": [
+          {"type": "node", "ref": "4:indicator-raw-id"},
+          {"type": "node", "ref": "4:source-raw-id"},
+          {"type": "relationship", "ref": "5:relationship-raw-id"},
+        ],
+      }],
+    },
   }
 
 
@@ -190,6 +204,93 @@ def _case_explanation_packet():
       "contains_raw_misp_payload": False,
     },
   }
+
+
+def _tag_test_value(value):
+  if value is None:
+    return {"type": "null"}
+  if isinstance(value, bool):
+    return {"type": "boolean", "value": value}
+  if isinstance(value, str):
+    return {"type": "string", "value": value}
+  if isinstance(value, int):
+    return {"type": "integer", "value": str(value)}
+  if isinstance(value, float):
+    return {"type": "float", "value": value}
+  if isinstance(value, list):
+    return {"type": "list", "items": [_tag_test_value(item) for item in value]}
+  return {
+    "type": "map",
+    "entries": [
+      {"key": str(key), "value": _tag_test_value(item)}
+      for key, item in value.items()
+    ],
+  }
+
+
+def _untag_test_value(value):
+  value_type = value.get("type")
+  if value_type == "null":
+    return None
+  if value_type in {"boolean", "string", "float"}:
+    return value["value"]
+  if value_type == "integer":
+    return int(value["value"])
+  if value_type == "list":
+    return [_untag_test_value(item) for item in value["items"]]
+  if value_type == "map":
+    return {
+      entry["key"]: _untag_test_value(entry["value"])
+      for entry in value["entries"]
+      if entry["value"].get("type") != "redacted"
+    }
+  return None
+
+
+def _prompt_evidence_for_packet(packet):
+  graph = packet.get("graph") or {}
+  nodes = graph.get("nodes") or []
+  relationships = graph.get("relationships") or []
+  values = [
+    *({"type": "node", "ref": node["id"]} for node in nodes),
+    *({"type": "relationship", "ref": relationship["id"]} for relationship in relationships),
+  ]
+  if not values:
+    values = [{"type": "null"}]
+  return {
+    "schema_version": "edgeguard.query_result_evidence.v1",
+    "columns": [f"value_{index}" for index in range(len(values))],
+    "rows": [{"ordinal": 0, "values": values}],
+  }, {
+    "nodes": [
+      {
+        "id": node["id"],
+        "labels": node.get("labels") or [],
+        "properties": _tag_test_value(node.get("properties") or {}),
+      }
+      for node in nodes
+    ],
+    "relationships": [
+      {
+        "id": relationship["id"],
+        "type": relationship.get("type"),
+        "startNodeId": relationship.get("startNodeId"),
+        "endNodeId": relationship.get("endNodeId"),
+        "properties": _tag_test_value(relationship.get("properties") or {}),
+      }
+      for relationship in relationships
+    ],
+  }
+
+
+def _call_model(plugin, packet, **kwargs):
+  query_result, catalog = _prompt_evidence_for_packet(packet)
+  return plugin._call_explanation_model(packet, query_result, catalog, **kwargs)
+
+
+def _build_payload(plugin, packet, **kwargs):
+  query_result, catalog = _prompt_evidence_for_packet(packet)
+  return plugin._build_explanation_payload(packet, query_result, catalog, **kwargs)
 
 
 def _explanation_for_packet(packet, caveat_types=None):
@@ -247,6 +348,28 @@ def _explanation_for_packet(packet, caveat_types=None):
 
 
 def _draft_for_packet(packet):
+  if not packet["graph"]["relationships"]:
+    nodes = packet["graph"]["nodes"]
+    indicator = next(node for node in nodes if "Indicator" in node["labels"])
+    source = next(node for node in nodes if "Source" in node["labels"])
+    return {
+      "summary": {
+        "text": "The returned row pairs the indicator with its source.",
+        "evidence_ids": [indicator["id"], source["id"]],
+      },
+      "entity_findings": [{
+        "entity_id": indicator["id"],
+        "role": "seed_indicator",
+        "finding": "The indicator is paired with the source in the returned row.",
+        "evidence_ids": [indicator["id"], source["id"]],
+      }],
+      "provenance": [{
+        "source_node_id": source["id"],
+        "source_name": source["properties"].get("name", source["caption"]),
+        "supports": [indicator["id"]],
+        "caveat": "The result establishes only this bounded row pairing.",
+      }],
+    }
   draft = _explanation_for_packet(packet)
   draft.pop("schema_version")
   draft.pop("caveats")
@@ -316,7 +439,42 @@ def _diagnostics(
 
 def _packet_from_provider_kwargs(kwargs):
   prompt_context = json.loads(kwargs["json"]["messages"][1]["content"])
-  return prompt_context["graph_evidence_packet"]
+  catalog = prompt_context["evidence_catalog"]
+  catalog_nodes = []
+  for node in catalog["nodes"]:
+    properties = _untag_test_value(node["properties"])
+    caption = (
+      properties.get("name")
+      or properties.get("value")
+      or (node["labels"][0] if node["labels"] else "Entity")
+    )
+    catalog_nodes.append({
+      "id": node["id"],
+      "labels": node["labels"],
+      "caption": caption,
+      "properties": properties,
+    })
+  return {
+    **_case_explanation_packet(),
+    "request": prompt_context["user_question"],
+    "accepted_cypher": prompt_context["query"]["accepted_cypher"],
+    "executed_cypher": prompt_context["query"]["executed_cypher"],
+    "graph": {
+      "nodes": catalog_nodes,
+      "relationships": [
+        {
+          "id": relationship["id"],
+          "type": relationship["type"],
+          "startNodeId": relationship["startNodeId"],
+          "endNodeId": relationship["endNodeId"],
+          "caption": relationship["type"],
+          "properties": {},
+        }
+        for relationship in catalog["relationships"]
+      ],
+      "truncated": False,
+    },
+  }
 
 
 def _make_api(**overrides):
@@ -336,6 +494,10 @@ def _make_api(**overrides):
   )
   plugin.cfg_edgeguard_explanation_temperature = overrides.get("edgeguard_explanation_temperature", 0.0)
   plugin.cfg_edgeguard_explanation_top_p = overrides.get("edgeguard_explanation_top_p", 1.0)
+  plugin.cfg_edgeguard_explanation_output_mode = overrides.get(
+    "edgeguard_explanation_output_mode",
+    "json_object",
+  )
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
   plugin.cfg_neo4j_query_timeout_seconds = overrides.get("neo4j_query_timeout_seconds", 30)
   plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", True)
@@ -460,55 +622,32 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
-    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.5")
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.7")
     self.assertEqual(explanation["draft_schema_version"], "edgeguard.case_explanation_draft.v2")
     self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
+    self.assertEqual(explanation["candidate_output_modes"], ["json_object", "json_schema"])
+    self.assertEqual(explanation["configured_output_mode"], "json_object")
+    self.assertEqual(explanation["selection_status"], "provisional_pending_phase_28_measurement")
     self.assertEqual(explanation["prompt_sha256"], _graph_explanation_prompt_sha256())
     self.assertRegex(explanation["prompt_sha256"], r"^[0-9a-f]{64}$")
 
   def test_graph_explanation_prompt_centers_question_and_bounds_graph_evidence(self):
-    packet = {
-      "request": "Which source supports this indicator?",
-      "limit_policy": {"limit_adjusted": True},
-      "execution": {"broadened": True, "truncated": False},
-      "graph": {
-        "truncated": True,
-        "nodes": [
-          {"id": "n:indicator", "labels": ["Indicator"], "properties": {"value": "example.org"}},
-          {"id": "n:source", "labels": ["Source"], "properties": {"name": "Example Feed"}},
-        ],
-        "relationships": [{
-          "id": "r:source",
-          "type": "SOURCED_FROM",
-          "startNodeId": "n:indicator",
-          "endNodeId": "n:source",
-          "properties": {},
-        }],
-      },
-    }
-
-    messages = _build_case_explanation_messages(packet)
+    packet = _case_explanation_packet()
+    query_result, catalog = _prompt_evidence_for_packet(packet)
+    messages = _build_case_explanation_messages(packet, query_result, catalog)
     contract = json.loads(messages[0]["content"])
     prompt_context = json.loads(messages[1]["content"])
 
     self.assertEqual(contract, GRAPH_EXPLANATION_PROMPT_CONTRACT)
     self.assertEqual(prompt_context["prompt_version"], GRAPH_EXPLANATION_PROMPT_VERSION)
     self.assertEqual(prompt_context["user_question"], packet["request"])
-    self.assertEqual(prompt_context["allowed_node_ids"], ["n:indicator", "n:source"])
-    self.assertEqual(prompt_context["allowed_relationship_ids"], ["r:source"])
-    self.assertEqual(prompt_context["allowed_source_ids"], ["n:source"])
-    self.assertEqual(prompt_context["connected_triples"], [{
-      "start_node_id": "n:indicator",
-      "relationship_id": "r:source",
-      "relationship_type": "SOURCED_FROM",
-      "end_node_id": "n:source",
-    }])
-    self.assertEqual(prompt_context["server_caveat_flags"], {
-      "graph_scope": True,
-      "broadening": True,
-      "truncation": True,
-      "limit_adjusted": True,
+    self.assertEqual(prompt_context["complete_query_result"], query_result)
+    self.assertEqual(prompt_context["evidence_catalog"], catalog)
+    self.assertEqual(prompt_context["query"], {
+      "accepted_cypher": packet["accepted_cypher"],
+      "executed_cypher": packet["executed_cypher"],
     })
+    self.assertNotIn("graph_evidence_packet", prompt_context)
     instructions = " ".join(contract["instructions"])
     for restriction in (
       "answer it directly in summary.text",
@@ -521,7 +660,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     ):
       self.assertIn(restriction, instructions)
 
-  def test_graph_explanation_prompt_projects_large_graph_into_context_budget(self):
+  def test_graph_explanation_prompt_rejects_large_complete_result_instead_of_projecting(self):
     nodes = [{
       "id": f"n:indicator-{index}",
       "labels": ["Indicator"],
@@ -566,24 +705,16 @@ class EdgeGuardApiTests(unittest.TestCase):
       },
     }
 
-    user_content = _build_case_explanation_messages(packet)[1]["content"]
-    prompt_context = json.loads(user_content)
-    prompt_packet = prompt_context["graph_evidence_packet"]
-    selected_node_ids = {node["id"] for node in prompt_packet["graph"]["nodes"]}
+    query_result, catalog = _prompt_evidence_for_packet(packet)
 
-    self.assertLessEqual(len(user_content.encode("utf-8")), EXPLANATION_MAX_PROMPT_USER_BYTES)
-    self.assertLess(len(selected_node_ids), len(nodes))
-    self.assertTrue(prompt_packet["graph"]["truncated"])
-    self.assertTrue(prompt_packet["execution"]["truncated"])
-    self.assertTrue(prompt_context["server_caveat_flags"]["truncation"])
-    self.assertTrue(prompt_packet["graph"]["relationships"])
-    for relationship in prompt_packet["graph"]["relationships"]:
-      self.assertIn(relationship["startNodeId"], selected_node_ids)
-      self.assertIn(relationship["endNodeId"], selected_node_ids)
+    with self.assertRaises(_ResultEvidenceError) as raised:
+      _build_case_explanation_messages(packet, query_result, catalog)
+
+    self.assertEqual(raised.exception.code, "complete_result_prompt_bytes")
 
   def test_graph_explanation_prompt_hash_is_canonical_and_packet_independent(self):
-    first = _build_case_explanation_messages({"request": "Question one", "graph": {}})[0]["content"]
-    second = _build_case_explanation_messages({"request": "Question two", "graph": {"nodes": []}})[0]["content"]
+    first = _build_case_explanation_messages({"request": "Question one"}, {}, {})[0]["content"]
+    second = _build_case_explanation_messages({"request": "Question two"}, {}, {})[0]["content"]
 
     self.assertEqual(first, second)
     self.assertEqual(first, _graph_explanation_prompt_contract_text())
@@ -757,7 +888,7 @@ class EdgeGuardApiTests(unittest.TestCase):
         if evidence_field:
           self.assertIn("draft_evidence_limit", codes)
 
-  def test_case_explanation_projection_truncation_is_disclosed(self):
+  def test_case_explanation_complete_prompt_overflow_is_not_projected(self):
     packet = _case_explanation_packet()
     for index in range(60):
       packet["graph"]["nodes"].append({
@@ -766,19 +897,10 @@ class EdgeGuardApiTests(unittest.TestCase):
         "caption": f"extra-{index}",
         "properties": {"value": f"extra-{index}.example.org", "description": "x" * 500},
       })
-    prompt_packet = json.loads(_build_case_explanation_messages(packet)[1]["content"])["graph_evidence_packet"]
-    draft = {
-      "summary": {
-        "text": "The returned graph includes the requested indicator.",
-        "evidence_ids": ["n:indicator"],
-      },
-    }
+    query_result, catalog = _prompt_evidence_for_packet(packet)
 
-    explanation, errors = _construct_case_explanation(draft, packet, prompt_packet)
-
-    self.assertEqual(errors, [])
-    self.assertTrue(prompt_packet["graph"]["truncated"])
-    self.assertIn("truncation", {item["type"] for item in explanation["caveats"]})
+    with self.assertRaises(_ResultEvidenceError):
+      _build_case_explanation_messages(packet, query_result, catalog)
 
   def test_case_explanation_draft_rejects_path_with_missing_endpoint_without_repair(self):
     packet = _case_explanation_packet()
@@ -1086,11 +1208,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     plugin = _make_api(edgeguard_explanation_max_tokens=1600)
     packet = {"request": "Explain this graph.", "graph": {"nodes": [], "relationships": []}}
 
-    default_payload = plugin._build_explanation_payload(packet)
-    smaller_payload = plugin._build_explanation_payload(packet, max_tokens=64)
-    larger_payload = plugin._build_explanation_payload(packet, max_tokens=2048)
-    non_positive_payload = plugin._build_explanation_payload(packet, max_tokens=0)
-    negative_payload = plugin._build_explanation_payload(packet, max_tokens=-1)
+    default_payload = _build_payload(plugin, packet)
+    smaller_payload = _build_payload(plugin, packet, max_tokens=64)
+    larger_payload = _build_payload(plugin, packet, max_tokens=2048)
+    non_positive_payload = _build_payload(plugin, packet, max_tokens=0)
+    negative_payload = _build_payload(plugin, packet, max_tokens=-1)
 
     self.assertEqual(default_payload["max_tokens"], 1024)
     self.assertEqual(smaller_payload["max_tokens"], 64)
@@ -1099,6 +1221,29 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(negative_payload["max_tokens"], 1024)
     for payload in (default_payload, smaller_payload, larger_payload, non_positive_payload, negative_payload):
       self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+    schema_payload = _build_payload(plugin, packet, output_mode="json_schema")
+    self.assertEqual(schema_payload["response_format"]["type"], "json_object")
+    self.assertEqual(schema_payload["response_format"]["schema"]["required"], ["summary"])
+    self.assertFalse(schema_payload["response_format"]["schema"]["additionalProperties"])
+    self.assertEqual(schema_payload["metadata"]["output_mode"], "json_schema")
+
+  def test_complete_prompt_accepts_exact_byte_limit_and_rejects_one_byte_more(self):
+    packet = _case_explanation_packet()
+    query_result, catalog = _prompt_evidence_for_packet(packet)
+    packet["request"] = "q"
+    base = _graph_explanation_user_content(packet, query_result, catalog)
+    packet["request"] = "x" * (
+      EXPLANATION_MAX_PROMPT_USER_BYTES - len(base.encode("utf-8")) + 1
+    )
+
+    at_limit = _graph_explanation_user_content(packet, query_result, catalog)
+    self.assertEqual(len(at_limit.encode("utf-8")), EXPLANATION_MAX_PROMPT_USER_BYTES)
+
+    packet["request"] += "x"
+    with self.assertRaises(_ResultEvidenceError) as raised:
+      _graph_explanation_user_content(packet, query_result, catalog)
+    self.assertEqual(raised.exception.code, "complete_result_prompt_bytes")
 
   def test_prepare_graph_explanation_returns_credential_free_primary_and_broadening_plan(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
@@ -1202,6 +1347,141 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(all(node["id"].startswith("n:") for node in packet["graph"]["nodes"]))
     self.assertTrue(all(rel["id"].startswith("r:") for rel in packet["graph"]["relationships"]))
 
+  def test_explain_graph_preserves_pairings_duplicates_nulls_scalars_maps_lists_and_reverse_path(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
+    execution_result = _serialized_execution(cypher, primary_row_count=2)
+    execution_result["row_count"] = 2
+    relationship = execution_result["graph"]["relationships"][0]
+    row_values = [
+      {"type": "node", "ref": "4:source-raw-id"},
+      {"type": "node", "ref": "4:indicator-raw-id"},
+      {"type": "null"},
+      {"type": "integer", "value": "9007199254740993"},
+      {"type": "float", "value": 1.5},
+      {"type": "list", "items": [{"type": "string", "value": "a"}, {"type": "null"}]},
+      {
+        "type": "map",
+        "entries": [
+          {"key": "count", "value": {"type": "integer", "value": "2"}},
+          {"key": "api_token", "value": {"type": "string", "value": "must-redact"}},
+        ],
+      },
+      {
+        "type": "path",
+        "start_node_ref": "4:source-raw-id",
+        "end_node_ref": "4:indicator-raw-id",
+        "segments": [{
+          "start_node_ref": "4:source-raw-id",
+          "relationship_ref": relationship["id"],
+          "end_node_ref": "4:indicator-raw-id",
+        }],
+      },
+    ]
+    execution_result["query_result_evidence"] = {
+      "schema_version": "edgeguard.query_result_evidence.v1",
+      "columns": ["source", "indicator", "nullable", "total", "ratio", "items", "aggregate", "path"],
+      "rows": [
+        {"ordinal": 0, "values": row_values},
+        {"ordinal": 1, "values": json.loads(json.dumps(row_values))},
+      ],
+    }
+    captured = {}
+
+    def provider_side_effect(*_args, **kwargs):
+      captured.update(json.loads(kwargs["json"]["messages"][1]["content"]))
+      return _provider_response_for_packet(_packet_from_provider_kwargs(kwargs))
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      side_effect=provider_side_effect,
+    ):
+      result = plugin.explain_graph(
+        cypher=cypher,
+        request="Explain the exact returned pairs.",
+        execution_result=execution_result,
+      )
+
+    self.assertEqual(result["status"], "ok")
+    complete = captured["complete_query_result"]
+    self.assertEqual(complete["columns"], execution_result["query_result_evidence"]["columns"])
+    self.assertEqual(
+      complete["rows"][0]["values"][:6],
+      complete["rows"][1]["values"][:6],
+    )
+    self.assertEqual(
+      complete["rows"][0]["values"][7],
+      complete["rows"][1]["values"][7],
+    )
+    self.assertEqual(
+      complete["rows"][1]["values"][6]["entries"][1]["value"]["type"],
+      "redacted",
+    )
+    self.assertEqual(complete["rows"][0]["values"][2], {"type": "null"})
+    self.assertEqual(complete["rows"][0]["values"][3]["value"], "9007199254740993")
+    redacted = complete["rows"][0]["values"][6]["entries"][1]["value"]
+    self.assertEqual(redacted["type"], "redacted")
+    self.assertEqual(redacted["reason"], "security_policy")
+    self.assertNotIn("must-redact", json.dumps(captured))
+    reverse_path = complete["rows"][0]["values"][7]
+    self.assertEqual(reverse_path["start_node_ref"], complete["rows"][0]["values"][0]["ref"])
+    self.assertEqual(reverse_path["end_node_ref"], complete["rows"][0]["values"][1]["ref"])
+    self.assertEqual(len(captured["evidence_catalog"]["relationships"]), 1)
+
+  def test_explain_graph_rejects_incomplete_or_oversized_evidence_without_model_call(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    truncated = _serialized_execution(cypher)
+    truncated["truncated"] = True
+    oversized = _serialized_execution(cypher)
+    oversized["query_result_evidence"]["rows"][0]["values"][0] = {
+      "type": "string",
+      "value": "x" * 525_000,
+    }
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+    ) as mocked_post:
+      truncated_result = plugin.explain_graph(cypher=cypher, execution_result=truncated)
+      oversized_result = plugin.explain_graph(cypher=cypher, execution_result=oversized)
+
+    self.assertIn(
+      "incomplete_execution_result",
+      {item["code"] for item in truncated_result["validation_errors"]},
+    )
+    self.assertIn(
+      "execution_result_size",
+      {item["code"] for item in oversized_result["validation_errors"]},
+    )
+    mocked_post.assert_not_called()
+
+  def test_explain_graph_rejects_unresolved_references_and_evidence_id_collisions(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    unresolved = _serialized_execution(cypher)
+    unresolved["query_result_evidence"]["rows"][0]["values"][0]["ref"] = "missing"
+    collision = _serialized_execution(cypher)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+    ) as mocked_post:
+      unresolved_result = plugin.explain_graph(cypher=cypher, execution_result=unresolved)
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api._evidence_id",
+        side_effect=lambda prefix, _key: f"{prefix}:collision",
+      ):
+        collision_result = plugin.explain_graph(cypher=cypher, execution_result=collision)
+
+    self.assertIn(
+      "unresolved_node_reference",
+      {item["code"] for item in unresolved_result["validation_errors"]},
+    )
+    self.assertIn(
+      "evidence_id_collision",
+      {item["code"] for item in collision_result["validation_errors"]},
+    )
+    mocked_post.assert_not_called()
+
   def test_explain_graph_evidence_mode_rejects_forwarded_connection_fields(self):
     plugin = _make_api()
     cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
@@ -1252,37 +1532,69 @@ class EdgeGuardApiTests(unittest.TestCase):
       for index in range(161)
     ]
     oversized["graph"]["relationships"] = []
+    too_many_relationships = _serialized_execution(cypher)
+    too_many_relationships["graph"]["relationships"] = [
+      {
+        "id": f"relationship-{index}",
+        "type": "SOURCED_FROM",
+        "startNodeId": "4:indicator-raw-id",
+        "endNodeId": "4:source-raw-id",
+        "properties": {},
+        "caption": "SOURCED_FROM",
+      }
+      for index in range(241)
+    ]
 
     with patch.object(plugin, "_neo4j_driver") as mocked_driver:
       malformed_result = plugin.explain_graph(cypher=cypher, execution_result=malformed)
       oversized_result = plugin.explain_graph(cypher=cypher, execution_result=oversized)
+      relationships_result = plugin.explain_graph(
+        cypher=cypher,
+        execution_result=too_many_relationships,
+      )
 
     self.assertIn(
       "serialized_relationship_endpoint_missing",
       {item["code"] for item in malformed_result["validation_errors"]},
     )
     self.assertIn("graph_node_limit", {item["code"] for item in oversized_result["validation_errors"]})
+    self.assertIn(
+      "graph_relationship_limit",
+      {item["code"] for item in relationships_result["validation_errors"]},
+    )
     mocked_driver.assert_not_called()
 
-  def test_explain_graph_evidence_mode_rejects_nested_properties_and_recursive_credentials(self):
-    plugin = _make_api()
+  def test_explain_graph_evidence_mode_rejects_nested_properties_and_redacts_sensitive_properties(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
     cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
     nested = _serialized_execution(cypher)
     nested["graph"]["nodes"][0]["properties"] = {"details": {"nested": True}}
     credential = _serialized_execution(cypher)
-    credential["graph"]["nodes"][0]["properties"] = {"username": "should-not-cross"}
+    credential["graph"]["nodes"][0]["properties"] = {"api_token": "should-not-cross"}
 
     nested_result = plugin.explain_graph(cypher=cypher, execution_result=nested)
-    credential_result = plugin.explain_graph(cypher=cypher, execution_result=credential)
+    captured = {}
+
+    def provider_side_effect(*_args, **kwargs):
+      captured.update(json.loads(kwargs["json"]["messages"][1]["content"]))
+      return _provider_response_for_packet(_packet_from_provider_kwargs(kwargs))
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      side_effect=provider_side_effect,
+    ):
+      credential_result = plugin.explain_graph(cypher=cypher, execution_result=credential)
 
     self.assertIn(
       "invalid_serialized_property_value",
       {item["code"] for item in nested_result["validation_errors"]},
     )
-    self.assertIn(
-      "credential_field_not_allowed",
-      {item["code"] for item in credential_result["validation_errors"]},
-    )
+    self.assertEqual(credential_result["status"], "ok")
+    flattened = json.dumps(captured)
+    self.assertNotIn("should-not-cross", flattened)
+    self.assertIn('"type": "redacted"', flattened)
+    self.assertIn('"reason": "security_policy"', flattened)
+    self.assertIn("/evidence_catalog/nodes/", flattened)
 
   def test_explain_graph_evidence_mode_rejects_all_top_level_credential_aliases(self):
     plugin = _make_api()
@@ -1384,7 +1696,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_session.post.return_value = _provider_response_for_packet(packet)
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=fake_session):
-      result = plugin._call_explanation_model(packet)
+      result = _call_model(plugin, packet)
 
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(result["provider"], "local")
@@ -1397,7 +1709,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     plugin = _make_api(edgeguard_explanation_model_host=None, edgeguard_explanation_model_port=None)
     plugin.P = MagicMock()
 
-    result = plugin._call_explanation_model(_case_explanation_packet())
+    result = _call_model(plugin, _case_explanation_packet())
 
     self.assertEqual(result["status"], "error")
     self.assertEqual(result["diagnostics"]["stage"], "configuration")
@@ -1442,11 +1754,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     })
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=fake_session):
-      provider_error = plugin._call_explanation_model(packet)
+      provider_error = _call_model(plugin, packet)
       fake_session.post.side_effect = requests.exceptions.ConnectionError(provider_internal)
-      request_error = plugin._call_explanation_model(packet)
+      request_error = _call_model(plugin, packet)
       fake_session.post.side_effect = RuntimeError(provider_internal)
-      unexpected_error = plugin._call_explanation_model(packet)
+      unexpected_error = _call_model(plugin, packet)
 
     for result in (provider_error, request_error, unexpected_error):
       self.assertNotIn(provider_internal, json.dumps(result))
@@ -1472,7 +1784,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     })
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=fake_session):
-      result = plugin._call_explanation_model({"schema_version": "edgeguard.graph_evidence_packet.v1"})
+      result = _call_model(plugin, {"schema_version": "edgeguard.graph_evidence_packet.v1"})
 
     self.assertEqual(result["status"], "rejected")
     self.assertEqual(result["error"], "Graph explanation evidence exceeds the model context window.")
@@ -1497,7 +1809,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     })
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=fake_session):
-      result = plugin._call_explanation_model({"schema_version": "edgeguard.graph_evidence_packet.v1"})
+      result = _call_model(plugin, {"schema_version": "edgeguard.graph_evidence_packet.v1"})
 
     self.assertEqual(result["status"], "timeout")
     self.assertEqual(result["error"], "EdgeGuard explanation model request timed out")
@@ -1552,22 +1864,17 @@ class EdgeGuardApiTests(unittest.TestCase):
       "MATCH p=(n:Indicator)-[:SOURCED_FROM]-() RETURN p LIMIT 25",
     )
 
-  def test_explain_graph_marks_truncated_packet_and_requires_caveat(self):
+  def test_explain_graph_rejects_truncated_execution_without_model_call(self):
     plugin = _make_api()
     fake_driver, _fake_session = _driver_with_results(
       _Result([_graph_record() for _idx in range(25)], keys=["p"]),
     )
 
-    def provider_side_effect(*_args, **kwargs):
-      packet = _packet_from_provider_kwargs(kwargs)
-      return _provider_response_for_packet(packet, caveat_types=["truncation"])
-
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
         with patch(
           "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-          side_effect=provider_side_effect,
-        ):
+        ) as mocked_post:
           result = plugin.explain_graph(
             uri="example.com:7687",
             scheme="bolt+s",
@@ -1576,10 +1883,12 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
           )
 
-    self.assertEqual(result["status"], "ok")
-    self.assertTrue(result["packet"]["execution"]["truncated"])
-    self.assertTrue(result["packet"]["graph"]["truncated"])
-    self.assertEqual(result["packet"]["execution"]["row_count"], 25)
+    self.assertEqual(result["status"], "rejected")
+    self.assertIn(
+      "incomplete_execution_result",
+      {item["code"] for item in result["validation_errors"]},
+    )
+    mocked_post.assert_not_called()
 
   def test_canonical_validator_still_rejects_missing_required_caveat(self):
     plugin = _make_api()
@@ -1652,7 +1961,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
       return_value=_nested_provider_response(partial, finish_reason="length", completion_tokens=1024),
     ):
-      result = plugin._call_explanation_model(packet)
+      result = _call_model(plugin, packet)
 
     self.assertEqual(result["status"], "rejected")
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
@@ -1677,7 +1986,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
       return_value=_nested_provider_response("{", finish_reason="stop", completion_tokens=64),
     ) as mocked_post:
-      result = plugin._call_explanation_model(packet, max_tokens=64)
+      result = _call_model(plugin, packet, max_tokens=64)
 
     self.assertEqual(mocked_post.call_args.kwargs["json"]["max_tokens"], 64)
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
@@ -1693,7 +2002,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
       return_value=_nested_provider_response(partial, finish_reason="stop", completion_tokens=1024),
     ):
-      result = plugin._call_explanation_model(packet)
+      result = _call_model(plugin, packet)
 
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
     self.assertNotIn("cap-secret", json.dumps(result))
@@ -1713,7 +2022,7 @@ class EdgeGuardApiTests(unittest.TestCase):
         completion_tokens=700,
       ),
     ):
-      result = plugin._call_explanation_model(packet)
+      result = _call_model(plugin, packet)
 
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(result["explanation"]["schema_version"], "edgeguard.case_explanation.v1")
@@ -1741,7 +2050,7 @@ class EdgeGuardApiTests(unittest.TestCase):
         completion_tokens=589,
       ),
     ):
-      result = plugin._call_explanation_model(packet)
+      result = _call_model(plugin, packet)
 
     self.assertEqual(result["status"], "rejected")
     diagnostics = result["diagnostics"]
@@ -1813,7 +2122,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
           return_value=provider_response,
         ):
-          result = plugin._call_explanation_model(packet)
+          result = _call_model(plugin, packet)
         self.assertEqual(result["diagnostics"]["stage"], stage)
         self.assertEqual(result["diagnostics"]["reason"], reason)
         outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
@@ -1834,7 +2143,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
           side_effect=failure,
         ):
-          result = plugin._call_explanation_model(packet)
+          result = _call_model(plugin, packet)
         self.assertEqual(result["diagnostics"]["stage"], stage)
         self.assertEqual(result["diagnostics"]["reason"], reason)
         outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
@@ -1856,7 +2165,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
           return_value=provider_response,
         ):
-          result = plugin._call_explanation_model(packet)
+          result = _call_model(plugin, packet)
         self.assertEqual(result["status"], "rejected")
         self.assertEqual({item["code"] for item in result["validation_errors"]}, {"malformed_json"})
         self.assertNotIn("raw_output", result)
@@ -1876,7 +2185,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
       return_value=response,
     ):
-      result = plugin._call_explanation_model(packet)
+      result = _call_model(plugin, packet)
 
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"malformed_json"})
     self.assertNotIn("raw_output", result)
@@ -1908,7 +2217,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
       return_value=response,
     ):
-      result = plugin._call_explanation_model(packet)
+      result = _call_model(plugin, packet)
 
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
     self.assertNotIn("partial-secret", json.dumps(result))

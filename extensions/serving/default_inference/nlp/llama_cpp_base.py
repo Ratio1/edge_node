@@ -345,7 +345,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       }
       request_id = jeeves_content.get(LlmCT.REQUEST_ID, None)
       messages = jeeves_content.get(LlmCT.MESSAGES, [])
-      temperature = jeeves_content.get(LlmCT.TEMPERATURE) or self.cfg_default_temperature
+      temperature = jeeves_content.get(LlmCT.TEMPERATURE)
+      if temperature is None:
+        temperature = self.cfg_default_temperature
       top_p = jeeves_content.get(LlmCT.TOP_P) or self.cfg_default_top_p
       max_tokens = jeeves_content.get(LlmCT.MAX_TOKENS) or self.cfg_default_max_tokens
       repetition_penalty = jeeves_content.get("REPETITION_PENALTY", self.cfg_repetition_penalty)
