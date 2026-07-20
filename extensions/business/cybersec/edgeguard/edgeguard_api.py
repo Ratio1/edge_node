@@ -55,7 +55,7 @@ EXPLANATION_MAX_PROPERTY_KEY_CHARS = 120
 EXPLANATION_MAX_PROPERTY_BYTES = 131_072
 EXPLANATION_MAX_EXECUTION_RESULT_BYTES = 524_288
 EXPLANATION_MAX_PROMPT_USER_BYTES = 3_300
-EXPLANATION_MAX_OUTPUT_TOKENS = 512
+EXPLANATION_MAX_OUTPUT_TOKENS = 1024
 EXPLANATION_SUMMARY_MAX_WORDS = 80
 EXPLANATION_SUMMARY_MAX_EVIDENCE_IDS = 8
 EXPLANATION_MAX_OPTIONAL_OBJECTS = 4
@@ -2003,6 +2003,20 @@ class EdgeguardApiPlugin(BasePlugin):
           "provider": "local",
         }
       completion = self._extract_explanation_completion(data)
+      raw_finish_reason = completion["finish_reason"]
+      normalized_finish_reason = (
+        raw_finish_reason if raw_finish_reason in {"stop", "length"} else
+        "missing" if raw_finish_reason is None else
+        "other"
+      )
+      self.Pd(
+        "EDGEGUARD_EXPLANATION_COMPLETION " + json.dumps({
+          "completion_tokens": completion["completion_tokens"],
+          "finish_reason": normalized_finish_reason,
+          "max_tokens": payload["max_tokens"],
+          "request_sha256": _sha256_text(str(packet.get("request") or "")),
+        }, sort_keys=True, separators=(",", ":"))
+      )
       content = completion["content"]
       if content is None:
         return {

@@ -38,6 +38,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _build_case_exp
 from extensions.business.cybersec.edgeguard.edgeguard_api import _construct_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_contract_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _sha256_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation_draft_bounds  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_graph_evidence_packet  # noqa: E402
@@ -1051,7 +1052,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(call_payload["model"], "base_qwen3_4b")
     self.assertEqual(call_payload["temperature"], 0.0)
     self.assertEqual(call_payload["top_p"], 1.0)
-    self.assertEqual(call_payload["max_tokens"], 512)
+    self.assertEqual(call_payload["max_tokens"], 1024)
     self.assertEqual(call_payload["response_format"], {"type": "json_object"})
     self.assertNotIn("schema", call_payload["response_format"])
     self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation_draft.v2")
@@ -1062,15 +1063,15 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     default_payload = plugin._build_explanation_payload(packet)
     smaller_payload = plugin._build_explanation_payload(packet, max_tokens=64)
-    larger_payload = plugin._build_explanation_payload(packet, max_tokens=1024)
+    larger_payload = plugin._build_explanation_payload(packet, max_tokens=2048)
     non_positive_payload = plugin._build_explanation_payload(packet, max_tokens=0)
     negative_payload = plugin._build_explanation_payload(packet, max_tokens=-1)
 
-    self.assertEqual(default_payload["max_tokens"], 512)
+    self.assertEqual(default_payload["max_tokens"], 1024)
     self.assertEqual(smaller_payload["max_tokens"], 64)
-    self.assertEqual(larger_payload["max_tokens"], 512)
-    self.assertEqual(non_positive_payload["max_tokens"], 512)
-    self.assertEqual(negative_payload["max_tokens"], 512)
+    self.assertEqual(larger_payload["max_tokens"], 1024)
+    self.assertEqual(non_positive_payload["max_tokens"], 1024)
+    self.assertEqual(negative_payload["max_tokens"], 1024)
     for payload in (default_payload, smaller_payload, larger_payload, non_positive_payload, negative_payload):
       self.assertEqual(payload["response_format"], {"type": "json_object"})
 
@@ -1560,12 +1561,13 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_explanation_provider_length_finish_rejects_before_parsing_without_raw_output(self):
     plugin = _make_api()
+    plugin.Pd = MagicMock()
     packet = _case_explanation_packet()
     partial = '{"summary":{"text":"partial-secret"'
 
     with patch(
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-      return_value=_nested_provider_response(partial, finish_reason="length", completion_tokens=512),
+      return_value=_nested_provider_response(partial, finish_reason="length", completion_tokens=1024),
     ):
       result = plugin._call_explanation_model(packet)
 
@@ -1574,6 +1576,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["error"], "Graph explanation output was truncated at the safe token limit.")
     self.assertNotIn("partial-secret", json.dumps(result))
     self.assertNotIn("raw_output", result)
+    audit_log = " ".join(str(call) for call in plugin.Pd.call_args_list)
+    self.assertIn('"completion_tokens":1024', audit_log)
+    self.assertIn('"finish_reason":"length"', audit_log)
+    self.assertIn('"max_tokens":1024', audit_log)
+    self.assertIn(f'"request_sha256":"{_sha256_text(packet["request"])}"', audit_log)
+    self.assertNotIn("partial-secret", audit_log)
 
   def test_explanation_provider_usage_at_effective_cap_rejects_malformed_output_as_truncated(self):
     plugin = _make_api()
@@ -1589,8 +1597,25 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
     self.assertNotIn("raw_output", result)
 
-  def test_explanation_provider_normal_stop_accepts_valid_json_at_token_cap(self):
+  def test_explanation_provider_usage_at_1024_cap_rejects_malformed_output_without_disclosure(self):
     plugin = _make_api()
+    plugin.Pd = MagicMock()
+    packet = _case_explanation_packet()
+    partial = '{"summary":{"text":"cap-secret"'
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=_nested_provider_response(partial, finish_reason="stop", completion_tokens=1024),
+    ):
+      result = plugin._call_explanation_model(packet)
+
+    self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
+    self.assertNotIn("cap-secret", json.dumps(result))
+    self.assertNotIn("cap-secret", " ".join(str(call) for call in plugin.Pd.call_args_list))
+
+  def test_explanation_provider_normal_stop_accepts_valid_json_above_old_token_cap(self):
+    plugin = _make_api()
+    plugin.Pd = MagicMock()
     packet = _case_explanation_packet()
     draft = _draft_for_packet(packet)
 
@@ -1599,20 +1624,25 @@ class EdgeGuardApiTests(unittest.TestCase):
       return_value=_nested_provider_response(
         json.dumps(draft),
         finish_reason="stop",
-        completion_tokens=512,
+        completion_tokens=700,
       ),
     ):
       result = plugin._call_explanation_model(packet)
 
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(result["explanation"]["schema_version"], "edgeguard.case_explanation.v1")
+    audit_log = " ".join(str(call) for call in plugin.Pd.call_args_list)
+    self.assertIn('"completion_tokens":700', audit_log)
+    self.assertIn('"finish_reason":"stop"', audit_log)
+    self.assertIn('"max_tokens":1024', audit_log)
+    self.assertNotIn(packet["request"], audit_log)
 
   def test_explanation_provider_malformed_below_cap_stays_distinct(self):
     plugin = _make_api()
     packet = _case_explanation_packet()
 
     responses = {
-      "below_cap": _nested_provider_response("{", finish_reason="stop", completion_tokens=511),
+      "below_cap": _nested_provider_response("{", finish_reason="stop", completion_tokens=1023),
       "missing_metadata": _Response(payload={"result": {"TEXT_RESPONSE": "{"}}),
     }
     for label, provider_response in responses.items():
@@ -1634,7 +1664,7 @@ class EdgeGuardApiTests(unittest.TestCase):
         "message": {"content": "{"},
         "finish_reason": "length",
       }],
-      "usage": {"completion_tokens": 512},
+      "usage": {"completion_tokens": 1024},
     })
 
     with patch(
@@ -1657,7 +1687,7 @@ class EdgeGuardApiTests(unittest.TestCase):
             "message": {"content": partial},
             "finish_reason": "length",
           }],
-          "usage": {"completion_tokens": 512},
+          "usage": {"completion_tokens": 1024},
         },
         "result": {
           "choices": [{
