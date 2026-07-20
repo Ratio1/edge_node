@@ -2111,7 +2111,10 @@ class EdgeguardApiPlugin(BasePlugin):
         effective_max_tokens=effective_max_tokens,
       )
 
-    url, err = self._explanation_url()
+    try:
+      url, err = self._explanation_url()
+    except Exception:
+      url, err = None, "EdgeGuard explanation model is not configured"
     if err:
       return finish(
         {"status": STATUS_ERROR, "error": "EdgeGuard explanation model is not configured"},
@@ -2746,15 +2749,19 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": "Cypher rejected by EdgeGuard guard; graph explanation was not executed.",
       }
 
-    explanation_url, explanation_err = self._explanation_url()
+    try:
+      explanation_url, explanation_err = self._explanation_url()
+    except Exception:
+      explanation_url = None
+      explanation_err = "EdgeGuard explanation model is not configured"
     if explanation_err:
-      return {
-        "status": "config_error",
-        "ok": False,
-        "executed": False,
-        "explained": False,
-        "error": explanation_err,
-      }
+      explanation_result = self._call_explanation_model(
+        {"request": request},
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+      )
+      return self._explanation_failure_transport(explanation_result)
 
     requested_limit = explanation_rows if explanation_rows is not None else max_rows
     broadening_enabled = (

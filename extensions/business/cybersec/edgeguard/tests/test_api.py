@@ -1317,8 +1317,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     mocked_driver.assert_not_called()
     mocked_post.assert_not_called()
 
-  def test_explain_graph_requires_local_explanation_provider(self):
+  def test_explain_graph_reports_unconfigured_provider_as_safe_terminal_failure(self):
     plugin = _make_api(edgeguard_explanation_model_url="https://example.test/v1/chat/completions")
+    plugin.P = MagicMock()
 
     with patch.object(plugin, "_neo4j_driver") as mocked_driver:
       result = plugin.explain_graph(
@@ -1329,9 +1330,17 @@ class EdgeGuardApiTests(unittest.TestCase):
         cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
       )
 
-    self.assertEqual(result["status"], "config_error")
-    self.assertFalse(result["executed"])
-    self.assertIn("local-only", result["error"])
+    self.assertEqual(result["status_code"], 500)
+    self.assertTrue(result["logged"])
+    self.assertEqual(result["result"]["status"], "error")
+    self.assertEqual(result["result"]["diagnostics"]["stage"], "configuration")
+    self.assertEqual(result["result"]["diagnostics"]["reason"], "model_not_configured")
+    self.assertEqual(
+      " ".join(str(call) for call in plugin.P.call_args_list).count(
+        "EDGEGUARD_EXPLANATION_OUTCOME"
+      ),
+      1,
+    )
     mocked_driver.assert_not_called()
 
   def test_explanation_model_call_disables_environment_proxies(self):
@@ -1396,6 +1405,29 @@ class EdgeGuardApiTests(unittest.TestCase):
     outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
     self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
     self.assertNotIn("port or URL", outcome_log)
+
+  def test_malformed_explanation_model_configuration_emits_one_safe_outcome(self):
+    plugin = _make_api(
+      edgeguard_explanation_model_url=None,
+      edgeguard_explanation_model_host="127.0.0.1",
+      edgeguard_explanation_model_port="not-a-port",
+    )
+    plugin.P = MagicMock()
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      result = plugin.explain_graph(
+        cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
+        request="Explain graph.",
+      )
+
+    self.assertEqual(result["status_code"], 500)
+    self.assertEqual(result["result"]["status"], "error")
+    self.assertEqual(result["result"]["diagnostics"]["stage"], "configuration")
+    self.assertEqual(result["result"]["diagnostics"]["reason"], "model_not_configured")
+    outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
+    self.assertNotIn("not-a-port", outcome_log)
+    mocked_driver.assert_not_called()
 
   def test_explanation_model_failures_do_not_expose_provider_internals(self):
     plugin = _make_api()
