@@ -759,6 +759,9 @@ class LLMInferenceApiPlugin(BasePlugin):
       """Return benchmark telemetry without inspecting or logging model content."""
       if not isinstance(inference, dict):
         return None
+      direct = inference.get("EDGEGUARD_BENCHMARK_TELEMETRY")
+      if isinstance(direct, dict):
+        return direct
       full_output = inference.get(LlmCT.FULL_OUTPUT, None)
       if isinstance(full_output, list) and len(full_output) == 1:
         full_output = full_output[0]
@@ -902,6 +905,9 @@ class LLMInferenceApiPlugin(BasePlugin):
         'TEXT_RESPONSE': text_response,
         LlmCT.FULL_OUTPUT: full_output,
       }
+      benchmark_telemetry = self._get_benchmark_telemetry(inference)
+      if benchmark_telemetry is not None:
+        self._requests[request_id]['result']["EDGEGUARD_BENCHMARK_TELEMETRY"] = benchmark_telemetry
       self._annotate_result_with_node_roles(
         result_payload=self._requests[request_id]['result'],
         request_data=request_data,
@@ -965,6 +971,9 @@ class LLMInferenceApiPlugin(BasePlugin):
         'MODEL_NAME': model_name,
         'TEXT_RESPONSE': text_response,
       }
+      benchmark_telemetry = self._get_benchmark_telemetry(inference)
+      if benchmark_telemetry is not None:
+        response_payload["EDGEGUARD_BENCHMARK_TELEMETRY"] = benchmark_telemetry
       # Check if full_output is already an API-friendly dict.
       # TODO: enhance this check based on expected structure.
       if isinstance(full_output, dict):

@@ -534,6 +534,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     results = super(LlamaCppBaseServingProcess, self)._post_process(preds_batch)
     for result in results:
       full_output = result.get(LlmCT.FULL_OUTPUT) if isinstance(result, dict) else None
+      benchmark_telemetry = full_output.get(BENCHMARK_TELEMETRY_KEY) if isinstance(full_output, dict) else None
+      if isinstance(benchmark_telemetry, dict):
+        result[BENCHMARK_TELEMETRY_KEY] = benchmark_telemetry
       inference_error = full_output.get("error") if isinstance(full_output, dict) else None
       if not isinstance(inference_error, dict):
         continue

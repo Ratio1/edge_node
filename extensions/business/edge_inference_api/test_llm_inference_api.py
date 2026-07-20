@@ -215,6 +215,18 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
         self.assertTrue(plugin.filter_valid_inference(inference))
         self.assertEqual(inference["REQUEST_ID"], "req-benchmark")
 
+  def test_filter_valid_inference_accepts_top_level_benchmark_telemetry(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin._requests = {"req-direct": {"status": "pending"}}  # pylint: disable=protected-access
+    inference = {
+      "REQUEST_ID": "req-direct",
+      "text": "",
+      "FULL_OUTPUT": {},
+      "IS_VALID": False,
+      "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
+    }
+    self.assertTrue(plugin.filter_valid_inference(inference))
+
   def test_filter_valid_inference_fails_single_pending_on_invalid_empty_output(self):
     plugin = LLMInferenceApiPlugin()
     plugin._requests = {"req-9": {"status": "pending"}}  # pylint: disable=protected-access
