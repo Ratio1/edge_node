@@ -1870,11 +1870,6 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
 
     plugin = MagicMock()
     plugin.cfg_instance_id = "instance"
-    plugin.cfg_api_operations = {
-      "ENABLED": True,
-      "TOKEN_HASHES": [hashlib.sha256(b"backend-token").hexdigest()],
-      "HMAC_SECRET": "unit-test-hmac-secret",
-    }
     job_specs = {
       "job_id": "job-raw",
       "job_type": "model_test",
