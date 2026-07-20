@@ -328,6 +328,23 @@ class LLMInferenceApiPlugin(BasePlugin):
 
   """API ENDPOINTS"""
   if True:
+    def _is_serving_ready(self):
+      shared = getattr(self, "global_shmem", None)
+      manager = shared.get("serving_manager") if isinstance(shared, dict) else None
+      if manager is None:
+        return False
+      try:
+        serving_processes = self.get_serving_processes()
+        return bool(serving_processes) and all(manager.is_avail(server) for server in serving_processes)
+      except (AttributeError, KeyError, TypeError):
+        return False
+
+    @BasePlugin.endpoint(method="GET")
+    def health(self):
+      result = super(LLMInferenceApiPlugin, self).health()
+      result["serving_ready"] = self._is_serving_ready()
+      return result
+
     # Override only to attach balanced endpoint metadata to the inherited handler.
     @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")

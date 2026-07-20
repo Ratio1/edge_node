@@ -29,6 +29,9 @@ class _FakeBasePlugin:
   def P(self, *args, **kwargs):  # pylint: disable=unused-argument
     return None
 
+  def health(self):
+    return {"status": "ok"}
+
   @staticmethod
   def shorten_str(value):
     return str(value)
@@ -71,6 +74,14 @@ LLMInferenceApiPlugin = _load_plugin_class()
 
 
 class LLMInferenceApiPluginTests(unittest.TestCase):
+  def test_health_reports_actual_serving_manager_readiness(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin.get_serving_processes = lambda: ["expected-server"]
+    plugin.global_shmem = {"serving_manager": type("Manager", (), {"is_avail": lambda _self, name: name == "expected-server"})()}
+    self.assertIs(plugin.health()["serving_ready"], True)
+    plugin.global_shmem = {}
+    self.assertIs(plugin.health()["serving_ready"], False)
+
   def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):
     for method_name in ("predict", "predict_async", "create_chat_completion", "create_chat_completion_async"):
       parameter = inspect.signature(getattr(LLMInferenceApiPlugin, method_name)).parameters["benchmark_mode"]
