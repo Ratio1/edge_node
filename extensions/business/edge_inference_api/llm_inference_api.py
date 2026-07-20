@@ -747,6 +747,18 @@ class LLMInferenceApiPlugin(BasePlugin):
       text = first.get("text")
       return isinstance(text, str) and len(text.strip()) > 0
 
+    def _get_benchmark_telemetry(self, inference):
+      """Return benchmark telemetry without inspecting or logging model content."""
+      if not isinstance(inference, dict):
+        return None
+      full_output = inference.get(LlmCT.FULL_OUTPUT, None)
+      if isinstance(full_output, list) and len(full_output) == 1:
+        full_output = full_output[0]
+      if not isinstance(full_output, dict):
+        return None
+      telemetry = full_output.get("EDGEGUARD_BENCHMARK_TELEMETRY")
+      return telemetry if isinstance(telemetry, dict) else None
+
     def _fail_invalid_empty_inference(self, inference):
       request_id = self._extract_request_id_from_inference(inference)
       if request_id is None:
@@ -764,6 +776,17 @@ class LLMInferenceApiPlugin(BasePlugin):
     def filter_valid_inference(self, inference):
       if not isinstance(inference, dict):
         return False
+      benchmark_telemetry = self._get_benchmark_telemetry(inference)
+      if benchmark_telemetry is not None:
+        request_id = self._extract_request_id_from_inference(inference)
+        if request_id not in self._requests:
+          request_id = self._get_single_pending_request_id()
+        if request_id is None:
+          self.P("Rejected benchmark terminal inference without an unambiguous request id.")
+          return False
+        inference[LlmCT.REQUEST_ID] = request_id
+        self.P("Accepted benchmark terminal inference with content-free telemetry.")
+        return True
       if inference.get("ERROR_CODE") == "context_window_exceeded":
         self.P("Rejected LLM inference because the model context window was exceeded.")
         self._fail_invalid_empty_inference(inference)

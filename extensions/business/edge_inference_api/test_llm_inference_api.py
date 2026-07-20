@@ -172,6 +172,32 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertTrue(plugin.filter_valid_inference(inference))
     self.assertEqual(inference["REQUEST_ID"], "req-8")
 
+  def test_filter_valid_inference_accepts_benchmark_terminal_outcomes_without_text(self):
+    for full_output in (
+      {
+        "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
+      },
+      {
+        "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
+      },
+      {
+        "error": {"code": "provider_error"},
+        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
+      },
+      {
+        "error": {"code": "context_window_exceeded"},
+        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
+      },
+    ):
+      with self.subTest(error=full_output.get("error")):
+        plugin = LLMInferenceApiPlugin()
+        plugin._requests = {"req-benchmark": {"status": "pending"}}  # pylint: disable=protected-access
+        inference = {"text": "", "FULL_OUTPUT": full_output, "IS_VALID": False}
+        self.assertTrue(plugin.filter_valid_inference(inference))
+        self.assertEqual(inference["REQUEST_ID"], "req-benchmark")
+
   def test_filter_valid_inference_fails_single_pending_on_invalid_empty_output(self):
     plugin = LLMInferenceApiPlugin()
     plugin._requests = {"req-9": {"status": "pending"}}  # pylint: disable=protected-access
