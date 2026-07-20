@@ -126,6 +126,7 @@ def _load_llama_cpp_base_class():
       VALID_CONDITION="VALID_CONDITION",
       PROCESS_METHOD="PROCESS_METHOD",
       RESPONSE_FORMAT="RESPONSE_FORMAT",
+      BENCHMARK_MODE="BENCHMARK_MODE",
       PRMP="prompt",
       TEXT="text",
       ADDITIONAL="ADDITIONAL",
@@ -328,6 +329,128 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertFalse(processed[0]["IS_VALID"])
     self.assertEqual(processed[0]["ERROR_CODE"], "context_window_exceeded")
     self.assertEqual(processed[0]["ERROR"], "Model context window exceeded.")
+
+  def test_llama_cpp_benchmark_mode_resets_once_calls_once_and_omits_retry_hints(self):
+    process = _make_llama_cpp_process()
+    process.cfg_default_temperature = 0.7
+    process.cfg_default_top_p = 0.9
+    process.cfg_default_max_tokens = 128
+    process.cfg_repetition_penalty = 1.0
+    process.check_relevant_input = lambda _input: True
+    process.maybe_add_context_to_messages = lambda messages, context: messages
+    process.get_default_response_format = lambda: None
+    process.process_predict_kwargs = lambda kwargs: kwargs
+    process._tps = []
+    process.time = lambda: 1.0
+    process.maybe_process_text = lambda text, _method: text
+    process.check_condition = lambda _text, _condition: False
+    reset_calls = []
+    completion_calls = []
+    process.model = types.SimpleNamespace(
+      reset=lambda: reset_calls.append(True),
+      create_chat_completion=lambda **kwargs: (
+        completion_calls.append(kwargs) or {
+          "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+          "usage": {"completion_tokens": 0},
+        }
+      ),
+    )
+
+    preprocessed = process._pre_process({
+      "DATA": [{"JEEVES_CONTENT": {
+        "MESSAGES": [{"role": "user", "content": "fixture"}],
+        "BENCHMARK_MODE": True,
+        "VALID_CONDITION": "must-not-run",
+        "PROCESS_METHOD": "must-not-run",
+      }}],
+    })
+    result = process._predict(preprocessed)
+
+    self.assertEqual(preprocessed[3], [None])
+    self.assertEqual(preprocessed[4], [None])
+    self.assertEqual(len(reset_calls), 1)
+    self.assertEqual(len(completion_calls), 1)
+    self.assertEqual(
+      result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"],
+      {"reset_succeeded": True, "attempt_count": 1},
+    )
+
+  def test_llama_cpp_benchmark_mode_missing_reset_makes_zero_completion_calls(self):
+    process = _make_llama_cpp_process()
+    process._tps = []
+    process.time = lambda: 1.0
+    process.maybe_process_text = lambda text, _method: text
+    process.check_condition = lambda _text, _condition: True
+    completion_calls = []
+    process.model = types.SimpleNamespace(
+      create_chat_completion=lambda **_kwargs: completion_calls.append(True),
+    )
+    result = process._predict([
+      [{"max_tokens": 128}],
+      [[{"role": "user", "content": "fixture"}]],
+      [{"REQUEST_ID": "req", "BENCHMARK_MODE": True}],
+      [None],
+      [None],
+      [0],
+      1,
+    ])
+
+    self.assertEqual(completion_calls, [])
+    self.assertEqual(result["FULL_OUTPUT"][0]["error"]["code"], "benchmark_reset_unavailable")
+    self.assertEqual(
+      result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"],
+      {"reset_succeeded": False, "attempt_count": 0},
+    )
+
+  def test_llama_cpp_benchmark_mode_terminal_outcomes_each_call_once(self):
+    outcomes = {
+      "success": lambda: {
+        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"completion_tokens": 1},
+      },
+      "empty": lambda: {
+        "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+        "usage": {"completion_tokens": 0},
+      },
+      "provider_error": lambda: {"error": {"code": "provider_error"}},
+      "context_error": lambda: (_ for _ in ()).throw(
+        ValueError("Requested tokens (3301) exceed context window of 4096")
+      ),
+    }
+    for label, outcome in outcomes.items():
+      with self.subTest(label=label):
+        process = _make_llama_cpp_process()
+        process._tps = []
+        process.time = lambda: 1.0
+        process.maybe_process_text = lambda text, _method: text
+        process.check_condition = lambda _text, _condition: False
+        reset_calls = []
+        completion_calls = []
+
+        def complete(**_kwargs):
+          completion_calls.append(True)
+          return outcome()
+
+        process.model = types.SimpleNamespace(
+          reset=lambda: reset_calls.append(True),
+          create_chat_completion=complete,
+        )
+        result = process._predict([
+          [{"max_tokens": 128}],
+          [[{"role": "user", "content": "fixture"}]],
+          [{"REQUEST_ID": "req", "BENCHMARK_MODE": True}],
+          [None],
+          [None],
+          [0],
+          1,
+        ])
+
+        self.assertEqual(len(reset_calls), 1)
+        self.assertEqual(len(completion_calls), 1)
+        self.assertEqual(
+          result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"],
+          {"reset_succeeded": True, "attempt_count": 1},
+        )
 
   def test_llama_cpp_generation_logs_only_content_free_diagnostics(self):
     process = _make_llama_cpp_process()

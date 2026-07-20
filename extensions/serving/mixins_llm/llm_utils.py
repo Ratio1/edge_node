@@ -40,6 +40,7 @@ class LlmCT:
   VALID_MASK = 'VALID_MASK'
   FULL_OUTPUT = 'FULL_OUTPUT'
   RESPONSE_FORMAT = 'RESPONSE_FORMAT'
+  BENCHMARK_MODE = 'BENCHMARK_MODE'
 
   # Constants for encoding a prompt using chat templates
   REQUEST_ROLE = 'user'
@@ -357,5 +358,4 @@ if True:
     def __repr__(self):
       return f"{self.__class__.__name__}(target_len={self.target_len.tolist()}, eos_id={self.eos_id})"
 """END LOGITS PROCESSOR SECTION"""
-
 

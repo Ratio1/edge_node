@@ -18,6 +18,9 @@ MODEL_N_CTX_DEFAULT_VALUE = 4096
 MODEL_N_BATCH_DEFAULT_VALUE = 512
 CONTEXT_WINDOW_ERROR_CODE = "context_window_exceeded"
 CONTEXT_WINDOW_ERROR_MESSAGE = "Model context window exceeded."
+BENCHMARK_TELEMETRY_KEY = "EDGEGUARD_BENCHMARK_TELEMETRY"
+BENCHMARK_RESET_UNAVAILABLE_CODE = "benchmark_reset_unavailable"
+BENCHMARK_RESET_FAILED_CODE = "benchmark_reset_failed"
 CONTEXT_WINDOW_ERROR_RE = re.compile(
   r"Requested tokens \((\d+)\) exceed context window of (\d+)",
 )
@@ -352,8 +355,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       max_tokens = jeeves_content.get(LlmCT.MAX_TOKENS) or self.cfg_default_max_tokens
       repetition_penalty = jeeves_content.get("REPETITION_PENALTY", self.cfg_repetition_penalty)
       request_context = jeeves_content.get(LlmCT.CONTEXT, None)
-      valid_condition = jeeves_content.get(LlmCT.VALID_CONDITION, None)
-      process_method = jeeves_content.get(LlmCT.PROCESS_METHOD, None)
+      benchmark_mode = jeeves_content.get(LlmCT.BENCHMARK_MODE, False) is True
+      valid_condition = None if benchmark_mode else jeeves_content.get(LlmCT.VALID_CONDITION, None)
+      process_method = None if benchmark_mode else jeeves_content.get(LlmCT.PROCESS_METHOD, None)
       response_format = jeeves_content.get(LlmCT.RESPONSE_FORMAT, self.get_default_response_format())
       predict_kwargs = {
         'temperature': temperature,
@@ -375,6 +379,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       predict_kwargs_lst.append(predict_kwargs)
       additional_lst.append({
         LlmCT.REQUEST_ID: request_id,
+        LlmCT.BENCHMARK_MODE: benchmark_mode,
       })
       valid_conditions.append(valid_condition)
       process_methods.append(process_method)
@@ -422,23 +427,41 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       for idx_orig, idx_curr in obj_for_inference:
         messages = messages_lst[idx_orig]
         predict_kwargs = predict_kwargs_lst[idx_orig]
+        benchmark_mode = additional_lst[idx_orig].get(LlmCT.BENCHMARK_MODE, False) is True
         t1 = self.time()
-        try:
-          out = self.model.create_chat_completion(
-            messages=messages,
-            **predict_kwargs
-          )
-        except ValueError as exc:
-          context_match = CONTEXT_WINDOW_ERROR_RE.search(str(exc))
-          if context_match is None:
-            raise
-          out = {
-            "error": {
-              "code": CONTEXT_WINDOW_ERROR_CODE,
-              "message": CONTEXT_WINDOW_ERROR_MESSAGE,
-              "requested_tokens": int(context_match.group(1)),
-              "context_window": int(context_match.group(2)),
-            },
+        reset_succeeded = False
+        reset = getattr(self.model, "reset", None)
+        if benchmark_mode and not callable(reset):
+          out = {"error": {"code": BENCHMARK_RESET_UNAVAILABLE_CODE}}
+        else:
+          if benchmark_mode:
+            try:
+              reset()
+              reset_succeeded = True
+            except Exception:
+              out = {"error": {"code": BENCHMARK_RESET_FAILED_CODE}}
+          if not benchmark_mode or reset_succeeded:
+            try:
+              out = self.model.create_chat_completion(
+                messages=messages,
+                **predict_kwargs
+              )
+            except ValueError as exc:
+              context_match = CONTEXT_WINDOW_ERROR_RE.search(str(exc))
+              if context_match is None:
+                raise
+              out = {
+                "error": {
+                  "code": CONTEXT_WINDOW_ERROR_CODE,
+                  "message": CONTEXT_WINDOW_ERROR_MESSAGE,
+                  "requested_tokens": int(context_match.group(1)),
+                  "context_window": int(context_match.group(2)),
+                },
+              }
+        if benchmark_mode and isinstance(out, dict):
+          out[BENCHMARK_TELEMETRY_KEY] = {
+            "reset_succeeded": reset_succeeded,
+            "attempt_count": 1 if reset_succeeded else 0,
           }
         elapsed = self.time() - t1
         timings.append(elapsed)
@@ -477,7 +500,8 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
                 or self.check_condition(current_text, valid_condition)
             )
         )
-        current_condition_satisfied = valid_text or (tries >= max_tries)
+        benchmark_mode = additional_lst[idx_orig].get(LlmCT.BENCHMARK_MODE, False) is True
+        current_condition_satisfied = valid_text or benchmark_mode or (tries >= max_tries)
         if current_condition_satisfied:
           # If the condition is satisfied, we can save the result
           results[idx_orig] = (idx_orig, valid_condition, process_method, current_text, full_output)
