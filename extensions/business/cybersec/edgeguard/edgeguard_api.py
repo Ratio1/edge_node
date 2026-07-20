@@ -9,12 +9,12 @@ server route, which calls model-specific LLM_INFERENCE_API workers directly.
 from __future__ import annotations
 
 import hashlib
+import calendar
 import json
 import math
 import re
 import secrets
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as datetime_time
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -90,8 +90,19 @@ EXPLANATION_TRUNCATED_MESSAGE = "Graph explanation output was truncated at the s
 EXPLANATION_DIAGNOSTIC_SCHEMA_VERSION = "edgeguard.graph_explanation_diagnostic.v1"
 EXPLANATION_DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 CANONICAL_INTEGER_RE = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
+DRIVER_YEAR_PATTERN = r"(?:[0-9]{4}|[+-][0-9]{6,9})"
+DRIVER_DATE_PATTERN = rf"{DRIVER_YEAR_PATTERN}-[0-9]{{2}}-[0-9]{{2}}"
+DRIVER_TIME_PATTERN = r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{9})?"
+DRIVER_OFFSET_PATTERN = r"(?:Z|[+-][0-9]{2}:[0-9]{2}(?::[0-9]{2})?)"
 DURATION_RE = re.compile(
-  r"^-?P(?=.*[0-9])(?:[0-9]+(?:\.[0-9]+)?[YMWD])*(?:T(?:[0-9]+(?:\.[0-9]+)?[HMS])*)?$"
+  r"^P"
+  r"(?:(-?[1-9][0-9]*)Y)?"
+  r"(?:(-?(?:[1-9]|1[01]))M)?"
+  r"(?:(-?[1-9][0-9]*)D)?"
+  r"T"
+  r"(?:(-?[1-9][0-9]*)H)?"
+  r"(?:(-?(?:[1-9]|[1-5][0-9]))M)?"
+  r"(?:(-?(?:0\.[0-9]{9}|(?:[1-9]|[1-5][0-9])(?:\.[0-9]{9})?))S)?$"
 )
 EXPLANATION_DIAGNOSTIC_STAGE_REASONS = {
   "configuration": {"model_not_configured"},
@@ -1270,23 +1281,71 @@ def _redacted_value(path: str) -> Dict[str, str]:
 
 
 def _valid_temporal_value(temporal_type: str, value: str) -> bool:
-  try:
-    if temporal_type == "date":
-      date.fromisoformat(value)
-      return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value))
-    if temporal_type in {"date_time", "local_date_time"}:
-      base = re.sub(r"\[[^\]]+\]$", "", value)
-      parsed = datetime.fromisoformat(base.replace("Z", "+00:00"))
-      if temporal_type == "date_time":
-        return parsed.tzinfo is not None or bool(re.search(r"\[[^\]]+\]$", value))
-      return parsed.tzinfo is None
-    if temporal_type in {"time", "local_time"}:
-      parsed = datetime_time.fromisoformat(value.replace("Z", "+00:00"))
-      return (parsed.tzinfo is not None) if temporal_type == "time" else (parsed.tzinfo is None)
-    if temporal_type == "duration":
-      return bool(DURATION_RE.fullmatch(value))
-  except ValueError:
-    return False
+  date_match = re.fullmatch(
+    rf"({DRIVER_YEAR_PATTERN})-([0-9]{{2}})-([0-9]{{2}})",
+    value[:value.find("T")] if "T" in value else value,
+  )
+  if date_match:
+    year = int(date_match.group(1))
+    month = int(date_match.group(2))
+    day = int(date_match.group(3))
+    if not -999_999_999 <= year <= 999_999_999 or not 1 <= month <= 12:
+      return False
+    try:
+      max_day = calendar.monthrange(year, month)[1]
+    except (ValueError, OverflowError):
+      return False
+    if not 1 <= day <= max_day:
+      return False
+
+  def valid_time(time_value: str) -> bool:
+    match = re.fullmatch(
+      r"([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{9}))?",
+      time_value,
+    )
+    return bool(
+      match
+      and int(match.group(1)) <= 23
+      and int(match.group(2)) <= 59
+      and int(match.group(3)) <= 59
+    )
+
+  if temporal_type == "date":
+    return bool(date_match and date_match.group(0) == value)
+  if temporal_type == "local_date_time":
+    match = re.fullmatch(rf"({DRIVER_DATE_PATTERN})T({DRIVER_TIME_PATTERN})", value)
+    return bool(match and date_match and valid_time(match.group(2)))
+  if temporal_type == "date_time":
+    match = re.fullmatch(
+      rf"({DRIVER_DATE_PATTERN})T({DRIVER_TIME_PATTERN})"
+      rf"({DRIVER_OFFSET_PATTERN}|\[[^\[\]]+\])",
+      value,
+    )
+    if not match or not date_match or not valid_time(match.group(2)):
+      return False
+    zone = match.group(3)
+    if zone.startswith(("+", "-")):
+      offset = [int(part) for part in zone[1:].split(":")]
+      return offset[0] <= 23 and offset[1] <= 59 and (len(offset) == 2 or offset[2] <= 59)
+    return True
+  if temporal_type == "local_time":
+    return valid_time(value)
+  if temporal_type == "time":
+    match = re.fullmatch(rf"({DRIVER_TIME_PATTERN})({DRIVER_OFFSET_PATTERN})", value)
+    if not match or not valid_time(match.group(1)):
+      return False
+    zone = match.group(2)
+    if zone.startswith(("+", "-")):
+      offset = [int(part) for part in zone[1:].split(":")]
+      return offset[0] <= 23 and offset[1] <= 59 and (len(offset) == 2 or offset[2] <= 59)
+    return True
+  if temporal_type == "duration":
+    if value == "PT0S":
+      return True
+    match = DURATION_RE.fullmatch(value)
+    if not match:
+      return False
+    return any(component is not None for component in match.groups())
   return False
 
 
@@ -3269,7 +3328,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "columns": columns,
       "rows": rows,
       "row_count": len(rows),
-      "truncated": bool(truncated or len(rows) >= row_limit),
+      "truncated": truncated,
     }
 
   def _empty_result_broadening_state(

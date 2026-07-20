@@ -28,6 +28,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import (  # noqa: E402
   GRAPH_EXPLANATION_PROMPT_VERSION,
   QUERY_RESULT_EVIDENCE_SCHEMA_VERSION,
   EdgeguardApiPlugin,
+  _ResultEvidenceError,
   _build_graph_evidence_packet_from_execution,
   _construct_case_explanation,
   _explanation_validation_codes,
@@ -247,6 +248,20 @@ def _build_fixtures() -> dict[str, dict[str, Any]]:
   )
   if selected["user_bytes"] != EXPLANATION_MAX_PROMPT_USER_BYTES:
     raise RuntimeError("mixed fixture could not be tuned to exactly 3,300 UTF-8 bytes")
+  try:
+    _ingest_fixture(
+      name="mixed_over_limit",
+      question="Summarize the mixed returned evidence and its provenance.",
+      cypher=mixed_cypher,
+      execution_result=_mixed_execution(mixed_cypher, "x" * (filler_bytes + 1)),
+    )
+  except _ResultEvidenceError as exc:
+    if exc.code != "complete_result_prompt_bytes":
+      raise RuntimeError(f"3,301-byte fixture failed with unexpected code {exc.code}") from exc
+  else:
+    raise RuntimeError("3,301-byte fixture was not rejected")
+  selected["over_limit_bytes"] = EXPLANATION_MAX_PROMPT_USER_BYTES + 1
+  selected["over_limit_rejection_code"] = "complete_result_prompt_bytes"
   return {"five_pairs": pair, "mixed_near_limit": selected}
 
 
@@ -343,6 +358,10 @@ def main() -> int:
         "fixture_sha256": fixture["fixture_sha256"],
         "user_prompt_sha256": fixture["user_prompt_sha256"],
         "user_bytes": fixture["user_bytes"],
+        **({
+          "over_limit_bytes": fixture["over_limit_bytes"],
+          "over_limit_rejection_code": fixture["over_limit_rejection_code"],
+        } if "over_limit_bytes" in fixture else {}),
       }
       for name, fixture in fixtures.items()
     },

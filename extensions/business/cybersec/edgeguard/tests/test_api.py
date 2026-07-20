@@ -1209,6 +1209,23 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertFalse(result["executed"])
     self.assertNotIn("secret", result["error"])
 
+  def test_legacy_query_marks_truncation_only_after_observing_an_extra_row(self):
+    plugin = _make_api()
+    exact_driver, _exact_session = _driver_with_results(
+      _Result([_graph_record() for _index in range(25)], keys=["i", "s"]),
+    )
+    overflow_driver, _overflow_session = _driver_with_results(
+      _Result([_graph_record() for _index in range(26)], keys=["i", "s"]),
+    )
+
+    exact = plugin._run_neo4j_query(exact_driver, "RETURN i, s LIMIT 25", 25)
+    overflow = plugin._run_neo4j_query(overflow_driver, "RETURN i, s LIMIT 25", 25)
+
+    self.assertEqual(exact["row_count"], 25)
+    self.assertFalse(exact["truncated"])
+    self.assertEqual(overflow["row_count"], 25)
+    self.assertTrue(overflow["truncated"])
+
   def test_explain_graph_executes_with_explanation_limit_and_validates_output(self):
     plugin = _make_api(
       edgeguard_explanation_model_port=5091,
@@ -1759,11 +1776,11 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     valid_temporals = {
       "date": "2026-07-20",
-      "date_time": "2026-07-20T12:30:00Z",
-      "duration": "P1DT2H",
-      "local_date_time": "2026-07-20T12:30:00",
-      "local_time": "12:30:00",
-      "time": "12:30:00+00:00",
+      "date_time": "2026-07-20T12:30:00.123456789Z",
+      "duration": "P-1Y-2M-3DT-1H-1M-1.123456789S",
+      "local_date_time": "2026-07-20T12:30:00.123456789",
+      "local_time": "12:30:00.123456789",
+      "time": "12:30:00.123456789+00:00",
     }
     self.assertTrue(all(
       _valid_temporal_value(temporal_type, value)
@@ -1771,6 +1788,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     ))
     self.assertFalse(_valid_temporal_value("date_time", "2026-07-20T12:30:00"))
     self.assertFalse(_valid_temporal_value("local_time", "12:30:00Z"))
+    self.assertFalse(_valid_temporal_value("duration", "P1Y2Y"))
+    self.assertFalse(_valid_temporal_value("date_time", "2026-07-20 12:30:00Z"))
+    self.assertFalse(_valid_temporal_value("date_time", "20260720T123000Z"))
+    self.assertTrue(_valid_temporal_value("duration", "P1DT"))
 
   def test_nested_map_and_row_invariants_fail_closed(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
@@ -2080,7 +2101,7 @@ class EdgeGuardApiTests(unittest.TestCase):
   def test_explain_graph_rejects_truncated_execution_without_model_call(self):
     plugin = _make_api()
     fake_driver, _fake_session = _driver_with_results(
-      _Result([_graph_record() for _idx in range(25)], keys=["p"]),
+      _Result([_graph_record() for _idx in range(26)], keys=["i", "s"]),
     )
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
