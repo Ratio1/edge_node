@@ -1792,6 +1792,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertFalse(_valid_temporal_value("date_time", "2026-07-20 12:30:00Z"))
     self.assertFalse(_valid_temporal_value("date_time", "20260720T123000Z"))
     self.assertTrue(_valid_temporal_value("duration", "P1DT"))
+    self.assertTrue(_valid_temporal_value(
+      "date_time",
+      "2026-07-20T12:30:00+02:00[Europe/Paris]",
+    ))
 
   def test_nested_map_and_row_invariants_fail_closed(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)

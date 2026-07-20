@@ -1318,14 +1318,15 @@ def _valid_temporal_value(temporal_type: str, value: str) -> bool:
   if temporal_type == "date_time":
     match = re.fullmatch(
       rf"({DRIVER_DATE_PATTERN})T({DRIVER_TIME_PATTERN})"
-      rf"({DRIVER_OFFSET_PATTERN}|\[[^\[\]]+\])",
+      rf"({DRIVER_OFFSET_PATTERN}(?:\[[^\[\]]+\])?|\[[^\[\]]+\])",
       value,
     )
     if not match or not date_match or not valid_time(match.group(2)):
       return False
     zone = match.group(3)
     if zone.startswith(("+", "-")):
-      offset = [int(part) for part in zone[1:].split(":")]
+      numeric_offset = zone.split("[", 1)[0]
+      offset = [int(part) for part in numeric_offset[1:].split(":")]
       return offset[0] <= 23 and offset[1] <= 59 and (len(offset) == 2 or offset[2] <= 59)
     return True
   if temporal_type == "local_time":
