@@ -72,14 +72,6 @@ LLMInferenceApiPlugin = _load_plugin_class()
 class LLMInferenceApiPluginTests(unittest.TestCase):
   def test_payload_uses_llm_serving_uppercase_contract(self):
     plugin = LLMInferenceApiPlugin()
-    schema = {
-      "type": "object",
-      "properties": {
-        "summary": {"type": "string"},
-      },
-      "required": ["summary"],
-      "additionalProperties": False,
-    }
 
     payload = plugin.compute_payload_kwargs_from_predict_params(
       request_id="req-1",
@@ -90,7 +82,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
           "max_tokens": 64,
           "top_p": 0.9,
           "repeat_penalty": 1.1,
-          "response_format": {"type": "json_object", "schema": schema},
+          "response_format": {"type": "json_object"},
           "seed": 123,
           "frequency_penalty": 0.2,
         }
@@ -102,10 +94,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(payload["JEEVES_CONTENT"]["REQUEST_TYPE"], "LLM")
     self.assertEqual(payload["JEEVES_CONTENT"]["MESSAGES"][0]["content"], "hello")
     self.assertEqual(payload["JEEVES_CONTENT"]["MAX_TOKENS"], 64)
-    self.assertEqual(payload["JEEVES_CONTENT"]["RESPONSE_FORMAT"], {
-      "type": "json_object",
-      "schema": schema,
-    })
+    self.assertEqual(payload["JEEVES_CONTENT"]["RESPONSE_FORMAT"], {"type": "json_object"})
     self.assertEqual(payload["JEEVES_CONTENT"]["REPETITION_PENALTY"], 1.1)
     self.assertEqual(payload["JEEVES_CONTENT"]["SEED"], 123)
     self.assertEqual(payload["JEEVES_CONTENT"]["FREQUENCY_PENALTY"], 0.2)

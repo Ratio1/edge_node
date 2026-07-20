@@ -44,7 +44,7 @@ GRAPH_PACKET_SCHEMA_VERSION = "edgeguard.graph_evidence_packet.v1"
 CASE_EXPLANATION_SCHEMA_VERSION = "edgeguard.case_explanation.v1"
 CASE_EXPLANATION_DRAFT_SCHEMA_VERSION = "edgeguard.case_explanation_draft.v2"
 GRAPH_PACKET_REDACTION_POLICY = "edgeguard_graph_packet_private_v1"
-GRAPH_EXPLANATION_PROMPT_VERSION = "edgeguard-graph-explanation-v0.6"
+GRAPH_EXPLANATION_PROMPT_VERSION = "edgeguard-graph-explanation-v0.5"
 EXPLANATION_DEFAULT_ROWS = 25
 EXPLANATION_SERVER_MAX_ROWS = 100
 EXPLANATION_MAX_GRAPH_NODES = 160
@@ -166,138 +166,6 @@ CAVEAT_TYPES = {
 }
 PRIORITY_VALUES = {"low", "medium", "high"}
 
-CASE_EXPLANATION_DRAFT_SCHEMA = {
-  "type": "object",
-  "properties": {
-    "summary": {
-      "type": "object",
-      "properties": {
-        "text": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "evidence_ids": {
-          "type": "array",
-          "items": {"type": "string", "pattern": r"^[nr]:[A-Za-z0-9_.:-]+$"},
-          "minItems": 1,
-          "maxItems": EXPLANATION_SUMMARY_MAX_EVIDENCE_IDS,
-        },
-      },
-      "required": ["text", "evidence_ids"],
-      "additionalProperties": False,
-    },
-    "key_paths": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "title": {"type": "string", "minLength": 1, "maxLength": 2000},
-          "path_evidence_ids": {
-            "type": "array",
-            "items": {"type": "string", "pattern": r"^[nr]:[A-Za-z0-9_.:-]+$"},
-            "minItems": 1,
-            "maxItems": EXPLANATION_OPTIONAL_MAX_EVIDENCE_IDS,
-          },
-          "interpretation": {"type": "string", "minLength": 1, "maxLength": 2000},
-          "confidence": {"type": "string", "enum": sorted(CONFIDENCE_VALUES)},
-        },
-        "required": ["title", "path_evidence_ids", "interpretation", "confidence"],
-        "additionalProperties": False,
-      },
-      "maxItems": EXPLANATION_OPTIONAL_SECTION_MAX_ITEMS["key_paths"],
-    },
-    "entity_findings": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "entity_id": {"type": "string", "pattern": r"^n:[A-Za-z0-9_.:-]+$"},
-          "role": {"type": "string", "pattern": r"^[a-z][a-z0-9_:-]{0,79}$"},
-          "finding": {"type": "string", "minLength": 1, "maxLength": 2000},
-          "evidence_ids": {
-            "type": "array",
-            "items": {"type": "string", "pattern": r"^[nr]:[A-Za-z0-9_.:-]+$"},
-            "minItems": 1,
-            "maxItems": EXPLANATION_OPTIONAL_MAX_EVIDENCE_IDS,
-          },
-        },
-        "required": ["entity_id", "role", "finding", "evidence_ids"],
-        "additionalProperties": False,
-      },
-      "maxItems": EXPLANATION_OPTIONAL_SECTION_MAX_ITEMS["entity_findings"],
-    },
-    "risk_interpretation": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "claim": {"type": "string", "minLength": 1, "maxLength": 2000},
-          "severity": {"type": "string", "enum": sorted(SEVERITY_VALUES)},
-          "evidence_ids": {
-            "type": "array",
-            "items": {"type": "string", "pattern": r"^[nr]:[A-Za-z0-9_.:-]+$"},
-            "minItems": 1,
-            "maxItems": EXPLANATION_OPTIONAL_MAX_EVIDENCE_IDS,
-          },
-          "limits": {"type": "string", "minLength": 1, "maxLength": 2000},
-        },
-        "required": ["claim", "severity", "evidence_ids", "limits"],
-        "additionalProperties": False,
-      },
-      "maxItems": EXPLANATION_OPTIONAL_SECTION_MAX_ITEMS["risk_interpretation"],
-    },
-    "provenance": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "source_node_id": {"type": "string", "pattern": r"^n:[A-Za-z0-9_.:-]+$"},
-          "source_name": {"type": "string", "minLength": 1, "maxLength": 160},
-          "supports": {
-            "type": "array",
-            "items": {"type": "string", "pattern": r"^[nr]:[A-Za-z0-9_.:-]+$"},
-            "minItems": 1,
-            "maxItems": EXPLANATION_OPTIONAL_MAX_EVIDENCE_IDS,
-          },
-          "caveat": {"type": "string", "minLength": 1, "maxLength": 2000},
-        },
-        "required": ["source_node_id", "source_name", "supports", "caveat"],
-        "additionalProperties": False,
-      },
-      "maxItems": EXPLANATION_OPTIONAL_SECTION_MAX_ITEMS["provenance"],
-    },
-    "missing_context": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "gap": {"type": "string", "minLength": 1, "maxLength": 2000},
-          "suggested_check": {"type": "string", "minLength": 1, "maxLength": 2000},
-        },
-        "required": ["gap", "suggested_check"],
-        "additionalProperties": False,
-      },
-      "maxItems": EXPLANATION_OPTIONAL_SECTION_MAX_ITEMS["missing_context"],
-    },
-    "next_pivots": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "question": {"type": "string", "minLength": 1, "maxLength": 2000},
-          "suggested_query_intent": {
-            "type": "string",
-            "pattern": r"^[a-z][a-z0-9_:-]{2,119}$",
-          },
-          "priority": {"type": "string", "enum": sorted(PRIORITY_VALUES)},
-        },
-        "required": ["question", "suggested_query_intent", "priority"],
-        "additionalProperties": False,
-      },
-      "maxItems": EXPLANATION_OPTIONAL_SECTION_MAX_ITEMS["next_pivots"],
-    },
-  },
-  "required": ["summary"],
-  "additionalProperties": False,
-}
-
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
 STATUS_ACCEPTED = "accepted"
@@ -317,7 +185,6 @@ GRAPH_EXPLANATION_PROMPT_CONTRACT = {
   "prompt_version": GRAPH_EXPLANATION_PROMPT_VERSION,
   "draft_schema_version": CASE_EXPLANATION_DRAFT_SCHEMA_VERSION,
   "public_output_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
-  "draft_schema": CASE_EXPLANATION_DRAFT_SCHEMA,
   "required_fields": ["summary"],
   "optional_fields": sorted(CASE_EXPLANATION_DRAFT_OPTIONAL_KEYS),
   "server_owned_fields": ["schema_version", "caveats"],
@@ -338,8 +205,7 @@ GRAPH_EXPLANATION_PROMPT_CONTRACT = {
     "If the returned graph does not contain enough evidence to answer the question, state that explicitly in summary.text and missing_context.",
     "Return only one bounded CaseExplanationDraft JSON object; summary is required and rich sections are optional.",
     "Keep summary within 80 words and 8 evidence IDs.",
-    "The sum of all six optional arrays must be at most 4 objects.",
-    "Per-section limits are ceilings, not quotas: 1 key path, 2 entity findings, 1 risk item, 2 provenance items, 1 missing-context item, and 1 pivot. Omit unused optional sections.",
+    "Emit at most 4 optional objects total: 1 key path, 2 entity findings, 1 risk item, 2 provenance items, 1 missing-context item, and 1 pivot.",
     "Use at most 6 evidence IDs per optional claim. Keep path and finding narratives within 40 words, risk/provenance/context within 30, and pivots within 25.",
     "Do not emit schema_version or caveats; the server owns those fields and adds deterministic graph-scope caveats.",
     "server_caveat_flags describe caveats the server will add and are not model output fields.",
@@ -1657,10 +1523,7 @@ def _construct_case_explanation(
 
 
 def _case_explanation_response_format() -> Dict[str, Any]:
-  return {
-    "type": "json_object",
-    "schema": CASE_EXPLANATION_DRAFT_SCHEMA,
-  }
+  return {"type": "json_object"}
 
 
 def _graph_explanation_prompt_contract_text() -> str:
