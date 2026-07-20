@@ -44,6 +44,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation_draft_bounds  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_graph_evidence_packet  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_packet_and_explanation  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _valid_temporal_value  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
@@ -100,6 +101,14 @@ class _GraphPath:
 def _graph_record():
   indicator = _GraphNode("indicator-1", ["Indicator"], {"value": "example.org", "type": "domain"})
   source = _GraphNode("source-1", ["Source"], {"name": "AlienVault OTX"})
+  fake_record = MagicMock()
+  fake_record.data.return_value = {"i": indicator, "s": source}
+  return fake_record
+
+
+def _graph_path_record():
+  indicator = _GraphNode("indicator-1", ["Indicator"], {"value": "example.org", "type": "domain"})
+  source = _GraphNode("source-1", ["Source"], {"name": "AlienVault OTX"})
   rel = _GraphRelationship("rel-1", "SOURCED_FROM", indicator, source, {"confidence": "medium"})
   path = _GraphPath([indicator, source], [rel])
   fake_record = MagicMock()
@@ -108,6 +117,55 @@ def _graph_record():
 
 
 def _serialized_execution(executed_cypher, *, broadened=False, primary_row_count=1):
+  return_clause = executed_cypher.split(" RETURN ", 1)[1].rsplit(" LIMIT ", 1)[0]
+  columns = []
+  expressions = [item.strip() for item in return_clause.split(",")]
+  base_expressions = []
+  for expression in expressions:
+    parts = expression.split(" AS ")
+    base_expressions.append(parts[0].strip())
+    columns.append(parts[-1].strip())
+  indicator = {
+    "id": "4:indicator-raw-id",
+    "labels": ["Indicator"],
+    "properties": {"value": "example.org", "type": "domain", "raw_payload": "drop me"},
+    "caption": "untrusted caption",
+  }
+  source = {
+    "id": "4:source-raw-id",
+    "labels": ["Source"],
+    "properties": {"name": "AlienVault OTX"},
+    "caption": "untrusted source caption",
+  }
+  relationship = {
+    "id": "5:relationship-raw-id",
+    "type": "SOURCED_FROM",
+    "startNodeId": "4:indicator-raw-id",
+    "endNodeId": "4:source-raw-id",
+    "properties": {"confidence": "medium"},
+    "caption": "untrusted relationship caption",
+  }
+  tagged_values = {
+    "i": {"type": "node", "ref": indicator["id"]},
+    "s": {"type": "node", "ref": source["id"]},
+    "r": {"type": "relationship", "ref": relationship["id"]},
+    "p": {
+      "type": "path",
+      "start_node_ref": indicator["id"],
+      "end_node_ref": source["id"],
+      "segments": [{
+        "start_node_ref": indicator["id"],
+        "relationship_ref": relationship["id"],
+        "end_node_ref": source["id"],
+      }],
+    },
+  }
+  graph_nodes = [indicator]
+  graph_relationships = []
+  if any(expression in {"s", "r", "p"} for expression in base_expressions):
+    graph_nodes.append(source)
+  if any(expression in {"r", "p"} for expression in base_expressions):
+    graph_relationships.append(relationship)
   return {
     "executed_cypher": executed_cypher,
     "primary_row_count": primary_row_count,
@@ -115,39 +173,18 @@ def _serialized_execution(executed_cypher, *, broadened=False, primary_row_count
     "truncated": False,
     "broadened": broadened,
     "graph": {
-      "nodes": [
-        {
-          "id": "4:indicator-raw-id",
-          "labels": ["Indicator"],
-          "properties": {"value": "example.org", "type": "domain", "raw_payload": "drop me"},
-          "caption": "untrusted caption",
-        },
-        {
-          "id": "4:source-raw-id",
-          "labels": ["Source"],
-          "properties": {"name": "AlienVault OTX"},
-          "caption": "untrusted source caption",
-        },
-      ],
-      "relationships": [{
-        "id": "5:relationship-raw-id",
-        "type": "SOURCED_FROM",
-        "startNodeId": "4:indicator-raw-id",
-        "endNodeId": "4:source-raw-id",
-        "properties": {"confidence": "medium"},
-        "caption": "untrusted relationship caption",
-      }],
+      "nodes": graph_nodes,
+      "relationships": graph_relationships,
       "truncated": False,
     },
     "query_result_evidence": {
       "schema_version": "edgeguard.query_result_evidence.v1",
-      "columns": ["indicator", "source", "relationship"],
+      "columns": columns,
       "rows": [{
         "ordinal": 0,
         "values": [
-          {"type": "node", "ref": "4:indicator-raw-id"},
-          {"type": "node", "ref": "4:source-raw-id"},
-          {"type": "relationship", "ref": "5:relationship-raw-id"},
+          tagged_values.get(expression, {"type": "string", "value": "example"})
+          for expression in base_expressions
         ],
       }],
     },
@@ -368,6 +405,17 @@ def _draft_for_packet(packet):
         "source_name": source["properties"].get("name", source["caption"]),
         "supports": [indicator["id"]],
         "caveat": "The result establishes only this bounded row pairing.",
+      }],
+      "risk_interpretation": [{
+        "claim": "The bounded row supports an informational finding only.",
+        "severity": "informational",
+        "evidence_ids": [indicator["id"], source["id"]],
+        "limits": "The returned row does not prove malicious activity.",
+      }],
+      "next_pivots": [{
+        "question": "Which malware is paired with this indicator?",
+        "suggested_query_intent": "indicator_to_malware",
+        "priority": "medium",
       }],
     }
   draft = _explanation_for_packet(packet)
@@ -1310,6 +1358,42 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(mixed_case["status"], "rejected")
     self.assertNotIn("should-not-cross", json.dumps(mixed_case))
 
+  def test_prepare_graph_explanation_rejects_dynamic_properties_procedures_and_ambiguous_columns(self):
+    plugin = _make_api()
+    queries = [
+      'MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
+      "MATCH (n:Indicator) CALL db.propertyKeys() YIELD propertyKey RETURN n, propertyKey LIMIT 5",
+      "MATCH (n:Indicator) RETURN count(*) LIMIT 5",
+    ]
+
+    for cypher in queries:
+      with self.subTest(cypher=cypher):
+        result = plugin.prepare_graph_explanation(cypher=cypher)
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn(
+          "unsafe_result_projection",
+          {item["code"] for item in result["validation_errors"]},
+        )
+
+  def test_legacy_explanation_applies_projection_checks_before_opening_driver(self):
+    plugin = _make_api()
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          username="neo4j",
+          password="secret",
+          cypher='MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
+        )
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertIn(
+      "unsafe_result_projection",
+      {item["code"] for item in result["validation_errors"]},
+    )
+    mocked_driver.assert_not_called()
+
   def test_explain_graph_ingests_bounded_evidence_remaps_ids_redacts_and_never_opens_driver(self):
     plugin = _make_api(
       edgeguard_explanation_model_port=5091,
@@ -1347,9 +1431,30 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(all(node["id"].startswith("n:") for node in packet["graph"]["nodes"]))
     self.assertTrue(all(rel["id"].startswith("r:") for rel in packet["graph"]["relationships"]))
 
+  def test_explain_graph_rejects_result_columns_that_do_not_match_return_projection(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    execution_result = _serialized_execution(cypher)
+    execution_result["query_result_evidence"]["columns"] = ["spoofed"]
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+    ) as mocked_post:
+      result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
+
+    self.assertIn(
+      "result_columns_mismatch",
+      {item["code"] for item in result["validation_errors"]},
+    )
+    mocked_post.assert_not_called()
+
   def test_explain_graph_preserves_pairings_duplicates_nulls_scalars_maps_lists_and_reverse_path(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
-    cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
+    cypher = (
+      "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) "
+      "RETURN s AS source, i AS indicator, i.value AS nullable, i.value AS total, "
+      "i.value AS ratio, i.value AS items, i.value AS aggregate, p AS path LIMIT 25"
+    )
     execution_result = _serialized_execution(cypher, primary_row_count=2)
     execution_result["row_count"] = 2
     relationship = execution_result["graph"]["relationships"][0]
@@ -1457,7 +1562,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_explain_graph_rejects_unresolved_references_and_evidence_id_collisions(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
-    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
     unresolved = _serialized_execution(cypher)
     unresolved["query_result_evidence"]["rows"][0]["values"][0]["ref"] = "missing"
     collision = _serialized_execution(cypher)
@@ -1523,7 +1628,10 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_explain_graph_evidence_mode_rejects_malformed_and_oversized_graphs(self):
     plugin = _make_api()
-    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    cypher = (
+      "MATCH (i:Indicator)-[r:SOURCED_FROM]->(s:Source) "
+      "RETURN i, s, r LIMIT 25"
+    )
     malformed = _serialized_execution(cypher)
     malformed["graph"]["relationships"][0]["endNodeId"] = "missing-node"
     oversized = _serialized_execution(cypher)
@@ -1566,7 +1674,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_explain_graph_evidence_mode_rejects_nested_properties_and_redacts_sensitive_properties(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
-    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
     nested = _serialized_execution(cypher)
     nested["graph"]["nodes"][0]["properties"] = {"details": {"nested": True}}
     credential = _serialized_execution(cypher)
@@ -1595,6 +1703,111 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn('"type": "redacted"', flattened)
     self.assertIn('"reason": "security_policy"', flattened)
     self.assertIn("/evidence_catalog/nodes/", flattened)
+
+  def test_forbidden_result_values_are_validated_before_server_redaction(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator) RETURN i.value AS api_token LIMIT 25"
+
+    for invalid_value, expected_code in (
+      ({"type": "redacted", "reason": "security_policy", "path": "/client"}, "client_redaction_not_allowed"),
+      ({}, "unsupported_query_result_value"),
+    ):
+      with self.subTest(expected_code=expected_code):
+        execution_result = _serialized_execution(cypher)
+        execution_result["query_result_evidence"]["rows"][0]["values"][0] = invalid_value
+        result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
+        self.assertIn(
+          expected_code,
+          {item["code"] for item in result["validation_errors"]},
+        )
+
+    map_cypher = "MATCH (i:Indicator) RETURN i, i.value AS mapping LIMIT 25"
+    map_result = _serialized_execution(map_cypher)
+    map_result["query_result_evidence"]["rows"][0]["values"][1] = {
+      "type": "map",
+      "entries": [{
+        "key": "api_token",
+        "value": {"type": "redacted", "reason": "security_policy", "path": "/client"},
+      }],
+    }
+    rejected_map = plugin.explain_graph(cypher=map_cypher, execution_result=map_result)
+    self.assertIn(
+      "client_redaction_not_allowed",
+      {item["code"] for item in rejected_map["validation_errors"]},
+    )
+
+  def test_canonical_integer_temporal_and_point_values_fail_closed(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator) RETURN i, i.value AS value LIMIT 25"
+    invalid_values = [
+      ({"type": "integer", "value": "-0"}, "invalid_result_integer"),
+      (
+        {"type": "temporal", "temporal_type": "date", "value": "not-a-date"},
+        "invalid_result_temporal",
+      ),
+      ({"type": "point", "srid": "4326", "x": float("inf"), "y": 1.0}, "invalid_result_point"),
+    ]
+    for value, expected_code in invalid_values:
+      with self.subTest(value=value):
+        execution_result = _serialized_execution(cypher)
+        execution_result["query_result_evidence"]["rows"][0]["values"][1] = value
+        result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
+        self.assertIn(
+          expected_code,
+          {item["code"] for item in result["validation_errors"]},
+        )
+
+    valid_temporals = {
+      "date": "2026-07-20",
+      "date_time": "2026-07-20T12:30:00Z",
+      "duration": "P1DT2H",
+      "local_date_time": "2026-07-20T12:30:00",
+      "local_time": "12:30:00",
+      "time": "12:30:00+00:00",
+    }
+    self.assertTrue(all(
+      _valid_temporal_value(temporal_type, value)
+      for temporal_type, value in valid_temporals.items()
+    ))
+    self.assertFalse(_valid_temporal_value("date_time", "2026-07-20T12:30:00"))
+    self.assertFalse(_valid_temporal_value("local_time", "12:30:00Z"))
+
+  def test_nested_map_and_row_invariants_fail_closed(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator) RETURN i, i.value AS value LIMIT 25"
+    nested = {"type": "string", "value": "leaf"}
+    for _index in range(10):
+      nested = {"type": "list", "items": [nested]}
+    cases = [
+      (nested, "result_nesting_limit"),
+      (
+        {
+          "type": "map",
+          "entries": [
+            {"key": "same", "value": {"type": "null"}},
+            {"key": "same", "value": {"type": "null"}},
+          ],
+        },
+        "invalid_result_map",
+      ),
+    ]
+    for value, expected_code in cases:
+      with self.subTest(expected_code=expected_code):
+        execution_result = _serialized_execution(cypher)
+        execution_result["query_result_evidence"]["rows"][0]["values"][1] = value
+        result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
+        self.assertIn(
+          expected_code,
+          {item["code"] for item in result["validation_errors"]},
+        )
+
+    bad_ordinal = _serialized_execution(cypher)
+    bad_ordinal["query_result_evidence"]["rows"][0]["ordinal"] = 1
+    result = plugin.explain_graph(cypher=cypher, execution_result=bad_ordinal)
+    self.assertIn(
+      "invalid_result_row",
+      {item["code"] for item in result["validation_errors"]},
+    )
 
   def test_explain_graph_evidence_mode_rejects_all_top_level_credential_aliases(self):
     plugin = _make_api()
@@ -1833,7 +2046,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     plugin = _make_api()
     fake_driver, fake_session = _driver_with_results(
       _Result([], keys=["p"]),
-      _Result([_graph_record()], keys=["p"]),
+      _Result([_graph_path_record()], keys=["p"]),
     )
 
     def provider_side_effect(*_args, **kwargs):
@@ -2265,7 +2478,6 @@ class EdgeGuardApiTests(unittest.TestCase):
       packet = _packet_from_provider_kwargs(kwargs)
       explanation = _draft_for_packet(packet)
       explanation["summary"].pop("text")
-      explanation["key_paths"][0]["confidence"] = "certain"
       explanation["next_pivots"][0]["priority"] = "urgent"
       return _Response(payload={"choices": [{"message": {"content": json.dumps(explanation)}}]})
 

@@ -14,6 +14,7 @@ import math
 import re
 import secrets
 from dataclasses import dataclass, field
+from datetime import date, datetime, time as datetime_time
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -88,7 +89,10 @@ EXPLANATION_OPTIONAL_NARRATIVE_MAX_WORDS = {
 EXPLANATION_TRUNCATED_MESSAGE = "Graph explanation output was truncated at the safe token limit."
 EXPLANATION_DIAGNOSTIC_SCHEMA_VERSION = "edgeguard.graph_explanation_diagnostic.v1"
 EXPLANATION_DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
-CANONICAL_INTEGER_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)$")
+CANONICAL_INTEGER_RE = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
+DURATION_RE = re.compile(
+  r"^-?P(?=.*[0-9])(?:[0-9]+(?:\.[0-9]+)?[YMWD])*(?:T(?:[0-9]+(?:\.[0-9]+)?[HMS])*)?$"
+)
 EXPLANATION_DIAGNOSTIC_STAGE_REASONS = {
   "configuration": {"model_not_configured"},
   "provider": {
@@ -610,6 +614,102 @@ def _normalize_explanation_cypher_limit(
   return executed_cypher, generated_limit, executed_limit, generated_limit != executed_limit
 
 
+def _split_top_level(value: str, delimiter: str = ",") -> list[str]:
+  parts = []
+  start = 0
+  depth = 0
+  quote: Optional[str] = None
+  escaped = False
+  for index, character in enumerate(value):
+    if quote is not None:
+      if escaped:
+        escaped = False
+      elif character == "\\" and quote in {"'", '"'}:
+        escaped = True
+      elif character == quote:
+        quote = None
+      continue
+    if character in {"'", '"', "`"}:
+      quote = character
+      continue
+    if character in "([{":
+      depth += 1
+      continue
+    if character in ")]}":
+      depth = max(0, depth - 1)
+      continue
+    if character == delimiter and depth == 0:
+      parts.append(value[start:index].strip())
+      start = index + 1
+  parts.append(value[start:].strip())
+  return parts
+
+
+def _top_level_return_clause(cypher: str) -> Optional[str]:
+  matches = list(re.finditer(r"\bRETURN\b", cypher, re.IGNORECASE))
+  if not matches:
+    return None
+  start = matches[-1].end()
+  tail = cypher[start:]
+  depth = 0
+  quote: Optional[str] = None
+  escaped = False
+  for index, character in enumerate(tail):
+    if quote is not None:
+      if escaped:
+        escaped = False
+      elif character == "\\" and quote in {"'", '"'}:
+        escaped = True
+      elif character == quote:
+        quote = None
+      continue
+    if character in {"'", '"', "`"}:
+      quote = character
+      continue
+    if character in "([{":
+      depth += 1
+      continue
+    if character in ")]}":
+      depth = max(0, depth - 1)
+      continue
+    if depth == 0:
+      suffix = tail[index:]
+      if re.match(r"\s+(?:ORDER\s+BY|SKIP|LIMIT)\b", suffix, re.IGNORECASE):
+        return tail[:index].strip()
+  return tail.rstrip().rstrip(";").strip()
+
+
+def _result_columns_from_cypher(cypher: str) -> Optional[list[str]]:
+  clause = _top_level_return_clause(cypher)
+  if not clause:
+    return None
+  if re.match(r"^DISTINCT\b", clause, re.IGNORECASE):
+    clause = re.sub(r"^DISTINCT\b", "", clause, count=1, flags=re.IGNORECASE).strip()
+  columns = []
+  for expression in _split_top_level(clause):
+    alias_match = re.search(
+      r"\s+AS\s+(`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\s*$",
+      expression,
+      re.IGNORECASE,
+    )
+    if alias_match:
+      alias = alias_match.group(1)
+      columns.append(alias[1:-1] if alias.startswith("`") else alias)
+      continue
+    compact = re.sub(r"\s+", "", expression)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", compact):
+      columns.append(compact)
+      continue
+    if re.fullmatch(
+      r"[A-Za-z_][A-Za-z0-9_]*\.`?[A-Za-z_][A-Za-z0-9_]*`?",
+      compact,
+    ):
+      columns.append(compact)
+      continue
+    return None
+  return columns if columns and len(set(columns)) == len(columns) else None
+
+
 def _prepare_graph_explanation_plan(
   cypher: str,
   requested_limit: Optional[int] = None,
@@ -624,6 +724,19 @@ def _prepare_graph_explanation_plan(
       "error": "Cypher rejected by EdgeGuard guard; graph explanation was not prepared.",
     }
   accepted_cypher = analysis["accepted_cypher"]
+  if re.search(r"\bCALL\b", accepted_cypher, re.IGNORECASE):
+    return {
+      "status": STATUS_REJECTED,
+      "ok": False,
+      "validation": analysis,
+      "error": "Cypher result projection is not safe for complete-result explanation.",
+      "validation_errors": [
+        _contract_error(
+          "unsafe_result_projection",
+          "procedure calls are not allowed for complete-result explanation",
+        )
+      ],
+    }
   if re.search(r"\bproperties\s*\(", accepted_cypher, re.IGNORECASE):
     return {
       "status": STATUS_REJECTED,
@@ -637,7 +750,7 @@ def _prepare_graph_explanation_plan(
         )
       ],
     }
-  if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\[\s*['\"]", accepted_cypher):
+  if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\[", accepted_cypher):
     return {
       "status": STATUS_REJECTED,
       "ok": False,
@@ -671,6 +784,20 @@ def _prepare_graph_explanation_plan(
         )
       ],
     }
+  result_columns = _result_columns_from_cypher(accepted_cypher)
+  if result_columns is None:
+    return {
+      "status": STATUS_REJECTED,
+      "ok": False,
+      "validation": analysis,
+      "error": "Cypher result projection is not safe for complete-result explanation.",
+      "validation_errors": [
+        _contract_error(
+          "unsafe_result_projection",
+          "every returned expression must have a deterministic unique column name",
+        )
+      ],
+    }
   try:
     primary_cypher, generated_limit, executed_limit, limit_adjusted = _normalize_explanation_cypher_limit(
       accepted_cypher,
@@ -686,11 +813,13 @@ def _prepare_graph_explanation_plan(
 
   broadening = build_empty_result_broadening_cypher(accepted_cypher) if broadening_enabled else None
   broadening_cypher = _replace_last_limit(broadening["cypher"], executed_limit) if broadening else None
+  broadening_columns = _result_columns_from_cypher(broadening_cypher) if broadening_cypher else None
   return {
     "status": STATUS_ACCEPTED,
     "ok": True,
     "accepted_cypher": accepted_cypher,
     "executed_cypher": primary_cypher,
+    "result_columns": result_columns,
     "limit_policy": {
       "generated_limit": generated_limit,
       "executed_limit": executed_limit,
@@ -701,6 +830,7 @@ def _prepare_graph_explanation_plan(
       "enabled": bool(broadening_enabled),
       "cypher": broadening_cypher,
       "strategy": broadening.get("strategy") if broadening else None,
+      "result_columns": broadening_columns,
     },
     "validation": analysis,
   }
@@ -1139,6 +1269,27 @@ def _redacted_value(path: str) -> Dict[str, str]:
   }
 
 
+def _valid_temporal_value(temporal_type: str, value: str) -> bool:
+  try:
+    if temporal_type == "date":
+      date.fromisoformat(value)
+      return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value))
+    if temporal_type in {"date_time", "local_date_time"}:
+      base = re.sub(r"\[[^\]]+\]$", "", value)
+      parsed = datetime.fromisoformat(base.replace("Z", "+00:00"))
+      if temporal_type == "date_time":
+        return parsed.tzinfo is not None or bool(re.search(r"\[[^\]]+\]$", value))
+      return parsed.tzinfo is None
+    if temporal_type in {"time", "local_time"}:
+      parsed = datetime_time.fromisoformat(value.replace("Z", "+00:00"))
+      return (parsed.tzinfo is not None) if temporal_type == "time" else (parsed.tzinfo is None)
+    if temporal_type == "duration":
+      return bool(DURATION_RE.fullmatch(value))
+  except ValueError:
+    return False
+  return False
+
+
 def _tag_serialized_property(value: Any, path: str, depth: int = 0) -> Dict[str, Any]:
   if depth > 8:
     raise _ResultEvidenceError("result_nesting_limit", f"{path}: nesting exceeds eight levels")
@@ -1229,9 +1380,13 @@ def _sanitize_query_result_value(
     return dict(value)
   if value_type == "temporal":
     _exact_keys(value, {"type", "temporal_type", "value"}, path)
-    if value["temporal_type"] not in {
-      "date", "date_time", "duration", "local_date_time", "local_time", "time",
-    } or not isinstance(value["value"], str) or not value["value"]:
+    if (
+      value["temporal_type"] not in {
+        "date", "date_time", "duration", "local_date_time", "local_time", "time",
+      }
+      or not isinstance(value["value"], str)
+      or not _valid_temporal_value(value["temporal_type"], value["value"])
+    ):
       raise _ResultEvidenceError("invalid_result_temporal", f"{path}: temporal value is invalid")
     return dict(value)
   if value_type == "point":
@@ -1280,6 +1435,17 @@ def _sanitize_query_result_value(
         raise _ResultEvidenceError("invalid_result_map", f"{path}: map keys must be unique strings")
       keys.add(key)
       value_path = f"{path}/entries/{index}/value"
+      if FORBIDDEN_PACKET_PROPERTY_RE.search(key):
+        _sanitize_query_result_value(
+          entry["value"],
+          path=value_path,
+          node_refs=node_refs,
+          relationship_refs=relationship_refs,
+          relationships=relationships,
+          referenced_nodes=set(),
+          referenced_relationships=set(),
+          depth=depth + 1,
+        )
       clean_entries.append({
         "key": key,
         "value": (
@@ -1361,6 +1527,7 @@ def _sanitize_query_result_evidence(
   *,
   value: Any,
   row_count: int,
+  expected_columns: list[str],
   node_refs: Dict[str, str],
   relationship_refs: Dict[str, str],
   graph_nodes: Dict[str, Dict[str, Any]],
@@ -1381,6 +1548,11 @@ def _sanitize_query_result_evidence(
     or len(set(columns)) != len(columns)
   ):
     raise _ResultEvidenceError("invalid_result_columns", "columns must be non-empty unique strings")
+  if columns != expected_columns:
+    raise _ResultEvidenceError(
+      "result_columns_mismatch",
+      "query_result_evidence columns must exactly match the executed Cypher RETURN projection",
+    )
   if not isinstance(rows, list) or len(rows) != row_count or len(rows) > EXPLANATION_SERVER_MAX_ROWS:
     raise _ResultEvidenceError("result_row_count_mismatch", "rows must exactly match the bounded execution row_count")
 
@@ -1394,6 +1566,16 @@ def _sanitize_query_result_evidence(
     clean_values = []
     for index, item in enumerate(row["values"]):
       path = f"/rows/{ordinal}/values/{index}"
+      if FORBIDDEN_PACKET_PROPERTY_RE.search(columns[index]):
+        _sanitize_query_result_value(
+          item,
+          path=path,
+          node_refs=node_refs,
+          relationship_refs=relationship_refs,
+          relationships=graph_relationships,
+          referenced_nodes=set(),
+          referenced_relationships=set(),
+        )
       clean_values.append(
         _redacted_value(path)
         if FORBIDDEN_PACKET_PROPERTY_RE.search(columns[index])
@@ -1706,6 +1888,11 @@ def _build_graph_evidence_packet_from_execution(
     clean_query_result, evidence_catalog = _sanitize_query_result_evidence(
       value=query_result_evidence,
       row_count=row_count,
+      expected_columns=(
+        plan["broadening"]["result_columns"]
+        if broadened
+        else plan["result_columns"]
+      ),
       node_refs=raw_node_ids,
       relationship_refs=raw_relationship_ids,
       graph_nodes=state.nodes,
@@ -3468,19 +3655,13 @@ class EdgeguardApiPlugin(BasePlugin):
       unavailable.update({"executed": False, "explained": False})
       return unavailable
 
-    try:
-      executed_cypher, generated_limit, executed_limit, limit_adjusted = _normalize_explanation_cypher_limit(
-        analysis["accepted_cypher"],
-        requested_limit=requested_limit,
-      )
-    except Exception as exc:
-      return {
-        "status": STATUS_ERROR,
-        "ok": False,
-        "executed": False,
-        "explained": False,
-        "error": f"Invalid explanation row limit: {exc}",
-      }
+    plan = _prepare_graph_explanation_plan(cypher, requested_limit, broadening_enabled)
+    if not plan.get("ok"):
+      return {**plan, "executed": False, "explained": False}
+    executed_cypher = plan["executed_cypher"]
+    generated_limit = plan["limit_policy"]["generated_limit"]
+    executed_limit = plan["limit_policy"]["executed_limit"]
+    limit_adjusted = plan["limit_policy"]["limit_adjusted"]
 
     driver = None
     try:
@@ -3490,15 +3671,14 @@ class EdgeguardApiPlugin(BasePlugin):
       final_executed_cypher = executed_cypher
       broadened_applied = False
       if broadening_enabled and not query_result["rows"]:
-        broadened = build_empty_result_broadening_cypher(analysis["accepted_cypher"])
-        if broadened is None:
+        broadened_cypher = plan["broadening"]["cypher"]
+        if broadened_cypher is None:
           live_retry = self._empty_result_broadening_state(
             enabled=True,
             attempted=True,
             reason="empty_result_without_allowed_label_relationship_pair",
           )
         else:
-          broadened_cypher = _replace_last_limit(broadened["cypher"], executed_limit)
           try:
             query_result = self._run_neo4j_query(driver, broadened_cypher, executed_limit)
             final_executed_cypher = broadened_cypher
@@ -3508,7 +3688,7 @@ class EdgeguardApiPlugin(BasePlugin):
               attempted=True,
               applied=True,
               reason="executed_no_rows",
-              strategy=broadened["strategy"],
+              strategy=plan["broadening"]["strategy"],
               broadening_cypher=broadened_cypher,
             )
           except Exception as exc:
@@ -3516,14 +3696,14 @@ class EdgeguardApiPlugin(BasePlugin):
               enabled=True,
               attempted=True,
               reason="broadening_execution_failed",
-              strategy=broadened["strategy"],
+              strategy=plan["broadening"]["strategy"],
               broadening_cypher=broadened_cypher,
               error=self._sanitize_error(exc, password),
             )
 
       packet, packet_meta = _build_graph_evidence_packet(
         request=request,
-        accepted_cypher=analysis["accepted_cypher"],
+        accepted_cypher=plan["accepted_cypher"],
         executed_cypher=final_executed_cypher,
         records=query_result["rows"],
         generated_limit=generated_limit,
@@ -3585,6 +3765,11 @@ class EdgeguardApiPlugin(BasePlugin):
         query_result_evidence, evidence_catalog = _sanitize_query_result_evidence(
           value=raw_query_result,
           row_count=packet["execution"]["row_count"],
+          expected_columns=(
+            plan["broadening"]["result_columns"]
+            if broadened_applied
+            else plan["result_columns"]
+          ),
           node_refs={packet_id: packet_id for packet_id in graph_nodes},
           relationship_refs={packet_id: packet_id for packet_id in graph_relationships},
           graph_nodes=graph_nodes,
