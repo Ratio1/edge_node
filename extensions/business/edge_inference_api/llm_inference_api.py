@@ -101,6 +101,9 @@ _CONFIG = {
   "TEMPERATURE_MAX": 1.5,
   "MIN_COMPLETION_TOKENS": 16,
   "MAX_COMPLETION_TOKENS": 4096,
+  # Internal research control. Enable only on an isolated benchmark instance and restore to false
+  # before ordinary service. Request input alone must never activate reset/one-attempt behavior.
+  "BENCHMARK_MODE_ENABLED": False,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -619,6 +622,11 @@ class LLMInferenceApiPlugin(BasePlugin):
       err = self.check_messages(messages)
       if err is not None:
         return err
+      benchmark_mode = kwargs.get("benchmark_mode", False)
+      if not isinstance(benchmark_mode, bool):
+        return "`benchmark_mode` must be a boolean."
+      if benchmark_mode and getattr(self, "cfg_benchmark_mode_enabled", False) is not True:
+        return "`benchmark_mode` is disabled on this instance."
       err = self.check_generation_params(
         temperature=temperature,
         max_tokens=max_tokens,
@@ -666,6 +674,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Processed parameters ready for dispatch.
       """
       normalized_messages = self.normalize_messages(messages)
+      if kwargs.get("benchmark_mode", False) is True and getattr(self, "cfg_benchmark_mode_enabled", False) is not True:
+        kwargs["benchmark_mode"] = False
       # No need to capture err_msg here, already validated in check_predict_params
       response_format, _ = self.check_and_normalize_response_format(response_format=response_format)
       return {

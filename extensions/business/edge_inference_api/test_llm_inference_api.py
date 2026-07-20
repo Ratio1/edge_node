@@ -89,6 +89,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
 
   def test_benchmark_mode_reaches_uppercase_worker_payload(self):
     plugin = LLMInferenceApiPlugin()
+    plugin.cfg_benchmark_mode_enabled = True
     parameters = plugin.process_predict_params(
       messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
       benchmark_mode=True,
@@ -97,6 +98,27 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
       "req-benchmark", {"parameters": parameters},
     )
     self.assertIs(payload["JEEVES_CONTENT"]["BENCHMARK_MODE"], True)
+
+  def test_benchmark_mode_requires_instance_enablement(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin.check_generation_params = lambda **_kwargs: None
+    plugin.cfg_benchmark_mode_enabled = False
+    error = plugin.check_predict_params(
+      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
+      benchmark_mode=True,
+    )
+    self.assertEqual(error, "`benchmark_mode` is disabled on this instance.")
+    parameters = plugin.process_predict_params(
+      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
+      benchmark_mode=True,
+    )
+    self.assertIs(parameters["benchmark_mode"], False)
+
+    plugin.cfg_benchmark_mode_enabled = True
+    self.assertIsNone(plugin.check_predict_params(
+      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
+      benchmark_mode=True,
+    ))
 
   def test_payload_uses_llm_serving_uppercase_contract(self):
     plugin = LLMInferenceApiPlugin()
