@@ -289,6 +289,31 @@ def _nested_provider_response(content, *, finish_reason="stop", completion_token
   })
 
 
+def _diagnostics(
+  *,
+  stage,
+  reason,
+  finish_reason="missing",
+  completion_tokens=None,
+  max_tokens=1024,
+  validation_codes=None,
+):
+  codes = sorted(set(validation_codes or []))
+  return {
+    "schema_version": "edgeguard.graph_explanation_diagnostic.v1",
+    "reference": "egx-0123456789abcdef",
+    "stage": stage,
+    "reason": reason,
+    "completion": {
+      "finish_reason": finish_reason,
+      "completion_tokens": completion_tokens,
+      "max_tokens": max_tokens,
+    },
+    "validation_codes": codes,
+    "validation_code_count": len(codes),
+  }
+
+
 def _packet_from_provider_kwargs(kwargs):
   prompt_context = json.loads(kwargs["json"]["messages"][1]["content"])
   return prompt_context["graph_evidence_packet"]
@@ -1359,6 +1384,19 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_session.post.assert_called_once()
     self.assertNotIn("127.0.0.1", " ".join(str(call) for call in plugin.Pd.call_args_list))
 
+  def test_explanation_model_configuration_failure_emits_one_safe_outcome(self):
+    plugin = _make_api(edgeguard_explanation_model_host=None, edgeguard_explanation_model_port=None)
+    plugin.P = MagicMock()
+
+    result = plugin._call_explanation_model(_case_explanation_packet())
+
+    self.assertEqual(result["status"], "error")
+    self.assertEqual(result["diagnostics"]["stage"], "configuration")
+    self.assertEqual(result["diagnostics"]["reason"], "model_not_configured")
+    outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
+    self.assertNotIn("port or URL", outcome_log)
+
   def test_explanation_model_failures_do_not_expose_provider_internals(self):
     plugin = _make_api()
     plugin.P = MagicMock()
@@ -1381,10 +1419,13 @@ class EdgeGuardApiTests(unittest.TestCase):
     for result in (provider_error, request_error, unexpected_error):
       self.assertNotIn(provider_internal, json.dumps(result))
       self.assertNotIn("token=secret", json.dumps(result))
+      self.assertRegex(result["diagnostics"]["reference"], r"^egx-[0-9a-f]{16}$")
     self.assertEqual(provider_error["provider"], "local")
     self.assertEqual(request_error["error"], "EdgeGuard explanation model request failed")
     self.assertEqual(unexpected_error["error"], "Unexpected explanation model failure")
-    self.assertNotIn(provider_internal, " ".join(str(call) for call in plugin.P.call_args_list))
+    outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 3)
+    self.assertNotIn(provider_internal, outcome_log)
 
   def test_explanation_model_context_overflow_returns_specific_safe_rejection(self):
     plugin = _make_api()
@@ -1407,6 +1448,9 @@ class EdgeGuardApiTests(unittest.TestCase):
       "code": "context_window_exceeded",
       "detail": "Reduce the returned graph or explanation row limit.",
     }])
+    self.assertEqual(result["diagnostics"]["stage"], "provider")
+    self.assertEqual(result["diagnostics"]["reason"], "context_window_exceeded")
+    self.assertEqual(result["diagnostics"]["validation_codes"], ["context_window_exceeded"])
 
   def test_explanation_model_nested_timeout_returns_specific_safe_timeout(self):
     plugin = _make_api()
@@ -1425,6 +1469,8 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertEqual(result["status"], "timeout")
     self.assertEqual(result["error"], "EdgeGuard explanation model request timed out")
+    self.assertEqual(result["diagnostics"]["stage"], "provider")
+    self.assertEqual(result["diagnostics"]["reason"], "provider_timeout")
     self.assertNotIn("private provider timeout detail", json.dumps(result))
 
   def test_health_does_not_expose_explanation_provider_location(self):
@@ -1555,8 +1601,13 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
           )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertIn("malformed_json", {item["code"] for item in result["validation_errors"]})
+    self.assertEqual(result["status_code"], 500)
+    self.assertTrue(result["logged"])
+    self.assertEqual(result["result"]["status"], "rejected")
+    self.assertEqual(result["result"]["diagnostics"]["reason"], "malformed_json")
+    self.assertEqual(result["result"]["diagnostics"]["validation_codes"], ["malformed_json"])
+    self.assertNotIn("validation_errors", result["result"])
+    self.assertNotIn("packet", result["result"])
     self.assertNotIn("raw_output", result)
 
   def test_explanation_provider_length_finish_rejects_before_parsing_without_raw_output(self):
@@ -1577,6 +1628,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertNotIn("partial-secret", json.dumps(result))
     self.assertNotIn("raw_output", result)
     audit_log = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertEqual(audit_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
+    self.assertRegex(audit_log, r'"reference":"egx-[0-9a-f]{16}"')
+    self.assertIn('"reason":"output_truncated"', audit_log)
     self.assertIn('"completion_tokens":1024', audit_log)
     self.assertIn('"finish_reason":"length"', audit_log)
     self.assertIn('"max_tokens":1024', audit_log)
@@ -1632,10 +1686,129 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(result["explanation"]["schema_version"], "edgeguard.case_explanation.v1")
     audit_log = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertEqual(audit_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
+    self.assertRegex(audit_log, r'"reference":"egx-[0-9a-f]{16}"')
+    self.assertIn('"reason":"accepted"', audit_log)
     self.assertIn('"completion_tokens":700', audit_log)
     self.assertIn('"finish_reason":"stop"', audit_log)
     self.assertIn('"max_tokens":1024', audit_log)
     self.assertNotIn(packet["request"], audit_log)
+
+  def test_explanation_normal_stop_validation_rejection_emits_one_safe_outcome(self):
+    plugin = _make_api()
+    plugin.P = MagicMock()
+    packet = _case_explanation_packet()
+    draft = _draft_for_packet(packet)
+    draft["summary"]["evidence_ids"] = ["n:private-evidence-sentinel"]
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=_nested_provider_response(
+        json.dumps(draft),
+        finish_reason="stop",
+        completion_tokens=589,
+      ),
+    ):
+      result = plugin._call_explanation_model(packet)
+
+    self.assertEqual(result["status"], "rejected")
+    diagnostics = result["diagnostics"]
+    self.assertEqual(diagnostics["stage"], "validation")
+    self.assertEqual(diagnostics["reason"], "deterministic_validation_failed")
+    self.assertEqual(diagnostics["completion"], {
+      "finish_reason": "stop",
+      "completion_tokens": 589,
+      "max_tokens": 1024,
+    })
+    self.assertIn("unknown_evidence_id", diagnostics["validation_codes"])
+    self.assertEqual(
+      diagnostics["validation_codes"],
+      sorted(set(diagnostics["validation_codes"])),
+    )
+    self.assertEqual(diagnostics["validation_code_count"], len(diagnostics["validation_codes"]))
+    self.assertRegex(diagnostics["reference"], r"^egx-[0-9a-f]{16}$")
+
+    outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
+    self.assertIn('"completion_tokens":589', outcome_log)
+    self.assertIn('"finish_reason":"stop"', outcome_log)
+    self.assertIn('"reason":"deterministic_validation_failed"', outcome_log)
+    for forbidden in (
+      packet["request"],
+      packet["accepted_cypher"],
+      "n:private-evidence-sentinel",
+      "unknown evidence id",
+    ):
+      self.assertNotIn(forbidden, outcome_log)
+
+    transport = plugin._explanation_failure_transport(result)
+    flattened = json.dumps(transport)
+    self.assertEqual(transport["status_code"], 500)
+    self.assertTrue(transport["logged"])
+    self.assertEqual(
+      transport["result"]["diagnostics"]["reference"],
+      diagnostics["reference"],
+    )
+    self.assertNotIn("validation_errors", transport["result"])
+    for forbidden in (
+      "packet",
+      "provider",
+      "model",
+      "n:private-evidence-sentinel",
+      packet["accepted_cypher"],
+    ):
+      self.assertNotIn(forbidden, flattened)
+
+  def test_explanation_terminal_failures_emit_one_outcome_with_fixed_reason(self):
+    packet = _case_explanation_packet()
+    cases = {
+      "missing_content": (
+        _Response(payload={"result": {"FULL_OUTPUT": {"usage": {"completion_tokens": 0}}}}),
+        "completion",
+        "missing_content",
+      ),
+      "provider_http_error": (
+        _Response(status_code=503, text="provider-secret"),
+        "provider",
+        "provider_http_error",
+      ),
+    }
+    for label, (provider_response, stage, reason) in cases.items():
+      with self.subTest(label=label):
+        plugin = _make_api()
+        plugin.P = MagicMock()
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+          return_value=provider_response,
+        ):
+          result = plugin._call_explanation_model(packet)
+        self.assertEqual(result["diagnostics"]["stage"], stage)
+        self.assertEqual(result["diagnostics"]["reason"], reason)
+        outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
+        self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
+        self.assertNotIn("provider-secret", outcome_log)
+
+  def test_explanation_timeout_and_unexpected_failure_emit_safe_outcomes(self):
+    packet = _case_explanation_packet()
+    cases = {
+      "timeout": (requests.exceptions.Timeout(), "provider", "provider_timeout"),
+      "unexpected": (RuntimeError("exception-secret /tmp/private"), "internal", "unexpected_failure"),
+    }
+    for label, (failure, stage, reason) in cases.items():
+      with self.subTest(label=label):
+        plugin = _make_api()
+        plugin.P = MagicMock()
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+          side_effect=failure,
+        ):
+          result = plugin._call_explanation_model(packet)
+        self.assertEqual(result["diagnostics"]["stage"], stage)
+        self.assertEqual(result["diagnostics"]["reason"], reason)
+        outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
+        self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
+        self.assertNotIn("exception-secret", outcome_log)
+        self.assertNotIn("/tmp/private", outcome_log)
 
   def test_explanation_provider_malformed_below_cap_stays_distinct(self):
     plugin = _make_api()
@@ -1719,6 +1892,13 @@ class EdgeGuardApiTests(unittest.TestCase):
         "code": "output_truncated",
         "message": "Graph explanation output was truncated at the safe token limit.",
       }],
+      "diagnostics": _diagnostics(
+        stage="completion",
+        reason="output_truncated",
+        finish_reason="length",
+        completion_tokens=1024,
+        validation_codes=["output_truncated"],
+      ),
     }):
       result = plugin.explain_graph(
         cypher=cypher,
@@ -1732,6 +1912,8 @@ class EdgeGuardApiTests(unittest.TestCase):
       {item["code"] for item in result["result"]["validation_errors"]},
       {"output_truncated"},
     )
+    self.assertTrue(result["logged"])
+    self.assertEqual(result["result"]["diagnostics"]["reason"], "output_truncated")
     self.assertNotIn("packet", result["result"])
 
   def test_explain_graph_rejects_nested_schema_invalid_output(self):
@@ -1760,10 +1942,15 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
           )
 
-    codes = {item["code"] for item in result["validation_errors"]}
-    self.assertEqual(result["status"], "rejected")
+    diagnostics = result["result"]["diagnostics"]
+    codes = set(diagnostics["validation_codes"])
+    self.assertEqual(result["status_code"], 500)
+    self.assertTrue(result["logged"])
+    self.assertEqual(diagnostics["stage"], "validation")
+    self.assertEqual(diagnostics["reason"], "deterministic_validation_failed")
     self.assertIn("schema_required", codes)
     self.assertIn("schema_enum", codes)
+    self.assertNotIn("validation_errors", result["result"])
 
   def test_explain_graph_rejects_unsupported_high_severity(self):
     plugin = _make_api()
@@ -1789,8 +1976,12 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
           )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertIn("severity_escalation_unsupported", {item["code"] for item in result["validation_errors"]})
+    self.assertEqual(result["status_code"], 500)
+    self.assertIn(
+      "severity_escalation_unsupported",
+      set(result["result"]["diagnostics"]["validation_codes"]),
+    )
+    self.assertNotIn("validation_errors", result["result"])
 
   def test_explain_graph_rejects_absent_evidence_invented_source_and_unsafe_pivot(self):
     plugin = _make_api()
@@ -1820,12 +2011,13 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
           )
 
-    codes = {item["code"] for item in result["validation_errors"]}
-    self.assertEqual(result["status"], "rejected")
+    codes = set(result["result"]["diagnostics"]["validation_codes"])
+    self.assertEqual(result["status_code"], 500)
     self.assertIn("unknown_evidence_id", codes)
     self.assertIn("invented_source_name", codes)
     self.assertIn("unsafe_pivot", codes)
-    self.assertIsNone(result.get("explanation"))
+    self.assertNotIn("explanation", result["result"])
+    self.assertNotIn("validation_errors", result["result"])
 
   def test_explain_graph_returns_provider_error_after_packet_build(self):
     plugin = _make_api()
@@ -1845,11 +2037,15 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
           )
 
-    self.assertEqual(result["status"], "error")
-    self.assertTrue(result["executed"])
-    self.assertFalse(result["explained"])
-    self.assertEqual(result["provider_status"], 500)
-    self.assertIn("packet", result)
+    self.assertEqual(result["status_code"], 500)
+    self.assertTrue(result["logged"])
+    self.assertEqual(result["result"]["status"], "error")
+    self.assertTrue(result["result"]["executed"])
+    self.assertFalse(result["result"]["explained"])
+    self.assertEqual(result["result"]["diagnostics"]["stage"], "provider")
+    self.assertEqual(result["result"]["diagnostics"]["reason"], "provider_http_error")
+    self.assertNotIn("provider_status", result["result"])
+    self.assertNotIn("packet", result["result"])
 
   def test_case_explanation_validator_rejects_redaction_flags(self):
     packet = {

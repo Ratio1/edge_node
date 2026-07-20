@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -77,6 +78,22 @@ EXPLANATION_OPTIONAL_NARRATIVE_MAX_WORDS = {
   "next_pivots": 25,
 }
 EXPLANATION_TRUNCATED_MESSAGE = "Graph explanation output was truncated at the safe token limit."
+EXPLANATION_DIAGNOSTIC_SCHEMA_VERSION = "edgeguard.graph_explanation_diagnostic.v1"
+EXPLANATION_DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+EXPLANATION_DIAGNOSTIC_STAGE_REASONS = {
+  "configuration": {"model_not_configured"},
+  "provider": {
+    "provider_http_error",
+    "provider_timeout",
+    "provider_failure",
+    "context_window_exceeded",
+  },
+  "completion": {"missing_content", "output_truncated"},
+  "response_parse": {"malformed_json", "invalid_explanation_draft"},
+  "validation": {"deterministic_validation_failed"},
+  "internal": {"unexpected_failure"},
+  "complete": {"accepted"},
+}
 LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)\b", re.IGNORECASE)
 IDENT_RE = re.compile(r"[^A-Za-z0-9_]+")
 EVIDENCE_ID_RE = re.compile(r"\b[nr]:[A-Za-z0-9_.:-]+\b")
@@ -395,6 +412,26 @@ def _contract_error(code: str, detail: str) -> Dict[str, str]:
 
 def _sha256_text(value: str) -> str:
   return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _normalize_explanation_finish_reason(value: Any) -> str:
+  if value in {"stop", "length"}:
+    return value
+  return "missing" if value is None else "other"
+
+
+def _explanation_validation_codes(errors: Any) -> list[str]:
+  if not isinstance(errors, list):
+    return []
+  return sorted({
+    item["code"]
+    for item in errors
+    if (
+      isinstance(item, dict)
+      and isinstance(item.get("code"), str)
+      and EXPLANATION_DIAGNOSTIC_CODE_RE.fullmatch(item["code"])
+    )
+  })
 
 
 def _compact_text(value: Any, max_chars: int) -> str:
@@ -1946,6 +1983,107 @@ class EdgeguardApiPlugin(BasePlugin):
       payload["model"] = self.cfg_edgeguard_explanation_model
     return payload
 
+  def _finish_explanation_attempt(
+    self,
+    *,
+    result: Dict[str, Any],
+    reference: str,
+    request_sha256: str,
+    stage: str,
+    reason: str,
+    completion: Dict[str, Any],
+    effective_max_tokens: Optional[int],
+  ) -> Dict[str, Any]:
+    if reason not in EXPLANATION_DIAGNOSTIC_STAGE_REASONS.get(stage, set()):
+      stage = "internal"
+      reason = "unexpected_failure"
+    validation_codes = _explanation_validation_codes(result.get("validation_errors"))
+    normalized_status = result.get("status")
+    if normalized_status not in {STATUS_ACCEPTED, STATUS_REJECTED, STATUS_ERROR, STATUS_TIMEOUT}:
+      normalized_status = STATUS_ERROR
+    finish_reason = _normalize_explanation_finish_reason(completion.get("finish_reason"))
+    completion_tokens = completion.get("completion_tokens")
+    if isinstance(completion_tokens, bool) or not isinstance(completion_tokens, int) or completion_tokens < 0:
+      completion_tokens = None
+    if (
+      isinstance(effective_max_tokens, bool)
+      or not isinstance(effective_max_tokens, int)
+      or effective_max_tokens <= 0
+    ):
+      effective_max_tokens = None
+    diagnostics = {
+      "schema_version": EXPLANATION_DIAGNOSTIC_SCHEMA_VERSION,
+      "reference": reference,
+      "stage": stage,
+      "reason": reason,
+      "completion": {
+        "finish_reason": finish_reason,
+        "completion_tokens": completion_tokens,
+        "max_tokens": effective_max_tokens,
+      },
+      "validation_codes": validation_codes,
+      "validation_code_count": len(validation_codes),
+    }
+    self.P(
+      "EDGEGUARD_EXPLANATION_OUTCOME " + json.dumps({
+        "completion_tokens": completion_tokens,
+        "finish_reason": finish_reason,
+        "max_tokens": effective_max_tokens,
+        "reason": reason,
+        "reference": reference,
+        "request_sha256": request_sha256,
+        "stage": stage,
+        "status": normalized_status,
+        "validation_code_count": len(validation_codes),
+        "validation_codes": validation_codes,
+      }, sort_keys=True, separators=(",", ":"))
+    )
+    if normalized_status != STATUS_ACCEPTED:
+      result["diagnostics"] = diagnostics
+    return result
+
+  def _explanation_failure_transport(self, result: Dict[str, Any]) -> Dict[str, Any]:
+    diagnostics = result.get("diagnostics")
+    reason = diagnostics.get("reason") if isinstance(diagnostics, dict) else None
+    error = {
+      "output_truncated": EXPLANATION_TRUNCATED_MESSAGE,
+      "context_window_exceeded": (
+        "The returned graph is too large to explain with the current model. "
+        "Narrow the query or lower the explanation row limit."
+      ),
+      "provider_timeout": "Graph explanation timed out.",
+      "deterministic_validation_failed": "Graph explanation failed deterministic validation.",
+      "malformed_json": "Graph explanation response was rejected.",
+      "invalid_explanation_draft": "Graph explanation response was rejected.",
+      "missing_content": "Graph explanation response was rejected.",
+    }.get(reason, "Graph explanation is unavailable.")
+    safe_result = {
+      "status": result.get("status") if result.get("status") in {
+        STATUS_REJECTED,
+        STATUS_ERROR,
+        STATUS_TIMEOUT,
+      } else STATUS_ERROR,
+      "ok": False,
+      "executed": True,
+      "explained": False,
+      "error": error,
+      "diagnostics": diagnostics,
+    }
+    validation_codes = (
+      diagnostics.get("validation_codes")
+      if isinstance(diagnostics, dict)
+      else []
+    )
+    if validation_codes == ["output_truncated"]:
+      safe_result["validation_errors"] = [
+        _contract_error("output_truncated", EXPLANATION_TRUNCATED_MESSAGE)
+      ]
+    return {
+      "status_code": 500,
+      "result": safe_result,
+      "logged": True,
+    }
+
   def _call_explanation_model(
     self,
     packet: Dict[str, Any],
@@ -1953,9 +2091,33 @@ class EdgeguardApiPlugin(BasePlugin):
     max_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
   ) -> Dict[str, Any]:
+    reference = f"egx-{secrets.token_hex(8)}"
+    request_sha256 = _sha256_text(str(packet.get("request") or ""))
+    completion: Dict[str, Any] = {
+      "content": None,
+      "finish_reason": None,
+      "completion_tokens": None,
+    }
+    effective_max_tokens: Optional[int] = None
+
+    def finish(result: Dict[str, Any], stage: str, reason: str) -> Dict[str, Any]:
+      return self._finish_explanation_attempt(
+        result=result,
+        reference=reference,
+        request_sha256=request_sha256,
+        stage=stage,
+        reason=reason,
+        completion=completion,
+        effective_max_tokens=effective_max_tokens,
+      )
+
     url, err = self._explanation_url()
     if err:
-      return {"status": "config_error", "error": err}
+      return finish(
+        {"status": STATUS_ERROR, "error": "EdgeGuard explanation model is not configured"},
+        "configuration",
+        "model_not_configured",
+      )
     try:
       prompt_packet = _project_graph_evidence_for_prompt(packet)
       payload = self._build_explanation_payload(
@@ -1965,6 +2127,7 @@ class EdgeguardApiPlugin(BasePlugin):
         top_p,
         prompt_packet=prompt_packet,
       )
+      effective_max_tokens = payload["max_tokens"]
       self.Pd("Calling configured localhost EdgeGuard explanation model API")
       session = requests.Session()
       session.trust_env = False
@@ -1975,25 +2138,32 @@ class EdgeguardApiPlugin(BasePlugin):
         timeout=self.cfg_request_timeout_seconds,
       )
       if response.status_code != 200:
-        return {
+        return finish({
           "status": STATUS_ERROR,
           "error": f"EdgeGuard explanation model returned status {response.status_code}",
           "provider_status": response.status_code,
-        }
-      data = response.json()
+        }, "provider", "provider_http_error")
+      try:
+        data = response.json()
+      except ValueError:
+        return finish(
+          {"status": STATUS_ERROR, "error": "EdgeGuard explanation model returned an invalid response"},
+          "provider",
+          "provider_failure",
+        )
       provider_result = self._extract_provider_failure(data)
       if provider_result is not None:
         provider_status = provider_result.get("status")
         if provider_result.get("error") == "Model context window exceeded.":
-          return {
+          return finish({
             "status": STATUS_REJECTED,
             "error": "Graph explanation evidence exceeds the model context window.",
             "validation_errors": [
               _contract_error("context_window_exceeded", "Reduce the returned graph or explanation row limit.")
             ],
             "provider": "local",
-          }
-        return {
+          }, "provider", "context_window_exceeded")
+        result = {
           "status": STATUS_TIMEOUT if provider_status == STATUS_TIMEOUT else STATUS_ERROR,
           "error": (
             "EdgeGuard explanation model request timed out"
@@ -2002,76 +2172,79 @@ class EdgeguardApiPlugin(BasePlugin):
           ),
           "provider": "local",
         }
-      completion = self._extract_explanation_completion(data)
-      raw_finish_reason = completion["finish_reason"]
-      normalized_finish_reason = (
-        raw_finish_reason if raw_finish_reason in {"stop", "length"} else
-        "missing" if raw_finish_reason is None else
-        "other"
-      )
-      self.P(
-        "EDGEGUARD_EXPLANATION_COMPLETION " + json.dumps({
-          "completion_tokens": completion["completion_tokens"],
-          "finish_reason": normalized_finish_reason,
-          "max_tokens": payload["max_tokens"],
-          "request_sha256": _sha256_text(str(packet.get("request") or "")),
-        }, sort_keys=True, separators=(",", ":"))
-      )
+        return finish(
+          result,
+          "provider",
+          "provider_timeout" if provider_status == STATUS_TIMEOUT else "provider_failure",
+        )
+      completion.update(self._extract_explanation_completion(data))
       content = completion["content"]
       if content is None:
-        return {
+        return finish({
           "status": STATUS_ERROR,
           "error": "EdgeGuard explanation model response did not contain assistant content",
-        }
+        }, "completion", "missing_content")
       if completion["finish_reason"] == "length":
-        return {
+        return finish({
           "status": STATUS_REJECTED,
           "error": EXPLANATION_TRUNCATED_MESSAGE,
           "validation_errors": [_contract_error("output_truncated", EXPLANATION_TRUNCATED_MESSAGE)],
-        }
+        }, "completion", "output_truncated")
       try:
         draft = json.loads(content)
-      except json.JSONDecodeError as exc:
+      except json.JSONDecodeError:
         if (
           completion["completion_tokens"] is not None
           and completion["completion_tokens"] >= payload["max_tokens"]
         ):
-          return {
+          return finish({
             "status": STATUS_REJECTED,
             "error": EXPLANATION_TRUNCATED_MESSAGE,
             "validation_errors": [_contract_error("output_truncated", EXPLANATION_TRUNCATED_MESSAGE)],
-          }
-        return {
+          }, "completion", "output_truncated")
+        return finish({
           "status": STATUS_REJECTED,
           "error": "EdgeGuard explanation model returned malformed JSON",
-          "validation_errors": [_contract_error("malformed_json", str(exc))],
-        }
+          "validation_errors": [_contract_error("malformed_json", "assistant content was not valid JSON")],
+        }, "response_parse", "malformed_json")
       if not isinstance(draft, dict):
-        return {
+        return finish({
           "status": STATUS_REJECTED,
           "error": "EdgeGuard explanation model returned non-object JSON",
           "validation_errors": [_contract_error("invalid_explanation_draft", "explanation draft must be an object")],
-        }
+        }, "response_parse", "invalid_explanation_draft")
       explanation, errors = _construct_case_explanation(draft, packet, prompt_packet)
       if errors:
-        return {
+        return finish({
           "status": STATUS_REJECTED,
           "error": "EdgeGuard explanation failed deterministic validation",
           "validation_errors": errors,
-        }
-      return {
+        }, "validation", "deterministic_validation_failed")
+      return finish({
         "status": STATUS_ACCEPTED,
         "explanation": explanation,
         "provider": "local",
         "model": self.cfg_edgeguard_explanation_model,
-      }
+      }, "complete", "accepted")
     except requests.exceptions.Timeout:
-      return {"status": STATUS_TIMEOUT, "error": "EdgeGuard explanation model request timed out"}
+      return finish(
+        {"status": STATUS_TIMEOUT, "error": "EdgeGuard explanation model request timed out"},
+        "provider",
+        "provider_timeout",
+      )
     except requests.exceptions.RequestException:
-      return {"status": STATUS_ERROR, "error": "EdgeGuard explanation model request failed"}
+      return finish(
+        {"status": STATUS_ERROR, "error": "EdgeGuard explanation model request failed"},
+        "provider",
+        "provider_failure",
+      )
     except Exception:
       self.P("Unexpected EdgeGuard explanation model failure", color='r')
-      return {"status": STATUS_ERROR, "error": "Unexpected explanation model failure"}
+      return finish(
+        {"status": STATUS_ERROR, "error": "Unexpected explanation model failure"},
+        "internal",
+        "unexpected_failure",
+      )
 
   @BasePlugin.endpoint(method="GET")
   def health(self) -> Dict[str, Any]:
@@ -2529,34 +2702,7 @@ class EdgeguardApiPlugin(BasePlugin):
       }
     explanation_result = self._call_explanation_model(packet, temperature, max_tokens, top_p)
     if explanation_result.get("status") != STATUS_ACCEPTED:
-      validation_errors = explanation_result.get("validation_errors", [])
-      if any(item.get("code") == "output_truncated" for item in validation_errors):
-        return {
-          "status_code": 500,
-          "result": {
-            "status": STATUS_REJECTED,
-            "ok": False,
-            "executed": True,
-            "explained": False,
-            "error": EXPLANATION_TRUNCATED_MESSAGE,
-            "validation_errors": validation_errors,
-          },
-        }
-      return {
-        "status": explanation_result.get("status", STATUS_ERROR),
-        "ok": False,
-        "executed": True,
-        "explained": False,
-        "error": explanation_result.get("error", "EdgeGuard graph explanation failed"),
-        "validation_errors": explanation_result.get("validation_errors", []),
-        "packet": packet,
-        "packet_meta": packet_meta,
-        "validation": plan.get("validation"),
-        "live_retry": live_retry,
-        "provider": explanation_result.get("provider"),
-        "provider_status": explanation_result.get("provider_status"),
-        "explanation": explanation_result.get("explanation"),
-      }
+      return self._explanation_failure_transport(explanation_result)
     return {
       "status": STATUS_OK,
       "ok": True,
@@ -2758,34 +2904,7 @@ class EdgeguardApiPlugin(BasePlugin):
 
       explanation_result = self._call_explanation_model(packet, temperature, max_tokens, top_p)
       if explanation_result.get("status") != STATUS_ACCEPTED:
-        validation_errors = explanation_result.get("validation_errors", [])
-        if any(item.get("code") == "output_truncated" for item in validation_errors):
-          return {
-            "status_code": 500,
-            "result": {
-              "status": STATUS_REJECTED,
-              "ok": False,
-              "executed": True,
-              "explained": False,
-              "error": EXPLANATION_TRUNCATED_MESSAGE,
-              "validation_errors": validation_errors,
-            },
-          }
-        return {
-          "status": explanation_result.get("status", STATUS_ERROR),
-          "ok": False,
-          "executed": True,
-          "explained": False,
-          "error": explanation_result.get("error", "EdgeGuard graph explanation failed"),
-          "validation_errors": explanation_result.get("validation_errors", []),
-          "packet": packet,
-          "packet_meta": packet_meta,
-          "validation": analysis,
-          "live_retry": live_retry,
-          "provider": explanation_result.get("provider"),
-          "provider_status": explanation_result.get("provider_status"),
-          "explanation": explanation_result.get("explanation"),
-        }
+        return self._explanation_failure_transport(explanation_result)
       return {
         "status": STATUS_OK,
         "ok": True,
