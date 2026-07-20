@@ -2,6 +2,7 @@ import json
 import sys
 import struct
 import unittest
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
@@ -3569,8 +3570,9 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["error"], "not_available")
 
   def test_manual_structured_analysis_backfills_legacy_fields(self):
-    """Manual structured analysis updates the pass report for get_analysis compatibility."""
+    """Postponed manual analysis updates the pass report for compatibility."""
     Plugin = self._get_plugin_class()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import _ManualAnalysisOutcome
     job_specs = self._build_running_job("job-llm", pass_count=1)
     for worker in job_specs["workers"].values():
       worker["finished"] = True
@@ -3584,6 +3586,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "AUTO_ANALYSIS_TYPE": "security_assessment",
     }
     plugin.cfg_llm_agent_api_port = 8080
+    plugin.cfg_llm_agent_api_host = "127.0.0.1"
+    plugin.cfg_request_timeout = 120
     plugin.r1fs = MagicMock()
     plugin.r1fs.get_json.return_value = {
       "pass_nr": 1,
@@ -3605,23 +3609,46 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
     plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+    plugin._collect_bounded_manual_analysis_reports = (
+      lambda workers: Plugin._collect_bounded_manual_analysis_reports(plugin, workers)
+    )
+    sections = {
+      "executive_headline": "Manual structured headline",
+      "overall_posture": "Manual structured posture",
+      "recommendation_summary": ["Review internet exposure"],
+      "conclusion": "Manual structured conclusion",
+    }
+    future = MagicMock()
+    future.done.return_value = True
+    future.result.return_value = _ManualAnalysisOutcome(sections=sections, failed=False)
+    plugin._manual_analysis_executor = MagicMock()
+    plugin._manual_analysis_executor.submit.return_value = future
+    plugin._manual_analysis_state = None
+    plugin.time.return_value = 100.0
+    plugin.create_postponed_request.return_value = "postponed"
 
-    def _structured_success(*_args, **_kwargs):
-      plugin._last_structured_llm_failed = False
-      return {
-        "executive_headline": "Manual structured headline",
-        "overall_posture": "Manual structured posture",
-        "recommendation_summary": ["Review internet exposure"],
-        "conclusion": "Manual structured conclusion",
-      }
+    def _write_job(_owner, _job_id, persisted, **_kwargs):
+      job_specs["pass_reports"] = deepcopy(persisted["pass_reports"])
+      return persisted
 
-    plugin._run_structured_report_sections = MagicMock(side_effect=_structured_success)
-
-    result = Plugin.analyze_job(plugin, job_id="job-llm")
+    with patch.dict(
+      "os.environ",
+      {"REDMESH_ANALYZE_TOKEN": "0123456789abcdef0123456789abcdef"},
+      clear=False,
+    ), patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
+      postponed = Plugin.analyze_job(
+        plugin,
+        token="0123456789abcdef0123456789abcdef",
+        job_id="job-llm",
+      )
+      self.assertEqual(postponed, "postponed")
+      pending_id = plugin._manual_analysis_state["pending_id"]
+      result = Plugin.solve_postponed_analyze_job(plugin, pending_id)
 
     updated_pass = plugin.r1fs.add_json.call_args[0][0]
+    persisted_job = write_job.call_args[0][2]
     self.assertEqual(result["analysis_type"], "structured_report_sections")
-    self.assertEqual(job_specs["pass_reports"][-1]["report_cid"], "QmUpdatedPass")
+    self.assertEqual(persisted_job["pass_reports"][-1]["report_cid"], "QmUpdatedPass")
     self.assertEqual(updated_pass["quick_summary"], "Manual structured headline")
     self.assertIn("Manual structured posture", updated_pass["llm_analysis"])
     self.assertIn("Review internet exposure", updated_pass["llm_analysis"])

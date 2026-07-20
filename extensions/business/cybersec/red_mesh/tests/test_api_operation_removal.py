@@ -28,4 +28,5 @@ class TestApiOperationRemoval(unittest.TestCase):
       self.assertFalse(hasattr(PentesterApi01Plugin, name), name)
 
     self.assertTrue(callable(PentesterApi01Plugin.analyze_job))
+    self.assertTrue(callable(PentesterApi01Plugin.solve_postponed_analyze_job))
     self.assertTrue(callable(PentesterApi01Plugin.preflight_model_test_provider))
