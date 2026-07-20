@@ -1561,7 +1561,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_explanation_provider_length_finish_rejects_before_parsing_without_raw_output(self):
     plugin = _make_api()
-    plugin.Pd = MagicMock()
+    plugin.P = MagicMock()
     packet = _case_explanation_packet()
     partial = '{"summary":{"text":"partial-secret"'
 
@@ -1576,7 +1576,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["error"], "Graph explanation output was truncated at the safe token limit.")
     self.assertNotIn("partial-secret", json.dumps(result))
     self.assertNotIn("raw_output", result)
-    audit_log = " ".join(str(call) for call in plugin.Pd.call_args_list)
+    audit_log = " ".join(str(call) for call in plugin.P.call_args_list)
     self.assertIn('"completion_tokens":1024', audit_log)
     self.assertIn('"finish_reason":"length"', audit_log)
     self.assertIn('"max_tokens":1024', audit_log)
@@ -1599,7 +1599,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_explanation_provider_usage_at_1024_cap_rejects_malformed_output_without_disclosure(self):
     plugin = _make_api()
-    plugin.Pd = MagicMock()
+    plugin.P = MagicMock()
     packet = _case_explanation_packet()
     partial = '{"summary":{"text":"cap-secret"'
 
@@ -1611,11 +1611,11 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertEqual({item["code"] for item in result["validation_errors"]}, {"output_truncated"})
     self.assertNotIn("cap-secret", json.dumps(result))
-    self.assertNotIn("cap-secret", " ".join(str(call) for call in plugin.Pd.call_args_list))
+    self.assertNotIn("cap-secret", " ".join(str(call) for call in plugin.P.call_args_list))
 
   def test_explanation_provider_normal_stop_accepts_valid_json_above_old_token_cap(self):
     plugin = _make_api()
-    plugin.Pd = MagicMock()
+    plugin.P = MagicMock()
     packet = _case_explanation_packet()
     draft = _draft_for_packet(packet)
 
@@ -1631,7 +1631,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(result["explanation"]["schema_version"], "edgeguard.case_explanation.v1")
-    audit_log = " ".join(str(call) for call in plugin.Pd.call_args_list)
+    audit_log = " ".join(str(call) for call in plugin.P.call_args_list)
     self.assertIn('"completion_tokens":700', audit_log)
     self.assertIn('"finish_reason":"stop"', audit_log)
     self.assertIn('"max_tokens":1024', audit_log)

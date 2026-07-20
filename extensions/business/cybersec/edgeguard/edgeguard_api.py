@@ -2009,7 +2009,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "missing" if raw_finish_reason is None else
         "other"
       )
-      self.Pd(
+      self.P(
         "EDGEGUARD_EXPLANATION_COMPLETION " + json.dumps({
           "completion_tokens": completion["completion_tokens"],
           "finish_reason": normalized_finish_reason,
