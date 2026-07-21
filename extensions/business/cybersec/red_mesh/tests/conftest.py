@@ -155,6 +155,19 @@ def mock_plugin_modules():
     CONFIG = {'VALIDATION_RULES': {}}
     endpoint = staticmethod(endpoint_decorator)
 
+    def create_postponed_request(self, solver_method, method_kwargs=None):
+      return {
+        "solver_method": solver_method,
+        "method_kwargs": dict(method_kwargs or {}),
+      }
+
+    def process(self):
+      return None
+
+    def on_close(self):
+      self._base_closed = True
+      return None
+
   mock_module = MagicMock()
   mock_module.FastApiWebAppPlugin = FakeBasePlugin
 

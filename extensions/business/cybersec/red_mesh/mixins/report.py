@@ -355,9 +355,12 @@ class _ReportMixin:
     self._stamp_finding_list(local_job_status.get("findings"),
                              worker_id, node_addr)
 
-  def _get_aggregated_report(self, local_jobs, worker_cls=None):
+  def _get_aggregated_report(self, local_jobs, worker_cls=None, log_details=True):
     """
     Aggregate results from multiple local workers.
+
+    ``log_details=False`` is used at request trust boundaries where aggregate
+    content must not be copied into runtime logs on failure.
 
     Parameters
     ----------
@@ -429,11 +432,14 @@ class _ReportMixin:
         self.P(f"Report aggregation done.")
       # endif we have local jobs
     except Exception as exc:
-      self.P("Error during report aggregation: {}:\n{}\n{}\ntype_or_func={}, field={}".format(
-        exc, self.trace_info(),
-        self.json_dumps(dct_aggregated_report, indent=2),
-        type_or_func, field
-      ))
+      if log_details:
+        self.P("Error during report aggregation: {}:\n{}\n{}\ntype_or_func={}, field={}".format(
+          exc, self.trace_info(),
+          self.json_dumps(dct_aggregated_report, indent=2),
+          type_or_func, field
+        ))
+      else:
+        self.P("Manual report aggregation failed", color='y')
     # Phase 0 dedup pass: collapse findings duplicated across workers
     # because each worker stamps its own _source_worker_id /
     # _source_node_addr before merge. The JSON-key fallback in

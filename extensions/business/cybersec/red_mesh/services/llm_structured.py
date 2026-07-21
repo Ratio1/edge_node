@@ -502,9 +502,10 @@ def build_response_format_for_prompt_profile(
 def generate_exec_summary(
   *,
   llm_call: LlmCall,
-  findings: list[dict] | None,
+  findings: list[dict] | None = None,
   aggregated_report: dict | None = None,
   engagement: dict | None = None,
+  prepared_input: LlmInput | None = None,
   model_name: str = "",
   provider_path: str | None = None,
   prompt_profile: str | None = None,
@@ -530,6 +531,9 @@ def generate_exec_summary(
       fields ONLY; raw blobs are dropped by build_llm_input.
   engagement : dict | None
       EngagementContext.to_dict() output.
+  prepared_input : LlmInput | None
+      Sanitized trust-boundary output prepared by the caller. When supplied,
+      raw findings/report/engagement inputs are ignored.
   model_name : str
       Stamped onto the resulting LlmReportSections.model.
   max_findings : int | None
@@ -555,12 +559,17 @@ def generate_exec_summary(
     temperature = profile.default_temperature
 
   # --- Trust boundary: scrub inputs through build_llm_input. ---
-  llm_input = build_llm_input(
-    findings=findings,
-    aggregated_report=aggregated_report,
-    engagement=engagement,
-    max_findings=max_findings,
-  )
+  if prepared_input is None:
+    llm_input = build_llm_input(
+      findings=findings,
+      aggregated_report=aggregated_report,
+      engagement=engagement,
+      max_findings=max_findings,
+    )
+  elif isinstance(prepared_input, LlmInput):
+    llm_input = prepared_input
+  else:
+    raise TypeError("prepared_input must be an LlmInput")
   compact_findings = _compact_findings_for_structured_prompt(llm_input.findings)
 
   messages = _build_messages_for_profile(
