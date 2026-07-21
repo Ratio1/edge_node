@@ -567,14 +567,17 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(Plugin._get_progress_publish_interval(plugin), 30.0)
     plugin.chainstore_hset.assert_not_called()
 
-  def test_job_write_guarantees_are_detection_only(self):
-    """Mutable job writes explicitly advertise detection-only semantics."""
+  def test_job_write_guarantees_are_launcher_guarded_without_cas(self):
+    """Mutable lifecycle writes advertise ownership guards, not atomic CAS."""
     Plugin = self._get_plugin_class()
     plugin = MagicMock()
 
-    self.assertFalse(Plugin._supports_guarded_job_writes(plugin))
-    self.assertEqual(Plugin._get_job_write_guarantees(plugin)["mode"], "detection_only")
-    self.assertFalse(Plugin._get_job_write_guarantees(plugin)["guarded_writes"])
+    self.assertTrue(Plugin._supports_guarded_job_writes(plugin))
+    guarantees = Plugin._get_job_write_guarantees(plugin)
+    self.assertEqual(guarantees["mode"], "launcher_single_writer")
+    self.assertTrue(guarantees["guarded_writes"])
+    self.assertFalse(guarantees["atomic_compare_and_swap"])
+    self.assertFalse(guarantees["distributed_lease"])
 
   def test_live_hsync_due_uses_fixed_config_interval(self):
     """Launcher live-hsync schedule uses the normalized fixed interval."""

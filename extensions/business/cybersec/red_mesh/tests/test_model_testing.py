@@ -3069,7 +3069,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     PentesterApi01Plugin._maybe_close_model_test_jobs(plugin)
 
     self.assertEqual(plugin.model_test_jobs, {})
-    self.assertEqual(plugin.r1fs.add_json.call_count, 2)
+    self.assertEqual(plugin.r1fs.add_json.call_count, 1)
     stored_result = stored_artifacts[0]
     self.assertEqual(stored_result["schema_version"], "model_test_worker_result_v1")
     self.assertEqual(stored_result["job_id"], "job-1")
@@ -3077,31 +3077,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(stored_result["status"], "complete")
     self.assertEqual(stored_result["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(stored_result["model_test_results"]["cases"][0]["status"], "evaluated")
-    stored_archive = stored_artifacts[1]
-    self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
-    self.assertEqual(stored_archive["job_id"], "job-1")
-    self.assertEqual(stored_archive["job_type"], "model_test")
-    self.assertEqual(stored_archive["job_config"]["job_id"], "job-1")
-    self.assertNotIn("model_provider_secret_ref", stored_archive["job_config"])
-    self.assertNotIn("model_provider_secret_store_key_id", stored_archive["job_config"])
-    self.assertEqual(stored_archive["model_test_results"]["overall_status"], "complete")
-    self.assertEqual(stored_archive["model_test_results"]["cases"][0]["case_id"], "cbrn-chemical-001")
-    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "complete")
-    self.assertEqual(stored_archive["model_test_node_selection"]["selected_execution_node"], "node-a")
-    self.assertEqual(stored_archive["ui_aggregate"]["scan_type"], "model_test")
-    self.assertEqual(stored_archive["ui_aggregate"]["finding_count"], 0)
-    self.assertEqual(stored_archive["duration"], 10.0)
-    self.assertEqual(len(written_records), 1)
-    persisted_specs = written_records[0][1]
-    self.assertEqual(written_records[0][2], "model_test_archive_prune")
-    self.assertEqual(persisted_specs["job_status"], "FINALIZED")
-    self.assertEqual(persisted_specs["job_type"], "model_test")
-    self.assertEqual(persisted_specs["scan_type"], "model_test")
-    self.assertEqual(persisted_specs["job_cid"], "cid-archive")
-    self.assertEqual(persisted_specs["job_config_cid"], "cid-config")
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "complete")
-    self.assertEqual(persisted_specs["model_test_node_selection"]["selected_execution_node"], "node-a")
-    self.assertNotIn("workers", persisted_specs)
+    self.assertEqual(written_records, [])
     plugin._publish_model_test_progress.assert_called_once()
     _, _, progress_specs = plugin._publish_model_test_progress.call_args.args[:3]
     self.assertEqual(progress_specs["workers"]["node-a"]["report_cid"], "cid-result")
@@ -3142,10 +3118,9 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
           "worker_type": "model_test",
           "start_port": 0,
           "end_port": 0,
-          "finished": True,
+          "finished": False,
           "canceled": False,
-          "model_test_worker_status": "finished",
-          "report_cid": "cid-result",
+          "model_test_worker_status": "assigned",
           "assignment_revision": 1,
           "assigned_at": 123.0,
         },
@@ -3198,10 +3173,31 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       },
     }
     plugin = MagicMock()
-    plugin.ee_addr = "node-a"
+    plugin.ee_addr = "launcher-node"
     plugin.cfg_instance_id = "instance"
     plugin.time.return_value = 130.0
-    plugin.chainstore_hgetall.return_value = {"job-stale": job_specs}
+    terminal_live = {
+      "job-stale:node-a": {
+        "job_id": "job-stale",
+        "worker_addr": "node-a",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 100.0,
+        "phase": "done",
+        "ports_scanned": 0,
+        "ports_total": 0,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 130.0,
+        "finished": True,
+        "report_cid": "cid-result",
+        "scan_type": "model_test",
+        "job_type": "model_test",
+      },
+    }
+    plugin.chainstore_hgetall.side_effect = lambda hkey: (
+      terminal_live if hkey == "instance:live" else {"job-stale": job_specs}
+    )
     plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
     written_records = []
     stored_artifacts = []
@@ -3244,6 +3240,30 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
     self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
     self.assertNotIn("workers", persisted_specs)
+
+  def test_non_launcher_cannot_finalize_model_test_job(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "worker-node"
+    plugin.r1fs = MagicMock()
+    job_specs = {
+      "job_id": "job-owned",
+      "launcher": "launcher-node",
+      "job_config_cid": "cid-config",
+    }
+
+    finalized = PentesterApi01Plugin._finalize_model_test_job(
+      plugin,
+      "job-owned",
+      job_specs,
+      {"status": "complete", "model_test_results": {}, "model_test_summary": {}},
+      "cid-result",
+    )
+
+    self.assertFalse(finalized)
+    plugin.r1fs.add_json.assert_not_called()
 
   def test_finished_model_test_recovery_skips_failed_attestation_record(self):
     mock_plugin_modules()
