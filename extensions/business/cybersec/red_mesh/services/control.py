@@ -485,6 +485,15 @@ def purge_all_jobs(owner):
 
   terminal_statuses = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED)
   for job_id, raw_payload in job_entries:
+    owner_error = _foreign_launcher_error(owner, job_id, raw_payload, "purge_all")
+    if owner_error:
+      jobs_failed += 1
+      failed_job_ids.add(job_id)
+      errors.append({
+        "job_id": job_id,
+        "message": owner_error["message"],
+      })
+      continue
     raw_status = raw_payload.get("job_status") if isinstance(raw_payload, dict) else None
     use_direct_purge = raw_status in terminal_statuses
     try:

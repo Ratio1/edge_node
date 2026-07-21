@@ -2116,6 +2116,29 @@ class TestPurgeAllJobs(unittest.TestCase):
     deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
     self.assertEqual(deleted_cids, {"cid-x"})
 
+  def test_bulk_purge_preserves_foreign_launcher_jobs_without_force_fallback(self):
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-foreign": {
+        "job_id": "job-foreign",
+        "job_status": "FINALIZED",
+        "job_cid": "cid-foreign",
+        "launcher": "node-B",
+      },
+    }
+    plugin = self._make_plugin(jobs)
+    plugin.r1fs = MagicMock()
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_failed"], 1)
+    self.assertEqual(result["jobs_force_purged"], 0)
+    self.assertIn("job-foreign", plugin._hashes["test-instance"])
+    plugin.purge_job.assert_not_called()
+    plugin.stop_and_delete_job.assert_not_called()
+    plugin.r1fs.delete_file.assert_not_called()
+
   def test_partial_status_preserves_state_no_force_purge(self):
     """status='partial' is the retry contract — state preserved, no force-purge."""
     Plugin = self._get_plugin_class()
