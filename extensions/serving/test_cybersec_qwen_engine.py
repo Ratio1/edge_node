@@ -71,6 +71,8 @@ class _FakeLlama:
 
 
 class _FakeLlamaCppLib:
+  _lib = types.SimpleNamespace(_name=__file__)
+
   @staticmethod
   def llama_supports_gpu_offload():
     return False
@@ -250,6 +252,9 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(fingerprint["gguf_sha256"], hashlib.sha256(b"gguf").hexdigest())
     self.assertEqual(fingerprint["model_revision"], f"artifact-sha256:{fingerprint['gguf_sha256']}")
     self.assertEqual(fingerprint["quantization"]["general.file_type"], 15)
+    self.assertEqual(fingerprint["llama_cpp"]["build_sha256"], hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    self.assertRegex(fingerprint["llama_cpp"]["system_info_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(fingerprint["load_configuration"]["draft_model_config_sha256"], r"^[0-9a-f]{64}$")
     self.assertRegex(fingerprint["fingerprint_sha256"], r"^[0-9a-f]{64}$")
     self.assertNotIn(str(model_path), json.dumps(fingerprint))
 
@@ -260,7 +265,9 @@ class CyberSecQwenEngineTests(unittest.TestCase):
       Path(downloaded_path).parent.mkdir(parents=True)
       Path(downloaded_path).write_bytes(b"gguf")
       fake_hf_module = types.SimpleNamespace(
-        HfApi=lambda token=None: types.SimpleNamespace(list_repo_files=lambda repo_id, token=None: ["model.gguf"]),
+        HfApi=lambda token=None: types.SimpleNamespace(
+          list_repo_files=lambda repo_id, revision=None, token=None: ["model.gguf"],
+        ),
         hf_hub_download=lambda **_kwargs: downloaded_path,
       )
       previous_hf_module = sys.modules.get("huggingface_hub")
@@ -282,6 +289,33 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(kwargs["model_path"], downloaded_path)
     self.assertEqual(process.safe_load_model_args["model_id"], "org/repo")
     self.assertEqual(process.safe_load_model_args["model_str_id"], "org/repo/model.gguf")
+
+  def test_llama_cpp_base_applies_requested_revision_but_records_loaded_snapshot(self):
+    process = _make_llama_cpp_process(cfg_model_revision="requested-tag")
+    calls = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+      snapshot = "b" * 40
+      downloaded_path = str(Path(tmpdir) / "snapshots" / snapshot / "model.gguf")
+      Path(downloaded_path).parent.mkdir(parents=True)
+      Path(downloaded_path).write_bytes(b"gguf")
+      fake_hf_module = types.SimpleNamespace(
+        HfApi=lambda token=None: types.SimpleNamespace(
+          list_repo_files=lambda **kwargs: calls.append(("list", kwargs)) or ["model.gguf"],
+        ),
+        hf_hub_download=lambda **kwargs: calls.append(("download", kwargs)) or downloaded_path,
+      )
+      previous_hf_module = sys.modules.get("huggingface_hub")
+      sys.modules["huggingface_hub"] = fake_hf_module
+      try:
+        process._load_model()
+      finally:
+        if previous_hf_module is None:
+          sys.modules.pop("huggingface_hub", None)
+        else:
+          sys.modules["huggingface_hub"] = previous_hf_module
+    self.assertEqual(process.get_runtime_fingerprint()["model_revision"], snapshot)
+    self.assertEqual(process.get_runtime_fingerprint()["load_configuration"]["requested_model_revision"], "requested-tag")
+    self.assertTrue(all(kwargs["revision"] == "requested-tag" for _name, kwargs in calls))
 
   def test_llama_cpp_base_missing_model_path_error_is_sanitized(self):
     with tempfile.TemporaryDirectory() as tmpdir:

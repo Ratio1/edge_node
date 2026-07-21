@@ -91,9 +91,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     return hashlib.sha256(encoded).hexdigest()
 
   @staticmethod
-  def _revision_from_loaded_path(path, configured_revision, gguf_sha256):
-    if isinstance(configured_revision, str) and configured_revision.strip():
-      return configured_revision.strip()
+  def _revision_from_loaded_path(path, gguf_sha256):
     parts = Path(path).parts
     if "snapshots" in parts:
       index = parts.index("snapshots")
@@ -114,8 +112,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     match = re.search(r"\.([Qq][0-9][A-Za-z0-9_-]*)\.gguf$", model_filename)
     return {"filename_profile": match.group(1).upper()} if match else {"filename_profile": "unknown"}
 
-  @staticmethod
-  def _llama_cpp_build_sha256():
+  def _llama_cpp_build_identity(self):
     try:
       package_version = importlib.metadata.version("llama-cpp-python")
     except importlib.metadata.PackageNotFoundError:
@@ -131,26 +128,38 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
           system_info = str(system_info)
       except Exception:
         system_info = "unavailable"
-    material = f"llama-cpp-python={package_version}\n{system_info}".encode("utf-8")
-    return package_version, hashlib.sha256(material).hexdigest()
+    loaded_library = getattr(llama_cpp_lib, "_lib", None)
+    loaded_library_path = getattr(loaded_library, "_name", None)
+    if not isinstance(loaded_library_path, str) or not os.path.isfile(loaded_library_path):
+      raise RuntimeError("Loaded llama.cpp native library is unavailable for runtime fingerprinting.")
+    return {
+      "package_version": package_version,
+      "build_sha256": self._sha256_file(loaded_library_path),
+      "system_info_sha256": hashlib.sha256(system_info.encode("utf-8")).hexdigest(),
+    }
+
+  def _opaque_config_sha256(self, value):
+    try:
+      material = self.json_dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+      )
+    except (TypeError, ValueError):
+      material = f"{type(value).__module__}.{type(value).__qualname__}:{value!r}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
   def _cache_runtime_fingerprint(self, loaded_model_path, model_params):
     gguf_sha256 = self._sha256_file(loaded_model_path)
-    package_version, build_sha256 = self._llama_cpp_build_sha256()
+    build_identity = self._llama_cpp_build_identity()
     model_filename = os.path.basename(loaded_model_path)
     document = {
       "schema_version": "edgeguard.loaded_runtime_fingerprint.v1",
       "gguf_sha256": gguf_sha256,
       "model_revision": self._revision_from_loaded_path(
         loaded_model_path,
-        getattr(self, "cfg_model_revision", None),
         gguf_sha256,
       ),
       "quantization": self._loaded_quantization(model_filename),
-      "llama_cpp": {
-        "package_version": package_version,
-        "build_sha256": build_sha256,
-      },
+      "llama_cpp": build_identity,
       "load_configuration": {
         "n_ctx": model_params["n_ctx"],
         "n_batch": model_params["n_batch"],
@@ -158,6 +167,8 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         "seed": model_params["seed"],
         "n_gpu_layers": model_params["n_gpu_layers"],
         "n_threads": model_params.get("n_threads"),
+        "requested_model_revision": getattr(self, "cfg_model_revision", None),
+        "draft_model_config_sha256": self._opaque_config_sha256(model_params.get("draft_model")),
       },
       "generation_defaults": {
         "temperature": getattr(self, "cfg_default_temperature", None),
@@ -341,7 +352,11 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       # endtry
 
       hf_api = HfApi(token=self.hf_token)
-      repo_files = hf_api.list_repo_files(repo_id=model_id, token=self.hf_token)
+      repo_files = hf_api.list_repo_files(
+        repo_id=model_id,
+        revision=self.cfg_model_revision,
+        token=self.hf_token,
+      )
       matching_files = [file for file in repo_files if fnmatch(file, model_filename)]
       if len(matching_files) == 0:
         raise ValueError(
@@ -364,6 +379,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         filename=Path(matching_file).name,
         subfolder=subfolder,
         cache_dir=self.cache_dir,
+        revision=self.cfg_model_revision,
         token=self.hf_token,
       )
       loaded_model_path = downloaded_model_path
