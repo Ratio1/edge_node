@@ -342,11 +342,30 @@ class LLMInferenceApiPlugin(BasePlugin):
       except (AttributeError, KeyError, TypeError):
         return False
 
+    def _get_loaded_runtime_fingerprint(self):
+      shared = getattr(self, "global_shmem", None)
+      manager = shared.get("serving_manager") if isinstance(shared, dict) else None
+      if manager is None:
+        return None
+      try:
+        serving_processes = self.get_serving_processes()
+        if len(serving_processes) != 1 or not manager.is_avail(serving_processes[0]):
+          return None
+        server = manager._get_server(serving_processes[0])
+        if getattr(server, "inprocess", False) is not True:
+          return None
+        getter = getattr(server, "get_runtime_fingerprint", None)
+        fingerprint = getter() if callable(getter) else None
+        return fingerprint if isinstance(fingerprint, dict) else None
+      except (AttributeError, KeyError, TypeError):
+        return None
+
     @BasePlugin.endpoint(method="GET")
     def health(self):
       result = super(LLMInferenceApiPlugin, self).health()
       result["serving_ready"] = self._is_serving_ready()
       result["benchmark_mode_enabled"] = getattr(self, "cfg_benchmark_mode_enabled", False) is True
+      result["runtime_fingerprint"] = self._get_loaded_runtime_fingerprint()
       return result
 
     # Override only to attach balanced endpoint metadata to the inherited handler.

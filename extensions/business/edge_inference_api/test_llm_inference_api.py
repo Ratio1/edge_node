@@ -80,10 +80,33 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     plugin.global_shmem = {"serving_manager": type("Manager", (), {"is_avail": lambda _self, name: name == "expected-server"})()}
     self.assertIs(plugin.health()["serving_ready"], True)
     self.assertIs(plugin.health()["benchmark_mode_enabled"], False)
+    self.assertIsNone(plugin.health()["runtime_fingerprint"])
     plugin.cfg_benchmark_mode_enabled = True
     self.assertIs(plugin.health()["benchmark_mode_enabled"], True)
     plugin.global_shmem = {}
     self.assertIs(plugin.health()["serving_ready"], False)
+
+  def test_health_reports_only_actual_inprocess_runtime_fingerprint(self):
+    fingerprint = {
+      "schema_version": "edgeguard.loaded_runtime_fingerprint.v1",
+      "gguf_sha256": "a" * 64,
+      "fingerprint_sha256": "b" * 64,
+    }
+    server = type("Server", (), {
+      "inprocess": True,
+      "get_runtime_fingerprint": lambda _self: dict(fingerprint),
+    })()
+    manager = type("Manager", (), {
+      "is_avail": lambda _self, _name: True,
+      "_get_server": lambda _self, _name: server,
+    })()
+    plugin = LLMInferenceApiPlugin()
+    plugin.get_serving_processes = lambda: ["expected-server"]
+    plugin.global_shmem = {"serving_manager": manager}
+
+    self.assertEqual(plugin.health()["runtime_fingerprint"], fingerprint)
+    server.inprocess = False
+    self.assertIsNone(plugin.health()["runtime_fingerprint"])
 
   def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):
     for method_name in ("predict", "predict_async", "create_chat_completion", "create_chat_completion_async"):

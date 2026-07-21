@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 import tempfile
@@ -60,6 +61,7 @@ class _FakeLlama:
 
   def __init__(self, **kwargs):
     self.kwargs = kwargs
+    self.metadata = {"general.file_type": 15, "general.quantization_version": 2}
     self.__class__.calls.append(("local", kwargs))
 
   @classmethod
@@ -72,6 +74,10 @@ class _FakeLlamaCppLib:
   @staticmethod
   def llama_supports_gpu_offload():
     return False
+
+  @staticmethod
+  def llama_print_system_info():
+    return b"fake-llama-build"
 
 
 def _load_cybersec_qwen_class():
@@ -160,11 +166,17 @@ def _make_llama_cpp_process(**overrides):
     "cfg_model_path": None,
     "cfg_model_name": "org/repo",
     "cfg_model_filename": "model.gguf",
+    "cfg_model_revision": None,
     "cfg_model_n_ctx": 1024,
     "cfg_chat_format": None,
     "cfg_draft_model": None,
     "cfg_n_gpu_layers": 0,
     "cfg_n_threads": 4,
+    "cfg_default_temperature": 0.7,
+    "cfg_default_top_p": 1.0,
+    "cfg_default_max_tokens": 128,
+    "cfg_repetition_penalty": 1.0,
+    "cfg_default_response_format": None,
   }
   defaults.update(overrides)
   for key, value in defaults.items():
@@ -234,24 +246,35 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(process.safe_load_model_args["model_str_id"], model_path.name)
     self.assertEqual(process.get_model_name(), model_path.name)
     self.assertFalse(any(str(model_path.parent) in message for message in process.messages))
+    fingerprint = process.get_runtime_fingerprint()
+    self.assertEqual(fingerprint["gguf_sha256"], hashlib.sha256(b"gguf").hexdigest())
+    self.assertEqual(fingerprint["model_revision"], f"artifact-sha256:{fingerprint['gguf_sha256']}")
+    self.assertEqual(fingerprint["quantization"]["general.file_type"], 15)
+    self.assertRegex(fingerprint["fingerprint_sha256"], r"^[0-9a-f]{64}$")
+    self.assertNotIn(str(model_path), json.dumps(fingerprint))
 
   def test_llama_cpp_base_blank_model_path_uses_repo_loading(self):
     process = _make_llama_cpp_process(cfg_model_path="  ")
-    downloaded_path = "/tmp/edge-node-test-cache/model.gguf"
-    fake_hf_module = types.SimpleNamespace(
-      HfApi=lambda token=None: types.SimpleNamespace(list_repo_files=lambda repo_id, token=None: ["model.gguf"]),
-      hf_hub_download=lambda **_kwargs: downloaded_path,
-    )
-    previous_hf_module = sys.modules.get("huggingface_hub")
-    sys.modules["huggingface_hub"] = fake_hf_module
+    with tempfile.TemporaryDirectory() as tmpdir:
+      downloaded_path = str(Path(tmpdir) / "snapshots" / ("a" * 40) / "model.gguf")
+      Path(downloaded_path).parent.mkdir(parents=True)
+      Path(downloaded_path).write_bytes(b"gguf")
+      fake_hf_module = types.SimpleNamespace(
+        HfApi=lambda token=None: types.SimpleNamespace(list_repo_files=lambda repo_id, token=None: ["model.gguf"]),
+        hf_hub_download=lambda **_kwargs: downloaded_path,
+      )
+      previous_hf_module = sys.modules.get("huggingface_hub")
+      sys.modules["huggingface_hub"] = fake_hf_module
 
-    try:
-      process._load_model()
-    finally:
-      if previous_hf_module is None:
-        sys.modules.pop("huggingface_hub", None)
-      else:
-        sys.modules["huggingface_hub"] = previous_hf_module
+      try:
+        process._load_model()
+      finally:
+        if previous_hf_module is None:
+          sys.modules.pop("huggingface_hub", None)
+        else:
+          sys.modules["huggingface_hub"] = previous_hf_module
+
+      self.assertEqual(process.get_runtime_fingerprint()["model_revision"], "a" * 40)
 
     self.assertEqual(len(_FakeLlama.calls), 1)
     call_type, kwargs = _FakeLlama.calls[0]
@@ -370,9 +393,13 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(preprocessed[4], [None])
     self.assertEqual(len(reset_calls), 1)
     self.assertEqual(len(completion_calls), 1)
+    telemetry = result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"]
+    self.assertEqual(telemetry["reset_succeeded"], True)
+    self.assertEqual(telemetry["attempt_count"], 1)
+    self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
     self.assertEqual(
-      result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"],
-      {"reset_succeeded": True, "attempt_count": 1},
+      telemetry["generation_config_sha256"],
+      process.benchmark_generation_config_sha256(completion_calls[0]),
     )
 
   def test_llama_cpp_benchmark_mode_missing_reset_makes_zero_completion_calls(self):
@@ -397,10 +424,10 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
     self.assertEqual(completion_calls, [])
     self.assertEqual(result["FULL_OUTPUT"][0]["error"]["code"], "benchmark_reset_unavailable")
-    self.assertEqual(
-      result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"],
-      {"reset_succeeded": False, "attempt_count": 0},
-    )
+    telemetry = result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"]
+    self.assertEqual(telemetry["reset_succeeded"], False)
+    self.assertEqual(telemetry["attempt_count"], 0)
+    self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
 
   def test_llama_cpp_benchmark_mode_terminal_outcomes_each_call_once(self):
     outcomes = {
@@ -447,10 +474,10 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
         self.assertEqual(len(reset_calls), 1)
         self.assertEqual(len(completion_calls), 1)
-        self.assertEqual(
-          result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"],
-          {"reset_succeeded": True, "attempt_count": 1},
-        )
+        telemetry = result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"]
+        self.assertEqual(telemetry["reset_succeeded"], True)
+        self.assertEqual(telemetry["attempt_count"], 1)
+        self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
 
   def test_llama_cpp_generation_logs_only_content_free_diagnostics(self):
     process = _make_llama_cpp_process()
