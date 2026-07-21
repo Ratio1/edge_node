@@ -2370,6 +2370,37 @@ class TestPhase2PassFinalization(unittest.TestCase):
     executor.submit.assert_called_once()
     plugin._log_audit_event.assert_not_called()
 
+  def test_soft_stop_during_automatic_analysis_is_preserved_on_resume(self):
+    """A responsive soft stop requested while analysis runs must end the pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    from extensions.business.cybersec.red_mesh.services.control import stop_monitoring
+
+    plugin, job_specs = self._build_finalize_plugin(
+      run_mode="CONTINUOUS_MONITORING",
+      llm_enabled=True,
+    )
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+    plugin.chainstore_hget.return_value = job_specs
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+
+    stop_result = stop_monitoring(plugin, job_specs["job_id"], stop_type="SOFT")
+    self.assertEqual(stop_result["job_status"], "SCHEDULED_FOR_STOP")
+
+    plugin._last_structured_llm_failed = False
+    future.set_result({"executive_headline": "Analysis complete"})
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+
   def test_automatic_analysis_future_failure_keeps_existing_llm_failure_path(self):
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)

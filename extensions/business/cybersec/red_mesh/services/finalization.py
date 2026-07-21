@@ -268,7 +268,8 @@ def maybe_finalize_pass(owner):
       )
     )
     if resumed_automatic_analysis:
-      job_status = automatic_completion["state"]["job_status"]
+      if job_status != JOB_STATUS_SCHEDULED_FOR_STOP:
+        job_status = automatic_completion["state"]["job_status"]
     elif isinstance(automatic_completion, dict):
       continue
     if is_terminal_job_status(job_status):
