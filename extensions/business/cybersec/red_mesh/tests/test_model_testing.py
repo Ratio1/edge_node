@@ -1397,6 +1397,11 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job_type": "model_test",
       "blockchain_attestation_enabled": True,
     }
+    plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    plugin.r1fs.get_json.side_effect = [
+      {"job_type": "model_test", "blockchain_attestation_enabled": True},
+      {"job_id": "job-123"},
+    ]
     plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
     job_specs = {
       "job_id": "job-123",
@@ -1427,15 +1432,17 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "QmWorkerResult",
     )
 
-    self.assertFalse(result)
+    self.assertTrue(result)
     plugin._submit_redmesh_test_attestation.assert_called_once()
-    plugin.r1fs.add_json.assert_not_called()
-    plugin._write_job_record.assert_called_with(
-      "job-123",
-      job_specs,
-      context="model_test_attestation_failed",
-    )
-    self.assertEqual(job_specs["job_status"], "FAILED")
+    archive = plugin.r1fs.add_json.call_args.args[0]
+    terminal_events = [event for event in archive["timeline"] if event["type"] in {"finalized", "failed", "canceled"}]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["type"], "failed")
+    self.assertEqual(terminal_events[0]["meta"]["overall_status"], "complete")
+    self.assertEqual(terminal_events[0]["meta"]["error_class"], "finalization_failed")
+    stub = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(stub["job_status"], "FAILED")
+    self.assertEqual(stub["failure_class"], "attestation_failed")
     self.assertEqual(job_specs["failure_class"], "attestation_failed")
 
   def test_model_test_finalization_end_attestation_exception_marks_failed(self):
@@ -1452,6 +1459,11 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job_type": "model_test",
       "blockchain_attestation_enabled": True,
     }
+    plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    plugin.r1fs.get_json.side_effect = [
+      {"job_type": "model_test", "blockchain_attestation_enabled": True},
+      {"job_id": "job-123"},
+    ]
     plugin._submit_redmesh_test_attestation = MagicMock(side_effect=RuntimeError("chain offline"))
     job_specs = {
       "job_id": "job-123",
@@ -1482,9 +1494,11 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "QmWorkerResult",
     )
 
-    self.assertFalse(result)
-    plugin.r1fs.add_json.assert_not_called()
-    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertTrue(result)
+    archive = plugin.r1fs.add_json.call_args.args[0]
+    self.assertEqual(archive["timeline"][-1]["type"], "failed")
+    stub = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(stub["job_status"], "FAILED")
     self.assertEqual(job_specs["failure_class"], "attestation_failed")
 
   def test_model_test_finalization_stores_successful_end_attestation(self):
@@ -1544,6 +1558,43 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stub["job_status"], "FINALIZED")
     self.assertTrue(stub["blockchain_attestation_enabled"])
 
+  def test_model_test_terminal_event_is_idempotent(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "Launcher"
+    plugin.time.return_value = 200.0
+    job_specs = {
+      "job_id": "job-idempotent",
+      "launcher": "launcher-node",
+      "model_test_summary": {
+        "overall_status": "incomplete",
+        "cases_completed": 4,
+        "cases_total": 12,
+      },
+      "model_test_node_selection": {"selected_execution_node": "worker-node"},
+      "workers": {"worker-node": {}},
+      "timeline": [],
+    }
+
+    PentesterApi01Plugin._terminalize_model_test_job(
+      plugin, job_specs, "incomplete", "FINALIZED",
+    )
+    PentesterApi01Plugin._terminalize_model_test_job(
+      plugin, job_specs, "incomplete", "FINALIZED",
+    )
+
+    terminal_events = [event for event in job_specs["timeline"] if event["type"] == "finalized"]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["meta"], {
+      "overall_status": "incomplete",
+      "selected_execution_node": "worker-node",
+      "cases_completed": 4,
+      "cases_total": 12,
+    })
+
   def test_model_test_finalization_records_raw_evidence_capture_failed_when_requested_without_artifact(self):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -1586,9 +1637,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job-raw",
       job_specs,
       {
-        "status": "completed",
-        "model_test_results": {"overall_status": "completed", "cases": []},
-        "model_test_summary": {"overall_status": "completed"},
+        "status": "incomplete",
+        "model_test_results": {"overall_status": "incomplete", "cases": []},
+        "model_test_summary": {"overall_status": "incomplete"},
       },
       "QmWorkerResult",
     )
@@ -1606,8 +1657,10 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stub["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_CAPTURE_FAILED)
     self.assertEqual(stub["model_test_raw_evidence"]["error_class"], RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE)
     event_types = [event["type"] for event in archive_payload["timeline"]]
-    self.assertIn("completed", event_types)
-    self.assertIn("finalized", event_types)
+    self.assertEqual(event_types.count("finalized"), 1)
+    terminal_event = next(event for event in archive_payload["timeline"] if event["type"] == "finalized")
+    self.assertEqual(terminal_event["meta"]["overall_status"], "incomplete")
+    self.assertEqual(archive_payload["model_test_summary"]["overall_status"], "incomplete")
 
   def test_model_test_finalization_stores_requested_raw_evidence_in_restricted_lane(self):
     mock_plugin_modules()
@@ -1695,8 +1748,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("raw prompt secret", str(archive_payload))
     self.assertNotIn("raw answer secret", str(archive_payload))
     event_types = [event["type"] for event in archive_payload["timeline"]]
-    self.assertIn("completed", event_types)
-    self.assertIn("finalized", event_types)
+    self.assertEqual(event_types.count("finalized"), 1)
+    terminal_event = next(event for event in archive_payload["timeline"] if event["type"] == "finalized")
+    self.assertEqual(terminal_event["meta"]["overall_status"], "complete")
 
     raw_metadata_write = next(
       call.kwargs["value"]
@@ -3231,14 +3285,14 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     stored_archive = stored_artifacts[0]
     self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
     self.assertEqual(stored_archive["job_id"], "job-stale")
-    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(stored_archive["model_test_results"]["cases"][0]["case_id"], "cbrn-chemical-001")
     self.assertEqual(len(written_records), 1)
     persisted_specs = written_records[0][1]
     self.assertEqual(written_records[0][2], "model_test_archive_prune")
     self.assertEqual(persisted_specs["job_status"], "FINALIZED")
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "complete")
     self.assertNotIn("workers", persisted_specs)
 
   def test_non_launcher_cannot_finalize_model_test_job(self):
@@ -3489,8 +3543,16 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(stored_artifacts[1]["schema_version"], "model_test_archive_v1")
     self.assertEqual(stored_artifacts[1]["model_test_summary"]["cases_completed"], 4)
     self.assertEqual(stored_artifacts[1]["model_test_results"]["cases"][0]["case_id"], "case-1")
+    terminal_events = [
+      event for event in stored_artifacts[1]["timeline"]
+      if event["type"] in {"finalized", "failed", "canceled"}
+    ]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["type"], "failed")
+    self.assertEqual(terminal_events[0]["meta"]["overall_status"], "failed")
+    self.assertEqual(terminal_events[0]["meta"]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
     persisted_specs = written_records[-1][1]
-    self.assertEqual(persisted_specs["job_status"], "STOPPED")
+    self.assertEqual(persisted_specs["job_status"], "FAILED")
     self.assertEqual(persisted_specs["model_test_summary"]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
     self.assertEqual(persisted_specs["model_test_summary"]["cases_completed"], 4)
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
@@ -3600,6 +3662,14 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(failed, [])
     self.assertEqual(stored_artifacts[0]["status"], "canceled")
     self.assertEqual(stored_artifacts[0]["error_class"], MODEL_TEST_ERROR_CANCELED_BY_USER)
+    terminal_events = [
+      event for event in stored_artifacts[1]["timeline"]
+      if event["type"] in {"finalized", "failed", "canceled"}
+    ]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["type"], "canceled")
+    self.assertEqual(terminal_events[0]["meta"]["overall_status"], "canceled")
+    self.assertNotIn("stopped", [event["type"] for event in stored_artifacts[1]["timeline"]])
     persisted_specs = written_records[-1][1]
     self.assertEqual(persisted_specs["job_status"], "STOPPED")
     self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "canceled")
