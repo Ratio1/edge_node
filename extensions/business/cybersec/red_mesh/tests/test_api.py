@@ -3962,7 +3962,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "write_mode": "launcher_single_writer",
     })
 
-  def test_launcher_lifecycle_write_rejects_non_launcher(self):
+  def test_shared_job_write_rejects_non_launcher(self):
     Plugin = self._get_plugin_class()
     current = {
       "job_id": "job-1",
@@ -3977,7 +3977,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.P = MagicMock()
 
     result = Plugin._write_job_record(
-      plugin, "job-1", dict(current), context="finalize_collecting",
+      plugin, "job-1", dict(current), context="stix_export",
     )
 
     self.assertIsNone(result)

@@ -745,6 +745,19 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
     return {"error": "Job not found", "job_id": job_id}
 
   _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+  launcher = job_specs.get("launcher")
+  if launcher and launcher != getattr(owner, "ee_addr", None):
+    owner.P(f"Stop request rejected on non-launcher node for job {job_id}.", color='y')
+    owner._log_audit_event("job_stop_owner_rejected", {
+      "job_id": job_id,
+      "writer": getattr(owner, "ee_addr", None),
+    })
+    return {
+      "error": "job_launcher_mismatch",
+      "message": "Stop requests must be handled by the job launcher.",
+      "status_code": 409,
+      "job_id": job_id,
+    }
   stop_type = str(stop_type).upper()
   is_continuous = job_specs.get("run_mode") == RUN_MODE_CONTINUOUS_MONITORING
 

@@ -2920,6 +2920,40 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(job_specs["model_test_summary"]["overall_status"], "cancel_requested")
     self.assertNotIn("launcher-node", job_specs["workers"])
 
+  def test_stop_monitoring_rejects_foreign_launcher_without_mutation(self):
+    from extensions.business.cybersec.red_mesh.services.control import stop_monitoring
+
+    stored = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "workers": {"node-a": {"worker_type": "model_test", "finished": False}},
+    }
+    local_worker = MagicMock()
+    owner = _owner(
+      ee_addr="worker-node",
+      chainstore_hget=MagicMock(return_value=deepcopy(stored)),
+    )
+    owner.scan_jobs = {}
+    owner.model_test_jobs = {"job-1": local_worker}
+    owner._normalize_job_record = MagicMock(
+      side_effect=lambda key, specs: (key, deepcopy(specs)),
+    )
+    owner._emit_timeline_event = MagicMock()
+    owner._log_audit_event = MagicMock()
+    owner.P = MagicMock()
+
+    result = stop_monitoring(owner, "job-1", stop_type="HARD")
+
+    self.assertEqual(result["error"], "job_launcher_mismatch")
+    self.assertEqual(result["status_code"], 409)
+    self.assertEqual(stored["job_status"], "RUNNING")
+    owner.chainstore_hset.assert_not_called()
+    owner._emit_timeline_event.assert_not_called()
+    local_worker.stop.assert_not_called()
+
   def test_maybe_stop_canceled_jobs_stops_active_model_test_worker(self):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
