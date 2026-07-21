@@ -2954,6 +2954,66 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     owner._emit_timeline_event.assert_not_called()
     local_worker.stop.assert_not_called()
 
+  def test_stop_and_delete_rejects_foreign_launcher_before_side_effects(self):
+    from extensions.business.cybersec.red_mesh.services.control import stop_and_delete_job
+
+    stored = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "launcher": "launcher-node",
+      "workers": {"node-a": {"worker_type": "model_test", "finished": False}},
+    }
+    local_worker = MagicMock()
+    owner = _owner(
+      ee_addr="worker-node",
+      chainstore_hget=MagicMock(return_value=deepcopy(stored)),
+    )
+    owner.scan_jobs = {}
+    owner.model_test_jobs = {"job-1": local_worker}
+    owner._normalize_job_record = MagicMock(
+      side_effect=lambda key, specs: (key, deepcopy(specs)),
+    )
+    owner._log_audit_event = MagicMock()
+    owner.P = MagicMock()
+    owner.purge_job = MagicMock()
+
+    result = stop_and_delete_job(owner, "job-1")
+
+    self.assertEqual(result["error"], "job_launcher_mismatch")
+    self.assertEqual(result["status_code"], 409)
+    owner.chainstore_hset.assert_not_called()
+    owner.purge_job.assert_not_called()
+    local_worker.stop.assert_not_called()
+
+  def test_purge_rejects_foreign_launcher_before_artifact_deletion(self):
+    from extensions.business.cybersec.red_mesh.services.control import _purge_job_locked
+
+    stored = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "launcher": "launcher-node",
+      "job_cid": "cid-archive",
+      "workers": {},
+    }
+    owner = _owner(
+      ee_addr="worker-node",
+      chainstore_hget=MagicMock(return_value=deepcopy(stored)),
+    )
+    owner._normalize_job_record = MagicMock(
+      side_effect=lambda key, specs: (key, deepcopy(specs)),
+    )
+    owner._log_audit_event = MagicMock()
+    owner.P = MagicMock()
+    owner.r1fs.delete = MagicMock()
+
+    result = _purge_job_locked(owner, "job-1")
+
+    self.assertEqual(result["error"], "job_launcher_mismatch")
+    self.assertEqual(result["status_code"], 409)
+    owner.r1fs.delete.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
   def test_maybe_stop_canceled_jobs_stops_active_model_test_worker(self):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
