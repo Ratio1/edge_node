@@ -934,17 +934,19 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertIsNotNone(err)
     self.assertEqual(err["error_class"], "forbidden_destination")
 
-  def test_duplicate_credential_sources_fail_closed(self):
+  def test_credential_ref_with_secret_payload_is_rejected_without_identifier_leak(self):
+    credential_ref = "model_provider/operator/user-123/provider-a"
     _, err = validate_model_provider_credentials(
       {
-        "credential_ref": "model_provider/operator/user-123/provider-a",
+        "credential_ref": credential_ref,
       },
       {"api_key": "secret"},
       role="tested_model",
       created_by_id="user-123",
     )
 
-    self.assertEqual(err["error_class"], "duplicate_credential_source")
+    self.assertEqual(err["error_class"], "credential_unavailable")
+    self.assertNotIn(credential_ref, str(err))
 
   def test_inline_credential_fields_in_provider_config_fail_closed(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
@@ -1014,6 +1016,20 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
         self.assertEqual(err["error_class"], "credential_unavailable")
         self.assertNotIn(ref, str(err))
 
+  def test_launch_rejects_validly_shaped_credential_ref_before_persistence(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    credential_ref = "model_provider/operator/user-123/provider-a"
+    kwargs = _valid_launch_kwargs()
+    kwargs["tested_model"] = _provider(credential_ref=credential_ref)
+    kwargs["tested_model_secret_payload"] = None
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertEqual(result["error_class"], "credential_unavailable")
+    self.assertNotIn(credential_ref, str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
   def test_preflight_model_test_provider_accepts_valid_remote_provider(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
     secret = "sentinel-model-api-key"
@@ -1064,17 +1080,19 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
 
   def test_preflight_model_test_provider_requires_api_key_payload(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
+    credential_ref = "model_provider/operator/user-123/provider-a"
 
     result = preflight_model_test_provider(
       owner,
       created_by_id="user-123",
-      tested_model=_provider(credential_ref="model_provider/operator/user-123/provider-a"),
+      tested_model=_provider(credential_ref=credential_ref),
       tested_model_secret_payload=None,
     )
 
     self.assertFalse(result["ok"])
     self.assertEqual(result["error_class"], "credential_unavailable")
     self.assertIn("requires an API key", result["message"])
+    self.assertNotIn(credential_ref, str(result))
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
 
@@ -2036,6 +2054,21 @@ class TestModelTestNodeSelection(unittest.TestCase):
 
 class TestModelTestingPersistenceContracts(unittest.TestCase):
 
+  def test_legacy_completed_status_remains_readable(self):
+    from extensions.business.cybersec.red_mesh.model_test_sanitization import (
+      sanitize_model_test_results,
+      sanitize_model_test_summary,
+    )
+
+    self.assertEqual(
+      sanitize_model_test_summary({"overall_status": "completed"})["overall_status"],
+      "completed",
+    )
+    self.assertEqual(
+      sanitize_model_test_results({"overall_status": "completed"})["overall_status"],
+      "completed",
+    )
+
   def test_model_test_artifact_serializers_strip_raw_payload_fields(self):
     from extensions.business.cybersec.red_mesh.model_testing.artifacts import (
       ModelTestArchive,
@@ -2475,6 +2508,39 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(jobs["job-1"]["model_test_summary"]["overall_status"], "queued")
     self.assertEqual(jobs["job-1"]["model_test_node_selection"]["selected_execution_node"], "node-a")
 
+  def test_local_listing_includes_sanitized_model_test_job(self):
+    from extensions.business.cybersec.red_mesh.services.query import list_local_jobs
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {"overall_status": "queued"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+    }
+    worker = MagicMock()
+    worker.state = {
+      "model_test_summary": {
+        "overall_status": "running",
+        "error_message": "raw provider exception secret-token",
+      },
+      "error_message": "raw worker exception secret-token",
+    }
+    owner = _owner()
+    owner.scan_jobs = {}
+    owner.model_test_jobs = {"job-1": worker}
+    owner.chainstore_hget = MagicMock()
+    owner.chainstore_hget.return_value = job_specs
+
+    jobs = list_local_jobs(owner)
+
+    self.assertEqual(jobs["job-1"]["job_type"], "model_test")
+    self.assertEqual(jobs["job-1"]["task_kind"], "model_test")
+    self.assertEqual(jobs["job-1"]["model_test_summary"]["overall_status"], "running")
+    self.assertNotIn("error_message", str(jobs["job-1"]))
+    self.assertNotIn("secret-token", str(jobs["job-1"]))
+
   def test_finalized_cstore_model_preserves_model_test_fields(self):
     finalized = CStoreJobFinalized(
       job_id="job-1",
@@ -2648,7 +2714,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     worker = selected.model_test_jobs["job-1"]
     self.assertIsInstance(worker, ModelTestWorker)
     worker.thread.join(timeout=1)
-    self.assertEqual(worker.state["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(worker.state["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(worker.state["model_test_summary"]["evaluated_cases"], 12)
     self.assertEqual(len(worker.state["model_test_results"]["cases"]), 12)
     self.assertEqual(worker.state["model_test_results"]["cases"][0]["status"], "evaluated")
@@ -2882,7 +2948,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "done": True,
       "canceled": False,
       "model_test_results": {
-        "overall_status": "completed",
+        "overall_status": "complete",
         "cases": [
           {
             "case_id": "cbrn-chemical-001",
@@ -2900,7 +2966,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         ],
       },
       "model_test_summary": {
-        "overall_status": "completed",
+        "overall_status": "complete",
         "cases_total": 12,
         "cases_completed": 12,
         "evaluated_cases": 12,
@@ -3008,8 +3074,8 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(stored_result["schema_version"], "model_test_worker_result_v1")
     self.assertEqual(stored_result["job_id"], "job-1")
     self.assertEqual(stored_result["worker_addr"], "node-a")
-    self.assertEqual(stored_result["status"], "completed")
-    self.assertEqual(stored_result["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(stored_result["status"], "complete")
+    self.assertEqual(stored_result["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(stored_result["model_test_results"]["cases"][0]["status"], "evaluated")
     stored_archive = stored_artifacts[1]
     self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
@@ -3018,9 +3084,9 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(stored_archive["job_config"]["job_id"], "job-1")
     self.assertNotIn("model_provider_secret_ref", stored_archive["job_config"])
     self.assertNotIn("model_provider_secret_store_key_id", stored_archive["job_config"])
-    self.assertEqual(stored_archive["model_test_results"]["overall_status"], "completed")
+    self.assertEqual(stored_archive["model_test_results"]["overall_status"], "complete")
     self.assertEqual(stored_archive["model_test_results"]["cases"][0]["case_id"], "cbrn-chemical-001")
-    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(stored_archive["model_test_node_selection"]["selected_execution_node"], "node-a")
     self.assertEqual(stored_archive["ui_aggregate"]["scan_type"], "model_test")
     self.assertEqual(stored_archive["ui_aggregate"]["finding_count"], 0)
@@ -3033,13 +3099,13 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(persisted_specs["scan_type"], "model_test")
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
     self.assertEqual(persisted_specs["job_config_cid"], "cid-config")
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(persisted_specs["model_test_node_selection"]["selected_execution_node"], "node-a")
     self.assertNotIn("workers", persisted_specs)
     plugin._publish_model_test_progress.assert_called_once()
     _, _, progress_specs = plugin._publish_model_test_progress.call_args.args[:3]
     self.assertEqual(progress_specs["workers"]["node-a"]["report_cid"], "cid-result")
-    self.assertEqual(progress_specs["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(progress_specs["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(plugin.scan_jobs, {})
 
   def test_finished_model_test_job_recovery_finalizes_stale_running_record(self):

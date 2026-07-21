@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
+import os
 import socket
 from urllib.parse import urlsplit
 
 
 MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE = "credential_unavailable"
-_MODEL_PROVIDER_REF_PREFIX = "model_provider/"
+BACKEND_TOKEN_ENV = "REDMESH_BACKEND_TOKEN"
+MIN_BACKEND_TOKEN_BYTES = 32
 _PROVIDER_ALLOWED_KEYS = {
   "adapter",
   "provider_label",
@@ -143,9 +146,49 @@ def validate_provider_url(base_url, *, resolver=None):
 
 def _credential_error():
   return _validation_error(
-    MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE,
+    "Provider requires an API key payload.",
     error_class=MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE,
   )
+
+
+def _backend_auth_error(*, status_code, error, error_class, message):
+  return {
+    "status": "error",
+    "status_code": status_code,
+    "error": error,
+    "error_class": error_class,
+    "message": message,
+  }
+
+
+def validate_backend_token(token):
+  """Validate the Navigator-to-edge bearer token without exposing token material."""
+  expected = os.environ.get(BACKEND_TOKEN_ENV, "")
+  expected_bytes = expected.encode("utf-8")
+  if len(expected_bytes) < MIN_BACKEND_TOKEN_BYTES:
+    return _backend_auth_error(
+      status_code=401,
+      error="unauthorized",
+      error_class="backend_auth_unavailable",
+      message="Backend authentication is not configured.",
+    )
+
+  presented = token if isinstance(token, str) else ""
+  if not presented:
+    return _backend_auth_error(
+      status_code=401,
+      error="unauthorized",
+      error_class="backend_auth_required",
+      message="Backend authentication is required.",
+    )
+  if not hmac.compare_digest(presented.encode("utf-8"), expected_bytes):
+    return _backend_auth_error(
+      status_code=403,
+      error="forbidden",
+      error_class="backend_auth_invalid",
+      message="Backend authentication failed.",
+    )
+  return None
 
 
 def validate_provider_config_shape(provider, *, role):
@@ -182,32 +225,11 @@ def validate_model_provider_credentials(
   if isinstance(secret_payload, dict):
     api_key = str(secret_payload.get("api_key") or "")
   has_secret = bool(api_key)
-  if credential_ref and has_secret:
-    return None, _validation_error(
-      f"{role} may not supply both credential_ref and secret payload",
-      error_class="duplicate_credential_source",
-    )
+  # Credential references are an accepted historical shape but there is no
+  # worker-local resolver yet. Reject them before launch/preflight persistence
+  # with one sanitized error that never includes the supplied identifier.
+  if credential_ref:
+    return None, _credential_error()
   if has_secret:
     return {"source": "secret_payload", "credential_ref_present": False}, None
-  if not credential_ref:
-    return None, _validation_error(
-      f"{role} requires credential_ref or secret payload",
-      error_class=MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE,
-    )
-  if not credential_ref.startswith(_MODEL_PROVIDER_REF_PREFIX):
-    return None, _credential_error()
-  ref_body = credential_ref[len(_MODEL_PROVIDER_REF_PREFIX):]
-  operator_prefix = f"operator/{created_by_id}/"
-  if ref_body.startswith(operator_prefix):
-    credential_id = ref_body[len(operator_prefix):]
-    if not credential_id or "/" in credential_id:
-      return None, _credential_error()
-    return {"source": "credential_ref", "credential_ref_present": True}, None
-  if ref_body.startswith("deploy/default_evaluator/"):
-    if role != "evaluator_model" or not use_default_evaluator_model:
-      return None, _credential_error()
-    credential_id = ref_body[len("deploy/default_evaluator/"):]
-    if not credential_id or "/" in credential_id:
-      return None, _credential_error()
-    return {"source": "credential_ref", "credential_ref_present": True}, None
   return None, _credential_error()

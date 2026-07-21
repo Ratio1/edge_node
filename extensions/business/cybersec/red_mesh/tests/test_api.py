@@ -4773,6 +4773,99 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["audit"], [])
 
 
+class TestModelTestingEndpointAuth(unittest.TestCase):
+  """Protected Model Testing endpoints validate the backend bearer token."""
+
+  @classmethod
+  def setUpClass(cls):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    cls.Plugin = PentesterApi01Plugin
+
+  def test_missing_backend_token_configuration_fails_closed(self):
+    plugin = MagicMock()
+    with patch.dict("os.environ", {}, clear=True), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "presented-token")
+
+    self.assertEqual(result["status_code"], 401)
+    self.assertEqual(result["error_class"], "backend_auth_unavailable")
+    self.assertNotIn("presented-token", str(result))
+    launch.assert_not_called()
+
+  def test_invalid_backend_token_is_forbidden_without_leak(self):
+    plugin = MagicMock()
+    expected = "expected-backend-token-material-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": expected}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "invalid-presented-token")
+
+    self.assertEqual(result["status_code"], 403)
+    self.assertEqual(result["error_class"], "backend_auth_invalid")
+    self.assertNotIn(expected, str(result))
+    self.assertNotIn("invalid-presented-token", str(result))
+    launch.assert_not_called()
+
+  def test_short_backend_token_configuration_fails_closed(self):
+    plugin = MagicMock()
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": "short-test-token"}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "short-test-token")
+
+    self.assertEqual(result["status_code"], 401)
+    self.assertEqual(result["error_class"], "backend_auth_unavailable")
+    self.assertNotIn("short-test-token", str(result))
+    launch.assert_not_called()
+
+  def test_empty_presented_token_is_unauthorized(self):
+    plugin = MagicMock()
+    expected = "expected-backend-token-material-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": expected}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "")
+
+    self.assertEqual(result["status_code"], 401)
+    self.assertEqual(result["error_class"], "backend_auth_required")
+    self.assertNotIn(expected, str(result))
+    launch.assert_not_called()
+
+  def test_authenticated_launch_forwards_navigator_actor_assertion(self):
+    plugin = MagicMock()
+    token = "valid-backend-token-material-at-least-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test",
+      return_value={"status": "ok"},
+    ) as launch:
+      result = self.Plugin.launch_model_test(
+        plugin,
+        token,
+        created_by_id="navigator-user-123",
+      )
+
+    self.assertEqual(result, {"status": "ok"})
+    self.assertEqual(launch.call_args.kwargs["created_by_id"], "navigator-user-123")
+
+  def test_authenticated_preflight_forwards_navigator_actor_assertion(self):
+    plugin = MagicMock()
+    token = "valid-backend-token-material-at-least-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.preflight_model_test_provider",
+      return_value={"status": "ok"},
+    ) as preflight:
+      result = self.Plugin.preflight_model_test_provider(
+        plugin,
+        token,
+        created_by_id="navigator-user-123",
+      )
+
+    self.assertEqual(result, {"status": "ok"})
+    self.assertEqual(preflight.call_args.kwargs["created_by_id"], "navigator-user-123")
+
+
 class TestPhase2AuditCounting(unittest.TestCase):
   """Phase 2: audit counts include graybox findings."""
 
