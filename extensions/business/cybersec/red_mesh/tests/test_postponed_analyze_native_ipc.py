@@ -27,7 +27,6 @@ FASTAPI_PLUGIN_PATH = (
   FRAMEWORK_PACKAGE / "business" / "default" / "web_app" / "fast_api_web_app.py"
 )
 FASTAPI_UTILS_PATH = FRAMEWORK_PACKAGE / "utils" / "fastapi_utils.py"
-TOKEN = "0123456789abcdef0123456789abcdef"
 NATIVE_RUNTIME_SOURCE_AVAILABLE = all(
   path.is_file()
   for path in (
@@ -196,7 +195,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
 
     analyze_parameters = list(
       inspect.signature(PentesterApi01Plugin.analyze_job).parameters.values()
-    )[2:]
+    )[1:]
     status_parameters = [
       inspect.Parameter("job_id", inspect.Parameter.POSITIONAL_OR_KEYWORD),
     ]
@@ -205,7 +204,6 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
         "analyze_job",
         "post",
         analyze_parameters,
-        require_token=True,
       ),
       self._descriptor("get_job_status", "get", status_parameters),
     ]
@@ -217,9 +215,9 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
       manager_port=manager_port,
       manager_auth=repr(manager_auth),
       request_timeout=120,
-      api_title=repr("RM-040 native postponed test"),
-      api_summary=repr("RM-040"),
-      api_description=repr("RM-040"),
+      api_title=repr("RM-041 native postponed test"),
+      api_summary=repr("RM-041"),
+      api_description=repr("RM-041"),
       api_version=repr("0.0.0-test"),
       static_directory="assets",
       debug_web_app=False,
@@ -287,13 +285,13 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     loop = asyncio.new_event_loop()
     try:
       result = loop.run_until_complete(
-        comms.call_plugin("analyze_job", TOKEN, "job-1")
+        comms.call_plugin("analyze_job", "job-1")
       )
 
       self.assertEqual(result["status_code"], 504)
       self.assertEqual(comms._commands, {})
       request = server_queue.get(timeout=1)
-      self.assertEqual(request["value"][:3], ("analyze_job", TOKEN, "job-1"))
+      self.assertEqual(request["value"][:2], ("analyze_job", "job-1"))
       with self.assertRaises(queue.Empty):
         server_queue.get(timeout=0.05)
 
@@ -333,10 +331,9 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     self.addCleanup(owner._manual_analysis_executor.shutdown, wait=False)
     harness = _SchedulerHarness.__new__(_SchedulerHarness)
     harness._endpoints = {
-      "analyze_job": lambda token, job_id, analysis_type="", focus_areas=None: (
+      "analyze_job": lambda job_id, analysis_type="", focus_areas=None: (
         PentesterApi01Plugin.analyze_job(
           owner,
-          token,
           job_id,
           analysis_type,
           focus_areas,
@@ -445,16 +442,15 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/analyze_job",
-            token=TOKEN,
             payload={"job_id": "job-1"},
           ))
 
         def _prepare(_plugin, job_id):
           if job_id == "explode":
-            raise RuntimeError(f"native admission failure {TOKEN}")
+            raise RuntimeError("native admission failure")
           return dict(state), None
 
-        with patch.dict(os.environ, {"REDMESH_ANALYZE_TOKEN": TOKEN}, clear=False), patch.object(
+        with patch.object(
           PentesterApi01Plugin,
           "_prepare_manual_analysis",
           side_effect=_prepare,
@@ -466,35 +462,10 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
           "extensions.business.cybersec.red_mesh.pentester_api_01._run_manual_analysis_worker",
           side_effect=_blocking_worker,
         ):
-          missing_status, missing_body, missing_elapsed = self._request(
-            port,
-            "POST",
-            "/analyze_job",
-            payload={"job_id": "job-1"},
-          )
-          self.assertEqual(missing_status, 401, missing_body)
-          self.assertLess(missing_elapsed, 1.0)
-          self.assertEqual(missing_body["detail"], "Not authenticated")
-
-          denied_status, denied_body, denied_elapsed = self._request(
-            port,
-            "POST",
-            "/analyze_job",
-            token="wrong-token",
-            payload={"job_id": "job-1"},
-          )
-          self.assertEqual(denied_status, 401, denied_body)
-          self.assertLess(denied_elapsed, 1.0)
-          self.assertEqual(
-            denied_body["detail"]["error"],
-            "analysis_auth_denied",
-          )
-
           failed_status, failed_body, failed_elapsed = self._request(
             port,
             "POST",
             "/analyze_job",
-            token=TOKEN,
             payload={"job_id": "explode"},
           )
           self.assertEqual(failed_status, 503, failed_body)
@@ -503,9 +474,6 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             failed_body["detail"]["error"],
             "analysis_executor_failed",
           )
-          self.assertNotIn(TOKEN, json.dumps(failed_body))
-          self.assertNotIn(TOKEN, "\n".join(harness._test_messages))
-
           analysis_thread = threading.Thread(target=_request_analysis, daemon=True)
           analysis_thread.start()
           self.assertTrue(worker_entered.wait(timeout=2))
@@ -523,7 +491,6 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/analyze_job",
-            token=TOKEN,
             payload={"job_id": "job-1"},
           )
           self.assertEqual(busy_status, 409, busy_body)

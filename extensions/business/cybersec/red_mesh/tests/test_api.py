@@ -1,7 +1,9 @@
 import json
 import sys
 import struct
+import time
 import unittest
+from concurrent.futures import Future
 from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
@@ -1736,6 +1738,20 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 300, "RETRIES": 2}
     plugin.time.return_value = 1000100.0
     plugin.json_dumps.return_value = "{}"
+    plugin._automatic_analysis_state = None
+    if llm_enabled:
+      executor = MagicMock()
+
+      def submit_immediately(fn, *args, **kwargs):
+        future = Future()
+        try:
+          future.set_result(fn(*args, **kwargs))
+        except Exception as exc:
+          future.set_exception(exc)
+        return future
+
+      executor.submit.side_effect = submit_immediately
+      plugin._get_manual_analysis_executor.return_value = executor
 
     # R1FS mock
     plugin.r1fs = MagicMock()
@@ -2249,6 +2265,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     # Check PassReport has llm_failed=True
     pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
@@ -2300,6 +2317,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     plugin._run_quick_summary_analysis.assert_not_called()
     plugin._run_aggregated_llm_analysis.assert_not_called()
@@ -2308,6 +2326,124 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(pass_report_dict["quick_summary"], "Structured headline")
     self.assertIn("## Overall Posture", pass_report_dict["llm_analysis"])
     self.assertIn("Structured posture", pass_report_dict["llm_analysis"])
+
+  def test_automatic_analysis_yields_and_resumes_without_stale_recovery(self):
+    """Pending model work returns promptly and is consumed once on a later turn."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+    sections = {
+      "executive_headline": "Structured headline",
+      "overall_posture": "Structured posture",
+      "recommendation_summary": ["Patch exposed services"],
+      "conclusion": "Structured conclusion",
+    }
+
+    started = time.monotonic()
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertLess(time.monotonic() - started, 0.1)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    self.assertIsNotNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+
+    started = time.monotonic()
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertLess(time.monotonic() - started, 0.1)
+
+    executor.submit.assert_called_once()
+    plugin._collect_node_reports.assert_called_once()
+    plugin._log_audit_event.assert_not_called()
+
+    plugin._last_structured_llm_failed = False
+    future.set_result(sections)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_automatic_analysis_future_failure_keeps_existing_llm_failure_path(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    future.set_exception(RuntimeError("provider failed"))
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(pass_report_dict["llm_failed"])
+    self.assertIsNone(pass_report_dict.get("llm_report_sections"))
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertIsNone(plugin._automatic_analysis_state)
+
+  def test_automatic_analysis_submit_failure_keeps_existing_llm_failure_path(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    executor = MagicMock()
+    executor.submit.side_effect = RuntimeError("executor unavailable")
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(pass_report_dict["llm_failed"])
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertIsNone(plugin._automatic_analysis_state)
+
+  def test_terminal_job_cancels_pending_automatic_analysis(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    job_specs["job_status"] = "FINALIZED"
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertTrue(future.cancelled())
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+    self.assertEqual(job_specs["pass_reports"], [])
+
+  def test_changed_report_identity_cancels_pending_automatic_analysis(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    replacement_future = Future()
+    executor = MagicMock()
+    executor.submit.side_effect = [future, replacement_future]
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    job_specs["workers"]["worker-A"]["report_cid"] = "QmChanged"
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertTrue(future.cancelled())
+    self.assertIsNotNone(plugin._automatic_analysis_state)
+    self.assertIn(
+      ("worker-A", "QmChanged"),
+      plugin._automatic_analysis_state["report_identity"],
+    )
+    self.assertEqual(executor.submit.call_count, 2)
+    self.assertEqual(job_specs["pass_reports"], [])
 
   def test_pass_reports_survive_typed_job_record_rewrites(self):
     """Pass reports must stay attached after typed repository rewrites the job dict."""
@@ -3631,14 +3767,9 @@ class TestPhase5Endpoints(unittest.TestCase):
       job_specs["pass_reports"] = deepcopy(persisted["pass_reports"])
       return persisted
 
-    with patch.dict(
-      "os.environ",
-      {"REDMESH_ANALYZE_TOKEN": "0123456789abcdef0123456789abcdef"},
-      clear=False,
-    ), patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
+    with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
       postponed = Plugin.analyze_job(
         plugin,
-        token="0123456789abcdef0123456789abcdef",
         job_id="job-llm",
       )
       self.assertEqual(postponed, "postponed")

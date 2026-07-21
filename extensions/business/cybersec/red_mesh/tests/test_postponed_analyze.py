@@ -1,9 +1,9 @@
 import importlib.util
 import json
-import os
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
@@ -22,7 +22,7 @@ from extensions.business.cybersec.red_mesh.pentester_api_01 import (
 )
 
 
-TOKEN = "0123456789abcdef0123456789abcdef"
+SECRET_SENTINEL = "credential-sentinel-private-value"
 
 
 def _valid_remote_sections():
@@ -44,36 +44,13 @@ def _valid_remote_sections():
 
 class TestPostponedAnalyze(unittest.TestCase):
 
-  def test_authentication_fails_closed_and_compares_valid_token(self):
-    with patch.dict(os.environ, {}, clear=True):
-      missing = PentesterApi01Plugin._validate_manual_analysis_token(TOKEN)
-    self.assertEqual(missing["error"], "analysis_auth_unavailable")
-    self.assertEqual(missing["status_code"], 503)
-
-    with patch.dict(os.environ, {"REDMESH_ANALYZE_TOKEN": "too-short"}, clear=True):
-      weak = PentesterApi01Plugin._validate_manual_analysis_token(TOKEN)
-    self.assertEqual(weak["error"], "analysis_auth_unavailable")
-
-    with patch.dict(os.environ, {"REDMESH_ANALYZE_TOKEN": TOKEN}, clear=True):
-      denied = PentesterApi01Plugin._validate_manual_analysis_token("wrong")
-      allowed = PentesterApi01Plugin._validate_manual_analysis_token(TOKEN)
-    self.assertEqual(denied["error"], "analysis_auth_denied")
-    self.assertEqual(denied["status_code"], 401)
-    self.assertIsNone(allowed)
-    self.assertNotIn(TOKEN, str(missing) + str(weak) + str(denied))
-
   def test_busy_request_does_not_prepare_or_queue_work(self):
     plugin = MagicMock()
     plugin._manual_analysis_state = {
       "future": MagicMock(),
       "discard_result": False,
     }
-    with patch.dict(os.environ, {"REDMESH_ANALYZE_TOKEN": TOKEN}, clear=True):
-      result = PentesterApi01Plugin.analyze_job(
-        plugin,
-        token=TOKEN,
-        job_id="job-1",
-      )
+    result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1")
     self.assertEqual(result["error"], "analysis_busy")
     self.assertEqual(result["status_code"], 409)
     self.assertTrue(result["retryable"])
@@ -225,20 +202,63 @@ class TestPostponedAnalyze(unittest.TestCase):
       "discard_result": False,
     }
 
-    with patch.dict(os.environ, {"REDMESH_ANALYZE_TOKEN": TOKEN}, clear=True), patch.object(
+    with patch.object(
       PentesterApi01Plugin,
       "_prepare_manual_analysis",
       return_value=(state, None),
     ):
       result = PentesterApi01Plugin.analyze_job(
         plugin,
-        token=TOKEN,
         job_id="job-1",
       )
 
     self.assertEqual(result["error"], "analysis_executor_failed")
     self.assertIsNone(plugin._manual_analysis_state)
     self.assertNotIn("credential-sentinel", str(result))
+
+  def test_manual_and_automatic_analysis_share_one_bounded_executor(self):
+    plugin = PentesterApi01Plugin.__new__(PentesterApi01Plugin)
+    executor = ThreadPoolExecutor(max_workers=1)
+    plugin._manual_analysis_executor = executor
+    plugin._manual_analysis_state = None
+    plugin.create_postponed_request = MagicMock(return_value="postponed")
+    automatic_started = threading.Event()
+    release_automatic = threading.Event()
+
+    def _automatic_work():
+      automatic_started.set()
+      release_automatic.wait(timeout=2)
+      return {"executive_headline": "automatic"}
+
+    automatic_future = executor.submit(_automatic_work)
+    plugin._automatic_analysis_state = {"future": automatic_future}
+    self.assertTrue(automatic_started.wait(timeout=1))
+    state = {
+      "pending_id": "opaque-key",
+      "job_id": "job-1",
+      "work": object(),
+      "discard_result": False,
+    }
+
+    try:
+      with patch.object(
+        PentesterApi01Plugin,
+        "_prepare_manual_analysis",
+        return_value=(state, None),
+      ), patch(
+        "extensions.business.cybersec.red_mesh.pentester_api_01._run_manual_analysis_worker",
+        return_value=_ManualAnalysisOutcome(sections={}, failed=False),
+      ):
+        result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1")
+        manual_future = plugin._manual_analysis_state["future"]
+        self.assertEqual(result, "postponed")
+        self.assertFalse(manual_future.done())
+        release_automatic.set()
+        automatic_future.result(timeout=1)
+        self.assertIsInstance(manual_future.result(timeout=1), _ManualAnalysisOutcome)
+    finally:
+      release_automatic.set()
+      executor.shutdown(wait=True, cancel_futures=True)
 
   def test_completion_releases_slot_for_retry(self):
     plugin = MagicMock()
@@ -411,45 +431,38 @@ class TestPostponedAnalyze(unittest.TestCase):
     repository.put_job.assert_not_called()
     plugin._log_audit_event.assert_called_once()
 
-  def test_debug_web_app_fails_closed_before_bearer_endpoint_registration(self):
-    plugin = PentesterApi01Plugin.__new__(PentesterApi01Plugin)
-    plugin.cfg_debug_web_app = True
-
-    with self.assertRaisesRegex(
-      RuntimeError,
-      "web debug mode is not supported",
-    ):
-      PentesterApi01Plugin.on_init(plugin)
-
-  def test_admission_exception_is_sanitized_before_native_runtime_can_log_token(self):
+  def test_admission_exception_is_sanitized(self):
     plugin = PentesterApi01Plugin.__new__(PentesterApi01Plugin)
     plugin._manual_analysis_state = None
-    with patch.dict(os.environ, {"REDMESH_ANALYZE_TOKEN": TOKEN}, clear=True), patch.object(
+    with patch.object(
       PentesterApi01Plugin,
       "_prepare_manual_analysis",
-      side_effect=RuntimeError(f"provider exploded with {TOKEN}"),
+      side_effect=RuntimeError(f"provider exploded with {SECRET_SENTINEL}"),
     ):
       result = PentesterApi01Plugin.analyze_job(
         plugin,
-        token=TOKEN,
         job_id="job-1",
       )
 
     self.assertEqual(result["error"], "analysis_executor_failed")
-    self.assertNotIn(TOKEN, str(result))
+    self.assertNotIn(SECRET_SENTINEL, str(result))
 
   def test_shutdown_cancels_pending_work_before_base_close(self):
     plugin = PentesterApi01Plugin.__new__(PentesterApi01Plugin)
     future = MagicMock()
+    automatic_future = MagicMock()
     executor = MagicMock()
     plugin._manual_analysis_state = {"future": future}
+    plugin._automatic_analysis_state = {"future": automatic_future}
     plugin._manual_analysis_executor = executor
 
     PentesterApi01Plugin.on_close(plugin)
 
     future.cancel.assert_called_once_with()
+    automatic_future.cancel.assert_called_once_with()
     executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
     self.assertIsNone(plugin._manual_analysis_state)
+    self.assertIsNone(plugin._automatic_analysis_state)
     self.assertTrue(plugin._base_closed)
 
   def test_worker_uses_prepared_input_without_plugin_or_secret_state(self):
@@ -497,7 +510,7 @@ class TestPostponedAnalyze(unittest.TestCase):
     self.assertIsNotNone(outcome.sections)
     serialized_payload = json.dumps(post.call_args.args[1])
     self.assertNotIn("credential-sentinel-private-body", serialized_payload)
-    self.assertNotIn(TOKEN, serialized_payload)
+    self.assertNotIn(SECRET_SENTINEL, serialized_payload)
     self.assertFalse(any("plugin" in name for name in work.__dataclass_fields__))
     provider_timeout = post.call_args.args[2]
     self.assertGreater(provider_timeout, 0)
