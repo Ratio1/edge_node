@@ -1,8 +1,12 @@
 """EdgeGuard Cypher Qwen3 4B GGUF local serving profile."""
 
-from extensions.serving.default_inference.nlp.llama_cpp_base import LlamaCppBaseServingProcess as BaseServingProcess
+from extensions.serving.default_inference.nlp.llama_cpp_base import (
+  LlamaCppBaseServingProcess as BaseServingProcess,
+  source_file_sha256,
+)
 
 __VER__ = '0.1.0.0'
+WORKER_MODULE_SHA256 = source_file_sha256(__file__)
 
 
 _CONFIG = {
@@ -27,3 +31,4 @@ _CONFIG = {
 
 class LlamaCppEdgeguardQwen4B(BaseServingProcess):
   CONFIG = _CONFIG
+  WORKER_MODULE_SHA256 = WORKER_MODULE_SHA256

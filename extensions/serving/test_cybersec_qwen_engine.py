@@ -140,6 +140,7 @@ def _load_llama_cpp_base_class():
       ADDITIONAL="ADDITIONAL",
       FULL_OUTPUT="FULL_OUTPUT",
     ),
+    "__file__": str(source_path),
     "__name__": "loaded_llama_cpp_base",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
@@ -257,6 +258,10 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertRegex(fingerprint["load_configuration"]["draft_model_config_sha256"], r"^[0-9a-f]{64}$")
     self.assertRegex(fingerprint["fingerprint_sha256"], r"^[0-9a-f]{64}$")
     self.assertNotIn(str(model_path), json.dumps(fingerprint))
+    process.__class__.WORKER_MODULE_SHA256 = "f" * 64
+    code_identity = process.get_worker_code_identity()
+    self.assertEqual(code_identity["serving_module_sha256"], "f" * 64)
+    self.assertRegex(code_identity["llama_cpp_base_sha256"], r"^[0-9a-f]{64}$")
 
   def test_llama_cpp_base_blank_model_path_uses_repo_loading(self):
     process = _make_llama_cpp_process(cfg_model_path="  ")

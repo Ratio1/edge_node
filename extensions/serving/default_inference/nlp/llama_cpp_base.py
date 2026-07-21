@@ -16,6 +16,17 @@ from extensions.serving.mixins_llm.llm_utils import LlmCT
 __VER__ = "0.1.0"
 
 
+def source_file_sha256(path):
+  digest = hashlib.sha256()
+  with open(path, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+LLAMA_CPP_BASE_MODULE_SHA256 = source_file_sha256(__file__)
+
+
 MODEL_N_CTX_MIN_VALUE = 512
 MODEL_N_CTX_DEFAULT_VALUE = 4096
 MODEL_N_BATCH_DEFAULT_VALUE = 512
@@ -184,6 +195,16 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
   def get_runtime_fingerprint(self):
     fingerprint = getattr(self, "_runtime_fingerprint", None)
     return copy.deepcopy(fingerprint) if isinstance(fingerprint, dict) else None
+
+  def get_worker_code_identity(self):
+    serving_module_sha256 = getattr(type(self), "WORKER_MODULE_SHA256", None)
+    if not isinstance(serving_module_sha256, str):
+      return None
+    return {
+      "schema_version": "edgeguard.serving-code-identity.v1",
+      "serving_module_sha256": serving_module_sha256,
+      "llama_cpp_base_sha256": LLAMA_CPP_BASE_MODULE_SHA256,
+    }
 
   def benchmark_generation_config_sha256(self, predict_kwargs):
     normalized = {

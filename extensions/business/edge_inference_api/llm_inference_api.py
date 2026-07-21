@@ -85,10 +85,25 @@ Example pipeline configuration:
 }
 """
 
+import hashlib
+import json
+from pathlib import Path
+
 from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _source_file_sha256(path):
+  digest = hashlib.sha256()
+  with open(path, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+LLM_INFERENCE_API_MODULE_SHA256 = _source_file_sha256(Path(__file__))
 
 
 _CONFIG = {
@@ -360,12 +375,45 @@ class LLMInferenceApiPlugin(BasePlugin):
       except (AttributeError, KeyError, TypeError):
         return None
 
+    def _get_loaded_worker_code_identity(self):
+      shared = getattr(self, "global_shmem", None)
+      manager = shared.get("serving_manager") if isinstance(shared, dict) else None
+      if manager is None:
+        return None
+      try:
+        serving_processes = self.get_serving_processes()
+        if len(serving_processes) != 1 or not manager.is_avail(serving_processes[0]):
+          return None
+        server = manager._get_server(serving_processes[0])
+        if getattr(server, "inprocess", False) is not True:
+          return None
+        getter = getattr(server, "get_worker_code_identity", None)
+        serving = getter() if callable(getter) else None
+        if not isinstance(serving, dict) or tuple(serving) != (
+          "schema_version", "serving_module_sha256", "llama_cpp_base_sha256",
+        ) or serving["schema_version"] != "edgeguard.serving-code-identity.v1":
+          return None
+        document = {
+          "schema_version": "edgeguard.worker-code-identity.v1",
+          "llm_inference_api_sha256": LLM_INFERENCE_API_MODULE_SHA256,
+          "serving_module_sha256": serving["serving_module_sha256"],
+          "llama_cpp_base_sha256": serving["llama_cpp_base_sha256"],
+        }
+        material = json.dumps(
+          document, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        document["identity_sha256"] = hashlib.sha256(material).hexdigest()
+        return document
+      except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
     @BasePlugin.endpoint(method="GET")
     def health(self):
       result = super(LLMInferenceApiPlugin, self).health()
       result["serving_ready"] = self._is_serving_ready()
       result["benchmark_mode_enabled"] = getattr(self, "cfg_benchmark_mode_enabled", False) is True
       result["runtime_fingerprint"] = self._get_loaded_runtime_fingerprint()
+      result["worker_code_identity"] = self._get_loaded_worker_code_identity()
       return result
 
     # Override only to attach balanced endpoint metadata to the inherited handler.

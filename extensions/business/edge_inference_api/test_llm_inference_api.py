@@ -1,4 +1,6 @@
+import hashlib
 import inspect
+import json
 import unittest
 from pathlib import Path
 
@@ -64,6 +66,7 @@ def _load_plugin_class():
   namespace = {
     "BasePlugin": _FakeBasePlugin,
     "LlmCT": _FakeLlmCT,
+    "__file__": str(source_path),
     "__name__": "loaded_llm_inference_api",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
@@ -81,6 +84,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertIs(plugin.health()["serving_ready"], True)
     self.assertIs(plugin.health()["benchmark_mode_enabled"], False)
     self.assertIsNone(plugin.health()["runtime_fingerprint"])
+    self.assertIsNone(plugin.health()["worker_code_identity"])
     plugin.cfg_benchmark_mode_enabled = True
     self.assertIs(plugin.health()["benchmark_mode_enabled"], True)
     plugin.global_shmem = {}
@@ -95,6 +99,11 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     server = type("Server", (), {
       "inprocess": True,
       "get_runtime_fingerprint": lambda _self: dict(fingerprint),
+      "get_worker_code_identity": lambda _self: {
+        "schema_version": "edgeguard.serving-code-identity.v1",
+        "serving_module_sha256": "c" * 64,
+        "llama_cpp_base_sha256": "d" * 64,
+      },
     })()
     manager = type("Manager", (), {
       "is_avail": lambda _self, _name: True,
@@ -105,8 +114,17 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     plugin.global_shmem = {"serving_manager": manager}
 
     self.assertEqual(plugin.health()["runtime_fingerprint"], fingerprint)
+    code_identity = plugin.health()["worker_code_identity"]
+    self.assertEqual(code_identity["serving_module_sha256"], "c" * 64)
+    self.assertEqual(code_identity["llama_cpp_base_sha256"], "d" * 64)
+    expected_hash = hashlib.sha256(json.dumps(
+      {key: value for key, value in code_identity.items() if key != "identity_sha256"},
+      ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    self.assertEqual(code_identity["identity_sha256"], expected_hash)
     server.inprocess = False
     self.assertIsNone(plugin.health()["runtime_fingerprint"])
+    self.assertIsNone(plugin.health()["worker_code_identity"])
 
   def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):
     for method_name in ("predict", "predict_async", "create_chat_completion", "create_chat_completion_async"):
