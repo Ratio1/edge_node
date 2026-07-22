@@ -1,7 +1,10 @@
 import json
 import sys
 import struct
+import time
 import unittest
+from concurrent.futures import Future
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
@@ -1735,6 +1738,20 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 300, "RETRIES": 2}
     plugin.time.return_value = 1000100.0
     plugin.json_dumps.return_value = "{}"
+    plugin._automatic_analysis_state = None
+    if llm_enabled:
+      executor = MagicMock()
+
+      def submit_immediately(fn, *args, **kwargs):
+        future = Future()
+        try:
+          future.set_result(fn(*args, **kwargs))
+        except Exception as exc:
+          future.set_exception(exc)
+        return future
+
+      executor.submit.side_effect = submit_immediately
+      plugin._get_manual_analysis_executor.return_value = executor
 
     # R1FS mock
     plugin.r1fs = MagicMock()
@@ -2248,6 +2265,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     # Check PassReport has llm_failed=True
     pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
@@ -2299,6 +2317,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     plugin._run_quick_summary_analysis.assert_not_called()
     plugin._run_aggregated_llm_analysis.assert_not_called()
@@ -2307,6 +2326,155 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(pass_report_dict["quick_summary"], "Structured headline")
     self.assertIn("## Overall Posture", pass_report_dict["llm_analysis"])
     self.assertIn("Structured posture", pass_report_dict["llm_analysis"])
+
+  def test_automatic_analysis_yields_and_resumes_without_stale_recovery(self):
+    """Pending model work returns promptly and is consumed once on a later turn."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+    sections = {
+      "executive_headline": "Structured headline",
+      "overall_posture": "Structured posture",
+      "recommendation_summary": ["Patch exposed services"],
+      "conclusion": "Structured conclusion",
+    }
+
+    started = time.monotonic()
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertLess(time.monotonic() - started, 0.1)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    self.assertIsNotNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+
+    started = time.monotonic()
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertLess(time.monotonic() - started, 0.1)
+
+    executor.submit.assert_called_once()
+    plugin._collect_node_reports.assert_called_once()
+    plugin._log_audit_event.assert_not_called()
+
+    plugin._last_structured_llm_failed = False
+    future.set_result(sections)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_soft_stop_during_automatic_analysis_is_preserved_on_resume(self):
+    """A responsive soft stop requested while analysis runs must end the pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    from extensions.business.cybersec.red_mesh.services.control import stop_monitoring
+
+    plugin, job_specs = self._build_finalize_plugin(
+      run_mode="CONTINUOUS_MONITORING",
+      llm_enabled=True,
+    )
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+    plugin.chainstore_hget.return_value = job_specs
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+
+    stop_result = stop_monitoring(plugin, job_specs["job_id"], stop_type="SOFT")
+    self.assertEqual(stop_result["job_status"], "SCHEDULED_FOR_STOP")
+
+    plugin._last_structured_llm_failed = False
+    future.set_result({"executive_headline": "Analysis complete"})
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+
+  def test_automatic_analysis_future_failure_keeps_existing_llm_failure_path(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    future.set_exception(RuntimeError("provider failed"))
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(pass_report_dict["llm_failed"])
+    self.assertIsNone(pass_report_dict.get("llm_report_sections"))
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertIsNone(plugin._automatic_analysis_state)
+
+  def test_automatic_analysis_submit_failure_keeps_existing_llm_failure_path(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    executor = MagicMock()
+    executor.submit.side_effect = RuntimeError("executor unavailable")
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(pass_report_dict["llm_failed"])
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertIsNone(plugin._automatic_analysis_state)
+
+  def test_terminal_job_cancels_pending_automatic_analysis(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    job_specs["job_status"] = "FINALIZED"
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertTrue(future.cancelled())
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+    self.assertEqual(job_specs["pass_reports"], [])
+
+  def test_changed_report_identity_cancels_pending_automatic_analysis(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    replacement_future = Future()
+    executor = MagicMock()
+    executor.submit.side_effect = [future, replacement_future]
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    job_specs["workers"]["worker-A"]["report_cid"] = "QmChanged"
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertTrue(future.cancelled())
+    self.assertIsNotNone(plugin._automatic_analysis_state)
+    self.assertIn(
+      ("worker-A", "QmChanged"),
+      plugin._automatic_analysis_state["report_identity"],
+    )
+    self.assertEqual(executor.submit.call_count, 2)
+    self.assertEqual(job_specs["pass_reports"], [])
 
   def test_pass_reports_survive_typed_job_record_rewrites(self):
     """Pass reports must stay attached after typed repository rewrites the job dict."""
@@ -3569,8 +3737,9 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["error"], "not_available")
 
   def test_manual_structured_analysis_backfills_legacy_fields(self):
-    """Manual structured analysis updates the pass report for get_analysis compatibility."""
+    """Postponed manual analysis updates the pass report for compatibility."""
     Plugin = self._get_plugin_class()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import _ManualAnalysisOutcome
     job_specs = self._build_running_job("job-llm", pass_count=1)
     for worker in job_specs["workers"].values():
       worker["finished"] = True
@@ -3584,6 +3753,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "AUTO_ANALYSIS_TYPE": "security_assessment",
     }
     plugin.cfg_llm_agent_api_port = 8080
+    plugin.cfg_llm_agent_api_host = "127.0.0.1"
+    plugin.cfg_request_timeout = 120
     plugin.r1fs = MagicMock()
     plugin.r1fs.get_json.return_value = {
       "pass_nr": 1,
@@ -3605,23 +3776,41 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
     plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+    plugin._collect_bounded_manual_analysis_reports = (
+      lambda workers: Plugin._collect_bounded_manual_analysis_reports(plugin, workers)
+    )
+    sections = {
+      "executive_headline": "Manual structured headline",
+      "overall_posture": "Manual structured posture",
+      "recommendation_summary": ["Review internet exposure"],
+      "conclusion": "Manual structured conclusion",
+    }
+    future = MagicMock()
+    future.done.return_value = True
+    future.result.return_value = _ManualAnalysisOutcome(sections=sections, failed=False)
+    plugin._manual_analysis_executor = MagicMock()
+    plugin._manual_analysis_executor.submit.return_value = future
+    plugin._manual_analysis_state = None
+    plugin.time.return_value = 100.0
+    plugin.create_postponed_request.return_value = "postponed"
 
-    def _structured_success(*_args, **_kwargs):
-      plugin._last_structured_llm_failed = False
-      return {
-        "executive_headline": "Manual structured headline",
-        "overall_posture": "Manual structured posture",
-        "recommendation_summary": ["Review internet exposure"],
-        "conclusion": "Manual structured conclusion",
-      }
+    def _write_job(_owner, _job_id, persisted, **_kwargs):
+      job_specs["pass_reports"] = deepcopy(persisted["pass_reports"])
+      return persisted
 
-    plugin._run_structured_report_sections = MagicMock(side_effect=_structured_success)
-
-    result = Plugin.analyze_job(plugin, job_id="job-llm")
+    with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
+      postponed = Plugin.analyze_job(
+        plugin,
+        job_id="job-llm",
+      )
+      self.assertEqual(postponed, "postponed")
+      pending_id = plugin._manual_analysis_state["pending_id"]
+      result = Plugin.solve_postponed_analyze_job(plugin, pending_id)
 
     updated_pass = plugin.r1fs.add_json.call_args[0][0]
+    persisted_job = write_job.call_args[0][2]
     self.assertEqual(result["analysis_type"], "structured_report_sections")
-    self.assertEqual(job_specs["pass_reports"][-1]["report_cid"], "QmUpdatedPass")
+    self.assertEqual(persisted_job["pass_reports"][-1]["report_cid"], "QmUpdatedPass")
     self.assertEqual(updated_pass["quick_summary"], "Manual structured headline")
     self.assertIn("Manual structured posture", updated_pass["llm_analysis"])
     self.assertIn("Review internet exposure", updated_pass["llm_analysis"])

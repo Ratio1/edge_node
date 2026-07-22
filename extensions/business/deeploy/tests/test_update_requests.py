@@ -63,7 +63,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       DEEPLOY_KEYS.ERROR: str(exc),
     }
     plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: ("0xSender", make_inputs(**request))
-    plugin._normalize_plugins_input = lambda request: request
+    plugin._normalize_plugins_input = lambda request, **kwargs: request
     plugin.deeploy_get_auth_result = lambda inputs: {
       DEEPLOY_KEYS.SENDER: "0xSender",
       DEEPLOY_KEYS.SENDER_ESCROW: "0xEscrow",
@@ -97,6 +97,200 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin._queue_pipeline_persistence = lambda state: called.__setitem__("queued", called["queued"] + 1)
     return plugin, called
 
+  def _make_four_replica_cockroach_update_fixture(self, plugin):
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c", "0xai_node_d"]
+    instance_id = "CONTAINER_APP_3ab323"
+    runtime_config = {
+      plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: instance_id,
+      "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+      "CONTAINER_RESOURCES": {"cpu": 1, "memory": "2g", "storage": "0g"},
+      "FIXED_SIZE_VOLUMES": {
+        "cockroach_data": {"SIZE": "8G", "MOUNTING_POINT": "/cockroach/cockroach-data"},
+      },
+      "ENV": {
+        "CRDB_DATABASE": "appdb",
+        "CRDB_USER": "app_user",
+        "CRDB_PASSWORD": "sanitized-password",
+        "CRDB_NODE_COUNT": "4",
+        "CRDB_HOSTNAMES": "roach1,roach2,roach3,roach4",
+      },
+      "PER_NODE_TARGET_NODES": nodes,
+    }
+    discovered_instances = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: instance_id,
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: node,
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": copy.deepcopy(runtime_config),
+        },
+      }
+      for node in nodes
+    ]
+    request_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      instance_id=instance_id,
+      IMAGE=runtime_config["IMAGE"],
+      CONTAINER_RESOURCES=copy.deepcopy(runtime_config["CONTAINER_RESOURCES"]),
+      FIXED_SIZE_VOLUMES=copy.deepcopy(runtime_config["FIXED_SIZE_VOLUMES"]),
+      ENV=copy.deepcopy(runtime_config["ENV"]),
+      PER_NODE_CONFIG={
+        "byNode": {
+          node: {"ENV": {"CF_TUNNEL_TOKEN": f"sanitized-token-{index + 1}"}}
+          for index, node in enumerate(nodes)
+        },
+      },
+    )
+    return nodes, discovered_instances, request_plugin
+
+  def _make_legacy_service_update_request(
+    self,
+    nodes,
+    request_plugin,
+    top_level_instance_id=None,
+    nested_instance_id=None,
+  ):
+    app_params = {
+      key: copy.deepcopy(value)
+      for key, value in request_plugin.items()
+      if key not in (DEEPLOY_KEYS.PLUGIN_SIGNATURE, DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+    }
+    if nested_instance_id is not None:
+      app_params[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = nested_instance_id
+    request = {
+      DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+      DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+      DEEPLOY_KEYS.TARGET_NODES: nodes,
+      DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE: request_plugin[DEEPLOY_KEYS.PLUGIN_SIGNATURE],
+      DEEPLOY_KEYS.APP_PARAMS: app_params,
+    }
+    if top_level_instance_id is not None:
+      request[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = top_level_instance_id
+    return request
+
+  def test_normalize_legacy_update_copies_top_level_instance_id(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CONTAINER_APP_3ab323",
+      DEEPLOY_KEYS.APP_PARAMS: {"IMAGE": "repo/app:2.0"},
+    }
+
+    normalized = plugin._normalize_plugins_input(
+      plugin.deepcopy(request),
+      preserve_legacy_instance_id=True,
+    )
+
+    self.assertEqual(
+      normalized[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "CONTAINER_APP_3ab323",
+    )
+
+  def test_normalize_legacy_identity_duplicate_and_create_compatibility(self):
+    plugin = make_deeploy_plugin()
+    matching_request = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CONTAINER_APP_3ab323",
+      DEEPLOY_KEYS.APP_PARAMS: {
+        DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CONTAINER_APP_3ab323",
+        "IMAGE": "repo/app:2.0",
+      },
+    }
+
+    normalized_update = plugin._normalize_plugins_input(
+      plugin.deepcopy(matching_request),
+      preserve_legacy_instance_id=True,
+    )
+    normalized_create = plugin._normalize_plugins_input(plugin.deepcopy({
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CONTAINER_APP_3ab323",
+      DEEPLOY_KEYS.APP_PARAMS: {"IMAGE": "repo/app:2.0"},
+    }))
+    nested_only = plugin._normalize_plugins_input(
+      plugin.deepcopy({
+        DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_KEYS.APP_PARAMS: {
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CONTAINER_APP_3ab323",
+          "IMAGE": "repo/app:2.0",
+        },
+      }),
+      preserve_legacy_instance_id=True,
+    )
+    modern_plugins = plugin._normalize_plugins_input(
+      plugin.deepcopy({
+        DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "IGNORED_TOP_LEVEL_ID",
+        DEEPLOY_KEYS.PLUGINS: [
+          make_plugin_entry(
+            "CONTAINER_APP_RUNNER",
+            instance_id="CONTAINER_APP_3ab323",
+            IMAGE="repo/app:2.0",
+          ),
+        ],
+      }),
+      preserve_legacy_instance_id=True,
+    )
+
+    self.assertEqual(
+      normalized_update[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "CONTAINER_APP_3ab323",
+    )
+    self.assertNotIn(
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+      normalized_create[DEEPLOY_KEYS.PLUGINS][0],
+    )
+    self.assertEqual(
+      nested_only[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "CONTAINER_APP_3ab323",
+    )
+    self.assertEqual(
+      modern_plugins[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "CONTAINER_APP_3ab323",
+    )
+
+  def test_normalize_legacy_update_rejects_conflicting_instance_ids(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CONTAINER_APP_3ab323",
+      DEEPLOY_KEYS.APP_PARAMS: {
+        DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CONTAINER_APP_other",
+        "IMAGE": "repo/app:2.0",
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, DEEPLOY_ERRORS.REQUEST3):
+      plugin._normalize_plugins_input(
+        request,
+        preserve_legacy_instance_id=True,
+      )
+
+  def test_normalize_legacy_update_preserves_blank_and_null_identity_for_validation(self):
+    plugin = make_deeploy_plugin()
+    for submitted_instance_id in ("", None):
+      with self.subTest(submitted_instance_id=submitted_instance_id):
+        normalized = plugin._normalize_plugins_input(
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: submitted_instance_id,
+            DEEPLOY_KEYS.APP_PARAMS: {"IMAGE": "repo/app:2.0"},
+          },
+          preserve_legacy_instance_id=True,
+        )
+
+        self.assertIn(
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+          normalized[DEEPLOY_KEYS.PLUGINS][0],
+        )
+        self.assertEqual(
+          normalized[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+          submitted_instance_id,
+        )
+
   def test_prepare_single_plugin_instance_update_uses_plugin_config_and_strips_signature_fields(self):
     plugin = make_deeploy_plugin()
 
@@ -118,6 +312,421 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instance["PORT"], 3000)
     self.assertNotIn(DEEPLOY_KEYS.PLUGIN_SIGNATURE, instance)
     self.assertNotIn("signature", instance)
+
+  def test_process_service_update_preserves_four_replica_identity_and_storage(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: " SERVICE ",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["deploy_kwargs"]["job_app_type"], JOB_APP_TYPES.SERVICE)
+    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(len(redeploy_inputs[DEEPLOY_KEYS.PLUGINS]), 1)
+    self.assertEqual(
+      redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "CONTAINER_APP_3ab323",
+    )
+    self.assertEqual(
+      plugin._aggregate_container_resources(redeploy_inputs)["storage"],
+      "8192m",
+    )
+
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
+    for node_plugins in prepared_plan["node_plugins_by_addr"].values():
+      self.assertEqual(len(node_plugins), 1)
+      instance = node_plugins[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+      self.assertEqual(instance[plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID], "CONTAINER_APP_3ab323")
+      self.assertEqual(instance["PER_NODE_TARGET_NODES"], nodes)
+      self.assertEqual(instance["CONTAINER_RESOURCES"]["storage"], "0g")
+      self.assertEqual(instance["FIXED_SIZE_VOLUMES"]["cockroach_data"]["SIZE"], "8G")
+
+  def test_process_legacy_service_update_preserves_four_replica_identity_and_storage(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    plugin._normalize_plugins_input = types.MethodType(
+      DeeployManagerApiPlugin._normalize_plugins_input,
+      plugin,
+    )
+    request = self._make_legacy_service_update_request(
+      nodes,
+      request_plugin,
+      top_level_instance_id="CONTAINER_APP_3ab323",
+    )
+
+    response = plugin._process_pipeline_request(
+      request,
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(len(redeploy_inputs[DEEPLOY_KEYS.PLUGINS]), 1)
+    self.assertEqual(
+      redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "CONTAINER_APP_3ab323",
+    )
+    self.assertEqual(plugin._aggregate_container_resources(redeploy_inputs)["storage"], "8192m")
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
+    prepared_ids = {
+      instance[plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
+      for node_plugins in prepared_plan["node_plugins_by_addr"].values()
+      for node_plugin in node_plugins
+      for instance in node_plugin[plugin.ct.CONFIG_PLUGIN.K_INSTANCES]
+    }
+    self.assertEqual(prepared_ids, {"CONTAINER_APP_3ab323"})
+
+  def test_process_legacy_service_update_without_identity_fails_before_side_effects(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    plugin._normalize_plugins_input = types.MethodType(
+      DeeployManagerApiPlugin._normalize_plugins_input,
+      plugin,
+    )
+    phase_calls = defaultdict(int)
+    plugin._ensure_plugin_instance_ids = (
+      lambda *args, **kwargs: phase_calls.__setitem__("backfill", phase_calls["backfill"] + 1)
+    )
+    plugin.deeploy_check_payment_and_job_owner = (
+      lambda *args, **kwargs: phase_calls.__setitem__("payment", phase_calls["payment"] + 1) or True
+    )
+    plugin._prepare_create_pipeline_deploy_plan = (
+      lambda **kwargs: phase_calls.__setitem__("preparation", phase_calls["preparation"] + 1) or {}
+    )
+    plugin._reset_chainstore_response_keys = (
+      lambda *args, **kwargs: phase_calls.__setitem__("reset", phase_calls["reset"] + 1)
+    )
+    request = self._make_legacy_service_update_request(nodes, request_plugin)
+
+    response = plugin._process_pipeline_request(
+      request,
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(dict(phase_calls), {})
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+
+  def test_process_legacy_service_update_rejects_conflicting_identity_before_discovery(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    plugin._normalize_plugins_input = types.MethodType(
+      DeeployManagerApiPlugin._normalize_plugins_input,
+      plugin,
+    )
+    phase_calls = defaultdict(int)
+    plugin._gather_running_pipeline_context = (
+      lambda **kwargs: phase_calls.__setitem__("discovery", phase_calls["discovery"] + 1) or {}
+    )
+    plugin.deeploy_check_payment_and_job_owner = (
+      lambda *args, **kwargs: phase_calls.__setitem__("payment", phase_calls["payment"] + 1) or True
+    )
+    plugin._prepare_create_pipeline_deploy_plan = (
+      lambda **kwargs: phase_calls.__setitem__("preparation", phase_calls["preparation"] + 1) or {}
+    )
+    plugin._reset_chainstore_response_keys = (
+      lambda *args, **kwargs: phase_calls.__setitem__("reset", phase_calls["reset"] + 1)
+    )
+    request = self._make_legacy_service_update_request(
+      nodes,
+      request_plugin,
+      top_level_instance_id="CONTAINER_APP_3ab323",
+      nested_instance_id="CONTAINER_APP_other",
+    )
+
+    response = plugin._process_pipeline_request(
+      request,
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Conflicting legacy instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(dict(phase_calls), {})
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+
+  def test_process_update_without_job_app_type_fails_before_discovery_or_side_effects(self):
+    for persisted_job_app_type in (None, JOB_APP_TYPES.SERVICE):
+      with self.subTest(persisted_job_app_type=persisted_job_app_type):
+        fixture_plugin = make_deeploy_plugin()
+        nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+          fixture_plugin
+        )
+        request_plugin.pop(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        request_plugin["IMAGE"] = "ghcr.io/ratio1/deeploy-cockroachdb-service:review-repro"
+        deeploy_specs = {
+          DEEPLOY_KEYS.JOB_ID: 11,
+          DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+        }
+        if persisted_job_app_type is not None:
+          deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = persisted_job_app_type
+        plugin, called = self._make_process_update_plugin(
+          discovered_instances=discovered_instances,
+          nodes=nodes,
+          deeploy_specs=deeploy_specs,
+        )
+        phase_calls = defaultdict(int)
+
+        def gather_context(**kwargs):
+          phase_calls["discovery"] += 1
+          return {
+            "discovered_instances": discovered_instances,
+            "nodes": nodes,
+            "deeploy_specs": deeploy_specs,
+          }
+
+        plugin._gather_running_pipeline_context = gather_context
+        plugin.deeploy_check_payment_and_job_owner = (
+          lambda *args, **kwargs: phase_calls.__setitem__("payment", phase_calls["payment"] + 1) or True
+        )
+        plugin._check_nodes_availability = (
+          lambda inputs: phase_calls.__setitem__("nodes", phase_calls["nodes"] + 1) or nodes
+        )
+        plugin._prepare_create_pipeline_deploy_plan = (
+          lambda **kwargs: phase_calls.__setitem__("preparation", phase_calls["preparation"] + 1)
+          or {"enable_chainstore_response": False, "response_keys": {}, "node_plugins_by_addr": {}}
+        )
+        plugin._reset_chainstore_response_keys = (
+          lambda *args, **kwargs: phase_calls.__setitem__("reset", phase_calls["reset"] + 1)
+        )
+
+        response = plugin._process_pipeline_request(
+          {
+            DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+            DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+            DEEPLOY_KEYS.JOB_ID: 11,
+            DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+            DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+            DEEPLOY_KEYS.TARGET_NODES: nodes,
+            DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+            DEEPLOY_KEYS.PLUGINS: [request_plugin],
+          },
+          is_create=False,
+          async_mode=True,
+        )
+
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
+        self.assertIn("job_app_type is required for update requests", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(dict(phase_calls), {})
+        self.assertEqual(called["delete"], 0)
+        self.assertEqual(called["deploy"], 0)
+        self.assertEqual(called["queued"], 0)
+
+  def test_process_update_rejects_blank_and_invalid_job_app_type_before_discovery(self):
+    for submitted_job_app_type in ("   ", "unsupported"):
+      with self.subTest(submitted_job_app_type=submitted_job_app_type):
+        plugin, called = self._make_process_update_plugin(discovered_instances=[])
+        discovery_calls = []
+        plugin._gather_running_pipeline_context = lambda **kwargs: discovery_calls.append(kwargs) or {}
+
+        response = plugin._process_pipeline_request(
+          {
+            DEEPLOY_KEYS.APP_ID: "app-123",
+            DEEPLOY_KEYS.APP_ALIAS: "app",
+            DEEPLOY_KEYS.JOB_ID: 11,
+            DEEPLOY_KEYS.JOB_APP_TYPE: submitted_job_app_type,
+            DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+            DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+            DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+            DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+            DEEPLOY_KEYS.PLUGINS: [
+              make_plugin_entry(
+                "CONTAINER_APP_RUNNER",
+                IMAGE="repo/app:2.0",
+                CONTAINER_RESOURCES={"cpu": 1, "memory": "256m", "storage": "1g"},
+              ),
+            ],
+          },
+          is_create=False,
+          async_mode=True,
+        )
+
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
+        self.assertIn("job_app_type", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(discovery_calls, [])
+        self.assertEqual(called["delete"], 0)
+        self.assertEqual(called["deploy"], 0)
+
+  def test_process_create_without_job_app_type_keeps_inference(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[],
+      nodes=["node-1"],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          make_plugin_entry(
+            "CONTAINER_APP_RUNNER",
+            IMAGE="repo/app:1.0",
+            CONTAINER_RESOURCES={"cpu": 1, "memory": "256m", "storage": "1g"},
+          ),
+        ],
+      },
+      is_create=True,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["deploy_kwargs"]["job_app_type"], JOB_APP_TYPES.GENERIC)
+    self.assertEqual(
+      called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.JOB_APP_TYPE],
+      JOB_APP_TYPES.GENERIC,
+    )
+
+  def test_process_legacy_create_ignores_top_level_instance_id(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[],
+      nodes=["node-1"],
+    )
+    plugin._normalize_plugins_input = types.MethodType(
+      DeeployManagerApiPlugin._normalize_plugins_input,
+      plugin,
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "CALLER_SUPPLIED_CREATE_ID",
+        DEEPLOY_KEYS.APP_PARAMS: {
+          "IMAGE": "repo/app:1.0",
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m", "storage": "1g"},
+        },
+      },
+      is_create=True,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["deploy"], 1)
+    self.assertNotIn(
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+      called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS][0],
+    )
+
+  def test_process_service_update_without_resolved_id_fails_before_side_effects(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    request_plugin.pop(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+    request_plugin["IMAGE"] = "repo/reconfigured-service:latest"
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    payment_calls = []
+    reset_calls = []
+    backfill_calls = []
+    plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: payment_calls.append(args) or True
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: reset_calls.append(args)
+    plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: backfill_calls.append(args)
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Service update plugins must include instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(backfill_calls, [])
+    self.assertEqual(payment_calls, [])
+    self.assertEqual(reset_calls, [])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
 
   def test_prepare_single_plugin_instance_update_falls_back_to_instance_conf(self):
     plugin = make_deeploy_plugin()
@@ -960,6 +1569,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
         DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "stack",
         DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
         DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
         DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
@@ -1202,7 +1812,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ["api-instance"],
     )
 
-  def test_process_update_detects_type_from_requested_replacement_only(self):
+  def test_process_update_uses_explicit_type_with_requested_replacement_only(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -1238,6 +1848,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
         DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
         DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
         DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
         DEEPLOY_KEYS.TARGET_NODES: ["node-1"],

@@ -14,6 +14,7 @@ python-docx
 pdfplumber
 docker
 aiofiles
+aiohttp
 paramiko
 pymisp
 neo4j>=5.28,<6
