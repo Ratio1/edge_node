@@ -656,6 +656,37 @@ class DeeployManagerApiPlugin(
     return response
   
 
+  def _validate_service_update_plugin_instance_ids(self, inputs, job_app_type):
+    """
+    Require stable plugin identity for every managed-service update entry.
+
+    This runs after legacy ID backfill and request/persisted job-type
+    reconciliation. Native updates remain free to submit new no-ID plugins.
+    """
+    if job_app_type != JOB_APP_TYPES.SERVICE:
+      return True
+
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    missing_indexes = []
+    for index, plugin_entry in enumerate(plugins_array or []):
+      if not isinstance(plugin_entry, dict):
+        continue
+      instance_id = (
+        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_entry.get("instance_id")
+        or plugin_entry.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+      )
+      if not instance_id or not str(instance_id).strip():
+        missing_indexes.append(index)
+
+    if missing_indexes:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLUGINS3}: Service update plugins must include instance_id "
+        f"after identity resolution. Missing for plugin indexes {missing_indexes}."
+      )
+    return True
+
+
   def _process_pipeline_request(
     self,
     request: dict,
@@ -912,6 +943,8 @@ class DeeployManagerApiPlugin(
             inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
             inputs.job_app_type = job_app_type
             self.P(f"Detected replacement job app type: {job_app_type}")
+
+        self._validate_service_update_plugin_instance_ids(inputs, job_app_type)
 
         is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
         if not is_valid:

@@ -97,6 +97,52 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin._queue_pipeline_persistence = lambda state: called.__setitem__("queued", called["queued"] + 1)
     return plugin, called
 
+  def _make_four_replica_cockroach_update_fixture(self, plugin):
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c", "0xai_node_d"]
+    instance_id = "CONTAINER_APP_3ab323"
+    runtime_config = {
+      plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: instance_id,
+      "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+      "CONTAINER_RESOURCES": {"cpu": 1, "memory": "2g", "storage": "0g"},
+      "FIXED_SIZE_VOLUMES": {
+        "cockroach_data": {"SIZE": "8G", "MOUNTING_POINT": "/cockroach/cockroach-data"},
+      },
+      "ENV": {
+        "CRDB_DATABASE": "appdb",
+        "CRDB_USER": "app_user",
+        "CRDB_PASSWORD": "sanitized-password",
+        "CRDB_NODE_COUNT": "4",
+        "CRDB_HOSTNAMES": "roach1,roach2,roach3,roach4",
+      },
+      "PER_NODE_TARGET_NODES": nodes,
+    }
+    discovered_instances = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: instance_id,
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: node,
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": copy.deepcopy(runtime_config),
+        },
+      }
+      for node in nodes
+    ]
+    request_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      instance_id=instance_id,
+      IMAGE=runtime_config["IMAGE"],
+      CONTAINER_RESOURCES=copy.deepcopy(runtime_config["CONTAINER_RESOURCES"]),
+      FIXED_SIZE_VOLUMES=copy.deepcopy(runtime_config["FIXED_SIZE_VOLUMES"]),
+      ENV=copy.deepcopy(runtime_config["ENV"]),
+      PER_NODE_CONFIG={
+        "byNode": {
+          node: {"ENV": {"CF_TUNNEL_TOKEN": f"sanitized-token-{index + 1}"}}
+          for index, node in enumerate(nodes)
+        },
+      },
+    )
+    return nodes, discovered_instances, request_plugin
+
   def test_prepare_single_plugin_instance_update_uses_plugin_config_and_strips_signature_fields(self):
     plugin = make_deeploy_plugin()
 
@@ -118,6 +164,100 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instance["PORT"], 3000)
     self.assertNotIn(DEEPLOY_KEYS.PLUGIN_SIGNATURE, instance)
     self.assertNotIn("signature", instance)
+
+  def test_process_service_update_preserves_four_replica_identity_and_storage(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(len(redeploy_inputs[DEEPLOY_KEYS.PLUGINS]), 1)
+    self.assertEqual(
+      redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
+      "CONTAINER_APP_3ab323",
+    )
+    self.assertEqual(
+      plugin._aggregate_container_resources(redeploy_inputs)["storage"],
+      "8192m",
+    )
+
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
+    for node_plugins in prepared_plan["node_plugins_by_addr"].values():
+      self.assertEqual(len(node_plugins), 1)
+      instance = node_plugins[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+      self.assertEqual(instance[plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID], "CONTAINER_APP_3ab323")
+      self.assertEqual(instance["PER_NODE_TARGET_NODES"], nodes)
+      self.assertEqual(instance["CONTAINER_RESOURCES"]["storage"], "0g")
+      self.assertEqual(instance["FIXED_SIZE_VOLUMES"]["cockroach_data"]["SIZE"], "8G")
+
+  def test_process_service_update_without_resolved_id_fails_before_side_effects(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    request_plugin.pop(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+    request_plugin["IMAGE"] = "repo/reconfigured-service:latest"
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    payment_calls = []
+    reset_calls = []
+    plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: payment_calls.append(args) or True
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: reset_calls.append(args)
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Service update plugins must include instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(payment_calls, [])
+    self.assertEqual(reset_calls, [])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
 
   def test_prepare_single_plugin_instance_update_falls_back_to_instance_conf(self):
     plugin = make_deeploy_plugin()
