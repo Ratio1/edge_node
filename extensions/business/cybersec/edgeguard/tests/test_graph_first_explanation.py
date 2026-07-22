@@ -348,6 +348,21 @@ class OutputAndCoverageTests(unittest.TestCase):
 
 
 class ProductionRuntimeTests(unittest.TestCase):
+  def test_document_hash_projection_is_cross_runtime_and_number_stable(self):
+    floating = {"a": 1.0, "b": 10.0, "c": 1_000_000_000_000_000.0, "d": 1e16, "e": 1e20, "f": 1e-6}
+    parsed = {"a": 1, "b": 10, "c": 1_000_000_000_000_000, "d": 10_000_000_000_000_000, "e": 100_000_000_000_000_000_000, "f": 0.000001}
+    self.assertEqual(runtime.document_sha256(floating), runtime.document_sha256(parsed))
+    self.assertEqual(
+      runtime.document_sha256(floating),
+      "6000174c7de813e494f2dec42b32253b5a6970ee9c22f0b4b104880ed7085d31",
+    )
+    self.assertEqual(
+      runtime.document_sha256({"g": -0.0, "unicode": {"\U00010000": 1, "\ue000": 2}}),
+      "8d10a133bcc1d99074c0e8bcd102b7b7f07fd338deb2e09951f4310afcddc162",
+    )
+    with self.assertRaises(runtime.GraphFirstRuntimeError):
+      runtime.document_sha256({"bad": float("nan")})
+
   def test_frozen_prompts_renderer_payload_and_reference_vectors(self):
     runtime.validate_frozen_sources()
     self.assertEqual(len(runtime.TOKENIZER_REFERENCE_VECTORS), 5)

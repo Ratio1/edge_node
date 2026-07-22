@@ -10,7 +10,9 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import math
 from pathlib import Path
+import struct
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -32,6 +34,7 @@ CHAT_RENDERER_VERSION = "edgeguard-qwen-chat-v1"
 MAP_SYSTEM_PROMPT_SHA256 = "817a82cbbc15ff95f249f23f99b4c7c7c424aab09f6978c37a7e835c6b3c50e0"
 SYNTHESIS_SYSTEM_PROMPT_SHA256 = "a1d99f3ce610418cb4281227aafd23df6126dedd42f874853586f159515c3cd3"
 PROFILE_LEGEND_SHA256 = "e0f010a379d02bddb295987cb005e5d23a6359c782948fe1a1aa898442a81b33"
+DOCUMENT_HASH_VERSION = "edgeguard-json-hash-v1"
 CHAT_RENDERER_SOURCE_SHA256 = "b513f42064095e02b85c5c2ec2b7877c1a5a2501afcd7000ef54d3bc48a70337"
 NEO4J_TRACE_MAX_BYTES = 524_288
 RESPONSE_MAX_BYTES = 1_048_576
@@ -70,6 +73,39 @@ class GraphFirstRuntimeError(RuntimeError):
 
 def sha256_text(value: str) -> str:
   return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def document_sha256(value: Any) -> str:
+  """Hash a JSON value through a cross-runtime typed projection.
+
+  JSON parsers erase distinctions such as 1 versus 1.0.  Encoding every
+  finite number by its IEEE-754 bytes makes the trace hash reproducible in
+  Python and JavaScript without changing the model-facing JSON-CB document.
+  """
+  def project(item: Any) -> Any:
+    if item is None:
+      return ["null"]
+    if isinstance(item, bool):
+      return ["boolean", "true" if item else "false"]
+    if isinstance(item, (int, float)):
+      try:
+        numeric = float(item)
+        if not math.isfinite(numeric):
+          raise ValueError("non-finite")
+        encoded = struct.pack(">d", numeric).hex()
+      except (OverflowError, struct.error, ValueError) as exc:
+        raise GraphFirstRuntimeError("document_hash_number", "validation", "document number is not an IEEE-754 value") from exc
+      return ["number", encoded]
+    if isinstance(item, str):
+      return ["string", item]
+    if isinstance(item, list):
+      return ["array", [project(child) for child in item]]
+    if isinstance(item, dict) and all(isinstance(key, str) for key in item):
+      return ["object", [[key, project(item[key])] for key in sorted(item)]]
+    raise GraphFirstRuntimeError("document_hash_shape", "validation", "document is not a JSON value")
+
+  serialized = json.dumps(project(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+  return sha256_text(serialized)
 
 
 def render_chat(messages: Sequence[Mapping[str, str]]) -> str:
@@ -471,7 +507,7 @@ def run_graph_first_explanation(
         "repeated_boundary_count": sum(1 for alias in (*batch.node_aliases, *batch.relationship_aliases) if alias in plan.repeated_boundaries),
         "measurement": dataclasses.asdict(measurement),
         "document": document,
-        "document_sha256": sha256_text(core.canonical_json(document)),
+        "document_sha256": document_sha256(document),
       })
     trace["normalization"] = {
       "ir_version": ir.version,
