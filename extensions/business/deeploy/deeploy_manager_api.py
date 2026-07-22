@@ -1539,6 +1539,10 @@ class DeeployManagerApiPlugin(
       job_id : int
           The job ID from blockchain
 
+      job_app_type : str
+          Required for every update. Must be one of generic, native, service, or stack.
+          The submitted value is authoritative and is not inferred from plugin configuration.
+
       pipeline_params : dict, optional
           Additional pipeline-level parameters forwarded to the data capture thread. `null` falls back to `{}`.
           The provided keys are merged into the pipeline configuration at the top level.
@@ -1557,6 +1561,7 @@ class DeeployManagerApiPlugin(
             Complete desired replacement set. Each object represents ONE plugin instance:
             - plugin_signature : str (required)
             - instance_id : str (required when updating an existing plugin instance)
+              - Required on every submitted service plugin and never inferred by the backend
             - **instance-specific parameters** (payload merged into the instance configuration)
               - Omit instance_id to attach a brand new plugin instance; supported for native apps only
             - Omit a live plugin from this array to remove it from the replacement deployment
