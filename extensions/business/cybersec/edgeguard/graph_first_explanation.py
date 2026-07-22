@@ -117,6 +117,7 @@ class EvidenceIR:
   relationships: tuple[EvidenceRelationship, ...]
   paths: tuple[EvidencePath, ...]
   rows: tuple[RowGroup, ...]
+  entity_order: tuple[tuple[str, str], ...]
   components: tuple[tuple[str, ...], ...]
   projected_slots: frozenset[tuple[str, str]]
   semantic_sha256: str
@@ -336,12 +337,14 @@ class _AliasState:
     self.node_aliases: dict[str, str] = {}
     self.relationship_aliases: dict[str, str] = {}
     self.paths: dict[str, EvidencePath] = {}
+    self.entity_encounter: list[tuple[str, str]] = []
 
   def node(self, source_id: str) -> str:
     if source_id not in self.raw_nodes:
       _fail("unresolved_node_reference", "node reference does not resolve")
     if source_id not in self.node_aliases:
       self.node_aliases[source_id] = f"N{len(self.node_aliases)}"
+      self.entity_encounter.append(("node", source_id))
     return self.node_aliases[source_id]
 
   def relationship(self, source_id: str) -> str:
@@ -350,6 +353,7 @@ class _AliasState:
       _fail("unresolved_relationship_reference", "relationship reference does not resolve")
     if source_id not in self.relationship_aliases:
       self.relationship_aliases[source_id] = f"E{len(self.relationship_aliases)}"
+      self.entity_encounter.append(("relationship", source_id))
     self.node(relationship["startNodeId"])
     self.node(relationship["endNodeId"])
     return self.relationship_aliases[source_id]
@@ -539,13 +543,14 @@ def build_evidence_ir(
     _fail("invalid_projected_property", "projected property ownership does not resolve")
   semantic = canonical_json({
     "columns": columns,
+    "entity_order": aliases.entity_encounter,
     "nodes": [[item.alias, item.source_id, item.labels, [[key, thaw(value)] for key, value in item.properties]] for item in nodes],
     "relationships": [[item.alias, item.source_id, item.type, item.start_alias, item.end_alias, [[key, thaw(value)] for key, value in item.properties]] for item in relationships],
     "paths": [[item.alias, item.start_alias, item.end_alias, item.steps] for item in paths],
     "rows": [[item.alias, item.ordinals, thaw(item.values)] for item in rows],
   })
   return EvidenceIR(
-    IR_VERSION, columns, nodes, relationships, paths, tuple(rows), components, projected,
+    IR_VERSION, columns, nodes, relationships, paths, tuple(rows), tuple(aliases.entity_encounter), components, projected,
     hashlib.sha256(semantic.encode("utf-8")).hexdigest(),
   )
 
@@ -568,7 +573,11 @@ def freeze_property_view(
 ) -> PropertyView:
   ordered = []
   alias_to_source = {node.alias: node.source_id for node in ir.nodes} | {relationship.alias: relationship.source_id for relationship in ir.relationships}
-  entities = [*ir.nodes, *ir.relationships]
+  entities_by_key = {
+    **{("node", entity.source_id): entity for entity in ir.nodes},
+    **{("relationship", entity.source_id): entity for entity in ir.relationships},
+  }
+  entities = [entities_by_key[key] for key in ir.entity_order]
   for entity in entities:
     for key, value in entity.properties:
       slot = (entity.source_id, key)

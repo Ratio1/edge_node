@@ -181,6 +181,21 @@ class IrAndBatchTests(unittest.TestCase):
     with self.assertRaisesRegex(GraphFirstContractError, "mandatory structural evidence"):
       freeze_property_view(ir, lambda _slots, _row: False)
 
+  def test_property_view_uses_cross_kind_entity_encounter_order(self):
+    result, catalog = fixtures()
+    result["columns"] = ["relationship"]
+    result["rows"][0]["values"] = [{"type": "relationship", "ref": "r:ab"}]
+    ir = build_evidence_ir(result, catalog)
+    self.assertEqual(ir.entity_order[:3], (("relationship", "r:ab"), ("node", "n:a"), ("node", "n:b")))
+    view = permissive_view(ir)
+    ordered_sources = []
+    for (source_id, _key), band in view.bands:
+      if band != 2:
+        continue
+      if source_id not in ordered_sources:
+        ordered_sources.append(source_id)
+    self.assertEqual(ordered_sources[:3], ["r:ab", "n:a", "n:b"])
+
   def test_batches_own_closures_once_repeat_boundaries_and_leave_sparse_aliases(self):
     result, catalog = fixtures(disconnected=True)
     # Three distinct closures share the first component; a disconnected fourth closure
