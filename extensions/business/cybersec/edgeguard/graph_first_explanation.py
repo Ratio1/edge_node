@@ -112,6 +112,7 @@ class RowGroup:
 @dataclasses.dataclass(frozen=True)
 class EvidenceIR:
   version: str
+  columns: tuple[str, ...]
   nodes: tuple[EvidenceNode, ...]
   relationships: tuple[EvidenceRelationship, ...]
   paths: tuple[EvidencePath, ...]
@@ -455,6 +456,9 @@ def build_evidence_ir(
   catalog = _exact_keys(evidence_catalog, {"nodes", "relationships"}, "evidence_catalog")
   if not isinstance(evidence["columns"], list) or not isinstance(evidence["rows"], list):
     _fail("invalid_evidence_shape", "columns and rows must be arrays")
+  if any(not isinstance(column, str) or not column or CONTROL_RE.search(column) for column in evidence["columns"]):
+    _fail("invalid_evidence_shape", "columns must be non-empty control-free strings")
+  columns = tuple(evidence["columns"])
   raw_nodes = {}
   for index, node in enumerate(catalog["nodes"]):
     _exact_keys(node, {"id", "labels", "properties"}, f"nodes/{index}")
@@ -534,12 +538,16 @@ def build_evidence_ir(
   if not projected.issubset(known_slots):
     _fail("invalid_projected_property", "projected property ownership does not resolve")
   semantic = canonical_json({
+    "columns": columns,
     "nodes": [[item.alias, item.source_id, item.labels, [[key, thaw(value)] for key, value in item.properties]] for item in nodes],
     "relationships": [[item.alias, item.source_id, item.type, item.start_alias, item.end_alias, [[key, thaw(value)] for key, value in item.properties]] for item in relationships],
     "paths": [[item.alias, item.start_alias, item.end_alias, item.steps] for item in paths],
     "rows": [[item.alias, item.ordinals, thaw(item.values)] for item in rows],
   })
-  return EvidenceIR(IR_VERSION, nodes, relationships, paths, tuple(rows), components, projected, hashlib.sha256(semantic.encode("utf-8")).hexdigest())
+  return EvidenceIR(
+    IR_VERSION, columns, nodes, relationships, paths, tuple(rows), components, projected,
+    hashlib.sha256(semantic.encode("utf-8")).hexdigest(),
+  )
 
 
 def _slot_band(key: str, value: Any, projected: bool) -> int:
@@ -581,9 +589,16 @@ def freeze_property_view(
   return PropertyView(frozenset(included), omitted, tuple(ordered))
 
 
-def _normalized_tokens(value: str) -> frozenset[str]:
-  normalized = unicodedata.normalize("NFKC", value).casefold()
-  return frozenset(token for token in re.split(r"[^\w.:/@+-]+", normalized) if token)
+def _normalized_match_value(value: str) -> str:
+  return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _contains_exact_value(text: str, value: str) -> bool:
+  normalized = _normalized_match_value(text)
+  if not value:
+    return False
+  boundary = r"\w.:/@+-"
+  return re.search(rf"(?<![{boundary}]){re.escape(value)}(?![{boundary}])", normalized) is not None
 
 
 def _identity_values(ir: EvidenceIR, view: PropertyView, row: RowGroup) -> frozenset[str]:
@@ -640,6 +655,7 @@ def build_batch_document(
     ]
 
   return {
+    "columns": list(ir.columns),
     "nodes": [
       [alias, list(nodes_by_alias[alias].labels), properties(nodes_by_alias[alias])]
       for alias in node_aliases
@@ -713,8 +729,8 @@ def plan_batches(
   remaining = list(ir.rows)
   batches = []
   owners = []
-  anchor_tokens = _normalized_tokens(question) | _normalized_tokens(cypher)
-  allowlisted = {unicodedata.normalize("NFKC", name).casefold() for name in schema_names}
+  anchor_texts = (question, cypher)
+  allowlisted = {_normalized_match_value(name) for name in schema_names}
   nodes_by_alias = {node.alias: node for node in ir.nodes}
   relationships_by_alias = {relationship.alias: relationship for relationship in ir.relationships}
   for batch_ordinal in range(map_call_cap):
@@ -722,11 +738,14 @@ def plan_batches(
     selected_components: set[int] = set()
     selected_nodes: set[str] = set()
     selected_relationships: set[str] = set()
+    selected_slots: set[tuple[str, str]] = set()
     while remaining and len(selected) < MAX_ROW_GROUPS_PER_BATCH:
       candidates = []
-      before_tokens = measure(tuple(row.alias for row in selected), view).chat_tokens if selected else 0
+      canonical_selected = sorted(selected, key=lambda item: min(item.ordinals))
+      before_tokens = measure(tuple(row.alias for row in canonical_selected), view).chat_tokens if selected else 0
       for row in remaining:
-        trial_aliases = tuple(item.alias for item in [*selected, row])
+        trial = sorted([*selected, row], key=lambda item: min(item.ordinals))
+        trial_aliases = tuple(item.alias for item in trial)
         measurement = measure(trial_aliases, view)
         if not measurement.fits:
           continue
@@ -746,8 +765,9 @@ def plan_batches(
             unicodedata.normalize("NFKC", key).casefold()
             for key, _ in relationship.properties if (relationship.source_id, key) in view.included
           )
-        matches = len((identities | (closure_schema & allowlisted)) & anchor_tokens)
-        band_counts = {1: 0, 2: 0}
+        anchors = identities | (closure_schema & allowlisted)
+        matches = sum(1 for anchor in anchors if any(_contains_exact_value(text, anchor) for text in anchor_texts))
+        band_slots = {1: set(), 2: set()}
         sources = {item.alias: item.source_id for item in ir.nodes} | {item.alias: item.source_id for item in ir.relationships}
         aliases = {item.alias: item for item in ir.nodes} | {item.alias: item for item in ir.relationships}
         for alias in (*row.node_aliases, *row.relationship_aliases):
@@ -755,15 +775,15 @@ def plan_batches(
           for key, value in entity.properties:
             slot = (sources[alias], key)
             band = _slot_band(key, value, slot in ir.projected_slots)
-            if slot in view.included and band in band_counts:
-              band_counts[band] += 1
+            if slot in view.included and band in band_slots:
+              band_slots[band].add(slot)
         score = (
           matches,
           len(set(row.component_ids) - selected_components),
           len((set(row.node_aliases) | set(row.relationship_aliases)) & (selected_nodes | selected_relationships)),
           len(set(row.relationship_aliases) - selected_relationships),
           len(set(row.node_aliases) - selected_nodes),
-          band_counts[1], band_counts[2],
+          len(band_slots[1] - selected_slots), len(band_slots[2] - selected_slots),
           -(measurement.chat_tokens - before_tokens),
           -min(row.ordinals),
         )
@@ -776,12 +796,19 @@ def plan_batches(
       selected_components.update(chosen.component_ids)
       selected_nodes.update(chosen.node_aliases)
       selected_relationships.update(chosen.relationship_aliases)
+      for alias in (*chosen.node_aliases, *chosen.relationship_aliases):
+        entity = ({item.alias: item for item in ir.nodes} | {item.alias: item for item in ir.relationships})[alias]
+        selected_slots.update(
+          (entity.source_id, key) for key, _value in entity.properties
+          if (entity.source_id, key) in view.included
+        )
     if not selected:
       if batches:
         break
       _fail("minimal_closure_oversized", "no complete row closure fits the selected envelope")
-    row_aliases = tuple(row.alias for row in selected)
-    nodes, relationships, paths = _batch_refs(selected)
+    canonical_selected = sorted(selected, key=lambda item: min(item.ordinals))
+    row_aliases = tuple(row.alias for row in canonical_selected)
+    nodes, relationships, paths = _batch_refs(canonical_selected)
     measurement = measure(row_aliases, view)
     batches.append(EvidenceBatch(batch_ordinal, row_aliases, nodes, relationships, paths, measurement))
     owners.extend((row.alias, batch_ordinal) for row in selected)

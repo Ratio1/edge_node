@@ -107,6 +107,7 @@ class IrAndBatchTests(unittest.TestCase):
     result, catalog = fixtures(duplicates=True, disconnected=True)
     ir = build_evidence_ir(result, catalog, projected_slots=[("n:a", "severity")])
     self.assertEqual(ir.version, "edgeguard.evidence_ir.v1")
+    self.assertEqual(ir.columns, ("p", "score", "q"))
     self.assertEqual(ir.rows[0].ordinals, (0, 1))
     self.assertEqual(ir.paths[0].steps[0], ("N0", "E0", "N1", False))
     self.assertEqual(len(ir.components), 2)
@@ -201,6 +202,7 @@ class IrAndBatchTests(unittest.TestCase):
     self.assertTrue(plan.repeated_boundaries)
     self.assertTrue(all(batch.measurement.message_bytes <= 2200 for batch in plan.batches))
     documents = [build_batch_document(ir, view, batch.row_aliases) for batch in plan.batches]
+    self.assertEqual(documents[0]["columns"], ["p", "score", "q"])
     repeated = plan.repeated_boundaries[0]
 
     def definition(document, alias):
@@ -214,6 +216,27 @@ class IrAndBatchTests(unittest.TestCase):
     self.assertTrue(all(item == occurrences[0] for item in occurrences))
     sparse = build_batch_document(ir, view, ("R1",))
     self.assertEqual([record[0] for record in sparse["nodes"]], ["N2"])
+
+  def test_ranked_batches_serialize_in_source_order_and_match_complete_multiword_identity(self):
+    result, catalog = fixtures(disconnected=True)
+    catalog["nodes"][2]["properties"] = tagged_map(
+      cve_id={"type": "string", "value": "Acme Gateway"},
+    )
+    ir = build_evidence_ir(result, catalog)
+    view = permissive_view(ir)
+    anchored = plan_batches(
+      ir, view, map_call_cap=1,
+      measure=lambda rows, _view: BatchMeasurement(2200 if len(rows) <= 1 else 2201, 100, 10 * len(rows)),
+      question="Explain Acme Gateway evidence",
+    )
+    self.assertEqual(anchored.batches[0].row_aliases, ("R1",))
+    plan = plan_batches(
+      ir, view, map_call_cap=1,
+      measure=lambda rows, _view: BatchMeasurement(100 * len(rows), 150 * len(rows), 10 * len(rows)),
+      question="Explain Acme Gateway evidence",
+    )
+    self.assertEqual(plan.batches[0].row_aliases, ("R0", "R1"))
+    self.assertEqual([row[0] for row in build_batch_document(ir, view, plan.batches[0].row_aliases)["rows"]], ["R0", "R1"])
 
   def test_oversized_minimal_closure_and_exact_boundaries(self):
     result, catalog = fixtures()
