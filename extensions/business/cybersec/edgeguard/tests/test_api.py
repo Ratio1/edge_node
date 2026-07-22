@@ -1395,6 +1395,10 @@ class EdgeGuardApiTests(unittest.TestCase):
       {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "max_rows": True},
       {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "temperature": "0.1"},
       {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "enable_empty_result_broadening": "false"},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "scheme": False},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "uri": 7},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "execution_result": []},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "unexpected": "field"},
     )
     with patch.object(plugin, "_neo4j_driver") as mocked_driver:
       for kwargs in invalid_requests:

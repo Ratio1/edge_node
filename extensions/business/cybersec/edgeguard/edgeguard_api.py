@@ -4051,6 +4051,25 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": "Graph explanation request must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_explanation_request", "request must be a non-empty string")],
       }
+    invalid_fields = [str(name) for name in kwargs] if execution_result is None else []
+    connection_types = {
+      "uri": uri,
+      "username": username,
+      "password": password,
+      "scheme": scheme,
+    }
+    invalid_fields.extend(name for name, value in connection_types.items() if value is not None and not isinstance(value, str))
+    if execution_result is not None and not isinstance(execution_result, dict):
+      invalid_fields.append("execution_result")
+    if invalid_fields:
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Graph explanation request contains invalid or unexpected fields.",
+        "validation_errors": [_contract_error("invalid_request_fields", "request fields must match the exact contract")],
+      }
     if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
       return {
         "status": STATUS_REJECTED,
@@ -4141,7 +4160,7 @@ class EdgeguardApiPlugin(BasePlugin):
         deadline=deadline,
       )
 
-    normalized_uri, err = self._normalize_neo4j_uri(uri, scheme or "bolt+s")
+    normalized_uri, err = self._normalize_neo4j_uri(uri, scheme if scheme else "bolt+s")
     if err:
       return {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}
     if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
