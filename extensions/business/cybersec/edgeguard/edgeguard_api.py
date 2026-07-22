@@ -46,6 +46,7 @@ from .graph_first_runtime import (
   TRACE_VERSION,
   TOKENIZER_DEFAULT_PATH,
   direct_projection_descriptors,
+  empty_failure_trace,
   production_token_counter,
   run_graph_first_explanation,
 )
@@ -3209,11 +3210,15 @@ class EdgeguardApiPlugin(BasePlugin):
     self,
     error: GraphFirstRuntimeError,
     *,
+    mode_plan: Optional[ModePlan] = None,
     packet: Optional[Mapping[str, Any]] = None,
     packet_meta: Optional[Mapping[str, Any]] = None,
     validation: Optional[Mapping[str, Any]] = None,
     live_retry: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
+    if error.trace is None:
+      selected_mode = mode_plan or resolve_mode()
+      error.trace = empty_failure_trace(selected_mode, error.stage, error.code)
     reference = f"egx-{secrets.token_hex(8)}"
     calls = error.trace.get("calls", []) if isinstance(error.trace, dict) else []
     completion = calls[-1] if calls else {}
@@ -4000,6 +4005,7 @@ class EdgeguardApiPlugin(BasePlugin):
     except GraphFirstRuntimeError as exc:
       return self._graph_first_failure_transport(
         exc,
+        mode_plan=mode_plan,
         packet=packet,
         packet_meta=packet_meta,
         validation=plan.get("validation"),
@@ -4094,7 +4100,7 @@ class EdgeguardApiPlugin(BasePlugin):
     if explanation_err:
       failure = self._graph_first_failure_transport(GraphFirstRuntimeError(
         "model_not_configured", "configuration", "graph-first model is not configured",
-      ))
+      ), mode_plan=mode_plan)
       failure["result"]["executed"] = False
       return failure
 
@@ -4347,6 +4353,7 @@ class EdgeguardApiPlugin(BasePlugin):
       except GraphFirstRuntimeError as exc:
         return self._graph_first_failure_transport(
           exc,
+          mode_plan=mode_plan,
           packet=packet,
           packet_meta=packet_meta,
           validation=analysis,

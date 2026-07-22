@@ -1954,6 +1954,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["result"]["status"], "error")
     self.assertEqual(result["result"]["diagnostics"]["stage"], "configuration")
     self.assertEqual(result["result"]["diagnostics"]["reason"], "model_not_configured")
+    self.assertEqual(result["result"]["explanation_trace"]["mode"]["requested"], "balanced")
+    self.assertEqual(result["result"]["explanation_trace"]["calls"], [])
+    self.assertEqual(result["result"]["explanation_trace"]["outcome"]["safe_code"], "model_not_configured")
     self.assertEqual(
       " ".join(str(call) for call in plugin.P.call_args_list).count(
         "EDGEGUARD_EXPLANATION_OUTCOME"
@@ -2059,6 +2062,8 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["result"]["status"], "error")
     self.assertEqual(result["result"]["diagnostics"]["stage"], "configuration")
     self.assertEqual(result["result"]["diagnostics"]["reason"], "model_not_configured")
+    self.assertEqual(result["result"]["explanation_trace"]["mode"]["requested"], "balanced")
+    self.assertEqual(result["result"]["explanation_trace"]["calls"], [])
     outcome_log = " ".join(str(call) for call in plugin.P.call_args_list)
     self.assertEqual(outcome_log.count("EDGEGUARD_EXPLANATION_OUTCOME"), 1)
     self.assertNotIn("not-a-port", outcome_log)

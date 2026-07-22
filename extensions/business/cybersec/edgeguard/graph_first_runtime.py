@@ -383,6 +383,24 @@ def _safe_failure_trace(trace: dict[str, Any], stage: str, code: str, attempted:
   }
 
 
+def empty_failure_trace(mode: core.ModePlan, stage: str, code: str) -> dict[str, Any]:
+  """Return the strict trace envelope for failures before normalization or dispatch."""
+  trace = {
+    "schema_version": TRACE_VERSION,
+    "profile": {"id": PROFILE_ID, "candidate_id": CANDIDATE_ID, "sha256": PROFILE_SHA256},
+    "mode": {
+      "requested": mode.mode,
+      "effective": mode.mode,
+      "row_limit": mode.row_limit,
+      "map_call_cap": mode.map_call_cap,
+    },
+    "normalization": {},
+    "calls": [],
+    "outcome": {},
+  }
+  return _safe_failure_trace(trace, stage, code, 0, 0)
+
+
 def run_graph_first_explanation(
   *,
   question: str,
