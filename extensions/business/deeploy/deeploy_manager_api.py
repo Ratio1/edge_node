@@ -710,7 +710,10 @@ class DeeployManagerApiPlugin(
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
-      normalized_request = self._normalize_plugins_input(self.deepcopy(request))
+      normalized_request = self._normalize_plugins_input(
+        self.deepcopy(request),
+        preserve_legacy_instance_id=not is_create,
+      )
       self._sync_normalized_plugins_input(inputs, normalized_request)
       submitted_job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
       if not is_create:
@@ -1570,6 +1573,9 @@ class DeeployManagerApiPlugin(
         plugin_signature : str
             The signature of the single plugin. Legacy payloads without the plugins array are
             normalized internally; any deprecated `app_params` field is ignored in responses.
+        instance_id : str
+            Required at the top level for legacy service updates. The value is copied into the
+            normalized plugin and validated against the running instance.
 
     Returns
     -------

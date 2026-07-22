@@ -1894,13 +1894,20 @@ class _DeeployMixin:
 
     return
 
-  def _normalize_plugins_input(self, request: dict):
+  def _normalize_plugins_input(
+    self,
+    request: dict,
+    *,
+    preserve_legacy_instance_id: bool = False,
+  ):
     """
     Normalize plugin input to always use the plugins array format.
     Converts legacy single-plugin format (plugin_signature + app_params) to new multi-plugin format.
 
     Args:
         request (dict): The request dictionary
+        preserve_legacy_instance_id (bool): Copy a canonical top-level identity into a
+            synthesized legacy plugin. Update processing enables this; create processing does not.
 
     Returns:
         dict: Request with normalized plugins array (simple format: each object is a plugin instance)
@@ -1948,6 +1955,17 @@ class _DeeployMixin:
         DEEPLOY_KEYS.PLUGIN_SIGNATURE: plugin_signature,
         **app_params
       }
+      if preserve_legacy_instance_id and DEEPLOY_KEYS.PLUGIN_INSTANCE_ID in request:
+        top_level_instance_id = request.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        if (
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID in app_params
+          and app_params.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) != top_level_instance_id
+        ):
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.REQUEST3}. Conflicting legacy instance_id values were provided "
+            "at the top level and in app_params."
+          )
+        plugin_instance[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = top_level_instance_id
       request_key, request_config = self._get_request_per_node_config(request)
       if request_key is not None:
         existing_keys = [
