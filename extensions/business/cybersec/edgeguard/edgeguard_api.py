@@ -14,8 +14,9 @@ import json
 import math
 import re
 import secrets
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -31,6 +32,22 @@ from .edgeguard_cypher_guard import (
   build_direct_cypher_system_prompt,
   build_schema_correction_prompt,
   canonical_schema_surface,
+)
+from .graph_first_explanation import GraphFirstContractError, ModePlan, resolve_mode
+from .graph_first_runtime import (
+  CANDIDATE_ID,
+  GraphFirstRuntimeError,
+  MAP_SYSTEM_PROMPT_SHA256,
+  NEO4J_TRACE_VERSION,
+  PROFILE_ID,
+  PROFILE_SHA256,
+  RESPONSE_MAX_BYTES,
+  SYNTHESIS_SYSTEM_PROMPT_SHA256,
+  TRACE_VERSION,
+  TOKENIZER_DEFAULT_PATH,
+  direct_projection_descriptors,
+  production_token_counter,
+  run_graph_first_explanation,
 )
 
 try:
@@ -55,7 +72,7 @@ EXPLANATION_OUTPUT_MODES = {
   EXPLANATION_OUTPUT_MODE_JSON_SCHEMA,
 }
 EXPLANATION_DEFAULT_ROWS = 25
-EXPLANATION_SERVER_MAX_ROWS = 100
+EXPLANATION_SERVER_MAX_ROWS = 50
 EXPLANATION_MAX_GRAPH_NODES = 160
 EXPLANATION_MAX_GRAPH_RELATIONSHIPS = 240
 EXPLANATION_MAX_RAW_ID_CHARS = 240
@@ -65,7 +82,8 @@ EXPLANATION_MAX_PROPERTY_KEY_CHARS = 120
 EXPLANATION_MAX_PROPERTY_BYTES = 131_072
 EXPLANATION_MAX_EXECUTION_RESULT_BYTES = 524_288
 EXPLANATION_MAX_PROMPT_USER_BYTES = 3_300
-EXPLANATION_MAX_OUTPUT_TOKENS = 1024
+EXPLANATION_MAX_OUTPUT_TOKENS = 127
+LEGACY_EXPLANATION_MAX_OUTPUT_TOKENS = 1_024
 EXPLANATION_SUMMARY_MAX_WORDS = 80
 EXPLANATION_SUMMARY_MAX_EVIDENCE_IDS = 8
 EXPLANATION_MAX_OPTIONAL_OBJECTS = 4
@@ -105,7 +123,7 @@ DURATION_RE = re.compile(
   r"(?:(-?(?:0\.[0-9]{9}|(?:[1-9]|[1-5][0-9])(?:\.[0-9]{9})?))S)?$"
 )
 EXPLANATION_DIAGNOSTIC_STAGE_REASONS = {
-  "configuration": {"model_not_configured", "output_mode_not_selected"},
+  "configuration": {"model_not_configured", "output_mode_not_selected", "graph_first_configuration"},
   "provider": {
     "provider_http_error",
     "provider_timeout",
@@ -742,7 +760,17 @@ def _prepare_graph_explanation_plan(
   cypher: str,
   requested_limit: Optional[int] = None,
   broadening_enabled: bool = False,
+  mode_plan: Optional[ModePlan] = None,
 ) -> Dict[str, Any]:
+  try:
+    selected_mode = mode_plan or resolve_mode(explanation_rows=requested_limit)
+  except GraphFirstContractError as exc:
+    return {
+      "status": STATUS_REJECTED,
+      "ok": False,
+      "error": "Graph explanation request configuration is invalid.",
+      "validation_errors": [_contract_error(exc.code, exc.detail)],
+    }
   analysis = analyze_generated_cypher(cypher)
   if not analysis["accepted"]:
     return {
@@ -866,9 +894,19 @@ def _prepare_graph_explanation_plan(
       ],
     }
   try:
+    projection_descriptors = direct_projection_descriptors(return_clause, result_columns)
+  except GraphFirstRuntimeError as exc:
+    return {
+      "status": STATUS_REJECTED,
+      "ok": False,
+      "validation": analysis,
+      "error": "Cypher result projection is not safe for complete-result explanation.",
+      "validation_errors": [_contract_error(exc.code, exc.detail)],
+    }
+  try:
     primary_cypher, generated_limit, executed_limit, limit_adjusted = _normalize_explanation_cypher_limit(
       accepted_cypher,
-      requested_limit=requested_limit,
+      requested_limit=selected_mode.row_limit,
     )
   except Exception as exc:
     return {
@@ -887,6 +925,14 @@ def _prepare_graph_explanation_plan(
     "accepted_cypher": accepted_cypher,
     "executed_cypher": primary_cypher,
     "result_columns": result_columns,
+    "projection_descriptors": projection_descriptors,
+    "explanation_mode": {
+      "requested": selected_mode.mode,
+      "effective": selected_mode.mode,
+      "row_limit": selected_mode.row_limit,
+      "map_call_cap": selected_mode.map_call_cap,
+      "max_tokens": selected_mode.max_tokens,
+    },
     "limit_policy": {
       "generated_limit": generated_limit,
       "executed_limit": executed_limit,
@@ -1797,6 +1843,7 @@ def _build_graph_evidence_packet_from_execution(
     "broadened",
     "graph",
     "query_result_evidence",
+    "execution_trace",
   }
   unexpected = sorted(set(execution_result).difference(allowed_execution_keys))
   if unexpected:
@@ -2660,10 +2707,11 @@ _CONFIG = {
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN": None,
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN_ENV": "EDGEGUARD_EXPLANATION_MODEL_TOKEN",
   "EDGEGUARD_EXPLANATION_MODEL": None,
+  "EDGEGUARD_EXPLANATION_TOKENIZER_PATH": TOKENIZER_DEFAULT_PATH,
   "EDGEGUARD_EXPLANATION_DEFAULT_ROWS": EXPLANATION_DEFAULT_ROWS,
   "EDGEGUARD_EXPLANATION_MAX_ROWS": EXPLANATION_SERVER_MAX_ROWS,
   "EDGEGUARD_EXPLANATION_MAX_TOKENS": EXPLANATION_MAX_OUTPUT_TOKENS,
-  "EDGEGUARD_EXPLANATION_TEMPERATURE": 0.0,
+  "EDGEGUARD_EXPLANATION_TEMPERATURE": 0.1,
   "EDGEGUARD_EXPLANATION_TOP_P": 1.0,
   "EDGEGUARD_EXPLANATION_OUTPUT_MODE": None,
 
@@ -2857,6 +2905,165 @@ class EdgeguardApiPlugin(BasePlugin):
       current = current.get("result")
     return None
 
+  def _graph_first_token_counter(self):
+    override = getattr(self, "_graph_first_token_counter_for_tests", None)
+    if callable(override):
+      return override
+    path = getattr(self, "cfg_edgeguard_explanation_tokenizer_path", TOKENIZER_DEFAULT_PATH)
+    if not isinstance(path, str) or not path:
+      raise GraphFirstRuntimeError("tokenizer_path", "configuration", "graph-first tokenizer path is invalid")
+    return production_token_counter(path)
+
+  def _call_graph_first_provider(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    override = getattr(self, "_graph_first_provider_for_tests", None)
+    if callable(override):
+      return override(payload)
+    url, err = self._explanation_url()
+    if err or not url:
+      raise GraphFirstRuntimeError("model_not_configured", "configuration", "graph-first model is not configured")
+    started = time.monotonic()
+    try:
+      session = requests.Session()
+      session.trust_env = False
+      response = session.post(
+        url,
+        headers=self._explanation_headers(),
+        json=dict(payload),
+        timeout=min(119, int(self.cfg_request_timeout_seconds)),
+      )
+    except requests.exceptions.Timeout as exc:
+      raise GraphFirstRuntimeError("provider_timeout", "provider", "graph-first provider timed out") from exc
+    except requests.exceptions.RequestException as exc:
+      raise GraphFirstRuntimeError("provider_failure", "provider", "graph-first provider request failed") from exc
+    duration_ms = round((time.monotonic() - started) * 1000, 1)
+    if response.status_code != 200:
+      raise GraphFirstRuntimeError("provider_http_error", "provider", "graph-first provider returned an error")
+    try:
+      data = response.json()
+    except ValueError as exc:
+      raise GraphFirstRuntimeError("provider_failure", "provider", "graph-first provider response is invalid") from exc
+    provider_failure = self._extract_provider_failure(data)
+    if provider_failure is not None:
+      if provider_failure.get("error") == "Model context window exceeded.":
+        raise GraphFirstRuntimeError("context_window_exceeded", "provider", "graph-first context window exceeded")
+      code = "provider_timeout" if provider_failure.get("status") == STATUS_TIMEOUT else "provider_failure"
+      raise GraphFirstRuntimeError(code, "provider", "graph-first provider failed")
+    completion = self._extract_explanation_completion(data)
+    return {
+      "content": completion.get("content"),
+      "finish_reason": completion.get("finish_reason"),
+      "completion_tokens": completion.get("completion_tokens"),
+      "duration_ms": duration_ms,
+    }
+
+  def _graph_first_execution_trace(self, plan: Mapping[str, Any], execution_result: Mapping[str, Any]) -> Dict[str, Any]:
+    selected = "broadening" if execution_result.get("broadened") else "primary"
+    provided = execution_result.get("execution_trace")
+    if provided is None:
+      return {
+        "selected": selected,
+        "executions": [{
+          "id": selected,
+          "executed_cypher": execution_result["executed_cypher"],
+          "row_count": execution_result["row_count"],
+          "truncated": execution_result["truncated"],
+          "duration_ms": 0.0,
+          "method": "unspecified",
+        }],
+      }
+    if not isinstance(provided, dict) or set(provided) != {"selected", "executions"}:
+      raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace has invalid keys")
+    if provided.get("selected") != selected or not isinstance(provided.get("executions"), list):
+      raise GraphFirstRuntimeError("execution_trace_selection", "validation", "execution trace selection is invalid")
+    executions = provided["executions"]
+    if not 1 <= len(executions) <= 2:
+      raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace count is invalid")
+    clean = []
+    for item in executions:
+      if not isinstance(item, dict) or set(item) != {
+        "id", "executed_cypher", "row_count", "truncated", "duration_ms", "method",
+      }:
+        raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace item has invalid keys")
+      if item["id"] not in {"primary", "broadening"} or not isinstance(item["executed_cypher"], str):
+        raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace identity is invalid")
+      if isinstance(item["row_count"], bool) or not isinstance(item["row_count"], int) or item["row_count"] < 0:
+        raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace row count is invalid")
+      if not isinstance(item["truncated"], bool):
+        raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace truncation is invalid")
+      if isinstance(item["duration_ms"], bool) or not isinstance(item["duration_ms"], (int, float)) or not math.isfinite(item["duration_ms"]) or item["duration_ms"] < 0:
+        raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace timing is invalid")
+      if item["method"] not in {"native_driver", "next_route", "unspecified"}:
+        raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace method is invalid")
+      clean.append(dict(item))
+    expected_ids = ["primary", "broadening"] if selected == "broadening" else ["primary"]
+    if [item["id"] for item in clean] != expected_ids:
+      raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace order is invalid")
+    chosen = next((item for item in clean if item["id"] == selected), None)
+    if chosen is None or chosen["executed_cypher"] != execution_result["executed_cypher"] or chosen["row_count"] != execution_result["row_count"] or chosen["truncated"] != execution_result["truncated"]:
+      raise GraphFirstRuntimeError("execution_trace_mismatch", "validation", "selected execution trace does not match evidence")
+    return {"selected": selected, "executions": clean}
+
+  def _bounded_graph_first_success(self, value: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+      size = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+      raise GraphFirstRuntimeError("explanation_response_shape", "internal", "graph-first response is not serializable") from exc
+    if size <= RESPONSE_MAX_BYTES:
+      return value
+    trace = value.get("explanation_trace")
+    safe_trace = None
+    if isinstance(trace, dict):
+      safe_trace = {
+        **trace,
+        "calls": [
+          {key: item for key, item in call.items() if key not in {"raw_output", "parsed"}}
+          for call in trace.get("calls", []) if isinstance(call, dict)
+        ],
+        "outcome": {
+          "status": "failed",
+          "attempted_calls": trace.get("outcome", {}).get("attempted_calls", 0),
+          "completed_calls": trace.get("outcome", {}).get("completed_calls", 0),
+          "failure_stage": "validation",
+          "safe_code": "explanation_response_size",
+        },
+      }
+    raise GraphFirstRuntimeError(
+      "explanation_response_size", "validation", "sanitized explanation response exceeds its byte cap", safe_trace,
+    )
+
+  def _run_graph_first(
+    self,
+    *,
+    plan: Mapping[str, Any],
+    execution_result: Mapping[str, Any],
+    packet: Mapping[str, Any],
+    query_result_evidence: Mapping[str, Any],
+    evidence_catalog: Mapping[str, Any],
+    request: str,
+    mode_plan: ModePlan,
+    deadline: float,
+  ) -> Dict[str, Any]:
+    execution_trace = self._graph_first_execution_trace(plan, execution_result)
+    caveats = _deterministic_case_explanation_caveats({
+      "broadened": bool(execution_result.get("broadened")),
+      "truncated": False,
+      "limit_adjusted": bool(plan["limit_policy"].get("limit_adjusted")),
+    })
+    return run_graph_first_explanation(
+      question=request,
+      cypher=str(plan["accepted_cypher"]),
+      evidence=query_result_evidence,
+      catalog=evidence_catalog,
+      projection_descriptors=plan.get("projection_descriptors", []),
+      mode=mode_plan,
+      execution_trace=execution_trace,
+      token_counter=self._graph_first_token_counter(),
+      provider_call=self._call_graph_first_provider,
+      remaining_time=lambda: max(0.0, deadline - time.monotonic()),
+      model=getattr(self, "cfg_edgeguard_explanation_model", None),
+      caveats=caveats,
+    )
+
   def _build_explanation_payload(
     self,
     packet: Dict[str, Any],
@@ -2869,7 +3076,7 @@ class EdgeguardApiPlugin(BasePlugin):
   ) -> Dict[str, Any]:
     configured_max_tokens = min(
       max(1, int(self.cfg_edgeguard_explanation_max_tokens)),
-      EXPLANATION_MAX_OUTPUT_TOKENS,
+      LEGACY_EXPLANATION_MAX_OUTPUT_TOKENS,
     )
     requested_max_tokens = int(max_tokens) if max_tokens is not None else configured_max_tokens
     if requested_max_tokens <= 0:
@@ -2997,6 +3204,77 @@ class EdgeguardApiPlugin(BasePlugin):
       "result": safe_result,
       "logged": True,
     }
+
+  def _graph_first_failure_transport(
+    self,
+    error: GraphFirstRuntimeError,
+    *,
+    packet: Optional[Mapping[str, Any]] = None,
+    packet_meta: Optional[Mapping[str, Any]] = None,
+    validation: Optional[Mapping[str, Any]] = None,
+    live_retry: Optional[Mapping[str, Any]] = None,
+  ) -> Dict[str, Any]:
+    reference = f"egx-{secrets.token_hex(8)}"
+    calls = error.trace.get("calls", []) if isinstance(error.trace, dict) else []
+    completion = calls[-1] if calls else {}
+    reason_by_stage = {
+      "configuration": (
+        "model_not_configured" if error.code == "model_not_configured" else "graph_first_configuration"
+      ),
+      "provider": error.code if error.code in EXPLANATION_DIAGNOSTIC_STAGE_REASONS["provider"] else "provider_failure",
+      "completion": "output_truncated" if completion.get("finish_reason") == "length" else "missing_content",
+      "response_parse": "malformed_json",
+      "validation": "deterministic_validation_failed",
+      "internal": "unexpected_failure",
+    }
+    stage = error.stage if error.stage in reason_by_stage else "internal"
+    reason = reason_by_stage[stage]
+    diagnostics = {
+      "schema_version": EXPLANATION_DIAGNOSTIC_SCHEMA_VERSION,
+      "reference": reference,
+      "stage": stage,
+      "reason": reason,
+      "completion": {
+        "finish_reason": _normalize_explanation_finish_reason(completion.get("finish_reason")),
+        "completion_tokens": (
+          completion.get("completion_tokens")
+          if isinstance(completion.get("completion_tokens"), int)
+          and not isinstance(completion.get("completion_tokens"), bool)
+          else None
+        ),
+        "max_tokens": 127,
+      },
+      "validation_codes": [error.code],
+      "validation_code_count": 1,
+    }
+    self.P("EDGEGUARD_EXPLANATION_OUTCOME " + json.dumps({
+      "completion_tokens": diagnostics["completion"]["completion_tokens"],
+      "finish_reason": diagnostics["completion"]["finish_reason"],
+      "max_tokens": 127,
+      "reason": reason,
+      "reference": reference,
+      "stage": stage,
+      "status": STATUS_ERROR,
+      "validation_code_count": 1,
+      "validation_codes": [error.code],
+    }, sort_keys=True, separators=(",", ":")))
+    result = {
+      "status": STATUS_TIMEOUT if error.code == "provider_timeout" else STATUS_ERROR,
+      "ok": False,
+      "executed": True,
+      "explained": False,
+      "error": "Graph explanation is unavailable.",
+      "validation_errors": [_contract_error(error.code, "Graph-first explanation failed safely.")],
+      "diagnostics": diagnostics,
+      "explanation_trace": error.trace,
+      "validation": validation,
+      "live_retry": live_retry,
+    }
+    if packet is not None and error.code != "explanation_response_size":
+      result["packet"] = dict(packet)
+    if packet_meta is not None and error.code != "explanation_response_size":
+      result["packet_meta"] = dict(packet_meta)
+    return {"status_code": 500, "result": result, "logged": True}
 
   def _call_explanation_model(
     self,
@@ -3261,14 +3539,18 @@ class EdgeguardApiPlugin(BasePlugin):
       "retry_default": DEFAULT_SCHEMA_RETRY_LIMIT,
       "profiles": profiles,
       "graph_explanation": {
-        "prompt_version": GRAPH_EXPLANATION_PROMPT_VERSION,
-        "prompt_sha256": _graph_explanation_prompt_sha256(),
-        "draft_schema_version": CASE_EXPLANATION_DRAFT_SCHEMA_VERSION,
+        "prompt_version": "edgeguard-graph-first-v1",
+        "profile_id": PROFILE_ID,
+        "candidate_id": CANDIDATE_ID,
+        "profile_sha256": PROFILE_SHA256,
+        "map_system_prompt_sha256": MAP_SYSTEM_PROMPT_SHA256,
+        "synthesis_system_prompt_sha256": SYNTHESIS_SYSTEM_PROMPT_SHA256,
         "output_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
-        "candidate_output_modes": sorted(EXPLANATION_OUTPUT_MODES),
-        "configured_output_mode": self.cfg_edgeguard_explanation_output_mode,
-        "selection_status": "provisional_pending_phase_28_measurement",
-        "expected_output": "one concise evidence-bounded CaseExplanationDraft JSON object",
+        "coverage_schema_version": "edgeguard.explanation_coverage.v1",
+        "neo4j_trace_schema_version": NEO4J_TRACE_VERSION,
+        "explanation_trace_schema_version": TRACE_VERSION,
+        "selection_status": "selected_egm_043",
+        "expected_output": "strict graph-first map JSON and conditional synthesis JSON",
       },
     }
 
@@ -3297,16 +3579,23 @@ class EdgeguardApiPlugin(BasePlugin):
         "output_contract": "one Cypher query string only",
       },
       "graph_explanation": {
-        "status": "prototype",
+        "status": "production_contract",
+        "profile_id": PROFILE_ID,
+        "candidate_id": CANDIDATE_ID,
+        "profile_sha256": PROFILE_SHA256,
         "packet_schema_version": GRAPH_PACKET_SCHEMA_VERSION,
         "case_explanation_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
+        "coverage_schema_version": "edgeguard.explanation_coverage.v1",
+        "neo4j_trace_schema_version": NEO4J_TRACE_VERSION,
+        "explanation_trace_schema_version": TRACE_VERSION,
         "provider_config_separate": True,
         "provider_default": "local-only",
-        "default_rows": int(self.cfg_edgeguard_explanation_default_rows),
-        "server_max_rows": int(self.cfg_edgeguard_explanation_max_rows),
-        "execution_mode": "prepared_execution_evidence",
-        "legacy_direct_driver_mode": "deprecated_compatibility_only",
-        "quality": "EGM-030 Phase 1 lower-bound baseline only; not promoted for fine-tuning.",
+        "default_mode": "balanced",
+        "default_rows": 25,
+        "server_max_rows": 50,
+        "execution_mode": "graph_first_prepared_evidence",
+        "direct_driver_mode": "graph_first_compatibility",
+        "quality": "EGM-043 selected JSON-CB/1 profile promoted by EGM-045.",
       },
       "fine_tuning": {
         "method": "QLoRA SFT",
@@ -3348,7 +3637,9 @@ class EdgeguardApiPlugin(BasePlugin):
   def _normalize_neo4j_uri(self, uri: str, scheme: str = "bolt+s") -> tuple[Optional[str], Optional[str]]:
     if not isinstance(uri, str) or not uri.strip():
       return None, "`uri` must be a non-empty string."
-    selected_scheme = str(scheme or "bolt+s").strip()
+    if not isinstance(scheme, str) or not scheme.strip():
+      return None, "`scheme` must be a non-empty string."
+    selected_scheme = scheme.strip()
     if selected_scheme not in NEO4J_SCHEMES:
       return None, f"`scheme` must be one of {sorted(NEO4J_SCHEMES)}."
     normalized = uri.strip()
@@ -3551,11 +3842,19 @@ class EdgeguardApiPlugin(BasePlugin):
   def prepare_graph_explanation(
     self,
     cypher: str,
+    explanation_mode: Optional[str] = None,
     explanation_rows: Optional[int] = None,
     max_rows: Optional[int] = None,
     enable_empty_result_broadening: Optional[bool] = None,
     **kwargs,
   ) -> Dict[str, Any]:
+    if not isinstance(cypher, str) or not cypher.strip():
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "error": "Graph explanation Cypher must be a non-empty string.",
+        "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
+      }
     forwarded = sorted(str(name) for name in kwargs)
     if forwarded:
       return {
@@ -3566,15 +3865,44 @@ class EdgeguardApiPlugin(BasePlugin):
           _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
         ],
       }
-    requested_limit = explanation_rows if explanation_rows is not None else max_rows
+    if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "error": "Graph explanation request configuration is invalid.",
+        "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
+      }
+    try:
+      mode_plan = resolve_mode(
+        explanation_mode=explanation_mode,
+        explanation_rows=explanation_rows,
+        max_rows=max_rows,
+      )
+    except GraphFirstContractError as exc:
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "error": "Graph explanation request configuration is invalid.",
+        "validation_errors": [_contract_error(exc.code, exc.detail)],
+      }
     broadening_enabled = (
       bool(self.cfg_live_empty_result_broadening)
       if enable_empty_result_broadening is None
       else bool(enable_empty_result_broadening)
     )
-    plan = _prepare_graph_explanation_plan(cypher, requested_limit, broadening_enabled)
+    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
     if not plan.get("ok"):
       return plan
+    try:
+      self._graph_first_token_counter()
+    except GraphFirstRuntimeError as exc:
+      return {
+        "status": "config_error",
+        "ok": False,
+        "validation": plan.get("validation"),
+        "error": "Graph-first explanation tokenizer is unavailable.",
+        "validation_errors": [_contract_error(exc.code, exc.detail)],
+      }
     _explanation_url, explanation_err = self._explanation_url()
     if explanation_err:
       return {
@@ -3591,9 +3919,8 @@ class EdgeguardApiPlugin(BasePlugin):
     plan: Dict[str, Any],
     execution_result: Any,
     request: str,
-    temperature: Optional[float],
-    max_tokens: Optional[int],
-    top_p: Optional[float],
+    mode_plan: ModePlan,
+    deadline: float,
   ) -> Dict[str, Any]:
     packet, packet_meta, ingestion_errors = _build_graph_evidence_packet_from_execution(
       request=request,
@@ -3647,43 +3974,38 @@ class EdgeguardApiPlugin(BasePlugin):
         "live_retry": live_retry,
       }
     try:
-      _graph_explanation_user_content(packet, query_result_evidence, evidence_catalog)
-    except _ResultEvidenceError as exc:
-      return {
-        "status": STATUS_REJECTED,
-        "ok": False,
+      graph_first = self._run_graph_first(
+        plan=plan,
+        execution_result=execution_result,
+        packet=packet,
+        query_result_evidence=query_result_evidence,
+        evidence_catalog=evidence_catalog,
+        request=request,
+        mode_plan=mode_plan,
+        deadline=deadline,
+      )
+      success = self._bounded_graph_first_success({
+        "status": STATUS_OK,
+        "ok": True,
         "executed": True,
-        "explained": False,
-        "error": "Complete query result failed deterministic validation",
-        "validation_errors": [_contract_error(exc.code, exc.detail)],
+        "explained": True,
         "packet": packet,
         "packet_meta": packet_meta,
+        **graph_first,
         "validation": plan.get("validation"),
         "live_retry": live_retry,
-      }
-    explanation_result = self._call_explanation_model(
-      packet,
-      query_result_evidence,
-      evidence_catalog,
-      temperature,
-      max_tokens,
-      top_p,
-    )
-    if explanation_result.get("status") != STATUS_ACCEPTED:
-      return self._explanation_failure_transport(explanation_result)
-    return {
-      "status": STATUS_OK,
-      "ok": True,
-      "executed": True,
-      "explained": True,
-      "packet": packet,
-      "packet_meta": packet_meta,
-      "explanation": explanation_result["explanation"],
-      "validation": plan.get("validation"),
-      "live_retry": live_retry,
-      "provider": explanation_result.get("provider"),
-      "model": explanation_result.get("model"),
-    }
+        "provider": "local",
+        "model": getattr(self, "cfg_edgeguard_explanation_model", None),
+      })
+    except GraphFirstRuntimeError as exc:
+      return self._graph_first_failure_transport(
+        exc,
+        packet=packet,
+        packet_meta=packet_meta,
+        validation=plan.get("validation"),
+        live_retry=live_retry,
+      )
+    return success
 
   @BasePlugin.endpoint(method="POST")
   def explain_graph(
@@ -3694,6 +4016,7 @@ class EdgeguardApiPlugin(BasePlugin):
     password: Optional[str] = None,
     request: str = "Explain the returned investigation graph.",
     scheme: Optional[str] = None,
+    explanation_mode: Optional[str] = None,
     explanation_rows: Optional[int] = None,
     max_rows: Optional[int] = None,
     enable_empty_result_broadening: Optional[bool] = None,
@@ -3703,6 +4026,55 @@ class EdgeguardApiPlugin(BasePlugin):
     top_p: Optional[float] = None,
     **kwargs,
   ) -> Dict[str, Any]:
+    deadline = time.monotonic() + EDGEGUARD_REQUEST_TIMEOUT_SECONDS
+    if not isinstance(cypher, str) or not cypher.strip():
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Graph explanation Cypher must be a non-empty string.",
+        "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
+      }
+    if not isinstance(request, str) or not request.strip():
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Graph explanation request must be a non-empty string.",
+        "validation_errors": [_contract_error("invalid_explanation_request", "request must be a non-empty string")],
+      }
+    if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
+      return {
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Graph explanation request configuration is invalid.",
+        "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
+      }
+    try:
+      mode_plan = resolve_mode(
+        explanation_mode=explanation_mode,
+        explanation_rows=explanation_rows,
+        max_rows=max_rows,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+      )
+      self._graph_first_token_counter()
+    except (GraphFirstContractError, GraphFirstRuntimeError) as exc:
+      code = exc.code
+      detail = exc.detail
+      return {
+        "status": "config_error",
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Graph-first explanation configuration is unavailable.",
+        "validation_errors": [_contract_error(code, detail)],
+      }
     analysis = analyze_generated_cypher(cypher)
     if not analysis["accepted"]:
       return {
@@ -3720,17 +4092,12 @@ class EdgeguardApiPlugin(BasePlugin):
       explanation_url = None
       explanation_err = "EdgeGuard explanation model is not configured"
     if explanation_err:
-      explanation_result = self._call_explanation_model(
-        {"request": request},
-        {},
-        {},
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-      )
-      return self._explanation_failure_transport(explanation_result)
+      failure = self._graph_first_failure_transport(GraphFirstRuntimeError(
+        "model_not_configured", "configuration", "graph-first model is not configured",
+      ))
+      failure["result"]["executed"] = False
+      return failure
 
-    requested_limit = explanation_rows if explanation_rows is not None else max_rows
     broadening_enabled = (
       bool(self.cfg_live_empty_result_broadening)
       if enable_empty_result_broadening is None
@@ -3757,22 +4124,21 @@ class EdgeguardApiPlugin(BasePlugin):
           ],
           "validation": analysis,
         }
-      plan = _prepare_graph_explanation_plan(cypher, requested_limit, broadening_enabled)
+      plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
       if not plan.get("ok"):
         return {**plan, "executed": False, "explained": False}
       return self._explain_prepared_execution(
         plan=plan,
         execution_result=execution_result,
         request=request,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
+        mode_plan=mode_plan,
+        deadline=deadline,
       )
 
     normalized_uri, err = self._normalize_neo4j_uri(uri, scheme or "bolt+s")
     if err:
       return {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}
-    if not username or not password:
+    if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
       return {
         "status": STATUS_ERROR,
         "ok": False,
@@ -3785,7 +4151,7 @@ class EdgeguardApiPlugin(BasePlugin):
       unavailable.update({"executed": False, "explained": False})
       return unavailable
 
-    plan = _prepare_graph_explanation_plan(cypher, requested_limit, broadening_enabled)
+    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
     if not plan.get("ok"):
       return {**plan, "executed": False, "explained": False}
     executed_cypher = plan["executed_cypher"]
@@ -3796,7 +4162,18 @@ class EdgeguardApiPlugin(BasePlugin):
     driver = None
     try:
       driver = self._neo4j_driver(normalized_uri, username, password)
+      primary_started = time.monotonic()
       query_result = self._run_neo4j_query(driver, executed_cypher, executed_limit)
+      primary_duration_ms = round((time.monotonic() - primary_started) * 1000, 1)
+      primary_row_count = len(query_result["rows"])
+      execution_trace_items = [{
+        "id": "primary",
+        "executed_cypher": executed_cypher,
+        "row_count": primary_row_count,
+        "truncated": bool(query_result.get("truncated")),
+        "duration_ms": primary_duration_ms,
+        "method": "native_driver",
+      }]
       live_retry = self._empty_result_broadening_state(enabled=broadening_enabled)
       final_executed_cypher = executed_cypher
       broadened_applied = False
@@ -3810,9 +4187,19 @@ class EdgeguardApiPlugin(BasePlugin):
           )
         else:
           try:
+            broadening_started = time.monotonic()
             query_result = self._run_neo4j_query(driver, broadened_cypher, executed_limit)
+            broadening_duration_ms = round((time.monotonic() - broadening_started) * 1000, 1)
             final_executed_cypher = broadened_cypher
             broadened_applied = True
+            execution_trace_items.append({
+              "id": "broadening",
+              "executed_cypher": broadened_cypher,
+              "row_count": len(query_result["rows"]),
+              "truncated": bool(query_result.get("truncated")),
+              "duration_ms": broadening_duration_ms,
+              "method": "native_driver",
+            })
             live_retry = self._empty_result_broadening_state(
               enabled=True,
               attempted=True,
@@ -3907,7 +4294,6 @@ class EdgeguardApiPlugin(BasePlugin):
           raw_nodes=raw_nodes,
           raw_relationships=raw_relationships,
         )
-        _graph_explanation_user_content(packet, query_result_evidence, evidence_catalog)
       except _ResultEvidenceError as exc:
         return {
           "status": STATUS_REJECTED,
@@ -3921,32 +4307,52 @@ class EdgeguardApiPlugin(BasePlugin):
           "validation": analysis,
           "live_retry": live_retry,
         }
-      explanation_result = self._call_explanation_model(
-        packet,
-        query_result_evidence,
-        evidence_catalog,
-        temperature,
-        max_tokens,
-        top_p,
-      )
-      if explanation_result.get("status") != STATUS_ACCEPTED:
-        return self._explanation_failure_transport(explanation_result)
-      return {
-        "status": STATUS_OK,
-        "ok": True,
-        "executed": True,
-        "explained": True,
-        "packet": packet,
-        "packet_meta": packet_meta,
-        "explanation": explanation_result["explanation"],
-        "validation": analysis,
-        "live_retry": live_retry,
-        "provider": explanation_result.get("provider"),
-        "model": explanation_result.get("model"),
-        "explanation_model_url": self._redact_url(explanation_url),
-        "mode": "legacy_direct_driver",
-        "deprecated": True,
+      execution_envelope = {
+        "executed_cypher": final_executed_cypher,
+        "primary_row_count": primary_row_count,
+        "row_count": packet["execution"]["row_count"],
+        "truncated": packet["execution"]["truncated"],
+        "broadened": broadened_applied,
+        "execution_trace": {
+          "selected": "broadening" if broadened_applied else "primary",
+          "executions": execution_trace_items,
+        },
       }
+      try:
+        graph_first = self._run_graph_first(
+          plan=plan,
+          execution_result=execution_envelope,
+          packet=packet,
+          query_result_evidence=query_result_evidence,
+          evidence_catalog=evidence_catalog,
+          request=request,
+          mode_plan=mode_plan,
+          deadline=deadline,
+        )
+        success = self._bounded_graph_first_success({
+          "status": STATUS_OK,
+          "ok": True,
+          "executed": True,
+          "explained": True,
+          "packet": packet,
+          "packet_meta": packet_meta,
+          **graph_first,
+          "validation": analysis,
+          "live_retry": live_retry,
+          "provider": "local",
+          "model": getattr(self, "cfg_edgeguard_explanation_model", None),
+          "explanation_model_url": self._redact_url(explanation_url),
+          "mode": "graph_first_direct_driver",
+        })
+      except GraphFirstRuntimeError as exc:
+        return self._graph_first_failure_transport(
+          exc,
+          packet=packet,
+          packet_meta=packet_meta,
+          validation=analysis,
+          live_retry=live_retry,
+        )
+      return success
     except Exception as exc:
       return {
         "status": STATUS_ERROR,

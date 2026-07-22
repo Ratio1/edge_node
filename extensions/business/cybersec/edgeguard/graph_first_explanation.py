@@ -256,8 +256,8 @@ def resolve_mode(
   ):
     _fail("explanation_configuration_drift", "top_p must be 1.0")
   selected_tokens = 127 if max_tokens is None else _strict_positive_integer(max_tokens, "max_tokens")
-  if selected_tokens is None or selected_tokens >= COMPLETION_TOKEN_LIMIT:
-    _fail("explanation_configuration_drift", "max_tokens must be less than 128")
+  if selected_tokens != 127:
+    _fail("explanation_configuration_drift", "max_tokens must be 127")
   return ModePlan(mode, row_limit, map_calls, selected_tokens)
 
 

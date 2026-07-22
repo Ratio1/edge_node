@@ -49,6 +49,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUE
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
+from extensions.business.cybersec.edgeguard.graph_first_runtime import GraphFirstRuntimeError, render_chat  # noqa: E402
 
 
 class _Response:
@@ -200,7 +201,7 @@ def _case_explanation_packet():
     "limit_policy": {
       "generated_limit": 25,
       "executed_limit": 25,
-      "server_max_rows": 100,
+      "server_max_rows": 50,
       "limit_adjusted": False,
     },
     "execution": {
@@ -525,6 +526,31 @@ def _packet_from_provider_kwargs(kwargs):
   }
 
 
+def _graph_first_provider(payload):
+  task = payload["metadata"]["task"]
+  user = payload["messages"][-1]["content"]
+  data = json.loads(user.split("\nDATA\n", 1)[1])
+  if task == "edgeguard_graph_first_synthesis":
+    content = {
+      "status": "supported",
+      "text": "The returned graph evidence supports the investigation finding.",
+      "maps": [finding["id"] for finding in data],
+    }
+  else:
+    content = {
+      "status": "supported",
+      "text": "The returned graph evidence supports the investigation finding.",
+      "anchor": data["nodes"][0][0],
+      "rows": [row[0] for row in data["rows"]],
+    }
+  return {
+    "content": json.dumps(content, separators=(",", ":")),
+    "finish_reason": "stop",
+    "completion_tokens": 16,
+    "duration_ms": 1.0,
+  }
+
+
 def _make_api(**overrides):
   plugin = EdgeguardApiPlugin.__new__(EdgeguardApiPlugin)
   plugin.cfg_edgeguard_explanation_model_url = overrides.get("edgeguard_explanation_model_url")
@@ -535,16 +561,28 @@ def _make_api(**overrides):
   plugin.cfg_edgeguard_explanation_model_token_env = overrides.get("edgeguard_explanation_model_token_env", "EDGEGUARD_EXPLANATION_MODEL_TOKEN")
   plugin.cfg_edgeguard_explanation_model = overrides.get("edgeguard_explanation_model", "qwen2.5-1.5b-instruct")
   plugin.cfg_edgeguard_explanation_default_rows = overrides.get("edgeguard_explanation_default_rows", 25)
-  plugin.cfg_edgeguard_explanation_max_rows = overrides.get("edgeguard_explanation_max_rows", 100)
+  plugin.cfg_edgeguard_explanation_max_rows = overrides.get("edgeguard_explanation_max_rows", 50)
   plugin.cfg_edgeguard_explanation_max_tokens = overrides.get(
     "edgeguard_explanation_max_tokens",
-    EXPLANATION_MAX_OUTPUT_TOKENS,
+    1024,
   )
-  plugin.cfg_edgeguard_explanation_temperature = overrides.get("edgeguard_explanation_temperature", 0.0)
+  plugin.cfg_edgeguard_explanation_temperature = overrides.get("edgeguard_explanation_temperature", 0.1)
   plugin.cfg_edgeguard_explanation_top_p = overrides.get("edgeguard_explanation_top_p", 1.0)
   plugin.cfg_edgeguard_explanation_output_mode = overrides.get(
     "edgeguard_explanation_output_mode",
     "json_object",
+  )
+  plugin.cfg_edgeguard_explanation_tokenizer_path = overrides.get(
+    "edgeguard_explanation_tokenizer_path",
+    "/test/tokenizer.json",
+  )
+  plugin._graph_first_token_counter_for_tests = overrides.get(
+    "graph_first_token_counter",
+    lambda messages: len(render_chat(messages).encode("utf-8")),
+  )
+  plugin._graph_first_provider_for_tests = overrides.get(
+    "graph_first_provider",
+    _graph_first_provider,
   )
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
   plugin.cfg_neo4j_query_timeout_seconds = overrides.get("neo4j_query_timeout_seconds", 30)
@@ -670,14 +708,14 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
-    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-explanation-v0.7")
-    self.assertEqual(explanation["draft_schema_version"], "edgeguard.case_explanation_draft.v2")
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v1")
+    self.assertEqual(explanation["profile_id"], "EEL/1")
+    self.assertEqual(explanation["candidate_id"], "JSON-CB/1")
     self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
-    self.assertEqual(explanation["candidate_output_modes"], ["json_object", "json_schema"])
-    self.assertEqual(explanation["configured_output_mode"], "json_object")
-    self.assertEqual(explanation["selection_status"], "provisional_pending_phase_28_measurement")
-    self.assertEqual(explanation["prompt_sha256"], _graph_explanation_prompt_sha256())
-    self.assertRegex(explanation["prompt_sha256"], r"^[0-9a-f]{64}$")
+    self.assertEqual(explanation["selection_status"], "selected_egm_043")
+    self.assertRegex(explanation["profile_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(explanation["map_system_prompt_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(explanation["synthesis_system_prompt_sha256"], r"^[0-9a-f]{64}$")
 
   def test_graph_explanation_prompt_centers_question_and_bounds_graph_evidence(self):
     packet = _case_explanation_packet()
@@ -1227,30 +1265,29 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(overflow["truncated"])
 
   def test_explain_graph_executes_with_explanation_limit_and_validates_output(self):
+    captured_payloads = []
+
+    def graph_first_provider(payload):
+      captured_payloads.append(payload)
+      return _graph_first_provider(payload)
+
     plugin = _make_api(
       edgeguard_explanation_model_port=5091,
       edgeguard_explanation_model="base_qwen3_4b",
+      graph_first_provider=graph_first_provider,
     )
     fake_driver, fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
-    def provider_side_effect(*_args, **kwargs):
-      packet = _packet_from_provider_kwargs(kwargs)
-      return _provider_response_for_packet(packet, caveat_types=["limit_adjusted"])
-
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
-        with patch(
-          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-          side_effect=provider_side_effect,
-        ) as mocked_post:
-          result = plugin.explain_graph(
-            uri="example.com:7687",
-            scheme="bolt+s",
-            username="neo4j",
-            password="secret",
-            request="Explain indicator provenance",
-            cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
-          )
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Explain indicator provenance",
+          cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
+        )
 
     self.assertEqual(result["status"], "ok")
     self.assertTrue(result["explained"])
@@ -1259,15 +1296,15 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["packet"]["limit_policy"]["limit_adjusted"])
     self.assertTrue(result["packet"]["executed_cypher"].endswith("LIMIT 25"))
     fake_session.run.assert_called_once_with("MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25")
-    call_payload = mocked_post.call_args.kwargs["json"]
-    self.assertEqual(mocked_post.call_args.args[0], "http://127.0.0.1:5091/create_chat_completion")
+    call_payload = captured_payloads[0]
     self.assertEqual(call_payload["model"], "base_qwen3_4b")
-    self.assertEqual(call_payload["temperature"], 0.0)
+    self.assertEqual(call_payload["temperature"], 0.1)
     self.assertEqual(call_payload["top_p"], 1.0)
-    self.assertEqual(call_payload["max_tokens"], 1024)
+    self.assertEqual(call_payload["max_tokens"], 127)
     self.assertEqual(call_payload["response_format"], {"type": "json_object"})
     self.assertNotIn("schema", call_payload["response_format"])
-    self.assertEqual(call_payload["metadata"]["schema_version"], "edgeguard.case_explanation_draft.v2")
+    self.assertEqual(call_payload["metadata"]["profile_id"], "EEL/1")
+    self.assertEqual(result["explanation_trace"]["calls"][0]["request"], call_payload)
 
   def test_explanation_payload_caps_output_and_honors_smaller_positive_limit(self):
     plugin = _make_api(edgeguard_explanation_max_tokens=1600)
@@ -1331,7 +1368,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["limit_policy"], {
       "generated_limit": 10,
       "executed_limit": 25,
-      "server_max_rows": 100,
+      "server_max_rows": 50,
       "limit_adjusted": True,
     })
     flattened = json.dumps(result)
@@ -1348,6 +1385,42 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertEqual(result["status"], "config_error")
     mocked_driver.assert_not_called()
+
+  def test_graph_first_request_fields_are_exact_types_before_execution(self):
+    provider = MagicMock(side_effect=_graph_first_provider)
+    plugin = _make_api(graph_first_provider=provider)
+    invalid_requests = (
+      {"cypher": 7},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "explanation_rows": "10"},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "max_rows": True},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "temperature": "0.1"},
+      {"cypher": "MATCH (i:Indicator) RETURN i LIMIT 25", "enable_empty_result_broadening": "false"},
+    )
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      for kwargs in invalid_requests:
+        with self.subTest(kwargs=kwargs):
+          result = plugin.explain_graph(**kwargs)
+          self.assertFalse(result["ok"])
+    mocked_driver.assert_not_called()
+    provider.assert_not_called()
+
+  def test_total_graph_first_success_response_cap_fails_without_output_echo(self):
+    plugin = _make_api()
+    value = {
+      "explanation_trace": {
+        "calls": [{"raw_output": "partial-secret", "parsed": {"text": "partial-secret"}, "status": "supported"}],
+        "outcome": {"attempted_calls": 1, "completed_calls": 1},
+      },
+      "large": "x" * 200,
+    }
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.RESPONSE_MAX_BYTES", 32):
+      with self.assertRaises(GraphFirstRuntimeError) as raised:
+        plugin._bounded_graph_first_success(value)
+    self.assertEqual(raised.exception.code, "explanation_response_size")
+    serialized = json.dumps(raised.exception.trace)
+    self.assertNotIn("partial-secret", serialized)
+    self.assertNotIn("raw_output", serialized)
+    self.assertNotIn("parsed", serialized)
 
   def test_prepare_graph_explanation_rejects_forwarded_credentials(self):
     plugin = _make_api()
@@ -1484,8 +1557,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
     cypher = (
       "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) "
-      "RETURN s AS source, i AS indicator, i.value AS nullable, i.value AS total, "
-      "i.value AS ratio, i.value AS items, i.value AS aggregate, p AS path LIMIT 25"
+      "RETURN s AS source, i AS indicator, coalesce(i.value, null) AS nullable, "
+      "toInteger(i.value) AS total, toFloat(i.value) AS ratio, collect(i.value) AS items, "
+      "collect(i.value) AS aggregate, p AS path LIMIT 25"
     )
     execution_result = _serialized_execution(cypher, primary_row_count=2)
     execution_result["row_count"] = 2
@@ -1523,24 +1597,14 @@ class EdgeGuardApiTests(unittest.TestCase):
         {"ordinal": 1, "values": json.loads(json.dumps(row_values))},
       ],
     }
-    captured = {}
-
-    def provider_side_effect(*_args, **kwargs):
-      captured.update(json.loads(kwargs["json"]["messages"][1]["content"]))
-      return _provider_response_for_packet(_packet_from_provider_kwargs(kwargs))
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-      side_effect=provider_side_effect,
-    ):
-      result = plugin.explain_graph(
-        cypher=cypher,
-        request="Explain the exact returned pairs.",
-        execution_result=execution_result,
-      )
+    result = plugin.explain_graph(
+      cypher=cypher,
+      request="Explain the exact returned pairs.",
+      execution_result=execution_result,
+    )
 
     self.assertEqual(result["status"], "ok")
-    complete = captured["complete_query_result"]
+    complete = result["neo4j_trace"]["result"]
     self.assertEqual(complete["columns"], execution_result["query_result_evidence"]["columns"])
     self.assertEqual(
       complete["rows"][0]["values"][:6],
@@ -1559,11 +1623,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     redacted = complete["rows"][0]["values"][6]["entries"][1]["value"]
     self.assertEqual(redacted["type"], "redacted")
     self.assertEqual(redacted["reason"], "security_policy")
-    self.assertNotIn("must-redact", json.dumps(captured))
+    self.assertNotIn("must-redact", json.dumps(complete))
     reverse_path = complete["rows"][0]["values"][7]
     self.assertEqual(reverse_path["start_node_ref"], complete["rows"][0]["values"][0]["ref"])
     self.assertEqual(reverse_path["end_node_ref"], complete["rows"][0]["values"][1]["ref"])
-    self.assertEqual(len(captured["evidence_catalog"]["relationships"]), 1)
+    self.assertEqual(len(complete["relationships"]), 1)
 
   def test_explain_graph_rejects_incomplete_or_oversized_evidence_without_model_call(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
@@ -1713,24 +1777,14 @@ class EdgeGuardApiTests(unittest.TestCase):
     credential["graph"]["nodes"][0]["properties"] = {"api_token": "should-not-cross"}
 
     nested_result = plugin.explain_graph(cypher=cypher, execution_result=nested)
-    captured = {}
-
-    def provider_side_effect(*_args, **kwargs):
-      captured.update(json.loads(kwargs["json"]["messages"][1]["content"]))
-      return _provider_response_for_packet(_packet_from_provider_kwargs(kwargs))
-
-    with patch(
-      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-      side_effect=provider_side_effect,
-    ):
-      credential_result = plugin.explain_graph(cypher=cypher, execution_result=credential)
+    credential_result = plugin.explain_graph(cypher=cypher, execution_result=credential)
 
     self.assertIn(
       "invalid_serialized_property_value",
       {item["code"] for item in nested_result["validation_errors"]},
     )
     self.assertEqual(credential_result["status"], "ok")
-    flattened = json.dumps(captured)
+    flattened = json.dumps(credential_result["neo4j_trace"])
     self.assertNotIn("should-not-cross", flattened)
     self.assertIn('"type": "redacted"', flattened)
     self.assertIn('"reason": "security_policy"', flattened)
@@ -1918,8 +1972,8 @@ class EdgeGuardApiTests(unittest.TestCase):
       "executed_cypher": "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
       "limit_policy": {
         "generated_limit": 25,
-        "executed_limit": 25,
-        "server_max_rows": 100,
+      "executed_limit": 25,
+      "server_max_rows": 50,
         "limit_adjusted": False,
       },
       "execution": {
@@ -2194,31 +2248,30 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("missing_required_caveat", {item["code"] for item in validation_errors})
 
   def test_explain_graph_rejects_malformed_json_output(self):
-    plugin = _make_api()
+    plugin = _make_api(graph_first_provider=lambda _payload: {
+      "content": "not json",
+      "finish_reason": "stop",
+      "completion_tokens": 2,
+      "duration_ms": 1.0,
+    })
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
-        with patch(
-          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-          return_value=_Response(payload={"choices": [{"message": {"content": "not json"}}]}),
-        ):
-          result = plugin.explain_graph(
-            uri="example.com:7687",
-            scheme="bolt+s",
-            username="neo4j",
-            password="secret",
-            cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
-          )
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
+        )
 
     self.assertEqual(result["status_code"], 500)
     self.assertTrue(result["logged"])
-    self.assertEqual(result["result"]["status"], "rejected")
+    self.assertEqual(result["result"]["status"], "error")
     self.assertEqual(result["result"]["diagnostics"]["reason"], "malformed_json")
-    self.assertEqual(result["result"]["diagnostics"]["validation_codes"], ["malformed_json"])
-    self.assertNotIn("validation_errors", result["result"])
-    self.assertNotIn("packet", result["result"])
-    self.assertNotIn("raw_output", result)
+    self.assertEqual(result["result"]["diagnostics"]["validation_codes"], ["invalid_model_output"])
+    self.assertNotIn("raw_output", json.dumps(result["result"]["explanation_trace"]))
 
   def test_explanation_provider_length_finish_rejects_before_parsing_without_raw_output(self):
     plugin = _make_api()
@@ -2492,144 +2545,132 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertNotIn("partial-secret", json.dumps(result))
 
   def test_explain_graph_preserves_paired_truncation_transport_envelope(self):
-    plugin = _make_api()
+    plugin = _make_api(graph_first_provider=lambda _payload: {
+      "content": '{"status":"supported"',
+      "finish_reason": "length",
+      "completion_tokens": 127,
+      "duration_ms": 1.0,
+    })
     cypher = "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25"
 
-    with patch.object(plugin, "_call_explanation_model", return_value={
-      "status": "rejected",
-      "error": "Graph explanation output was truncated at the safe token limit.",
-      "validation_errors": [{
-        "code": "output_truncated",
-        "message": "Graph explanation output was truncated at the safe token limit.",
-      }],
-      "diagnostics": _diagnostics(
-        stage="completion",
-        reason="output_truncated",
-        finish_reason="length",
-        completion_tokens=1024,
-        validation_codes=["output_truncated"],
-      ),
-    }):
-      result = plugin.explain_graph(
-        cypher=cypher,
-        request="Which source supports this indicator?",
-        execution_result=_serialized_execution(cypher),
-      )
+    result = plugin.explain_graph(
+      cypher=cypher,
+      request="Which source supports this indicator?",
+      execution_result=_serialized_execution(cypher),
+    )
 
     self.assertEqual(result["status_code"], 500)
-    self.assertEqual(result["result"]["error"], "Graph explanation output was truncated at the safe token limit.")
+    self.assertEqual(result["result"]["error"], "Graph explanation is unavailable.")
     self.assertEqual(
       {item["code"] for item in result["result"]["validation_errors"]},
-      {"output_truncated"},
+      {"finish_reason"},
     )
     self.assertTrue(result["logged"])
     self.assertEqual(result["result"]["diagnostics"]["reason"], "output_truncated")
-    self.assertNotIn("packet", result["result"])
+    self.assertNotIn("raw_output", json.dumps(result["result"]["explanation_trace"]))
 
-  def test_explain_graph_rejects_nested_schema_invalid_output(self):
-    plugin = _make_api()
+  def test_explain_graph_rejects_extra_map_output_keys(self):
+    def invalid_provider(payload):
+      valid = json.loads(_graph_first_provider(payload)["content"])
+      valid["extra"] = "not allowed"
+      return {
+        "content": json.dumps(valid),
+        "finish_reason": "stop",
+        "completion_tokens": 16,
+        "duration_ms": 1.0,
+      }
+
+    plugin = _make_api(graph_first_provider=invalid_provider)
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
-
-    def provider_side_effect(*_args, **kwargs):
-      packet = _packet_from_provider_kwargs(kwargs)
-      explanation = _draft_for_packet(packet)
-      explanation["summary"].pop("text")
-      explanation["next_pivots"][0]["priority"] = "urgent"
-      return _Response(payload={"choices": [{"message": {"content": json.dumps(explanation)}}]})
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
-        with patch(
-          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-          side_effect=provider_side_effect,
-        ):
-          result = plugin.explain_graph(
-            uri="example.com:7687",
-            scheme="bolt+s",
-            username="neo4j",
-            password="secret",
-            cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
-          )
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
+        )
 
     diagnostics = result["result"]["diagnostics"]
     codes = set(diagnostics["validation_codes"])
     self.assertEqual(result["status_code"], 500)
     self.assertTrue(result["logged"])
-    self.assertEqual(diagnostics["stage"], "validation")
-    self.assertEqual(diagnostics["reason"], "deterministic_validation_failed")
-    self.assertIn("schema_required", codes)
-    self.assertIn("schema_enum", codes)
-    self.assertNotIn("validation_errors", result["result"])
+    self.assertEqual(diagnostics["stage"], "response_parse")
+    self.assertEqual(diagnostics["reason"], "malformed_json")
+    self.assertEqual(codes, {"invalid_map_output"})
+    self.assertNotIn("raw_output", json.dumps(result["result"]["explanation_trace"]))
 
-  def test_explain_graph_rejects_unsupported_high_severity(self):
-    plugin = _make_api()
+  def test_explain_graph_rejects_unknown_map_anchor(self):
+    def invalid_provider(payload):
+      valid = json.loads(_graph_first_provider(payload)["content"])
+      valid["anchor"] = "N999"
+      return {
+        "content": json.dumps(valid),
+        "finish_reason": "stop",
+        "completion_tokens": 16,
+        "duration_ms": 1.0,
+      }
+
+    plugin = _make_api(graph_first_provider=invalid_provider)
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
-
-    def provider_side_effect(*_args, **kwargs):
-      packet = _packet_from_provider_kwargs(kwargs)
-      explanation = _draft_for_packet(packet)
-      explanation["risk_interpretation"][0]["severity"] = "high"
-      return _Response(payload={"choices": [{"message": {"content": json.dumps(explanation)}}]})
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
-        with patch(
-          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-          side_effect=provider_side_effect,
-        ):
-          result = plugin.explain_graph(
-            uri="example.com:7687",
-            scheme="bolt+s",
-            username="neo4j",
-            password="secret",
-            cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
-          )
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
+        )
 
     self.assertEqual(result["status_code"], 500)
     self.assertIn(
-      "severity_escalation_unsupported",
+      "invalid_map_citation",
       set(result["result"]["diagnostics"]["validation_codes"]),
     )
-    self.assertNotIn("validation_errors", result["result"])
+    self.assertEqual(
+      {item["code"] for item in result["result"]["validation_errors"]},
+      {"invalid_map_citation"},
+    )
 
-  def test_explain_graph_rejects_absent_evidence_invented_source_and_unsafe_pivot(self):
-    plugin = _make_api()
+  def test_explain_graph_rejects_incomplete_map_row_citations(self):
+    def invalid_provider(payload):
+      valid = json.loads(_graph_first_provider(payload)["content"])
+      valid["rows"] = []
+      return {
+        "content": json.dumps(valid),
+        "finish_reason": "stop",
+        "completion_tokens": 16,
+        "duration_ms": 1.0,
+      }
+
+    plugin = _make_api(graph_first_provider=invalid_provider)
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
-
-    def provider_side_effect(*_args, **kwargs):
-      packet = _packet_from_provider_kwargs(kwargs)
-      explanation = _draft_for_packet(packet)
-      explanation["summary"]["evidence_ids"] = ["n:absent"]
-      explanation["provenance"][0]["source_name"] = "Invented Source"
-      explanation["next_pivots"][0]["question"] = "CALL apoc.load.json to fetch more data"
-      return _Response(payload={
-        "choices": [{"message": {"content": json.dumps(explanation)}}],
-      })
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
-        with patch(
-          "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
-          side_effect=provider_side_effect,
-        ):
-          result = plugin.explain_graph(
-            uri="example.com:7687",
-            scheme="bolt+s",
-            username="neo4j",
-            password="secret",
-            cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
-          )
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
+        )
 
     codes = set(result["result"]["diagnostics"]["validation_codes"])
     self.assertEqual(result["status_code"], 500)
-    self.assertIn("unknown_evidence_id", codes)
-    self.assertIn("invented_source_name", codes)
-    self.assertIn("unsafe_pivot", codes)
+    self.assertEqual(codes, {"invalid_map_citation"})
     self.assertNotIn("explanation", result["result"])
-    self.assertNotIn("validation_errors", result["result"])
+    self.assertEqual(
+      {item["code"] for item in result["result"]["validation_errors"]},
+      {"invalid_map_citation"},
+    )
 
   def test_explain_graph_returns_provider_error_after_packet_build(self):
-    plugin = _make_api()
+    plugin = _make_api(graph_first_provider=None)
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
@@ -2654,7 +2695,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["result"]["diagnostics"]["stage"], "provider")
     self.assertEqual(result["result"]["diagnostics"]["reason"], "provider_http_error")
     self.assertNotIn("provider_status", result["result"])
-    self.assertNotIn("packet", result["result"])
+    self.assertIn("packet", result["result"])
 
   def test_case_explanation_validator_rejects_redaction_flags(self):
     packet = {
@@ -2665,7 +2706,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "limit_policy": {
         "generated_limit": 25,
         "executed_limit": 25,
-        "server_max_rows": 100,
+      "server_max_rows": 50,
         "limit_adjusted": False,
       },
       "execution": {

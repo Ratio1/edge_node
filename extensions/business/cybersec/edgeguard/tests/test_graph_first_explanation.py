@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+
+from extensions.business.cybersec.edgeguard import graph_first_runtime as runtime
 
 from extensions.business.cybersec.edgeguard.graph_first_explanation import (
   BatchMeasurement,
@@ -95,10 +98,10 @@ class ModeTests(unittest.TestCase):
 
 
 class IrAndBatchTests(unittest.TestCase):
-  def test_phase_two_core_is_not_imported_by_production_or_coupled_to_research(self):
+  def test_promoted_core_is_imported_by_production_and_not_coupled_to_research(self):
     module_path = Path(__file__).parents[1] / "graph_first_explanation.py"
     api_path = Path(__file__).parents[1] / "edgeguard_api.py"
-    self.assertNotIn("graph_first_explanation", api_path.read_text(encoding="utf-8"))
+    self.assertIn("from .graph_first_explanation import", api_path.read_text(encoding="utf-8"))
     source = module_path.read_text(encoding="utf-8")
     self.assertNotIn("candidate_codecs", source)
     self.assertNotIn("transformers", source)
@@ -342,6 +345,142 @@ class OutputAndCoverageTests(unittest.TestCase):
     self.assertLessEqual(coverage["counts"]["nodes"]["cited"], len(self.ir.nodes))
     self.assertEqual(coverage["calls"]["total"], len(self.plan.batches) + (1 if len(maps) > 1 else 0))
     self.assertEqual(coverage["completeness"]["overall"], 1.0)
+
+
+class ProductionRuntimeTests(unittest.TestCase):
+  def test_frozen_prompts_renderer_payload_and_reference_vectors(self):
+    runtime.validate_frozen_sources()
+    self.assertEqual(len(runtime.TOKENIZER_REFERENCE_VECTORS), 5)
+    self.assertEqual(
+      runtime.sha256_text(runtime.MAP_SYSTEM_PROMPT),
+      "817a82cbbc15ff95f249f23f99b4c7c7c424aab09f6978c37a7e835c6b3c50e0",
+    )
+    result, catalog = fixtures()
+    ir = build_evidence_ir(result, catalog)
+    view = permissive_view(ir)
+    document = build_batch_document(ir, view, ("R0",))
+    payload = runtime.map_payload(document, "Which source?", "base_qwen3_4b")
+    self.assertEqual(
+      runtime.sha256_text(runtime.core.canonical_json(payload)),
+      "27bb47686bff3bd76ca7bff88f3074a875885fc444c412f9c13865b8db035739",
+    )
+    self.assertEqual(payload["temperature"], 0.1)
+    self.assertEqual(payload["top_p"], 1.0)
+    self.assertEqual(payload["max_tokens"], 127)
+    with patch.object(runtime, "MAP_SYSTEM_PROMPT_SHA256", "0" * 64):
+      with self.assertRaises(runtime.GraphFirstRuntimeError) as raised:
+        runtime.validate_frozen_sources()
+    self.assertEqual(raised.exception.code, "prompt_renderer_drift")
+
+  def test_tokenizer_compatibility_conversion_is_in_memory_and_strict(self):
+    raw = json.dumps({
+      "model": {
+        "ignore_merges": True,
+        "merges": [["left", "right"], "already merged"],
+      },
+    }).encode()
+    converted = json.loads(runtime._compatible_tokenizer_json(raw))
+    self.assertNotIn("ignore_merges", converted["model"])
+    self.assertEqual(converted["model"]["merges"], ["left right", "already merged"])
+    with self.assertRaises(runtime.GraphFirstRuntimeError):
+      runtime._compatible_tokenizer_json(b'{"model":{"merges":[["only-one"]]}}')
+
+  def test_two_maps_synthesize_and_return_consistent_sanitized_traces(self):
+    evidence, catalog = fixtures(disconnected=True)
+    evidence["rows"][0]["values"][1] = {"type": "string", "value": "a" * 800}
+    evidence["rows"][1]["values"][1] = {"type": "string", "value": "b" * 800}
+    calls = []
+
+    def provider(payload):
+      calls.append(payload)
+      data = json.loads(payload["messages"][-1]["content"].split("\nDATA\n", 1)[1])
+      if payload["metadata"]["task"].endswith("synthesis"):
+        content = {"status": "supported", "text": "Combined grounded result.", "maps": [item["id"] for item in data]}
+      else:
+        content = {
+          "status": "supported",
+          "text": "Grounded map result.",
+          "anchor": data["nodes"][0][0],
+          "rows": [row[0] for row in data["rows"]],
+        }
+      return {"content": json.dumps(content), "finish_reason": "stop", "completion_tokens": 16, "duration_ms": 2.0}
+
+    result = runtime.run_graph_first_explanation(
+      question="Explain evidence.",
+      cypher="MATCH p=()--() RETURN p",
+      evidence=evidence,
+      catalog=catalog,
+      projection_descriptors=(),
+      mode=resolve_mode("balanced"),
+      execution_trace={
+        "selected": "primary",
+        "executions": [{
+          "id": "primary", "executed_cypher": "MATCH p=()--() RETURN p", "row_count": 2,
+          "truncated": False, "duration_ms": 4.0, "method": "next_route",
+        }],
+      },
+      token_counter=lambda messages: len(runtime.render_chat(messages).encode()),
+      provider_call=provider,
+      remaining_time=lambda: 600.0,
+    )
+    self.assertEqual(len(calls), 3)
+    self.assertEqual([call["kind"] for call in result["explanation_trace"]["calls"]], ["map", "map", "synthesis"])
+    self.assertEqual(result["coverage"]["calls"], {"map": 2, "synthesis": 1, "total": 3})
+    self.assertEqual(result["explanation"]["summary"]["text"], "Combined grounded result.")
+    self.assertEqual(set(result["neo4j_trace"]), {"schema_version", "selected", "executions", "result"})
+
+  def test_insufficient_skips_synthesis_and_failure_trace_strips_all_output(self):
+    evidence, catalog = fixtures()
+
+    def insufficient(_payload):
+      return {
+        "content": '{"status":"insufficient","text":"Not enough evidence.","anchor":null,"rows":[]}',
+        "finish_reason": "stop", "completion_tokens": 12, "duration_ms": 1.0,
+      }
+
+    kwargs = {
+      "question": "Explain evidence.", "cypher": "MATCH p=()--() RETURN p", "evidence": evidence,
+      "catalog": catalog, "projection_descriptors": (), "mode": resolve_mode("fast"),
+      "execution_trace": {"selected": "primary", "executions": [{
+        "id": "primary", "executed_cypher": "MATCH p=()--() RETURN p", "row_count": 1,
+        "truncated": False, "duration_ms": 1.0, "method": "next_route",
+      }]},
+      "token_counter": lambda _messages: 1, "remaining_time": lambda: 600.0,
+    }
+    result = runtime.run_graph_first_explanation(provider_call=insufficient, **kwargs)
+    self.assertEqual(result["coverage"]["calls"], {"map": 1, "synthesis": 0, "total": 1})
+    self.assertEqual(result["explanation_trace"]["outcome"]["status"], "insufficient")
+
+    def malformed(_payload):
+      return {
+        "content": 'partial-secret {"status":', "finish_reason": "stop",
+        "completion_tokens": 5, "duration_ms": 1.0,
+      }
+
+    with self.assertRaises(runtime.GraphFirstRuntimeError) as raised:
+      runtime.run_graph_first_explanation(provider_call=malformed, **kwargs)
+    serialized = json.dumps(raised.exception.trace)
+    self.assertNotIn("partial-secret", serialized)
+    self.assertNotIn("raw_output", serialized)
+    self.assertNotIn("parsed", serialized)
+    self.assertEqual(raised.exception.trace["outcome"]["attempted_calls"], 1)
+
+  def test_direct_projection_must_resolve_to_exactly_one_referenced_entity(self):
+    evidence = {
+      "columns": ["left", "right", "value"],
+      "rows": [{"ordinal": 0, "values": [
+        {"type": "node", "ref": "n:a"}, {"type": "node", "ref": "n:b"},
+        {"type": "string", "value": "same"},
+      ]}],
+    }
+    catalog = {"nodes": [
+      {"id": "n:a", "properties": tagged_map(value={"type": "string", "value": "same"})},
+      {"id": "n:b", "properties": tagged_map(value={"type": "string", "value": "same"})},
+    ], "relationships": []}
+    descriptor = [{"column_index": 2, "column": "value", "variable": "n", "property": "value"}]
+    with self.assertRaises(runtime.GraphFirstRuntimeError) as raised:
+      runtime.projected_property_slots(evidence, catalog, descriptor)
+    self.assertEqual(raised.exception.code, "projected_property_ambiguous")
 
 
 if __name__ == "__main__":
