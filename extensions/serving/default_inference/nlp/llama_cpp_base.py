@@ -9,8 +9,10 @@ import re
 from fnmatch import fnmatch
 from pathlib import Path
 
+from extensions.serving.base import base_llm_serving as base_llm_serving_module
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
 from llama_cpp import Llama, llama_cpp as llama_cpp_lib
+from extensions.serving.mixins_llm import llm_utils as llm_utils_module
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 __VER__ = "0.1.0"
@@ -25,6 +27,8 @@ def source_file_sha256(path):
 
 
 LLAMA_CPP_BASE_MODULE_SHA256 = source_file_sha256(__file__)
+BASE_LLM_SERVING_MODULE_SHA256 = source_file_sha256(base_llm_serving_module.__file__)
+LLM_UTILS_MODULE_SHA256 = source_file_sha256(llm_utils_module.__file__)
 
 
 MODEL_N_CTX_MIN_VALUE = 512
@@ -201,9 +205,11 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     if not isinstance(serving_module_sha256, str):
       return None
     return {
-      "schema_version": "edgeguard.serving-code-identity.v1",
+      "schema_version": "edgeguard.serving-code-identity.v2",
       "serving_module_sha256": serving_module_sha256,
       "llama_cpp_base_sha256": LLAMA_CPP_BASE_MODULE_SHA256,
+      "base_llm_serving_sha256": BASE_LLM_SERVING_MODULE_SHA256,
+      "llm_utils_sha256": LLM_UTILS_MODULE_SHA256,
     }
 
   def benchmark_generation_config_sha256(self, predict_kwargs):

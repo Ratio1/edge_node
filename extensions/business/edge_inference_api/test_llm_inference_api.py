@@ -52,11 +52,19 @@ class _FakeLlmCT:
   FULL_OUTPUT = "FULL_OUTPUT"
 
 
-def _load_plugin_class():
+def _load_plugin_module():
   source_path = ROOT / "extensions" / "business" / "edge_inference_api" / "llm_inference_api.py"
   source = source_path.read_text(encoding="utf-8")
   source = source.replace(
+    "from extensions.business.edge_inference_api import base_inference_api as base_inference_api_module\n",
+    "",
+  )
+  source = source.replace(
     "from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin\n",
+    "",
+  )
+  source = source.replace(
+    "from extensions.serving.mixins_llm import llm_utils as llm_utils_module\n",
     "",
   )
   source = source.replace(
@@ -66,14 +74,22 @@ def _load_plugin_class():
   namespace = {
     "BasePlugin": _FakeBasePlugin,
     "LlmCT": _FakeLlmCT,
+    "base_inference_api_module": type("BaseInferenceApiModule", (), {
+      "__file__": str(ROOT / "extensions/business/edge_inference_api/base_inference_api.py"),
+    }),
+    "llm_utils_module": type("LlmUtilsModule", (), {
+      "__file__": str(ROOT / "extensions/serving/mixins_llm/llm_utils.py"),
+    }),
     "__file__": str(source_path),
     "__name__": "loaded_llm_inference_api",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
-  return namespace["LLMInferenceApiPlugin"]
+  return namespace
 
 
-LLMInferenceApiPlugin = _load_plugin_class()
+LOADED_PLUGIN_MODULE = _load_plugin_module()
+LLMInferenceApiPlugin = LOADED_PLUGIN_MODULE["LLMInferenceApiPlugin"]
+LLM_UTILS_MODULE_SHA256 = LOADED_PLUGIN_MODULE["LLM_UTILS_MODULE_SHA256"]
 
 
 class LLMInferenceApiPluginTests(unittest.TestCase):
@@ -100,9 +116,11 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
       "inprocess": True,
       "get_runtime_fingerprint": lambda _self: dict(fingerprint),
       "get_worker_code_identity": lambda _self: {
-        "schema_version": "edgeguard.serving-code-identity.v1",
+        "schema_version": "edgeguard.serving-code-identity.v2",
         "serving_module_sha256": "c" * 64,
         "llama_cpp_base_sha256": "d" * 64,
+        "base_llm_serving_sha256": "e" * 64,
+        "llm_utils_sha256": LLM_UTILS_MODULE_SHA256,
       },
     })()
     manager = type("Manager", (), {
@@ -117,6 +135,8 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     code_identity = plugin.health()["worker_code_identity"]
     self.assertEqual(code_identity["serving_module_sha256"], "c" * 64)
     self.assertEqual(code_identity["llama_cpp_base_sha256"], "d" * 64)
+    self.assertEqual(code_identity["base_llm_serving_sha256"], "e" * 64)
+    self.assertEqual(code_identity["llm_utils_sha256"], LLM_UTILS_MODULE_SHA256)
     expected_hash = hashlib.sha256(json.dumps(
       {key: value for key, value in code_identity.items() if key != "identity_sha256"},
       ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
@@ -124,6 +144,27 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(code_identity["identity_sha256"], expected_hash)
     server.inprocess = False
     self.assertIsNone(plugin.health()["runtime_fingerprint"])
+    self.assertIsNone(plugin.health()["worker_code_identity"])
+
+  def test_health_rejects_a_serving_identity_from_different_llm_utils_bytes(self):
+    server = type("Server", (), {
+      "inprocess": True,
+      "get_worker_code_identity": lambda _self: {
+        "schema_version": "edgeguard.serving-code-identity.v2",
+        "serving_module_sha256": "c" * 64,
+        "llama_cpp_base_sha256": "d" * 64,
+        "base_llm_serving_sha256": "e" * 64,
+        "llm_utils_sha256": "f" * 64,
+      },
+    })()
+    manager = type("Manager", (), {
+      "is_avail": lambda _self, _name: True,
+      "_get_server": lambda _self, _name: server,
+    })()
+    plugin = LLMInferenceApiPlugin()
+    plugin.get_serving_processes = lambda: ["expected-server"]
+    plugin.global_shmem = {"serving_manager": manager}
+
     self.assertIsNone(plugin.health()["worker_code_identity"])
 
   def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):

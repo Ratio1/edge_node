@@ -107,6 +107,10 @@ def _load_llama_cpp_base_class():
   source_path = ROOT / "extensions" / "serving" / "default_inference" / "nlp" / "llama_cpp_base.py"
   source = source_path.read_text(encoding="utf-8")
   source = source.replace(
+    "from extensions.serving.base import base_llm_serving as base_llm_serving_module\n",
+    "",
+  )
+  source = source.replace(
     "from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess\n",
     "",
   )
@@ -115,13 +119,23 @@ def _load_llama_cpp_base_class():
     "",
   )
   source = source.replace(
+    "from extensions.serving.mixins_llm import llm_utils as llm_utils_module\n",
+    "",
+  )
+  source = source.replace(
     "from extensions.serving.mixins_llm.llm_utils import LlmCT\n",
     "",
   )
   namespace = {
     "BaseServingProcess": _FakeBaseServingProcess,
+    "base_llm_serving_module": types.SimpleNamespace(
+      __file__=str(ROOT / "extensions/serving/base/base_llm_serving.py"),
+    ),
     "Llama": _FakeLlama,
     "llama_cpp_lib": _FakeLlamaCppLib,
+    "llm_utils_module": types.SimpleNamespace(
+      __file__=str(ROOT / "extensions/serving/mixins_llm/llm_utils.py"),
+    ),
     "LlmCT": types.SimpleNamespace(
       ROLE_KEY="role",
       DATA_KEY="content",
@@ -262,6 +276,8 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     code_identity = process.get_worker_code_identity()
     self.assertEqual(code_identity["serving_module_sha256"], "f" * 64)
     self.assertRegex(code_identity["llama_cpp_base_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(code_identity["base_llm_serving_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(code_identity["llm_utils_sha256"], r"^[0-9a-f]{64}$")
 
   def test_llama_cpp_base_blank_model_path_uses_repo_loading(self):
     process = _make_llama_cpp_process(cfg_model_path="  ")

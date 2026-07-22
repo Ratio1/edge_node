@@ -89,7 +89,9 @@ import hashlib
 import json
 from pathlib import Path
 
+from extensions.business.edge_inference_api import base_inference_api as base_inference_api_module
 from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
+from extensions.serving.mixins_llm import llm_utils as llm_utils_module
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -104,6 +106,8 @@ def _source_file_sha256(path):
 
 
 LLM_INFERENCE_API_MODULE_SHA256 = _source_file_sha256(Path(__file__))
+BASE_INFERENCE_API_MODULE_SHA256 = _source_file_sha256(Path(base_inference_api_module.__file__))
+LLM_UTILS_MODULE_SHA256 = _source_file_sha256(Path(llm_utils_module.__file__))
 
 
 _CONFIG = {
@@ -391,13 +395,19 @@ class LLMInferenceApiPlugin(BasePlugin):
         serving = getter() if callable(getter) else None
         if not isinstance(serving, dict) or tuple(serving) != (
           "schema_version", "serving_module_sha256", "llama_cpp_base_sha256",
-        ) or serving["schema_version"] != "edgeguard.serving-code-identity.v1":
+          "base_llm_serving_sha256", "llm_utils_sha256",
+        ) or serving["schema_version"] != "edgeguard.serving-code-identity.v2":
+          return None
+        if serving["llm_utils_sha256"] != LLM_UTILS_MODULE_SHA256:
           return None
         document = {
-          "schema_version": "edgeguard.worker-code-identity.v1",
+          "schema_version": "edgeguard.worker-code-identity.v2",
           "llm_inference_api_sha256": LLM_INFERENCE_API_MODULE_SHA256,
+          "base_inference_api_sha256": BASE_INFERENCE_API_MODULE_SHA256,
           "serving_module_sha256": serving["serving_module_sha256"],
           "llama_cpp_base_sha256": serving["llama_cpp_base_sha256"],
+          "base_llm_serving_sha256": serving["base_llm_serving_sha256"],
+          "llm_utils_sha256": serving["llm_utils_sha256"],
         }
         material = json.dumps(
           document, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
