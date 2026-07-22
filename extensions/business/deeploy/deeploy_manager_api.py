@@ -21,7 +21,6 @@ from .deeploy_const import (
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
   DEEPLOY_NODE_SPECS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
   DEEPLOY_GET_PREFERRED_NODES_REQUEST, DEEPLOY_SAVE_PREFERRED_NODES_REQUEST,
-  CONTAINERIZED_APPS_SIGNATURES,
 )
   
 
@@ -660,7 +659,7 @@ class DeeployManagerApiPlugin(
     """
     Require stable plugin identity for every managed-service update entry.
 
-    This runs after legacy ID backfill and request/persisted job-type
+    This runs before legacy ID backfill and after request/persisted job-type
     reconciliation. Native updates remain free to submit new no-ID plugins.
     """
     if job_app_type != JOB_APP_TYPES.SERVICE:
@@ -671,11 +670,7 @@ class DeeployManagerApiPlugin(
     for index, plugin_entry in enumerate(plugins_array or []):
       if not isinstance(plugin_entry, dict):
         continue
-      instance_id = (
-        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-        or plugin_entry.get("instance_id")
-        or plugin_entry.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-      )
+      instance_id = plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
       if not instance_id or not str(instance_id).strip():
         missing_indexes.append(index)
 
@@ -699,7 +694,8 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     request : dict
-        The request dictionary
+        The request dictionary. Updates must include a valid `job_app_type`;
+        service updates must also include `instance_id` for every plugin.
     is_create : bool
         True for create operations, False for update operations
     async_mode : bool
@@ -716,6 +712,20 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
       normalized_request = self._normalize_plugins_input(self.deepcopy(request))
       self._sync_normalized_plugins_input(inputs, normalized_request)
+      submitted_job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
+      if not is_create:
+        if not isinstance(submitted_job_app_type, str) or not submitted_job_app_type.strip():
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.REQUEST3}. job_app_type is required for update requests."
+          )
+        job_app_type = submitted_job_app_type.strip().lower()
+        if job_app_type not in JOB_APP_TYPES_ALL:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.REQUEST3}. Invalid job_app_type '{submitted_job_app_type}'. "
+            f"Expected one of {JOB_APP_TYPES_ALL}."
+          )
+      else:
+        job_app_type = submitted_job_app_type
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       is_confirmable_job = inputs.chainstore_response
@@ -733,18 +743,17 @@ class DeeployManagerApiPlugin(
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
-      job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
-      has_request_job_app_type = bool(job_app_type)
-      if job_app_type:
-        job_app_type = str(job_app_type).lower()
-        if job_app_type not in JOB_APP_TYPES_ALL:
-          raise ValueError(f"Invalid job_app_type '{job_app_type}'. Expected one of {JOB_APP_TYPES_ALL}.")
-      else:
-        plugins_for_detection = self.deeploy_prepare_plugins(inputs)
-        job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
-        if job_app_type not in JOB_APP_TYPES_ALL:
-          job_app_type = JOB_APP_TYPES.NATIVE
-      self.P(f"Detected job app type: {job_app_type}")
+      if is_create:
+        if job_app_type:
+          job_app_type = str(job_app_type).lower()
+          if job_app_type not in JOB_APP_TYPES_ALL:
+            raise ValueError(f"Invalid job_app_type '{job_app_type}'. Expected one of {JOB_APP_TYPES_ALL}.")
+        else:
+          plugins_for_detection = self.deeploy_prepare_plugins(inputs)
+          job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
+          if job_app_type not in JOB_APP_TYPES_ALL:
+            job_app_type = JOB_APP_TYPES.NATIVE
+      self.P(f"Resolved job app type: {job_app_type}")
       # persist job type so downstream mixins can adjust validations (e.g. native app resource checks)
       inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
       inputs.job_app_type = job_app_type
@@ -863,24 +872,6 @@ class DeeployManagerApiPlugin(
           except Exception as exc:
             self.Pd(f"Unable to read previous pipeline CID for job {job_id}: {exc}", color='y')
 
-        # Ensure plugin IDs are preserved for existing instances before any destructive action.
-        self._ensure_plugin_instance_ids(
-          inputs,
-          discovered_plugin_instances=discovered_plugin_instances,
-          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-          app_id=app_id,
-          job_id=job_id,
-        )
-        self._validate_update_plugin_identities(
-          inputs,
-          discovered_plugin_instances=discovered_plugin_instances,
-        )
-        self._warn_on_live_plugin_config_drift(
-          discovered_plugin_instances,
-          job_id=job_id,
-          app_id=app_id,
-        )
-
         if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
           msg = (
             f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
@@ -901,7 +892,6 @@ class DeeployManagerApiPlugin(
           existing_job_app_type = existing_job_app_type.lower()
         if (
           existing_job_app_type in JOB_APP_TYPES_ALL
-          and has_request_job_app_type
           and job_app_type != existing_job_app_type
         ):
           msg = (
@@ -916,35 +906,26 @@ class DeeployManagerApiPlugin(
           # Discovery is used only for identity safety and drift diagnostics.
           self._validate_plugins_array(plugins_array)
 
-          if not has_request_job_app_type:
-            replacement_job_app_type = deeploy_specs_payload.get(DEEPLOY_KEYS.JOB_APP_TYPE)
-            if isinstance(replacement_job_app_type, str):
-              replacement_job_app_type = replacement_job_app_type.lower()
-            if replacement_job_app_type in JOB_APP_TYPES_ALL:
-              job_app_type = replacement_job_app_type
-            else:
-              plugins_for_detection = self.deeploy_prepare_plugins(inputs)
-              job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
-              has_containerized_replacement = any(
-                isinstance(plugin_entry, dict) and
-                isinstance(plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE), str) and
-                plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE).upper() in CONTAINERIZED_APPS_SIGNATURES
-                for plugin_entry in plugins_array
-              )
-              if job_app_type == JOB_APP_TYPES.NATIVE and has_containerized_replacement:
-                msg = (
-                  f"{DEEPLOY_ERRORS.REQUEST3}. Update request omitted job_app_type and the live "
-                  "deeploy_specs do not identify the replacement job_app_type for a containerized "
-                  "replacement payload. Provide job_app_type explicitly."
-                )
-                raise ValueError(msg)
-              if job_app_type not in JOB_APP_TYPES_ALL:
-                job_app_type = JOB_APP_TYPES.NATIVE
-            inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
-            inputs.job_app_type = job_app_type
-            self.P(f"Detected replacement job app type: {job_app_type}")
-
         self._validate_service_update_plugin_instance_ids(inputs, job_app_type)
+        if job_app_type != JOB_APP_TYPES.SERVICE:
+          # Legacy non-service updates may still identify an existing plugin by
+          # exact identity matching. Service identity is request-authoritative.
+          self._ensure_plugin_instance_ids(
+            inputs,
+            discovered_plugin_instances=discovered_plugin_instances,
+            owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+            app_id=app_id,
+            job_id=job_id,
+          )
+        self._validate_update_plugin_identities(
+          inputs,
+          discovered_plugin_instances=discovered_plugin_instances,
+        )
+        self._warn_on_live_plugin_config_drift(
+          discovered_plugin_instances,
+          job_id=job_id,
+          app_id=app_id,
+        )
 
         is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
         if not is_valid:

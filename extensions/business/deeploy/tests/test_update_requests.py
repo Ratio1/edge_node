@@ -183,7 +183,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
         DEEPLOY_KEYS.JOB_ID: 11,
-        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.JOB_APP_TYPE: " SERVICE ",
         DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
         DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
         DEEPLOY_KEYS.TARGET_NODES: nodes,
@@ -197,6 +197,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
     self.assertEqual(called["delete"], 1)
     self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["deploy_kwargs"]["job_app_type"], JOB_APP_TYPES.SERVICE)
     redeploy_inputs = called["deploy_kwargs"]["inputs"]
     self.assertEqual(len(redeploy_inputs[DEEPLOY_KEYS.PLUGINS]), 1)
     self.assertEqual(
@@ -218,6 +219,144 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       self.assertEqual(instance["CONTAINER_RESOURCES"]["storage"], "0g")
       self.assertEqual(instance["FIXED_SIZE_VOLUMES"]["cockroach_data"]["SIZE"], "8G")
 
+  def test_process_update_without_job_app_type_fails_before_discovery_or_side_effects(self):
+    for persisted_job_app_type in (None, JOB_APP_TYPES.SERVICE):
+      with self.subTest(persisted_job_app_type=persisted_job_app_type):
+        fixture_plugin = make_deeploy_plugin()
+        nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+          fixture_plugin
+        )
+        request_plugin.pop(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        request_plugin["IMAGE"] = "ghcr.io/ratio1/deeploy-cockroachdb-service:review-repro"
+        deeploy_specs = {
+          DEEPLOY_KEYS.JOB_ID: 11,
+          DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+        }
+        if persisted_job_app_type is not None:
+          deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = persisted_job_app_type
+        plugin, called = self._make_process_update_plugin(
+          discovered_instances=discovered_instances,
+          nodes=nodes,
+          deeploy_specs=deeploy_specs,
+        )
+        phase_calls = defaultdict(int)
+
+        def gather_context(**kwargs):
+          phase_calls["discovery"] += 1
+          return {
+            "discovered_instances": discovered_instances,
+            "nodes": nodes,
+            "deeploy_specs": deeploy_specs,
+          }
+
+        plugin._gather_running_pipeline_context = gather_context
+        plugin.deeploy_check_payment_and_job_owner = (
+          lambda *args, **kwargs: phase_calls.__setitem__("payment", phase_calls["payment"] + 1) or True
+        )
+        plugin._check_nodes_availability = (
+          lambda inputs: phase_calls.__setitem__("nodes", phase_calls["nodes"] + 1) or nodes
+        )
+        plugin._prepare_create_pipeline_deploy_plan = (
+          lambda **kwargs: phase_calls.__setitem__("preparation", phase_calls["preparation"] + 1)
+          or {"enable_chainstore_response": False, "response_keys": {}, "node_plugins_by_addr": {}}
+        )
+        plugin._reset_chainstore_response_keys = (
+          lambda *args, **kwargs: phase_calls.__setitem__("reset", phase_calls["reset"] + 1)
+        )
+
+        response = plugin._process_pipeline_request(
+          {
+            DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+            DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+            DEEPLOY_KEYS.JOB_ID: 11,
+            DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+            DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+            DEEPLOY_KEYS.TARGET_NODES: nodes,
+            DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+            DEEPLOY_KEYS.PLUGINS: [request_plugin],
+          },
+          is_create=False,
+          async_mode=True,
+        )
+
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
+        self.assertIn("job_app_type is required for update requests", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(dict(phase_calls), {})
+        self.assertEqual(called["delete"], 0)
+        self.assertEqual(called["deploy"], 0)
+        self.assertEqual(called["queued"], 0)
+
+  def test_process_update_rejects_blank_and_invalid_job_app_type_before_discovery(self):
+    for submitted_job_app_type in ("   ", "unsupported"):
+      with self.subTest(submitted_job_app_type=submitted_job_app_type):
+        plugin, called = self._make_process_update_plugin(discovered_instances=[])
+        discovery_calls = []
+        plugin._gather_running_pipeline_context = lambda **kwargs: discovery_calls.append(kwargs) or {}
+
+        response = plugin._process_pipeline_request(
+          {
+            DEEPLOY_KEYS.APP_ID: "app-123",
+            DEEPLOY_KEYS.APP_ALIAS: "app",
+            DEEPLOY_KEYS.JOB_ID: 11,
+            DEEPLOY_KEYS.JOB_APP_TYPE: submitted_job_app_type,
+            DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+            DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+            DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+            DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+            DEEPLOY_KEYS.PLUGINS: [
+              make_plugin_entry(
+                "CONTAINER_APP_RUNNER",
+                IMAGE="repo/app:2.0",
+                CONTAINER_RESOURCES={"cpu": 1, "memory": "256m", "storage": "1g"},
+              ),
+            ],
+          },
+          is_create=False,
+          async_mode=True,
+        )
+
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
+        self.assertIn("job_app_type", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(discovery_calls, [])
+        self.assertEqual(called["delete"], 0)
+        self.assertEqual(called["deploy"], 0)
+
+  def test_process_create_without_job_app_type_keeps_inference(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[],
+      nodes=["node-1"],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          make_plugin_entry(
+            "CONTAINER_APP_RUNNER",
+            IMAGE="repo/app:1.0",
+            CONTAINER_RESOURCES={"cpu": 1, "memory": "256m", "storage": "1g"},
+          ),
+        ],
+      },
+      is_create=True,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["deploy_kwargs"]["job_app_type"], JOB_APP_TYPES.GENERIC)
+    self.assertEqual(
+      called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.JOB_APP_TYPE],
+      JOB_APP_TYPES.GENERIC,
+    )
+
   def test_process_service_update_without_resolved_id_fails_before_side_effects(self):
     fixture_plugin = make_deeploy_plugin()
     nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
@@ -234,14 +373,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
     payment_calls = []
     reset_calls = []
+    backfill_calls = []
     plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: payment_calls.append(args) or True
     plugin._reset_chainstore_response_keys = lambda *args, **kwargs: reset_calls.append(args)
+    plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: backfill_calls.append(args)
 
     response = plugin._process_pipeline_request(
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
         DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
         DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
         DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
         DEEPLOY_KEYS.TARGET_NODES: nodes,
@@ -254,6 +396,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR])
     self.assertIn("Service update plugins must include instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(backfill_calls, [])
     self.assertEqual(payment_calls, [])
     self.assertEqual(reset_calls, [])
     self.assertEqual(called["delete"], 0)
@@ -1100,6 +1243,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
         DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "stack",
         DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
         DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
         DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
@@ -1342,7 +1486,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ["api-instance"],
     )
 
-  def test_process_update_detects_type_from_requested_replacement_only(self):
+  def test_process_update_uses_explicit_type_with_requested_replacement_only(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -1378,6 +1522,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
         DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
         DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
         DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
         DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
