@@ -260,6 +260,40 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     }
     return plugin
 
+  def test_process_handles_every_aligned_struct_data_inference(self):
+    plugin = self._make_plugin()
+    handled = []
+    plugin.dataapi_struct_datas = lambda: {
+      0: {"slot": "startup-placeholder"},
+      1: {"slot": "completed-request"},
+    }
+    plugin.dataapi_struct_datas_inferences = lambda: {
+      "fake-engine": [
+        {"IS_VALID": False, "text": ""},
+        {"IS_VALID": True, "REQUEST_ID": "req-live", "text": "MATCH (n) RETURN n"},
+      ],
+    }
+    plugin.maybe_refresh_metrics = lambda: None
+    plugin._publish_capacity_record = lambda: None
+    plugin._poll_delegated_results = lambda: None
+    plugin._poll_delegated_requests = lambda: None
+    plugin._schedule_pending_requests = lambda: None
+    plugin._retry_same_peer_delegations = lambda: None
+    plugin._reconcile_requests = lambda: None
+    plugin._publish_executor_results = lambda: None
+    plugin._cleanup_balancing_state = lambda: None
+    plugin.cleanup_expired_requests = lambda: None
+    plugin.maybe_save_persistence_data = lambda: None
+    plugin.handle_inferences = lambda inferences, data=None: handled.append((inferences, data))
+
+    plugin.process()
+
+    self.assertEqual(len(handled), 2)
+    self.assertEqual(handled[0][0][0]["IS_VALID"], False)
+    self.assertEqual(handled[0][1], [{"slot": "startup-placeholder"}])
+    self.assertEqual(handled[1][0][0]["REQUEST_ID"], "req-live")
+    self.assertEqual(handled[1][1], [{"slot": "completed-request"}])
+
   def test_capacity_publish_uses_soft_state_cstore_options(self):
     plugin = self._make_plugin(
       REQUEST_BALANCING_CAPACITY_CSTORE_TIMEOUT=3,
