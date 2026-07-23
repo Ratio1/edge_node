@@ -695,3 +695,12 @@ Entry format:
 - Details: `ThHfModelBase` keeps Transformers/PT as the default GPU and fallback path, but CPU-only `HF_RUNTIME=auto` now loads `artifact_manifest.json`, selects a declared ONNX Runtime artifact, downloads only safe allow-patterns, loads schema and contract decoder from HF artifacts, and exposes the decoded artifact contract through the existing text-classifier flow. Business API response shaping now passes through generic model/runtime metadata emitted by serving.
 - Verification: `python3 -m unittest extensions.serving.test_th_hf_model_base extensions.serving.test_th_text_classifier extensions.serving.test_th_privacy_filter extensions.business.edge_inference_api.test_text_classifier_inference_api extensions.business.edge_inference_api.test_privacy_filter_inference_api`; `python3 -m py_compile extensions/serving/default_inference/nlp/th_hf_model_base.py extensions/business/edge_inference_api/text_classifier_inference_api.py`; required serving gate `python3 -m unittest extensions.serving.model_testing.test_llm_servings` currently fails at import with `ImportError: cannot import name 'Logger' from 'naeural_core'`.
 - Links: `extensions/serving/default_inference/nlp/th_hf_model_base.py`, `extensions/business/edge_inference_api/text_classifier_inference_api.py`, `extensions/serving/test_th_hf_model_base.py`
+
+- ID: `ML-20260723-001`
+- Timestamp: `2026-07-23T13:45:20Z`
+- Type: `change`
+- Summary: dAuth job-secret requests now require signed 120-second timestamp nonces, and GET responses encrypt secret bundles to the authorized runner.
+- Criticality: Security protocol change preventing indefinite signed-request/response replay and removing plaintext job secrets from HTTP responses.
+- Details: `/add_secrets` and `/get_secrets` validate signed hex-millisecond timestamp nonces and echo them in successful signed responses. `/get_secrets` encrypts the serialized bundle to the signed requester address; clients must verify the response signer and echoed nonce before decrypting.
+- Verification: `python -m unittest discover -s extensions/business/dauth -p 'test_*.py'`; cross-repo SDK dAuth client tests.
+- Links: `extensions/business/dauth/dauth_mixin.py`, `extensions/business/dauth/dauth_manager.py`

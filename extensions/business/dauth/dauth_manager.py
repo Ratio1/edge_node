@@ -347,11 +347,16 @@ class DauthManagerPlugin(
   # /add_secrets
   def add_secrets(self, body: dict):
     """
-    Store the full dAuth secret bundle for a job. Only protocol oracles can write.
+    Store a full job secret bundle from a protocol oracle.
+
+    The signed request must include a hex-millisecond timestamp nonce no older
+    than 120 seconds.
     """
+    request_nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._dauth_server_enabled:
       response = self.__get_response({
-        'error': 'dAuth server is not registered as a dAuth oracle'
+        'error': 'dAuth server is not registered as a dAuth oracle',
+        'nonce': request_nonce,
       })
       return response
 
@@ -364,6 +369,7 @@ class DauthManagerPlugin(
       }
 
     response = self.__get_response({
+      'nonce': request_nonce,
       **data
     })
     return response
@@ -372,12 +378,16 @@ class DauthManagerPlugin(
   # /get_secrets
   def get_secrets(self, body: dict):
     """
-    Return the full dAuth secret bundle for a job. Only nodes currently running the
-    job in the R1FS-stored pipeline can read.
+    Return an encrypted job secret bundle to a current R1FS job runner.
+
+    The signed request must include a hex-millisecond timestamp nonce no older
+    than 120 seconds. The signed response echoes that nonce.
     """
+    request_nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._dauth_server_enabled:
       response = self.__get_response({
-        'error': 'dAuth server is not registered as a dAuth oracle'
+        'error': 'dAuth server is not registered as a dAuth oracle',
+        'nonce': request_nonce,
       })
       return response
 
@@ -390,6 +400,7 @@ class DauthManagerPlugin(
       }
 
     response = self.__get_response({
+      'nonce': request_nonce,
       **data
     })
     return response

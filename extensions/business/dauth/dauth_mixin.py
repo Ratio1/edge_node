@@ -17,6 +17,7 @@ plugin to provide a complete decentralized authentication solution.
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
+DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
 
 
 def version_to_int(version):
@@ -192,6 +193,23 @@ class _DauthMixin(object):
       raise ValueError("No oracles found - this is a critical issue!")
     return node_address_eth.lower() in [addr.lower() for addr in eth_oracles]
 
+  def _validate_dauth_secret_request_nonce(self, body):
+    """Validate the signed hex-millisecond timestamp nonce."""
+    nonce = body.get(self.const.BASE_CT.dAuth.DAUTH_NONCE)
+    if not isinstance(nonce, str) or not nonce:
+      raise ValueError("dAuth request nonce is required.")
+    try:
+      request_time = int(nonce, 16) / 1000
+    except (TypeError, ValueError) as exc:
+      raise ValueError("dAuth request nonce is invalid.") from exc
+
+    request_age = self.time() - request_time
+    if request_age < 0:
+      raise ValueError("dAuth request nonce is from the future.")
+    if request_age > DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS:
+      raise ValueError("dAuth request nonce is expired.")
+    return nonce
+
   def _normalize_dauth_job_id(self, job_id):
     if job_id in [None, ""]:
       raise ValueError("Job ID is required.")
@@ -262,6 +280,7 @@ class _DauthMixin(object):
 
   def process_dauth_add_secrets_request(self, body):
     requester, requester_eth = self._verify_signed_dauth_body(body)
+    request_nonce = self._validate_dauth_secret_request_nonce(body)
     if not self._is_protocol_oracle_eth(requester_eth):
       raise ValueError(f"Sender {requester_eth} is not an oracle.")
 
@@ -272,10 +291,12 @@ class _DauthMixin(object):
     return {
       "status": "success",
       "job_id": job_id,
+      self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
     }
 
   def process_dauth_get_secret_request(self, body):
     requester, _ = self._verify_signed_dauth_body(body)
+    request_nonce = self._validate_dauth_secret_request_nonce(body)
     job_id = self._normalize_dauth_job_id(body.get("job_id"))
 
     if not self._is_node_running_dauth_job(job_id, requester):
@@ -284,11 +305,18 @@ class _DauthMixin(object):
     secret_bundle = self._load_dauth_job_secret_bundle(job_id)
     if not isinstance(secret_bundle, dict):
       raise ValueError(f"No dAuth secret bundle found for job {job_id}.")
+    encrypted_secret_bundle = self.bc.encrypt_str(
+      str_data=self.json_dumps(secret_bundle),
+      str_recipient=requester,
+    )
+    if not isinstance(encrypted_secret_bundle, str) or not encrypted_secret_bundle:
+      raise ValueError(f"Failed to encrypt dAuth secrets for job {job_id}.")
 
     return {
       "status": "success",
       "job_id": job_id,
-      "secret_bundle": secret_bundle,
+      self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
+      "encrypted_secret_bundle": encrypted_secret_bundle,
     }
 
   def chainstore_store_dauth_request(

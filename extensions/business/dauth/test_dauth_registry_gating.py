@@ -1,4 +1,5 @@
 from collections import deque
+import json
 import queue
 import threading
 import unittest
@@ -13,6 +14,8 @@ from extensions.business.dauth.dauth_mixin import (
 
 
 ROOT = Path(__file__).resolve().parents[3]
+REQUEST_TIME = 1_700_000_000
+REQUEST_NONCE = hex(REQUEST_TIME * 1000)
 
 
 class _FakeProcess:
@@ -139,6 +142,7 @@ DauthManagerPlugin = _load_dauth_manager_class()
 
 
 class _FakeDauthConst:
+  DAUTH_NONCE = "nonce"
   DAUTH_ENV_KEYS_PREFIX = "EE_"
   DAUTH_WHITELIST = "DAUTH_WHITELIST"
 
@@ -170,6 +174,7 @@ class _FakeBC:
     self.dauth_oracle = dauth_oracle
     self.protocol_oracles = protocol_oracles or ["node-oracle"]
     self.valid_signature = valid_signature
+    self.encrypt_calls = []
     self.node_eth = {
       "node-oracle": "0xORACLE",
       "node-runner": "0xRUNNER",
@@ -211,6 +216,10 @@ class _FakeBC:
       return node_address
     return "0xai_" + node_address
 
+  def encrypt_str(self, str_data, str_recipient):
+    self.encrypt_calls.append((str_data, str_recipient))
+    return "encrypted-secret-bundle"
+
 
 class _FakeR1FS:
 
@@ -234,6 +243,8 @@ def _make_dauth_harness(*, dauth_oracle=True, protocol_oracles=None, valid_signa
     valid_signature=valid_signature,
   )
   plugin.deepcopy = deepcopy
+  plugin.json_dumps = json.dumps
+  plugin.time = lambda: REQUEST_TIME
   plugin._chainstore = {}
   plugin._r1fs_data = {}
   plugin.r1fs = _FakeR1FS(plugin._r1fs_data)
@@ -334,6 +345,30 @@ class DauthRegistrySecretGatingTests(unittest.TestCase):
 
 class DauthJobSecretEndpointTests(unittest.TestCase):
 
+  def test_secret_request_nonce_accepts_only_last_120_seconds(self):
+    plugin = _make_dauth_harness()
+
+    self.assertEqual(
+      plugin._validate_dauth_secret_request_nonce({"nonce": REQUEST_NONCE}),
+      REQUEST_NONCE,
+    )
+    boundary_nonce = hex(int((REQUEST_TIME - 120) * 1000))
+    self.assertEqual(
+      plugin._validate_dauth_secret_request_nonce({"nonce": boundary_nonce}),
+      boundary_nonce,
+    )
+
+    invalid_nonces = (
+      ({}, "required"),
+      ({"nonce": "not-hex"}, "invalid"),
+      ({"nonce": hex(int((REQUEST_TIME + 1) * 1000))}, "future"),
+      ({"nonce": hex(int((REQUEST_TIME - 121) * 1000))}, "expired"),
+    )
+    for body, message in invalid_nonces:
+      with self.subTest(body=body):
+        with self.assertRaisesRegex(ValueError, message):
+          plugin._validate_dauth_secret_request_nonce(body)
+
   def test_add_secrets_allows_protocol_oracle_and_overwrites_bundle(self):
     plugin = _make_dauth_harness(protocol_oracles=["node-oracle"])
     plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
@@ -343,6 +378,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     body = {
       "EE_SENDER": "node-oracle",
       "EE_ETH_SENDER": "0xORACLE",
+      "nonce": REQUEST_NONCE,
       "job_id": 7,
       "job_secrets": {
         "plugins": {
@@ -361,6 +397,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
 
     self.assertEqual(response["status"], "success")
     self.assertEqual(response["job_id"], "7")
+    self.assertEqual(response["nonce"], REQUEST_NONCE)
     self.assertEqual(
       plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")],
       {
@@ -374,6 +411,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     body = {
       "EE_SENDER": "node-runner",
       "EE_ETH_SENDER": "0xRUNNER",
+      "nonce": REQUEST_NONCE,
       "job_id": "7",
       "job_secrets": {"plugins": {}},
     }
@@ -383,11 +421,27 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
 
     self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), plugin._chainstore)
 
+  def test_add_secrets_rejects_expired_nonce_before_write(self):
+    plugin = _make_dauth_harness()
+    body = {
+      "EE_SENDER": "node-oracle",
+      "EE_ETH_SENDER": "0xORACLE",
+      "nonce": hex(int((REQUEST_TIME - 121) * 1000)),
+      "job_id": "7",
+      "job_secrets": {"plugins": {}},
+    }
+
+    with self.assertRaisesRegex(ValueError, "nonce is expired"):
+      plugin.process_dauth_add_secrets_request(body)
+
+    self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), plugin._chainstore)
+
   def test_add_secrets_rejects_invalid_signature(self):
     plugin = _make_dauth_harness(valid_signature=False)
     body = {
       "EE_SENDER": "node-oracle",
       "EE_ETH_SENDER": "0xORACLE",
+      "nonce": REQUEST_NONCE,
       "job_id": "7",
       "job_secrets": {"plugins": {}},
     }
@@ -402,6 +456,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     body = {
       "EE_SENDER": "node-oracle",
       "EE_ETH_SENDER": "0xORACLE",
+      "nonce": REQUEST_NONCE,
       "job_id": "7",
       "plugin_secrets": {"plugins": {}},
     }
@@ -437,6 +492,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     body = {
       "EE_SENDER": "node-runner",
       "EE_ETH_SENDER": "0xRUNNER",
+      "nonce": REQUEST_NONCE,
       "job_id": "7",
     }
 
@@ -444,7 +500,16 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
 
     self.assertEqual(response["status"], "success")
     self.assertEqual(response["job_id"], "7")
-    self.assertEqual(response["secret_bundle"], bundle)
+    self.assertEqual(response["nonce"], REQUEST_NONCE)
+    self.assertEqual(
+      response["encrypted_secret_bundle"],
+      "encrypted-secret-bundle",
+    )
+    self.assertNotIn("secret_bundle", response)
+    self.assertEqual(
+      plugin.bc.encrypt_calls,
+      [(json.dumps(bundle), "node-runner")],
+    )
 
   def test_get_secrets_rejects_node_not_running_job(self):
     plugin = _make_dauth_harness()
@@ -461,6 +526,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     body = {
       "EE_SENDER": "node-other",
       "EE_ETH_SENDER": "0xOTHER",
+      "nonce": REQUEST_NONCE,
       "job_id": "7",
     }
 
@@ -500,7 +566,27 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._init_request_tracking = lambda: None
     plugin.bc.address = "node-address"
     plugin.bc.eth_address = "0xNODE"
+    plugin._DauthManagerPlugin__get_response = lambda data: data
     return plugin
+
+  def test_secret_endpoint_errors_echo_request_nonce(self):
+    plugin = self._make_manager(dauth_oracle=True)
+    plugin._dauth_server_enabled = True
+    plugin.process_dauth_add_secrets_request = lambda body: (_ for _ in ()).throw(
+      ValueError("add failed")
+    )
+    plugin.process_dauth_get_secret_request = lambda body: (_ for _ in ()).throw(
+      ValueError("get failed")
+    )
+    body = {"nonce": REQUEST_NONCE}
+
+    add_response = plugin.add_secrets(body)
+    get_response = plugin.get_secrets(body)
+
+    self.assertEqual(add_response["nonce"], REQUEST_NONCE)
+    self.assertEqual(add_response["error"], "add failed")
+    self.assertEqual(get_response["nonce"], REQUEST_NONCE)
+    self.assertEqual(get_response["error"], "get failed")
 
   def test_startup_lookup_is_cached_across_repeated_lifecycle_predicates(self):
     plugin = self._make_manager(dauth_oracle=True)
