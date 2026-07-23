@@ -35,6 +35,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EdgeguardApiPlu
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_CONTRACT  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_VERSION  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _build_case_explanation_messages  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _build_graph_evidence_packet_from_execution  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _construct_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_contract_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
@@ -1918,6 +1919,35 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn('"type": "redacted"', flattened)
     self.assertIn('"reason": "security_policy"', flattened)
     self.assertIn("/evidence_catalog/nodes/", flattened)
+
+  def test_graph_first_evidence_preserves_bounded_scalar_lists_larger_than_twenty(self):
+    plugin = _make_api(edgeguard_explanation_model_port=5091)
+    cypher = "MATCH (i:Indicator) RETURN i LIMIT 25"
+    plan = plugin.prepare_graph_explanation(cypher=cypher)
+
+    for item_count in (20, 21, 50):
+      with self.subTest(item_count=item_count):
+        execution = _serialized_execution(cypher)
+        values = [f"T{index:04d}" for index in range(item_count)]
+        execution["graph"]["nodes"][0]["properties"] = {"uses_techniques": values}
+
+        packet, packet_meta, errors = _build_graph_evidence_packet_from_execution(
+          request="Show the returned indicator.",
+          plan=plan,
+          execution_result=execution,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(packet)
+        packet_properties = packet["graph"]["nodes"][0]["properties"]
+        self.assertEqual(
+          "uses_techniques" in packet_properties,
+          item_count <= 20,
+        )
+        catalog_properties = packet_meta["_evidence_catalog"]["nodes"][0]["properties"]
+        tagged_list = catalog_properties["entries"][0]["value"]
+        self.assertEqual(tagged_list["type"], "list")
+        self.assertEqual(len(tagged_list["items"]), item_count)
 
   def test_forbidden_result_values_are_validated_before_server_redaction(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)

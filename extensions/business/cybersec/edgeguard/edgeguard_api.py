@@ -1046,18 +1046,18 @@ def _sanitize_packet_properties(properties: Dict[str, Any], state: _GraphPacketS
       continue
     if isinstance(value, str):
       if len(value) > 500:
-        state.truncated_properties += 1
-      clean[key_text] = _compact_text(value, 500)
+        continue
+      clean[key_text] = value
     elif _is_scalar(value):
       clean[key_text] = value
     elif isinstance(value, list):
       scalar_items = [item for item in value if _is_scalar(item)]
-      if len(scalar_items) != len(value) or len(scalar_items) > 20:
+      if len(scalar_items) != len(value):
         state.truncated_properties += 1
-      clean[key_text] = [
-        _compact_text(item, 500) if isinstance(item, str) else item
-        for item in scalar_items[:20]
-      ]
+        continue
+      if len(scalar_items) > 20 or any(isinstance(item, str) and len(item) > 500 for item in scalar_items):
+        continue
+      clean[key_text] = list(scalar_items)
     else:
       state.truncated_properties += 1
   return clean
@@ -1403,7 +1403,7 @@ def _validate_serialized_properties(properties: Any, where: str) -> Optional[Dic
       return _contract_error("invalid_serialized_property_key", f"{where}: property key is invalid")
     if _is_scalar(value):
       continue
-    if isinstance(value, list) and len(value) <= 20 and all(_is_scalar(item) for item in value):
+    if isinstance(value, list) and all(_is_scalar(item) for item in value):
       continue
     return _contract_error("invalid_serialized_property_value", f"{where}.{key}: nested values are not allowed")
   return None
