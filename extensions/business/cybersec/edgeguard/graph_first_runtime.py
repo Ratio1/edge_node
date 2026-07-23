@@ -402,12 +402,72 @@ def _parsed_synthesis(value: core.SynthesisFinding) -> dict[str, Any]:
   return {"status": "supported", "text": value.text, "maps": list(value.maps)}
 
 
+def _content_free_normalization(value: Mapping[str, Any]) -> dict[str, Any]:
+  safe = {
+    key: value[key]
+    for key in (
+      "ir_version",
+      "ir_sha256",
+      "property_view_version",
+      "property_view_sha256",
+      "included_property_slots",
+      "omitted_property_slots",
+      "row_groups",
+    )
+    if key in value
+  }
+  batches = []
+  for batch in value.get("batches", ()):
+    if not isinstance(batch, Mapping):
+      continue
+    batches.append({
+      key: batch[key]
+      for key in (
+        "id",
+        "row_aliases",
+        "node_aliases",
+        "relationship_aliases",
+        "path_aliases",
+        "repeated_boundary_count",
+        "measurement",
+        "document_sha256",
+      )
+      if key in batch
+    })
+  if batches:
+    safe["batches"] = batches
+  return safe
+
+
 def _safe_failure_trace(trace: dict[str, Any], stage: str, code: str, attempted: int, completed: int) -> dict[str, Any]:
   safe_calls = []
   for call in trace["calls"]:
-    safe_calls.append({key: value for key, value in call.items() if key not in {"raw_output", "parsed"}})
+    request = call.get("request")
+    configuration = {}
+    if isinstance(request, Mapping):
+      configuration = {
+        key: request[key]
+        for key in ("temperature", "top_p", "max_tokens")
+        if key in request
+      }
+    safe_call = {
+      key: call[key]
+      for key in (
+        "id",
+        "kind",
+        "batch_id",
+        "duration_ms",
+        "finish_reason",
+        "completion_tokens",
+        "status",
+      )
+      if key in call
+    }
+    safe_call["configuration"] = configuration
+    safe_calls.append(safe_call)
   return {
     **trace,
+    "normalization": _content_free_normalization(trace.get("normalization", {})),
     "calls": safe_calls,
     "outcome": {
       "status": "failed",
@@ -417,6 +477,21 @@ def _safe_failure_trace(trace: dict[str, Any], stage: str, code: str, attempted:
       "safe_code": code,
     },
   }
+
+
+def _validated_completion_tokens(value: Any) -> int:
+  if (
+    isinstance(value, bool)
+    or not isinstance(value, int)
+    or value < 0
+    or value >= core.COMPLETION_TOKEN_LIMIT
+  ):
+    raise GraphFirstRuntimeError(
+      "completion_metadata_missing",
+      "completion",
+      "graph-first completion token accounting is missing or invalid",
+    )
+  return value
 
 
 def empty_failure_trace(mode: core.ModePlan, stage: str, code: str) -> dict[str, Any]:
@@ -538,7 +613,7 @@ def run_graph_first_explanation(
       response = provider_call(payload)
       call["duration_ms"] = response.get("duration_ms")
       call["finish_reason"] = response.get("finish_reason")
-      call["completion_tokens"] = response.get("completion_tokens")
+      call["completion_tokens"] = _validated_completion_tokens(response.get("completion_tokens"))
       if call["finish_reason"] != "stop":
         raise GraphFirstRuntimeError("finish_reason", "completion", "graph-first completion did not stop normally")
       core.validate_boundary(batch.measurement, call["completion_tokens"])
@@ -576,7 +651,7 @@ def run_graph_first_explanation(
       response = provider_call(payload)
       call["duration_ms"] = response.get("duration_ms")
       call["finish_reason"] = response.get("finish_reason")
-      call["completion_tokens"] = response.get("completion_tokens")
+      call["completion_tokens"] = _validated_completion_tokens(response.get("completion_tokens"))
       if call["finish_reason"] != "stop":
         raise GraphFirstRuntimeError("finish_reason", "completion", "graph-first completion did not stop normally")
       core.validate_boundary(measurement, call["completion_tokens"])

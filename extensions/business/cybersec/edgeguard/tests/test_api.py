@@ -1371,6 +1371,23 @@ class EdgeGuardApiTests(unittest.TestCase):
       "server_max_rows": 50,
       "limit_adjusted": True,
     })
+    self.assertEqual(result["explanation_contract"], {
+      "schema_version": "edgeguard.graph_first_prepare.v1",
+      "profile_id": "EEL/1",
+      "candidate_id": "JSON-CB/1",
+      "profile_sha256": "865f47894e13b1ff9242fd121b760994d413f7220db99c57851c0008f61d64e3",
+      "case_explanation_schema_version": "edgeguard.case_explanation.v1",
+      "coverage_schema_version": "edgeguard.explanation_coverage.v1",
+      "neo4j_trace_schema_version": "edgeguard.neo4j_trace.v1",
+      "explanation_trace_schema_version": "edgeguard.explanation_trace.v1",
+      "resolved_mode": {
+        "requested": "balanced",
+        "effective": "balanced",
+        "row_limit": 25,
+        "map_call_cap": 2,
+        "max_tokens": 127,
+      },
+    })
     flattened = json.dumps(result)
     for forbidden in ("username", "password", "neo4j-bolt.edgeguard.org"):
       self.assertNotIn(forbidden, flattened)
@@ -1384,7 +1401,56 @@ class EdgeGuardApiTests(unittest.TestCase):
       )
 
     self.assertEqual(result["status"], "config_error")
+    self.assertEqual(
+      result["explanation_contract"]["schema_version"],
+      "edgeguard.graph_first_prepare.v1",
+    )
+    self.assertEqual(
+      result["explanation_contract"]["resolved_mode"]["effective"],
+      "balanced",
+    )
     mocked_driver.assert_not_called()
+
+  def test_graph_first_provider_receipt_is_content_free_and_preserves_metadata_type(self):
+    plugin = _make_api(graph_first_provider=None)
+    plugin.P = MagicMock()
+    content = '{"status":"supported","text":"receipt-secret"}'
+    response = _nested_provider_response(content, completion_tokens="16")
+    payload = {
+      "metadata": {
+        "candidate_id": "JSON-CB/1",
+        "profile_id": "EEL/1",
+        "task": "edgeguard_graph_first_map",
+      },
+    }
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=response,
+    ):
+      completion = plugin._call_graph_first_provider(payload)
+
+    self.assertIsNone(completion["completion_tokens"])
+    receipt_logs = [
+      call.args[0]
+      for call in plugin.P.call_args_list
+      if call.args and str(call.args[0]).startswith("EDGEGUARD_GRAPH_FIRST_PROVIDER_RECEIPT ")
+    ]
+    self.assertEqual(len(receipt_logs), 1)
+    receipt = json.loads(receipt_logs[0].split(" ", 1)[1])
+    self.assertEqual(receipt, {
+      "schema_version": "edgeguard.graph_first_provider_receipt.v1",
+      "task_kind": "map",
+      "envelope_path": "$.result.FULL_OUTPUT",
+      "content_bytes": len(content.encode("utf-8")),
+      "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+      "finish_reason": "stop",
+      "completion_tokens_type": "string",
+      "completion_tokens": None,
+      "duration_ms": receipt["duration_ms"],
+    })
+    self.assertIsInstance(receipt["duration_ms"], float)
+    self.assertNotIn("receipt-secret", " ".join(receipt_logs))
 
   def test_graph_first_request_fields_are_exact_types_before_execution(self):
     provider = MagicMock(side_effect=_graph_first_provider)
@@ -2590,6 +2656,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       }
 
     plugin = _make_api(graph_first_provider=invalid_provider)
+    plugin.P = MagicMock()
     fake_driver, _fake_session = _driver_with_results(_Result([_graph_record()], keys=["p"]))
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
@@ -2599,6 +2666,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           scheme="bolt+s",
           username="neo4j",
           password="secret",
+          request="private-question-sentinel",
           cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
         )
 
@@ -2609,7 +2677,15 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(diagnostics["stage"], "response_parse")
     self.assertEqual(diagnostics["reason"], "malformed_json")
     self.assertEqual(codes, {"invalid_map_output"})
-    self.assertNotIn("raw_output", json.dumps(result["result"]["explanation_trace"]))
+    serialized_result = json.dumps(result["result"])
+    serialized_logs = " ".join(str(call) for call in plugin.P.call_args_list)
+    self.assertNotIn("raw_output", serialized_result)
+    self.assertNotIn("private-question-sentinel", serialized_result)
+    self.assertNotIn("example.org", serialized_result)
+    self.assertNotIn('"packet"', serialized_result)
+    self.assertNotIn('"packet_meta"', serialized_result)
+    self.assertNotIn("private-question-sentinel", serialized_logs)
+    self.assertNotIn("example.org", serialized_logs)
 
   def test_explain_graph_rejects_unknown_map_anchor(self):
     def invalid_provider(payload):
@@ -2704,7 +2780,8 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["result"]["diagnostics"]["stage"], "provider")
     self.assertEqual(result["result"]["diagnostics"]["reason"], "provider_http_error")
     self.assertNotIn("provider_status", result["result"])
-    self.assertIn("packet", result["result"])
+    self.assertNotIn("packet", result["result"])
+    self.assertNotIn("packet_meta", result["result"])
 
   def test_case_explanation_validator_rejects_redaction_flags(self):
     packet = {

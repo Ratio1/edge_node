@@ -446,6 +446,7 @@ class ProductionRuntimeTests(unittest.TestCase):
 
   def test_insufficient_skips_synthesis_and_failure_trace_strips_all_output(self):
     evidence, catalog = fixtures()
+    catalog["nodes"][0]["properties"]["entries"][2]["value"]["value"] = "private-evidence-sentinel"
 
     def insufficient(_payload):
       return {
@@ -454,7 +455,7 @@ class ProductionRuntimeTests(unittest.TestCase):
       }
 
     kwargs = {
-      "question": "Explain evidence.", "cypher": "MATCH p=()--() RETURN p", "evidence": evidence,
+      "question": "private-question-sentinel", "cypher": "MATCH p=()--() RETURN p", "evidence": evidence,
       "catalog": catalog, "projection_descriptors": (), "mode": resolve_mode("fast"),
       "execution_trace": {"selected": "primary", "executions": [{
         "id": "primary", "executed_cypher": "MATCH p=()--() RETURN p", "row_count": 1,
@@ -476,9 +477,86 @@ class ProductionRuntimeTests(unittest.TestCase):
       runtime.run_graph_first_explanation(provider_call=malformed, **kwargs)
     serialized = json.dumps(raised.exception.trace)
     self.assertNotIn("partial-secret", serialized)
+    self.assertNotIn("private-question-sentinel", serialized)
+    self.assertNotIn("private-evidence-sentinel", serialized)
+    self.assertNotIn('"request":', serialized)
+    self.assertNotIn('"messages":', serialized)
+    self.assertNotIn('"document":', serialized)
     self.assertNotIn("raw_output", serialized)
     self.assertNotIn("parsed", serialized)
     self.assertEqual(raised.exception.trace["outcome"]["attempted_calls"], 1)
+
+  def test_invalid_completion_metadata_fails_before_map_parsing(self):
+    evidence, catalog = fixtures()
+    kwargs = {
+      "question": "Explain evidence.", "cypher": "MATCH p=()--() RETURN p", "evidence": evidence,
+      "catalog": catalog, "projection_descriptors": (), "mode": resolve_mode("fast"),
+      "execution_trace": {"selected": "primary", "executions": [{
+        "id": "primary", "executed_cypher": "MATCH p=()--() RETURN p", "row_count": 1,
+        "truncated": False, "duration_ms": 1.0, "method": "next_route",
+      }]},
+      "token_counter": lambda _messages: 1, "remaining_time": lambda: 600.0,
+    }
+    invalid_values = (None, True, "16", 16.0, -1, 128, 1_000_000)
+    for invalid in invalid_values:
+      def provider(_payload, value=invalid):
+        return {
+          "content": "not-json-must-not-be-parsed",
+          "finish_reason": "stop",
+          "completion_tokens": value,
+          "duration_ms": 1.0,
+        }
+
+      with self.subTest(value=invalid), self.assertRaises(runtime.GraphFirstRuntimeError) as raised:
+        runtime.run_graph_first_explanation(provider_call=provider, **kwargs)
+      self.assertEqual(raised.exception.code, "completion_metadata_missing")
+      self.assertEqual(raised.exception.stage, "completion")
+      self.assertNotIn("not-json-must-not-be-parsed", json.dumps(raised.exception.trace))
+
+  def test_invalid_completion_metadata_fails_before_synthesis_parsing(self):
+    evidence, catalog = fixtures(disconnected=True)
+    evidence["rows"][0]["values"][1] = {"type": "string", "value": "a" * 800}
+    evidence["rows"][1]["values"][1] = {"type": "string", "value": "b" * 800}
+    kwargs = {
+      "question": "Explain evidence.", "cypher": "MATCH p=()--() RETURN p", "evidence": evidence,
+      "catalog": catalog, "projection_descriptors": (), "mode": resolve_mode("balanced"),
+      "execution_trace": {"selected": "primary", "executions": [{
+        "id": "primary", "executed_cypher": "MATCH p=()--() RETURN p", "row_count": 2,
+        "truncated": False, "duration_ms": 1.0, "method": "next_route",
+      }]},
+      "token_counter": lambda messages: len(runtime.render_chat(messages).encode()),
+      "remaining_time": lambda: 600.0,
+    }
+    invalid_values = (None, True, "16", 16.0, -1, 128, 1_000_000)
+    for invalid in invalid_values:
+      def provider(payload, value=invalid):
+        data = json.loads(payload["messages"][-1]["content"].split("\nDATA\n", 1)[1])
+        if payload["metadata"]["task"] == "edgeguard_graph_first_synthesis":
+          return {
+            "content": "not-json-must-not-be-parsed",
+            "finish_reason": "stop",
+            "completion_tokens": value,
+            "duration_ms": 1.0,
+          }
+        return {
+          "content": json.dumps({
+            "status": "supported",
+            "text": "Grounded map result.",
+            "anchor": data["nodes"][0][0],
+            "rows": [row[0] for row in data["rows"]],
+          }),
+          "finish_reason": "stop",
+          "completion_tokens": 16,
+          "duration_ms": 1.0,
+        }
+
+      with self.subTest(value=invalid), self.assertRaises(runtime.GraphFirstRuntimeError) as raised:
+        runtime.run_graph_first_explanation(provider_call=provider, **kwargs)
+      self.assertEqual(raised.exception.code, "completion_metadata_missing")
+      self.assertEqual(raised.exception.stage, "completion")
+      self.assertEqual(raised.exception.trace["outcome"]["attempted_calls"], 3)
+      self.assertEqual(raised.exception.trace["outcome"]["completed_calls"], 2)
+      self.assertNotIn("not-json-must-not-be-parsed", json.dumps(raised.exception.trace))
 
   def test_direct_projection_must_resolve_to_exactly_one_referenced_entity(self):
     evidence = {

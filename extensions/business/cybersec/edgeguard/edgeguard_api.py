@@ -33,7 +33,7 @@ from .edgeguard_cypher_guard import (
   build_schema_correction_prompt,
   canonical_schema_surface,
 )
-from .graph_first_explanation import GraphFirstContractError, ModePlan, resolve_mode
+from .graph_first_explanation import COVERAGE_VERSION, GraphFirstContractError, ModePlan, resolve_mode
 from .graph_first_runtime import (
   CANDIDATE_ID,
   GraphFirstRuntimeError,
@@ -64,6 +64,8 @@ GRAPH_PACKET_SCHEMA_VERSION = "edgeguard.graph_evidence_packet.v1"
 QUERY_RESULT_EVIDENCE_SCHEMA_VERSION = "edgeguard.query_result_evidence.v1"
 CASE_EXPLANATION_SCHEMA_VERSION = "edgeguard.case_explanation.v1"
 CASE_EXPLANATION_DRAFT_SCHEMA_VERSION = "edgeguard.case_explanation_draft.v2"
+GRAPH_FIRST_PREPARE_SCHEMA_VERSION = "edgeguard.graph_first_prepare.v1"
+GRAPH_FIRST_PROVIDER_RECEIPT_SCHEMA_VERSION = "edgeguard.graph_first_provider_receipt.v1"
 GRAPH_PACKET_REDACTION_POLICY = "edgeguard_graph_packet_private_v1"
 GRAPH_EXPLANATION_PROMPT_VERSION = "edgeguard-graph-explanation-v0.7"
 EXPLANATION_OUTPUT_MODE_JSON_OBJECT = "json_object"
@@ -131,7 +133,7 @@ EXPLANATION_DIAGNOSTIC_STAGE_REASONS = {
     "provider_failure",
     "context_window_exceeded",
   },
-  "completion": {"missing_content", "output_truncated"},
+  "completion": {"completion_metadata_missing", "missing_content", "output_truncated"},
   "response_parse": {"malformed_json", "invalid_explanation_draft"},
   "validation": {"deterministic_validation_failed"},
   "internal": {"unexpected_failure"},
@@ -604,6 +606,57 @@ class _GraphPacketState:
 
 def _contract_error(code: str, detail: str) -> Dict[str, str]:
   return {"code": code, "detail": detail}
+
+
+def _graph_first_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, Any]:
+  resolved_mode = None
+  if mode_plan is not None:
+    resolved_mode = {
+      "requested": mode_plan.mode,
+      "effective": mode_plan.mode,
+      "row_limit": mode_plan.row_limit,
+      "map_call_cap": mode_plan.map_call_cap,
+      "max_tokens": mode_plan.max_tokens,
+    }
+  return {
+    "schema_version": GRAPH_FIRST_PREPARE_SCHEMA_VERSION,
+    "profile_id": PROFILE_ID,
+    "candidate_id": CANDIDATE_ID,
+    "profile_sha256": PROFILE_SHA256,
+    "case_explanation_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
+    "coverage_schema_version": COVERAGE_VERSION,
+    "neo4j_trace_schema_version": NEO4J_TRACE_VERSION,
+    "explanation_trace_schema_version": TRACE_VERSION,
+    "resolved_mode": resolved_mode,
+  }
+
+
+def _with_graph_first_prepare_contract(
+  result: Mapping[str, Any],
+  mode_plan: Optional[ModePlan] = None,
+) -> Dict[str, Any]:
+  return {
+    **dict(result),
+    "explanation_contract": _graph_first_prepare_contract(mode_plan),
+  }
+
+
+def _json_type_name(value: Any) -> str:
+  if value is None:
+    return "null"
+  if isinstance(value, bool):
+    return "boolean"
+  if isinstance(value, int):
+    return "integer"
+  if isinstance(value, float):
+    return "number"
+  if isinstance(value, str):
+    return "string"
+  if isinstance(value, list):
+    return "array"
+  if isinstance(value, dict):
+    return "object"
+  return "missing"
 
 
 def _sha256_text(value: str) -> str:
@@ -2819,9 +2872,10 @@ class EdgeguardApiPlugin(BasePlugin):
     return message
 
   def _extract_explanation_completion(self, response: Any) -> Dict[str, Any]:
-    def parse_envelope(value: Any) -> Optional[Dict[str, Any]]:
+    def parse_envelope(value: Any, path: str) -> Optional[Dict[str, Any]]:
       if isinstance(value, list) and len(value) == 1:
         value = value[0]
+        path += "[0]"
       if not isinstance(value, dict):
         return None
       content = None
@@ -2837,7 +2891,13 @@ class EdgeguardApiPlugin(BasePlugin):
         if isinstance(first.get("finish_reason"), str):
           finish_reason = first["finish_reason"]
       usage = value.get("usage")
-      completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+      raw_completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+      completion_tokens_type = (
+        _json_type_name(raw_completion_tokens)
+        if isinstance(usage, dict) and "completion_tokens" in usage
+        else "missing"
+      )
+      completion_tokens = raw_completion_tokens
       if isinstance(completion_tokens, bool) or not isinstance(completion_tokens, int):
         completion_tokens = None
       if content is None and finish_reason is None and completion_tokens is None:
@@ -2846,6 +2906,8 @@ class EdgeguardApiPlugin(BasePlugin):
         "content": content,
         "finish_reason": finish_reason,
         "completion_tokens": completion_tokens,
+        "completion_tokens_type": completion_tokens_type,
+        "envelope_path": path,
       }
 
     def extract_direct_content(value: Any) -> Optional[str]:
@@ -2863,25 +2925,29 @@ class EdgeguardApiPlugin(BasePlugin):
 
     branches = []
     current = response
+    current_path = "$"
     for _depth in range(4):
       if not isinstance(current, dict):
         break
-      branches.append(current)
+      branches.append((current_path, current))
       current = current.get("result")
-    for branch in reversed(branches):
-      completion = parse_envelope(branch.get("FULL_OUTPUT"))
+      current_path += ".result"
+    for branch_path, branch in reversed(branches):
+      completion = parse_envelope(branch.get("FULL_OUTPUT"), f"{branch_path}.FULL_OUTPUT")
       if completion is not None:
         if completion["content"] is None and isinstance(branch.get("TEXT_RESPONSE"), str):
           completion["content"] = branch["TEXT_RESPONSE"]
         if completion["content"] is not None:
           return completion
-    for branch in reversed(branches):
+    for branch_path, branch in reversed(branches):
       direct_content = extract_direct_content(branch)
       if direct_content is not None:
         return {
           "content": direct_content,
           "finish_reason": None,
           "completion_tokens": None,
+          "completion_tokens_type": "missing",
+          "envelope_path": branch_path,
         }
       for key in ("TEXT_RESPONSE", "text", "content", "response"):
         if isinstance(branch.get(key), str):
@@ -2889,11 +2955,15 @@ class EdgeguardApiPlugin(BasePlugin):
             "content": branch[key],
             "finish_reason": None,
             "completion_tokens": None,
+            "completion_tokens_type": "missing",
+            "envelope_path": f"{branch_path}.{key}",
           }
     return {
       "content": None,
       "finish_reason": None,
       "completion_tokens": None,
+      "completion_tokens_type": "missing",
+      "envelope_path": None,
     }
 
   def _extract_provider_failure(self, response: Any) -> Optional[Dict[str, Any]]:
@@ -2950,10 +3020,42 @@ class EdgeguardApiPlugin(BasePlugin):
       code = "provider_timeout" if provider_failure.get("status") == STATUS_TIMEOUT else "provider_failure"
       raise GraphFirstRuntimeError(code, "provider", "graph-first provider failed")
     completion = self._extract_explanation_completion(data)
-    return {
-      "content": completion.get("content"),
+    content = completion.get("content")
+    completion_tokens = completion.get("completion_tokens")
+    receipt_tokens = (
+      completion_tokens
+      if isinstance(completion_tokens, int)
+      and not isinstance(completion_tokens, bool)
+      and 0 <= completion_tokens <= 1_000_000
+      else None
+    )
+    task = payload.get("metadata", {}).get("task") if isinstance(payload.get("metadata"), Mapping) else None
+    task_kind = (
+      "map"
+      if task == "edgeguard_graph_first_map"
+      else "synthesis"
+      if task == "edgeguard_graph_first_synthesis"
+      else "unknown"
+    )
+    receipt = {
+      "schema_version": GRAPH_FIRST_PROVIDER_RECEIPT_SCHEMA_VERSION,
+      "task_kind": task_kind,
+      "envelope_path": completion.get("envelope_path"),
+      "content_bytes": len(content.encode("utf-8")) if isinstance(content, str) else 0,
+      "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest() if isinstance(content, str) else None,
       "finish_reason": completion.get("finish_reason"),
-      "completion_tokens": completion.get("completion_tokens"),
+      "completion_tokens_type": completion.get("completion_tokens_type", "missing"),
+      "completion_tokens": receipt_tokens,
+      "duration_ms": duration_ms,
+    }
+    self.P(
+      "EDGEGUARD_GRAPH_FIRST_PROVIDER_RECEIPT "
+      + json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    )
+    return {
+      "content": content,
+      "finish_reason": completion.get("finish_reason"),
+      "completion_tokens": completion_tokens,
       "duration_ms": duration_ms,
     }
 
@@ -3227,7 +3329,13 @@ class EdgeguardApiPlugin(BasePlugin):
         "model_not_configured" if error.code == "model_not_configured" else "graph_first_configuration"
       ),
       "provider": error.code if error.code in EXPLANATION_DIAGNOSTIC_STAGE_REASONS["provider"] else "provider_failure",
-      "completion": "output_truncated" if completion.get("finish_reason") == "length" else "missing_content",
+      "completion": (
+        "completion_metadata_missing"
+        if error.code == "completion_metadata_missing"
+        else "output_truncated"
+        if completion.get("finish_reason") == "length"
+        else "missing_content"
+      ),
       "response_parse": "malformed_json",
       "validation": "deterministic_validation_failed",
       "internal": "unexpected_failure",
@@ -3272,13 +3380,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "validation_errors": [_contract_error(error.code, "Graph-first explanation failed safely.")],
       "diagnostics": diagnostics,
       "explanation_trace": error.trace,
-      "validation": validation,
-      "live_retry": live_retry,
     }
-    if packet is not None and error.code != "explanation_response_size":
-      result["packet"] = dict(packet)
-    if packet_meta is not None and error.code != "explanation_response_size":
-      result["packet_meta"] = dict(packet_meta)
     return {"status_code": 500, "result": result, "logged": True}
 
   def _call_explanation_model(
@@ -3854,29 +3956,29 @@ class EdgeguardApiPlugin(BasePlugin):
     **kwargs,
   ) -> Dict[str, Any]:
     if not isinstance(cypher, str) or not cypher.strip():
-      return {
+      return _with_graph_first_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation Cypher must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
-      }
+      })
     forwarded = sorted(str(name) for name in kwargs)
     if forwarded:
-      return {
+      return _with_graph_first_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation preparation does not accept Neo4j connection fields.",
         "validation_errors": [
           _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
         ],
-      }
+      })
     if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
-      return {
+      return _with_graph_first_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
-      }
+      })
     try:
       mode_plan = resolve_mode(
         explanation_mode=explanation_mode,
@@ -3884,12 +3986,12 @@ class EdgeguardApiPlugin(BasePlugin):
         max_rows=max_rows,
       )
     except GraphFirstContractError as exc:
-      return {
+      return _with_graph_first_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error(exc.code, exc.detail)],
-      }
+      })
     broadening_enabled = (
       bool(self.cfg_live_empty_result_broadening)
       if enable_empty_result_broadening is None
@@ -3897,26 +3999,26 @@ class EdgeguardApiPlugin(BasePlugin):
     )
     plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
     if not plan.get("ok"):
-      return plan
+      return _with_graph_first_prepare_contract(plan, mode_plan)
     try:
       self._graph_first_token_counter()
     except GraphFirstRuntimeError as exc:
-      return {
+      return _with_graph_first_prepare_contract({
         "status": "config_error",
         "ok": False,
         "validation": plan.get("validation"),
         "error": "Graph-first explanation tokenizer is unavailable.",
         "validation_errors": [_contract_error(exc.code, exc.detail)],
-      }
+      }, mode_plan)
     _explanation_url, explanation_err = self._explanation_url()
     if explanation_err:
-      return {
+      return _with_graph_first_prepare_contract({
         "status": "config_error",
         "ok": False,
         "validation": plan.get("validation"),
         "error": explanation_err,
-      }
-    return plan
+      }, mode_plan)
+    return _with_graph_first_prepare_contract(plan, mode_plan)
 
   def _explain_prepared_execution(
     self,
