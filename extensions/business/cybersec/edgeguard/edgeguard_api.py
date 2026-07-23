@@ -3037,13 +3037,21 @@ class EdgeguardApiPlugin(BasePlugin):
       if task == "edgeguard_graph_first_synthesis"
       else "unknown"
     )
+    raw_finish_reason = completion.get("finish_reason")
+    receipt_finish_reason = (
+      raw_finish_reason
+      if raw_finish_reason in {"stop", "length"}
+      else "missing"
+      if raw_finish_reason is None
+      else "invalid"
+    )
     receipt = {
       "schema_version": GRAPH_FIRST_PROVIDER_RECEIPT_SCHEMA_VERSION,
       "task_kind": task_kind,
       "envelope_path": completion.get("envelope_path"),
       "content_bytes": len(content.encode("utf-8")) if isinstance(content, str) else 0,
       "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest() if isinstance(content, str) else None,
-      "finish_reason": completion.get("finish_reason"),
+      "finish_reason": receipt_finish_reason,
       "completion_tokens_type": completion.get("completion_tokens_type", "missing"),
       "completion_tokens": receipt_tokens,
       "duration_ms": duration_ms,

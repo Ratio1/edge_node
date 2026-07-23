@@ -1452,6 +1452,41 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIsInstance(receipt["duration_ms"], float)
     self.assertNotIn("receipt-secret", " ".join(receipt_logs))
 
+  def test_graph_first_provider_receipt_normalizes_hostile_finish_reason(self):
+    plugin = _make_api(graph_first_provider=None)
+    plugin.P = MagicMock()
+    hostile_finish = "\nprovider-controlled-" + ("x" * 10_000)
+    response = _nested_provider_response(
+      '{"status":"supported","text":"safe"}',
+      finish_reason=hostile_finish,
+      completion_tokens=16,
+    )
+    payload = {
+      "metadata": {
+        "candidate_id": "JSON-CB/1",
+        "profile_id": "EEL/1",
+        "task": "edgeguard_graph_first_map",
+      },
+    }
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+      return_value=response,
+    ):
+      completion = plugin._call_graph_first_provider(payload)
+
+    self.assertEqual(completion["finish_reason"], hostile_finish)
+    receipt_logs = [
+      call.args[0]
+      for call in plugin.P.call_args_list
+      if call.args and str(call.args[0]).startswith("EDGEGUARD_GRAPH_FIRST_PROVIDER_RECEIPT ")
+    ]
+    self.assertEqual(len(receipt_logs), 1)
+    receipt = json.loads(receipt_logs[0].split(" ", 1)[1])
+    self.assertEqual(receipt["finish_reason"], "invalid")
+    self.assertNotIn("provider-controlled", receipt_logs[0])
+    self.assertLess(len(receipt_logs[0]), 1_000)
+
   def test_graph_first_request_fields_are_exact_types_before_execution(self):
     provider = MagicMock(side_effect=_graph_first_provider)
     plugin = _make_api(graph_first_provider=provider)
