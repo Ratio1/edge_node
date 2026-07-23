@@ -192,6 +192,12 @@ def _serialized_execution(executed_cypher, *, broadened=False, primary_row_count
   }
 
 
+def _graph_first_payload(result):
+  if isinstance(result, dict) and set(result) == {"status_code", "result", "logged"}:
+    return result["result"]
+  return result
+
+
 def _case_explanation_packet():
   return {
     "schema_version": "edgeguard.graph_evidence_packet.v1",
@@ -1652,10 +1658,19 @@ class EdgeGuardApiTests(unittest.TestCase):
     ) as mocked_post:
       result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
 
+    self.assertEqual(set(result), {"status_code", "result", "logged"})
+    self.assertEqual(result["status_code"], 500)
+    self.assertTrue(result["logged"])
     self.assertIn(
       "result_columns_mismatch",
-      {item["code"] for item in result["validation_errors"]},
+      {item["code"] for item in result["result"]["validation_errors"]},
     )
+    self.assertEqual(result["result"]["diagnostics"]["stage"], "validation")
+    self.assertEqual(
+      result["result"]["diagnostics"]["validation_codes"],
+      ["result_columns_mismatch"],
+    )
+    self.assertEqual(result["result"]["explanation_trace"]["calls"], [])
     mocked_post.assert_not_called()
 
   def test_explain_graph_preserves_pairings_duplicates_nulls_scalars_maps_lists_and_reverse_path(self):
@@ -1753,11 +1768,11 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertIn(
       "incomplete_execution_result",
-      {item["code"] for item in truncated_result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(truncated_result)["validation_errors"]},
     )
     self.assertIn(
       "execution_result_size",
-      {item["code"] for item in oversized_result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(oversized_result)["validation_errors"]},
     )
     mocked_post.assert_not_called()
 
@@ -1780,11 +1795,11 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertIn(
       "unresolved_node_reference",
-      {item["code"] for item in unresolved_result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(unresolved_result)["validation_errors"]},
     )
     self.assertIn(
       "evidence_id_collision",
-      {item["code"] for item in collision_result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(collision_result)["validation_errors"]},
     )
     mocked_post.assert_not_called()
 
@@ -1823,8 +1838,14 @@ class EdgeGuardApiTests(unittest.TestCase):
         execution_result=_serialized_execution(broadened, broadened=True, primary_row_count=1),
       )
 
-    self.assertIn("executed_cypher_mismatch", {item["code"] for item in mismatch["validation_errors"]})
-    self.assertIn("broadening_primary_not_empty", {item["code"] for item in bad_broadening["validation_errors"]})
+    self.assertIn(
+      "executed_cypher_mismatch",
+      {item["code"] for item in _graph_first_payload(mismatch)["validation_errors"]},
+    )
+    self.assertIn(
+      "broadening_primary_not_empty",
+      {item["code"] for item in _graph_first_payload(bad_broadening)["validation_errors"]},
+    )
     mocked_driver.assert_not_called()
 
   def test_explain_graph_evidence_mode_rejects_malformed_and_oversized_graphs(self):
@@ -1864,12 +1885,15 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertIn(
       "serialized_relationship_endpoint_missing",
-      {item["code"] for item in malformed_result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(malformed_result)["validation_errors"]},
     )
-    self.assertIn("graph_node_limit", {item["code"] for item in oversized_result["validation_errors"]})
+    self.assertIn(
+      "graph_node_limit",
+      {item["code"] for item in _graph_first_payload(oversized_result)["validation_errors"]},
+    )
     self.assertIn(
       "graph_relationship_limit",
-      {item["code"] for item in relationships_result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(relationships_result)["validation_errors"]},
     )
     mocked_driver.assert_not_called()
 
@@ -1886,7 +1910,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertIn(
       "invalid_serialized_property_value",
-      {item["code"] for item in nested_result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(nested_result)["validation_errors"]},
     )
     self.assertEqual(credential_result["status"], "ok")
     flattened = json.dumps(credential_result["neo4j_trace"])
@@ -1909,7 +1933,7 @@ class EdgeGuardApiTests(unittest.TestCase):
         result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
         self.assertIn(
           expected_code,
-          {item["code"] for item in result["validation_errors"]},
+          {item["code"] for item in _graph_first_payload(result)["validation_errors"]},
         )
 
     map_cypher = "MATCH (i:Indicator) RETURN i, i.value AS mapping LIMIT 25"
@@ -1924,7 +1948,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     rejected_map = plugin.explain_graph(cypher=map_cypher, execution_result=map_result)
     self.assertIn(
       "client_redaction_not_allowed",
-      {item["code"] for item in rejected_map["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(rejected_map)["validation_errors"]},
     )
 
   def test_canonical_integer_temporal_and_point_values_fail_closed(self):
@@ -1945,7 +1969,7 @@ class EdgeGuardApiTests(unittest.TestCase):
         result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
         self.assertIn(
           expected_code,
-          {item["code"] for item in result["validation_errors"]},
+          {item["code"] for item in _graph_first_payload(result)["validation_errors"]},
         )
 
     valid_temporals = {
@@ -1997,7 +2021,7 @@ class EdgeGuardApiTests(unittest.TestCase):
         result = plugin.explain_graph(cypher=cypher, execution_result=execution_result)
         self.assertIn(
           expected_code,
-          {item["code"] for item in result["validation_errors"]},
+          {item["code"] for item in _graph_first_payload(result)["validation_errors"]},
         )
 
     bad_ordinal = _serialized_execution(cypher)
@@ -2005,7 +2029,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     result = plugin.explain_graph(cypher=cypher, execution_result=bad_ordinal)
     self.assertIn(
       "invalid_result_row",
-      {item["code"] for item in result["validation_errors"]},
+      {item["code"] for item in _graph_first_payload(result)["validation_errors"]},
     )
 
   def test_explain_graph_evidence_mode_rejects_all_top_level_credential_aliases(self):

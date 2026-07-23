@@ -4043,30 +4043,30 @@ class EdgeguardApiPlugin(BasePlugin):
       execution_result=execution_result,
     )
     if ingestion_errors:
-      return {
-        "status": STATUS_REJECTED,
-        "ok": False,
-        "executed": False,
-        "explained": False,
-        "error": "Execution evidence failed deterministic validation",
-        "validation_errors": ingestion_errors,
-        "validation": plan.get("validation"),
-      }
+      first_error = ingestion_errors[0]
+      return self._graph_first_failure_transport(
+        GraphFirstRuntimeError(
+          str(first_error.get("code") or "execution_evidence_validation"),
+          "validation",
+          "execution evidence failed deterministic validation",
+        ),
+        mode_plan=mode_plan,
+        validation=plan.get("validation"),
+      )
     query_result_evidence = packet_meta.pop("_query_result_evidence")
     evidence_catalog = packet_meta.pop("_evidence_catalog")
     packet_errors, _context = _validate_graph_evidence_packet(packet)
     if packet_errors:
-      return {
-        "status": STATUS_REJECTED,
-        "ok": False,
-        "executed": True,
-        "explained": False,
-        "error": "GraphEvidencePacket failed deterministic validation",
-        "validation_errors": packet_errors,
-        "packet": packet,
-        "packet_meta": packet_meta,
-        "validation": plan.get("validation"),
-      }
+      first_error = packet_errors[0]
+      return self._graph_first_failure_transport(
+        GraphFirstRuntimeError(
+          str(first_error.get("code") or "graph_evidence_packet_validation"),
+          "validation",
+          "graph evidence packet failed deterministic validation",
+        ),
+        mode_plan=mode_plan,
+        validation=plan.get("validation"),
+      )
     broadened = bool(execution_result.get("broadened"))
     live_retry = self._empty_result_broadening_state(
       enabled=bool(plan["broadening"]["enabled"]),
