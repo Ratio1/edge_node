@@ -444,6 +444,74 @@ class ProductionRuntimeTests(unittest.TestCase):
     self.assertEqual(result["explanation"]["summary"]["text"], "Combined grounded result.")
     self.assertEqual(set(result["neo4j_trace"]), {"schema_version", "selected", "executions", "result"})
 
+  def test_thorough_three_maps_synthesize_with_exact_call_accounting(self):
+    evidence, catalog = fixtures(disconnected=True)
+    catalog["nodes"].append({
+      "id": "n:d",
+      "labels": ["ThreatActor"],
+      "properties": tagged_map(name={"type": "string", "value": "Example Actor"}),
+    })
+    evidence["rows"][0]["values"][1] = {"type": "string", "value": "a" * 1_000}
+    evidence["rows"][1]["values"][1] = {"type": "string", "value": "b" * 1_000}
+    evidence["rows"].append({
+      "ordinal": 2,
+      "values": [
+        {"type": "node", "ref": "n:d"},
+        {"type": "string", "value": "c" * 1_000},
+        {"type": "null"},
+      ],
+    })
+    calls = []
+
+    def provider(payload):
+      calls.append(payload)
+      data = json.loads(payload["messages"][-1]["content"].split("\nDATA\n", 1)[1])
+      if payload["metadata"]["task"].endswith("synthesis"):
+        content = {
+          "status": "supported",
+          "text": "Combined thorough result.",
+          "maps": [item["id"] for item in data],
+        }
+      else:
+        content = {
+          "status": "supported",
+          "text": "Grounded map result.",
+          "anchor": data["nodes"][0][0],
+          "rows": [row[0] for row in data["rows"]],
+        }
+      return {
+        "content": json.dumps(content),
+        "finish_reason": "stop",
+        "completion_tokens": 16,
+        "duration_ms": 2.0,
+      }
+
+    result = runtime.run_graph_first_explanation(
+      question="Explain evidence thoroughly.",
+      cypher="MATCH p=()--() RETURN p",
+      evidence=evidence,
+      catalog=catalog,
+      projection_descriptors=(),
+      mode=resolve_mode("thorough"),
+      execution_trace={
+        "selected": "primary",
+        "executions": [{
+          "id": "primary", "executed_cypher": "MATCH p=()--() RETURN p", "row_count": 3,
+          "truncated": False, "duration_ms": 4.0, "method": "next_route",
+        }],
+      },
+      token_counter=lambda messages: len(runtime.render_chat(messages).encode()),
+      provider_call=provider,
+      remaining_time=lambda: 600.0,
+    )
+    self.assertEqual(len(calls), 4)
+    self.assertEqual(
+      [call["kind"] for call in result["explanation_trace"]["calls"]],
+      ["map", "map", "map", "synthesis"],
+    )
+    self.assertEqual(result["coverage"]["calls"], {"map": 3, "synthesis": 1, "total": 4})
+    self.assertEqual(result["explanation"]["summary"]["text"], "Combined thorough result.")
+
   def test_insufficient_skips_synthesis_and_failure_trace_strips_all_output(self):
     evidence, catalog = fixtures()
     catalog["nodes"][0]["properties"]["entries"][2]["value"]["value"] = "private-evidence-sentinel"
