@@ -221,6 +221,10 @@ class CyberSecQwenEngineTests(unittest.TestCase):
       "llama_cpp_edgeguard_qwen_4b",
     )
     self.assertEqual(
+      utils.get_serving_process_given_ai_engine("base_qwen_4b"),
+      "llama_cpp_base_qwen_4b",
+    )
+    self.assertEqual(
       utils.get_serving_process_given_ai_engine(("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")),
       ("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
     )

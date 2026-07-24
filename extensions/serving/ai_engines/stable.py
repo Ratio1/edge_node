@@ -29,6 +29,10 @@ AI_ENGINES['edgeguard_qwen_4b'] = {
   'SERVING_PROCESS': 'llama_cpp_edgeguard_qwen_4b'
 }
 
+AI_ENGINES['base_qwen_4b'] = {
+  'SERVING_PROCESS': 'llama_cpp_base_qwen_4b'
+}
+
 AI_ENGINES['llm_reason'] = {
   'SERVING_PROCESS': 'deepseek_r1_qwen_7b'
 }
