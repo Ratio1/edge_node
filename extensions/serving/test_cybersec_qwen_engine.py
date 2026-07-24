@@ -94,6 +94,7 @@ def _load_cybersec_qwen_class():
   )
   namespace = {
     "BaseServingProcess": _FakeBaseServingProcess,
+    "__file__": str(source_path),
     "__name__": "loaded_llama_cpp_cybersec_qwen_4b",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
@@ -149,6 +150,7 @@ def _load_llama_cpp_base_class():
       PROCESS_METHOD="PROCESS_METHOD",
       RESPONSE_FORMAT="RESPONSE_FORMAT",
       BENCHMARK_MODE="BENCHMARK_MODE",
+      SEED="SEED",
       PRMP="prompt",
       TEXT="text",
       ADDITIONAL="ADDITIONAL",
@@ -194,6 +196,7 @@ def _make_llama_cpp_process(**overrides):
     "cfg_default_max_tokens": 128,
     "cfg_repetition_penalty": 1.0,
     "cfg_default_response_format": None,
+    "cfg_generation_seed": 123,
   }
   defaults.update(overrides)
   for key, value in defaults.items():
@@ -444,6 +447,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         "BENCHMARK_MODE": True,
         "VALID_CONDITION": "must-not-run",
         "PROCESS_METHOD": "must-not-run",
+        "SEED": 42,
       }}],
     })
     result = process._predict(preprocessed)
@@ -452,10 +456,14 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(preprocessed[4], [None])
     self.assertEqual(len(reset_calls), 1)
     self.assertEqual(len(completion_calls), 1)
+    self.assertEqual(completion_calls[0]["seed"], 42)
     telemetry = result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"]
     self.assertEqual(telemetry["reset_succeeded"], True)
     self.assertEqual(telemetry["attempt_count"], 1)
     self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
+    self.assertEqual(telemetry["effective_generation_config"]["seed"], 42)
+    self.assertEqual(telemetry["reset_ms"], 0.0)
+    self.assertEqual(telemetry["generation_ms"], 0.0)
     self.assertEqual(
       telemetry["generation_config_sha256"],
       process.benchmark_generation_config_sha256(completion_calls[0]),

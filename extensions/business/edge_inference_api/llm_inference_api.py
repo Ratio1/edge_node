@@ -440,6 +440,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         benchmark_mode: bool = False,
+        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -481,6 +482,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         benchmark_mode=benchmark_mode,
+        seed=seed,
         **kwargs
       )
 
@@ -499,6 +501,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         authorization: Optional[str] = None,
         request_id: Optional[str] = None,
         benchmark_mode: bool = False,
+        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -544,6 +547,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         authorization=authorization,
         request_id=request_id,
         benchmark_mode=benchmark_mode,
+        seed=seed,
         **kwargs
       )
 
@@ -559,6 +563,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         benchmark_mode: bool = False,
+        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -600,6 +605,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         benchmark_mode=benchmark_mode,
+        seed=seed,
         **kwargs
       )
 
@@ -615,6 +621,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         benchmark_mode: bool = False,
+        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -656,6 +663,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         benchmark_mode=benchmark_mode,
+        seed=seed,
         **kwargs
       )
   """END API ENDPOINTS"""
@@ -705,6 +713,9 @@ class LLMInferenceApiPlugin(BasePlugin):
         return "`benchmark_mode` must be a boolean."
       if benchmark_mode and getattr(self, "cfg_benchmark_mode_enabled", False) is not True:
         return "`benchmark_mode` is disabled on this instance."
+      seed = kwargs.get("seed")
+      if benchmark_mode and (isinstance(seed, bool) or not isinstance(seed, int)):
+        return "`seed` must be an integer in benchmark mode."
       err = self.check_generation_params(
         temperature=temperature,
         max_tokens=max_tokens,
@@ -1012,6 +1023,15 @@ class LLMInferenceApiPlugin(BasePlugin):
       }
       benchmark_telemetry = self._get_benchmark_telemetry(inference)
       if benchmark_telemetry is not None:
+        execution_started_at = self._infer_execution_started_at(request_data=request_data)
+        created_at = request_data.get("created_at")
+        finished_at = request_data.get("finished_at")
+        api_timing = {}
+        if isinstance(created_at, (int, float)) and isinstance(finished_at, (int, float)):
+          api_timing["api_total_ms"] = round((finished_at - created_at) * 1000, 3)
+        if isinstance(created_at, (int, float)) and isinstance(execution_started_at, (int, float)):
+          api_timing["api_queue_ms"] = round((execution_started_at - created_at) * 1000, 3)
+        benchmark_telemetry = {**benchmark_telemetry, **api_timing}
         self._requests[request_id]['result']["EDGEGUARD_BENCHMARK_TELEMETRY"] = benchmark_telemetry
       self._annotate_result_with_node_roles(
         result_payload=self._requests[request_id]['result'],

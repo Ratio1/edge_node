@@ -219,6 +219,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       "max_tokens": predict_kwargs.get("max_tokens"),
       "repeat_penalty": predict_kwargs.get("repeat_penalty"),
       "response_format": predict_kwargs.get("response_format"),
+      "seed": predict_kwargs.get("seed"),
     }
     return self._canonical_sha256(normalized)
 
@@ -520,6 +521,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       repetition_penalty = jeeves_content.get("REPETITION_PENALTY", self.cfg_repetition_penalty)
       request_context = jeeves_content.get(LlmCT.CONTEXT, None)
       benchmark_mode = jeeves_content.get(LlmCT.BENCHMARK_MODE, False) is True
+      seed = jeeves_content.get(LlmCT.SEED)
+      if seed is None:
+        seed = self.cfg_generation_seed
       valid_condition = None if benchmark_mode else jeeves_content.get(LlmCT.VALID_CONDITION, None)
       process_method = None if benchmark_mode else jeeves_content.get(LlmCT.PROCESS_METHOD, None)
       response_format = jeeves_content.get(LlmCT.RESPONSE_FORMAT, self.get_default_response_format())
@@ -529,6 +533,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         'max_tokens': max_tokens,
         'repeat_penalty': repetition_penalty,
         'response_format': response_format,
+        'seed': seed,
       }
       predict_kwargs = self.process_predict_kwargs(predict_kwargs)
       if not isinstance(messages, list):
@@ -594,6 +599,8 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         benchmark_mode = additional_lst[idx_orig].get(LlmCT.BENCHMARK_MODE, False) is True
         generation_config_sha256 = self.benchmark_generation_config_sha256(predict_kwargs)
         t1 = self.time()
+        reset_ms = None
+        generation_ms = None
         reset_succeeded = False
         reset = getattr(self.model, "reset", None)
         if benchmark_mode and not callable(reset):
@@ -601,17 +608,23 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         else:
           if benchmark_mode:
             try:
+              reset_started = self.time()
               reset()
+              reset_ms = round((self.time() - reset_started) * 1000, 3)
               reset_succeeded = True
             except Exception:
+              reset_ms = round((self.time() - reset_started) * 1000, 3)
               out = {"error": {"code": BENCHMARK_RESET_FAILED_CODE}}
           if not benchmark_mode or reset_succeeded:
             try:
+              generation_started = self.time()
               out = self.model.create_chat_completion(
                 messages=messages,
                 **predict_kwargs
               )
+              generation_ms = round((self.time() - generation_started) * 1000, 3)
             except ValueError as exc:
+              generation_ms = round((self.time() - generation_started) * 1000, 3)
               context_match = CONTEXT_WINDOW_ERROR_RE.search(str(exc))
               if context_match is None:
                 raise
@@ -628,6 +641,15 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
             "reset_succeeded": reset_succeeded,
             "attempt_count": 1 if reset_succeeded else 0,
             "generation_config_sha256": generation_config_sha256,
+            "effective_generation_config": {
+              "temperature": predict_kwargs.get("temperature"),
+              "top_p": predict_kwargs.get("top_p"),
+              "max_tokens": predict_kwargs.get("max_tokens"),
+              "repeat_penalty": predict_kwargs.get("repeat_penalty"),
+              "seed": predict_kwargs.get("seed"),
+            },
+            "reset_ms": reset_ms,
+            "generation_ms": generation_ms,
           }
         elapsed = self.time() - t1
         timings.append(elapsed)

@@ -50,6 +50,7 @@ class _FakeLlmCT:
   ADDITIONAL = "ADDITIONAL"
   TEXT = "text"
   FULL_OUTPUT = "FULL_OUTPUT"
+  SEED = "SEED"
 
 
 def _load_plugin_module():
@@ -202,7 +203,29 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     plugin.cfg_benchmark_mode_enabled = True
     self.assertIsNone(plugin.check_predict_params(
       messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
+      benchmark_mode=True, seed=42,
+    ))
+
+  def test_benchmark_mode_requires_integer_seed(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin.check_generation_params = lambda **_kwargs: None
+    plugin.cfg_benchmark_mode_enabled = True
+    self.assertEqual(
+      plugin.check_predict_params(
+        messages=[{"role": "user", "content": "x"}],
+        temperature=0.1,
+        max_tokens=512,
+        benchmark_mode=True,
+        seed=None,
+      ),
+      "`seed` must be an integer in benchmark mode.",
+    )
+    self.assertIsNone(plugin.check_predict_params(
+      messages=[{"role": "user", "content": "x"}],
+      temperature=0.1,
+      max_tokens=512,
       benchmark_mode=True,
+      seed=42,
     ))
 
   def test_payload_uses_llm_serving_uppercase_contract(self):

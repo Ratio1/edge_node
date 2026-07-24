@@ -7,9 +7,22 @@ Initial RMM-002 target:
 - Dedicated serving process so RedMesh does not rely on a generic llama_cpp alias.
 """
 
+import hashlib
+
 from extensions.serving.default_inference.nlp.llama_cpp_base import LlamaCppBaseServingProcess as BaseServingProcess
 
 __VER__ = '0.1.0.0'
+
+
+def source_file_sha256(path):
+  digest = hashlib.sha256()
+  with open(path, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+WORKER_MODULE_SHA256 = source_file_sha256(__file__)
 
 
 _CONFIG = {
@@ -34,3 +47,4 @@ _CONFIG = {
 
 class LlamaCppCybersecQwen4B(BaseServingProcess):
   CONFIG = _CONFIG
+  WORKER_MODULE_SHA256 = WORKER_MODULE_SHA256
