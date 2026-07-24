@@ -33,22 +33,28 @@ from .edgeguard_cypher_guard import (
   build_schema_correction_prompt,
   canonical_schema_surface,
 )
-from .graph_first_explanation import COVERAGE_VERSION, GraphFirstContractError, ModePlan, resolve_mode
+from .graph_first_explanation import GraphFirstContractError
 from .graph_first_runtime import (
-  CANDIDATE_ID,
   GraphFirstRuntimeError,
-  MAP_SYSTEM_PROMPT_SHA256,
   NEO4J_TRACE_VERSION,
+  RESPONSE_MAX_BYTES,
+  direct_projection_descriptors,
+  sanitized_neo4j_trace,
+)
+from .explain_runtime_v2 import (
+  COVERAGE_VERSION,
+  MAX_TOKENS as EXPLANATION_V2_MAX_TOKENS,
+  ModePlanV2,
+  NOTATION_ID,
   PROFILE_ID,
   PROFILE_SHA256,
-  RESPONSE_MAX_BYTES,
-  SYNTHESIS_SYSTEM_PROMPT_SHA256,
-  TRACE_VERSION,
+  TASK_KINDS,
   TOKENIZER_DEFAULT_PATH,
-  direct_projection_descriptors,
+  TRACE_VERSION,
   empty_failure_trace,
   production_token_counter,
-  run_graph_first_explanation,
+  resolve_mode_v2,
+  run_explanation_v2,
 )
 
 try:
@@ -64,7 +70,7 @@ GRAPH_PACKET_SCHEMA_VERSION = "edgeguard.graph_evidence_packet.v1"
 QUERY_RESULT_EVIDENCE_SCHEMA_VERSION = "edgeguard.query_result_evidence.v1"
 CASE_EXPLANATION_SCHEMA_VERSION = "edgeguard.case_explanation.v1"
 CASE_EXPLANATION_DRAFT_SCHEMA_VERSION = "edgeguard.case_explanation_draft.v2"
-GRAPH_FIRST_PREPARE_SCHEMA_VERSION = "edgeguard.graph_first_prepare.v1"
+GRAPH_FIRST_PREPARE_SCHEMA_VERSION = "edgeguard.graph_first_prepare.v2"
 GRAPH_FIRST_PROVIDER_RECEIPT_SCHEMA_VERSION = "edgeguard.graph_first_provider_receipt.v1"
 GRAPH_PACKET_REDACTION_POLICY = "edgeguard_graph_packet_private_v1"
 GRAPH_EXPLANATION_PROMPT_VERSION = "edgeguard-graph-explanation-v0.7"
@@ -133,7 +139,7 @@ EXPLANATION_DIAGNOSTIC_STAGE_REASONS = {
     "provider_failure",
     "context_window_exceeded",
   },
-  "completion": {"completion_metadata_missing", "missing_content", "output_truncated"},
+  "completion": {"completion_metadata_missing", "missing_content", "output_truncated", "insufficient_deadline_budget"},
   "response_parse": {"malformed_json", "invalid_explanation_draft"},
   "validation": {"deterministic_validation_failed"},
   "internal": {"unexpected_failure"},
@@ -608,20 +614,20 @@ def _contract_error(code: str, detail: str) -> Dict[str, str]:
   return {"code": code, "detail": detail}
 
 
-def _graph_first_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, Any]:
+def _graph_first_prepare_contract(mode_plan: Optional[ModePlanV2]) -> Dict[str, Any]:
   resolved_mode = None
   if mode_plan is not None:
     resolved_mode = {
       "requested": mode_plan.mode,
       "effective": mode_plan.mode,
       "row_limit": mode_plan.row_limit,
-      "map_call_cap": mode_plan.map_call_cap,
+      "call_cap": mode_plan.call_cap,
       "max_tokens": mode_plan.max_tokens,
     }
   return {
     "schema_version": GRAPH_FIRST_PREPARE_SCHEMA_VERSION,
     "profile_id": PROFILE_ID,
-    "candidate_id": CANDIDATE_ID,
+    "notation_id": NOTATION_ID,
     "profile_sha256": PROFILE_SHA256,
     "case_explanation_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
     "coverage_schema_version": COVERAGE_VERSION,
@@ -633,7 +639,7 @@ def _graph_first_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, An
 
 def _with_graph_first_prepare_contract(
   result: Mapping[str, Any],
-  mode_plan: Optional[ModePlan] = None,
+  mode_plan: Optional[ModePlanV2] = None,
 ) -> Dict[str, Any]:
   return {
     **dict(result),
@@ -814,10 +820,10 @@ def _prepare_graph_explanation_plan(
   cypher: str,
   requested_limit: Optional[int] = None,
   broadening_enabled: bool = False,
-  mode_plan: Optional[ModePlan] = None,
+  mode_plan: Optional[ModePlanV2] = None,
 ) -> Dict[str, Any]:
   try:
-    selected_mode = mode_plan or resolve_mode(explanation_rows=requested_limit)
+    selected_mode = mode_plan or resolve_mode_v2(explanation_rows=requested_limit)
   except GraphFirstContractError as exc:
     return {
       "status": STATUS_REJECTED,
@@ -984,7 +990,7 @@ def _prepare_graph_explanation_plan(
       "requested": selected_mode.mode,
       "effective": selected_mode.mode,
       "row_limit": selected_mode.row_limit,
-      "map_call_cap": selected_mode.map_call_cap,
+      "call_cap": selected_mode.call_cap,
       "max_tokens": selected_mode.max_tokens,
     },
     "limit_policy": {
@@ -3031,10 +3037,10 @@ class EdgeguardApiPlugin(BasePlugin):
     )
     task = payload.get("metadata", {}).get("task") if isinstance(payload.get("metadata"), Mapping) else None
     task_kind = (
-      "map"
-      if task == "edgeguard_graph_first_map"
-      else "synthesis"
-      if task == "edgeguard_graph_first_synthesis"
+      "analyst"
+      if task == TASK_KINDS["analyst"]
+      else "retry"
+      if task == TASK_KINDS["retry"]
       else "unknown"
     )
     raw_finish_reason = completion.get("finish_reason")
@@ -3151,7 +3157,7 @@ class EdgeguardApiPlugin(BasePlugin):
     query_result_evidence: Mapping[str, Any],
     evidence_catalog: Mapping[str, Any],
     request: str,
-    mode_plan: ModePlan,
+    mode_plan: ModePlanV2,
     deadline: float,
   ) -> Dict[str, Any]:
     execution_trace = self._graph_first_execution_trace(plan, execution_result)
@@ -3160,20 +3166,40 @@ class EdgeguardApiPlugin(BasePlugin):
       "truncated": False,
       "limit_adjusted": bool(plan["limit_policy"].get("limit_adjusted")),
     })
-    return run_graph_first_explanation(
+    # `packet["graph"]` node/relationship ids are the same id-space as
+    # `evidence_catalog` (both are derived from the same server-side
+    # `_evidence_id(...)`-keyed dict at packet-build time -- see
+    # `_build_graph_evidence_packet_from_execution` and the direct-driver
+    # path in `explain_graph`), so the notation renderer can cite packet
+    # graph entities directly and the UI's evidence-ID membership check
+    # against `neo4j_trace` holds.
+    # Built before dispatch: `sanitized_neo4j_trace` depends only on the
+    # already-validated evidence/catalog/execution trace, never on model
+    # output, so an oversized-trace failure fails closed before any model
+    # call is spent (a stricter posture than the EEL/1-era ordering, which
+    # computed it last).
+    neo4j_trace = sanitized_neo4j_trace(query_result_evidence, evidence_catalog, execution_trace)
+    descriptors = plan.get("projection_descriptors") or []
+    projected_columns = [
+      item["property"] for item in descriptors
+      if isinstance(item, Mapping) and isinstance(item.get("property"), str)
+    ]
+    graph = {
+      "nodes": list(packet["graph"]["nodes"]),
+      "relationships": list(packet["graph"]["relationships"]),
+    }
+    graph_first = run_explanation_v2(
       question=request,
-      cypher=str(plan["accepted_cypher"]),
-      evidence=query_result_evidence,
-      catalog=evidence_catalog,
-      projection_descriptors=plan.get("projection_descriptors", []),
+      graph=graph,
       mode=mode_plan,
-      execution_trace=execution_trace,
       token_counter=self._graph_first_token_counter(),
       provider_call=self._call_graph_first_provider,
       remaining_time=lambda: max(0.0, deadline - time.monotonic()),
       model=getattr(self, "cfg_edgeguard_explanation_model", None),
       caveats=caveats,
+      projected_columns=projected_columns,
     )
+    return {**graph_first, "neo4j_trace": neo4j_trace}
 
   def _build_explanation_payload(
     self,
@@ -3320,14 +3346,14 @@ class EdgeguardApiPlugin(BasePlugin):
     self,
     error: GraphFirstRuntimeError,
     *,
-    mode_plan: Optional[ModePlan] = None,
+    mode_plan: Optional[ModePlanV2] = None,
     packet: Optional[Mapping[str, Any]] = None,
     packet_meta: Optional[Mapping[str, Any]] = None,
     validation: Optional[Mapping[str, Any]] = None,
     live_retry: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
     if error.trace is None:
-      selected_mode = mode_plan or resolve_mode()
+      selected_mode = mode_plan or resolve_mode_v2()
       error.trace = empty_failure_trace(selected_mode, error.stage, error.code)
     reference = f"egx-{secrets.token_hex(8)}"
     calls = error.trace.get("calls", []) if isinstance(error.trace, dict) else []
@@ -3340,6 +3366,8 @@ class EdgeguardApiPlugin(BasePlugin):
       "completion": (
         "completion_metadata_missing"
         if error.code == "completion_metadata_missing"
+        else "insufficient_deadline_budget"
+        if error.code == "insufficient_deadline_budget"
         else "output_truncated"
         if completion.get("finish_reason") == "length"
         else "missing_content"
@@ -3350,6 +3378,17 @@ class EdgeguardApiPlugin(BasePlugin):
     }
     stage = error.stage if error.stage in reason_by_stage else "internal"
     reason = reason_by_stage[stage]
+    # EGX/1 deterministic gate failures: the gate NAMES travel as validation
+    # codes (never the gate detail strings, which are server-log-only) --
+    # see the EGX/1 spec's "Deterministic semantic gates" section. Recovered
+    # from the last call's content-free `gates` map, never from `error.detail`.
+    call_gates = completion.get("gates") if isinstance(completion, Mapping) else None
+    failed_gate_names = (
+      sorted(name for name, outcome in call_gates.items() if isinstance(outcome, Mapping) and not outcome.get("pass"))
+      if isinstance(call_gates, Mapping)
+      else []
+    )
+    validation_codes = failed_gate_names if failed_gate_names else [error.code]
     diagnostics = {
       "schema_version": EXPLANATION_DIAGNOSTIC_SCHEMA_VERSION,
       "reference": reference,
@@ -3363,21 +3402,21 @@ class EdgeguardApiPlugin(BasePlugin):
           and not isinstance(completion.get("completion_tokens"), bool)
           else None
         ),
-        "max_tokens": 127,
+        "max_tokens": EXPLANATION_V2_MAX_TOKENS,
       },
-      "validation_codes": [error.code],
-      "validation_code_count": 1,
+      "validation_codes": validation_codes,
+      "validation_code_count": len(validation_codes),
     }
     self.P("EDGEGUARD_EXPLANATION_OUTCOME " + json.dumps({
       "completion_tokens": diagnostics["completion"]["completion_tokens"],
       "finish_reason": diagnostics["completion"]["finish_reason"],
-      "max_tokens": 127,
+      "max_tokens": EXPLANATION_V2_MAX_TOKENS,
       "reason": reason,
       "reference": reference,
       "stage": stage,
       "status": STATUS_ERROR,
-      "validation_code_count": 1,
-      "validation_codes": [error.code],
+      "validation_code_count": len(validation_codes),
+      "validation_codes": validation_codes,
     }, sort_keys=True, separators=(",", ":")))
     result = {
       "status": STATUS_TIMEOUT if error.code == "provider_timeout" else STATUS_ERROR,
@@ -3385,7 +3424,9 @@ class EdgeguardApiPlugin(BasePlugin):
       "executed": True,
       "explained": False,
       "error": "Graph explanation is unavailable.",
-      "validation_errors": [_contract_error(error.code, "Graph-first explanation failed safely.")],
+      "validation_errors": [
+        _contract_error(code, "Graph-first explanation failed safely.") for code in validation_codes
+      ],
       "diagnostics": diagnostics,
       "explanation_trace": error.trace,
     }
@@ -3595,6 +3636,11 @@ class EdgeguardApiPlugin(BasePlugin):
       "explanation_model_config_valid": explanation_error is None,
       "neo4j_driver_available": GraphDatabase is not None,
       "live_empty_result_broadening": bool(self.cfg_live_empty_result_broadening),
+      "graph_explanation": {
+        "profile_id": PROFILE_ID,
+        "notation_id": NOTATION_ID,
+        "profile_sha256": PROFILE_SHA256,
+      },
       "metrics": {
         "total_requests": self._request_count,
         "failed_requests": self._error_count,
@@ -3654,18 +3700,16 @@ class EdgeguardApiPlugin(BasePlugin):
       "retry_default": DEFAULT_SCHEMA_RETRY_LIMIT,
       "profiles": profiles,
       "graph_explanation": {
-        "prompt_version": "edgeguard-graph-first-v1",
+        "prompt_version": "edgeguard-graph-first-v2",
         "profile_id": PROFILE_ID,
-        "candidate_id": CANDIDATE_ID,
+        "notation_id": NOTATION_ID,
         "profile_sha256": PROFILE_SHA256,
-        "map_system_prompt_sha256": MAP_SYSTEM_PROMPT_SHA256,
-        "synthesis_system_prompt_sha256": SYNTHESIS_SYSTEM_PROMPT_SHA256,
         "output_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
-        "coverage_schema_version": "edgeguard.explanation_coverage.v1",
+        "coverage_schema_version": COVERAGE_VERSION,
         "neo4j_trace_schema_version": NEO4J_TRACE_VERSION,
         "explanation_trace_schema_version": TRACE_VERSION,
-        "selection_status": "selected_egm_043",
-        "expected_output": "strict graph-first map JSON and conditional synthesis JSON",
+        "selection_status": "selected_egm_047",
+        "expected_output": "citations-first analyst JSON ({\"citations\": [...], \"finding\": \"...\"})",
       },
     }
 
@@ -3696,11 +3740,11 @@ class EdgeguardApiPlugin(BasePlugin):
       "graph_explanation": {
         "status": "production_contract",
         "profile_id": PROFILE_ID,
-        "candidate_id": CANDIDATE_ID,
+        "notation_id": NOTATION_ID,
         "profile_sha256": PROFILE_SHA256,
         "packet_schema_version": GRAPH_PACKET_SCHEMA_VERSION,
         "case_explanation_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
-        "coverage_schema_version": "edgeguard.explanation_coverage.v1",
+        "coverage_schema_version": COVERAGE_VERSION,
         "neo4j_trace_schema_version": NEO4J_TRACE_VERSION,
         "explanation_trace_schema_version": TRACE_VERSION,
         "provider_config_separate": True,
@@ -3710,7 +3754,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "server_max_rows": 50,
         "execution_mode": "graph_first_prepared_evidence",
         "direct_driver_mode": "graph_first_compatibility",
-        "quality": "EGM-043 selected JSON-CB/1 profile promoted by EGM-045.",
+        "quality": "EGM-047 selected EGX/1 profile (numbered_facts notation).",
       },
       "fine_tuning": {
         "method": "QLoRA SFT",
@@ -3988,7 +4032,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
       })
     try:
-      mode_plan = resolve_mode(
+      mode_plan = resolve_mode_v2(
         explanation_mode=explanation_mode,
         explanation_rows=explanation_rows,
         max_rows=max_rows,
@@ -4034,7 +4078,7 @@ class EdgeguardApiPlugin(BasePlugin):
     plan: Dict[str, Any],
     execution_result: Any,
     request: str,
-    mode_plan: ModePlan,
+    mode_plan: ModePlanV2,
     deadline: float,
   ) -> Dict[str, Any]:
     packet, packet_meta, ingestion_errors = _build_graph_evidence_packet_from_execution(
@@ -4190,7 +4234,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
       }
     try:
-      mode_plan = resolve_mode(
+      mode_plan = resolve_mode_v2(
         explanation_mode=explanation_mode,
         explanation_rows=explanation_rows,
         max_rows=max_rows,

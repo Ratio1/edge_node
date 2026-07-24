@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import requests
 import unittest
 import sys
@@ -534,22 +535,27 @@ def _packet_from_provider_kwargs(kwargs):
 
 
 def _graph_first_provider(payload):
-  task = payload["metadata"]["task"]
+  """Generic EGX/1 analyst-profile stub: extracts the EVIDENCE block from the
+  dispatched user message and returns a grounded citations-first response
+  (cites the first `F#` fact id, quotes the first quoted name in the
+  evidence) so every gate passes regardless of the caller's graph fixture."""
   user = payload["messages"][-1]["content"]
-  data = json.loads(user.split("\nDATA\n", 1)[1])
-  if task == "edgeguard_graph_first_synthesis":
-    content = {
-      "status": "supported",
-      "text": "The returned graph evidence supports the investigation finding.",
-      "maps": [finding["id"] for finding in data],
-    }
+  evidence = user.split("EVIDENCE:\n", 1)[1].split("\n\nQUESTION:", 1)[0]
+  fact_match = re.search(r"F\d+", evidence)
+  if fact_match is None:
+    # No renderable fact survived selection (e.g. every property redacted) --
+    # respond with no citations and no quoted names, which every gate passes
+    # vacuously.
+    content = {"citations": [], "finding": "The bounded evidence did not carry a specific named finding."}
   else:
-    content = {
-      "status": "supported",
-      "text": "The returned graph evidence supports the investigation finding.",
-      "anchor": data["nodes"][0][0],
-      "rows": [row[0] for row in data["rows"]],
-    }
+    fact_id = fact_match.group(0)
+    quoted_match = re.search(r'"([^"]+)"', evidence)
+    quoted = quoted_match.group(1) if quoted_match else None
+    finding = (
+      f'The evidence links "{quoted}" [{fact_id}] to the investigation.'
+      if quoted else f"The evidence [{fact_id}] supports the investigation finding."
+    )
+    content = {"citations": [fact_id], "finding": finding}
   return {
     "content": json.dumps(content, separators=(",", ":")),
     "finish_reason": "stop",
@@ -585,7 +591,7 @@ def _make_api(**overrides):
   )
   plugin._graph_first_token_counter_for_tests = overrides.get(
     "graph_first_token_counter",
-    lambda messages: len(render_chat(messages).encode("utf-8")),
+    lambda text: max(1, len(str(text).split())) if text else 0,
   )
   plugin._graph_first_provider_for_tests = overrides.get(
     "graph_first_provider",
@@ -715,14 +721,14 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
-    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v1")
-    self.assertEqual(explanation["profile_id"], "EEL/1")
-    self.assertEqual(explanation["candidate_id"], "JSON-CB/1")
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v2")
+    self.assertEqual(explanation["profile_id"], "EGX/1")
+    self.assertEqual(explanation["notation_id"], "numbered_facts")
     self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
-    self.assertEqual(explanation["selection_status"], "selected_egm_043")
+    self.assertEqual(explanation["coverage_schema_version"], "edgeguard.explanation_coverage.v2")
+    self.assertEqual(explanation["explanation_trace_schema_version"], "edgeguard.explanation_trace.v2")
+    self.assertEqual(explanation["selection_status"], "selected_egm_047")
     self.assertRegex(explanation["profile_sha256"], r"^[0-9a-f]{64}$")
-    self.assertRegex(explanation["map_system_prompt_sha256"], r"^[0-9a-f]{64}$")
-    self.assertRegex(explanation["synthesis_system_prompt_sha256"], r"^[0-9a-f]{64}$")
 
   def test_graph_explanation_prompt_centers_question_and_bounds_graph_evidence(self):
     packet = _case_explanation_packet()
@@ -1305,13 +1311,17 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_session.run.assert_called_once_with("MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25")
     call_payload = captured_payloads[0]
     self.assertEqual(call_payload["model"], "base_qwen3_4b")
-    self.assertEqual(call_payload["temperature"], 0.1)
-    self.assertEqual(call_payload["top_p"], 1.0)
-    self.assertEqual(call_payload["max_tokens"], 127)
+    self.assertEqual(call_payload["temperature"], 0.7)
+    self.assertEqual(call_payload["top_p"], 0.8)
+    self.assertEqual(call_payload["max_tokens"], 320)
     self.assertEqual(call_payload["response_format"], {"type": "json_object"})
     self.assertNotIn("schema", call_payload["response_format"])
-    self.assertEqual(call_payload["metadata"]["profile_id"], "EEL/1")
-    self.assertEqual(result["explanation_trace"]["calls"][0]["request"], call_payload)
+    self.assertEqual(call_payload["metadata"]["profile_id"], "EGX/1")
+    self.assertEqual(
+      result["explanation_trace"]["calls"][0]["configuration"],
+      {"temperature": 0.7, "top_p": 0.8, "max_tokens": 320},
+    )
+    self.assertNotIn("request", result["explanation_trace"]["calls"][0])
 
   def test_explanation_payload_caps_output_and_honors_smaller_positive_limit(self):
     plugin = _make_api(edgeguard_explanation_max_tokens=1600)
@@ -1379,20 +1389,20 @@ class EdgeGuardApiTests(unittest.TestCase):
       "limit_adjusted": True,
     })
     self.assertEqual(result["explanation_contract"], {
-      "schema_version": "edgeguard.graph_first_prepare.v1",
-      "profile_id": "EEL/1",
-      "candidate_id": "JSON-CB/1",
-      "profile_sha256": "865f47894e13b1ff9242fd121b760994d413f7220db99c57851c0008f61d64e3",
+      "schema_version": "edgeguard.graph_first_prepare.v2",
+      "profile_id": "EGX/1",
+      "notation_id": "numbered_facts",
+      "profile_sha256": "7edfcd2c8873d02db9da72de13cadc631e65d4a9f2273df2a9a2c10ced9f1488",
       "case_explanation_schema_version": "edgeguard.case_explanation.v1",
-      "coverage_schema_version": "edgeguard.explanation_coverage.v1",
+      "coverage_schema_version": "edgeguard.explanation_coverage.v2",
       "neo4j_trace_schema_version": "edgeguard.neo4j_trace.v1",
-      "explanation_trace_schema_version": "edgeguard.explanation_trace.v1",
+      "explanation_trace_schema_version": "edgeguard.explanation_trace.v2",
       "resolved_mode": {
         "requested": "balanced",
         "effective": "balanced",
         "row_limit": 25,
-        "map_call_cap": 2,
-        "max_tokens": 127,
+        "call_cap": 1,
+        "max_tokens": 320,
       },
     })
     flattened = json.dumps(result)
@@ -1410,7 +1420,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "config_error")
     self.assertEqual(
       result["explanation_contract"]["schema_version"],
-      "edgeguard.graph_first_prepare.v1",
+      "edgeguard.graph_first_prepare.v2",
     )
     self.assertEqual(
       result["explanation_contract"]["resolved_mode"]["effective"],
@@ -1425,9 +1435,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     response = _nested_provider_response(content, completion_tokens="16")
     payload = {
       "metadata": {
-        "candidate_id": "JSON-CB/1",
-        "profile_id": "EEL/1",
-        "task": "edgeguard_graph_first_map",
+        "profile_id": "EGX/1",
+        "notation_id": "numbered_facts",
+        "task": "edgeguard_explain_v2_analyst",
       },
     }
 
@@ -1447,7 +1457,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     receipt = json.loads(receipt_logs[0].split(" ", 1)[1])
     self.assertEqual(receipt, {
       "schema_version": "edgeguard.graph_first_provider_receipt.v1",
-      "task_kind": "map",
+      "task_kind": "analyst",
       "envelope_path": "$.result.FULL_OUTPUT",
       "content_bytes": len(content.encode("utf-8")),
       "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -1470,9 +1480,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     payload = {
       "metadata": {
-        "candidate_id": "JSON-CB/1",
-        "profile_id": "EEL/1",
-        "task": "edgeguard_graph_first_map",
+        "profile_id": "EGX/1",
+        "notation_id": "numbered_facts",
+        "task": "edgeguard_explain_v2_analyst",
       },
     }
 
@@ -2733,7 +2743,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["result"]["diagnostics"]["reason"], "output_truncated")
     self.assertNotIn("raw_output", json.dumps(result["result"]["explanation_trace"]))
 
-  def test_explain_graph_rejects_extra_map_output_keys(self):
+  def test_explain_graph_rejects_extra_analyst_output_keys(self):
     def invalid_provider(payload):
       valid = json.loads(_graph_first_provider(payload)["content"])
       valid["extra"] = "not allowed"
@@ -2765,7 +2775,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["logged"])
     self.assertEqual(diagnostics["stage"], "response_parse")
     self.assertEqual(diagnostics["reason"], "malformed_json")
-    self.assertEqual(codes, {"invalid_map_output"})
+    self.assertEqual(codes, {"invalid_model_output"})
     serialized_result = json.dumps(result["result"])
     serialized_logs = " ".join(str(call) for call in plugin.P.call_args_list)
     self.assertNotIn("raw_output", serialized_result)
@@ -2776,12 +2786,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertNotIn("private-question-sentinel", serialized_logs)
     self.assertNotIn("example.org", serialized_logs)
 
-  def test_explain_graph_rejects_unknown_map_anchor(self):
+  def test_explain_graph_rejects_fabricated_citation_after_one_retry(self):
     def invalid_provider(payload):
-      valid = json.loads(_graph_first_provider(payload)["content"])
-      valid["anchor"] = "N999"
       return {
-        "content": json.dumps(valid),
+        "content": json.dumps({"citations": ["F999"], "finding": "fabricated citation not in the evidence."}),
         "finish_reason": "stop",
         "completion_tokens": 16,
         "duration_ms": 1.0,
@@ -2801,21 +2809,23 @@ class EdgeGuardApiTests(unittest.TestCase):
         )
 
     self.assertEqual(result["status_code"], 500)
-    self.assertIn(
-      "invalid_map_citation",
-      set(result["result"]["diagnostics"]["validation_codes"]),
-    )
+    codes = set(result["result"]["diagnostics"]["validation_codes"])
+    self.assertIn("citation_membership", codes)
     self.assertEqual(
       {item["code"] for item in result["result"]["validation_errors"]},
-      {"invalid_map_citation"},
+      codes,
     )
+    self.assertEqual(result["result"]["diagnostics"]["reason"], "deterministic_validation_failed")
+    self.assertEqual(result["result"]["explanation_trace"]["outcome"]["attempted_calls"], 2)
 
-  def test_explain_graph_rejects_incomplete_map_row_citations(self):
+  def test_explain_graph_rejects_ungrounded_quoted_finding_after_one_retry(self):
     def invalid_provider(payload):
-      valid = json.loads(_graph_first_provider(payload)["content"])
-      valid["rows"] = []
+      user = payload["messages"][-1]["content"]
+      evidence = user.split("EVIDENCE:\n", 1)[1].split("\n\nQUESTION:", 1)[0]
+      import re as re_mod
+      fact_id = re_mod.search(r"F\d+", evidence).group(0)
       return {
-        "content": json.dumps(valid),
+        "content": json.dumps({"citations": [fact_id], "finding": 'The evidence names "totally-fabricated-name" here.'}),
         "finish_reason": "stop",
         "completion_tokens": 16,
         "duration_ms": 1.0,
@@ -2836,12 +2846,13 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     codes = set(result["result"]["diagnostics"]["validation_codes"])
     self.assertEqual(result["status_code"], 500)
-    self.assertEqual(codes, {"invalid_map_citation"})
+    self.assertIn("lexical_grounding", codes)
     self.assertNotIn("explanation", result["result"])
     self.assertEqual(
       {item["code"] for item in result["result"]["validation_errors"]},
-      {"invalid_map_citation"},
+      codes,
     )
+    self.assertNotIn("totally-fabricated-name", json.dumps(result["result"]))
 
   def test_explain_graph_returns_provider_error_after_packet_build(self):
     plugin = _make_api(graph_first_provider=None)
