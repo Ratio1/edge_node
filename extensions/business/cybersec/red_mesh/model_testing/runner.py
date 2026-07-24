@@ -795,7 +795,7 @@ class ModelTestRunner:
         raw_evidence_cases.append(case_evidence)
       metrics["completed_cases"] += 1
       results.append(case_result)
-    overall_status = "completed" if metrics["evaluated_cases"] == metrics["total_cases"] else "incomplete"
+    overall_status = "complete" if metrics["evaluated_cases"] == metrics["total_cases"] else "incomplete"
     if not results:
       overall_status = "failed"
     summary = {

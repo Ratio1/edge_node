@@ -48,11 +48,36 @@ def _delete_job_record(owner, job_id):
   _job_repo(owner).delete_job(job_id)
 
 
+def _foreign_launcher_error(owner, job_id, job_specs, action):
+  launcher = job_specs.get("launcher") if isinstance(job_specs, dict) else None
+  if not launcher or launcher == getattr(owner, "ee_addr", None):
+    return None
+  owner.P(f"{action} rejected on non-launcher node for job {job_id}.", color='y')
+  owner._log_audit_event(f"job_{action}_owner_rejected", {
+    "job_id": job_id,
+    "writer": getattr(owner, "ee_addr", None),
+  })
+  return {
+    "error": "job_launcher_mismatch",
+    "message": f"{action.replace('_', ' ').capitalize()} must be handled by the job launcher.",
+    "status_code": 409,
+    "job_id": job_id,
+  }
+
+
 def stop_and_delete_job(owner, job_id: str):
   """
   Stop a running job, mark it stopped, then delegate to purge_job
   for full R1FS + CStore cleanup.
   """
+  raw_job_specs = _job_repo(owner).get_job(job_id)
+  job_specs = None
+  if isinstance(raw_job_specs, dict):
+    _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+    owner_error = _foreign_launcher_error(owner, job_id, job_specs, "stop_and_delete")
+    if owner_error:
+      return owner_error
+
   local_workers = owner.scan_jobs.get(job_id)
   if local_workers:
     owner.P(f"Stopping and deleting job {job_id}.")
@@ -62,9 +87,7 @@ def stop_and_delete_job(owner, job_id: str):
     owner.P(f"Job {job_id} stopped.")
   owner.scan_jobs.pop(job_id, None)
 
-  raw_job_specs = _job_repo(owner).get_job(job_id)
-  if isinstance(raw_job_specs, dict):
-    _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+  if isinstance(job_specs, dict):
     workers_map = job_specs.setdefault("workers", {})
     if is_model_test_job(job_specs):
       selected_worker = selected_model_test_worker_addr(job_specs, fallback=getattr(owner, "ee_addr", None))
@@ -122,6 +145,9 @@ def _purge_job_locked(owner, job_id: str):
     return {"status": "error", "message": f"Job {job_id} not found."}
 
   _, job_specs = owner._normalize_job_record(job_id, raw)
+  owner_error = _foreign_launcher_error(owner, job_id, job_specs, "purge")
+  if owner_error:
+    return owner_error
 
   job_status = job_specs.get("job_status", "")
   workers = job_specs.get("workers", {})
@@ -459,6 +485,15 @@ def purge_all_jobs(owner):
 
   terminal_statuses = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED)
   for job_id, raw_payload in job_entries:
+    owner_error = _foreign_launcher_error(owner, job_id, raw_payload, "purge_all")
+    if owner_error:
+      jobs_failed += 1
+      failed_job_ids.add(job_id)
+      errors.append({
+        "job_id": job_id,
+        "message": owner_error["message"],
+      })
+      continue
     raw_status = raw_payload.get("job_status") if isinstance(raw_payload, dict) else None
     use_direct_purge = raw_status in terminal_statuses
     try:
@@ -745,6 +780,9 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
     return {"error": "Job not found", "job_id": job_id}
 
   _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+  owner_error = _foreign_launcher_error(owner, job_id, job_specs, "stop_monitoring")
+  if owner_error:
+    return owner_error
   stop_type = str(stop_type).upper()
   is_continuous = job_specs.get("run_mode") == RUN_MODE_CONTINUOUS_MONITORING
 

@@ -22,6 +22,16 @@ def _artifact_repo(owner):
   return ArtifactRepository(owner)
 
 
+def _write_job_record(owner, job_id, job_specs, context):
+  writer = getattr(type(owner), "_write_job_record", None)
+  if callable(writer):
+    return writer(owner, job_id, job_specs, context=context)
+  launcher = job_specs.get("launcher") if isinstance(job_specs, dict) else None
+  if launcher and launcher != getattr(owner, "ee_addr", None):
+    return None
+  return _job_repo(owner).put_job(job_id, job_specs)
+
+
 def _archive_contains_finding(archive: dict, finding_id: str) -> bool:
   return _find_archive_finding(archive, finding_id) is not None
 
@@ -97,6 +107,14 @@ def _update_finding_triage_locked(owner, job_id: str, finding_id: str, status: s
     return {"error": "not_found", "message": f"Job {job_id} not found."}
   if not job_specs.get("job_cid"):
     return {"error": "not_available", "message": f"Job {job_id} is still running (triage requires archived findings)."}
+  launcher = job_specs.get("launcher")
+  if launcher and launcher != getattr(owner, "ee_addr", None):
+    return {
+      "error": "job_launcher_mismatch",
+      "message": "Finding triage must be handled by the job launcher.",
+      "status_code": 409,
+      "job_id": job_id,
+    }
 
   archive = _artifact_repo(owner).get_archive(job_specs)
   if not isinstance(archive, dict):
@@ -140,7 +158,7 @@ def _update_finding_triage_locked(owner, job_id: str, finding_id: str, status: s
     event_action="triaged",
   )
   if isinstance(job_specs.get("soc_event_status"), dict):
-    repo.put_job(job_id, job_specs)
+    _write_job_record(owner, job_id, job_specs, context="finding_triage_soc_event")
   return {
     "job_id": job_id,
     "finding_id": finding_id,
