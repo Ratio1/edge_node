@@ -538,7 +538,7 @@ def run_explanation_v2(
         raise GraphFirstRuntimeError("invalid_model_output", "response_parse", "graph-first response is not valid citations-first JSON")
 
       gate_results = gates.evaluate_all(parsed, rendered)
-      call["gates"] = {name: {"pass": passed} for name, (passed, _detail) in gate_results.items()}
+      call["gates"] = {name: passed for name, (passed, _detail) in gate_results.items()}
       all_pass = all(passed for passed, _detail in gate_results.values())
       completed += 1
       if all_pass:

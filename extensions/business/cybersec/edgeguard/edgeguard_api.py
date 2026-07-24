@@ -3384,7 +3384,7 @@ class EdgeguardApiPlugin(BasePlugin):
     # from the last call's content-free `gates` map, never from `error.detail`.
     call_gates = completion.get("gates") if isinstance(completion, Mapping) else None
     failed_gate_names = (
-      sorted(name for name, outcome in call_gates.items() if isinstance(outcome, Mapping) and not outcome.get("pass"))
+      sorted(name for name, outcome in call_gates.items() if outcome is False)
       if isinstance(call_gates, Mapping)
       else []
     )
