@@ -85,7 +85,10 @@ pipeline JSON committed to git.
 - `POST /prepare_graph_explanation`, which revalidates accepted Cypher and returns a credential-free
   primary query, limit policy, and optional deterministic broadening query
 - evidence-mode `POST /explain_graph`, which recomputes that plan, validates a bounded serialized
-  graph, assigns packet-local IDs, redacts properties, and never opens a Neo4j driver
+  graph, assigns packet-local IDs, redacts properties, runs the EGX/1 explanation profile
+  (deterministic Stage A-D relevance selection, `numbered_facts` evidence rendering with real
+  entity names, one analyst call plus at most one validated retry, five deterministic semantic
+  gates), and never opens a Neo4j driver
 - deprecated direct-driver Neo4j query/explanation compatibility endpoints; the playground does not
   use them for graph explanation
 
