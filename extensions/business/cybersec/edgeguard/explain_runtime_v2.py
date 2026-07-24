@@ -513,8 +513,14 @@ def run_explanation_v2(
       call = _new_call(f"C{attempt}", kind, payload)
       trace["calls"].append(call)
       attempted += 1
+      dispatch_started = time.monotonic()
       raw = provider_call(payload)
-      call["duration_ms"] = raw.get("duration_ms")
+      reported_duration = raw.get("duration_ms")
+      call["duration_ms"] = (
+        float(reported_duration)
+        if isinstance(reported_duration, (int, float)) and reported_duration >= 0
+        else round((time.monotonic() - dispatch_started) * 1000.0, 3)
+      )
       finish_reason = raw.get("finish_reason")
       call["finish_reason"] = finish_reason
       call["completion_tokens"] = _validated_completion_tokens(raw.get("completion_tokens"))
