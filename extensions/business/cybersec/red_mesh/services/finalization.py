@@ -28,6 +28,7 @@ from .event_hooks import (
   emit_finding_event,
   emit_lifecycle_event,
 )
+from .rulebook_assessment import ensure_rulebook_assessment
 from .scan_strategy import coerce_scan_type, get_scan_strategy
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
 
@@ -97,6 +98,82 @@ def _record_stale_intermediate_recovery(owner, job_specs, previous_status, worke
     })
 
 
+def _automatic_analysis_report_identity(workers):
+  return tuple(sorted(
+    (str(address), str(worker.get("report_cid") or ""))
+    for address, worker in (workers or {}).items()
+    if isinstance(worker, dict)
+  ))
+
+
+def _automatic_analysis_state_matches(job_specs, state):
+  if not isinstance(job_specs, dict) or not isinstance(state, dict):
+    return False
+  return (
+    job_specs.get("job_id") == state.get("job_id")
+    and job_specs.get("job_pass", 1) == state.get("pass_nr")
+    and _automatic_analysis_report_identity(job_specs.get("workers"))
+      == state.get("report_identity")
+  )
+
+
+def _poll_automatic_analysis(owner, all_jobs):
+  """Yield while automatic model work runs, then return its single result."""
+  state = owner.__dict__.get("_automatic_analysis_state")
+  if not isinstance(state, dict):
+    return None, False
+
+  current_job = None
+  for job_key, job_specs in all_jobs.items():
+    normalized_key, normalized = owner._normalize_job_record(job_key, job_specs)
+    if normalized_key is None:
+      continue
+    if isinstance(normalized, dict) and normalized.get("job_id") == state.get("job_id"):
+      current_job = normalized
+      break
+
+  future = state.get("future")
+  invalidated = (
+    not _automatic_analysis_state_matches(current_job, state)
+    or is_terminal_job_status((current_job or {}).get("job_status"))
+  )
+  if invalidated:
+    state["discard_result"] = True
+    if future is not None:
+      future.cancel()
+
+  if future is None:
+    owner._automatic_analysis_state = None
+    return None, False
+  if not future.done():
+    return None, True
+  if state.get("discard_result"):
+    try:
+      future.result()
+    except Exception:
+      pass
+    owner._automatic_analysis_state = None
+    return None, False
+
+  try:
+    sections = future.result()
+  except Exception as exc:
+    owner.P(
+      f"Structured LLM call raised for job {state.get('job_id')}: {exc}",
+      color='y',
+    )
+    sections = None
+    failed = True
+  else:
+    failed = bool(getattr(owner, "_last_structured_llm_failed", None))
+  owner._automatic_analysis_state = None
+  return {
+    "state": state,
+    "sections": sections,
+    "failed": failed,
+  }, False
+
+
 def _attestation_required(job_specs, job_config) -> bool:
   if isinstance(job_specs, dict) and "blockchain_attestation_enabled" in job_specs:
     return bool(job_specs.get("blockchain_attestation_enabled"))
@@ -129,12 +206,38 @@ def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, mess
   owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
 
 
+def _ensure_rulebook_assessment_after_pass(owner, job_specs, *, job_id, pass_nr):
+  try:
+    result = ensure_rulebook_assessment(owner, job_id, pass_nr=pass_nr)
+  except Exception as exc:
+    owner.P(f"[NIS2] Rulebook assessment ensure failed for job {job_id} pass {pass_nr}: {exc}", color='y')
+    return job_specs
+
+  if not isinstance(result, dict) or result.get("status") != "ok":
+    error = result.get("error") if isinstance(result, dict) else "unknown_error"
+    owner.P(f"[NIS2] Rulebook assessment not generated for job {job_id} pass {pass_nr}: {error}", color='y')
+    return job_specs
+
+  owner.P(
+    f"[NIS2] Rulebook assessment ready for job {job_id} pass {pass_nr}: "
+    f"{result.get('artifact_cid') or 'cached'}"
+  )
+  refreshed = owner._get_job_from_cstore(job_id)
+  return refreshed if isinstance(refreshed, dict) else job_specs
+
+
 def maybe_finalize_pass(owner):
   """
   Launcher finalizes completed passes and orchestrates continuous monitoring.
   """
   all_jobs = _job_repo(owner).list_jobs()
   artifacts = _artifact_repo(owner)
+  automatic_completion, should_yield = _poll_automatic_analysis(
+    owner,
+    all_jobs,
+  )
+  if should_yield:
+    return
 
   for job_key, job_specs in all_jobs.items():
     normalized_key, job_specs = owner._normalize_job_record(job_key, job_specs)
@@ -157,12 +260,24 @@ def maybe_finalize_pass(owner):
     next_pass_at = job_specs.get("next_pass_at")
     job_pass = job_specs.get("job_pass", 1)
     job_id = job_specs.get("job_id")
+    resumed_automatic_analysis = (
+      isinstance(automatic_completion, dict)
+      and _automatic_analysis_state_matches(
+        job_specs,
+        automatic_completion.get("state"),
+      )
+    )
+    if resumed_automatic_analysis:
+      if job_status != JOB_STATUS_SCHEDULED_FOR_STOP:
+        job_status = automatic_completion["state"]["job_status"]
+    elif isinstance(automatic_completion, dict):
+      continue
     if is_terminal_job_status(job_status):
       if not job_specs.get("job_cid") and job_specs.get("pass_reports"):
         owner.P(f"[STUCK RECOVERY] {job_id} is {job_status} but has no job_cid — retrying archive build", color='y')
         owner._build_job_archive(job_id, job_specs)
       continue
-    if is_intermediate_job_status(job_status):
+    if is_intermediate_job_status(job_status) and not resumed_automatic_analysis:
       if not _is_stale_intermediate_recovery_candidate(job_specs, workers, job_status, next_pass_at):
         continue
       _record_stale_intermediate_recovery(owner, job_specs, job_status, len(workers))
@@ -171,7 +286,10 @@ def maybe_finalize_pass(owner):
 
     if all_finished and next_pass_at is None:
       pass_date_started = owner._get_timeline_date(job_specs, "pass_started") or owner._get_timeline_date(job_specs, "created")
-      pass_date_completed = owner.time()
+      pass_date_completed = (
+        automatic_completion["state"]["pass_date_completed"]
+        if resumed_automatic_analysis else owner.time()
+      )
       now_ts = pass_date_completed
 
       set_job_status(job_specs, JOB_STATUS_COLLECTING)
@@ -217,28 +335,47 @@ def maybe_finalize_pass(owner):
       llm_report_sections = None
       structured_llm_failed = None
       if llm_cfg["ENABLED"] and aggregated:
-        set_job_status(job_specs, JOB_STATUS_ANALYZING)
-        job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
-        # PTES report narrative uses only the structured LLM path.
-        # Legacy aggregate/quick-summary calls accepted raw scan-shaped
-        # payloads and are intentionally bypassed for report finalization.
-        try:
-          llm_report_sections = owner._run_structured_report_sections(
-            job_id=job_id,
-            findings=flat_findings,
-            aggregated_report=aggregated,
-            engagement=job_config.get("engagement") if isinstance(job_config, dict) else None,
-          )
-          structured_llm_failed = getattr(owner, "_last_structured_llm_failed", None)
-          if llm_report_sections and not structured_llm_failed:
-            llm_text, summary_text = render_legacy_llm_fields(llm_report_sections)
-        except Exception as exc:
-          owner.P(
-            f"Structured LLM call raised for job {job_id}: {exc}",
-            color='y',
-          )
-          llm_report_sections = None
-          structured_llm_failed = True
+        if resumed_automatic_analysis:
+          llm_report_sections = automatic_completion["sections"]
+          structured_llm_failed = automatic_completion["failed"]
+        else:
+          set_job_status(job_specs, JOB_STATUS_ANALYZING)
+          job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
+          try:
+            executor = owner._get_manual_analysis_executor()
+            # HTTP work yields with PostponedRequest. Automatic work has no
+            # request to postpone, so process() yields by checking this future
+            # on later turns.
+            future = executor.submit(
+              owner._run_structured_report_sections,
+              job_id=job_id,
+              findings=flat_findings,
+              aggregated_report=aggregated,
+              engagement=(
+                job_config.get("engagement")
+                if isinstance(job_config, dict) else None
+              ),
+            )
+            owner._automatic_analysis_state = {
+              "job_id": job_id,
+              "pass_nr": job_pass,
+              "report_identity": _automatic_analysis_report_identity(workers),
+              "job_status": job_status,
+              "pass_date_completed": pass_date_completed,
+              "future": future,
+              "discard_result": False,
+            }
+            return
+          except Exception as exc:
+            owner._automatic_analysis_state = None
+            owner.P(
+              f"Structured LLM call raised for job {job_id}: {exc}",
+              color='y',
+            )
+            structured_llm_failed = True
+
+        if llm_report_sections and not structured_llm_failed:
+          llm_text, summary_text = render_legacy_llm_fields(llm_report_sections)
 
       llm_failed = True if (llm_cfg["ENABLED"] and structured_llm_failed) else None
       if llm_failed:
@@ -421,6 +558,7 @@ def maybe_finalize_pass(owner):
 
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
+      job_specs = _ensure_rulebook_assessment_after_pass(owner, job_specs, job_id=job_id, pass_nr=job_pass)
 
       if required_attestation_failed:
         _mark_attestation_failed(

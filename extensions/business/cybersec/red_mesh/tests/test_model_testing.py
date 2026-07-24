@@ -934,17 +934,19 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertIsNotNone(err)
     self.assertEqual(err["error_class"], "forbidden_destination")
 
-  def test_duplicate_credential_sources_fail_closed(self):
+  def test_credential_ref_with_secret_payload_is_rejected_without_identifier_leak(self):
+    credential_ref = "model_provider/operator/user-123/provider-a"
     _, err = validate_model_provider_credentials(
       {
-        "credential_ref": "model_provider/operator/user-123/provider-a",
+        "credential_ref": credential_ref,
       },
       {"api_key": "secret"},
       role="tested_model",
       created_by_id="user-123",
     )
 
-    self.assertEqual(err["error_class"], "duplicate_credential_source")
+    self.assertEqual(err["error_class"], "credential_unavailable")
+    self.assertNotIn(credential_ref, str(err))
 
   def test_inline_credential_fields_in_provider_config_fail_closed(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
@@ -1014,6 +1016,20 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
         self.assertEqual(err["error_class"], "credential_unavailable")
         self.assertNotIn(ref, str(err))
 
+  def test_launch_rejects_validly_shaped_credential_ref_before_persistence(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    credential_ref = "model_provider/operator/user-123/provider-a"
+    kwargs = _valid_launch_kwargs()
+    kwargs["tested_model"] = _provider(credential_ref=credential_ref)
+    kwargs["tested_model_secret_payload"] = None
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertEqual(result["error_class"], "credential_unavailable")
+    self.assertNotIn(credential_ref, str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
   def test_preflight_model_test_provider_accepts_valid_remote_provider(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
     secret = "sentinel-model-api-key"
@@ -1064,17 +1080,19 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
 
   def test_preflight_model_test_provider_requires_api_key_payload(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
+    credential_ref = "model_provider/operator/user-123/provider-a"
 
     result = preflight_model_test_provider(
       owner,
       created_by_id="user-123",
-      tested_model=_provider(credential_ref="model_provider/operator/user-123/provider-a"),
+      tested_model=_provider(credential_ref=credential_ref),
       tested_model_secret_payload=None,
     )
 
     self.assertFalse(result["ok"])
     self.assertEqual(result["error_class"], "credential_unavailable")
     self.assertIn("requires an API key", result["message"])
+    self.assertNotIn(credential_ref, str(result))
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
 
@@ -1379,6 +1397,11 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job_type": "model_test",
       "blockchain_attestation_enabled": True,
     }
+    plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    plugin.r1fs.get_json.side_effect = [
+      {"job_type": "model_test", "blockchain_attestation_enabled": True},
+      {"job_id": "job-123"},
+    ]
     plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
     job_specs = {
       "job_id": "job-123",
@@ -1409,15 +1432,17 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "QmWorkerResult",
     )
 
-    self.assertFalse(result)
+    self.assertTrue(result)
     plugin._submit_redmesh_test_attestation.assert_called_once()
-    plugin.r1fs.add_json.assert_not_called()
-    plugin._write_job_record.assert_called_with(
-      "job-123",
-      job_specs,
-      context="model_test_attestation_failed",
-    )
-    self.assertEqual(job_specs["job_status"], "FAILED")
+    archive = plugin.r1fs.add_json.call_args.args[0]
+    terminal_events = [event for event in archive["timeline"] if event["type"] in {"finalized", "failed", "canceled"}]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["type"], "failed")
+    self.assertEqual(terminal_events[0]["meta"]["overall_status"], "complete")
+    self.assertEqual(terminal_events[0]["meta"]["error_class"], "finalization_failed")
+    stub = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(stub["job_status"], "FAILED")
+    self.assertEqual(stub["failure_class"], "attestation_failed")
     self.assertEqual(job_specs["failure_class"], "attestation_failed")
 
   def test_model_test_finalization_end_attestation_exception_marks_failed(self):
@@ -1434,6 +1459,11 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job_type": "model_test",
       "blockchain_attestation_enabled": True,
     }
+    plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    plugin.r1fs.get_json.side_effect = [
+      {"job_type": "model_test", "blockchain_attestation_enabled": True},
+      {"job_id": "job-123"},
+    ]
     plugin._submit_redmesh_test_attestation = MagicMock(side_effect=RuntimeError("chain offline"))
     job_specs = {
       "job_id": "job-123",
@@ -1464,9 +1494,11 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "QmWorkerResult",
     )
 
-    self.assertFalse(result)
-    plugin.r1fs.add_json.assert_not_called()
-    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertTrue(result)
+    archive = plugin.r1fs.add_json.call_args.args[0]
+    self.assertEqual(archive["timeline"][-1]["type"], "failed")
+    stub = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(stub["job_status"], "FAILED")
     self.assertEqual(job_specs["failure_class"], "attestation_failed")
 
   def test_model_test_finalization_stores_successful_end_attestation(self):
@@ -1526,6 +1558,43 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stub["job_status"], "FINALIZED")
     self.assertTrue(stub["blockchain_attestation_enabled"])
 
+  def test_model_test_terminal_event_is_idempotent(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "Launcher"
+    plugin.time.return_value = 200.0
+    job_specs = {
+      "job_id": "job-idempotent",
+      "launcher": "launcher-node",
+      "model_test_summary": {
+        "overall_status": "incomplete",
+        "cases_completed": 4,
+        "cases_total": 12,
+      },
+      "model_test_node_selection": {"selected_execution_node": "worker-node"},
+      "workers": {"worker-node": {}},
+      "timeline": [],
+    }
+
+    PentesterApi01Plugin._terminalize_model_test_job(
+      plugin, job_specs, "incomplete", "FINALIZED",
+    )
+    PentesterApi01Plugin._terminalize_model_test_job(
+      plugin, job_specs, "incomplete", "FINALIZED",
+    )
+
+    terminal_events = [event for event in job_specs["timeline"] if event["type"] == "finalized"]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["meta"], {
+      "overall_status": "incomplete",
+      "selected_execution_node": "worker-node",
+      "cases_completed": 4,
+      "cases_total": 12,
+    })
+
   def test_model_test_finalization_records_raw_evidence_capture_failed_when_requested_without_artifact(self):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -1568,9 +1637,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job-raw",
       job_specs,
       {
-        "status": "completed",
-        "model_test_results": {"overall_status": "completed", "cases": []},
-        "model_test_summary": {"overall_status": "completed"},
+        "status": "incomplete",
+        "model_test_results": {"overall_status": "incomplete", "cases": []},
+        "model_test_summary": {"overall_status": "incomplete"},
       },
       "QmWorkerResult",
     )
@@ -1588,8 +1657,10 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stub["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_CAPTURE_FAILED)
     self.assertEqual(stub["model_test_raw_evidence"]["error_class"], RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE)
     event_types = [event["type"] for event in archive_payload["timeline"]]
-    self.assertIn("completed", event_types)
-    self.assertIn("finalized", event_types)
+    self.assertEqual(event_types.count("finalized"), 1)
+    terminal_event = next(event for event in archive_payload["timeline"] if event["type"] == "finalized")
+    self.assertEqual(terminal_event["meta"]["overall_status"], "incomplete")
+    self.assertEqual(archive_payload["model_test_summary"]["overall_status"], "incomplete")
 
   def test_model_test_finalization_stores_requested_raw_evidence_in_restricted_lane(self):
     mock_plugin_modules()
@@ -1677,8 +1748,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("raw prompt secret", str(archive_payload))
     self.assertNotIn("raw answer secret", str(archive_payload))
     event_types = [event["type"] for event in archive_payload["timeline"]]
-    self.assertIn("completed", event_types)
-    self.assertIn("finalized", event_types)
+    self.assertEqual(event_types.count("finalized"), 1)
+    terminal_event = next(event for event in archive_payload["timeline"] if event["type"] == "finalized")
+    self.assertEqual(terminal_event["meta"]["overall_status"], "complete")
 
     raw_metadata_write = next(
       call.kwargs["value"]
@@ -1870,11 +1942,6 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
 
     plugin = MagicMock()
     plugin.cfg_instance_id = "instance"
-    plugin.cfg_api_operations = {
-      "ENABLED": True,
-      "TOKEN_HASHES": [hashlib.sha256(b"backend-token").hexdigest()],
-      "HMAC_SECRET": "unit-test-hmac-secret",
-    }
     job_specs = {
       "job_id": "job-raw",
       "job_type": "model_test",
@@ -2040,6 +2107,21 @@ class TestModelTestNodeSelection(unittest.TestCase):
 
 
 class TestModelTestingPersistenceContracts(unittest.TestCase):
+
+  def test_legacy_completed_status_remains_readable(self):
+    from extensions.business.cybersec.red_mesh.model_test_sanitization import (
+      sanitize_model_test_results,
+      sanitize_model_test_summary,
+    )
+
+    self.assertEqual(
+      sanitize_model_test_summary({"overall_status": "completed"})["overall_status"],
+      "completed",
+    )
+    self.assertEqual(
+      sanitize_model_test_results({"overall_status": "completed"})["overall_status"],
+      "completed",
+    )
 
   def test_model_test_artifact_serializers_strip_raw_payload_fields(self):
     from extensions.business.cybersec.red_mesh.model_testing.artifacts import (
@@ -2480,6 +2562,39 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(jobs["job-1"]["model_test_summary"]["overall_status"], "queued")
     self.assertEqual(jobs["job-1"]["model_test_node_selection"]["selected_execution_node"], "node-a")
 
+  def test_local_listing_includes_sanitized_model_test_job(self):
+    from extensions.business.cybersec.red_mesh.services.query import list_local_jobs
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {"overall_status": "queued"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+    }
+    worker = MagicMock()
+    worker.state = {
+      "model_test_summary": {
+        "overall_status": "running",
+        "error_message": "raw provider exception secret-token",
+      },
+      "error_message": "raw worker exception secret-token",
+    }
+    owner = _owner()
+    owner.scan_jobs = {}
+    owner.model_test_jobs = {"job-1": worker}
+    owner.chainstore_hget = MagicMock()
+    owner.chainstore_hget.return_value = job_specs
+
+    jobs = list_local_jobs(owner)
+
+    self.assertEqual(jobs["job-1"]["job_type"], "model_test")
+    self.assertEqual(jobs["job-1"]["task_kind"], "model_test")
+    self.assertEqual(jobs["job-1"]["model_test_summary"]["overall_status"], "running")
+    self.assertNotIn("error_message", str(jobs["job-1"]))
+    self.assertNotIn("secret-token", str(jobs["job-1"]))
+
   def test_finalized_cstore_model_preserves_model_test_fields(self):
     finalized = CStoreJobFinalized(
       job_id="job-1",
@@ -2653,7 +2768,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     worker = selected.model_test_jobs["job-1"]
     self.assertIsInstance(worker, ModelTestWorker)
     worker.thread.join(timeout=1)
-    self.assertEqual(worker.state["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(worker.state["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(worker.state["model_test_summary"]["evaluated_cases"], 12)
     self.assertEqual(len(worker.state["model_test_results"]["cases"]), 12)
     self.assertEqual(worker.state["model_test_results"]["cases"][0]["status"], "evaluated")
@@ -2805,6 +2920,100 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(job_specs["model_test_summary"]["overall_status"], "cancel_requested")
     self.assertNotIn("launcher-node", job_specs["workers"])
 
+  def test_stop_monitoring_rejects_foreign_launcher_without_mutation(self):
+    from extensions.business.cybersec.red_mesh.services.control import stop_monitoring
+
+    stored = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "workers": {"node-a": {"worker_type": "model_test", "finished": False}},
+    }
+    local_worker = MagicMock()
+    owner = _owner(
+      ee_addr="worker-node",
+      chainstore_hget=MagicMock(return_value=deepcopy(stored)),
+    )
+    owner.scan_jobs = {}
+    owner.model_test_jobs = {"job-1": local_worker}
+    owner._normalize_job_record = MagicMock(
+      side_effect=lambda key, specs: (key, deepcopy(specs)),
+    )
+    owner._emit_timeline_event = MagicMock()
+    owner._log_audit_event = MagicMock()
+    owner.P = MagicMock()
+
+    result = stop_monitoring(owner, "job-1", stop_type="HARD")
+
+    self.assertEqual(result["error"], "job_launcher_mismatch")
+    self.assertEqual(result["status_code"], 409)
+    self.assertEqual(stored["job_status"], "RUNNING")
+    owner.chainstore_hset.assert_not_called()
+    owner._emit_timeline_event.assert_not_called()
+    local_worker.stop.assert_not_called()
+
+  def test_stop_and_delete_rejects_foreign_launcher_before_side_effects(self):
+    from extensions.business.cybersec.red_mesh.services.control import stop_and_delete_job
+
+    stored = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "launcher": "launcher-node",
+      "workers": {"node-a": {"worker_type": "model_test", "finished": False}},
+    }
+    local_worker = MagicMock()
+    owner = _owner(
+      ee_addr="worker-node",
+      chainstore_hget=MagicMock(return_value=deepcopy(stored)),
+    )
+    owner.scan_jobs = {}
+    owner.model_test_jobs = {"job-1": local_worker}
+    owner._normalize_job_record = MagicMock(
+      side_effect=lambda key, specs: (key, deepcopy(specs)),
+    )
+    owner._log_audit_event = MagicMock()
+    owner.P = MagicMock()
+    owner.purge_job = MagicMock()
+
+    result = stop_and_delete_job(owner, "job-1")
+
+    self.assertEqual(result["error"], "job_launcher_mismatch")
+    self.assertEqual(result["status_code"], 409)
+    owner.chainstore_hset.assert_not_called()
+    owner.purge_job.assert_not_called()
+    local_worker.stop.assert_not_called()
+
+  def test_purge_rejects_foreign_launcher_before_artifact_deletion(self):
+    from extensions.business.cybersec.red_mesh.services.control import _purge_job_locked
+
+    stored = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "launcher": "launcher-node",
+      "job_cid": "cid-archive",
+      "workers": {},
+    }
+    owner = _owner(
+      ee_addr="worker-node",
+      chainstore_hget=MagicMock(return_value=deepcopy(stored)),
+    )
+    owner._normalize_job_record = MagicMock(
+      side_effect=lambda key, specs: (key, deepcopy(specs)),
+    )
+    owner._log_audit_event = MagicMock()
+    owner.P = MagicMock()
+    owner.r1fs.delete = MagicMock()
+
+    result = _purge_job_locked(owner, "job-1")
+
+    self.assertEqual(result["error"], "job_launcher_mismatch")
+    self.assertEqual(result["status_code"], 409)
+    owner.r1fs.delete.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
   def test_maybe_stop_canceled_jobs_stops_active_model_test_worker(self):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -2887,7 +3096,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "done": True,
       "canceled": False,
       "model_test_results": {
-        "overall_status": "completed",
+        "overall_status": "complete",
         "cases": [
           {
             "case_id": "cbrn-chemical-001",
@@ -2905,7 +3114,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         ],
       },
       "model_test_summary": {
-        "overall_status": "completed",
+        "overall_status": "complete",
         "cases_total": 12,
         "cases_completed": 12,
         "evaluated_cases": 12,
@@ -3008,43 +3217,19 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     PentesterApi01Plugin._maybe_close_model_test_jobs(plugin)
 
     self.assertEqual(plugin.model_test_jobs, {})
-    self.assertEqual(plugin.r1fs.add_json.call_count, 2)
+    self.assertEqual(plugin.r1fs.add_json.call_count, 1)
     stored_result = stored_artifacts[0]
     self.assertEqual(stored_result["schema_version"], "model_test_worker_result_v1")
     self.assertEqual(stored_result["job_id"], "job-1")
     self.assertEqual(stored_result["worker_addr"], "node-a")
-    self.assertEqual(stored_result["status"], "completed")
-    self.assertEqual(stored_result["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(stored_result["status"], "complete")
+    self.assertEqual(stored_result["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(stored_result["model_test_results"]["cases"][0]["status"], "evaluated")
-    stored_archive = stored_artifacts[1]
-    self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
-    self.assertEqual(stored_archive["job_id"], "job-1")
-    self.assertEqual(stored_archive["job_type"], "model_test")
-    self.assertEqual(stored_archive["job_config"]["job_id"], "job-1")
-    self.assertNotIn("model_provider_secret_ref", stored_archive["job_config"])
-    self.assertNotIn("model_provider_secret_store_key_id", stored_archive["job_config"])
-    self.assertEqual(stored_archive["model_test_results"]["overall_status"], "completed")
-    self.assertEqual(stored_archive["model_test_results"]["cases"][0]["case_id"], "cbrn-chemical-001")
-    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "completed")
-    self.assertEqual(stored_archive["model_test_node_selection"]["selected_execution_node"], "node-a")
-    self.assertEqual(stored_archive["ui_aggregate"]["scan_type"], "model_test")
-    self.assertEqual(stored_archive["ui_aggregate"]["finding_count"], 0)
-    self.assertEqual(stored_archive["duration"], 10.0)
-    self.assertEqual(len(written_records), 1)
-    persisted_specs = written_records[0][1]
-    self.assertEqual(written_records[0][2], "model_test_archive_prune")
-    self.assertEqual(persisted_specs["job_status"], "FINALIZED")
-    self.assertEqual(persisted_specs["job_type"], "model_test")
-    self.assertEqual(persisted_specs["scan_type"], "model_test")
-    self.assertEqual(persisted_specs["job_cid"], "cid-archive")
-    self.assertEqual(persisted_specs["job_config_cid"], "cid-config")
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
-    self.assertEqual(persisted_specs["model_test_node_selection"]["selected_execution_node"], "node-a")
-    self.assertNotIn("workers", persisted_specs)
+    self.assertEqual(written_records, [])
     plugin._publish_model_test_progress.assert_called_once()
     _, _, progress_specs = plugin._publish_model_test_progress.call_args.args[:3]
     self.assertEqual(progress_specs["workers"]["node-a"]["report_cid"], "cid-result")
-    self.assertEqual(progress_specs["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(progress_specs["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(plugin.scan_jobs, {})
 
   def test_finished_model_test_job_recovery_finalizes_stale_running_record(self):
@@ -3081,10 +3266,9 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
           "worker_type": "model_test",
           "start_port": 0,
           "end_port": 0,
-          "finished": True,
+          "finished": False,
           "canceled": False,
-          "model_test_worker_status": "finished",
-          "report_cid": "cid-result",
+          "model_test_worker_status": "assigned",
           "assignment_revision": 1,
           "assigned_at": 123.0,
         },
@@ -3137,10 +3321,31 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       },
     }
     plugin = MagicMock()
-    plugin.ee_addr = "node-a"
+    plugin.ee_addr = "launcher-node"
     plugin.cfg_instance_id = "instance"
     plugin.time.return_value = 130.0
-    plugin.chainstore_hgetall.return_value = {"job-stale": job_specs}
+    terminal_live = {
+      "job-stale:node-a": {
+        "job_id": "job-stale",
+        "worker_addr": "node-a",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 100.0,
+        "phase": "done",
+        "ports_scanned": 0,
+        "ports_total": 0,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 130.0,
+        "finished": True,
+        "report_cid": "cid-result",
+        "scan_type": "model_test",
+        "job_type": "model_test",
+      },
+    }
+    plugin.chainstore_hgetall.side_effect = lambda hkey: (
+      terminal_live if hkey == "instance:live" else {"job-stale": job_specs}
+    )
     plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
     written_records = []
     stored_artifacts = []
@@ -3174,15 +3379,39 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     stored_archive = stored_artifacts[0]
     self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
     self.assertEqual(stored_archive["job_id"], "job-stale")
-    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(stored_archive["model_test_results"]["cases"][0]["case_id"], "cbrn-chemical-001")
     self.assertEqual(len(written_records), 1)
     persisted_specs = written_records[0][1]
     self.assertEqual(written_records[0][2], "model_test_archive_prune")
     self.assertEqual(persisted_specs["job_status"], "FINALIZED")
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "complete")
     self.assertNotIn("workers", persisted_specs)
+
+  def test_non_launcher_cannot_finalize_model_test_job(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "worker-node"
+    plugin.r1fs = MagicMock()
+    job_specs = {
+      "job_id": "job-owned",
+      "launcher": "launcher-node",
+      "job_config_cid": "cid-config",
+    }
+
+    finalized = PentesterApi01Plugin._finalize_model_test_job(
+      plugin,
+      "job-owned",
+      job_specs,
+      {"status": "complete", "model_test_results": {}, "model_test_summary": {}},
+      "cid-result",
+    )
+
+    self.assertFalse(finalized)
+    plugin.r1fs.add_json.assert_not_called()
 
   def test_finished_model_test_recovery_skips_failed_attestation_record(self):
     mock_plugin_modules()
@@ -3408,8 +3637,16 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(stored_artifacts[1]["schema_version"], "model_test_archive_v1")
     self.assertEqual(stored_artifacts[1]["model_test_summary"]["cases_completed"], 4)
     self.assertEqual(stored_artifacts[1]["model_test_results"]["cases"][0]["case_id"], "case-1")
+    terminal_events = [
+      event for event in stored_artifacts[1]["timeline"]
+      if event["type"] in {"finalized", "failed", "canceled"}
+    ]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["type"], "failed")
+    self.assertEqual(terminal_events[0]["meta"]["overall_status"], "failed")
+    self.assertEqual(terminal_events[0]["meta"]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
     persisted_specs = written_records[-1][1]
-    self.assertEqual(persisted_specs["job_status"], "STOPPED")
+    self.assertEqual(persisted_specs["job_status"], "FAILED")
     self.assertEqual(persisted_specs["model_test_summary"]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
     self.assertEqual(persisted_specs["model_test_summary"]["cases_completed"], 4)
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
@@ -3519,6 +3756,14 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(failed, [])
     self.assertEqual(stored_artifacts[0]["status"], "canceled")
     self.assertEqual(stored_artifacts[0]["error_class"], MODEL_TEST_ERROR_CANCELED_BY_USER)
+    terminal_events = [
+      event for event in stored_artifacts[1]["timeline"]
+      if event["type"] in {"finalized", "failed", "canceled"}
+    ]
+    self.assertEqual(len(terminal_events), 1)
+    self.assertEqual(terminal_events[0]["type"], "canceled")
+    self.assertEqual(terminal_events[0]["meta"]["overall_status"], "canceled")
+    self.assertNotIn("stopped", [event["type"] for event in stored_artifacts[1]["timeline"]])
     persisted_specs = written_records[-1][1]
     self.assertEqual(persisted_specs["job_status"], "STOPPED")
     self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "canceled")

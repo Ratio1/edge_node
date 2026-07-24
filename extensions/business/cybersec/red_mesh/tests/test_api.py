@@ -1,7 +1,13 @@
+import ast
+import inspect
 import json
 import sys
 import struct
+import time
+import textwrap
 import unittest
+from concurrent.futures import Future
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
@@ -1735,6 +1741,20 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 300, "RETRIES": 2}
     plugin.time.return_value = 1000100.0
     plugin.json_dumps.return_value = "{}"
+    plugin._automatic_analysis_state = None
+    if llm_enabled:
+      executor = MagicMock()
+
+      def submit_immediately(fn, *args, **kwargs):
+        future = Future()
+        try:
+          future.set_result(fn(*args, **kwargs))
+        except Exception as exc:
+          future.set_exception(exc)
+        return future
+
+      executor.submit.side_effect = submit_immediately
+      plugin._get_manual_analysis_executor.return_value = executor
 
     # R1FS mock
     plugin.r1fs = MagicMock()
@@ -2248,6 +2268,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     # Check PassReport has llm_failed=True
     pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
@@ -2299,6 +2320,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     plugin._run_quick_summary_analysis.assert_not_called()
     plugin._run_aggregated_llm_analysis.assert_not_called()
@@ -2307,6 +2329,155 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(pass_report_dict["quick_summary"], "Structured headline")
     self.assertIn("## Overall Posture", pass_report_dict["llm_analysis"])
     self.assertIn("Structured posture", pass_report_dict["llm_analysis"])
+
+  def test_automatic_analysis_yields_and_resumes_without_stale_recovery(self):
+    """Pending model work returns promptly and is consumed once on a later turn."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+    sections = {
+      "executive_headline": "Structured headline",
+      "overall_posture": "Structured posture",
+      "recommendation_summary": ["Patch exposed services"],
+      "conclusion": "Structured conclusion",
+    }
+
+    started = time.monotonic()
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertLess(time.monotonic() - started, 0.1)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    self.assertIsNotNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+
+    started = time.monotonic()
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertLess(time.monotonic() - started, 0.1)
+
+    executor.submit.assert_called_once()
+    plugin._collect_node_reports.assert_called_once()
+    plugin._log_audit_event.assert_not_called()
+
+    plugin._last_structured_llm_failed = False
+    future.set_result(sections)
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_soft_stop_during_automatic_analysis_is_preserved_on_resume(self):
+    """A responsive soft stop requested while analysis runs must end the pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    from extensions.business.cybersec.red_mesh.services.control import stop_monitoring
+
+    plugin, job_specs = self._build_finalize_plugin(
+      run_mode="CONTINUOUS_MONITORING",
+      llm_enabled=True,
+    )
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+    plugin.chainstore_hget.return_value = job_specs
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+
+    stop_result = stop_monitoring(plugin, job_specs["job_id"], stop_type="SOFT")
+    self.assertEqual(stop_result["job_status"], "SCHEDULED_FOR_STOP")
+
+    plugin._last_structured_llm_failed = False
+    future.set_result({"executive_headline": "Analysis complete"})
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+
+  def test_automatic_analysis_future_failure_keeps_existing_llm_failure_path(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    future.set_exception(RuntimeError("provider failed"))
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(pass_report_dict["llm_failed"])
+    self.assertIsNone(pass_report_dict.get("llm_report_sections"))
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertIsNone(plugin._automatic_analysis_state)
+
+  def test_automatic_analysis_submit_failure_keeps_existing_llm_failure_path(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    executor = MagicMock()
+    executor.submit.side_effect = RuntimeError("executor unavailable")
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(pass_report_dict["llm_failed"])
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertIsNone(plugin._automatic_analysis_state)
+
+  def test_terminal_job_cancels_pending_automatic_analysis(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    executor = MagicMock()
+    executor.submit.return_value = future
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    job_specs["job_status"] = "FINALIZED"
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertTrue(future.cancelled())
+    self.assertIsNone(plugin._automatic_analysis_state)
+    executor.submit.assert_called_once()
+    self.assertEqual(job_specs["pass_reports"], [])
+
+  def test_changed_report_identity_cancels_pending_automatic_analysis(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+    self._configure_successful_pass_finalization(plugin, job_specs)
+    future = Future()
+    replacement_future = Future()
+    executor = MagicMock()
+    executor.submit.side_effect = [future, replacement_future]
+    plugin._get_manual_analysis_executor.return_value = executor
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+    job_specs["workers"]["worker-A"]["report_cid"] = "QmChanged"
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertTrue(future.cancelled())
+    self.assertIsNotNone(plugin._automatic_analysis_state)
+    self.assertIn(
+      ("worker-A", "QmChanged"),
+      plugin._automatic_analysis_state["report_identity"],
+    )
+    self.assertEqual(executor.submit.call_count, 2)
+    self.assertEqual(job_specs["pass_reports"], [])
 
   def test_pass_reports_survive_typed_job_record_rewrites(self):
     """Pass reports must stay attached after typed repository rewrites the job dict."""
@@ -2337,6 +2508,55 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(job_specs["pass_reports"][0]["pass_nr"], 1)
     archived_job_specs = plugin._build_job_archive.call_args[0][1]
     self.assertEqual(len(archived_job_specs["pass_reports"]), 1)
+
+  def test_finalization_runs_nis2_ensure_after_pass_report(self):
+    """Completed pass finalization triggers default-on NIS2 assessment ensure."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.finalization.ensure_rulebook_assessment",
+      return_value={"status": "ok", "artifact_cid": "QmRulebook", "pass_nr": 1},
+    ) as ensure_mock:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    ensure_mock.assert_called_once_with(plugin, job_specs["job_id"], pass_nr=1)
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_nis2_ensure_failure_does_not_block_finalization(self):
+    """NIS2 generation is best-effort and must not fail the scan."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.finalization.ensure_rulebook_assessment",
+      return_value={"status": "error", "error": "artifact_write_failed"},
+    ) as ensure_mock:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    ensure_mock.assert_called_once_with(plugin, job_specs["job_id"], pass_nr=1)
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_continuous_pass_runs_nis2_ensure_before_next_pass_schedule(self):
+    """Continuous jobs refresh NIS2 readiness against each completed pass."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.finalization.ensure_rulebook_assessment",
+      return_value={"status": "ok", "artifact_cid": "QmRulebook", "pass_nr": 1},
+    ) as ensure_mock:
+      PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    ensure_mock.assert_called_once_with(plugin, job_specs["job_id"], pass_nr=1)
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertIsNotNone(job_specs["next_pass_at"])
+    plugin._build_job_archive.assert_not_called()
 
   def test_aggregated_report_write_failure(self):
     """R1FS fails for aggregated → pass finalization skipped, no partial state."""
@@ -3042,6 +3262,23 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertIn("ui_aggregate", archive_dict)
     self.assertIn("total_open_ports", archive_dict["ui_aggregate"])
 
+  def test_duplicate_archive_finalization_reuses_existing_cid(self):
+    """Retrying finalization after prune is harmless and writes no artifact."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    plugin.chainstore_hget.return_value = {
+      "job_id": "test-job",
+      "job_status": "FINALIZED",
+      "launcher": "launcher-node",
+      "job_cid": "QmExistingArchive",
+    }
+
+    result = Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    self.assertEqual(result, "QmExistingArchive")
+    plugin.r1fs.add_json.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
+
   def test_archive_ui_aggregate_includes_graybox_summary(self):
     """Archive UI aggregate preserves graybox scan metadata and scenario counts."""
     Plugin = self._get_plugin_class()
@@ -3404,6 +3641,16 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin._get_job_from_cstore = lambda job_id: Plugin._get_job_from_cstore(plugin, job_id)
     return plugin
 
+  def test_get_report_does_not_pin_retrieved_cid(self):
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
+
+    result = Plugin.get_report(plugin, "QmReportCID")
+
+    self.assertEqual(result["report"]["artifact_kind"], "review_submission")
+    plugin.r1fs.get_json.assert_called_once_with("QmReportCID", pin=False)
+
   def test_get_job_archive_finalized(self):
     """get_job_archive for finalized job returns archive with matching job_id."""
     Plugin = self._get_plugin_class()
@@ -3510,8 +3757,9 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["error"], "not_available")
 
   def test_manual_structured_analysis_backfills_legacy_fields(self):
-    """Manual structured analysis updates the pass report for get_analysis compatibility."""
+    """Postponed manual analysis updates the pass report for compatibility."""
     Plugin = self._get_plugin_class()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import _ManualAnalysisOutcome
     job_specs = self._build_running_job("job-llm", pass_count=1)
     for worker in job_specs["workers"].values():
       worker["finished"] = True
@@ -3525,6 +3773,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "AUTO_ANALYSIS_TYPE": "security_assessment",
     }
     plugin.cfg_llm_agent_api_port = 8080
+    plugin.cfg_llm_agent_api_host = "127.0.0.1"
+    plugin.cfg_request_timeout = 120
     plugin.r1fs = MagicMock()
     plugin.r1fs.get_json.return_value = {
       "pass_nr": 1,
@@ -3546,23 +3796,41 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
     plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+    plugin._collect_bounded_manual_analysis_reports = (
+      lambda workers: Plugin._collect_bounded_manual_analysis_reports(plugin, workers)
+    )
+    sections = {
+      "executive_headline": "Manual structured headline",
+      "overall_posture": "Manual structured posture",
+      "recommendation_summary": ["Review internet exposure"],
+      "conclusion": "Manual structured conclusion",
+    }
+    future = MagicMock()
+    future.done.return_value = True
+    future.result.return_value = _ManualAnalysisOutcome(sections=sections, failed=False)
+    plugin._manual_analysis_executor = MagicMock()
+    plugin._manual_analysis_executor.submit.return_value = future
+    plugin._manual_analysis_state = None
+    plugin.time.return_value = 100.0
+    plugin.create_postponed_request.return_value = "postponed"
 
-    def _structured_success(*_args, **_kwargs):
-      plugin._last_structured_llm_failed = False
-      return {
-        "executive_headline": "Manual structured headline",
-        "overall_posture": "Manual structured posture",
-        "recommendation_summary": ["Review internet exposure"],
-        "conclusion": "Manual structured conclusion",
-      }
+    def _write_job(_owner, _job_id, persisted, **_kwargs):
+      job_specs["pass_reports"] = deepcopy(persisted["pass_reports"])
+      return persisted
 
-    plugin._run_structured_report_sections = MagicMock(side_effect=_structured_success)
-
-    result = Plugin.analyze_job(plugin, job_id="job-llm")
+    with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
+      postponed = Plugin.analyze_job(
+        plugin,
+        job_id="job-llm",
+      )
+      self.assertEqual(postponed, "postponed")
+      pending_id = plugin._manual_analysis_state["pending_id"]
+      result = Plugin.solve_postponed_analyze_job(plugin, pending_id)
 
     updated_pass = plugin.r1fs.add_json.call_args[0][0]
+    persisted_job = write_job.call_args[0][2]
     self.assertEqual(result["analysis_type"], "structured_report_sections")
-    self.assertEqual(job_specs["pass_reports"][-1]["report_cid"], "QmUpdatedPass")
+    self.assertEqual(persisted_job["pass_reports"][-1]["report_cid"], "QmUpdatedPass")
     self.assertEqual(updated_pass["quick_summary"], "Manual structured headline")
     self.assertIn("Manual structured posture", updated_pass["llm_analysis"])
     self.assertIn("Review internet exposure", updated_pass["llm_analysis"])
@@ -3656,17 +3924,21 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(running.job_revision, 3)
     plugin._log_audit_event.assert_not_called()
 
-  def test_job_write_guarantees_report_detection_only_mode(self):
-    """RedMesh exposes detection-only semantics when chainstore lacks CAS."""
+  def test_job_write_guarantees_report_launcher_guard_mode(self):
+    """Lifecycle guards are explicit without claiming chainstore CAS."""
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
 
-    self.assertFalse(Plugin._supports_guarded_job_writes(plugin))
+    self.assertTrue(Plugin._supports_guarded_job_writes(plugin))
     self.assertEqual(Plugin._get_job_write_guarantees(plugin), {
-      "mode": "detection_only",
-      "guarded_writes": False,
+      "mode": "launcher_single_writer",
+      "guarded_writes": True,
       "stale_write_detection": True,
+      "terminal_monotonicity": True,
       "job_revision": True,
+      "atomic_compare_and_swap": False,
+      "distributed_lease": False,
+      "duplicate_owner_exclusion": "operational",
     })
 
   def test_write_job_record_logs_stale_write(self):
@@ -3687,8 +3959,77 @@ class TestPhase5Endpoints(unittest.TestCase):
       "expected_revision": 3,
       "current_revision": 5,
       "context": "close_job",
-      "write_mode": "detection_only",
+      "write_mode": "launcher_single_writer",
     })
+
+  def test_shared_job_write_rejects_non_launcher(self):
+    Plugin = self._get_plugin_class()
+    current = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "launcher": "launcher-node",
+      "job_revision": 2,
+    }
+    plugin = self._build_plugin({"job-1": current})
+    plugin.ee_addr = "worker-node"
+    plugin.chainstore_hset = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.P = MagicMock()
+
+    result = Plugin._write_job_record(
+      plugin, "job-1", dict(current), context="stix_export",
+    )
+
+    self.assertIsNone(result)
+    plugin.chainstore_hset.assert_not_called()
+    plugin._log_audit_event.assert_called_once()
+
+  def test_terminal_write_cannot_regress(self):
+    Plugin = self._get_plugin_class()
+    current = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "launcher": "launcher-node",
+      "job_cid": "cid-final",
+      "job_revision": 4,
+    }
+    plugin = self._build_plugin({"job-1": current})
+    plugin.chainstore_hset = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.P = MagicMock()
+
+    result = Plugin._write_job_record(
+      plugin,
+      "job-1",
+      {**current, "job_status": "RUNNING", "job_cid": None},
+      context="finalize_collecting",
+    )
+
+    self.assertEqual(result, current)
+    plugin.chainstore_hset.assert_not_called()
+    plugin._log_audit_event.assert_called_once()
+
+  def test_duplicate_terminal_archive_write_is_idempotent(self):
+    Plugin = self._get_plugin_class()
+    current = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "launcher": "launcher-node",
+      "job_cid": "cid-final",
+      "job_revision": 4,
+    }
+    plugin = self._build_plugin({"job-1": current})
+    plugin.chainstore_hset = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.P = MagicMock()
+
+    result = Plugin._write_job_record(
+      plugin, "job-1", dict(current), context="archive_prune",
+    )
+
+    self.assertEqual(result, current)
+    plugin.chainstore_hset.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
 
   def test_get_job_config_resolves_secret_ref_for_runtime(self):
     """Runtime config loading resolves secret_ref into inline credentials."""
@@ -3760,7 +4101,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       )
     self.assertEqual(len(plugin.r1fs.get_json.call_args_list), 2)
 
-  def test_mark_worker_terminal_error_sets_common_fields(self):
+  def test_mark_worker_terminal_error_publishes_live_terminal_state(self):
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
     job_specs = {
@@ -3768,92 +4109,27 @@ class TestPhase5Endpoints(unittest.TestCase):
       "workers": {"worker-a": {"start_port": 443, "end_port": 443}},
     }
 
-    with patch.object(Plugin, "_write_job_record", return_value=job_specs) as write:
-      Plugin._mark_worker_terminal_error(
-        plugin,
-        job_specs,
-        "worker-a",
-        "secret_resolution_failed",
-        "Failed to resolve graybox secret_ref",
-        context="test_terminal",
-      )
+    plugin.time.return_value = 100.0
+    Plugin._mark_worker_terminal_error(
+      plugin,
+      job_specs,
+      "worker-a",
+      "secret_resolution_failed",
+      "Failed to resolve graybox secret_ref",
+      context="test_terminal",
+    )
 
-    worker = job_specs["workers"]["worker-a"]
-    self.assertTrue(worker["finished"])
-    self.assertEqual(worker["terminal_reason"], "secret_resolution_failed")
-    self.assertIn("secret_ref", worker["error"])
-    write.assert_called_once()
+    live_call = next(
+      call for call in plugin.chainstore_hset.call_args_list
+      if call.kwargs.get("hkey") == "test-instance:live"
+    )
+    live = live_call.kwargs["value"]
+    self.assertTrue(live["finished"])
+    self.assertEqual(live["error_class"], "secret_resolution_failed")
+    self.assertNotIn("error", live)
+    self.assertNotIn("error_message", live)
 
-  def test_mark_worker_terminal_error_merges_against_current_record(self):
-    """B8: concurrent terminal writes must merge by worker key, not overwrite."""
-    Plugin = self._get_plugin_class()
-    # Current record in CStore has worker-A already terminal (written by
-    # worker A's concurrent failure).
-    current_record = {
-      "job_id": "job-concurrent",
-      "job_status": "RUNNING",
-      "job_pass": 1,
-      "run_mode": "SINGLEPASS",
-      "launcher": "launcher-node",
-      "target": "example.com",
-      "scan_type": "webapp",
-      "target_url": "https://example.com/app",
-      "start_port": 443,
-      "end_port": 443,
-      "date_created": 1000000.0,
-      "job_config_cid": "QmConfig",
-      "workers": {
-        "worker-A": {
-          "start_port": 443, "end_port": 443,
-          "finished": True,
-          "terminal_reason": "assignment_validation_failed",
-          "error": "A error",
-        },
-        "worker-B": {"start_port": 443, "end_port": 443, "finished": False},
-      },
-      "timeline": [],
-      "pass_reports": [],
-      "job_revision": 7,
-    }
-    plugin = self._build_plugin({"job-concurrent": current_record})
-
-    # Worker-B's stale local snapshot doesn't know about A's terminal flag.
-    stale_snapshot = {
-      "job_id": "job-concurrent",
-      "workers": {
-        "worker-A": {"start_port": 443, "end_port": 443, "finished": False},
-        "worker-B": {"start_port": 443, "end_port": 443, "finished": False},
-      },
-    }
-
-    captured = {}
-
-    def _capture(self_plugin, job_id, job_specs, expected_revision=None, context=""):
-      captured["job_id"] = job_id
-      captured["job_specs"] = dict(job_specs)
-      captured["context"] = context
-      return job_specs
-
-    with patch.object(Plugin, "_write_job_record", side_effect=_capture):
-      Plugin._mark_worker_terminal_error(
-        plugin,
-        stale_snapshot,
-        "worker-B",
-        "launch_failed",
-        "B error",
-        context="b_terminal",
-      )
-
-    persisted_workers = captured["job_specs"]["workers"]
-    # A's pre-existing terminal data survived the B write.
-    self.assertTrue(persisted_workers["worker-A"]["finished"])
-    self.assertEqual(persisted_workers["worker-A"]["terminal_reason"], "assignment_validation_failed")
-    self.assertEqual(persisted_workers["worker-A"]["error"], "A error")
-    # B's terminal patch is applied.
-    self.assertTrue(persisted_workers["worker-B"]["finished"])
-    self.assertEqual(persisted_workers["worker-B"]["terminal_reason"], "launch_failed")
-
-  def test_maybe_launch_jobs_secret_resolution_failure_marks_terminal(self):
+  def test_maybe_launch_jobs_secret_resolution_failure_publishes_terminal_live(self):
     Plugin = self._get_plugin_class()
     assignments, error = build_graybox_worker_assignments(["launcher-node"])
     self.assertIsNone(error)
@@ -3898,10 +4174,33 @@ class TestPhase5Endpoints(unittest.TestCase):
     with patch.object(Plugin, "_write_job_record", return_value=job_specs) as write:
       Plugin._maybe_launch_jobs(plugin)
 
-    self.assertTrue(worker_entry["finished"])
-    self.assertEqual(worker_entry["terminal_reason"], "secret_resolution_failed")
-    self.assertIn("secret_ref", worker_entry["error"])
-    write.assert_called_once()
+    write.assert_not_called()
+    live_call = next(
+      call for call in plugin.chainstore_hset.call_args_list
+      if call.kwargs.get("hkey") == "test-instance:live"
+    )
+    self.assertTrue(live_call.kwargs["value"]["finished"])
+    self.assertEqual(live_call.kwargs["value"]["error_class"], "secret_resolution_failed")
+
+  def test_worker_background_paths_have_no_shared_lifecycle_writer_calls(self):
+    """Structural guard: worker/background paths cannot call the shared writer."""
+    Plugin = self._get_plugin_class()
+    functions = (
+      Plugin._maybe_launch_model_test_jobs,
+      Plugin._maybe_close_model_test_jobs,
+      Plugin._maybe_stop_canceled_jobs,
+      Plugin._close_job,
+      Plugin._mark_worker_terminal_error,
+    )
+    for function in functions:
+      tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+      writer_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_write_job_record"
+      ]
+      self.assertEqual(writer_calls, [], function.__name__)
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""
@@ -4523,6 +4822,99 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     self.assertFalse(result["found"])
     self.assertEqual(result["audit"], [])
+
+
+class TestModelTestingEndpointAuth(unittest.TestCase):
+  """Protected Model Testing endpoints validate the backend bearer token."""
+
+  @classmethod
+  def setUpClass(cls):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    cls.Plugin = PentesterApi01Plugin
+
+  def test_missing_backend_token_configuration_fails_closed(self):
+    plugin = MagicMock()
+    with patch.dict("os.environ", {}, clear=True), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "presented-token")
+
+    self.assertEqual(result["status_code"], 401)
+    self.assertEqual(result["error_class"], "backend_auth_unavailable")
+    self.assertNotIn("presented-token", str(result))
+    launch.assert_not_called()
+
+  def test_invalid_backend_token_is_forbidden_without_leak(self):
+    plugin = MagicMock()
+    expected = "expected-backend-token-material-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": expected}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "invalid-presented-token")
+
+    self.assertEqual(result["status_code"], 403)
+    self.assertEqual(result["error_class"], "backend_auth_invalid")
+    self.assertNotIn(expected, str(result))
+    self.assertNotIn("invalid-presented-token", str(result))
+    launch.assert_not_called()
+
+  def test_short_backend_token_configuration_fails_closed(self):
+    plugin = MagicMock()
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": "short-test-token"}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "short-test-token")
+
+    self.assertEqual(result["status_code"], 401)
+    self.assertEqual(result["error_class"], "backend_auth_unavailable")
+    self.assertNotIn("short-test-token", str(result))
+    launch.assert_not_called()
+
+  def test_empty_presented_token_is_unauthorized(self):
+    plugin = MagicMock()
+    expected = "expected-backend-token-material-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": expected}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test"
+    ) as launch:
+      result = self.Plugin.launch_model_test(plugin, "")
+
+    self.assertEqual(result["status_code"], 401)
+    self.assertEqual(result["error_class"], "backend_auth_required")
+    self.assertNotIn(expected, str(result))
+    launch.assert_not_called()
+
+  def test_authenticated_launch_forwards_navigator_actor_assertion(self):
+    plugin = MagicMock()
+    token = "valid-backend-token-material-at-least-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test",
+      return_value={"status": "ok"},
+    ) as launch:
+      result = self.Plugin.launch_model_test(
+        plugin,
+        token,
+        created_by_id="navigator-user-123",
+      )
+
+    self.assertEqual(result, {"status": "ok"})
+    self.assertEqual(launch.call_args.kwargs["created_by_id"], "navigator-user-123")
+
+  def test_authenticated_preflight_forwards_navigator_actor_assertion(self):
+    plugin = MagicMock()
+    token = "valid-backend-token-material-at-least-32-bytes"
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.preflight_model_test_provider",
+      return_value={"status": "ok"},
+    ) as preflight:
+      result = self.Plugin.preflight_model_test_provider(
+        plugin,
+        token,
+        created_by_id="navigator-user-123",
+      )
+
+    self.assertEqual(result, {"status": "ok"})
+    self.assertEqual(preflight.call_args.kwargs["created_by_id"], "navigator-user-123")
 
 
 class TestPhase2AuditCounting(unittest.TestCase):

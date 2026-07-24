@@ -1,4 +1,5 @@
 from copy import deepcopy
+from contextlib import ExitStack
 
 from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
@@ -19,6 +20,16 @@ def _artifact_repo(owner):
   if callable(getter):
     return getter(owner)
   return ArtifactRepository(owner)
+
+
+def _write_job_record(owner, job_id, job_specs, context):
+  writer = getattr(type(owner), "_write_job_record", None)
+  if callable(writer):
+    return writer(owner, job_id, job_specs, context=context)
+  launcher = job_specs.get("launcher") if isinstance(job_specs, dict) else None
+  if launcher and launcher != getattr(owner, "ee_addr", None):
+    return None
+  return _job_repo(owner).put_job(job_id, job_specs)
 
 
 def _archive_contains_finding(archive: dict, finding_id: str) -> bool:
@@ -65,6 +76,26 @@ def get_job_triage(owner, job_id: str, finding_id: str = ""):
 
 
 def update_finding_triage(owner, job_id: str, finding_id: str, status: str, note: str = "", actor: str = "", review_at: float = 0):
+  from .rulebook_assessment import _submission_lock, list_rulebook_profiles
+
+  with ExitStack() as stack:
+    profiles = sorted(list_rulebook_profiles(), key=lambda item: item["profile_id"])
+    for profile in profiles:
+      stack.enter_context(_submission_lock(owner, job_id, profile["profile_id"]))
+    repo = _job_repo(owner)
+    for profile in profiles:
+      registry = repo.get_rulebook_submission_registry(job_id, profile["profile_id"])
+      if isinstance(registry, dict) and registry.get("pending"):
+        return {
+          "error": "submission_in_progress",
+          "message": "Finding triage cannot change while a formal review submission is pending.",
+          "job_id": job_id,
+          "finding_id": finding_id,
+        }
+    return _update_finding_triage_locked(owner, job_id, finding_id, status, note, actor, review_at)
+
+
+def _update_finding_triage_locked(owner, job_id: str, finding_id: str, status: str, note: str = "", actor: str = "", review_at: float = 0):
   if status not in VALID_TRIAGE_STATUSES:
     return {
       "error": "validation_error",
@@ -76,6 +107,14 @@ def update_finding_triage(owner, job_id: str, finding_id: str, status: str, note
     return {"error": "not_found", "message": f"Job {job_id} not found."}
   if not job_specs.get("job_cid"):
     return {"error": "not_available", "message": f"Job {job_id} is still running (triage requires archived findings)."}
+  launcher = job_specs.get("launcher")
+  if launcher and launcher != getattr(owner, "ee_addr", None):
+    return {
+      "error": "job_launcher_mismatch",
+      "message": "Finding triage must be handled by the job launcher.",
+      "status_code": 409,
+      "job_id": job_id,
+    }
 
   archive = _artifact_repo(owner).get_archive(job_specs)
   if not isinstance(archive, dict):
@@ -119,7 +158,7 @@ def update_finding_triage(owner, job_id: str, finding_id: str, status: str, note
     event_action="triaged",
   )
   if isinstance(job_specs.get("soc_event_status"), dict):
-    repo.put_job(job_id, job_specs)
+    _write_job_record(owner, job_id, job_specs, context="finding_triage_soc_event")
   return {
     "job_id": job_id,
     "finding_id": finding_id,

@@ -3,6 +3,9 @@ from ..models import (
   CStoreJobRunning,
   FindingTriageAuditEntry,
   FindingTriageState,
+  RulebookReviewAuditEntry,
+  RulebookReviewState,
+  RulebookSubmissionRegistry,
   WorkerProgress,
 )
 
@@ -45,6 +48,18 @@ class JobStateRepository:
   @property
   def _model_test_raw_evidence_hkey(self):
     return f"{self.owner.cfg_instance_id}:model_test_raw_evidence"
+
+  @property
+  def _rulebook_review_hkey(self):
+    return f"{self.owner.cfg_instance_id}:rulebook_review"
+
+  @property
+  def _rulebook_review_audit_hkey(self):
+    return f"{self.owner.cfg_instance_id}:rulebook_review:audit"
+
+  @property
+  def _rulebook_review_submissions_hkey(self):
+    return f"{self.owner.cfg_instance_id}:rulebook_review:submissions"
 
   def get_job(self, job_id):
     return self.owner.chainstore_hget(hkey=self._jobs_hkey, key=job_id)
@@ -303,4 +318,98 @@ class JobStateRepository:
         key=self.triage_key(job_id, finding_id),
         value=None,
       )
+    return
+
+  @staticmethod
+  def rulebook_key(job_id, profile_id):
+    return f"{job_id}:{profile_id}"
+
+  def get_rulebook_review(self, job_id, profile_id):
+    return self.owner.chainstore_hget(
+      hkey=self._rulebook_review_hkey,
+      key=self.rulebook_key(job_id, profile_id),
+    )
+
+  def get_rulebook_review_model(self, job_id, profile_id):
+    payload = self.get_rulebook_review(job_id, profile_id)
+    if not isinstance(payload, dict):
+      return None
+    return RulebookReviewState.from_dict(payload)
+
+  def put_rulebook_review(self, review):
+    if isinstance(review, RulebookReviewState):
+      payload = review.to_dict()
+    else:
+      payload = RulebookReviewState.from_dict(review).to_dict()
+    self.owner.chainstore_hset(
+      hkey=self._rulebook_review_hkey,
+      key=self.rulebook_key(payload["job_id"], payload["profile_id"]),
+      value=payload,
+    )
+    return payload
+
+  def get_rulebook_review_audit(self, job_id, profile_id):
+    payload = self.owner.chainstore_hget(
+      hkey=self._rulebook_review_audit_hkey,
+      key=self.rulebook_key(job_id, profile_id),
+    )
+    return payload if isinstance(payload, list) else []
+
+  def append_rulebook_review_audit(self, entry):
+    if isinstance(entry, RulebookReviewAuditEntry):
+      payload = entry.to_dict()
+    else:
+      payload = RulebookReviewAuditEntry.from_dict(entry).to_dict()
+    key = self.rulebook_key(payload["job_id"], payload["profile_id"])
+    audit_log = list(self.get_rulebook_review_audit(payload["job_id"], payload["profile_id"]))
+    audit_log.append(payload)
+    self.owner.chainstore_hset(hkey=self._rulebook_review_audit_hkey, key=key, value=audit_log)
+    return audit_log
+
+  def get_rulebook_submission_registry(self, job_id, profile_id):
+    return self.owner.chainstore_hget(
+      hkey=self._rulebook_review_submissions_hkey,
+      key=self.rulebook_key(job_id, profile_id),
+    )
+
+  def get_rulebook_submission_registry_model(self, job_id, profile_id):
+    payload = self.get_rulebook_submission_registry(job_id, profile_id)
+    if not isinstance(payload, dict):
+      return None
+    return RulebookSubmissionRegistry.from_dict(payload)
+
+  def put_rulebook_submission_registry(self, job_id, profile_id, registry):
+    if isinstance(registry, RulebookSubmissionRegistry):
+      payload = registry.to_dict()
+    else:
+      payload = RulebookSubmissionRegistry.from_dict(registry).to_dict()
+    self.owner.chainstore_hset(
+      hkey=self._rulebook_review_submissions_hkey,
+      key=self.rulebook_key(job_id, profile_id),
+      value=payload,
+    )
+    return payload
+
+  def list_job_rulebook_submission_registries(self, job_id):
+    payload = self.owner.chainstore_hgetall(hkey=self._rulebook_review_submissions_hkey) or {}
+    prefix = f"{job_id}:"
+    return {
+      key[len(prefix):]: value
+      for key, value in payload.items()
+      if isinstance(key, str) and key.startswith(prefix) and isinstance(value, dict)
+    }
+
+  def delete_job_rulebook_reviews(self, job_id):
+    prefix = f"{job_id}:"
+    for hkey in (
+      self._rulebook_review_hkey,
+      self._rulebook_review_audit_hkey,
+      self._rulebook_review_submissions_hkey,
+    ):
+      payload = self.owner.chainstore_hgetall(hkey=hkey) or {}
+      if not isinstance(payload, dict):
+        continue
+      for key in list(payload):
+        if isinstance(key, str) and key.startswith(prefix):
+          self.owner.chainstore_hset(hkey=hkey, key=key, value=None)
     return

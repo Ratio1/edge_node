@@ -503,7 +503,28 @@ def list_local_jobs(owner):
   """
   Return jobs currently running on the local node.
   """
-  return {
+  local_jobs = {
     job_id: owner._get_job_status(job_id)
-    for job_id, local_workers in owner.scan_jobs.items()
+    for job_id in getattr(owner, "scan_jobs", {})
   }
+  for job_id, worker in getattr(owner, "model_test_jobs", {}).items():
+    job_specs = _job_repo(owner).get_job(job_id)
+    if isinstance(job_specs, dict) and not _is_model_test_specs(job_specs):
+      continue
+    job_specs = job_specs if isinstance(job_specs, dict) else {}
+    worker_state = getattr(worker, "state", None)
+    live_summary = worker_state.get("model_test_summary") if isinstance(worker_state, dict) else None
+    job_status = job_specs.get("job_status") or "RUNNING"
+    local_jobs[job_id] = {
+      "job_id": job_id,
+      "status": job_status,
+      "job_status": job_status,
+      "job_type": MODEL_TEST_JOB_TYPE,
+      "task_kind": MODEL_TEST_JOB_TYPE,
+      "scan_type": MODEL_TEST_JOB_TYPE,
+      "model_test_summary": sanitize_model_test_summary(
+        live_summary or job_specs.get("model_test_summary")
+      ),
+      "model_test_node_selection": job_specs.get("model_test_node_selection"),
+    }
+  return local_jobs

@@ -521,6 +521,32 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertNotIn("report_cid", job_specs["workers"]["worker-A"])
     owner._write_job_record.assert_not_called()
 
+  def test_reconcile_workers_from_terminal_error_stops_job(self):
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_pass": 2,
+      "launcher": "launcher-A",
+      "workers": {
+        "worker-A": {"start_port": 1, "end_port": 10, "assignment_revision": 3},
+      },
+    }
+    live_payloads = self._terminal_live_payload(cid=None)
+    live_payloads["job-1:worker-A"]["phase"] = "failed"
+    live_payloads["job-1:worker-A"]["error_class"] = "launch_failed"
+    owner, _repo = self._make_live_reconcile_owner(job_specs, live_payloads)
+
+    changed = reconcile_workers_from_live(owner, "job-1")
+
+    self.assertTrue(changed)
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    worker = job_specs["workers"]["worker-A"]
+    self.assertTrue(worker["finished"])
+    self.assertEqual(worker["terminal_reason"], "launch_failed")
+    owner._write_job_record.assert_called_once_with(
+      "job-1", job_specs, context="reconcile_from_live",
+    )
+
   def test_reconcile_workers_from_live_skips_canceled_and_unreachable(self):
     job_specs = {
       "job_id": "job-1",

@@ -47,6 +47,13 @@ class TestJobStateMachine(unittest.TestCase):
 
     self.assertEqual(job_specs["job_status"], JOB_STATUS_COLLECTING)
 
+  def test_allows_soft_stop_to_be_scheduled_during_analysis(self):
+    job_specs = {"job_status": JOB_STATUS_ANALYZING}
+
+    set_job_status(job_specs, JOB_STATUS_SCHEDULED_FOR_STOP)
+
+    self.assertEqual(job_specs["job_status"], JOB_STATUS_SCHEDULED_FOR_STOP)
+
   def test_allows_finalizing_retry_to_collecting(self):
     job_specs = {"job_status": JOB_STATUS_FINALIZING}
 

@@ -27,9 +27,18 @@ class ArtifactRepository:
       return self.owner.r1fs.add_json(payload, show_logs=show_logs, secret=secret)
     return self.owner.r1fs.add_json(payload, show_logs=show_logs)
 
-  def delete(self, cid, *, show_logs=False, raise_on_error=False):
+  def delete(self, cid, *, show_logs=False, raise_on_error=False, purge=False):
     if not cid:
       return False
+    if purge:
+      return self.owner.r1fs.delete_file(
+        cid,
+        unpin_remote=True,
+        run_gc=True,
+        cleanup_local_files=True,
+        show_logs=show_logs,
+        raise_on_error=raise_on_error,
+      )
     return self.owner.r1fs.delete_file(cid, show_logs=show_logs, raise_on_error=raise_on_error)
 
   def get_job_config(self, job_specs):

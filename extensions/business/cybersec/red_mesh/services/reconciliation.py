@@ -1,3 +1,4 @@
+from ..constants import JOB_STATUS_STOPPED
 from ..models import WorkerProgress
 from .config import resolve_config_block
 
@@ -228,7 +229,15 @@ def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None, 
     if not live.finished:
       continue
     if not live.report_cid:
-      _stats_inc_once(stats, "ignored_no_report_cid", (job_id, worker_addr))
+      if not live.error_class:
+        _stats_inc_once(stats, "ignored_no_report_cid", (job_id, worker_addr))
+        continue
+      worker_entry["finished"] = True
+      worker_entry["terminal_reason"] = live.error_class
+      worker_entry["error_class"] = live.error_class
+      worker_entry["result"] = None
+      job_specs["job_status"] = JOB_STATUS_STOPPED
+      changed_workers.append(worker_addr)
       continue
 
     if not worker_entry.get("report_cid"):
