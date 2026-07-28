@@ -152,7 +152,12 @@ class DeeployProcessRequestTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
         "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
         "CONTAINER_RESOURCES": {"cpu": 1, "memory": "2g", "storage": "8g"},
-        "ENV": {"CRDB_MAX_OFFSET": "500ms"},
+        "ENV": {
+          "CRDB_DATABASE": "appdb",
+          "CRDB_USER": "appuser",
+          "CRDB_PASSWORD": "secret-password",
+          "CRDB_MAX_OFFSET": "500ms",
+        },
       }],
       "PER_NODE_CONFIG": {
         "byNode": {
