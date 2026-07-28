@@ -91,7 +91,14 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     plugin.chainstore_hset = chainstore_hset
 
-    called = {"delete": 0, "deploy": 0, "deploy_kwargs": None, "queued": 0, "bc_update": 0}
+    called = {
+      "delete": 0,
+      "deploy": 0,
+      "deploy_kwargs": None,
+      "queued": 0,
+      "bc_update": 0,
+      "stage": 0,
+    }
     plugin.bc = types.SimpleNamespace(
       node_addr_to_eth_addr=lambda node: node,
       submit_node_update=lambda **kwargs: called.__setitem__("bc_update", called["bc_update"] + 1),
@@ -116,11 +123,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     plugin.cmdapi_build_pipeline_config = build_pipeline_config
     plugin._load_dauth_job_secret_bundle = lambda job_id: None
-    plugin.stage_job_pipeline_and_secrets = lambda pipeline, job_id, secret_bundle: {
-      "job_id": str(job_id),
-      "pipeline": copy.deepcopy(pipeline),
-      "secret_bundle": copy.deepcopy(secret_bundle),
-    }
+    def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
+      called["stage"] += 1
+      return {
+        "job_id": str(job_id),
+        "pipeline": copy.deepcopy(pipeline),
+        "secret_bundle": copy.deepcopy(secret_bundle),
+      }
+
+    plugin.stage_job_pipeline_and_secrets = stage_job_pipeline_and_secrets
     plugin.commit_staged_job_pipeline_and_secrets = lambda state: True
     plugin.rollback_staged_job_pipeline_and_secrets = lambda state: True
     plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
@@ -1709,7 +1720,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 1)
-    self.assertEqual(called["queued"], 1)
+    self.assertEqual(called["stage"], 1)
+    self.assertEqual(called["queued"], 0)
     self.assertEqual(called["bc_update"], 1)
     self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["new-node-1"])
     redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]

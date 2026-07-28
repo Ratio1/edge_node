@@ -871,15 +871,6 @@ class DeeployManagerApiPlugin(
         inputs.target_nodes = deployment_targets
         inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
         inputs.target_nodes_count = len(deployment_targets)
-        # Ensure plugin IDs are preserved for existing instances before any destructive action.
-        self._ensure_plugin_instance_ids(
-          inputs,
-          discovered_plugin_instances=discovered_plugin_instances,
-          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-          app_id=app_id,
-          job_id=job_id,
-        )
-
         if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
           msg = (
             f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
