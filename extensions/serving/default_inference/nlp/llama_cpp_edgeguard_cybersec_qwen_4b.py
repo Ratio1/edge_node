@@ -1,4 +1,4 @@
-"""Unmodified Qwen3 4B GGUF serving profile for EdgeGuard comparisons."""
+"""CyberSecQwen 4B comparison profile isolated for EdgeGuard."""
 
 from extensions.serving.default_inference.nlp.llama_cpp_edgeguard_base import (
   LlamaCppEdgeguardBaseServingProcess as BaseServingProcess,
@@ -13,15 +13,15 @@ _CONFIG = {
   **BaseServingProcess.CONFIG,
 
   "DEFAULT_DEVICE": "cpu",
-  "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
-  "MODEL_FILENAME": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
-  "MODEL_REVISION": "aec29f0e8c31130ba811bec2c774c2ef44888f55",
-  "EXPECTED_MODEL_SHA256": "953ba5b5511fbb2ec9bcb4e588b1e72cedef19b908dba1da0fb3fb340cfb1c3e",
+  "MODEL_NAME": "mradermacher/CyberSecQwen-4B-GGUF",
+  "MODEL_FILENAME": "CyberSecQwen-4B.Q4_K_M.gguf",
+  "MODEL_REVISION": "4b369711d408b9fde0efcca155409c072b19a1f6",
+  "EXPECTED_MODEL_SHA256": "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
   "MODEL_N_CTX": 4096,
   "N_GPU_LAYERS": 0,
   "N_THREADS": 4,
-  "MODEL_INSTANCE_ID": "edgeguard-base-qwen3-4b",
-  "DEFAULT_MAX_TOKENS": 512,
+  "MODEL_INSTANCE_ID": "edgeguard-cybersec-qwen-4b",
+  "DEFAULT_MAX_TOKENS": 1024,
 
   'VALIDATION_RULES': {
     **BaseServingProcess.CONFIG['VALIDATION_RULES'],
@@ -29,6 +29,6 @@ _CONFIG = {
 }
 
 
-class LlamaCppBaseQwen4B(BaseServingProcess):
+class LlamaCppEdgeguardCybersecQwen4B(BaseServingProcess):
   CONFIG = _CONFIG
   WORKER_MODULE_SHA256 = WORKER_MODULE_SHA256

@@ -163,6 +163,61 @@ def _load_llama_cpp_base_class():
   return namespace["LlamaCppBaseServingProcess"]
 
 
+def _load_edgeguard_llama_cpp_base_class():
+  source_path = (
+    ROOT / "extensions" / "serving" / "default_inference" / "nlp" /
+    "llama_cpp_edgeguard_base.py"
+  )
+  source = source_path.read_text(encoding="utf-8")
+  source = source.replace("from llama_cpp import Llama\n", "")
+  source = source.replace(
+    "from extensions.serving.default_inference.nlp.llama_cpp_base import (\n"
+    "  MODEL_N_BATCH_DEFAULT_VALUE,\n"
+    "  MODEL_N_CTX_DEFAULT_VALUE,\n"
+    "  MODEL_N_CTX_MIN_VALUE,\n"
+    "  LlamaCppBaseServingProcess as BaseServingProcess,\n"
+    "  source_file_sha256,\n"
+    ")\n",
+    "",
+  )
+  generic_class = _load_llama_cpp_base_class()
+  namespace = {
+    "BaseServingProcess": generic_class,
+    "Llama": _FakeLlama,
+    "MODEL_N_BATCH_DEFAULT_VALUE": 512,
+    "MODEL_N_CTX_DEFAULT_VALUE": 4096,
+    "MODEL_N_CTX_MIN_VALUE": 512,
+    "source_file_sha256": lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+    "__file__": str(source_path),
+    "__name__": "loaded_llama_cpp_edgeguard_base",
+  }
+  exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
+  return namespace["LlamaCppEdgeguardBaseServingProcess"]
+
+
+def _load_edgeguard_profile_config(filename):
+  source_path = (
+    ROOT / "extensions" / "serving" / "default_inference" / "nlp" / filename
+  )
+  source = source_path.read_text(encoding="utf-8")
+  import_start = (
+    "from extensions.serving.default_inference.nlp.llama_cpp_edgeguard_base import (\n"
+  )
+  import_end = ")\n"
+  start = source.index(import_start)
+  end = source.index(import_end, start) + len(import_end)
+  source = source[:start] + source[end:]
+  edgeguard_class = _load_edgeguard_llama_cpp_base_class()
+  namespace = {
+    "BaseServingProcess": edgeguard_class,
+    "source_file_sha256": lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+    "__file__": str(source_path),
+    "__name__": f"loaded_{source_path.stem}",
+  }
+  exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
+  return namespace["_CONFIG"]
+
+
 def _load_ai_engine_utils():
   source_path = ROOT / "naeural_core" / "naeural_core" / "serving" / "ai_engines" / "utils.py"
   source = source_path.read_text(encoding="utf-8")
@@ -204,6 +259,33 @@ def _make_llama_cpp_process(**overrides):
   return process
 
 
+def _make_edgeguard_llama_cpp_process(**overrides):
+  _FakeLlama.calls = []
+  process = _load_edgeguard_llama_cpp_base_class()()
+  defaults = {
+    "cfg_model_path": "/must/not/be/used/local.gguf",
+    "cfg_model_name": "org/repo",
+    "cfg_model_filename": "model.gguf",
+    "cfg_model_revision": "a" * 40,
+    "cfg_expected_model_sha256": hashlib.sha256(b"gguf").hexdigest(),
+    "cfg_model_n_ctx": 1024,
+    "cfg_chat_format": None,
+    "cfg_draft_model": None,
+    "cfg_n_gpu_layers": 0,
+    "cfg_n_threads": 4,
+    "cfg_default_temperature": 0.7,
+    "cfg_default_top_p": 1.0,
+    "cfg_default_max_tokens": 128,
+    "cfg_repetition_penalty": 1.0,
+    "cfg_default_response_format": None,
+    "cfg_generation_seed": 123,
+  }
+  defaults.update(overrides)
+  for key, value in defaults.items():
+    setattr(process, key, value)
+  return process
+
+
 class CyberSecQwenEngineTests(unittest.TestCase):
   def test_dedicated_ai_engine_mapping(self):
     self.assertEqual(
@@ -213,6 +295,10 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(
       AI_ENGINES["edgeguard_qwen_4b"]["SERVING_PROCESS"],
       "llama_cpp_edgeguard_qwen_4b",
+    )
+    self.assertEqual(
+      AI_ENGINES["edgeguard_cybersec_qwen_4b"]["SERVING_PROCESS"],
+      "llama_cpp_edgeguard_cybersec_qwen_4b",
     )
     self.assertNotIn("llama_cpp", AI_ENGINES)
 
@@ -251,6 +337,103 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(config["MODEL_INSTANCE_ID"], "cybersecqwen-4b")
     self.assertEqual(config["MODEL_NAME"], "mradermacher/CyberSecQwen-4B-GGUF")
     self.assertEqual(config["MODEL_FILENAME"], "CyberSecQwen-4B.Q4_K_M.gguf")
+
+  def test_edgeguard_profiles_pin_revisions_and_expected_bytes(self):
+    expected = {
+      "llama_cpp_base_qwen_4b.py": (
+        "aec29f0e8c31130ba811bec2c774c2ef44888f55",
+        "953ba5b5511fbb2ec9bcb4e588b1e72cedef19b908dba1da0fb3fb340cfb1c3e",
+      ),
+      "llama_cpp_edgeguard_qwen_4b.py": (
+        "369066092b5eef41c9093474ff7142cc530a853f",
+        "7f7ed0f4d3341d36204d17343a07e3b6d99ec135a4ce67da66ad09b8eba2a91b",
+      ),
+      "llama_cpp_edgeguard_cybersec_qwen_4b.py": (
+        "4b369711d408b9fde0efcca155409c072b19a1f6",
+        "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
+      ),
+    }
+    for filename, (revision, sha256) in expected.items():
+      with self.subTest(filename=filename):
+        config = _load_edgeguard_profile_config(filename)
+        self.assertEqual(config["MODEL_REVISION"], revision)
+        self.assertEqual(config["EXPECTED_MODEL_SHA256"], sha256)
+
+  def test_generic_and_edgeguard_cybersec_profiles_use_separate_bases(self):
+    profile_dir = ROOT / "extensions" / "serving" / "default_inference" / "nlp"
+    generic_source = (profile_dir / "llama_cpp_cybersec_qwen_4b.py").read_text(encoding="utf-8")
+    edgeguard_source = (
+      profile_dir / "llama_cpp_edgeguard_cybersec_qwen_4b.py"
+    ).read_text(encoding="utf-8")
+
+    self.assertIn("nlp.llama_cpp_base import", generic_source)
+    self.assertNotIn("llama_cpp_edgeguard_base", generic_source)
+    self.assertIn("llama_cpp_edgeguard_base import", edgeguard_source)
+
+  def test_edgeguard_ignores_model_path_and_verifies_pinned_remote_artifact(self):
+    process = _make_edgeguard_llama_cpp_process()
+    calls = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+      downloaded_path = Path(tmpdir) / "snapshots" / ("a" * 40) / "model.gguf"
+      downloaded_path.parent.mkdir(parents=True)
+      downloaded_path.write_bytes(b"gguf")
+      fake_hf_module = types.SimpleNamespace(
+        HfApi=lambda token=None: types.SimpleNamespace(
+          list_repo_files=lambda **kwargs: calls.append(("list", kwargs)) or ["model.gguf"],
+        ),
+        hf_hub_download=lambda **kwargs: calls.append(("download", kwargs)) or str(downloaded_path),
+      )
+      previous_hf_module = sys.modules.get("huggingface_hub")
+      sys.modules["huggingface_hub"] = fake_hf_module
+      try:
+        process._load_model()
+      finally:
+        if previous_hf_module is None:
+          sys.modules.pop("huggingface_hub", None)
+        else:
+          sys.modules["huggingface_hub"] = previous_hf_module
+
+    self.assertEqual(process._get_model_path(), None)
+    self.assertTrue(all(call[1]["revision"] == "a" * 40 for call in calls))
+    self.assertEqual(_FakeLlama.calls[0][1]["model_path"], str(downloaded_path))
+    self.assertNotEqual(_FakeLlama.calls[0][1]["model_path"], process.cfg_model_path)
+    self.assertEqual(process.get_runtime_fingerprint()["gguf_sha256"], hashlib.sha256(b"gguf").hexdigest())
+    process.__class__.WORKER_MODULE_SHA256 = "f" * 64
+    identity = process.get_worker_code_identity()
+    edgeguard_base_path = (
+      ROOT / "extensions" / "serving" / "default_inference" / "nlp" /
+      "llama_cpp_edgeguard_base.py"
+    )
+    self.assertEqual(
+      identity["llama_cpp_base_sha256"],
+      hashlib.sha256(edgeguard_base_path.read_bytes()).hexdigest(),
+    )
+
+  def test_edgeguard_rejects_wrong_pinned_artifact_before_llama_construction(self):
+    process = _make_edgeguard_llama_cpp_process(
+      cfg_expected_model_sha256="0" * 64,
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+      downloaded_path = Path(tmpdir) / "model.gguf"
+      downloaded_path.write_bytes(b"wrong")
+      fake_hf_module = types.SimpleNamespace(
+        HfApi=lambda token=None: types.SimpleNamespace(
+          list_repo_files=lambda **_kwargs: ["model.gguf"],
+        ),
+        hf_hub_download=lambda **_kwargs: str(downloaded_path),
+      )
+      previous_hf_module = sys.modules.get("huggingface_hub")
+      sys.modules["huggingface_hub"] = fake_hf_module
+      try:
+        with self.assertRaisesRegex(RuntimeError, "GGUF SHA-256 mismatch"):
+          process._load_model()
+      finally:
+        if previous_hf_module is None:
+          sys.modules.pop("huggingface_hub", None)
+        else:
+          sys.modules["huggingface_hub"] = previous_hf_module
+
+    self.assertEqual(_FakeLlama.calls, [])
 
   def test_llama_cpp_base_can_load_mounted_model_file(self):
     with tempfile.TemporaryDirectory() as tmpdir:
