@@ -34,17 +34,17 @@ The finetuned worker serves the private EGM-029 v0.10 graph-intent continuation:
 ```text
 MODEL_NAME=ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf
 MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf
-MODEL_REVISION=369066092b5eef41c9093474ff7142cc530a853f
+MODEL_PATH=/edge_node/_local_cache/_models/models--ratio1--edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf/snapshots/369066092b5eef41c9093474ff7142cc530a853f/edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf
 AI_ENGINE=edgeguard_qwen_4b
 ```
 
-The base comparison worker uses its dedicated EdgeGuard base profile with a distinct startup model
-instance id:
+The base comparison worker uses a configuration-only profile over generic llama.cpp serving with a
+distinct startup model instance id:
 
 ```text
 MODEL_NAME=MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF
 MODEL_FILENAME=Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-MODEL_REVISION=aec29f0e8c31130ba811bec2c774c2ef44888f55
+MODEL_PATH=/edge_node/_local_cache/egm030-qwen3-base/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 AI_ENGINE=base_qwen_4b
 STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-base-qwen3-4b
 ```
@@ -58,24 +58,25 @@ runtime contract is the plain `base_qwen_4b` alias plus `MODEL_INSTANCE_ID` in
 `("llama_cpp_base_qwen_4b", "edgeguard-base-qwen3-4b")` and routes results back to
 `("base_qwen_4b", "edgeguard-base-qwen3-4b")`.
 
-The public CyberSecQwen worker uses the EdgeGuard-specific serving engine and downloads the pinned
-GGUF into its normal Hugging Face runtime cache during startup:
+The public CyberSecQwen worker uses the existing generic serving engine and a previously cached
+snapshot path:
 
 ```text
 MODEL_NAME=mradermacher/CyberSecQwen-4B-GGUF
 MODEL_FILENAME=CyberSecQwen-4B.Q4_K_M.gguf
-MODEL_REVISION=4b369711d408b9fde0efcca155409c072b19a1f6
-AI_ENGINE=edgeguard_cybersec_qwen_4b
+MODEL_PATH=/edge_node/_local_cache/_models/models--mradermacher--CyberSecQwen-4B-GGUF/snapshots/4b369711d408b9fde0efcca155409c072b19a1f6/CyberSecQwen-4B.Q4_K_M.gguf
+AI_ENGINE=cybersec_qwen_4b
 STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-cybersec-qwen-4b
 ```
 
-`MODEL_NAME`, `MODEL_FILENAME`, and the exact `MODEL_REVISION` are the only artifact-source
-settings. Do not configure `MODEL_PATH`, a repository-local/LFS artifact, or a preseeded model file.
-`AI_ENGINE`, `PORT`, and `MODEL_INSTANCE_ID` are routing identity rather than artifact-source
-configuration.
+For this local deployment, `MODEL_PATH` is the artifact-source setting; verify the file manually
+against the approved SHA-256 before every migration or restart. Generic serving does not consume a
+model revision or enforce a checksum at runtime. `MODEL_NAME` and `MODEL_FILENAME` remain model
+identity and remote-fallback defaults. `AI_ENGINE`, `PORT`, and `MODEL_INSTANCE_ID` are routing
+identity rather than artifact-source configuration.
 
-Set the private Hugging Face token as a runtime secret for the finetuned worker; do not put it in a
-pipeline JSON committed to git.
+If a private remote fallback is deliberately used instead of `MODEL_PATH`, set the Hugging Face
+token as a runtime secret; do not put it in a pipeline JSON committed to git.
 
 ## Guard Contract
 
@@ -130,7 +131,7 @@ Use one stream per model worker:
             "MODEL_NAME": "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf",
             "MODEL_FILENAME": "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
             "MODEL_INSTANCE_ID": "edgeguard-finetuned-v0-10",
-            "MODEL_REVISION": "369066092b5eef41c9093474ff7142cc530a853f",
+            "MODEL_PATH": "/edge_node/_local_cache/_models/models--ratio1--edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf/snapshots/369066092b5eef41c9093474ff7142cc530a853f/edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
             "HF_TOKEN": "$HF_TOKEN"
           }
         }
@@ -156,7 +157,7 @@ Use one stream per model worker:
             "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
             "MODEL_FILENAME": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
             "MODEL_INSTANCE_ID": "edgeguard-base-qwen3-4b",
-            "MODEL_REVISION": "aec29f0e8c31130ba811bec2c774c2ef44888f55"
+            "MODEL_PATH": "/edge_node/_local_cache/egm030-qwen3-base/Qwen3-4B-Instruct-2507.Q4_K_M.gguf"
           }
         }
       ]
@@ -177,13 +178,13 @@ Keep the CyberSecQwen worker in its own stream and balancing pool:
       "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_llm_cybersec_qwen_4b",
-          "AI_ENGINE": "edgeguard_cybersec_qwen_4b",
+          "AI_ENGINE": "cybersec_qwen_4b",
           "PORT": 5092,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "mradermacher/CyberSecQwen-4B-GGUF",
             "MODEL_FILENAME": "CyberSecQwen-4B.Q4_K_M.gguf",
             "MODEL_INSTANCE_ID": "edgeguard-cybersec-qwen-4b",
-            "MODEL_REVISION": "4b369711d408b9fde0efcca155409c072b19a1f6"
+            "MODEL_PATH": "/edge_node/_local_cache/_models/models--mradermacher--CyberSecQwen-4B-GGUF/snapshots/4b369711d408b9fde0efcca155409c072b19a1f6/CyberSecQwen-4B.Q4_K_M.gguf"
           }
         }
       ]
@@ -267,7 +268,8 @@ direct-driver compatibility endpoints.
 
 ## Required Secrets
 
-- `HF_TOKEN` for the private Hugging Face model artifact.
+- `HF_TOKEN` only when deliberately using the private Hugging Face remote fallback instead of the
+  verified local `MODEL_PATH`.
 - `EDGEGUARD_PLAYGROUND_PASSWORD` for the shared UI password gate.
 - `EDGEGUARD_SESSION_SECRET` for the UI session cookie signature.
 - `EDGEGUARD_PLAYGROUND_UI_GH_TOKEN` for Worker App Runner access to the private UI repo.

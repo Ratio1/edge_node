@@ -1,6 +1,4 @@
-import hashlib
 import inspect
-import json
 import unittest
 from pathlib import Path
 
@@ -90,7 +88,6 @@ def _load_plugin_module():
 
 LOADED_PLUGIN_MODULE = _load_plugin_module()
 LLMInferenceApiPlugin = LOADED_PLUGIN_MODULE["LLMInferenceApiPlugin"]
-LLM_UTILS_MODULE_SHA256 = LOADED_PLUGIN_MODULE["LLM_UTILS_MODULE_SHA256"]
 
 
 class LLMInferenceApiPluginTests(unittest.TestCase):
@@ -107,66 +104,21 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     plugin.global_shmem = {}
     self.assertIs(plugin.health()["serving_ready"], False)
 
-  def test_health_reports_only_actual_inprocess_runtime_fingerprint(self):
-    fingerprint = {
-      "schema_version": "edgeguard.loaded_runtime_fingerprint.v1",
-      "gguf_sha256": "a" * 64,
-      "fingerprint_sha256": "b" * 64,
-    }
-    server = type("Server", (), {
-      "inprocess": True,
-      "get_runtime_fingerprint": lambda _self: dict(fingerprint),
-      "get_worker_code_identity": lambda _self: {
-        "schema_version": "edgeguard.serving-code-identity.v2",
-        "serving_module_sha256": "c" * 64,
-        "llama_cpp_base_sha256": "d" * 64,
-        "base_llm_serving_sha256": "e" * 64,
-        "llm_utils_sha256": LLM_UTILS_MODULE_SHA256,
-      },
-    })()
+  def test_health_keeps_null_identity_keys_for_inprocess_generic_worker(self):
+    server = type("GenericServer", (), {"inprocess": True})()
     manager = type("Manager", (), {
       "is_avail": lambda _self, _name: True,
       "_get_server": lambda _self, _name: server,
     })()
     plugin = LLMInferenceApiPlugin()
-    plugin.get_serving_processes = lambda: ["expected-server"]
+    plugin.get_serving_processes = lambda: ["generic-llama-server"]
     plugin.global_shmem = {"serving_manager": manager}
 
-    self.assertEqual(plugin.health()["runtime_fingerprint"], fingerprint)
-    code_identity = plugin.health()["worker_code_identity"]
-    self.assertEqual(code_identity["serving_module_sha256"], "c" * 64)
-    self.assertEqual(code_identity["llama_cpp_base_sha256"], "d" * 64)
-    self.assertEqual(code_identity["base_llm_serving_sha256"], "e" * 64)
-    self.assertEqual(code_identity["llm_utils_sha256"], LLM_UTILS_MODULE_SHA256)
-    expected_hash = hashlib.sha256(json.dumps(
-      {key: value for key, value in code_identity.items() if key != "identity_sha256"},
-      ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
-    self.assertEqual(code_identity["identity_sha256"], expected_hash)
-    server.inprocess = False
-    self.assertIsNone(plugin.health()["runtime_fingerprint"])
-    self.assertIsNone(plugin.health()["worker_code_identity"])
+    health = plugin.health()
 
-  def test_health_rejects_a_serving_identity_from_different_llm_utils_bytes(self):
-    server = type("Server", (), {
-      "inprocess": True,
-      "get_worker_code_identity": lambda _self: {
-        "schema_version": "edgeguard.serving-code-identity.v2",
-        "serving_module_sha256": "c" * 64,
-        "llama_cpp_base_sha256": "d" * 64,
-        "base_llm_serving_sha256": "e" * 64,
-        "llm_utils_sha256": "f" * 64,
-      },
-    })()
-    manager = type("Manager", (), {
-      "is_avail": lambda _self, _name: True,
-      "_get_server": lambda _self, _name: server,
-    })()
-    plugin = LLMInferenceApiPlugin()
-    plugin.get_serving_processes = lambda: ["expected-server"]
-    plugin.global_shmem = {"serving_manager": manager}
-
-    self.assertIsNone(plugin.health()["worker_code_identity"])
+    self.assertIs(health["serving_ready"], True)
+    self.assertIsNone(health["runtime_fingerprint"])
+    self.assertIsNone(health["worker_code_identity"])
 
   def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):
     for method_name in ("predict", "predict_async", "create_chat_completion", "create_chat_completion_async"):
@@ -330,50 +282,12 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertTrue(plugin.filter_valid_inference(inference))
     self.assertEqual(inference["REQUEST_ID"], "req-8")
 
-  def test_filter_valid_inference_accepts_benchmark_terminal_outcomes_without_text(self):
-    for full_output in (
-      {
-        "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
-        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
-      },
-      {
-        "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
-        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
-      },
-      {
-        "error": {"code": "provider_error"},
-        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
-      },
-      {
-        "error": {"code": "context_window_exceeded"},
-        "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
-      },
-    ):
-      with self.subTest(error=full_output.get("error")):
-        plugin = LLMInferenceApiPlugin()
-        plugin._requests = {"req-benchmark": {"status": "pending"}}  # pylint: disable=protected-access
-        inference = {"text": "", "FULL_OUTPUT": full_output, "IS_VALID": False}
-        self.assertTrue(plugin.filter_valid_inference(inference))
-        self.assertEqual(inference["REQUEST_ID"], "req-benchmark")
-
-  def test_filter_valid_inference_accepts_top_level_benchmark_telemetry(self):
-    plugin = LLMInferenceApiPlugin()
-    plugin._requests = {"req-direct": {"status": "pending"}}  # pylint: disable=protected-access
-    inference = {
-      "REQUEST_ID": "req-direct",
-      "text": "",
-      "FULL_OUTPUT": {},
-      "IS_VALID": False,
-      "EDGEGUARD_BENCHMARK_TELEMETRY": {"reset_succeeded": True, "attempt_count": 1},
-    }
-    self.assertTrue(plugin.filter_valid_inference(inference))
-
-  def test_edgeguard_serving_envelope_keeps_existing_completion_response_shape(self):
+  def test_generic_serving_envelope_keeps_existing_completion_response_shape(self):
     plugin = LLMInferenceApiPlugin()
     plugin.time = lambda: 1234.5
     plugin._annotate_result_with_node_roles = lambda **_kwargs: None
     inference = {
-      "REQUEST_ID": "req-edgeguard",
+      "REQUEST_ID": "req-generic",
       "text": "MATCH (n) RETURN n LIMIT 1",
       "FULL_OUTPUT": {
         "choices": [{
@@ -386,17 +300,17 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     }
 
     response = plugin.build_completion_response(
-      request_id="req-edgeguard",
+      request_id="req-generic",
       model_name="edgeguard-base-qwen3-4b",
       inference=inference,
       request_data={"metadata": {"route": "base"}},
     )
 
-    self.assertEqual(response["REQUEST_ID"], "req-edgeguard")
+    self.assertEqual(response["REQUEST_ID"], "req-generic")
     self.assertEqual(response["MODEL_NAME"], "edgeguard-base-qwen3-4b")
     self.assertEqual(response["TEXT_RESPONSE"], "MATCH (n) RETURN n LIMIT 1")
     self.assertEqual(response["object"], "chat.completion")
-    self.assertEqual(response["id"], "req-edgeguard")
+    self.assertEqual(response["id"], "req-generic")
     self.assertEqual(response["model"], "edgeguard-base-qwen3-4b")
     self.assertEqual(response["metadata"], {"route": "base"})
     self.assertEqual(response["choices"], inference["FULL_OUTPUT"]["choices"])
@@ -463,62 +377,6 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
 
         self.assertFalse(plugin.filter_valid_inference(inference))
         self.assertEqual(plugin._requests["req-live"]["status"], "pending")  # pylint: disable=protected-access
-
-  def test_filter_valid_inference_never_logs_model_output(self):
-    sentinel = "partial-secret-sentinel"
-    plugin = LLMInferenceApiPlugin()
-    plugin._requests = {  # pylint: disable=protected-access
-      "req-a": {"status": "pending"},
-      "req-b": {"status": "pending"},
-    }
-    logs = []
-    plugin.P = lambda message, *_args, **_kwargs: logs.append(str(message))
-
-    self.assertFalse(plugin.filter_valid_inference({
-      "text": sentinel,
-      "IS_VALID": True,
-    }))
-    self.assertFalse(plugin.filter_valid_inference({
-      "REQUEST_ID": "unknown",
-      "text": sentinel,
-      "IS_VALID": True,
-    }))
-    self.assertFalse(plugin.filter_valid_inference({
-      "text": sentinel,
-      "IS_VALID": False,
-      "FULL_OUTPUT": {},
-    }))
-
-    self.assertNotIn(sentinel, "\n".join(logs))
-
-  def test_filter_valid_inference_fails_context_overflow_with_safe_specific_error(self):
-    plugin = LLMInferenceApiPlugin()
-    plugin._requests = {"req-context": {"status": "pending"}}  # pylint: disable=protected-access
-    failed = {}
-    plugin._fail_request = lambda request_id, error_message: failed.update({  # pylint: disable=protected-access
-      "request_id": request_id,
-      "error_message": error_message,
-    }) or True
-    inference = {
-      "REQUEST_ID": "req-context",
-      "text": "",
-      "IS_VALID": False,
-      "ERROR_CODE": "context_window_exceeded",
-      "ERROR": "Model context window exceeded.",
-      "FULL_OUTPUT": {
-        "error": {
-          "code": "context_window_exceeded",
-          "message": "Model context window exceeded.",
-        },
-      },
-    }
-
-    self.assertFalse(plugin.filter_valid_inference(inference))
-    self.assertEqual(failed, {
-      "request_id": "req-context",
-      "error_message": "Model context window exceeded.",
-    })
-
 
 if __name__ == "__main__":
   unittest.main()

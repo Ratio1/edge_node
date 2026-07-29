@@ -25,10 +25,6 @@ AI_ENGINES['cybersec_qwen_4b'] = {
   'SERVING_PROCESS': 'llama_cpp_cybersec_qwen_4b'
 }
 
-AI_ENGINES['edgeguard_cybersec_qwen_4b'] = {
-  'SERVING_PROCESS': 'llama_cpp_edgeguard_cybersec_qwen_4b'
-}
-
 AI_ENGINES['edgeguard_qwen_4b'] = {
   'SERVING_PROCESS': 'llama_cpp_edgeguard_qwen_4b'
 }

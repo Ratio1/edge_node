@@ -945,11 +945,6 @@ class BaseLlmServing(
     return dct_result
 
 
-  def _log_batch_text_prediction(self, text_lst):
-    self.P(f"Found batch text prediction for {len(text_lst)} texts:\n{self.shorten_str(text_lst)}")
-    return
-
-
   def _post_process(self, preds_batch):
     if preds_batch is None:
       return []
@@ -968,7 +963,7 @@ class BaseLlmServing(
       self.processed_requests.add(additional[LlmCT.REQUEST_ID])
 
     if len(text_lst) > 0:
-      self._log_batch_text_prediction(text_lst)
+      self.P(f"Found batch text prediction for {len(text_lst)} texts:\n{self.shorten_str(text_lst)}")
     for i, decoded in enumerate(text_lst):
       dct_result = {
         "IS_VALID": True,
@@ -1000,3 +995,4 @@ class BaseLlmServing(
         })
     # endfor total inputs
     return final_result
+

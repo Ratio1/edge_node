@@ -1,6 +1,5 @@
-import hashlib
+import ast
 import json
-import sys
 import tempfile
 import types
 import unittest
@@ -10,6 +9,7 @@ from extensions.serving.ai_engines.stable import AI_ENGINES
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PROFILE_DIR = ROOT / "extensions" / "serving" / "default_inference" / "nlp"
 
 
 class _FakeBaseServingProcess:
@@ -39,29 +39,12 @@ class _FakeBaseServingProcess:
     }
     return load_model_method()
 
-  @staticmethod
-  def _post_process(preds_batch):
-    return [
-      {
-        "IS_VALID": True,
-        "text": text,
-        "FULL_OUTPUT": full_output,
-        **additional,
-      }
-      for text, full_output, additional in zip(
-        preds_batch["text"],
-        preds_batch["FULL_OUTPUT"],
-        preds_batch["ADDITIONAL"],
-      )
-    ]
-
 
 class _FakeLlama:
   calls = []
 
   def __init__(self, **kwargs):
     self.kwargs = kwargs
-    self.metadata = {"general.file_type": 15, "general.quantization_version": 2}
     self.__class__.calls.append(("local", kwargs))
 
   @classmethod
@@ -71,46 +54,14 @@ class _FakeLlama:
 
 
 class _FakeLlamaCppLib:
-  _lib = types.SimpleNamespace(_name=__file__)
-
   @staticmethod
   def llama_supports_gpu_offload():
     return False
 
-  @staticmethod
-  def llama_print_system_info():
-    return b"fake-llama-build"
-
-
-def _load_cybersec_qwen_class():
-  source_path = (
-    ROOT / "extensions" / "serving" / "default_inference" / "nlp" /
-    "llama_cpp_cybersec_qwen_4b.py"
-  )
-  source = source_path.read_text(encoding="utf-8")
-  source = source.replace(
-    "from extensions.serving.default_inference.nlp.llama_cpp_base import LlamaCppBaseServingProcess as BaseServingProcess\n",
-    "",
-  )
-  namespace = {
-    "BaseServingProcess": _FakeBaseServingProcess,
-    "__file__": str(source_path),
-    "__name__": "loaded_llama_cpp_cybersec_qwen_4b",
-  }
-  exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
-  return types.SimpleNamespace(
-    cls=namespace["LlamaCppCybersecQwen4B"],
-    config=namespace["_CONFIG"],
-  )
-
 
 def _load_llama_cpp_base_class():
-  source_path = ROOT / "extensions" / "serving" / "default_inference" / "nlp" / "llama_cpp_base.py"
+  source_path = PROFILE_DIR / "llama_cpp_base.py"
   source = source_path.read_text(encoding="utf-8")
-  source = source.replace(
-    "from extensions.serving.base import base_llm_serving as base_llm_serving_module\n",
-    "",
-  )
   source = source.replace(
     "from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess\n",
     "",
@@ -120,23 +71,13 @@ def _load_llama_cpp_base_class():
     "",
   )
   source = source.replace(
-    "from extensions.serving.mixins_llm import llm_utils as llm_utils_module\n",
-    "",
-  )
-  source = source.replace(
     "from extensions.serving.mixins_llm.llm_utils import LlmCT\n",
     "",
   )
   namespace = {
     "BaseServingProcess": _FakeBaseServingProcess,
-    "base_llm_serving_module": types.SimpleNamespace(
-      __file__=str(ROOT / "extensions/serving/base/base_llm_serving.py"),
-    ),
     "Llama": _FakeLlama,
     "llama_cpp_lib": _FakeLlamaCppLib,
-    "llm_utils_module": types.SimpleNamespace(
-      __file__=str(ROOT / "extensions/serving/mixins_llm/llm_utils.py"),
-    ),
     "LlmCT": types.SimpleNamespace(
       ROLE_KEY="role",
       DATA_KEY="content",
@@ -149,8 +90,6 @@ def _load_llama_cpp_base_class():
       VALID_CONDITION="VALID_CONDITION",
       PROCESS_METHOD="PROCESS_METHOD",
       RESPONSE_FORMAT="RESPONSE_FORMAT",
-      BENCHMARK_MODE="BENCHMARK_MODE",
-      SEED="SEED",
       PRMP="prompt",
       TEXT="text",
       ADDITIONAL="ADDITIONAL",
@@ -163,96 +102,25 @@ def _load_llama_cpp_base_class():
   return namespace["LlamaCppBaseServingProcess"]
 
 
-def _load_edgeguard_llama_cpp_base_class():
-  source_path = (
-    ROOT / "extensions" / "serving" / "default_inference" / "nlp" /
-    "llama_cpp_edgeguard_base.py"
-  )
+def _load_profile(filename, class_name):
+  source_path = PROFILE_DIR / filename
   source = source_path.read_text(encoding="utf-8")
-  source = source.replace("from llama_cpp import Llama, llama_cpp as llama_cpp_lib\n", "")
   source = source.replace(
-    "from extensions.serving.base import base_llm_serving as base_llm_serving_module\n",
+    "from extensions.serving.default_inference.nlp.llama_cpp_base import "
+    "LlamaCppBaseServingProcess as BaseServingProcess\n",
     "",
   )
-  source = source.replace(
-    "from extensions.serving.default_inference.nlp.llama_cpp_base import (\n"
-    "  MODEL_N_BATCH_DEFAULT_VALUE,\n"
-    "  MODEL_N_CTX_DEFAULT_VALUE,\n"
-    "  MODEL_N_CTX_MIN_VALUE,\n"
-    "  LlamaCppBaseServingProcess as BaseServingProcess,\n"
-    ")\n",
-    "",
-  )
-  source = source.replace(
-    "from extensions.serving.mixins_llm import llm_utils as llm_utils_module\n",
-    "",
-  )
-  source = source.replace(
-    "from extensions.serving.mixins_llm.llm_utils import LlmCT\n",
-    "",
-  )
-  generic_class = _load_llama_cpp_base_class()
   namespace = {
-    "BaseServingProcess": generic_class,
-    "base_llm_serving_module": types.SimpleNamespace(
-      __file__=str(ROOT / "extensions/serving/base/base_llm_serving.py"),
-    ),
-    "Llama": _FakeLlama,
-    "llama_cpp_lib": _FakeLlamaCppLib,
-    "llm_utils_module": types.SimpleNamespace(
-      __file__=str(ROOT / "extensions/serving/mixins_llm/llm_utils.py"),
-    ),
-    "LlmCT": types.SimpleNamespace(
-      ROLE_KEY="role",
-      DATA_KEY="content",
-      REQUEST_ID="REQUEST_ID",
-      MESSAGES="MESSAGES",
-      TEMPERATURE="TEMPERATURE",
-      TOP_P="TOP_P",
-      MAX_TOKENS="MAX_TOKENS",
-      CONTEXT="CONTEXT",
-      VALID_CONDITION="VALID_CONDITION",
-      PROCESS_METHOD="PROCESS_METHOD",
-      RESPONSE_FORMAT="RESPONSE_FORMAT",
-      BENCHMARK_MODE="BENCHMARK_MODE",
-      SEED="SEED",
-      PRMP="prompt",
-      TEXT="text",
-      ADDITIONAL="ADDITIONAL",
-      FULL_OUTPUT="FULL_OUTPUT",
-    ),
-    "MODEL_N_BATCH_DEFAULT_VALUE": 512,
-    "MODEL_N_CTX_DEFAULT_VALUE": 4096,
-    "MODEL_N_CTX_MIN_VALUE": 512,
-    "source_file_sha256": lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest(),
-    "__file__": str(source_path),
-    "__name__": "loaded_llama_cpp_edgeguard_base",
-  }
-  exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
-  return namespace["LlamaCppEdgeguardBaseServingProcess"]
-
-
-def _load_edgeguard_profile_config(filename):
-  source_path = (
-    ROOT / "extensions" / "serving" / "default_inference" / "nlp" / filename
-  )
-  source = source_path.read_text(encoding="utf-8")
-  import_start = (
-    "from extensions.serving.default_inference.nlp.llama_cpp_edgeguard_base import (\n"
-  )
-  import_end = ")\n"
-  start = source.index(import_start)
-  end = source.index(import_end, start) + len(import_end)
-  source = source[:start] + source[end:]
-  edgeguard_class = _load_edgeguard_llama_cpp_base_class()
-  namespace = {
-    "BaseServingProcess": edgeguard_class,
-    "source_file_sha256": lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+    "BaseServingProcess": _FakeBaseServingProcess,
     "__file__": str(source_path),
     "__name__": f"loaded_{source_path.stem}",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
-  return namespace["_CONFIG"]
+  return types.SimpleNamespace(
+    cls=namespace[class_name],
+    config=namespace["_CONFIG"],
+    source=source_path.read_text(encoding="utf-8"),
+  )
 
 
 def _load_ai_engine_utils():
@@ -295,205 +163,124 @@ def _make_llama_cpp_process(**overrides):
   return process
 
 
-def _make_edgeguard_llama_cpp_process(**overrides):
-  _FakeLlama.calls = []
-  process = _load_edgeguard_llama_cpp_base_class()()
-  defaults = {
-    "cfg_model_path": "/must/not/be/used/local.gguf",
-    "cfg_model_name": "org/repo",
-    "cfg_model_filename": "model.gguf",
-    "cfg_model_revision": "a" * 40,
-    "cfg_expected_model_sha256": hashlib.sha256(b"gguf").hexdigest(),
-    "cfg_model_n_ctx": 1024,
-    "cfg_chat_format": None,
-    "cfg_draft_model": None,
-    "cfg_n_gpu_layers": 0,
-    "cfg_n_threads": 4,
-    "cfg_default_temperature": 0.7,
-    "cfg_default_top_p": 1.0,
-    "cfg_default_max_tokens": 128,
-    "cfg_repetition_penalty": 1.0,
-    "cfg_default_response_format": None,
-    "cfg_generation_seed": 123,
-  }
-  defaults.update(overrides)
-  for key, value in defaults.items():
-    setattr(process, key, value)
-  return process
-
-
 class CyberSecQwenEngineTests(unittest.TestCase):
-  def test_dedicated_ai_engine_mapping(self):
-    self.assertEqual(
-      AI_ENGINES["cybersec_qwen_4b"]["SERVING_PROCESS"],
-      "llama_cpp_cybersec_qwen_4b",
-    )
-    self.assertEqual(
-      AI_ENGINES["edgeguard_qwen_4b"]["SERVING_PROCESS"],
-      "llama_cpp_edgeguard_qwen_4b",
-    )
-    self.assertEqual(
-      AI_ENGINES["edgeguard_cybersec_qwen_4b"]["SERVING_PROCESS"],
-      "llama_cpp_edgeguard_cybersec_qwen_4b",
-    )
-    self.assertNotIn("llama_cpp", AI_ENGINES)
+  PROFILES = {
+    "base_qwen_4b": (
+      "llama_cpp_base_qwen_4b.py",
+      "LlamaCppBaseQwen4B",
+      "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
+      "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
+      "edgeguard-base-qwen3-4b",
+    ),
+    "edgeguard_qwen_4b": (
+      "llama_cpp_edgeguard_qwen_4b.py",
+      "LlamaCppEdgeguardQwen4B",
+      "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf",
+      "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
+      "edgeguard-qwen3-4b-cypher",
+    ),
+    "cybersec_qwen_4b": (
+      "llama_cpp_cybersec_qwen_4b.py",
+      "LlamaCppCybersecQwen4B",
+      "mradermacher/CyberSecQwen-4B-GGUF",
+      "CyberSecQwen-4B.Q4_K_M.gguf",
+      "cybersecqwen-4b",
+    ),
+  }
 
-  def test_edgeguard_model_instance_id_keeps_dual_workers_distinct(self):
-    utils = _load_ai_engine_utils()
-
-    self.assertEqual(
-      utils.get_serving_process_given_ai_engine("edgeguard_qwen_4b"),
-      "llama_cpp_edgeguard_qwen_4b",
-    )
-    self.assertEqual(
-      utils.get_serving_process_given_ai_engine("base_qwen_4b"),
-      "llama_cpp_base_qwen_4b",
-    )
-    self.assertEqual(
-      utils.get_serving_process_given_ai_engine(("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")),
-      ("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
-    )
-    self.assertEqual(
-      utils.get_ai_engine_given_serving_process(
-        ("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
-      ),
-      ("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b"),
-    )
-
-  def test_serving_config_is_cpu_bounded_q4_model(self):
-    loaded = _load_cybersec_qwen_class()
-    config = loaded.config
-
-    self.assertIs(loaded.cls.CONFIG, config)
-    self.assertEqual(config["DEFAULT_DEVICE"], "cpu")
-    self.assertEqual(config["N_GPU_LAYERS"], 0)
-    self.assertEqual(config["N_THREADS"], 4)
-    self.assertEqual(config["MODEL_N_CTX"], 4096)
-    self.assertEqual(config["DEFAULT_MAX_TOKENS"], 1024)
-    self.assertEqual(config["MODEL_INSTANCE_ID"], "cybersecqwen-4b")
-    self.assertEqual(config["MODEL_NAME"], "mradermacher/CyberSecQwen-4B-GGUF")
-    self.assertEqual(config["MODEL_FILENAME"], "CyberSecQwen-4B.Q4_K_M.gguf")
-
-  def test_edgeguard_profiles_pin_revisions_and_expected_bytes(self):
+  def test_three_model_ai_engine_mappings_use_generic_profiles(self):
     expected = {
-      "llama_cpp_base_qwen_4b.py": (
-        "aec29f0e8c31130ba811bec2c774c2ef44888f55",
-        "953ba5b5511fbb2ec9bcb4e588b1e72cedef19b908dba1da0fb3fb340cfb1c3e",
-      ),
-      "llama_cpp_edgeguard_qwen_4b.py": (
-        "369066092b5eef41c9093474ff7142cc530a853f",
-        "7f7ed0f4d3341d36204d17343a07e3b6d99ec135a4ce67da66ad09b8eba2a91b",
-      ),
-      "llama_cpp_edgeguard_cybersec_qwen_4b.py": (
-        "4b369711d408b9fde0efcca155409c072b19a1f6",
-        "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
-      ),
+      "base_qwen_4b": "llama_cpp_base_qwen_4b",
+      "edgeguard_qwen_4b": "llama_cpp_edgeguard_qwen_4b",
+      "cybersec_qwen_4b": "llama_cpp_cybersec_qwen_4b",
     }
-    for filename, (revision, sha256) in expected.items():
+    for engine, serving_process in expected.items():
+      with self.subTest(engine=engine):
+        self.assertEqual(AI_ENGINES[engine]["SERVING_PROCESS"], serving_process)
+    self.assertNotIn("edgeguard_cybersec_qwen_4b", AI_ENGINES)
+
+  def test_three_model_ai_engine_aliases_round_trip_with_instance_ids(self):
+    utils = _load_ai_engine_utils()
+    instances = {
+      "base_qwen_4b": "edgeguard-base-qwen3-4b",
+      "edgeguard_qwen_4b": "edgeguard-finetuned-v0-10",
+      "cybersec_qwen_4b": "edgeguard-cybersec-qwen-4b",
+    }
+    for engine, instance_id in instances.items():
+      with self.subTest(engine=engine):
+        serving_process = AI_ENGINES[engine]["SERVING_PROCESS"]
+        self.assertEqual(
+          utils.get_serving_process_given_ai_engine((engine, instance_id)),
+          (serving_process, instance_id),
+        )
+        self.assertEqual(
+          utils.get_ai_engine_given_serving_process((serving_process, instance_id)),
+          (engine, instance_id),
+        )
+
+  def test_profiles_keep_model_identity_and_cpu_bounds(self):
+    for engine, profile_args in self.PROFILES.items():
+      filename, class_name, model_name, model_filename, instance_id = profile_args
+      with self.subTest(engine=engine):
+        loaded = _load_profile(filename, class_name)
+        config = loaded.config
+        self.assertIs(loaded.cls.CONFIG, config)
+        self.assertEqual(config["DEFAULT_DEVICE"], "cpu")
+        self.assertEqual(config["N_GPU_LAYERS"], 0)
+        self.assertEqual(config["N_THREADS"], 4)
+        self.assertEqual(config["MODEL_N_CTX"], 4096)
+        self.assertEqual(config["MODEL_NAME"], model_name)
+        self.assertEqual(config["MODEL_FILENAME"], model_filename)
+        self.assertEqual(config["MODEL_INSTANCE_ID"], instance_id)
+
+  def test_base_and_finetuned_profiles_are_configuration_only_generic_subclasses(self):
+    for filename, class_name in (
+      ("llama_cpp_base_qwen_4b.py", "LlamaCppBaseQwen4B"),
+      ("llama_cpp_edgeguard_qwen_4b.py", "LlamaCppEdgeguardQwen4B"),
+    ):
       with self.subTest(filename=filename):
-        config = _load_edgeguard_profile_config(filename)
-        self.assertEqual(config["MODEL_REVISION"], revision)
-        self.assertEqual(config["EXPECTED_MODEL_SHA256"], sha256)
+        source = (PROFILE_DIR / filename).read_text(encoding="utf-8")
+        self.assertIn("nlp.llama_cpp_base import LlamaCppBaseServingProcess", source)
+        self.assertNotIn("llama_cpp_edgeguard_base", source)
+        self.assertNotIn("MODEL_REVISION", source)
+        self.assertNotIn("EXPECTED_MODEL_SHA256", source)
+        self.assertNotIn("WORKER_MODULE_SHA256", source)
+        module = ast.parse(source)
+        profile_class = next(
+          node for node in module.body
+          if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        self.assertTrue(all(isinstance(node, (ast.Assign, ast.AnnAssign)) for node in profile_class.body))
 
-  def test_generic_and_edgeguard_cybersec_profiles_use_separate_bases(self):
-    profile_dir = ROOT / "extensions" / "serving" / "default_inference" / "nlp"
-    generic_source = (profile_dir / "llama_cpp_cybersec_qwen_4b.py").read_text(encoding="utf-8")
-    edgeguard_source = (
-      profile_dir / "llama_cpp_edgeguard_cybersec_qwen_4b.py"
-    ).read_text(encoding="utf-8")
+  def test_edgeguard_specific_serving_modules_are_removed(self):
+    self.assertFalse((PROFILE_DIR / "llama_cpp_edgeguard_base.py").exists())
+    self.assertFalse((PROFILE_DIR / "llama_cpp_edgeguard_cybersec_qwen_4b.py").exists())
 
-    self.assertIn("nlp.llama_cpp_base import", generic_source)
-    self.assertNotIn("llama_cpp_edgeguard_base", generic_source)
-    self.assertIn("llama_cpp_edgeguard_base import", edgeguard_source)
+  def test_generic_llama_cpp_loads_all_three_local_profile_paths(self):
+    for engine, profile_args in self.PROFILES.items():
+      filename, class_name, model_name, model_filename, _instance_id = profile_args
+      loaded = _load_profile(filename, class_name)
+      with self.subTest(engine=engine), tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / model_filename
+        model_path.write_bytes(b"gguf")
+        process = _make_llama_cpp_process(
+          cfg_model_path=str(model_path),
+          cfg_model_name=model_name,
+          cfg_model_filename=model_filename,
+        )
 
-  def test_edgeguard_ignores_model_path_and_verifies_pinned_remote_artifact(self):
-    process = _make_edgeguard_llama_cpp_process()
-    calls = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-      downloaded_path = Path(tmpdir) / "snapshots" / ("a" * 40) / "model.gguf"
-      downloaded_path.parent.mkdir(parents=True)
-      downloaded_path.write_bytes(b"gguf")
-      fake_hf_module = types.SimpleNamespace(
-        HfApi=lambda token=None: types.SimpleNamespace(
-          list_repo_files=lambda **kwargs: calls.append(("list", kwargs)) or ["model.gguf"],
-        ),
-        hf_hub_download=lambda **kwargs: calls.append(("download", kwargs)) or str(downloaded_path),
-      )
-      previous_hf_module = sys.modules.get("huggingface_hub")
-      sys.modules["huggingface_hub"] = fake_hf_module
-      try:
-        process._load_model()
-      finally:
-        if previous_hf_module is None:
-          sys.modules.pop("huggingface_hub", None)
-        else:
-          sys.modules["huggingface_hub"] = previous_hf_module
+        self.assertIsNone(process._load_model())
+        self.assertEqual(len(_FakeLlama.calls), 1)
+        call_type, kwargs = _FakeLlama.calls[0]
+        self.assertEqual(call_type, "local")
+        self.assertEqual(kwargs["model_path"], str(model_path))
+        self.assertEqual(kwargs["n_threads"], loaded.config["N_THREADS"])
+        self.assertEqual(process.safe_load_model_args["model_id"], model_filename)
+        self.assertEqual(process.safe_load_model_args["model_str_id"], model_filename)
+        self.assertEqual(process.get_model_name(), model_filename)
+        self.assertFalse(any(str(model_path.parent) in message for message in process.messages))
 
-    self.assertEqual(process._get_model_path(), None)
-    self.assertTrue(all(call[1]["revision"] == "a" * 40 for call in calls))
-    self.assertEqual(_FakeLlama.calls[0][1]["model_path"], str(downloaded_path))
-    self.assertNotEqual(_FakeLlama.calls[0][1]["model_path"], process.cfg_model_path)
-    fingerprint = process.get_runtime_fingerprint()
-    self.assertEqual(fingerprint["gguf_sha256"], hashlib.sha256(b"gguf").hexdigest())
-    self.assertEqual(fingerprint["model_revision"], "a" * 40)
-    self.assertEqual(fingerprint["load_configuration"]["requested_model_revision"], "a" * 40)
-    process.__class__.WORKER_MODULE_SHA256 = "f" * 64
-    identity = process.get_worker_code_identity()
-    edgeguard_base_path = (
-      ROOT / "extensions" / "serving" / "default_inference" / "nlp" /
-      "llama_cpp_edgeguard_base.py"
-    )
-    self.assertEqual(
-      identity["llama_cpp_base_sha256"],
-      hashlib.sha256(edgeguard_base_path.read_bytes()).hexdigest(),
-    )
-
-  def test_edgeguard_rejects_wrong_pinned_artifact_before_llama_construction(self):
-    process = _make_edgeguard_llama_cpp_process(
-      cfg_expected_model_sha256="0" * 64,
-    )
-    with tempfile.TemporaryDirectory() as tmpdir:
-      downloaded_path = Path(tmpdir) / "model.gguf"
-      downloaded_path.write_bytes(b"wrong")
-      fake_hf_module = types.SimpleNamespace(
-        HfApi=lambda token=None: types.SimpleNamespace(
-          list_repo_files=lambda **_kwargs: ["model.gguf"],
-        ),
-        hf_hub_download=lambda **_kwargs: str(downloaded_path),
-      )
-      previous_hf_module = sys.modules.get("huggingface_hub")
-      sys.modules["huggingface_hub"] = fake_hf_module
-      try:
-        with self.assertRaisesRegex(RuntimeError, "GGUF SHA-256 mismatch"):
-          process._load_model()
-      finally:
-        if previous_hf_module is None:
-          sys.modules.pop("huggingface_hub", None)
-        else:
-          sys.modules["huggingface_hub"] = previous_hf_module
-
-    self.assertEqual(_FakeLlama.calls, [])
-
-  def test_llama_cpp_base_can_load_mounted_model_file(self):
-    with tempfile.TemporaryDirectory() as tmpdir:
-      model_path = Path(tmpdir) / "CyberSecQwen-4B.Q4_K_M.gguf"
-      model_path.write_bytes(b"gguf")
-      process = _make_llama_cpp_process(cfg_model_path=str(model_path))
-
-      loaded = process._load_model()
-
-    self.assertIsNone(loaded)
-    self.assertEqual(len(_FakeLlama.calls), 1)
-    call_type, kwargs = _FakeLlama.calls[0]
-    self.assertEqual(call_type, "local")
-    self.assertEqual(kwargs["model_path"], str(model_path))
-    self.assertEqual(kwargs["n_threads"], 4)
-    self.assertEqual(process.safe_load_model_args["model_id"], model_path.name)
-    self.assertEqual(process.safe_load_model_args["model_str_id"], model_path.name)
-    self.assertEqual(process.get_model_name(), model_path.name)
-    self.assertFalse(any(str(model_path.parent) in message for message in process.messages))
-
-  def test_llama_cpp_base_blank_model_path_uses_repo_loading(self):
+  def test_generic_llama_cpp_blank_model_path_uses_repo_loading_without_revision(self):
     process = _make_llama_cpp_process(cfg_model_path="  ")
     process._load_model()
 
@@ -506,7 +293,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(process.safe_load_model_args["model_id"], "org/repo")
     self.assertEqual(process.safe_load_model_args["model_str_id"], "org/repo/model.gguf")
 
-  def test_llama_cpp_base_missing_model_path_error_is_sanitized(self):
+  def test_generic_llama_cpp_missing_model_path_error_is_sanitized(self):
     with tempfile.TemporaryDirectory() as tmpdir:
       model_path = Path(tmpdir) / "missing.gguf"
       process = _make_llama_cpp_process(cfg_model_path=str(model_path))
@@ -519,10 +306,6 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
   def test_generic_llama_cpp_uses_origin_zero_temperature_fallback_and_omits_seed(self):
     process = _make_llama_cpp_process()
-    process.cfg_default_temperature = 0.7
-    process.cfg_default_top_p = 0.9
-    process.cfg_default_max_tokens = 1024
-    process.cfg_repetition_penalty = 1.0
     process.check_relevant_input = lambda _input: True
     process.maybe_add_context_to_messages = lambda messages, context: messages
     process.get_default_response_format = lambda: {"type": "text"}
@@ -542,195 +325,6 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(preprocessed[0][0]["temperature"], 0.7)
     self.assertNotIn("seed", preprocessed[0][0])
     self.assertEqual(preprocessed[2], [{"REQUEST_ID": None}])
-
-  def test_edgeguard_llama_cpp_preserves_explicit_zero_temperature_and_seed(self):
-    process = _make_edgeguard_llama_cpp_process()
-    process.check_relevant_input = lambda _input: True
-    process.maybe_add_context_to_messages = lambda messages, context: messages
-    process.get_default_response_format = lambda: {"type": "text"}
-    process.process_predict_kwargs = lambda kwargs: kwargs
-
-    preprocessed = process._pre_process({
-      "DATA": [{
-        "JEEVES_CONTENT": {
-          "MESSAGES": [{"role": "user", "content": "Explain"}],
-          "TEMPERATURE": 0.0,
-          "SEED": 42,
-        },
-      }],
-    })
-
-    self.assertEqual(preprocessed[0][0]["temperature"], 0.0)
-    self.assertEqual(preprocessed[0][0]["seed"], 42)
-    self.assertEqual(preprocessed[2], [{"REQUEST_ID": None, "BENCHMARK_MODE": False}])
-
-  def test_edgeguard_llama_cpp_context_overflow_returns_structured_failure_without_retry(self):
-    process = _make_edgeguard_llama_cpp_process()
-    process._tps = []
-    process.time = lambda: 1.0
-    process.maybe_process_text = lambda text, _method: text
-    process.check_condition = lambda _text, _condition: True
-    process.model = types.SimpleNamespace()
-    calls = []
-
-    def overflow(**_kwargs):
-      calls.append(True)
-      raise ValueError("Requested tokens (17893) exceed context window of 4096")
-
-    process.model.create_chat_completion = overflow
-    result = process._predict([
-      [{"max_tokens": 1600}],
-      [[{"role": "user", "content": "large packet"}]],
-      [{"REQUEST_ID": "req-context"}],
-      [None],
-      [None],
-      [0],
-      1,
-    ])
-
-    self.assertEqual(len(calls), 1)
-    self.assertEqual(result["text"], [""])
-    self.assertEqual(
-      result["FULL_OUTPUT"][0]["error"]["code"],
-      "context_window_exceeded",
-    )
-    self.assertEqual(result["FULL_OUTPUT"][0]["error"]["requested_tokens"], 17893)
-    self.assertEqual(result["FULL_OUTPUT"][0]["error"]["context_window"], 4096)
-    processed = process._post_process(result)
-    self.assertFalse(processed[0]["IS_VALID"])
-    self.assertEqual(processed[0]["ERROR_CODE"], "context_window_exceeded")
-    self.assertEqual(processed[0]["ERROR"], "Model context window exceeded.")
-
-  def test_llama_cpp_benchmark_mode_resets_once_calls_once_and_omits_retry_hints(self):
-    process = _make_edgeguard_llama_cpp_process()
-    process.cfg_default_temperature = 0.7
-    process.cfg_default_top_p = 0.9
-    process.cfg_default_max_tokens = 128
-    process.cfg_repetition_penalty = 1.0
-    process.check_relevant_input = lambda _input: True
-    process.maybe_add_context_to_messages = lambda messages, context: messages
-    process.get_default_response_format = lambda: None
-    process.process_predict_kwargs = lambda kwargs: kwargs
-    process._tps = []
-    process.time = lambda: 1.0
-    process.maybe_process_text = lambda text, _method: text
-    process.check_condition = lambda _text, _condition: False
-    reset_calls = []
-    completion_calls = []
-    process.model = types.SimpleNamespace(
-      reset=lambda: reset_calls.append(True),
-      create_chat_completion=lambda **kwargs: (
-        completion_calls.append(kwargs) or {
-          "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
-          "usage": {"completion_tokens": 0},
-        }
-      ),
-    )
-
-    preprocessed = process._pre_process({
-      "DATA": [{"JEEVES_CONTENT": {
-        "MESSAGES": [{"role": "user", "content": "fixture"}],
-        "BENCHMARK_MODE": True,
-        "VALID_CONDITION": "must-not-run",
-        "PROCESS_METHOD": "must-not-run",
-        "SEED": 42,
-      }}],
-    })
-    result = process._predict(preprocessed)
-
-    self.assertEqual(preprocessed[3], [None])
-    self.assertEqual(preprocessed[4], [None])
-    self.assertEqual(len(reset_calls), 1)
-    self.assertEqual(len(completion_calls), 1)
-    self.assertEqual(completion_calls[0]["seed"], 42)
-    telemetry = result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"]
-    self.assertEqual(telemetry["reset_succeeded"], True)
-    self.assertEqual(telemetry["attempt_count"], 1)
-    self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
-    self.assertEqual(telemetry["effective_generation_config"]["seed"], 42)
-    self.assertEqual(telemetry["reset_ms"], 0.0)
-    self.assertEqual(telemetry["generation_ms"], 0.0)
-    self.assertEqual(
-      telemetry["generation_config_sha256"],
-      process.benchmark_generation_config_sha256(completion_calls[0]),
-    )
-
-  def test_llama_cpp_benchmark_mode_missing_reset_makes_zero_completion_calls(self):
-    process = _make_edgeguard_llama_cpp_process()
-    process._tps = []
-    process.time = lambda: 1.0
-    process.maybe_process_text = lambda text, _method: text
-    process.check_condition = lambda _text, _condition: True
-    completion_calls = []
-    process.model = types.SimpleNamespace(
-      create_chat_completion=lambda **_kwargs: completion_calls.append(True),
-    )
-    result = process._predict([
-      [{"max_tokens": 128}],
-      [[{"role": "user", "content": "fixture"}]],
-      [{"REQUEST_ID": "req", "BENCHMARK_MODE": True}],
-      [None],
-      [None],
-      [0],
-      1,
-    ])
-
-    self.assertEqual(completion_calls, [])
-    self.assertEqual(result["FULL_OUTPUT"][0]["error"]["code"], "benchmark_reset_unavailable")
-    telemetry = result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"]
-    self.assertEqual(telemetry["reset_succeeded"], False)
-    self.assertEqual(telemetry["attempt_count"], 0)
-    self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
-
-  def test_llama_cpp_benchmark_mode_terminal_outcomes_each_call_once(self):
-    outcomes = {
-      "success": lambda: {
-        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
-        "usage": {"completion_tokens": 1},
-      },
-      "empty": lambda: {
-        "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
-        "usage": {"completion_tokens": 0},
-      },
-      "provider_error": lambda: {"error": {"code": "provider_error"}},
-      "context_error": lambda: (_ for _ in ()).throw(
-        ValueError("Requested tokens (3301) exceed context window of 4096")
-      ),
-    }
-    for label, outcome in outcomes.items():
-      with self.subTest(label=label):
-        process = _make_edgeguard_llama_cpp_process()
-        process._tps = []
-        process.time = lambda: 1.0
-        process.maybe_process_text = lambda text, _method: text
-        process.check_condition = lambda _text, _condition: False
-        reset_calls = []
-        completion_calls = []
-
-        def complete(**_kwargs):
-          completion_calls.append(True)
-          return outcome()
-
-        process.model = types.SimpleNamespace(
-          reset=lambda: reset_calls.append(True),
-          create_chat_completion=complete,
-        )
-        result = process._predict([
-          [{"max_tokens": 128}],
-          [[{"role": "user", "content": "fixture"}]],
-          [{"REQUEST_ID": "req", "BENCHMARK_MODE": True}],
-          [None],
-          [None],
-          [0],
-          1,
-        ])
-
-        self.assertEqual(len(reset_calls), 1)
-        self.assertEqual(len(completion_calls), 1)
-        telemetry = result["FULL_OUTPUT"][0]["EDGEGUARD_BENCHMARK_TELEMETRY"]
-        self.assertEqual(telemetry["reset_succeeded"], True)
-        self.assertEqual(telemetry["attempt_count"], 1)
-        self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
 
   def test_generic_llama_cpp_retries_invalid_output_and_logs_raw_text(self):
     process = _make_llama_cpp_process()
@@ -764,47 +358,6 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(result["text"], ["second-output"])
     self.assertTrue(any("first-output" in message for message in process.messages))
     self.assertTrue(any("second-output" in message for message in process.messages))
-
-  def test_edgeguard_llama_cpp_generation_logs_only_content_free_diagnostics(self):
-    process = _make_edgeguard_llama_cpp_process()
-    process._tps = []
-    process.time = lambda: 1.0
-    process.maybe_process_text = lambda text, _method: text
-    process.check_condition = lambda _text, _condition: True
-    partial_output = "partial-secret-model-output"
-    process.model = types.SimpleNamespace(
-      create_chat_completion=lambda **_kwargs: {
-        "choices": [{
-          "message": {"content": partial_output},
-          "finish_reason": "length",
-        }],
-        "usage": {"completion_tokens": 512},
-      },
-    )
-
-    result = process._predict([
-      [{"max_tokens": 512}],
-      [[{"role": "user", "content": "bounded prompt"}]],
-      [{"REQUEST_ID": "req-length"}],
-      [None],
-      [None],
-      [0],
-      1,
-    ])
-
-    self.assertEqual(result["text"], [partial_output])
-    self.assertFalse(any(partial_output in message for message in process.messages))
-    self.assertTrue(any("text_chars=" in message for message in process.messages))
-
-    base_source = (
-      ROOT / "extensions" / "serving" / "base" / "base_llm_serving.py"
-    ).read_text(encoding="utf-8")
-    edgeguard_source = (
-      ROOT / "extensions" / "serving" / "default_inference" / "nlp" /
-      "llama_cpp_edgeguard_base.py"
-    ).read_text(encoding="utf-8")
-    self.assertIn("shorten_str(text_lst)", base_source)
-    self.assertIn("text_chars=", edgeguard_source)
 
 
 if __name__ == "__main__":

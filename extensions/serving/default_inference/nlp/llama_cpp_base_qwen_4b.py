@@ -1,12 +1,8 @@
 """Unmodified Qwen3 4B GGUF serving profile for EdgeGuard comparisons."""
 
-from extensions.serving.default_inference.nlp.llama_cpp_edgeguard_base import (
-  LlamaCppEdgeguardBaseServingProcess as BaseServingProcess,
-  source_file_sha256,
-)
+from extensions.serving.default_inference.nlp.llama_cpp_base import LlamaCppBaseServingProcess as BaseServingProcess
 
 __VER__ = '0.1.0.0'
-WORKER_MODULE_SHA256 = source_file_sha256(__file__)
 
 
 _CONFIG = {
@@ -15,8 +11,6 @@ _CONFIG = {
   "DEFAULT_DEVICE": "cpu",
   "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
   "MODEL_FILENAME": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
-  "MODEL_REVISION": "aec29f0e8c31130ba811bec2c774c2ef44888f55",
-  "EXPECTED_MODEL_SHA256": "953ba5b5511fbb2ec9bcb4e588b1e72cedef19b908dba1da0fb3fb340cfb1c3e",
   "MODEL_N_CTX": 4096,
   "N_GPU_LAYERS": 0,
   "N_THREADS": 4,
@@ -31,4 +25,3 @@ _CONFIG = {
 
 class LlamaCppBaseQwen4B(BaseServingProcess):
   CONFIG = _CONFIG
-  WORKER_MODULE_SHA256 = WORKER_MODULE_SHA256
