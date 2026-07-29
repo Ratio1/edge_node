@@ -368,6 +368,40 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     }
     self.assertTrue(plugin.filter_valid_inference(inference))
 
+  def test_edgeguard_serving_envelope_keeps_existing_completion_response_shape(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin.time = lambda: 1234.5
+    plugin._annotate_result_with_node_roles = lambda **_kwargs: None
+    inference = {
+      "REQUEST_ID": "req-edgeguard",
+      "text": "MATCH (n) RETURN n LIMIT 1",
+      "FULL_OUTPUT": {
+        "choices": [{
+          "message": {"content": "MATCH (n) RETURN n LIMIT 1"},
+          "finish_reason": "stop",
+        }],
+        "usage": {"completion_tokens": 9},
+      },
+      "IS_VALID": True,
+    }
+
+    response = plugin.build_completion_response(
+      request_id="req-edgeguard",
+      model_name="edgeguard-base-qwen3-4b",
+      inference=inference,
+      request_data={"metadata": {"route": "base"}},
+    )
+
+    self.assertEqual(response["REQUEST_ID"], "req-edgeguard")
+    self.assertEqual(response["MODEL_NAME"], "edgeguard-base-qwen3-4b")
+    self.assertEqual(response["TEXT_RESPONSE"], "MATCH (n) RETURN n LIMIT 1")
+    self.assertEqual(response["object"], "chat.completion")
+    self.assertEqual(response["id"], "req-edgeguard")
+    self.assertEqual(response["model"], "edgeguard-base-qwen3-4b")
+    self.assertEqual(response["metadata"], {"route": "base"})
+    self.assertEqual(response["choices"], inference["FULL_OUTPUT"]["choices"])
+    self.assertEqual(response["usage"], {"completion_tokens": 9})
+
   def test_filter_valid_inference_fails_single_pending_on_invalid_empty_output(self):
     plugin = LLMInferenceApiPlugin()
     plugin._requests = {"req-9": {"status": "pending"}}  # pylint: disable=protected-access

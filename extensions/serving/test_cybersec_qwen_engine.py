@@ -169,21 +169,58 @@ def _load_edgeguard_llama_cpp_base_class():
     "llama_cpp_edgeguard_base.py"
   )
   source = source_path.read_text(encoding="utf-8")
-  source = source.replace("from llama_cpp import Llama\n", "")
+  source = source.replace("from llama_cpp import Llama, llama_cpp as llama_cpp_lib\n", "")
+  source = source.replace(
+    "from extensions.serving.base import base_llm_serving as base_llm_serving_module\n",
+    "",
+  )
   source = source.replace(
     "from extensions.serving.default_inference.nlp.llama_cpp_base import (\n"
     "  MODEL_N_BATCH_DEFAULT_VALUE,\n"
     "  MODEL_N_CTX_DEFAULT_VALUE,\n"
     "  MODEL_N_CTX_MIN_VALUE,\n"
     "  LlamaCppBaseServingProcess as BaseServingProcess,\n"
-    "  source_file_sha256,\n"
     ")\n",
+    "",
+  )
+  source = source.replace(
+    "from extensions.serving.mixins_llm import llm_utils as llm_utils_module\n",
+    "",
+  )
+  source = source.replace(
+    "from extensions.serving.mixins_llm.llm_utils import LlmCT\n",
     "",
   )
   generic_class = _load_llama_cpp_base_class()
   namespace = {
     "BaseServingProcess": generic_class,
+    "base_llm_serving_module": types.SimpleNamespace(
+      __file__=str(ROOT / "extensions/serving/base/base_llm_serving.py"),
+    ),
     "Llama": _FakeLlama,
+    "llama_cpp_lib": _FakeLlamaCppLib,
+    "llm_utils_module": types.SimpleNamespace(
+      __file__=str(ROOT / "extensions/serving/mixins_llm/llm_utils.py"),
+    ),
+    "LlmCT": types.SimpleNamespace(
+      ROLE_KEY="role",
+      DATA_KEY="content",
+      REQUEST_ID="REQUEST_ID",
+      MESSAGES="MESSAGES",
+      TEMPERATURE="TEMPERATURE",
+      TOP_P="TOP_P",
+      MAX_TOKENS="MAX_TOKENS",
+      CONTEXT="CONTEXT",
+      VALID_CONDITION="VALID_CONDITION",
+      PROCESS_METHOD="PROCESS_METHOD",
+      RESPONSE_FORMAT="RESPONSE_FORMAT",
+      BENCHMARK_MODE="BENCHMARK_MODE",
+      SEED="SEED",
+      PRMP="prompt",
+      TEXT="text",
+      ADDITIONAL="ADDITIONAL",
+      FULL_OUTPUT="FULL_OUTPUT",
+    ),
     "MODEL_N_BATCH_DEFAULT_VALUE": 512,
     "MODEL_N_CTX_DEFAULT_VALUE": 4096,
     "MODEL_N_CTX_MIN_VALUE": 512,
@@ -240,7 +277,6 @@ def _make_llama_cpp_process(**overrides):
     "cfg_model_path": None,
     "cfg_model_name": "org/repo",
     "cfg_model_filename": "model.gguf",
-    "cfg_model_revision": None,
     "cfg_model_n_ctx": 1024,
     "cfg_chat_format": None,
     "cfg_draft_model": None,
@@ -397,7 +433,10 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertTrue(all(call[1]["revision"] == "a" * 40 for call in calls))
     self.assertEqual(_FakeLlama.calls[0][1]["model_path"], str(downloaded_path))
     self.assertNotEqual(_FakeLlama.calls[0][1]["model_path"], process.cfg_model_path)
-    self.assertEqual(process.get_runtime_fingerprint()["gguf_sha256"], hashlib.sha256(b"gguf").hexdigest())
+    fingerprint = process.get_runtime_fingerprint()
+    self.assertEqual(fingerprint["gguf_sha256"], hashlib.sha256(b"gguf").hexdigest())
+    self.assertEqual(fingerprint["model_revision"], "a" * 40)
+    self.assertEqual(fingerprint["load_configuration"]["requested_model_revision"], "a" * 40)
     process.__class__.WORKER_MODULE_SHA256 = "f" * 64
     identity = process.get_worker_code_identity()
     edgeguard_base_path = (
@@ -453,80 +492,19 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(process.safe_load_model_args["model_str_id"], model_path.name)
     self.assertEqual(process.get_model_name(), model_path.name)
     self.assertFalse(any(str(model_path.parent) in message for message in process.messages))
-    fingerprint = process.get_runtime_fingerprint()
-    self.assertEqual(fingerprint["gguf_sha256"], hashlib.sha256(b"gguf").hexdigest())
-    self.assertEqual(fingerprint["model_revision"], f"artifact-sha256:{fingerprint['gguf_sha256']}")
-    self.assertEqual(fingerprint["quantization"]["general.file_type"], 15)
-    self.assertEqual(fingerprint["llama_cpp"]["build_sha256"], hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
-    self.assertRegex(fingerprint["llama_cpp"]["system_info_sha256"], r"^[0-9a-f]{64}$")
-    self.assertRegex(fingerprint["load_configuration"]["draft_model_config_sha256"], r"^[0-9a-f]{64}$")
-    self.assertRegex(fingerprint["fingerprint_sha256"], r"^[0-9a-f]{64}$")
-    self.assertNotIn(str(model_path), json.dumps(fingerprint))
-    process.__class__.WORKER_MODULE_SHA256 = "f" * 64
-    code_identity = process.get_worker_code_identity()
-    self.assertEqual(code_identity["serving_module_sha256"], "f" * 64)
-    self.assertRegex(code_identity["llama_cpp_base_sha256"], r"^[0-9a-f]{64}$")
-    self.assertRegex(code_identity["base_llm_serving_sha256"], r"^[0-9a-f]{64}$")
-    self.assertRegex(code_identity["llm_utils_sha256"], r"^[0-9a-f]{64}$")
 
   def test_llama_cpp_base_blank_model_path_uses_repo_loading(self):
     process = _make_llama_cpp_process(cfg_model_path="  ")
-    with tempfile.TemporaryDirectory() as tmpdir:
-      downloaded_path = str(Path(tmpdir) / "snapshots" / ("a" * 40) / "model.gguf")
-      Path(downloaded_path).parent.mkdir(parents=True)
-      Path(downloaded_path).write_bytes(b"gguf")
-      fake_hf_module = types.SimpleNamespace(
-        HfApi=lambda token=None: types.SimpleNamespace(
-          list_repo_files=lambda repo_id, revision=None, token=None: ["model.gguf"],
-        ),
-        hf_hub_download=lambda **_kwargs: downloaded_path,
-      )
-      previous_hf_module = sys.modules.get("huggingface_hub")
-      sys.modules["huggingface_hub"] = fake_hf_module
-
-      try:
-        process._load_model()
-      finally:
-        if previous_hf_module is None:
-          sys.modules.pop("huggingface_hub", None)
-        else:
-          sys.modules["huggingface_hub"] = previous_hf_module
-
-      self.assertEqual(process.get_runtime_fingerprint()["model_revision"], "a" * 40)
+    process._load_model()
 
     self.assertEqual(len(_FakeLlama.calls), 1)
     call_type, kwargs = _FakeLlama.calls[0]
-    self.assertEqual(call_type, "local")
-    self.assertEqual(kwargs["model_path"], downloaded_path)
+    self.assertEqual(call_type, "remote")
+    self.assertEqual(kwargs["repo_id"], "org/repo")
+    self.assertEqual(kwargs["filename"], "model.gguf")
+    self.assertNotIn("revision", kwargs)
     self.assertEqual(process.safe_load_model_args["model_id"], "org/repo")
     self.assertEqual(process.safe_load_model_args["model_str_id"], "org/repo/model.gguf")
-
-  def test_llama_cpp_base_applies_requested_revision_but_records_loaded_snapshot(self):
-    process = _make_llama_cpp_process(cfg_model_revision="requested-tag")
-    calls = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-      snapshot = "b" * 40
-      downloaded_path = str(Path(tmpdir) / "snapshots" / snapshot / "model.gguf")
-      Path(downloaded_path).parent.mkdir(parents=True)
-      Path(downloaded_path).write_bytes(b"gguf")
-      fake_hf_module = types.SimpleNamespace(
-        HfApi=lambda token=None: types.SimpleNamespace(
-          list_repo_files=lambda **kwargs: calls.append(("list", kwargs)) or ["model.gguf"],
-        ),
-        hf_hub_download=lambda **kwargs: calls.append(("download", kwargs)) or downloaded_path,
-      )
-      previous_hf_module = sys.modules.get("huggingface_hub")
-      sys.modules["huggingface_hub"] = fake_hf_module
-      try:
-        process._load_model()
-      finally:
-        if previous_hf_module is None:
-          sys.modules.pop("huggingface_hub", None)
-        else:
-          sys.modules["huggingface_hub"] = previous_hf_module
-    self.assertEqual(process.get_runtime_fingerprint()["model_revision"], snapshot)
-    self.assertEqual(process.get_runtime_fingerprint()["load_configuration"]["requested_model_revision"], "requested-tag")
-    self.assertTrue(all(kwargs["revision"] == "requested-tag" for _name, kwargs in calls))
 
   def test_llama_cpp_base_missing_model_path_error_is_sanitized(self):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -539,7 +517,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertIn("missing.gguf", str(raised.exception))
     self.assertNotIn(tmpdir, str(raised.exception))
 
-  def test_llama_cpp_base_preserves_explicit_zero_temperature(self):
+  def test_generic_llama_cpp_uses_origin_zero_temperature_fallback_and_omits_seed(self):
     process = _make_llama_cpp_process()
     process.cfg_default_temperature = 0.7
     process.cfg_default_top_p = 0.9
@@ -555,14 +533,39 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         "JEEVES_CONTENT": {
           "MESSAGES": [{"role": "user", "content": "Explain"}],
           "TEMPERATURE": 0.0,
+          "SEED": 42,
+          "BENCHMARK_MODE": True,
+        },
+      }],
+    })
+
+    self.assertEqual(preprocessed[0][0]["temperature"], 0.7)
+    self.assertNotIn("seed", preprocessed[0][0])
+    self.assertEqual(preprocessed[2], [{"REQUEST_ID": None}])
+
+  def test_edgeguard_llama_cpp_preserves_explicit_zero_temperature_and_seed(self):
+    process = _make_edgeguard_llama_cpp_process()
+    process.check_relevant_input = lambda _input: True
+    process.maybe_add_context_to_messages = lambda messages, context: messages
+    process.get_default_response_format = lambda: {"type": "text"}
+    process.process_predict_kwargs = lambda kwargs: kwargs
+
+    preprocessed = process._pre_process({
+      "DATA": [{
+        "JEEVES_CONTENT": {
+          "MESSAGES": [{"role": "user", "content": "Explain"}],
+          "TEMPERATURE": 0.0,
+          "SEED": 42,
         },
       }],
     })
 
     self.assertEqual(preprocessed[0][0]["temperature"], 0.0)
+    self.assertEqual(preprocessed[0][0]["seed"], 42)
+    self.assertEqual(preprocessed[2], [{"REQUEST_ID": None, "BENCHMARK_MODE": False}])
 
-  def test_llama_cpp_context_overflow_returns_structured_failure_without_retry(self):
-    process = _make_llama_cpp_process()
+  def test_edgeguard_llama_cpp_context_overflow_returns_structured_failure_without_retry(self):
+    process = _make_edgeguard_llama_cpp_process()
     process._tps = []
     process.time = lambda: 1.0
     process.maybe_process_text = lambda text, _method: text
@@ -599,7 +602,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertEqual(processed[0]["ERROR"], "Model context window exceeded.")
 
   def test_llama_cpp_benchmark_mode_resets_once_calls_once_and_omits_retry_hints(self):
-    process = _make_llama_cpp_process()
+    process = _make_edgeguard_llama_cpp_process()
     process.cfg_default_temperature = 0.7
     process.cfg_default_top_p = 0.9
     process.cfg_default_max_tokens = 128
@@ -653,7 +656,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     )
 
   def test_llama_cpp_benchmark_mode_missing_reset_makes_zero_completion_calls(self):
-    process = _make_llama_cpp_process()
+    process = _make_edgeguard_llama_cpp_process()
     process._tps = []
     process.time = lambda: 1.0
     process.maybe_process_text = lambda text, _method: text
@@ -696,7 +699,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     }
     for label, outcome in outcomes.items():
       with self.subTest(label=label):
-        process = _make_llama_cpp_process()
+        process = _make_edgeguard_llama_cpp_process()
         process._tps = []
         process.time = lambda: 1.0
         process.maybe_process_text = lambda text, _method: text
@@ -729,8 +732,41 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         self.assertEqual(telemetry["attempt_count"], 1)
         self.assertRegex(telemetry["generation_config_sha256"], r"^[0-9a-f]{64}$")
 
-  def test_llama_cpp_generation_logs_only_content_free_diagnostics(self):
+  def test_generic_llama_cpp_retries_invalid_output_and_logs_raw_text(self):
     process = _make_llama_cpp_process()
+    process._tps = []
+    process.time = lambda: 1.0
+    process.maybe_process_text = lambda text, _method: text
+    process.check_condition = lambda text, _condition: text == "second-output"
+    outputs = iter(["first-output", "second-output"])
+    completion_calls = []
+
+    def complete(**_kwargs):
+      completion_calls.append(True)
+      text = next(outputs)
+      return {
+        "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+        "usage": {"completion_tokens": 1},
+      }
+
+    process.model = types.SimpleNamespace(create_chat_completion=complete)
+    result = process._predict([
+      [{"max_tokens": 8}],
+      [[{"role": "user", "content": "fixture"}]],
+      [{"REQUEST_ID": "req-generic"}],
+      ["must-pass"],
+      [None],
+      [0],
+      1,
+    ])
+
+    self.assertEqual(len(completion_calls), 2)
+    self.assertEqual(result["text"], ["second-output"])
+    self.assertTrue(any("first-output" in message for message in process.messages))
+    self.assertTrue(any("second-output" in message for message in process.messages))
+
+  def test_edgeguard_llama_cpp_generation_logs_only_content_free_diagnostics(self):
+    process = _make_edgeguard_llama_cpp_process()
     process._tps = []
     process.time = lambda: 1.0
     process.maybe_process_text = lambda text, _method: text
@@ -763,8 +799,12 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     base_source = (
       ROOT / "extensions" / "serving" / "base" / "base_llm_serving.py"
     ).read_text(encoding="utf-8")
-    self.assertNotIn("shorten_str(text_lst)", base_source)
-    self.assertIn("text_chars=", base_source)
+    edgeguard_source = (
+      ROOT / "extensions" / "serving" / "default_inference" / "nlp" /
+      "llama_cpp_edgeguard_base.py"
+    ).read_text(encoding="utf-8")
+    self.assertIn("shorten_str(text_lst)", base_source)
+    self.assertIn("text_chars=", edgeguard_source)
 
 
 if __name__ == "__main__":
