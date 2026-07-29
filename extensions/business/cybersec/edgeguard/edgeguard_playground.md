@@ -34,41 +34,45 @@ The finetuned worker serves the private EGM-029 v0.10 graph-intent continuation:
 ```text
 MODEL_NAME=ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf
 MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf
+MODEL_REVISION=369066092b5eef41c9093474ff7142cc530a853f
 AI_ENGINE=edgeguard_qwen_4b
 ```
 
-The base comparison worker reuses the existing EdgeGuard llama.cpp AI-engine alias with a distinct
-startup model instance id instead of adding a new AI-engine alias:
+The base comparison worker uses its dedicated EdgeGuard base profile with a distinct startup model
+instance id:
 
 ```text
 MODEL_NAME=MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF
 MODEL_FILENAME=Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-AI_ENGINE=edgeguard_qwen_4b
+MODEL_REVISION=aec29f0e8c31130ba811bec2c774c2ef44888f55
+AI_ENGINE=base_qwen_4b
 STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-base-qwen3-4b
 ```
 
 Do not use a raw serving-process value
-(`llama_cpp_edgeguard_qwen_4b?edgeguard-base-qwen3-4b`) or an `AI_ENGINE` suffix
-(`edgeguard_qwen_4b?edgeguard-base-qwen3-4b`) for this worker. Live smoke showed both can register
+(`llama_cpp_base_qwen_4b?edgeguard-base-qwen3-4b`) or an `AI_ENGINE` suffix
+(`base_qwen_4b?edgeguard-base-qwen3-4b`) for this worker. Live smoke showed both can register
 details under a key that does not match the core inference router's reverse lookup. The stable
-runtime contract is the plain `edgeguard_qwen_4b` alias plus `MODEL_INSTANCE_ID` in
+runtime contract is the plain `base_qwen_4b` alias plus `MODEL_INSTANCE_ID` in
 `STARTUP_AI_ENGINE_PARAMS`, which makes the serving handle
-`("llama_cpp_edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")` and routes results back to
-`("edgeguard_qwen_4b", "edgeguard-base-qwen3-4b")`.
+`("llama_cpp_base_qwen_4b", "edgeguard-base-qwen3-4b")` and routes results back to
+`("base_qwen_4b", "edgeguard-base-qwen3-4b")`.
 
-The public CyberSecQwen worker uses the existing dedicated serving engine and downloads
-the GGUF into its normal Hugging Face runtime cache during startup:
+The public CyberSecQwen worker uses the EdgeGuard-specific serving engine and downloads the pinned
+GGUF into its normal Hugging Face runtime cache during startup:
 
 ```text
 MODEL_NAME=mradermacher/CyberSecQwen-4B-GGUF
 MODEL_FILENAME=CyberSecQwen-4B.Q4_K_M.gguf
-AI_ENGINE=cybersec_qwen_4b
+MODEL_REVISION=4b369711d408b9fde0efcca155409c072b19a1f6
+AI_ENGINE=edgeguard_cybersec_qwen_4b
 STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-cybersec-qwen-4b
 ```
 
-`MODEL_NAME` and `MODEL_FILENAME` are the only artifact-source overrides. Do not configure
-`MODEL_PATH`, a repository-local/LFS artifact, or a preseeded model file. `AI_ENGINE`, `PORT`, and
-`MODEL_INSTANCE_ID` are routing identity rather than artifact-source configuration.
+`MODEL_NAME`, `MODEL_FILENAME`, and the exact `MODEL_REVISION` are the only artifact-source
+settings. Do not configure `MODEL_PATH`, a repository-local/LFS artifact, or a preseeded model file.
+`AI_ENGINE`, `PORT`, and `MODEL_INSTANCE_ID` are routing identity rather than artifact-source
+configuration.
 
 Set the private Hugging Face token as a runtime secret for the finetuned worker; do not put it in a
 pipeline JSON committed to git.
@@ -126,6 +130,7 @@ Use one stream per model worker:
             "MODEL_NAME": "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf",
             "MODEL_FILENAME": "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
             "MODEL_INSTANCE_ID": "edgeguard-finetuned-v0-10",
+            "MODEL_REVISION": "369066092b5eef41c9093474ff7142cc530a853f",
             "HF_TOKEN": "$HF_TOKEN"
           }
         }
@@ -145,12 +150,13 @@ Use one stream per model worker:
       "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_llm_base_qwen3_4b",
-          "AI_ENGINE": "edgeguard_qwen_4b",
+          "AI_ENGINE": "base_qwen_4b",
           "PORT": 5091,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
             "MODEL_FILENAME": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
-            "MODEL_INSTANCE_ID": "edgeguard-base-qwen3-4b"
+            "MODEL_INSTANCE_ID": "edgeguard-base-qwen3-4b",
+            "MODEL_REVISION": "aec29f0e8c31130ba811bec2c774c2ef44888f55"
           }
         }
       ]
@@ -171,12 +177,13 @@ Keep the CyberSecQwen worker in its own stream and balancing pool:
       "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_llm_cybersec_qwen_4b",
-          "AI_ENGINE": "cybersec_qwen_4b",
+          "AI_ENGINE": "edgeguard_cybersec_qwen_4b",
           "PORT": 5092,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "mradermacher/CyberSecQwen-4B-GGUF",
             "MODEL_FILENAME": "CyberSecQwen-4B.Q4_K_M.gguf",
-            "MODEL_INSTANCE_ID": "edgeguard-cybersec-qwen-4b"
+            "MODEL_INSTANCE_ID": "edgeguard-cybersec-qwen-4b",
+            "MODEL_REVISION": "4b369711d408b9fde0efcca155409c072b19a1f6"
           }
         }
       ]
