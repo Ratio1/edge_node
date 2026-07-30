@@ -3164,9 +3164,16 @@ class BaseInferenceApiPlugin(
       self._schedule_pending_requests()
       self._retry_same_peer_delegations()
       self._last_balancing_mailbox_poll = now_ts
-    data = self.dataapi_struct_datas()
-    inferences = self.dataapi_struct_data_inferences()
-    self.handle_inferences(inferences=inferences, data=data)
+    data_by_index = self.dataapi_struct_datas()
+    inferences_by_model = self.dataapi_struct_datas_inferences()
+    if isinstance(data_by_index, dict) and isinstance(inferences_by_model, dict):
+      for data_index, input_data in data_by_index.items():
+        aligned_inferences = []
+        for model_inferences in inferences_by_model.values():
+          if isinstance(model_inferences, (list, tuple)) and data_index < len(model_inferences):
+            aligned_inferences.append(model_inferences[data_index])
+        aligned_data = [input_data] * len(aligned_inferences)
+        self.handle_inferences(inferences=aligned_inferences, data=aligned_data)
     self._reconcile_requests()
     self._publish_executor_results()
     self._cleanup_balancing_state()
