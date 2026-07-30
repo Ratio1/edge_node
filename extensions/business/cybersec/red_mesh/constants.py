@@ -299,6 +299,30 @@ COMMON_PORTS = [
 ALL_PORTS = list(range(1, 65536))
 
 # =====================================================================
+# Geographic vantage-point comparison mode
+# =====================================================================
+# When comparison mode is enabled every selected node runs the SAME bounded
+# "comparison tier" of ports (so results can be compared across countries),
+# while any larger user range is sliced across nodes for coverage.
+#
+# The comparison tier = COMMON_PORTS plus the operator's chosen range when that
+# range is no larger than COMPARISON_MIRROR_PORT_CAP. Above the cap only
+# COMMON_PORTS is mirrored and the bulk range is sliced — this bounds the N×
+# redundant scanning that a naive full MIRROR would cause.
+COMPARISON_MIRROR_PORT_CAP = 1024
+
+# Standard webapp/graybox feature bundle always run (mirrored to every node) in
+# comparison mode so cross-country response divergence is meaningful even if the
+# operator narrowed the selection. These are safe, unauthenticated checks; their
+# methods are force-enabled (removed from excluded_features) when comparison
+# mode is on. Referenced by feature id in FEATURE_CATALOG.
+COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS = [
+  "web_discovery",
+  "web_hardening",
+  "web_api_exposure",
+]
+
+# =====================================================================
 # Risk score computation
 # =====================================================================
 

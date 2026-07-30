@@ -45,6 +45,9 @@ class JobConfig:
   task_description: str = ""
   monitor_interval: int = 0
   selected_peers: list = None       # [str] or None
+  # ── geographic vantage-point comparison mode ──
+  comparison_mode: bool = False     # tiered mirror+slice; per-country comparison
+  comparison_ports: list = None     # [int] ports mirrored to every node (comparison tier)
   created_by_name: str = ""
   created_by_id: str = ""
   authorized: bool = False
@@ -145,6 +148,8 @@ class JobConfig:
       task_description=d.get("task_description", ""),
       monitor_interval=d.get("monitor_interval", 0),
       selected_peers=d.get("selected_peers"),
+      comparison_mode=d.get("comparison_mode", False),
+      comparison_ports=d.get("comparison_ports"),
       created_by_name=d.get("created_by_name", ""),
       created_by_id=d.get("created_by_id", ""),
       authorized=d.get("authorized", False),
@@ -267,6 +272,7 @@ class WorkerReportMeta:
   open_ports: list = None           # [int]
   nr_findings: int = 0
   node_ip: str = ""                 # worker node's IP address
+  country: str = ""                 # worker node's ISO-2 country (from location_data); "" when unknown
 
   def to_dict(self) -> dict:
     d = asdict(self)
@@ -284,6 +290,7 @@ class WorkerReportMeta:
       open_ports=d.get("open_ports", []),
       nr_findings=d.get("nr_findings", 0),
       node_ip=d.get("node_ip", ""),
+      country=d.get("country", ""),
     )
 
 
@@ -376,7 +383,9 @@ class UiAggregate:
   findings_count: dict = None       # { CRITICAL: int, HIGH: int, MEDIUM: int, LOW: int, INFO: int }
   top_findings: list = None         # top 10 CRITICAL+HIGH findings for dashboard display
   finding_timeline: dict = None     # { finding_id: { first_seen, last_seen, pass_count } }
-  worker_activity: list = None      # [ { id, start_port, end_port, open_ports } ]
+  worker_activity: list = None      # [ { id, start_port, end_port, open_ports, country } ]
+  country_breakdown: list = None    # [ { code, count } ] origin countries the pass ran from
+  node_comparison: list = None      # per-node vantage-point comparison (comparison_mode only); see report.py
   # ── graybox-aware ──
   scan_type: str = "network"
   total_routes_discovered: int = 0          # webapp: discovered routes
@@ -400,6 +409,8 @@ class UiAggregate:
       top_findings=d.get("top_findings"),
       finding_timeline=d.get("finding_timeline"),
       worker_activity=d.get("worker_activity"),
+      country_breakdown=d.get("country_breakdown"),
+      node_comparison=d.get("node_comparison"),
       scan_type=d.get("scan_type", "network"),
       total_routes_discovered=d.get("total_routes_discovered", 0),
       total_forms_discovered=d.get("total_forms_discovered", 0),

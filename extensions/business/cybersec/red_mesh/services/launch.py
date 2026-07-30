@@ -20,6 +20,7 @@ def _launch_network_jobs(
   end_port,
   job_config,
   nr_local_workers_override=None,
+  target_ports=None,
 ):
   exceptions = job_config.get("exceptions", [])
   if not isinstance(exceptions, list):
@@ -42,7 +43,13 @@ def _launch_network_jobs(
 
   owner.P("Using {} local workers for job {}".format(workers_requested, job_id))
 
-  ports = list(range(start_port, end_port + 1))
+  # Comparison mode supplies an explicit, possibly non-contiguous port list
+  # (mirrored comparison tier + this node's coverage slice). Otherwise scan the
+  # contiguous assigned range.
+  if target_ports:
+    ports = [int(p) for p in target_ports]
+  else:
+    ports = list(range(start_port, end_port + 1))
   batches = []
   if port_order == PORT_ORDER_SEQUENTIAL:
     ports = sorted(ports)
@@ -139,6 +146,7 @@ def launch_local_jobs(
   end_port,
   job_config,
   nr_local_workers_override=None,
+  target_ports=None,
 ):
   strategy = get_scan_strategy(job_config.get("scan_type", ScanType.NETWORK.value))
   if strategy.scan_type == ScanType.WEBAPP:
@@ -160,4 +168,5 @@ def launch_local_jobs(
     end_port=end_port,
     job_config=job_config,
     nr_local_workers_override=nr_local_workers_override,
+    target_ports=target_ports,
   )

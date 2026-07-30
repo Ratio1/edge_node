@@ -2,8 +2,12 @@ from copy import deepcopy
 from urllib.parse import urlparse
 
 from ..constants import (
+  COMMON_PORTS,
+  COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS,
+  COMPARISON_MIRROR_PORT_CAP,
   DISTRIBUTION_MIRROR,
   DISTRIBUTION_SLICE,
+  FEATURE_CATALOG,
   JOB_STATUS_RUNNING,
   LOCAL_WORKERS_MAX,
   LOCAL_WORKERS_MIN,
@@ -828,11 +832,83 @@ def required_unsafe_confirmation_ids(
   return required
 
 
-def build_network_workers(owner, active_peers, start_port, end_port, distribution_strategy):
+def comparison_bundle_methods():
+  """Expand COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS to their probe method names."""
+  ids = set(COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS)
+  methods = []
+  for item in FEATURE_CATALOG:
+    if item.get("id") in ids:
+      methods.extend(item.get("methods", []))
+  return methods
+
+
+def compute_comparison_port_tier(start_port, end_port, full_mirror=False):
+  """Ports mirrored to every node in comparison mode (compared across countries).
+
+  With ``full_mirror`` (the operator chose MIRROR) the whole chosen range is
+  mirrored — every port is compared across countries, at N x the work. Otherwise
+  (SLICE / tiered) the tier = COMMON_PORTS, plus the chosen range when it is small
+  enough (<= COMPARISON_MIRROR_PORT_CAP); above the cap only COMMON_PORTS is
+  mirrored and the bulk range is sliced for coverage. Returns a sorted port list.
+  """
+  range_size = end_port - start_port + 1
+  tier = set(COMMON_PORTS)
+  if full_mirror or range_size <= COMPARISON_MIRROR_PORT_CAP:
+    tier |= set(range(start_port, end_port + 1))
+  return sorted(p for p in tier if 1 <= p <= 65535)
+
+
+def build_comparison_workers(active_peers, start_port, end_port, full_mirror=False):
+  """Tiered assignment: mirror a bounded comparison tier + slice the bulk range.
+
+  Every node scans the same comparison tier (for cross-country comparison) plus
+  its own unique slice of any range beyond the cap (for efficient coverage).
+  Each worker carries an explicit non-contiguous ``target_ports`` list.
+
+  With ``full_mirror`` the comparison tier is the whole chosen range (plus the
+  standard ports), so every node scans an identical full set and there is no
+  coverage slice — the operator's MIRROR choice, comparing the entire range.
+  """
+  comparison_tier = compute_comparison_port_tier(start_port, end_port, full_mirror=full_mirror)
+  comparison_set = set(comparison_tier)
+  range_size = end_port - start_port + 1
+  # Bulk coverage ports = the user range beyond the mirrored tier (empty under
+  # full mirror, or when the whole range already fits in the comparison tier).
+  if full_mirror or range_size <= COMPARISON_MIRROR_PORT_CAP:
+    coverage_ports = []
+  else:
+    coverage_ports = [p for p in range(start_port, end_port + 1) if p not in comparison_set]
+
+  num_workers = len(active_peers)
+  base_count = len(coverage_ports) // num_workers
+  rem_count = len(coverage_ports) % num_workers
+  workers = {}
+  idx = 0
+  for i, address in enumerate(active_peers):
+    size = base_count + 1 if i < rem_count else base_count
+    node_slice = coverage_ports[idx:idx + size]
+    idx += size
+    target_ports = sorted(comparison_set | set(node_slice))
+    workers[address] = {
+      "start_port": target_ports[0],
+      "end_port": target_ports[-1],
+      "target_ports": target_ports,
+      "finished": False,
+      "result": None,
+    }
+  return workers
+
+
+def build_network_workers(owner, active_peers, start_port, end_port, distribution_strategy,
+                          comparison_mode=False):
   """Build peer assignments for network scans."""
   num_workers = len(active_peers)
   if num_workers == 0:
     return None, validation_error("No workers available for job execution.")
+
+  if comparison_mode:
+    full_mirror = distribution_strategy == DISTRIBUTION_MIRROR
+    return build_comparison_workers(active_peers, start_port, end_port, full_mirror=full_mirror), None
 
   workers = {}
   if distribution_strategy == DISTRIBUTION_MIRROR:
@@ -957,13 +1033,35 @@ def announce_launch(
   gateway_bearer_refresh_token="",
   target_config_secrets=None,
   blockchain_attestation_enabled=False,
+  comparison_mode=False,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
+  comparison_mode = bool(comparison_mode)
   excluded_features, enabled_features = resolve_enabled_features(
     owner,
     excluded_features,
     scan_type=scan_type,
   )
+
+  # Comparison mode: mirror the graybox tests so every node runs the same webapp
+  # checks (comparable across countries) and force-enable the standard bundle.
+  comparison_ports = None
+  if comparison_mode:
+    if scan_type == ScanType.WEBAPP.value:
+      graybox_assignment_strategy = GRAYBOX_ASSIGNMENT_MIRROR
+      bundle_methods = comparison_bundle_methods()
+      all_features = set(owner._get_all_features(scan_type=scan_type))
+      enable = [m for m in bundle_methods if m in all_features]
+      excluded_features = [f for f in excluded_features if f not in enable]
+      enabled_features = sorted(set(enabled_features) | set(enable))
+    else:
+      # Network scans: record the mirrored comparison tier (ports scanned from
+      # every node) so the report can distinguish compared vs coverage ports.
+      # Under MIRROR the whole range is the tier; under SLICE it is bounded.
+      comparison_ports = compute_comparison_port_tier(
+        start_port, end_port,
+        full_mirror=(distribution_strategy == DISTRIBUTION_MIRROR),
+      )
 
   if not scanner_identity:
     scanner_identity = owner.cfg_scanner_identity
@@ -995,6 +1093,8 @@ def announce_launch(
     task_description=task_description,
     monitor_interval=monitor_interval,
     selected_peers=active_peers,
+    comparison_mode=comparison_mode,
+    comparison_ports=comparison_ports,
     created_by_name=created_by_name or "",
     created_by_id=created_by_id or "",
     authorized=True,
@@ -1215,11 +1315,13 @@ def launch_network_scan(
   authorization=None,
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
+  comparison_mode=False,
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
   if not target:
     return validation_error("target required for network scan")
 
+  comparison_mode = bool(comparison_mode)
   start_port = int(start_port)
   end_port = int(end_port)
   if start_port > end_port:
@@ -1243,6 +1345,9 @@ def launch_network_scan(
   )
   if "error" in options:
     return options
+  # Comparison mode keeps the operator's MIRROR/SLICE choice: MIRROR mirrors the
+  # whole range to every node (full comparison); SLICE uses the tiered scheme
+  # (mirror the comparison tier, slice the bulk). See build_comparison_workers.
   required_confirmation_ids = required_unsafe_confirmation_ids(
     scan_type=ScanType.NETWORK.value,
     options=options,
@@ -1303,6 +1408,7 @@ def launch_network_scan(
     start_port,
     end_port,
     options["distribution_strategy"],
+    comparison_mode=comparison_mode,
   )
   if worker_error:
     return worker_error
@@ -1353,6 +1459,7 @@ def launch_network_scan(
     roe=typed_context["roe"],
     authorization=typed_context["authorization"],
     blockchain_attestation_enabled=blockchain_attestation_enabled,
+    comparison_mode=comparison_mode,
   )
 
 
@@ -1415,6 +1522,7 @@ def launch_webapp_scan(
   allow_mirror_per_worker_budget=False,
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
+  comparison_mode=False,
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
@@ -1669,6 +1777,7 @@ def launch_webapp_scan(
     gateway_bearer_refresh_token=gateway_bearer_refresh_token,
     target_config_secrets=target_config_secrets,
     blockchain_attestation_enabled=blockchain_attestation_enabled,
+    comparison_mode=comparison_mode,
   )
 
 
@@ -1733,6 +1842,7 @@ def launch_test(
   authorization=None,
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
+  comparison_mode=False,
 ):
   """Compatibility shim that routes to scan-type-specific launch endpoints."""
   try:
@@ -1792,6 +1902,7 @@ def launch_test(
       authorization=authorization,
       unsafe_launch_confirmations=unsafe_launch_confirmations,
       blockchain_attestation_enabled=blockchain_attestation_enabled,
+      comparison_mode=comparison_mode,
     )
 
   return owner.launch_network_scan(
@@ -1827,4 +1938,5 @@ def launch_test(
     authorization=authorization,
     unsafe_launch_confirmations=unsafe_launch_confirmations,
     blockchain_attestation_enabled=blockchain_attestation_enabled,
+    comparison_mode=comparison_mode,
   )

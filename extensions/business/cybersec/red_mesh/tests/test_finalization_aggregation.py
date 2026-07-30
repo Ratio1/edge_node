@@ -388,5 +388,78 @@ class TestNetworkAggregationRegression(unittest.TestCase):
     self.assertIn("443", agg["service_info"])
 
 
+class _AggHost(_Host):
+  """_Host plus the service-count helper _compute_ui_aggregate depends on."""
+
+  def _count_services(self, service_info):
+    return len(service_info or {})
+
+
+class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
+  """Origin-country breakdown and comparison-mode per-node vantage comparison."""
+
+  def _latest_pass(self):
+    return {
+      "pass_nr": 1,
+      "findings": [
+        {"finding_signature": "sig1", "severity": "HIGH", "title": "XSS",
+         "port": 443, "_source_node_addr": "0xUS"},
+      ],
+      "worker_reports": {
+        "0xUS": {"start_port": 1, "end_port": 443, "open_ports": [80, 443],
+                 "node_ip": "1.1.1.1", "country": "US", "nr_findings": 1},
+        "0xIN": {"start_port": 1, "end_port": 443, "open_ports": [80],
+                 "node_ip": "2.2.2.2", "country": "in", "nr_findings": 0},
+      },
+      "worker_scan_metrics": {
+        "0xUS": {"scan_metrics": {"connection_outcomes": {"connected": 5, "timeout": 0},
+                                  "response_times": {"p95": 0.12}}},
+        "0xBR": {"scan_metrics": {"connection_outcomes": {"connected": 0, "timeout": 9},
+                                  "response_times": {"p95": 2.0}}},
+      },
+    }
+
+  def test_country_breakdown_and_per_worker_country(self):
+    host = _AggHost()
+    ui = host._compute_ui_aggregate(
+      [self._latest_pass()],
+      {"open_ports": [80, 443], "service_info": {}},
+      job_config={"scan_type": "network"},
+    )
+    d = ui.to_dict()
+    # Counts per ISO-2 (uppercased), sorted by (-count, code) — tie sorts IN before US.
+    self.assertEqual(d.get("country_breakdown"), [{"code": "IN", "count": 1}, {"code": "US", "count": 1}])
+    by_id = {w["id"]: w["country"] for w in d["worker_activity"]}
+    self.assertEqual(by_id["0xUS"], "US")
+    self.assertEqual(by_id["0xIN"], "IN")
+    # node_comparison is only computed in comparison mode.
+    self.assertNotIn("node_comparison", d)
+
+  def test_node_comparison_includes_failed_and_timed_out_nodes(self):
+    host = _AggHost()
+    cfg = {
+      "scan_type": "network",
+      "comparison_mode": True,
+      "selected_peers": ["0xUS", "0xIN", "0xBR", "0xCN"],
+      "comparison_ports": [80, 443],
+    }
+    ui = host._compute_ui_aggregate(
+      [self._latest_pass()],
+      {"open_ports": [80, 443], "service_info": {}},
+      job_config=cfg,
+    )
+    comp = {e["address"]: e for e in ui.to_dict()["node_comparison"]}
+    # Reached node: open ports + finding attribution + latency.
+    self.assertEqual(comp["0xUS"]["status"], "reached")
+    self.assertEqual(comp["0xUS"]["open_ports"], [80, 443])
+    self.assertEqual(comp["0xUS"]["metrics"]["response_p95_ms"], 120.0)
+    self.assertEqual(comp["0xUS"]["findings"][0]["signature"], "sig1")
+    # Metrics-only node with all-timeout connections -> timeout.
+    self.assertEqual(comp["0xBR"]["status"], "timeout")
+    # Selected peer that never reported at all -> failed (China-timeout case).
+    self.assertEqual(comp["0xCN"]["status"], "failed")
+    self.assertEqual(comp["0xCN"]["country"], "UN")
+
+
 if __name__ == '__main__':
   unittest.main()

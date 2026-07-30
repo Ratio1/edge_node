@@ -396,6 +396,7 @@ def maybe_finalize_pass(owner):
           open_ports=report.get("open_ports", []),
           nr_findings=nr_findings,
           node_ip=report.get("node_ip", ""),
+          country=(report.get("country_code") or "").upper(),
         ).to_dict()
 
       aggregated_report_cid = None
