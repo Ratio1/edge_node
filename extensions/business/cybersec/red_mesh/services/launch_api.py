@@ -4,7 +4,6 @@ from urllib.parse import urlparse
 from ..constants import (
   COMMON_PORTS,
   COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS,
-  COMPARISON_MIRROR_PORT_CAP,
   DISTRIBUTION_MIRROR,
   DISTRIBUTION_SLICE,
   FEATURE_CATALOG,
@@ -845,36 +844,34 @@ def comparison_bundle_methods():
 def compute_comparison_port_tier(start_port, end_port, full_mirror=False):
   """Ports mirrored to every node in comparison mode (compared across countries).
 
-  With ``full_mirror`` (the operator chose MIRROR) the whole chosen range is
-  mirrored — every port is compared across countries, at N x the work. Otherwise
-  (SLICE / tiered) the tier = COMMON_PORTS, plus the chosen range when it is small
-  enough (<= COMPARISON_MIRROR_PORT_CAP); above the cap only COMMON_PORTS is
-  mirrored and the bulk range is sliced for coverage. Returns a sorted port list.
+  The comparison tier is the set every node scans, so it is what can be compared
+  across countries. By default (SLICE) it is the standard ``COMMON_PORTS`` bundle;
+  the operator's chosen range is NOT mirrored — it is sliced across nodes for
+  coverage. With ``full_mirror`` (the operator chose MIRROR) the whole chosen
+  range is added to the tier, so every port is compared, at N x the work.
+  Returns a sorted list of valid ports.
   """
-  range_size = end_port - start_port + 1
   tier = set(COMMON_PORTS)
-  if full_mirror or range_size <= COMPARISON_MIRROR_PORT_CAP:
+  if full_mirror:
     tier |= set(range(start_port, end_port + 1))
   return sorted(p for p in tier if 1 <= p <= 65535)
 
 
 def build_comparison_workers(active_peers, start_port, end_port, full_mirror=False):
-  """Tiered assignment: mirror a bounded comparison tier + slice the bulk range.
+  """Comparison-mode assignment: mirror the comparison tier + slice the rest.
 
-  Every node scans the same comparison tier (for cross-country comparison) plus
-  its own unique slice of any range beyond the cap (for efficient coverage).
-  Each worker carries an explicit non-contiguous ``target_ports`` list.
-
-  With ``full_mirror`` the comparison tier is the whole chosen range (plus the
-  standard ports), so every node scans an identical full set and there is no
-  coverage slice — the operator's MIRROR choice, comparing the entire range.
+  Every node scans the same comparison tier (for cross-country comparison). Under
+  SLICE (default) the tier is just the standard ``COMMON_PORTS``, and the
+  operator's chosen range is split across nodes for efficient coverage; under
+  ``full_mirror`` (MIRROR) the tier is the whole range, so every node scans an
+  identical full set and there is no coverage slice. Each worker carries an
+  explicit, possibly non-contiguous ``target_ports`` list.
   """
   comparison_tier = compute_comparison_port_tier(start_port, end_port, full_mirror=full_mirror)
   comparison_set = set(comparison_tier)
-  range_size = end_port - start_port + 1
-  # Bulk coverage ports = the user range beyond the mirrored tier (empty under
-  # full mirror, or when the whole range already fits in the comparison tier).
-  if full_mirror or range_size <= COMPARISON_MIRROR_PORT_CAP:
+  # Coverage ports = the operator's chosen range minus whatever is already
+  # mirrored in the tier. Empty under full mirror (the whole range is the tier).
+  if full_mirror:
     coverage_ports = []
   else:
     coverage_ports = [p for p in range(start_port, end_port + 1) if p not in comparison_set]

@@ -301,15 +301,13 @@ ALL_PORTS = list(range(1, 65536))
 # =====================================================================
 # Geographic vantage-point comparison mode
 # =====================================================================
-# When comparison mode is enabled every selected node runs the SAME bounded
-# "comparison tier" of ports (so results can be compared across countries),
-# while any larger user range is sliced across nodes for coverage.
-#
-# The comparison tier = COMMON_PORTS plus the operator's chosen range when that
-# range is no larger than COMPARISON_MIRROR_PORT_CAP. Above the cap only
-# COMMON_PORTS is mirrored and the bulk range is sliced — this bounds the N×
-# redundant scanning that a naive full MIRROR would cause.
-COMPARISON_MIRROR_PORT_CAP = 1024
+# When comparison mode is enabled every selected node runs the SAME "comparison
+# tier" of ports (so results can be compared across countries). The distribution
+# choice controls what the tier is:
+#   - SLICE (default): the tier is the standard COMMON_PORTS bundle; the
+#     operator's chosen range is split across nodes for coverage (not compared).
+#   - MIRROR: the tier is the whole chosen range (plus COMMON_PORTS), so every
+#     port is compared across countries, at N x the work.
 
 # Standard webapp/graybox feature bundle always run (mirrored to every node) in
 # comparison mode so cross-country response divergence is meaningful even if the

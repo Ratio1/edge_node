@@ -152,18 +152,36 @@ class TestLaunchService(unittest.TestCase):
 class TestComparisonTieredAssignment(unittest.TestCase):
   """Tiered mirror+slice port assignment for geographic comparison mode."""
 
-  def test_small_range_is_fully_mirrored(self):
+  def test_slice_mirrors_common_ports_and_splits_the_chosen_range(self):
+    """SLICE (default): only COMMON_PORTS are mirrored/compared; the operator's
+    chosen range is split across nodes for coverage (not mirrored)."""
+    from extensions.business.cybersec.red_mesh.constants import COMMON_PORTS
     from extensions.business.cybersec.red_mesh.services.launch_api import (
       build_comparison_workers,
       compute_comparison_port_tier,
     )
-    workers = build_comparison_workers(["0xA", "0xB", "0xC"], 1, 100)
-    port_sets = [tuple(w["target_ports"]) for w in workers.values()]
-    # Every node scans exactly the same set (fully mirrored, no slicing).
-    self.assertEqual(len(set(port_sets)), 1)
-    tier = set(compute_comparison_port_tier(1, 100))
-    self.assertTrue({1, 100, 443, 8080}.issubset(tier))
-    self.assertEqual(set(port_sets[0]), tier)
+    # The comparison tier is exactly COMMON_PORTS — the chosen range is NOT in it.
+    tier = set(compute_comparison_port_tier(1, 33))
+    self.assertEqual(tier, {p for p in COMMON_PORTS if 1 <= p <= 65535})
+    self.assertNotIn(1, tier)
+    self.assertIn(443, tier)
+
+    workers = build_comparison_workers(["0xA", "0xB", "0xC"], 1, 33)
+    common = set(COMMON_PORTS)
+    coverage_slices = []
+    for w in workers.values():
+      target = set(w["target_ports"])
+      self.assertTrue(common.issubset(target))  # standard ports mirrored to all
+      coverage_slices.append(target - common)
+    # The chosen range (minus common ports already mirrored) is split disjointly
+    # across nodes and together covers 1..33 — i.e. sliced, not mirrored.
+    union = set().union(*coverage_slices) | common
+    self.assertTrue(set(range(1, 34)).issubset(union))
+    for i in range(len(coverage_slices)):
+      for j in range(i + 1, len(coverage_slices)):
+        self.assertTrue(coverage_slices[i].isdisjoint(coverage_slices[j]))
+    # Not every node scans the same set (slicing actually happened).
+    self.assertGreater(len({tuple(w["target_ports"]) for w in workers.values()}), 1)
 
   def test_large_range_mirrors_common_ports_and_slices_bulk(self):
     from extensions.business.cybersec.red_mesh.constants import COMMON_PORTS
