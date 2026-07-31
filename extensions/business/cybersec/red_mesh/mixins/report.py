@@ -713,10 +713,11 @@ class _ReportMixin:
       has_report = addr in worker_reports
       country = (wr.get("country") or "").upper() or self._resolve_node_country_tag(addr) or "UN"
 
+      # Status reflects REACHABILITY only. Blocking / rate-limiting are advisory
+      # detection signals carried in metrics (a node can be reached AND flagged),
+      # so they must not override "reached" when the node returned results.
       if not has_report and addr not in worker_scan_metrics:
         status = "failed"
-      elif sm.get("blocking_detected"):
-        status = "blocked"
       elif outcomes and outcomes.get("connected", 0) == 0 and outcomes.get("timeout", 0) > 0:
         status = "timeout"
       else:
