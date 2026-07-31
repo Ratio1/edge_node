@@ -15,6 +15,9 @@ plugin to provide a complete decentralized authentication solution.
 """
 
 
+from extensions.business.dauth.dauth_registry import dauth_registry_write_kwargs
+
+
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
 DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
@@ -229,6 +232,7 @@ class _DauthMixin(object):
       hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
       key=job_id,
       value=secret_bundle,
+      **dauth_registry_write_kwargs(self),
     )
     if not result:
       raise ValueError(f"Failed to store dAuth secrets for job {job_id}.")

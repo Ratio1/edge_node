@@ -704,3 +704,12 @@ Entry format:
 - Details: `/add_secrets` and `/get_secrets` validate signed hex-millisecond timestamp nonces and echo them in successful signed responses. `/get_secrets` encrypts the serialized bundle to the signed requester address; clients must verify the response signer and echoed nonce before decrypting.
 - Verification: `python -m unittest discover -s extensions/business/dauth -p 'test_*.py'`; cross-repo SDK dAuth client tests.
 - Links: `extensions/business/dauth/dauth_mixin.py`, `extensions/business/dauth/dauth_manager.py`
+
+- ID: `ML-20260731-001`
+- Timestamp: `2026-07-31T16:48:11Z`
+- Type: `change`
+- Summary: dAuth job-secret ChainStore writes and minute syncs now target only startup-cached dAuth registry peers.
+- Criticality: Secret-replication boundary and recovery behavior across every dAuth server.
+- Details: The dAuth manager reads registry ETH addresses once at startup, keeps local service eligibility fixed until restart, and refreshes only ETH-to-internal mappings from local NetMon state. `DAUTH_JOB_SECRETS` writes and 60-second hsync calls disable default/configured ChainStore peers. Known deferred risks: generic ChainStore does not authorize inbound operations by hash namespace, and first-response hsync has no freshness arbitration; production hardening requires an inbound ACL or dedicated authenticated replication protocol plus version-aware merges.
+- Verification: `python3 -m unittest discover -s extensions/business/dauth -p 'test_*.py'`; `python3 -m py_compile extensions/business/dauth/dauth_registry.py extensions/business/dauth/dauth_manager.py extensions/business/dauth/dauth_mixin.py extensions/business/dauth/test_dauth_registry_gating.py extensions/business/dauth/test_dauth_secret_routing.py`; `git diff --check`
+- Links: `extensions/business/dauth/dauth_registry.py`, `extensions/business/dauth/dauth_manager.py`, `extensions/business/dauth/dauth_mixin.py`

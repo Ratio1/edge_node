@@ -23,7 +23,14 @@ WHITELIST (oracles)
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
-from extensions.business.dauth.dauth_mixin import _DauthMixin
+from extensions.business.dauth.dauth_mixin import (
+  DAUTH_JOB_SECRETS_CSTORE_HKEY,
+  _DauthMixin,
+)
+from extensions.business.dauth.dauth_registry import (
+  dauth_registry_write_kwargs,
+  load_dauth_registry_snapshot,
+)
 
 __VER__ = '0.3.0'
 
@@ -41,6 +48,8 @@ _CONFIG = {
   'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
   'REQUESTS_MAX_RECORDS': 2,
   'REQUESTS_LOG_INTERVAL': 5 * 60,
+
+  'DAUTH_JOB_SECRETS_HSYNC_INTERVAL': 60,
 
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
@@ -105,6 +114,9 @@ class DauthManagerPlugin(
     super(DauthManagerPlugin, self).__init__(**kwargs)
     self._dauth_server_enabled = None
     self._dauth_server_enabled_message = None
+    self._dauth_registry_eth_oracles = None
+    self._dauth_registry_internal_peers = None
+    self._last_dauth_job_secrets_hsync = None
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
     return
@@ -117,6 +129,8 @@ class DauthManagerPlugin(
     self._dauth_web_app_initialized = True
     if not self._is_dauth_server_enabled():
       self.on_pause()
+    else:
+      self._maybe_hsync_dauth_job_secrets()
     # endif
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
@@ -134,7 +148,13 @@ class DauthManagerPlugin(
 
     error = None
     try:
-      enabled = self.bc.is_dauth_oracle() is True
+      peers, eth_oracles = load_dauth_registry_snapshot(self)
+      enabled = self.bc.eth_address.lower() in [
+        address.lower() for address in eth_oracles
+      ]
+      if enabled:
+        self._dauth_registry_eth_oracles = eth_oracles
+        self._dauth_registry_internal_peers = peers
     except Exception as e:
       enabled = False
       error = str(e)
@@ -237,10 +257,33 @@ class DauthManagerPlugin(
     return
 
   def process(self):
+    self._maybe_hsync_dauth_job_secrets()
     # TODO: this will be re-enabled in the future.
     if False:
       self._maybe_log_and_save_tracked_requests()
     return
+
+  def _maybe_hsync_dauth_job_secrets(self):
+    if not self._is_dauth_server_enabled():
+      return None
+
+    now = self.time()
+    last_sync = getattr(self, "_last_dauth_job_secrets_hsync", None)
+    if (
+      last_sync is not None
+      and now - last_sync < self.cfg_dauth_job_secrets_hsync_interval
+    ):
+      return None
+
+    self._last_dauth_job_secrets_hsync = now
+    try:
+      return self.chainstore_hsync(
+        hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+        **dauth_registry_write_kwargs(self),
+      )
+    except Exception as exc:
+      self.P(f"Could not sync dAuth job secrets: {exc}", color="y")
+    return None
 
   def __get_current_epoch(self):
     """

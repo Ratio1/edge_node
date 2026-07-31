@@ -11,6 +11,7 @@ from extensions.business.dauth.dauth_mixin import (
   DEEPLOY_JOBS_CSTORE_HKEY,
   _DauthMixin,
 )
+from extensions.business.dauth.dauth_registry import load_dauth_registry_snapshot
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -124,14 +125,33 @@ def _load_dauth_manager_class():
     "",
   )
   source = source.replace(
-    "from extensions.business.dauth.dauth_mixin import _DauthMixin\n",
+    "from extensions.business.dauth.dauth_mixin import (\n"
+    "  DAUTH_JOB_SECRETS_CSTORE_HKEY,\n"
+    "  _DauthMixin,\n"
+    ")\n",
+    "",
+  )
+  source = source.replace(
+    "from extensions.business.dauth.dauth_registry import (\n"
+    "  dauth_registry_write_kwargs,\n"
+    "  load_dauth_registry_snapshot,\n"
+    ")\n",
     "",
   )
   namespace = {
     "BasePlugin": _FakeBasePlugin,
+    "DAUTH_JOB_SECRETS_CSTORE_HKEY": DAUTH_JOB_SECRETS_CSTORE_HKEY,
     "_DauthMixin": _FakeDauthMixin,
     "_NodeTagsMixin": _FakeNodeTagsMixin,
     "_RequestTrackingMixin": _FakeRequestTrackingMixin,
+    "dauth_registry_write_kwargs": (
+      lambda plugin: {
+        "extra_peers": list(plugin._dauth_registry_internal_peers),
+        "include_default_peers": False,
+        "include_configured_peers": False,
+      }
+    ),
+    "load_dauth_registry_snapshot": load_dauth_registry_snapshot,
     "__name__": "loaded_dauth_manager",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
@@ -273,7 +293,8 @@ def _make_dauth_harness(*, dauth_oracle=True, protocol_oracles=None, valid_signa
   plugin.fetch_node_tags = lambda node_address_eth=None: {}
   plugin.P = lambda *args, **kwargs: None
   plugin.Pd = lambda *args, **kwargs: None
-  plugin.chainstore_hset = lambda hkey, key, value: plugin._chainstore.__setitem__(
+  plugin._dauth_registry_internal_peers = ["node-oracle"]
+  plugin.chainstore_hset = lambda hkey, key, value, **kwargs: plugin._chainstore.__setitem__(
     (hkey, str(key)),
     deepcopy(value),
   ) or True
@@ -542,11 +563,17 @@ class DauthServerRegistryGateTests(unittest.TestCase):
         self.result = result
         self.calls = 0
 
-      def is_dauth_oracle(self):
+      def get_eth_dauth_oracles(self):
         self.calls += 1
         if isinstance(self.result, Exception):
           raise self.result
-        return self.result
+        return ["0xNODE", "0xPEER"] if self.result else ["0xPEER"]
+
+      def eth_addr_to_internal_addr(self, eth_address):
+        return {
+          "0xnode": "node-address",
+          "0xpeer": "peer-address",
+        }.get(eth_address.lower())
 
     plugin = DauthManagerPlugin.__new__(DauthManagerPlugin)
     plugin.bc = _ManagerBC(dauth_oracle)
@@ -566,6 +593,14 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._init_request_tracking = lambda: None
     plugin.bc.address = "node-address"
     plugin.bc.eth_address = "0xNODE"
+    plugin._dauth_registry_eth_oracles = None
+    plugin._dauth_registry_internal_peers = None
+    plugin._last_dauth_job_secrets_hsync = None
+    plugin.cfg_dauth_job_secrets_hsync_interval = 60
+    plugin._hsync_calls = []
+    plugin.chainstore_hsync = lambda **kwargs: plugin._hsync_calls.append(kwargs) or {
+      "hkey": kwargs["hkey"],
+    }
     plugin._DauthManagerPlugin__get_response = lambda data: data
     return plugin
 
@@ -601,6 +636,45 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(plugin.bc.calls, 1)
     self.assertEqual(plugin._base_init_calls, 1)
     self.assertEqual(plugin._lifecycle_events, ["base_init"])
+    self.assertEqual(
+      plugin._dauth_registry_internal_peers,
+      ["node-address", "peer-address"],
+    )
+
+  def test_secret_hsync_runs_at_startup_and_once_per_minute_on_cached_peers(self):
+    plugin = self._make_manager(dauth_oracle=True)
+
+    plugin.on_init()
+    plugin.process()
+    plugin._now += 59
+    plugin.process()
+    plugin._now += 1
+    plugin.process()
+
+    self.assertEqual(plugin.bc.calls, 1)
+    self.assertEqual(len(plugin._hsync_calls), 2)
+    for call in plugin._hsync_calls:
+      self.assertEqual(call["hkey"], DAUTH_JOB_SECRETS_CSTORE_HKEY)
+      self.assertEqual(call["extra_peers"], ["node-address", "peer-address"])
+      self.assertFalse(call["include_default_peers"])
+      self.assertFalse(call["include_configured_peers"])
+
+  def test_secret_hsync_failure_waits_until_next_interval(self):
+    plugin = self._make_manager(dauth_oracle=True)
+    attempts = []
+
+    def fail_hsync(**kwargs):
+      attempts.append(kwargs)
+      raise ValueError("sync unavailable")
+
+    plugin.chainstore_hsync = fail_hsync
+    plugin.on_init()
+    plugin.process()
+    plugin._now += 60
+    plugin.process()
+
+    self.assertEqual(len(attempts), 2)
+    self.assertTrue(any("sync unavailable" in message for message in plugin._messages))
 
   def test_false_startup_lookup_fails_closed_and_tears_down_fastapi(self):
     plugin = self._make_manager(dauth_oracle=False)
@@ -610,6 +684,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertTrue(plugin.should_pause())
     self.assertFalse(plugin.should_resume())
     self.assertEqual(plugin.bc.calls, 1)
+    self.assertEqual(plugin._hsync_calls, [])
     self.assertTrue(plugin._stop_request_monitor.is_set())
     self.assertFalse(plugin._request_monitor_thread.is_alive())
     self.assertEqual(plugin.start_commands_started, [False, False])
