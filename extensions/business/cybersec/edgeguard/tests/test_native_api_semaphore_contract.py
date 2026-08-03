@@ -43,7 +43,7 @@ class EdgeGuardNativeApiSemaphoreContractTests(unittest.TestCase):
     self.assertIn('"AI_ENGINE": "edgeguard_qwen_4b"', source)
     self.assertIn("snapshots/369066092b5eef41c9093474ff7142cc530a853f/", source)
     self.assertIn('"NAME": "edgeguard_llm_base_api"', source)
-    self.assertIn('"AI_ENGINE": "base_qwen_4b"', source)
+    self.assertIn('"AI_ENGINE": "base_qwen3_4b"', source)
     self.assertIn('"MODEL_PATH": "/edge_node/_local_cache/egm030-qwen3-base/', source)
     self.assertIn('"NAME": "edgeguard_llm_cybersec_api"', source)
     self.assertIn('"AI_ENGINE": "cybersec_qwen_4b"', source)

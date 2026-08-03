@@ -1,9 +1,11 @@
 import ast
 import json
+import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from extensions.serving.ai_engines.stable import AI_ENGINES
 
@@ -138,6 +140,21 @@ def _load_ai_engine_utils():
   )
 
 
+def _load_plugins_manager_mixin():
+  source_path = ROOT / "ratio1_sdk" / "ratio1" / "plugins_manager_mixin.py"
+  source = source_path.read_text(encoding="utf-8")
+  source = source.replace(
+    "from .code_cheker.base import BaseCodeChecker\n",
+    "class BaseCodeChecker:\n  pass\n",
+  )
+  namespace = {
+    "__file__": str(source_path),
+    "__name__": "loaded_plugins_manager_mixin",
+  }
+  exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
+  return namespace["_PluginsManagerMixin"]
+
+
 def _make_llama_cpp_process(**overrides):
   _FakeLlama.calls = []
   process = _load_llama_cpp_base_class()()
@@ -165,9 +182,9 @@ def _make_llama_cpp_process(**overrides):
 
 class CyberSecQwenEngineTests(unittest.TestCase):
   PROFILES = {
-    "base_qwen_4b": (
-      "llama_cpp_base_qwen_4b.py",
-      "LlamaCppBaseQwen4B",
+    "base_qwen3_4b": (
+      "llama_cpp_base_qwen3_4b.py",
+      "LlamaCppBaseQwen34B",
       "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
       "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
       "edgeguard-base-qwen3-4b",
@@ -190,7 +207,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
   def test_three_model_ai_engine_mappings_use_generic_profiles(self):
     expected = {
-      "base_qwen_4b": "llama_cpp_base_qwen_4b",
+      "base_qwen3_4b": "llama_cpp_base_qwen3_4b",
       "edgeguard_qwen_4b": "llama_cpp_edgeguard_qwen_4b",
       "cybersec_qwen_4b": "llama_cpp_cybersec_qwen_4b",
     }
@@ -202,7 +219,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
   def test_three_model_ai_engine_aliases_round_trip_with_instance_ids(self):
     utils = _load_ai_engine_utils()
     instances = {
-      "base_qwen_4b": "edgeguard-base-qwen3-4b",
+      "base_qwen3_4b": "edgeguard-base-qwen3-4b",
       "edgeguard_qwen_4b": "edgeguard-finetuned-v0-10",
       "cybersec_qwen_4b": "edgeguard-cybersec-qwen-4b",
     }
@@ -235,7 +252,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
 
   def test_profiles_are_configuration_only_generic_subclasses(self):
     for filename, class_name in (
-      ("llama_cpp_base_qwen_4b.py", "LlamaCppBaseQwen4B"),
+      ("llama_cpp_base_qwen3_4b.py", "LlamaCppBaseQwen34B"),
       ("llama_cpp_edgeguard_qwen_4b.py", "LlamaCppEdgeguardQwen4B"),
       ("llama_cpp_cybersec_qwen_4b.py", "LlamaCppCybersecQwen4B"),
     ):
@@ -256,6 +273,32 @@ class CyberSecQwenEngineTests(unittest.TestCase):
   def test_edgeguard_specific_serving_modules_are_removed(self):
     self.assertFalse((PROFILE_DIR / "llama_cpp_edgeguard_base.py").exists())
     self.assertFalse((PROFILE_DIR / "llama_cpp_edgeguard_cybersec_qwen_4b.py").exists())
+
+  def test_production_plugin_loader_resolves_base_qwen3_profile_class(self):
+    module_name = (
+      "extensions.serving.default_inference.nlp.llama_cpp_base_qwen3_4b"
+    )
+    base_module_name = "extensions.serving.default_inference.nlp.llama_cpp_base"
+    fake_base_module = types.ModuleType(base_module_name)
+    fake_base_module.LlamaCppBaseServingProcess = _FakeBaseServingProcess
+    loader_class = _load_plugins_manager_mixin()
+    loader = object.__new__(loader_class)
+    loader.P = lambda *_args, **_kwargs: None
+    loader._get_plugin_by_name = lambda *_args, **_kwargs: module_name
+
+    try:
+      with patch.dict(sys.modules, {base_module_name: fake_base_module}):
+        module, class_name, class_def, config = loader._get_module_name_and_class(
+          locations=["extensions.serving.default_inference.nlp"],
+          name="llama_cpp_base_qwen3_4b",
+        )
+    finally:
+      sys.modules.pop(module_name, None)
+
+    self.assertEqual(module.__name__, module_name)
+    self.assertEqual(class_name, "LlamaCppBaseQwen34B")
+    self.assertIs(class_def.CONFIG, module._CONFIG)
+    self.assertEqual(config["MODEL_INSTANCE_ID"], "edgeguard-base-qwen3-4b")
 
   def test_generic_llama_cpp_loads_all_three_local_profile_paths(self):
     for engine, profile_args in self.PROFILES.items():

@@ -23,5 +23,5 @@ _CONFIG = {
 }
 
 
-class LlamaCppBaseQwen4B(BaseServingProcess):
+class LlamaCppBaseQwen34B(BaseServingProcess):
   CONFIG = _CONFIG

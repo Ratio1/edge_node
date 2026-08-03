@@ -45,18 +45,21 @@ distinct startup model instance id:
 MODEL_NAME=MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF
 MODEL_FILENAME=Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 MODEL_PATH=/edge_node/_local_cache/egm030-qwen3-base/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-AI_ENGINE=base_qwen_4b
+AI_ENGINE=base_qwen3_4b
 STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-base-qwen3-4b
 ```
 
 Do not use a raw serving-process value
-(`llama_cpp_base_qwen_4b?edgeguard-base-qwen3-4b`) or an `AI_ENGINE` suffix
-(`base_qwen_4b?edgeguard-base-qwen3-4b`) for this worker. Live smoke showed both can register
+(`llama_cpp_base_qwen3_4b?edgeguard-base-qwen3-4b`) or an `AI_ENGINE` suffix
+(`base_qwen3_4b?edgeguard-base-qwen3-4b`) for this worker. Live smoke showed both can register
 details under a key that does not match the core inference router's reverse lookup. The stable
-runtime contract is the plain `base_qwen_4b` alias plus `MODEL_INSTANCE_ID` in
+runtime contract is the plain `base_qwen3_4b` alias plus `MODEL_INSTANCE_ID` in
 `STARTUP_AI_ENGINE_PARAMS`, which makes the serving handle
-`("llama_cpp_base_qwen_4b", "edgeguard-base-qwen3-4b")` and routes results back to
-`("base_qwen_4b", "edgeguard-base-qwen3-4b")`.
+`("llama_cpp_base_qwen3_4b", "edgeguard-base-qwen3-4b")` and routes results back to
+`("base_qwen3_4b", "edgeguard-base-qwen3-4b")`.
+
+Keep this identity pinned to Qwen3 4B. A future Qwen3.5 comparison worker must receive its own engine,
+serving profile, model key, artifact, and instance identity rather than repointing this alias.
 
 The public CyberSecQwen worker uses the existing generic serving engine and a previously cached
 snapshot path:
@@ -151,7 +154,7 @@ Use one stream per model worker:
       "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_llm_base_qwen3_4b",
-          "AI_ENGINE": "base_qwen_4b",
+          "AI_ENGINE": "base_qwen3_4b",
           "PORT": 5091,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
