@@ -233,10 +233,11 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         self.assertEqual(config["MODEL_FILENAME"], model_filename)
         self.assertEqual(config["MODEL_INSTANCE_ID"], instance_id)
 
-  def test_base_and_finetuned_profiles_are_configuration_only_generic_subclasses(self):
+  def test_profiles_are_configuration_only_generic_subclasses(self):
     for filename, class_name in (
       ("llama_cpp_base_qwen_4b.py", "LlamaCppBaseQwen4B"),
       ("llama_cpp_edgeguard_qwen_4b.py", "LlamaCppEdgeguardQwen4B"),
+      ("llama_cpp_cybersec_qwen_4b.py", "LlamaCppCybersecQwen4B"),
     ):
       with self.subTest(filename=filename):
         source = (PROFILE_DIR / filename).read_text(encoding="utf-8")
@@ -317,7 +318,6 @@ class CyberSecQwenEngineTests(unittest.TestCase):
           "MESSAGES": [{"role": "user", "content": "Explain"}],
           "TEMPERATURE": 0.0,
           "SEED": 42,
-          "BENCHMARK_MODE": True,
         },
       }],
     })

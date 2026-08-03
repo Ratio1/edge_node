@@ -85,29 +85,10 @@ Example pipeline configuration:
 }
 """
 
-import hashlib
-import json
-from pathlib import Path
-
-from extensions.business.edge_inference_api import base_inference_api as base_inference_api_module
 from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
-from extensions.serving.mixins_llm import llm_utils as llm_utils_module
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 from typing import Any, Dict, List, Optional, Tuple
-
-
-def _source_file_sha256(path):
-  digest = hashlib.sha256()
-  with open(path, "rb") as handle:
-    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-      digest.update(chunk)
-  return digest.hexdigest()
-
-
-LLM_INFERENCE_API_MODULE_SHA256 = _source_file_sha256(Path(__file__))
-BASE_INFERENCE_API_MODULE_SHA256 = _source_file_sha256(Path(base_inference_api_module.__file__))
-LLM_UTILS_MODULE_SHA256 = _source_file_sha256(Path(llm_utils_module.__file__))
 
 
 _CONFIG = {
@@ -120,10 +101,6 @@ _CONFIG = {
   "TEMPERATURE_MAX": 1.5,
   "MIN_COMPLETION_TOKENS": 16,
   "MAX_COMPLETION_TOKENS": 4096,
-  # Internal research control. Enable only on an isolated benchmark instance and restore to false
-  # before ordinary service. Request input alone must never activate reset/one-attempt behavior.
-  "BENCHMARK_MODE_ENABLED": False,
-
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -350,82 +327,6 @@ class LLMInferenceApiPlugin(BasePlugin):
 
   """API ENDPOINTS"""
   if True:
-    def _is_serving_ready(self):
-      shared = getattr(self, "global_shmem", None)
-      manager = shared.get("serving_manager") if isinstance(shared, dict) else None
-      if manager is None:
-        return False
-      try:
-        serving_processes = self.get_serving_processes()
-        return bool(serving_processes) and all(manager.is_avail(server) for server in serving_processes)
-      except (AttributeError, KeyError, TypeError):
-        return False
-
-    def _get_loaded_runtime_fingerprint(self):
-      shared = getattr(self, "global_shmem", None)
-      manager = shared.get("serving_manager") if isinstance(shared, dict) else None
-      if manager is None:
-        return None
-      try:
-        serving_processes = self.get_serving_processes()
-        if len(serving_processes) != 1 or not manager.is_avail(serving_processes[0]):
-          return None
-        server = manager._get_server(serving_processes[0])
-        if getattr(server, "inprocess", False) is not True:
-          return None
-        getter = getattr(server, "get_runtime_fingerprint", None)
-        fingerprint = getter() if callable(getter) else None
-        return fingerprint if isinstance(fingerprint, dict) else None
-      except (AttributeError, KeyError, TypeError):
-        return None
-
-    def _get_loaded_worker_code_identity(self):
-      shared = getattr(self, "global_shmem", None)
-      manager = shared.get("serving_manager") if isinstance(shared, dict) else None
-      if manager is None:
-        return None
-      try:
-        serving_processes = self.get_serving_processes()
-        if len(serving_processes) != 1 or not manager.is_avail(serving_processes[0]):
-          return None
-        server = manager._get_server(serving_processes[0])
-        if getattr(server, "inprocess", False) is not True:
-          return None
-        getter = getattr(server, "get_worker_code_identity", None)
-        serving = getter() if callable(getter) else None
-        if not isinstance(serving, dict) or tuple(serving) != (
-          "schema_version", "serving_module_sha256", "llama_cpp_base_sha256",
-          "base_llm_serving_sha256", "llm_utils_sha256",
-        ) or serving["schema_version"] != "edgeguard.serving-code-identity.v2":
-          return None
-        if serving["llm_utils_sha256"] != LLM_UTILS_MODULE_SHA256:
-          return None
-        document = {
-          "schema_version": "edgeguard.worker-code-identity.v2",
-          "llm_inference_api_sha256": LLM_INFERENCE_API_MODULE_SHA256,
-          "base_inference_api_sha256": BASE_INFERENCE_API_MODULE_SHA256,
-          "serving_module_sha256": serving["serving_module_sha256"],
-          "llama_cpp_base_sha256": serving["llama_cpp_base_sha256"],
-          "base_llm_serving_sha256": serving["base_llm_serving_sha256"],
-          "llm_utils_sha256": serving["llm_utils_sha256"],
-        }
-        material = json.dumps(
-          document, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
-        ).encode("utf-8")
-        document["identity_sha256"] = hashlib.sha256(material).hexdigest()
-        return document
-      except (AttributeError, KeyError, TypeError, ValueError):
-        return None
-
-    @BasePlugin.endpoint(method="GET")
-    def health(self):
-      result = super(LLMInferenceApiPlugin, self).health()
-      result["serving_ready"] = self._is_serving_ready()
-      result["benchmark_mode_enabled"] = getattr(self, "cfg_benchmark_mode_enabled", False) is True
-      result["runtime_fingerprint"] = self._get_loaded_runtime_fingerprint()
-      result["worker_code_identity"] = self._get_loaded_worker_code_identity()
-      return result
-
     # Override only to attach balanced endpoint metadata to the inherited handler.
     @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
@@ -440,7 +341,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         benchmark_mode: bool = False,
-        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -482,7 +382,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         benchmark_mode=benchmark_mode,
-        seed=seed,
         **kwargs
       )
 
@@ -501,7 +400,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         authorization: Optional[str] = None,
         request_id: Optional[str] = None,
         benchmark_mode: bool = False,
-        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -547,7 +445,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         authorization=authorization,
         request_id=request_id,
         benchmark_mode=benchmark_mode,
-        seed=seed,
         **kwargs
       )
 
@@ -563,7 +460,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         benchmark_mode: bool = False,
-        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -605,7 +501,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         benchmark_mode=benchmark_mode,
-        seed=seed,
         **kwargs
       )
 
@@ -621,7 +516,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         benchmark_mode: bool = False,
-        seed: Optional[int] = None,
         **kwargs
     ):
       """
@@ -663,7 +557,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         benchmark_mode=benchmark_mode,
-        seed=seed,
         **kwargs
       )
   """END API ENDPOINTS"""
@@ -711,11 +604,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       benchmark_mode = kwargs.get("benchmark_mode", False)
       if not isinstance(benchmark_mode, bool):
         return "`benchmark_mode` must be a boolean."
-      if benchmark_mode and getattr(self, "cfg_benchmark_mode_enabled", False) is not True:
+      if benchmark_mode:
         return "`benchmark_mode` is disabled on this instance."
-      seed = kwargs.get("seed")
-      if benchmark_mode and (isinstance(seed, bool) or not isinstance(seed, int)):
-        return "`seed` must be an integer in benchmark mode."
       err = self.check_generation_params(
         temperature=temperature,
         max_tokens=max_tokens,
@@ -763,8 +653,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         Processed parameters ready for dispatch.
       """
       normalized_messages = self.normalize_messages(messages)
-      if kwargs.get("benchmark_mode", False) is True and getattr(self, "cfg_benchmark_mode_enabled", False) is not True:
-        kwargs["benchmark_mode"] = False
+      kwargs.pop("benchmark_mode", None)
       # No need to capture err_msg here, already validated in check_predict_params
       response_format, _ = self.check_and_normalize_response_format(response_format=response_format)
       return {
@@ -871,52 +760,19 @@ class LLMInferenceApiPlugin(BasePlugin):
       text = first.get("text")
       return isinstance(text, str) and len(text.strip()) > 0
 
-    def _get_benchmark_telemetry(self, inference):
-      """Return benchmark telemetry without inspecting or logging model content."""
-      if not isinstance(inference, dict):
-        return None
-      direct = inference.get("EDGEGUARD_BENCHMARK_TELEMETRY")
-      if isinstance(direct, dict):
-        return direct
-      full_output = inference.get(LlmCT.FULL_OUTPUT, None)
-      if isinstance(full_output, list) and len(full_output) == 1:
-        full_output = full_output[0]
-      if not isinstance(full_output, dict):
-        return None
-      telemetry = full_output.get("EDGEGUARD_BENCHMARK_TELEMETRY")
-      return telemetry if isinstance(telemetry, dict) else None
-
     def _fail_invalid_empty_inference(self, inference):
       request_id = self._extract_request_id_from_inference(inference)
       if request_id is None:
         return False
       if request_id not in self._requests:
         return False
-      error_message = "Local LLM returned an invalid empty response."
-      if inference.get("ERROR_CODE") == "context_window_exceeded":
-        error_message = "Model context window exceeded."
       return self._fail_request(
         request_id=request_id,
-        error_message=error_message,
+        error_message="Local LLM returned an invalid empty response.",
       )
 
     def filter_valid_inference(self, inference):
       if not isinstance(inference, dict):
-        return False
-      benchmark_telemetry = self._get_benchmark_telemetry(inference)
-      if benchmark_telemetry is not None:
-        request_id = self._extract_request_id_from_inference(inference)
-        if request_id not in self._requests:
-          request_id = self._get_single_pending_request_id()
-        if request_id is None:
-          self.P("Rejected benchmark terminal inference without an unambiguous request id.")
-          return False
-        inference[LlmCT.REQUEST_ID] = request_id
-        self.P("Accepted benchmark terminal inference with content-free telemetry.")
-        return True
-      if inference.get("ERROR_CODE") == "context_window_exceeded":
-        self.P("Rejected LLM inference because the model context window was exceeded.")
-        self._fail_invalid_empty_inference(inference)
         return False
       if not inference.get("IS_VALID", True):
         if not self._has_text_result(inference=inference):
@@ -1021,18 +877,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         'TEXT_RESPONSE': text_response,
         LlmCT.FULL_OUTPUT: full_output,
       }
-      benchmark_telemetry = self._get_benchmark_telemetry(inference)
-      if benchmark_telemetry is not None:
-        execution_started_at = self._infer_execution_started_at(request_data=request_data)
-        created_at = request_data.get("created_at")
-        finished_at = request_data.get("finished_at")
-        api_timing = {}
-        if isinstance(created_at, (int, float)) and isinstance(finished_at, (int, float)):
-          api_timing["api_total_ms"] = round((finished_at - created_at) * 1000, 3)
-        if isinstance(created_at, (int, float)) and isinstance(execution_started_at, (int, float)):
-          api_timing["api_queue_ms"] = round((execution_started_at - created_at) * 1000, 3)
-        benchmark_telemetry = {**benchmark_telemetry, **api_timing}
-        self._requests[request_id]['result']["EDGEGUARD_BENCHMARK_TELEMETRY"] = benchmark_telemetry
       self._annotate_result_with_node_roles(
         result_payload=self._requests[request_id]['result'],
         request_data=request_data,
@@ -1096,9 +940,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         'MODEL_NAME': model_name,
         'TEXT_RESPONSE': text_response,
       }
-      benchmark_telemetry = self._get_benchmark_telemetry(inference)
-      if benchmark_telemetry is not None:
-        response_payload["EDGEGUARD_BENCHMARK_TELEMETRY"] = benchmark_telemetry
       # Check if full_output is already an API-friendly dict.
       # TODO: enhance this check based on expected structure.
       if isinstance(full_output, dict):

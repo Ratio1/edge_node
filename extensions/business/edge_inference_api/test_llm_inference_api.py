@@ -48,22 +48,13 @@ class _FakeLlmCT:
   ADDITIONAL = "ADDITIONAL"
   TEXT = "text"
   FULL_OUTPUT = "FULL_OUTPUT"
-  SEED = "SEED"
 
 
 def _load_plugin_module():
   source_path = ROOT / "extensions" / "business" / "edge_inference_api" / "llm_inference_api.py"
   source = source_path.read_text(encoding="utf-8")
   source = source.replace(
-    "from extensions.business.edge_inference_api import base_inference_api as base_inference_api_module\n",
-    "",
-  )
-  source = source.replace(
     "from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin\n",
-    "",
-  )
-  source = source.replace(
-    "from extensions.serving.mixins_llm import llm_utils as llm_utils_module\n",
     "",
   )
   source = source.replace(
@@ -73,12 +64,6 @@ def _load_plugin_module():
   namespace = {
     "BasePlugin": _FakeBasePlugin,
     "LlmCT": _FakeLlmCT,
-    "base_inference_api_module": type("BaseInferenceApiModule", (), {
-      "__file__": str(ROOT / "extensions/business/edge_inference_api/base_inference_api.py"),
-    }),
-    "llm_utils_module": type("LlmUtilsModule", (), {
-      "__file__": str(ROOT / "extensions/serving/mixins_llm/llm_utils.py"),
-    }),
     "__file__": str(source_path),
     "__name__": "loaded_llm_inference_api",
   }
@@ -91,94 +76,27 @@ LLMInferenceApiPlugin = LOADED_PLUGIN_MODULE["LLMInferenceApiPlugin"]
 
 
 class LLMInferenceApiPluginTests(unittest.TestCase):
-  def test_health_reports_actual_serving_manager_readiness(self):
-    plugin = LLMInferenceApiPlugin()
-    plugin.get_serving_processes = lambda: ["expected-server"]
-    plugin.global_shmem = {"serving_manager": type("Manager", (), {"is_avail": lambda _self, name: name == "expected-server"})()}
-    self.assertIs(plugin.health()["serving_ready"], True)
-    self.assertIs(plugin.health()["benchmark_mode_enabled"], False)
-    self.assertIsNone(plugin.health()["runtime_fingerprint"])
-    self.assertIsNone(plugin.health()["worker_code_identity"])
-    plugin.cfg_benchmark_mode_enabled = True
-    self.assertIs(plugin.health()["benchmark_mode_enabled"], True)
-    plugin.global_shmem = {}
-    self.assertIs(plugin.health()["serving_ready"], False)
-
-  def test_health_keeps_null_identity_keys_for_inprocess_generic_worker(self):
-    server = type("GenericServer", (), {"inprocess": True})()
-    manager = type("Manager", (), {
-      "is_avail": lambda _self, _name: True,
-      "_get_server": lambda _self, _name: server,
-    })()
-    plugin = LLMInferenceApiPlugin()
-    plugin.get_serving_processes = lambda: ["generic-llama-server"]
-    plugin.global_shmem = {"serving_manager": manager}
-
-    health = plugin.health()
-
-    self.assertIs(health["serving_ready"], True)
-    self.assertIsNone(health["runtime_fingerprint"])
-    self.assertIsNone(health["worker_code_identity"])
-
   def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):
     for method_name in ("predict", "predict_async", "create_chat_completion", "create_chat_completion_async"):
       parameter = inspect.signature(getattr(LLMInferenceApiPlugin, method_name)).parameters["benchmark_mode"]
       self.assertIs(parameter.default, False)
 
-  def test_benchmark_mode_reaches_uppercase_worker_payload(self):
-    plugin = LLMInferenceApiPlugin()
-    plugin.cfg_benchmark_mode_enabled = True
-    parameters = plugin.process_predict_params(
-      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
-      benchmark_mode=True,
-    )
-    payload = plugin.compute_payload_kwargs_from_predict_params(
-      "req-benchmark", {"parameters": parameters},
-    )
-    self.assertIs(payload["JEEVES_CONTENT"]["BENCHMARK_MODE"], True)
-
-  def test_benchmark_mode_requires_instance_enablement(self):
+  def test_benchmark_mode_is_always_rejected(self):
     plugin = LLMInferenceApiPlugin()
     plugin.check_generation_params = lambda **_kwargs: None
-    plugin.cfg_benchmark_mode_enabled = False
     error = plugin.check_predict_params(
       messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
       benchmark_mode=True,
     )
     self.assertEqual(error, "`benchmark_mode` is disabled on this instance.")
+
+  def test_default_off_benchmark_mode_is_not_forwarded(self):
+    plugin = LLMInferenceApiPlugin()
     parameters = plugin.process_predict_params(
       messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
-      benchmark_mode=True,
+      benchmark_mode=False,
     )
-    self.assertIs(parameters["benchmark_mode"], False)
-
-    plugin.cfg_benchmark_mode_enabled = True
-    self.assertIsNone(plugin.check_predict_params(
-      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
-      benchmark_mode=True, seed=42,
-    ))
-
-  def test_benchmark_mode_requires_integer_seed(self):
-    plugin = LLMInferenceApiPlugin()
-    plugin.check_generation_params = lambda **_kwargs: None
-    plugin.cfg_benchmark_mode_enabled = True
-    self.assertEqual(
-      plugin.check_predict_params(
-        messages=[{"role": "user", "content": "x"}],
-        temperature=0.1,
-        max_tokens=512,
-        benchmark_mode=True,
-        seed=None,
-      ),
-      "`seed` must be an integer in benchmark mode.",
-    )
-    self.assertIsNone(plugin.check_predict_params(
-      messages=[{"role": "user", "content": "x"}],
-      temperature=0.1,
-      max_tokens=512,
-      benchmark_mode=True,
-      seed=42,
-    ))
+    self.assertNotIn("benchmark_mode", parameters)
 
   def test_payload_uses_llm_serving_uppercase_contract(self):
     plugin = LLMInferenceApiPlugin()
