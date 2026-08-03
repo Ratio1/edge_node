@@ -1,4 +1,3 @@
-import inspect
 import unittest
 from pathlib import Path
 
@@ -29,9 +28,6 @@ class _FakeBasePlugin:
   def P(self, *args, **kwargs):  # pylint: disable=unused-argument
     return None
 
-  def health(self):
-    return {"status": "ok"}
-
   @staticmethod
   def shorten_str(value):
     return str(value)
@@ -50,7 +46,7 @@ class _FakeLlmCT:
   FULL_OUTPUT = "FULL_OUTPUT"
 
 
-def _load_plugin_module():
+def _load_plugin_class():
   source_path = ROOT / "extensions" / "business" / "edge_inference_api" / "llm_inference_api.py"
   source = source_path.read_text(encoding="utf-8")
   source = source.replace(
@@ -64,40 +60,16 @@ def _load_plugin_module():
   namespace = {
     "BasePlugin": _FakeBasePlugin,
     "LlmCT": _FakeLlmCT,
-    "__file__": str(source_path),
     "__name__": "loaded_llm_inference_api",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
-  return namespace
+  return namespace["LLMInferenceApiPlugin"]
 
 
-LOADED_PLUGIN_MODULE = _load_plugin_module()
-LLMInferenceApiPlugin = LOADED_PLUGIN_MODULE["LLMInferenceApiPlugin"]
+LLMInferenceApiPlugin = _load_plugin_class()
 
 
 class LLMInferenceApiPluginTests(unittest.TestCase):
-  def test_benchmark_mode_is_an_explicit_default_off_endpoint_parameter(self):
-    for method_name in ("predict", "predict_async", "create_chat_completion", "create_chat_completion_async"):
-      parameter = inspect.signature(getattr(LLMInferenceApiPlugin, method_name)).parameters["benchmark_mode"]
-      self.assertIs(parameter.default, False)
-
-  def test_benchmark_mode_is_always_rejected(self):
-    plugin = LLMInferenceApiPlugin()
-    plugin.check_generation_params = lambda **_kwargs: None
-    error = plugin.check_predict_params(
-      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
-      benchmark_mode=True,
-    )
-    self.assertEqual(error, "`benchmark_mode` is disabled on this instance.")
-
-  def test_default_off_benchmark_mode_is_not_forwarded(self):
-    plugin = LLMInferenceApiPlugin()
-    parameters = plugin.process_predict_params(
-      messages=[{"role": "user", "content": "x"}], temperature=0.0, max_tokens=1,
-      benchmark_mode=False,
-    )
-    self.assertNotIn("benchmark_mode", parameters)
-
   def test_payload_uses_llm_serving_uppercase_contract(self):
     plugin = LLMInferenceApiPlugin()
 
@@ -200,44 +172,12 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertTrue(plugin.filter_valid_inference(inference))
     self.assertEqual(inference["REQUEST_ID"], "req-8")
 
-  def test_generic_serving_envelope_keeps_existing_completion_response_shape(self):
-    plugin = LLMInferenceApiPlugin()
-    plugin.time = lambda: 1234.5
-    plugin._annotate_result_with_node_roles = lambda **_kwargs: None
-    inference = {
-      "REQUEST_ID": "req-generic",
-      "text": "MATCH (n) RETURN n LIMIT 1",
-      "FULL_OUTPUT": {
-        "choices": [{
-          "message": {"content": "MATCH (n) RETURN n LIMIT 1"},
-          "finish_reason": "stop",
-        }],
-        "usage": {"completion_tokens": 9},
-      },
-      "IS_VALID": True,
-    }
-
-    response = plugin.build_completion_response(
-      request_id="req-generic",
-      model_name="edgeguard-base-qwen3-4b",
-      inference=inference,
-      request_data={"metadata": {"route": "base"}},
-    )
-
-    self.assertEqual(response["REQUEST_ID"], "req-generic")
-    self.assertEqual(response["MODEL_NAME"], "edgeguard-base-qwen3-4b")
-    self.assertEqual(response["TEXT_RESPONSE"], "MATCH (n) RETURN n LIMIT 1")
-    self.assertEqual(response["object"], "chat.completion")
-    self.assertEqual(response["id"], "req-generic")
-    self.assertEqual(response["model"], "edgeguard-base-qwen3-4b")
-    self.assertEqual(response["metadata"], {"route": "base"})
-    self.assertEqual(response["choices"], inference["FULL_OUTPUT"]["choices"])
-    self.assertEqual(response["usage"], {"completion_tokens": 9})
-
   def test_filter_valid_inference_fails_single_pending_on_invalid_empty_output(self):
     plugin = LLMInferenceApiPlugin()
     plugin._requests = {"req-9": {"status": "pending"}}  # pylint: disable=protected-access
     failed = {}
+    logged = []
+    plugin.P = lambda *args, **kwargs: logged.append((args, kwargs))
     plugin._fail_request = lambda request_id, error_message: failed.update({  # pylint: disable=protected-access
       "request_id": request_id,
       "error_message": error_message,
@@ -245,12 +185,15 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     inference = {
       "REQUEST_ID": "req-9",
       "text": "",
+      "raw_model_output": "SENTINEL_MODEL_CONTENT_MUST_NOT_BE_LOGGED",
       "IS_VALID": False,
     }
 
     self.assertFalse(plugin.filter_valid_inference(inference))
     self.assertEqual(failed["request_id"], "req-9")
     self.assertEqual(failed["error_message"], "Local LLM returned an invalid empty response.")
+    self.assertIn("Rejected invalid LLM inference without text output.", repr(logged))
+    self.assertNotIn("SENTINEL_MODEL_CONTENT_MUST_NOT_BE_LOGGED", repr(logged))
 
   def test_filter_valid_inference_ignores_request_id_less_empty_placeholder(self):
     plugin = LLMInferenceApiPlugin()

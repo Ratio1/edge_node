@@ -101,6 +101,7 @@ _CONFIG = {
   "TEMPERATURE_MAX": 1.5,
   "MIN_COMPLETION_TOKENS": 16,
   "MAX_COMPLETION_TOKENS": 4096,
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -340,7 +341,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
-        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -381,7 +381,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format=response_format,
         metadata=metadata,
         authorization=authorization,
-        benchmark_mode=benchmark_mode,
         **kwargs
       )
 
@@ -399,7 +398,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         request_id: Optional[str] = None,
-        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -444,7 +442,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata=metadata,
         authorization=authorization,
         request_id=request_id,
-        benchmark_mode=benchmark_mode,
         **kwargs
       )
 
@@ -459,7 +456,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
-        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -500,7 +496,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format=response_format,
         metadata=metadata,
         authorization=authorization,
-        benchmark_mode=benchmark_mode,
         **kwargs
       )
 
@@ -515,7 +510,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
-        benchmark_mode: bool = False,
         **kwargs
     ):
       """
@@ -556,7 +550,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format=response_format,
         metadata=metadata,
         authorization=authorization,
-        benchmark_mode=benchmark_mode,
         **kwargs
       )
   """END API ENDPOINTS"""
@@ -601,11 +594,6 @@ class LLMInferenceApiPlugin(BasePlugin):
       err = self.check_messages(messages)
       if err is not None:
         return err
-      benchmark_mode = kwargs.get("benchmark_mode", False)
-      if not isinstance(benchmark_mode, bool):
-        return "`benchmark_mode` must be a boolean."
-      if benchmark_mode:
-        return "`benchmark_mode` is disabled on this instance."
       err = self.check_generation_params(
         temperature=temperature,
         max_tokens=max_tokens,
@@ -653,7 +641,6 @@ class LLMInferenceApiPlugin(BasePlugin):
         Processed parameters ready for dispatch.
       """
       normalized_messages = self.normalize_messages(messages)
-      kwargs.pop("benchmark_mode", None)
       # No need to capture err_msg here, already validated in check_predict_params
       response_format, _ = self.check_and_normalize_response_format(response_format=response_format)
       return {

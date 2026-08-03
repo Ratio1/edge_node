@@ -749,3 +749,12 @@ Entry format:
 - Details: The historical sealed benchmark remains documentation-only. `LLM_INFERENCE_API` keeps an explicit default-off `benchmark_mode` parameter solely to reject `true` with a stable error and strips `false` before dispatch. Benchmark enablement, seed validation, telemetry handling, health readiness and identity claims, source hashing, and CyberSec worker hashing were removed. Ordinary inference envelopes and the generic llama.cpp serving implementation are unchanged.
 - Verification: Focused inference and serving unit tests; live `edg3` health, disabled-mode rejection, and ordinary completion checks.
 - Links: `extensions/business/edge_inference_api/llm_inference_api.py`, `extensions/business/edge_inference_api/test_llm_inference_api.py`, `extensions/serving/default_inference/nlp/llama_cpp_cybersec_qwen_4b.py`, `AGENTS.md`
+
+- ID: `ML-20260803-002`
+- Timestamp: `2026-08-03T09:53:00Z`
+- Type: `correction`
+- Summary: Removed benchmark mode entirely from the LLM inference API.
+- Criticality: Corrects `ML-20260803-001`; generic inference no longer exposes, validates, rejects, strips, or otherwise interprets a benchmark control.
+- Details: The four LLM completion endpoints have no `benchmark_mode` parameter or special benchmark path. Stale or unknown request input has no supported benchmark semantics. The dormant EdgeGuard UI path remains unavailable because generic workers expose no runtime proof fields. Any reactivation requires a new atomic API/UI/runtime implementation and a new unseen sealed set. The indexed queued-result alignment fix and attributable, content-safe invalid-empty response handling remain as ordinary inference reliability behavior.
+- Verification: Focused balancing, LLM inference, serving-profile, and EdgeGuard API tests; scoped dead-symbol search; exact `llm_utils.py` parity with `origin/develop`; live `edg3` health and ordinary completion checks.
+- Links: `extensions/business/edge_inference_api/llm_inference_api.py`, `extensions/business/edge_inference_api/base_inference_api.py`, `extensions/business/edge_inference_api/test_llm_inference_api.py`, `AGENTS.md`
