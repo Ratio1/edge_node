@@ -575,8 +575,6 @@ class DauthServerRegistryGateTests(unittest.TestCase):
         self.calls += 1
         if isinstance(self.result, Exception):
           raise self.result
-        if callable(self.result):
-          return self.result()
         if isinstance(self.result, list):
           return self.result
         return ["0xNODE", "0xPEER"] if self.result else ["0xPEER"]
@@ -610,13 +608,10 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._dauth_registry_internal_peers = None
     plugin._last_dauth_registry_refresh = None
     plugin._dauth_registry_refresh_failed = False
-    plugin._dauth_registry_lookup_threads = []
     plugin._last_dauth_job_secrets_hsync = None
     plugin.cfg_dauth_job_secrets_hsync_interval = 10 * 60
     plugin.cfg_dauth_registry_refresh_interval = 60 * 60
     plugin.cfg_dauth_registry_refresh_retry_interval = 60
-    plugin.cfg_dauth_registry_refresh_timeout = 30
-    plugin.cfg_dauth_registry_max_pending_lookups = 2
     plugin._is_plugin_ready = None
     plugin._hsync_calls = []
     plugin.chainstore_hsync = lambda **kwargs: plugin._hsync_calls.append(kwargs) or {
@@ -753,57 +748,6 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._now += 1
     self.assertTrue(plugin.should_pause())
     self.assertEqual(plugin.bc.calls, 2)
-
-  def test_registry_lookup_timeout_fails_closed_without_late_state_update(self):
-    lookup_release = threading.Event()
-
-    def delayed_registry_lookup():
-      lookup_release.wait()
-      return ["0xNODE", "0xPEER"]
-
-    plugin = self._make_manager(dauth_oracle=delayed_registry_lookup)
-    plugin.cfg_dauth_registry_refresh_timeout = 0.001
-
-    plugin.on_init()
-
-    self.assertFalse(plugin._is_dauth_server_enabled())  # pylint: disable=protected-access
-    self.assertIn("timed out", plugin._dauth_server_enabled_message)
-    self.assertEqual(len(plugin._dauth_registry_lookup_threads), 1)
-    self.assertTrue(plugin._dauth_registry_lookup_threads[0].is_alive())
-
-    plugin.bc.result = True
-    plugin._now += 60
-    self.assertTrue(plugin.should_resume())
-    self.assertEqual(plugin.bc.calls, 2)
-
-    lookup_release.set()
-    plugin._dauth_registry_lookup_threads[0].join(timeout=1)
-    self.assertTrue(plugin._is_dauth_server_enabled())  # pylint: disable=protected-access
-
-  def test_registry_lookup_timeouts_cap_abandoned_workers(self):
-    lookup_release = threading.Event()
-
-    def blocked_registry_lookup():
-      lookup_release.wait()
-      return ["0xNODE", "0xPEER"]
-
-    plugin = self._make_manager(dauth_oracle=blocked_registry_lookup)
-    plugin.cfg_dauth_registry_refresh_timeout = 0.001
-    plugin.on_init()
-
-    plugin._now += 60
-    self.assertFalse(plugin.should_resume())
-    plugin._now += 60
-    self.assertFalse(plugin.should_resume())
-
-    self.assertEqual(plugin.bc.calls, 2)
-    self.assertEqual(len(plugin._dauth_registry_lookup_threads), 2)
-    self.assertIn("too many", plugin._dauth_server_enabled_message)
-
-    lookup_release.set()
-    for lookup_thread in plugin._dauth_registry_lookup_threads:
-      lookup_thread.join(timeout=1)
-    # endfor
 
   def test_hourly_refresh_revokes_server_and_secret_replication(self):
     plugin = self._make_manager(dauth_oracle=True)

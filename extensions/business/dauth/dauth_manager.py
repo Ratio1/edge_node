@@ -20,8 +20,6 @@ WHITELIST (oracles)
 
 
 """
-import threading
-
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
@@ -54,8 +52,6 @@ _CONFIG = {
   'DAUTH_JOB_SECRETS_HSYNC_INTERVAL': 10 * 60,
   'DAUTH_REGISTRY_REFRESH_INTERVAL': 60 * 60,
   'DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL': 60,
-  'DAUTH_REGISTRY_REFRESH_TIMEOUT': 30,
-  'DAUTH_REGISTRY_MAX_PENDING_LOOKUPS': 2,
 
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
@@ -124,7 +120,6 @@ class DauthManagerPlugin(
     self._dauth_registry_internal_peers = None
     self._last_dauth_registry_refresh = None
     self._dauth_registry_refresh_failed = False
-    self._dauth_registry_lookup_threads = []
     self._last_dauth_job_secrets_hsync = None
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
@@ -179,7 +174,7 @@ class DauthManagerPlugin(
 
     error = None
     try:
-      peers, eth_oracles = self._load_dauth_registry_snapshot_with_timeout()
+      peers, eth_oracles = load_dauth_registry_snapshot(self)
       enabled = self.bc.eth_address.lower() in [
         address.lower() for address in eth_oracles
       ]
@@ -209,43 +204,6 @@ class DauthManagerPlugin(
       )
     # endif
     return enabled
-
-  def _load_dauth_registry_snapshot_with_timeout(self):
-    lookup_threads = [
-      thread for thread in getattr(self, "_dauth_registry_lookup_threads", [])
-      if thread.is_alive()
-    ]
-    self._dauth_registry_lookup_threads = lookup_threads
-    if len(lookup_threads) >= self.cfg_dauth_registry_max_pending_lookups:
-      raise TimeoutError("too many dAuth registry lookups are still running")
-    # endif
-
-    result = {}
-
-    def load_registry():
-      try:
-        result["snapshot"] = load_dauth_registry_snapshot(self)
-      except Exception as exc:
-        result["error"] = exc
-      # end try
-      return
-
-    lookup_thread = threading.Thread(target=load_registry, daemon=True)
-    self._dauth_registry_lookup_threads.append(lookup_thread)
-    lookup_thread.start()
-    lookup_thread.join(timeout=self.cfg_dauth_registry_refresh_timeout)
-    if lookup_thread.is_alive():
-      raise TimeoutError(
-        f"dAuth registry lookup timed out after "
-        f"{self.cfg_dauth_registry_refresh_timeout} seconds"
-      )
-    # endif
-
-    self._dauth_registry_lookup_threads.remove(lookup_thread)
-    error = result.get("error")
-    if error is not None:
-      raise error
-    return result["snapshot"]
 
   def _is_dauth_server_enabled(self):
     return getattr(self, "_dauth_server_enabled", None) is True
