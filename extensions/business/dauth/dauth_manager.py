@@ -20,6 +20,8 @@ WHITELIST (oracles)
 
 
 """
+import threading
+
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
@@ -49,7 +51,11 @@ _CONFIG = {
   'REQUESTS_MAX_RECORDS': 2,
   'REQUESTS_LOG_INTERVAL': 5 * 60,
 
-  'DAUTH_JOB_SECRETS_HSYNC_INTERVAL': 60,
+  'DAUTH_JOB_SECRETS_HSYNC_INTERVAL': 10 * 60,
+  'DAUTH_REGISTRY_REFRESH_INTERVAL': 60 * 60,
+  'DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL': 60,
+  'DAUTH_REGISTRY_REFRESH_TIMEOUT': 30,
+  'DAUTH_REGISTRY_MAX_PENDING_LOOKUPS': 2,
 
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
@@ -116,6 +122,9 @@ class DauthManagerPlugin(
     self._dauth_server_enabled_message = None
     self._dauth_registry_eth_oracles = None
     self._dauth_registry_internal_peers = None
+    self._last_dauth_registry_refresh = None
+    self._dauth_registry_refresh_failed = False
+    self._dauth_registry_lookup_threads = []
     self._last_dauth_job_secrets_hsync = None
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
@@ -146,26 +155,52 @@ class DauthManagerPlugin(
       return self._dauth_server_enabled
     # endif
 
+    return self._refresh_dauth_registry(force=True)
+
+  def _refresh_dauth_registry(self, force=False):
+    now = self.time()
+    last_refresh = getattr(self, "_last_dauth_registry_refresh", None)
+    refresh_interval = (
+      self.cfg_dauth_registry_refresh_retry_interval
+      if getattr(self, "_dauth_registry_refresh_failed", False)
+      else self.cfg_dauth_registry_refresh_interval
+    )
+    if (
+      not force
+      and last_refresh is not None
+      and now - last_refresh < refresh_interval
+    ):
+      return self._is_dauth_server_enabled()
+    # endif
+
+    self._last_dauth_registry_refresh = now
+    previous_enabled = getattr(self, "_dauth_server_enabled", None)
+    previous_eth_oracles = getattr(self, "_dauth_registry_eth_oracles", None)
+
     error = None
     try:
-      peers, eth_oracles = load_dauth_registry_snapshot(self)
+      peers, eth_oracles = self._load_dauth_registry_snapshot_with_timeout()
       enabled = self.bc.eth_address.lower() in [
         address.lower() for address in eth_oracles
       ]
-      if enabled:
-        self._dauth_registry_eth_oracles = eth_oracles
-        self._dauth_registry_internal_peers = peers
     except Exception as e:
       enabled = False
       error = str(e)
     # end try
 
     message = None if enabled else error or "current node is not registered as a dAuth oracle"
+    self._dauth_registry_eth_oracles = eth_oracles if enabled else None
+    self._dauth_registry_internal_peers = peers if enabled else None
+    self._dauth_registry_refresh_failed = error is not None
     self._dauth_server_enabled = enabled
     self._dauth_server_enabled_message = message
-    if enabled:
-      self.P(f"{self.__class__.__name__} dAuth registry gate is enabled")
-    else:
+    registry_changed = previous_eth_oracles != self._dauth_registry_eth_oracles
+    if enabled and (previous_enabled is not True or registry_changed):
+      self.P(
+        f"{self.__class__.__name__} dAuth registry gate is enabled "
+        f"with {len(eth_oracles)} registered oracle(s)"
+      )
+    elif not enabled and (previous_enabled is not False or error is not None):
       self.P(
         f"{self.__class__.__name__} dAuth registry gate is disabled. "
         f"(cause: {message})",
@@ -175,13 +210,52 @@ class DauthManagerPlugin(
     # endif
     return enabled
 
+  def _load_dauth_registry_snapshot_with_timeout(self):
+    lookup_threads = [
+      thread for thread in getattr(self, "_dauth_registry_lookup_threads", [])
+      if thread.is_alive()
+    ]
+    self._dauth_registry_lookup_threads = lookup_threads
+    if len(lookup_threads) >= self.cfg_dauth_registry_max_pending_lookups:
+      raise TimeoutError("too many dAuth registry lookups are still running")
+    # endif
+
+    result = {}
+
+    def load_registry():
+      try:
+        result["snapshot"] = load_dauth_registry_snapshot(self)
+      except Exception as exc:
+        result["error"] = exc
+      # end try
+      return
+
+    lookup_thread = threading.Thread(target=load_registry, daemon=True)
+    self._dauth_registry_lookup_threads.append(lookup_thread)
+    lookup_thread.start()
+    lookup_thread.join(timeout=self.cfg_dauth_registry_refresh_timeout)
+    if lookup_thread.is_alive():
+      raise TimeoutError(
+        f"dAuth registry lookup timed out after "
+        f"{self.cfg_dauth_registry_refresh_timeout} seconds"
+      )
+    # endif
+
+    self._dauth_registry_lookup_threads.remove(lookup_thread)
+    error = result.get("error")
+    if error is not None:
+      raise error
+    return result["snapshot"]
+
   def _is_dauth_server_enabled(self):
     return getattr(self, "_dauth_server_enabled", None) is True
 
   def should_pause(self):
+    self._refresh_dauth_registry()
     return not self._is_dauth_server_enabled()
 
   def should_resume(self):
+    self._refresh_dauth_registry()
     return self._is_dauth_server_enabled()
 
   def on_pause(self):
@@ -189,6 +263,7 @@ class DauthManagerPlugin(
       return
     # endif
 
+    self.set_plugin_ready(False)
     self._dauth_pause_teardown_succeeded = False
     self._stop_request_monitor.set()
     if self._request_monitor_thread is not None:
@@ -245,6 +320,13 @@ class DauthManagerPlugin(
     self.failed = False
     self._stop_request_monitor.clear()
     self._start_request_monitor_thread()
+    return
+
+  def on_log_handler(self, text, key=None):
+    super(DauthManagerPlugin, self).on_log_handler(text, key=key)
+    if self._is_dauth_server_enabled() and "Uvicorn running on " in text:
+      self.set_plugin_ready(True)
+    # endif
     return
     
   

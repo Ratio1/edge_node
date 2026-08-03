@@ -15,7 +15,7 @@ def resolve_dauth_registry_internal_peers(plugin, eth_oracles):
 
 
 def load_dauth_registry_snapshot(plugin):
-  """Load the dAuth registry once and resolve its currently known peers."""
+  """Load the current dAuth registry and resolve its currently known peers."""
   eth_oracles = plugin.bc.get_eth_dauth_oracles()
   eth_oracles = list(dict.fromkeys(
     address
@@ -32,7 +32,7 @@ def load_dauth_registry_snapshot(plugin):
 
 
 def get_cached_dauth_registry_internal_peers(plugin):
-  """Return the startup-cached dAuth oracle internal addresses."""
+  """Return the latest cached dAuth oracle internal addresses."""
   eth_oracles = getattr(plugin, "_dauth_registry_eth_oracles", None)
   if eth_oracles:
     peers = resolve_dauth_registry_internal_peers(plugin, eth_oracles)
@@ -40,7 +40,7 @@ def get_cached_dauth_registry_internal_peers(plugin):
       plugin._dauth_registry_internal_peers = peers
   peers = getattr(plugin, "_dauth_registry_internal_peers", None)
   if not peers:
-    raise ValueError("dAuth registry peers were not cached at startup.")
+    raise ValueError("dAuth registry peers are not cached.")
   return list(peers)
 
 

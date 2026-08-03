@@ -96,6 +96,14 @@ class _FakeBasePlugin:
     self._request_monitor_thread = _FakeThread()
     return
 
+  def set_plugin_ready(self, ready=True):
+    self._is_plugin_ready = ready
+    return
+
+  def on_log_handler(self, text, key=None):  # pylint: disable=unused-argument
+    self._lifecycle_events.append("log")
+    return
+
 
 class _FakeDauthMixin:
   pass
@@ -567,12 +575,17 @@ class DauthServerRegistryGateTests(unittest.TestCase):
         self.calls += 1
         if isinstance(self.result, Exception):
           raise self.result
+        if callable(self.result):
+          return self.result()
+        if isinstance(self.result, list):
+          return self.result
         return ["0xNODE", "0xPEER"] if self.result else ["0xPEER"]
 
       def eth_addr_to_internal_addr(self, eth_address):
         return {
           "0xnode": "node-address",
           "0xpeer": "peer-address",
+          "0xnew": "new-peer-address",
         }.get(eth_address.lower())
 
     plugin = DauthManagerPlugin.__new__(DauthManagerPlugin)
@@ -595,8 +608,16 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.bc.eth_address = "0xNODE"
     plugin._dauth_registry_eth_oracles = None
     plugin._dauth_registry_internal_peers = None
+    plugin._last_dauth_registry_refresh = None
+    plugin._dauth_registry_refresh_failed = False
+    plugin._dauth_registry_lookup_threads = []
     plugin._last_dauth_job_secrets_hsync = None
-    plugin.cfg_dauth_job_secrets_hsync_interval = 60
+    plugin.cfg_dauth_job_secrets_hsync_interval = 10 * 60
+    plugin.cfg_dauth_registry_refresh_interval = 60 * 60
+    plugin.cfg_dauth_registry_refresh_retry_interval = 60
+    plugin.cfg_dauth_registry_refresh_timeout = 30
+    plugin.cfg_dauth_registry_max_pending_lookups = 2
+    plugin._is_plugin_ready = None
     plugin._hsync_calls = []
     plugin.chainstore_hsync = lambda **kwargs: plugin._hsync_calls.append(kwargs) or {
       "hkey": kwargs["hkey"],
@@ -623,7 +644,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(get_response["nonce"], REQUEST_NONCE)
     self.assertEqual(get_response["error"], "get failed")
 
-  def test_startup_lookup_is_cached_across_repeated_lifecycle_predicates(self):
+  def test_registry_lookup_is_cached_between_hourly_lifecycle_refreshes(self):
     plugin = self._make_manager(dauth_oracle=True)
 
     plugin.on_init()
@@ -641,12 +662,20 @@ class DauthServerRegistryGateTests(unittest.TestCase):
       ["node-address", "peer-address"],
     )
 
-  def test_secret_hsync_runs_at_startup_and_once_per_minute_on_cached_peers(self):
+    plugin._now += (60 * 60) - 1
+    self.assertFalse(plugin.should_pause())
+    self.assertEqual(plugin.bc.calls, 1)
+
+    plugin._now += 1
+    self.assertFalse(plugin.should_pause())
+    self.assertEqual(plugin.bc.calls, 2)
+
+  def test_secret_hsync_runs_at_startup_and_every_ten_minutes_on_cached_peers(self):
     plugin = self._make_manager(dauth_oracle=True)
 
     plugin.on_init()
     plugin.process()
-    plugin._now += 59
+    plugin._now += (10 * 60) - 1
     plugin.process()
     plugin._now += 1
     plugin.process()
@@ -670,7 +699,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.chainstore_hsync = fail_hsync
     plugin.on_init()
     plugin.process()
-    plugin._now += 60
+    plugin._now += 10 * 60
     plugin.process()
 
     self.assertEqual(len(attempts), 2)
@@ -705,7 +734,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
       ],
     )
 
-  def test_startup_lookup_error_fails_closed_and_is_not_retried(self):
+  def test_startup_lookup_error_fails_closed_and_retries_after_one_minute(self):
     plugin = self._make_manager(dauth_oracle=RuntimeError("registry unavailable"))
 
     plugin.on_init()
@@ -717,6 +746,144 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(plugin._dauth_server_enabled_message, "registry unavailable")
     self.assertTrue(plugin._dauth_pause_teardown_succeeded)
 
+    plugin._now += 59
+    self.assertTrue(plugin.should_pause())
+    self.assertEqual(plugin.bc.calls, 1)
+
+    plugin._now += 1
+    self.assertTrue(plugin.should_pause())
+    self.assertEqual(plugin.bc.calls, 2)
+
+  def test_registry_lookup_timeout_fails_closed_without_late_state_update(self):
+    lookup_release = threading.Event()
+
+    def delayed_registry_lookup():
+      lookup_release.wait()
+      return ["0xNODE", "0xPEER"]
+
+    plugin = self._make_manager(dauth_oracle=delayed_registry_lookup)
+    plugin.cfg_dauth_registry_refresh_timeout = 0.001
+
+    plugin.on_init()
+
+    self.assertFalse(plugin._is_dauth_server_enabled())  # pylint: disable=protected-access
+    self.assertIn("timed out", plugin._dauth_server_enabled_message)
+    self.assertEqual(len(plugin._dauth_registry_lookup_threads), 1)
+    self.assertTrue(plugin._dauth_registry_lookup_threads[0].is_alive())
+
+    plugin.bc.result = True
+    plugin._now += 60
+    self.assertTrue(plugin.should_resume())
+    self.assertEqual(plugin.bc.calls, 2)
+
+    lookup_release.set()
+    plugin._dauth_registry_lookup_threads[0].join(timeout=1)
+    self.assertTrue(plugin._is_dauth_server_enabled())  # pylint: disable=protected-access
+
+  def test_registry_lookup_timeouts_cap_abandoned_workers(self):
+    lookup_release = threading.Event()
+
+    def blocked_registry_lookup():
+      lookup_release.wait()
+      return ["0xNODE", "0xPEER"]
+
+    plugin = self._make_manager(dauth_oracle=blocked_registry_lookup)
+    plugin.cfg_dauth_registry_refresh_timeout = 0.001
+    plugin.on_init()
+
+    plugin._now += 60
+    self.assertFalse(plugin.should_resume())
+    plugin._now += 60
+    self.assertFalse(plugin.should_resume())
+
+    self.assertEqual(plugin.bc.calls, 2)
+    self.assertEqual(len(plugin._dauth_registry_lookup_threads), 2)
+    self.assertIn("too many", plugin._dauth_server_enabled_message)
+
+    lookup_release.set()
+    for lookup_thread in plugin._dauth_registry_lookup_threads:
+      lookup_thread.join(timeout=1)
+    # endfor
+
+  def test_hourly_refresh_revokes_server_and_secret_replication(self):
+    plugin = self._make_manager(dauth_oracle=True)
+    plugin.on_init()
+    plugin.bc.result = False
+
+    plugin._now += (60 * 60) - 1
+    self.assertFalse(plugin.should_pause())
+    self.assertEqual(plugin.bc.calls, 1)
+
+    plugin._now += 1
+    self.assertTrue(plugin.should_pause())
+    plugin.on_pause()
+    self.assertEqual(plugin.bc.calls, 2)
+    self.assertIsNone(plugin._dauth_registry_eth_oracles)
+    self.assertIsNone(plugin._dauth_registry_internal_peers)
+    self.assertTrue(plugin._stop_request_monitor.is_set())
+    self.assertEqual(plugin.start_commands_processes, [None, None])
+
+    hsync_calls = len(plugin._hsync_calls)
+    plugin._now += 10 * 60
+    plugin.process()
+    self.assertEqual(len(plugin._hsync_calls), hsync_calls)
+
+  def test_hourly_refresh_replaces_removed_replication_peers(self):
+    plugin = self._make_manager(dauth_oracle=True)
+    plugin.on_init()
+    plugin.bc.result = ["0xNODE", "0xNEW"]
+
+    plugin._now += 60 * 60
+    self.assertFalse(plugin.should_pause())
+
+    self.assertEqual(plugin.bc.calls, 2)
+    self.assertEqual(plugin._dauth_registry_eth_oracles, ["0xNODE", "0xNEW"])
+    self.assertEqual(
+      plugin._dauth_registry_internal_peers,
+      ["node-address", "new-peer-address"],
+    )
+    plugin.process()
+    self.assertEqual(
+      plugin._hsync_calls[-1]["extra_peers"],
+      ["node-address", "new-peer-address"],
+    )
+
+  def test_hourly_refresh_allows_newly_registered_server_to_resume(self):
+    plugin = self._make_manager(dauth_oracle=False)
+    plugin.on_init()
+    plugin.bc.result = True
+
+    plugin._now += 60 * 60
+    self.assertTrue(plugin.should_resume())
+
+    self.assertEqual(plugin.bc.calls, 2)
+    self.assertEqual(
+      plugin._dauth_registry_internal_peers,
+      ["node-address", "peer-address"],
+    )
+
+  def test_hourly_refresh_error_revokes_server_and_clears_peers(self):
+    plugin = self._make_manager(dauth_oracle=True)
+    plugin.on_init()
+    plugin.bc.result = RuntimeError("registry unavailable")
+
+    plugin._now += 60 * 60
+    self.assertTrue(plugin.should_pause())
+
+    self.assertEqual(plugin.bc.calls, 2)
+    self.assertEqual(plugin._dauth_server_enabled_message, "registry unavailable")
+    self.assertIsNone(plugin._dauth_registry_eth_oracles)
+    self.assertIsNone(plugin._dauth_registry_internal_peers)
+
+    plugin.bc.result = True
+    plugin._now += 59
+    self.assertFalse(plugin.should_resume())
+    self.assertEqual(plugin.bc.calls, 2)
+
+    plugin._now += 1
+    self.assertTrue(plugin.should_resume())
+    self.assertEqual(plugin.bc.calls, 3)
+
   def test_pause_tears_down_and_resume_restarts_only_request_monitor(self):
     plugin = self._make_manager(dauth_oracle=True)
     plugin.on_init()
@@ -727,6 +894,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.on_pause()
 
     self.assertTrue(plugin._dauth_pause_teardown_succeeded)
+    self.assertFalse(plugin._is_plugin_ready)
     self.assertEqual(plugin.start_commands_processes, [None, None])
     self.assertEqual(list(plugin._incoming_requests), [])
     self.assertEqual(list(plugin.postponed_requests), [])
@@ -738,8 +906,12 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertFalse(plugin.failed)
     self.assertFalse(plugin._stop_request_monitor.is_set())
     self.assertTrue(plugin._request_monitor_thread.is_alive())
+    self.assertFalse(plugin._is_plugin_ready)
     self.assertEqual(plugin._lifecycle_events[-1], "start_monitor")
     self.assertEqual(plugin.bc.calls, 1)
+
+    plugin.on_log_handler("Uvicorn running on http://0.0.0.0:1234 (Press CTRL+C to quit)")
+    self.assertTrue(plugin._is_plugin_ready)
 
   def test_ineligible_server_cannot_resume(self):
     plugin = self._make_manager(dauth_oracle=False)
