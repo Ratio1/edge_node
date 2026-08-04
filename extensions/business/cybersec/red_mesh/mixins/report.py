@@ -7,6 +7,8 @@ the UI aggregate view for the frontend.
 
 import hashlib as _hashlib
 import json as _json
+import math as _math
+import struct as _struct
 
 from ..worker import PentestLocalWorker
 from ..models import UiAggregate
@@ -244,6 +246,13 @@ def _compact_finding_signature(finding):
       return str(explicit)
 
   def normalize(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+      numeric = float(value)
+      if not _math.isfinite(numeric):
+        return None
+      if numeric == 0:
+        numeric = 0.0
+      return "__redmesh_number__:" + _struct.pack(">d", numeric).hex()
     if isinstance(value, dict):
       return {
         key: normalize(item)

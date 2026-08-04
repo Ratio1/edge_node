@@ -472,6 +472,7 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
     report = {
       "findings": [{
         "title": "TLS issue", "severity": "HIGH", "port": 443,
+        "cvss_score": 7.0, "negative_zero": -0.0, "not_a_number": float("nan"),
         "evidence": {"z": True, "a": "é", "_source_worker_id": "thread-a"},
         "_source_node_addr": "0xUS",
       }],
@@ -480,7 +481,7 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
     _, _, signatures = _AggHost()._summarize_worker_findings(report)
 
     self.assertEqual(signatures, [
-      "sha256:f5629a722dcbdd8bece9e8647efcc972869648374d1dab7b16aab2a4740464ca",
+      "sha256:34f703bc05595ea95796eda463b738b5e7bca69b2a6a611575d2f22ffcee8f8d",
     ])
 
   def test_country_breakdown_and_per_worker_country(self):
