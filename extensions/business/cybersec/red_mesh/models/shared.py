@@ -99,8 +99,11 @@ class ScanMetrics:
 
   # ── Detection indicators ──
   success_rate_over_time: list = None  # [ { "window_start": 0, "window_end": 60,
-                                       #     "success_rate": 0.98 }, ... ]
-                                       # degrading rate = scan likely detected
+                                       #     "success_rate": 0.12, "attempts": 100,
+                                       #     "responsive_count": 98,
+                                       #     "response_rate": 0.98 }, ... ]
+                                       # success_rate remains connected-only;
+                                       # response_rate includes refused/reset.
   rate_limiting_detected: bool = False
   blocking_detected: bool = False
 

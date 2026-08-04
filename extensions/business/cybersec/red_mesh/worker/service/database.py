@@ -44,7 +44,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     raw = {"version": None, "auth_plugin": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       data = sock.recv(256)
       sock.close()
@@ -174,7 +174,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     for username, password in creds:
       try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
+        sock.settimeout(self._target_timeout(3))
         sock.connect((target, port))
         data = sock.recv(256)
 
@@ -289,7 +289,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     # First, connect to get version
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       data = sock.recv(256)
       sock.close()
@@ -322,7 +322,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(5)
+      sock.settimeout(self._target_timeout(5))
       sock.connect((target, port))
 
       for _ in range(attempts):
@@ -382,7 +382,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         if resp and len(resp) >= 5 and resp[4] == 0xFF:
           sock.close()
           sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-          sock.settimeout(3)
+          sock.settimeout(self._target_timeout(3))
           sock.connect((target, port))
 
       sock.close()
@@ -451,7 +451,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     """Open a TCP socket to Redis."""
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       return sock
     except Exception as e:
@@ -666,7 +666,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       prelogin = bytes.fromhex(
         "1201001600000000000000000000000000000000000000000000000000000000"
@@ -719,7 +719,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     raw = {"auth_type": None, "version": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       payload = b'user\x00postgres\x00database\x00postgres\x00\x00'
       startup = struct.pack('!I', len(payload) + 8) + struct.pack('!I', 196608) + payload
@@ -890,7 +890,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     for username, password in creds:
       try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
+        sock.settimeout(self._target_timeout(3))
         sock.connect((target, port))
         payload = f'user\x00{username}\x00database\x00postgres\x00\x00'.encode()
         startup = struct.pack('!I', len(payload) + 8) + struct.pack('!I', 196608) + payload
@@ -1041,7 +1041,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
       sock.connect((target, port))
 
       # Extract version
@@ -1153,11 +1153,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       return probe_error(target, port, "MongoDB", e)
     return probe_result(raw_data=raw, findings=findings)
 
-  @staticmethod
-  def _mongodb_query(target, port, command_name):
+  def _mongodb_query(self, target, port, command_name):
     """Send a MongoDB OP_QUERY command and return the raw response bytes."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(3)
+    sock.settimeout(self._target_timeout(3))
     sock.connect((target, port))
     # Build BSON: {<command_name>: 1}
     field = b'\x10' + command_name + b'\x00' + struct.pack('<i', 1)
@@ -1221,7 +1220,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # 1. Root endpoint — identifies CouchDB and extracts version
     try:
-      resp = requests.get(base_url, timeout=3)
+      resp = requests.get(base_url, timeout=self._target_timeout(3))
       if not resp.ok:
         return None
       data = resp.json()
@@ -1248,7 +1247,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # 2. Database listing — unauthenticated access to /_all_dbs
     try:
-      resp = requests.get(f"{base_url}/_all_dbs", timeout=3)
+      resp = requests.get(f"{base_url}/_all_dbs", timeout=self._target_timeout(3))
       if resp.ok:
         dbs = resp.json()
         if isinstance(dbs, list):
@@ -1270,7 +1269,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # 3. Admin panel (Fauxton) accessibility
     try:
-      resp = requests.get(f"{base_url}/_utils/", timeout=3, allow_redirects=True)
+      resp = requests.get(f"{base_url}/_utils/", timeout=self._target_timeout(3), allow_redirects=True)
       if resp.ok and ("fauxton" in resp.text.lower() or "couchdb" in resp.text.lower()):
         findings.append(Finding(
           severity=Severity.HIGH,
@@ -1287,7 +1286,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # 4. Config endpoint — critical if accessible
     try:
-      resp = requests.get(f"{base_url}/_node/_local/_config", timeout=3)
+      resp = requests.get(f"{base_url}/_node/_local/_config", timeout=self._target_timeout(3))
       if resp.ok and resp.text.startswith("{"):
         findings.append(Finding(
           severity=Severity.CRITICAL,
@@ -1330,7 +1329,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # 1. Ping — extract version from X-Influxdb-Version header
     try:
-      resp = requests.get(f"{base_url}/ping", timeout=3)
+      resp = requests.get(f"{base_url}/ping", timeout=self._target_timeout(3))
       version = resp.headers.get("X-Influxdb-Version")
       if not version:
         return None  # Not InfluxDB
@@ -1352,7 +1351,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # 2. Unauthenticated database listing
     try:
-      resp = requests.get(f"{base_url}/query", params={"q": "SHOW DATABASES"}, timeout=3)
+      resp = requests.get(f"{base_url}/query", params={"q": "SHOW DATABASES"}, timeout=self._target_timeout(3))
       if resp.ok:
         data = resp.json()
         results = data.get("results", [])
@@ -1390,7 +1389,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     # 3. Debug endpoint exposure
     try:
-      resp = requests.get(f"{base_url}/debug/vars", timeout=3)
+      resp = requests.get(f"{base_url}/debug/vars", timeout=self._target_timeout(3))
       if resp.ok and "memstats" in resp.text:
         findings.append(Finding(
           severity=Severity.MEDIUM,

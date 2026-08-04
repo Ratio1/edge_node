@@ -522,6 +522,31 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertNotIn(81, worker.state["open_ports"])
     self.assertIn("scan_ports_step_completed", worker.state["completed_tests"])
 
+  def test_port_scan_does_not_treat_unreachable_errno_as_responsive(self):
+    import errno
+
+    owner, worker = self._build_worker(ports=[81])
+
+    class DummySocket:
+      def settimeout(self, timeout):
+        return None
+
+      def connect_ex(self, address):
+        return errno.EHOSTUNREACH
+
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket",
+      return_value=DummySocket(),
+    ):
+      worker._scan_ports_step()
+
+    outcomes = worker.metrics.build().connection_outcomes
+    self.assertEqual(outcomes["error"], 1)
+    self.assertEqual(outcomes["refused"], 0)
+
   def test_service_telnet_banner(self):
     owner, worker = self._build_worker(ports=[23])
 

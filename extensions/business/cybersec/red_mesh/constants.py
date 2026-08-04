@@ -182,6 +182,25 @@ DISTRIBUTION_MIRROR = "MIRROR"
 PORT_ORDER_SHUFFLE = "SHUFFLE"
 PORT_ORDER_SEQUENTIAL = "SEQUENTIAL"
 
+# Network target-response timeout profiles. Standard preserves every existing
+# call-site timeout; Thorough expands ordinary waits without changing probe
+# breadth, pacing, or timing-sensitive detection thresholds.
+TIMEOUT_PROFILE_STANDARD = "STANDARD"
+TIMEOUT_PROFILE_THOROUGH = "THOROUGH"
+TIMEOUT_PROFILES = frozenset({TIMEOUT_PROFILE_STANDARD, TIMEOUT_PROFILE_THOROUGH})
+
+
+def normalize_timeout_profile(value):
+  normalized = str(value or TIMEOUT_PROFILE_STANDARD).strip().upper()
+  return normalized if normalized in TIMEOUT_PROFILES else TIMEOUT_PROFILE_STANDARD
+
+
+def resolve_target_response_timeout(timeout_profile, standard_timeout):
+  """Resolve an ordinary network target-response maximum wait in seconds."""
+  if normalize_timeout_profile(timeout_profile) != TIMEOUT_PROFILE_THOROUGH:
+    return standard_timeout
+  return round(min(float(standard_timeout) * 3, 15.0), 3)
+
 # LLM Agent API status constants
 LLM_API_STATUS_OK = "ok"
 LLM_API_STATUS_ERROR = "error"
@@ -297,6 +316,28 @@ COMMON_PORTS = [
 ]
 
 ALL_PORTS = list(range(1, 65536))
+
+# =====================================================================
+# Geographic vantage-point comparison mode
+# =====================================================================
+# When comparison mode is enabled every selected node runs the SAME "comparison
+# tier" of ports (so results can be compared across countries). The distribution
+# choice controls what the tier is:
+#   - SLICE (default): the tier is the standard COMMON_PORTS bundle; the
+#     operator's chosen range is split across nodes for coverage (not compared).
+#   - MIRROR: the tier is the whole chosen range (plus COMMON_PORTS), so every
+#     port is compared across countries, at N x the work.
+
+# Standard webapp/graybox feature bundle always run (mirrored to every node) in
+# comparison mode so cross-country response divergence is meaningful even if the
+# operator narrowed the selection. These are safe, unauthenticated checks; their
+# methods are force-enabled (removed from excluded_features) when comparison
+# mode is on. Referenced by feature id in FEATURE_CATALOG.
+COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS = [
+  "web_discovery",
+  "web_hardening",
+  "web_api_exposure",
+]
 
 # =====================================================================
 # Risk score computation

@@ -20,6 +20,7 @@ def _launch_network_jobs(
   end_port,
   job_config,
   nr_local_workers_override=None,
+  target_ports=None,
 ):
   exceptions = job_config.get("exceptions", [])
   if not isinstance(exceptions, list):
@@ -32,6 +33,10 @@ def _launch_network_jobs(
   ics_safe_mode = job_config.get("ics_safe_mode", owner.cfg_ics_safe_mode)
   scanner_identity = job_config.get("scanner_identity", owner.cfg_scanner_identity)
   scanner_user_agent = job_config.get("scanner_user_agent", owner.cfg_scanner_user_agent)
+  timeout_profile = job_config.get("timeout_profile")
+  # The comparison tier is node-wide evidence, not per-thread work: it goes to
+  # a single worker so the tier is probed exactly once from this vantage.
+  comparison_ports = job_config.get("comparison_ports") or []
   workers_from_spec = job_config.get("nr_local_workers")
   if nr_local_workers_override is not None:
     workers_requested = nr_local_workers_override
@@ -42,7 +47,13 @@ def _launch_network_jobs(
 
   owner.P("Using {} local workers for job {}".format(workers_requested, job_id))
 
-  ports = list(range(start_port, end_port + 1))
+  # Comparison mode supplies an explicit, possibly non-contiguous port list
+  # (mirrored comparison tier + this node's coverage slice). Otherwise scan the
+  # contiguous assigned range.
+  if target_ports:
+    ports = [int(p) for p in target_ports]
+  else:
+    ports = list(range(start_port, end_port + 1))
   batches = []
   if port_order == PORT_ORDER_SEQUENTIAL:
     ports = sorted(ports)
@@ -89,6 +100,8 @@ def _launch_network_jobs(
         ics_safe_mode=ics_safe_mode,
         scanner_identity=scanner_identity,
         scanner_user_agent=scanner_user_agent,
+        timeout_profile=timeout_profile,
+        comparison_ports=comparison_ports if index == 0 else None,
       )
       batch_job.start()
       local_jobs[batch_job.local_worker_id] = batch_job
@@ -139,6 +152,7 @@ def launch_local_jobs(
   end_port,
   job_config,
   nr_local_workers_override=None,
+  target_ports=None,
 ):
   strategy = get_scan_strategy(job_config.get("scan_type", ScanType.NETWORK.value))
   if strategy.scan_type == ScanType.WEBAPP:
@@ -160,4 +174,5 @@ def launch_local_jobs(
     end_port=end_port,
     job_config=job_config,
     nr_local_workers_override=nr_local_workers_override,
+    target_ports=target_ports,
   )
