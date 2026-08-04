@@ -3716,10 +3716,13 @@ class _DeeployMixin:
     deepcopy = getattr(self, "deepcopy", copy.deepcopy)
     redacted = deepcopy(plugins)
 
-    def redact(value):
+    def redact(value, path):
       if isinstance(value, dict):
         for key, item in list(value.items()):
+          item_path = path + [key]
           if key in PER_NODE_CONFIG_KEYS and item:
+            value[key] = "***"
+          elif self._matches_deeploy_dauth_secret_path(item_path) and item:
             value[key] = "***"
           elif any(
             part in re.sub(r"[^A-Z0-9]", "", str(key).upper())
@@ -3727,12 +3730,12 @@ class _DeeployMixin:
           ):
             value[key] = "***" if item else item
           else:
-            redact(item)
+            redact(item, item_path)
       elif isinstance(value, list):
-        for item in value:
-          redact(item)
+        for idx, item in enumerate(value):
+          redact(item, path + [idx])
 
-    redact(redacted)
+    redact(redacted, [])
     return redacted
 
   def _matches_deeploy_dauth_secret_path(self, path):

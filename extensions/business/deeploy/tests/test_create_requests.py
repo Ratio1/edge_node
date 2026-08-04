@@ -2,6 +2,7 @@ import unittest
 from collections import defaultdict
 import sys
 import types
+from unittest.mock import patch
 
 
 for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
@@ -16,7 +17,11 @@ from extensions.business.deeploy.deeploy_const import (
   DEEPLOY_PLUGIN_DATA,
   JOB_APP_TYPES,
 )
-from extensions.business.deeploy.deeploy_mixin import DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+from extensions.business.deeploy import deeploy_mixin
+from extensions.business.deeploy.deeploy_mixin import (
+  DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES,
+  DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+)
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
 
 
@@ -257,6 +262,37 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertIn("'privateKey': '***'", serialized)
     self.assertIn("'R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD': '***'", serialized)
     self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
+
+  def test_log_redaction_covers_every_dauth_secret_path_without_key_heuristics(self):
+    plugin = make_deeploy_plugin()
+
+    with patch.object(deeploy_mixin, "SENSITIVE_LOG_KEY_PARTS", ()):
+      for suffix in DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES:
+        with self.subTest(path=suffix):
+          instance = {}
+          payload = {"PLUGINS": [{"INSTANCES": [instance]}]}
+          current = instance
+          for part in suffix[:-1]:
+            key = "wildcard" if part == "*" else part
+            current[key] = {}
+            current = current[key]
+          leaf = "wildcard" if suffix[-1] == "*" else suffix[-1]
+          current[leaf] = "must-not-be-logged"
+
+          redacted = plugin._redact_per_node_config_for_log(payload)
+
+          self.assertNotIn("must-not-be-logged", str(redacted))
+          self.assertIn("***", str(redacted))
+
+      list_shaped_ports = {
+        "EXPOSED_PORTS": [{
+          "token": "list-port-token",
+          "tunnel": {"token": "list-tunnel-token"},
+        }],
+      }
+      redacted_ports = plugin._redact_per_node_config_for_log(list_shaped_ports)
+      self.assertNotIn("list-port-token", str(redacted_ports))
+      self.assertNotIn("list-tunnel-token", str(redacted_ports))
 
   def test_dauth_secret_extraction_redacts_only_mandatory_paths(self):
     plugin = make_deeploy_plugin()
