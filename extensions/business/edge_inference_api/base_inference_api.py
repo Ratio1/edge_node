@@ -172,6 +172,25 @@ class BaseInferenceApiPlugin(
   STATUS_FAILED = "failed"
   STATUS_TIMEOUT = "timeout"
 
+  def _serving_ready(self):
+    """Return whether every configured serving process reached READY.
+
+    Publishing the inference API port only proves that the HTTP facade is up.
+    Model processes start separately and can still be loading, so callers must
+    not treat facade reachability as model readiness.
+    """
+    shared = getattr(self, "global_shmem", None)
+    manager = shared.get("serving_manager") if isinstance(shared, dict) else None
+    get_processes = getattr(self, "get_serving_processes", None)
+    is_available = getattr(manager, "is_avail", None)
+    if not callable(get_processes) or not callable(is_available):
+      return False
+    try:
+      processes = get_processes()
+      return bool(processes) and all(is_available(process) for process in processes)
+    except Exception:
+      return False
+
   @staticmethod
   def balanced_endpoint(func):
     """Mark an endpoint as eligible for peer request balancing.
@@ -2769,6 +2788,7 @@ class BaseInferenceApiPlugin(
         "plugin": self.get_signature(),
         "instance_id": self.get_instance_id(),
         "loopback_enabled": self.cfg_is_loopback_plugin,
+        "serving_ready": self._serving_ready(),
         "uptime": self.get_alive_time(),
         "last_error_time": self.last_handled_error_time,
         "total_errors": len(self._api_errors),

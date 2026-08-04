@@ -162,6 +162,8 @@ def _make_llama_cpp_process(**overrides):
     "cfg_model_path": None,
     "cfg_model_name": "org/repo",
     "cfg_model_filename": "model.gguf",
+    "cfg_model_revision": None,
+    "cfg_model_api_key": None,
     "cfg_model_n_ctx": 1024,
     "cfg_chat_format": None,
     "cfg_draft_model": None,
@@ -236,6 +238,11 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         )
 
   def test_profiles_keep_model_identity_and_cpu_bounds(self):
+    api_keys = {
+      "base_qwen3_4b": "base_qwen3_4b",
+      "edgeguard_qwen_4b": "finetuned_v0_10",
+      "cybersec_qwen_4b": "cybersec_qwen_4b",
+    }
     for engine, profile_args in self.PROFILES.items():
       filename, class_name, model_name, model_filename, instance_id = profile_args
       with self.subTest(engine=engine):
@@ -249,6 +256,14 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         self.assertEqual(config["MODEL_NAME"], model_name)
         self.assertEqual(config["MODEL_FILENAME"], model_filename)
         self.assertEqual(config["MODEL_INSTANCE_ID"], instance_id)
+        self.assertEqual(config["MODEL_API_KEY"], api_keys[engine])
+
+  def test_shared_inference_bus_honors_explicit_model_route(self):
+    process = _make_llama_cpp_process(cfg_model_api_key="base_qwen3_4b")
+
+    self.assertTrue(process._matches_model_route({"JEEVES_CONTENT": {"MODEL": "base_qwen3_4b"}}))
+    self.assertFalse(process._matches_model_route({"JEEVES_CONTENT": {"MODEL": "cybersec_qwen_4b"}}))
+    self.assertTrue(process._matches_model_route({"JEEVES_CONTENT": {}}))
 
   def test_profiles_are_configuration_only_generic_subclasses(self):
     for filename, class_name in (
@@ -324,18 +339,30 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         self.assertEqual(process.get_model_name(), model_filename)
         self.assertFalse(any(str(model_path.parent) in message for message in process.messages))
 
-  def test_generic_llama_cpp_blank_model_path_uses_repo_loading_without_revision(self):
-    process = _make_llama_cpp_process(cfg_model_path="  ")
-    process._load_model()
+  def test_generic_llama_cpp_remote_loading_forwards_token_and_revision(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      downloaded = Path(tmpdir) / "model.gguf"
+      downloaded.write_bytes(b"gguf")
+      calls = []
+      process = _make_llama_cpp_process(
+        cfg_model_path="  ",
+        cfg_model_revision="revision-123",
+      )
+      process.hf_token = "private-test-token"
+      process._download_hf_model = lambda model_id, filename, revision: calls.append(
+        (model_id, filename, revision, process.hf_token)
+      ) or str(downloaded)
 
+      process._load_model()
+
+    self.assertEqual(calls, [("org/repo", "model.gguf", "revision-123", "private-test-token")])
     self.assertEqual(len(_FakeLlama.calls), 1)
     call_type, kwargs = _FakeLlama.calls[0]
-    self.assertEqual(call_type, "remote")
-    self.assertEqual(kwargs["repo_id"], "org/repo")
-    self.assertEqual(kwargs["filename"], "model.gguf")
-    self.assertNotIn("revision", kwargs)
+    self.assertEqual(call_type, "local")
+    self.assertEqual(kwargs["model_path"], str(downloaded))
     self.assertEqual(process.safe_load_model_args["model_id"], "org/repo")
     self.assertEqual(process.safe_load_model_args["model_str_id"], "org/repo/model.gguf")
+    self.assertFalse(any("private-test-token" in message for message in process.messages))
 
   def test_generic_llama_cpp_missing_model_path_error_is_sanitized(self):
     with tempfile.TemporaryDirectory() as tmpdir:

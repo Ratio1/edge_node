@@ -251,6 +251,17 @@ BaseInferenceApiPlugin = _load_plugin_class()
 
 
 class BaseInferenceApiBalancingTests(unittest.TestCase):
+  def test_serving_ready_requires_every_configured_model_process(self):
+    plugin = self._make_plugin()
+    plugin.get_serving_processes = lambda: ["model-a", "model-b"]
+    manager = SimpleNamespace(is_avail=lambda process: process == "model-a")
+    plugin.global_shmem = {"serving_manager": manager}
+
+    self.assertFalse(plugin._serving_ready())
+
+    manager.is_avail = lambda _process: True
+    self.assertTrue(plugin._serving_ready())
+
   def _make_plugin(self, **kwargs):
     plugin = BaseInferenceApiPlugin(**kwargs)
     plugin.on_init()

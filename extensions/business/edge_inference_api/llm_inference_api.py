@@ -334,6 +334,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def predict(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -374,6 +375,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return super(LLMInferenceApiPlugin, self).predict(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
@@ -390,6 +392,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def predict_async(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -434,6 +437,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return super(LLMInferenceApiPlugin, self).predict_async(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
@@ -449,6 +453,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def create_chat_completion(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -489,6 +494,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return self.predict(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
@@ -503,6 +509,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def create_chat_completion_async(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -543,6 +550,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return self.predict_async(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,

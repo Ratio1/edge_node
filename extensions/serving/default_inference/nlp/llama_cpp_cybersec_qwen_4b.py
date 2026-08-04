@@ -22,6 +22,7 @@ _CONFIG = {
   "N_GPU_LAYERS": 0,
   "N_THREADS": 4,
   "MODEL_INSTANCE_ID": "cybersecqwen-4b",
+  "MODEL_API_KEY": "cybersec_qwen_4b",
 
   # Keep default generations bounded on CPU. Callers may request less.
   "DEFAULT_MAX_TOKENS": 1024,

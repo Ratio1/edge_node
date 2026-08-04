@@ -77,6 +77,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
       request_id="req-1",
       request_data={
         "parameters": {
+          "model": "base_qwen3_4b",
           "messages": [{"role": "user", "content": "hello"}],
           "temperature": 0.1,
           "max_tokens": 64,
@@ -92,6 +93,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertIn("JEEVES_CONTENT", payload)
     self.assertEqual(payload["JEEVES_CONTENT"]["REQUEST_ID"], "req-1")
     self.assertEqual(payload["JEEVES_CONTENT"]["REQUEST_TYPE"], "LLM")
+    self.assertEqual(payload["JEEVES_CONTENT"]["MODEL"], "base_qwen3_4b")
     self.assertEqual(payload["JEEVES_CONTENT"]["MESSAGES"][0]["content"], "hello")
     self.assertEqual(payload["JEEVES_CONTENT"]["MAX_TOKENS"], 64)
     self.assertEqual(payload["JEEVES_CONTENT"]["RESPONSE_FORMAT"], {"type": "json_object"})

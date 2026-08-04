@@ -15,6 +15,7 @@ _CONFIG = {
   "N_GPU_LAYERS": 0,
   "N_THREADS": 4,
   "MODEL_INSTANCE_ID": "edgeguard-base-qwen3-4b",
+  "MODEL_API_KEY": "base_qwen3_4b",
   "DEFAULT_MAX_TOKENS": 512,
 
   'VALIDATION_RULES': {

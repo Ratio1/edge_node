@@ -15,6 +15,7 @@ _CONFIG = {
   "N_GPU_LAYERS": 0,
   "N_THREADS": 4,
   "MODEL_INSTANCE_ID": "edgeguard-qwen3-4b-cypher",
+  "MODEL_API_KEY": "finetuned_v0_10",
 
   # Keep default generations bounded on CPU. The agent only needs one query.
   "DEFAULT_MAX_TOKENS": 512,

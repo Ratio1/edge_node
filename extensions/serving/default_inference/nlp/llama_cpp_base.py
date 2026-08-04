@@ -31,7 +31,12 @@ _CONFIG = {
 
   "MODEL_NAME": None,
   "MODEL_FILENAME": None,
+  "MODEL_REVISION": None,
   "MODEL_PATH": None,
+  # Optional OpenAI-compatible `model` routing key. When configured, a
+  # request carrying a different key belongs to another engine sharing the
+  # same inference bus and must be ignored by this process.
+  "MODEL_API_KEY": None,
 
   # Format used to compute the prompt for the model
   "CHAT_FORMAT": None,
@@ -57,6 +62,36 @@ _CONFIG = {
 class LlamaCppBaseServingProcess(BaseServingProcess):
   CONFIG = _CONFIG
 
+  def _matches_model_route(self, input_dict):
+    """Keep a semaphore-targeted API request on its intended model engine.
+
+    LLM API plugin instances publish distinct HTTP ports, but their inference
+    payloads share the same internal signature. The standard OpenAI `model`
+    field is therefore also carried on the bus and used as the engine-level
+    discriminator. Requests without a model retain legacy broadcast behavior.
+    """
+    configured = self.cfg_model_api_key
+    if not isinstance(configured, str) or not configured.strip():
+      return True
+    content = input_dict.get("JEEVES_CONTENT", {})
+    if not isinstance(content, dict):
+      return True
+    requested = content.get("MODEL", content.get("model"))
+    if requested is None:
+      return True
+    return isinstance(requested, str) and requested.strip() == configured.strip()
+
+  def check_relevant_input(self, input_dict: dict):
+    if not super().check_relevant_input(input_dict):
+      return False
+    if self._matches_model_route(input_dict):
+      return True
+    self.P(
+      "[DEBUG]Skipping request routed to another model API key",
+      color='y',
+    )
+    return False
+
   def _get_model_path(self):
     model_path = self.cfg_model_path
     if model_path is None:
@@ -70,6 +105,18 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
   def _get_model_path_display_name(self, model_path):
     model_name = os.path.basename(model_path.rstrip(os.sep))
     return model_name or "local_gguf_model"
+
+  def _download_hf_model(self, model_id, model_filename, model_revision):
+    """Resolve a GGUF artifact through the authenticated Hugging Face client."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(
+      repo_id=model_id,
+      filename=model_filename,
+      revision=model_revision,
+      cache_dir=self.cache_dir,
+      token=self.hf_token,
+    )
 
   def _load_tokenizer(self):
     # llama.cpp uses built-in tokenizer
@@ -137,8 +184,10 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
 
   def _load_model(self):
     model_path = self._get_model_path()
+    configured_model_path = model_path is not None
     model_id = self.cfg_model_name
     model_filename = self.cfg_model_filename
+    model_revision = self.cfg_model_revision
     if model_path is not None:
       model_ref = self._get_model_path_display_name(model_path)
       if not os.path.isfile(model_path):
@@ -151,6 +200,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       # endif model id/filename check
       model_ref = f"{model_id}/{model_filename}"
       safe_model_id = model_id
+      model_path = self._download_hf_model(model_id, model_filename, model_revision)
+      if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Downloaded Llama_cpp model is unavailable: {model_filename}")
     # endif local path
 
     n_ctx = self.cfg_model_n_ctx
@@ -173,7 +225,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       model_params['n_threads'] = int(n_threads)
     # endif configured thread count
 
-    if model_path is not None:
+    if configured_model_path:
       self.P(f"Loading Llama_cpp model from local file '{model_ref}' with parameters: {self.json_dumps(model_params, indent=2)}")
     else:
       self.P(f"Loading Llama_cpp model '{model_id}' from file '{model_filename}' with parameters: {self.json_dumps(model_params, indent=2)}")
@@ -197,16 +249,8 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         # endif layers offloaded to GPU
       first_attempt_done = True
       # endif not the first attempt
-      if model_path is not None:
-        return Llama(
-          model_path=model_path,
-          **model_params,
-        )
-      # endif local model path
-      return Llama.from_pretrained(
-        repo_id=model_id,
-        filename=model_filename,
-        cache_dir=self.cache_dir,
+      return Llama(
+        model_path=model_path,
         **model_params,
       )
 
