@@ -1,5 +1,7 @@
-#FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
-FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-dnctk
+FROM ratio1/base_edge_node_amd64_gpu:py3.13-th2.11-cu12.8-trt10.16-tr5.8@sha256:9c5865db36d4ea379c1daa212c6ac32725f6113f11185cf9c1501539f9c66fd2
+
+RUN test "$(command -v python3)" = "/opt/python/bin/python3" && \
+    /opt/python/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
 
 # Install IPFS
 # The line below was creating issues due to flaky external repos

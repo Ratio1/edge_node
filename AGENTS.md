@@ -42,6 +42,9 @@ The operating model intentionally follows current agent practice:
 
 ### Runtime Constraints
 - Primary runtime is container-first. Most operator flows assume Docker, mounted `_local_cache`, and env-driven configuration.
+- The shared development container targets CPython 3.13 from `/opt/python/bin/python3`. The base
+  image also contains Ubuntu's `/usr/bin/python3`, which is an OS interpreter and must not be used for
+  Edge Node development, dependency installation, watchers, or device processes.
 - Runtime state is persisted under `/edge_node/_local_cache`. Treat `_local_cache/**` as runtime data, not as normal source files.
 - Secrets and operator credentials must remain env-driven via `EE_*` variables or deployment secret stores. Never hardcode live credentials.
 - `device.py` is effectively frozen unless an explicit task requires entrypoint/process-lifecycle change and the change is justified against upstream `naeural_core`.
@@ -785,3 +788,13 @@ Entry format:
 - Details: The four LLM completion endpoints have no `benchmark_mode` parameter or special benchmark path. Stale or unknown request input has no supported benchmark semantics. The dormant EdgeGuard UI path remains unavailable because generic workers expose no runtime proof fields. Any reactivation requires a new atomic API/UI/runtime implementation and a new unseen sealed set. The indexed queued-result alignment fix and attributable, content-safe invalid-empty response handling remain as ordinary inference reliability behavior.
 - Verification: Focused balancing, LLM inference, serving-profile, and EdgeGuard API tests; scoped dead-symbol search; exact `llm_utils.py` parity with `origin/develop`; live `edg3` health and ordinary completion checks.
 - Links: `extensions/business/edge_inference_api/llm_inference_api.py`, `extensions/business/edge_inference_api/base_inference_api.py`, `extensions/business/edge_inference_api/test_llm_inference_api.py`, `AGENTS.md`
+- ID: `ML-20260804-001`
+- Timestamp: `2026-08-04T23:20:33Z`
+- Type: `change`
+- Summary: The shared development container now follows the production CPython 3.13 runtime family.
+- Criticality: Cross-cutting development/runtime alignment for every Edge Node devcontainer consumer.
+- Details: The devcontainer base is pinned by version and digest to the Python 3.13 GPU-capable image;
+  Edge Node tooling must use `/opt/python/bin/python3` because `/usr/bin/python3` is the separate
+  Ubuntu system interpreter. Runtime GPU exposure remains opt-in and is not added by the pin.
+- Verification: `docker buildx imagetools inspect ratio1/base_edge_node_amd64_gpu:py3.13-th2.11-cu12.8-trt10.16-tr5.8`; `devcontainer build --workspace-folder .`; `/opt/python/bin/python3 --version`
+- Links: `.devcontainer/Dockerfile`, `.devcontainer/devcontainer.json`, `AGENTS.md`
