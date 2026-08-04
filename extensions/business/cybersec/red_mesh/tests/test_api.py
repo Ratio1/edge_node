@@ -98,6 +98,25 @@ class TestPhase1ConfigCID(unittest.TestCase):
     d = config.to_dict()
     self.assertNotIn("selected_peers", d)
 
+  def test_worker_report_meta_optional_finding_evidence_roundtrip(self):
+    from extensions.business.cybersec.red_mesh.models import WorkerReportMeta
+
+    legacy = WorkerReportMeta.from_dict({
+      "report_cid": "cid-legacy", "start_port": 1, "end_port": 10,
+    })
+    self.assertIsNone(legacy.finding_counts)
+    self.assertIsNone(legacy.finding_signatures)
+    self.assertNotIn("finding_counts", legacy.to_dict())
+    self.assertNotIn("finding_signatures", legacy.to_dict())
+
+    current = WorkerReportMeta(
+      report_cid="cid-current", start_port=1, end_port=10, nr_findings=2,
+      finding_counts={"HIGH": 2}, finding_signatures=["type-a"],
+    )
+    restored = WorkerReportMeta.from_dict(current.to_dict())
+    self.assertEqual(restored.finding_counts, {"HIGH": 2})
+    self.assertEqual(restored.finding_signatures, ["type-a"])
+
   @classmethod
   def _mock_plugin_modules(cls):
     mock_plugin_modules()
@@ -1815,6 +1834,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin._count_nested_findings = lambda section: Plugin._count_nested_findings(section)
     plugin._count_all_findings = lambda report: Plugin._count_all_findings(plugin, report)
+    plugin._summarize_worker_findings = lambda report: Plugin._summarize_worker_findings(report)
 
     return plugin, job_specs
 
@@ -1953,8 +1973,8 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertIn("date_started", pass_report_dict)
     self.assertIn("date_completed", pass_report_dict)
 
-  def test_pass_report_worker_meta_counts_graybox_findings(self):
-    """WorkerReportMeta.nr_findings includes graybox findings."""
+  def test_pass_report_worker_meta_counts_findings_before_aggregation(self):
+    """WorkerReportMeta evidence is captured before aggregate mutation/dedup."""
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin()
 
@@ -1971,11 +1991,20 @@ class TestPhase2PassFinalization(unittest.TestCase):
       correlation_findings=[{"title": "corr"}],
     )
     plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [443], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
-      "port_protocols": {"443": "https"}, "graybox_results": report_a["graybox_results"],
-    })
+    def aggregate_after_mutating_raw_reports(*_args, **_kwargs):
+      for section_name in ("service_info", "web_tests_info", "graybox_results"):
+        for port_entry in report_a[section_name].values():
+          for probe_entry in port_entry.values():
+            if isinstance(probe_entry, dict):
+              probe_entry["findings"] = []
+      report_a["correlation_findings"] = []
+      return {
+        "open_ports": [443], "service_info": {}, "web_tests_info": {},
+        "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+        "port_protocols": {"443": "https"}, "graybox_results": {},
+      }
+
+    plugin._get_aggregated_report = MagicMock(side_effect=aggregate_after_mutating_raw_reports)
     plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
     plugin._get_job_config = MagicMock(return_value={"target": "example.com", "scan_type": "webapp"})
     plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {"findings_score": 5}}, []))
@@ -1986,7 +2015,10 @@ class TestPhase2PassFinalization(unittest.TestCase):
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
-    self.assertEqual(pass_report_dict["worker_reports"]["worker-A"]["nr_findings"], 5)
+    worker_meta = pass_report_dict["worker_reports"]["worker-A"]
+    self.assertEqual(worker_meta["nr_findings"], 5)
+    self.assertEqual(worker_meta["finding_counts"], {"INFO": 5})
+    self.assertEqual(len(worker_meta["finding_signatures"]), 5)
 
   def test_aggregated_report_separate_cid(self):
     """aggregated_report_cid is a separate R1FS write from the PassReport."""
@@ -4962,6 +4994,7 @@ class TestPhase2AuditCounting(unittest.TestCase):
     plugin._log_audit_event = MagicMock()
     plugin._count_nested_findings = lambda section: Plugin._count_nested_findings(section)
     plugin._count_all_findings = lambda report: Plugin._count_all_findings(plugin, report)
+    plugin._summarize_worker_findings = lambda report: Plugin._summarize_worker_findings(report)
 
     report = {
       "start_port": 443,

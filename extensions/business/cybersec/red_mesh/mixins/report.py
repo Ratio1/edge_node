@@ -5,6 +5,7 @@ Handles merging worker results, credential redaction, and pre-computing
 the UI aggregate view for the frontend.
 """
 
+import hashlib as _hashlib
 import json as _json
 
 from ..worker import PentestLocalWorker
@@ -201,6 +202,50 @@ def _dedup_findings_in_aggregated(aggregated):
   return aggregated
 
 
+def _iter_report_findings(report):
+  """Yield every raw finding record from the worker-report paths we publish."""
+  if not isinstance(report, dict):
+    return
+
+  def _items(value):
+    return value if isinstance(value, list) else ()
+
+  for section_name in ("service_info", "web_tests_info"):
+    for port_entry in (report.get(section_name) or {}).values():
+      if not isinstance(port_entry, dict):
+        continue
+      for finding in _items(port_entry.get("findings")):
+        yield finding
+      for probe_entry in port_entry.values():
+        if not isinstance(probe_entry, dict):
+          continue
+        for finding in _items(probe_entry.get("findings")):
+          yield finding
+
+  for port_probes in (report.get("graybox_results") or {}).values():
+    if not isinstance(port_probes, dict):
+      continue
+    for probe_entry in port_probes.values():
+      if not isinstance(probe_entry, dict):
+        continue
+      for finding in _items(probe_entry.get("findings")):
+        yield finding
+
+  for section_name in ("correlation_findings", "findings"):
+    for finding in _items(report.get(section_name)):
+      yield finding
+
+
+def _compact_finding_signature(finding):
+  """Return a stable compact type signature without worker-attribution fields."""
+  if isinstance(finding, dict):
+    explicit = finding.get("finding_signature") or finding.get("finding_id")
+    if explicit:
+      return str(explicit)
+  stable = _finding_dedup_key(finding).encode("utf-8", errors="replace")
+  return "sha256:" + _hashlib.sha256(stable).hexdigest()
+
+
 class _ReportMixin:
   """Report aggregation and UI view methods for PentesterApi01Plugin."""
 
@@ -221,14 +266,28 @@ class _ReportMixin:
 
   def _count_all_findings(self, report):
     """Count all findings emitted by network and graybox reporting sections."""
-    if not isinstance(report, dict):
-      return 0
-    return (
-      self._count_nested_findings(report.get("service_info")) +
-      self._count_nested_findings(report.get("web_tests_info")) +
-      len(report.get("correlation_findings") or []) +
-      self._count_nested_findings(report.get("graybox_results"))
-    )
+    return sum(1 for _finding in _iter_report_findings(report))
+
+  @staticmethod
+  def _summarize_worker_findings(report):
+    """Count raw records and unique types before aggregate cross-worker dedup."""
+    counts = {}
+    signatures = []
+    seen_signatures = set()
+    nr_findings = 0
+    for finding in _iter_report_findings(report):
+      nr_findings += 1
+      severity = "INFO"
+      if isinstance(finding, dict):
+        severity = str(finding.get("severity") or "INFO").upper()
+      if severity not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        severity = "INFO"
+      counts[severity] = counts.get(severity, 0) + 1
+      signature = _compact_finding_signature(finding)
+      if signature not in seen_signatures:
+        seen_signatures.add(signature)
+        signatures.append(signature)
+    return nr_findings, counts, signatures
 
   @staticmethod
   def _dedupe_items(items):
@@ -707,7 +766,8 @@ class _ReportMixin:
     comparison = []
     for addr in participating:
       wr = worker_reports.get(addr) or {}
-      sm = (worker_scan_metrics.get(addr) or {}).get("scan_metrics") or {}
+      worker_metric_entry = worker_scan_metrics.get(addr) or {}
+      sm = worker_metric_entry.get("scan_metrics") or {}
       outcomes = sm.get("connection_outcomes") or {}
       response_times = sm.get("response_times") or {}
       has_report = addr in worker_reports
@@ -731,13 +791,24 @@ class _ReportMixin:
         "status": status,
         "open_ports": wr.get("open_ports", []),
         "nr_findings": wr.get("nr_findings", len(findings_by_node.get(addr, []))),
+        "finding_counts": wr.get("finding_counts"),
+        "finding_signatures": wr.get("finding_signatures"),
         "findings": findings_by_node.get(addr, []),
         "metrics": {
           "connected": outcomes.get("connected", 0),
           "timeout": outcomes.get("timeout", 0),
           "refused": outcomes.get("refused", 0),
+          "reset": outcomes.get("reset", 0),
           "error": outcomes.get("error", 0),
           "response_p95_ms": round(p95 * 1000, 1) if isinstance(p95, (int, float)) else None,
+          "coverage": sm.get("coverage"),
+          "probes_attempted": sm.get("probes_attempted"),
+          "probes_completed": sm.get("probes_completed"),
+          "probes_failed": sm.get("probes_failed"),
+          "phase_durations": sm.get("phase_durations"),
+          "total_duration": sm.get("total_duration"),
+          "traffic_windows": sm.get("success_rate_over_time"),
+          "threads": worker_metric_entry.get("threads"),
           "rate_limited": bool(sm.get("rate_limiting_detected")),
           "blocked": bool(sm.get("blocking_detected")),
         },

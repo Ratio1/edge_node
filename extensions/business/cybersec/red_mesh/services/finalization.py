@@ -296,6 +296,10 @@ def maybe_finalize_pass(owner):
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_collecting")
 
       node_reports = owner._collect_node_reports(workers)
+      worker_finding_summaries = {
+        addr: owner._summarize_worker_findings(report)
+        for addr, report in node_reports.items()
+      }
       # Audit #4: resolve the worker class from scan_type so
       # graybox-specific aggregation fields (graybox_results,
       # completed_tests, aborted/abort_reason/abort_phase) merge
@@ -387,7 +391,7 @@ def maybe_finalize_pass(owner):
 
       worker_metas = {}
       for addr, report in node_reports.items():
-        nr_findings = owner._count_all_findings(report)
+        nr_findings, finding_counts, finding_signatures = worker_finding_summaries[addr]
         worker_metas[addr] = WorkerReportMeta(
           report_cid=workers[addr].get("report_cid", ""),
           start_port=report.get("start_port", 0),
@@ -397,6 +401,8 @@ def maybe_finalize_pass(owner):
           nr_findings=nr_findings,
           node_ip=report.get("node_ip", ""),
           country=(report.get("country_code") or "").upper(),
+          finding_counts=finding_counts,
+          finding_signatures=finding_signatures,
         ).to_dict()
 
       aggregated_report_cid = None

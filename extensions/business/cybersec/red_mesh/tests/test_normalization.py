@@ -409,8 +409,8 @@ class TestGrayboxRedaction(unittest.TestCase):
 
 class TestFindingCounting(unittest.TestCase):
 
-  def test_count_all_findings_walks_all_sections(self):
-    """_count_all_findings counts service, web, correlation, and graybox findings."""
+  def test_count_all_findings_walks_all_published_paths(self):
+    """Counting covers nested/flat service, web, graybox, correlation, and top-level paths."""
     from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
 
     class MockHost(_ReportMixin):
@@ -420,15 +420,18 @@ class TestFindingCounting(unittest.TestCase):
     report = {
       "service_info": {
         "80": {
+          "findings": [{"title": "legacy-flat-service"}],
           "_service_info_http": {"findings": [{"title": "svc-1"}, {"title": "svc-2"}]},
         },
       },
       "web_tests_info": {
         "80": {
+          "findings": [{"title": "legacy-flat-web"}],
           "_web_test_xss": {"findings": [{"title": "web-1"}]},
         },
       },
       "correlation_findings": [{"title": "corr-1"}],
+      "findings": [{"title": "top-1"}],
       "graybox_results": {
         "443": {
           "_graybox_test": {"findings": [{"title": "gb-1"}, {"title": "gb-2"}]},
@@ -436,7 +439,7 @@ class TestFindingCounting(unittest.TestCase):
       },
     }
 
-    self.assertEqual(host._count_all_findings(report), 6)
+    self.assertEqual(host._count_all_findings(report), 9)
 
 
 class TestLaunchValidation(unittest.TestCase):

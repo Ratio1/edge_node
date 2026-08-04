@@ -8,6 +8,7 @@ and merging of scan metrics across worker threads.
 from ..graybox.models import GrayboxCredentialSet
 from ..models import WorkerProgress
 from ..constants import PHASE_ORDER, GRAYBOX_PHASE_ORDER
+from ..connection_metrics import detect_connection_signals, merge_connection_windows
 
 DEFAULT_PROGRESS_PUBLISH_INTERVAL = 30.0
 
@@ -175,7 +176,6 @@ class _LiveProgressMixin:
         all_phases[phase] = max(all_phases.get(phase, 0), dur)
     if all_phases:
       merged["phase_durations"] = all_phases
-    longest = max(metrics_list, key=lambda m: m.get("total_duration", 0))
     # Merge stats distributions (response_times, port_scan_delays)
     # Use weighted mean, global min/max, approximate p95/p99 from max of per-thread values
     for stats_field in ("response_times", "port_scan_delays"):
@@ -193,12 +193,12 @@ class _LiveProgressMixin:
             "p99": round(max(s.get("p99", 0) for s in stats_list), 4),
             "count": total_count,
           }
-    # Success rate over time: take from the longest-running thread
-    if longest.get("success_rate_over_time"):
-      merged["success_rate_over_time"] = longest["success_rate_over_time"]
-    # Detection flags (any thread detecting = True)
-    merged["rate_limiting_detected"] = any(m.get("rate_limiting_detected") for m in metrics_list)
-    merged["blocking_detected"] = any(m.get("blocking_detected") for m in metrics_list)
+    # Merge aligned traffic evidence, then derive node signals from the combined
+    # sample counts. Legacy windows without counts remain visible but unverified.
+    connection_windows = merge_connection_windows(metrics_list)
+    if connection_windows:
+      merged["success_rate_over_time"] = connection_windows
+    merged.update(detect_connection_signals(connection_windows))
     # Open port details: union, deduplicate by port
     all_details = []
     seen_ports = set()

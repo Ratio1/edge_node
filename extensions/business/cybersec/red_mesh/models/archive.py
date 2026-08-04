@@ -276,12 +276,14 @@ class WorkerReportMeta:
   nr_findings: int = 0
   node_ip: str = ""                 # worker node's IP address
   country: str = ""                 # worker node's ISO-2 country (from location_data); "" when unknown
+  finding_counts: dict = None       # compact raw record counts by severity
+  finding_signatures: list = None   # unique raw finding-type signatures
 
   def to_dict(self) -> dict:
     d = asdict(self)
     if d["open_ports"] is None:
       d["open_ports"] = []
-    return d
+    return _strip_none(d)
 
   @classmethod
   def from_dict(cls, d: dict) -> WorkerReportMeta:
@@ -294,6 +296,8 @@ class WorkerReportMeta:
       nr_findings=d.get("nr_findings", 0),
       node_ip=d.get("node_ip", ""),
       country=d.get("country", ""),
+      finding_counts=d.get("finding_counts"),
+      finding_signatures=d.get("finding_signatures"),
     )
 
 

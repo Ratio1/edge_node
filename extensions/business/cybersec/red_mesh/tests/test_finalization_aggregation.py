@@ -131,6 +131,42 @@ class TestStampWorkerSource(unittest.TestCase):
     self.assertEqual(f["_source_node_addr"], "0xaddr")
 
 
+class TestWorkerFindingEvidence(unittest.TestCase):
+
+  def test_raw_record_counts_and_unique_signatures_precede_cross_worker_dedup(self):
+    host = _Host()
+    findings = [
+      {
+        "finding_signature": f"type-{index % 188}",
+        "severity": "HIGH" if index < 28 else "MEDIUM",
+        "title": f"record-{index}",
+        "_source_node_addr": "0xworker-a",
+      }
+      for index in range(228)
+    ]
+    report = {
+      "service_info": {"443": {"probe": {"findings": findings}}},
+    }
+
+    nr_findings, counts, signatures = host._summarize_worker_findings(report)
+
+    self.assertEqual(nr_findings, 228)
+    self.assertEqual(counts, {"HIGH": 28, "MEDIUM": 200})
+    self.assertEqual(len(signatures), 188)
+    self.assertEqual(signatures[0], "type-0")
+
+  def test_fallback_signature_ignores_worker_attribution(self):
+    host = _Host()
+    base = {"title": "Same issue", "severity": "LOW", "port": 80}
+    report_a = {"findings": [{**base, "_source_node_addr": "0xa"}]}
+    report_b = {"findings": [{**base, "_source_node_addr": "0xb"}]}
+
+    self.assertEqual(
+      host._summarize_worker_findings(report_a)[2],
+      host._summarize_worker_findings(report_b)[2],
+    )
+
+
 class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
 
   def test_graybox_results_merge_across_workers(self):
@@ -407,13 +443,26 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
       ],
       "worker_reports": {
         "0xUS": {"start_port": 1, "end_port": 443, "open_ports": [80, 443],
-                 "node_ip": "1.1.1.1", "country": "US", "nr_findings": 1},
+                 "node_ip": "1.1.1.1", "country": "US", "nr_findings": 1,
+                 "finding_counts": {"HIGH": 1}, "finding_signatures": ["sig1"]},
         "0xIN": {"start_port": 1, "end_port": 443, "open_ports": [80],
                  "node_ip": "2.2.2.2", "country": "in", "nr_findings": 0},
       },
       "worker_scan_metrics": {
-        "0xUS": {"scan_metrics": {"connection_outcomes": {"connected": 5, "timeout": 0},
-                                  "response_times": {"p95": 0.12}}},
+        "0xUS": {"scan_metrics": {
+          "connection_outcomes": {"connected": 5, "timeout": 0, "refused": 2, "reset": 1},
+          "response_times": {"p95": 0.12},
+          "coverage": 0.75,
+          "probes_attempted": 4,
+          "probes_completed": 3,
+          "probes_failed": 1,
+          "phase_durations": {"port_scan": 12.5},
+          "total_duration": 19.0,
+          "success_rate_over_time": [{
+            "window_start": 0, "window_end": 60, "success_rate": 0.625,
+            "attempts": 8, "responsive_count": 8, "response_rate": 1.0,
+          }],
+        }, "threads": [{"local_worker_id": "thread-1"}]},
         "0xBR": {"scan_metrics": {"connection_outcomes": {"connected": 0, "timeout": 9},
                                   "response_times": {"p95": 2.0}}},
       },
@@ -454,6 +503,15 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
     self.assertEqual(comp["0xUS"]["open_ports"], [80, 443])
     self.assertEqual(comp["0xUS"]["metrics"]["response_p95_ms"], 120.0)
     self.assertEqual(comp["0xUS"]["findings"][0]["signature"], "sig1")
+    self.assertEqual(comp["0xUS"]["finding_counts"], {"HIGH": 1})
+    self.assertEqual(comp["0xUS"]["finding_signatures"], ["sig1"])
+    self.assertEqual(comp["0xUS"]["metrics"]["refused"], 2)
+    self.assertEqual(comp["0xUS"]["metrics"]["reset"], 1)
+    self.assertEqual(comp["0xUS"]["metrics"]["coverage"], 0.75)
+    self.assertEqual(comp["0xUS"]["metrics"]["probes_completed"], 3)
+    self.assertEqual(comp["0xUS"]["metrics"]["total_duration"], 19.0)
+    self.assertEqual(comp["0xUS"]["metrics"]["traffic_windows"][0]["attempts"], 8)
+    self.assertEqual(comp["0xUS"]["metrics"]["threads"][0]["local_worker_id"], "thread-1")
     # Metrics-only node with all-timeout connections -> timeout.
     self.assertEqual(comp["0xBR"]["status"], "timeout")
     # Selected peer that never reported at all -> failed (China-timeout case).
