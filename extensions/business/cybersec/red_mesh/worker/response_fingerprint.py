@@ -26,6 +26,8 @@ import threading
 import time
 
 import requests
+from requests.compat import urljoin
+from requests.models import DEFAULT_REDIRECT_LIMIT
 
 from ..constants import FINGERPRINT_HTTP_TIMEOUT, FINGERPRINT_TIMEOUT
 
@@ -40,6 +42,7 @@ EXCERPT_CONTENT_TYPES = ("text/html", "text/plain", "application/json")
 # Headers that identify *which* infrastructure answered. These are what
 # actually differ between a CDN edge in Brazil and one in China.
 CAPTURED_HEADERS = ("server", "via", "x-cache", "cf-ray", "x-powered-by", "location")
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 TITLE_MAX_CHARS = 200
 RESPONSE_BODY_MAX_BYTES = 1024 * 1024
@@ -57,8 +60,10 @@ _REDACTIONS = (
   (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"), "bearer [REDACTED]"),
   (
     re.compile(
-      r"(?i)\b(authorization|api[-_]?key|apikey|access[-_]?token|token|"
-      r"session[-_]?id|sessionid|session|secret|password|passwd|pwd)\b"
+      r"(?i)\b(authorization|"
+      r"(?:api|access|refresh|session|client|auth|id|private|secret)[-_]?"
+      r"(?:key|token|secret|id)|"
+      r"apikey|token|session|secret|password|passwd|pwd)\b"
       # An optional closing quote covers JSON keys such as {"api_key": "..."}.
       r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
       r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;&<>}]+)"
@@ -172,25 +177,52 @@ def read_bounded_response_body(response, max_bytes, max_seconds):
   """Read a streamed response without allowing a hostile peer to grow memory forever."""
   chunks = []
   total = 0
-  complete = True
   deadline = time.monotonic() + max_seconds
+  events = queue.Queue(maxsize=1)
+  stopped = threading.Event()
 
-  for chunk in response.iter_content(chunk_size=64 * 1024):
-    if time.monotonic() >= deadline:
-      complete = False
-      break
-    if not chunk:
+  def _read():
+    try:
+      for chunk in response.iter_content(chunk_size=64 * 1024):
+        if stopped.is_set():
+          return
+        events.put(("chunk", chunk))
+      if not stopped.is_set():
+        events.put(("done", None))
+    except Exception:
+      if not stopped.is_set():
+        events.put(("error", None))
+
+  threading.Thread(target=_read, daemon=True).start()
+
+  while True:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+      stopped.set()
+      response.close()
+      try:
+        events.get_nowait()
+      except queue.Empty:
+        pass
+      return b"".join(chunks), False
+    try:
+      kind, payload = events.get(timeout=remaining_seconds)
+    except queue.Empty:
+      stopped.set()
+      response.close()
+      return b"".join(chunks), False
+    if kind == "done":
+      return b"".join(chunks), True
+    if kind == "error":
+      return b"".join(chunks), False
+    if not payload:
       continue
-    remaining = max_bytes - total
-    if len(chunk) >= remaining:
-      chunks.append(chunk[:remaining])
-      total += min(len(chunk), remaining)
-      complete = False
-      break
-    chunks.append(chunk)
-    total += len(chunk)
-
-  return b"".join(chunks), complete
+    chunks.append(payload)
+    total += len(payload)
+    if total > max_bytes:
+      stopped.set()
+      response.close()
+      return b"".join(chunks)[:max_bytes], False
 
 
 def certificate_identity(cert_der):
@@ -290,27 +322,48 @@ class _ResponseFingerprintMixin:
   def _fingerprint_http(self, scheme, port):
     """Issue one GET and reduce the response to comparable attributes."""
     url = f"{scheme}://{self.target}:{port}/"
+    session = requests.Session()
+    resp = None
     try:
       user_agent = getattr(self, "scanner_user_agent", "")
       headers = {"User-Agent": user_agent} if user_agent else {}
       timeout = self._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
-      resp = requests.get(
-        url,
-        timeout=timeout,
-        verify=False,
-        allow_redirects=True,
-        headers=headers,
-        stream=True,
-      )
+      deadline = time.monotonic() + timeout
+      current_url = url
+      redirect_count = 0
+      while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          raise requests.Timeout("response fingerprint deadline exceeded")
+        resp = session.get(
+          current_url,
+          timeout=remaining,
+          verify=False,
+          allow_redirects=False,
+          headers=headers,
+          stream=True,
+        )
+        location = resp.headers.get("Location")
+        if resp.status_code not in REDIRECT_STATUSES or not location:
+          break
+        if redirect_count >= DEFAULT_REDIRECT_LIMIT:
+          raise requests.TooManyRedirects("response fingerprint redirect limit exceeded")
+        current_url = urljoin(resp.url or current_url, location)
+        redirect_count += 1
+        resp.close()
+        resp = None
     except Exception as exc:
       self.P(f"Response fingerprint GET failed on {url}: {exc}", color='y')
+      if resp is not None:
+        resp.close()
+      session.close()
       return None, None
 
     try:
       body, body_complete = read_bounded_response_body(
         resp,
         max_bytes=RESPONSE_BODY_MAX_BYTES,
-        max_seconds=timeout,
+        max_seconds=max(deadline - time.monotonic(), 0),
       )
       encoding = resp.encoding or "utf-8"
       try:
@@ -330,7 +383,7 @@ class _ResponseFingerprintMixin:
       http = {
         "status": resp.status_code,
         "final_url": resp.url,
-        "redirect_count": len(resp.history),
+        "redirect_count": redirect_count,
         "title": title_match.group(1).strip()[:TITLE_MAX_CHARS] if title_match else None,
         "content_type": content_type,
         "body_length": body_length,
@@ -346,3 +399,4 @@ class _ResponseFingerprintMixin:
       return http, excerpt
     finally:
       resp.close()
+      session.close()

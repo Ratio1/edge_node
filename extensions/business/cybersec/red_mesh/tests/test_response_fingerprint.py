@@ -72,6 +72,12 @@ class TestExcerptSanitization(unittest.TestCase):
     excerpt = sanitize_excerpt("Authorization: Basic dXNlcjpwYXNz")
     self.assertNotIn("dXNlcjpwYXNz", excerpt)
 
+  def test_redacts_common_compound_credential_keys(self):
+    for key in ("client_secret", "refresh_token", "session_token", "clientSecret"):
+      with self.subTest(key=key):
+        excerpt = sanitize_excerpt(f'{key}="short-sensitive"')
+        self.assertNotIn("short-sensitive", excerpt)
+
   def test_redacts_bearer_tokens(self):
     excerpt = sanitize_excerpt("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload")
     self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", excerpt)
@@ -231,15 +237,18 @@ class TestHttpCapture(unittest.TestCase):
     worker = _make_worker(comparison_ports=[443])
     worker._target_timeout = MagicMock(return_value=12)
     response = self._response(**{"Content-Length": "37", "server": "nginx"})
+    session = MagicMock()
+    session.get.return_value = response
     with patch(
-      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.get",
-      return_value=response,
-    ) as get:
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
+    ):
       http, excerpt = worker._fingerprint_http("https", 443)
 
     worker._target_timeout.assert_called_once_with(FINGERPRINT_HTTP_TIMEOUT)
-    self.assertTrue(get.call_args.kwargs["stream"])
-    self.assertEqual(get.call_args.kwargs["timeout"], 12)
+    self.assertTrue(session.get.call_args.kwargs["stream"])
+    self.assertFalse(session.get.call_args.kwargs["allow_redirects"])
+    self.assertLessEqual(session.get.call_args.kwargs["timeout"], 12)
     self.assertEqual(http["status"], 200)
     self.assertEqual(http["title"], "Acme")
     self.assertIsNotNone(http["body_sha256"])
@@ -248,13 +257,15 @@ class TestHttpCapture(unittest.TestCase):
 
   def test_oversized_body_is_capped_without_claiming_a_partial_hash(self):
     response = self._response(
-      body=b"a" * RESPONSE_BODY_MAX_BYTES,
+      body=b"a" * (RESPONSE_BODY_MAX_BYTES + 1),
       **{"Content-Length": str(RESPONSE_BODY_MAX_BYTES + 100)},
     )
     worker = _make_worker(comparison_ports=[443])
+    session = MagicMock()
+    session.get.return_value = response
     with patch(
-      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.get",
-      return_value=response,
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
     ):
       http, excerpt = worker._fingerprint_http("https", 443)
 
@@ -266,14 +277,37 @@ class TestHttpCapture(unittest.TestCase):
     response = self._response(body=b"plain text")
     response.encoding = "not-a-real-codec"
     worker = _make_worker(comparison_ports=[443])
+    session = MagicMock()
+    session.get.return_value = response
     with patch(
-      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.get",
-      return_value=response,
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
     ):
       http, excerpt = worker._fingerprint_http("https", 443)
 
     self.assertEqual(http["status"], 200)
     self.assertEqual(excerpt, "plain text")
+
+  def test_redirect_bodies_are_never_buffered(self):
+    redirect = self._response(**{"Location": "/final"})
+    redirect.status_code = 302
+    redirect.url = "https://example.test/start"
+    redirect.iter_content.side_effect = AssertionError("redirect body must not be read")
+    final = self._response()
+    final.url = "https://example.test/final"
+    session = MagicMock()
+    session.get.side_effect = [redirect, final]
+    worker = _make_worker(comparison_ports=[443])
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
+    ):
+      http, _excerpt = worker._fingerprint_http("https", 443)
+
+    redirect.iter_content.assert_not_called()
+    redirect.close.assert_called_once()
+    self.assertEqual(http["redirect_count"], 1)
+    self.assertEqual(http["final_url"], "https://example.test/final")
 
   def test_port_probe_uses_existing_fingerprint_timeout_constant(self):
     worker = _make_worker(comparison_ports=[443])
@@ -297,6 +331,32 @@ class TestHttpCapture(unittest.TestCase):
     body, complete = read_bounded_response_body(response, max_bytes=4, max_seconds=10)
     self.assertEqual(body, b"abcd")
     self.assertFalse(complete)
+
+  def test_bounded_reader_hashes_an_exact_cap_complete_body(self):
+    response = MagicMock()
+    response.iter_content.return_value = [b"a" * RESPONSE_BODY_MAX_BYTES]
+    body, complete = read_bounded_response_body(
+      response,
+      max_bytes=RESPONSE_BODY_MAX_BYTES,
+      max_seconds=10,
+    )
+    self.assertEqual(len(body), RESPONSE_BODY_MAX_BYTES)
+    self.assertTrue(complete)
+
+  def test_bounded_reader_enforces_wall_deadline(self):
+    response = MagicMock()
+
+    def delayed_chunks(**_kwargs):
+      time.sleep(0.2)
+      yield b"late"
+
+    response.iter_content.side_effect = delayed_chunks
+    started = time.monotonic()
+    body, complete = read_bounded_response_body(response, max_bytes=10, max_seconds=0.01)
+    elapsed = time.monotonic() - started
+    self.assertEqual(body, b"")
+    self.assertFalse(complete)
+    self.assertLess(elapsed, 0.1)
 
 
 class TestAggregationAttribution(unittest.TestCase):
