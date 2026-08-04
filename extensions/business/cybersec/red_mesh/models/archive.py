@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
 from extensions.business.cybersec.red_mesh.constants import (
   DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS, JOB_ARCHIVE_VERSION,
+  TIMEOUT_PROFILE_STANDARD, normalize_timeout_profile,
 )
 
 
@@ -35,6 +36,7 @@ class JobConfig:
   enabled_features: list            # [str]
   excluded_features: list           # [str]
   run_mode: str                     # SINGLEPASS | CONTINUOUS_MONITORING
+  timeout_profile: str = TIMEOUT_PROFILE_STANDARD  # STANDARD | THOROUGH (network scans)
   scan_min_delay: float = 0
   scan_max_delay: float = 0
   ics_safe_mode: bool = False
@@ -45,6 +47,9 @@ class JobConfig:
   task_description: str = ""
   monitor_interval: int = 0
   selected_peers: list = None       # [str] or None
+  # ── geographic vantage-point comparison mode ──
+  comparison_mode: bool = False     # tiered mirror+slice; per-country comparison
+  comparison_ports: list = None     # [int] ports mirrored to every node (comparison tier)
   created_by_name: str = ""
   created_by_id: str = ""
   authorized: bool = False
@@ -135,6 +140,7 @@ class JobConfig:
       enabled_features=d.get("enabled_features", []),
       excluded_features=d.get("excluded_features", []),
       run_mode=d.get("run_mode", RUN_MODE_SINGLEPASS),
+      timeout_profile=normalize_timeout_profile(d.get("timeout_profile")),
       scan_min_delay=d.get("scan_min_delay", 0),
       scan_max_delay=d.get("scan_max_delay", 0),
       ics_safe_mode=d.get("ics_safe_mode", False),
@@ -145,6 +151,8 @@ class JobConfig:
       task_description=d.get("task_description", ""),
       monitor_interval=d.get("monitor_interval", 0),
       selected_peers=d.get("selected_peers"),
+      comparison_mode=d.get("comparison_mode", False),
+      comparison_ports=d.get("comparison_ports"),
       created_by_name=d.get("created_by_name", ""),
       created_by_id=d.get("created_by_id", ""),
       authorized=d.get("authorized", False),
@@ -267,12 +275,16 @@ class WorkerReportMeta:
   open_ports: list = None           # [int]
   nr_findings: int = 0
   node_ip: str = ""                 # worker node's IP address
+  country: str = ""                 # worker node's ISO-2 country (from location_data); "" when unknown
+  finding_counts: dict = None       # compact raw record counts by severity
+  finding_signatures: list = None   # unique raw finding-type signatures
+  response_evidence: dict = None    # per-vantage target response fingerprint (comparison mode)
 
   def to_dict(self) -> dict:
     d = asdict(self)
     if d["open_ports"] is None:
       d["open_ports"] = []
-    return d
+    return _strip_none(d)
 
   @classmethod
   def from_dict(cls, d: dict) -> WorkerReportMeta:
@@ -284,6 +296,10 @@ class WorkerReportMeta:
       open_ports=d.get("open_ports", []),
       nr_findings=d.get("nr_findings", 0),
       node_ip=d.get("node_ip", ""),
+      country=d.get("country", ""),
+      finding_counts=d.get("finding_counts"),
+      finding_signatures=d.get("finding_signatures"),
+      response_evidence=d.get("response_evidence"),
     )
 
 
@@ -376,7 +392,9 @@ class UiAggregate:
   findings_count: dict = None       # { CRITICAL: int, HIGH: int, MEDIUM: int, LOW: int, INFO: int }
   top_findings: list = None         # top 10 CRITICAL+HIGH findings for dashboard display
   finding_timeline: dict = None     # { finding_id: { first_seen, last_seen, pass_count } }
-  worker_activity: list = None      # [ { id, start_port, end_port, open_ports } ]
+  worker_activity: list = None      # [ { id, start_port, end_port, open_ports, country } ]
+  country_breakdown: list = None    # [ { code, count } ] origin countries the pass ran from
+  node_comparison: list = None      # per-node vantage-point comparison (comparison_mode only); see report.py
   # ── graybox-aware ──
   scan_type: str = "network"
   total_routes_discovered: int = 0          # webapp: discovered routes
@@ -400,6 +418,8 @@ class UiAggregate:
       top_findings=d.get("top_findings"),
       finding_timeline=d.get("finding_timeline"),
       worker_activity=d.get("worker_activity"),
+      country_breakdown=d.get("country_breakdown"),
+      node_comparison=d.get("node_comparison"),
       scan_type=d.get("scan_type", "network"),
       total_routes_discovered=d.get("total_routes_discovered", 0),
       total_forms_discovered=d.get("total_forms_discovered", 0),

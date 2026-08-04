@@ -51,7 +51,7 @@ class _WebDiscoveryMixin:
     # --- Catch-all detection: 200-for-all ---
     try:
       canary_path = f"/{_uuid.uuid4().hex}"
-      canary_resp = requests.get(base_url + canary_path, timeout=2, verify=False)
+      canary_resp = requests.get(base_url + canary_path, timeout=self._target_timeout(2), verify=False)
       if canary_resp.status_code == 200:
         findings_list.append(Finding(
           severity=Severity.HIGH,
@@ -100,7 +100,7 @@ class _WebDiscoveryMixin:
     try:
       for path, (severity, cwe, owasp, desc) in _PATH_META.items():
         url = base_url + path
-        resp = requests.get(url, timeout=2, verify=False)
+        resp = requests.get(url, timeout=self._target_timeout(2), verify=False)
         if resp.status_code == 200:
           findings_list.append(Finding(
             severity=severity,
@@ -161,7 +161,7 @@ class _WebDiscoveryMixin:
     }
 
     try:
-      resp_main = requests.get(base_url, timeout=3, verify=False)
+      resp_main = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       text = resp_main.text[:10000]
       for marker, (severity, title, owasp) in _MARKER_META.items():
         if marker in text:
@@ -215,7 +215,7 @@ class _WebDiscoveryMixin:
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
 
     try:
-      resp = requests.get(base_url, timeout=4, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(4), verify=False)
 
       # Server header
       server = resp.headers.get("Server")
@@ -359,7 +359,7 @@ class _WebDiscoveryMixin:
     for entry in vpn_checks:
       try:
         url = base_url.rstrip("/") + entry["path"]
-        resp = requests.get(url, timeout=3, verify=False, allow_redirects=False)
+        resp = requests.get(url, timeout=self._target_timeout(3), verify=False, allow_redirects=False)
         if entry["check"](resp):
           raw["vpn_endpoints"].append({"product": entry["product"], "path": entry["path"]})
           findings_list.append(Finding(
@@ -429,7 +429,7 @@ class _WebDiscoveryMixin:
     # --- WordPress detection ---
     wp_version = None
     try:
-      resp = requests.get(base_url, timeout=3, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       if resp.ok:
         gen_match = _re.search(
           r'<meta[^>]*name=["\']generator["\'][^>]*content=["\']WordPress\s+([0-9.]+)',
@@ -444,7 +444,7 @@ class _WebDiscoveryMixin:
 
     if not wp_version:
       try:
-        resp = requests.get(base_url + "/wp-login.php", timeout=3, verify=False, allow_redirects=False)
+        resp = requests.get(base_url + "/wp-login.php", timeout=self._target_timeout(3), verify=False, allow_redirects=False)
         if resp.status_code in (200, 302) and ('wp-login' in resp.text.lower() or 'wordpress' in resp.text.lower()):
           wp_version = "unknown"
       except Exception:
@@ -458,7 +458,7 @@ class _WebDiscoveryMixin:
         ("/readme.html", r'Version\s+([0-9.]+)'),
       ]:
         try:
-          resp = requests.get(base_url + _wp_path, timeout=3, verify=False)
+          resp = requests.get(base_url + _wp_path, timeout=self._target_timeout(3), verify=False)
           if resp.ok:
             _wp_m = _re.search(_wp_re, resp.text, _re.IGNORECASE)
             if _wp_m:
@@ -484,7 +484,7 @@ class _WebDiscoveryMixin:
       findings_list += self._wp_detect_plugins(base_url)
       for path, desc in self._WP_SENSITIVE_PATHS:
         try:
-          resp = requests.get(base_url + path, timeout=3, verify=False)
+          resp = requests.get(base_url + path, timeout=self._target_timeout(3), verify=False)
           if resp.status_code == 200:
             findings_list.append(Finding(
               severity=Severity.MEDIUM,
@@ -503,7 +503,7 @@ class _WebDiscoveryMixin:
     # --- Drupal detection ---
     drupal_version = None
     try:
-      resp = requests.get(base_url + "/core/CHANGELOG.txt", timeout=3, verify=False)
+      resp = requests.get(base_url + "/core/CHANGELOG.txt", timeout=self._target_timeout(3), verify=False)
       if resp.ok and "Drupal" in resp.text:
         ver_match = _re.search(r'Drupal\s+([0-9.]+)', resp.text)
         drupal_version = ver_match.group(1) if ver_match else "unknown"
@@ -511,7 +511,7 @@ class _WebDiscoveryMixin:
       pass
     if not drupal_version:
       try:
-        resp = requests.get(base_url, timeout=3, verify=False)
+        resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
         if resp.ok:
           gen_match = _re.search(
             r'<meta[^>]*name=["\']generator["\'][^>]*content=["\']Drupal\s+([0-9.]+)',
@@ -531,7 +531,7 @@ class _WebDiscoveryMixin:
     if drupal_version and (drupal_version == "unknown" or _re.match(r'^\d+$', drupal_version)):
       for _dp_path, _dp_re in _DRUPAL_VERSION_SOURCES:
         try:
-          resp = requests.get(base_url + _dp_path, timeout=3, verify=False)
+          resp = requests.get(base_url + _dp_path, timeout=self._target_timeout(3), verify=False)
           if resp.ok:
             _dp_m = _re.search(_dp_re, resp.text)
             if _dp_m:
@@ -559,11 +559,11 @@ class _WebDiscoveryMixin:
     # --- Joomla detection ---
     joomla_version = None
     try:
-      resp = requests.get(base_url + "/administrator/", timeout=3, verify=False, allow_redirects=False)
+      resp = requests.get(base_url + "/administrator/", timeout=self._target_timeout(3), verify=False, allow_redirects=False)
       if resp.status_code in (200, 302) and 'joomla' in resp.text.lower():
         joomla_version = "unknown"
         try:
-          resp2 = requests.get(base_url + "/language/en-GB/en-GB.xml", timeout=3, verify=False)
+          resp2 = requests.get(base_url + "/language/en-GB/en-GB.xml", timeout=self._target_timeout(3), verify=False)
           if resp2.ok:
             ver_match = _re.search(r'<version>([0-9.]+)</version>', resp2.text)
             if ver_match:
@@ -591,7 +591,7 @@ class _WebDiscoveryMixin:
       try:
         resp = requests.get(
           base_url + "/api/index.php/v1/config/application?public=true",
-          timeout=3, verify=False,
+          timeout=self._target_timeout(3), verify=False,
         )
         if resp.ok and ("password" in resp.text.lower() or '"db"' in resp.text.lower() or '"dbtype"' in resp.text.lower()):
           findings_list.append(Finding(
@@ -615,7 +615,7 @@ class _WebDiscoveryMixin:
 
     # Check /_ignition/health-check
     try:
-      resp = requests.get(base_url + "/_ignition/health-check", timeout=3, verify=False)
+      resp = requests.get(base_url + "/_ignition/health-check", timeout=self._target_timeout(3), verify=False)
       if resp.ok and ("can_execute_commands" in resp.text or "ok" in resp.text.lower()):
         ignition_detected = True
         laravel_detected = True
@@ -638,7 +638,7 @@ class _WebDiscoveryMixin:
       try:
         resp = requests.get(
           base_url + "/nonexistent_" + _uuid.uuid4().hex[:8],
-          timeout=3, verify=False,
+          timeout=self._target_timeout(3), verify=False,
         )
         body = resp.text[:10000].lower()
         if "laravel" in body or "illuminate" in body:
@@ -652,7 +652,7 @@ class _WebDiscoveryMixin:
         resp = requests.post(
           base_url + "/_ignition/execute-solution",
           json={"solution": "test", "parameters": {}},
-          timeout=3, verify=False,
+          timeout=self._target_timeout(3), verify=False,
         )
         if resp.status_code != 404:
           findings_list.append(Finding(
@@ -724,7 +724,7 @@ class _WebDiscoveryMixin:
     for slug, name in self._WP_PLUGIN_CHECKS:
       try:
         url = f"{base_url}/wp-content/plugins/{slug}/readme.txt"
-        resp = requests.get(url, timeout=3, verify=False)
+        resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
         if resp.status_code != 200:
           continue
         ver_match = _re.search(r'Stable tag:\s*([0-9.]+)', resp.text, _re.IGNORECASE)
@@ -799,7 +799,7 @@ class _WebDiscoveryMixin:
     # --- 1. Trigger a 404 and inspect the error page ---
     try:
       canary = f"/nonexistent_{_uuid.uuid4().hex[:8]}"
-      resp = requests.get(base_url + canary, timeout=3, verify=False)
+      resp = requests.get(base_url + canary, timeout=self._target_timeout(3), verify=False)
       body = resp.text[:10000]
 
       for marker, framework in self._STACK_TRACE_MARKERS:
@@ -835,7 +835,7 @@ class _WebDiscoveryMixin:
 
     # --- 2. Debug mode detection on homepage ---
     try:
-      resp = requests.get(base_url, timeout=3, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       body = resp.text[:10000]
       for marker, framework in self._DEBUG_MODE_MARKERS:
         if marker in body:
@@ -856,7 +856,7 @@ class _WebDiscoveryMixin:
 
     # --- 3. Django __debug__/ endpoint ---
     try:
-      resp = requests.get(base_url + "/__debug__/", timeout=3, verify=False)
+      resp = requests.get(base_url + "/__debug__/", timeout=self._target_timeout(3), verify=False)
       if resp.status_code == 200 and "djdt" in resp.text.lower():
         findings_list.append(Finding(
           severity=Severity.HIGH,
@@ -915,7 +915,7 @@ class _WebDiscoveryMixin:
     weblogic_version = None
     # Console login page
     try:
-      resp = requests.get(base_url + "/console/login/LoginForm.jsp", timeout=4, verify=False, allow_redirects=True)
+      resp = requests.get(base_url + "/console/login/LoginForm.jsp", timeout=self._target_timeout(4), verify=False, allow_redirects=True)
       if resp.ok and "WebLogic" in resp.text:
         raw["java_server"] = "WebLogic"
         ver_m = _re.search(r'(?:WebLogic Server|footerVersion)[^0-9]*(\d+\.\d+\.\d+\.\d+)', resp.text)
@@ -928,7 +928,7 @@ class _WebDiscoveryMixin:
     # T3/IIOP banner on root (some WebLogic instances)
     if not weblogic_version:
       try:
-        resp = requests.get(base_url, timeout=3, verify=False)
+        resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
         if resp.ok:
           # Check for WebLogic error page patterns
           if "WebLogic" in resp.text or "BEA-" in resp.text:
@@ -958,7 +958,7 @@ class _WebDiscoveryMixin:
         findings_list += check_cves("weblogic", weblogic_version)
       # Check for console exposure
       try:
-        resp = requests.get(base_url + "/console/", timeout=3, verify=False, allow_redirects=True)
+        resp = requests.get(base_url + "/console/", timeout=self._target_timeout(3), verify=False, allow_redirects=True)
         if resp.ok and ("login" in resp.text.lower() or "WebLogic" in resp.text):
           findings_list.append(Finding(
             severity=Severity.HIGH,
@@ -975,7 +975,7 @@ class _WebDiscoveryMixin:
       # CVE-2020-14882: Console authentication bypass via double-encoded path
       try:
         bypass_url = base_url + "/console/css/%252e%252e%252fconsole.portal"
-        resp = requests.get(bypass_url, timeout=4, verify=False, allow_redirects=False)
+        resp = requests.get(bypass_url, timeout=self._target_timeout(4), verify=False, allow_redirects=False)
         if resp.status_code == 200 and len(resp.text) > 500 and (
             "portal" in resp.text.lower() or "console" in resp.text.lower()):
           findings_list.append(Finding(
@@ -997,7 +997,7 @@ class _WebDiscoveryMixin:
     # --- 2. Tomcat detection ---
     tomcat_version = None
     try:
-      resp = requests.get(base_url, timeout=3, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       if resp.ok:
         # Tomcat default page or error page
         tc_m = _re.search(r'Apache Tomcat[/\s]*(\d+\.\d+\.\d+)', resp.text)
@@ -1015,7 +1015,7 @@ class _WebDiscoveryMixin:
     # Try 404 page which often reveals Tomcat version
     if not tomcat_version:
       try:
-        resp = requests.get(base_url + "/nonexistent_" + _uuid.uuid4().hex[:6], timeout=3, verify=False)
+        resp = requests.get(base_url + "/nonexistent_" + _uuid.uuid4().hex[:6], timeout=self._target_timeout(3), verify=False)
         tc_m = _re.search(r'Apache Tomcat[/\s]*(\d+\.\d+\.\d+)', resp.text)
         if tc_m:
           tomcat_version = tc_m.group(1)
@@ -1038,7 +1038,7 @@ class _WebDiscoveryMixin:
       # Manager app exposure
       for mgr_path in ["/manager/html", "/manager/status"]:
         try:
-          resp = requests.get(base_url + mgr_path, timeout=3, verify=False)
+          resp = requests.get(base_url + mgr_path, timeout=self._target_timeout(3), verify=False)
           if resp.status_code in (200, 401, 403):
             findings_list.append(Finding(
               severity=Severity.HIGH if resp.status_code == 200 else Severity.MEDIUM,
@@ -1058,7 +1058,7 @@ class _WebDiscoveryMixin:
     # --- 3. JBoss / WildFly detection ---
     jboss_version = None
     try:
-      resp = requests.get(base_url, timeout=3, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       xpb = resp.headers.get("X-Powered-By", "")
       jb_m = _re.search(r'JBossAS[- ]*(\d+)', xpb)
       if jb_m:
@@ -1105,7 +1105,7 @@ class _WebDiscoveryMixin:
         findings_list += check_cves("jboss", jboss_version)
       # JMX console exposure
       try:
-        resp = requests.get(base_url + "/jmx-console/", timeout=3, verify=False)
+        resp = requests.get(base_url + "/jmx-console/", timeout=self._target_timeout(3), verify=False)
         if resp.status_code in (200, 401):
           findings_list.append(Finding(
             severity=Severity.HIGH if resp.status_code == 200 else Severity.MEDIUM,
@@ -1124,7 +1124,7 @@ class _WebDiscoveryMixin:
     # --- 4. Spring Framework detection ---
     spring_detected = False
     try:
-      resp = requests.get(base_url, timeout=3, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       body = resp.text[:10000]
       # Spring Whitelabel Error Page
       if "Whitelabel Error Page" in body or "Spring" in resp.headers.get("X-Application-Context", ""):
@@ -1136,7 +1136,7 @@ class _WebDiscoveryMixin:
       pass
     if not spring_detected:
       try:
-        resp = requests.get(base_url + "/nonexistent_" + _uuid.uuid4().hex[:6], timeout=3, verify=False)
+        resp = requests.get(base_url + "/nonexistent_" + _uuid.uuid4().hex[:6], timeout=self._target_timeout(3), verify=False)
         if "Whitelabel Error Page" in resp.text:
           spring_detected = True
         elif "org.springframework" in resp.text or "DispatcherServlet" in resp.text:
@@ -1146,7 +1146,7 @@ class _WebDiscoveryMixin:
     # Spring MVC: POST to root returns 405 with Spring-specific message
     if not spring_detected:
       try:
-        resp = requests.post(base_url, data="", timeout=3, verify=False)
+        resp = requests.post(base_url, data="", timeout=self._target_timeout(3), verify=False)
         if resp.status_code == 405:
           body = resp.text
           if "Request method" in body and "not supported" in body:
@@ -1173,7 +1173,7 @@ class _WebDiscoveryMixin:
     struts_evidence = ""
     # 5a. Check /struts/utils.js — present in all Struts2 apps using <s:head/> tag
     try:
-      resp = requests.get(base_url + "/struts/utils.js", timeout=3, verify=False)
+      resp = requests.get(base_url + "/struts/utils.js", timeout=self._target_timeout(3), verify=False)
       if resp.ok and len(resp.text) > 50:
         struts_detected = True
         struts_evidence = "/struts/utils.js present"
@@ -1182,7 +1182,7 @@ class _WebDiscoveryMixin:
     # 5b. Check homepage for .action/.do URLs or Struts indicators
     if not struts_detected:
       try:
-        resp = requests.get(base_url, timeout=3, verify=False)
+        resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
         body = resp.text[:10000]
         struts_indicators = [".action", ".do", "struts", "Struts Problem Report"]
         if any(ind in body for ind in struts_indicators):
@@ -1219,7 +1219,7 @@ class _WebDiscoveryMixin:
 
     # --- 6. Jetty detection (from Server header) ---
     try:
-      resp = requests.get(base_url, timeout=3, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       srv = resp.headers.get("Server", "")
       jetty_m = _re.search(r'[Jj]etty\(?(\d+\.\d+\.\d+)', srv)
       if jetty_m:
@@ -1293,7 +1293,7 @@ class _WebDiscoveryMixin:
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
 
     try:
-      resp = requests.get(base_url, timeout=4, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(4), verify=False)
       if resp.status_code != 200:
         return probe_result(findings=findings_list)
       html = resp.text

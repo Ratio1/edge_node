@@ -5,7 +5,10 @@ Handles merging worker results, credential redaction, and pre-computing
 the UI aggregate view for the frontend.
 """
 
+import hashlib as _hashlib
 import json as _json
+import math as _math
+import struct as _struct
 
 from ..worker import PentestLocalWorker
 from ..models import UiAggregate
@@ -201,6 +204,76 @@ def _dedup_findings_in_aggregated(aggregated):
   return aggregated
 
 
+def _iter_report_findings(report):
+  """Yield every raw finding record from the worker-report paths we publish."""
+  if not isinstance(report, dict):
+    return
+
+  def _items(value):
+    return value if isinstance(value, list) else ()
+
+  for section_name in ("service_info", "web_tests_info"):
+    for port_entry in (report.get(section_name) or {}).values():
+      if not isinstance(port_entry, dict):
+        continue
+      for finding in _items(port_entry.get("findings")):
+        yield finding
+      for probe_entry in port_entry.values():
+        if not isinstance(probe_entry, dict):
+          continue
+        for finding in _items(probe_entry.get("findings")):
+          yield finding
+
+  for port_probes in (report.get("graybox_results") or {}).values():
+    if not isinstance(port_probes, dict):
+      continue
+    for probe_entry in port_probes.values():
+      if not isinstance(probe_entry, dict):
+        continue
+      for finding in _items(probe_entry.get("findings")):
+        yield finding
+
+  for section_name in ("correlation_findings", "findings"):
+    for finding in _items(report.get(section_name)):
+      yield finding
+
+
+def _compact_finding_signature(finding):
+  """Return a stable compact type signature without worker-attribution fields."""
+  if isinstance(finding, dict):
+    explicit = finding.get("finding_signature") or finding.get("finding_id")
+    if explicit:
+      return str(explicit)
+
+  def normalize(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+      numeric = float(value)
+      if not _math.isfinite(numeric):
+        return None
+      if numeric == 0:
+        numeric = 0.0
+      return "__redmesh_number__:" + _struct.pack(">d", numeric).hex()
+    if isinstance(value, dict):
+      return {
+        key: normalize(item)
+        for key, item in value.items()
+        if key not in _DEDUP_EXCLUDE_FIELDS
+      }
+    if isinstance(value, (list, tuple)):
+      return [normalize(item) for item in value]
+    return value
+
+  try:
+    canonical = _json.dumps(
+      normalize(finding), sort_keys=True, default=str,
+      ensure_ascii=False, separators=(",", ":"),
+    )
+  except (TypeError, ValueError):
+    canonical = repr(normalize(finding))
+  stable = canonical.encode("utf-8", errors="replace")
+  return "sha256:" + _hashlib.sha256(stable).hexdigest()
+
+
 class _ReportMixin:
   """Report aggregation and UI view methods for PentesterApi01Plugin."""
 
@@ -221,14 +294,28 @@ class _ReportMixin:
 
   def _count_all_findings(self, report):
     """Count all findings emitted by network and graybox reporting sections."""
-    if not isinstance(report, dict):
-      return 0
-    return (
-      self._count_nested_findings(report.get("service_info")) +
-      self._count_nested_findings(report.get("web_tests_info")) +
-      len(report.get("correlation_findings") or []) +
-      self._count_nested_findings(report.get("graybox_results"))
-    )
+    return sum(1 for _finding in _iter_report_findings(report))
+
+  @staticmethod
+  def _summarize_worker_findings(report):
+    """Count raw records and unique types before aggregate cross-worker dedup."""
+    counts = {}
+    signatures = []
+    seen_signatures = set()
+    nr_findings = 0
+    for finding in _iter_report_findings(report):
+      nr_findings += 1
+      severity = "INFO"
+      if isinstance(finding, dict):
+        severity = str(finding.get("severity") or "INFO").upper()
+      if severity not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        severity = "INFO"
+      counts[severity] = counts.get(severity, 0) + 1
+      signature = _compact_finding_signature(finding)
+      if signature not in seen_signatures:
+        seen_signatures.add(signature)
+        signatures.append(signature)
+    return nr_findings, counts, signatures
 
   @staticmethod
   def _dedupe_items(items):
@@ -648,6 +735,115 @@ class _ReportMixin:
     redacted.pop("secret_ref", None)
     return redacted
 
+  def _resolve_node_country_tag(self, addr):
+    """Resolve a node's ISO-2 country from its netmon ``CT:`` tag.
+
+    Fallback for nodes that produced no report (e.g. a fully-timed-out vantage
+    point), so every participating node still carries a country. Returns "" when
+    netmon is unavailable or the node has no country tag.
+    """
+    netmon = getattr(self, "netmon", None)
+    if netmon is None:
+      return ""
+    try:
+      tags = netmon.get_network_node_tags(addr) or []
+    except Exception:
+      return ""
+    for tag in tags:
+      if isinstance(tag, str) and tag.startswith("CT:"):
+        return tag[3:].strip().upper()
+    return ""
+
+  def _compute_node_comparison(self, latest, job_config):
+    """Per-node vantage-point comparison for comparison-mode jobs.
+
+    One entry per participating node — including nodes that never reported —
+    carrying country, reachability status, open ports, findings, and per-node
+    metrics so the UI/report can compare results across countries.
+
+    Open ports and per-node metrics are node-accurate. Findings are attributed
+    via each finding's ``_source_node_addr`` stamp (single-node attribution
+    after cross-node dedup); the UI derives per-country "seen-by" sets from
+    these per-node finding lists.
+    """
+    cfg = job_config or {}
+    worker_reports = latest.get("worker_reports") or {}
+    worker_scan_metrics = latest.get("worker_scan_metrics") or {}
+    findings = latest.get("findings") or []
+
+    findings_by_node = {}
+    for f in findings:
+      addr = f.get("_source_node_addr")
+      if not addr:
+        continue
+      findings_by_node.setdefault(addr, []).append({
+        "signature": f.get("finding_signature") or f.get("finding_id"),
+        "severity": f.get("severity", "INFO"),
+        "title": f.get("title", ""),
+        "port": f.get("port"),
+      })
+
+    # Participating nodes = union of report authors, metric authors, and the
+    # originally selected peers (the latter surfaces nodes that never reported).
+    participating = list(dict.fromkeys(
+      list(worker_reports.keys())
+      + list(worker_scan_metrics.keys())
+      + list(cfg.get("selected_peers") or [])
+    ))
+
+    comparison = []
+    for addr in participating:
+      wr = worker_reports.get(addr) or {}
+      worker_metric_entry = worker_scan_metrics.get(addr) or {}
+      sm = worker_metric_entry.get("scan_metrics") or {}
+      outcomes = sm.get("connection_outcomes") or {}
+      response_times = sm.get("response_times") or {}
+      has_report = addr in worker_reports
+      country = (wr.get("country") or "").upper() or self._resolve_node_country_tag(addr) or "UN"
+
+      # Status reflects REACHABILITY only. Blocking / rate-limiting are advisory
+      # detection signals carried in metrics (a node can be reached AND flagged),
+      # so they must not override "reached" when the node returned results.
+      if not has_report and addr not in worker_scan_metrics:
+        status = "failed"
+      elif outcomes and outcomes.get("connected", 0) == 0 and outcomes.get("timeout", 0) > 0:
+        status = "timeout"
+      else:
+        status = "reached"
+
+      p95 = response_times.get("p95")
+      comparison.append({
+        "address": addr,
+        "country": country,
+        "node_ip": wr.get("node_ip", ""),
+        "status": status,
+        "open_ports": wr.get("open_ports", []),
+        "nr_findings": wr.get("nr_findings", len(findings_by_node.get(addr, []))),
+        "finding_counts": wr.get("finding_counts"),
+        "finding_signatures": wr.get("finding_signatures"),
+        "response_evidence": wr.get("response_evidence"),
+        "findings": findings_by_node.get(addr, []),
+        "metrics": {
+          "connected": outcomes.get("connected", 0),
+          "timeout": outcomes.get("timeout", 0),
+          "refused": outcomes.get("refused", 0),
+          "reset": outcomes.get("reset", 0),
+          "error": outcomes.get("error", 0),
+          "response_p95_ms": round(p95 * 1000, 1) if isinstance(p95, (int, float)) else None,
+          "coverage": sm.get("coverage"),
+          "probes_attempted": sm.get("probes_attempted"),
+          "probes_completed": sm.get("probes_completed"),
+          "probes_failed": sm.get("probes_failed"),
+          "phase_durations": sm.get("phase_durations"),
+          "total_duration": sm.get("total_duration"),
+          "traffic_windows": sm.get("success_rate_over_time"),
+          "threads": worker_metric_entry.get("threads"),
+          "rate_limited": bool(sm.get("rate_limiting_detected")),
+          "blocked": bool(sm.get("blocking_detected")),
+        },
+      })
+    return comparison
+
   def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None):
     """Compute pre-aggregated view for frontend from pass reports.
 
@@ -702,6 +898,24 @@ class _ReportMixin:
           finding_timeline[fid]["last_seen"] = pass_nr
           finding_timeline[fid]["pass_count"] += 1
 
+    # Origin-country breakdown for the latest pass: count participating worker
+    # nodes per ISO-2 country (empty country grouped under "UN"/Unknown in the UI).
+    worker_reports = latest.get("worker_reports") or {}
+    country_counter = Counter(
+      (w.get("country") or "UN").upper() for w in worker_reports.values()
+    )
+    country_breakdown = [
+      {"code": code, "count": count}
+      for code, count in sorted(country_counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    # Geographic vantage-point comparison (comparison_mode jobs only): durable
+    # per-node divergence — reachability, open ports, findings, and latency —
+    # including nodes that never reported (fully-timed-out vantage points).
+    node_comparison = None
+    if (job_config or {}).get("comparison_mode"):
+      node_comparison = self._compute_node_comparison(latest, job_config) or None
+
     return UiAggregate(
       total_open_ports=sorted(set(agg.get("open_ports", []))),
       total_services=self._count_services(agg.get("service_info", {})),
@@ -718,9 +932,12 @@ class _ReportMixin:
           "start_port": w["start_port"],
           "end_port": w["end_port"],
           "open_ports": w.get("open_ports", []),
+          "country": (w.get("country") or "").upper(),
         }
-        for addr, w in (latest.get("worker_reports") or {}).items()
+        for addr, w in worker_reports.items()
       ] or None,
+      country_breakdown=country_breakdown or None,
+      node_comparison=node_comparison,
       scan_type=scan_type,
       total_routes_discovered=graybox_stats["total_routes_discovered"],
       total_forms_discovered=graybox_stats["total_forms_discovered"],

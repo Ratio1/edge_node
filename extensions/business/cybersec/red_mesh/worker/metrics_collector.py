@@ -1,6 +1,7 @@
 import time
 import statistics
 
+from ..connection_metrics import RESPONSIVE_CONNECTION_OUTCOMES, detect_connection_signals
 from ..models.shared import ScanMetrics
 
 
@@ -24,8 +25,8 @@ class MetricsCollector:
     self._banner_confirmed = 0
     self._banner_guessed = 0
     self._finding_counts = {}
-    # For success rate over time windows
-    self._connection_log = []  # [(timestamp, success_bool)]
+    # For connection behavior over time windows.
+    self._connection_log = []  # [(timestamp, outcome)]
     # Aborts: fatal safety/policy gate failures that stop the scan.
     # Tracked separately from probe_failed because the abort is the
     # reason the scan stopped, not a per-probe outcome.
@@ -45,7 +46,7 @@ class MetricsCollector:
     self._connection_outcomes[outcome] = self._connection_outcomes.get(outcome, 0) + 1
     if response_time >= 0:
       self._response_times.append(response_time)
-    self._connection_log.append((time.time(), outcome == "connected"))
+    self._connection_log.append((time.time(), outcome))
     self._ports_scanned += 1
 
   def record_port_scan_delay(self, delay: float):
@@ -109,41 +110,40 @@ class MetricsCollector:
   def _compute_success_windows(self, window_size: float = 60.0) -> list | None:
     if not self._connection_log:
       return None
+    events = sorted(self._connection_log, key=lambda entry: entry[0])
+    start_time = self._scan_start if self._scan_start is not None else events[0][0]
+    buckets = {}
+    for timestamp, outcome in events:
+      bucket_index = int((timestamp - start_time) // window_size)
+      counts = buckets.setdefault(bucket_index, {
+        "attempts": 0,
+        "connected": 0,
+        "responsive": 0,
+      })
+      counts["attempts"] += 1
+      counts["connected"] += int(outcome == "connected")
+      counts["responsive"] += int(outcome in RESPONSIVE_CONNECTION_OUTCOMES)
+
     windows = []
-    start_time = self._connection_log[0][0]
-    end_time = self._connection_log[-1][0]
-    t = start_time
-    while t < end_time:
-      w_end = t + window_size
-      entries = [(ts, ok) for ts, ok in self._connection_log if t <= ts < w_end]
-      if entries:
-        rate = sum(1 for _, ok in entries if ok) / len(entries)
-        windows.append({
-          "window_start": round(t - start_time, 1),
-          "window_end": round(w_end - start_time, 1),
-          "success_rate": round(rate, 3),
-        })
-      t = w_end
-    return windows if windows else None
+    for bucket_index, counts in sorted(buckets.items()):
+      attempts = counts["attempts"]
+      window_start = bucket_index * window_size
+      windows.append({
+        "window_start": round(window_start, 1),
+        "window_end": round(window_start + window_size, 1),
+        # Retain the historical connected-only meaning for compatibility.
+        "success_rate": round(counts["connected"] / attempts, 3),
+        "attempts": attempts,
+        "responsive_count": counts["responsive"],
+        "response_rate": round(counts["responsive"] / attempts, 3),
+      })
+    return windows
 
   def _detect_rate_limiting(self) -> bool:
-    windows = self._compute_success_windows()
-    if not windows or len(windows) < 3:
-      return False
-    # Detect: last 2 windows have significantly lower success rate than first 2
-    first = sum(w["success_rate"] for w in windows[:2]) / 2
-    last = sum(w["success_rate"] for w in windows[-2:]) / 2
-    return first > 0.5 and last < first * 0.7
+    return detect_connection_signals(self._compute_success_windows())["rate_limiting_detected"]
 
   def _detect_blocking(self) -> bool:
-    windows = self._compute_success_windows()
-    if not windows or len(windows) < 2:
-      return False
-    # Detect: any window with 0% success rate after a window with >50% success
-    for i in range(1, len(windows)):
-      if windows[i - 1]["success_rate"] > 0.5 and windows[i]["success_rate"] == 0:
-        return True
-    return False
+    return detect_connection_signals(self._compute_success_windows())["blocking_detected"]
 
   def _compute_port_distribution(self) -> dict | None:
     if not self._open_ports:
@@ -178,6 +178,8 @@ class MetricsCollector:
     probes_failed = sum(1 for v in self._probe_results.values() if v == "failed" or v.startswith("failed:"))
 
     banner_total = self._banner_confirmed + self._banner_guessed
+    connection_windows = self._compute_success_windows()
+    connection_signals = detect_connection_signals(connection_windows)
     return ScanMetrics(
       phase_durations=self._compute_phase_durations(),
       total_duration=round(time.time() - self._scan_start, 2) if self._scan_start else 0,
@@ -185,9 +187,9 @@ class MetricsCollector:
       connection_outcomes=outcomes if total_connections > 0 else None,
       response_times=self._compute_stats(self._response_times),
       slow_ports=None,
-      success_rate_over_time=self._compute_success_windows(),
-      rate_limiting_detected=self._detect_rate_limiting(),
-      blocking_detected=self._detect_blocking(),
+      success_rate_over_time=connection_windows,
+      rate_limiting_detected=connection_signals["rate_limiting_detected"],
+      blocking_detected=connection_signals["blocking_detected"],
       coverage=self._compute_coverage(),
       probes_attempted=probes_attempted,
       probes_completed=probes_completed,

@@ -26,7 +26,7 @@ class _InjectionTestBase:
       for payload, needle in payloads:
         try:
           url = f"{base_url}?{param}={payload}"
-          resp = requests.get(url, timeout=3, verify=False)
+          resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
           if check_fn(resp, needle):
             findings.append(finding_factory(param, payload, resp, url))
             break  # Found for this param, next param
@@ -85,7 +85,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         break
       try:
         url = base_url.rstrip("/") + payload_path
-        resp = requests.get(url, timeout=2, verify=False)
+        resp = requests.get(url, timeout=self._target_timeout(2), verify=False)
         if any(n in resp.text for n in unix_needles):
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
@@ -127,7 +127,7 @@ class _WebInjectionMixin(_InjectionTestBase):
       for payload, needles in payloads_qs:
         try:
           url = f"{base_url}?{param}={payload}"
-          resp = requests.get(url, timeout=2, verify=False)
+          resp = requests.get(url, timeout=self._target_timeout(2), verify=False)
           if any(n in resp.text for n in needles):
             findings_list.append(Finding(
               severity=Severity.CRITICAL,
@@ -189,7 +189,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         break
       try:
         url = base_url.rstrip("/") + f"/{payload}"
-        resp = requests.get(url, timeout=3, verify=False)
+        resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
         if needle in resp.text:
           findings_list.append(Finding(
             severity=Severity.HIGH,
@@ -313,9 +313,9 @@ class _WebInjectionMixin(_InjectionTestBase):
           url_false = f"{base_url}?{param}=1 AND 1=2"
           url_base = f"{base_url}?{param}=1"
 
-          resp_base = requests.get(url_base, timeout=3, verify=False)
-          resp_true = requests.get(url_true, timeout=3, verify=False)
-          resp_false = requests.get(url_false, timeout=3, verify=False)
+          resp_base = requests.get(url_base, timeout=self._target_timeout(3), verify=False)
+          resp_true = requests.get(url_true, timeout=self._target_timeout(3), verify=False)
+          resp_false = requests.get(url_false, timeout=self._target_timeout(3), verify=False)
 
           # Baseline should match true, differ from false
           if (resp_base.status_code == resp_true.status_code and
@@ -406,7 +406,7 @@ class _WebInjectionMixin(_InjectionTestBase):
     # (e.g. "49" naturally appears in many pages)
     baseline_text = ""
     try:
-      baseline_resp = requests.get(base_url, timeout=3, verify=False)
+      baseline_resp = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       baseline_text = baseline_resp.text
     except Exception:
       pass
@@ -423,12 +423,12 @@ class _WebInjectionMixin(_InjectionTestBase):
           # For short expected values (e.g. "49"), bracket the payload with
           # two control requests to catch incrementing counters/timestamps
           if len(expected) <= 3:
-            ctrl1 = requests.get(f"{base_url}?{param}=harmless1", timeout=3, verify=False)
+            ctrl1 = requests.get(f"{base_url}?{param}=harmless1", timeout=self._target_timeout(3), verify=False)
           url = f"{base_url}?{param}={quote(payload)}"
-          resp = requests.get(url, timeout=3, verify=False)
+          resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
           if expected in resp.text and payload not in resp.text:
             if len(expected) <= 3:
-              ctrl2 = requests.get(f"{base_url}?{param}=harmless2", timeout=3, verify=False)
+              ctrl2 = requests.get(f"{base_url}?{param}=harmless2", timeout=self._target_timeout(3), verify=False)
               if expected in ctrl1.text or expected in ctrl2.text:
                 continue
             findings_list.append(Finding(
@@ -455,7 +455,7 @@ class _WebInjectionMixin(_InjectionTestBase):
           continue
         try:
           url = base_url.rstrip("/") + "/" + quote(payload)
-          resp = requests.get(url, timeout=3, verify=False)
+          resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
           if expected in resp.text and payload not in resp.text:
             findings_list.append(Finding(
               severity=Severity.CRITICAL,
@@ -531,7 +531,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             "User-Agent": shellshock_payload,
             "Referer": shellshock_payload,
           },
-          timeout=4,
+          timeout=self._target_timeout(4),
           verify=False,
         )
         if marker in resp.text:
@@ -591,7 +591,7 @@ class _WebInjectionMixin(_InjectionTestBase):
       resp = requests.get(
         base_url,
         headers={"User-Agentt": "zerodiumsystem('echo REDMESH_PHP_BACKDOOR');"},
-        timeout=3,
+        timeout=self._target_timeout(3),
         verify=False,
       )
       if "REDMESH_PHP_BACKDOOR" in resp.text:
@@ -626,7 +626,7 @@ class _WebInjectionMixin(_InjectionTestBase):
           test_url,
           data="<?php echo 'REDMESH_PHPCGI_TEST'; ?>",
           headers={"Content-Type": "application/x-www-form-urlencoded"},
-          timeout=3,
+          timeout=self._target_timeout(3),
           verify=False,
         )
         # Guard: auto_prepend_file output appears at the very start of the
@@ -652,7 +652,7 @@ class _WebInjectionMixin(_InjectionTestBase):
     # --- 3. PHP-CGI source disclosure via -s flag ---
     if not findings_list:
       try:
-        resp = requests.get(base_url + "/?%ADs", timeout=3, verify=False)
+        resp = requests.get(base_url + "/?%ADs", timeout=self._target_timeout(3), verify=False)
         if "<code>" in resp.text and "<?php" in resp.text:
           findings_list.append(Finding(
             severity=Severity.HIGH,
@@ -736,7 +736,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         resp = requests.get(
           url,
           headers={"Content-Type": ognl_payload},
-          timeout=5,
+          timeout=self._target_timeout(5),
           verify=False,
         )
         if marker in resp.text:
@@ -764,7 +764,7 @@ class _WebInjectionMixin(_InjectionTestBase):
           resp = requests.get(
             url,
             headers={"Content-Type": "%{1+1}"},
-            timeout=4,
+            timeout=self._target_timeout(4),
             verify=False,
           )
           if resp.status_code == 200 and "ognl" in resp.text.lower():
@@ -858,7 +858,7 @@ class _WebInjectionMixin(_InjectionTestBase):
     for ep in deser_endpoints:
       try:
         url = base_url.rstrip("/") + ep["path"]
-        resp = requests.get(url, timeout=4, verify=False)
+        resp = requests.get(url, timeout=self._target_timeout(4), verify=False)
         if ep["check"](resp):
           title = f"Java deserialization endpoint: {ep['path']}"
           if ep["cve"]:
@@ -930,7 +930,7 @@ class _WebInjectionMixin(_InjectionTestBase):
     for path, desc in actuator_paths:
       try:
         url = base_url.rstrip("/") + path
-        resp = requests.get(url, timeout=3, verify=False)
+        resp = requests.get(url, timeout=self._target_timeout(3), verify=False)
         if resp.status_code == 200:
           # Validate it's actually an actuator/Spring endpoint
           ct = resp.headers.get("Content-Type", "").lower()
@@ -963,7 +963,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         base_url + "/functionRouter",
         data="test",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=5,
+        timeout=self._target_timeout(5),
         verify=False,
       )
       # Now send with SpEL header
@@ -975,7 +975,7 @@ class _WebInjectionMixin(_InjectionTestBase):
           "spring.cloud.function.routing-expression":
             f'T(java.lang.Runtime).getRuntime().exec("echo {marker}")',
         },
-        timeout=5,
+        timeout=self._target_timeout(5),
         verify=False,
       )
       spel_detected = False
@@ -1034,12 +1034,12 @@ class _WebInjectionMixin(_InjectionTestBase):
       # Control: send a bogus class path that no framework would bind
       resp_control = requests.get(
         base_url + "/?class.INVALID_RM_CTRL.x=1",
-        timeout=3,
+        timeout=self._target_timeout(3),
         verify=False,
       )
       resp_cl = requests.get(
         base_url + "/?class.module.classLoader.DefaultAssertionStatus=true",
-        timeout=3,
+        timeout=self._target_timeout(3),
         verify=False,
       )
       # If both return 200 with similar body length, server MAY ignore params.
@@ -1050,12 +1050,12 @@ class _WebInjectionMixin(_InjectionTestBase):
         # Secondary check: URLs[0] differentiates Spring from catch-all servers
         resp_urls = requests.get(
           base_url + "/?class.module.classLoader.URLs%5B0%5D=0",
-          timeout=3,
+          timeout=self._target_timeout(3),
           verify=False,
         )
         resp_urls_ctrl = requests.get(
           base_url + "/?class.INVALID_RM_CTRL.URLs%5B0%5D=0",
-          timeout=3,
+          timeout=self._target_timeout(3),
           verify=False,
         )
         if (resp_urls.status_code in (400, 500) and
@@ -1080,7 +1080,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         # proceed with URLs[0] check
         resp2 = requests.get(
           base_url + "/?class.module.classLoader.URLs%5B0%5D=0",
-          timeout=3,
+          timeout=self._target_timeout(3),
           verify=False,
         )
         if resp2.status_code == 200:
@@ -1169,8 +1169,8 @@ class _WebInjectionMixin(_InjectionTestBase):
       try:
         url1 = f"{base_url.rstrip('/')}{path_prefix}1"
         url2 = f"{base_url.rstrip('/')}{path_prefix}2"
-        resp1 = requests.get(url1, timeout=3, verify=False)
-        resp2 = requests.get(url2, timeout=3, verify=False)
+        resp1 = requests.get(url1, timeout=self._target_timeout(3), verify=False)
+        resp2 = requests.get(url2, timeout=self._target_timeout(3), verify=False)
 
         if resp1.status_code != 200 or resp2.status_code != 200:
           continue
