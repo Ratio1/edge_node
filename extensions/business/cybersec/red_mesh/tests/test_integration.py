@@ -2657,7 +2657,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     self.assertNotIn("probe_breakdown", d)
 
   def test_merge_worker_metrics(self):
-    """_merge_worker_metrics sums outcomes, coverage, findings; maxes duration; ORs flags."""
+    """_merge_worker_metrics sums outcomes, coverage, findings, and recomputes flags."""
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     m1 = {
@@ -2734,8 +2734,8 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     self.assertEqual(rt["p99"], 0.7)    # max of per-thread p99
     # Max duration
     self.assertEqual(merged["total_duration"], 75.0)
-    # OR flags
-    self.assertTrue(merged["rate_limiting_detected"])
+    # Flags without count-bearing windows are not treated as verified evidence.
+    self.assertFalse(merged["rate_limiting_detected"])
     self.assertFalse(merged["blocking_detected"])
     # Open port details: deduplicated by port, sorted
     opd = merged["open_port_details"]
@@ -2818,8 +2818,8 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     # Probes summed
     self.assertEqual(sm["probes_attempted"], 4)
     self.assertEqual(sm["probes_completed"], 3)
-    # OR flags
-    self.assertTrue(sm["rate_limiting_detected"])
+    # Flags are recomputed from windows, not ORed from thread booleans.
+    self.assertFalse(sm["rate_limiting_detected"])
 
     live_writes = [
       call.kwargs["value"]
@@ -2906,6 +2906,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     plugin.r1fs.add_json.side_effect = capture_add_json
 
     plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 25, "breakdown": {}}, []))
+    plugin._summarize_worker_findings = MagicMock(return_value=(0, {}, []))
     plugin._get_job_config = MagicMock(return_value={})
     plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
     plugin._build_job_archive = MagicMock()
@@ -2932,6 +2933,6 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     self.assertEqual(sm["probes_attempted"], 6)
     self.assertEqual(sm["probes_completed"], 5)
     self.assertEqual(sm["probes_failed"], 1)
-    # OR flags
+    # Flags are recomputed from windows, not ORed from node booleans.
     self.assertFalse(sm["rate_limiting_detected"])
-    self.assertTrue(sm["blocking_detected"])
+    self.assertFalse(sm["blocking_detected"])

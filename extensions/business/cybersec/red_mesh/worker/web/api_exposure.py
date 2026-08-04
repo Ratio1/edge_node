@@ -45,7 +45,7 @@ class _WebApiExposureMixin:
     graphql_url = base_url.rstrip("/") + "/graphql"
     try:
       payload = {"query": "{__schema{types{name}}}"}
-      resp = requests.post(graphql_url, json=payload, timeout=5, verify=False)
+      resp = requests.post(graphql_url, json=payload, timeout=self._target_timeout(5), verify=False)
       if resp.status_code == 200 and "__schema" in resp.text:
         findings_list.append(Finding(
           severity=Severity.MEDIUM,
@@ -112,7 +112,7 @@ class _WebApiExposureMixin:
     try:
       for path, provider, extra_headers in metadata_paths:
         url = base_url.rstrip("/") + path
-        resp = requests.get(url, timeout=3, verify=False, headers=extra_headers)
+        resp = requests.get(url, timeout=self._target_timeout(3), verify=False, headers=extra_headers)
         if resp.status_code == 200:
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
@@ -187,7 +187,7 @@ class _WebApiExposureMixin:
             break
           try:
             url = f"{base_url.rstrip('/')}{path}?{param}={ssrf_payload}"
-            resp = requests.get(url, timeout=4, verify=False)
+            resp = requests.get(url, timeout=self._target_timeout(4), verify=False)
             body_lower = resp.text.lower()
             if resp.status_code == 200 and any(m in body_lower for m in self._SSRF_MARKERS):
               findings_list.append(Finding(
@@ -251,7 +251,7 @@ class _WebApiExposureMixin:
         url = base_url.rstrip("/") + path
         resp = requests.get(
           url,
-          timeout=3,
+          timeout=self._target_timeout(3),
           verify=False,
           headers={"Authorization": "Bearer invalid-token"},
         )

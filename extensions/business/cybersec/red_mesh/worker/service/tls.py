@@ -111,7 +111,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
       ctx.check_hostname = False
       ctx.verify_mode = ssl.CERT_NONE
-      with socket.create_connection((target, port), timeout=3) as sock:
+      with socket.create_connection((target, port), timeout=self._target_timeout(3)) as sock:
         with ctx.wrap_socket(sock, server_hostname=target) as ssock:
           proto = ssock.version()
           cipher_info = ssock.cipher()
@@ -157,7 +157,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     findings = []
     try:
       ctx = ssl.create_default_context()
-      with socket.create_connection((target, port), timeout=3) as sock:
+      with socket.create_connection((target, port), timeout=self._target_timeout(3)) as sock:
         with ctx.wrap_socket(sock, server_hostname=target) as ssock:
           cert = ssock.getpeercert()
           subj = dict(x[0] for x in cert.get("subject", ()))
@@ -353,7 +353,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       ctx.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
 
       raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      raw_sock.settimeout(3)
+      raw_sock.settimeout(self._target_timeout(3))
       raw_sock.connect((target, port))
       tls_sock = ctx.wrap_socket(raw_sock, server_hostname=target)
 
@@ -393,7 +393,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       try:
         raw_after = tls_sock.unwrap()
         raw_after.sendall(tls_record)
-        raw_after.settimeout(3)
+        raw_after.settimeout(self._target_timeout(3))
         response = raw_after.recv(65536)
         raw_after.close()
       except (ssl.SSLError, OSError):
@@ -443,7 +443,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     """
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(5)
+      sock.settimeout(self._target_timeout(5))
       sock.connect((target, port))
 
       # Minimal TLS 1.0 ClientHello with heartbeat extension
@@ -506,7 +506,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       sock.sendall(hb_record)
 
       # Read response
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       try:
         response = sock.recv(65536)
       except (socket.timeout, OSError):
@@ -548,7 +548,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       ctx.maximum_version = ssl.TLSVersion.SSLv3
       ctx.minimum_version = ssl.TLSVersion.SSLv3
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       tls_sock = ctx.wrap_socket(sock, server_hostname=target)
       negotiated = tls_sock.version()
@@ -576,7 +576,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       ctx.maximum_version = ssl.TLSVersion.TLSv1
       ctx.minimum_version = ssl.TLSVersion.TLSv1
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       tls_sock = ctx.wrap_socket(sock, server_hostname=target)
       negotiated = tls_sock.version()
@@ -660,7 +660,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
       sock.connect((target, port))
       raw_bytes = sock.recv(512)
       sock.close()
