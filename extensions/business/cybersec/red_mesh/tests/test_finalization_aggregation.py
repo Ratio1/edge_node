@@ -468,6 +468,21 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
       },
     }
 
+  def test_compact_fallback_signature_uses_cross_client_canonical_json(self):
+    report = {
+      "findings": [{
+        "title": "TLS issue", "severity": "HIGH", "port": 443,
+        "evidence": {"z": True, "a": "é", "_source_worker_id": "thread-a"},
+        "_source_node_addr": "0xUS",
+      }],
+    }
+
+    _, _, signatures = _AggHost()._summarize_worker_findings(report)
+
+    self.assertEqual(signatures, [
+      "sha256:f5629a722dcbdd8bece9e8647efcc972869648374d1dab7b16aab2a4740464ca",
+    ])
+
   def test_country_breakdown_and_per_worker_country(self):
     host = _AggHost()
     ui = host._compute_ui_aggregate(

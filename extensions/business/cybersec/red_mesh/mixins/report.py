@@ -242,7 +242,26 @@ def _compact_finding_signature(finding):
     explicit = finding.get("finding_signature") or finding.get("finding_id")
     if explicit:
       return str(explicit)
-  stable = _finding_dedup_key(finding).encode("utf-8", errors="replace")
+
+  def normalize(value):
+    if isinstance(value, dict):
+      return {
+        key: normalize(item)
+        for key, item in value.items()
+        if key not in _DEDUP_EXCLUDE_FIELDS
+      }
+    if isinstance(value, (list, tuple)):
+      return [normalize(item) for item in value]
+    return value
+
+  try:
+    canonical = _json.dumps(
+      normalize(finding), sort_keys=True, default=str,
+      ensure_ascii=False, separators=(",", ":"),
+    )
+  except (TypeError, ValueError):
+    canonical = repr(normalize(finding))
+  stable = canonical.encode("utf-8", errors="replace")
   return "sha256:" + _hashlib.sha256(stable).hexdigest()
 
 
