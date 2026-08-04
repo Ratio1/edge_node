@@ -706,6 +706,7 @@ class DeeployManagerApiPlugin(
     dict
         The response dictionary
     """
+    staging_state = None
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
@@ -778,9 +779,10 @@ class DeeployManagerApiPlugin(
       deeploy_specs_for_update = None
       deeploy_specs_payload = None
       prepared_create_deploy_plan = None
+      prepared_pipeline_configs = None
       skip_create_response_key_reset = False
-      previous_pipeline_cid = None
       update_context_from_persisted_pipeline = False
+      delete_existing_after_stage = False
       if is_create:
         is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
         if not is_valid:
@@ -869,12 +871,6 @@ class DeeployManagerApiPlugin(
         inputs.target_nodes = deployment_targets
         inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
         inputs.target_nodes_count = len(deployment_targets)
-        if job_id is not None:
-          try:
-            previous_pipeline_cid = self._get_pipeline_from_cstore(job_id)
-          except Exception as exc:
-            self.Pd(f"Unable to read previous pipeline CID for job {job_id}: {exc}", color='y')
-
         if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
           msg = (
             f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
@@ -959,7 +955,6 @@ class DeeployManagerApiPlugin(
           )
           skip_create_response_key_reset = True
 
-        # All validations and response-key resets passed; remove the running job and redeploy.
         if update_context_from_persisted_pipeline:
           # TODO: stop stale offline old-node pipelines through ChainDist reconciliation when they return.
           self.Pd(
@@ -968,17 +963,10 @@ class DeeployManagerApiPlugin(
             color='y',
           )
         else:
-          self.delete_pipeline_from_nodes(
-            app_id=app_id,
-            job_id=job_id,
-            owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-            discovered_instances=discovered_plugin_instances,
-          )
-
+          delete_existing_after_stage = True
         deployment_nodes = list(validated_nodes)
         confirmation_nodes = list(validated_nodes)
         nodes_changed = set(current_nodes) != set(deployment_nodes)
-        discovered_plugin_instances = []
 
       inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_nodes
       inputs.target_nodes = deployment_nodes
@@ -1002,6 +990,52 @@ class DeeployManagerApiPlugin(
           pipeline_params=pipeline_params,
         )
 
+      if prepared_create_deploy_plan is None:
+        prepared_create_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+          nodes=deployment_nodes,
+          inputs=inputs,
+          app_id=app_id,
+          job_app_type=job_app_type,
+          dct_deeploy_specs=deeploy_specs_payload,
+        )
+      prepared_pipeline_configs = self._build_create_pipeline_configs(
+        inputs=inputs,
+        app_id=app_id,
+        app_alias=app_alias,
+        app_type=app_type,
+        owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+        prepared_deploy_plan=prepared_create_deploy_plan,
+      )
+      prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+      prepared_pipeline_configs, complete_secret_bundle = (
+        self._redact_pipeline_configs_and_build_secret_bundle(
+          job_id=job_id,
+          pipeline_configs=prepared_pipeline_configs,
+          prior_bundle=prior_bundle,
+        )
+      )
+      node_plugins_by_addr = prepared_create_deploy_plan.get("node_plugins_by_addr", {})
+      for node, pipeline_config in prepared_pipeline_configs.items():
+        if node in node_plugins_by_addr:
+          node_plugins_by_addr[node] = self.deepcopy(
+            pipeline_config.get(self.ct.CONFIG_STREAM.K_PLUGINS, [])
+          )
+      pipeline_to_stage = next(iter(prepared_pipeline_configs.values()))
+      staging_state = self.stage_job_pipeline_and_secrets(
+        pipeline=pipeline_to_stage,
+        job_id=job_id,
+        secret_bundle=complete_secret_bundle,
+      )
+
+      if delete_existing_after_stage:
+        self.delete_pipeline_from_nodes(
+          app_id=app_id,
+          job_id=job_id,
+          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+          discovered_instances=discovered_plugin_instances,
+        )
+        discovered_plugin_instances = []
+
       dct_status, str_status, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         inputs=inputs,
@@ -1013,21 +1047,14 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances=discovered_plugin_instances,
         dct_deeploy_specs_create=deeploy_specs_payload,
         prepared_create_deploy_plan=prepared_create_deploy_plan,
+        prepared_pipeline_configs=prepared_pipeline_configs,
         skip_create_response_key_reset=skip_create_response_key_reset,
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
       )
-      persistence_state = self._build_pipeline_persistence_state(
-        job_id=job_id,
-        pipeline=pipeline_to_persist,
-        app_id=app_id,
-        previous_cid=previous_pipeline_cid,
-        delete_previous=not is_create,
-      )
-
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
-        dct_request = self.deepcopy(request)
+        dct_request = self._redact_deeploy_dauth_secrets_for_response(request)
         dct_request.pop(DEEPLOY_KEYS.APP_PARAMS, None)
       else:
         # Build simplified request summary (no app_params - data is in plugins array now)
@@ -1046,7 +1073,8 @@ class DeeployManagerApiPlugin(
         #   dct_request[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
       if async_mode:
         if len(response_keys) == 0:
-          self._queue_pipeline_persistence(persistence_state)
+          self.commit_staged_job_pipeline_and_secrets(staging_state)
+          staging_state = None
           if nodes_changed and not is_confirmable_job:
             eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
             eth_nodes = sorted(eth_nodes)
@@ -1088,12 +1116,9 @@ class DeeployManagerApiPlugin(
             'is_confirmable_job': is_confirmable_job,
             'job_id': job_id,
           },
-          'persistence': persistence_state,
+          'staging': staging_state,
         }
         return {'__pending__': pending_state}
-
-      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-        self._queue_pipeline_persistence(persistence_state)
 
       if nodes_changed and str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
         if (dct_status is not None and is_confirmable_job and len(confirmation_nodes) == len(dct_status)) or not is_confirmable_job:
@@ -1111,6 +1136,12 @@ class DeeployManagerApiPlugin(
         #endif
       #endif
 
+      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+        self.commit_staged_job_pipeline_and_secrets(staging_state)
+      else:
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+      staging_state = None
+
       result = {
         DEEPLOY_KEYS.STATUS: str_status,
         DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
@@ -1122,6 +1153,8 @@ class DeeployManagerApiPlugin(
       if self.cfg_deeploy_verbose > 1:
         self.P(f"Request Result: {result}")
     except Exception as e:
+      if staging_state is not None:
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
       result = self.__handle_error(e, request)
     #endtry
     
@@ -1177,6 +1210,7 @@ class DeeployManagerApiPlugin(
     if now is None:
       now = self.time()
     if (now - pending['start_time']) > pending['timeout']:
+      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
       if pending.get('kind') == 'scale_up':
         result = {
           DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
@@ -1239,7 +1273,9 @@ class DeeployManagerApiPlugin(
     # endif nodes changed and success or delivered
 
     if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-      self._queue_pipeline_persistence(pending.get('persistence'))
+      self.commit_staged_job_pipeline_and_secrets(pending.get('staging'))
+    else:
+      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
 
     return {
       DEEPLOY_KEYS.STATUS: str_status,
@@ -1281,6 +1317,10 @@ class DeeployManagerApiPlugin(
       job_id=job_id,
       is_confirmable_job=is_confirmable_job,
     )
+    if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+      self.commit_staged_job_pipeline_and_secrets(pending.get('staging'))
+    else:
+      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
     return {
       DEEPLOY_KEYS.STATUS: str_status,
       DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
@@ -1631,6 +1671,7 @@ class DeeployManagerApiPlugin(
     dict
         A dictionary with the result of the operation
     """
+    staging_state = None
     try:
       self.__ensure_eth_balance()
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="scale up workers")
@@ -1665,7 +1706,7 @@ class DeeployManagerApiPlugin(
       update_nodes = list(running_apps_for_job.keys())
       new_nodes = self._check_nodes_availability(inputs)
       
-      dct_status, str_status, response_keys = self.scale_up_job(
+      dct_status, str_status, response_keys, staging_state = self.scale_up_job(
         new_nodes=new_nodes,
         update_nodes=update_nodes,
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
@@ -1680,6 +1721,8 @@ class DeeployManagerApiPlugin(
       else:
         dct_request = None
       if len(response_keys) == 0:
+        self.commit_staged_job_pipeline_and_secrets(staging_state)
+        staging_state = None
         if not is_confirmable_job:
           nodes = list(set(update_nodes + new_nodes))
           self.Pd(f"Nodes to confirm (non-confirmable job): {self.json_dumps(nodes, indent=2)}")
@@ -1713,10 +1756,13 @@ class DeeployManagerApiPlugin(
         'is_confirmable_job': is_confirmable_job,
         'request': dct_request,
         'auth': auth_result,
+        'staging': staging_state,
       }
       return self._register_pending_deploy_request(pending_state)
 
     except Exception as e:
+      if staging_state is not None:
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
       result = self.__handle_error(e, request)
     #endtry
     

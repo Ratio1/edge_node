@@ -1,6 +1,15 @@
+from extensions.business.dauth.dauth_registry import (
+  DAUTH_SECRET_PIPELINE_CID_KEY,
+  dauth_registry_write_kwargs,
+  get_dauth_registry_internal_peers,
+  pipeline_registry_write_kwargs,
+)
+
 NONCE = 42
 R1FS_FILENAME = 'data.json'
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
+DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
+
 
 class _DeeployJobMixin:
   """
@@ -114,12 +123,162 @@ class _DeeployJobMixin:
 
       pipeline_key = str(job_id)
 
-      result = self.chainstore_hset(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=pipeline_key, value=cid)
+      result = self.chainstore_hset(
+        hkey=DEEPLOY_JOBS_CSTORE_HKEY,
+        key=pipeline_key,
+        value=cid,
+        **pipeline_registry_write_kwargs(self),
+      )
     except Exception as e:
       self.P(f"Error saving pipeline for job {job_id} to CSTORE: {e}", color='r')
       return False
 
     return result
+
+  def _load_dauth_job_secret_bundle(self, job_id):
+    return self.chainstore_hget(
+      hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+      key=str(job_id),
+    )
+
+  def _write_dauth_job_secret_bundle(self, job_id, bundle, write_kwargs=None):
+    if write_kwargs is None:
+      write_kwargs = dauth_registry_write_kwargs(self)
+    return self.chainstore_hset(
+      hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+      key=str(job_id),
+      value=bundle,
+      **write_kwargs,
+    )
+
+  def _write_job_pipeline_cid(self, job_id, cid, write_kwargs=None):
+    if write_kwargs is None:
+      write_kwargs = pipeline_registry_write_kwargs(self)
+    return self.chainstore_hset(
+      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
+      key=str(job_id),
+      value=cid,
+      **write_kwargs,
+    )
+
+  def stage_job_pipeline_and_secrets(self, pipeline, job_id, secret_bundle):
+    """Stage redacted pipeline metadata and its complete dAuth bundle."""
+    if job_id in [None, ""]:
+      raise ValueError("Cannot stage Deeploy metadata without job_id.")
+    if not isinstance(pipeline, dict):
+      raise ValueError("Cannot stage invalid Deeploy pipeline metadata.")
+    if not isinstance(secret_bundle, dict):
+      raise ValueError("Cannot stage invalid dAuth secret bundle.")
+
+    job_id = str(job_id)
+    # Resolve both routes before creating an R1FS object, so a missing registry
+    # cannot leave an unreferenced staged CID behind.
+    registry_peers = get_dauth_registry_internal_peers(self)
+    pipeline_write_kwargs = pipeline_registry_write_kwargs(self, peers=registry_peers)
+    secret_write_kwargs = dauth_registry_write_kwargs(self, peers=registry_peers)
+    prior_cid = self._get_pipeline_from_cstore(job_id)
+    prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+    sanitized_pipeline = self.extract_invariable_data_from_pipeline(pipeline)
+    sorted_pipeline = self._recursively_sort_pipeline_data(sanitized_pipeline)
+    staged_cid = self._save_pipeline_to_r1fs(sorted_pipeline)
+    if not staged_cid:
+      raise ValueError(f"Failed to stage pipeline metadata for job {job_id} in R1FS.")
+
+    bound_secret_bundle = self.deepcopy(secret_bundle)
+    bound_secret_bundle[DAUTH_SECRET_PIPELINE_CID_KEY] = staged_cid
+    state = {
+      "job_id": job_id,
+      "prior_cid": prior_cid,
+      "prior_bundle": self.deepcopy(prior_bundle),
+      "staged_cid": staged_cid,
+      "staged_bundle": self.deepcopy(bound_secret_bundle),
+      "pipeline_staged": False,
+      "bundle_staged": False,
+      "pipeline_write_kwargs": pipeline_write_kwargs,
+      "secret_write_kwargs": secret_write_kwargs,
+    }
+    try:
+      if not self._write_dauth_job_secret_bundle(
+        job_id,
+        self.deepcopy(bound_secret_bundle),
+        write_kwargs=secret_write_kwargs,
+      ):
+        raise ValueError(f"Failed to stage dAuth secrets for job {job_id}.")
+      state["bundle_staged"] = True
+      if not self._write_job_pipeline_cid(
+        job_id,
+        staged_cid,
+        write_kwargs=pipeline_write_kwargs,
+      ):
+        raise ValueError(f"Failed to stage pipeline CID for job {job_id}.")
+      state["pipeline_staged"] = True
+    except Exception:
+      self.rollback_staged_job_pipeline_and_secrets(state)
+      raise
+    return state
+
+  def commit_staged_job_pipeline_and_secrets(self, state):
+    """Commit a staged transaction by removing its superseded R1FS object."""
+    if not isinstance(state, dict):
+      return False
+    staged_cid = state.get("staged_cid")
+    try:
+      current_cid = self._get_pipeline_from_cstore(state.get("job_id"))
+      current_bundle = self._load_dauth_job_secret_bundle(state.get("job_id"))
+    except Exception as exc:
+      self.Pd(f"Unable to verify staged pipeline commit: {exc}", color='y')
+      return False
+    if (
+      current_cid != staged_cid
+      or current_bundle != state.get("staged_bundle")
+    ):
+      return False
+    prior_cid = state.get("prior_cid")
+    if prior_cid and prior_cid != staged_cid:
+      self._delete_pipeline_cid_from_r1fs(prior_cid)
+    return True
+
+  def rollback_staged_job_pipeline_and_secrets(self, state):
+    """Restore matching staged state without disturbing a newer deployment."""
+    if not isinstance(state, dict):
+      return False
+    job_id = state.get("job_id")
+    staged_cid = state.get("staged_cid")
+    restored = False
+    try:
+      current_cid = self._get_pipeline_from_cstore(job_id)
+      current_bundle = self._load_dauth_job_secret_bundle(job_id)
+      expected_cid = (
+        staged_cid if state.get("pipeline_staged") else state.get("prior_cid")
+      )
+      expected_bundle = (
+        state.get("staged_bundle") if state.get("bundle_staged")
+        else state.get("prior_bundle")
+      )
+      if current_cid == expected_cid and current_bundle == expected_bundle:
+        try:
+          pipeline_ok = True
+          if state.get("pipeline_staged"):
+            pipeline_ok = self._write_job_pipeline_cid(
+              job_id,
+              state.get("prior_cid"),
+              write_kwargs=state.get("pipeline_write_kwargs"),
+            )
+          bundle_ok = True
+          if state.get("bundle_staged"):
+            bundle_ok = self._write_dauth_job_secret_bundle(
+              job_id,
+              self.deepcopy(state.get("prior_bundle")),
+              write_kwargs=state.get("secret_write_kwargs"),
+            )
+          restored = bool(pipeline_ok and bundle_ok)
+          if restored:
+            self._delete_pipeline_cid_from_r1fs(staged_cid)
+        except Exception as exc:
+          self.Pd(f"Unable to restore staged Deeploy metadata for job {job_id}: {exc}", color='y')
+    except Exception as exc:
+      self.Pd(f"Unable to verify staged Deeploy rollback for job {job_id}: {exc}", color='y')
+    return restored
 
   def list_all_deployed_jobs_from_cstore(self):
     """

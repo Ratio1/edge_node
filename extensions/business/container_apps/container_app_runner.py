@@ -2036,7 +2036,6 @@ class ContainerAppRunnerPlugin(
     try:
       host_port = self._get_host_port_for_container_port(container_port)
       self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...")
-      self.Pd(f"  Command: {' '.join(command)}")
 
       # Use list-based subprocess to prevent shell injection
       popen_kwargs = dict(
@@ -2365,13 +2364,14 @@ class ContainerAppRunnerPlugin(
     log_str += f"Container data:\n"
     log_str += f"  Image: {self.cfg_image}\n"
     log_str += f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}\n"
-    log_str += f"  Env: {self.json_dumps(self.env) if self.env else 'None'}\n"
+    env_names = sorted(self.env) if self.env else []
+    log_str += f"  Env vars: {len(env_names)} configured\n"
     log_str += f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}\n"
     log_str += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}\n"
     log_str += f"  Restart policy: {self.cfg_restart_policy}\n"
     log_str += f"  Pull policy: {self.cfg_image_pull_policy}\n"
     log_str += f"  Entrypoint: {self._entrypoint if self._entrypoint else 'Image default'}\n"
-    log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}\n"
+    log_str += f"  Start command: {'configured' if self._start_command else 'Image default'}\n"
     log_str += f"  User: {self.cfg_container_user if self.cfg_container_user else 'Image default'}\n"
 
     self.P(log_str)
@@ -2649,7 +2649,7 @@ class ContainerAppRunnerPlugin(
           self._record_restart_failure()
         return
 
-      self.P(f"Running container exec command: {shell_cmd}")
+      self.P("Running configured container exec command")
       exec_kwargs = dict(
         stream=True,
         detach=False,

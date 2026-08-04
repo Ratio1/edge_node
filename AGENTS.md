@@ -696,6 +696,15 @@ Entry format:
 - Verification: `python3 -m unittest extensions.serving.test_th_hf_model_base extensions.serving.test_th_text_classifier extensions.serving.test_th_privacy_filter extensions.business.edge_inference_api.test_text_classifier_inference_api extensions.business.edge_inference_api.test_privacy_filter_inference_api`; `python3 -m py_compile extensions/serving/default_inference/nlp/th_hf_model_base.py extensions/business/edge_inference_api/text_classifier_inference_api.py`; required serving gate `python3 -m unittest extensions.serving.model_testing.test_llm_servings` currently fails at import with `ImportError: cannot import name 'Logger' from 'naeural_core'`.
 - Links: `extensions/serving/default_inference/nlp/th_hf_model_base.py`, `extensions/business/edge_inference_api/text_classifier_inference_api.py`, `extensions/serving/test_th_hf_model_base.py`
 
+- ID: `ML-20260716-001`
+- Timestamp: `2026-07-16T15:06:19Z`
+- Type: `change`
+- Summary: Deeploy now stages redacted R1FS authorization metadata and complete dAuth secret bundles before worker dispatch.
+- Criticality: Cross-cutting security and deployment transaction change affecting Deeploy create, replacement update, scale-up, dAuth replication, rollback, and worker secret authorization.
+- Details: Exact pipeline command metadata is built before dispatch, mandatory secrets are replaced with the shared `__R1_DAUTH_SECRET__` marker, unchanged placeholders are reconstructed from the prior same-path bundle, and unresolved paths fail closed. Pipeline metadata is replicated to normal peers plus registry-selected dAuth peers; secret bundles target only dAuth peers and are bound to the exact R1FS CID so interleaved writes cannot return mixed generations. Structurally complete legacy bundles are CID-bound lazily after a pointer recheck. R1FS is the scale-up source of truth and persisted offline target nodes survive scale-up. Successful deployments remove the superseded CID, while failures and timeouts restore the prior pointer and bundle only if both staged values are still current. Container platform logs no longer render full environment dictionaries, tunnel-token commands, configured start commands, dynamic secret values, or exec shell text.
+- Verification: `python -m unittest discover -s extensions/business/deeploy/tests -p 'test_*.py'` (215 passed); focused dAuth/staging/log tests (18 passed); focused cross-surface tests (75 passed). Full container-app discovery has three documented local-environment failures unrelated to this change.
+- Links: `extensions/business/deeploy/deeploy_manager_api.py`, `extensions/business/deeploy/deeploy_job_mixin.py`, `extensions/business/deeploy/deeploy_mixin.py`, `extensions/business/dauth/dauth_registry.py`, `extensions/business/container_apps/container_app_runner.py`
+
 - ID: `ML-20260723-001`
 - Timestamp: `2026-07-23T13:45:20Z`
 - Type: `change`

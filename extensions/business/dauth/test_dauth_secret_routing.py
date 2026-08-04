@@ -26,6 +26,11 @@ class _RegistryBCStub:
     return None
 
 
+class _ProtocolOracleBCStub:
+  def get_eth_oracles(self):
+    return ["0xOracleA", "0xOracleB"]
+
+
 class _DauthStub(_DauthMixin):
   def __init__(self):
     self._dauth_registry_internal_peers = ["dauth-a", "dauth-b"]
@@ -99,6 +104,14 @@ class DauthSecretRoutingTests(unittest.TestCase):
       )
 
     self.assertEqual(plugin.writes, [])
+
+  def test_all_protocol_oracles_remain_authorized_writers(self):
+    plugin = _DauthStub()
+    plugin.bc = _ProtocolOracleBCStub()
+
+    self.assertTrue(plugin._is_protocol_oracle_eth("0xoraclea"))
+    self.assertTrue(plugin._is_protocol_oracle_eth("0xOracleB"))
+    self.assertFalse(plugin._is_protocol_oracle_eth("0xNotOracle"))
 
 
 if __name__ == "__main__":
