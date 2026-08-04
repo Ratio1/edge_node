@@ -403,6 +403,7 @@ def maybe_finalize_pass(owner):
           country=(report.get("country_code") or "").upper(),
           finding_counts=finding_counts,
           finding_signatures=finding_signatures,
+          response_evidence=report.get("response_evidence"),
         ).to_dict()
 
       aggregated_report_cid = None

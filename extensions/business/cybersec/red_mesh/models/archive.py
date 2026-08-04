@@ -278,6 +278,7 @@ class WorkerReportMeta:
   country: str = ""                 # worker node's ISO-2 country (from location_data); "" when unknown
   finding_counts: dict = None       # compact raw record counts by severity
   finding_signatures: list = None   # unique raw finding-type signatures
+  response_evidence: dict = None    # per-vantage target response fingerprint (comparison mode)
 
   def to_dict(self) -> dict:
     d = asdict(self)
@@ -298,6 +299,7 @@ class WorkerReportMeta:
       country=d.get("country", ""),
       finding_counts=d.get("finding_counts"),
       finding_signatures=d.get("finding_signatures"),
+      response_evidence=d.get("response_evidence"),
     )
 
 

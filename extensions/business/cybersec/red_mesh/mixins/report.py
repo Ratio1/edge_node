@@ -821,6 +821,7 @@ class _ReportMixin:
         "nr_findings": wr.get("nr_findings", len(findings_by_node.get(addr, []))),
         "finding_counts": wr.get("finding_counts"),
         "finding_signatures": wr.get("finding_signatures"),
+        "response_evidence": wr.get("response_evidence"),
         "findings": findings_by_node.get(addr, []),
         "metrics": {
           "connected": outcomes.get("connected", 0),

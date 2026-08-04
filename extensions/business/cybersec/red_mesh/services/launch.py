@@ -34,6 +34,9 @@ def _launch_network_jobs(
   scanner_identity = job_config.get("scanner_identity", owner.cfg_scanner_identity)
   scanner_user_agent = job_config.get("scanner_user_agent", owner.cfg_scanner_user_agent)
   timeout_profile = job_config.get("timeout_profile")
+  # The comparison tier is node-wide evidence, not per-thread work: it goes to
+  # a single worker so the tier is probed exactly once from this vantage.
+  comparison_ports = job_config.get("comparison_ports") or []
   workers_from_spec = job_config.get("nr_local_workers")
   if nr_local_workers_override is not None:
     workers_requested = nr_local_workers_override
@@ -98,6 +101,7 @@ def _launch_network_jobs(
         scanner_identity=scanner_identity,
         scanner_user_agent=scanner_user_agent,
         timeout_profile=timeout_profile,
+        comparison_ports=comparison_ports if index == 0 else None,
       )
       batch_job.start()
       local_jobs[batch_job.local_worker_id] = batch_job
