@@ -1,126 +1,87 @@
 # EdgeGuard Playground API Notes
 
-## Runtime Shape
+## Runtime ownership
 
-The playground uses edge-node runtime pieces plus the Next.js server route as the
-generation orchestrator:
+`EDGEGUARD_API` is the complete EdgeGuard workflow boundary. It owns model selection and dispatch,
+prompt construction, Cypher validation and correction attempts, Neo4j connection selection and
+bounded execution, graph/evidence construction, explanation inference, deterministic validation,
+coverage, and sanitized diagnostics.
 
-- `LLM_INFERENCE_API` finetuned worker for the private Ratio1 EdgeGuard v0.10 GGUF
-- `LLM_INFERENCE_API` base worker for the public Qwen3 4B Instruct GGUF
-- `LLM_INFERENCE_API` worker for the public CyberSecQwen 4B GGUF
-- `EDGEGUARD_API` as the UI-facing safety facade for health, model catalog, prompt contract
-  metadata, deterministic `/check_cypher`, graph-explanation plan preparation, evidence-packet
-  construction/redaction, prompting, and explanation validation
-- `WORKER_APP_RUNNER` for the Next.js UI repo
+The authenticated Next.js application owns only authentication, input collection, local presentation
+state/history, API transport, and rendering. It must not connect to Neo4j, address model workers,
+construct prompts, poll inference workers, or rebuild/validate graph explanation evidence.
 
-There is no `EDGEGUARD_LLM_AGENT_API` layer and no `EDGEGUARD_API /generate` endpoint in this
-flow. The authenticated Next.js route `/api/edgeguard/generate` selects an allowlisted
-model-specific LLM worker, builds the prompt, calls `POST /predict_async`, polls
-`GET /request_status?request_id=...&return_full=true`, validates every attempt through
-`EDGEGUARD_API /check_cypher`, and returns the full attempt trail to the browser.
+The edg3 deployment uses one `edgeguard_playground_api` Loopback pipeline containing three
+`LLM_INFERENCE_API` instances and one `EDGEGUARD_API` instance. Only the API has a stable published
+port (`5055`). Each model worker receives a runtime-selected port and publishes `API_HOST` and
+`API_PORT` through a unique semaphore:
 
-Use request balancing only among replicas of the same model. Do not place the base and finetuned
-workers in one balancing group.
+| Public model key | AI engine | Semaphore |
+| --- | --- | --- |
+| `finetuned_v0_10` | `edgeguard_qwen_4b` | `edgeguard_llm_finetuned` |
+| `base_qwen3_4b` | `base_qwen3_4b` | `edgeguard_llm_base` |
+| `cybersec_qwen_4b` | `cybersec_qwen_4b` | `edgeguard_llm_cybersec` |
 
-Run all model workers in separate loopback streams. Do not put multiple models
-`LLM_INFERENCE_API` instances in one stream: the edge-node serving aggregator builds model inputs
-from stream-captured data, and live smoke showed same-stream LLM workers can see each other's
-`JEEVES_CONTENT` request IDs.
+`EDGEGUARD_API` resolves the selected worker address from its semaphore for every request. Port
+publication proves only that the worker facade is reachable: worker `/health` also reports whether
+its configured serving process reached READY. Aggregate API health remains `starting` until every
+model is ready. A missing facade fails with `worker_not_ready`; a loading model fails immediately
+and retryably with `model_not_ready`, before Neo4j or model work. Graph explanations use
+`edgeguard_llm_base` with public model key `base_qwen3_4b`; generation routing remains selected by
+the user-facing model key.
 
-## Model Workers
+Every generation or explanation request carries its public model key through `LLM_INFERENCE_API` to
+the generic llama.cpp engine. A targeted packet is relevant only to the engine whose
+`MODEL_API_KEY` matches exactly. Untargeted legacy packets retain the historical broadcast behavior,
+but a targeted completion can never be overwritten by another model in the shared pipeline.
 
-The finetuned worker serves the private EGM-029 v0.10 graph-intent continuation:
+## Hub-backed model contract
 
-```text
-MODEL_NAME=ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf
-MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf
-MODEL_PATH=/edge_node/_local_cache/_models/models--ratio1--edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf/snapshots/369066092b5eef41c9093474ff7142cc530a853f/edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf
-AI_ENGINE=edgeguard_qwen_4b
-```
+Runtime configuration contains no `MODEL_PATH`. Generic llama.cpp serving resolves the configured
+file with `hf_hub_download`, forwarding `MODEL_REVISION`, the runtime cache directory, and
+`$EE_HF_TOKEN`, then opens the returned cached file with `Llama`. The Hugging Face repository and
+pinned revision are the artifact source of truth; the normal persistent Hub cache is permitted.
 
-The base comparison worker uses a configuration-only profile over generic llama.cpp serving with a
-distinct startup model instance id:
+| Worker | Repository | Revision | File |
+| --- | --- | --- | --- |
+| Fine-tuned | `ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf` | `369066092b5eef41c9093474ff7142cc530a853f` | `edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf` |
+| Base | `MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF` | `aec29f0e8c31130ba811bec2c774c2ef44888f55` | `Qwen3-4B-Instruct-2507.Q4_K_M.gguf` |
+| CyberSec | `mradermacher/CyberSecQwen-4B-GGUF` | `4b369711d408b9fde0efcca155409c072b19a1f6` | `CyberSecQwen-4B.Q4_K_M.gguf` |
 
-```text
-MODEL_NAME=MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF
-MODEL_FILENAME=Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-MODEL_PATH=/edge_node/_local_cache/egm030-qwen3-base/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-AI_ENGINE=base_qwen3_4b
-STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-base-qwen3-4b
-```
+Keep the base engine identity pinned to Qwen3 4B. A future generation receives a separate engine,
+profile, public key, artifact, instance, and semaphore instead of repointing `base_qwen3_4b`.
 
-Do not use a raw serving-process value
-(`llama_cpp_base_qwen3_4b?edgeguard-base-qwen3-4b`) or an `AI_ENGINE` suffix
-(`base_qwen3_4b?edgeguard-base-qwen3-4b`) for this worker. Live smoke showed both can register
-details under a key that does not match the core inference router's reverse lookup. The stable
-runtime contract is the plain `base_qwen3_4b` alias plus `MODEL_INSTANCE_ID` in
-`STARTUP_AI_ENGINE_PARAMS`, which makes the serving handle
-`("llama_cpp_base_qwen3_4b", "edgeguard-base-qwen3-4b")` and routes results back to
-`("base_qwen3_4b", "edgeguard-base-qwen3-4b")`.
+## API contract
 
-Keep this identity pinned to Qwen3 4B. A future Qwen3.5 comparison worker must receive its own engine,
-serving profile, model key, artifact, and instance identity rather than repointing this alias.
+- `GET /health` reports API status plus per-model serving readiness without returning worker
+  addresses, credentials, paths, or tokens.
+- `GET /models`, `GET /model`, and `GET /prompt_contract` expose safe model/schema metadata.
+- `POST /generate` accepts the user request and public model key, calls the selected worker at
+  temperature `0`, validates every candidate, applies literal grounding, and performs at most two
+  correction attempts.
+- `POST /check_cypher` remains available as a standalone deterministic validator.
+- `POST /neo4j_test` and `POST /neo4j_query` use either the complete API default connection or a
+  complete request override. Fields are never merged between those sources.
+- `POST /prepare_graph_explanation` remains a credential-free planning/diagnostic endpoint.
+- `POST /explain_graph` owns Neo4j execution when no execution evidence is supplied, then runs the
+  restored EEL/1 + JSON-CB/1 map/reduce explanation contract. Compatibility evidence mode remains supported
+  for direct API clients but is not used by the playground UI.
 
-The public CyberSecQwen worker uses the existing generic serving engine and a previously cached
-snapshot path:
+Sampling and safety remain frozen: text-to-Cypher temperature `0`; explanation temperature `0.1`,
+top-p `1.0`, and `max_tokens=127`; Fast/Balanced/Thorough row caps `10/25/50` with map caps `1/2/3`
+and at most one synthesis; one attempt per call with no repair retry; read-only/schema guard;
+complete bounded evidence; server-owned citations, coverage, caveats, and safe diagnostics.
 
-```text
-MODEL_NAME=mradermacher/CyberSecQwen-4B-GGUF
-MODEL_FILENAME=CyberSecQwen-4B.Q4_K_M.gguf
-MODEL_PATH=/edge_node/_local_cache/_models/models--mradermacher--CyberSecQwen-4B-GGUF/snapshots/4b369711d408b9fde0efcca155409c072b19a1f6/CyberSecQwen-4B.Q4_K_M.gguf
-AI_ENGINE=cybersec_qwen_4b
-STARTUP_AI_ENGINE_PARAMS.MODEL_INSTANCE_ID=edgeguard-cybersec-qwen-4b
-```
+EEL/1 maps complete `RowPathClosure` batches. Every supported map becomes an entity finding,
+summary evidence is the union of cited rows, and synthesis must cite all supported maps in canonical
+order. Provider, timeout, context, completion-metadata, parser, or citation failure remains
+fail-closed without exposing raw content.
 
-For this local deployment, `MODEL_PATH` is the artifact-source setting; verify the file manually
-against the approved SHA-256 before every migration or restart. Generic serving does not consume a
-model revision or enforce a checksum at runtime. `MODEL_NAME` and `MODEL_FILENAME` remain model
-identity and remote-fallback defaults. `AI_ENGINE`, `PORT`, and `MODEL_INSTANCE_ID` are routing
-identity rather than artifact-source configuration.
-
-If a private remote fallback is deliberately used instead of `MODEL_PATH`, set the Hugging Face
-token as a runtime secret; do not put it in a pipeline JSON committed to git.
-
-## Guard Contract
-
-`EDGEGUARD_API` owns deterministic safety checks and execution boundaries. It exposes:
-
-- `GET /models` with opaque model keys, display names, repo/file metadata, prompt profile ids, and
-  no backend URLs
-- `GET /prompt_contract` with schema version, schema surface, temporal policy, retry default, and
-  prompt template versions/hashes
-- `POST /check_cypher` for deterministic query-only, read-only, schema-compatible validation
-- `POST /prepare_graph_explanation`, which revalidates accepted Cypher and returns a credential-free
-  primary query, limit policy, and optional deterministic broadening query
-- evidence-mode `POST /explain_graph`, which recomputes that plan, validates a bounded serialized
-  graph, assigns packet-local IDs, redacts properties, runs the EGX/1 explanation profile
-  (deterministic Stage A-D relevance selection, `numbered_facts` evidence rendering with real
-  entity names, one analyst call plus at most one validated retry, five deterministic semantic
-  gates), and never opens a Neo4j driver
-- deprecated direct-driver Neo4j query/explanation compatibility endpoints; the playground does not
-  use them for graph explanation
-
-Accepted generated output is still one read-only Cypher query string only:
-
-- no JSON, markdown, prose, `query_id`, `params`, or `$param` placeholders
-- no `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `DROP`, `LOAD CSV`, or dangerous procedure calls
-- only the allowed EdgeGuard labels, relationship types, and properties
-- at most two schema-correction retries by default
-
-When an accepted generated query executes successfully but returns zero rows, `EDGEGUARD_API`
-prepares an optional empty-result broadening fallback from the first allowed label and relationship
-type already present in the accepted Cypher. The authenticated Next.js route owns Bolt-over-WSS
-execution and may execute that prepared broadening query only after a successful empty primary
-result. It sends bounded graph evidence, never credentials, back to `EDGEGUARD_API`, which verifies
-the query/count/flag pairing and returns explicit `live_retry` metadata.
-
-## Minimal Pipeline Sketch
-
-Use one stream per model worker:
+## Unified pipeline sketch
 
 ```json
 {
-  "NAME": "edgeguard_llm_finetuned_api",
+  "NAME": "edgeguard_playground_api",
   "TYPE": "Loopback",
   "PLUGINS": [
     {
@@ -129,122 +90,62 @@ Use one stream per model worker:
         {
           "INSTANCE_ID": "edgeguard_llm_finetuned_v0_10",
           "AI_ENGINE": "edgeguard_qwen_4b",
-          "PORT": 5090,
+          "SEMAPHORE": "edgeguard_llm_finetuned",
+          "PORT": null,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf",
             "MODEL_FILENAME": "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
-            "MODEL_INSTANCE_ID": "edgeguard-finetuned-v0-10",
-            "MODEL_PATH": "/edge_node/_local_cache/_models/models--ratio1--edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf/snapshots/369066092b5eef41c9093474ff7142cc530a853f/edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
-            "HF_TOKEN": "$HF_TOKEN"
+            "MODEL_REVISION": "369066092b5eef41c9093474ff7142cc530a853f"
           }
-        }
-      ]
-    }
-  ]
-}
-```
-
-```json
-{
-  "NAME": "edgeguard_llm_base_api",
-  "TYPE": "Loopback",
-  "PLUGINS": [
-    {
-      "SIGNATURE": "LLM_INFERENCE_API",
-      "INSTANCES": [
+        },
         {
           "INSTANCE_ID": "edgeguard_llm_base_qwen3_4b",
           "AI_ENGINE": "base_qwen3_4b",
-          "PORT": 5091,
+          "SEMAPHORE": "edgeguard_llm_base",
+          "PORT": null,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
             "MODEL_FILENAME": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
-            "MODEL_INSTANCE_ID": "edgeguard-base-qwen3-4b",
-            "MODEL_PATH": "/edge_node/_local_cache/egm030-qwen3-base/Qwen3-4B-Instruct-2507.Q4_K_M.gguf"
+            "MODEL_REVISION": "aec29f0e8c31130ba811bec2c774c2ef44888f55"
           }
-        }
-      ]
-    }
-  ]
-}
-```
-
-Keep the CyberSecQwen worker in its own stream and balancing pool:
-
-```json
-{
-  "NAME": "edgeguard_llm_cybersec_api",
-  "TYPE": "Loopback",
-  "PLUGINS": [
-    {
-      "SIGNATURE": "LLM_INFERENCE_API",
-      "INSTANCES": [
+        },
         {
           "INSTANCE_ID": "edgeguard_llm_cybersec_qwen_4b",
           "AI_ENGINE": "cybersec_qwen_4b",
-          "PORT": 5092,
+          "SEMAPHORE": "edgeguard_llm_cybersec",
+          "PORT": null,
           "STARTUP_AI_ENGINE_PARAMS": {
             "MODEL_NAME": "mradermacher/CyberSecQwen-4B-GGUF",
             "MODEL_FILENAME": "CyberSecQwen-4B.Q4_K_M.gguf",
-            "MODEL_INSTANCE_ID": "edgeguard-cybersec-qwen-4b",
-            "MODEL_PATH": "/edge_node/_local_cache/_models/models--mradermacher--CyberSecQwen-4B-GGUF/snapshots/4b369711d408b9fde0efcca155409c072b19a1f6/CyberSecQwen-4B.Q4_K_M.gguf"
+            "MODEL_REVISION": "4b369711d408b9fde0efcca155409c072b19a1f6"
           }
         }
       ]
-    }
-  ]
-}
-```
-
-Keep the safety API and UI runner outside those LLM streams:
-
-```json
-{
-  "NAME": "edgeguard_playground_api",
-  "TYPE": "Loopback",
-  "PLUGINS": [
+    },
     {
       "SIGNATURE": "EDGEGUARD_API",
       "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_api",
           "SEMAPHORE": "edgeguard_api",
+          "SEMAPHORED_KEYS": [
+            "edgeguard_llm_finetuned",
+            "edgeguard_llm_base",
+            "edgeguard_llm_cybersec"
+          ],
           "PORT": 5055,
-          "REQUEST_TIMEOUT": 600,
-          "REQUEST_TIMEOUT_SECONDS": 600,
-          "NEO4J_MAX_ROWS": 100,
-          "LIVE_EMPTY_RESULT_BROADENING": true
-        }
-      ]
-    }
-  ]
-}
-```
-
-```json
-{
-  "NAME": "edgeguard_playground_ui",
-  "TYPE": "Loopback",
-  "PLUGINS": [
-    {
-      "SIGNATURE": "WORKER_APP_RUNNER",
-      "INSTANCES": [
-        {
-          "INSTANCE_ID": "edgeguard_playground_ui",
-          "SEMAPHORED_KEYS": ["edgeguard_api"],
-          "PORT": 3010,
-          "DYNAMIC_ENV": {
-            "EDGEGUARD_API_BASE_URL": [
-              {
-                "type": "shmem",
-                "path": ["edgeguard_api", "API_URL"]
-              }
-            ]
+          "EDGEGUARD_GENERATION_WORKERS": {
+            "finetuned_v0_10": {"SEMAPHORE": "edgeguard_llm_finetuned"},
+            "base_qwen3_4b": {"SEMAPHORE": "edgeguard_llm_base"},
+            "cybersec_qwen_4b": {"SEMAPHORE": "edgeguard_llm_cybersec"}
           },
-          "ENV": {
-            "EDGEGUARD_LLM_FINETUNED_URLS": "http://127.0.0.1:5090",
-            "EDGEGUARD_LLM_BASE_URLS": "http://127.0.0.1:5091",
-            "EDGEGUARD_LLM_CYBERSEC_URLS": "http://127.0.0.1:5092"
+          "EDGEGUARD_EXPLANATION_WORKER": {"SEMAPHORE": "edgeguard_llm_base"},
+          "EDGEGUARD_EXPLANATION_MODEL": "base_qwen3_4b",
+          "NEO4J_DEFAULT_CONNECTION": {
+            "uri": "$EE_NEO4J_URI",
+            "scheme": "bolt+s",
+            "username": "$EE_NEO4J_USERNAME",
+            "password": "$EE_NEO4J_PASSWORD"
           }
         }
       ]
@@ -253,29 +154,13 @@ Keep the safety API and UI runner outside those LLM streams:
 }
 ```
 
-The `WORKER_APP_RUNNER` stream injects the three model-specific URLs above as server-only environment
-variables. The deployment-specific repository, build, tunnel, and secret settings are intentionally
-omitted from this minimal contract sketch.
+## Secrets and deployment
 
-The UI must not hardcode `EDGEGUARD_API_BASE_URL` when deployed in edge-node. `EDGEGUARD_API`
-publishes `API_URL` through semaphore key `edgeguard_api`; `WORKER_APP_RUNNER` waits for that
-semaphore and injects the resolved value through `DYNAMIC_ENV` before starting the Next.js app.
+edg3 receives an ignored, mode-`0600` runtime env file containing `EE_HF_TOKEN` and the four
+`EE_NEO4J_*` values. The tracked devcontainer configuration contains no secret and injects that file
+only into edg3 through the generated local devcontainer config. The generic loader reads the Hub
+token from the process environment while the stream pins only repository, filename, and revision.
+Never place literal credentials in tracked files, logs, task records, prompts, or responses.
 
-The LLM worker URLs are server-only Worker App Runner environment variables. They are not returned
-by `EDGEGUARD_API`, not exposed to the browser, and not written to local query history.
-
-Graph explanation through the playground does not require the Neo4j Python driver in edge-node. The
-authenticated Next.js route uses its existing `neo4j-driver` Bolt-over-WSS transport and forwards
-only bounded execution evidence. The edge-node Python driver remains relevant only to deprecated
-direct-driver compatibility endpoints.
-
-## Required Secrets
-
-- `HF_TOKEN` only when deliberately using the private Hugging Face remote fallback instead of the
-  verified local `MODEL_PATH`.
-- `EDGEGUARD_PLAYGROUND_PASSWORD` for the shared UI password gate.
-- `EDGEGUARD_SESSION_SECRET` for the UI session cookie signature.
-- `EDGEGUARD_PLAYGROUND_UI_GH_TOKEN` for Worker App Runner access to the private UI repo.
-- `EDGEGUARD_PLAYGROUND_UI_CF_TOKEN` for the Worker App Runner Cloudflare tunnel on UI port `3010`.
-- `EDGEGUARD_API_TOKEN` only if an API bearer-token boundary is enabled.
-- `EDGEGUARD_LLM_API_TOKEN` only if the local LLM workers enforce bearer-token auth.
+The Next.js Worker App Runner needs only the semaphored `EDGEGUARD_API_BASE_URL` plus its own
+authentication/deployment secrets. It no longer receives model URLs or Neo4j transport dependencies.

@@ -19,6 +19,27 @@ from typing import Any, Mapping, Sequence
 
 QUOTED_RE = re.compile(r'"([^"]+)"')
 INLINE_ID_RE = re.compile(r"\[(E\d+|L\d+|F\d+)\]")
+CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+WORD_RE = re.compile(r"[a-z0-9]+")
+
+# Bump this whenever the deterministic lexical/relationship entailment rules
+# change. The profile manifest includes the value, so a gate change cannot
+# silently retain the old production identity.
+LEXICAL_GROUNDING_VERSION = "cited_fact_tokens_v1"
+
+# Function words and deliberately neutral graph-link paraphrases. Directional,
+# causal, or mediating vocabulary (for example `via`, `using`, `causes`) is not
+# allowlisted: it must occur in the cited fact itself.
+_GROUNDING_ALLOWLIST = frozenset({
+  "a", "an", "and", "are", "as", "associated", "association", "be", "been",
+  "being", "between", "but", "by", "connect", "connected", "connecting",
+  "connects", "evidence", "for", "from", "graph", "in", "is", "it", "its",
+  "link", "linked", "linking", "links", "of", "on", "or", "observed",
+  "related", "relates", "relationship", "relationships", "returned", "s",
+  "show", "shows", "supports", "that", "the", "their", "them", "these",
+  "they", "this", "those", "to", "was", "were", "which", "who", "whom",
+  "whose", "with",
+})
 
 DUPLICATE_JACCARD_THRESHOLD = 0.8
 REDUNDANCY_JACCARD_THRESHOLD = 0.8
@@ -35,16 +56,60 @@ def citation_membership(response: Mapping[str, Any], evidence_citation_ids) -> t
   return True, f"all {len(citations)} citation(s) resolve in the evidence"
 
 
+def _semantic_tokens(text: Any) -> set[str]:
+  expanded = CAMEL_BOUNDARY_RE.sub(" ", str(text or "")).replace("_", " ")
+  return set(WORD_RE.findall(expanded.lower()))
+
+
+def _token_is_grounded(token: str, evidence_tokens: set[str]) -> bool:
+  if token in evidence_tokens or token in _GROUNDING_ALLOWLIST:
+    return True
+  # Permit ordinary English plurals when the cited fact carries the singular.
+  if token.endswith("ies") and len(token) > 3 and f"{token[:-3]}y" in evidence_tokens:
+    return True
+  if token.endswith("es") and len(token) > 2 and token[:-2] in evidence_tokens:
+    return True
+  if token.endswith("s") and len(token) > 1 and token[:-1] in evidence_tokens:
+    return True
+  return False
+
+
+def _cited_evidence_text(response: Mapping[str, Any], evidence_text: str) -> str:
+  citations = {item for item in (response.get("citations") or []) if isinstance(item, str)}
+  if not citations:
+    return evidence_text
+  selected = []
+  for line in evidence_text.splitlines():
+    stripped = line.lstrip()
+    if any(stripped.startswith(f"{citation}:") or f"[{citation}]" in stripped for citation in citations):
+      selected.append(line)
+  return "\n".join(selected) if selected else evidence_text
+
+
 def lexical_grounding(response: Mapping[str, Any], evidence_text: str) -> tuple[bool, str]:
-  """Gate (b): every double-quoted string in the finding is a
-  case-insensitive substring of the rendered evidence text."""
+  """Gate (b): quoted names must occur in the rendered evidence and every
+  non-grammar finding token must occur in the *cited* fact lines.
+
+  This closes the quoted-only gap that allowed fluent but unsupported
+  relational language such as "indicates ... via MITRE techniques" to pass
+  when the cited facts contained only `ATTRIBUTED_TO` edges.
+  """
   finding = response.get("finding") or ""
   haystack = evidence_text.lower()
   quoted = QUOTED_RE.findall(finding)
   ungrounded = [q for q in quoted if q.lower() not in haystack]
   if ungrounded:
     return False, f"quoted string(s) not found in evidence: {ungrounded}"
-  return True, f"all {len(quoted)} quoted string(s) grounded in evidence"
+  cited_text = _cited_evidence_text(response, evidence_text)
+  evidence_tokens = _semantic_tokens(cited_text)
+  finding_without_inline_ids = INLINE_ID_RE.sub(" ", finding)
+  unsupported = sorted(
+    token for token in _semantic_tokens(finding_without_inline_ids)
+    if not _token_is_grounded(token, evidence_tokens)
+  )
+  if unsupported:
+    return False, f"finding token(s) absent from cited evidence: {unsupported}"
+  return True, f"all {len(quoted)} quoted string(s) and finding tokens grounded in cited evidence"
 
 
 def inline_id_validity(response: Mapping[str, Any], evidence_citation_ids) -> tuple[bool, str]:

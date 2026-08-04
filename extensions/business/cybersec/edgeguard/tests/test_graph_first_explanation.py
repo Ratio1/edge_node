@@ -24,6 +24,7 @@ from extensions.business.cybersec.edgeguard.graph_first_explanation import (
   validate_boundary,
   validate_dispatch_budget,
 )
+from extensions.business.cybersec.edgeguard.result_digest import build_result_digest
 
 
 def tagged_map(**values):
@@ -98,6 +99,65 @@ class ModeTests(unittest.TestCase):
 
 
 class IrAndBatchTests(unittest.TestCase):
+  def test_result_digest_truthfully_represents_an_empty_exact_result(self):
+    digest = build_result_digest(
+      {"schema_version": "edgeguard.query_result_evidence.v1", "columns": ["p"], "rows": []},
+      {"nodes": [], "relationships": []},
+      accepted_cypher="MATCH p=()--() RETURN p LIMIT 5",
+      executed_cypher="MATCH p=()--() RETURN p LIMIT 5",
+      transport_row_cap=25,
+      truncated=False,
+    )
+
+    self.assertEqual(digest["summary"]["text"], "The exact query returned no rows and therefore no graph evidence.")
+    self.assertEqual(digest["counts"], {
+      "returned_rows": 0,
+      "distinct_row_groups": 0,
+      "duplicate_row_occurrences": 0,
+      "nodes": 0,
+      "relationships": 0,
+      "paths": 0,
+      "topology_components": 0,
+    })
+    self.assertEqual(digest["groups"], [])
+    self.assertTrue(digest["coverage"]["complete"])
+
+  def test_result_digest_is_stable_and_accounts_for_every_row(self):
+    result, catalog = fixtures(duplicates=True, disconnected=True)
+    first = build_result_digest(
+      result,
+      catalog,
+      accepted_cypher="MATCH p=()--() RETURN p, 1 AS score, null AS q LIMIT 3",
+      executed_cypher="MATCH p=()--() RETURN p, 1 AS score, null AS q LIMIT 3",
+      transport_row_cap=25,
+      truncated=False,
+    )
+    second = build_result_digest(
+      json.loads(json.dumps(result)),
+      json.loads(json.dumps(catalog)),
+      accepted_cypher="MATCH p=()--() RETURN p, 1 AS score, null AS q LIMIT 3",
+      executed_cypher="MATCH p=()--() RETURN p, 1 AS score, null AS q LIMIT 3",
+      transport_row_cap=25,
+      truncated=False,
+    )
+    self.assertEqual(first, second)
+    self.assertEqual(first["schema_version"], "edgeguard.result_digest.v1")
+    self.assertEqual(first["counts"]["returned_rows"], 3)
+    self.assertEqual(first["counts"]["distinct_row_groups"], 2)
+    self.assertEqual(first["counts"]["duplicate_row_occurrences"], 1)
+    self.assertEqual(first["coverage"]["schema_version"], "edgeguard.result_digest_coverage.v2")
+    self.assertEqual(first["coverage"]["rows"]["returned"], [0, 1, 2])
+    self.assertEqual(first["coverage"]["rows"]["represented"], [0, 1, 2])
+    self.assertEqual(first["coverage"]["rows"]["missing"], [])
+    self.assertEqual(first["coverage"]["rows"]["unexpected"], [])
+    self.assertEqual(first["coverage"]["rows"]["repeated"], [])
+    for kind in ("paths", "nodes", "relationships", "topology_components", "property_slots"):
+      self.assertEqual(first["coverage"][kind]["returned"], first["coverage"][kind]["represented"])
+      self.assertEqual(first["coverage"][kind]["missing"], [])
+    self.assertTrue(first["coverage"]["complete"])
+    self.assertTrue(first["query_scope"]["accepted_equals_executed"])
+    self.assertEqual(first["groups"][0]["relationship_types"], ["SOURCED_FROM"])
+
   def test_promoted_core_is_imported_by_production_and_not_coupled_to_research(self):
     module_path = Path(__file__).parents[1] / "graph_first_explanation.py"
     api_path = Path(__file__).parents[1] / "edgeguard_api.py"

@@ -202,6 +202,7 @@ REL_TYPE_REF = re.compile(r"\[[^\]]*:\s*(" + TOKEN + r"(?:\s*\|\s*" + TOKEN + r"
 PROPERTY_ACCESS = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*(" + TOKEN + r")(?!\s*\()")
 MAP_KEY = re.compile(r"(?<=[{,])\s*(" + TOKEN + r")\s*:")
 PROCEDURE_CALL = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\(")
+CYPHER_STRING_LITERAL = re.compile(r"'(?:\\.|''|[^'])*'|\"(?:\\.|\"\"|[^\"])*\"")
 FORBIDDEN_OUTPUT = {
   "json_object": re.compile(r"^\s*\{", re.S),
   "markdown_fence": re.compile(r"```"),
@@ -308,7 +309,7 @@ def build_empty_result_broadening_cypher(
 
 
 def extract_schema_tokens(cypher: str) -> dict[str, set[str]]:
-  property_source = PROCEDURE_CALL.sub("(", cypher)
+  property_source = CYPHER_STRING_LITERAL.sub("''", PROCEDURE_CALL.sub("(", cypher))
   labels = {normalize_schema_token(match.group(1)) for match in LABEL_REF.finditer(cypher)}
   relationship_types: set[str] = set()
   for match in REL_TYPE_REF.finditer(cypher):
@@ -548,6 +549,7 @@ def build_direct_cypher_system_prompt(artifact: dict[str, Any] | None = None) ->
     "- Return exactly one Cypher query and nothing else.",
     "- Do not return JSON, markdown fences, comments, explanations, query_id, params, or prose.",
     "- Inline user-provided values directly as escaped Cypher literals when needed.",
+    "- Never add a literal value or WHERE filter that is absent from the user request.",
     "- Use only the allowed labels, relationship types, and properties listed above.",
     "- Do not invent labels, relationship types, properties, procedures, or temporal fields.",
     "- Prefer graph/path returns for investigations, neighborhoods, provenance, sector, CVE, indicator, ATT&CK, and relationship questions unless the user clearly asks for a count or table.",

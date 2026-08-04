@@ -58,6 +58,14 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
 
     self.assertEqual(tokens["properties"], set())
 
+  def test_schema_extractor_ignores_dot_tokens_inside_string_literals(self):
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator) WHERE i.value = 'gait.com' RETURN i"
+    )
+
+    self.assertTrue(analysis["accepted"])
+    self.assertNotIn("com", analysis["schema_unknown"].get("properties", []))
+
   def test_empty_result_broadening_uses_first_allowed_label_and_relationship(self):
     broadened = build_empty_result_broadening_cypher(
       "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) WHERE i.value = 'x' RETURN i.value AS value"
@@ -80,6 +88,7 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
     prompt = build_direct_cypher_system_prompt()
 
     self.assertIn("Return exactly one Cypher query and nothing else.", prompt)
+    self.assertIn("Never add a literal value or WHERE filter", prompt)
     self.assertIn("Indicator", prompt)
     self.assertIn("EXPLOITS", prompt)
     self.assertIn("confidence_score", prompt)

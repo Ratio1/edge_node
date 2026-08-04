@@ -1,9 +1,11 @@
 import hashlib
 import json
+import os
 import re
 import requests
 import unittest
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 def mock_plugin_modules():
@@ -36,12 +38,14 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EdgeguardApiPlu
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_CONTRACT  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GRAPH_EXPLANATION_PROMPT_VERSION  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _build_case_explanation_messages  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _build_graph_evidence_packet  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _build_graph_evidence_packet_from_execution  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _construct_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_contract_text  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_prompt_sha256  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _graph_explanation_user_content  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _sha256_text  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _tag_serialized_property  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_case_explanation_draft_bounds  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _validate_graph_evidence_packet  # noqa: E402
@@ -73,6 +77,21 @@ class _Result(list):
     return self._keys
 
 
+class _DriverRecord:
+  def __init__(self, values, exported):
+    self._values = values
+    self._exported = exported
+
+  def keys(self):
+    return list(self._values)
+
+  def __getitem__(self, key):
+    return self._values[key]
+
+  def data(self):
+    return self._exported
+
+
 class _GraphNode:
   def __init__(self, element_id, labels, properties):
     self.element_id = element_id
@@ -101,12 +120,18 @@ class _GraphPath:
     self.relationships = relationships
 
 
+class DateTime:
+  def __str__(self):
+    return "2026-08-03T17:00:00Z"
+
+
 def _graph_record():
   indicator = _GraphNode("indicator-1", ["Indicator"], {"value": "example.org", "type": "domain"})
   source = _GraphNode("source-1", ["Source"], {"name": "AlienVault OTX"})
-  fake_record = MagicMock()
-  fake_record.data.return_value = {"i": indicator, "s": source}
-  return fake_record
+  return _DriverRecord(
+    {"i": indicator, "s": source},
+    {"i": {"value": "example.org", "type": "domain"}, "s": {"name": "AlienVault OTX"}},
+  )
 
 
 def _graph_path_record():
@@ -114,9 +139,10 @@ def _graph_path_record():
   source = _GraphNode("source-1", ["Source"], {"name": "AlienVault OTX"})
   rel = _GraphRelationship("rel-1", "SOURCED_FROM", indicator, source, {"confidence": "medium"})
   path = _GraphPath([indicator, source], [rel])
-  fake_record = MagicMock()
-  fake_record.data.return_value = {"p": path}
-  return fake_record
+  return _DriverRecord(
+    {"p": path},
+    {"p": [{"value": "example.org", "type": "domain"}, "SOURCED_FROM", {"name": "AlienVault OTX"}]},
+  )
 
 
 def _serialized_execution(executed_cypher, *, broadened=False, primary_row_count=1):
@@ -535,27 +561,23 @@ def _packet_from_provider_kwargs(kwargs):
 
 
 def _graph_first_provider(payload):
-  """Generic EGX/1 analyst-profile stub: extracts the EVIDENCE block from the
-  dispatched user message and returns a grounded citations-first response
-  (cites the first `F#` fact id, quotes the first quoted name in the
-  evidence) so every gate passes regardless of the caller's graph fixture."""
+  """Return a valid EEL/1 map or synthesis completion for API tests."""
+  task = payload["metadata"]["task"]
   user = payload["messages"][-1]["content"]
-  evidence = user.split("EVIDENCE:\n", 1)[1].split("\n\nQUESTION:", 1)[0]
-  fact_match = re.search(r"F\d+", evidence)
-  if fact_match is None:
-    # No renderable fact survived selection (e.g. every property redacted) --
-    # respond with no citations and no quoted names, which every gate passes
-    # vacuously.
-    content = {"citations": [], "finding": "The bounded evidence did not carry a specific named finding."}
+  data = json.loads(user.split("\nDATA\n", 1)[1])
+  if task == "edgeguard_graph_first_synthesis":
+    content = {
+      "status": "supported",
+      "text": "The returned graph evidence supports the investigation finding.",
+      "maps": [finding["id"] for finding in data],
+    }
   else:
-    fact_id = fact_match.group(0)
-    quoted_match = re.search(r'"([^"]+)"', evidence)
-    quoted = quoted_match.group(1) if quoted_match else None
-    finding = (
-      f'The evidence links "{quoted}" [{fact_id}] to the investigation.'
-      if quoted else f"The evidence [{fact_id}] supports the investigation finding."
-    )
-    content = {"citations": [fact_id], "finding": finding}
+    content = {
+      "status": "supported",
+      "text": "The returned graph evidence supports the investigation finding.",
+      "anchor": data["nodes"][0][0],
+      "rows": [row[0] for row in data["rows"]],
+    }
   return {
     "content": json.dumps(content, separators=(",", ":")),
     "finish_reason": "stop",
@@ -566,13 +588,18 @@ def _graph_first_provider(payload):
 
 def _make_api(**overrides):
   plugin = EdgeguardApiPlugin.__new__(EdgeguardApiPlugin)
+  plugin.cfg_edgeguard_generation_workers = overrides.get(
+    "edgeguard_generation_workers",
+    EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"],
+  )
+  plugin.cfg_edgeguard_explanation_worker = overrides.get("edgeguard_explanation_worker", {})
   plugin.cfg_edgeguard_explanation_model_url = overrides.get("edgeguard_explanation_model_url")
   plugin.cfg_edgeguard_explanation_model_host = overrides.get("edgeguard_explanation_model_host", "127.0.0.1")
   plugin.cfg_edgeguard_explanation_model_port = overrides.get("edgeguard_explanation_model_port", 5090)
   plugin.cfg_edgeguard_explanation_model_path = overrides.get("edgeguard_explanation_model_path", "/create_chat_completion")
   plugin.cfg_edgeguard_explanation_model_token = overrides.get("edgeguard_explanation_model_token")
   plugin.cfg_edgeguard_explanation_model_token_env = overrides.get("edgeguard_explanation_model_token_env", "EDGEGUARD_EXPLANATION_MODEL_TOKEN")
-  plugin.cfg_edgeguard_explanation_model = overrides.get("edgeguard_explanation_model", "qwen2.5-1.5b-instruct")
+  plugin.cfg_edgeguard_explanation_model = overrides.get("edgeguard_explanation_model", "base_qwen3_4b")
   plugin.cfg_edgeguard_explanation_default_rows = overrides.get("edgeguard_explanation_default_rows", 25)
   plugin.cfg_edgeguard_explanation_max_rows = overrides.get("edgeguard_explanation_max_rows", 50)
   plugin.cfg_edgeguard_explanation_max_tokens = overrides.get(
@@ -585,13 +612,17 @@ def _make_api(**overrides):
     "edgeguard_explanation_output_mode",
     "json_object",
   )
+  plugin.cfg_edgeguard_explanation_strategy = overrides.get(
+    "edgeguard_explanation_strategy",
+    "eel_compatibility",
+  )
   plugin.cfg_edgeguard_explanation_tokenizer_path = overrides.get(
     "edgeguard_explanation_tokenizer_path",
     "/test/tokenizer.json",
   )
   plugin._graph_first_token_counter_for_tests = overrides.get(
     "graph_first_token_counter",
-    lambda text: max(1, len(str(text).split())) if text else 0,
+    lambda messages: len(render_chat(messages).encode("utf-8")),
   )
   plugin._graph_first_provider_for_tests = overrides.get(
     "graph_first_provider",
@@ -599,6 +630,7 @@ def _make_api(**overrides):
   )
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
   plugin.cfg_neo4j_query_timeout_seconds = overrides.get("neo4j_query_timeout_seconds", 30)
+  plugin.cfg_neo4j_default_connection = overrides.get("neo4j_default_connection", {})
   plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", True)
   plugin.cfg_request_timeout_seconds = overrides.get("request_timeout_seconds", 120)
   plugin.cfg_edgeguard_verbose = 0
@@ -616,10 +648,58 @@ def _make_api(**overrides):
   plugin.cfg_port = overrides.get("cfg_port", 5055)
   plugin.semaphore_env = {}
   plugin.semaphore_set_env = lambda key, value: plugin.semaphore_env.__setitem__(key, str(value))
+  plugin.worker_semaphore_env = overrides.get("worker_semaphore_env", {})
+  plugin.semaphore_get_env_value = lambda semaphore, key: plugin.worker_semaphore_env.get(
+    semaphore, {}
+  ).get(key, "")
   return plugin
 
 
 class EdgeGuardApiTests(unittest.TestCase):
+  def test_worker_runtime_readiness_requires_serving_ready_signal(self):
+    plugin = _make_api(worker_semaphore_env={
+      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": False}})
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=session):
+      self.assertFalse(plugin._worker_runtime_ready(
+        EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"]["finetuned_v0_10"]
+      ))
+
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=session):
+      self.assertTrue(plugin._worker_runtime_ready(
+        EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"]["finetuned_v0_10"]
+      ))
+
+  def test_explain_fails_fast_with_retryable_503_while_model_is_starting(self):
+    worker = EdgeguardApiPlugin.CONFIG["EDGEGUARD_EXPLANATION_WORKER"]
+    plugin = _make_api(
+      edgeguard_explanation_worker=worker,
+      worker_semaphore_env={
+        "edgeguard_llm_base": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+      },
+    )
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": False}})
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+            result = plugin.explain_graph(
+        request="Show indicators",
+        cypher="MATCH (i:Indicator) RETURN i LIMIT 5",
+        explanation_mode="fast",
+      )
+
+    self.assertEqual(result["status_code"], 503)
+    self.assertFalse(result["result"]["executed"])
+    self.assertEqual(result["result"]["diagnostics"]["reason"], "model_not_ready")
+    session.post.assert_not_called()
+
   def test_edgeguard_api_timeout_defaults_keep_long_generation_budget_for_ui_route(self):
     self.assertEqual(EDGEGUARD_REQUEST_TIMEOUT_SECONDS, 600)
     self.assertEqual(EdgeguardApiPlugin.CONFIG["REQUEST_TIMEOUT"], 600)
@@ -642,8 +722,207 @@ class EdgeGuardApiTests(unittest.TestCase):
       {"SERVING_PROCESS": "llama_cpp_edgeguard_qwen_4b"},
     )
 
-  def test_edgeguard_api_no_longer_exposes_generation_endpoint(self):
-    self.assertFalse(hasattr(EdgeguardApiPlugin, "generate"))
+  def test_edgeguard_api_owns_generation_endpoint(self):
+    self.assertTrue(hasattr(EdgeguardApiPlugin, "generate"))
+
+  def test_explanation_worker_defaults_to_base_qwen_semaphore(self):
+    self.assertEqual(
+      EdgeguardApiPlugin.CONFIG["EDGEGUARD_EXPLANATION_WORKER"]["SEMAPHORE"],
+      "edgeguard_llm_base",
+    )
+    self.assertEqual(EdgeguardApiPlugin.CONFIG["EDGEGUARD_EXPLANATION_MODEL"], "base_qwen3_4b")
+
+  def test_generate_fails_before_model_call_when_selected_worker_is_not_ready(self):
+    plugin = _make_api()
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post") as post:
+      result = plugin.generate(request="Show indicators", model_key="finetuned_v0_10")
+
+    self.assertEqual(result["status"], "error")
+    self.assertEqual(result["diagnostics"]["code"], "worker_not_ready")
+    post.assert_not_called()
+
+  def test_generate_uses_semaphore_worker_and_validates_model_output(self):
+    plugin = _make_api(worker_semaphore_env={
+      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+    response = _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": "MATCH (i:Indicator) RETURN i LIMIT 10",
+        "FULL_OUTPUT": {
+          "choices": [{
+            "message": {"content": "MATCH (i:Indicator) RETURN i LIMIT 10"},
+            "finish_reason": "stop",
+          }],
+          "usage": {"completion_tokens": 10},
+        },
+      },
+    })
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.return_value = response
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show indicators", model_key="finetuned_v0_10")
+
+    self.assertEqual(result["status"], "accepted")
+    self.assertEqual(result["accepted_cypher"], "MATCH (i:Indicator) RETURN i LIMIT 10")
+    self.assertEqual(result["attempts"][0]["validated_by"], "EDGEGUARD_API /check_cypher")
+    self.assertIn("edgeguard_api_ms", result["metrics"])
+    self.assertEqual(session.post.call_args.args[0], "http://127.0.0.1:53001/create_chat_completion")
+    self.assertEqual(session.post.call_args.kwargs["json"]["temperature"], 0.0)
+    self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 64)
+    self.assertEqual(session.post.call_args.kwargs["json"]["model"], "finetuned_v0_10")
+    self.assertEqual(result["attempts"][0]["finish_reason"], "stop")
+    self.assertEqual(result["attempts"][0]["completion_tokens"], 10)
+
+  def test_generate_rejects_length_completion_before_accepting_corrected_query(self):
+    plugin = _make_api(worker_semaphore_env={
+      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+    truncated = _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source)",
+        "FULL_OUTPUT": {
+          "choices": [{
+            "message": {"content": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source)"},
+            "finish_reason": "length",
+          }],
+          "usage": {"completion_tokens": 64},
+        },
+      },
+    })
+    corrected = _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 5",
+        "FULL_OUTPUT": {
+          "choices": [{
+            "message": {"content": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 5"},
+            "finish_reason": "stop",
+          }],
+          "usage": {"completion_tokens": 24},
+        },
+      },
+    })
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [truncated, corrected]
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(
+        request="Show indicators and their source reports",
+        model_key="finetuned_v0_10",
+      )
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 2)
+    self.assertFalse(result["attempts"][0]["accepted"])
+    self.assertEqual(result["attempts"][0]["finish_reason"], "length")
+    self.assertIn("did not stop cleanly", result["attempts"][0]["validation_feedback"])
+    self.assertTrue(result["attempts"][1]["accepted"])
+    self.assertEqual(session.post.call_count, 2)
+
+  def test_generate_fails_fast_while_model_process_is_starting(self):
+    plugin = _make_api(worker_semaphore_env={
+      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": False}})
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show indicators", model_key="finetuned_v0_10")
+
+    self.assertEqual(result["diagnostics"]["code"], "model_not_ready")
+    self.assertTrue(result["diagnostics"]["retryable"])
+    session.post.assert_not_called()
+
+  def test_neo4j_connection_uses_complete_default_or_complete_override(self):
+    plugin = _make_api(neo4j_default_connection={
+      "uri": "default.example:7687",
+      "username": "default-user",
+      "password": "default-secret",
+      "scheme": "bolt+s",
+    })
+
+    default, error = plugin._resolve_neo4j_connection(None, None, None, None)
+    self.assertIsNone(error)
+    self.assertEqual(default["uri"], "default.example:7687")
+
+    override, error = plugin._resolve_neo4j_connection(
+      "override.example:7687", "override-user", "override-secret", "neo4j+s",
+    )
+    self.assertIsNone(error)
+    self.assertEqual(override["password"], "override-secret")
+
+    incomplete, error = plugin._resolve_neo4j_connection(
+      "override.example:7687", None, None, "neo4j+s",
+    )
+    self.assertIsNone(incomplete)
+    self.assertIn("must include", error)
+
+  def test_neo4j_api_config_defaults_to_encrypted_bolt_scheme(self):
+    self.assertEqual(
+      EdgeguardApiPlugin.CONFIG["NEO4J_DEFAULT_CONNECTION"],
+      {"scheme": "bolt+s"},
+    )
+
+  def test_neo4j_default_resolves_strict_environment_references(self):
+    plugin = _make_api(neo4j_default_connection={
+      "uri": "$EE_NEO4J_URI",
+      "username": "$EE_NEO4J_USERNAME",
+      "password": "$EE_NEO4J_PASSWORD",
+      "scheme": "$EE_NEO4J_SCHEME",
+    })
+
+    with patch.dict(os.environ, {
+      "EE_NEO4J_URI": "default.example:7687",
+      "EE_NEO4J_USERNAME": "default-user",
+      "EE_NEO4J_PASSWORD": "default-secret",
+      "EE_NEO4J_SCHEME": "bolt+s",
+    }):
+      connection, error = plugin._resolve_neo4j_connection(None, None, None, None)
+
+    self.assertIsNone(error)
+    self.assertEqual(connection["uri"], "default.example:7687")
+    self.assertEqual(connection["scheme"], "bolt+s")
+
+  def test_neo4j_bolt_over_wss_uses_local_bridge_and_closes_it(self):
+    plugin = _make_api(neo4j_query_timeout_seconds=17)
+    raw_driver = MagicMock()
+    bridge = MagicMock()
+    bridge.start.return_value = "bolt://127.0.0.1:45123"
+    graph_database = MagicMock()
+    graph_database.driver.return_value = raw_driver
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api._BoltOverWssBridge",
+      return_value=bridge,
+    ) as bridge_type, patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase",
+      graph_database,
+    ):
+      driver = plugin._neo4j_driver(
+        "bolt+s://neo4j-bolt.example:443", "user", "secret", "bolt_over_wss",
+      )
+      driver.close()
+
+    bridge_type.assert_called_once_with("wss://neo4j-bolt.example", 17)
+    graph_database.driver.assert_called_once_with(
+      "bolt://127.0.0.1:45123",
+      auth=("user", "secret"),
+      connection_timeout=17,
+    )
+    raw_driver.close.assert_called_once_with()
+    bridge.close.assert_called_once_with()
 
   def test_api_model_metadata_uses_v010_graph_intent_artifact(self):
     plugin = _make_api()
@@ -721,13 +1000,13 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
-    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v2")
-    self.assertEqual(explanation["profile_id"], "EGX/1")
-    self.assertEqual(explanation["notation_id"], "numbered_facts")
+    self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v1")
+    self.assertEqual(explanation["profile_id"], "EEL/1")
+    self.assertEqual(explanation["candidate_id"], "JSON-CB/1")
     self.assertEqual(explanation["output_schema_version"], "edgeguard.case_explanation.v1")
-    self.assertEqual(explanation["coverage_schema_version"], "edgeguard.explanation_coverage.v2")
-    self.assertEqual(explanation["explanation_trace_schema_version"], "edgeguard.explanation_trace.v2")
-    self.assertEqual(explanation["selection_status"], "selected_egm_047")
+    self.assertEqual(explanation["coverage_schema_version"], "edgeguard.explanation_coverage.v1")
+    self.assertEqual(explanation["explanation_trace_schema_version"], "edgeguard.explanation_trace.v1")
+    self.assertEqual(explanation["selection_status"], "selected_egm_043")
     self.assertRegex(explanation["profile_sha256"], r"^[0-9a-f]{64}$")
 
   def test_graph_explanation_prompt_centers_question_and_bounds_graph_evidence(self):
@@ -1174,6 +1453,67 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_session.run.assert_called_once_with("MATCH (i:Indicator) RETURN i.value AS value LIMIT 10")
     fake_driver.close.assert_called_once()
 
+  def test_neo4j_query_projects_returned_path_into_ui_graph(self):
+    plugin = _make_api()
+    fake_result = _Result([_graph_path_record()], keys=["p"])
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = fake_result
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    self.assertTrue(result["executed"])
+    self.assertEqual(len(result["graph"]["nodes"]), 2)
+    self.assertEqual(len(result["graph"]["relationships"]), 1)
+    self.assertFalse(result["graph"]["truncated"])
+
+  def test_graph_packet_canonicalizes_driver_temporal_properties_without_truncation(self):
+    indicator = _GraphNode(
+      "indicator-temporal",
+      ["Indicator"],
+      {"value": "example.org", "last_updated": DateTime()},
+    )
+    source = _GraphNode("source-temporal", ["Source"], {"name": "Example source"})
+    relationship = _GraphRelationship(
+      "rel-temporal", "SOURCED_FROM", indicator, source,
+    )
+    path = _GraphPath([indicator, source], [relationship])
+
+    packet, meta = _build_graph_evidence_packet(
+      request="Explain indicator provenance",
+      accepted_cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 5",
+      executed_cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 5",
+      records=[{"p": path}],
+      generated_limit=5,
+      executed_limit=5,
+      limit_adjusted=False,
+    )
+
+    indicator_packet = next(
+      node for node in packet["graph"]["nodes"] if "Indicator" in node["labels"]
+    )
+    self.assertEqual(indicator_packet["properties"]["last_updated"], "2026-08-03T17:00:00Z")
+    self.assertEqual(meta["truncated_properties"], 0)
+    self.assertFalse(packet["execution"]["truncated"])
+    self.assertEqual(
+      _tag_serialized_property(DateTime(), "/node/last_updated"),
+      {
+        "type": "temporal",
+        "temporal_type": "date_time",
+        "value": "2026-08-03T17:00:00Z",
+      },
+    )
+
   def test_neo4j_query_broadens_empty_result_once(self):
     plugin = _make_api()
     fake_record = MagicMock()
@@ -1303,25 +1643,222 @@ class EdgeGuardApiTests(unittest.TestCase):
         )
 
     self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["result_digest"]["query_scope"]["mode"], "exact")
+    self.assertTrue(result["result_digest"]["query_scope"]["accepted_equals_executed"])
     self.assertTrue(result["explained"])
+    self.assertNotIn("explanation_model_url", result)
+    self.assertNotIn("mode", result)
+    self.assertNotIn("metrics", result)
     self.assertEqual(result["packet"]["limit_policy"]["generated_limit"], 10)
-    self.assertEqual(result["packet"]["limit_policy"]["executed_limit"], 25)
-    self.assertTrue(result["packet"]["limit_policy"]["limit_adjusted"])
-    self.assertTrue(result["packet"]["executed_cypher"].endswith("LIMIT 25"))
-    fake_session.run.assert_called_once_with("MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25")
+    self.assertEqual(result["packet"]["limit_policy"]["executed_limit"], 10)
+    self.assertFalse(result["packet"]["limit_policy"]["limit_adjusted"])
+    self.assertTrue(result["packet"]["executed_cypher"].endswith("LIMIT 10"))
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 1)
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    fake_session.run.assert_called_once_with("MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10")
     call_payload = captured_payloads[0]
     self.assertEqual(call_payload["model"], "base_qwen3_4b")
-    self.assertEqual(call_payload["temperature"], 0.7)
-    self.assertEqual(call_payload["top_p"], 0.8)
-    self.assertEqual(call_payload["max_tokens"], 320)
+    self.assertEqual(call_payload["temperature"], 0.1)
+    self.assertEqual(call_payload["top_p"], 1.0)
+    self.assertEqual(call_payload["max_tokens"], 127)
     self.assertEqual(call_payload["response_format"], {"type": "json_object"})
-    self.assertNotIn("schema", call_payload["response_format"])
-    self.assertEqual(call_payload["metadata"]["profile_id"], "EGX/1")
+    self.assertEqual(call_payload["metadata"], {
+      "candidate_id": "JSON-CB/1",
+      "profile_id": "EEL/1",
+      "task": "edgeguard_graph_first_map",
+    })
     self.assertEqual(
-      result["explanation_trace"]["calls"][0]["configuration"],
-      {"temperature": 0.7, "top_p": 0.8, "max_tokens": 320},
+      {
+        key: result["explanation_trace"]["calls"][0]["request"][key]
+        for key in ("temperature", "top_p", "max_tokens")
+      },
+      {"temperature": 0.1, "top_p": 1.0, "max_tokens": 127},
     )
-    self.assertNotIn("request", result["explanation_trace"]["calls"][0])
+    self.assertEqual(result["explanation_trace"]["calls"][0]["kind"], "map")
+
+  def test_one_call_strategy_uses_complete_digest_and_no_retry(self):
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      digest_document = json.loads(payload["messages"][1]["content"])["result_view"]
+      return {
+          "content": json.dumps({
+            "text": "The SOURCED FROM branch is fully represented by the deterministic digest.",
+          }),
+        "finish_reason": "stop",
+        "completion_tokens": 21,
+      }
+
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      graph_first_provider=provider,
+    )
+    fake_driver, _fake_session = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Explain all returned branches.",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(len(payloads), 1)
+    self.assertEqual(payloads[0]["metadata"], {
+      "profile_id": "EAB/1",
+      "task": "edgeguard_result_digest_analyst_brief",
+    })
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["explained"])
+    self.assertEqual(result["analyst_brief"]["strategy"], "one_call")
+    self.assertEqual(result["analyst_brief"]["configured_max_tokens"], 127)
+    self.assertEqual(
+      result["analyst_brief"]["group_ids"],
+      [item["id"] for item in result["result_digest"]["groups"]],
+    )
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertNotIn("explanation", result)
+    self.assertEqual(result["explanation_trace"]["schema_version"], "edgeguard.analyst_brief_trace.v1")
+
+  def test_one_call_failure_keeps_digest_without_raw_content_or_retry(self):
+    calls = 0
+
+    def provider(_payload):
+      nonlocal calls
+      calls += 1
+      return {"content": "private malformed output", "finish_reason": "stop", "completion_tokens": 3}
+
+    plugin = _make_api(edgeguard_explanation_strategy="one_call", graph_first_provider=provider)
+    fake_driver, _fake_session = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(calls, 1)
+    self.assertEqual(result["status"], "ok")
+    self.assertFalse(result["explained"])
+    self.assertEqual(result["analyst_brief"]["status"], "unavailable")
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "invalid_brief_json")
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 1)
+    self.assertEqual(result["explanation_trace"]["outcome"]["completed_calls"], 1)
+    self.assertEqual(result["explanation_trace"]["calls"][0]["status"], "completed")
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertNotIn("private malformed output", json.dumps(result))
+
+  def test_one_call_deadline_admission_degrades_before_dispatch(self):
+    calls = 0
+
+    def provider(_payload):
+      nonlocal calls
+      calls += 1
+      raise AssertionError("provider must not be called")
+
+    plugin = _make_api(edgeguard_explanation_strategy="one_call", graph_first_provider=provider)
+    result = plugin._run_digest_analyst_brief(
+      digest={
+        "schema_version": "edgeguard.result_digest.v1",
+        "groups": [],
+        "coverage": {"complete": True},
+      },
+      packet={},
+      packet_meta={},
+      validation={"accepted": True},
+      live_retry={},
+      request="Explain.",
+      deadline=time.monotonic() + 259,
+    )
+
+    self.assertEqual(calls, 0)
+    self.assertFalse(result["explained"])
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "insufficient_deadline_budget")
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
+    self.assertEqual(result["explanation_trace"]["outcome"]["completed_calls"], 0)
+
+  def test_api_owned_complete_evidence_dispatches_balanced_map_map_synthesis_to_base_qwen(self):
+    from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode
+    from extensions.business.cybersec.edgeguard.tests.test_graph_first_explanation import fixtures
+
+    evidence, catalog = fixtures(disconnected=True)
+    evidence["rows"][0]["values"][1] = {"type": "string", "value": "a" * 800}
+    evidence["rows"][1]["values"][1] = {"type": "string", "value": "b" * 800}
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return _graph_first_provider(payload)
+
+    plugin = _make_api(graph_first_provider=provider)
+    cypher = "MATCH p=()--() RETURN p LIMIT 25"
+    result = plugin._run_graph_first(
+      plan={
+        "accepted_cypher": cypher,
+        "projection_descriptors": [],
+        "limit_policy": {"limit_adjusted": False},
+      },
+      execution_result={
+        "executed_cypher": cypher,
+        "row_count": 2,
+        "truncated": False,
+        "broadened": False,
+        "execution_trace": {
+          "selected": "primary",
+          "executions": [{
+            "id": "primary",
+            "executed_cypher": cypher,
+            "row_count": 2,
+            "truncated": False,
+            "duration_ms": 1.0,
+            "method": "native_driver",
+          }],
+        },
+      },
+      packet={},
+      query_result_evidence=evidence,
+      evidence_catalog=catalog,
+      request="Explain both disconnected branches.",
+      mode_plan=resolve_mode("balanced"),
+      deadline=1e20,
+    )
+
+    self.assertEqual(
+      [payload["metadata"]["task"] for payload in payloads],
+      [
+        "edgeguard_graph_first_map",
+        "edgeguard_graph_first_map",
+        "edgeguard_graph_first_synthesis",
+      ],
+    )
+    self.assertTrue(all(payload["model"] == "base_qwen3_4b" for payload in payloads))
+    self.assertTrue(all(payload["temperature"] == 0.1 for payload in payloads))
+    self.assertTrue(all(payload["top_p"] == 1.0 for payload in payloads))
+    self.assertTrue(all(payload["max_tokens"] == 127 for payload in payloads))
+    self.assertEqual(
+      [call["kind"] for call in result["explanation_trace"]["calls"]],
+      ["map", "map", "synthesis"],
+    )
+    self.assertTrue(all("gates" not in call for call in result["explanation_trace"]["calls"]))
+    self.assertEqual(result["coverage"]["calls"], {"map": 2, "synthesis": 1, "total": 3})
+    self.assertEqual(len(result["explanation"]["entity_findings"]), 2)
+    union = []
+    for finding in result["explanation"]["entity_findings"]:
+      for evidence_id in finding["evidence_ids"]:
+        if evidence_id not in union:
+          union.append(evidence_id)
+    self.assertEqual(result["explanation"]["summary"]["evidence_ids"], union)
+    self.assertEqual(
+      result["explanation_trace"]["calls"][-1]["parsed"]["maps"],
+      ["F0", "F1"],
+    )
+    self.assertEqual(result["neo4j_trace"]["result"]["rows"], evidence["rows"])
 
   def test_explanation_payload_caps_output_and_honors_smaller_positive_limit(self):
     plugin = _make_api(edgeguard_explanation_max_tokens=1600)
@@ -1376,38 +1913,167 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(
       result["executed_cypher"],
-      "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
+      "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
     )
     self.assertEqual(
       result["broadening"]["cypher"],
       "MATCH p=(n:Indicator)-[:SOURCED_FROM]-() RETURN p LIMIT 25",
     )
+
     self.assertEqual(result["limit_policy"], {
       "generated_limit": 10,
-      "executed_limit": 25,
+      "executed_limit": 10,
+      "transport_row_cap": 25,
       "server_max_rows": 50,
-      "limit_adjusted": True,
+      "limit_adjusted": False,
+      "query_rewritten": False,
     })
     self.assertEqual(result["explanation_contract"], {
-      "schema_version": "edgeguard.graph_first_prepare.v2",
-      "profile_id": "EGX/1",
-      "notation_id": "numbered_facts",
-      "profile_sha256": "7edfcd2c8873d02db9da72de13cadc631e65d4a9f2273df2a9a2c10ced9f1488",
+      "schema_version": "edgeguard.graph_first_prepare.v1",
+      "profile_id": "EEL/1",
+      "candidate_id": "JSON-CB/1",
+      "profile_sha256": "865f47894e13b1ff9242fd121b760994d413f7220db99c57851c0008f61d64e3",
       "case_explanation_schema_version": "edgeguard.case_explanation.v1",
-      "coverage_schema_version": "edgeguard.explanation_coverage.v2",
+      "coverage_schema_version": "edgeguard.explanation_coverage.v1",
       "neo4j_trace_schema_version": "edgeguard.neo4j_trace.v1",
-      "explanation_trace_schema_version": "edgeguard.explanation_trace.v2",
+      "explanation_trace_schema_version": "edgeguard.explanation_trace.v1",
       "resolved_mode": {
         "requested": "balanced",
         "effective": "balanced",
         "row_limit": 25,
-        "call_cap": 1,
-        "max_tokens": 320,
+        "map_call_cap": 2,
+        "max_tokens": 127,
       },
     })
+
+  def test_one_call_prepare_contract_has_distinct_identity_and_cap(self):
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    result = plugin.prepare_graph_explanation(
+      cypher="MATCH (i:Indicator) RETURN i LIMIT 10",
+      explanation_mode="balanced",
+      enable_empty_result_broadening=False,
+    )
+
+    self.assertTrue(result["ok"])
+    contract = result["explanation_contract"]
+    self.assertEqual(contract["schema_version"], "edgeguard.result_digest_prepare.v1")
+    self.assertEqual(contract["profile_id"], "EAB/1")
+    self.assertEqual(
+      contract["digest_coverage_schema_version"],
+      "edgeguard.result_digest_coverage.v2",
+    )
+    self.assertEqual(contract["strategy"], "one_call")
+    self.assertEqual(contract["max_tokens"], 127)
+    self.assertEqual(contract["resolved_mode"]["map_call_cap"], 0)
+    self.assertEqual(contract["resolved_mode"]["row_limit"], 25)
+    self.assertEqual(result["accepted_cypher"], result["executed_cypher"])
     flattened = json.dumps(result)
     for forbidden in ("username", "password", "neo4j-bolt.edgeguard.org"):
       self.assertNotIn(forbidden, flattened)
+
+  def test_one_call_prepare_accepts_when_model_is_unconfigured(self):
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      edgeguard_explanation_model_port=None,
+    )
+
+    result = plugin.prepare_graph_explanation(
+      cypher="MATCH (i:Indicator) RETURN i LIMIT 10",
+    )
+
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["status"], "accepted")
+    self.assertEqual(result["explanation_contract"]["profile_id"], "EAB/1")
+    self.assertFalse(result["broadening"]["enabled"])
+
+  def test_one_call_model_not_ready_returns_digest_after_exact_execution(self):
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    fake_driver, fake_session = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        with patch.object(plugin, "_explanation_worker_ready", return_value=False):
+          result = plugin.explain_graph(
+            uri="example.com:7687",
+            scheme="bolt+s",
+            username="neo4j",
+            password="secret",
+            request="Explain the exact graph.",
+            cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+          )
+
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["executed"])
+    self.assertFalse(result["explained"])
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "model_not_ready")
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
+    self.assertEqual(result["result_digest"]["query_scope"]["mode"], "exact")
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_explain_graph_default_scope_does_not_broaden_an_empty_result(self):
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    fake_driver, fake_session = _driver_with_results(
+      _Result([], keys=["p"]),
+      _Result([_graph_path_record()], keys=["p"]),
+    )
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["executed"])
+    self.assertFalse(result["explained"])
+    self.assertFalse(result["live_retry"]["enabled"])
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 0)
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(
+      result["result_digest"]["summary"]["text"],
+      "The exact query returned no rows and therefore no graph evidence.",
+    )
+    self.assertEqual(result["analyst_brief"]["call_count"], 0)
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "no_graph_evidence")
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
+    self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_one_call_prepared_empty_result_returns_complete_zero_call_digest(self):
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    cypher = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10"
+    execution_result = _serialized_execution(cypher, primary_row_count=0)
+    execution_result.update({
+      "row_count": 0,
+      "graph": {"nodes": [], "relationships": [], "truncated": False},
+    })
+    execution_result["query_result_evidence"]["rows"] = []
+
+    result = plugin.explain_graph(
+      cypher=cypher,
+      request="Explain the exact graph.",
+      execution_result=execution_result,
+    )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["executed"])
+    self.assertFalse(result["explained"])
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 0)
+    self.assertEqual(
+      result["result_digest"]["coverage"]["schema_version"],
+      "edgeguard.result_digest_coverage.v2",
+    )
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(result["analyst_brief"]["call_count"], 0)
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "no_graph_evidence")
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
+    self.assertEqual(result["explanation_trace"]["outcome"]["completed_calls"], 0)
 
   def test_prepare_graph_explanation_rejects_before_execution_when_provider_is_unconfigured(self):
     plugin = _make_api(edgeguard_explanation_model_port=None)
@@ -1420,7 +2086,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "config_error")
     self.assertEqual(
       result["explanation_contract"]["schema_version"],
-      "edgeguard.graph_first_prepare.v2",
+      "edgeguard.graph_first_prepare.v1",
     )
     self.assertEqual(
       result["explanation_contract"]["resolved_mode"]["effective"],
@@ -1435,9 +2101,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     response = _nested_provider_response(content, completion_tokens="16")
     payload = {
       "metadata": {
-        "profile_id": "EGX/1",
-        "notation_id": "numbered_facts",
-        "task": "edgeguard_explain_v2_analyst",
+        "candidate_id": "JSON-CB/1",
+        "profile_id": "EEL/1",
+        "task": "edgeguard_graph_first_map",
       },
     }
 
@@ -1457,7 +2123,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     receipt = json.loads(receipt_logs[0].split(" ", 1)[1])
     self.assertEqual(receipt, {
       "schema_version": "edgeguard.graph_first_provider_receipt.v1",
-      "task_kind": "analyst",
+      "task_kind": "map",
       "envelope_path": "$.result.FULL_OUTPUT",
       "content_bytes": len(content.encode("utf-8")),
       "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -1480,9 +2146,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     payload = {
       "metadata": {
-        "profile_id": "EGX/1",
-        "notation_id": "numbered_facts",
-        "task": "edgeguard_explain_v2_analyst",
+        "candidate_id": "JSON-CB/1",
+        "profile_id": "EEL/1",
+        "task": "edgeguard_graph_first_synthesis",
       },
     }
 
@@ -1611,6 +2277,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           uri="example.com:7687",
           username="neo4j",
           password="secret",
+          scheme="bolt+s",
           cypher='MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
         )
 
@@ -2179,7 +2846,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(result["provider"], "local")
-    self.assertEqual(result["model"], "qwen2.5-1.5b-instruct")
+    self.assertEqual(result["model"], "base_qwen3_4b")
     self.assertIs(fake_session.trust_env, False)
     fake_session.post.assert_called_once()
     self.assertNotIn("127.0.0.1", " ".join(str(call) for call in plugin.Pd.call_args_list))
@@ -2347,11 +3014,14 @@ class EdgeGuardApiTests(unittest.TestCase):
             uri="example.com:7687",
             scheme="bolt+s",
             username="neo4j",
-            password="secret",
-            cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
-          )
+              password="secret",
+              cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
+              enable_empty_result_broadening=True,
+            )
 
     self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["result_digest"]["query_scope"]["mode"], "expand")
+    self.assertFalse(result["result_digest"]["query_scope"]["accepted_equals_executed"])
     self.assertTrue(result["packet"]["execution"]["broadened"])
     self.assertEqual(result["packet"]["execution"]["live_retry_reason"], "executed_no_rows")
     self.assertTrue(result["live_retry"]["applied"])
@@ -2361,7 +3031,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "MATCH p=(n:Indicator)-[:SOURCED_FROM]-() RETURN p LIMIT 25",
     )
 
-  def test_explain_graph_rejects_truncated_execution_without_model_call(self):
+  def test_explain_graph_returns_truthful_truncated_digest_without_model_call(self):
     plugin = _make_api()
     fake_driver, _fake_session = _driver_with_results(
       _Result([_graph_record() for _idx in range(26)], keys=["i", "s"]),
@@ -2380,10 +3050,15 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
           )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertIn(
-      "incomplete_execution_result",
-      {item["code"] for item in result["validation_errors"]},
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["ok"])
+    self.assertFalse(result["explained"])
+    self.assertTrue(result["result_digest"]["query_scope"]["truncated"])
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 25)
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(
+      result["analyst_brief"]["diagnostics"]["validation_codes"],
+      ["transport_truncated"],
     )
     mocked_post.assert_not_called()
 
@@ -2412,14 +3087,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "ok")
     self.assertTrue(result["explained"])
     explanation = result["explanation"]
-    self.assertIn("limit_adjusted", {item["type"] for item in explanation["caveats"]})
-    explanation["caveats"] = [
-      caveat for caveat in explanation["caveats"] if caveat["type"] != "limit_adjusted"
-    ]
+    self.assertNotIn("limit_adjusted", {item["type"] for item in explanation["caveats"]})
     packet_errors, context = _validate_graph_evidence_packet(result["packet"])
     self.assertEqual(packet_errors, [])
     validation_errors = _validate_case_explanation(explanation, context)
-    self.assertIn("missing_required_caveat", {item["code"] for item in validation_errors})
+    self.assertNotIn("missing_required_caveat", {item["code"] for item in validation_errors})
 
   def test_explain_graph_rejects_malformed_json_output(self):
     plugin = _make_api(graph_first_provider=lambda _payload: {
@@ -2440,12 +3112,13 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
         )
 
-    self.assertEqual(result["status_code"], 500)
-    self.assertTrue(result["logged"])
-    self.assertEqual(result["result"]["status"], "error")
-    self.assertEqual(result["result"]["diagnostics"]["reason"], "malformed_json")
-    self.assertEqual(result["result"]["diagnostics"]["validation_codes"], ["invalid_model_output"])
-    self.assertNotIn("raw_output", json.dumps(result["result"]["explanation_trace"]))
+    self.assertEqual(result["status"], "ok")
+    self.assertFalse(result["explained"])
+    diagnostics = result["analyst_brief"]["diagnostics"]
+    self.assertEqual(diagnostics["reason"], "malformed_json")
+    self.assertEqual(diagnostics["validation_codes"], ["invalid_model_output"])
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertNotIn("raw_output", json.dumps(result["explanation_trace"]))
 
   def test_explanation_provider_length_finish_rejects_before_parsing_without_raw_output(self):
     plugin = _make_api()
@@ -2733,17 +3406,16 @@ class EdgeGuardApiTests(unittest.TestCase):
       execution_result=_serialized_execution(cypher),
     )
 
-    self.assertEqual(result["status_code"], 500)
-    self.assertEqual(result["result"]["error"], "Graph explanation is unavailable.")
-    self.assertEqual(
-      {item["code"] for item in result["result"]["validation_errors"]},
-      {"finish_reason"},
-    )
-    self.assertTrue(result["logged"])
-    self.assertEqual(result["result"]["diagnostics"]["reason"], "output_truncated")
-    self.assertNotIn("raw_output", json.dumps(result["result"]["explanation_trace"]))
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["executed"])
+    self.assertFalse(result["explained"])
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(result["analyst_brief"]["status"], "unavailable")
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "output_truncated")
+    self.assertNotIn("raw_output", json.dumps(result["explanation_trace"]))
 
-  def test_explain_graph_rejects_extra_analyst_output_keys(self):
+  def test_explain_graph_rejects_extra_map_output_keys_without_retry(self):
     def invalid_provider(payload):
       valid = json.loads(_graph_first_provider(payload)["content"])
       valid["extra"] = "not allowed"
@@ -2769,27 +3441,26 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
         )
 
-    diagnostics = result["result"]["diagnostics"]
+    diagnostics = result["analyst_brief"]["diagnostics"]
     codes = set(diagnostics["validation_codes"])
-    self.assertEqual(result["status_code"], 500)
-    self.assertTrue(result["logged"])
+    self.assertEqual(result["status"], "ok")
+    self.assertFalse(result["explained"])
     self.assertEqual(diagnostics["stage"], "response_parse")
     self.assertEqual(diagnostics["reason"], "malformed_json")
-    self.assertEqual(codes, {"invalid_model_output"})
-    serialized_result = json.dumps(result["result"])
+    self.assertEqual(codes, {"invalid_map_output"})
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 1)
+    serialized_result = json.dumps(result)
     serialized_logs = " ".join(str(call) for call in plugin.P.call_args_list)
     self.assertNotIn("raw_output", serialized_result)
-    self.assertNotIn("private-question-sentinel", serialized_result)
-    self.assertNotIn("example.org", serialized_result)
-    self.assertNotIn('"packet"', serialized_result)
-    self.assertNotIn('"packet_meta"', serialized_result)
     self.assertNotIn("private-question-sentinel", serialized_logs)
     self.assertNotIn("example.org", serialized_logs)
 
-  def test_explain_graph_rejects_fabricated_citation_after_one_retry(self):
+  def test_explain_graph_rejects_unknown_map_anchor_without_retry(self):
     def invalid_provider(payload):
+      valid = json.loads(_graph_first_provider(payload)["content"])
+      valid["anchor"] = "N999"
       return {
-        "content": json.dumps({"citations": ["F999"], "finding": "fabricated citation not in the evidence."}),
+        "content": json.dumps(valid),
         "finish_reason": "stop",
         "completion_tokens": 16,
         "duration_ms": 1.0,
@@ -2808,24 +3479,18 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
         )
 
-    self.assertEqual(result["status_code"], 500)
-    codes = set(result["result"]["diagnostics"]["validation_codes"])
-    self.assertIn("citation_membership", codes)
-    self.assertEqual(
-      {item["code"] for item in result["result"]["validation_errors"]},
-      codes,
-    )
-    self.assertEqual(result["result"]["diagnostics"]["reason"], "deterministic_validation_failed")
-    self.assertEqual(result["result"]["explanation_trace"]["outcome"]["attempted_calls"], 2)
+    self.assertEqual(result["status"], "ok")
+    codes = set(result["analyst_brief"]["diagnostics"]["validation_codes"])
+    self.assertEqual(codes, {"invalid_map_citation"})
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "malformed_json")
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 1)
 
-  def test_explain_graph_rejects_ungrounded_quoted_finding_after_one_retry(self):
+  def test_explain_graph_rejects_incomplete_map_row_citations_without_retry(self):
     def invalid_provider(payload):
-      user = payload["messages"][-1]["content"]
-      evidence = user.split("EVIDENCE:\n", 1)[1].split("\n\nQUESTION:", 1)[0]
-      import re as re_mod
-      fact_id = re_mod.search(r"F\d+", evidence).group(0)
+      valid = json.loads(_graph_first_provider(payload)["content"])
+      valid["rows"] = []
       return {
-        "content": json.dumps({"citations": [fact_id], "finding": 'The evidence names "totally-fabricated-name" here.'}),
+        "content": json.dumps(valid),
         "finish_reason": "stop",
         "completion_tokens": 16,
         "duration_ms": 1.0,
@@ -2844,15 +3509,12 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
         )
 
-    codes = set(result["result"]["diagnostics"]["validation_codes"])
-    self.assertEqual(result["status_code"], 500)
-    self.assertIn("lexical_grounding", codes)
-    self.assertNotIn("explanation", result["result"])
-    self.assertEqual(
-      {item["code"] for item in result["result"]["validation_errors"]},
-      codes,
-    )
-    self.assertNotIn("totally-fabricated-name", json.dumps(result["result"]))
+    codes = set(result["analyst_brief"]["diagnostics"]["validation_codes"])
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(codes, {"invalid_map_citation"})
+    self.assertNotIn("explanation", result)
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 1)
 
   def test_explain_graph_returns_provider_error_after_packet_build(self):
     plugin = _make_api(graph_first_provider=None)
@@ -2872,16 +3534,13 @@ class EdgeGuardApiTests(unittest.TestCase):
             cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 25",
           )
 
-    self.assertEqual(result["status_code"], 500)
-    self.assertTrue(result["logged"])
-    self.assertEqual(result["result"]["status"], "error")
-    self.assertTrue(result["result"]["executed"])
-    self.assertFalse(result["result"]["explained"])
-    self.assertEqual(result["result"]["diagnostics"]["stage"], "provider")
-    self.assertEqual(result["result"]["diagnostics"]["reason"], "provider_http_error")
-    self.assertNotIn("provider_status", result["result"])
-    self.assertNotIn("packet", result["result"])
-    self.assertNotIn("packet_meta", result["result"])
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["executed"])
+    self.assertFalse(result["explained"])
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["stage"], "provider")
+    self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "provider_http_error")
+    self.assertNotIn("provider_status", result)
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
 
   def test_case_explanation_validator_rejects_redaction_flags(self):
     packet = {

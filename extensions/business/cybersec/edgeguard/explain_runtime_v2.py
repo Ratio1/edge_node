@@ -27,8 +27,10 @@ import dataclasses
 import hashlib
 import json
 import math
+import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -93,7 +95,7 @@ def resolve_mode_v2(
   max_tokens: Any = None,
 ) -> ModePlanV2:
   """Resolve the EGX/1 mode plan; reject drift from the pinned sampling
-  contract (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `max_tokens=320`)."""
+  contract (`temperature=0.1`, `top_p=1.0`, `top_k=20`, `max_tokens=64`)."""
   rows = _strict_positive_integer(explanation_rows, "explanation_rows")
   legacy_max = _strict_positive_integer(max_rows, "max_rows")
   if rows is not None and legacy_max is not None and rows != legacy_max:
@@ -115,19 +117,19 @@ def resolve_mode_v2(
     isinstance(temperature, bool) or not isinstance(temperature, (int, float))
     or not math.isfinite(float(temperature)) or float(temperature) != profile.MODEL_CARD_SAMPLING["temperature"]
   ):
-    _fail("explanation_configuration_drift", "temperature must be 0.7")
+    _fail("explanation_configuration_drift", f"temperature must be {profile.MODEL_CARD_SAMPLING['temperature']}")
   if top_p is not None and (
     isinstance(top_p, bool) or not isinstance(top_p, (int, float))
     or not math.isfinite(float(top_p)) or float(top_p) != profile.MODEL_CARD_SAMPLING["top_p"]
   ):
-    _fail("explanation_configuration_drift", "top_p must be 0.8")
+    _fail("explanation_configuration_drift", f"top_p must be {profile.MODEL_CARD_SAMPLING['top_p']}")
   if top_k is not None and (
     isinstance(top_k, bool) or not isinstance(top_k, int) or top_k != profile.MODEL_CARD_SAMPLING["top_k"]
   ):
     _fail("explanation_configuration_drift", "top_k must be 20")
   selected_tokens = MAX_TOKENS if max_tokens is None else _strict_positive_integer(max_tokens, "max_tokens")
   if selected_tokens != MAX_TOKENS:
-    _fail("explanation_configuration_drift", "max_tokens must be 320")
+    _fail("explanation_configuration_drift", f"max_tokens must be {MAX_TOKENS}")
   return ModePlanV2(mode, row_limit, CALL_CAP, selected_tokens)
 
 
@@ -188,7 +190,72 @@ def production_token_counter(path: str = TOKENIZER_DEFAULT_PATH) -> Callable[[st
 # Payload / parsing / gates
 # --------------------------------------------------------------------------
 
-def _payload(prompt: Mapping[str, str], kind: str, mode: ModePlanV2, model: Optional[str]) -> dict[str, Any]:
+def _primary_fact_pair(rendered) -> Optional[tuple[str, str]]:
+  """Return the first canonical fact ID/body as one indivisible pair.
+
+  The selector has already ranked and bounded the evidence graph. Binding the
+  response grammar to its first fact prevents a model from citing one fact
+  while borrowing entities or relations from another. The ordinary parser
+  and every deterministic grounding gate still validate the completion.
+  """
+  if not rendered.fact_ids:
+    return None
+  fact_id = rendered.fact_ids[0]
+  prefix = f"{fact_id}: "
+  for line in rendered.text.splitlines():
+    if line.startswith(prefix):
+      body = line[len(prefix):].strip()
+      if body:
+        # llama.cpp's JSON-schema-to-grammar compiler does not safely accept
+        # arbitrary punctuation (notably quoted Windows-style indicator
+        # values) inside enum literals. Canonicalize only the constrained
+        # prose value; the rendered evidence itself remains byte-unchanged.
+        canonical = unicodedata.normalize("NFKC", body)
+        canonical = re.sub(r"[^A-Za-z0-9 _.,:-]+", " ", canonical)
+        canonical = re.sub(r"\s+", " ", canonical).strip()
+        canonical = re.sub(r"\s+([.,:])", r"\1", canonical)
+        if canonical:
+          return fact_id, canonical
+  raise GraphFirstRuntimeError(
+    "invalid_rendered_evidence", "internal",
+    "primary citation does not resolve to a canonical fact line",
+  )
+
+
+def _constrained_response_format(rendered) -> dict[str, Any]:
+  primary = _primary_fact_pair(rendered)
+  if primary is None:
+    citations_schema = {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 0,
+      "maxItems": 0,
+    }
+    findings = ["Evidence."]
+  else:
+    fact_id, fact_body = primary
+    citations_schema = {
+      "type": "array",
+      "items": {"type": "string", "enum": [fact_id]},
+      "minItems": 1,
+      "maxItems": 1,
+    }
+    findings = [fact_body]
+  return {
+    "type": "json_object",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "citations": citations_schema,
+        "finding": {"type": "string", "enum": findings},
+      },
+      "required": ["citations", "finding"],
+      "additionalProperties": False,
+    },
+  }
+
+
+def _payload(prompt: Mapping[str, str], kind: str, mode: ModePlanV2, model: Optional[str], rendered) -> dict[str, Any]:
   value: dict[str, Any] = {
     "max_tokens": mode.max_tokens,
     "messages": [
@@ -196,7 +263,7 @@ def _payload(prompt: Mapping[str, str], kind: str, mode: ModePlanV2, model: Opti
       {"role": "user", "content": prompt["user"]},
     ],
     "metadata": {"profile_id": PROFILE_ID, "notation_id": NOTATION_ID, "task": TASK_KINDS[kind]},
-    "response_format": {"type": "json_object"},
+    "response_format": _constrained_response_format(rendered),
     "temperature": profile.MODEL_CARD_SAMPLING["temperature"],
     "top_p": profile.MODEL_CARD_SAMPLING["top_p"],
   }
@@ -225,7 +292,7 @@ def _parse_response(content: Any) -> tuple[Optional[dict[str, Any]], Optional[st
 
 def _validated_completion_tokens(value: Any) -> Optional[int]:
   """Completion-token ceiling: an integer in `[0, COMPLETION_TOKEN_LIMIT]`
-  (384) inclusive."""
+  (127) inclusive; 128 is the first rejected value."""
   if value is None:
     return None
   if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > COMPLETION_TOKEN_LIMIT:
@@ -508,7 +575,7 @@ def run_explanation_v2(
     for attempt in range(2):
       kind = "analyst" if attempt == 0 else "retry"
       current_prompt = prompt if attempt == 0 else profile.build_retry_prompt(notation_id, rendered.text, question, failed_names)
-      payload = _payload(current_prompt, kind, mode, model)
+      payload = _payload(current_prompt, kind, mode, model, rendered)
       _validate_dispatch_budget(remaining_time())
       call = _new_call(f"C{attempt}", kind, payload)
       trace["calls"].append(call)

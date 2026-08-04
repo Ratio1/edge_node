@@ -298,10 +298,26 @@ class GatesTests(unittest.TestCase):
     passed, _detail = gates.lexical_grounding(response, self.rendered.text)
     self.assertTrue(passed)
 
+  def test_lexical_grounding_rejects_relation_language_absent_from_cited_facts(self):
+    response = {
+      "citations": ["F2"],
+      "finding": "Malware LockBit 4.0 indicates FIN13 via MITRE techniques.",
+    }
+    passed, detail = gates.lexical_grounding(response, self.rendered.text)
+    self.assertFalse(passed)
+    self.assertIn("indicates", detail)
+    self.assertIn("via", detail)
+
+  def test_lexical_grounding_allows_exact_relation_and_generic_link_words(self):
+    exact = {"citations": ["F2"], "finding": "Malware LockBit 4.0 is attributed to ThreatActor FIN13."}
+    linked = {"citations": ["F2"], "finding": "Malware LockBit 4.0 is linked to ThreatActor FIN13."}
+    self.assertTrue(gates.lexical_grounding(exact, self.rendered.text)[0])
+    self.assertTrue(gates.lexical_grounding(linked, self.rendered.text)[0])
+
   def test_inline_id_validity_catches_unquoted_entity_hallucination(self):
-    response = {"citations": [], "finding": "The actor also targets FakeCorp [F99]."}
+    response = {"citations": ["F1"], "finding": "Indicator paylock-updates.com [F99] indicates Malware LockBit 4.0."}
     lexical_passed, _ = gates.lexical_grounding(response, self.rendered.text)
-    self.assertTrue(lexical_passed, "no quoted string to check -- gate (b) cannot see this hallucination")
+    self.assertTrue(lexical_passed, "inline IDs are validated by the dedicated gate")
     inline_passed, detail = gates.inline_id_validity(response, self.universe)
     self.assertFalse(inline_passed)
     self.assertIn("F99", detail)
@@ -389,16 +405,16 @@ class ProfileTests(unittest.TestCase):
   def test_prompt_caps_appear_in_both_system_and_user_messages(self):
     prompt = profile.build_analyst_prompt("numbered_facts", "EVIDENCE-TEXT", "QUESTION-TEXT")
     for message in (prompt["system"], prompt["user"]):
-      self.assertIn("AT MOST 3 sentences", message)
-      self.assertIn("AT MOST 8 IDs", message)
+      self.assertIn("at most 20 words", message)
+      self.assertIn("at most 4", message)
     self.assertIn("EVIDENCE-TEXT", prompt["user"])
     self.assertIn("QUESTION-TEXT", prompt["user"])
     self.assertIn('{"citations"', prompt["system"])
 
   def test_prompt_requires_named_entities_and_exact_ids(self):
     prompt = profile.build_analyst_prompt("numbered_facts", "EVIDENCE-TEXT", "QUESTION-TEXT")
-    self.assertIn("Name the actual entities", prompt["system"])
-    self.assertIn("never invent an ID", prompt["system"])
+    self.assertIn("Copy one cited fact", prompt["system"])
+    self.assertIn("copy one cited fact", prompt["user"])
 
   def test_retry_prompt_names_failed_checks_only(self):
     prompt = profile.build_retry_prompt("numbered_facts", "EVIDENCE-TEXT", "QUESTION-TEXT", ["citation_membership", "lexical_grounding"])
@@ -419,9 +435,9 @@ class ProfileTests(unittest.TestCase):
     self.assertFalse(profile.MAP_REDUCE_ENABLED)
 
   def test_sampling_and_token_constants_match_the_egx1_spec(self):
-    self.assertEqual(profile.MODEL_CARD_SAMPLING, {"temperature": 0.7, "top_p": 0.8, "top_k": 20})
-    self.assertEqual(profile.MAX_TOKENS, 320)
-    self.assertEqual(profile.COMPLETION_TOKEN_LIMIT, 384)
+    self.assertEqual(profile.MODEL_CARD_SAMPLING, {"temperature": 0.1, "top_p": 1.0, "top_k": 20})
+    self.assertEqual(profile.MAX_TOKENS, 64)
+    self.assertEqual(profile.COMPLETION_TOKEN_LIMIT, 127)
 
   def test_compute_evidence_budget_matches_measured_rate_formula(self):
     total = profile.total_prompt_token_budget()
@@ -442,7 +458,7 @@ class ProfileTests(unittest.TestCase):
     # computed once from the checked-in profile.
     self.assertEqual(
       profile.PROFILE_MANIFEST_SHA256,
-      "7edfcd2c8873d02db9da72de13cadc631e65d4a9f2273df2a9a2c10ced9f1488",
+      "77cdb50d37ef7b26a4d4231dfc3e7b3fa753cce818b49c9bd8e9eb669ffc2369",
     )
     self.assertRegex(profile.PROFILE_MANIFEST_SHA256, r"^[0-9a-f]{64}$")
 
@@ -457,12 +473,12 @@ class ProfileTests(unittest.TestCase):
 # ==========================================================================
 
 class ResolveModeV2Tests(unittest.TestCase):
-  def test_default_mode_is_balanced_320_tokens(self):
+  def test_default_mode_is_balanced_64_tokens(self):
     plan = runtime.resolve_mode_v2()
     self.assertEqual(plan.mode, "balanced")
     self.assertEqual(plan.row_limit, 25)
     self.assertEqual(plan.call_cap, 1)
-    self.assertEqual(plan.max_tokens, 320)
+    self.assertEqual(plan.max_tokens, 64)
 
   def test_explicit_modes_resolve_row_limits(self):
     self.assertEqual(runtime.resolve_mode_v2(explanation_mode="fast").row_limit, 10)
@@ -475,17 +491,17 @@ class ResolveModeV2Tests(unittest.TestCase):
     self.assertEqual(raised.exception.code, "invalid_explanation_mode")
 
   def test_matching_sampling_values_are_accepted(self):
-    plan = runtime.resolve_mode_v2(temperature=0.7, top_p=0.8, top_k=20, max_tokens=320)
-    self.assertEqual(plan.max_tokens, 320)
+    plan = runtime.resolve_mode_v2(temperature=0.1, top_p=1.0, top_k=20, max_tokens=64)
+    self.assertEqual(plan.max_tokens, 64)
 
   def test_temperature_drift_rejected(self):
     with self.assertRaises(GraphFirstContractError) as raised:
-      runtime.resolve_mode_v2(temperature=0.1)
+      runtime.resolve_mode_v2(temperature=0.7)
     self.assertEqual(raised.exception.code, "explanation_configuration_drift")
 
   def test_top_p_drift_rejected(self):
     with self.assertRaises(GraphFirstContractError) as raised:
-      runtime.resolve_mode_v2(top_p=1.0)
+      runtime.resolve_mode_v2(top_p=0.8)
     self.assertEqual(raised.exception.code, "explanation_configuration_drift")
 
   def test_top_k_drift_rejected(self):
@@ -495,7 +511,7 @@ class ResolveModeV2Tests(unittest.TestCase):
 
   def test_max_tokens_drift_rejected(self):
     with self.assertRaises(GraphFirstContractError) as raised:
-      runtime.resolve_mode_v2(max_tokens=127)
+      runtime.resolve_mode_v2(max_tokens=128)
     self.assertEqual(raised.exception.code, "explanation_configuration_drift")
 
   def test_row_limit_exceeds_cap_rejected(self):
@@ -558,6 +574,12 @@ class RunExplanationV2Tests(unittest.TestCase):
       remaining_time=lambda: 500.0,
     )
     self.assertEqual(len(provider.calls), 1)
+    response_schema = provider.calls[0]["response_format"]["schema"]
+    self.assertEqual(response_schema["properties"]["citations"]["items"]["enum"], ["F1"])
+    self.assertEqual(
+      response_schema["properties"]["finding"]["enum"],
+      [runtime._primary_fact_pair(rendered)[1]],
+    )
     self.assertEqual(result["explanation"]["schema_version"], "edgeguard.case_explanation.v1")
     self.assertEqual(len(result["explanation"]["entity_findings"]), 1)
     self.assertEqual(result["coverage"]["schema_version"], "edgeguard.explanation_coverage.v2")
@@ -569,6 +591,21 @@ class RunExplanationV2Tests(unittest.TestCase):
     self.assertIn("parsed", result["explanation_trace"]["calls"][0])
     self.assertEqual(result["coverage"]["calls"], {"analyst": 1, "retry": 0, "total": 1})
 
+  def test_constrained_finding_canonicalizes_grammar_unsafe_indicator_punctuation(self):
+    rendered = notation.RenderedEvidence(
+      "numbered_facts",
+      'F1: Indicator "T104%WINDIR%\\Management Instrumentation" INDICATES Malware "quietsieve".',
+      ("F1",),
+      {"F1": "n:indicator"},
+      {"F1": ("n:indicator", "r:indicates", "n:malware")},
+    )
+
+    response_format = runtime._constrained_response_format(rendered)
+
+    self.assertEqual(
+      response_format["schema"]["properties"]["finding"]["enum"],
+      ["Indicator T104 WINDIR Management Instrumentation INDICATES Malware quietsieve."],
+    )
   def test_call_records_never_carry_full_request_or_messages_success_or_failure(self):
     # UI contract: `configuration` echoes exactly the sampling contract; no
     # `request`/`messages` key ever appears on a trace-v2 call, win or lose.
@@ -581,7 +618,7 @@ class RunExplanationV2Tests(unittest.TestCase):
     ok_call = ok_result["explanation_trace"]["calls"][0]
     self.assertNotIn("request", ok_call)
     self.assertNotIn("messages", ok_call)
-    self.assertEqual(ok_call["configuration"], {"temperature": 0.7, "top_p": 0.8, "max_tokens": 320})
+    self.assertEqual(ok_call["configuration"], {"temperature": 0.1, "top_p": 1.0, "max_tokens": 64})
 
     bad = _stop(_analyst_response_for(rendered, ok=False))
     bad_provider = ScriptedProvider([bad, bad])
@@ -593,19 +630,19 @@ class RunExplanationV2Tests(unittest.TestCase):
     for call in raised.exception.trace["calls"]:
       self.assertNotIn("request", call)
       self.assertNotIn("messages", call)
-      self.assertEqual(call["configuration"], {"temperature": 0.7, "top_p": 0.8, "max_tokens": 320})
+      self.assertEqual(call["configuration"], {"temperature": 0.1, "top_p": 1.0, "max_tokens": 64})
 
-  def test_completion_token_ceiling_is_inclusive_of_384(self):
+  def test_completion_token_boundary_accepts_127_and_rejects_128(self):
     rendered = self._rendered_for()
-    at_ceiling = _stop(_analyst_response_for(rendered), completion_tokens=384)
+    at_ceiling = _stop(_analyst_response_for(rendered), completion_tokens=127)
     provider = ScriptedProvider([at_ceiling])
     result = runtime.run_explanation_v2(
       question="q", graph=self.graph, mode=self.mode, token_counter=word_counter,
       provider_call=provider, remaining_time=lambda: 500.0,
     )
-    self.assertEqual(result["explanation_trace"]["calls"][0]["completion_tokens"], 384)
+    self.assertEqual(result["explanation_trace"]["calls"][0]["completion_tokens"], 127)
 
-    over_ceiling = _stop(_analyst_response_for(rendered), completion_tokens=385)
+    over_ceiling = _stop(_analyst_response_for(rendered), completion_tokens=128)
     provider = ScriptedProvider([over_ceiling])
     with self.assertRaises(GraphFirstRuntimeError) as raised:
       runtime.run_explanation_v2(
@@ -675,7 +712,7 @@ class RunExplanationV2Tests(unittest.TestCase):
     self.assertEqual(raised.exception.stage, "response_parse")
 
   def test_length_finish_reason_retries_then_fails_closed(self):
-    truncated = {"content": '{"citations": ["F1"', "finish_reason": "length", "completion_tokens": 320, "duration_ms": 1.0}
+    truncated = {"content": '{"citations": ["F1"', "finish_reason": "length", "completion_tokens": 127, "duration_ms": 1.0}
     provider = ScriptedProvider([truncated, truncated])
     with self.assertRaises(GraphFirstRuntimeError) as raised:
       runtime.run_explanation_v2(
