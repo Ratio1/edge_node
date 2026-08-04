@@ -23,7 +23,14 @@ WHITELIST (oracles)
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
-from extensions.business.dauth.dauth_mixin import _DauthMixin
+from extensions.business.dauth.dauth_mixin import (
+  DAUTH_JOB_SECRETS_CSTORE_HKEY,
+  _DauthMixin,
+)
+from extensions.business.dauth.dauth_registry import (
+  dauth_registry_write_kwargs,
+  load_dauth_registry_snapshot,
+)
 
 __VER__ = '0.3.0'
 
@@ -41,6 +48,10 @@ _CONFIG = {
   'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
   'REQUESTS_MAX_RECORDS': 2,
   'REQUESTS_LOG_INTERVAL': 5 * 60,
+
+  'DAUTH_JOB_SECRETS_HSYNC_INTERVAL': 10 * 60,
+  'DAUTH_REGISTRY_REFRESH_INTERVAL': 60 * 60,
+  'DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL': 60,
 
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
@@ -105,6 +116,11 @@ class DauthManagerPlugin(
     super(DauthManagerPlugin, self).__init__(**kwargs)
     self._dauth_server_enabled = None
     self._dauth_server_enabled_message = None
+    self._dauth_registry_eth_oracles = None
+    self._dauth_registry_internal_peers = None
+    self._last_dauth_registry_refresh = None
+    self._dauth_registry_refresh_failed = False
+    self._last_dauth_job_secrets_hsync = None
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
     return
@@ -117,6 +133,8 @@ class DauthManagerPlugin(
     self._dauth_web_app_initialized = True
     if not self._is_dauth_server_enabled():
       self.on_pause()
+    else:
+      self._maybe_hsync_dauth_job_secrets()
     # endif
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
@@ -132,20 +150,52 @@ class DauthManagerPlugin(
       return self._dauth_server_enabled
     # endif
 
+    return self._refresh_dauth_registry(force=True)
+
+  def _refresh_dauth_registry(self, force=False):
+    now = self.time()
+    last_refresh = getattr(self, "_last_dauth_registry_refresh", None)
+    refresh_interval = (
+      self.cfg_dauth_registry_refresh_retry_interval
+      if getattr(self, "_dauth_registry_refresh_failed", False)
+      else self.cfg_dauth_registry_refresh_interval
+    )
+    if (
+      not force
+      and last_refresh is not None
+      and now - last_refresh < refresh_interval
+    ):
+      return self._is_dauth_server_enabled()
+    # endif
+
+    self._last_dauth_registry_refresh = now
+    previous_enabled = getattr(self, "_dauth_server_enabled", None)
+    previous_eth_oracles = getattr(self, "_dauth_registry_eth_oracles", None)
+
     error = None
     try:
-      enabled = self.bc.is_dauth_oracle() is True
+      peers, eth_oracles = load_dauth_registry_snapshot(self)
+      enabled = self.bc.eth_address.lower() in [
+        address.lower() for address in eth_oracles
+      ]
     except Exception as e:
       enabled = False
       error = str(e)
     # end try
 
     message = None if enabled else error or "current node is not registered as a dAuth oracle"
+    self._dauth_registry_eth_oracles = eth_oracles if enabled else None
+    self._dauth_registry_internal_peers = peers if enabled else None
+    self._dauth_registry_refresh_failed = error is not None
     self._dauth_server_enabled = enabled
     self._dauth_server_enabled_message = message
-    if enabled:
-      self.P(f"{self.__class__.__name__} dAuth registry gate is enabled")
-    else:
+    registry_changed = previous_eth_oracles != self._dauth_registry_eth_oracles
+    if enabled and (previous_enabled is not True or registry_changed):
+      self.P(
+        f"{self.__class__.__name__} dAuth registry gate is enabled "
+        f"with {len(eth_oracles)} registered oracle(s)"
+      )
+    elif not enabled and (previous_enabled is not False or error is not None):
       self.P(
         f"{self.__class__.__name__} dAuth registry gate is disabled. "
         f"(cause: {message})",
@@ -159,9 +209,11 @@ class DauthManagerPlugin(
     return getattr(self, "_dauth_server_enabled", None) is True
 
   def should_pause(self):
+    self._refresh_dauth_registry()
     return not self._is_dauth_server_enabled()
 
   def should_resume(self):
+    self._refresh_dauth_registry()
     return self._is_dauth_server_enabled()
 
   def on_pause(self):
@@ -169,6 +221,7 @@ class DauthManagerPlugin(
       return
     # endif
 
+    self.set_plugin_ready(False)
     self._dauth_pause_teardown_succeeded = False
     self._stop_request_monitor.set()
     if self._request_monitor_thread is not None:
@@ -226,6 +279,13 @@ class DauthManagerPlugin(
     self._stop_request_monitor.clear()
     self._start_request_monitor_thread()
     return
+
+  def on_log_handler(self, text, key=None):
+    super(DauthManagerPlugin, self).on_log_handler(text, key=key)
+    if self._is_dauth_server_enabled() and "Uvicorn running on " in text:
+      self.set_plugin_ready(True)
+    # endif
+    return
     
   
   def on_request(self, request):
@@ -237,10 +297,33 @@ class DauthManagerPlugin(
     return
 
   def process(self):
+    self._maybe_hsync_dauth_job_secrets()
     # TODO: this will be re-enabled in the future.
     if False:
       self._maybe_log_and_save_tracked_requests()
     return
+
+  def _maybe_hsync_dauth_job_secrets(self):
+    if not self._is_dauth_server_enabled():
+      return None
+
+    now = self.time()
+    last_sync = getattr(self, "_last_dauth_job_secrets_hsync", None)
+    if (
+      last_sync is not None
+      and now - last_sync < self.cfg_dauth_job_secrets_hsync_interval
+    ):
+      return None
+
+    self._last_dauth_job_secrets_hsync = now
+    try:
+      return self.chainstore_hsync(
+        hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+        **dauth_registry_write_kwargs(self),
+      )
+    except Exception as exc:
+      self.P(f"Could not sync dAuth job secrets: {exc}", color="y")
+    return None
 
   def __get_current_epoch(self):
     """
@@ -340,6 +423,68 @@ class DauthManagerPlugin(
       }
     
     response = self.__get_response({
+      **data
+    })
+    return response
+
+  @BasePlugin.endpoint(method="post")
+  # /add_secrets
+  def add_secrets(self, body: dict):
+    """
+    Store a full job secret bundle from a protocol oracle.
+
+    The signed request must include a hex-millisecond timestamp nonce no older
+    than 120 seconds.
+    """
+    request_nonce = body.get("nonce") if isinstance(body, dict) else None
+    if not self._is_dauth_server_enabled():
+      response = self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle',
+        'nonce': request_nonce,
+      })
+      return response
+
+    try:
+      data = self.process_dauth_add_secrets_request(body)
+    except Exception as e:
+      self.P("Error processing add_secrets request: {}".format(e), color='r')
+      data = {
+        'error' : str(e)
+      }
+
+    response = self.__get_response({
+      'nonce': request_nonce,
+      **data
+    })
+    return response
+
+  @BasePlugin.endpoint(method="post")
+  # /get_secrets
+  def get_secrets(self, body: dict):
+    """
+    Return an encrypted job secret bundle to a current R1FS job runner.
+
+    The signed request must include a hex-millisecond timestamp nonce no older
+    than 120 seconds. The signed response echoes that nonce.
+    """
+    request_nonce = body.get("nonce") if isinstance(body, dict) else None
+    if not self._is_dauth_server_enabled():
+      response = self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle',
+        'nonce': request_nonce,
+      })
+      return response
+
+    try:
+      data = self.process_dauth_get_secret_request(body)
+    except Exception as e:
+      self.P("Error processing get_secrets request: {}".format(e), color='r')
+      data = {
+        'error' : str(e)
+      }
+
+    response = self.__get_response({
+      'nonce': request_nonce,
       **data
     })
     return response
