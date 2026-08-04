@@ -33,6 +33,7 @@ def _launch_network_jobs(
   ics_safe_mode = job_config.get("ics_safe_mode", owner.cfg_ics_safe_mode)
   scanner_identity = job_config.get("scanner_identity", owner.cfg_scanner_identity)
   scanner_user_agent = job_config.get("scanner_user_agent", owner.cfg_scanner_user_agent)
+  timeout_profile = job_config.get("timeout_profile")
   workers_from_spec = job_config.get("nr_local_workers")
   if nr_local_workers_override is not None:
     workers_requested = nr_local_workers_override
@@ -96,6 +97,7 @@ def _launch_network_jobs(
         ics_safe_mode=ics_safe_mode,
         scanner_identity=scanner_identity,
         scanner_user_agent=scanner_user_agent,
+        timeout_profile=timeout_profile,
       )
       batch_job.start()
       local_jobs[batch_job.local_worker_id] = batch_job

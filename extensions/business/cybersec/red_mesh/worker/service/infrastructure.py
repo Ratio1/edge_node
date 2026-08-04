@@ -45,7 +45,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
       sock.connect((target, port))
       raw["banner"] = "RDP service open"
       findings.append(Finding(
@@ -99,7 +99,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
 
       # Read server banner (e.g. "RFB 003.008\n")
@@ -214,7 +214,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     sock = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
       packet = bytes.fromhex(
         "302e020103300702010304067075626c6963a019020405f5e10002010002010030100406082b060102010101000500"
       )
@@ -386,7 +386,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     sock = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
 
       def _walk(prefix):
         oid = prefix
@@ -483,7 +483,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     sock = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
       tid = random.randint(0, 0xffff)
       header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
       qname = b'\x07version\x04bind\x00'
@@ -604,7 +604,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     for domain in list(candidates):
       try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2)
+        sock.settimeout(self._target_timeout(2))
         tid = random.randint(0, 0xffff)
         header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
         qname = b""
@@ -648,7 +648,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     for domain in test_domains[:4]:  # Test at most 4 domains
       try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
+        sock.settimeout(self._target_timeout(3))
         sock.connect((target, port))
 
         # Build AXFR query
@@ -711,7 +711,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     """
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
       tid = random.randint(0, 0xffff)
       # Standard recursive query for example.com A record
       header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)  # RD=1
@@ -808,7 +808,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(4)
+      sock.settimeout(self._target_timeout(4))
       sock.connect((target, port))
       sock.sendall(netbios_header + smb_payload)
 
@@ -1024,7 +1024,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     sock = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(4)
+      sock.settimeout(self._target_timeout(4))
       sock.connect((target, port))
 
       def _send_smb(payload):
@@ -1479,7 +1479,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     """
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
 
       # --- Negotiate ---
@@ -1665,7 +1665,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       sock = None
       try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3)
+        sock.settimeout(self._target_timeout(3))
         sock.sendto(nbns_query, (target, udp_port))
         data, _ = sock.recvfrom(1024)
         return _parse_nbns_response(data)
@@ -1750,7 +1750,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         wrepl_packet = wrepl_header + wrepl_body
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
+        sock.settimeout(self._target_timeout(3))
         sock.connect((target, port))
         sock.sendall(wrepl_packet)
 
@@ -1887,7 +1887,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       request = b'\x00\x01\x00\x00\x00\x06\x01\x2b\x0e\x01\x00'
       sock.sendall(request)
@@ -1963,7 +1963,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     """GET / — extract version, cluster name."""
     findings = []
     try:
-      resp = requests.get(base_url, timeout=3)
+      resp = requests.get(base_url, timeout=self._target_timeout(3))
       if resp.ok:
         try:
           data = resp.json()
@@ -2001,7 +2001,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     """GET /_cat/indices — list accessible indices."""
     findings = []
     try:
-      resp = requests.get(f"{base_url}/_cat/indices?v", timeout=3)
+      resp = requests.get(f"{base_url}/_cat/indices?v", timeout=self._target_timeout(3))
       if resp.ok and resp.text.strip():
         lines = resp.text.strip().split("\n")
         index_count = max(0, len(lines) - 1)  # subtract header
@@ -2025,7 +2025,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     """GET /_nodes — extract transport/publish addresses, classify IPs, check JVM."""
     findings = []
     try:
-      resp = requests.get(f"{base_url}/_nodes", timeout=3)
+      resp = requests.get(f"{base_url}/_nodes", timeout=self._target_timeout(3))
       if resp.ok:
         data = resp.json()
         nodes = data.get("nodes", {})

@@ -45,7 +45,7 @@ class _WebHardeningMixin:
       base_url = f"{scheme}://{target}:{port}"
 
     try:
-      resp_main = requests.get(base_url, timeout=3, verify=False)
+      resp_main = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       # Check cookies for Secure/HttpOnly flags
       cookies_hdr = resp_main.headers.get("Set-Cookie", "")
       if cookies_hdr:
@@ -150,7 +150,7 @@ class _WebHardeningMixin:
     }
 
     try:
-      resp_main = requests.get(base_url, timeout=3, verify=False)
+      resp_main = requests.get(base_url, timeout=self._target_timeout(3), verify=False)
       for header, (severity, cwe, owasp, desc) in _HEADER_META.items():
         if header not in resp_main.headers:
           findings_list.append(Finding(
@@ -207,7 +207,7 @@ class _WebHardeningMixin:
       malicious_origin = "https://attacker.example"
       resp = requests.get(
         base_url,
-        timeout=3,
+        timeout=self._target_timeout(3),
         verify=False,
         headers={"Origin": malicious_origin}
       )
@@ -276,7 +276,7 @@ class _WebHardeningMixin:
       redirect_url = base_url.rstrip("/") + f"/login?next={quote(payload, safe=':/')}"
       resp = requests.get(
         redirect_url,
-        timeout=3,
+        timeout=self._target_timeout(3),
         verify=False,
         allow_redirects=False
       )
@@ -330,7 +330,7 @@ class _WebHardeningMixin:
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
     try:
-      resp = requests.options(base_url, timeout=3, verify=False)
+      resp = requests.options(base_url, timeout=self._target_timeout(3), verify=False)
       allow = resp.headers.get("Allow", "")
       if allow:
         risky = [method for method in ("PUT", "DELETE", "TRACE", "CONNECT") if method in allow.upper()]
@@ -408,7 +408,7 @@ class _WebHardeningMixin:
 
     for path in ("/", "/login", "/contact", "/register"):
       try:
-        resp = requests.get(base_url + path, timeout=3, verify=False)
+        resp = requests.get(base_url + path, timeout=self._target_timeout(3), verify=False)
         if resp.status_code != 200:
           continue
 
@@ -500,7 +500,7 @@ class _WebHardeningMixin:
       try:
         resp_fake = requests.post(
           url, data={"username": fake_user, "password": password},
-          timeout=3, verify=False, allow_redirects=False,
+          timeout=self._target_timeout(3), verify=False, allow_redirects=False,
         )
         if resp_fake.status_code == 404:
           continue
@@ -508,7 +508,7 @@ class _WebHardeningMixin:
         for real_user in real_candidates:
           resp_real = requests.post(
             url, data={"username": real_user, "password": password},
-            timeout=3, verify=False, allow_redirects=False,
+            timeout=self._target_timeout(3), verify=False, allow_redirects=False,
           )
           fake_lower = resp_fake.text.lower()
           real_lower = resp_real.text.lower()
@@ -589,7 +589,7 @@ class _WebHardeningMixin:
     for path in login_paths:
       url = base_url.rstrip("/") + path
       try:
-        probe_resp = requests.get(url, timeout=3, verify=False, allow_redirects=False)
+        probe_resp = requests.get(url, timeout=self._target_timeout(3), verify=False, allow_redirects=False)
         if probe_resp.status_code == 404:
           continue
 
@@ -598,7 +598,7 @@ class _WebHardeningMixin:
           resp = requests.post(
             url,
             data={"username": f"test_user_{i}", "password": password},
-            timeout=3, verify=False, allow_redirects=False,
+            timeout=self._target_timeout(3), verify=False, allow_redirects=False,
           )
           if resp.status_code == 429:
             rate_limited = True
@@ -676,7 +676,7 @@ class _WebHardeningMixin:
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
 
     try:
-      resp = requests.get(base_url, timeout=4, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(4), verify=False)
       if resp.status_code != 200:
         return probe_result(findings=findings_list)
       html = resp.text
@@ -765,7 +765,7 @@ class _WebHardeningMixin:
     base_url = f"https://{target}" if port == 443 else f"https://{target}:{port}"
 
     try:
-      resp = requests.get(base_url, timeout=4, verify=False)
+      resp = requests.get(base_url, timeout=self._target_timeout(4), verify=False)
       if resp.status_code != 200:
         return probe_result(findings=findings_list)
       html = resp.text

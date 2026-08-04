@@ -103,7 +103,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       self.P(f"Fetching {url} for banner...")
       ua = getattr(self, 'scanner_user_agent', '')
       headers = {'User-Agent': ua} if ua else {}
-      resp = requests.get(url, timeout=5, verify=False, allow_redirects=True, headers=headers)
+      resp = requests.get(url, timeout=self._target_timeout(5), verify=False, allow_redirects=True, headers=headers)
 
       result["banner"] = f"HTTP {resp.status_code} {resp.reason}"
       result["server"] = resp.headers.get("Server")
@@ -158,7 +158,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       # (some servers like nginx drop requests with unrecognized Host values).
       try:
         _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _s.settimeout(3)
+        _s.settimeout(self._target_timeout(3))
         _s.connect((target, port))
         # Use HTTP/1.0 without Host — matches nmap's GetRequest probe
         _s.send(b"GET / HTTP/1.0\r\n\r\n")
@@ -234,7 +234,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     dangerous = []
     for method in ("TRACE", "PUT", "DELETE"):
       try:
-        r = requests.request(method, url, timeout=3, verify=False)
+        r = requests.request(method, url, timeout=self._target_timeout(3), verify=False)
         if r.status_code < 400:
           dangerous.append(method)
       except Exception:
@@ -310,7 +310,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     raw = {"banner": None, "server": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(2)
+      sock.settimeout(self._target_timeout(2))
       sock.connect((target, port))
       ua = getattr(self, 'scanner_user_agent', '')
       ua_header = f"\r\nUser-Agent: {ua}" if ua else ""
@@ -370,7 +370,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       self.P(f"Fetching {url} for banner...")
       ua = getattr(self, 'scanner_user_agent', '')
       headers = {'User-Agent': ua} if ua else {}
-      resp = requests.get(url, timeout=3, verify=False, headers=headers)
+      resp = requests.get(url, timeout=self._target_timeout(3), verify=False, headers=headers)
       raw["banner"] = f"HTTPS {resp.status_code} {resp.reason}"
       raw["server"] = resp.headers.get("Server")
       if raw["server"]:
@@ -445,7 +445,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     realm = None
     for path in ("/", "/admin", "/manager"):
       try:
-        resp = requests.get(base_url + path, timeout=3, verify=False)
+        resp = requests.get(base_url + path, timeout=self._target_timeout(3), verify=False)
         if resp.status_code == 401:
           www_auth = resp.headers.get("WWW-Authenticate", "")
           if "Basic" in www_auth:
@@ -466,7 +466,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     consecutive_401 = 0
     for username, password in self._HTTP_BASIC_CREDS:
       try:
-        resp = requests.get(auth_url, timeout=3, verify=False, auth=(username, password))
+        resp = requests.get(auth_url, timeout=self._target_timeout(3), verify=False, auth=(username, password))
         raw["tested"] += 1
 
         if resp.status_code == 429:
@@ -558,8 +558,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     def _ftp_connect(user=None, passwd=None):
       """Open a fresh FTP connection and optionally login."""
-      ftp = ftplib.FTP(timeout=5)
-      ftp.connect(target, port, timeout=5)
+      ftp = ftplib.FTP(timeout=self._target_timeout(5))
+      ftp.connect(target, port, timeout=self._target_timeout(5))
       if user is not None:
         ftp.login(user, passwd or "")
       return ftp
@@ -837,7 +837,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 1. Banner grab (raw socket) ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       banner = sock.recv(1024).decode("utf-8", errors="ignore").strip()
       sock.close()
@@ -886,7 +886,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         client.connect(
           target, port=port,
           username=username, password=password,
-          timeout=3, auth_timeout=3,
+          timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
           look_for_keys=False, allow_agent=False,
         )
         accepted_creds.append(f"{username}:{password}")
@@ -905,7 +905,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       client.connect(
         target, port=port,
         username=random_user, password=random_pass,
-        timeout=3, auth_timeout=3,
+        timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
         look_for_keys=False, allow_agent=False,
       )
       findings.append(Finding(
@@ -1110,7 +1110,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       msg.add_byte(b'\x34')
       transport._send_message(msg)
       try:
-        chan = transport.open_session(timeout=3)
+        chan = transport.open_session(timeout=self._target_timeout(3))
         if chan is not None:
           chan.close()
           transport.close()
@@ -1181,7 +1181,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     # --- 1. Connect and grab banner ---
     try:
-      smtp = smtplib.SMTP(timeout=5)
+      smtp = smtplib.SMTP(timeout=self._target_timeout(5))
       code, msg = smtp.connect(target, port)
       result["banner"] = f"{code} {msg.decode(errors='replace')}"
     except Exception as e:
@@ -1355,7 +1355,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
       try:
-        smtp = smtplib.SMTP(target, port, timeout=5)
+        smtp = smtplib.SMTP(target, port, timeout=self._target_timeout(5))
         smtp.ehlo(identity)
       except Exception:
         smtp = None
@@ -1467,7 +1467,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 1. Banner grab + IAC negotiation parsing ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(5)
+      sock.settimeout(self._target_timeout(5))
       sock.connect((target, port))
       raw = sock.recv(2048)
       sock.close()
@@ -1509,7 +1509,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       """Attempt Telnet login, return (success, uid_line, uname_line)."""
       try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
+        s.settimeout(self._target_timeout(5))
         s.connect((target, port))
 
         # Read until login prompt
@@ -1707,7 +1707,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 1. Connect and receive banner ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(self._target_timeout(3))
       sock.connect((target, port))
       banner = sock.recv(256).decode("utf-8", errors="ignore").strip()
     except Exception as e:
@@ -1794,7 +1794,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     for mod in raw["modules"]:
       try:
         sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock2.settimeout(3)
+        sock2.settimeout(self._target_timeout(3))
         sock2.connect((target, port))
         sock2.recv(256)  # banner
         sock2.sendall(f"@RSYNCD: {proto_version}\n".encode())

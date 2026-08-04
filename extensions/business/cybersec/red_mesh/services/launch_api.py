@@ -14,6 +14,8 @@ from ..constants import (
   PORT_ORDER_SHUFFLE,
   RUN_MODE_CONTINUOUS_MONITORING,
   RUN_MODE_SINGLEPASS,
+  TIMEOUT_PROFILES,
+  TIMEOUT_PROFILE_STANDARD,
   ScanType,
 )
 from ..models import (
@@ -102,6 +104,15 @@ def _job_repo(owner):
 def validation_error(message: str):
   """Return a consistent validation error payload."""
   return {"error": "validation_error", "message": message}
+
+
+def normalize_network_timeout_profile(value):
+  normalized = str(value or TIMEOUT_PROFILE_STANDARD).strip().upper()
+  if normalized not in TIMEOUT_PROFILES:
+    return None, validation_error(
+      "timeout_profile must be STANDARD or THOROUGH for network scans"
+    )
+  return normalized, None
 
 
 def _parse_confirmation_ids(value):
@@ -1031,6 +1042,7 @@ def announce_launch(
   target_config_secrets=None,
   blockchain_attestation_enabled=False,
   comparison_mode=False,
+  timeout_profile=TIMEOUT_PROFILE_STANDARD,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   comparison_mode = bool(comparison_mode)
@@ -1080,6 +1092,7 @@ def announce_launch(
     enabled_features=enabled_features,
     excluded_features=excluded_features,
     run_mode=run_mode,
+    timeout_profile=timeout_profile,
     scan_min_delay=scan_min_delay,
     scan_max_delay=scan_max_delay,
     ics_safe_mode=ics_safe_mode,
@@ -1313,12 +1326,16 @@ def launch_network_scan(
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
   comparison_mode=False,
+  timeout_profile=TIMEOUT_PROFILE_STANDARD,
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
   if not target:
     return validation_error("target required for network scan")
 
   comparison_mode = bool(comparison_mode)
+  timeout_profile, timeout_profile_error = normalize_network_timeout_profile(timeout_profile)
+  if timeout_profile_error:
+    return timeout_profile_error
   start_port = int(start_port)
   end_port = int(end_port)
   if start_port > end_port:
@@ -1457,6 +1474,7 @@ def launch_network_scan(
     authorization=typed_context["authorization"],
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,
+    timeout_profile=timeout_profile,
   )
 
 
@@ -1840,6 +1858,7 @@ def launch_test(
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
   comparison_mode=False,
+  timeout_profile=TIMEOUT_PROFILE_STANDARD,
 ):
   """Compatibility shim that routes to scan-type-specific launch endpoints."""
   try:
@@ -1936,4 +1955,5 @@ def launch_test(
     unsafe_launch_confirmations=unsafe_launch_confirmations,
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,
+    timeout_profile=timeout_profile,
   )

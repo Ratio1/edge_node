@@ -148,6 +148,34 @@ class TestLaunchService(unittest.TestCase):
     )
     self.assertEqual(scanned, [22, 443, 8080])
 
+  def test_network_timeout_profile_reaches_each_local_worker(self):
+    owner = DummyOwner()
+    strategy = ScanStrategy(
+      scan_type=ScanType.NETWORK,
+      worker_cls=DummyNetworkWorker,
+      catalog_categories=("service",),
+    )
+    with patch("extensions.business.cybersec.red_mesh.services.launch.get_scan_strategy", return_value=strategy):
+      local_jobs = launch_local_jobs(
+        owner,
+        job_id="job-thorough",
+        target="10.0.0.10",
+        launcher="0xlauncher",
+        start_port=80,
+        end_port=81,
+        job_config={
+          "scan_type": "network",
+          "nr_local_workers": 2,
+          "port_order": PORT_ORDER_SEQUENTIAL,
+          "timeout_profile": "THOROUGH",
+        },
+      )
+
+    self.assertEqual(
+      {worker.kwargs["timeout_profile"] for worker in local_jobs.values()},
+      {"THOROUGH"},
+    )
+
 
 class TestComparisonTieredAssignment(unittest.TestCase):
   """Tiered mirror+slice port assignment for geographic comparison mode."""

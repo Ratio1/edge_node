@@ -247,6 +247,20 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertIsNotNone(job_specs, "Expected chainstore_hset call for job_specs")
     self.assertEqual(job_specs["job_config_cid"], "QmFakeConfigCID123")
 
+  def test_network_timeout_profile_is_validated_and_persisted(self):
+    plugin = self._build_mock_plugin(job_id="test-job-thorough")
+
+    result = self._launch_network(plugin, timeout_profile="thorough")
+
+    self.assertNotIn("error", result)
+    self.assertEqual(self._latest_job_config(plugin)["timeout_profile"], "THOROUGH")
+
+    invalid_plugin = self._build_mock_plugin(job_id="test-job-invalid-timeout")
+    invalid = self._launch_network(invalid_plugin, timeout_profile="patient")
+    self.assertEqual(invalid["error"], "validation_error")
+    self.assertIn("STANDARD or THOROUGH", invalid["message"])
+    invalid_plugin.r1fs.add_json.assert_not_called()
+
   def test_cstore_has_no_static_config(self):
     """After launch, CStore object has no exceptions, distribution_strategy, etc."""
     plugin = self._build_mock_plugin(job_id="test-job-2")

@@ -182,6 +182,25 @@ DISTRIBUTION_MIRROR = "MIRROR"
 PORT_ORDER_SHUFFLE = "SHUFFLE"
 PORT_ORDER_SEQUENTIAL = "SEQUENTIAL"
 
+# Network target-response timeout profiles. Standard preserves every existing
+# call-site timeout; Thorough expands ordinary waits without changing probe
+# breadth, pacing, or timing-sensitive detection thresholds.
+TIMEOUT_PROFILE_STANDARD = "STANDARD"
+TIMEOUT_PROFILE_THOROUGH = "THOROUGH"
+TIMEOUT_PROFILES = frozenset({TIMEOUT_PROFILE_STANDARD, TIMEOUT_PROFILE_THOROUGH})
+
+
+def normalize_timeout_profile(value):
+  normalized = str(value or TIMEOUT_PROFILE_STANDARD).strip().upper()
+  return normalized if normalized in TIMEOUT_PROFILES else TIMEOUT_PROFILE_STANDARD
+
+
+def resolve_target_response_timeout(timeout_profile, standard_timeout):
+  """Resolve an ordinary network target-response maximum wait in seconds."""
+  if normalize_timeout_profile(timeout_profile) != TIMEOUT_PROFILE_THOROUGH:
+    return standard_timeout
+  return round(min(float(standard_timeout) * 3, 15.0), 3)
+
 # LLM Agent API status constants
 LLM_API_STATUS_OK = "ok"
 LLM_API_STATUS_ERROR = "error"

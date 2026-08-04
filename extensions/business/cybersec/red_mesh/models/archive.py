@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
 from extensions.business.cybersec.red_mesh.constants import (
   DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS, JOB_ARCHIVE_VERSION,
+  TIMEOUT_PROFILE_STANDARD, normalize_timeout_profile,
 )
 
 
@@ -35,6 +36,7 @@ class JobConfig:
   enabled_features: list            # [str]
   excluded_features: list           # [str]
   run_mode: str                     # SINGLEPASS | CONTINUOUS_MONITORING
+  timeout_profile: str = TIMEOUT_PROFILE_STANDARD  # STANDARD | THOROUGH (network scans)
   scan_min_delay: float = 0
   scan_max_delay: float = 0
   ics_safe_mode: bool = False
@@ -138,6 +140,7 @@ class JobConfig:
       enabled_features=d.get("enabled_features", []),
       excluded_features=d.get("excluded_features", []),
       run_mode=d.get("run_mode", RUN_MODE_SINGLEPASS),
+      timeout_profile=normalize_timeout_profile(d.get("timeout_profile")),
       scan_min_delay=d.get("scan_min_delay", 0),
       scan_max_delay=d.get("scan_max_delay", 0),
       ics_safe_mode=d.get("ics_safe_mode", False),
