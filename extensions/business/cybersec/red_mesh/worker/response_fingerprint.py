@@ -19,10 +19,15 @@ value can leave the node.
 
 import hashlib
 import ipaddress
+import queue
 import re
 import socket
+import threading
+import time
 
 import requests
+
+from ..constants import FINGERPRINT_HTTP_TIMEOUT, FINGERPRINT_TIMEOUT
 
 # Excerpts exist so an operator can see *that* two vantages were served
 # different content. A few hundred bytes of the head of the document is
@@ -37,6 +42,7 @@ EXCERPT_CONTENT_TYPES = ("text/html", "text/plain", "application/json")
 CAPTURED_HEADERS = ("server", "via", "x-cache", "cf-ray", "x-powered-by", "location")
 
 TITLE_MAX_CHARS = 200
+RESPONSE_BODY_MAX_BYTES = 1024 * 1024
 
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -54,13 +60,20 @@ _REDACTIONS = (
       r"(?i)\b(authorization|api[-_]?key|apikey|access[-_]?token|token|"
       r"session[-_]?id|sessionid|session|secret|password|passwd|pwd)\b"
       # An optional closing quote covers JSON keys such as {"api_key": "..."}.
-      r"[\"']?(\s*[:=]\s*)[\"']?[^\s\"',;&<>]+"
+      r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
+      r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;&<>}]+)"
     ),
-    r"\1\2[REDACTED]",
+    r"\1\g<quote>\g<separator>[REDACTED]",
   ),
   (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
   (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "[REDACTED_HEX]"),
-  (re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}"), "[REDACTED_B64]"),
+  (
+    re.compile(
+      r"(?<![A-Za-z0-9_+/\-])[A-Za-z0-9_+/\-]{32,}={0,2}"
+      r"(?![A-Za-z0-9_+/\-=])"
+    ),
+    "[REDACTED_B64]",
+  ),
 )
 
 
@@ -109,7 +122,7 @@ def normalize_content_type(content_type):
   return content_type.split(";")[0].strip().lower() or None
 
 
-def resolve_host(host):
+def resolve_host(host, timeout=None):
   """
   Resolve a target host to its sorted, deduplicated A/AAAA set.
 
@@ -130,12 +143,54 @@ def resolve_host(host):
     return [], None
   except ValueError:
     pass
-  try:
-    infos = socket.getaddrinfo(host, None)
-  except Exception as exc:
-    return [], str(exc)
+  if timeout is None:
+    try:
+      infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+      return [], str(exc)
+  else:
+    result = queue.Queue(maxsize=1)
+
+    def _lookup():
+      try:
+        result.put((socket.getaddrinfo(host, None), None))
+      except Exception as exc:
+        result.put((None, exc))
+
+    threading.Thread(target=_lookup, daemon=True).start()
+    try:
+      infos, error = result.get(timeout=timeout)
+    except queue.Empty:
+      return [], "DNS resolution timed out"
+    if error is not None:
+      return [], str(error)
   addresses = {info[4][0] for info in infos if info[4]}
   return sorted(addresses), None
+
+
+def read_bounded_response_body(response, max_bytes, max_seconds):
+  """Read a streamed response without allowing a hostile peer to grow memory forever."""
+  chunks = []
+  total = 0
+  complete = True
+  deadline = time.monotonic() + max_seconds
+
+  for chunk in response.iter_content(chunk_size=64 * 1024):
+    if time.monotonic() >= deadline:
+      complete = False
+      break
+    if not chunk:
+      continue
+    remaining = max_bytes - total
+    if len(chunk) >= remaining:
+      chunks.append(chunk[:remaining])
+      total += min(len(chunk), remaining)
+      complete = False
+      break
+    chunks.append(chunk)
+    total += len(chunk)
+
+  return b"".join(chunks), complete
 
 
 def certificate_identity(cert_der):
@@ -183,7 +238,10 @@ class _ResponseFingerprintMixin:
     if not ports:
       return
 
-    resolved_ips, resolver_error = resolve_host(self.target)
+    resolved_ips, resolver_error = resolve_host(
+      self.target,
+      timeout=self._target_timeout(FINGERPRINT_HTTP_TIMEOUT),
+    )
     evidence = {
       "target_host": self.target,
       "resolved_ips": resolved_ips,
@@ -204,7 +262,10 @@ class _ResponseFingerprintMixin:
     entry = {"reachable": False, "tls": None, "http": None, "excerpt": None}
 
     try:
-      with socket.create_connection((self.target, port), timeout=self._target_timeout(3)):
+      with socket.create_connection(
+        (self.target, port),
+        timeout=self._target_timeout(FINGERPRINT_TIMEOUT),
+      ):
         entry["reachable"] = True
     except Exception:
       # An unreachable port is itself a comparable result: a target that
@@ -232,33 +293,56 @@ class _ResponseFingerprintMixin:
     try:
       user_agent = getattr(self, "scanner_user_agent", "")
       headers = {"User-Agent": user_agent} if user_agent else {}
+      timeout = self._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
       resp = requests.get(
         url,
-        timeout=self._target_timeout(5),
+        timeout=timeout,
         verify=False,
         allow_redirects=True,
         headers=headers,
+        stream=True,
       )
     except Exception as exc:
       self.P(f"Response fingerprint GET failed on {url}: {exc}", color='y')
       return None, None
 
-    content_type = normalize_content_type(resp.headers.get("Content-Type"))
-    title_match = _TITLE_RE.search(resp.text[:5000])
-    http = {
-      "status": resp.status_code,
-      "final_url": resp.url,
-      "redirect_count": len(resp.history),
-      "title": title_match.group(1).strip()[:TITLE_MAX_CHARS] if title_match else None,
-      "content_type": content_type,
-      "body_length": len(resp.content),
-      "body_sha256": hashlib.sha256(resp.content).hexdigest(),
-      "headers": {
-        name: resp.headers.get(name)
-        for name in CAPTURED_HEADERS
-        if resp.headers.get(name)
-      },
-    }
+    try:
+      body, body_complete = read_bounded_response_body(
+        resp,
+        max_bytes=RESPONSE_BODY_MAX_BYTES,
+        max_seconds=timeout,
+      )
+      encoding = resp.encoding or "utf-8"
+      try:
+        body_text = body.decode(encoding, errors="replace")
+      except LookupError:
+        body_text = body.decode("utf-8", errors="replace")
+      content_type = normalize_content_type(resp.headers.get("Content-Type"))
+      title_match = _TITLE_RE.search(body_text[:5000])
+      declared_length = resp.headers.get("Content-Length")
+      try:
+        declared_length = int(declared_length) if declared_length is not None else None
+      except (TypeError, ValueError):
+        declared_length = None
+      if declared_length is not None and declared_length < 0:
+        declared_length = None
+      body_length = len(body) if body_complete else declared_length
+      http = {
+        "status": resp.status_code,
+        "final_url": resp.url,
+        "redirect_count": len(resp.history),
+        "title": title_match.group(1).strip()[:TITLE_MAX_CHARS] if title_match else None,
+        "content_type": content_type,
+        "body_length": body_length,
+        "body_sha256": hashlib.sha256(body).hexdigest() if body_complete else None,
+        "headers": {
+          name: resp.headers.get(name)
+          for name in CAPTURED_HEADERS
+          if resp.headers.get(name)
+        },
+      }
 
-    excerpt = sanitize_excerpt(resp.text) if excerpt_allowed(content_type) else None
-    return http, excerpt
+      excerpt = sanitize_excerpt(body_text) if excerpt_allowed(content_type) else None
+      return http, excerpt
+    finally:
+      resp.close()

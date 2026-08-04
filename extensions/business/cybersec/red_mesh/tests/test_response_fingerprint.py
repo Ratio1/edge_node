@@ -7,16 +7,23 @@ contract that keeps each vantage's evidence attributable to that vantage.
 """
 
 import unittest
+import time
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.worker import PentestLocalWorker
 from extensions.business.cybersec.red_mesh.worker.response_fingerprint import (
   EXCERPT_MAX_BYTES,
+  RESPONSE_BODY_MAX_BYTES,
   certificate_identity,
   excerpt_allowed,
   normalize_content_type,
+  read_bounded_response_body,
   resolve_host,
   sanitize_excerpt,
+)
+from extensions.business.cybersec.red_mesh.constants import (
+  FINGERPRINT_HTTP_TIMEOUT,
+  FINGERPRINT_TIMEOUT,
 )
 from .conftest import DummyOwner
 
@@ -57,6 +64,14 @@ class TestExcerptSanitization(unittest.TestCase):
     self.assertNotIn("sk-abc123def456", excerpt)
     self.assertIn("REDACTED", excerpt)
 
+  def test_redacts_multiword_credential_values(self):
+    excerpt = sanitize_excerpt('{"password": "correct horse battery staple", "ok": 1}')
+    self.assertNotIn("correct horse battery staple", excerpt)
+
+  def test_redacts_basic_authorization_values(self):
+    excerpt = sanitize_excerpt("Authorization: Basic dXNlcjpwYXNz")
+    self.assertNotIn("dXNlcjpwYXNz", excerpt)
+
   def test_redacts_bearer_tokens(self):
     excerpt = sanitize_excerpt("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload")
     self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", excerpt)
@@ -73,6 +88,11 @@ class TestExcerptSanitization(unittest.TestCase):
 
   def test_redacts_long_base64_runs(self):
     blob = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0NTY3ODkw"
+    excerpt = sanitize_excerpt(f"state {blob} end")
+    self.assertNotIn(blob, excerpt)
+
+  def test_redacts_long_urlsafe_base64_runs(self):
+    blob = "0123456789_abcdefghijklmnopqrstuvwxyz-ABCDE"
     excerpt = sanitize_excerpt(f"state {blob} end")
     self.assertNotIn(blob, excerpt)
 
@@ -136,6 +156,16 @@ class TestHostResolution(unittest.TestCase):
     self.assertEqual(addresses, ["1.2.3.4", "93.184.216.34"])
     self.assertIsNone(error)
 
+  def test_resolution_timeout_is_recorded(self):
+    blocker = MagicMock(side_effect=lambda *_args: time.sleep(0.2))
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.socket.getaddrinfo",
+      blocker,
+    ):
+      addresses, error = resolve_host("slow.example", timeout=0.01)
+    self.assertEqual(addresses, [])
+    self.assertEqual(error, "DNS resolution timed out")
+
 
 class TestCertificateIdentity(unittest.TestCase):
 
@@ -182,6 +212,91 @@ class TestComparisonTierScoping(unittest.TestCase):
     worker = _make_worker(comparison_ports=[443])
     worker.state["response_evidence"] = {"target_host": "example.test", "ports": {}}
     self.assertIn("response_evidence", worker.get_status())
+
+
+class TestHttpCapture(unittest.TestCase):
+
+  @staticmethod
+  def _response(body=b"<html><title>Acme</title>hello</html>", **headers):
+    response = MagicMock()
+    response.status_code = 200
+    response.url = "https://example.test/"
+    response.history = []
+    response.encoding = "utf-8"
+    response.headers = {"Content-Type": "text/html", **headers}
+    response.iter_content.return_value = [body]
+    return response
+
+  def test_http_capture_streams_and_uses_existing_timeout_constant(self):
+    worker = _make_worker(comparison_ports=[443])
+    worker._target_timeout = MagicMock(return_value=12)
+    response = self._response(**{"Content-Length": "37", "server": "nginx"})
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.get",
+      return_value=response,
+    ) as get:
+      http, excerpt = worker._fingerprint_http("https", 443)
+
+    worker._target_timeout.assert_called_once_with(FINGERPRINT_HTTP_TIMEOUT)
+    self.assertTrue(get.call_args.kwargs["stream"])
+    self.assertEqual(get.call_args.kwargs["timeout"], 12)
+    self.assertEqual(http["status"], 200)
+    self.assertEqual(http["title"], "Acme")
+    self.assertIsNotNone(http["body_sha256"])
+    self.assertIn("hello", excerpt)
+    response.close.assert_called_once()
+
+  def test_oversized_body_is_capped_without_claiming_a_partial_hash(self):
+    response = self._response(
+      body=b"a" * RESPONSE_BODY_MAX_BYTES,
+      **{"Content-Length": str(RESPONSE_BODY_MAX_BYTES + 100)},
+    )
+    worker = _make_worker(comparison_ports=[443])
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.get",
+      return_value=response,
+    ):
+      http, excerpt = worker._fingerprint_http("https", 443)
+
+    self.assertEqual(http["body_length"], RESPONSE_BODY_MAX_BYTES + 100)
+    self.assertIsNone(http["body_sha256"])
+    self.assertLessEqual(len(excerpt.encode("utf-8")), EXCERPT_MAX_BYTES)
+
+  def test_unknown_response_encoding_falls_back_safely(self):
+    response = self._response(body=b"plain text")
+    response.encoding = "not-a-real-codec"
+    worker = _make_worker(comparison_ports=[443])
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.get",
+      return_value=response,
+    ):
+      http, excerpt = worker._fingerprint_http("https", 443)
+
+    self.assertEqual(http["status"], 200)
+    self.assertEqual(excerpt, "plain text")
+
+  def test_port_probe_uses_existing_fingerprint_timeout_constant(self):
+    worker = _make_worker(comparison_ports=[443])
+    worker._target_timeout = MagicMock(return_value=6)
+    worker._tls_unverified_connect = MagicMock(return_value=(None, None, None))
+    worker._fingerprint_http = MagicMock(return_value=(None, None))
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.socket.create_connection",
+      return_value=connection,
+    ) as create_connection:
+      worker._fingerprint_port(443)
+
+    worker._target_timeout.assert_called_once_with(FINGERPRINT_TIMEOUT)
+    self.assertEqual(create_connection.call_args.kwargs["timeout"], 6)
+
+  def test_bounded_reader_stops_at_the_byte_cap(self):
+    response = MagicMock()
+    response.iter_content.return_value = [b"abc", b"def"]
+    body, complete = read_bounded_response_body(response, max_bytes=4, max_seconds=10)
+    self.assertEqual(body, b"abcd")
+    self.assertFalse(complete)
 
 
 class TestAggregationAttribution(unittest.TestCase):
