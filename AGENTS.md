@@ -696,6 +696,33 @@ Entry format:
 - Verification: `python3 -m unittest extensions.serving.test_th_hf_model_base extensions.serving.test_th_text_classifier extensions.serving.test_th_privacy_filter extensions.business.edge_inference_api.test_text_classifier_inference_api extensions.business.edge_inference_api.test_privacy_filter_inference_api`; `python3 -m py_compile extensions/serving/default_inference/nlp/th_hf_model_base.py extensions/business/edge_inference_api/text_classifier_inference_api.py`; required serving gate `python3 -m unittest extensions.serving.model_testing.test_llm_servings` currently fails at import with `ImportError: cannot import name 'Logger' from 'naeural_core'`.
 - Links: `extensions/serving/default_inference/nlp/th_hf_model_base.py`, `extensions/business/edge_inference_api/text_classifier_inference_api.py`, `extensions/serving/test_th_hf_model_base.py`
 
+- ID: `ML-20260723-001`
+- Timestamp: `2026-07-23T13:45:20Z`
+- Type: `change`
+- Summary: dAuth job-secret requests now require signed 120-second timestamp nonces, and GET responses encrypt secret bundles to the authorized runner.
+- Criticality: Security protocol change preventing indefinite signed-request/response replay and removing plaintext job secrets from HTTP responses.
+- Details: `/add_secrets` and `/get_secrets` validate signed hex-millisecond timestamp nonces and echo them in successful signed responses. `/get_secrets` encrypts the serialized bundle to the signed requester address; clients must verify the response signer and echoed nonce before decrypting.
+- Verification: `python -m unittest discover -s extensions/business/dauth -p 'test_*.py'`; cross-repo SDK dAuth client tests.
+- Links: `extensions/business/dauth/dauth_mixin.py`, `extensions/business/dauth/dauth_manager.py`
+
+- ID: `ML-20260731-001`
+- Timestamp: `2026-07-31T16:48:11Z`
+- Type: `change`
+- Summary: dAuth job-secret ChainStore writes and minute syncs now target only startup-cached dAuth registry peers.
+- Criticality: Secret-replication boundary and recovery behavior across every dAuth server.
+- Details: The dAuth manager reads registry ETH addresses once at startup, keeps local service eligibility fixed until restart, and refreshes only ETH-to-internal mappings from local NetMon state. `DAUTH_JOB_SECRETS` writes and 60-second hsync calls disable default/configured ChainStore peers. Known deferred risks: generic ChainStore does not authorize inbound operations by hash namespace, and first-response hsync has no freshness arbitration; production hardening requires an inbound ACL or dedicated authenticated replication protocol plus version-aware merges.
+- Verification: `python3 -m unittest discover -s extensions/business/dauth -p 'test_*.py'`; `python3 -m py_compile extensions/business/dauth/dauth_registry.py extensions/business/dauth/dauth_manager.py extensions/business/dauth/dauth_mixin.py extensions/business/dauth/test_dauth_registry_gating.py extensions/business/dauth/test_dauth_secret_routing.py`; `git diff --check`
+- Links: `extensions/business/dauth/dauth_registry.py`, `extensions/business/dauth/dauth_manager.py`, `extensions/business/dauth/dauth_mixin.py`
+
+- ID: `ML-20260803-001`
+- Timestamp: `2026-08-03T16:09:26Z`
+- Type: `change`
+- Summary: dAuth server eligibility and secret-replication peers now refresh from the on-chain registry every hour; secret hsync runs every 10 minutes.
+- Criticality: Authorization revocation and secret-replication routing across every dAuth server.
+- Details: Lifecycle pause/resume predicates perform the rate-limited registry refresh without adding RPC calls to endpoint request paths. Successful reads remain cached for one hour; failed reads clear cached peers, fail closed, and retry after one minute. Registry reads are synchronous and rely on the SDK Web3 provider to return or time out. A removed local node causes the web app to pause and become unready; readiness returns only after a resumed Uvicorn process reports startup. Remaining dAuth nodes replace their cached peer set on their next hourly refresh. The inbound namespace authorization and version-aware hsync limitations from `ML-20260731-001` remain open.
+- Verification: `python3 -m unittest discover -s extensions/business/dauth -p 'test_*.py'`; `python3 -m py_compile extensions/business/dauth/dauth_registry.py extensions/business/dauth/dauth_manager.py extensions/business/dauth/dauth_mixin.py extensions/business/dauth/test_dauth_registry_gating.py extensions/business/dauth/test_dauth_secret_routing.py`; `git diff --check`
+- Links: `extensions/business/dauth/dauth_manager.py`, `extensions/business/dauth/test_dauth_registry_gating.py`
+
 - ID: `ML-20260707-001`
 - Timestamp: `2026-07-07T20:44:27Z`
 - Type: `discovery`
