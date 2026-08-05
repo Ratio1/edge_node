@@ -195,6 +195,7 @@ class _BridgeNeo4jDriver:
       self.bridge.close()
 GRAPH_PACKET_SCHEMA_VERSION = "edgeguard.graph_evidence_packet.v1"
 QUERY_RESULT_EVIDENCE_SCHEMA_VERSION = "edgeguard.query_result_evidence.v1"
+NEO4J_CONNECTION_STATUS_SCHEMA_VERSION = "edgeguard.neo4j_connection_status.v1"
 CASE_EXPLANATION_SCHEMA_VERSION = "edgeguard.case_explanation.v1"
 CASE_EXPLANATION_DRAFT_SCHEMA_VERSION = "edgeguard.case_explanation_draft.v2"
 GRAPH_FIRST_PREPARE_SCHEMA_VERSION = "edgeguard.graph_first_prepare.v1"
@@ -4484,6 +4485,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "explanation_model_ready": explanation_ready,
       "neo4j_driver_available": GraphDatabase is not None,
       "neo4j_bolt_over_wss_available": GraphDatabase is not None and websocket is not None,
+      "neo4j": self._neo4j_default_connection_status(),
       "live_empty_result_broadening": bool(self.cfg_live_empty_result_broadening),
       "graph_explanation": {
         "profile_id": PROFILE_ID,
@@ -4691,6 +4693,44 @@ class EdgeguardApiPlugin(BasePlugin):
       if any(not isinstance(value, str) or not value.strip() for value in connection.values()):
         return None, "The default Neo4j connection is not configured."
     return {key: value.strip() for key, value in connection.items()}, None
+
+  def _neo4j_default_connection_status(self) -> Dict[str, Any]:
+    unavailable = {
+      "schema_version": NEO4J_CONNECTION_STATUS_SCHEMA_VERSION,
+      "default_connection": {
+        "configured": False,
+        "endpoint": None,
+        "method": None,
+      },
+    }
+    connection, err = self._resolve_neo4j_connection(None, None, None, None)
+    if err or connection is None:
+      return unavailable
+    normalized_uri, err = self._normalize_neo4j_uri(
+      connection["uri"], connection["scheme"],
+    )
+    if err or normalized_uri is None:
+      return unavailable
+    parsed = urlsplit(normalized_uri)
+    hostname = parsed.hostname
+    if not hostname:
+      return unavailable
+    try:
+      port = parsed.port
+    except ValueError:
+      return unavailable
+    public_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+      public_host = f"{public_host}:{port}"
+    endpoint = urlunsplit((parsed.scheme, public_host, "", "", ""))
+    return {
+      "schema_version": NEO4J_CONNECTION_STATUS_SCHEMA_VERSION,
+      "default_connection": {
+        "configured": True,
+        "endpoint": endpoint,
+        "method": "bolt_over_wss",
+      },
+    }
 
   def _neo4j_unavailable(self) -> Dict[str, Any]:
     return {

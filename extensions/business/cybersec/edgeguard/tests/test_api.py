@@ -895,6 +895,51 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(connection["uri"], "default.example:7687")
     self.assertEqual(connection["scheme"], "bolt+s")
 
+  def test_health_reports_only_sanitized_neo4j_default_connection_status(self):
+    plugin = _make_api(neo4j_default_connection={
+      "uri": "bolt+s://uri-user:uri-secret@default.example:8443/private?token=hidden#fragment",
+      "username": "default-user",
+      "password": "default-secret",
+      "scheme": "bolt+s",
+    })
+
+    status = plugin.health()["neo4j"]
+
+    self.assertEqual(status, {
+      "schema_version": "edgeguard.neo4j_connection_status.v1",
+      "default_connection": {
+        "configured": True,
+        "endpoint": "bolt+s://default.example:8443",
+        "method": "bolt_over_wss",
+      },
+    })
+    flattened = json.dumps(status)
+    for private_value in (
+      "uri-user", "uri-secret", "default-user", "default-secret", "private", "hidden", "fragment",
+    ):
+      self.assertNotIn(private_value, flattened)
+
+  def test_health_reports_unavailable_neo4j_default_without_private_reason(self):
+    plugin = _make_api(neo4j_default_connection={
+      "uri": "$EE_NEO4J_URI",
+      "username": "$EE_NEO4J_USERNAME",
+      "password": "$EE_NEO4J_PASSWORD",
+      "scheme": "$EE_NEO4J_SCHEME",
+    })
+
+    with patch.dict(os.environ, {}, clear=True):
+      status = plugin.health()["neo4j"]
+
+    self.assertEqual(status, {
+      "schema_version": "edgeguard.neo4j_connection_status.v1",
+      "default_connection": {
+        "configured": False,
+        "endpoint": None,
+        "method": None,
+      },
+    })
+    self.assertNotIn("EE_NEO4J", json.dumps(status))
+
   def test_neo4j_bolt_over_wss_uses_local_bridge_and_closes_it(self):
     plugin = _make_api(neo4j_query_timeout_seconds=17)
     raw_driver = MagicMock()
