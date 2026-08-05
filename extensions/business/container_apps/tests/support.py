@@ -7,6 +7,10 @@ from unittest.mock import MagicMock
 
 import numpy as _np
 
+# Load the real shared per-node helper before this test harness installs its
+# lightweight ``naeural_core.business`` module stubs.
+from naeural_core.utils import per_node_config as _per_node_config  # noqa: F401,E402
+
 
 def install_docker_stub_if_needed():
   """Provide the tiny docker-py surface these unit tests need."""

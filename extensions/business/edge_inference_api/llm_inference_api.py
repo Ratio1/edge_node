@@ -94,6 +94,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _CONFIG = {
   **BasePlugin.CONFIG,
   "AI_ENGINE": "llama_cpp_small",
+  "SERVED_MODELS": [],
 
   "API_TITLE": "LLM Inference API",
 
@@ -110,6 +111,81 @@ _CONFIG = {
 
 class LLMInferenceApiPlugin(BasePlugin):
   CONFIG = _CONFIG
+
+  def _get_local_model_ids(self):
+    """Return normalized model identifiers served by this instance.
+
+    Explicit ``SERVED_MODELS`` aliases are combined with the effective
+    per-node AI engine and startup model identifiers. This lets API clients use
+    stable public aliases while retaining useful engine/model ids for backward
+    compatibility.
+    """
+    model_ids = set()
+    configured_aliases = getattr(self, 'cfg_served_models', [])
+    if isinstance(configured_aliases, str):
+      configured_aliases = [configured_aliases]
+    if isinstance(configured_aliases, (list, tuple, set)):
+      model_ids.update(
+        str(value).strip()
+        for value in configured_aliases
+        if isinstance(value, str) and value.strip()
+      )
+
+    ai_engines = getattr(self, 'cfg_ai_engine', None)
+    if isinstance(ai_engines, str):
+      ai_engines = [ai_engines]
+    if isinstance(ai_engines, (list, tuple, set)):
+      model_ids.update(
+        str(value).strip()
+        for value in ai_engines
+        if isinstance(value, str) and value.strip()
+      )
+
+    startup_params = getattr(self, 'cfg_startup_ai_engine_params', {})
+    pending = [startup_params]
+    while pending:
+      current = pending.pop()
+      if not isinstance(current, dict):
+        continue
+      for key, value in current.items():
+        if isinstance(value, dict):
+          pending.append(value)
+        elif key in {'MODEL_NAME', 'MODEL_INSTANCE_ID'} and isinstance(value, str) and value.strip():
+          model_ids.add(value.strip())
+        elif key == 'MODEL_PATH' and isinstance(value, str) and value.strip():
+          model_ids.add(value.rstrip('/').rsplit('/', 1)[-1])
+    return sorted(model_ids)
+
+  def _get_balancing_capabilities(self):
+    return {'models': self._get_local_model_ids()}
+
+  @staticmethod
+  def _get_requested_model(request_data):
+    if not isinstance(request_data, dict):
+      return None
+    parameters = request_data.get('parameters')
+    if not isinstance(parameters, dict):
+      return None
+    model = parameters.get('model')
+    if not isinstance(model, str):
+      return None
+    return model.strip() or None
+
+  def _can_execute_request(self, request_data):
+    requested_model = self._get_requested_model(request_data)
+    return requested_model is None or requested_model in self._get_local_model_ids()
+
+  def _capacity_record_can_execute_request(self, record, request_data):
+    requested_model = self._get_requested_model(request_data)
+    if requested_model is None:
+      return True
+    if not isinstance(record, dict):
+      return False
+    capabilities = record.get('capabilities')
+    if not isinstance(capabilities, dict):
+      return False
+    models = capabilities.get('models')
+    return isinstance(models, list) and requested_model in models
 
   """VALIDATION SECTION"""
   if True:
@@ -334,6 +410,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def predict(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -350,6 +427,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -374,6 +453,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return super(LLMInferenceApiPlugin, self).predict(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
@@ -390,6 +470,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def predict_async(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -407,6 +488,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -434,6 +517,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return super(LLMInferenceApiPlugin, self).predict_async(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
@@ -449,6 +533,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def create_chat_completion(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -465,6 +550,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -489,6 +576,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return self.predict(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
@@ -503,6 +591,7 @@ class LLMInferenceApiPlugin(BasePlugin):
     def create_chat_completion_async(
         self,
         messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -519,6 +608,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -543,6 +634,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       return self.predict_async(
         messages=messages,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
@@ -561,6 +653,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        model: Optional[str] = None,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
         response_format: Optional[Dict[str, Any]] = None,
@@ -573,6 +666,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
+      model : str or None, optional
+        Requested model identifier used for capability-aware routing.
       temperature : float
         Sampling temperature.
       max_tokens : int
@@ -591,6 +686,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       str or None
         Error message when validation fails, otherwise None.
       """
+      if model is not None and (not isinstance(model, str) or not model.strip()):
+        return "`model` must be a non-empty string when provided."
       err = self.check_messages(messages)
       if err is not None:
         return err
@@ -610,6 +707,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        model: Optional[str] = None,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
         response_format: Optional[Dict[str, Any]] = None,
@@ -622,6 +720,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
+      model : str or None, optional
+        Requested model identifier retained in the tracked request.
       temperature : float
         Sampling temperature.
       max_tokens : int
@@ -643,7 +743,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       normalized_messages = self.normalize_messages(messages)
       # No need to capture err_msg here, already validated in check_predict_params
       response_format, _ = self.check_and_normalize_response_format(response_format=response_format)
-      return {
+      parameters = {
         'messages': normalized_messages,
         'temperature': temperature,
         'max_tokens': max_tokens,
@@ -652,6 +752,9 @@ class LLMInferenceApiPlugin(BasePlugin):
         'response_format': response_format,
         **kwargs
       }
+      if model is not None:
+        parameters['model'] = model.strip()
+      return parameters
 
     def compute_payload_kwargs_from_predict_params(
         self,
@@ -682,6 +785,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       if repeat_penalty is not None:
         jeeves_content['REPETITION_PENALTY'] = repeat_penalty
       jeeves_content.pop('REPEAT_PENALTY', None)
+      jeeves_content.pop('MODEL', None)
       jeeves_content[LlmCT.REQUEST_ID] = request_id
       jeeves_content[LlmCT.REQUEST_TYPE] = 'LLM'
       return {
@@ -816,9 +920,10 @@ class LLMInferenceApiPlugin(BasePlugin):
       if request_data['status'] != self.STATUS_PENDING:
         return
 
+      resolved_model_name = model_name or request_data.get('parameters', {}).get('model')
       response_payload = self.build_completion_response(
         request_id=request_id,
-        model_name=model_name or request_data['model'],
+        model_name=resolved_model_name,
         inference=inference,
         request_data=request_data
       )
@@ -834,7 +939,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       # TODO: adapt this to match OpenAI-style response structure if flag active
       self._requests[request_id]['result'] = {
         'REQUEST_ID': request_id,
-        'MODEL_NAME': model_name,
+        'MODEL_NAME': resolved_model_name,
         'TEXT_RESPONSE': text_response,
         LlmCT.FULL_OUTPUT: full_output,
       }
