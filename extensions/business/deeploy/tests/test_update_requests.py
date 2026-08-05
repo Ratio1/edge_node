@@ -3233,6 +3233,73 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(updated["CHAINSTORE_PEERS"], expected_nodes)
     self.assertEqual(updated["PER_NODE_TARGET_NODES"], expected_nodes)
 
+  def test_scale_up_prepare_canonicalizes_persisted_per_node_config(self):
+    plugin = make_deeploy_plugin()
+    plugin.defaultdict = defaultdict
+    plugin.time = lambda: 1000
+    base_pipeline = {
+      "app_id": "app-1",
+      "pipeline_type": "Void",
+      "url": "",
+      "pipeline_params": {},
+      "deeploy_specs": {
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["0xai_node_a"],
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      },
+      "plugins": [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{
+          "INSTANCE_ID": "stale-instance",
+          "perNodeConfig": {"byNode": {"0xai_node_b": {"ENV": {"NODE_ID": "2"}}}},
+        }],
+      }],
+    }
+
+    create_pipelines, _update_pipelines, _response_keys = plugin.prepare_create_update_pipelines(
+      base_pipeline=base_pipeline,
+      new_nodes=["0xai_node_b"],
+      update_nodes=[],
+      running_apps_for_job={},
+    )
+
+    instance = create_pipelines["0xai_node_b"]["plugins"][0]["INSTANCES"][0]
+    self.assertNotIn("perNodeConfig", instance)
+    self.assertEqual(
+      instance["PER_NODE_CONFIG"],
+      {"byNode": {"0xai_node_b": {"ENV": {"NODE_ID": "2"}}}},
+    )
+
+  def test_scale_up_prepare_rejects_duplicate_per_node_config_spellings(self):
+    plugin = make_deeploy_plugin()
+    plugin.defaultdict = defaultdict
+    plugin.time = lambda: 1000
+    base_pipeline = {
+      "app_id": "app-1",
+      "pipeline_type": "Void",
+      "url": "",
+      "pipeline_params": {},
+      "deeploy_specs": {
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["0xai_node_a"],
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      },
+      "plugins": [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{
+          "INSTANCE_ID": "stale-instance",
+          "perNodeConfig": {"byNode": {}},
+          "PER_NODE_CONFIG": {"byNode": {}},
+        }],
+      }],
+    }
+
+    with self.assertRaisesRegex(ValueError, "Only one perNodeConfig spelling"):
+      plugin.prepare_create_update_pipelines(
+        base_pipeline=base_pipeline,
+        new_nodes=["0xai_node_b"],
+        update_nodes=[],
+        running_apps_for_job={},
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

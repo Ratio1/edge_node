@@ -217,6 +217,32 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "duplicate aliases"):
       plugin._normalize_per_node_config({"byIndex": {}, "BY_INDEX": {}})
 
+  def test_per_node_config_rejects_duplicate_normalized_selectors(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "duplicate normalized index 1"):
+      plugin._normalize_per_node_config({
+        "byIndex": {
+          "01": {"ENV": {"NODE_ID": "first"}},
+          "1": {"ENV": {"NODE_ID": "second"}},
+        },
+      })
+    with self.assertRaisesRegex(ValueError, "duplicate node selector '1'"):
+      plugin._normalize_per_node_config({
+        "byNode": {
+          1: {"ENV": {"NODE_ID": "first"}},
+          "1": {"ENV": {"NODE_ID": "second"}},
+        },
+      })
+
+  def test_per_node_config_rejects_normalized_nested_alias(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "Nested .* overlays"):
+      plugin._normalize_per_node_config({
+        "byIndex": {"0": {"PerNodeConfig": {}}},
+      })
+
   def test_log_redaction_masks_per_node_config_and_token_keys(self):
     plugin = make_deeploy_plugin()
 

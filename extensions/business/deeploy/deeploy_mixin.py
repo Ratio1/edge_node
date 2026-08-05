@@ -5047,6 +5047,12 @@ class _DeeployMixin:
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
       deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
+    for plugin in base_pipeline.get(NetMonCt.PLUGINS, []):
+      if not isinstance(plugin, dict):
+        continue
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES, []) or []:
+        if isinstance(instance, dict):
+          self._canonicalize_per_node_config_key(instance)
     # TODO: Delegate service-specific persisted-pipeline preparation through
     # the managed-service abstraction when CockroachDB is no longer the only
     # service with generated per-node runtime material.

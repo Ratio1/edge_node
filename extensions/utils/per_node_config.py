@@ -133,20 +133,27 @@ def normalize_config(
       raise ValueError(f"{label}.byIndex key {raw_index!r} must be an integer index.") from exc
     if index < 0:
       raise ValueError(f"{label}.byIndex key {raw_index!r} must be non-negative.")
+    if index in normalized_by_index:
+      raise ValueError(f"{label}.byIndex contains duplicate normalized index {index}.")
     normalized_by_index[index] = overlay
 
   normalized_by_node = {}
   for raw_node, overlay in by_node.items():
     if not isinstance(overlay, dict):
       raise ValueError(f"{label}.byNode[{raw_node!r}] must be a dictionary.")
-    normalized_by_node[str(raw_node)] = overlay
+    node = str(raw_node)
+    if node in normalized_by_node:
+      raise ValueError(f"{label}.byNode contains duplicate node selector {node!r}.")
+    normalized_by_node[node] = overlay
 
+  normalized_config_keys = {str(key).upper() for key in config_keys}
+  normalized_system_keys = {str(key).upper() for key in system_keys}
   for overlay in [default_overlay, *normalized_by_index.values(), *normalized_by_node.values()]:
     for key in overlay:
       normalized_key = str(key).upper()
-      if key in config_keys:
+      if normalized_key in normalized_config_keys:
         raise ValueError(f"Nested {label} overlays are not supported.")
-      if normalized_key in system_keys:
+      if normalized_key in normalized_system_keys:
         raise ValueError(
           f"{label} cannot override system-managed or preflighted key '{key}'."
         )
