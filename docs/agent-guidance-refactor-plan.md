@@ -16,7 +16,7 @@ cards, and execution workflows, and while making the referenced devcontainer gui
 
 - [x] Add `docs/agent-workflows.md` with the eight condensed roles and the single-agent and
   actor-critic workflows. Commit this file together with the normalized plan record.
-- [ ] Add `.devcontainer/README.md` with setup, rebuild, configuration, and verification guidance.
+- [x] Add `.devcontainer/README.md` with setup, rebuild, configuration, and verification guidance.
 - [ ] Refine root `AGENTS.md` after both targets exist: remove duplication, retain a compact repository
   map and conventions, and link to both detailed documents.
 
@@ -74,3 +74,6 @@ git diff --name-only 318cb5ac..HEAD | diff -u <(printf '%s\n' \
 - 2026-08-05: Phase 1 added the workflow reference with all eight condensed roles and the default
   single-agent and higher-risk actor-critic workflows. Stale memory-log duties were replaced with a
   current Documentation Curator role; Ops-Infra ownership now includes `.devcontainer/**`.
+- 2026-08-05: Phase 2 added the missing devcontainer guide. Configuration parsing passed with
+  Dev Container CLI 0.87.0; the guide records the resolved bind mount, build context, fixed name,
+  privileged/default-CPU behavior, mutable base, install sources, and post-start verification.
