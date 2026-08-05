@@ -1,5 +1,12 @@
-#FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
-FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-dnctk
+# Keep the development container aligned with the runtime Dockerfiles. The
+# edge-node source itself is bind-mounted at /edge_node by the devcontainer
+# configuration.
+ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu:latest
+FROM ${BASE_IMAGE}
+
+# The base image sources this file from /root/.profile, but does not create it.
+# Keep login-shell commands usable for devcontainer lifecycle and plugin scripts.
+RUN mkdir -p /root/.local/bin && touch /root/.local/bin/env
 
 # Install IPFS
 # The line below was creating issues due to flaky external repos
