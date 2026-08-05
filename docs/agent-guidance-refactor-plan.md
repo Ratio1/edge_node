@@ -17,7 +17,7 @@ cards, and execution workflows, and while making the referenced devcontainer gui
 - [x] Add `docs/agent-workflows.md` with the eight condensed roles and the single-agent and
   actor-critic workflows. Commit this file together with the normalized plan record.
 - [x] Add `.devcontainer/README.md` with setup, rebuild, configuration, and verification guidance.
-- [ ] Refine root `AGENTS.md` after both targets exist: remove duplication, retain a compact repository
+- [x] Refine root `AGENTS.md` after both targets exist: remove duplication, retain a compact repository
   map and conventions, and link to both detailed documents.
 
 ## Acceptance Criteria
@@ -77,3 +77,13 @@ git diff --name-only 318cb5ac..HEAD | diff -u <(printf '%s\n' \
 - 2026-08-05: Phase 2 added the missing devcontainer guide. Configuration parsing passed with
   Dev Container CLI 0.87.0; the guide records the resolved bind mount, build context, fixed name,
   privileged/default-CPU behavior, mutable base, install sources, and post-start verification.
+- 2026-08-05: Phase 3 replaced overlapping catalog/ownership material with a compact repository map,
+  restored explicit repository conventions, consolidated runtime-state guidance, and routed detailed
+  workflows and devcontainer instructions through verified Markdown links.
+- 2026-08-05: Final validation passed: base-to-HEAD whitespace check, exact four-path documentation
+  whitelist, both root Markdown links, eight roles with four required fields, both workflow headings,
+  negative root-detail checks, one `_local_cache` occurrence, 107-line root limit, and Dev Container
+  CLI 0.87.0 configuration parsing.
+- 2026-08-05: Two independent implementation reviews returned specification `PASS` with no blocking
+  findings or non-blocking concerns. Both reviewers replayed the documented checks and inspected the
+  complete three-commit, documentation-only diff.
