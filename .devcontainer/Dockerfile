@@ -1,7 +1,7 @@
-# Keep the development container on the same Python 3.13 runtime base as the
-# local testnet Dockerfile. The edge-node source itself is bind-mounted at
-# /edge_node by the devcontainer configuration.
-ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu@sha256:0a66e7b63ea90ee5b50c1fa0833cf1d7798f6671923b932f7f15dd685c5e43b2
+# Keep the development container aligned with the runtime Dockerfiles. The
+# edge-node source itself is bind-mounted at /edge_node by the devcontainer
+# configuration.
+ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu:latest
 FROM ${BASE_IMAGE}
 
 # The base image sources this file from /root/.profile, but does not create it.
