@@ -1,8 +1,16 @@
+"""Compatibility helpers for Edge per-node deployment configuration.
+
+Edge accepts ``perNodeConfig`` at its public Deeploy boundary and rewrites it
+to canonical ``PER_NODE_CONFIG`` before dispatch. Container runners consume
+that canonical runtime field.
+"""
+
 from copy import deepcopy as _deepcopy
 
 
 CANONICAL_PER_NODE_CONFIG_KEY = "PER_NODE_CONFIG"
 PER_NODE_TARGET_NODES_KEY = "PER_NODE_TARGET_NODES"
+# Accepted Deeploy boundary spellings; dispatched instances use the canonical key.
 PER_NODE_CONFIG_KEYS = ("perNodeConfig", CANONICAL_PER_NODE_CONFIG_KEY)
 PER_NODE_CONFIG_STRUCTURED_KEYS = {
   "default",

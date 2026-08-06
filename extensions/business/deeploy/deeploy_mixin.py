@@ -3282,6 +3282,7 @@ class _DeeployMixin:
     return None
 
   def _canonicalize_per_node_config_key(self, plugin_instance):
+    """Rewrite the supported public spelling and reject ambiguous instances."""
     present_keys = [
       key for key in PER_NODE_CONFIG_KEYS
       if key in plugin_instance
