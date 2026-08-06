@@ -1168,6 +1168,12 @@ class _ContainerUtilsMixin:
     if hasattr(self, "_apply_env_overrides_to_env"):
       self._apply_env_overrides_to_env()
 
+    # Runtime identities are reserved and authoritative. Apply them after every
+    # configurable environment source so container configuration cannot spoof
+    # the application or plugin that owns the workload.
+    self.env["R1EN_APP_ID"] = self._stream_id
+    self.env["R1EN_PLUGIN_ID"] = self.cfg_instance_id
+
     # Format ports for Docker API
     # Docker expects: {"container_port/tcp": "host_port"}
     # extra_ports_mapping contains: {host_port: container_port}
