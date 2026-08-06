@@ -101,7 +101,7 @@ class _ContainerUtilsMixin:
       "EE_CONTAINER_NAME": self.container_name,
       "R1EN_CONTAINER_NAME": self.container_name,
       "R1EN_APP_ID": self._stream_id,
-      "R1EN_PLUGIN_ID": self.cfg_instance_id,
+      "R1EN_INSTANCE_ID": self.cfg_instance_id,
       "EE_HOST_IP": localhost_ip,
       "R1EN_HOST_IP": localhost_ip,
       "EE_HOST_ID": self.ee_id,
@@ -1174,7 +1174,7 @@ class _ContainerUtilsMixin:
     # Runtime identities are default environment values, but remain reserved
     # and authoritative after every configurable environment source.
     self.env["R1EN_APP_ID"] = default_env["R1EN_APP_ID"]
-    self.env["R1EN_PLUGIN_ID"] = default_env["R1EN_PLUGIN_ID"]
+    self.env["R1EN_INSTANCE_ID"] = default_env["R1EN_INSTANCE_ID"]
 
     # Format ports for Docker API
     # Docker expects: {"container_port/tcp": "host_port"}

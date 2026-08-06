@@ -460,7 +460,7 @@ class RuntimeIdentityEnvTests(unittest.TestCase):
     plugin.P = lambda *args, **kwargs: None
     plugin.Pd = lambda *args, **kwargs: None
     plugin._stream_id = "navigator-app"
-    plugin.cfg_instance_id = "navigator-plugin"
+    plugin.cfg_instance_id = "navigator-instance"
     plugin.container_name = "navigator-container"
     plugin.ee_id = "edge-node"
     plugin.ee_addr = "0xedge"
@@ -481,18 +481,20 @@ class RuntimeIdentityEnvTests(unittest.TestCase):
     default_env = plugin._get_default_env_vars()
 
     self.assertEqual(default_env["R1EN_APP_ID"], "navigator-app")
-    self.assertEqual(default_env["R1EN_PLUGIN_ID"], "navigator-plugin")
+    self.assertEqual(default_env["R1EN_INSTANCE_ID"], "navigator-instance")
+    self.assertNotIn("R1EN_PLUGIN_ID", default_env)
 
     plugin._setup_env_and_ports()
 
     self.assertEqual(plugin.env["R1EN_APP_ID"], "navigator-app")
-    self.assertEqual(plugin.env["R1EN_PLUGIN_ID"], "navigator-plugin")
+    self.assertEqual(plugin.env["R1EN_INSTANCE_ID"], "navigator-instance")
+    self.assertNotIn("R1EN_PLUGIN_ID", plugin.env)
 
   def test_runtime_identity_values_override_every_environment_source(self):
     plugin = self._make_plugin()
     spoofed = {
       "R1EN_APP_ID": "spoofed-app",
-      "R1EN_PLUGIN_ID": "spoofed-plugin",
+      "R1EN_INSTANCE_ID": "spoofed-instance",
     }
     plugin.dynamic_env = dict(spoofed)
     plugin.semaphore_get_env = lambda: dict(spoofed)
@@ -506,7 +508,7 @@ class RuntimeIdentityEnvTests(unittest.TestCase):
     plugin._setup_env_and_ports()
 
     self.assertEqual(plugin.env["R1EN_APP_ID"], "navigator-app")
-    self.assertEqual(plugin.env["R1EN_PLUGIN_ID"], "navigator-plugin")
+    self.assertEqual(plugin.env["R1EN_INSTANCE_ID"], "navigator-instance")
 
 
 if __name__ == "__main__":
