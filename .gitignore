@@ -136,6 +136,9 @@ dmypy.json
 # local python files
 *__local__.py
 
+# local dependency checkouts
+/naeural_core/
+
 */_local_cache/*
 */ratio1_0*
 */_data/*

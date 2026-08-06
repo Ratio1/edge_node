@@ -1,7 +1,12 @@
-FROM ratio1/base_edge_node_amd64_gpu:py3.13-th2.11-cu12.8-trt10.16-tr5.8@sha256:9c5865db36d4ea379c1daa212c6ac32725f6113f11185cf9c1501539f9c66fd2
+# Keep the development container aligned with the runtime Dockerfiles. The
+# edge-node source itself is bind-mounted at /edge_node by the devcontainer
+# configuration.
+ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu:latest
+FROM ${BASE_IMAGE}
 
-RUN test "$(command -v python3)" = "/opt/python/bin/python3" && \
-    /opt/python/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
+# The base image sources this file from /root/.profile, but does not create it.
+# Keep login-shell commands usable for devcontainer lifecycle and plugin scripts.
+RUN mkdir -p /root/.local/bin && touch /root/.local/bin/env
 
 # Install IPFS
 # The line below was creating issues due to flaky external repos
