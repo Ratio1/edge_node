@@ -453,5 +453,50 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
     self.assertEqual(content, "valid content")
 
 
+class RuntimeIdentityEnvTests(unittest.TestCase):
+
+  def _make_plugin(self):
+    plugin = ContainerAppRunnerPlugin.__new__(ContainerAppRunnerPlugin)
+    plugin.P = lambda *args, **kwargs: None
+    plugin.Pd = lambda *args, **kwargs: None
+    plugin._stream_id = "navigator-app"
+    plugin.cfg_instance_id = "navigator-plugin"
+    plugin.cfg_env = {}
+    plugin.dynamic_env = {}
+    plugin.extra_ports_mapping = {}
+    plugin.cfg_port = None
+    plugin._get_default_env_vars = lambda: {}
+    return plugin
+
+  def test_runtime_identity_values_are_injected(self):
+    plugin = self._make_plugin()
+
+    plugin._setup_env_and_ports()
+
+    self.assertEqual(plugin.env["R1EN_APP_ID"], "navigator-app")
+    self.assertEqual(plugin.env["R1EN_PLUGIN_ID"], "navigator-plugin")
+
+  def test_runtime_identity_values_override_every_environment_source(self):
+    plugin = self._make_plugin()
+    spoofed = {
+      "R1EN_APP_ID": "spoofed-app",
+      "R1EN_PLUGIN_ID": "spoofed-plugin",
+    }
+    plugin._get_default_env_vars = lambda: dict(spoofed)
+    plugin.dynamic_env = dict(spoofed)
+    plugin.semaphore_get_env = lambda: dict(spoofed)
+    plugin.cfg_env = dict(spoofed)
+
+    def apply_local_overrides():
+      plugin.env.update(spoofed)
+
+    plugin._apply_env_overrides_to_env = apply_local_overrides
+
+    plugin._setup_env_and_ports()
+
+    self.assertEqual(plugin.env["R1EN_APP_ID"], "navigator-app")
+    self.assertEqual(plugin.env["R1EN_PLUGIN_ID"], "navigator-plugin")
+
+
 if __name__ == "__main__":
   unittest.main()
