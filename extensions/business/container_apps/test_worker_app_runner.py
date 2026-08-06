@@ -461,15 +461,27 @@ class RuntimeIdentityEnvTests(unittest.TestCase):
     plugin.Pd = lambda *args, **kwargs: None
     plugin._stream_id = "navigator-app"
     plugin.cfg_instance_id = "navigator-plugin"
+    plugin.container_name = "navigator-container"
+    plugin.ee_id = "edge-node"
+    plugin.ee_addr = "0xedge"
+    plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
+    plugin.bc = types.SimpleNamespace(eth_address="0x0", get_evm_network=lambda: "testnet")
+    plugin.json_dumps = lambda value: "[]"
+    plugin.cfg_chainstore_peers = []
+    plugin.cfg_semaphored_keys = None
     plugin.cfg_env = {}
     plugin.dynamic_env = {}
     plugin.extra_ports_mapping = {}
     plugin.cfg_port = None
-    plugin._get_default_env_vars = lambda: {}
     return plugin
 
-  def test_runtime_identity_values_are_injected(self):
+  def test_runtime_identity_values_are_default_env_vars(self):
     plugin = self._make_plugin()
+
+    default_env = plugin._get_default_env_vars()
+
+    self.assertEqual(default_env["R1EN_APP_ID"], "navigator-app")
+    self.assertEqual(default_env["R1EN_PLUGIN_ID"], "navigator-plugin")
 
     plugin._setup_env_and_ports()
 
@@ -482,7 +494,6 @@ class RuntimeIdentityEnvTests(unittest.TestCase):
       "R1EN_APP_ID": "spoofed-app",
       "R1EN_PLUGIN_ID": "spoofed-plugin",
     }
-    plugin._get_default_env_vars = lambda: dict(spoofed)
     plugin.dynamic_env = dict(spoofed)
     plugin.semaphore_get_env = lambda: dict(spoofed)
     plugin.cfg_env = dict(spoofed)

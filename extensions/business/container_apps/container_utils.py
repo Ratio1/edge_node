@@ -100,6 +100,8 @@ class _ContainerUtilsMixin:
       "CONTAINER_NAME": self.container_name,
       "EE_CONTAINER_NAME": self.container_name,
       "R1EN_CONTAINER_NAME": self.container_name,
+      "R1EN_APP_ID": self._stream_id,
+      "R1EN_PLUGIN_ID": self.cfg_instance_id,
       "EE_HOST_IP": localhost_ip,
       "R1EN_HOST_IP": localhost_ip,
       "EE_HOST_ID": self.ee_id,
@@ -1136,7 +1138,8 @@ class _ContainerUtilsMixin:
     """
     # Environment variables
     # allow cfg_env to override default env vars
-    self.env = self._get_default_env_vars()
+    default_env = self._get_default_env_vars()
+    self.env = dict(default_env)
     self.env.update(self.dynamic_env)
 
     # Add environment variables from semaphored paired plugins
@@ -1168,11 +1171,10 @@ class _ContainerUtilsMixin:
     if hasattr(self, "_apply_env_overrides_to_env"):
       self._apply_env_overrides_to_env()
 
-    # Runtime identities are reserved and authoritative. Apply them after every
-    # configurable environment source so container configuration cannot spoof
-    # the application or plugin that owns the workload.
-    self.env["R1EN_APP_ID"] = self._stream_id
-    self.env["R1EN_PLUGIN_ID"] = self.cfg_instance_id
+    # Runtime identities are default environment values, but remain reserved
+    # and authoritative after every configurable environment source.
+    self.env["R1EN_APP_ID"] = default_env["R1EN_APP_ID"]
+    self.env["R1EN_PLUGIN_ID"] = default_env["R1EN_PLUGIN_ID"]
 
     # Format ports for Docker API
     # Docker expects: {"container_port/tcp": "host_port"}
