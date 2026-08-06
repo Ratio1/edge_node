@@ -7,9 +7,8 @@ from unittest.mock import MagicMock
 
 import numpy as _np
 
-# Load the real shared per-node helper before this test harness installs its
-# lightweight ``naeural_core.business`` module stubs.
-from naeural_core.utils import per_node_config as _per_node_config  # noqa: F401,E402
+# Keep the real package root so the business stubs do not poison later imports.
+import naeural_core as _naeural_core  # noqa: F401
 
 
 def install_docker_stub_if_needed():
@@ -194,23 +193,40 @@ class _DummyBasePlugin:
 
 def install_dummy_base_plugin():
   module_hierarchy = [
-    ('naeural_core', types.ModuleType('naeural_core')),
     ('naeural_core.business', types.ModuleType('naeural_core.business')),
     ('naeural_core.business.base', types.ModuleType('naeural_core.business.base')),
     ('naeural_core.business.base.web_app', types.ModuleType('naeural_core.business.base.web_app')),
   ]
 
+  missing = object()
+  previous_modules = {
+    name: sys.modules.get(name, missing)
+    for name, _module in module_hierarchy
+  }
   for name, module in module_hierarchy:
-    sys.modules.setdefault(name, module)
+    sys.modules[name] = module
 
+  leaf_name = 'naeural_core.business.base.web_app.base_tunnel_engine_plugin'
+  previous_modules[leaf_name] = sys.modules.get(leaf_name, missing)
   base_tunnel_mod = types.ModuleType('naeural_core.business.base.web_app.base_tunnel_engine_plugin')
   base_tunnel_mod.BaseTunnelEnginePlugin = _DummyBasePlugin
-  sys.modules['naeural_core.business.base.web_app.base_tunnel_engine_plugin'] = base_tunnel_mod
+  sys.modules[leaf_name] = base_tunnel_mod
+
+  def restore_modules():
+    for name, previous_module in previous_modules.items():
+      if previous_module is missing:
+        sys.modules.pop(name, None)
+      else:
+        sys.modules[name] = previous_module
+
+  return restore_modules
 
 
-install_dummy_base_plugin()
-
-from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
+_restore_core_modules = install_dummy_base_plugin()
+try:
+  from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
+finally:
+  _restore_core_modules()
 
 
 def make_container_app_runner():
