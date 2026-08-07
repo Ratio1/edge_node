@@ -1,7 +1,9 @@
 import copy
+import hashlib
 import json
 import ipaddress
 import re
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
@@ -104,6 +106,18 @@ COCKROACHDB_REQUIRED_AUTH_ENV_KEYS = (
   "CRDB_DATABASE",
   "CRDB_USER",
   "CRDB_PASSWORD",
+)
+COCKROACHDB_ALLOCATION_PARAM = "deeploy_cockroachdb"
+COCKROACHDB_CERT_REGENERATION_REQUEST_KEY = "cockroachdb_certificate_regeneration_id"
+COCKROACHDB_CERT_HOSTNAME_KEY = "certificateHostname"
+COCKROACHDB_CERT_GENERATION_ID_KEY = "certificateGenerationId"
+COCKROACHDB_CERT_CA_SHA256_KEY = "certificateCaSha256"
+COCKROACHDB_CERT_REGENERATION_INTENT_KEY = "certificateRegenerationIntentSha256"
+COCKROACHDB_CERT_LIFECYCLE_KEYS = (
+  COCKROACHDB_CERT_HOSTNAME_KEY,
+  COCKROACHDB_CERT_GENERATION_ID_KEY,
+  COCKROACHDB_CERT_CA_SHA256_KEY,
+  COCKROACHDB_CERT_REGENERATION_INTENT_KEY,
 )
 
 class _DeeployMixin:
@@ -3437,6 +3451,7 @@ class _DeeployMixin:
     if not isinstance(raw_config, dict):
       return False
     try:
+      common_ca = None
       for index, node in enumerate(target_nodes):
         overlay = self._overlay_for_node(raw_config, node, index)
         env = overlay.get("ENV")
@@ -3445,6 +3460,10 @@ class _DeeployMixin:
         for key in COCKROACHDB_CERT_ENV_KEYS:
           if not isinstance(env.get(key), str) or "-----BEGIN" not in env.get(key):
             return False
+        if common_ca is None:
+          common_ca = env["CRDB_CA_CRT"]
+        elif env["CRDB_CA_CRT"] != common_ca:
+          return False
         if index == 0:
           for key in COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS:
             if not isinstance(env.get(key), str) or "-----BEGIN" not in env.get(key):
@@ -3452,6 +3471,201 @@ class _DeeployMixin:
     except Exception:
       return False
     return True
+
+  def _inherit_cockroachdb_certificates_from_discovered(
+    self,
+    inputs,
+    discovered_plugin_instances,
+    target_nodes,
+  ):
+    plugins = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if not isinstance(plugins, list) or not isinstance(discovered_plugin_instances, list):
+      return inputs
+    cert_keys = (*COCKROACHDB_CERT_ENV_KEYS, *COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS)
+
+    for plugin_instance in plugins:
+      if not self._is_cockroachdb_plugin_instance(plugin_instance):
+        continue
+      instance_id = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+      if not instance_id:
+        continue
+      self._canonicalize_per_node_config_key(plugin_instance)
+      raw_config = plugin_instance.get(CANONICAL_PER_NODE_CONFIG_KEY)
+      by_node = {}
+      for index, node in enumerate(target_nodes or []):
+        overlay = self._overlay_for_node(raw_config, node, index) if raw_config else {}
+        overlay = self.deepcopy(overlay) if isinstance(overlay, dict) else {}
+        overlay_env = overlay.get("ENV")
+        overlay_env = self.deepcopy(overlay_env) if isinstance(overlay_env, dict) else {}
+
+        for discovered in discovered_plugin_instances:
+          if discovered.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID) != instance_id:
+            continue
+          runtime = discovered.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE, {})
+          runtime_config = runtime.get("instance_conf", {}) if isinstance(runtime, dict) else {}
+          runtime_raw_config = (
+            runtime_config.get(CANONICAL_PER_NODE_CONFIG_KEY)
+            or runtime_config.get("perNodeConfig")
+          ) if isinstance(runtime_config, dict) else None
+          discovered_node = discovered.get(DEEPLOY_PLUGIN_DATA.NODE)
+          if discovered_node != node and not isinstance(runtime_raw_config, dict):
+            continue
+          runtime_envs = []
+          direct_env = runtime_config.get("ENV") if isinstance(runtime_config, dict) else None
+          if discovered_node == node and isinstance(direct_env, dict):
+            runtime_envs.append(direct_env)
+          runtime_overlay = (
+            self._overlay_for_node(runtime_raw_config, node, index)
+            if isinstance(runtime_raw_config, dict) else {}
+          )
+          per_node_env = runtime_overlay.get("ENV") if isinstance(runtime_overlay, dict) else None
+          if isinstance(per_node_env, dict):
+            runtime_envs.append(per_node_env)
+          for runtime_env in runtime_envs:
+            for key in cert_keys:
+              if isinstance(runtime_env.get(key), str):
+                overlay_env[key] = runtime_env[key]
+
+        overlay["ENV"] = overlay_env
+        by_node[node] = overlay
+      plugin_instance[CANONICAL_PER_NODE_CONFIG_KEY] = {"byNode": by_node}
+    return inputs
+
+  def _cockroachdb_client_hostname(self, endpoint):
+    if not isinstance(endpoint, str) or not endpoint.strip():
+      raise ValueError("CockroachDB client tunnel endpoint is missing.")
+    value = endpoint.strip()
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    if "://" in value and parsed.scheme.lower() != "tcp":
+      raise ValueError("CockroachDB client tunnel endpoint must use the tcp scheme.")
+    if parsed.username or parsed.password:
+      raise ValueError("CockroachDB client tunnel endpoint must not include credentials.")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+      raise ValueError("CockroachDB client tunnel endpoint must not include a path, query, or fragment.")
+    try:
+      parsed.port
+    except ValueError as exc:
+      raise ValueError("CockroachDB client tunnel endpoint contains an invalid port.") from exc
+    hostname = parsed.hostname
+    if not hostname or "*" in hostname:
+      raise ValueError("CockroachDB client tunnel endpoint must contain an exact hostname or IP address.")
+    hostname = hostname.rstrip(".").lower()
+    try:
+      ipaddress.ip_address(hostname)
+      return hostname
+    except ValueError:
+      pass
+    if len(hostname) > 253:
+      raise ValueError("CockroachDB client tunnel hostname is too long.")
+    labels = hostname.split(".")
+    if any(
+      not label
+      or len(label) > 63
+      or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+      for label in labels
+    ):
+      raise ValueError("CockroachDB client tunnel endpoint contains an invalid hostname.")
+    return hostname
+
+  def _get_cockroachdb_allocation(self, inputs, required=True):
+    pipeline_params = self._extract_pipeline_params(inputs)
+    allocation = pipeline_params.get(COCKROACHDB_ALLOCATION_PARAM)
+    if not isinstance(allocation, dict):
+      if not required:
+        return None, None
+      raise ValueError("CockroachDB client tunnel allocation is missing.")
+    client_tunnel = allocation.get("clientTunnel")
+    if not isinstance(client_tunnel, dict):
+      if not required:
+        return allocation, None
+      raise ValueError("CockroachDB client tunnel allocation is missing.")
+    endpoint = client_tunnel.get("url")
+    if not endpoint and not required:
+      return allocation, None
+    hostname = self._cockroachdb_client_hostname(endpoint)
+    return allocation, hostname
+
+  def _get_cockroachdb_regeneration_id(self, inputs):
+    value = inputs.get(COCKROACHDB_CERT_REGENERATION_REQUEST_KEY)
+    if value is None:
+      return None
+    if not isinstance(value, str) or not re.fullmatch(
+      r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+      value,
+      flags=re.IGNORECASE,
+    ):
+      raise ValueError("CockroachDB certificate regeneration id must be a UUIDv4 string.")
+    return value.lower()
+
+  def _get_cockroachdb_allocation_from_specs(self, deeploy_specs):
+    pipeline_params = self._get_pipeline_params_from_deeploy_specs(deeploy_specs)
+    allocation = pipeline_params.get(COCKROACHDB_ALLOCATION_PARAM)
+    return allocation if isinstance(allocation, dict) else None
+
+  def _cockroachdb_regeneration_intent_hash(self, inputs):
+    payload = self.deepcopy(dict(inputs))
+    for key in (*DEEPLOY_V3_HASH_EXCLUDED_KEYS, DEEPLOY_KEYS.NONCE, COCKROACHDB_CERT_REGENERATION_REQUEST_KEY):
+      payload.pop(key, None)
+    pipeline_params = payload.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
+    allocation = (
+      pipeline_params.get(COCKROACHDB_ALLOCATION_PARAM)
+      if isinstance(pipeline_params, dict) else None
+    )
+    if isinstance(allocation, dict):
+      for key in (*COCKROACHDB_CERT_LIFECYCLE_KEYS, "updatedAt"):
+        allocation.pop(key, None)
+    return compact_canonical_sha256(payload)
+
+  def _prepare_cockroachdb_regeneration_lifecycle(
+    self,
+    inputs,
+    deeploy_specs,
+    applied_operation=None,
+  ):
+    if not self._request_has_cockroachdb_plugin(inputs):
+      return None, None, False
+
+    regeneration_id = self._get_cockroachdb_regeneration_id(inputs)
+    allocation, _ = self._get_cockroachdb_allocation(
+      inputs,
+      required=bool(regeneration_id),
+    )
+    current_allocation = self._get_cockroachdb_allocation_from_specs(deeploy_specs)
+    if isinstance(allocation, dict) and isinstance(current_allocation, dict):
+      for key in COCKROACHDB_CERT_LIFECYCLE_KEYS:
+        if key in current_allocation:
+          allocation[key] = self.deepcopy(current_allocation[key])
+        else:
+          allocation.pop(key, None)
+
+    if not regeneration_id:
+      return None, None, False
+
+    if not bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False)):
+      raise ValueError(
+        "CockroachDB certificate regeneration requires all-node response confirmation."
+      )
+    intent_hash = self._cockroachdb_regeneration_intent_hash(inputs)
+    if applied_operation:
+      applied_id, applied_intent = applied_operation
+      if applied_id == regeneration_id:
+        if applied_intent != intent_hash:
+          raise ValueError(
+            "CockroachDB certificate regeneration id was already applied to a different update intent."
+          )
+        return regeneration_id, intent_hash, True
+    if isinstance(current_allocation, dict) and current_allocation.get(
+      COCKROACHDB_CERT_GENERATION_ID_KEY
+    ) == regeneration_id:
+      current_intent = current_allocation.get(COCKROACHDB_CERT_REGENERATION_INTENT_KEY)
+      if current_intent != intent_hash:
+        raise ValueError(
+          "CockroachDB certificate regeneration id was already applied to a different update intent."
+        )
+      return regeneration_id, intent_hash, True
+
+    allocation[COCKROACHDB_CERT_REGENERATION_INTENT_KEY] = intent_hash
+    return regeneration_id, intent_hash, False
 
   def _pem_private_key(self, key):
     from cryptography.hazmat.primitives import serialization
@@ -3473,7 +3687,7 @@ class _DeeployMixin:
       x509.NameAttribute(NameOID.COMMON_NAME, value),
     ])
 
-  def _generate_cockroachdb_cert_bundle(self, target_nodes):
+  def _generate_cockroachdb_cert_bundle(self, target_nodes, client_hostname=None):
     """
     Generate a temporary CA and per-node CockroachDB certificates.
 
@@ -3524,6 +3738,14 @@ class _DeeployMixin:
     roach_names = [f"roach{i}" for i in range(1, len(target_nodes) + 1)]
     dns_sans = [*roach_names, "localhost"]
     ip_sans = ["127.0.0.1"]
+    if client_hostname:
+      try:
+        ipaddress.ip_address(client_hostname)
+        if client_hostname not in ip_sans:
+          ip_sans.append(client_hostname)
+      except ValueError:
+        if client_hostname not in dns_sans:
+          dns_sans.append(client_hostname)
 
     def build_signed_cert(common_name, public_key, san_dns=None, san_ips=None, client=False, server=False):
       san_items = []
@@ -3589,17 +3811,46 @@ class _DeeployMixin:
     if not target_nodes:
       return inputs
 
-    for plugin_instance in plugins_array:
-      if not self._is_cockroachdb_plugin_instance(plugin_instance):
-        continue
+    cockroachdb_plugins = [
+      plugin_instance for plugin_instance in plugins_array
+      if self._is_cockroachdb_plugin_instance(plugin_instance)
+    ]
+    if not cockroachdb_plugins:
+      return inputs
+
+    regeneration_id = self._get_cockroachdb_regeneration_id(inputs)
+    for plugin_instance in cockroachdb_plugins:
+      self._validate_cockroachdb_auth_env(plugin_instance.get("ENV"))
+    allocation, client_hostname = self._get_cockroachdb_allocation(
+      inputs,
+      required=bool(regeneration_id),
+    )
+    managed_hostname = (
+      allocation.get(COCKROACHDB_CERT_HOSTNAME_KEY)
+      if isinstance(allocation, dict) else None
+    )
+    hostname_changed = bool(
+      client_hostname
+      and isinstance(managed_hostname, str)
+      and managed_hostname != client_hostname
+    )
+
+    for plugin_instance in cockroachdb_plugins:
       env = plugin_instance.setdefault("ENV", {})
-      self._validate_cockroachdb_auth_env(env)
       env["CRDB_SECURE"] = "true"
 
       self._canonicalize_per_node_config_key(plugin_instance)
       raw_config = plugin_instance.get(CANONICAL_PER_NODE_CONFIG_KEY)
       existing_complete = self._cockroachdb_cert_bundle_complete(plugin_instance, target_nodes)
-      cert_bundle = None if existing_complete else self._generate_cockroachdb_cert_bundle(target_nodes)
+      regeneration_pending = bool(
+        regeneration_id
+        and allocation.get(COCKROACHDB_CERT_GENERATION_ID_KEY) != regeneration_id
+      )
+      must_generate = not existing_complete or hostname_changed or regeneration_pending
+      cert_bundle = (
+        self._generate_cockroachdb_cert_bundle(target_nodes, client_hostname)
+        if must_generate else None
+      )
 
       by_node = {}
       for index, node in enumerate(target_nodes):
@@ -3615,6 +3866,24 @@ class _DeeployMixin:
         overlay["ENV"] = overlay_env
         by_node[node] = overlay
       plugin_instance[CANONICAL_PER_NODE_CONFIG_KEY] = {"byNode": by_node}
+
+      if (
+        isinstance(allocation, dict)
+        and client_hostname
+        and (cert_bundle is not None or managed_hostname == client_hostname)
+      ):
+        allocation[COCKROACHDB_CERT_HOSTNAME_KEY] = client_hostname
+      if isinstance(allocation, dict) and cert_bundle is not None:
+        ca_crt = cert_bundle[target_nodes[0]]["CRDB_CA_CRT"]
+        allocation[COCKROACHDB_CERT_CA_SHA256_KEY] = hashlib.sha256(
+          ca_crt.encode("ascii")
+        ).hexdigest()
+      if isinstance(allocation, dict) and cert_bundle is not None:
+        if regeneration_id:
+          allocation[COCKROACHDB_CERT_GENERATION_ID_KEY] = regeneration_id
+        else:
+          allocation.pop(COCKROACHDB_CERT_GENERATION_ID_KEY, None)
+          allocation.pop(COCKROACHDB_CERT_REGENERATION_INTENT_KEY, None)
 
     return inputs
 
@@ -3647,7 +3916,16 @@ class _DeeployMixin:
     if len(target_nodes) < 2:
       raise ValueError("CockroachDB requires at least 2 target nodes.")
 
-    cert_bundle = self._generate_cockroachdb_cert_bundle(target_nodes)
+    pipeline_params = pipeline.get("pipeline_params")
+    allocation = (
+      pipeline_params.get(COCKROACHDB_ALLOCATION_PARAM)
+      if isinstance(pipeline_params, dict) else None
+    )
+    client_tunnel = allocation.get("clientTunnel") if isinstance(allocation, dict) else None
+    client_hostname = None
+    if isinstance(client_tunnel, dict) and client_tunnel.get("url"):
+      client_hostname = self._cockroachdb_client_hostname(client_tunnel.get("url"))
+    cert_bundle = self._generate_cockroachdb_cert_bundle(target_nodes, client_hostname)
     for plugin in plugins:
       if not isinstance(plugin, dict):
         continue

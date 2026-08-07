@@ -70,7 +70,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       DEEPLOY_KEYS.ESCROW_OWNER: "0xOwner",
     }
     plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: True
-    plugin._extract_pipeline_params = lambda inputs: {}
+    plugin._extract_pipeline_params = lambda inputs: inputs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
     plugin._check_and_maybe_convert_address = lambda node: node
     plugin._gather_running_pipeline_context = lambda **kwargs: {
       "discovered_instances": discovered_instances,
@@ -78,9 +78,21 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "deeploy_specs": deeploy_specs or {"job_id": 11},
     }
     plugin._get_pipeline_from_cstore = lambda job_id: None
+    plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: {
+      "OWNER": "0xOwner",
+      "NAME": "cockroachdb_422ce92",
+      "DEEPLOY_SPECS": copy.deepcopy(deeploy_specs or {"job_id": 11}),
+    }
     plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
 
-    called = {"delete": 0, "deploy": 0, "deploy_kwargs": None, "queued": 0, "bc_update": 0}
+    called = {
+      "delete": 0,
+      "deploy": 0,
+      "deploy_kwargs": None,
+      "queued": 0,
+      "persisted": 0,
+      "bc_update": 0,
+    }
     plugin.bc = types.SimpleNamespace(
       node_addr_to_eth_addr=lambda node: node,
       submit_node_update=lambda **kwargs: called.__setitem__("bc_update", called["bc_update"] + 1),
@@ -94,7 +106,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     plugin.check_and_deploy_pipelines = check_and_deploy_pipelines
     plugin._build_pipeline_persistence_state = lambda **kwargs: {"state": kwargs}
-    plugin._queue_pipeline_persistence = lambda state: called.__setitem__("queued", called["queued"] + 1)
+    plugin._queue_pipeline_persistence = (
+      lambda state: called.__setitem__("queued", called["queued"] + 1) or True
+    )
+    plugin.persist_job_pipeline_metadata = (
+      lambda **kwargs: called.__setitem__("persisted", called["persisted"] + 1) or True
+    )
     return plugin, called
 
   def _make_four_replica_cockroach_update_fixture(self, plugin):
@@ -366,6 +383,426 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       self.assertEqual(instance["PER_NODE_TARGET_NODES"], nodes)
       self.assertEqual(instance["CONTAINER_RESOURCES"]["storage"], "0g")
       self.assertEqual(instance["FIXED_SIZE_VOLUMES"]["cockroach_data"]["SIZE"], "8G")
+
+  def test_process_cockroachdb_regeneration_replay_is_noop_and_intent_bound(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    regeneration_id = "11111111-1111-4111-8111-111111111111"
+    allocation = {
+      "version": 1,
+      "service": "cockroachdb",
+      "status": "allocated",
+      "nodeOrder": nodes,
+      "clientTunnel": {"url": "crdb-client.test:26257"},
+      "internalTunnels": [],
+    }
+    request = {
+      DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+      DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+      DEEPLOY_KEYS.TARGET_NODES: nodes,
+      DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+      DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": allocation},
+      DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      "cockroachdb_certificate_regeneration_id": regeneration_id,
+    }
+    intent_hash = fixture_plugin._cockroachdb_regeneration_intent_hash(make_inputs(**request))
+    persisted_allocation = copy.deepcopy(allocation)
+    persisted_allocation.update({
+      "certificateGenerationId": regeneration_id,
+      "certificateRegenerationIntentSha256": intent_hash,
+    })
+    deeploy_specs = {
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      DEEPLOY_KEYS.JOB_CONFIG: {
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": persisted_allocation},
+      },
+    }
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs=deeploy_specs,
+    )
+
+    response = plugin._process_pipeline_request(request, is_create=False, async_mode=True)
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
+    self.assertEqual(
+      response[DEEPLOY_KEYS.STATUS_DETAILS]["cockroachdb_certificate_regeneration"],
+      "already_applied",
+    )
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+
+    changed_request = copy.deepcopy(request)
+    changed_request[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_USER"] = "different_user"
+    changed_response = plugin._process_pipeline_request(
+      changed_request,
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("different update intent", changed_response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_process_normal_cockroachdb_edit_inherits_running_certificates(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    cert_bundle = fixture_plugin._generate_cockroachdb_cert_bundle(nodes, "crdb-client.test")
+    for index, discovered in enumerate(discovered_instances):
+      node = discovered[DEEPLOY_PLUGIN_DATA.NODE]
+      runtime_config = discovered[DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]
+      if index % 2 == 0:
+        runtime_config["ENV"].update(cert_bundle[node])
+      else:
+        runtime_config["PER_NODE_CONFIG"] = {
+          "byNode": {node: {"ENV": copy.deepcopy(cert_bundle[node])}},
+        }
+    allocation = {
+      "version": 1,
+      "service": "cockroachdb",
+      "status": "allocated",
+      "nodeOrder": nodes,
+      "clientTunnel": {"url": "crdb-client.test:26257"},
+      "internalTunnels": [],
+      "certificateHostname": "crdb-client.test",
+    }
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+        DEEPLOY_KEYS.JOB_CONFIG: {
+          DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": copy.deepcopy(allocation)},
+        },
+      },
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": allocation},
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    prepared = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    for index, node in enumerate(nodes):
+      emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+      overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
+      self.assertEqual(overlay["ENV"]["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+
+  def test_process_offline_cockroachdb_edit_inherits_persisted_per_node_certificates(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    cert_bundle = fixture_plugin._generate_cockroachdb_cert_bundle(nodes, "crdb-client.test")
+    persisted_instance = discovered_instances[0]
+    persisted_instance[DEEPLOY_PLUGIN_DATA.NODE] = nodes[0]
+    persisted_instance[DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]["PER_NODE_CONFIG"] = {
+      "byNode": {
+        node: {"ENV": copy.deepcopy(cert_bundle[node])}
+        for node in nodes
+      },
+    }
+    allocation = {
+      "version": 1,
+      "service": "cockroachdb",
+      "status": "allocated",
+      "nodeOrder": nodes,
+      "clientTunnel": {"url": "crdb-client.test:26257"},
+      "internalTunnels": [],
+      "certificateHostname": "crdb-client.test",
+    }
+    deeploy_specs = {
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      DEEPLOY_KEYS.JOB_CONFIG: {
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": copy.deepcopy(allocation)},
+      },
+    }
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[persisted_instance],
+      nodes=nodes,
+      deeploy_specs=deeploy_specs,
+    )
+    plugin._gather_running_pipeline_context = (
+      lambda **kwargs: (_ for _ in ()).throw(ValueError(f"{DEEPLOY_ERRORS.NODES3}: offline"))
+    )
+    plugin._gather_persisted_pipeline_update_context = lambda **kwargs: {
+      "discovered_instances": [persisted_instance],
+      "nodes": nodes,
+      "deeploy_specs": deeploy_specs,
+    }
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": allocation},
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    prepared = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    for index, node in enumerate(nodes):
+      emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+      overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
+      self.assertEqual(overlay["ENV"]["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 1)
+
+  def test_cockroachdb_regeneration_rejects_live_duplicate_claim(self):
+    plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
+    regeneration_id = "11111111-1111-4111-8111-111111111111"
+    claim = plugin._claim_cockroachdb_regeneration(
+      "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-a"
+    )
+
+    with self.assertRaisesRegex(ValueError, "already in progress"):
+      plugin._claim_cockroachdb_regeneration(
+        "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-a"
+      )
+    with self.assertRaisesRegex(ValueError, "Another CockroachDB certificate regeneration"):
+      plugin._claim_cockroachdb_regeneration(
+        "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-b"
+      )
+
+    plugin._release_cockroachdb_regeneration(claim)
+    self.assertEqual(
+      plugin._claim_cockroachdb_regeneration(
+        "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-a"
+      ),
+      claim,
+    )
+
+  def test_cockroachdb_regeneration_reports_persistence_failure_after_three_attempts(self):
+    plugin, called = self._make_process_update_plugin(discovered_instances=[])
+    plugin.persist_job_pipeline_metadata = (
+      lambda **kwargs: called.__setitem__("persisted", called["persisted"] + 1) or False
+    )
+    operation = (
+      "0xOwner",
+      "cockroachdb_422ce92",
+      "11111111-1111-4111-8111-111111111111",
+      "intent-a",
+    )
+    claim_key = plugin._claim_cockroachdb_regeneration(*operation)
+
+    result = plugin.finalize_pending_request_pipeline(
+      pending={
+        "confirm": {"nodes_changed": False},
+        "persistence": {
+          "pipeline": {"NAME": "cockroachdb_422ce92"},
+          "job_id": 11,
+          "previous_cid": "old-cid",
+          "delete_previous": True,
+        },
+        "cockroachdb_regeneration_claim_key": claim_key,
+        "cockroachdb_regeneration_operation": operation,
+        "base_result": {},
+      },
+      dct_status={"response-1": {"node": "node-1"}},
+      str_status=DEEPLOY_STATUS.SUCCESS,
+    )
+
+    self.assertEqual(result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertIn("metadata persistence failed", result[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["persisted"], 3)
+    self.assertEqual(called["queued"], 1)
+    self.assertEqual(
+      plugin._cockroachdb_pending_regenerations,
+      {("0xOwner", "cockroachdb_422ce92"): (operation[2], operation[3])},
+    )
+
+  def test_process_cockroachdb_regeneration_replay_uses_recent_confirmed_success(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    regeneration_id = "11111111-1111-4111-8111-111111111111"
+    allocation = {
+      "version": 1,
+      "service": "cockroachdb",
+      "status": "allocated",
+      "nodeOrder": nodes,
+      "clientTunnel": {"url": "crdb-client.test:26257"},
+      "internalTunnels": [],
+    }
+    request = {
+      DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+      DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+      DEEPLOY_KEYS.TARGET_NODES: nodes,
+      DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+      DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": allocation},
+      DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      "cockroachdb_certificate_regeneration_id": regeneration_id,
+    }
+    intent_hash = fixture_plugin._cockroachdb_regeneration_intent_hash(make_inputs(**request))
+    stale_specs = {
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      DEEPLOY_KEYS.JOB_CONFIG: {
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": copy.deepcopy(allocation)},
+      },
+    }
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs=stale_specs,
+    )
+    applied_specs = copy.deepcopy(stale_specs)
+    applied_specs[DEEPLOY_KEYS.JOB_CONFIG][DEEPLOY_KEYS.PIPELINE_PARAMS][
+      "deeploy_cockroachdb"
+    ].update({
+      "certificateGenerationId": regeneration_id,
+      "certificateRegenerationIntentSha256": intent_hash,
+    })
+    durable_pipeline = {}
+
+    def persist_regeneration(**kwargs):
+      called["persisted"] += 1
+      durable_pipeline.update(copy.deepcopy(kwargs["pipeline"]))
+      return True
+
+    plugin.persist_job_pipeline_metadata = persist_regeneration
+    claim_key = plugin._claim_cockroachdb_regeneration(
+      "0xOwner", "cockroachdb_422ce92", regeneration_id, intent_hash
+    )
+    plugin.finalize_pending_request_pipeline(
+      pending={
+        "confirm": {"nodes_changed": False},
+        "persistence": {
+          "pipeline": {
+            "OWNER": "0xOwner",
+            "NAME": "cockroachdb_422ce92",
+            "DEEPLOY_SPECS": applied_specs,
+          },
+          "job_id": 11,
+          "previous_cid": "old-cid",
+          "delete_previous": True,
+        },
+        "cockroachdb_regeneration_claim_key": claim_key,
+        "cockroachdb_regeneration_operation": (
+          "0xOwner",
+          "cockroachdb_422ce92",
+          regeneration_id,
+          intent_hash,
+        ),
+        "base_result": {},
+      },
+      dct_status={f"response-{index}": {"node": node} for index, node in enumerate(nodes)},
+      str_status=DEEPLOY_STATUS.SUCCESS,
+    )
+    self.assertEqual(called["persisted"], 1)
+    called["queued"] = 0
+    plugin._cockroachdb_applied_regenerations = {}
+    plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: copy.deepcopy(durable_pipeline)
+
+    response = plugin._process_pipeline_request(request, is_create=False, async_mode=True)
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
+    self.assertEqual(
+      response[DEEPLOY_KEYS.STATUS_DETAILS]["cockroachdb_certificate_regeneration"],
+      "already_applied",
+    )
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_process_cockroachdb_regeneration_requires_response_keys_for_all_nodes(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    allocation = {
+      "version": 1,
+      "service": "cockroachdb",
+      "status": "allocated",
+      "nodeOrder": nodes,
+      "clientTunnel": {"url": "crdb-client.test:26257"},
+      "internalTunnels": [],
+    }
+    persisted_specs = {
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      DEEPLOY_KEYS.JOB_CONFIG: {
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": copy.deepcopy(allocation)},
+      },
+    }
+    request = {
+      DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+      DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+      DEEPLOY_KEYS.JOB_ID: 11,
+      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+      DEEPLOY_KEYS.TARGET_NODES: nodes,
+      DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+      DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": allocation},
+      DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      "cockroachdb_certificate_regeneration_id": "11111111-1111-4111-8111-111111111111",
+    }
+    intent_hash = fixture_plugin._cockroachdb_regeneration_intent_hash(make_inputs(**request))
+    live_candidate_specs = copy.deepcopy(persisted_specs)
+    live_candidate_specs[DEEPLOY_KEYS.JOB_CONFIG][DEEPLOY_KEYS.PIPELINE_PARAMS][
+      "deeploy_cockroachdb"
+    ].update({
+      "certificateGenerationId": request["cockroachdb_certificate_regeneration_id"],
+      "certificateRegenerationIntentSha256": intent_hash,
+    })
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs=live_candidate_specs,
+    )
+    plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: {
+      "OWNER": "0xOwner",
+      "NAME": "cockroachdb_422ce92",
+      "DEEPLOY_SPECS": copy.deepcopy(persisted_specs),
+    }
+    plugin._prepare_create_pipeline_deploy_plan = lambda **kwargs: {
+      "enable_chainstore_response": True,
+      "response_keys": {node: [f"response-{index}"] for index, node in enumerate(nodes[:-1])},
+      "node_plugins_by_addr": {},
+    }
+
+    response = plugin._process_pipeline_request(request, is_create=False, async_mode=True)
+
+    self.assertIn("response keys for every target node", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
 
   def test_process_legacy_service_update_preserves_four_replica_identity_and_storage(self):
     fixture_plugin = make_deeploy_plugin()
@@ -1173,6 +1610,9 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         },
       ],
     )
+    logs = []
+    plugin.cfg_deeploy_verbose = 2
+    plugin.P = lambda message, **kwargs: logs.append(str(message))
 
     response = plugin._process_pipeline_request(
       {
@@ -1200,10 +1640,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
+      async_mode=False,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
     self.assertEqual(called["deploy"], 1)
     request_payload = response[DEEPLOY_KEYS.REQUEST]
     self.assertEqual(request_payload[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["API_TOKEN"], "raw-token")
@@ -1211,6 +1651,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       request_payload[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["node-1"]["ENV"]["NODE_PASSWORD"],
       "raw-password",
     )
+    self.assertNotIn("raw-token", "\n".join(logs))
+    self.assertNotIn("raw-password", "\n".join(logs))
 
   def test_process_update_rejects_duplicate_plugin_names_before_delete(self):
     plugin, called = self._make_process_update_plugin(

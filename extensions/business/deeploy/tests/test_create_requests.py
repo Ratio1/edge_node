@@ -1,7 +1,11 @@
 import unittest
+import copy
 from collections import defaultdict
+import ipaddress
 import sys
 import types
+
+from cryptography import x509
 
 
 for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
@@ -28,6 +32,176 @@ class _KeyErrorOnMissingAttrInputs(dict):
 
 
 class DeeployCreateRequestPreparationTests(unittest.TestCase):
+
+  def _make_cockroachdb_secure_inputs(self, client_url="tcp.ratio1.link:30472"):
+    return make_inputs(
+      pipeline_params={
+        "deeploy_cockroachdb": {
+          "version": 1,
+          "service": "cockroachdb",
+          "status": "allocated",
+          "nodeOrder": ["0xai_node_a", "0xai_node_b"],
+          "clientTunnel": {"url": client_url},
+          "internalTunnels": [],
+        },
+      },
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+
+  def test_cockroachdb_client_hostname_parser_accepts_tunnel_endpoint_forms(self):
+    plugin = make_deeploy_plugin()
+
+    self.assertEqual(
+      plugin._cockroachdb_client_hostname("tcp.ratio1.link:30472"),
+      "tcp.ratio1.link",
+    )
+    self.assertEqual(
+      plugin._cockroachdb_client_hostname("tcp://db.example.test:26257"),
+      "db.example.test",
+    )
+    self.assertEqual(plugin._cockroachdb_client_hostname("127.0.0.2:26257"), "127.0.0.2")
+
+    for invalid in (
+      "",
+      "tcp://user:password@db.example.test:26257",
+      "tcp://*.example.test:26257",
+      "tcp://db.example.test:26257/path",
+      "tcp://db.example.test:26257?query=value",
+      "tcp://db.example.test:not-a-port",
+      "tcp://db.example.test:70000",
+    ):
+      with self.subTest(invalid=invalid):
+        with self.assertRaisesRegex(ValueError, "client tunnel"):
+          plugin._cockroachdb_client_hostname(invalid)
+
+  def test_generated_cockroachdb_node_certificates_include_client_hostname(self):
+    plugin = make_deeploy_plugin()
+
+    bundle = plugin._generate_cockroachdb_cert_bundle(
+      ["0xai_node_a", "0xai_node_b"],
+      client_hostname="tcp.ratio1.link",
+    )
+
+    for node in ("0xai_node_a", "0xai_node_b"):
+      cert = x509.load_pem_x509_certificate(bundle[node]["CRDB_NODE_CRT"].encode("ascii"))
+      san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+      self.assertIn("tcp.ratio1.link", san.get_values_for_type(x509.DNSName))
+      self.assertIn("roach1", san.get_values_for_type(x509.DNSName))
+      self.assertIn("roach2", san.get_values_for_type(x509.DNSName))
+      self.assertIn("localhost", san.get_values_for_type(x509.DNSName))
+
+    ip_bundle = plugin._generate_cockroachdb_cert_bundle(
+      ["0xai_node_a", "0xai_node_b"],
+      client_hostname="127.0.0.2",
+    )
+    ip_cert = x509.load_pem_x509_certificate(ip_bundle["0xai_node_a"]["CRDB_NODE_CRT"].encode("ascii"))
+    ip_san = ip_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    self.assertIn(ipaddress.ip_address("127.0.0.2"), ip_san.get_values_for_type(x509.IPAddress))
+
+  def test_cockroachdb_secure_config_reuses_hostname_bound_bundle_and_forces_one_generation(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs()
+    nodes = ["0xai_node_a", "0xai_node_b"]
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    allocation = inputs[DEEPLOY_KEYS.PIPELINE_PARAMS]["deeploy_cockroachdb"]
+    first_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(allocation["certificateHostname"], "tcp.ratio1.link")
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    reused_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(reused_key, first_key)
+
+    inputs["cockroachdb_certificate_regeneration_id"] = "11111111-1111-4111-8111-111111111111"
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    regenerated_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertNotEqual(regenerated_key, first_key)
+    self.assertEqual(
+      allocation["certificateGenerationId"],
+      "11111111-1111-4111-8111-111111111111",
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    replay_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(replay_key, regenerated_key)
+
+    inputs.pop("cockroachdb_certificate_regeneration_id")
+    allocation["clientTunnel"]["url"] = "replacement.example.test:26257"
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    self.assertNotIn("certificateGenerationId", allocation)
+    self.assertNotIn("certificateRegenerationIntentSha256", allocation)
+
+  def test_cockroachdb_secure_config_regenerates_when_managed_hostname_changes(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs("old.example.test:26257")
+    nodes = ["0xai_node_a", "0xai_node_b"]
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    first_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    allocation = inputs[DEEPLOY_KEYS.PIPELINE_PARAMS]["deeploy_cockroachdb"]
+    allocation["clientTunnel"]["url"] = "new.example.test:26257"
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+
+    second_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertNotEqual(second_key, first_key)
+    self.assertEqual(allocation["certificateHostname"], "new.example.test")
+
+  def test_cockroachdb_regeneration_ignores_request_supplied_lifecycle_metadata(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs()
+    nodes = ["0xai_node_a", "0xai_node_b"]
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    original_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"][
+      "CRDB_NODE_KEY"
+    ]
+    allocation = inputs[DEEPLOY_KEYS.PIPELINE_PARAMS]["deeploy_cockroachdb"]
+    persisted_allocation = copy.deepcopy(allocation)
+    persisted_allocation["certificateGenerationId"] = "11111111-1111-4111-8111-111111111111"
+    persisted_allocation["certificateRegenerationIntentSha256"] = "old-intent"
+    new_id = "22222222-2222-4222-8222-222222222222"
+    allocation["certificateGenerationId"] = new_id
+    allocation["certificateRegenerationIntentSha256"] = "caller-controlled"
+    inputs["cockroachdb_certificate_regeneration_id"] = new_id
+    inputs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE] = True
+
+    plugin._prepare_cockroachdb_regeneration_lifecycle(
+      inputs,
+      {
+        DEEPLOY_KEYS.JOB_CONFIG: {
+          DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": persisted_allocation},
+        },
+      },
+    )
+    self.assertEqual(
+      allocation["certificateGenerationId"],
+      "11111111-1111-4111-8111-111111111111",
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+
+    regenerated_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"][
+      "CRDB_NODE_KEY"
+    ]
+    self.assertNotEqual(regenerated_key, original_key)
+    self.assertEqual(allocation["certificateGenerationId"], new_id)
 
   def test_prepare_single_plugin_instance_uses_signature_and_app_params(self):
     plugin = make_deeploy_plugin()

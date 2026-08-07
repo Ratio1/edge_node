@@ -98,6 +98,9 @@ class DeeployManagerApiPlugin(
       self.maybe_stop_tunnel_engine()
     self._init_request_tracking()
     self.__pending_deploy_requests = {}
+    self._cockroachdb_pending_regenerations = {}
+    self._cockroachdb_applied_regenerations = {}
+    self._cockroachdb_regeneration_lock = threading.Lock()
     self.__pipeline_persistence_queue = deque()
     self.__pipeline_persistence_lock = threading.Lock()
     self.__pipeline_persistence_event = threading.Event()
@@ -152,6 +155,12 @@ class DeeployManagerApiPlugin(
           )
 
         if ok:
+          self._mark_cockroachdb_regeneration_applied(
+            job.get('cockroachdb_regeneration_operation')
+          )
+          self._release_cockroachdb_regeneration(
+            job.get('cockroachdb_regeneration_claim_key')
+          )
           self.P(
             f"Persisted deployed pipeline metadata for job {job.get('job_id')}"
             f"{' (' + job.get('app_id') + ')' if job.get('app_id') else ''}."
@@ -160,6 +169,9 @@ class DeeployManagerApiPlugin(
 
         attempts = int(job.get('attempts', 0)) + 1
         if attempts >= 3:
+          self._release_cockroachdb_regeneration(
+            job.get('cockroachdb_regeneration_claim_key')
+          )
           self.P(
             f"Failed to persist deployed pipeline metadata for job {job.get('job_id')} after {attempts} attempts.",
             color='r'
@@ -219,6 +231,92 @@ class DeeployManagerApiPlugin(
       f"{' (' + persistence_state.get('app_id') + ')' if persistence_state.get('app_id') else ''}."
     )
     return True
+
+  def _claim_cockroachdb_regeneration(self, owner, app_id, regeneration_id, intent_hash):
+    if not regeneration_id:
+      return None
+    lock = getattr(self, "_cockroachdb_regeneration_lock", None)
+    if lock is None:
+      lock = threading.Lock()
+      self._cockroachdb_regeneration_lock = lock
+    with lock:
+      pending = getattr(self, "_cockroachdb_pending_regenerations", None)
+      if not isinstance(pending, dict):
+        pending = {}
+        self._cockroachdb_pending_regenerations = pending
+      key = (owner, app_id)
+      existing = pending.get(key)
+      if existing:
+        if existing == (regeneration_id, intent_hash):
+          raise ValueError("CockroachDB certificate regeneration is already in progress.")
+        raise ValueError("Another CockroachDB certificate regeneration is already in progress for this job.")
+      pending[key] = (regeneration_id, intent_hash)
+    return key
+
+  def _release_cockroachdb_regeneration(self, claim_key):
+    lock = getattr(self, "_cockroachdb_regeneration_lock", None)
+    if claim_key is not None and lock is not None:
+      with lock:
+        pending = getattr(self, "_cockroachdb_pending_regenerations", None)
+        if isinstance(pending, dict):
+          pending.pop(claim_key, None)
+    elif claim_key is not None:
+      pending = getattr(self, "_cockroachdb_pending_regenerations", None)
+      if isinstance(pending, dict):
+        pending.pop(claim_key, None)
+
+  def _get_cockroachdb_applied_regeneration(self, owner, app_id):
+    lock = getattr(self, "_cockroachdb_regeneration_lock", None)
+    if lock is None:
+      return None
+    with lock:
+      applied = getattr(self, "_cockroachdb_applied_regenerations", None)
+      return applied.get((owner, app_id)) if isinstance(applied, dict) else None
+
+  def _mark_cockroachdb_regeneration_applied(self, operation):
+    if not operation:
+      return
+    owner, app_id, regeneration_id, intent_hash = operation
+    lock = getattr(self, "_cockroachdb_regeneration_lock", None)
+    if lock is None:
+      lock = threading.Lock()
+      self._cockroachdb_regeneration_lock = lock
+    with lock:
+      applied = getattr(self, "_cockroachdb_applied_regenerations", None)
+      if not isinstance(applied, dict):
+        applied = {}
+        self._cockroachdb_applied_regenerations = applied
+      applied[(owner, app_id)] = (regeneration_id, intent_hash)
+
+  def _get_persisted_cockroachdb_deeploy_specs(self, job_id, owner, app_id):
+    pipeline = self.get_job_pipeline_from_cstore(
+      job_id,
+      timeout=30,
+      pin=False,
+      raise_on_error=False,
+      show_logs=False,
+    )
+    if not isinstance(pipeline, dict):
+      raise ValueError(
+        "CockroachDB certificate regeneration requires the persisted pipeline metadata."
+      )
+    pipeline_owner = pipeline.get(NetMonCt.OWNER.upper()) or pipeline.get(NetMonCt.OWNER)
+    pipeline_app_id = pipeline.get("NAME") or pipeline.get("name")
+    if str(pipeline_owner).lower() != str(owner).lower():
+      raise ValueError("Persisted CockroachDB pipeline owner does not match the update request.")
+    if str(pipeline_app_id).lower() != str(app_id).lower():
+      raise ValueError("Persisted CockroachDB pipeline app id does not match the update request.")
+    deeploy_specs = (
+      pipeline.get(NetMonCt.DEEPLOY_SPECS.upper())
+      or pipeline.get(NetMonCt.DEEPLOY_SPECS)
+    )
+    if not isinstance(deeploy_specs, dict):
+      raise ValueError(
+        "CockroachDB certificate regeneration requires persisted Deeploy specifications."
+      )
+    if str(deeploy_specs.get(DEEPLOY_KEYS.JOB_ID)).lower() != str(job_id).lower():
+      raise ValueError("Persisted CockroachDB pipeline job id does not match the update request.")
+    return deeploy_specs
 
 
   def on_request(self, request):
@@ -706,6 +804,8 @@ class DeeployManagerApiPlugin(
     dict
         The response dictionary
     """
+    regeneration_claim_key = None
+    keep_regeneration_claim = False
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
@@ -936,6 +1036,55 @@ class DeeployManagerApiPlugin(
           raise ValueError(msg)
         # TODO: Add check if jobType resources match the requested resources.
 
+        submitted_regeneration_id = self._get_cockroachdb_regeneration_id(inputs)
+        regeneration_specs = deeploy_specs_for_update
+        applied_operation = None
+        if submitted_regeneration_id:
+          applied_operation = self._get_cockroachdb_applied_regeneration(
+            auth_result[DEEPLOY_KEYS.ESCROW_OWNER], app_id
+          )
+          if applied_operation and applied_operation[0] == submitted_regeneration_id:
+            regeneration_specs = {}
+          else:
+            regeneration_specs = self._get_persisted_cockroachdb_deeploy_specs(
+              job_id,
+              auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+              app_id,
+            )
+        regeneration_id, regeneration_intent, already_applied = (
+          self._prepare_cockroachdb_regeneration_lifecycle(
+            inputs,
+            regeneration_specs,
+            applied_operation=applied_operation,
+          )
+        )
+        if already_applied:
+          return self._get_response({
+            DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+            DEEPLOY_KEYS.STATUS_DETAILS: {
+              "cockroachdb_certificate_regeneration": "already_applied",
+            },
+            DEEPLOY_KEYS.APP_ID: app_id,
+            DEEPLOY_KEYS.REQUEST: {
+              DEEPLOY_KEYS.APP_ALIAS: app_alias,
+              DEEPLOY_KEYS.TARGET_NODES: deployment_targets,
+              DEEPLOY_KEYS.TARGET_NODES_COUNT: len(deployment_targets),
+              DEEPLOY_KEYS.JOB_APP_TYPE: job_app_type,
+            },
+            DEEPLOY_KEYS.AUTH: auth_result,
+          })
+        regeneration_claim_key = self._claim_cockroachdb_regeneration(
+          auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+          app_id,
+          regeneration_id,
+          regeneration_intent,
+        )
+        self._inherit_cockroachdb_certificates_from_discovered(
+          inputs,
+          discovered_plugin_instances,
+          deployment_targets,
+        )
+
         validated_nodes = self._check_nodes_availability(inputs)
         if set(validated_nodes) != set(deployment_targets):
           msg = (
@@ -952,6 +1101,15 @@ class DeeployManagerApiPlugin(
           job_app_type=job_app_type,
           dct_deeploy_specs=deeploy_specs_payload,
         )
+        if regeneration_id:
+          response_key_nodes = set(prepared_create_deploy_plan.get("response_keys") or {})
+          if (
+            not prepared_create_deploy_plan.get("enable_chainstore_response")
+            or response_key_nodes != set(validated_nodes)
+          ):
+            raise ValueError(
+              "CockroachDB certificate regeneration requires response keys for every target node."
+            )
         if prepared_create_deploy_plan.get("enable_chainstore_response"):
           self._reset_chainstore_response_keys(
             prepared_create_deploy_plan.get("response_keys", {}),
@@ -1089,7 +1247,15 @@ class DeeployManagerApiPlugin(
             'job_id': job_id,
           },
           'persistence': persistence_state,
+          'cockroachdb_regeneration_claim_key': regeneration_claim_key,
+          'cockroachdb_regeneration_operation': (
+            auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+            app_id,
+            regeneration_id,
+            regeneration_intent,
+          ) if regeneration_id else None,
         }
+        keep_regeneration_claim = regeneration_claim_key is not None
         return {'__pending__': pending_state}
 
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
@@ -1120,10 +1286,13 @@ class DeeployManagerApiPlugin(
       }
 
       if self.cfg_deeploy_verbose > 1:
-        self.P(f"Request Result: {result}")
+        self.P(f"Request Result: status={str_status}, app_id={app_id}")
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
+    finally:
+      if regeneration_claim_key is not None and not keep_regeneration_claim:
+        self._release_cockroachdb_regeneration(regeneration_claim_key)
     
     response = self._get_response({
       **result
@@ -1192,6 +1361,9 @@ class DeeployManagerApiPlugin(
           **pending.get('base_result', {})
         }
       self.__pending_deploy_requests.pop(pending_id, None)
+      self._release_cockroachdb_regeneration(
+        pending.get('cockroachdb_regeneration_claim_key')
+      )
       res = self._get_response({
         **result
       })
@@ -1238,9 +1410,44 @@ class DeeployManagerApiPlugin(
           self.P(f"An error occurred while submitting node update for job {job_id}: {e}", color='r')
     # endif nodes changed and success or delivered
 
-    if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-      self._queue_pipeline_persistence(pending.get('persistence'))
+    regeneration_operation = pending.get('cockroachdb_regeneration_operation')
+    persistence_state = pending.get('persistence')
+    if str_status == DEEPLOY_STATUS.SUCCESS and regeneration_operation:
+      persisted = False
+      if persistence_state:
+        for _ in range(3):
+          persisted = self.persist_job_pipeline_metadata(
+            pipeline=persistence_state['pipeline'],
+            job_id=persistence_state['job_id'],
+            previous_cid=persistence_state.get('previous_cid'),
+            delete_previous=persistence_state.get('delete_previous', False),
+          )
+          if persisted:
+            break
+      if not persisted:
+        if persistence_state:
+          persistence_state['cockroachdb_regeneration_operation'] = regeneration_operation
+          persistence_state['cockroachdb_regeneration_claim_key'] = pending.get(
+            'cockroachdb_regeneration_claim_key'
+          )
+        queued = self._queue_pipeline_persistence(persistence_state)
+        if not queued:
+          self._release_cockroachdb_regeneration(
+            pending.get('cockroachdb_regeneration_claim_key')
+          )
+        return {
+          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL,
+          DEEPLOY_KEYS.ERROR: "CockroachDB certificate regeneration succeeded but metadata persistence failed.",
+          DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
+          **pending.get('base_result', {})
+        }
+      self._mark_cockroachdb_regeneration_applied(regeneration_operation)
+    elif str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+      self._queue_pipeline_persistence(persistence_state)
 
+    self._release_cockroachdb_regeneration(
+      pending.get('cockroachdb_regeneration_claim_key')
+    )
     return {
       DEEPLOY_KEYS.STATUS: str_status,
       DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
@@ -1549,6 +1756,10 @@ class DeeployManagerApiPlugin(
       pipeline_params : dict, optional
           Additional pipeline-level parameters forwarded to the data capture thread. `null` falls back to `{}`.
           The provided keys are merged into the pipeline configuration at the top level.
+
+      cockroachdb_certificate_regeneration_id : str, optional
+          UUIDv4 operation id for an explicit full-fleet CockroachDB TLS certificate regeneration.
+          Valid only for CockroachDB service updates with all-node response confirmation enabled.
 
       nonce : str
           The nonce used for signing the request
