@@ -107,6 +107,7 @@ COCKROACHDB_REQUIRED_AUTH_ENV_KEYS = (
   "CRDB_USER",
   "CRDB_PASSWORD",
 )
+COCKROACHDB_MIN_TARGET_NODES = 3
 COCKROACHDB_ALLOCATION_PARAM = "deeploy_cockroachdb"
 COCKROACHDB_CERT_REGENERATION_REQUEST_KEY = "cockroachdb_certificate_regeneration_id"
 COCKROACHDB_CERT_HOSTNAME_KEY = "certificateHostname"
@@ -3571,9 +3572,7 @@ class _DeeployMixin:
       return True
 
     current_nodes = list(current_nodes or [])
-    requested_nodes = list(requested_nodes or [])
-    if len(requested_nodes) < 2:
-      raise ValueError("CockroachDB requires at least 2 target nodes.")
+    requested_nodes = self._require_cockroachdb_min_target_nodes(requested_nodes)
     if current_nodes and len(requested_nodes) < len(current_nodes):
       raise ValueError("CockroachDB scale-down is not supported in v1.")
     same_count_changed = (
@@ -3588,6 +3587,18 @@ class _DeeployMixin:
       if existing_prefix != current_nodes:
         raise ValueError("CockroachDB scale-up must append new nodes after the existing node order in v1.")
     return True
+
+  def _require_cockroachdb_min_target_nodes(self, target_nodes):
+    target_nodes = list(target_nodes or [])
+    if (
+      len(target_nodes) < COCKROACHDB_MIN_TARGET_NODES
+      or len(set(target_nodes)) != len(target_nodes)
+    ):
+      raise ValueError(
+        f"CockroachDB requires at least {COCKROACHDB_MIN_TARGET_NODES} target nodes "
+        "with distinct addresses."
+      )
+    return target_nodes
 
   def _validate_cockroachdb_auth_env(self, env):
     if not isinstance(env, dict):
@@ -3975,9 +3986,6 @@ class _DeeployMixin:
     plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
     if not isinstance(plugins_array, list):
       return inputs
-    target_nodes = list(target_nodes or [])
-    if not target_nodes:
-      return inputs
 
     cockroachdb_plugins = [
       plugin_instance for plugin_instance in plugins_array
@@ -3985,6 +3993,7 @@ class _DeeployMixin:
     ]
     if not cockroachdb_plugins:
       return inputs
+    target_nodes = self._require_cockroachdb_min_target_nodes(target_nodes)
 
     regeneration_id = self._get_cockroachdb_regeneration_id(inputs)
     for plugin_instance in cockroachdb_plugins:
@@ -4062,8 +4071,6 @@ class _DeeployMixin:
     if not isinstance(plugins, list):
       return pipeline
     target_nodes = list(target_nodes or [])
-    if not target_nodes:
-      return pipeline
 
     has_cockroachdb = False
     for plugin in plugins:
@@ -4081,8 +4088,7 @@ class _DeeployMixin:
 
     if not has_cockroachdb:
       return pipeline
-    if len(target_nodes) < 2:
-      raise ValueError("CockroachDB requires at least 2 target nodes.")
+    target_nodes = self._require_cockroachdb_min_target_nodes(target_nodes)
 
     pipeline_params = pipeline.get("pipeline_params")
     allocation = (

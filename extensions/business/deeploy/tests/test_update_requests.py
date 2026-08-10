@@ -389,6 +389,44 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       self.assertEqual(instance["CONTAINER_RESOURCES"]["storage"], "0g")
       self.assertEqual(instance["FIXED_SIZE_VOLUMES"]["cockroach_data"]["SIZE"], "8G")
 
+  def test_process_two_node_cockroachdb_edit_rejects_before_side_effects(self):
+    fixture_plugin = make_deeploy_plugin()
+    all_nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
+    nodes = all_nodes[:2]
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances[:2],
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_legacy_two_nodes",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("at least 3 target nodes", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+    self.assertEqual(called["persisted"], 0)
+    self.assertEqual(called["bc_update"], 0)
+
   def test_managed_update_actions_serialize_per_job_and_cache_by_kind(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
     certificate_action = {
