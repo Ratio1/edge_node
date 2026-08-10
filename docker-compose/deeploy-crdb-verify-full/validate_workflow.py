@@ -71,6 +71,7 @@ def generate_bundle(root, regeneration_id=None):
     "internalTunnels": [],
   }
   request = {
+    "service_kind": "cockroachdb",
     "target_nodes": list(NODES),
     "pipeline_params": {"deeploy_cockroachdb": allocation},
     "plugins": [
@@ -88,7 +89,8 @@ def generate_bundle(root, regeneration_id=None):
   if regeneration_id:
     request["cockroachdb_certificate_regeneration_id"] = regeneration_id
   inputs = make_inputs(**request)
-  plugin._prepare_cockroachdb_secure_config(inputs, NODES)
+  service_kind = plugin._resolve_deeploy_service_kind(inputs=inputs)
+  plugin._prepare_managed_service_secure_config(service_kind, inputs, NODES)
   by_node = inputs["plugins"][0]["PER_NODE_CONFIG"]["byNode"]
   bundle = {node: by_node[node]["ENV"] for node in NODES}
   write_bundle(root, bundle)

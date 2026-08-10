@@ -375,6 +375,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
 
     prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(
+      prepared_plan["deeploy_specs"][DEEPLOY_KEYS.SERVICE_KIND],
+      "cockroachdb",
+      "The first edit of a legacy CockroachDB deployment should persist its resolved service kind.",
+    )
     self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
     for node_plugins in prepared_plan["node_plugins_by_addr"].values():
       self.assertEqual(len(node_plugins), 1)
@@ -383,6 +388,96 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       self.assertEqual(instance["PER_NODE_TARGET_NODES"], nodes)
       self.assertEqual(instance["CONTAINER_RESOURCES"]["storage"], "0g")
       self.assertEqual(instance["FIXED_SIZE_VOLUMES"]["cockroach_data"]["SIZE"], "8G")
+
+  def test_managed_update_actions_serialize_per_job_and_cache_by_kind(self):
+    plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
+    certificate_action = {
+      "kind": "cockroachdb_certificate_regeneration",
+      "operation_id": "11111111-1111-4111-8111-111111111111",
+      "intent_hash": "intent-a",
+    }
+    future_action = {
+      "kind": "future_service_rotation",
+      "operation_id": "operation-b",
+      "intent_hash": "intent-b",
+    }
+
+    claim = plugin._claim_managed_update_action(
+      "0xOwner", "cockroachdb_422ce92", certificate_action
+    )
+    with self.assertRaisesRegex(ValueError, "already in progress"):
+      plugin._claim_managed_update_action(
+        "0xOwner", "cockroachdb_422ce92", certificate_action
+      )
+    with self.assertRaisesRegex(ValueError, "Another managed service update action"):
+      plugin._claim_managed_update_action(
+        "0xOwner", "cockroachdb_422ce92", future_action
+      )
+
+    operation = {
+      **certificate_action,
+      "owner": "0xOwner",
+      "app_id": "cockroachdb_422ce92",
+    }
+    plugin._mark_managed_update_action_applied(operation)
+    self.assertEqual(
+      plugin._get_applied_managed_update_action(
+        "0xOwner", "cockroachdb_422ce92", certificate_action["kind"]
+      ),
+      (certificate_action["operation_id"], certificate_action["intent_hash"]),
+    )
+    self.assertIsNone(
+      plugin._get_applied_managed_update_action(
+        "0xOwner", "cockroachdb_422ce92", future_action["kind"]
+      )
+    )
+    plugin._release_managed_update_action(claim)
+    self.assertEqual(
+      plugin._claim_managed_update_action(
+        "0xOwner", "cockroachdb_422ce92", future_action
+      ),
+      claim,
+    )
+
+  def test_process_update_rejects_service_kind_mismatch_before_side_effects(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+      fixture_plugin
+    )
+    request_plugin["IMAGE"] = "postgres:17"
+    request_plugin["plugin_name"] = "postgres"
+    request_plugin["ENV"] = {"POSTGRES_PASSWORD": "ordinary-secret"}
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.SERVICE_KIND: "cockroachdb",
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.SERVICE_KIND: "cockroachdb",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("service kind does not match", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
 
   def test_process_cockroachdb_regeneration_replay_is_noop_and_intent_bound(self):
     fixture_plugin = make_deeploy_plugin()
@@ -585,24 +680,26 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
   def test_cockroachdb_regeneration_rejects_live_duplicate_claim(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
     regeneration_id = "11111111-1111-4111-8111-111111111111"
-    claim = plugin._claim_cockroachdb_regeneration(
-      "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-a"
-    )
+    action = {
+      "kind": "cockroachdb_certificate_regeneration",
+      "operation_id": regeneration_id,
+      "intent_hash": "intent-a",
+      "label": "CockroachDB certificate regeneration",
+    }
+    claim = plugin._claim_managed_update_action("0xOwner", "cockroachdb_422ce92", action)
 
     with self.assertRaisesRegex(ValueError, "already in progress"):
-      plugin._claim_cockroachdb_regeneration(
-        "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-a"
-      )
-    with self.assertRaisesRegex(ValueError, "Another CockroachDB certificate regeneration"):
-      plugin._claim_cockroachdb_regeneration(
-        "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-b"
+      plugin._claim_managed_update_action("0xOwner", "cockroachdb_422ce92", action)
+    with self.assertRaisesRegex(ValueError, "Another managed service update action"):
+      plugin._claim_managed_update_action(
+        "0xOwner",
+        "cockroachdb_422ce92",
+        {**action, "intent_hash": "intent-b"},
       )
 
-    plugin._release_cockroachdb_regeneration(claim)
+    plugin._release_managed_update_action(claim)
     self.assertEqual(
-      plugin._claim_cockroachdb_regeneration(
-        "0xOwner", "cockroachdb_422ce92", regeneration_id, "intent-a"
-      ),
+      plugin._claim_managed_update_action("0xOwner", "cockroachdb_422ce92", action),
       claim,
     )
 
@@ -611,13 +708,19 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.persist_job_pipeline_metadata = (
       lambda **kwargs: called.__setitem__("persisted", called["persisted"] + 1) or False
     )
-    operation = (
-      "0xOwner",
-      "cockroachdb_422ce92",
-      "11111111-1111-4111-8111-111111111111",
-      "intent-a",
+    operation = {
+      "owner": "0xOwner",
+      "app_id": "cockroachdb_422ce92",
+      "kind": "cockroachdb_certificate_regeneration",
+      "operation_id": "11111111-1111-4111-8111-111111111111",
+      "intent_hash": "intent-a",
+      "persistence_failure_error": (
+        "CockroachDB certificate regeneration succeeded but metadata persistence failed."
+      ),
+    }
+    claim_key = plugin._claim_managed_update_action(
+      operation["owner"], operation["app_id"], operation
     )
-    claim_key = plugin._claim_cockroachdb_regeneration(*operation)
 
     result = plugin.finalize_pending_request_pipeline(
       pending={
@@ -628,8 +731,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
           "previous_cid": "old-cid",
           "delete_previous": True,
         },
-        "cockroachdb_regeneration_claim_key": claim_key,
-        "cockroachdb_regeneration_operation": operation,
+        "managed_update_action_claim_key": claim_key,
+        "managed_update_action": operation,
         "base_result": {},
       },
       dct_status={"response-1": {"node": "node-1"}},
@@ -641,8 +744,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["persisted"], 3)
     self.assertEqual(called["queued"], 1)
     self.assertEqual(
-      plugin._cockroachdb_pending_regenerations,
-      {("0xOwner", "cockroachdb_422ce92"): (operation[2], operation[3])},
+      plugin._pending_managed_update_actions,
+      {
+        ("0xOwner", "cockroachdb_422ce92"): (
+          operation["kind"], operation["operation_id"], operation["intent_hash"]
+        ),
+      },
     )
 
   def test_process_cockroachdb_regeneration_replay_uses_recent_confirmed_success(self):
@@ -699,8 +806,18 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       return True
 
     plugin.persist_job_pipeline_metadata = persist_regeneration
-    claim_key = plugin._claim_cockroachdb_regeneration(
-      "0xOwner", "cockroachdb_422ce92", regeneration_id, intent_hash
+    operation = {
+      "owner": "0xOwner",
+      "app_id": "cockroachdb_422ce92",
+      "kind": "cockroachdb_certificate_regeneration",
+      "operation_id": regeneration_id,
+      "intent_hash": intent_hash,
+      "persistence_failure_error": (
+        "CockroachDB certificate regeneration succeeded but metadata persistence failed."
+      ),
+    }
+    claim_key = plugin._claim_managed_update_action(
+      operation["owner"], operation["app_id"], operation
     )
     plugin.finalize_pending_request_pipeline(
       pending={
@@ -715,13 +832,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
           "previous_cid": "old-cid",
           "delete_previous": True,
         },
-        "cockroachdb_regeneration_claim_key": claim_key,
-        "cockroachdb_regeneration_operation": (
-          "0xOwner",
-          "cockroachdb_422ce92",
-          regeneration_id,
-          intent_hash,
-        ),
+        "managed_update_action_claim_key": claim_key,
+        "managed_update_action": operation,
         "base_result": {},
       },
       dct_status={f"response-{index}": {"node": node} for index, node in enumerate(nodes)},
@@ -729,7 +841,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
     self.assertEqual(called["persisted"], 1)
     called["queued"] = 0
-    plugin._cockroachdb_applied_regenerations = {}
+    plugin._applied_managed_update_actions = {}
     plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: copy.deepcopy(durable_pipeline)
 
     response = plugin._process_pipeline_request(request, is_create=False, async_mode=True)

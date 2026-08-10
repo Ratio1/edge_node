@@ -119,6 +119,9 @@ COCKROACHDB_CERT_LIFECYCLE_KEYS = (
   COCKROACHDB_CERT_CA_SHA256_KEY,
   COCKROACHDB_CERT_REGENERATION_INTENT_KEY,
 )
+MANAGED_SERVICE_KIND_COCKROACHDB = "cockroachdb"
+SUPPORTED_MANAGED_SERVICE_KINDS = (MANAGED_SERVICE_KIND_COCKROACHDB,)
+COCKROACHDB_CERT_REGENERATION_ACTION_KIND = "cockroachdb_certificate_regeneration"
 
 class _DeeployMixin:
   def __init__(self):
@@ -780,6 +783,7 @@ class _DeeployMixin:
     app_id,
     job_app_type=None,
     dct_deeploy_specs=None,
+    service_kind=None,
   ):
     """
     Build the exact create payload that will be sent to target nodes.
@@ -790,7 +794,12 @@ class _DeeployMixin:
     """
     nodes = list(nodes or [])
     enable_chainstore_response = bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False))
-    self._prepare_cockroachdb_secure_config(inputs, nodes)
+    service_kind = self._resolve_deeploy_service_kind(
+      inputs=inputs,
+      deeploy_specs=dct_deeploy_specs,
+      expected_service_kind=service_kind,
+    )
+    self._prepare_managed_service_secure_config(service_kind, inputs, nodes)
     plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
     self._validate_dependency_tree(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
@@ -836,6 +845,10 @@ class _DeeployMixin:
     dct_deeploy_specs[DEEPLOY_KEYS.JOB_TAGS] = job_tags
     dct_deeploy_specs[DEEPLOY_KEYS.SPARE_NODES] = spare_nodes
     dct_deeploy_specs[DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD] = allow_replication_in_the_wild
+    if service_kind:
+      dct_deeploy_specs[DEEPLOY_KEYS.SERVICE_KIND] = service_kind
+    else:
+      dct_deeploy_specs.pop(DEEPLOY_KEYS.SERVICE_KIND, None)
     dct_deeploy_specs = self._ensure_deeploy_specs_job_config(
       dct_deeploy_specs,
       pipeline_params=pipeline_params,
@@ -3356,10 +3369,6 @@ class _DeeployMixin:
     instance_payload[CANONICAL_PER_NODE_CONFIG_KEY] = self.deepcopy(request_config)
     return instance_payload
 
-  # TODO: Move CockroachDB-specific service detection, target policy, credential
-  # validation, certificate generation, and per-node materialization behind a
-  # generic Deeploy managed-service abstraction when a second stateful service
-  # needs the same lifecycle hooks.
   def _is_cockroachdb_plugin_instance(self, instance):
     if not isinstance(instance, dict):
       return False
@@ -3393,6 +3402,165 @@ class _DeeployMixin:
       if self._is_cockroachdb_plugin_instance(instance_conf):
         return True
     return False
+
+  def _plugins_have_cockroachdb_instance(self, plugins):
+    for plugin in plugins or []:
+      if self._is_cockroachdb_plugin_instance(plugin):
+        return True
+      if not isinstance(plugin, dict):
+        continue
+      instances = plugin.get("INSTANCES") or plugin.get("instances")
+      if isinstance(instances, list) and any(
+        self._is_cockroachdb_plugin_instance(instance) for instance in instances
+      ):
+        return True
+    return False
+
+  def _normalize_deeploy_service_kind(self, value, source):
+    if value is None:
+      return None
+    if not isinstance(value, str) or not value.strip():
+      raise ValueError(f"Deeploy service kind from {source} must be a non-empty string.")
+    service_kind = value.strip().lower()
+    if service_kind not in SUPPORTED_MANAGED_SERVICE_KINDS:
+      raise ValueError(f"Unsupported Deeploy service kind '{value}'.")
+    return service_kind
+
+  def _resolve_deeploy_service_kind(
+    self,
+    inputs=None,
+    deeploy_specs=None,
+    discovered_plugin_instances=None,
+    expected_service_kind=None,
+    pipeline_plugins=None,
+  ):
+    explicit_kind = self._normalize_deeploy_service_kind(
+      inputs.get(DEEPLOY_KEYS.SERVICE_KIND) if inputs is not None else None,
+      "request",
+    )
+    persisted_kind = self._normalize_deeploy_service_kind(
+      deeploy_specs.get(DEEPLOY_KEYS.SERVICE_KIND) if isinstance(deeploy_specs, dict) else None,
+      "persisted Deeploy specifications",
+    )
+    expected_kind = self._normalize_deeploy_service_kind(expected_service_kind, "caller")
+    request_plugins = inputs.get(DEEPLOY_KEYS.PLUGINS) if inputs is not None else None
+    request_kind = (
+      MANAGED_SERVICE_KIND_COCKROACHDB
+      if self._plugins_have_cockroachdb_instance(request_plugins)
+      else None
+    )
+    discovered_kind = (
+      MANAGED_SERVICE_KIND_COCKROACHDB
+      if self._discovered_has_cockroachdb_plugin(discovered_plugin_instances)
+      or self._plugins_have_cockroachdb_instance(pipeline_plugins)
+      else None
+    )
+
+    declared_kinds = [kind for kind in (explicit_kind, persisted_kind, expected_kind) if kind]
+    detected_kinds = [kind for kind in (request_kind, discovered_kind) if kind]
+    resolved_kinds = set(declared_kinds + detected_kinds)
+    if len(resolved_kinds) > 1:
+      raise ValueError("Deeploy service kind declarations do not match the detected service.")
+    resolved_kind = next(iter(resolved_kinds), None)
+    if resolved_kind and request_plugins is not None and request_kind != resolved_kind:
+      raise ValueError("Deeploy service kind does not match the requested plugin configuration.")
+    return resolved_kind
+
+  def _validate_managed_service_target_change(
+    self,
+    service_kind,
+    current_nodes,
+    requested_nodes,
+    inputs,
+    discovered_plugin_instances=None,
+  ):
+    if service_kind == MANAGED_SERVICE_KIND_COCKROACHDB:
+      return self._validate_cockroachdb_target_change(
+        current_nodes=current_nodes,
+        requested_nodes=requested_nodes,
+        inputs=inputs,
+        discovered_plugin_instances=discovered_plugin_instances,
+      )
+    return True
+
+  def _prepare_managed_service_secure_config(self, service_kind, inputs, target_nodes):
+    if service_kind == MANAGED_SERVICE_KIND_COCKROACHDB:
+      return self._prepare_cockroachdb_secure_config(inputs, target_nodes)
+    return inputs
+
+  def _inherit_managed_service_runtime_config(
+    self,
+    service_kind,
+    inputs,
+    discovered_plugin_instances,
+    target_nodes,
+  ):
+    if service_kind == MANAGED_SERVICE_KIND_COCKROACHDB:
+      return self._inherit_cockroachdb_certificates_from_discovered(
+        inputs,
+        discovered_plugin_instances,
+        target_nodes,
+      )
+    return inputs
+
+  def _get_managed_service_update_action_request(self, service_kind, inputs):
+    if service_kind != MANAGED_SERVICE_KIND_COCKROACHDB:
+      return None
+    regeneration_id = self._get_cockroachdb_regeneration_id(inputs)
+    if not regeneration_id:
+      return None
+    return {
+      "kind": COCKROACHDB_CERT_REGENERATION_ACTION_KIND,
+      "operation_id": regeneration_id,
+      "label": "CockroachDB certificate regeneration",
+    }
+
+  def _prepare_managed_service_update_action(
+    self,
+    service_kind,
+    inputs,
+    deeploy_specs,
+    applied_operation=None,
+  ):
+    if service_kind != MANAGED_SERVICE_KIND_COCKROACHDB:
+      return None
+    operation_id, intent_hash, already_applied = self._prepare_cockroachdb_regeneration_lifecycle(
+      inputs,
+      deeploy_specs,
+      applied_operation=applied_operation,
+    )
+    if not operation_id:
+      return None
+    return {
+      "kind": COCKROACHDB_CERT_REGENERATION_ACTION_KIND,
+      "operation_id": operation_id,
+      "intent_hash": intent_hash,
+      "already_applied": already_applied,
+      "requires_all_target_responses": True,
+      "already_applied_status_details": {
+        "cockroachdb_certificate_regeneration": "already_applied",
+      },
+      "persistence_failure_error": (
+        "CockroachDB certificate regeneration succeeded but metadata persistence failed."
+      ),
+      "label": "CockroachDB certificate regeneration",
+    }
+
+  def _prepare_managed_service_secure_config_for_pipeline(self, pipeline, target_nodes):
+    if not isinstance(pipeline, dict):
+      return pipeline
+    deeploy_specs = pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
+    pipeline_plugins = pipeline.get(NetMonCt.PLUGINS, [])
+    service_kind = self._resolve_deeploy_service_kind(
+      deeploy_specs=deeploy_specs,
+      pipeline_plugins=pipeline_plugins,
+    )
+    if service_kind:
+      deeploy_specs[DEEPLOY_KEYS.SERVICE_KIND] = service_kind
+      pipeline[NetMonCt.DEEPLOY_SPECS] = deeploy_specs
+    if service_kind == MANAGED_SERVICE_KIND_COCKROACHDB:
+      return self._prepare_cockroachdb_secure_config_for_pipeline(pipeline, target_nodes)
+    return pipeline
 
   def _validate_cockroachdb_target_change(self, current_nodes, requested_nodes, inputs, discovered_plugin_instances=None):
     is_cockroachdb = (
@@ -5325,10 +5493,7 @@ class _DeeployMixin:
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
       deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
-    # TODO: Delegate service-specific persisted-pipeline preparation through
-    # the managed-service abstraction when CockroachDB is no longer the only
-    # service with generated per-node runtime material.
-    self._prepare_cockroachdb_secure_config_for_pipeline(base_pipeline, chainstore_peers)
+    self._prepare_managed_service_secure_config_for_pipeline(base_pipeline, chainstore_peers)
 
     chainstore_response_keys = self.defaultdict(list)
 

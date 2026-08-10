@@ -91,6 +91,82 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "client tunnel"):
           plugin._cockroachdb_client_hostname(invalid)
 
+  def test_managed_service_kind_resolves_explicit_legacy_and_persisted_cockroachdb(self):
+    plugin = make_deeploy_plugin()
+    cockroach_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="cockroachdb",
+      IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+    )
+
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[cockroach_plugin]),
+      ),
+      "cockroachdb",
+    )
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(inputs=make_inputs(plugins=[cockroach_plugin])),
+      "cockroachdb",
+    )
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(plugins=[cockroach_plugin]),
+        deeploy_specs={DEEPLOY_KEYS.SERVICE_KIND: "cockroachdb"},
+      ),
+      "cockroachdb",
+    )
+
+  def test_managed_service_kind_rejects_unsupported_or_conflicting_identity(self):
+    plugin = make_deeploy_plugin()
+    postgres_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="postgres",
+      IMAGE="postgres:17",
+    )
+
+    with self.assertRaisesRegex(ValueError, "Unsupported Deeploy service kind"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="postgresql", plugins=[postgres_plugin]),
+      )
+    with self.assertRaisesRegex(ValueError, "service kind.*does not match"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[postgres_plugin]),
+      )
+    with self.assertRaisesRegex(ValueError, "service kind.*does not match"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(plugins=[postgres_plugin]),
+        deeploy_specs={DEEPLOY_KEYS.SERVICE_KIND: "cockroachdb"},
+      )
+
+  def test_managed_service_kind_is_absent_for_ordinary_services(self):
+    plugin = make_deeploy_plugin()
+    postgres_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="postgres",
+      IMAGE="postgres:17",
+    )
+
+    self.assertIsNone(
+      plugin._resolve_deeploy_service_kind(inputs=make_inputs(plugins=[postgres_plugin]))
+    )
+
+  def test_managed_service_secure_config_matches_legacy_cockroachdb_hook(self):
+    plugin = make_deeploy_plugin()
+    nodes = ["0xai_node_a", "0xai_node_b"]
+    cert_bundle = plugin._generate_cockroachdb_cert_bundle(nodes, "tcp.ratio1.link")
+    direct_inputs = self._make_cockroachdb_secure_inputs()
+    generic_inputs = copy.deepcopy(direct_inputs)
+    plugin._generate_cockroachdb_cert_bundle = (
+      lambda target_nodes, client_hostname=None: copy.deepcopy(cert_bundle)
+    )
+
+    plugin._prepare_cockroachdb_secure_config(direct_inputs, nodes)
+    service_kind = plugin._resolve_deeploy_service_kind(inputs=generic_inputs)
+    plugin._prepare_managed_service_secure_config(service_kind, generic_inputs, nodes)
+
+    self.assertEqual(generic_inputs, direct_inputs)
+
   def test_generated_cockroachdb_node_certificates_include_client_hostname(self):
     plugin = make_deeploy_plugin()
 
