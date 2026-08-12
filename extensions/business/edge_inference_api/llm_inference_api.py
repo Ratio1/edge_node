@@ -410,7 +410,6 @@ class LLMInferenceApiPlugin(BasePlugin):
     def predict(
         self,
         messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -418,6 +417,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        model: Optional[str] = None,
         **kwargs
     ):
       """
@@ -427,8 +427,6 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
-      model : str or None, optional
-        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -443,6 +441,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Additional metadata to store with the request.
       authorization : str or None, optional
         Bearer token used for authentication.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       **kwargs
         Extra parameters forwarded to the base handler.
 
@@ -470,7 +470,6 @@ class LLMInferenceApiPlugin(BasePlugin):
     def predict_async(
         self,
         messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -479,6 +478,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         request_id: Optional[str] = None,
+        model: Optional[str] = None,
         **kwargs
     ):
       """
@@ -488,8 +488,6 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
-      model : str or None, optional
-        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -507,6 +505,8 @@ class LLMInferenceApiPlugin(BasePlugin):
       request_id : str or None, optional
         Caller-provided id to use for request tracking. If omitted, the API
         keeps the legacy generated-id behavior.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       **kwargs
         Extra parameters forwarded to the base handler.
 
@@ -533,7 +533,6 @@ class LLMInferenceApiPlugin(BasePlugin):
     def create_chat_completion(
         self,
         messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -541,6 +540,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        model: Optional[str] = None,
         **kwargs
     ):
       """
@@ -550,8 +550,6 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
-      model : str or None, optional
-        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -566,6 +564,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Additional metadata to store with the request.
       authorization : str or None, optional
         Bearer token used for authentication.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       **kwargs
         Extra parameters forwarded to the base handler.
 
@@ -591,7 +591,6 @@ class LLMInferenceApiPlugin(BasePlugin):
     def create_chat_completion_async(
         self,
         messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
         top_p: float = 1.0,
@@ -599,6 +598,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        model: Optional[str] = None,
         **kwargs
     ):
       """
@@ -608,8 +608,6 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
-      model : str or None, optional
-        Requested model identifier used for local execution or peer routing.
       temperature : float, optional
         Sampling temperature.
       max_tokens : int, optional
@@ -624,6 +622,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Additional metadata to store with the request.
       authorization : str or None, optional
         Bearer token used for authentication.
+      model : str or None, optional
+        Requested model identifier used for local execution or peer routing.
       **kwargs
         Extra parameters forwarded to the base handler.
 
@@ -653,10 +653,10 @@ class LLMInferenceApiPlugin(BasePlugin):
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
-        model: Optional[str] = None,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
         response_format: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
         **kwargs
     ):
       """
@@ -666,8 +666,6 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
-      model : str or None, optional
-        Requested model identifier used for capability-aware routing.
       temperature : float
         Sampling temperature.
       max_tokens : int
@@ -678,6 +676,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Penalty for repeated tokens if supported by the backend.
       response_format : dict or None, optional
         Controls structured output constraints for the model response.
+      model : str or None, optional
+        Requested model identifier used for capability-aware routing.
       **kwargs
         Additional parameters not validated here.
 
@@ -707,10 +707,10 @@ class LLMInferenceApiPlugin(BasePlugin):
         messages: List[Dict[str, Any]],
         temperature: float,
         max_tokens: int,
-        model: Optional[str] = None,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
         response_format: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
         **kwargs
     ):
       """
@@ -720,8 +720,6 @@ class LLMInferenceApiPlugin(BasePlugin):
       ----------
       messages : list of dict
         Chat history for the model to complete.
-      model : str or None, optional
-        Requested model identifier retained in the tracked request.
       temperature : float
         Sampling temperature.
       max_tokens : int
@@ -732,6 +730,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Penalty for repeated tokens if supported by the backend.
       response_format : dict or None, optional
         Controls structured output constraints for the model response.
+      model : str or None, optional
+        Requested model identifier retained in the tracked request.
       **kwargs
         Additional parameters to include as-is.
 

@@ -7,9 +7,6 @@ from unittest.mock import MagicMock
 
 import numpy as _np
 
-# Keep the real package root so the business stubs do not poison later imports.
-import naeural_core as _naeural_core  # noqa: F401
-
 
 def install_docker_stub_if_needed():
   """Provide the tiny docker-py surface these unit tests need."""
@@ -193,6 +190,7 @@ class _DummyBasePlugin:
 
 def install_dummy_base_plugin():
   module_hierarchy = [
+    ('naeural_core', types.ModuleType('naeural_core')),
     ('naeural_core.business', types.ModuleType('naeural_core.business')),
     ('naeural_core.business.base', types.ModuleType('naeural_core.business.base')),
     ('naeural_core.business.base.web_app', types.ModuleType('naeural_core.business.base.web_app')),

@@ -1,4 +1,5 @@
 import unittest
+from inspect import signature
 from pathlib import Path
 
 
@@ -28,6 +29,12 @@ class _FakeBasePlugin:
 
   def P(self, *args, **kwargs):  # pylint: disable=unused-argument
     return None
+
+  def predict(self, authorization=None, **kwargs):
+    return {"authorization": authorization, **kwargs}
+
+  def predict_async(self, authorization=None, request_id=None, **kwargs):
+    return {"authorization": authorization, "request_id": request_id, **kwargs}
 
   @staticmethod
   def shorten_str(value):
@@ -118,6 +125,35 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertTrue(  # pylint: disable=protected-access
       plugin._capacity_record_can_execute_request({}, {"parameters": {}})
     )
+
+  def test_legacy_positional_endpoint_calls_preserve_parameter_order(self):
+    plugin = self._make_plugin()
+    messages = [{"role": "user", "content": "hello"}]
+
+    for endpoint_name in (
+      "predict",
+      "predict_async",
+      "create_chat_completion",
+      "create_chat_completion_async",
+    ):
+      with self.subTest(endpoint=endpoint_name):
+        result = getattr(plugin, endpoint_name)(messages, 0.2, 128)
+        self.assertEqual(result["messages"], messages)
+        self.assertEqual(result["temperature"], 0.2)
+        self.assertEqual(result["max_tokens"], 128)
+        self.assertIsNone(result["model"])
+
+    keyword_model = plugin.predict(messages, 0.2, 128, model="model-b")
+    self.assertEqual(keyword_model["model"], "model-b")
+
+    self.assertEqual(
+      list(signature(plugin.check_predict_params).parameters)[:3],
+      ["messages", "temperature", "max_tokens"],
+    )
+    processed = plugin.process_predict_params(messages, 0.2, 128)
+    self.assertEqual(processed["temperature"], 0.2)
+    self.assertEqual(processed["max_tokens"], 128)
+    self.assertNotIn("model", processed)
 
   def test_payload_uses_llm_serving_uppercase_contract(self):
     plugin = self._make_plugin()

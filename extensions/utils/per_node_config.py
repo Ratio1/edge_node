@@ -22,6 +22,8 @@ PER_NODE_CONFIG_STRUCTURED_KEYS = {
 }
 PER_NODE_CONFIG_SYSTEM_KEYS = {
   "INSTANCE_ID",
+  "INSTANCE_COMMAND",
+  "INSTANCE_COMMAND_LAST",
   "CHAINSTORE_PEERS",
   "CHAINSTORE_RESPONSE_KEY",
   "CONTAINER_RESOURCES",
@@ -44,6 +46,32 @@ PER_NODE_CONFIG_SYSTEM_KEYS = {
   "TUNNEL_ENGINE",
   "TUNNEL_ENGINE_ENABLED",
 }
+
+
+def _normalize_overlay_keys(
+    overlay,
+    label,
+    normalized_config_keys,
+    normalized_system_keys,
+):
+  """Canonicalize top-level config keys while rejecting ambiguous spellings."""
+  normalized = {}
+  for key, value in overlay.items():
+    if not isinstance(key, str):
+      raise ValueError(f"{label} overlay keys must be strings.")
+    normalized_key = key.upper()
+    if normalized_key in normalized:
+      raise ValueError(
+        f"{label} overlay contains duplicate normalized key '{normalized_key}'."
+      )
+    if normalized_key in normalized_config_keys:
+      raise ValueError(f"Nested {label} overlays are not supported.")
+    if normalized_key in normalized_system_keys:
+      raise ValueError(
+        f"{label} cannot override system-managed or preflighted key '{key}'."
+      )
+    normalized[normalized_key] = value
+  return normalized
 
 
 def deep_merge_config(base, overlay, copy_fn=_deepcopy):
@@ -156,15 +184,21 @@ def normalize_config(
 
   normalized_config_keys = {str(key).upper() for key in config_keys}
   normalized_system_keys = {str(key).upper() for key in system_keys}
-  for overlay in [default_overlay, *normalized_by_index.values(), *normalized_by_node.values()]:
-    for key in overlay:
-      normalized_key = str(key).upper()
-      if normalized_key in normalized_config_keys:
-        raise ValueError(f"Nested {label} overlays are not supported.")
-      if normalized_key in normalized_system_keys:
-        raise ValueError(
-          f"{label} cannot override system-managed or preflighted key '{key}'."
-        )
+  default_overlay = _normalize_overlay_keys(
+    default_overlay, label, normalized_config_keys, normalized_system_keys
+  )
+  normalized_by_index = {
+    index: _normalize_overlay_keys(
+      overlay, label, normalized_config_keys, normalized_system_keys
+    )
+    for index, overlay in normalized_by_index.items()
+  }
+  normalized_by_node = {
+    node: _normalize_overlay_keys(
+      overlay, label, normalized_config_keys, normalized_system_keys
+    )
+    for node, overlay in normalized_by_node.items()
+  }
 
   return default_overlay, normalized_by_index, normalized_by_node
 
