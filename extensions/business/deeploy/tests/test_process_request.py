@@ -119,7 +119,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
     plugin.check_and_deploy_pipelines = check_and_deploy_pipelines
     request = {
       DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
-      DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b"],
+      DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
       DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
       DEEPLOY_KEYS.PIPELINE_INPUT_URI: None,
       DEEPLOY_KEYS.PIPELINE_PARAMS: {
@@ -142,9 +142,26 @@ class DeeployProcessRequestTests(unittest.TestCase):
         "byNode": {
           "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
           "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+          "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
         },
       },
     }
+
+    invalid_request = copy.deepcopy(request)
+    invalid_request[DEEPLOY_KEYS.TARGET_NODES] = ["0xai_node_a", "0xai_node_b"]
+    invalid_res = plugin._process_pipeline_request(invalid_request, is_create=True, async_mode=True)
+    self.assertEqual(invalid_res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertIn("at least 3 target nodes", invalid_res[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(captured, {})
+    self.assertEqual(plugin.bc.submitted, [])
+
+    duplicate_request = copy.deepcopy(request)
+    duplicate_request[DEEPLOY_KEYS.TARGET_NODES] = ["0xai_node_a", "0xai_node_a", "0xai_node_a"]
+    duplicate_res = plugin._process_pipeline_request(duplicate_request, is_create=True, async_mode=True)
+    self.assertEqual(duplicate_res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertIn("distinct addresses", duplicate_res[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(captured, {})
+    self.assertEqual(plugin.bc.submitted, [])
 
     res = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
 
@@ -161,7 +178,10 @@ class DeeployProcessRequestTests(unittest.TestCase):
       prepared_plugin["PER_NODE_CONFIG"]["byNode"]["0xai_node_b"]["ENV"]["CRDB_NODE_ID"],
       "2",
     )
-    self.assertEqual(plugin.bc.submitted, [(97, ["eth_0xai_node_a", "eth_0xai_node_b"])])
+    self.assertEqual(
+      plugin.bc.submitted,
+      [(97, ["eth_0xai_node_a", "eth_0xai_node_b", "eth_0xai_node_c"])],
+    )
     self.assertIn("token-a", str(res[DEEPLOY_KEYS.REQUEST]))
     self.assertIn("token-b", str(res[DEEPLOY_KEYS.REQUEST]))
     self.assertIsInstance(res[DEEPLOY_KEYS.REQUEST]["PER_NODE_CONFIG"], dict)
