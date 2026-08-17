@@ -1,0 +1,87 @@
+name: deeploy-crdb-verify-full
+
+x-edge-env: &edge-env
+  EE_CONFIG: /edge_node/docker-compose/deeploy-testbed/config_startup_deeploy_testbed.json
+  EE_DEVICE: cpu
+  EE_ETH_ENABLED: "false"
+  EE_EVM_NET: devnet
+  EE_DAUTH_URL: N/A
+  EE_MQTT_HOST: deeploy_verify_mqtt
+  EE_MQTT_PORT: "1883"
+  EE_MQTT_USER: ""
+  EE_MQTT: ""
+  EE_MQTT_SUBTOPIC: address
+  EE_MQTT_SECURED: "false"
+  EE_MINIO_ACCESS_KEY: ""
+  EE_MINIO_ENDPOINT: ""
+  EE_MINIO_SECRET_KEY: ""
+  EE_MINIO_SECURE: "false"
+  EE_MINIO_UPLOAD_BUCKET: ""
+  EE_SECURED: "0"
+  EE_TUNNEL_ENGINE: none
+
+x-edge-node: &edge-node
+  image: local_edge_node_deeploy_0009
+  build:
+    context: ..
+    dockerfile: Dockerfile_devnet
+  privileged: true
+  restart: "no"
+  command: ["python3", "/edge_node/docker-compose/deeploy-testbed/device_no_extra_packages.py"]
+  depends_on:
+    deeploy_verify_mqtt:
+      condition: service_healthy
+  environment: *edge-env
+  volumes:
+    - ./deeploy-testbed:/edge_node/docker-compose/deeploy-testbed:ro
+
+services:
+  deeploy_verify_mqtt:
+    image: eclipse-mosquitto:2
+    restart: "no"
+    volumes:
+      - ./deeploy-testbed/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -p 1883 -t deeploy_verify/health -m ok >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  deeploy_verify_node_1:
+    <<: *edge-node
+    environment:
+      <<: *edge-env
+      EE_ID: deeploy_verify_node_1
+      EE_SUPERVISOR: "false"
+    volumes:
+      - deeploy_verify_node_1_cache:/edge_node/_local_cache
+      - ./deeploy-testbed:/edge_node/docker-compose/deeploy-testbed:ro
+
+  deeploy_verify_node_2:
+    <<: *edge-node
+    environment:
+      <<: *edge-env
+      EE_ID: deeploy_verify_node_2
+      EE_SUPERVISOR: "false"
+    volumes:
+      - deeploy_verify_node_2_cache:/edge_node/_local_cache
+      - ./deeploy-testbed:/edge_node/docker-compose/deeploy-testbed:ro
+
+  deeploy_verify_node_3:
+    <<: *edge-node
+    environment:
+      <<: *edge-env
+      EE_ID: deeploy_verify_node_3
+      EE_SUPERVISOR: "false"
+    volumes:
+      - deeploy_verify_node_3_cache:/edge_node/_local_cache
+      - ./deeploy-testbed:/edge_node/docker-compose/deeploy-testbed:ro
+
+volumes:
+  deeploy_verify_node_1_cache:
+  deeploy_verify_node_2_cache:
+  deeploy_verify_node_3_cache:
+
+networks:
+  default:
+    name: deeploy-crdb-verify-full
