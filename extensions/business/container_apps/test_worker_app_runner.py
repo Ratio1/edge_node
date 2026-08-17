@@ -453,5 +453,106 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
     self.assertEqual(content, "valid content")
 
 
+class RuntimeIdentityEnvTests(unittest.TestCase):
+
+  def _make_plugin(self):
+    plugin = ContainerAppRunnerPlugin.__new__(ContainerAppRunnerPlugin)
+    plugin.messages = []
+    plugin.P = lambda message, *args, **kwargs: plugin.messages.append(str(message))
+    plugin.Pd = lambda message, *args, **kwargs: plugin.messages.append(str(message))
+    plugin._stream_id = "navigator-app"
+    plugin.cfg_instance_id = "navigator-instance"
+    plugin.container_name = "navigator-container"
+    plugin.ee_id = "edge-node"
+    plugin.ee_addr = "0xedge"
+    plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
+    plugin.bc = types.SimpleNamespace(eth_address="0x0", get_evm_network=lambda: "testnet")
+    plugin.json_dumps = lambda value: "[]"
+    plugin.cfg_chainstore_peers = []
+    plugin.cfg_semaphored_keys = None
+    plugin.cfg_env = {}
+    plugin.dynamic_env = {}
+    plugin.extra_ports_mapping = {}
+    plugin.cfg_port = None
+    return plugin
+
+  def test_runtime_identity_values_are_default_env_vars(self):
+    plugin = self._make_plugin()
+
+    default_env = plugin._get_default_env_vars()
+
+    self.assertEqual(default_env["R1EN_APP_ID"], "navigator-app")
+    self.assertEqual(default_env["R1EN_INSTANCE_ID"], "navigator-instance")
+    self.assertNotIn("R1EN_PLUGIN_ID", default_env)
+
+    plugin._setup_env_and_ports()
+
+    self.assertEqual(plugin.env["R1EN_APP_ID"], "navigator-app")
+    self.assertEqual(plugin.env["R1EN_INSTANCE_ID"], "navigator-instance")
+    self.assertNotIn("R1EN_PLUGIN_ID", plugin.env)
+
+  def test_runner_owned_env_values_reject_configurable_overrides(self):
+    plugin = self._make_plugin()
+    protected_overrides = {
+      "CONTAINER_NAME": "attempted-dynamic-container-name",
+      "R1EN_APP_ID": "attempted-dynamic-app-id",
+      "R1EN_INSTANCE_ID": "attempted-dynamic-instance-id",
+      "R1EN_CHAINSTORE_API_URL": "attempted-dynamic-endpoint",
+    }
+    plugin.dynamic_env = {
+      **protected_overrides,
+      "SHARED_VALUE": "dynamic",
+      "DYNAMIC_ONLY": "dynamic-only",
+    }
+    plugin.semaphore_get_env = lambda: {
+      "container-name": "attempted-semaphore-container-name",
+      "r1en-app-id": "attempted-semaphore-app-id",
+      "r1en-instance-id": "attempted-semaphore-instance-id",
+      "r1en-chainstore-api-url": "attempted-semaphore-endpoint",
+      "SHARED_VALUE": "semaphore",
+      "SEMAPHORE_ONLY": "semaphore-only",
+    }
+    plugin.cfg_env = {
+      "CONTAINER_NAME": "attempted-config-container-name",
+      "R1EN_APP_ID": "attempted-config-app-id",
+      "R1EN_INSTANCE_ID": "attempted-config-instance-id",
+      "R1EN_CHAINSTORE_API_URL": "attempted-config-endpoint",
+      "SHARED_VALUE": "configured",
+      "CONFIG_ONLY": "configured-only",
+      "R1EN_CSTORE_AUTH_TOKEN": "configured-auth-token",
+    }
+
+    plugin._setup_env_and_ports()
+
+    default_env = plugin._get_default_env_vars()
+    for key, value in default_env.items():
+      self.assertEqual(plugin.env[key], value)
+
+    self.assertEqual(plugin.env["SHARED_VALUE"], "dynamic")
+    self.assertEqual(plugin.env["DYNAMIC_ONLY"], "dynamic-only")
+    self.assertEqual(plugin.env["SEMAPHORE_ONLY"], "semaphore-only")
+    self.assertEqual(plugin.env["CONFIG_ONLY"], "configured-only")
+    self.assertEqual(plugin.env["R1EN_CSTORE_AUTH_TOKEN"], "configured-auth-token")
+
+    rejection_warnings = [
+      message for message in plugin.messages
+      if message.startswith("Ignoring runner-owned environment variables")
+    ]
+    self.assertEqual(len(rejection_warnings), 3)
+    self.assertTrue(any("dynamic_env" in message for message in rejection_warnings))
+    self.assertTrue(any("semaphore_env" in message for message in rejection_warnings))
+    self.assertTrue(any("cfg_env" in message for message in rejection_warnings))
+    for message in rejection_warnings:
+      self.assertIn("CONTAINER_NAME", message)
+      self.assertIn("R1EN_APP_ID", message)
+      self.assertIn("R1EN_INSTANCE_ID", message)
+      self.assertIn("R1EN_CHAINSTORE_API_URL", message)
+
+    all_logs = "\n".join(plugin.messages)
+    self.assertNotIn("attempted-dynamic", all_logs)
+    self.assertNotIn("attempted-semaphore", all_logs)
+    self.assertNotIn("attempted-config", all_logs)
+
+
 if __name__ == "__main__":
   unittest.main()
