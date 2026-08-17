@@ -1135,46 +1135,69 @@ class _ContainerUtilsMixin:
       3. Semaphore env vars (from paired provider plugins)
       4. cfg_env (user-configured)
       5. local env overrides (host-private, managed via /r1en_system)
+
+    Keys supplied by the default environment are runner-owned and cannot be
+    overridden by dynamic, semaphore, or configured inputs.
     """
     # Environment variables
-    # allow cfg_env to override default env vars
     default_env = self._get_default_env_vars()
+    protected_env_keys = frozenset(default_env)
+
+    def filter_runner_owned_env_vars(source, env_vars):
+      accepted = {}
+      rejected = []
+      for key, value in env_vars.items():
+        if key in protected_env_keys:
+          rejected.append(key)
+        else:
+          accepted[key] = value
+      if rejected:
+        self.P(
+          "Ignoring runner-owned environment variables from {}: {}".format(
+            source, ", ".join(sorted(rejected))
+          ),
+          color='y',
+        )
+      return accepted
+
+    filtered_dynamic_env = filter_runner_owned_env_vars(
+      "dynamic_env", self.dynamic_env
+    )
     self.env = dict(default_env)
-    self.env.update(self.dynamic_env)
+    self.env.update(filtered_dynamic_env)
 
     # Add environment variables from semaphored paired plugins
     if hasattr(self, 'semaphore_get_env'):
       semaphore_env = self.semaphore_get_env()
       if semaphore_env:
-        sanitized_semaphore_env = {}
+        sanitized_semaphore_env = {
+          self._sanitize_semaphore_env_var_name(key): value
+          for key, value in semaphore_env.items()
+        }
+        sanitized_semaphore_env = filter_runner_owned_env_vars(
+          "semaphore_env", sanitized_semaphore_env
+        )
         log_lines = [
           "=" * 60,
           "SEMAPHORE ENV INJECTION",
           "=" * 60,
-          f"  Adding {len(semaphore_env)} env vars from semaphored plugins:",
+          f"  Adding {len(sanitized_semaphore_env)} env vars from semaphored plugins:",
         ]
-        for key, value in semaphore_env.items():
-          sanitized_key = self._sanitize_semaphore_env_var_name(key)
-          sanitized_semaphore_env[sanitized_key] = value
-          log_lines.append(f"    {sanitized_key} = {value}")
+        for key, value in sanitized_semaphore_env.items():
+          log_lines.append(f"    {key} = {value}")
         log_lines.append("=" * 60)
         self.Pd("\n".join(log_lines))
         self.env.update(sanitized_semaphore_env)
     # endif semaphore env
 
     if self.cfg_env:
-      self.env.update(self.cfg_env)
+      self.env.update(filter_runner_owned_env_vars("cfg_env", self.cfg_env))
     if self.dynamic_env:
-      self.env.update(self.dynamic_env)
+      self.env.update(filtered_dynamic_env)
     # endif dynamic env
 
     if hasattr(self, "_apply_env_overrides_to_env"):
       self._apply_env_overrides_to_env()
-
-    # Runtime identities are default environment values, but remain reserved
-    # and authoritative after every configurable environment source.
-    self.env["R1EN_APP_ID"] = default_env["R1EN_APP_ID"]
-    self.env["R1EN_INSTANCE_ID"] = default_env["R1EN_INSTANCE_ID"]
 
     # Format ports for Docker API
     # Docker expects: {"container_port/tcp": "host_port"}
