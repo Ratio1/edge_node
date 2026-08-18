@@ -42,16 +42,21 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("EE_NETMON_ACCEPT_LOCAL_SUPERVISOR_SUMMARY: \"1\"", compose_text)
     self.assertNotIn("EE_NETMON_USE_SUMMARY_STATUS", compose_text)
 
-  def test_app_config_has_isolated_topics_and_channel_qos(self):
+  def test_app_config_has_regrouped_traffic_roles_and_channel_qos(self):
     config = json.loads((REPO_ROOT / ".config_app_comms.json").read_text())
     instances = config["COMMUNICATION"]["INSTANCES"]
     params = config["COMMUNICATION"]["PARAMS"]
 
-    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CTRL_CHANNEL")
+    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CONFIG_CHANNEL")
     self.assertEqual(instances["COMMANDCONTROL"]["SEND_TO"], "CONFIG_CHANNEL")
-    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CONFIG_CHANNEL")
+    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CTRL_CHANNEL")
     self.assertEqual(instances["HEARTBEATS"]["SEND_TO"], "CTRL_CHANNEL")
     self.assertEqual(params["HOST"], "emqx")
+    self.assertEqual(params["HEARTBEAT_AUTH_MODE"], "shadow")
+    self.assertEqual(params["HEARTBEAT_AUTH_MAX_IN_FLIGHT"], 32)
+    self.assertEqual(params["HEARTBEAT_AUTH_WORKERS"], 4)
+    self.assertEqual(params["HEARTBEAT_INGRESS_QUEUE_SIZE"], 10000)
+    self.assertTrue(params["HEARTBEAT_INGRESS_WORKER_ENABLED"])
     self.assertEqual(params["PORT"], 1883)
     self.assertEqual(params["SECURED"], 0)
     self.assertEqual(params["CTRL_CHANNEL"]["TOPIC"], "naeural_comms_local/ctrl")
@@ -63,13 +68,63 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
 
   def test_default_app_config_enables_segregated_heartbeat_and_command_qos(self):
     config = json.loads((REPO_ROOT / ".config_app.json").read_text())
+    instances = config["COMMUNICATION"]["INSTANCES"]
     params = config["COMMUNICATION"]["PARAMS"]
 
+    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CONFIG_CHANNEL")
+    self.assertEqual(instances["COMMANDCONTROL"]["SEND_TO"], "CONFIG_CHANNEL")
+    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CTRL_CHANNEL")
+    self.assertEqual(instances["HEARTBEATS"]["SEND_TO"], "CTRL_CHANNEL")
     self.assertEqual(params["CTRL_CHANNEL"]["TOPIC"], "naeural/ctrl")
     self.assertEqual(params["CTRL_CHANNEL"]["QOS"], 1)
     self.assertEqual(params["CONFIG_CHANNEL"]["TOPIC"], "naeural/{}/config")
     self.assertEqual(params["CONFIG_CHANNEL"]["QOS"], 2)
     self.assertEqual(params["QOS"], 2)
+    self.assertEqual(params["HEARTBEAT_AUTH_MODE"], "shadow")
+    self.assertEqual(params["HEARTBEAT_AUTH_MAX_IN_FLIGHT"], 32)
+    self.assertEqual(params["HEARTBEAT_AUTH_WORKERS"], 4)
+    self.assertEqual(params["HEARTBEAT_INGRESS_QUEUE_SIZE"], 10000)
+    self.assertTrue(params["HEARTBEAT_INGRESS_WORKER_ENABLED"])
+
+  def test_legacy_topology_fixture_remains_available_for_rollback(self):
+    fixture = json.loads((
+      REPO_ROOT / "tests" / "fixtures" / "communication_topology_legacy.json"
+    ).read_text())
+
+    self.assertEqual(fixture["COMMANDCONTROL"]["RECV_FROM"], "CTRL_CHANNEL")
+    self.assertEqual(fixture["COMMANDCONTROL"]["SEND_TO"], "CONFIG_CHANNEL")
+    self.assertEqual(fixture["HEARTBEATS"]["RECV_FROM"], "CONFIG_CHANNEL")
+    self.assertEqual(fixture["HEARTBEATS"]["SEND_TO"], "CTRL_CHANNEL")
+
+    full_fixture = json.loads((
+      REPO_ROOT / "tests" / "fixtures" / "config_app_comms_legacy.json"
+    ).read_text())
+    full_instances = full_fixture["COMMUNICATION"]["INSTANCES"]
+    self.assertEqual(full_instances["COMMANDCONTROL"], fixture["COMMANDCONTROL"])
+    self.assertEqual(full_instances["HEARTBEATS"], fixture["HEARTBEATS"])
+    self.assertEqual(
+      full_fixture["COMMUNICATION"]["PARAMS"]["CTRL_CHANNEL"]["QOS"],
+      1,
+    )
+    self.assertEqual(
+      full_fixture["COMMUNICATION"]["PARAMS"]["CONFIG_CHANNEL"]["QOS"],
+      2,
+    )
+    self.assertEqual(
+      full_fixture["COMMUNICATION"]["PARAMS"]["HEARTBEAT_AUTH_WORKERS"],
+      4,
+    )
+
+  def test_heartbeat_ingress_rollout_documents_persisted_config_and_rollback(self):
+    rollout = (
+      REPO_ROOT / "docs" / "heartbeat-ingress-rollout.md"
+    ).read_text()
+
+    self.assertIn("config_app.txt", rollout)
+    self.assertIn("HEARTBEAT_AUTH_WORKERS", rollout)
+    self.assertIn("HEARTBEAT_AUTH_MAX_IN_FLIGHT", rollout)
+    self.assertIn("HEARTBEAT_INGRESS_WORKER_ENABLED=false", rollout)
+    self.assertIn("no write-ahead log", rollout.lower())
 
   def test_startup_config_keeps_required_admin_pipeline_only(self):
     config = json.loads((REPO_ROOT / ".config_startup_comms.json").read_text())
