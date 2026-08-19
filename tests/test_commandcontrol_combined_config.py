@@ -66,16 +66,23 @@ class TestCombinedCommandControlConfig(unittest.TestCase):
       self.assertIn(".config_app_comms.json", text)
       self.assertIn("rollback", text.lower())
 
-  def test_live_testbed_enables_mirror_and_has_broker_fanout_probe(self):
+  def test_live_testbed_has_broker_fanout_probe(self):
     compose = (REPO_ROOT / "docker-compose_comms.yaml").read_text()
     probe = (REPO_ROOT / "tests" / "validate_sdk_heartbeat_fanout.py").read_text()
 
-    self.assertIn('EE_HEARTBEAT_TARGETED_MIRROR_ENABLED: "1"', compose)
+    self.assertNotIn('EE_HEARTBEAT_TARGETED_MIRROR_ENABLED', compose)
     self.assertIn("/api/v5/subscriptions", probe)
     self.assertIn("send_msg", probe)
     self.assertIn("send_oct", probe)
     self.assertIn("post_delivery_filter", probe)
     self.assertIn("heartbeat_observation_mode", probe)
+
+  def test_comms_env_precedence_is_not_testbed_forced(self):
+    config = self._load(".config_app_comms.json")
+    self.assertTrue(
+      config["COMMUNICATION"]["PARAMS"]["HEARTBEAT_TARGETED_MIRROR_ENABLED"],
+    )
+
 
 
 if __name__ == "__main__":

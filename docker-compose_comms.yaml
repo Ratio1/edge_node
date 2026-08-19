@@ -27,7 +27,6 @@ x-edge-comms-node: &edge-comms-node
     EE_MQTT_SUBTOPIC: address
     EE_MQTT_HEARTBEAT_QOS: "1"
     EE_MQTT_COMMAND_QOS: "2"
-    EE_HEARTBEAT_TARGETED_MIRROR_ENABLED: "1"
     EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE: "1"
     EE_ENABLE_NETMON_API_PROBE: "1"
     # The comms testbed does not run child workloads, so DinD TLS only adds a
