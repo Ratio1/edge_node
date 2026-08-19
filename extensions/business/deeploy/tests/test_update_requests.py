@@ -1274,7 +1274,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     fixture_plugin = make_deeploy_plugin()
     nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
     request_plugin.pop(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-    request_plugin["IMAGE"] = "repo/reconfigured-service:latest"
+    request_plugin["IMAGE"] = (
+      "ghcr.io/ratio1/r1-meshdb@sha256:"
+      "3be00a63467628d0f5c3382be8ae7a885c5b658762dfd095fba0cb0b5549fab4"
+    )
     plugin, called = self._make_process_update_plugin(
       discovered_instances=discovered_instances,
       nodes=nodes,

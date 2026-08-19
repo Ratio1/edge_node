@@ -118,6 +118,55 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "cockroachdb",
     )
 
+  def test_managed_service_kind_recognizes_exact_r1_meshdb_and_legacy_repositories(self):
+    plugin = make_deeploy_plugin()
+    digest = "sha256:" + ("a" * 64)
+    accepted = (
+      "ghcr.io/ratio1/r1-meshdb:v1.0.0",
+      f"ghcr.io/ratio1/r1-meshdb@{digest}",
+      f"ghcr.io/ratio1/r1-meshdb:v1.0.0@{digest}",
+      "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+      f"ghcr.io/ratio1/deeploy-cockroachdb-service@{digest}",
+      f"ghcr.io/ratio1/deeploy-cockroachdb-service:main@{digest}",
+    )
+    rejected = (
+      "ghcr.io/example/r1-meshdb:latest",
+      "ghcr.io/ratio1/r1-meshdb-helper:latest",
+      "ghcr.io/ratio1/deeploy-cockroachdb-service2:main",
+    )
+
+    for image in accepted:
+      with self.subTest(image=image):
+        self.assertTrue(plugin._is_cockroachdb_plugin_instance({"IMAGE": image}))
+    for image in rejected:
+      with self.subTest(image=image):
+        self.assertFalse(plugin._is_cockroachdb_plugin_instance({"IMAGE": image}))
+        misleading = {
+          "IMAGE": image,
+          "plugin_name": "cockroachdb",
+          "ENV": {"CRDB_NODE_COUNT": "3"},
+        }
+        self.assertFalse(plugin._is_cockroachdb_plugin_instance(misleading))
+
+    candidate = make_plugin_entry("CONTAINER_APP_RUNNER", IMAGE=accepted[1])
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[candidate]),
+      ),
+      "cockroachdb",
+    )
+
+    near_match = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="cockroachdb",
+      IMAGE=rejected[1],
+      ENV={"CRDB_NODE_COUNT": "3"},
+    )
+    with self.assertRaisesRegex(ValueError, "service kind.*does not match"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[near_match]),
+      )
+
   def test_managed_service_kind_rejects_unsupported_or_conflicting_identity(self):
     plugin = make_deeploy_plugin()
     postgres_plugin = make_plugin_entry(
@@ -774,7 +823,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_d"]["ENV"])
     self.assertEqual(by_node["0xai_node_d"]["ENV"]["CF_TUNNEL_TOKEN"], "token-d")
 
-  def test_cockroachdb_secure_config_rejects_root_or_unsafe_identifiers(self):
+  def test_cockroachdb_secure_config_rejects_reserved_or_unsafe_identifiers(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
       plugins=[
@@ -794,8 +843,42 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
 
     inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_DATABASE"] = "appdb"
-    with self.assertRaisesRegex(ValueError, "must not be root"):
-      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
+    for reserved_user in ("root", "ROOT", "admin", "AdMiN", "node", "public"):
+      with self.subTest(reserved_user=reserved_user):
+        inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_USER"] = reserved_user
+        with self.assertRaisesRegex(ValueError, "reserved"):
+          plugin._prepare_cockroachdb_secure_config(
+            inputs,
+            ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+          )
+
+  def test_legacy_pipeline_rejects_reserved_user_before_certificate_generation(self):
+    plugin = make_deeploy_plugin()
+    generation_calls = []
+    plugin._generate_cockroachdb_cert_bundle = (
+      lambda *args, **kwargs: generation_calls.append((args, kwargs))
+    )
+    pipeline = {
+      NetMonCt.PLUGINS: [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "admin",
+            "CRDB_PASSWORD": "secret-password",
+          },
+        }],
+      }],
+    }
+
+    with self.assertRaisesRegex(ValueError, "reserved"):
+      plugin._prepare_cockroachdb_secure_config_for_pipeline(
+        pipeline,
+        ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+      )
+
+    self.assertEqual(generation_calls, [])
 
   def test_deeploy_status_payload_keeps_cockroachdb_config_unredacted(self):
     payload = {

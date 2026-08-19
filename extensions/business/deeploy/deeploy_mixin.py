@@ -92,7 +92,10 @@ SENSITIVE_LOG_KEY_PARTS = (
   "ACCESS_KEY",
   "ACCESSKEY",
 )
-COCKROACHDB_IMAGE_MARKER = "deeploy-cockroachdb-service"
+COCKROACHDB_IMAGE_REPOSITORIES = frozenset((
+  "ghcr.io/ratio1/deeploy-cockroachdb-service",
+  "ghcr.io/ratio1/r1-meshdb",
+))
 COCKROACHDB_CERT_ENV_KEYS = (
   "CRDB_CA_CRT",
   "CRDB_NODE_CRT",
@@ -107,6 +110,7 @@ COCKROACHDB_REQUIRED_AUTH_ENV_KEYS = (
   "CRDB_USER",
   "CRDB_PASSWORD",
 )
+COCKROACHDB_RESERVED_USERS = frozenset(("root", "admin", "node", "public"))
 COCKROACHDB_MIN_TARGET_NODES = 3
 COCKROACHDB_ALLOCATION_PARAM = "deeploy_cockroachdb"
 COCKROACHDB_CERT_REGENERATION_REQUEST_KEY = "cockroachdb_certificate_regeneration_id"
@@ -3375,8 +3379,13 @@ class _DeeployMixin:
     if not isinstance(instance, dict):
       return False
     image = instance.get("IMAGE")
-    if isinstance(image, str) and COCKROACHDB_IMAGE_MARKER in image.lower():
-      return True
+    if isinstance(image, str):
+      repository = image.strip().lower().split("@", 1)[0]
+      last_slash = repository.rfind("/")
+      last_colon = repository.rfind(":")
+      if last_colon > last_slash:
+        repository = repository[:last_colon]
+      return repository in COCKROACHDB_IMAGE_REPOSITORIES
     env = instance.get("ENV")
     if isinstance(env, dict) and (
       "CRDB_NODE_COUNT" in env or "CRDB_HOSTNAMES" in env
@@ -3620,8 +3629,8 @@ class _DeeployMixin:
         raise ValueError(
           "CockroachDB {} must be a SQL identifier: letters, digits, and underscores, not starting with a digit.".format(key)
         )
-    if env.get("CRDB_USER", "").lower() == "root":
-      raise ValueError("CockroachDB CRDB_USER must not be root.")
+    if env.get("CRDB_USER", "").lower() in COCKROACHDB_RESERVED_USERS:
+      raise ValueError("CockroachDB CRDB_USER is reserved.")
     return True
 
   def _cockroachdb_cert_bundle_complete(self, instance, target_nodes):
@@ -4082,10 +4091,8 @@ class _DeeployMixin:
         continue
       for instance in instances:
         if self._is_cockroachdb_plugin_instance(instance):
+          self._validate_cockroachdb_auth_env(instance.get("ENV"))
           has_cockroachdb = True
-          break
-      if has_cockroachdb:
-        break
 
     if not has_cockroachdb:
       return pipeline
@@ -4111,7 +4118,6 @@ class _DeeployMixin:
         if not self._is_cockroachdb_plugin_instance(instance):
           continue
         env = instance.setdefault("ENV", {})
-        self._validate_cockroachdb_auth_env(env)
         hostnames = [
           item.strip()
           for item in str(env.get("CRDB_HOSTNAMES", "")).split(",")

@@ -1,8 +1,8 @@
-# CockroachDB Verify-Full Testbed
+# R1 MeshDB Verify-Full Testbed
 
 This local-only bed starts three real edge runtimes on a private broker. The
-validator then uses the edge certificate-preparation helper and the published
-CockroachDB service image to run a three-node SQL cluster on the same isolated
+validator then uses the edge certificate-preparation helper and the exact
+published R1 MeshDB digest to run a three-node SQL cluster on the same isolated
 network. No dAuth, Cloudflare, remote node, or live Deeploy resource is used.
 
 Run from the `edge_node` worktree root:
@@ -15,7 +15,8 @@ PYTHONPATH=/mnt/c/repos/naeural_client:. /home/bleot/venvs/umbrella313/bin/pytho
 docker compose -f docker-compose/deeploy-crdb-verify-full.yaml down -v --remove-orphans
 ```
 
-The validator checks DNS hostname verification, wrong-host/wrong-CA/plaintext
+The validator checks the production `CRDB_MAX_OFFSET=500ms` bound, DNS hostname
+verification, wrong-host/wrong-CA/plaintext
 rejection, password authentication, three-node membership, data persistence
 across full certificate regeneration, delayed third-node convergence, and a
 packet capture with unique SQL canaries. It deletes raw captures, certificates,
