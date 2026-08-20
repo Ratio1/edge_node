@@ -20,13 +20,19 @@ class TestCombinedCommandControlConfig(unittest.TestCase):
 
   def _assert_combined_params(self, config, mirror_enabled):
     params = config["COMMUNICATION"]["PARAMS"]
+    self.assertIs(type(params["HEARTBEAT_INGRESS_WORKER_ENABLED"]), bool)
     self.assertTrue(params["HEARTBEAT_INGRESS_WORKER_ENABLED"])
+    self.assertIs(type(params["HEARTBEAT_INGRESS_QUEUE_SIZE"]), int)
     self.assertEqual(params["HEARTBEAT_INGRESS_QUEUE_SIZE"], 10000)
+    self.assertIs(type(params["HEARTBEAT_AUTH_WORKERS"]), int)
     self.assertEqual(params["HEARTBEAT_AUTH_WORKERS"], 4)
+    self.assertIs(type(params["HEARTBEAT_AUTH_MAX_IN_FLIGHT"]), int)
     self.assertEqual(params["HEARTBEAT_AUTH_MAX_IN_FLIGHT"], 32)
     self.assertEqual(params["HEARTBEAT_AUTH_MODE"], "shadow")
     self.assertIn("{}", params["CTRL_CHANNEL"]["TARGETED_TOPIC"])
+    self.assertIs(type(params["CTRL_CHANNEL"]["SUBSCRIBE_TARGETED"]), bool)
     self.assertFalse(params["CTRL_CHANNEL"]["SUBSCRIBE_TARGETED"])
+    self.assertIs(type(params["HEARTBEAT_TARGETED_MIRROR_ENABLED"]), bool)
     self.assertEqual(
       params["HEARTBEAT_TARGETED_MIRROR_ENABLED"],
       mirror_enabled,
