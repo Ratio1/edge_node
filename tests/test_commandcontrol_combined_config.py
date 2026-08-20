@@ -69,21 +69,19 @@ class TestCombinedCommandControlConfig(unittest.TestCase):
   def test_live_testbed_has_broker_fanout_probe(self):
     compose = (REPO_ROOT / "docker-compose_comms.yaml").read_text()
     probe = (REPO_ROOT / "tests" / "validate_sdk_heartbeat_fanout.py").read_text()
+    config = self._load(".config_app_comms.json")
 
     self.assertNotIn('EE_HEARTBEAT_TARGETED_MIRROR_ENABLED', compose)
+    self.assertTrue(
+      config["COMMUNICATION"]["PARAMS"]["HEARTBEAT_TARGETED_MIRROR_ENABLED"],
+    )
+    self.assertIn("config_app.txt", probe)
+    self.assertIn("Primary fanout validation must not use", probe)
     self.assertIn("/api/v5/subscriptions", probe)
     self.assertIn("send_msg", probe)
     self.assertIn("send_oct", probe)
     self.assertIn("post_delivery_filter", probe)
     self.assertIn("heartbeat_observation_mode", probe)
-
-  def test_comms_env_precedence_is_not_testbed_forced(self):
-    config = self._load(".config_app_comms.json")
-    self.assertTrue(
-      config["COMMUNICATION"]["PARAMS"]["HEARTBEAT_TARGETED_MIRROR_ENABLED"],
-    )
-
-
 
 if __name__ == "__main__":
   unittest.main()

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Prove SDK heartbeat modes by broker delivery, not post-delivery filtering.
 
-Run this only against ``docker-compose_comms.yaml``. The probe discovers one
-node and one NetMon publisher, starts real Ratio1 SDK sessions for every mode,
-then compares EMQX per-client delivered messages and bytes over one shared
-traffic window.
+Run this inside one node from ``docker-compose_comms.yaml``. The probe first
+proves targeted mirroring comes from the node's persisted configuration, then
+discovers one node and one NetMon publisher, starts real Ratio1 SDK sessions
+for every mode, and compares EMQX delivery over one shared traffic window.
 """
 
 import importlib.util
@@ -30,6 +30,48 @@ USER = os.environ.get("ECOMMS_MQTT_USER", "ecomms")
 PASSWORD = os.environ.get("ECOMMS_MQTT_PASS", "ecomms")
 DISCOVERY_SECONDS = float(os.environ.get("ECOMMS_SDK_DISCOVERY_SECONDS", "90"))
 MEASURE_SECONDS = float(os.environ.get("ECOMMS_SDK_MEASURE_SECONDS", "30"))
+MIRROR_ENV_KEY = "EE_HEARTBEAT_TARGETED_MIRROR_ENABLED"
+PERSISTED_CONFIG_PATH = pathlib.Path(os.environ.get(
+  "ECOMMS_PERSISTED_CONFIG_PATH",
+  "/edge_node/_local_cache/_data/box_configuration/config_app.txt",
+))
+
+
+def _assert_persisted_mirror_source():
+  """Prove this live node mirrors from persisted config, not an env override.
+
+  Returns
+  -------
+  str
+    Path of the effective persisted application configuration.
+
+  Raises
+  ------
+  AssertionError
+    If an environment override exists or persisted mirroring is not enabled.
+  """
+  if MIRROR_ENV_KEY in os.environ:
+    raise AssertionError(
+      "Primary fanout validation must not use {}".format(MIRROR_ENV_KEY)
+    )
+  try:
+    config = json.loads(PERSISTED_CONFIG_PATH.read_text())
+    mirror_enabled = config["COMMUNICATION"]["PARAMS"][
+      "HEARTBEAT_TARGETED_MIRROR_ENABLED"
+    ]
+  except Exception as exc:
+    raise AssertionError(
+      "Cannot read persisted mirror setting from {}".format(
+        PERSISTED_CONFIG_PATH,
+      )
+    ) from exc
+  if mirror_enabled is not True:
+    raise AssertionError(
+      "Persisted heartbeat targeted mirror must be true, got {!r}".format(
+        mirror_enabled,
+      )
+    )
+  return str(PERSISTED_CONFIG_PATH)
 
 
 def _broker_module():
@@ -192,6 +234,7 @@ def _start_subscription_sampler(broker, interval=0.25):
 
 
 def main():
+  persisted_config_path = _assert_persisted_mirror_source()
   broker = _broker_module()
   discovered = _discover_publishers()
   selected_node = discovered["node"]
@@ -310,6 +353,7 @@ def main():
 
       print(json.dumps({
         "status": "ok",
+        "persisted_mirror_config": persisted_config_path,
         "selected_node": selected_node,
         "summary_publisher": summary_publisher,
         "unavailable_node": unavailable_node,
