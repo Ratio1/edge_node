@@ -870,6 +870,7 @@ class DeeployManagerApiPlugin(
           if job_app_type not in JOB_APP_TYPES_ALL:
             job_app_type = JOB_APP_TYPES.NATIVE
         service_kind = self._resolve_deeploy_service_kind(inputs=inputs)
+        self._validate_managed_service_request_admission(service_kind, inputs)
       self.P(f"Resolved job app type: {job_app_type}")
       # persist job type so downstream mixins can adjust validations (e.g. native app resource checks)
       inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
@@ -937,6 +938,7 @@ class DeeployManagerApiPlugin(
           deeploy_specs=deeploy_specs_for_update,
           discovered_plugin_instances=discovered_plugin_instances,
         )
+        self._validate_managed_service_request_admission(service_kind, inputs)
         self.P(
           f"Discovered {len(discovered_plugin_instances)} live plugin instance record(s) "
           f"for update job_id={job_id}, app_id={app_id}."

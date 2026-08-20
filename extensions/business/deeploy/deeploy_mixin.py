@@ -3477,6 +3477,18 @@ class _DeeployMixin:
       raise ValueError("Deeploy service kind does not match the requested plugin configuration.")
     return resolved_kind
 
+  def _validate_managed_service_request_admission(self, service_kind, inputs):
+    if service_kind != MANAGED_SERVICE_KIND_COCKROACHDB:
+      return True
+    for plugin_instance in inputs.get(DEEPLOY_KEYS.PLUGINS) or []:
+      if not self._is_cockroachdb_plugin_instance(plugin_instance):
+        continue
+      env = plugin_instance.get("ENV")
+      user = env.get("CRDB_USER") if isinstance(env, dict) else None
+      if isinstance(user, str) and user.lower() in COCKROACHDB_RESERVED_USERS:
+        raise ValueError("CockroachDB CRDB_USER is reserved.")
+    return True
+
   def _validate_managed_service_target_change(
     self,
     service_kind,
