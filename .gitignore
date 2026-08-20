@@ -202,3 +202,6 @@ prompt.md
 
 # RedMesh LLM probe benchmark artifacts
 extensions/business/cybersec/red_mesh/test_results/
+
+# Local SDK state created by the isolated per-node LLM testbed
+.per-node-llm-e2e-sdk-cache/

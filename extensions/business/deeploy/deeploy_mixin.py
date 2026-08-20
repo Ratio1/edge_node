@@ -3310,6 +3310,7 @@ class _DeeployMixin:
     return None
 
   def _canonicalize_per_node_config_key(self, plugin_instance):
+    """Rewrite the supported public spelling and reject ambiguous instances."""
     present_keys = [
       key for key in PER_NODE_CONFIG_KEYS
       if key in plugin_instance
@@ -5499,6 +5500,12 @@ class _DeeployMixin:
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
       deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
+    for plugin in base_pipeline.get(NetMonCt.PLUGINS, []):
+      if not isinstance(plugin, dict):
+        continue
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES, []) or []:
+        if isinstance(instance, dict):
+          self._canonicalize_per_node_config_key(instance)
     self._prepare_managed_service_secure_config_for_pipeline(base_pipeline, chainstore_peers)
 
     chainstore_response_keys = self.defaultdict(list)
