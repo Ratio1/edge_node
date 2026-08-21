@@ -15,6 +15,65 @@ CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 ALLOWED_TUNNEL_PROTOCOLS = ("http", "https", "tcp", "ssh", "rdp", "smb")
 
 
+def validate_exposed_ports_origin_tls_options(exposed_ports, main_port=None):
+  """Validate the narrow origin-TLS exception before runtime side effects."""
+  if not isinstance(exposed_ports, dict):
+    raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+
+  try:
+    main_port = int(main_port) if main_port is not None else None
+  except (TypeError, ValueError):
+    main_port = None
+
+  for raw_container_port, raw_config in exposed_ports.items():
+    try:
+      container_port = int(raw_container_port)
+    except (TypeError, ValueError):
+      raise ValueError(f"EXPOSED_PORTS key must be an integer port, got: {raw_container_port}")
+    if container_port < 1 or container_port > 65535:
+      raise ValueError(f"EXPOSED_PORTS key must be a valid port number, got: {container_port}")
+
+    if raw_config is None:
+      raw_config = {}
+    if not isinstance(raw_config, dict):
+      raise ValueError(
+        f"EXPOSED_PORTS[{container_port}] must be a dictionary, got: {type(raw_config)}"
+      )
+    if "no_tls_verify" not in raw_config:
+      continue
+
+    no_tls_verify = raw_config.get("no_tls_verify")
+    if not isinstance(no_tls_verify, bool):
+      raise ValueError(
+        f"EXPOSED_PORTS[{raw_container_port}].no_tls_verify must be a boolean"
+      )
+    if not no_tls_verify:
+      continue
+
+    if raw_config.get("is_main_port") is True or (
+      main_port is not None and container_port == main_port
+    ):
+      raise ValueError(
+        f"EXPOSED_PORTS[{raw_container_port}].no_tls_verify is supported only for non-main tunnels"
+      )
+
+    nested = raw_config.get("tunnel")
+    nested = nested if isinstance(nested, dict) and nested.get("enabled", False) else {}
+    token = raw_config.get("token") or nested.get("token")
+    engine = raw_config.get("engine") or nested.get("engine") or "cloudflare"
+    protocol = raw_config.get("protocol", "http")
+    if not (
+      isinstance(token, str) and token.strip()
+      and isinstance(engine, str) and engine.strip().lower() == "cloudflare"
+      and isinstance(protocol, str) and protocol.strip().lower() == "https"
+    ):
+      raise ValueError(
+        f"EXPOSED_PORTS[{raw_container_port}].no_tls_verify requires a token-backed "
+        "Cloudflare https tunnel"
+      )
+  return True
+
+
 class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
@@ -184,8 +243,10 @@ class _ContainerUtilsMixin:
     exposed_ports : dict
         Raw exposed ports config keyed by container port.
     """
-    if not isinstance(exposed_ports, dict):
-      raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+    validate_exposed_ports_origin_tls_options(
+      exposed_ports,
+      main_port=getattr(self, "cfg_port", None),
+    )
 
     normalized = {}
     main_ports = []

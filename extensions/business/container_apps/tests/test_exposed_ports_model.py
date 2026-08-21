@@ -90,6 +90,21 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "no_tls_verify requires a token-backed Cloudflare https tunnel"):
       plugin._normalize_exposed_ports_config()
 
+  def test_normalize_exposed_ports_rejects_origin_tls_override_on_main_port(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_port = 8080
+    plugin.cfg_exposed_ports = {
+      "8080": {
+        "is_main_port": True,
+        "token": "main-token",
+        "protocol": "https",
+        "no_tls_verify": True,
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, "supported only for non-main tunnels"):
+      plugin._normalize_exposed_ports_config()
+
   def test_validate_runner_config_caches_normalized_exposed_ports(self):
     plugin = make_container_app_runner()
     plugin.cfg_exposed_ports = {

@@ -21,6 +21,7 @@ from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KE
   DEEPLOY_DYNAMIC_ENV_KEYS, DEEPLOY_DYNAMIC_ENV_TYPES
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
+from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
 from extensions.utils.per_node_config import (
   CANONICAL_PER_NODE_CONFIG_KEY,
   PER_NODE_CONFIG_KEYS,
@@ -1876,6 +1877,11 @@ class _DeeployMixin:
       if exposed_ports is not None and not isinstance(exposed_ports, dict):
         raise ValueError(
           f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'EXPOSED_PORTS' must be a dictionary."
+        )
+      if exposed_ports is not None:
+        validate_exposed_ports_origin_tls_options(
+          exposed_ports,
+          main_port=plugin_instance.get("PORT"),
         )
 
     # Add validation for other plugin types here as needed

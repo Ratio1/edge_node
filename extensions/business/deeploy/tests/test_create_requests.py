@@ -1156,6 +1156,69 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "EXPOSED_PORTS"):
       plugin._validate_plugins_array(plugins)
 
+  def test_validate_plugins_array_accepts_extra_https_origin_tls_override(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      make_plugin_entry(
+        "CONTAINER_APP_RUNNER",
+        IMAGE="repo/app:latest",
+        PORT=5432,
+        CONTAINER_RESOURCES={"cpu": 1, "memory": "128m"},
+        EXPOSED_PORTS={
+          "5432": {"is_main_port": True, "token": "client-token", "protocol": "tcp"},
+          "8080": {"token": "dashboard-token", "protocol": "https", "no_tls_verify": True},
+        },
+      )
+    ]
+
+    self.assertTrue(plugin._validate_plugins_array(plugins))
+
+  def test_validate_plugins_array_rejects_invalid_origin_tls_override_before_dispatch(self):
+    plugin = make_deeploy_plugin()
+    base_instance = {
+      "IMAGE": "repo/app:latest",
+      "PORT": 5432,
+      "CONTAINER_RESOURCES": {"cpu": 1, "memory": "128m"},
+    }
+
+    invalid_configs = [
+      {"8080": {"token": "dashboard-token", "protocol": "https", "no_tls_verify": "true"}},
+      {"8080": {"token": "dashboard-token", "protocol": "http", "no_tls_verify": True}},
+      {"5432": {"is_main_port": True, "token": "client-token", "protocol": "https", "no_tls_verify": True}},
+    ]
+    for exposed_ports in invalid_configs:
+      plugins = [
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          **base_instance,
+          EXPOSED_PORTS=exposed_ports,
+        )
+      ]
+      with self.subTest(exposed_ports=exposed_ports):
+        with self.assertRaisesRegex(ValueError, "no_tls_verify"):
+          plugin._validate_plugins_array(plugins)
+
+  def test_validate_plugins_array_rejects_invalid_exposed_port_key_before_dispatch(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      make_plugin_entry(
+        "CONTAINER_APP_RUNNER",
+        IMAGE="repo/app:latest",
+        PORT=5432,
+        CONTAINER_RESOURCES={"cpu": 1, "memory": "128m"},
+        EXPOSED_PORTS={
+          "not-a-port": {
+            "token": "dashboard-token",
+            "protocol": "https",
+            "no_tls_verify": True,
+          },
+        },
+      )
+    ]
+
+    with self.assertRaisesRegex(ValueError, "key must be an integer port"):
+      plugin._validate_plugins_array(plugins)
+
   def test_prepare_plugins_resolves_shmem_with_app_id(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(

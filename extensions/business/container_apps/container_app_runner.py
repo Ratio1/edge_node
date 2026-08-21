@@ -65,6 +65,7 @@ EXTRA_TUNNELS Feature:
 import docker
 import os
 import requests
+import shlex
 import shutil
 import signal
 import threading
@@ -1547,6 +1548,78 @@ class ContainerAppRunnerPlugin(
       # end if
     # end if
     return
+
+
+  def run_tunnel_command(self, command):
+    """Launch a main tunnel without a shell or credential-bearing logs."""
+    if not command:
+      return None
+
+    try:
+      if isinstance(command, str):
+        command = shlex.split(command)
+      elif isinstance(command, (list, tuple)):
+        command = [str(part) for part in command]
+      else:
+        raise ValueError("tunnel command must be a string or argument sequence")
+    except ValueError as exc:
+      self.P(f"Invalid tunnel command: {exc}", color='r')
+      return None
+
+    if not command:
+      return None
+
+    token = self.get_cloudflare_token()
+    safe_command = list(command)
+    if self.use_cloudflare():
+      safe_command = self._redact_tunnel_command(safe_command)
+    elif token:
+      safe_command = ["[REDACTED]" if part == str(token) else part for part in safe_command]
+
+    try:
+      self.P(f"Running tunnel command: {' '.join(safe_command)}")
+      popen_kwargs = dict(
+        args=command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+      )
+      if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+      process = subprocess.Popen(**popen_kwargs)
+      self._remember_process_group(process)
+
+      logs_reader = self.LogReader(process.stdout, size=100, daemon=None)
+      err_logs_reader = self.LogReader(process.stderr, size=100, daemon=None)
+      if not hasattr(self, "dct_logs_reader"):
+        self.dct_logs_reader = {}
+      if not hasattr(self, "dct_err_logs_reader"):
+        self.dct_err_logs_reader = {}
+      self.dct_logs_reader["tunnel"] = logs_reader
+      self.dct_err_logs_reader["tunnel"] = err_logs_reader
+      return process
+    except Exception as exc:
+      self.P(f"Error running tunnel command: {type(exc).__name__}")
+      return None
+
+
+  def run_tunnel_engine(self):
+    """Build the primary Cloudflare command as an argument vector."""
+    if not self.use_cloudflare():
+      return super(ContainerAppRunnerPlugin, self).run_tunnel_engine()
+
+    normalized = self._normalized_exposed_ports or self._normalize_exposed_ports_config()
+    main_container_port = self._get_main_container_port(normalized)
+    tunnel_config = self._get_main_tunnel_config()
+    if main_container_port is None or not tunnel_config:
+      return None
+
+    command = self._build_tunnel_command(
+      main_container_port,
+      tunnel_config.get("token"),
+      tunnel_config.get("protocol", "http"),
+    )
+    return self.run_tunnel_command(command)
 
   def _get_main_tunnel_config(self):
     """
