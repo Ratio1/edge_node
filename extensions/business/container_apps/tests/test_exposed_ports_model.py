@@ -37,6 +37,59 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
     self.assertIsNone(normalized[3001]["host_port"])
     self.assertIsNone(normalized[3001]["token"])
 
+  def test_normalize_exposed_ports_accepts_https_origin_tls_override(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "8080": {
+        "token": "dashboard-token",
+        "protocol": "https",
+        "engine": "cloudflare",
+        "no_tls_verify": True,
+      },
+    }
+
+    normalized = plugin._normalize_exposed_ports_config()
+
+    self.assertTrue(normalized[8080]["no_tls_verify"])
+
+  def test_normalize_exposed_ports_rejects_non_boolean_origin_tls_override(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "8080": {
+        "token": "dashboard-token",
+        "protocol": "https",
+        "no_tls_verify": "true",
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, "no_tls_verify must be a boolean"):
+      plugin._normalize_exposed_ports_config()
+
+  def test_normalize_exposed_ports_rejects_origin_tls_override_for_non_https_tunnel(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "8080": {
+        "token": "dashboard-token",
+        "protocol": "http",
+        "no_tls_verify": True,
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, "no_tls_verify requires a token-backed Cloudflare https tunnel"):
+      plugin._normalize_exposed_ports_config()
+
+  def test_normalize_exposed_ports_rejects_origin_tls_override_without_token(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "8080": {
+        "protocol": "https",
+        "no_tls_verify": True,
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, "no_tls_verify requires a token-backed Cloudflare https tunnel"):
+      plugin._normalize_exposed_ports_config()
+
   def test_validate_runner_config_caches_normalized_exposed_ports(self):
     plugin = make_container_app_runner()
     plugin.cfg_exposed_ports = {

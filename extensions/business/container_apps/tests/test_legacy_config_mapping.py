@@ -30,6 +30,7 @@ class ContainerAppRunnerLegacyConfigMappingTests(unittest.TestCase):
         "token": "token-3005",
         "protocol": "http",
         "engine": "cloudflare",
+        "no_tls_verify": False,
       }
     })
     self.assertEqual(plugin.extra_ports_mapping, {

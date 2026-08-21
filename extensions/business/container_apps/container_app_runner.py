@@ -1937,7 +1937,9 @@ class ContainerAppRunnerPlugin(
     return True
 
 
-  def _build_tunnel_command(self, container_port, token, protocol="http"):
+  def _build_tunnel_command(
+    self, container_port, token, protocol="http", no_tls_verify=False
+  ):
     """
     Build Cloudflare tunnel command for a specific port.
 
@@ -1949,6 +1951,8 @@ class ContainerAppRunnerPlugin(
         Cloudflare tunnel token
     protocol : str, optional
         Tunnel origin protocol (default "http")
+    no_tls_verify : bool, optional
+        Disable Cloudflare origin TLS verification for this HTTPS tunnel
 
     Returns
     -------
@@ -1961,7 +1965,7 @@ class ContainerAppRunnerPlugin(
       return None
 
     # Return list to avoid shell injection - use list-based subprocess
-    return [
+    command = [
       "cloudflared",
       "tunnel",
       "--no-autoupdate",
@@ -1971,6 +1975,20 @@ class ContainerAppRunnerPlugin(
       "--url",
       f"{protocol}://127.0.0.1:{host_port}"
     ]
+    if no_tls_verify:
+      command.append("--no-tls-verify")
+    return command
+
+
+  def _redact_tunnel_command(self, command):
+    """Return a log-safe copy of a cloudflared command."""
+    redacted = list(command)
+    try:
+      token_index = redacted.index("--token") + 1
+      redacted[token_index] = "[REDACTED]"
+    except (ValueError, IndexError):
+      pass
+    return redacted
 
 
   def _should_start_main_tunnel(self):
@@ -2019,16 +2037,20 @@ class ContainerAppRunnerPlugin(
     if isinstance(tunnel_config, dict):
       token = tunnel_config.get("token")
       protocol = tunnel_config.get("protocol", "http")
+      no_tls_verify = tunnel_config.get("no_tls_verify", False)
     else:
       token = tunnel_config  # legacy compat
       protocol = "http"
+      no_tls_verify = False
 
     if not token:
       self.P(f"No token provided for extra tunnel on port {container_port}", color='r')
       return False
 
     # Build tunnel command
-    command = self._build_tunnel_command(container_port, token, protocol)
+    command = self._build_tunnel_command(
+      container_port, token, protocol, no_tls_verify=no_tls_verify
+    )
     if not command:
       return False
 
@@ -2036,7 +2058,7 @@ class ContainerAppRunnerPlugin(
     try:
       host_port = self._get_host_port_for_container_port(container_port)
       self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...")
-      self.Pd(f"  Command: {' '.join(command)}")
+      self.Pd(f"  Command: {' '.join(self._redact_tunnel_command(command))}")
 
       # Use list-based subprocess to prevent shell injection
       popen_kwargs = dict(

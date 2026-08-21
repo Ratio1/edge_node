@@ -340,6 +340,19 @@ class _ContainerUtilsMixin:
           f"got '{protocol}'"
         )
 
+      no_tls_verify = config.get("no_tls_verify", False)
+      if not isinstance(no_tls_verify, bool):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].no_tls_verify must be a boolean"
+        )
+      if no_tls_verify and not (
+        token is not None and engine == "cloudflare" and protocol == "https"
+      ):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].no_tls_verify requires a token-backed "
+          "Cloudflare https tunnel"
+        )
+
       normalized[container_port] = {
         "container_port": container_port,
         "is_main_port": is_main_port,
@@ -347,6 +360,7 @@ class _ContainerUtilsMixin:
         "token": token,
         "protocol": protocol,
         "engine": engine,
+        "no_tls_verify": no_tls_verify,
       }
 
     if len(main_ports) > 1:
@@ -1540,6 +1554,7 @@ class _ContainerUtilsMixin:
         "token": token,
         "protocol": port_config.get("protocol", "http"),
         "engine": port_config.get("engine", "cloudflare"),
+        "no_tls_verify": port_config.get("no_tls_verify", False),
       }
 
     self.inverted_ports_mapping = {
