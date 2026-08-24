@@ -468,6 +468,61 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "duplicate aliases"):
       plugin._normalize_per_node_config({"byIndex": {}, "BY_INDEX": {}})
 
+  def test_per_node_config_canonicalizes_overlay_keys_and_rejects_collisions(self):
+    plugin = make_deeploy_plugin()
+
+    _default, by_index, _by_node = plugin._normalize_per_node_config({
+      "byIndex": {"0": {"ai_engine": "llama_cpp_medium"}},
+    })
+    self.assertEqual(by_index[0], {"AI_ENGINE": "llama_cpp_medium"})
+
+    with self.assertRaisesRegex(ValueError, "duplicate normalized key 'AI_ENGINE'"):
+      plugin._normalize_per_node_config({
+        "byIndex": {
+          "0": {
+            "AI_ENGINE": "llama_cpp_small",
+            "ai_engine": "llama_cpp_medium",
+          },
+        },
+      })
+
+  def test_per_node_config_rejects_one_shot_commands(self):
+    plugin = make_deeploy_plugin()
+
+    for command_key in ("INSTANCE_COMMAND", "INSTANCE_COMMAND_LAST"):
+      with self.subTest(command_key=command_key), self.assertRaisesRegex(
+        ValueError, "system-managed"
+      ):
+        plugin._normalize_per_node_config({
+          "byIndex": {"0": {command_key.lower(): {"COMMAND": "RESTART"}}},
+        })
+
+  def test_per_node_config_rejects_duplicate_normalized_selectors(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "duplicate normalized index 1"):
+      plugin._normalize_per_node_config({
+        "byIndex": {
+          "01": {"ENV": {"NODE_ID": "first"}},
+          "1": {"ENV": {"NODE_ID": "second"}},
+        },
+      })
+    with self.assertRaisesRegex(ValueError, "duplicate node selector '1'"):
+      plugin._normalize_per_node_config({
+        "byNode": {
+          1: {"ENV": {"NODE_ID": "first"}},
+          "1": {"ENV": {"NODE_ID": "second"}},
+        },
+      })
+
+  def test_per_node_config_rejects_normalized_nested_alias(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "Nested .* overlays"):
+      plugin._normalize_per_node_config({
+        "byIndex": {"0": {"PerNodeConfig": {}}},
+      })
+
   def test_log_redaction_masks_per_node_config_and_token_keys(self):
     plugin = make_deeploy_plugin()
 
