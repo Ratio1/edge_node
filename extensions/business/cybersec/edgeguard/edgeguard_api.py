@@ -5647,6 +5647,30 @@ class EdgeguardApiPlugin(BasePlugin):
         evidence_catalog=evidence_catalog,
       )
       if packet["execution"]["truncated"]:
+        if self._active_explanation_strategy() == "insight_brief":
+          result = egx2.run_insight_brief(
+            question=request,
+            graph=packet.get("graph") or {},
+            model=getattr(self, "cfg_edgeguard_explanation_model", None),
+            provider_call=self._call_graph_first_provider,
+            allow_model=False,
+            deterministic_reason="transport_truncated",
+          )
+          return self._bounded_graph_first_success({
+            "status": STATUS_OK,
+            "ok": True,
+            "executed": True,
+            "explained": False,
+            "packet": dict(packet),
+            "packet_meta": dict(packet_meta),
+            "result_digest": dict(digest),
+            "case_explanation": result["case_explanation"],
+            "explanation_trace": result["explanation_trace"],
+            "validation": analysis,
+            "live_retry": dict(live_retry),
+            "provider": "local",
+            "model": getattr(self, "cfg_edgeguard_explanation_model", None),
+          })
         failure = self._graph_first_failure_transport(
           GraphFirstRuntimeError(
             "transport_truncated",

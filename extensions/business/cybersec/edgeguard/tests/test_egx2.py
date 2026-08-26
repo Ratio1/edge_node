@@ -161,3 +161,19 @@ class Egx2GateTests(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class Egx2TruncationTests(unittest.TestCase):
+  def test_deterministic_reason_skips_model_and_carries_safe_code(self):
+    def provider(payload):
+      raise AssertionError("model must not be called for a truncated result")
+
+    result = egx2.run_insight_brief(
+      question="q", graph=sample_graph(), model=None, provider_call=provider,
+      deterministic_reason="transport_truncated",
+    )
+    case = result["case_explanation"]
+    self.assertEqual(case["provenance"]["mode"], "deterministic_fallback")
+    self.assertIn("transport row cap", case["assessment"]["text"])
+    outcome = result["explanation_trace"]["outcome"]
+    self.assertEqual(outcome, {"status": "fallback", "attempted_calls": 0, "completed_calls": 0, "safe_code": "transport_truncated"})

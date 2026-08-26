@@ -223,6 +223,15 @@ def _trace(calls: list[Mapping[str, Any]], status: str, safe_code: Optional[str]
   }
 
 
+DETERMINISTIC_REASON_TEXTS = {
+  "transport_truncated": (
+    "Deterministic brief: the transport row cap was reached before result "
+    "exhaustion, so the model was not consulted; the precomputed insights "
+    "below summarize the transported rows only."
+  ),
+}
+
+
 def run_insight_brief(
   *,
   question: str,
@@ -230,9 +239,18 @@ def run_insight_brief(
   model: Optional[str],
   provider_call: Callable[[Mapping[str, Any]], Mapping[str, Any]],
   allow_model: bool = True,
+  deterministic_reason: Optional[str] = None,
 ) -> dict[str, Any]:
   sheet = insights.build_insight_sheet(graph)
   substantive = [ins for ins in sheet if ins.get("kind") != "confidence"]
+  if deterministic_reason is not None:
+    text = DETERMINISTIC_REASON_TEXTS.get(
+      deterministic_reason,
+      "Deterministic brief: the model was not consulted; the precomputed "
+      "insights below summarize the result verbatim.",
+    )
+    case = _deterministic_case(sheet, graph, "deterministic_fallback", text)
+    return {"case_explanation": case, "explanation_trace": _trace([], "fallback", deterministic_reason)}
   if not substantive:
     case = _deterministic_case(
       sheet, graph, "deterministic_no_pattern",
