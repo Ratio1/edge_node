@@ -57,6 +57,7 @@ from .graph_first_runtime import (
 )
 from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_result_digest
 from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
+from . import egx2
 
 try:
   from neo4j import GraphDatabase
@@ -801,6 +802,27 @@ def _analyst_brief_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, 
       "row_limit": mode_plan.row_limit,
       "map_call_cap": 0,
       "max_tokens": ANALYST_BRIEF_MAX_TOKENS,
+    },
+  }
+
+
+def _insight_brief_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, Any]:
+  return {
+    "schema_version": "edgeguard.result_digest_prepare.v1",
+    "profile_id": egx2.PROFILE_ID,
+    "profile_sha256": egx2.PROFILE_SHA256,
+    "result_digest_schema_version": "edgeguard.result_digest.v1",
+    "digest_coverage_schema_version": DIGEST_COVERAGE_SCHEMA_VERSION,
+    "case_explanation_schema_version": egx2.CASE_EXPLANATION_VERSION,
+    "explanation_trace_schema_version": egx2.TRACE_VERSION,
+    "strategy": egx2.STRATEGY,
+    "max_tokens": egx2.MAX_TOKENS,
+    "resolved_mode": None if mode_plan is None else {
+      "requested": mode_plan.mode,
+      "effective": mode_plan.mode,
+      "row_limit": mode_plan.row_limit,
+      "map_call_cap": 0,
+      "max_tokens": egx2.MAX_TOKENS,
     },
   }
 
@@ -2972,6 +2994,10 @@ _CONFIG = {
   "EDGEGUARD_EXPLANATION_TOP_P": 1.0,
   "EDGEGUARD_EXPLANATION_OUTPUT_MODE": None,
   "EDGEGUARD_EXPLANATION_STRATEGY": "one_call",
+  # Admission floor for the EGX/2 insight-brief model call: skip the model (and
+  # degrade deterministically) unless this much request budget remains. Sized
+  # from the measured GPU-serving throughput; re-measure on hardware change.
+  "EDGEGUARD_INSIGHT_BRIEF_ADMISSION_SECONDS": 240,
   "EDGEGUARD_GENERATION_WORKERS": {
     FINETUNED_MODEL_KEY: {
       "SEMAPHORE": "edgeguard_llm_finetuned",
@@ -3869,7 +3895,7 @@ class EdgeguardApiPlugin(BasePlugin):
 
   def _active_explanation_strategy(self) -> str:
     value = getattr(self, "cfg_edgeguard_explanation_strategy", "one_call")
-    return value if value in {"one_call", "eel_compatibility"} else "one_call"
+    return value if value in {"one_call", "eel_compatibility", "insight_brief"} else "one_call"
 
   def _run_digest_analyst_brief(
     self,
@@ -4010,6 +4036,54 @@ class EdgeguardApiPlugin(BasePlugin):
         "provider": "local",
         "model": getattr(self, "cfg_edgeguard_explanation_model", None),
       })
+
+  def _run_insight_brief(
+    self,
+    *,
+    digest: Mapping[str, Any],
+    packet: Mapping[str, Any],
+    packet_meta: Mapping[str, Any],
+    validation: Optional[Mapping[str, Any]],
+    live_retry: Mapping[str, Any],
+    request: str,
+    deadline: float,
+  ) -> Dict[str, Any]:
+    graph = packet.get("graph") or {}
+    allow_model = bool(graph.get("nodes")) and digest.get("counts", {}).get("returned_rows") != 0
+    if allow_model:
+      try:
+        _explanation_url, explanation_err = self._explanation_url()
+      except Exception:
+        explanation_err = "EdgeGuard explanation model is not configured"
+      if explanation_err or not self._explanation_worker_ready():
+        allow_model = False
+      else:
+        admission = getattr(self, "cfg_edgeguard_insight_brief_admission_seconds", 240)
+        if deadline - time.monotonic() < admission:
+          allow_model = False
+    result = egx2.run_insight_brief(
+      question=request,
+      graph=graph,
+      model=getattr(self, "cfg_edgeguard_explanation_model", None),
+      provider_call=self._call_graph_first_provider,
+      allow_model=allow_model,
+    )
+    outcome_status = result["explanation_trace"].get("outcome", {}).get("status")
+    return self._bounded_graph_first_success({
+      "status": STATUS_OK,
+      "ok": True,
+      "executed": True,
+      "explained": outcome_status == "supported",
+      "packet": dict(packet),
+      "packet_meta": dict(packet_meta),
+      "result_digest": dict(digest),
+      "case_explanation": result["case_explanation"],
+      "explanation_trace": result["explanation_trace"],
+      "validation": validation,
+      "live_retry": dict(live_retry),
+      "provider": "local",
+      "model": getattr(self, "cfg_edgeguard_explanation_model", None),
+    })
 
   def _digest_only_success(
     self,
@@ -4487,10 +4561,19 @@ class EdgeguardApiPlugin(BasePlugin):
       "neo4j_bolt_over_wss_available": GraphDatabase is not None and websocket is not None,
       "neo4j": self._neo4j_default_connection_status(),
       "live_empty_result_broadening": bool(self.cfg_live_empty_result_broadening),
+      "explanation_strategy": self._active_explanation_strategy(),
       "graph_explanation": {
         "profile_id": PROFILE_ID,
         "candidate_id": CANDIDATE_ID,
         "profile_sha256": PROFILE_SHA256,
+      },
+      "insight_brief": {
+        "profile_id": egx2.PROFILE_ID,
+        "profile_sha256": egx2.PROFILE_SHA256,
+        "case_explanation_schema_version": egx2.CASE_EXPLANATION_VERSION,
+        "explanation_trace_schema_version": egx2.TRACE_VERSION,
+        "catalog_sha256": egx2.CATALOG_SHA256,
+        "max_tokens": egx2.MAX_TOKENS,
       },
       "metrics": {
         "total_requests": self._request_count,
@@ -4561,6 +4644,16 @@ class EdgeguardApiPlugin(BasePlugin):
         "explanation_trace_schema_version": TRACE_VERSION,
         "selection_status": "selected_egm_043",
         "expected_output": "strict map and synthesis JSON objects with canonical alias citations",
+      },
+      "insight_brief": {
+        "profile_id": egx2.PROFILE_ID,
+        "profile_sha256": egx2.PROFILE_SHA256,
+        "strategy": egx2.STRATEGY,
+        "output_schema_version": egx2.CASE_EXPLANATION_VERSION,
+        "explanation_trace_schema_version": egx2.TRACE_VERSION,
+        "catalog_sha256": egx2.CATALOG_SHA256,
+        "max_tokens": egx2.MAX_TOKENS,
+        "expected_output": "typed BLUF analyst brief JSON narrating the deterministic insight sheet",
       },
     }
 
@@ -4891,9 +4984,13 @@ class EdgeguardApiPlugin(BasePlugin):
     result: Mapping[str, Any],
     mode_plan: Optional[ModePlan] = None,
   ) -> Dict[str, Any]:
-    if self._active_explanation_strategy() == "one_call":
+    strategy = self._active_explanation_strategy()
+    if strategy in {"one_call", "insight_brief"}:
       public = dict(result)
-      contract = _analyst_brief_prepare_contract(mode_plan)
+      if strategy == "insight_brief":
+        contract = _insight_brief_prepare_contract(mode_plan)
+      else:
+        contract = _analyst_brief_prepare_contract(mode_plan)
       if mode_plan is not None and isinstance(public.get("explanation_mode"), Mapping):
         public["explanation_mode"] = dict(contract["resolved_mode"])
       return {**public, "explanation_contract": contract}
@@ -5062,7 +5159,7 @@ class EdgeguardApiPlugin(BasePlugin):
     plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
     if not plan.get("ok"):
       return self._with_active_prepare_contract(plan, mode_plan)
-    if self._active_explanation_strategy() != "one_call":
+    if self._active_explanation_strategy() == "eel_compatibility":
       try:
         self._graph_first_token_counter()
       except GraphFirstRuntimeError as exc:
@@ -5137,6 +5234,16 @@ class EdgeguardApiPlugin(BasePlugin):
       strategy=plan["broadening"].get("strategy") if broadened else None,
       broadening_cypher=plan["broadening"].get("cypher") if broadened else None,
     )
+    if self._active_explanation_strategy() == "insight_brief":
+      return self._run_insight_brief(
+        digest=digest,
+        packet=packet,
+        packet_meta=packet_meta,
+        validation=plan.get("validation"),
+        live_retry=live_retry,
+        request=request,
+        deadline=deadline,
+      )
     if self._active_explanation_strategy() == "one_call":
       return self._run_digest_analyst_brief(
         digest=digest,
@@ -5288,7 +5395,7 @@ class EdgeguardApiPlugin(BasePlugin):
         top_p=top_p,
         max_tokens=max_tokens,
       )
-      if self._active_explanation_strategy() != "one_call":
+      if self._active_explanation_strategy() == "eel_compatibility":
         self._graph_first_token_counter()
     except (GraphFirstContractError, GraphFirstRuntimeError) as exc:
       code = exc.code
@@ -5312,7 +5419,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": "Cypher rejected by EdgeGuard guard; graph explanation was not executed.",
       }
 
-    if self._active_explanation_strategy() != "one_call":
+    if self._active_explanation_strategy() == "eel_compatibility":
       try:
         _explanation_url, explanation_err = self._explanation_url()
       except Exception:
@@ -5559,6 +5666,16 @@ class EdgeguardApiPlugin(BasePlugin):
           packet_meta=packet_meta,
           validation=analysis,
           live_retry=live_retry,
+        )
+      if self._active_explanation_strategy() == "insight_brief":
+        return self._run_insight_brief(
+          digest=digest,
+          packet=packet,
+          packet_meta=packet_meta,
+          validation=analysis,
+          live_retry=live_retry,
+          request=request,
+          deadline=deadline,
         )
       if self._active_explanation_strategy() == "one_call":
         return self._run_digest_analyst_brief(
