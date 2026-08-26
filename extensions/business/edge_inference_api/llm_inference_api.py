@@ -786,6 +786,12 @@ class LLMInferenceApiPlugin(BasePlugin):
         jeeves_content['REPETITION_PENALTY'] = repeat_penalty
       jeeves_content.pop('REPEAT_PENALTY', None)
       jeeves_content.pop('MODEL', None)
+      # Preserve the requested model as a routing tag: every LLM serving sees
+      # every 'LLM' request, so without this tag whichever serving polls first
+      # executes the request regardless of the model the caller asked for.
+      target_model = request_parameters.get('model')
+      if isinstance(target_model, str) and target_model.strip():
+        jeeves_content['TARGET_MODEL_KEY'] = target_model.strip()
       jeeves_content[LlmCT.REQUEST_ID] = request_id
       jeeves_content[LlmCT.REQUEST_TYPE] = 'LLM'
       return {

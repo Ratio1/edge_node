@@ -450,6 +450,18 @@ class BaseLlmServing(
       self.P(f"[DEBUG]No jeeves content found in input: {self.shorten_str(input_dict)}", color='y')
       return False
     self.P(f"[DEBUG]Extracted jeeves content for relevance check: {self.shorten_str(jeeves_content)}", color='g')
+    # Model-targeted requests are only relevant to the serving whose configured
+    # MODEL_API_KEY matches; untagged requests keep the legacy any-serving
+    # behavior, and servings without a model key accept everything.
+    target_model_key = jeeves_content.get('TARGET_MODEL_KEY')
+    own_model_key = getattr(self, 'cfg_model_api_key', None)
+    if (
+      isinstance(target_model_key, str) and target_model_key
+      and isinstance(own_model_key, str) and own_model_key
+      and target_model_key != own_model_key
+    ):
+      self.P(f"[DEBUG]Skipping request targeted at model '{target_model_key}' (this serving is '{own_model_key}')", color='y')
+      return False
     return self.check_supported_request_type(message_data=jeeves_content)
 
   def process_predict_kwargs(self, predict_kwargs: dict):

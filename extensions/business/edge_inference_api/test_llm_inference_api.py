@@ -186,6 +186,20 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(payload["JEEVES_CONTENT"]["FREQUENCY_PENALTY"], 0.2)
     self.assertNotIn("MODEL", payload["JEEVES_CONTENT"])
     self.assertNotIn("REPEAT_PENALTY", payload["JEEVES_CONTENT"])
+    self.assertEqual(payload["JEEVES_CONTENT"]["TARGET_MODEL_KEY"], "llama_cpp_small")
+
+  def test_compute_payload_kwargs_without_model_has_no_target_key(self):
+    plugin = LLMInferenceApiPlugin()
+    payload = plugin.compute_payload_kwargs_from_predict_params(
+      request_id="req-nm",
+      request_data={
+        "parameters": {
+          "messages": [{"role": "user", "content": "hello"}],
+          "max_tokens": 16,
+        }
+      },
+    )
+    self.assertNotIn("TARGET_MODEL_KEY", payload["JEEVES_CONTENT"])
 
   def test_filter_valid_inference_accepts_lowercase_request_id(self):
     plugin = LLMInferenceApiPlugin()
