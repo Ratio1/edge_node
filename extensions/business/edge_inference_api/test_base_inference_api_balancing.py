@@ -171,6 +171,9 @@ class _FakeBasePlugin:
   def dataapi_struct_data_inferences(self):
     return []
 
+  def dataapi_struct_datas_inferences(self):
+    return {}
+
   def create_postponed_request(self, solver_method=None, method_kwargs=None):
     return {
       "postponed": True,
@@ -271,19 +274,20 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     }
     return plugin
 
-  def test_process_handles_every_aligned_struct_data_inference(self):
+  def test_process_dispatches_structured_inferences_via_handle_structured_inference_batch(self):
     plugin = self._make_plugin()
-    handled = []
-    plugin.dataapi_struct_datas = lambda: {
+    data = {
       0: {"slot": "startup-placeholder"},
       1: {"slot": "completed-request"},
     }
-    plugin.dataapi_struct_datas_inferences = lambda: {
+    inferences_by_model = {
       "fake-engine": [
         {"IS_VALID": False, "text": ""},
         {"IS_VALID": True, "REQUEST_ID": "req-live", "text": "MATCH (n) RETURN n"},
       ],
     }
+    plugin.dataapi_struct_datas = lambda: data
+    plugin.dataapi_struct_datas_inferences = lambda: inferences_by_model
     plugin.maybe_refresh_metrics = lambda: None
     plugin._publish_capacity_record = lambda: None
     plugin._poll_delegated_results = lambda: None
@@ -295,15 +299,14 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     plugin._cleanup_balancing_state = lambda: None
     plugin.cleanup_expired_requests = lambda: None
     plugin.maybe_save_persistence_data = lambda: None
-    plugin.handle_inferences = lambda inferences, data=None: handled.append((inferences, data))
+    calls = []
+    plugin._handle_structured_inference_batch = (  # pylint: disable=protected-access
+      lambda inferences_by_model, data=None: calls.append((inferences_by_model, data))
+    )
 
     plugin.process()
 
-    self.assertEqual(len(handled), 2)
-    self.assertEqual(handled[0][0][0]["IS_VALID"], False)
-    self.assertEqual(handled[0][1], [{"slot": "startup-placeholder"}])
-    self.assertEqual(handled[1][0][0]["REQUEST_ID"], "req-live")
-    self.assertEqual(handled[1][1], [{"slot": "completed-request"}])
+    self.assertEqual(calls, [(inferences_by_model, data)])
 
   def test_capacity_publish_uses_soft_state_cstore_options(self):
     plugin = self._make_plugin(
@@ -496,6 +499,14 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertLessEqual(due_seconds, 420.0)
     self.assertEqual(due_seconds, plugin._get_capacity_refresh_due_seconds())  # pylint: disable=protected-access
 
+  def test_capacity_record_advertises_instance_capabilities(self):
+    plugin = self._make_plugin()
+    plugin._get_balancing_capabilities = lambda: {"models": ["model-a"]}  # pylint: disable=protected-access
+
+    record = plugin._build_capacity_record_snapshot()  # pylint: disable=protected-access
+
+    self.assertEqual(record["capabilities"], {"models": ["model-a"]})
+
   def test_select_execution_peer_prefers_highest_capacity_free_and_ignores_stale(self):
     plugin = self._make_plugin()
     plugin.chainstore_hgetall_values[plugin._capacity_hkey()] = {
@@ -560,6 +571,50 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     selected = plugin._select_execution_peer()  # pylint: disable=protected-access
 
     self.assertEqual(selected["instance_id"], "inst-b")
+
+  def test_requested_capability_skips_local_and_filters_remote_peers(self):
+    plugin = self._make_plugin()
+    plugin._can_execute_request = (  # pylint: disable=protected-access
+      lambda request_data: request_data["parameters"].get("model") == "model-local"
+    )
+    plugin._capacity_record_can_execute_request = (  # pylint: disable=protected-access
+      lambda record, request_data: request_data["parameters"].get("model")
+      in (record.get("capabilities") or {}).get("models", [])
+    )
+    plugin.chainstore_hgetall_values[plugin._capacity_hkey()] = {
+      "wrong-model": {
+        "ee_addr": "peer-wrong",
+        "instance_id": "wrong",
+        "balancer_group": plugin._normalize_balancing_group(),
+        "signature": plugin.get_signature(),
+        "capacity_free": 5,
+        "capabilities": {"models": ["model-other"]},
+        "updated_at": plugin.time(),
+      },
+      "requested-model": {
+        "ee_addr": "peer-model-b",
+        "instance_id": "model-b",
+        "balancer_group": plugin._normalize_balancing_group(),
+        "signature": plugin.get_signature(),
+        "capacity_free": 1,
+        "capabilities": {"models": ["model-b"]},
+        "updated_at": plugin.time(),
+      },
+    }
+    request_id, request_data = plugin.register_request(
+      subject="anonymous",
+      parameters={"model": "model-b"},
+    )
+
+    scheduled = plugin._attempt_schedule_request(  # pylint: disable=protected-access
+      request_id=request_id,
+      request_data=request_data,
+      endpoint_name="predict",
+    )
+
+    self.assertTrue(scheduled)
+    self.assertEqual(request_data["execution_mode"], "delegated")
+    self.assertEqual(request_data["delegation_target_addr"], "peer-model-b")
 
   def test_write_delegated_request_targets_only_executor(self):
     plugin = self._make_plugin()
@@ -1026,6 +1081,22 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
         owned_request_id: {"request_id": owned_request_id, "metadata": {"source": "owned"}},
       },
     )
+
+  def test_structured_inference_batch_keeps_owned_result_after_irrelevant_input(self):
+    plugin = self._make_plugin()
+    handled = []
+    plugin.handle_inferences = lambda inferences, data: handled.append((inferences, data))
+    inputs = [{"kind": "unrelated"}, {"request_id": "owned-1"}]
+    inferences = {
+      "fake-engine": [
+        {"IS_VALID": False, "text": ""},
+        {"IS_VALID": True, "REQUEST_ID": "owned-1", "text": "done"},
+      ],
+    }
+
+    plugin._handle_structured_inference_batch(inferences, data=inputs)  # pylint: disable=protected-access
+
+    self.assertEqual(handled, [(inferences["fake-engine"], inputs)])
 
 
 if __name__ == "__main__":

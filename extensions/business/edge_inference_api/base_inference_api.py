@@ -589,6 +589,28 @@ class BaseInferenceApiPlugin(
     """
     return self._get_capacity_free() > 0
 
+  def _get_balancing_capabilities(self):
+    """Return stable capabilities advertised to balancing peers.
+
+    Subclasses may expose request-relevant capabilities such as model ids.
+    Values must remain JSON serializable because capacity records are stored in
+    ChainStore.
+
+    Returns
+    -------
+    dict
+      Capability fields for the current plugin instance.
+    """
+    return {}
+
+  def _can_execute_request(self, request_data):
+    """Return whether the current instance can satisfy a tracked request."""
+    return True
+
+  def _capacity_record_can_execute_request(self, record, request_data):
+    """Return whether a peer capacity record can satisfy a tracked request."""
+    return True
+
   def _decrement_active_requests(self):
     """Decrease the active request metric without allowing underflow.
 
@@ -750,6 +772,7 @@ class BaseInferenceApiPlugin(
       'capacity_used': capacity_used,
       'capacity_free': capacity_free,
       'max_cstore_bytes': self._get_max_cstore_bytes(),
+      'capabilities': self._get_balancing_capabilities(),
       # Keep both fields: capacity_free is numeric slot availability, while
       # accepting_requests is admission/readiness policy and may be false even
       # when slots are physically free, e.g. during serving cold start.
@@ -1069,7 +1092,7 @@ class BaseInferenceApiPlugin(
       target_peer=effective_target,
     )
 
-  def _select_execution_peer(self):
+  def _select_execution_peer(self, request_data=None):
     """Select an eligible peer for delegated execution.
 
     Returns
@@ -1091,6 +1114,8 @@ class BaseInferenceApiPlugin(
       if record.get('balancer_group') != self._normalize_balancing_group():
         continue
       if record.get('signature') != self.get_signature():
+        continue
+      if not self._capacity_record_can_execute_request(record, request_data):
         continue
       updated_at = record.get('updated_at')
       if not isinstance(updated_at, (int, float)):
@@ -1407,12 +1432,12 @@ class BaseInferenceApiPlugin(
     """
     if self._is_request_terminal(request_data):
       return True
-    if self._can_accept_execution():
+    if self._can_accept_execution() and self._can_execute_request(request_data):
       if not self._reserve_execution_slot(request_id):
         return False
       request_data['execution_mode'] = 'local'
       return self._dispatch_local_request(request_id=request_id, request_data=request_data)
-    target_record = self._select_execution_peer()
+    target_record = self._select_execution_peer(request_data=request_data)
     if not target_record:
       return False
     delegation_id, err = self._write_delegated_request(
@@ -2239,6 +2264,28 @@ class BaseInferenceApiPlugin(
         continue
       owned_payloads.setdefault(request_id, payload)
     return owned_payloads
+
+  def _handle_structured_inference_batch(self, inferences_by_model, data=None):
+    """Handle every structured inference in the current capture batch.
+
+    Loopback captures may prepend unrelated structured payloads to the API
+    request. Reading only structured-data index zero can therefore discard the
+    owned inference even though the serving process completed it.
+
+    Parameters
+    ----------
+    inferences_by_model : dict[str, list[dict]] or None
+      Structured inference lists keyed by serving process.
+    data : list[dict] or None, optional
+      Structured inputs aligned with each model's inference list.
+    """
+    if not isinstance(inferences_by_model, dict):
+      return
+    for model_inferences in inferences_by_model.values():
+      if not isinstance(model_inferences, list):
+        continue
+      self.handle_inferences(inferences=model_inferences, data=data)
+    return
 
   def _setup_semaphore_env(self):
     """
@@ -3100,6 +3147,9 @@ class BaseInferenceApiPlugin(
         request_data['delegation_expires_at'] = delegation_context.get('expires_at')
 
       if force_local_execution:
+        if not self._can_execute_request(request_data):
+          self._fail_request(request_id, 'Executor cannot satisfy the request capabilities.')
+          return request_data['result']
         if not self._reserve_execution_slot(request_id):
           self._fail_request(request_id, 'Executor has no free capacity.')
           return request_data['result']
@@ -3121,10 +3171,13 @@ class BaseInferenceApiPlugin(
               error_message='Inference API pending queue is full.',
             )
       else:
-        self._dispatch_local_request(
-          request_id=request_id,
-          request_data=request_data,
-        )
+        if self._can_execute_request(request_data):
+          self._dispatch_local_request(
+            request_id=request_id,
+            request_data=request_data,
+          )
+        else:
+          self._fail_request(request_id, 'Local instance cannot satisfy the request capabilities.')
 
       if delegated_execution or force_local_execution:
         return request_data
@@ -3184,16 +3237,12 @@ class BaseInferenceApiPlugin(
       self._schedule_pending_requests()
       self._retry_same_peer_delegations()
       self._last_balancing_mailbox_poll = now_ts
-    data_by_index = self.dataapi_struct_datas()
+    data = self.dataapi_struct_datas()
     inferences_by_model = self.dataapi_struct_datas_inferences()
-    if isinstance(data_by_index, dict) and isinstance(inferences_by_model, dict):
-      for data_index, input_data in data_by_index.items():
-        aligned_inferences = []
-        for model_inferences in inferences_by_model.values():
-          if isinstance(model_inferences, (list, tuple)) and data_index < len(model_inferences):
-            aligned_inferences.append(model_inferences[data_index])
-        aligned_data = [input_data] * len(aligned_inferences)
-        self.handle_inferences(inferences=aligned_inferences, data=aligned_data)
+    self._handle_structured_inference_batch(
+      inferences_by_model=inferences_by_model,
+      data=data,
+    )
     self._reconcile_requests()
     self._publish_executor_results()
     self._cleanup_balancing_state()

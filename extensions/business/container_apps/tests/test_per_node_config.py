@@ -46,6 +46,32 @@ class TestContainerRunnerPerNodeConfig(unittest.TestCase):
     self.assertEqual(plugin.config_data["CONTAINER_START_COMMAND"], ["start-node-b"])
     self.assertNotIn("PER_NODE_CONFIG", plugin.config_data)
 
+  def test_container_runner_canonicalizes_overlay_keys(self):
+    plugin = make_runner()
+    plugin.config_data = {
+      "CHAINSTORE_PEERS": ["0xai_node_b"],
+      "ENV": {"BASE": "1"},
+      "PER_NODE_CONFIG": {
+        "byNode": {
+          "0xai_node_b": {"env": {"NODE": "2"}},
+        },
+      },
+    }
+
+    self.assertTrue(plugin._apply_per_node_config())
+    self.assertEqual(plugin.config_data["ENV"], {"BASE": "1", "NODE": "2"})
+    self.assertNotIn("env", plugin.config_data)
+
+  def test_container_runner_rejects_overlay_key_case_collisions(self):
+    plugin = make_runner()
+
+    with self.assertRaisesRegex(ValueError, "duplicate normalized key 'ENV'"):
+      plugin._normalize_per_node_config({
+        "byNode": {
+          "0xai_node_b": {"ENV": {}, "env": {}},
+        },
+      })
+
   def test_container_runner_accepts_compact_node_selector(self):
     plugin = make_runner(node_addr="0xai_node_b")
     plugin.config_data = {
@@ -217,6 +243,17 @@ class TestContainerRunnerPerNodeConfig(unittest.TestCase):
 
     with self.assertRaisesRegex(ValueError, "IMAGE"):
       plugin._apply_per_node_config()
+
+  def test_per_node_config_rejects_one_shot_commands(self):
+    plugin = make_runner()
+
+    for command_key in ("INSTANCE_COMMAND", "INSTANCE_COMMAND_LAST"):
+      with self.subTest(command_key=command_key), self.assertRaisesRegex(
+        ValueError, "system-managed"
+      ):
+        plugin._normalize_per_node_config({
+          "byNode": {"0xai_node_b": {command_key.lower(): {"COMMAND": "RESTART"}}},
+        })
 
 
 if __name__ == "__main__":
