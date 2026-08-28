@@ -64,7 +64,10 @@ _REDACTIONS = (
   (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"), "bearer [REDACTED]"),
   (
     re.compile(
-      r"(?i)\b(authorization|"
+      # `(?<![A-Za-z0-9])` rather than `\b`: an underscore is a word character,
+      # so `\b` could never match after one and every `db_password=` /
+      # `jwt_secret=` style key escaped this rule entirely.
+      r"(?i)(?<![A-Za-z0-9])(authorization|"
       r"(?:api|access|refresh|session|client|auth|id|private|secret)[-_]?"
       r"(?:key|token|secret|id)|"
       r"apikey|token|session|secret|password|passwd|pwd)\b"
@@ -76,9 +79,15 @@ _REDACTIONS = (
   ),
   (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
   (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "[REDACTED_HEX]"),
+  # A token is distinguished from prose by an unbroken alphanumeric run, not by
+  # its alphabet. Admitting `-` and `_` without that requirement swallowed
+  # ordinary hyphenated titles, CSS class names and paths — which are exactly
+  # the content this evidence exists to compare between vantages.
   (
     re.compile(
-      r"(?<![A-Za-z0-9_+/\-])[A-Za-z0-9_+/\-]{32,}={0,2}"
+      r"(?<![A-Za-z0-9_+/\-])"
+      r"(?=[A-Za-z0-9_+/\-]*[A-Za-z0-9+/]{20,})"
+      r"[A-Za-z0-9_+/\-]{32,}={0,2}"
       r"(?![A-Za-z0-9_+/\-=])"
     ),
     "[REDACTED_B64]",
@@ -217,6 +226,31 @@ def redirect_stays_on_target(next_url, host, port):
   )
 
 
+def release_response_connection(response):
+  """
+  Break a streamed connection without waiting for the reader to finish.
+
+  `response.close()` acquires the same buffer lock the reader thread holds
+  inside `iter_content`, so against a peer that keeps dribbling bytes it blocks
+  well past any deadline — the read timeout never fires, because data keeps
+  arriving. Shutting the socket down instead makes the reader's blocked read
+  fail at once, after which it unwinds on its own and the connection can be
+  released normally by the caller's `finally`.
+  """
+  sock = getattr(getattr(response, "raw", None), "_connection", None)
+  sock = getattr(sock, "sock", None)
+  if sock is not None:
+    try:
+      sock.shutdown(socket.SHUT_RDWR)
+      return
+    except OSError:
+      pass
+  try:
+    response.close()
+  except Exception:
+    pass
+
+
 def read_bounded_response_body(response, max_bytes, max_seconds):
   """Read a streamed response without allowing a hostile peer to grow memory forever."""
   chunks = []
@@ -249,14 +283,13 @@ def read_bounded_response_body(response, max_bytes, max_seconds):
     it, so every exit path must call this rather than only setting the flag.
     """
     stopped.set()
-    # Drain before closing, not after: `response.close()` can itself block on
-    # the lock the reader holds inside `iter_content`, and a reader left
-    # blocked on a full queue would never be released if the close came first.
+    # Drain first: a reader blocked on the full queue must be released, and the
+    # connection teardown below is not guaranteed to reach it.
     try:
       events.get_nowait()
     except queue.Empty:
       pass
-    response.close()
+    release_response_connection(response)
 
   threading.Thread(target=_read, daemon=True).start()
 
@@ -471,6 +504,13 @@ class _ResponseFingerprintMixin:
 
       excerpt = sanitize_excerpt(body_text) if excerpt_allowed(content_type) else None
       return http, excerpt
+    except Exception as exc:
+      # Reading and reducing the body must not end the scan. This block is no
+      # longer safe-by-construction now that the body is streamed rather than
+      # buffered by requests, and an uncaught error here reaches execute_job's
+      # catch-all and skips every remaining phase.
+      self.P(f"Response fingerprint capture failed on {url}: {exc}", color='y')
+      return None, None
     finally:
       resp.close()
       session.close()

@@ -6,10 +6,13 @@ scoping that keeps the phase off non-comparison jobs, and the aggregation
 contract that keeps each vantage's evidence attributable to that vantage.
 """
 
+import socket
+import threading
 import unittest
 import time
 from unittest.mock import MagicMock, patch
 
+import requests
 from requests.structures import CaseInsensitiveDict
 
 from extensions.business.cybersec.red_mesh.worker import PentestLocalWorker
@@ -104,6 +107,31 @@ class TestExcerptSanitization(unittest.TestCase):
     blob = "0123456789_abcdefghijklmnopqrstuvwxyz-ABCDE"
     excerpt = sanitize_excerpt(f"state {blob} end")
     self.assertNotIn(blob, excerpt)
+
+  def test_ordinary_prose_and_markup_survive_redaction(self):
+    # Titles and excerpts are the divergence signal. If hyphenated prose is
+    # redacted, two vantages serving different content both record the same
+    # token and read as identical — a manufactured "no divergence".
+    intact = (
+      "Best-Laptops-For-Developers-2024-Review",
+      "user_profile_settings_page_header_title",
+      '<div class="container-fluid-main-wrapper-outer">',
+    )
+    for text in intact:
+      with self.subTest(text=text):
+        self.assertEqual(sanitize_excerpt(text), text)
+
+  def test_underscore_prefixed_credential_keys_are_redacted(self):
+    # `\b` cannot match after an underscore, so these keys escaped the
+    # key/value rule entirely and archived their values verbatim.
+    for pair, secret in (
+      ("db_password=Tr0ub4dor", "Tr0ub4dor"),
+      ("admin_password: letmein", "letmein"),
+      ("jwt_secret=hunter2", "hunter2"),
+      ("oauth_client_secret=cs_1", "cs_1"),
+    ):
+      with self.subTest(pair=pair):
+        self.assertNotIn(secret, sanitize_excerpt(pair))
 
   def test_redaction_precedes_truncation(self):
     # A credential straddling the byte cap must not survive as a prefix.
@@ -221,6 +249,142 @@ class TestComparisonTierScoping(unittest.TestCase):
     worker = _make_worker(comparison_ports=[443])
     worker.state["response_evidence"] = {"target_host": "example.test", "ports": {}}
     self.assertIn("response_evidence", worker.get_status())
+
+
+class _DripServer:
+  """
+  A peer that declares a large body and then drips bytes forever.
+
+  Every other test in this file mocks the socket, which is why a close that
+  blocks against a real connection was invisible: a MagicMock's close() always
+  returns instantly. Behaviour against a real socket needs a real socket.
+  """
+
+  def __init__(self, interval=0.05, declared=10_000_000, headers=b""):
+    self.interval = interval
+    self._server = socket.socket()
+    self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    self._server.bind(("127.0.0.1", 0))
+    self._server.listen(1)
+    self.port = self._server.getsockname()[1]
+    self._headers = headers
+    self._declared = declared
+    self._stop = threading.Event()
+    threading.Thread(target=self._serve, daemon=True).start()
+
+  def _serve(self):
+    conn = None
+    try:
+      conn, _addr = self._server.accept()
+      conn.recv(65536)
+      conn.sendall(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+        b"Content-Length: %d\r\n%s\r\n" % (self._declared, self._headers)
+      )
+      while not self._stop.is_set():
+        conn.sendall(b"x")
+        time.sleep(self.interval)
+    except Exception:
+      pass
+    finally:
+      for sock in (conn, self._server):
+        try:
+          sock.close()
+        except Exception:
+          pass
+
+  def close(self):
+    self._stop.set()
+
+
+class TestRealSocketBounding(unittest.TestCase):
+  """The bounding guarantees, measured against a real connection."""
+
+  def test_a_slow_drip_peer_cannot_outlast_the_deadline(self):
+    server = _DripServer()
+    self.addCleanup(server.close)
+    response = requests.get(
+      f"http://127.0.0.1:{server.port}/", stream=True, timeout=30
+    )
+    self.addCleanup(response.close)
+
+    outcome = {}
+
+    def _read():
+      started = time.monotonic()
+      outcome["result"] = read_bounded_response_body(
+        response, max_bytes=RESPONSE_BODY_MAX_BYTES, max_seconds=1.0
+      )
+      outcome["elapsed"] = time.monotonic() - started
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    # Joined rather than called inline: if the deadline is not enforced this
+    # blocks forever, and a hanging suite is worse than a failing one.
+    reader.join(timeout=15)
+
+    self.assertFalse(
+      reader.is_alive(),
+      "read_bounded_response_body never returned; its wall-clock deadline is "
+      "not enforced against a peer that keeps dripping bytes",
+    )
+    self.assertLess(outcome["elapsed"], 5.0)
+    self.assertFalse(outcome["result"][1])
+
+
+class _StaticServer:
+  """Serves one complete response, then closes. Real socket, no mocks."""
+
+  def __init__(self, body, headers=b"Content-Type: text/html\r\n"):
+    self._server = socket.socket()
+    self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    self._server.bind(("127.0.0.1", 0))
+    self._server.listen(1)
+    self.port = self._server.getsockname()[1]
+    self._body = body
+    self._headers = headers
+    threading.Thread(target=self._serve, daemon=True).start()
+
+  def _serve(self):
+    conn = None
+    try:
+      conn, _addr = self._server.accept()
+      conn.recv(65536)
+      conn.sendall(
+        b"HTTP/1.1 200 OK\r\n%sContent-Length: %d\r\n\r\n"
+        % (self._headers, len(self._body))
+      )
+      conn.sendall(self._body)
+    except Exception:
+      pass
+    finally:
+      for sock in (conn, self._server):
+        try:
+          sock.close()
+        except Exception:
+          pass
+
+
+class TestRealSocketCapture(unittest.TestCase):
+  """End-to-end capture over a real connection, exercising the streaming path."""
+
+  def _capture(self, body, headers=b"Content-Type: text/html\r\n"):
+    server = _StaticServer(body, headers)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[server.port])
+    return worker._fingerprint_http("http", server.port)
+
+  def test_complete_response_is_captured_and_hashed(self):
+    http, excerpt = self._capture(b"<html><title>Acme Home</title>hello world</html>")
+    self.assertEqual(http["status"], 200)
+    self.assertTrue(http["body_complete"])
+    self.assertIsNotNone(http["body_sha256"])
+    self.assertEqual(http["title"], "Acme Home")
+    self.assertIn("hello world", excerpt)
+
+  def test_oversized_response_is_truncated_without_a_hash(self):
+    http, _excerpt = self._capture(b"a" * (RESPONSE_BODY_MAX_BYTES + 5000))
+    self.assertFalse(http["body_complete"])
+    self.assertIsNone(http["body_sha256"])
 
 
 class TestRedirectScopeGuard(unittest.TestCase):
