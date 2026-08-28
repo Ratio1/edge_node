@@ -10,6 +10,8 @@ import unittest
 import time
 from unittest.mock import MagicMock, patch
 
+from requests.structures import CaseInsensitiveDict
+
 from extensions.business.cybersec.red_mesh.worker import PentestLocalWorker
 from extensions.business.cybersec.red_mesh.worker.response_fingerprint import (
   EXCERPT_MAX_BYTES,
@@ -18,6 +20,7 @@ from extensions.business.cybersec.red_mesh.worker.response_fingerprint import (
   excerpt_allowed,
   normalize_content_type,
   read_bounded_response_body,
+  redirect_stays_on_target,
   resolve_host,
   sanitize_excerpt,
 )
@@ -220,6 +223,37 @@ class TestComparisonTierScoping(unittest.TestCase):
     self.assertIn("response_evidence", worker.get_status())
 
 
+class TestRedirectScopeGuard(unittest.TestCase):
+  """The guard must agree with the parser that actually dials the request."""
+
+  def test_guard_never_allows_a_hop_requests_would_dial_elsewhere(self):
+    # Parser differential: urlparse reads `http://10.0.0.1\@authorized/` as
+    # host=authorized (userinfo=10.0.0.1\), while urllib3 — which requests
+    # dials with — reads host=10.0.0.1. Trusting the wrong parser is a bypass.
+    import requests as _requests
+    from urllib3.util import parse_url
+
+    hostile = (
+      r"http://169.254.169.254\@127.0.0.1/latest/meta-data/",
+      r"https://169.254.169.254\@127.0.0.1:443/x",
+      r"http://127.0.0.1\@169.254.169.254/",
+      "http://127.0.0.1@169.254.169.254/",
+      r"http://169.254.169.254\t@127.0.0.1/",
+    )
+    for location in hostile:
+      with self.subTest(location=location):
+        allowed = redirect_stays_on_target(location, "127.0.0.1", 443)
+        dialed = parse_url(_requests.Request("GET", location).prepare().url).host
+        if allowed:
+          # If the guard permits the hop, the host that will actually be
+          # contacted must be the authorized target — no exceptions.
+          self.assertEqual(dialed, "127.0.0.1")
+
+  def test_guard_still_allows_the_legitimate_endpoint(self):
+    self.assertTrue(redirect_stays_on_target("https://127.0.0.1:443/next", "127.0.0.1", 443))
+    self.assertTrue(redirect_stays_on_target("https://127.0.0.1/next", "127.0.0.1", 443))
+
+
 class TestHttpCapture(unittest.TestCase):
 
   @staticmethod
@@ -229,7 +263,9 @@ class TestHttpCapture(unittest.TestCase):
     response.url = "https://example.test/"
     response.history = []
     response.encoding = "utf-8"
-    response.headers = {"Content-Type": "text/html", **headers}
+    # Real responses expose headers case-insensitively; a plain dict would let
+    # a test pass while production lookups (e.g. "location") miss.
+    response.headers = CaseInsensitiveDict({"Content-Type": "text/html", **headers})
     response.iter_content.return_value = [body]
     return response
 
@@ -352,6 +388,25 @@ class TestHttpCapture(unittest.TestCase):
     self.assertNotIn("hunter2", http["final_url"])
     self.assertNotIn("sk-live-abc123", http["final_url"])
     self.assertNotIn("sk-live-abc123", http["title"])
+
+  def test_captured_headers_are_scrubbed(self):
+    # A hop refused as off-target is kept as evidence, and its raw Location
+    # commonly carries a token in the query string.
+    redirect = self._response(
+      **{"Location": "https://elsewhere.test/cb?access_token=sk-live-zzz999"}
+    )
+    redirect.status_code = 302
+    redirect.url = "https://127.0.0.1:443/"
+    session = MagicMock()
+    session.get.side_effect = [redirect]
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
+    ):
+      http, _excerpt = worker._fingerprint_http("https", 443)
+
+    self.assertNotIn("sk-live-zzz999", http["headers"]["location"])
 
   def test_redirect_off_the_authorized_target_is_never_fetched(self):
     # A scanned target answering 302 -> cloud metadata must not make the edge

@@ -28,6 +28,7 @@ import time
 import requests
 from requests.compat import urljoin, urlparse
 from requests.models import DEFAULT_REDIRECT_LIMIT
+from urllib3.util import parse_url
 
 from ..constants import FINGERPRINT_HTTP_TIMEOUT, FINGERPRINT_TIMEOUT
 
@@ -187,17 +188,33 @@ def redirect_stays_on_target(next_url, host, port):
   or private — is out of scope by definition. Classifying the hop's IP would
   add nothing here and would break scanning private targets, which is a normal
   authorized case.
+
+  Both parsers must agree, because validating with either alone is bypassable.
+  This module reads a URL with `urlparse` while `requests` dials with urllib3's
+  `parse_url`, and the two split authority differently:
+  `http://169.254.169.254\\@authorized-host/` is host `authorized-host` to the
+  first and `169.254.169.254` to the second, so a guard trusting `urlparse`
+  would wave through a hop that fetches cloud metadata. Refusing on
+  disagreement fails closed against that whole class of parser differential
+  rather than against one spelling of it.
   """
-  parsed = urlparse(next_url)
-  if parsed.scheme not in ("http", "https"):
-    return False
-  if (parsed.hostname or "").lower() != (host or "").lower():
-    return False
   try:
-    hop_port = parsed.port
-  except ValueError:
+    stdlib = urlparse(next_url)
+    dialed = parse_url(next_url)
+    # `.port` raises on a malformed port; refuse rather than guess.
+    hop_ports = (stdlib.port, dialed.port)
+  except Exception:
     return False
-  return (hop_port or (443 if parsed.scheme == "https" else 80)) == port
+  scheme = (stdlib.scheme or "").lower()
+  if scheme not in ("http", "https"):
+    return False
+  expected_host = (host or "").lower()
+  hop_hosts = ((stdlib.hostname or "").lower(), (dialed.host or "").lower())
+  default_port = 443 if scheme == "https" else 80
+  return (
+    all(hop == expected_host for hop in hop_hosts)
+    and all((hop or default_port) == port for hop in hop_ports)
+  )
 
 
 def read_bounded_response_body(response, max_bytes, max_seconds):
@@ -427,8 +444,11 @@ class _ResponseFingerprintMixin:
         # and must not be treated as stable identity when comparing vantages.
         "body_complete": body_complete,
         "body_sha256": hashlib.sha256(body).hexdigest() if body_complete else None,
+        # Captured headers are archived too, and `location` routinely carries a
+        # token in its query string — especially on a hop refused as off-target,
+        # whose raw Location would otherwise be stored verbatim.
         "headers": {
-          name: resp.headers.get(name)
+          name: sanitize_excerpt(resp.headers.get(name))
           for name in CAPTURED_HEADERS
           if resp.headers.get(name)
         },
