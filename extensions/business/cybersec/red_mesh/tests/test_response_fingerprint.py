@@ -382,6 +382,8 @@ class TestHttpCapture(unittest.TestCase):
       "http://127.0.0.1:8080/admin",   # same host, unauthorized port
       "gopher://127.0.0.1:443/x",      # scheme outside http(s)
       "http://127.0.0.1:99999/x",      # unparseable port must not raise
+      "http://127.0.0.1@evil.test/",   # userinfo trick: real host is evil.test
+      "//evil.test/x",                 # protocol-relative escape
     )
     for location in off_scope:
       with self.subTest(location=location):
