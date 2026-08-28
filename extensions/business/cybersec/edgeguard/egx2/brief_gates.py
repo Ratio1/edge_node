@@ -166,10 +166,65 @@ def insight_coverage(brief, sheet, k=None):
     return True, f"covered {hit}/{k} top insights"
 
 
+_SUPERLATIVE_TERMS = {"lowest", "highest", "least", "most"}
+_COMPARATIVE_TERMS = {"lower", "higher", "greater", "smaller", "better", "worse"}
+_CONFIDENCE_COMPARATIVE = re.compile(
+    r"\b(lowest|highest|lower|higher|least|most|greater|smaller|better|worse)\b[^.!?]*\bconfidence\b"
+    r"|\bconfidence\b[^.!?]*\b(lowest|highest|lower|higher|least|most|greater|smaller|better|worse)\b",
+    re.IGNORECASE,
+)
+
+
+def confidence_comparisons(brief, sheet):
+    """Comparative/superlative confidence claims must be backed by the sheet's
+    per-member confidence values ("member source-data confidence mean") and
+    must match them: a superlative names the entity that actually holds the
+    extreme; a pairwise comparative respects the computed order. Anything the
+    sheet cannot verify is rejected (fail-closed)."""
+    groups = {}
+    for ins in sheet:
+        value = ins.get("group_confidence")
+        if isinstance(value, (int, float)) and ins.get("target"):
+            groups[str(ins["target"]).lower()] = float(value)
+    problems = []
+    for text in _brief_texts(brief):
+        for sentence in re.split(r"[.!?]", text):
+            m = _CONFIDENCE_COMPARATIVE.search(sentence)
+            if not m:
+                continue
+            term = (m.group(1) or m.group(2) or "").lower()
+            wants_min = term in {"lowest", "least", "lower", "smaller", "worse"}
+            if len(groups) < 2:
+                problems.append("comparative confidence claim without per-member confidence values in the sheet")
+                continue
+            lowered = sentence.lower()
+            named = sorted(
+                (name for name in groups if name in lowered),
+                key=lambda name: lowered.index(name),
+            )
+            if not named:
+                problems.append("comparative confidence claim names no sheet entity")
+            elif term in _SUPERLATIVE_TERMS:
+                extreme = min(groups, key=groups.get) if wants_min else max(groups, key=groups.get)
+                if extreme not in named:
+                    problems.append("claimed confidence extreme does not match the computed per-member values")
+            elif len(named) >= 2:
+                first, second = groups[named[0]], groups[named[1]]
+                ordered = first < second if wants_min else first > second
+                if not ordered:
+                    problems.append("pairwise confidence comparison contradicts the computed per-member values")
+            else:
+                problems.append("pairwise confidence comparison names fewer than two sheet entities")
+    if problems:
+        return False, "; ".join(sorted(set(problems))[:3])
+    return True, "no unbacked confidence comparisons"
+
+
 HARD_GATES = {
     "entity_linking": entity_linking,
     "insight_id_validity": insight_id_validity,
     "count_claims": count_claims,
+    "confidence_comparisons": confidence_comparisons,
 }
 ADVISORY_GATES = {
     "estimative_language": estimative_language,

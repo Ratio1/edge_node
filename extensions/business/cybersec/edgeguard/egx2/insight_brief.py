@@ -47,6 +47,10 @@ RETRY_NOTE_TEMPLATE = (
 PROFILE_MANIFEST = {
   "profile_id": PROFILE_ID,
   "strategy": STRATEGY,
+  # Bumped with deterministic insight-layer changes (primitives, sheet
+  # rendering, gate set) so the profile hash reflects notation changes even
+  # when the prompt text is unchanged.
+  "insights_version": 2,
   "case_explanation_schema_version": CASE_EXPLANATION_VERSION,
   "trace_schema_version": TRACE_VERSION,
   "catalog_sha256": fc.CATALOG_SHA256,

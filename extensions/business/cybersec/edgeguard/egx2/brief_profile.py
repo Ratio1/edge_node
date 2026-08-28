@@ -40,6 +40,9 @@ SYSTEM = (
     "not a report.\n"
     "- Set confidence.tier to the source-data-confidence tier stated in the sheet; do not change it. "
     "It reflects how sure the sources are of the data, not certainty in any judgment; say so.\n"
+    "- Compare confidence between entities ONLY when the sheet states per-member confidence values "
+    "(\"member source-data confidence mean\") for each entity you compare, and only as those numbers "
+    "read; never rank confidence otherwise.\n"
     "- Respond with exactly one JSON object of this shape and nothing else:\n"
     f"{BRIEF_SCHEMA_HINT}"
 )
@@ -65,17 +68,19 @@ def render_sheet(sheet):
         # dropped here so the model describes them by type and count and never
         # recites a 64-char hash - which also keeps the output within budget.
         named = [e for e in (ins.get("exemplars") or []) if fc.is_nameable_value(e)]
-        # Also allow the convergence target name as an example.
-        if ins.get("target") and fc.is_nameable_value(ins["target"]) and ins["target"] not in named:
-            named = [ins["target"]] + named
+        # The convergence/chain target is already quoted in the hint text and is
+        # citable from there; presenting it as a member "example" of its own
+        # group produced self-referential prose ("VirusTotal ... examples like
+        # VirusTotal"), so only real member names appear here.
         if named:
             dropped = len(ins.get("entities") or []) - len(named)
             more = f" (+{dropped} more)" if dropped > 0 else ""
             line += f" [examples: {', '.join(str(e) for e in named)}{more}]"
         else:
-            # No nameable examples: tell the model explicitly not to name anything
-            # for this insight (prevents inventing placeholder domains/CVEs).
-            line += " [no example names - describe by count and type only, name nothing]"
+            # No nameable member examples: the model may cite names quoted in
+            # the insight text itself, but must describe the members only by
+            # count and type (prevents inventing placeholder domains/CVEs).
+            line += " [members have no citable names - describe members by count and type; quoted names in the insight text may be cited]"
         lines.append(line)
     return "\n".join(lines)
 

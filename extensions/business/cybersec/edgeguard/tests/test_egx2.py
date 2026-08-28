@@ -177,3 +177,86 @@ class Egx2TruncationTests(unittest.TestCase):
     self.assertIn("transport row cap", case["assessment"]["text"])
     outcome = result["explanation_trace"]["outcome"]
     self.assertEqual(outcome, {"status": "fallback", "attempted_calls": 0, "completed_calls": 0, "safe_code": "transport_truncated"})
+
+
+def chain_graph():
+  nodes = [
+    {"id": f"i{k}", "labels": ["Indicator"], "properties": {"value": chr(97 + k) * 64, "indicator_type": "hash", "confidence_score": 0.3 + k * 0.1, "source": ["otx"]}}
+    for k in range(4)
+  ]
+  nodes += [
+    {"id": "m1", "labels": ["Malware"], "properties": {"name": "kyber", "confidence_score": 0.5, "source": ["otx"]}},
+    {"id": "s1", "labels": ["Source"], "properties": {"name": "AlienVault OTX", "confidence_score": 0.9, "source": ["otx", "misp"]}},
+  ]
+  rels = [
+    {"id": f"r{k}", "type": "INDICATES", "startNodeId": f"i{k}", "endNodeId": "m1", "properties": {}}
+    for k in range(4)
+  ] + [
+    {"id": f"q{k}", "type": "SOURCED_FROM", "startNodeId": f"i{k}", "endNodeId": "s1", "properties": {}}
+    for k in range(3)
+  ]
+  return {"nodes": nodes, "relationships": rels, "truncated": False}
+
+
+class Egx2InsightLayerV2Tests(unittest.TestCase):
+  def test_plural_verb_and_group_confidence(self):
+    sheet = insights.build_insight_sheet(chain_graph())
+    conv = [i for i in sheet if i["kind"] == "convergence"]
+    self.assertTrue(conv)
+    kyber = next(i for i in conv if i["target"] == "kyber")
+    self.assertIn("4 indicators indicate malware \"kyber\"", kyber["text_hint"])
+    self.assertIn("member source-data confidence mean", kyber["text_hint"])
+    self.assertIsInstance(kyber["group_confidence"], float)
+
+  def test_chain_primitive_stitches_two_hops(self):
+    sheet = insights.build_insight_sheet(chain_graph())
+    chains = [i for i in sheet if i["kind"] == "chain"]
+    self.assertEqual(len(chains), 1)
+    hint = chains[0]["text_hint"]
+    self.assertIn("3 indicators both indicate malware \"kyber\"", hint)
+    self.assertIn("sourced from source \"AlienVault OTX\"", hint)
+    self.assertEqual(chains[0]["count"], 3)
+
+  def test_render_sheet_does_not_use_target_as_member_example(self):
+    from extensions.business.cybersec.edgeguard.egx2 import brief_profile
+    sheet = insights.build_insight_sheet(chain_graph())
+    rendered = brief_profile.render_sheet(sheet)
+    self.assertNotIn("[examples: kyber", rendered)
+    self.assertIn("members have no citable names", rendered)
+
+
+class Egx2ConfidenceComparisonGateTests(unittest.TestCase):
+  def _brief_with_assessment(self, sheet, text):
+    brief = valid_brief(sheet)
+    brief["assessment"] = text
+    return brief
+
+  def test_unbacked_superlative_rejected(self):
+    sheet = insights.build_insight_sheet(sample_graph())  # single group -> no comparisons possible
+    brief = self._brief_with_assessment(sheet, "Malware quietsieve shows the lowest source-data confidence.")
+    passed, detail, tier = brief_gates.grade(brief, sheet)["confidence_comparisons"]
+    self.assertFalse(passed)
+    self.assertEqual(tier, "hard")
+
+  def test_backed_superlative_accepted_when_extreme_matches(self):
+    sheet = insights.build_insight_sheet(chain_graph())
+    groups = {i["target"]: i["group_confidence"] for i in sheet if "group_confidence" in i}
+    self.assertGreaterEqual(len(groups), 2)
+    lowest = min(groups, key=groups.get)
+    brief = self._brief_with_assessment(sheet, f"\"{lowest}\" shows the lowest member confidence.")
+    passed, detail, _ = brief_gates.grade(brief, sheet)["confidence_comparisons"]
+    self.assertTrue(passed, detail)
+
+  def test_backed_superlative_rejected_when_extreme_wrong(self):
+    sheet = insights.build_insight_sheet(chain_graph())
+    groups = {i["target"]: i["group_confidence"] for i in sheet if "group_confidence" in i}
+    highest = max(groups, key=groups.get)
+    brief = self._brief_with_assessment(sheet, f"\"{highest}\" shows the lowest member confidence.")
+    passed, detail, _ = brief_gates.grade(brief, sheet)["confidence_comparisons"]
+    self.assertFalse(passed)
+
+  def test_plain_tier_statement_passes(self):
+    sheet = insights.build_insight_sheet(sample_graph())
+    brief = self._brief_with_assessment(sheet, "Source-data confidence is low across the result.")
+    passed, _detail, _ = brief_gates.grade(brief, sheet)["confidence_comparisons"]
+    self.assertTrue(passed)

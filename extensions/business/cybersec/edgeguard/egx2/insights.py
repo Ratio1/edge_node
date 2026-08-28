@@ -104,6 +104,26 @@ def group_by_aggregation(graph):
 # P2: convergence / co-targeting (shared-neighbor >= 2, same source type)
 # --------------------------------------------------------------------------
 
+def _plural_verb(rel: str, count: int) -> str:
+    """`INDICATES` -> `indicate` for a plural subject; leaves phrases like
+    `sourced from` untouched (only a trailing `s` on the first word drops)."""
+    words = rel.lower().replace("_", " ").split()
+    if count > 1 and words and words[0].endswith("s") and not words[0].endswith("ss"):
+        words[0] = words[0][:-1]
+    return " ".join(words)
+
+
+def _member_confidence(members):
+    scores = [
+        fc.project(m).get("confidence_score")
+        for m in members
+    ]
+    scores = [s for s in scores if isinstance(s, (int, float))]
+    if not scores:
+        return None
+    return round(sum(scores) / len(scores), 2)
+
+
 def convergence(graph):
     idx = _node_index(graph)
     out = []
@@ -124,15 +144,71 @@ def convergence(graph):
         # aggregate; skip it here to avoid a duplicate insight.
         if fc.label_of(target) == "Sector":
             continue
-        verb = rel.lower().replace("_", " ")
+        verb = _plural_verb(rel, len(uniq))
+        hint = f"{len(uniq)} {src_label.lower()}s {verb} {fc.label_of(target).lower()} \"{_display(target)}\""
+        group_confidence = _member_confidence(uniq)
+        if group_confidence is not None:
+            hint += f" (member source-data confidence mean {group_confidence:.2f})"
         ins = _insight(
-            "convergence", "relationship",
-            f"{len(uniq)} {src_label.lower()}s {verb} {fc.label_of(target).lower()} \"{_display(target)}\"",
+            "convergence", "relationship", hint,
             [_display(s) for s in uniq],  # exemplars/others count sources only
             len(uniq), [s["id"] for s in uniq] + [target_id],
         )
         ins["target"] = _display(target)
+        if group_confidence is not None:
+            ins["group_confidence"] = group_confidence
         out.append(ins)
+    return out
+
+
+# --------------------------------------------------------------------------
+# P2b: shared-origin chains (two-hop corroboration through a common member)
+# --------------------------------------------------------------------------
+
+MAX_CHAIN_INSIGHTS = 3
+
+
+def shared_origin_chains(graph):
+    """Members that reach TWO distinct targets stitch a corroboration chain:
+    e.g. `8 indicators indicate malware "kyber" and are sourced from source
+    "AlienVault OTX"`. Deterministic co-occurrence over the packet graph."""
+    idx = _node_index(graph)
+    outgoing = {}
+    for r in graph.get("relationships", []):
+        s = r.get("startNodeId")
+        t = r.get("endNodeId")
+        if s not in idx or t not in idx:
+            continue
+        outgoing.setdefault(s, set()).add((r.get("type"), t))
+    combos = {}
+    for start, edges in outgoing.items():
+        edges = sorted(edges)
+        for i in range(len(edges)):
+            for j in range(i + 1, len(edges)):
+                (rel1, t1), (rel2, t2) = edges[i], edges[j]
+                if t1 == t2:
+                    continue
+                combos.setdefault((rel1, t1, rel2, t2), set()).add(start)
+    out = []
+    ranked = sorted(combos.items(), key=lambda kv: -len(kv[1]))
+    for (rel1, t1, rel2, t2), starts in ranked[:MAX_CHAIN_INSIGHTS]:
+        if len(starts) < 2:
+            continue
+        members = [idx[s] for s in sorted(starts)]
+        src_label = fc.label_of(members[0])
+        target1, target2 = idx[t1], idx[t2]
+        verb1 = _plural_verb(rel1, len(members))
+        verb2 = _plural_verb(rel2, len(members))
+        hint = (
+            f"{len(members)} {src_label.lower()}s both {verb1} "
+            f"{fc.label_of(target1).lower()} \"{_display(target1)}\" and {verb2} "
+            f"{fc.label_of(target2).lower()} \"{_display(target2)}\""
+        )
+        out.append(_insight(
+            "chain", "relationship", hint,
+            [_display(m) for m in members], len(members),
+            [m["id"] for m in members] + [t1, t2],
+        ))
     return out
 
 
@@ -280,7 +356,7 @@ def lookalike_intraset(graph):
     return out
 
 
-PRIMITIVES_CORE = [group_by_aggregation, convergence, tactic_spread, cve_notability, confidence_tier]
+PRIMITIVES_CORE = [group_by_aggregation, convergence, shared_origin_chains, tactic_spread, cve_notability, confidence_tier]
 PRIMITIVES_OPTIONAL = [lookalike_intraset]
 
 
@@ -291,7 +367,7 @@ def build_insight_sheet(graph, include_optional=True):
         insights.extend(prim(graph))
     # Stable ordering by a notability rank: convergence and KEV first, then
     # aggregates, then confidence last (it is the basis line, not a headline).
-    rank = {"convergence": 0, "kev": 1, "high_severity": 2, "lookalike": 3,
+    rank = {"convergence": 0, "chain": 1, "kev": 1, "high_severity": 2, "lookalike": 3,
             "tactic_spread": 4, "sector_targeting": 5, "indicator_type_breakdown": 6, "confidence": 9}
     insights.sort(key=lambda x: (rank.get(x["kind"], 7), -x["count"]))
     for i, ins in enumerate(insights):
