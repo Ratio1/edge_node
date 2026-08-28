@@ -26,7 +26,7 @@ import threading
 import time
 
 import requests
-from requests.compat import urljoin
+from requests.compat import urljoin, urlparse
 from requests.models import DEFAULT_REDIRECT_LIMIT
 
 from ..constants import FINGERPRINT_HTTP_TIMEOUT, FINGERPRINT_TIMEOUT
@@ -57,6 +57,9 @@ _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 #     local part;
 #   - hex precedes base64, because hex is a strict subset of that alphabet.
 _REDACTIONS = (
+  # URL userinfo, first: `https://user:secret@host` carries a credential that
+  # none of the key/value patterns below would recognise.
+  (re.compile(r"(?<=://)[^/@\s]+:[^/@\s]+@"), "[REDACTED]@"),
   (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"), "bearer [REDACTED]"),
   (
     re.compile(
@@ -171,6 +174,30 @@ def resolve_host(host, timeout=None):
       return [], str(error)
   addresses = {info[4][0] for info in infos if info[4]}
   return sorted(addresses), None
+
+
+def redirect_stays_on_target(next_url, host, port):
+  """
+  A scan is authorized for one host and port, so a redirect is followed only
+  when it stays there. A target that answers `302 -> http://169.254.169.254/`
+  would otherwise make this node fetch an internal endpoint and archive the
+  response as scan evidence.
+
+  Pinning to the authorized host is the whole control: anything else — public
+  or private — is out of scope by definition. Classifying the hop's IP would
+  add nothing here and would break scanning private targets, which is a normal
+  authorized case.
+  """
+  parsed = urlparse(next_url)
+  if parsed.scheme not in ("http", "https"):
+    return False
+  if (parsed.hostname or "").lower() != (host or "").lower():
+    return False
+  try:
+    hop_port = parsed.port
+  except ValueError:
+    return False
+  return (hop_port or (443 if parsed.scheme == "https" else 80)) == port
 
 
 def read_bounded_response_body(response, max_bytes, max_seconds):
@@ -348,7 +375,12 @@ class _ResponseFingerprintMixin:
           break
         if redirect_count >= DEFAULT_REDIRECT_LIMIT:
           raise requests.TooManyRedirects("response fingerprint redirect limit exceeded")
-        current_url = urljoin(resp.url or current_url, location)
+        next_url = urljoin(resp.url or current_url, location)
+        if not redirect_stays_on_target(next_url, self.target, port):
+          # Out of scope: keep this last in-scope response as the evidence and
+          # never issue the off-target request.
+          break
+        current_url = next_url
         redirect_count += 1
         resp.close()
         resp = None
@@ -380,13 +412,20 @@ class _ResponseFingerprintMixin:
       if declared_length is not None and declared_length < 0:
         declared_length = None
       body_length = len(body) if body_complete else declared_length
+      # Redact before truncating, so a credential straddling the cap cannot
+      # survive as a prefix — the same order sanitize_excerpt uses internally.
+      title = sanitize_excerpt(title_match.group(1).strip()) if title_match else None
       http = {
         "status": resp.status_code,
-        "final_url": resp.url,
+        "final_url": sanitize_excerpt(resp.url),
         "redirect_count": redirect_count,
-        "title": title_match.group(1).strip()[:TITLE_MAX_CHARS] if title_match else None,
+        "title": title[:TITLE_MAX_CHARS] if title else None,
         "content_type": content_type,
         "body_length": body_length,
+        # False means body_length is the peer's declared Content-Length and
+        # title is derived from a partial body: both are attacker-influenced
+        # and must not be treated as stable identity when comparing vantages.
+        "body_complete": body_complete,
         "body_sha256": hashlib.sha256(body).hexdigest() if body_complete else None,
         "headers": {
           name: resp.headers.get(name)

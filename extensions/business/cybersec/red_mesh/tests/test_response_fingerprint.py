@@ -291,13 +291,15 @@ class TestHttpCapture(unittest.TestCase):
   def test_redirect_bodies_are_never_buffered(self):
     redirect = self._response(**{"Location": "/final"})
     redirect.status_code = 302
-    redirect.url = "https://example.test/start"
+    # The hop must stay on the authorized host, or it is refused before it is
+    # ever followed (see test_redirect_off_the_authorized_target_is_never_fetched).
+    redirect.url = "https://127.0.0.1:443/start"
     redirect.iter_content.side_effect = AssertionError("redirect body must not be read")
     final = self._response()
-    final.url = "https://example.test/final"
+    final.url = "https://127.0.0.1:443/final"
     session = MagicMock()
     session.get.side_effect = [redirect, final]
-    worker = _make_worker(comparison_ports=[443])
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
     with patch(
       "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
       return_value=session,
@@ -307,7 +309,117 @@ class TestHttpCapture(unittest.TestCase):
     redirect.iter_content.assert_not_called()
     redirect.close.assert_called_once()
     self.assertEqual(http["redirect_count"], 1)
-    self.assertEqual(http["final_url"], "https://example.test/final")
+    self.assertEqual(http["final_url"], "https://127.0.0.1:443/final")
+
+  def test_body_completeness_is_explicit_in_the_contract(self):
+    # body_length falls back to the peer's Content-Length when the body was
+    # truncated, and title is body-derived. Consumers comparing two vantages
+    # need to know which fields were measured and which were merely declared.
+    truncated = self._response(
+      body=b"a" * (RESPONSE_BODY_MAX_BYTES + 1),
+      **{"Content-Length": str(RESPONSE_BODY_MAX_BYTES + 100)},
+    )
+    whole = self._response()
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
+    results = []
+    for response in (truncated, whole):
+      session = MagicMock()
+      session.get.return_value = response
+      with patch(
+        "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+        return_value=session,
+      ):
+        http, _excerpt = worker._fingerprint_http("https", 443)
+      results.append(http)
+
+    self.assertFalse(results[0]["body_complete"])
+    self.assertTrue(results[1]["body_complete"])
+
+  def test_metadata_never_persists_credentials(self):
+    # final_url and title are archived alongside the excerpt, so they must pass
+    # the same scrubber; otherwise userinfo and token query values survive.
+    response = self._response(body=b"<html><title>access_token=sk-live-abc123</title>x</html>")
+    response.url = "https://operator:hunter2@127.0.0.1:443/cb?api_key=sk-live-abc123"
+    session = MagicMock()
+    session.get.return_value = response
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
+    ):
+      http, _excerpt = worker._fingerprint_http("https", 443)
+
+    self.assertNotIn("hunter2", http["final_url"])
+    self.assertNotIn("sk-live-abc123", http["final_url"])
+    self.assertNotIn("sk-live-abc123", http["title"])
+
+  def test_redirect_off_the_authorized_target_is_never_fetched(self):
+    # A scanned target answering 302 -> cloud metadata must not make the edge
+    # node fetch that endpoint. The scan is authorized for one host and port.
+    redirect = self._response(**{"Location": "http://169.254.169.254/latest/meta-data/"})
+    redirect.status_code = 302
+    redirect.url = "https://127.0.0.1:443/"
+    session = MagicMock()
+    session.get.side_effect = [redirect]
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
+    ):
+      http, _excerpt = worker._fingerprint_http("https", 443)
+
+    requested = [call.args[0] for call in session.get.call_args_list]
+    self.assertEqual(requested, ["https://127.0.0.1:443/"])
+    # The refused hop is not counted as followed; the last in-scope response
+    # remains the recorded evidence.
+    self.assertEqual(http["status"], 302)
+    self.assertEqual(http["redirect_count"], 0)
+
+  def test_redirect_scope_covers_port_and_scheme_not_just_host(self):
+    # The authorized endpoint is a host *and* a port; a hop to another port on
+    # the same host, or to a non-http scheme, is a different endpoint.
+    off_scope = (
+      "http://127.0.0.1:8080/admin",   # same host, unauthorized port
+      "gopher://127.0.0.1:443/x",      # scheme outside http(s)
+      "http://127.0.0.1:99999/x",      # unparseable port must not raise
+    )
+    for location in off_scope:
+      with self.subTest(location=location):
+        redirect = self._response(**{"Location": location})
+        redirect.status_code = 302
+        redirect.url = "https://127.0.0.1:443/"
+        session = MagicMock()
+        session.get.side_effect = [redirect]
+        worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
+        with patch(
+          "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+          return_value=session,
+        ):
+          http, _excerpt = worker._fingerprint_http("https", 443)
+        self.assertEqual(
+          [call.args[0] for call in session.get.call_args_list],
+          ["https://127.0.0.1:443/"],
+        )
+        self.assertEqual(http["redirect_count"], 0)
+
+  def test_same_host_and_port_redirect_is_followed(self):
+    # The guard must not break the legitimate case it wraps.
+    redirect = self._response(**{"Location": "https://127.0.0.1:443/next"})
+    redirect.status_code = 302
+    redirect.url = "https://127.0.0.1:443/"
+    final = self._response()
+    final.url = "https://127.0.0.1:443/next"
+    session = MagicMock()
+    session.get.side_effect = [redirect, final]
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint.requests.Session",
+      return_value=session,
+    ):
+      http, _excerpt = worker._fingerprint_http("https", 443)
+
+    self.assertEqual(http["redirect_count"], 1)
+    self.assertEqual(http["final_url"], "https://127.0.0.1:443/next")
 
   def test_port_probe_uses_existing_fingerprint_timeout_constant(self):
     worker = _make_worker(comparison_ports=[443])
