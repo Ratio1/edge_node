@@ -6,6 +6,7 @@ scoping that keeps the phase off non-comparison jobs, and the aggregation
 contract that keeps each vantage's evidence attributable to that vantage.
 """
 
+import itertools
 import socket
 import threading
 import unittest
@@ -251,26 +252,43 @@ class TestComparisonTierScoping(unittest.TestCase):
     self.assertIn("response_evidence", worker.get_status())
 
 
-class _DripServer:
+class _Peer:
   """
-  A peer that declares a large body and then drips bytes forever.
+  A real HTTP peer driven by a chunk script.
 
-  Every other test in this file mocks the socket, which is why a close that
-  blocks against a real connection was invisible: a MagicMock's close() always
-  returns instantly. Behaviour against a real socket needs a real socket.
+  Every other test here mocks the socket, and a mock's close() always returns
+  instantly - which is precisely why a close that blocks against a live
+  connection stayed invisible behind a green suite. Bounding behaviour has to
+  be measured against a real socket.
+
+  `script` is an iterable of (payload, delay_seconds) applied after the header.
   """
 
-  def __init__(self, interval=0.05, declared=10_000_000, headers=b""):
-    self.interval = interval
+  def __init__(self, script, declared, headers=b"Content-Type: text/html\r\n"):
+    self._script = script
+    self._declared = declared
+    self._headers = headers
+    self._stop = threading.Event()
     self._server = socket.socket()
     self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     self._server.bind(("127.0.0.1", 0))
     self._server.listen(1)
     self.port = self._server.getsockname()[1]
-    self._headers = headers
-    self._declared = declared
-    self._stop = threading.Event()
     threading.Thread(target=self._serve, daemon=True).start()
+
+  @classmethod
+  def serving(cls, body):
+    """A peer that returns one complete body and closes."""
+    return cls([(body, 0)], declared=len(body))
+
+  @classmethod
+  def dripping(cls, prefix=b"", interval=0.05):
+    """A peer that optionally bursts, then drips forever without ever ending."""
+    script = itertools.chain(
+      [(prefix, 0)] if prefix else [],
+      itertools.repeat((b"x", interval)),
+    )
+    return cls(script, declared=100_000_000)
 
   def _serve(self):
     conn = None
@@ -278,12 +296,15 @@ class _DripServer:
       conn, _addr = self._server.accept()
       conn.recv(65536)
       conn.sendall(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
-        b"Content-Length: %d\r\n%s\r\n" % (self._declared, self._headers)
+        b"HTTP/1.1 200 OK\r\n%sContent-Length: %d\r\n\r\n"
+        % (self._headers, self._declared)
       )
-      while not self._stop.is_set():
-        conn.sendall(b"x")
-        time.sleep(self.interval)
+      for payload, delay in self._script:
+        if self._stop.is_set():
+          break
+        conn.sendall(payload)
+        if delay:
+          time.sleep(delay)
     except Exception:
       pass
     finally:
@@ -300,78 +321,59 @@ class _DripServer:
 class TestRealSocketBounding(unittest.TestCase):
   """The bounding guarantees, measured against a real connection."""
 
-  def test_a_slow_drip_peer_cannot_outlast_the_deadline(self):
-    server = _DripServer()
-    self.addCleanup(server.close)
-    response = requests.get(
-      f"http://127.0.0.1:{server.port}/", stream=True, timeout=30
-    )
+  def _read_within(self, peer, max_seconds, limit):
+    """Run the bounded read off-thread so a hang fails instead of wedging."""
+    response = requests.get(f"http://127.0.0.1:{peer.port}/", stream=True, timeout=30)
     self.addCleanup(response.close)
-
     outcome = {}
 
     def _read():
       started = time.monotonic()
       outcome["result"] = read_bounded_response_body(
-        response, max_bytes=RESPONSE_BODY_MAX_BYTES, max_seconds=1.0
+        response, max_bytes=RESPONSE_BODY_MAX_BYTES, max_seconds=max_seconds
       )
       outcome["elapsed"] = time.monotonic() - started
 
     reader = threading.Thread(target=_read, daemon=True)
     reader.start()
-    # Joined rather than called inline: if the deadline is not enforced this
-    # blocks forever, and a hanging suite is worse than a failing one.
-    reader.join(timeout=15)
-
+    reader.join(timeout=limit)
     self.assertFalse(
       reader.is_alive(),
-      "read_bounded_response_body never returned; its wall-clock deadline is "
-      "not enforced against a peer that keeps dripping bytes",
+      "read_bounded_response_body never returned; a peer that keeps the "
+      "connection alive can stall the scan phase indefinitely",
     )
+    return outcome
+
+  def test_a_slow_drip_peer_cannot_outlast_the_deadline(self):
+    peer = _Peer.dripping()
+    self.addCleanup(peer.close)
+    outcome = self._read_within(peer, max_seconds=1.0, limit=15)
     self.assertLess(outcome["elapsed"], 5.0)
     self.assertFalse(outcome["result"][1])
 
-
-class _StaticServer:
-  """Serves one complete response, then closes. Real socket, no mocks."""
-
-  def __init__(self, body, headers=b"Content-Type: text/html\r\n"):
-    self._server = socket.socket()
-    self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    self._server.bind(("127.0.0.1", 0))
-    self._server.listen(1)
-    self.port = self._server.getsockname()[1]
-    self._body = body
-    self._headers = headers
-    threading.Thread(target=self._serve, daemon=True).start()
-
-  def _serve(self):
-    conn = None
-    try:
-      conn, _addr = self._server.accept()
-      conn.recv(65536)
-      conn.sendall(
-        b"HTTP/1.1 200 OK\r\n%sContent-Length: %d\r\n\r\n"
-        % (self._headers, len(self._body))
-      )
-      conn.sendall(self._body)
-    except Exception:
-      pass
-    finally:
-      for sock in (conn, self._server):
-        try:
-          sock.close()
-        except Exception:
-          pass
+  def test_a_peer_that_drips_after_the_cap_cannot_stall_the_teardown(self):
+    # Crossing the byte cap takes a different exit path from the deadline, and
+    # that path tore the connection down with a call that blocks. The drip
+    # keeps the socket alive so a blocking close never returns.
+    peer = _Peer.dripping(prefix=b"a" * (RESPONSE_BODY_MAX_BYTES + 65536), interval=0.2)
+    self.addCleanup(peer.close)
+    outcome = self._read_within(peer, max_seconds=30.0, limit=20)
+    body, complete = outcome["result"]
+    self.assertFalse(complete)
+    self.assertEqual(len(body), RESPONSE_BODY_MAX_BYTES)
+    self.assertLess(outcome["elapsed"], 10.0)
 
 
 class TestRealSocketCapture(unittest.TestCase):
   """End-to-end capture over a real connection, exercising the streaming path."""
 
-  def _capture(self, body, headers=b"Content-Type: text/html\r\n"):
-    server = _StaticServer(body, headers)
-    worker = _make_worker(target="127.0.0.1", comparison_ports=[server.port])
-    return worker._fingerprint_http("http", server.port)
+  def _capture(self, body):
+    peer = _Peer.serving(body)
+    self.addCleanup(peer.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    captured = worker._fingerprint_http("http", peer.port)
+    self.assertIsNotNone(captured[0], "capture failed against the local peer")
+    return captured
 
   def test_complete_response_is_captured_and_hashed(self):
     http, excerpt = self._capture(b"<html><title>Acme Home</title>hello world</html>")

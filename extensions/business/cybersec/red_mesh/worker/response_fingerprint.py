@@ -88,7 +88,10 @@ _REDACTIONS = (
       r"(?<![A-Za-z0-9_+/\-])"
       r"(?=[A-Za-z0-9_+/\-]*[A-Za-z0-9+/]{20,})"
       r"[A-Za-z0-9_+/\-]{32,}={0,2}"
-      r"(?![A-Za-z0-9_+/\-=])"
+      # `=` is deliberately absent from this trailing class: including it made a
+      # long run followed by padding-plus-more unmatchable, silently narrowing
+      # the rule against what develop caught.
+      r"(?![A-Za-z0-9_+/\-])"
     ),
     "[REDACTED_B64]",
   ),
@@ -236,18 +239,22 @@ def release_response_connection(response):
   arriving. Shutting the socket down instead makes the reader's blocked read
   fail at once, after which it unwinds on its own and the connection can be
   released normally by the caller's `finally`.
+
+  Reaching through `raw._connection` is deliberate: urllib3 only grew a
+  supported `HTTPResponse.shutdown()` in 2.3, and this deployment pins an
+  earlier release. Prefer that API once the floor moves.
+
+  There is deliberately no `response.close()` fallback — that is the blocking
+  call this exists to avoid, and the caller's `finally` already closes the
+  response once the reader has unwound.
   """
   sock = getattr(getattr(response, "raw", None), "_connection", None)
   sock = getattr(sock, "sock", None)
-  if sock is not None:
-    try:
-      sock.shutdown(socket.SHUT_RDWR)
-      return
-    except OSError:
-      pass
   try:
-    response.close()
+    sock.shutdown(socket.SHUT_RDWR)
   except Exception:
+    # No reachable socket (already closed, mocked, or a wrapped raw). The
+    # reader is still released by the queue drain in the caller.
     pass
 
 
@@ -312,8 +319,7 @@ def read_bounded_response_body(response, max_bytes, max_seconds):
     chunks.append(payload)
     total += len(payload)
     if total > max_bytes:
-      stopped.set()
-      response.close()
+      _stop()
       return b"".join(chunks)[:max_bytes], False
 
 
@@ -512,5 +518,11 @@ class _ResponseFingerprintMixin:
       self.P(f"Response fingerprint capture failed on {url}: {exc}", color='y')
       return None, None
     finally:
-      resp.close()
+      # Guarded: a raising close would escape both handlers above, leak the
+      # session, and reach execute_job's catch-all — skipping every remaining
+      # scan phase, which is exactly what the handler above exists to prevent.
+      try:
+        resp.close()
+      except Exception:
+        pass
       session.close()
