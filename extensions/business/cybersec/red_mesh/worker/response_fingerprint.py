@@ -237,23 +237,38 @@ def read_bounded_response_body(response, max_bytes, max_seconds):
       if not stopped.is_set():
         events.put(("error", None))
 
+  def _stop():
+    """
+    Stop the reader and free it if it is blocked.
+
+    Checking `stopped` before a put is not enough on its own: a put that was
+    already blocked completes the moment this consumer takes an item, refilling
+    the one-slot queue, and the reader can then block on a further put before it
+    observes `stopped`. With no timeout on `Queue.put` that thread would wait
+    forever, pinning a chunk and the response. Draining one slot here releases
+    it, so every exit path must call this rather than only setting the flag.
+    """
+    stopped.set()
+    # Drain before closing, not after: `response.close()` can itself block on
+    # the lock the reader holds inside `iter_content`, and a reader left
+    # blocked on a full queue would never be released if the close came first.
+    try:
+      events.get_nowait()
+    except queue.Empty:
+      pass
+    response.close()
+
   threading.Thread(target=_read, daemon=True).start()
 
   while True:
     remaining_seconds = deadline - time.monotonic()
     if remaining_seconds <= 0:
-      stopped.set()
-      response.close()
-      try:
-        events.get_nowait()
-      except queue.Empty:
-        pass
+      _stop()
       return b"".join(chunks), False
     try:
       kind, payload = events.get(timeout=remaining_seconds)
     except queue.Empty:
-      stopped.set()
-      response.close()
+      _stop()
       return b"".join(chunks), False
     if kind == "done":
       return b"".join(chunks), True
