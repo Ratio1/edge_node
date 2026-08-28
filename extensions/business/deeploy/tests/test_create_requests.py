@@ -1,7 +1,11 @@
 import unittest
+import copy
 from collections import defaultdict
+import ipaddress
 import sys
 import types
+
+from cryptography import x509
 
 
 for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
@@ -28,6 +32,253 @@ class _KeyErrorOnMissingAttrInputs(dict):
 
 
 class DeeployCreateRequestPreparationTests(unittest.TestCase):
+
+  def _make_cockroachdb_secure_inputs(self, client_url="tcp.ratio1.link:30472"):
+    return make_inputs(
+      pipeline_params={
+        "deeploy_cockroachdb": {
+          "version": 1,
+          "service": "cockroachdb",
+          "status": "allocated",
+          "nodeOrder": ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+          "clientTunnel": {"url": client_url},
+          "internalTunnels": [],
+        },
+      },
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+              "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
+            },
+          },
+        ),
+      ],
+    )
+
+  def test_cockroachdb_client_hostname_parser_accepts_tunnel_endpoint_forms(self):
+    plugin = make_deeploy_plugin()
+
+    self.assertEqual(
+      plugin._cockroachdb_client_hostname("tcp.ratio1.link:30472"),
+      "tcp.ratio1.link",
+    )
+    self.assertEqual(
+      plugin._cockroachdb_client_hostname("tcp://db.example.test:26257"),
+      "db.example.test",
+    )
+    self.assertEqual(plugin._cockroachdb_client_hostname("127.0.0.2:26257"), "127.0.0.2")
+
+    for invalid in (
+      "",
+      "tcp://user:password@db.example.test:26257",
+      "tcp://*.example.test:26257",
+      "tcp://db.example.test:26257/path",
+      "tcp://db.example.test:26257?query=value",
+      "tcp://db.example.test:not-a-port",
+      "tcp://db.example.test:70000",
+    ):
+      with self.subTest(invalid=invalid):
+        with self.assertRaisesRegex(ValueError, "client tunnel"):
+          plugin._cockroachdb_client_hostname(invalid)
+
+  def test_managed_service_kind_resolves_explicit_legacy_and_persisted_cockroachdb(self):
+    plugin = make_deeploy_plugin()
+    cockroach_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="cockroachdb",
+      IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+    )
+
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[cockroach_plugin]),
+      ),
+      "cockroachdb",
+    )
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(inputs=make_inputs(plugins=[cockroach_plugin])),
+      "cockroachdb",
+    )
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(plugins=[cockroach_plugin]),
+        deeploy_specs={DEEPLOY_KEYS.SERVICE_KIND: "cockroachdb"},
+      ),
+      "cockroachdb",
+    )
+
+  def test_managed_service_kind_rejects_unsupported_or_conflicting_identity(self):
+    plugin = make_deeploy_plugin()
+    postgres_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="postgres",
+      IMAGE="postgres:17",
+    )
+
+    with self.assertRaisesRegex(ValueError, "Unsupported Deeploy service kind"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="postgresql", plugins=[postgres_plugin]),
+      )
+    with self.assertRaisesRegex(ValueError, "service kind.*does not match"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[postgres_plugin]),
+      )
+    with self.assertRaisesRegex(ValueError, "service kind.*does not match"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(plugins=[postgres_plugin]),
+        deeploy_specs={DEEPLOY_KEYS.SERVICE_KIND: "cockroachdb"},
+      )
+
+  def test_managed_service_kind_is_absent_for_ordinary_services(self):
+    plugin = make_deeploy_plugin()
+    postgres_plugin = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="postgres",
+      IMAGE="postgres:17",
+    )
+
+    self.assertIsNone(
+      plugin._resolve_deeploy_service_kind(inputs=make_inputs(plugins=[postgres_plugin]))
+    )
+
+  def test_managed_service_secure_config_matches_legacy_cockroachdb_hook(self):
+    plugin = make_deeploy_plugin()
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
+    cert_bundle = plugin._generate_cockroachdb_cert_bundle(nodes, "tcp.ratio1.link")
+    direct_inputs = self._make_cockroachdb_secure_inputs()
+    generic_inputs = copy.deepcopy(direct_inputs)
+    plugin._generate_cockroachdb_cert_bundle = (
+      lambda target_nodes, client_hostname=None: copy.deepcopy(cert_bundle)
+    )
+
+    plugin._prepare_cockroachdb_secure_config(direct_inputs, nodes)
+    service_kind = plugin._resolve_deeploy_service_kind(inputs=generic_inputs)
+    plugin._prepare_managed_service_secure_config(service_kind, generic_inputs, nodes)
+
+    self.assertEqual(generic_inputs, direct_inputs)
+
+  def test_generated_cockroachdb_node_certificates_include_client_hostname(self):
+    plugin = make_deeploy_plugin()
+
+    bundle = plugin._generate_cockroachdb_cert_bundle(
+      ["0xai_node_a", "0xai_node_b"],
+      client_hostname="tcp.ratio1.link",
+    )
+
+    for node in ("0xai_node_a", "0xai_node_b"):
+      cert = x509.load_pem_x509_certificate(bundle[node]["CRDB_NODE_CRT"].encode("ascii"))
+      san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+      self.assertIn("tcp.ratio1.link", san.get_values_for_type(x509.DNSName))
+      self.assertIn("roach1", san.get_values_for_type(x509.DNSName))
+      self.assertIn("roach2", san.get_values_for_type(x509.DNSName))
+      self.assertIn("localhost", san.get_values_for_type(x509.DNSName))
+
+    ip_bundle = plugin._generate_cockroachdb_cert_bundle(
+      ["0xai_node_a", "0xai_node_b"],
+      client_hostname="127.0.0.2",
+    )
+    ip_cert = x509.load_pem_x509_certificate(ip_bundle["0xai_node_a"]["CRDB_NODE_CRT"].encode("ascii"))
+    ip_san = ip_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    self.assertIn(ipaddress.ip_address("127.0.0.2"), ip_san.get_values_for_type(x509.IPAddress))
+
+  def test_cockroachdb_secure_config_reuses_hostname_bound_bundle_and_forces_one_generation(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs()
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    allocation = inputs[DEEPLOY_KEYS.PIPELINE_PARAMS]["deeploy_cockroachdb"]
+    first_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(allocation["certificateHostname"], "tcp.ratio1.link")
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    reused_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(reused_key, first_key)
+
+    inputs["cockroachdb_certificate_regeneration_id"] = "11111111-1111-4111-8111-111111111111"
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    regenerated_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertNotEqual(regenerated_key, first_key)
+    self.assertEqual(
+      allocation["certificateGenerationId"],
+      "11111111-1111-4111-8111-111111111111",
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    replay_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(replay_key, regenerated_key)
+
+    inputs.pop("cockroachdb_certificate_regeneration_id")
+    allocation["clientTunnel"]["url"] = "replacement.example.test:26257"
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    self.assertNotIn("certificateGenerationId", allocation)
+    self.assertNotIn("certificateRegenerationIntentSha256", allocation)
+
+  def test_cockroachdb_secure_config_regenerates_when_managed_hostname_changes(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs("old.example.test:26257")
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    first_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    allocation = inputs[DEEPLOY_KEYS.PIPELINE_PARAMS]["deeploy_cockroachdb"]
+    allocation["clientTunnel"]["url"] = "new.example.test:26257"
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+
+    second_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"]["CRDB_NODE_KEY"]
+    self.assertNotEqual(second_key, first_key)
+    self.assertEqual(allocation["certificateHostname"], "new.example.test")
+
+  def test_cockroachdb_regeneration_ignores_request_supplied_lifecycle_metadata(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs()
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    original_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"][
+      "CRDB_NODE_KEY"
+    ]
+    allocation = inputs[DEEPLOY_KEYS.PIPELINE_PARAMS]["deeploy_cockroachdb"]
+    persisted_allocation = copy.deepcopy(allocation)
+    persisted_allocation["certificateGenerationId"] = "11111111-1111-4111-8111-111111111111"
+    persisted_allocation["certificateRegenerationIntentSha256"] = "old-intent"
+    new_id = "22222222-2222-4222-8222-222222222222"
+    allocation["certificateGenerationId"] = new_id
+    allocation["certificateRegenerationIntentSha256"] = "caller-controlled"
+    inputs["cockroachdb_certificate_regeneration_id"] = new_id
+    inputs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE] = True
+
+    plugin._prepare_cockroachdb_regeneration_lifecycle(
+      inputs,
+      {
+        DEEPLOY_KEYS.JOB_CONFIG: {
+          DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": persisted_allocation},
+        },
+      },
+    )
+    self.assertEqual(
+      allocation["certificateGenerationId"],
+      "11111111-1111-4111-8111-111111111111",
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+
+    regenerated_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"][nodes[0]]["ENV"][
+      "CRDB_NODE_KEY"
+    ]
+    self.assertNotEqual(regenerated_key, original_key)
+    self.assertEqual(allocation["certificateGenerationId"], new_id)
 
   def test_prepare_single_plugin_instance_uses_signature_and_app_params(self):
     plugin = make_deeploy_plugin()
@@ -217,6 +468,61 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "duplicate aliases"):
       plugin._normalize_per_node_config({"byIndex": {}, "BY_INDEX": {}})
 
+  def test_per_node_config_canonicalizes_overlay_keys_and_rejects_collisions(self):
+    plugin = make_deeploy_plugin()
+
+    _default, by_index, _by_node = plugin._normalize_per_node_config({
+      "byIndex": {"0": {"ai_engine": "llama_cpp_medium"}},
+    })
+    self.assertEqual(by_index[0], {"AI_ENGINE": "llama_cpp_medium"})
+
+    with self.assertRaisesRegex(ValueError, "duplicate normalized key 'AI_ENGINE'"):
+      plugin._normalize_per_node_config({
+        "byIndex": {
+          "0": {
+            "AI_ENGINE": "llama_cpp_small",
+            "ai_engine": "llama_cpp_medium",
+          },
+        },
+      })
+
+  def test_per_node_config_rejects_one_shot_commands(self):
+    plugin = make_deeploy_plugin()
+
+    for command_key in ("INSTANCE_COMMAND", "INSTANCE_COMMAND_LAST"):
+      with self.subTest(command_key=command_key), self.assertRaisesRegex(
+        ValueError, "system-managed"
+      ):
+        plugin._normalize_per_node_config({
+          "byIndex": {"0": {command_key.lower(): {"COMMAND": "RESTART"}}},
+        })
+
+  def test_per_node_config_rejects_duplicate_normalized_selectors(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "duplicate normalized index 1"):
+      plugin._normalize_per_node_config({
+        "byIndex": {
+          "01": {"ENV": {"NODE_ID": "first"}},
+          "1": {"ENV": {"NODE_ID": "second"}},
+        },
+      })
+    with self.assertRaisesRegex(ValueError, "duplicate node selector '1'"):
+      plugin._normalize_per_node_config({
+        "byNode": {
+          1: {"ENV": {"NODE_ID": "first"}},
+          "1": {"ENV": {"NODE_ID": "second"}},
+        },
+      })
+
+  def test_per_node_config_rejects_normalized_nested_alias(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "Nested .* overlays"):
+      plugin._normalize_per_node_config({
+        "byIndex": {"0": {"PerNodeConfig": {}}},
+      })
+
   def test_log_redaction_masks_per_node_config_and_token_keys(self):
     plugin = make_deeploy_plugin()
 
@@ -274,13 +580,14 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
             "byNode": {
               "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
               "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+              "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
             },
           },
         ),
       ],
     )
 
-    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
 
     instance = inputs[DEEPLOY_KEYS.PLUGINS][0]
     self.assertEqual(instance["ENV"]["CRDB_SECURE"], "true")
@@ -321,13 +628,14 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
             "byNode": {
               "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
               "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+              "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
             },
           },
         ),
       ],
     )
 
-    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
 
     instance = inputs[DEEPLOY_KEYS.PLUGINS][0]
     self.assertNotIn("perNodeConfig", instance)
@@ -352,16 +660,17 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
             "byNode": {
               "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
               "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+              "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
             },
           },
         ),
       ],
     )
 
-    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
     node_a_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
 
-    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
 
     reused_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
     self.assertEqual(node_a_key, reused_key)
@@ -382,24 +691,28 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
             "byNode": {
               "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
               "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+              "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
             },
           },
         ),
       ],
     )
 
-    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
     first_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
-    inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_c"] = {
-      "ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}
+    inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_d"] = {
+      "ENV": {"CRDB_NODE_ID": "4", "CF_TUNNEL_TOKEN": "token-d"}
     }
 
-    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
+    plugin._prepare_cockroachdb_secure_config(
+      inputs,
+      ["0xai_node_a", "0xai_node_b", "0xai_node_c", "0xai_node_d"],
+    )
 
     by_node = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
     self.assertNotEqual(first_key, by_node["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"])
-    self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_c"]["ENV"])
-    self.assertEqual(by_node["0xai_node_c"]["ENV"]["CF_TUNNEL_TOKEN"], "token-c")
+    self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_d"]["ENV"])
+    self.assertEqual(by_node["0xai_node_d"]["ENV"]["CF_TUNNEL_TOKEN"], "token-d")
 
   def test_cockroachdb_pipeline_secure_config_regenerates_for_legacy_scale_up(self):
     plugin = make_deeploy_plugin()
@@ -412,47 +725,54 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
             "CRDB_DATABASE": "appdb",
             "CRDB_USER": "app_user",
             "CRDB_PASSWORD": "secret-password",
-            "CRDB_NODE_COUNT": "2",
-            "CRDB_HOSTNAMES": "roach1.example,roach2.example",
+            "CRDB_NODE_COUNT": "3",
+            "CRDB_HOSTNAMES": "roach1.example,roach2.example,roach3.example",
           },
           "PER_NODE_CONFIG": {
             "byNode": {
               "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
               "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+              "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
             },
           },
         }],
       }],
     }
 
-    plugin._prepare_cockroachdb_secure_config_for_pipeline(pipeline, ["0xai_node_a", "0xai_node_b"])
+    plugin._prepare_cockroachdb_secure_config_for_pipeline(
+      pipeline,
+      ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+    )
     first_key = pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
-    pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_c"] = {
-      "ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}
+    pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_d"] = {
+      "ENV": {"CRDB_NODE_ID": "4", "CF_TUNNEL_TOKEN": "token-d"}
     }
 
     with self.assertRaisesRegex(ValueError, "CRDB_HOSTNAMES"):
       plugin._prepare_cockroachdb_secure_config_for_pipeline(
         pipeline,
-        ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+        ["0xai_node_a", "0xai_node_b", "0xai_node_c", "0xai_node_d"],
       )
 
     pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]["ENV"]["CRDB_HOSTNAMES"] = (
-      "roach1.example,roach2.example,roach3.example"
+      "roach1.example,roach2.example,roach3.example,roach4.example"
     )
     plugin._prepare_cockroachdb_secure_config_for_pipeline(
       pipeline,
-      ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+      ["0xai_node_a", "0xai_node_b", "0xai_node_c", "0xai_node_d"],
     )
 
     instance = pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]
     by_node = instance["PER_NODE_CONFIG"]["byNode"]
     self.assertEqual(instance["ENV"]["CRDB_SECURE"], "true")
-    self.assertEqual(instance["ENV"]["CRDB_NODE_COUNT"], "3")
-    self.assertEqual(instance["ENV"]["CRDB_HOSTNAMES"], "roach1.example,roach2.example,roach3.example")
+    self.assertEqual(instance["ENV"]["CRDB_NODE_COUNT"], "4")
+    self.assertEqual(
+      instance["ENV"]["CRDB_HOSTNAMES"],
+      "roach1.example,roach2.example,roach3.example,roach4.example",
+    )
     self.assertNotEqual(first_key, by_node["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"])
-    self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_c"]["ENV"])
-    self.assertEqual(by_node["0xai_node_c"]["ENV"]["CF_TUNNEL_TOKEN"], "token-c")
+    self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_d"]["ENV"])
+    self.assertEqual(by_node["0xai_node_d"]["ENV"]["CF_TUNNEL_TOKEN"], "token-d")
 
   def test_cockroachdb_secure_config_rejects_root_or_unsafe_identifiers(self):
     plugin = make_deeploy_plugin()
@@ -471,11 +791,11 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     )
 
     with self.assertRaisesRegex(ValueError, "SQL identifier"):
-      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
 
     inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_DATABASE"] = "appdb"
     with self.assertRaisesRegex(ValueError, "must not be root"):
-      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
 
   def test_deeploy_status_payload_keeps_cockroachdb_config_unredacted(self):
     payload = {
@@ -540,7 +860,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    self.assertTrue(plugin._validate_cockroachdb_target_change([], ["0xai_a", "0xai_b"], inputs))
+    self.assertTrue(plugin._validate_cockroachdb_target_change([], ["0xai_a", "0xai_b", "0xai_c"], inputs))
     self.assertTrue(
       plugin._validate_cockroachdb_target_change(
         ["0xai_a", "0xai_b"],
@@ -560,26 +880,85 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
         ["0xai_b", "0xai_a", "0xai_c"],
         inputs,
       )
-    with self.assertRaisesRegex(ValueError, "at least 2"):
+    with self.assertRaisesRegex(ValueError, "at least 3"):
+      plugin._validate_cockroachdb_target_change([], ["0xai_a", "0xai_b"], inputs)
+    with self.assertRaisesRegex(ValueError, "at least 3"):
       plugin._validate_cockroachdb_target_change([], ["0xai_a"], inputs)
+    with self.assertRaisesRegex(ValueError, "distinct addresses"):
+      plugin._validate_cockroachdb_target_change([], ["0xai_a", "0xai_a", "0xai_a"], inputs)
     with self.assertRaisesRegex(ValueError, "scale-down"):
       plugin._validate_cockroachdb_target_change(
+        ["0xai_a", "0xai_b", "0xai_c", "0xai_d"],
         ["0xai_a", "0xai_b", "0xai_c"],
-        ["0xai_a", "0xai_b"],
         inputs,
       )
     with self.assertRaisesRegex(ValueError, "reordering"):
       plugin._validate_cockroachdb_target_change(
-        ["0xai_a", "0xai_b"],
-        ["0xai_b", "0xai_a"],
+        ["0xai_a", "0xai_b", "0xai_c"],
+        ["0xai_b", "0xai_a", "0xai_c"],
         inputs,
       )
     with self.assertRaisesRegex(ValueError, "replacement or reordering"):
       plugin._validate_cockroachdb_target_change(
-        ["0xai_a", "0xai_b"],
-        ["0xai_a", "0xai_replacement"],
+        ["0xai_a", "0xai_b", "0xai_c"],
+        ["0xai_a", "0xai_b", "0xai_replacement"],
         inputs,
       )
+
+  def test_cockroachdb_secure_config_rejects_fewer_than_three_nodes(self):
+    plugin = make_deeploy_plugin()
+    certificate_generation_calls = []
+    plugin._generate_cockroachdb_cert_bundle = (
+      lambda *args, **kwargs: certificate_generation_calls.append((args, kwargs))
+    )
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+
+    with self.assertRaisesRegex(ValueError, "at least 3"):
+      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    self.assertEqual(certificate_generation_calls, [])
+    with self.assertRaisesRegex(ValueError, "distinct addresses"):
+      plugin._prepare_cockroachdb_secure_config(
+        inputs,
+        ["0xai_node_a", "0xai_node_a", "0xai_node_a"],
+      )
+    self.assertEqual(certificate_generation_calls, [])
+
+    pipeline = {
+      NetMonCt.PLUGINS: [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [copy.deepcopy(inputs[DEEPLOY_KEYS.PLUGINS][0])],
+      }],
+    }
+    with self.assertRaisesRegex(ValueError, "at least 3"):
+      plugin._prepare_cockroachdb_secure_config_for_pipeline(
+        pipeline,
+        ["0xai_node_a", "0xai_node_b"],
+      )
+    self.assertEqual(certificate_generation_calls, [])
+    with self.assertRaisesRegex(ValueError, "distinct addresses"):
+      plugin._prepare_cockroachdb_secure_config_for_pipeline(
+        pipeline,
+        ["0xai_node_a", "0xai_node_a", "0xai_node_a"],
+      )
+    self.assertEqual(certificate_generation_calls, [])
 
   def test_running_pipeline_context_uses_persisted_target_order_over_discovery_order(self):
     plugin = make_deeploy_plugin()

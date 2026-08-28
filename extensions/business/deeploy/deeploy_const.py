@@ -41,6 +41,7 @@ class DEEPLOY_KEYS:
   PROJECT_NAME = "project_name"
   JOB_TAGS = "job_tags"
   JOB_APP_TYPE = "job_app_type"
+  SERVICE_KIND = "service_kind"
   CHAINSTORE_RESPONSE = "chainstore_response"
   CHAINSTORE_RESPONSE_KEYS = "chainstore_response_keys"
   PIPELINE_INPUT_TYPE = "pipeline_input_type"

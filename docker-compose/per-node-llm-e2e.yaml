@@ -1,0 +1,94 @@
+name: per-node-llm-e2e
+
+x-edge-env: &edge-env
+  AINODE_ENV: per-node-llm-e2e
+  EE_CONFIG: /edge_node/docker-compose/deeploy-testbed/config_startup_deeploy_testbed.json
+  EE_DEVICE: cpu
+  EE_ETH_ENABLED: "false"
+  EE_EVM_NET: devnet
+  EE_DAUTH_URL: N/A
+  EE_MQTT_HOST: per_node_llm_mqtt
+  EE_MQTT_PORT: "1883"
+  EE_MQTT_USER: ""
+  EE_MQTT: ""
+  EE_MQTT_SUBTOPIC: address
+  EE_MQTT_SECURED: "false"
+  EE_SECURED: "0"
+  EE_MINIO_ENDPOINT: ""
+  EE_MINIO_ACCESS_KEY: ""
+  EE_MINIO_SECRET_KEY: ""
+  EE_MINIO_SECURE: "false"
+  EE_MINIO_MODEL_BUCKET: ""
+  EE_MINIO_UPLOAD_BUCKET: ""
+  EE_GITVER: ""
+  EE_NGROK_AUTH_TOKEN: ""
+  EE_NGROK_EDGE_LABEL: ""
+  EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER: ""
+  EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER: ""
+  EE_TUNNEL_ENGINE: none
+  PYTHONPATH: /opt/naeural_core:/edge_node
+
+x-edge-node: &edge-node
+  image: per-node-llm-e2e-edge:latest
+  build:
+    context: ..
+    dockerfile: docker-compose/per-node-llm-e2e/Dockerfile
+  privileged: true
+  restart: "no"
+  command: ["python3", "/edge_node/docker-compose/deeploy-testbed/device_no_extra_packages.py"]
+  depends_on:
+    per_node_llm_mqtt:
+      condition: service_healthy
+  environment: *edge-env
+  networks:
+    - per_node_llm_net
+
+services:
+  per_node_llm_mqtt:
+    image: eclipse-mosquitto:2
+    restart: "no"
+    ports:
+      - "127.0.0.1:18884:1883"
+    volumes:
+      - ./deeploy-testbed/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -p 1883 -t per_node_llm/health -m ok >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks:
+      - per_node_llm_net
+
+  per_node_llm_node_1:
+    <<: *edge-node
+    environment:
+      <<: *edge-env
+      EE_ID: per_node_llm_node_1
+      EE_SUPERVISOR: "false"
+    ports:
+      - "127.0.0.1:18101:18080"
+    volumes:
+      - per_node_llm_node_1_cache:/edge_node/_local_cache
+      - ../../naeural_core:/opt/naeural_core:ro
+      - ${PER_NODE_LLM_MODEL_A:?set PER_NODE_LLM_MODEL_A to an absolute GGUF path}:/models/model-a.gguf:ro
+
+  per_node_llm_node_2:
+    <<: *edge-node
+    environment:
+      <<: *edge-env
+      EE_ID: per_node_llm_node_2
+      EE_SUPERVISOR: "false"
+    ports:
+      - "127.0.0.1:18102:18080"
+    volumes:
+      - per_node_llm_node_2_cache:/edge_node/_local_cache
+      - ../../naeural_core:/opt/naeural_core:ro
+      - ${PER_NODE_LLM_MODEL_B:?set PER_NODE_LLM_MODEL_B to an absolute GGUF path}:/models/model-b.gguf:ro
+
+networks:
+  per_node_llm_net:
+    internal: false
+
+volumes:
+  per_node_llm_node_1_cache:
+  per_node_llm_node_2_cache:
