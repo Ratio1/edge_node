@@ -59,8 +59,11 @@ _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 #   - hex precedes base64, because hex is a strict subset of that alphabet.
 _REDACTIONS = (
   # URL userinfo, first: `https://user:secret@host` carries a credential that
-  # none of the key/value patterns below would recognise.
-  (re.compile(r"(?<=://)[^/@\s]+:[^/@\s]+@"), "[REDACTED]@"),
+  # none of the key/value patterns below would recognise. The password half is
+  # optional, because `https://TOKEN@host/` is a credential too — and without
+  # this the e-mail rule would match it first and take the host with it,
+  # destroying the field that makes vantages comparable.
+  (re.compile(r"(?<=://)[^/@\s]+(?::[^/@\s]+)?@"), "[REDACTED]@"),
   (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"), "bearer [REDACTED]"),
   (
     re.compile(
@@ -70,6 +73,11 @@ _REDACTIONS = (
       r"(?i)(?<![A-Za-z0-9])(authorization|"
       r"(?:api|access|refresh|session|client|auth|id|private|secret)[-_]?"
       r"(?:key|token|secret|id)|"
+      # Session-cookie and SAML names carry no `session`/`token` substring, so
+      # they are named explicitly. Deliberately absent: `code`, `state`, `sig`,
+      # `ticket` — ordinary English words whose inclusion would redact prose,
+      # which is a failure this table has already made once.
+      r"jsessionid|phpsessid|samlresponse|"
       r"apikey|token|session|secret|password|passwd|pwd)\b"
       # An optional closing quote covers JSON keys such as {"api_key": "..."}.
       r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"

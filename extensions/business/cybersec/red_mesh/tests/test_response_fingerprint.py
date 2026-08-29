@@ -134,6 +134,33 @@ class TestExcerptSanitization(unittest.TestCase):
       with self.subTest(pair=pair):
         self.assertNotIn(secret, sanitize_excerpt(pair))
 
+  def test_session_cookie_names_are_redacted(self):
+    for pair, secret in (
+      ("jsessionid=ABCDEF1234ZZ", "ABCDEF1234ZZ"),
+      ("PHPSESSID=9f8b7c6d5e4f3a2b1c0d", "9f8b7c6d5e4f3a2b1c0d"),
+      ("SAMLResponse=PHNhbWxwOl", "PHNhbWxwOl"),
+    ):
+      with self.subTest(pair=pair):
+        self.assertNotIn(secret, sanitize_excerpt(pair))
+
+  def test_ambiguous_english_keys_are_left_alone(self):
+    # `code`, `state`, `sig` and `ticket` are ordinary words. Redacting them
+    # would destroy comparison signal the way the base64 rule once did.
+    for text in (
+      "state: California",
+      "the code: refactored yesterday",
+      "ticket: renewed",
+    ):
+      with self.subTest(text=text):
+        self.assertEqual(sanitize_excerpt(text), text)
+
+  def test_userinfo_without_a_password_keeps_the_host(self):
+    # The e-mail rule would otherwise match `TOKEN@host` and take the host with
+    # it, removing the field that makes two vantages comparable.
+    excerpt = sanitize_excerpt("https://SECRETTOKENabc@target.example.com/x")
+    self.assertNotIn("SECRETTOKENabc", excerpt)
+    self.assertIn("target.example.com", excerpt)
+
   def test_redaction_precedes_truncation(self):
     # A credential straddling the byte cap must not survive as a prefix.
     padding = "x" * (EXCERPT_MAX_BYTES - 20)
