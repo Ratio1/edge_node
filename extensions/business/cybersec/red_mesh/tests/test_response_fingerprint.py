@@ -288,13 +288,19 @@ class _Peer:
   connection stayed invisible behind a green suite. Bounding behaviour has to
   be measured against a real socket.
 
-  `script` is an iterable of (payload, delay_seconds) applied after the header.
+  `script` is a factory returning a fresh iterable of (payload, delay_seconds)
+  applied after the header. It must be a factory, not one iterator: probing a
+  single port opens three connections (reachability, TLS, then the HTTP request
+  under test), and a shared iterator is part-drained by the first two, so the
+  request under test would be served mid-stream bytes instead of the script.
   """
 
-  def __init__(self, script, declared, headers=b"Content-Type: text/html\r\n"):
+  def __init__(self, script, declared, headers=b"Content-Type: text/html\r\n",
+               header_script=None):
     self._script = script
     self._declared = declared
     self._headers = headers
+    self._header_script = header_script
     self._stop = threading.Event()
     self._server = socket.socket()
     self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -306,27 +312,68 @@ class _Peer:
   @classmethod
   def serving(cls, body):
     """A peer that returns one complete body and closes."""
-    return cls([(body, 0)], declared=len(body))
+    return cls(lambda: [(body, 0)], declared=len(body))
 
   @classmethod
   def dripping(cls, prefix=b"", interval=0.05):
     """A peer that optionally bursts, then drips forever without ever ending."""
-    script = itertools.chain(
-      [(prefix, 0)] if prefix else [],
-      itertools.repeat((b"x", interval)),
-    )
+    def script():
+      return itertools.chain(
+        [(prefix, 0)] if prefix else [],
+        itertools.repeat((b"x", interval)),
+      )
     return cls(script, declared=100_000_000)
 
+  @classmethod
+  def header_dripping(cls, interval=0.5):
+    """
+    A peer that answers, then never finishes its header block.
+
+    `requests`' timeout is per socket operation, so a peer that emits one header
+    line just inside that window keeps resetting it. The header read is the
+    phase before any response object exists, which is why the body bounding
+    cannot reach it.
+    """
+    def header_script():
+      return itertools.chain(
+        [(b"HTTP/1.1 200 OK\r\n", 0)],
+        ((b"X-Pad-%d: y\r\n" % i, interval) for i in itertools.count()),
+      )
+    return cls(lambda: [], declared=0, header_script=header_script)
+
   def _serve(self):
-    conn = None
+    # Accept repeatedly: `_fingerprint_port` opens a reachability probe and a
+    # TLS probe before the HTTP request, and a single-shot listener would be
+    # gone by the time the request under test arrives — making a bounding
+    # assertion pass because nothing was ever served.
     try:
-      conn, _addr = self._server.accept()
+      while not self._stop.is_set():
+        conn, _addr = self._server.accept()
+        threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+    except Exception:
+      pass
+    finally:
+      try:
+        self._server.close()
+      except Exception:
+        pass
+
+  def _handle(self, conn):
+    try:
       conn.recv(65536)
+      if self._header_script is not None:
+        for payload, delay in self._header_script():
+          if self._stop.is_set():
+            break
+          conn.sendall(payload)
+          if delay:
+            time.sleep(delay)
+        return
       conn.sendall(
         b"HTTP/1.1 200 OK\r\n%sContent-Length: %d\r\n\r\n"
         % (self._headers, self._declared)
       )
-      for payload, delay in self._script:
+      for payload, delay in self._script():
         if self._stop.is_set():
           break
         conn.sendall(payload)
@@ -335,14 +382,20 @@ class _Peer:
     except Exception:
       pass
     finally:
-      for sock in (conn, self._server):
-        try:
-          sock.close()
-        except Exception:
-          pass
+      # Only this connection: the listener is shared with the probes that
+      # follow, and closing it here is what made a single-shot peer look
+      # unreachable to everything after the first connect.
+      try:
+        conn.close()
+      except Exception:
+        pass
 
   def close(self):
     self._stop.set()
+    try:
+      self._server.close()
+    except Exception:
+      pass
 
 
 class TestRealSocketBounding(unittest.TestCase):
@@ -389,6 +442,76 @@ class TestRealSocketBounding(unittest.TestCase):
     self.assertFalse(complete)
     self.assertEqual(len(body), RESPONSE_BODY_MAX_BYTES)
     self.assertLess(outcome["elapsed"], 10.0)
+
+  def test_a_header_dripping_peer_cannot_outlast_the_budget(self):
+    # The body bounding starts only once a response object exists. A peer that
+    # never finishes its header block is read entirely inside `session.get`,
+    # where `requests`' per-operation timeout is reset by every line that
+    # arrives. `execute_job` has no deadline of its own and `stop()` cannot
+    # interrupt a thread blocked in `socket.readinto`, so the stall is the whole
+    # job, not one probe.
+    peer = _Peer.header_dripping(interval=0.5)
+    self.addCleanup(peer.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+    outcome = {}
+
+    def _probe():
+      started = time.monotonic()
+      outcome["result"] = worker._fingerprint_http("http", peer.port)
+      outcome["elapsed"] = time.monotonic() - started
+
+    prober = threading.Thread(target=_probe, daemon=True)
+    prober.start()
+    prober.join(timeout=budget * 8)
+    self.assertFalse(
+      prober.is_alive(),
+      "_fingerprint_http never returned; a header-dripping peer pins the worker",
+    )
+    self.assertLess(
+      outcome["elapsed"], budget * 3,
+      "the header read is not bounded by the phase budget",
+    )
+    self.assertEqual(outcome["result"], (None, None))
+
+  def test_the_comparison_tier_stays_bounded_against_hostile_ports(self):
+    # The tier is an operator-chosen port range walked sequentially, so a
+    # per-probe bound is only useful if it composes: one hostile port must cost
+    # its budget and no more, or a wide range stalls the whole job.
+    peers = [_Peer.header_dripping(interval=0.5) for _ in range(2)]
+    for peer in peers:
+      self.addCleanup(peer.close)
+    worker = _make_worker(
+      target="127.0.0.1", comparison_ports=[peer.port for peer in peers]
+    )
+    budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+    outcome = {}
+
+    def _tier():
+      started = time.monotonic()
+      worker._capture_response_fingerprint()
+      outcome["elapsed"] = time.monotonic() - started
+
+    runner = threading.Thread(target=_tier, daemon=True)
+    runner.start()
+    runner.join(timeout=len(peers) * budget * 8)
+    self.assertFalse(runner.is_alive(), "the comparison tier never completed")
+    evidence = worker.state["response_evidence"]
+    self.assertEqual(len(evidence["ports"]), len(peers))
+    for port, entry in evidence["ports"].items():
+      # Guard against the assertion below passing for the wrong reason: an
+      # unreachable port also yields http=None, having proven nothing.
+      self.assertTrue(entry["reachable"], f"port {port} was never probed")
+      # A reply assembled only because our watchdog cut the connection is our
+      # timeout, not the target's answer, and must not be recorded as one.
+      self.assertIsNone(entry["http"], f"port {port} recorded a fabricated reply")
+    # Each hostile port must actually cost its budget — an instant return means
+    # the probe never engaged and the bound was never exercised.
+    self.assertGreater(outcome["elapsed"], budget)
+    self.assertLess(
+      outcome["elapsed"], len(peers) * budget * 3,
+      "per-probe bounding does not compose across the tier",
+    )
 
 
 class TestRealSocketCapture(unittest.TestCase):

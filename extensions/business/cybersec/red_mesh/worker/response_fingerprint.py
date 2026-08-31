@@ -26,8 +26,11 @@ import threading
 import time
 
 import requests
+from requests.adapters import HTTPAdapter
 from requests.compat import urljoin, urlparse
 from requests.models import DEFAULT_REDIRECT_LIMIT
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.util import parse_url
 
 from ..constants import FINGERPRINT_HTTP_TIMEOUT, FINGERPRINT_TIMEOUT
@@ -266,6 +269,107 @@ def release_response_connection(response):
     pass
 
 
+def _socket_recording_pool_classes(registry):
+  """
+  Pool classes whose connections append their socket to `registry` on connect.
+
+  The header read happens inside `session.get`, before any response object
+  exists, so `release_response_connection` cannot reach it. Recording the socket
+  at connect time is what gives a watchdog something to shut down.
+
+  `PoolManager.pool_classes_by_scheme` is an instance attribute precisely so it
+  can be overridden. The registry is closed over rather than passed as a pool
+  keyword because pool keywords are folded into the connection-pool cache key,
+  which rejects unknown names.
+  """
+  class _RecordingHTTPConnection(HTTPConnection):
+    def connect(self):
+      super().connect()
+      registry.append(self.sock)
+
+  class _RecordingHTTPSConnection(HTTPSConnection):
+    def connect(self):
+      super().connect()
+      # Post-handshake, so this is the TLS socket: shutting it down unblocks a
+      # reader stalled inside the wrapped stream, which the raw socket would not.
+      registry.append(self.sock)
+
+  class _RecordingHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _RecordingHTTPConnection
+
+  class _RecordingHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _RecordingHTTPSConnection
+
+  return {
+    "http": _RecordingHTTPConnectionPool,
+    "https": _RecordingHTTPSConnectionPool,
+  }
+
+
+class _SocketRecordingAdapter(HTTPAdapter):
+  """A transport adapter that exposes the sockets it opens."""
+
+  def __init__(self, socket_registry, **kwargs):
+    self._socket_registry = socket_registry
+    super().__init__(**kwargs)
+
+  def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+    super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+    self.poolmanager.pool_classes_by_scheme = _socket_recording_pool_classes(
+      self._socket_registry
+    )
+
+
+def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
+  """
+  Issue one GET under a wall-clock deadline the peer cannot reset.
+
+  `requests`' `timeout` is per socket operation, not a deadline: every header
+  line that arrives restarts it, so a peer emitting one line just inside the
+  window holds the read open indefinitely. Measured against a real socket, a
+  4-second budget was still blocked after 50 seconds, and a byte-wise drip
+  inside a single header line reaches hours. Neither `Timeout(total=...)` nor
+  `stop()` helps — the former only recomputes the same per-operation timeout,
+  and the latter cannot interrupt a thread blocked in `socket.readinto`.
+
+  A response that arrives only because the watchdog fired is discarded: the
+  header block was truncated mid-flight, and `http.client` parses what it has
+  into a plausible-looking reply. Recording that as the target's answer would
+  turn our own timeout into fabricated evidence.
+  """
+  expired = threading.Event()
+  finished = threading.Event()
+
+  def _watch():
+    if finished.wait(max_seconds):
+      return
+    expired.set()
+    for sock in list(sockets):
+      try:
+        sock.shutdown(socket.SHUT_RDWR)
+      except Exception:
+        # Already closed, or never connected. Nothing to release.
+        pass
+
+  threading.Thread(target=_watch, daemon=True).start()
+  try:
+    response = session.get(url, timeout=max_seconds, **kwargs)
+  except Exception:
+    if expired.is_set():
+      raise requests.Timeout("response fingerprint header deadline exceeded") from None
+    raise
+  finally:
+    finished.set()
+
+  if expired.is_set():
+    try:
+      response.close()
+    except Exception:
+      pass
+    raise requests.Timeout("response fingerprint header deadline exceeded")
+  return response
+
+
 def read_bounded_response_body(response, max_bytes, max_seconds):
   """Read a streamed response without allowing a hostile peer to grow memory forever."""
   chunks = []
@@ -429,6 +533,11 @@ class _ResponseFingerprintMixin:
     """Issue one GET and reduce the response to comparable attributes."""
     url = f"{scheme}://{self.target}:{port}/"
     session = requests.Session()
+    # Per-call, so concurrent probes never observe each other's sockets.
+    sockets = []
+    adapter = _SocketRecordingAdapter(sockets)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     resp = None
     try:
       user_agent = getattr(self, "scanner_user_agent", "")
@@ -441,9 +550,11 @@ class _ResponseFingerprintMixin:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
           raise requests.Timeout("response fingerprint deadline exceeded")
-        resp = session.get(
+        resp = request_within_deadline(
+          session,
           current_url,
-          timeout=remaining,
+          sockets,
+          max_seconds=remaining,
           verify=False,
           allow_redirects=False,
           headers=headers,
