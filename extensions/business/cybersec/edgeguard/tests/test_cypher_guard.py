@@ -60,7 +60,7 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
 
   def test_schema_extractor_ignores_dot_tokens_inside_string_literals(self):
     analysis = analyze_generated_cypher(
-      "MATCH (i:Indicator) WHERE i.value = 'gait.com' RETURN i"
+      "MATCH (i:Indicator) WHERE i.value = 'gait.com' RETURN i LIMIT 10"
     )
 
     self.assertTrue(analysis["accepted"])
@@ -156,3 +156,136 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
     self.assertIn("Schema correction attempt 1 of 2", prompt)
     self.assertIn("Unknown properties: timestamp", prompt)
     self.assertIn("Return only the corrected read-only Cypher query", prompt)
+
+
+class EdgeGuardExecutionSafetyTests(unittest.TestCase):
+  """EG-013 execution-safety denial classes and their positive regressions."""
+
+  def _analysis(self, cypher, **kwargs):
+    return analyze_generated_cypher(cypher, **kwargs)
+
+  def assert_rejected(self, cypher, fragment, **kwargs):
+    analysis = self._analysis(cypher, **kwargs)
+    self.assertFalse(analysis["accepted"], cypher)
+    feedback = (analysis.get("execution_safety_error") or "") + (analysis.get("read_only_error") or "")
+    self.assertIn(fragment, feedback, cypher)
+
+  def test_rejects_every_call_form(self):
+    cases = [
+      "MATCH (n:Indicator) CALL custom.write(n) RETURN n LIMIT 5",
+      "MATCH (n:Indicator) OPTIONAL CALL custom.read(n) RETURN n LIMIT 5",
+      "MATCH (n:Indicator) CALL { WITH n RETURN n AS m } RETURN m LIMIT 5",
+      "MATCH (n:Indicator) call dbms.components() YIELD name RETURN n LIMIT 5",
+      "WITH 1 AS x CALL apoc.load.json('x') YIELD value RETURN value LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "CALL")
+
+  def test_rejects_catalog_procedure_start(self):
+    analysis = self._analysis("CALL db.labels() YIELD label RETURN label")
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("read-only Cypher clause", analysis["read_only_error"])
+
+  def test_call_inside_string_literal_is_not_a_call(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator) WHERE i.value = 'CALL me maybe' RETURN i.value AS value LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis)
+
+  def test_rejects_properties_projection(self):
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN properties(i) AS all_properties LIMIT 5",
+      "properties() projection",
+    )
+
+  def test_rejects_wildcard_map_projection(self):
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i{.*} AS mapping LIMIT 5",
+      "wildcard map projection",
+    )
+
+  def test_rejects_bracket_property_access(self):
+    cases = [
+      'MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS v LIMIT 5',
+      "MATCH (n:Indicator) RETURN n['value'] AS v LIMIT 5",
+      "MATCH p=(n:Indicator)-[:INDICATES]->() RETURN nodes(p)[0] AS head LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "bracket property access")
+
+  def test_pattern_brackets_and_in_lists_are_not_bracket_access(self):
+    cases = [
+      "MATCH p=(i:Indicator)-[:INDICATES]->(m:Malware) RETURN p LIMIT 5",
+      "MATCH (i:Indicator)-[r:INDICATES]->(m:Malware) RETURN i.value AS value LIMIT 5",
+      "MATCH (i:Indicator) WHERE i.indicator_type IN ['hash', 'domain'] RETURN i LIMIT 5",
+      "MATCH (i:Indicator) WHERE i.value = 'foo[bar]' RETURN i LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertTrue(analysis["accepted"], f"{cypher!r}: {analysis['validation_feedback']}")
+
+  def test_rejects_schema_free_scans(self):
+    cases = [
+      "MATCH (n) RETURN n LIMIT 5",
+      "MATCH ()-[r]->() RETURN r LIMIT 5",
+      "WITH 1 AS x RETURN x LIMIT 1",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "not anchored")
+
+  def test_rejects_materializing_collect(self):
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN collect(i.value) AS values LIMIT 5",
+      "collect()",
+    )
+
+  def test_limit_rules(self):
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i.value AS value",
+      "explicit positive LIMIT",
+    )
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 0",
+      "explicit positive LIMIT",
+    )
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 500",
+      "server row cap of 100",
+      max_limit=100,
+    )
+    accepted = self._analysis(
+      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 100", max_limit=100,
+    )
+    self.assertTrue(accepted["accepted"], accepted["validation_feedback"])
+    uncapped = self._analysis("MATCH (i:Indicator) RETURN i.value AS value LIMIT 500")
+    self.assertTrue(uncapped["accepted"], "max_limit=None skips only the cap comparison")
+
+  def test_scalar_aggregate_only_queries_may_omit_limit(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN count(i) AS total",
+      "MATCH (i:Indicator) RETURN count(i) AS total, max(i.confidence_score) AS best",
+      "MATCH (i:Indicator) RETURN DISTINCT count(i) AS total",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertTrue(analysis["accepted"], f"{cypher!r}: {analysis['validation_feedback']}")
+    mixed = self._analysis("MATCH (i:Indicator) RETURN count(i) AS total, i.value AS value")
+    self.assertFalse(mixed["accepted"], "mixed aggregate and scalar projection still needs LIMIT")
+
+  def test_broadening_template_survives_execution_safety(self):
+    analysis = self._analysis("MATCH p=(n:Indicator)-[:INDICATES]-() RETURN p LIMIT 5", max_limit=100)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_accepted_cypher_is_never_rewritten(self):
+    cypher = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10"
+    analysis = self._analysis(cypher, max_limit=100)
+    self.assertEqual(analysis["accepted_cypher"], cypher)
+
+  def test_execution_safety_feedback_reaches_validation_feedback(self):
+    analysis = self._analysis("MATCH (i:Indicator) RETURN i.value AS value")
+    self.assertIn("Execution safety error", analysis["validation_feedback"])

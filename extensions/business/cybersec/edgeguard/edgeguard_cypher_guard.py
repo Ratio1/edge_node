@@ -215,12 +215,21 @@ WRITE_CYPHER = re.compile(
   r"\b(CREATE|MERGE|DELETE|DETACH\s+DELETE|SET|REMOVE|DROP|LOAD\s+CSV|FOREACH)\b",
   re.I,
 )
-DANGEROUS_CALL = re.compile(r"\bCALL\s+(dbms|apoc|algo|gds)\.", re.I)
-READ_ONLY_CALL = re.compile(
-  r"^\s*CALL\s+db\.(labels|relationshipTypes)\(\)\s+YIELD\s+"
-  r"(label|relationshipType)\s+RETURN\s+\2\b",
-  re.I,
-)
+# EG-013: every procedure or subquery CALL is rejected — no procedure allowlist.
+# (Replaces the former DANGEROUS_CALL prefix list and the READ_ONLY_CALL
+# db.labels/db.relationshipTypes catalog allowance.)
+CALL_CLAUSE = re.compile(r"\bCALL\b", re.I)
+PROPERTIES_PROJECTION = re.compile(r"\bproperties\s*\(", re.I)
+WILDCARD_PROJECTION = re.compile(r"\.\s*\*")
+# Dynamic/bracket property access: an identifier or `)` immediately before `[`.
+# Pattern brackets (`-[:REL]-`, `-[r:REL]->`, `[*1..2]`) and list literals after
+# IN are not matched.
+BRACKET_ACCESS = re.compile(r"(?:\b(?!IN\b)[A-Za-z_][A-Za-z0-9_]*|\))\s*\[", re.I)
+COLLECT_AGGREGATE = re.compile(r"\bcollect\s*\(", re.I)
+LIMIT_LITERAL = re.compile(r"\bLIMIT\s+(\d+)\b", re.I)
+RETURN_CLAUSE = re.compile(r"\bRETURN\b", re.I)
+RETURN_TERMINATOR = re.compile(r"\b(ORDER\s+BY|SKIP|LIMIT)\b", re.I)
+SCALAR_AGGREGATE_ITEM = re.compile(r"^(?:DISTINCT\s+)?(count|min|max|sum|avg)\s*\(", re.I)
 TEMPORAL_REQUEST = re.compile(
   r"\b(last|latest|recent|since|before|after|between|past|today|yesterday|days?|weeks?|months?|"
   r"years?|hours?|date|time|timestamp|first seen|seen since|until)\b",
@@ -326,10 +335,7 @@ def extract_schema_tokens(cypher: str) -> dict[str, set[str]]:
 def assert_read_only_cypher(text: str, row_id: str = "generated-output", field: str = "output") -> None:
   if not isinstance(text, str) or not text.strip():
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} must be a non-empty string")
-  if not (
-    text.lstrip().upper().startswith(("MATCH ", "OPTIONAL MATCH ", "WITH "))
-    or READ_ONLY_CALL.search(text)
-  ):
+  if not text.lstrip().upper().startswith(("MATCH ", "OPTIONAL MATCH ", "WITH ")):
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} does not start with a read-only Cypher clause")
   if PARAM_REF.search(text):
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} still contains a parameter reference")
@@ -337,8 +343,8 @@ def assert_read_only_cypher(text: str, row_id: str = "generated-output", field: 
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} contains a semicolon")
   if WRITE_CYPHER.search(text):
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} contains write Cypher")
-  if DANGEROUS_CALL.search(text):
-    raise EdgeGuardCypherGuardError(f"{row_id}: {field} contains a dangerous procedure call")
+  if CALL_CLAUSE.search(CYPHER_STRING_LITERAL.sub("''", text)):
+    raise EdgeGuardCypherGuardError(f"{row_id}: {field} contains a procedure or subquery CALL")
 
 
 def unknown_schema_tokens(cypher: str, allowed: dict[str, set[str]]) -> dict[str, list[str]]:
@@ -386,11 +392,14 @@ def format_schema_validation_feedback(
   read_only_error: str | None = None,
   allowed: dict[str, set[str]] | None = None,
   forbidden: dict[str, bool] | None = None,
+  execution_safety_error: str | None = None,
 ) -> str:
   lines = []
   active_forbidden = sorted(name for name, active in (forbidden or {}).items() if active)
   if read_only_error:
     lines.append(f"Read-only/output error: {read_only_error}")
+  if execution_safety_error:
+    lines.append(f"Execution safety error: {execution_safety_error}")
   if "parameter_ref" in active_forbidden:
     lines.append(
       "Output contains a parameter placeholder such as `$name`. Inline the concrete user value as a "
@@ -417,7 +426,80 @@ def format_schema_validation_feedback(
   return "\n".join(lines) if lines else "The previous output failed schema validation."
 
 
-def analyze_generated_cypher(output: str, allowed: dict[str, set[str]] | None = None) -> dict[str, Any]:
+def _split_top_level(text: str) -> list[str]:
+  """Split on commas outside (), [], and {} nesting."""
+  items: list[str] = []
+  depth = 0
+  current: list[str] = []
+  for char in text:
+    if char in "([{":
+      depth += 1
+    elif char in ")]}":
+      depth = max(0, depth - 1)
+    if char == "," and depth == 0:
+      items.append("".join(current).strip())
+      current = []
+    else:
+      current.append(char)
+  tail = "".join(current).strip()
+  if tail:
+    items.append(tail)
+  return items
+
+
+def _scalar_aggregate_only_return(stripped: str) -> bool:
+  """True when every top-level RETURN item is a scalar aggregate
+  (count/min/max/sum/avg). Such queries return a bounded row set by
+  construction and may omit LIMIT."""
+  matches = list(RETURN_CLAUSE.finditer(stripped))
+  if not matches:
+    return False
+  tail = stripped[matches[-1].end():]
+  terminator = RETURN_TERMINATOR.search(tail)
+  if terminator:
+    tail = tail[:terminator.start()]
+  tail = re.sub(r"^\s*DISTINCT\b", "", tail, flags=re.I).strip()
+  items = _split_top_level(tail)
+  if not items:
+    return False
+  return all(SCALAR_AGGREGATE_ITEM.match(item) for item in items)
+
+
+def _execution_safety_error(
+  candidate: str,
+  schema_tokens: dict[str, set[str]],
+  max_limit: int | None,
+) -> str | None:
+  """First execution-safety violation for an otherwise read-only query, or
+  None. Runs on string-literal-stripped text; messages are the stable
+  rejection diagnostics."""
+  stripped = CYPHER_STRING_LITERAL.sub("''", candidate)
+  if PROPERTIES_PROJECTION.search(stripped):
+    return "properties() projection is not allowed"
+  if WILDCARD_PROJECTION.search(stripped):
+    return "wildcard map projection is not allowed"
+  if BRACKET_ACCESS.search(stripped):
+    return "dynamic or bracket property access is not allowed"
+  if COLLECT_AGGREGATE.search(stripped):
+    return "materializing collect() aggregation is not allowed"
+  if not schema_tokens["labels"] and not schema_tokens["relationship_types"]:
+    return "query is not anchored to any allowlisted label or relationship type"
+  if not _scalar_aggregate_only_return(stripped):
+    limits = [int(match.group(1)) for match in LIMIT_LITERAL.finditer(stripped)]
+    if not limits or limits[-1] < 1:
+      cap_text = f" of at most {max_limit} rows" if isinstance(max_limit, int) else ""
+      return f"add an explicit positive LIMIT{cap_text} to the final RETURN"
+    if isinstance(max_limit, int) and limits[-1] > max_limit:
+      return f"LIMIT exceeds the server row cap of {max_limit} rows"
+  return None
+
+
+def analyze_generated_cypher(
+  output: str,
+  allowed: dict[str, set[str]] | None = None,
+  *,
+  max_limit: int | None = None,
+) -> dict[str, Any]:
   allowed = allowed or schema_sets()
   candidate = str(output or "").strip()
   forbidden = {name: bool(pattern.search(candidate)) for name, pattern in FORBIDDEN_OUTPUT.items()}
@@ -437,15 +519,22 @@ def analyze_generated_cypher(output: str, allowed: dict[str, set[str]] | None = 
 
   schema_unknown = {}
   schema_compatible = False
+  execution_safety_error = None
   if read_only_static:
-    schema_unknown = unknown_schema_tokens(candidate, allowed)
+    schema_tokens = extract_schema_tokens(candidate)
+    schema_unknown = {
+      key: sorted(schema_tokens[key] - allowed[key])
+      for key in SCHEMA_KEYS
+      if schema_tokens[key] - allowed[key]
+    }
     schema_compatible = not schema_unknown
+    execution_safety_error = _execution_safety_error(candidate, schema_tokens, max_limit)
 
   invented_temporal = sorted(
     set(schema_unknown.get("properties", [])) & set(TEMPORAL_HALLUCINATION_PROPERTIES)
   )
   query_only = output_clean and read_only_static
-  accepted = query_only and schema_compatible
+  accepted = query_only and schema_compatible and execution_safety_error is None
   return {
     "candidate": candidate,
     "non_empty": bool(candidate),
@@ -456,6 +545,7 @@ def analyze_generated_cypher(output: str, allowed: dict[str, set[str]] | None = 
     "read_only_error": read_only_error,
     "schema_compatible": schema_compatible,
     "schema_unknown": schema_unknown,
+    "execution_safety_error": execution_safety_error,
     "invented_temporal_properties": invented_temporal,
     "accepted": accepted,
     "accepted_cypher": candidate if accepted else None,
@@ -464,6 +554,7 @@ def analyze_generated_cypher(output: str, allowed: dict[str, set[str]] | None = 
       read_only_error,
       allowed=allowed,
       forbidden=forbidden,
+      execution_safety_error=execution_safety_error,
     ),
   }
 

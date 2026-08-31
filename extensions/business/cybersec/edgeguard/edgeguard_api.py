@@ -999,6 +999,7 @@ def _prepare_graph_explanation_plan(
   requested_limit: Optional[int] = None,
   broadening_enabled: bool = False,
   mode_plan: Optional[ModePlan] = None,
+  guard_max_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
   try:
     selected_mode = mode_plan or resolve_mode(explanation_rows=requested_limit)
@@ -1009,7 +1010,11 @@ def _prepare_graph_explanation_plan(
       "error": "Graph explanation request configuration is invalid.",
       "validation_errors": [_contract_error(exc.code, exc.detail)],
     }
-  analysis = analyze_generated_cypher(cypher)
+  # CALL/properties()/wildcard/bracket projection safety now lives in the
+  # shared guard's execution-safety stage (EG-013), so every execution route
+  # rejects them identically; only the packet-property projection policy below
+  # remains explanation-specific.
+  analysis = analyze_generated_cypher(cypher, max_limit=guard_max_limit)
   if not analysis["accepted"]:
     return {
       "status": STATUS_REJECTED,
@@ -1018,58 +1023,6 @@ def _prepare_graph_explanation_plan(
       "error": "Cypher rejected by EdgeGuard guard; graph explanation was not prepared.",
     }
   accepted_cypher = analysis["accepted_cypher"]
-  if re.search(r"\bCALL\b", accepted_cypher, re.IGNORECASE):
-    return {
-      "status": STATUS_REJECTED,
-      "ok": False,
-      "validation": analysis,
-      "error": "Cypher result projection is not safe for complete-result explanation.",
-      "validation_errors": [
-        _contract_error(
-          "unsafe_result_projection",
-          "procedure calls are not allowed for complete-result explanation",
-        )
-      ],
-    }
-  if re.search(r"\bproperties\s*\(", accepted_cypher, re.IGNORECASE):
-    return {
-      "status": STATUS_REJECTED,
-      "ok": False,
-      "validation": analysis,
-      "error": "Cypher result projection is not safe for complete-result explanation.",
-      "validation_errors": [
-        _contract_error(
-          "unsafe_result_projection",
-          "properties() cannot establish allowlisted property provenance",
-        )
-      ],
-    }
-  if re.search(r"\.\s*\*", accepted_cypher):
-    return {
-      "status": STATUS_REJECTED,
-      "ok": False,
-      "validation": analysis,
-      "error": "Cypher result projection is not safe for complete-result explanation.",
-      "validation_errors": [
-        _contract_error(
-          "unsafe_result_projection",
-          "wildcard map projection cannot establish allowlisted property provenance",
-        )
-      ],
-    }
-  if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\[", accepted_cypher):
-    return {
-      "status": STATUS_REJECTED,
-      "ok": False,
-      "validation": analysis,
-      "error": "Cypher result projection is not safe for complete-result explanation.",
-      "validation_errors": [
-        _contract_error(
-          "unsafe_result_projection",
-          "dynamic property lookup cannot establish allowlisted property provenance",
-        )
-      ],
-    }
   projected_properties = re.findall(
     r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
     accepted_cypher,
@@ -3731,7 +3684,7 @@ class EdgeguardApiPlugin(BasePlugin):
         raw_output, llm_model, timing_ms, completion = self._call_generation_model(
           url, messages, model,
         )
-        validation = analyze_generated_cypher(raw_output)
+        validation = analyze_generated_cypher(raw_output, max_limit=int(self.cfg_neo4j_max_rows))
         if completion.get("finish_reason") != "stop":
           validation = {
             **validation,
@@ -4735,7 +4688,7 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="POST")
   def check_cypher(self, cypher: str, **kwargs) -> Dict[str, Any]:
-    analysis = analyze_generated_cypher(cypher)
+    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
     return {
       "status": STATUS_ACCEPTED if analysis["accepted"] else STATUS_REJECTED,
       **analysis,
@@ -5014,7 +4967,7 @@ class EdgeguardApiPlugin(BasePlugin):
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
-    analysis = analyze_generated_cypher(cypher)
+    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
     if not analysis["accepted"]:
       return {
         "status": STATUS_REJECTED,
@@ -5160,7 +5113,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation_errors": [_contract_error(exc.code, exc.detail)],
       })
     broadening_enabled = bool(enable_empty_result_broadening) if enable_empty_result_broadening is not None else False
-    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
+    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
     if not plan.get("ok"):
       return self._with_active_prepare_contract(plan, mode_plan)
     if self._active_explanation_strategy() == "eel_compatibility":
@@ -5412,7 +5365,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": "Graph-first explanation configuration is unavailable.",
         "validation_errors": [_contract_error(code, detail)],
       }
-    analysis = analyze_generated_cypher(cypher)
+    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
     if not analysis["accepted"]:
       return {
         "status": STATUS_REJECTED,
@@ -5463,7 +5416,7 @@ class EdgeguardApiPlugin(BasePlugin):
           ],
           "validation": analysis,
         }
-      plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
+      plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
       if not plan.get("ok"):
         return {**plan, "executed": False, "explained": False}
       return self._explain_prepared_execution(
@@ -5485,7 +5438,7 @@ class EdgeguardApiPlugin(BasePlugin):
       unavailable.update({"executed": False, "explained": False})
       return unavailable
 
-    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan)
+    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
     if not plan.get("ok"):
       return {**plan, "executed": False, "explained": False}
     executed_cypher = plan["executed_cypher"]

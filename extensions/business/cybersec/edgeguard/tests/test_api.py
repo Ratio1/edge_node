@@ -2407,9 +2407,17 @@ class EdgeGuardApiTests(unittest.TestCase):
           ) as mocked_post:
             result = plugin.prepare_graph_explanation(cypher=cypher)
         self.assertEqual(result["status"], "rejected")
-        self.assertIn(
-          "unsafe_result_projection",
-          {item["code"] for item in result["validation_errors"]},
+        # Projection safety moved into the shared guard (EG-013): guard-level
+        # rejections carry execution_safety_error/read_only_error in the
+        # validation verdict; the remaining plan-only checks keep the
+        # unsafe_result_projection validation_errors code.
+        codes = {item["code"] for item in result.get("validation_errors", [])}
+        validation = result.get("validation") or {}
+        self.assertTrue(
+          "unsafe_result_projection" in codes
+          or validation.get("execution_safety_error")
+          or validation.get("read_only_error"),
+          f"no rejection mechanism recorded for {cypher!r}: {result}",
         )
         mocked_driver.assert_not_called()
         mocked_post.assert_not_called()
@@ -2429,8 +2437,8 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertEqual(result["status"], "rejected")
     self.assertIn(
-      "unsafe_result_projection",
-      {item["code"] for item in result["validation_errors"]},
+      "dynamic or bracket property access",
+      str((result.get("validation") or {}).get("execution_safety_error")),
     )
     mocked_driver.assert_not_called()
 
@@ -2502,8 +2510,8 @@ class EdgeGuardApiTests(unittest.TestCase):
     cypher = (
       "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) "
       "RETURN s AS source, i AS indicator, coalesce(i.value, null) AS nullable, "
-      "toInteger(i.value) AS total, toFloat(i.value) AS ratio, collect(i.value) AS items, "
-      "collect(i.value) AS aggregate, p AS path LIMIT 25"
+      "toInteger(i.value) AS total, toFloat(i.value) AS ratio, [i.value] AS items, "
+      "coalesce(i.value, i.value) AS aggregate, p AS path LIMIT 25"
     )
     execution_result = _serialized_execution(cypher, primary_row_count=2)
     execution_result["row_count"] = 2
