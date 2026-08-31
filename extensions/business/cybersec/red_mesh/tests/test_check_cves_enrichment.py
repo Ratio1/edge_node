@@ -230,5 +230,71 @@ class TestGracefulDegradation(unittest.TestCase):
       cache.close()
 
 
+class TestCveApplicability(unittest.TestCase):
+  """
+  `CveEntry` had no component/role dimension, so every CVE tagged `openssh`
+  fired on any OpenSSH artifact — including client-side ones matched off a
+  *listening sshd banner*: SCP client-side file overwrite, client
+  VerifyHostKeyDNS, ssh-add, forwarded ssh-agent. A server banner cannot
+  evidence a client-side weakness.
+  """
+
+  def _ids(self, version, **kwargs):
+    return {
+      cve_id
+      for finding in check_cves("openssh", version, **kwargs)
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+
+  def test_a_listening_server_banner_does_not_raise_client_side_cves(self):
+    fired = self._ids("OpenSSH_8.9p1")
+    # CVE-2019-6111 is an scp *client* file-overwrite; CVE-2025-26465 is a
+    # client-side VerifyHostKeyDNS bypass. Neither is evidenced by sshd.
+    self.assertNotIn("CVE-2019-6111", fired)
+    self.assertNotIn("CVE-2025-26465", fired)
+
+  def test_client_side_cves_are_still_reachable_when_asked_for(self):
+    # 7.9 is inside CVE-2019-6111's `<8.1` range; the gate hides it from a
+    # server query rather than dropping it from the catalog.
+    self.assertNotIn("CVE-2019-6111", self._ids("OpenSSH_7.9"))
+    self.assertIn("CVE-2019-6111", self._ids("OpenSSH_7.9", applicability="client"))
+
+
+class TestRegreSSHionConstraint(unittest.TestCase):
+  """
+  CVE-2024-6387 was encoded as `openssh <9.3`. The published scope is
+  `<4.4p1` plus `>=8.5p1,<9.8p1`, so the single range both over-matched
+  (4.4p1 through 8.5p1 are not vulnerable) and under-matched (9.3 through
+  9.8p1 are).
+  """
+
+  def _fires(self, version):
+    return "CVE-2024-6387" in {
+      cve_id
+      for finding in check_cves("openssh", version)
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+
+  def test_the_vulnerable_ranges_fire(self):
+    for version in ("OpenSSH_4.3", "OpenSSH_8.5p1", "OpenSSH_8.9p1", "OpenSSH_9.7"):
+      with self.subTest(version=version):
+        self.assertTrue(self._fires(version), f"{version} is in the published scope")
+
+  def test_the_unaffected_middle_range_does_not_fire(self):
+    # Over-matching: these sit between the two vulnerable ranges.
+    for version in ("OpenSSH_4.4p1", "OpenSSH_5.0", "OpenSSH_7.4", "OpenSSH_8.4"):
+      with self.subTest(version=version):
+        self.assertFalse(self._fires(version), f"{version} is not in the published scope")
+
+  def test_the_upper_range_is_not_truncated_at_9_3(self):
+    # Under-matching: 9.3 to 9.8p1 are vulnerable and were being missed.
+    for version in ("OpenSSH_9.3", "OpenSSH_9.6"):
+      with self.subTest(version=version):
+        self.assertTrue(self._fires(version), f"{version} is in the published scope")
+
+  def test_the_fixed_release_does_not_fire(self):
+    self.assertFalse(self._fires("OpenSSH_9.8p1"))
+
+
 if __name__ == "__main__":
   unittest.main()

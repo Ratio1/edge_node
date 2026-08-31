@@ -31,6 +31,40 @@ class CveEntry:
   severity: Severity
   title: str
   cwe_id: str = ""
+  # "server" | "client" — which component of the product the weakness lives in.
+  # Left empty here and resolved through CLIENT_SIDE_CVE_IDS, so the separate
+  # expansion catalog (a table of plain tuples) is covered by the same rule
+  # rather than needing the field threaded through it too.
+  applicability: str = ""
+
+
+# CVEs whose weakness is in the *client* side of the product. Everything a probe
+# fingerprints is a listening service, so matching these off a server banner
+# asserts a weakness the evidence cannot support: a running sshd says nothing
+# about whether anyone on that host ever runs `scp` or `ssh-add`.
+CLIENT_SIDE_CVE_IDS = frozenset({
+  "CVE-2019-6111",    # scp client-side file overwrite
+  "CVE-2025-26465",   # client VerifyHostKeyDNS bypass
+  "CVE-2023-28531",   # ssh-add destination constraint bypass
+  "CVE-2023-38408",   # ssh-agent PKCS#11 search path code execution
+  "CVE-2016-10009",   # ssh-agent untrusted search path
+  "CVE-2021-28041",   # ssh-agent double free
+  "CVE-2016-0778",    # roaming client memory disclosure
+  "CVE-2020-12062",   # scp duplicate response mishandling
+  "CVE-2020-15778",   # scp command injection
+})
+
+SERVER_APPLICABILITY = "server"
+CLIENT_APPLICABILITY = "client"
+
+
+def entry_applicability(entry) -> str:
+  """Resolve which component of the product an entry's weakness lives in."""
+  declared = getattr(entry, "applicability", "") or ""
+  if declared:
+    return declared
+  cve_id = getattr(entry, "cve_id", "") or ""
+  return CLIENT_APPLICABILITY if cve_id in CLIENT_SIDE_CVE_IDS else SERVER_APPLICABILITY
 
 
 CVE_DATABASE: list = [
@@ -43,7 +77,12 @@ CVE_DATABASE: list = [
   CveEntry("elasticsearch", ">=7.0.0,<7.17.19", "CVE-2024-23450", Severity.HIGH, "Ingest pipeline DoS via deep nesting", "CWE-400"),
 
   # ── OpenSSH ────────────────────────────────────────────────────────
-  CveEntry("openssh", "<9.3",  "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
+  # Two rows because the published scope is a disjunction — `<4.4p1` OR
+  # `>=8.5p1,<9.8p1` — and a constraint string joins with AND. Encoded as a
+  # single `<9.3` it both over-matched (4.4p1 through 8.5p1 are not affected)
+  # and under-matched (9.3 through 9.8p1 are).
+  CveEntry("openssh", "<4.4p1", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
+  CveEntry("openssh", ">=8.5p1,<9.8p1", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
   CveEntry("openssh", ">=6.8,<9.9.2", "CVE-2025-26465", Severity.HIGH, "MitM via VerifyHostKeyDNS bypass", "CWE-305"),
   CveEntry("openssh", "<8.1",  "CVE-2019-6111", Severity.HIGH, "SCP client-side file overwrite", "CWE-20"),
   CveEntry("openssh", "<7.6",  "CVE-2017-15906", Severity.MEDIUM, "Improper write restriction in readonly mode", "CWE-732"),
@@ -238,7 +277,13 @@ for _product, _constraint, _cve_id, _severity, _title, _cwe_id in EXPANDED_CVE_R
   ))
 
 
-def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
+def check_cves(
+  product: str,
+  version: str,
+  *,
+  applicability: str = SERVER_APPLICABILITY,
+  dynamic_cache=None,
+) -> list:
   """Match version against CVE database. Returns list of Findings.
 
   When ``dynamic_cache`` is a ``DynamicReferenceCache`` instance,
@@ -251,11 +296,19 @@ def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
     dynamic_cache = get_dynamic_reference_cache()
 
   findings = []
+  seen_cves = set()
   for entry in CVE_DATABASE:
     if entry.product != product:
       continue
+    if applicability and entry_applicability(entry) != applicability:
+      continue
     if not _matches_constraint(version, entry.constraint):
       continue
+    # A CVE whose published scope is a disjunction is carried as one row per
+    # range, so it must still be reported once.
+    if entry.cve_id in seen_cves:
+      continue
+    seen_cves.add(entry.cve_id)
     findings.append(_build_finding(entry, product, version, dynamic_cache))
   return findings
 

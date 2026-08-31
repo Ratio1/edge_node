@@ -1455,8 +1455,11 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     self.assertIsInstance(result, dict)
     self.assertEqual(result.get("product"), "openssh")
-    # OpenSSH 7.4 is vulnerable to CVE-2024-6387 (regreSSHion, <9.3)
-    self._assert_has_finding(result, "CVE-2024-6387")
+    # CVE-2017-15906 is in scope for 7.4 (`<7.6`). This previously asserted
+    # CVE-2024-6387 on the strength of the old `<9.3` encoding; the published
+    # regreSSHion scope is `<4.4p1` plus `>=8.5p1,<9.8p1`, and 7.4 is in
+    # neither, so the assertion was encoding the over-match.
+    self._assert_has_finding(result, "CVE-2017-15906")
 
   def test_generic_probe_binary_returns_none(self):
     """Generic probe should return None for pure binary banners."""
