@@ -147,15 +147,41 @@ class TestExcerptSanitization(unittest.TestCase):
         self.assertNotIn(secret, sanitize_excerpt(pair))
 
   def test_ambiguous_english_keys_are_left_alone(self):
-    # `code`, `state`, `sig` and `ticket` are ordinary words. Redacting them
-    # would destroy comparison signal the way the base64 rule once did.
+    # `code`, `state`, `sig` and `ticket` are ordinary words. Redacting them on
+    # the key alone would destroy comparison signal the way the base64 rule
+    # once did, so the value has to earn the redaction.
     for text in (
       "state: California",
       "the code: refactored yesterday",
       "ticket: renewed",
+      "?state=open&sort=date",
+      "?code=US&lang=en",
+      "sig: abc",
+      "<code>print(x)</code>",
+      '<code class="language-python">x</code>',
+      'data-state="collapsed"',
+      # Long enough to clear the unbroken-run test, so only the absent digit
+      # keeps it out of the redaction.
+      "code: internationalization",
+      "signature: Jonathan Featherstonehaugh",
     ):
       with self.subTest(text=text):
         self.assertEqual(sanitize_excerpt(text), text)
+
+  def test_ambiguous_english_keys_are_redacted_when_the_value_is_token_shaped(self):
+    # These four were left out of the key table entirely because the keys are
+    # English. That also archived every real OAuth code, SAML signature and
+    # service ticket in the clear. The discriminator is the value's shape — an
+    # unbroken alphanumeric run no prose carries — not the key.
+    for pair, secret in (
+      ("?code=Ab3Xk9Qz2Lm7Pw4Rt8Nv1Cd", "Ab3Xk9Qz2Lm7Pw4Rt8Nv1Cd"),
+      ("state=eyJhbGciOiJIUzI1NiJ9xyz", "eyJhbGciOiJIUzI1NiJ9xyz"),
+      ("sig: 9f8b7c6d5e4f3a2b1c0d9e8f", "9f8b7c6d5e4f3a2b1c0d9e8f"),
+      ("ticket=ST1a2b3c4d5e6f7g8h9i0j", "ST1a2b3c4d5e6f7g8h9i0j"),
+      ('{"code": "4Ab3Xk9Qz2Lm7Pw4Rt8Nv"}', "4Ab3Xk9Qz2Lm7Pw4Rt8Nv"),
+    ):
+      with self.subTest(pair=pair):
+        self.assertNotIn(secret, sanitize_excerpt(pair))
 
   def test_userinfo_without_a_password_keeps_the_host(self):
     # The e-mail rule would otherwise match `TOKEN@host` and take the host with

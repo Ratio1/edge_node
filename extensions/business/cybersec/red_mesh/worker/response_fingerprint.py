@@ -88,6 +88,25 @@ _REDACTIONS = (
     ),
     r"\1\g<quote>\g<separator>[REDACTED]",
   ),
+  # Keys that are ordinary English words, so the key alone cannot justify a
+  # redaction — `state: California` and `?code=US` are comparison signal, while
+  # an OAuth code, a SAML signature and a service ticket are credentials under
+  # exactly the same names. The value decides, on two counts: an unbroken
+  # 16-character alphanumeric run (the same token-versus-prose discriminator the
+  # base64 rule below uses), *and* a digit somewhere in it. The digit is what
+  # separates a generated token from a long word — `code: internationalization`
+  # clears the run test on length alone, and redacting it would destroy exactly
+  # the comparison signal this table has already destroyed once.
+  (
+    re.compile(
+      r"(?i)(?<![A-Za-z0-9])(code|state|sig|signature|ticket)"
+      r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
+      r"(?=[\"']?[A-Za-z0-9_+/\-]*[A-Za-z0-9]{16,})"
+      r"(?=[^\r\n,;&<>}]*[0-9])"
+      r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;&<>}]+)"
+    ),
+    r"\1\g<quote>\g<separator>[REDACTED]",
+  ),
   (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
   (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "[REDACTED_HEX]"),
   # A token is distinguished from prose by an unbroken alphanumeric run, not by
