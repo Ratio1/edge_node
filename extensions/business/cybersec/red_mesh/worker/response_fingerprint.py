@@ -19,10 +19,18 @@ value can leave the node.
 
 import hashlib
 import ipaddress
+import queue
 import re
 import socket
+import threading
+import time
 
 import requests
+from requests.compat import urljoin, urlparse
+from requests.models import DEFAULT_REDIRECT_LIMIT
+from urllib3.util import parse_url
+
+from ..constants import FINGERPRINT_HTTP_TIMEOUT, FINGERPRINT_TIMEOUT
 
 # Excerpts exist so an operator can see *that* two vantages were served
 # different content. A few hundred bytes of the head of the document is
@@ -35,8 +43,10 @@ EXCERPT_CONTENT_TYPES = ("text/html", "text/plain", "application/json")
 # Headers that identify *which* infrastructure answered. These are what
 # actually differ between a CDN edge in Brazil and one in China.
 CAPTURED_HEADERS = ("server", "via", "x-cache", "cf-ray", "x-powered-by", "location")
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 TITLE_MAX_CHARS = 200
+RESPONSE_BODY_MAX_BYTES = 1024 * 1024
 
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -48,19 +58,51 @@ _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 #     local part;
 #   - hex precedes base64, because hex is a strict subset of that alphabet.
 _REDACTIONS = (
+  # URL userinfo, first: `https://user:secret@host` carries a credential that
+  # none of the key/value patterns below would recognise. The password half is
+  # optional, because `https://TOKEN@host/` is a credential too — and without
+  # this the e-mail rule would match it first and take the host with it,
+  # destroying the field that makes vantages comparable.
+  (re.compile(r"(?<=://)[^/@\s]+(?::[^/@\s]+)?@"), "[REDACTED]@"),
   (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"), "bearer [REDACTED]"),
   (
     re.compile(
-      r"(?i)\b(authorization|api[-_]?key|apikey|access[-_]?token|token|"
-      r"session[-_]?id|sessionid|session|secret|password|passwd|pwd)\b"
+      # `(?<![A-Za-z0-9])` rather than `\b`: an underscore is a word character,
+      # so `\b` could never match after one and every `db_password=` /
+      # `jwt_secret=` style key escaped this rule entirely.
+      r"(?i)(?<![A-Za-z0-9])(authorization|"
+      r"(?:api|access|refresh|session|client|auth|id|private|secret)[-_]?"
+      r"(?:key|token|secret|id)|"
+      # Session-cookie and SAML names carry no `session`/`token` substring, so
+      # they are named explicitly. Deliberately absent: `code`, `state`, `sig`,
+      # `ticket` — ordinary English words whose inclusion would redact prose,
+      # which is a failure this table has already made once.
+      r"jsessionid|phpsessid|samlresponse|"
+      r"apikey|token|session|secret|password|passwd|pwd)\b"
       # An optional closing quote covers JSON keys such as {"api_key": "..."}.
-      r"[\"']?(\s*[:=]\s*)[\"']?[^\s\"',;&<>]+"
+      r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
+      r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;&<>}]+)"
     ),
-    r"\1\2[REDACTED]",
+    r"\1\g<quote>\g<separator>[REDACTED]",
   ),
   (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
   (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "[REDACTED_HEX]"),
-  (re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}"), "[REDACTED_B64]"),
+  # A token is distinguished from prose by an unbroken alphanumeric run, not by
+  # its alphabet. Admitting `-` and `_` without that requirement swallowed
+  # ordinary hyphenated titles, CSS class names and paths — which are exactly
+  # the content this evidence exists to compare between vantages.
+  (
+    re.compile(
+      r"(?<![A-Za-z0-9_+/\-])"
+      r"(?=[A-Za-z0-9_+/\-]*[A-Za-z0-9+/]{20,})"
+      r"[A-Za-z0-9_+/\-]{32,}={0,2}"
+      # `=` is deliberately absent from this trailing class: including it made a
+      # long run followed by padding-plus-more unmatchable, silently narrowing
+      # the rule against what develop caught.
+      r"(?![A-Za-z0-9_+/\-])"
+    ),
+    "[REDACTED_B64]",
+  ),
 )
 
 
@@ -109,7 +151,7 @@ def normalize_content_type(content_type):
   return content_type.split(";")[0].strip().lower() or None
 
 
-def resolve_host(host):
+def resolve_host(host, timeout=None):
   """
   Resolve a target host to its sorted, deduplicated A/AAAA set.
 
@@ -130,12 +172,163 @@ def resolve_host(host):
     return [], None
   except ValueError:
     pass
-  try:
-    infos = socket.getaddrinfo(host, None)
-  except Exception as exc:
-    return [], str(exc)
+  if timeout is None:
+    try:
+      infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+      return [], str(exc)
+  else:
+    result = queue.Queue(maxsize=1)
+
+    def _lookup():
+      try:
+        result.put((socket.getaddrinfo(host, None), None))
+      except Exception as exc:
+        result.put((None, exc))
+
+    threading.Thread(target=_lookup, daemon=True).start()
+    try:
+      infos, error = result.get(timeout=timeout)
+    except queue.Empty:
+      return [], "DNS resolution timed out"
+    if error is not None:
+      return [], str(error)
   addresses = {info[4][0] for info in infos if info[4]}
   return sorted(addresses), None
+
+
+def redirect_stays_on_target(next_url, host, port):
+  """
+  A scan is authorized for one host and port, so a redirect is followed only
+  when it stays there. A target that answers `302 -> http://169.254.169.254/`
+  would otherwise make this node fetch an internal endpoint and archive the
+  response as scan evidence.
+
+  Pinning to the authorized host is the whole control: anything else — public
+  or private — is out of scope by definition. Classifying the hop's IP would
+  add nothing here and would break scanning private targets, which is a normal
+  authorized case.
+
+  Both parsers must agree, because validating with either alone is bypassable.
+  This module reads a URL with `urlparse` while `requests` dials with urllib3's
+  `parse_url`, and the two split authority differently:
+  `http://169.254.169.254\\@authorized-host/` is host `authorized-host` to the
+  first and `169.254.169.254` to the second, so a guard trusting `urlparse`
+  would wave through a hop that fetches cloud metadata. Refusing on
+  disagreement fails closed against that whole class of parser differential
+  rather than against one spelling of it.
+  """
+  try:
+    stdlib = urlparse(next_url)
+    dialed = parse_url(next_url)
+    # `.port` raises on a malformed port; refuse rather than guess.
+    hop_ports = (stdlib.port, dialed.port)
+  except Exception:
+    return False
+  scheme = (stdlib.scheme or "").lower()
+  if scheme not in ("http", "https"):
+    return False
+  expected_host = (host or "").lower()
+  hop_hosts = ((stdlib.hostname or "").lower(), (dialed.host or "").lower())
+  default_port = 443 if scheme == "https" else 80
+  return (
+    all(hop == expected_host for hop in hop_hosts)
+    and all((hop or default_port) == port for hop in hop_ports)
+  )
+
+
+def release_response_connection(response):
+  """
+  Break a streamed connection without waiting for the reader to finish.
+
+  `response.close()` acquires the same buffer lock the reader thread holds
+  inside `iter_content`, so against a peer that keeps dribbling bytes it blocks
+  well past any deadline — the read timeout never fires, because data keeps
+  arriving. Shutting the socket down instead makes the reader's blocked read
+  fail at once, after which it unwinds on its own and the connection can be
+  released normally by the caller's `finally`.
+
+  Reaching through `raw._connection` is deliberate: urllib3 only grew a
+  supported `HTTPResponse.shutdown()` in 2.3, and this deployment pins an
+  earlier release. Prefer that API once the floor moves.
+
+  There is deliberately no `response.close()` fallback — that is the blocking
+  call this exists to avoid, and the caller's `finally` already closes the
+  response once the reader has unwound.
+  """
+  sock = getattr(getattr(response, "raw", None), "_connection", None)
+  sock = getattr(sock, "sock", None)
+  try:
+    sock.shutdown(socket.SHUT_RDWR)
+  except Exception:
+    # No reachable socket (already closed, mocked, or a wrapped raw). The
+    # reader is still released by the queue drain in the caller.
+    pass
+
+
+def read_bounded_response_body(response, max_bytes, max_seconds):
+  """Read a streamed response without allowing a hostile peer to grow memory forever."""
+  chunks = []
+  total = 0
+  deadline = time.monotonic() + max_seconds
+  events = queue.Queue(maxsize=1)
+  stopped = threading.Event()
+
+  def _read():
+    try:
+      for chunk in response.iter_content(chunk_size=64 * 1024):
+        if stopped.is_set():
+          return
+        events.put(("chunk", chunk))
+      if not stopped.is_set():
+        events.put(("done", None))
+    except Exception:
+      if not stopped.is_set():
+        events.put(("error", None))
+
+  def _stop():
+    """
+    Stop the reader and free it if it is blocked.
+
+    Checking `stopped` before a put is not enough on its own: a put that was
+    already blocked completes the moment this consumer takes an item, refilling
+    the one-slot queue, and the reader can then block on a further put before it
+    observes `stopped`. With no timeout on `Queue.put` that thread would wait
+    forever, pinning a chunk and the response. Draining one slot here releases
+    it, so every exit path must call this rather than only setting the flag.
+    """
+    stopped.set()
+    # Drain first: a reader blocked on the full queue must be released, and the
+    # connection teardown below is not guaranteed to reach it.
+    try:
+      events.get_nowait()
+    except queue.Empty:
+      pass
+    release_response_connection(response)
+
+  threading.Thread(target=_read, daemon=True).start()
+
+  while True:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+      _stop()
+      return b"".join(chunks), False
+    try:
+      kind, payload = events.get(timeout=remaining_seconds)
+    except queue.Empty:
+      _stop()
+      return b"".join(chunks), False
+    if kind == "done":
+      return b"".join(chunks), True
+    if kind == "error":
+      return b"".join(chunks), False
+    if not payload:
+      continue
+    chunks.append(payload)
+    total += len(payload)
+    if total > max_bytes:
+      _stop()
+      return b"".join(chunks)[:max_bytes], False
 
 
 def certificate_identity(cert_der):
@@ -183,7 +376,10 @@ class _ResponseFingerprintMixin:
     if not ports:
       return
 
-    resolved_ips, resolver_error = resolve_host(self.target)
+    resolved_ips, resolver_error = resolve_host(
+      self.target,
+      timeout=self._target_timeout(FINGERPRINT_HTTP_TIMEOUT),
+    )
     evidence = {
       "target_host": self.target,
       "resolved_ips": resolved_ips,
@@ -204,7 +400,10 @@ class _ResponseFingerprintMixin:
     entry = {"reachable": False, "tls": None, "http": None, "excerpt": None}
 
     try:
-      with socket.create_connection((self.target, port), timeout=self._target_timeout(3)):
+      with socket.create_connection(
+        (self.target, port),
+        timeout=self._target_timeout(FINGERPRINT_TIMEOUT),
+      ):
         entry["reachable"] = True
     except Exception:
       # An unreachable port is itself a comparable result: a target that
@@ -229,36 +428,109 @@ class _ResponseFingerprintMixin:
   def _fingerprint_http(self, scheme, port):
     """Issue one GET and reduce the response to comparable attributes."""
     url = f"{scheme}://{self.target}:{port}/"
+    session = requests.Session()
+    resp = None
     try:
       user_agent = getattr(self, "scanner_user_agent", "")
       headers = {"User-Agent": user_agent} if user_agent else {}
-      resp = requests.get(
-        url,
-        timeout=self._target_timeout(5),
-        verify=False,
-        allow_redirects=True,
-        headers=headers,
-      )
+      timeout = self._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+      deadline = time.monotonic() + timeout
+      current_url = url
+      redirect_count = 0
+      while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          raise requests.Timeout("response fingerprint deadline exceeded")
+        resp = session.get(
+          current_url,
+          timeout=remaining,
+          verify=False,
+          allow_redirects=False,
+          headers=headers,
+          stream=True,
+        )
+        location = resp.headers.get("Location")
+        if resp.status_code not in REDIRECT_STATUSES or not location:
+          break
+        if redirect_count >= DEFAULT_REDIRECT_LIMIT:
+          raise requests.TooManyRedirects("response fingerprint redirect limit exceeded")
+        next_url = urljoin(resp.url or current_url, location)
+        if not redirect_stays_on_target(next_url, self.target, port):
+          # Out of scope: keep this last in-scope response as the evidence and
+          # never issue the off-target request.
+          break
+        current_url = next_url
+        redirect_count += 1
+        resp.close()
+        resp = None
     except Exception as exc:
       self.P(f"Response fingerprint GET failed on {url}: {exc}", color='y')
+      if resp is not None:
+        resp.close()
+      session.close()
       return None, None
 
-    content_type = normalize_content_type(resp.headers.get("Content-Type"))
-    title_match = _TITLE_RE.search(resp.text[:5000])
-    http = {
-      "status": resp.status_code,
-      "final_url": resp.url,
-      "redirect_count": len(resp.history),
-      "title": title_match.group(1).strip()[:TITLE_MAX_CHARS] if title_match else None,
-      "content_type": content_type,
-      "body_length": len(resp.content),
-      "body_sha256": hashlib.sha256(resp.content).hexdigest(),
-      "headers": {
-        name: resp.headers.get(name)
-        for name in CAPTURED_HEADERS
-        if resp.headers.get(name)
-      },
-    }
+    try:
+      body, body_complete = read_bounded_response_body(
+        resp,
+        max_bytes=RESPONSE_BODY_MAX_BYTES,
+        max_seconds=max(deadline - time.monotonic(), 0),
+      )
+      encoding = resp.encoding or "utf-8"
+      try:
+        body_text = body.decode(encoding, errors="replace")
+      except LookupError:
+        body_text = body.decode("utf-8", errors="replace")
+      content_type = normalize_content_type(resp.headers.get("Content-Type"))
+      title_match = _TITLE_RE.search(body_text[:5000])
+      declared_length = resp.headers.get("Content-Length")
+      try:
+        declared_length = int(declared_length) if declared_length is not None else None
+      except (TypeError, ValueError):
+        declared_length = None
+      if declared_length is not None and declared_length < 0:
+        declared_length = None
+      body_length = len(body) if body_complete else declared_length
+      # Redact before truncating, so a credential straddling the cap cannot
+      # survive as a prefix — the same order sanitize_excerpt uses internally.
+      title = sanitize_excerpt(title_match.group(1).strip()) if title_match else None
+      http = {
+        "status": resp.status_code,
+        "final_url": sanitize_excerpt(resp.url),
+        "redirect_count": redirect_count,
+        "title": title[:TITLE_MAX_CHARS] if title else None,
+        "content_type": content_type,
+        "body_length": body_length,
+        # False means body_length is the peer's declared Content-Length and
+        # title is derived from a partial body: both are attacker-influenced
+        # and must not be treated as stable identity when comparing vantages.
+        "body_complete": body_complete,
+        "body_sha256": hashlib.sha256(body).hexdigest() if body_complete else None,
+        # Captured headers are archived too, and `location` routinely carries a
+        # token in its query string — especially on a hop refused as off-target,
+        # whose raw Location would otherwise be stored verbatim.
+        "headers": {
+          name: sanitize_excerpt(resp.headers.get(name))
+          for name in CAPTURED_HEADERS
+          if resp.headers.get(name)
+        },
+      }
 
-    excerpt = sanitize_excerpt(resp.text) if excerpt_allowed(content_type) else None
-    return http, excerpt
+      excerpt = sanitize_excerpt(body_text) if excerpt_allowed(content_type) else None
+      return http, excerpt
+    except Exception as exc:
+      # Reading and reducing the body must not end the scan. This block is no
+      # longer safe-by-construction now that the body is streamed rather than
+      # buffered by requests, and an uncaught error here reaches execute_job's
+      # catch-all and skips every remaining phase.
+      self.P(f"Response fingerprint capture failed on {url}: {exc}", color='y')
+      return None, None
+    finally:
+      # Guarded: a raising close would escape both handlers above, leak the
+      # session, and reach execute_job's catch-all — skipping every remaining
+      # scan phase, which is exactly what the handler above exists to prevent.
+      try:
+        resp.close()
+      except Exception:
+        pass
+      session.close()
