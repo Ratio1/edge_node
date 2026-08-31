@@ -3746,3 +3746,117 @@ class EdgeGuardApiTests(unittest.TestCase):
     errors, _context = _validate_packet_and_explanation(packet, explanation)
 
     self.assertIn("customer_evidence_not_allowed", {item["code"] for item in errors})
+
+
+class _FakeNeo4jQuery:
+  def __init__(self, text, timeout=None):
+    self.text = text
+    self.timeout = timeout
+
+
+class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
+  """EG-013 P3: database-side timeout, read routing, recursive evidence privacy."""
+
+  def test_run_neo4j_query_sends_transaction_timeout_and_read_access(self):
+    plugin = _make_api(neo4j_query_timeout_seconds=30)
+    fake_driver, fake_session = _driver_with_results(_Result([], keys=["value"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.Query", _FakeNeo4jQuery):
+      with patch("extensions.business.cybersec.edgeguard.edgeguard_api.READ_ACCESS", "READ"):
+        plugin._run_neo4j_query(fake_driver, "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5", 5)
+
+    fake_driver.session.assert_called_once_with(default_access_mode="READ")
+    query = fake_session.run.call_args[0][0]
+    self.assertIsInstance(query, _FakeNeo4jQuery)
+    self.assertEqual(query.text, "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5")
+    self.assertEqual(query.timeout, 30)
+
+  def test_run_neo4j_query_falls_back_to_raw_text_without_neo4j_query(self):
+    plugin = _make_api()
+    fake_driver, fake_session = _driver_with_results(_Result([], keys=["value"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.Query", None):
+      plugin._run_neo4j_query(fake_driver, "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5", 5)
+
+    self.assertEqual(
+      fake_session.run.call_args[0][0],
+      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5",
+    )
+
+  def test_query_timeout_failure_returns_sanitized_error(self):
+    plugin = _make_api()
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = RuntimeError("transaction timeout reached for secret@host")
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 5",
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+        )
+
+    self.assertFalse(result["ok"])
+    self.assertNotIn("secret", json.dumps(result))
+
+  def test_prepared_execution_rejects_nested_connection_fields(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    cypher = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10"
+    for path_label, mutate in (
+      ("row map", lambda er: er["query_result_evidence"]["rows"][0]["values"].append(
+        {"type": "map", "entries": [{"key": "uri", "value": {"type": "string", "value": "bolt://sentinel-host"}}]},
+      )),
+      ("graph properties", lambda er: er["graph"]["nodes"][0]["properties"].update(
+        {"password": "sentinel-value"},
+      )),
+    ):
+      with self.subTest(path=path_label):
+        execution_result = _serialized_execution(cypher)
+        mutate(execution_result)
+
+        provider_calls = []
+        plugin._graph_first_provider_for_tests = lambda payload: provider_calls.append(payload)
+        result = plugin.explain_graph(
+          cypher=cypher,
+          request="Explain the exact graph.",
+          execution_result=execution_result,
+        )
+
+        serialized = json.dumps(result)
+        self.assertNotIn("sentinel-host", serialized)
+        self.assertNotIn("sentinel-value", serialized)
+        self.assertEqual(provider_calls, [])
+        self.assertFalse(result.get("explained"))
+        self.assertIn("credential_field_not_allowed", serialized)
+
+  def test_live_path_rejects_nested_connection_fields_before_evidence(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    leaky = _GraphNode("indicator-1", ["Indicator"], {"value": "example.org", "uri": "bolt://sentinel-host"})
+    source = _GraphNode("source-1", ["Source"], {"name": "AlienVault OTX"})
+    rel = _GraphRelationship("rel-1", "SOURCED_FROM", leaky, source, {})
+    record = _DriverRecord({"p": _GraphPath([leaky, source], [rel])}, {"p": ["x"]})
+    fake_driver, fake_session = _driver_with_results(_Result([record], keys=["p"]))
+
+    provider_calls = []
+    plugin._graph_first_provider_for_tests = lambda payload: provider_calls.append(payload)
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Explain the returned graph.",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    serialized = json.dumps(result)
+    self.assertNotIn("sentinel-host", serialized)
+    self.assertEqual(provider_calls, [])
+    self.assertFalse(result.get("explained"))
+    self.assertIn("credential_field_not_allowed", serialized)

@@ -60,9 +60,11 @@ from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_b
 from . import egx2
 
 try:
-  from neo4j import GraphDatabase
+  from neo4j import GraphDatabase, Query, READ_ACCESS
 except Exception:  # pragma: no cover - exercised through dependency-missing tests.
   GraphDatabase = None
+  Query = None
+  READ_ACCESS = "READ"
 
 try:
   import websocket
@@ -1524,11 +1526,21 @@ def _serialized_graph_error(code: str, detail: str) -> tuple[None, None, list[Di
   return None, None, [_contract_error(code, detail)]
 
 
+FORBIDDEN_EXECUTION_FIELDS = frozenset({
+  "uri", "username", "password", "scheme", "authorization", "credential", "credentials",
+})
+
+
 def _forbidden_execution_field(value: Any) -> Optional[str]:
   if isinstance(value, dict):
+    # Tagged-map encoding carries field names as the VALUE of a "key" entry
+    # ({"key": "uri", "value": ...}), so plain dict-key scanning misses them.
+    tagged_key = value.get("key")
+    if "value" in value and isinstance(tagged_key, str) and tagged_key.lower() in FORBIDDEN_EXECUTION_FIELDS:
+      return tagged_key
     for key, item in value.items():
       key_text = str(key).lower()
-      if key_text in {"uri", "username", "password", "scheme", "authorization", "credential", "credentials"}:
+      if key_text in FORBIDDEN_EXECUTION_FIELDS:
         return str(key)
       nested = _forbidden_execution_field(item)
       if nested:
@@ -2043,16 +2055,10 @@ def _build_graph_evidence_packet_from_execution(
 ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], list[Dict[str, str]]]:
   if not isinstance(execution_result, dict):
     return _serialized_graph_error("invalid_execution_result", "execution_result must be an object")
-  forbidden_field = next(
-    (
-      str(key)
-      for key in execution_result
-      if str(key).lower() in {
-        "uri", "username", "password", "scheme", "authorization", "credential", "credentials",
-      }
-    ),
-    None,
-  )
+  # EG-013: the forbidden-field validation is recursive — nested connection or
+  # credential keys anywhere in the execution result reject the whole input
+  # before any evidence, digest, or model-input construction.
+  forbidden_field = _forbidden_execution_field(execution_result)
   if forbidden_field:
     return _serialized_graph_error(
       "credential_field_not_allowed",
@@ -4833,8 +4839,14 @@ class EdgeguardApiPlugin(BasePlugin):
     rows = []
     columns = []
     truncated = False
-    with driver.session() as session:
-      result = session.run(cypher)
+    # EG-013: the configured value is a database transaction timeout, and the
+    # session requests read routing (routing, not authorization — the least-
+    # privilege principal remains an independent prerequisite). The Cypher text
+    # itself is never rewritten.
+    timeout_seconds = max(1, int(self.cfg_neo4j_query_timeout_seconds))
+    query = Query(cypher, timeout=timeout_seconds) if Query is not None else cypher
+    with driver.session(default_access_mode=READ_ACCESS) as session:
+      result = session.run(query)
       columns = list(getattr(result, "keys", lambda: [])())
       for idx, record in enumerate(result):
         if idx >= row_limit:
@@ -5507,6 +5519,26 @@ class EdgeguardApiPlugin(BasePlugin):
               broadening_cypher=broadened_cypher,
               error=self._sanitize_error(exc, connection["password"]),
             )
+
+      # EG-013: recursive no-connection-data invariant on the API-owned path —
+      # nested connection or credential keys anywhere in the executed result
+      # reject the complete input before packet, evidence, digest, or model
+      # input construction, so no response artifact carries the values.
+      forbidden_field = _forbidden_execution_field(query_result)
+      if forbidden_field:
+        return {
+          "status": STATUS_REJECTED,
+          "ok": False,
+          "executed": True,
+          "explained": False,
+          "error": "Complete query result failed deterministic validation",
+          "validation_errors": [_contract_error(
+            "credential_field_not_allowed",
+            f"executed result must not contain connection or credential field {forbidden_field}",
+          )],
+          "validation": analysis,
+          "live_retry": live_retry,
+        }
 
       packet, packet_meta = _build_graph_evidence_packet(
         request=request,
