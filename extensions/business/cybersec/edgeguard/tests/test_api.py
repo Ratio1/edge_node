@@ -3,6 +3,7 @@ import json
 import os
 import re
 import requests
+import threading
 import unittest
 import sys
 import time
@@ -636,6 +637,7 @@ def _make_api(**overrides):
   plugin.cfg_edgeguard_verbose = 0
   plugin.os_environ = overrides.get("os_environ", {})
   plugin._explanation_token = overrides.get("explanation_token")
+  plugin._metrics_lock = threading.Lock()
   plugin._request_count = 0
   plugin._error_count = 0
   plugin._last_request_time = None
@@ -3860,3 +3862,79 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
     self.assertEqual(provider_calls, [])
     self.assertFalse(result.get("explained"))
     self.assertIn("credential_field_not_allowed", serialized)
+
+
+class EdgeGuardHealthMetricsTests(unittest.TestCase):
+  """EG-013 P4: truthful process-lifetime request metrics."""
+
+  def _metrics(self, plugin):
+    with patch.object(plugin, "_explanation_url", return_value=(None, "off")):
+      with patch.object(plugin, "_worker_readiness", return_value={}):
+        with patch.object(plugin, "_explanation_worker_ready", return_value=False):
+          return plugin.health()["metrics"]
+
+  def test_success_increments_total_only(self):
+    plugin = _make_api()
+    plugin.models()
+    metrics = self._metrics(plugin)
+    self.assertEqual(metrics["total_requests"], 1)
+    self.assertEqual(metrics["failed_requests"], 0)
+    self.assertEqual(metrics["last_request_time"], 1000)
+
+  def test_guard_rejection_counts_as_failed_exactly_once(self):
+    plugin = _make_api()
+    result = plugin.check_cypher(cypher="MATCH (i:Indicator) RETURN i.value AS value")
+    self.assertEqual(result["status"], "rejected")
+    metrics = self._metrics(plugin)
+    self.assertEqual(metrics["total_requests"], 1)
+    self.assertEqual(metrics["failed_requests"], 1)
+
+  def test_raised_exception_counts_as_failed_and_reraises(self):
+    from extensions.business.cybersec.edgeguard.edgeguard_api import _tracked_endpoint
+
+    plugin = _make_api()
+
+    @_tracked_endpoint
+    def exploding(self):
+      raise RuntimeError("boom")
+
+    with self.assertRaises(RuntimeError):
+      exploding(plugin)
+    metrics = self._metrics(plugin)
+    self.assertEqual(metrics["total_requests"], 1)
+    self.assertEqual(metrics["failed_requests"], 1)
+
+  def test_health_is_excluded_from_tracking(self):
+    plugin = _make_api()
+    self._metrics(plugin)
+    metrics = self._metrics(plugin)
+    self.assertEqual(metrics["total_requests"], 0)
+    self.assertIsNone(metrics["last_request_time"])
+
+  def test_counters_reset_semantics_are_process_local(self):
+    plugin = _make_api()
+    plugin.models()
+    plugin._metrics_lock = threading.Lock()
+    plugin._request_count = 0
+    plugin._error_count = 0
+    plugin._last_request_time = None
+    metrics = self._metrics(plugin)
+    self.assertEqual(metrics["total_requests"], 0)
+
+  def test_concurrent_increments_are_exact(self):
+    plugin = _make_api()
+    workers = 8
+    calls_per_worker = 25
+
+    def hammer():
+      for _ in range(calls_per_worker):
+        plugin.models()
+
+    threads = [threading.Thread(target=hammer) for _ in range(workers)]
+    for thread in threads:
+      thread.start()
+    for thread in threads:
+      thread.join()
+    metrics = self._metrics(plugin)
+    self.assertEqual(metrics["total_requests"], workers * calls_per_worker)
+    self.assertEqual(metrics["failed_requests"], 0)

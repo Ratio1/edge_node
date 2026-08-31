@@ -6,6 +6,7 @@ execution, evidence construction, and explanation for the colleague playground.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import calendar
 import json
@@ -514,6 +515,44 @@ STATUS_REJECTED = "rejected"
 STATUS_TIMEOUT = "timeout"
 
 EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
+
+# EG-013 P4: non-success endpoint outcomes for the /health request metrics.
+# A deterministic guard rejection counts as a failed request; plain metadata
+# dicts without ok/status keys count as success by construction.
+_FAILED_ENDPOINT_STATUSES = {STATUS_REJECTED, STATUS_ERROR, STATUS_TIMEOUT, "config_error", "empty_graph"}
+
+
+def _is_failed_endpoint_response(response: Any) -> bool:
+  if not isinstance(response, dict):
+    return False
+  if response.get("ok") is False:
+    return True
+  return response.get("status") in _FAILED_ENDPOINT_STATUSES
+
+
+def _tracked_endpoint(func):
+  """Process-lifetime request accounting for the /health metrics block.
+
+  total_requests and last_request_time update when a tracked endpoint begins;
+  failed_requests increments exactly once when the endpoint raises or returns
+  a non-success outcome. Counters reset on plugin init/restart.
+  """
+  @functools.wraps(func)
+  def wrapper(self, *args, **kwargs):
+    with self._metrics_lock:
+      self._request_count += 1
+      self._last_request_time = self.time()
+    try:
+      response = func(self, *args, **kwargs)
+    except BaseException:
+      with self._metrics_lock:
+        self._error_count += 1
+      raise
+    if _is_failed_endpoint_response(response):
+      with self._metrics_lock:
+        self._error_count += 1
+    return response
+  return wrapper
 
 FINETUNED_MODEL_KEY = "finetuned_v0_10"
 BASE_MODEL_KEY = "base_qwen3_4b"
@@ -2995,6 +3034,7 @@ class EdgeguardApiPlugin(BasePlugin):
 
   def on_init(self):
     super(EdgeguardApiPlugin, self).on_init()
+    self._metrics_lock = threading.Lock()
     self._request_count = 0
     self._error_count = 0
     self._last_request_time = None
@@ -3602,6 +3642,7 @@ class EdgeguardApiPlugin(BasePlugin):
     )
 
   @BasePlugin.endpoint(method="POST")
+  @_tracked_endpoint
   def generate(
     self,
     request: str,
@@ -4503,6 +4544,14 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="GET")
   def health(self) -> Dict[str, Any]:
+    # /health is deliberately untracked and reads a locked snapshot; the
+    # counters describe only the current plugin process (reset on init).
+    with self._metrics_lock:
+      metrics = {
+        "total_requests": self._request_count,
+        "failed_requests": self._error_count,
+        "last_request_time": self._last_request_time,
+      }
     explanation_url, explanation_error = self._explanation_url()
     worker_readiness = self._worker_readiness()
     generation_ready = all(worker_readiness.values())
@@ -4538,14 +4587,11 @@ class EdgeguardApiPlugin(BasePlugin):
         "catalog_sha256": egx2.CATALOG_SHA256,
         "max_tokens": egx2.MAX_TOKENS,
       },
-      "metrics": {
-        "total_requests": self._request_count,
-        "failed_requests": self._error_count,
-        "last_request_time": self._last_request_time,
-      },
+      "metrics": metrics,
     }
 
   @BasePlugin.endpoint(method="GET")
+  @_tracked_endpoint
   def models(self) -> Dict[str, Any]:
     return {
       "schema_version": "edgeguard.model_catalog.v1",
@@ -4554,6 +4600,7 @@ class EdgeguardApiPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="GET")
+  @_tracked_endpoint
   def prompt_contract(self) -> Dict[str, Any]:
     direct_system_prompt = build_direct_cypher_system_prompt()
     correction_prompt = build_schema_correction_prompt(
@@ -4621,6 +4668,7 @@ class EdgeguardApiPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="GET")
+  @_tracked_endpoint
   def model(self) -> Dict[str, Any]:
     return {
       "model_key": FINETUNED_MODEL_KEY,
@@ -4693,6 +4741,7 @@ class EdgeguardApiPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="POST")
+  @_tracked_endpoint
   def check_cypher(self, cypher: str, **kwargs) -> Dict[str, Any]:
     analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
     return {
@@ -4894,6 +4943,7 @@ class EdgeguardApiPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="POST")
+  @_tracked_endpoint
   def neo4j_test(
     self,
     uri: Optional[str] = None,
@@ -4966,6 +5016,7 @@ class EdgeguardApiPlugin(BasePlugin):
     return _with_graph_first_prepare_contract(result, mode_plan)
 
   @BasePlugin.endpoint(method="POST")
+  @_tracked_endpoint
   def neo4j_query(
     self,
     cypher: str,
@@ -5078,6 +5129,7 @@ class EdgeguardApiPlugin(BasePlugin):
       self._close_neo4j_driver(driver)
 
   @BasePlugin.endpoint(method="POST")
+  @_tracked_endpoint
   def prepare_graph_explanation(
     self,
     cypher: str,
@@ -5286,6 +5338,7 @@ class EdgeguardApiPlugin(BasePlugin):
     return success
 
   @BasePlugin.endpoint(method="POST")
+  @_tracked_endpoint
   def explain_graph(
     self,
     cypher: str,
