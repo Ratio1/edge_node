@@ -57,6 +57,11 @@ RESPONSE_BODY_MAX_BYTES = 1024 * 1024
 # the watchdog cannot reach it still releases the scan phase promptly.
 _DEADLINE_GRACE_SECONDS = 1.0
 
+# How often an expired watchdog re-sweeps the socket registry while the request
+# it is breaking is still alive. The socket it needs may not exist yet when the
+# deadline passes.
+_WATCHDOG_SWEEP_SECONDS = 0.25
+
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 # Order matters:
@@ -436,51 +441,63 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
   # the same failure `read_bounded_response_body._stop` exists to prevent.
   outcome = queue.Queue()
 
+  # Only this hop's sockets. One registry serves every redirect hop, and scoping
+  # by index is what keeps a watchdog off a later hop's connection — not the
+  # shared deadline, which is a weaker argument than it looks.
+  first_socket = len(sockets)
+
   def _watch():
     if finished.wait(max_seconds):
       return
     expired.set()
-    for sock in list(sockets):
-      try:
-        sock.shutdown(socket.SHUT_RDWR)
-      except Exception:
-        # Already closed, or never connected. Nothing to release.
-        pass
+    # Sweep until the issuing thread actually stops, rather than firing once and
+    # retiring. A socket is registered only *after* `connect()` returns, so a
+    # slow connect produces one after this point; a one-shot watchdog left that
+    # socket unguarded and the request unkillable — which relocated the very
+    # hang this function exists to close into a daemon thread, and leaked a
+    # thread and an fd on every probed port.
+    while True:
+      for sock in list(sockets)[first_socket:]:
+        try:
+          sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+          # Already shut down, already closed, or not yet connected.
+          pass
+      if finished.wait(_WATCHDOG_SWEEP_SECONDS):
+        return
 
   def _issue():
     try:
-      response = session.get(url, timeout=max_seconds, **kwargs)
-    except Exception as exc:
-      outcome.put(("error", exc))
-      return
-    if expired.is_set():
-      # Nobody is waiting for this any more. Close it here or it leaks.
       try:
-        response.close()
-      except Exception:
-        pass
-      outcome.put(("expired", None))
-      return
-    outcome.put(("ok", response))
+        response = session.get(url, timeout=max_seconds, **kwargs)
+      except Exception as exc:
+        outcome.put(("error", exc))
+        return
+      if expired.is_set():
+        # Nobody is waiting for this any more. Close it here or it leaks.
+        try:
+          response.close()
+        except Exception:
+          pass
+        outcome.put(("expired", None))
+        return
+      outcome.put(("ok", response))
+    finally:
+      # Retiring the watchdog is the issuing thread's job, not the caller's.
+      # When the caller gives up first, this request is still running and still
+      # needs a watchdog to break it.
+      finished.set()
 
-  # One registry serves every redirect hop, so a retired watchdog could in
-  # principle cut a socket a later hop is reading. It cannot: every hop passes
-  # `max_seconds=deadline-now` against the same absolute deadline, so once one
-  # watchdog has fired the caller's own `remaining <= 0` check has already
-  # bailed out of the loop. Safety rests on that shared deadline — giving hops
-  # independent budgets would open this.
   threading.Thread(target=_watch, daemon=True).start()
   threading.Thread(target=_issue, daemon=True).start()
   try:
     kind, payload = outcome.get(timeout=max_seconds + _DEADLINE_GRACE_SECONDS)
   except queue.Empty:
-    # The request is wedged somewhere the watchdog cannot reach — the connect
-    # leg, before any socket exists to shut down. Returning on time is the
-    # guarantee that matters: the abandoned thread unwinds on its own once its
-    # own connect attempts expire, while the scan phase proceeds.
+    # Wedged where the watchdog could not reach at the moment it fired — the
+    # connect leg, before any socket exists. Returning on time is the guarantee
+    # that matters here; the watchdog keeps sweeping until the abandoned request
+    # dies, so it cannot outlive its connect attempts.
     raise requests.Timeout("response fingerprint deadline exceeded") from None
-  finally:
-    finished.set()
 
   if kind == "error":
     if expired.is_set():
@@ -730,7 +747,14 @@ class _ResponseFingerprintMixin:
       encoding = resp.encoding or "utf-8"
       try:
         body_text = body.decode(encoding, errors="replace")
-      except LookupError:
+      except (LookupError, UnicodeError):
+        # `UnicodeError` as well as `LookupError`: the charset comes from the
+        # target's own Content-Type, and `charset=idna` or `charset=undefined`
+        # raise UnicodeError rather than LookupError. Letting that escape drops
+        # the whole port's evidence — status, headers, body hash, TLS identity
+        # and excerpt — so a target could blank its own fingerprint per vantage
+        # with one header while still serving geo-differentiated content, and
+        # read as "no divergence".
         body_text = body.decode("utf-8", errors="replace")
       content_type = normalize_content_type(resp.headers.get("Content-Type"))
       title_match = _TITLE_RE.search(body_text[:5000])
@@ -774,7 +798,12 @@ class _ResponseFingerprintMixin:
       # longer safe-by-construction now that the body is streamed rather than
       # buffered by requests, and an uncaught error here reaches execute_job's
       # catch-all and skips every remaining phase.
-      self.P(f"Response fingerprint capture failed on {url}: {exc}", color='y')
+      # Scrubbed for the same reason as the GET handler above: the reachable
+      # exception set here is target-influenced.
+      self.P(
+        f"Response fingerprint capture failed on {url}: {sanitize_excerpt(str(exc))}",
+        color='y',
+      )
       return None, None
     finally:
       # Guarded: a raising close would escape both handlers above, leak the

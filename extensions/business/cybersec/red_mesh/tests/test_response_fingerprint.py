@@ -641,6 +641,10 @@ class TestRealSocketBounding(unittest.TestCase):
     prober.join(timeout=budget * 8)
     self.assertFalse(prober.is_alive(), "_fingerprint_http never returned over TLS")
     self.assertEqual(outcome["result"], (None, None))
+    # Lower bound too: a handshake that failed instantly also returns
+    # (None, None) quickly, which would satisfy the upper bound while proving
+    # nothing about the deadline over TLS.
+    self.assertGreater(outcome["elapsed"], budget)
     self.assertLess(outcome["elapsed"], budget * 3)
 
   def test_teardown_falls_through_when_the_supported_shutdown_raises(self):
@@ -695,6 +699,59 @@ class TestRealSocketBounding(unittest.TestCase):
       f"{len(blackholes)} A-records held the probe for "
       f"{outcome.get('elapsed', 0):.1f}s against a {budget}s budget",
     )
+
+  def test_a_slow_connect_does_not_leak_a_thread_and_socket_per_probe(self):
+    # The socket is registered only after connect() returns. A target that puts
+    # one non-responsive address ahead of its live one makes connect outlast the
+    # deadline, so a watchdog that fired once and retired shut down nothing and
+    # left the request unkillable — turning a bounded stall into a permanent
+    # thread and fd leak on every probed port, which is worse than the hang.
+    peer = _Peer.header_dripping(interval=0.5)
+    self.addCleanup(peer.close)
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _slow_then_live(host, port, *args, **kwargs):
+      # One blackhole ahead of the live address: connect spends its per-address
+      # timeout on the first before reaching the second.
+      return [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", port)),
+      ] + real_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    before = threading.active_count()
+    with patch("socket.getaddrinfo", side_effect=_slow_then_live):
+      for _ in range(3):
+        worker._fingerprint_http("http", peer.port)
+
+    # Give the watchdogs their sweep interval to break the abandoned requests.
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and threading.active_count() > before + 2:
+      time.sleep(0.25)
+    self.assertLessEqual(
+      threading.active_count(), before + 2,
+      f"threads {before} -> {threading.active_count()} after 3 probes; the "
+      "watchdog is not breaking abandoned requests",
+    )
+
+  def test_a_hostile_charset_cannot_blank_a_ports_evidence(self):
+    # The charset comes from the target's own Content-Type. `charset=idna`
+    # raises UnicodeError rather than LookupError, and letting it escape drops
+    # status, headers, body hash and excerpt for the port — letting a target
+    # erase its own fingerprint per vantage while still serving different
+    # content to real users, which reads as "no divergence".
+    for charset in ("utf-8", "idna", "undefined"):
+      with self.subTest(charset=charset):
+        peer = _Peer(
+          lambda: [(b"<html><title>Divergent</title>hello</html>", 0)],
+          declared=len(b"<html><title>Divergent</title>hello</html>"),
+          headers=b"Content-Type: text/html; charset=%s\r\n" % charset.encode(),
+        )
+        self.addCleanup(peer.close)
+        worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+        http, _excerpt = worker._fingerprint_http("http", peer.port)
+        self.assertIsNotNone(http, f"charset={charset} blanked the evidence")
+        self.assertEqual(http["status"], 200)
+        self.assertEqual(http["title"], "Divergent")
 
   def test_a_redirect_query_string_cannot_reach_the_log(self):
     # `redirect_stays_on_target` pins host and port but not path or query, so a
