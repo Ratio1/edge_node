@@ -6,9 +6,11 @@ scoping that keeps the phase off non-comparison jobs, and the aggregation
 contract that keeps each vantage's evidence attributable to that vantage.
 """
 
+import gzip
 import itertools
 import socket
 import threading
+import tracemalloc
 import unittest
 import time
 from unittest.mock import MagicMock, patch
@@ -25,6 +27,7 @@ from extensions.business.cybersec.red_mesh.worker.response_fingerprint import (
   normalize_content_type,
   read_bounded_response_body,
   redirect_stays_on_target,
+  release_response_connection,
   resolve_host,
   sanitize_excerpt,
 )
@@ -473,6 +476,87 @@ class TestRealSocketBounding(unittest.TestCase):
       "the header read is not bounded by the phase budget",
     )
     self.assertEqual(outcome["result"], (None, None))
+
+  def test_fingerprint_http_survives_a_peer_that_drips_after_the_cap(self):
+    # The sibling test drives read_bounded_response_body directly, so it would
+    # stay green if the hang relocated into _fingerprint_http's `finally` —
+    # where `resp.close()` is called on a connection the peer is still feeding.
+    peer = _Peer.dripping(prefix=b"a" * (RESPONSE_BODY_MAX_BYTES + 65536), interval=0.2)
+    self.addCleanup(peer.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+    outcome = {}
+
+    def _probe():
+      started = time.monotonic()
+      outcome["result"] = worker._fingerprint_http("http", peer.port)
+      outcome["elapsed"] = time.monotonic() - started
+
+    prober = threading.Thread(target=_probe, daemon=True)
+    prober.start()
+    prober.join(timeout=budget * 8)
+    self.assertFalse(prober.is_alive(), "_fingerprint_http never returned")
+    http, _excerpt = outcome["result"]
+    self.assertIsNotNone(http, "the capture was lost rather than bounded")
+    self.assertFalse(http["body_complete"])
+    self.assertIsNone(http["body_sha256"])
+    self.assertLess(outcome["elapsed"], budget * 3)
+
+  def test_teardown_reports_when_it_cannot_reach_a_live_connection(self):
+    # urllib3 2.3 adds a supported shutdown() and this deployment pins 2.0.7.
+    # If a bump ever removed the private path without providing the public one,
+    # teardown would degrade to a silent no-op and the hang would return with
+    # every test still green. The failure has to be audible.
+    reported = []
+    response = MagicMock()
+    response.raw = MagicMock(spec=["_connection"])
+    response.raw._connection = MagicMock(spec=[])  # a connection, but no `sock`
+    release_response_connection(response, log=lambda msg, **kw: reported.append(msg))
+    self.assertTrue(reported, "a failed teardown reach was swallowed")
+
+  def test_teardown_prefers_the_supported_shutdown_api(self):
+    response = MagicMock()
+    response.raw = MagicMock(spec=["shutdown", "_connection"])
+    release_response_connection(response)
+    response.raw.shutdown.assert_called_once_with()
+
+  def test_a_compressed_bomb_cannot_outgrow_the_byte_cap(self):
+    # The cap counts decoded bytes and is checked only once a chunk has been
+    # materialised, so the guarantee rests entirely on urllib3 2.x capping
+    # decoded output at the requested read size. urllib3 1.x has no such buffer
+    # and would let one 64 KiB compressed read expand to tens of MiB. That is
+    # what `urllib3>=2.0` in the requirements files pins, and this is the test
+    # that fails if the floor is ever dropped.
+    # 128 MiB is 128x the cap — enough to prove the bound without spending
+    # seconds of suite time compressing zeros.
+    decoded = 128 * 1024 * 1024
+    payload = gzip.compress(b"\0" * decoded, 9)
+    self.assertGreater(decoded / len(payload), 100, "not a compression bomb")
+    peer = _Peer(
+      lambda: [(payload, 0)],
+      declared=len(payload),
+      headers=b"Content-Type: text/html\r\nContent-Encoding: gzip\r\n",
+    )
+    self.addCleanup(peer.close)
+    response = requests.get(f"http://127.0.0.1:{peer.port}/", stream=True, timeout=30)
+    self.addCleanup(response.close)
+
+    tracemalloc.start()
+    try:
+      body, complete = read_bounded_response_body(
+        response, max_bytes=RESPONSE_BODY_MAX_BYTES, max_seconds=30
+      )
+      _current, peak = tracemalloc.get_traced_memory()
+    finally:
+      tracemalloc.stop()
+
+    self.assertFalse(complete)
+    self.assertEqual(len(body), RESPONSE_BODY_MAX_BYTES)
+    self.assertLess(
+      peak, RESPONSE_BODY_MAX_BYTES * 8,
+      f"decoding peaked at {peak / 1048576:.1f} MiB against a "
+      f"{RESPONSE_BODY_MAX_BYTES / 1048576:.0f} MiB cap",
+    )
 
   def test_the_comparison_tier_stays_bounded_against_hostile_ports(self):
     # The tier is an operator-chosen port range walked sequentially, so a

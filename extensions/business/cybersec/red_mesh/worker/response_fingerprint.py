@@ -240,7 +240,7 @@ def redirect_stays_on_target(next_url, host, port):
   )
 
 
-def release_response_connection(response):
+def release_response_connection(response, log=None):
   """
   Break a streamed connection without waiting for the reader to finish.
 
@@ -251,22 +251,43 @@ def release_response_connection(response):
   fail at once, after which it unwinds on its own and the connection can be
   released normally by the caller's `finally`.
 
-  Reaching through `raw._connection` is deliberate: urllib3 only grew a
-  supported `HTTPResponse.shutdown()` in 2.3, and this deployment pins an
-  earlier release. Prefer that API once the floor moves.
+  urllib3 grew a supported `HTTPResponse.shutdown()` in 2.3, preferred whenever
+  present. Below that floor the only route is through `raw._connection`, and a
+  private reach is exactly what a version bump removes — so failing to find the
+  socket is reported rather than swallowed. Degrading silently to a no-op would
+  restore the hang with the whole suite still green.
 
   There is deliberately no `response.close()` fallback — that is the blocking
   call this exists to avoid, and the caller's `finally` already closes the
   response once the reader has unwound.
   """
-  sock = getattr(getattr(response, "raw", None), "_connection", None)
-  sock = getattr(sock, "sock", None)
+  raw = getattr(response, "raw", None)
+  supported = getattr(raw, "shutdown", None)
+  if callable(supported):
+    try:
+      supported()
+    except Exception as exc:
+      if log:
+        log(f"Response connection shutdown failed: {exc}", color='y')
+    return
+
+  connection = getattr(raw, "_connection", None)
+  sock = getattr(connection, "sock", None)
+  if sock is None:
+    # Nothing to shut down. Only alarming when there was a live connection to
+    # reach, which is the shape a urllib3 upgrade would produce.
+    if connection is not None and log:
+      log(
+        "Response connection teardown found no reachable socket; a slow peer "
+        "can hold this connection open",
+        color='r',
+      )
+    return
   try:
     sock.shutdown(socket.SHUT_RDWR)
-  except Exception:
-    # No reachable socket (already closed, mocked, or a wrapped raw). The
-    # reader is still released by the queue drain in the caller.
-    pass
+  except Exception as exc:
+    if log:
+      log(f"Response connection shutdown failed: {exc}", color='y')
 
 
 def _socket_recording_pool_classes(registry):
@@ -370,7 +391,7 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
   return response
 
 
-def read_bounded_response_body(response, max_bytes, max_seconds):
+def read_bounded_response_body(response, max_bytes, max_seconds, log=None):
   """Read a streamed response without allowing a hostile peer to grow memory forever."""
   chunks = []
   total = 0
@@ -408,7 +429,7 @@ def read_bounded_response_body(response, max_bytes, max_seconds):
       events.get_nowait()
     except queue.Empty:
       pass
-    release_response_connection(response)
+    release_response_connection(response, log=log)
 
   threading.Thread(target=_read, daemon=True).start()
 
@@ -586,6 +607,7 @@ class _ResponseFingerprintMixin:
         resp,
         max_bytes=RESPONSE_BODY_MAX_BYTES,
         max_seconds=max(deadline - time.monotonic(), 0),
+        log=self.P,
       )
       encoding = resp.encoding or "utf-8"
       try:
