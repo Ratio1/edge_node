@@ -5,13 +5,49 @@ Pure computation — takes aggregated scan reports and produces risk scores
 (0-100) with breakdowns and flat findings lists. No CStore or R1FS access.
 """
 
+import math
+
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
-  RISK_SIGMOID_K,
+  RISK_RAW_TOTAL_CEILING,
   RISK_CRED_PENALTY_PER,
   RISK_CRED_PENALTY_CAP,
 )
+
+
+def normalize_risk_score(raw_total):
+  """
+  Map a raw risk total onto 0-100 without saturating.
+
+  The previous logistic curve (`100 * (2/(1+e^-0.02x) - 1)`) reached 100 once
+  `raw_total` passed roughly 300 — about eight CRITICAL findings — and
+  `raw_total` grows linearly with finding count, so any substantial scan pinned
+  at the ceiling. Measured on three real archived runs: a 46-finding blackbox
+  run (raw 609), the client job (raw 1123) and a 600-finding run (raw 9007) all
+  scored exactly 100. A remediation cycle could remove hundreds of findings
+  without moving the number, which is the one thing a risk score has to do.
+
+  Log compression keeps the curve monotonic across orders of magnitude and
+  anchors the low end close to where it was — a single CRITICAL finding scores
+  37 here against 38 before — while separating the cases that used to collide:
+  those same three runs now score 65, 71 and 92.
+
+  This is a customer-visible change in the mid range: four CRITICAL findings
+  previously scored 92 and now score 51. That is the cost of a curve that can
+  still rise afterwards, and it is deliberate.
+  """
+  try:
+    raw_total = float(raw_total)
+  except (TypeError, ValueError):
+    return 0
+  # NaN survives float() and compares False against every bound, so it would
+  # reach int(round(...)) and raise. Infinity is clamped by the min() below,
+  # but NaN has no meaningful score.
+  if not math.isfinite(raw_total) or raw_total <= 0:
+    return 0
+  ratio = math.log10(1.0 + raw_total) / math.log10(1.0 + RISK_RAW_TOTAL_CEILING)
+  return max(0, min(100, int(round(100.0 * ratio))))
 
 
 class _RiskScoringMixin:
@@ -131,9 +167,8 @@ class _RiskScoringMixin:
     # Raw total
     raw_total = findings_score + open_ports_score + breadth_score + credentials_penalty
 
-    # Normalize to 0-100 via logistic curve
-    score = int(round(100.0 * (2.0 / (1.0 + math.exp(-RISK_SIGMOID_K * raw_total)) - 1.0)))
-    score = max(0, min(100, score))
+    # Normalize to 0-100 (log-compressed; see normalize_risk_score)
+    score = normalize_risk_score(raw_total)
 
     return {
       "score": score,
@@ -469,8 +504,7 @@ class _RiskScoringMixin:
       credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
 
     raw_total = findings_score + open_ports_score + breadth_score + credentials_penalty
-    score = int(round(100.0 * (2.0 / (1.0 + math.exp(-RISK_SIGMOID_K * raw_total)) - 1.0)))
-    score = max(0, min(100, score))
+    score = normalize_risk_score(raw_total)
 
     risk_result = {
       "score": score,

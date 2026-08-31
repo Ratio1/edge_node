@@ -684,3 +684,60 @@ class TestRiskScoreGraybox(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestRiskScoreDynamicRange(unittest.TestCase):
+  """
+  The logistic curve pinned at 100 once raw_total passed ~300 — about eight
+  CRITICAL findings — while raw_total grows linearly with finding count. Three
+  real archived runs spanning 46 to 600 findings all scored exactly 100, so a
+  remediation cycle could remove hundreds of findings without moving the number.
+  """
+
+  # (label, raw_total) from the archived runs named in the task.
+  ARCHIVED = (
+    ("R1 blackbox, 46 findings", 609.1),
+    ("client job 6cc55610", 1123.5),
+    ("phase-a-v3, 600 findings", 9006.9),
+  )
+
+  def test_real_runs_that_all_scored_100_are_now_distinguishable(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    scores = [normalize_risk_score(raw) for _label, raw in self.ARCHIVED]
+    self.assertEqual(
+      len(set(scores)), len(scores),
+      f"archived runs still collide: {list(zip([l for l, _ in self.ARCHIVED], scores))}",
+    )
+    for score in scores:
+      self.assertLess(score, 100, "a real run still pins at the ceiling")
+
+  def test_the_score_keeps_rising_past_eight_critical_findings(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    # One CRITICAL/certain finding contributes 40 to raw_total.
+    eight = normalize_risk_score(8 * 40)
+    twenty = normalize_risk_score(20 * 40)
+    hundred = normalize_risk_score(100 * 40)
+    self.assertLess(eight, twenty)
+    self.assertLess(twenty, hundred)
+
+  def test_the_score_is_monotonic_and_bounded(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    previous = -1
+    for raw in (0, 1, 10, 40, 100, 320, 1000, 5000, 20000, 100000):
+      score = normalize_risk_score(raw)
+      self.assertGreaterEqual(score, previous)
+      self.assertGreaterEqual(score, 0)
+      self.assertLessEqual(score, 100)
+      previous = score
+
+  def test_a_single_critical_finding_stays_where_it_was(self):
+    # The low end is anchored so small scans stay comparable with historical
+    # reports: one CRITICAL finding scored 38 under the logistic curve.
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    self.assertAlmostEqual(normalize_risk_score(40), 38, delta=3)
+
+  def test_a_malformed_raw_total_scores_zero_rather_than_raising(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    for bad in (None, "", "abc", float("nan")):
+      with self.subTest(raw=bad):
+        self.assertIsInstance(normalize_risk_score(bad), int)
