@@ -8,6 +8,7 @@ contract that keeps each vantage's evidence attributable to that vantage.
 
 import gzip
 import itertools
+import os
 import socket
 import ssl
 import threading
@@ -31,6 +32,7 @@ from extensions.business.cybersec.red_mesh.worker.response_fingerprint import (
   redirect_stays_on_target,
   _SocketRecordingAdapter,
   release_response_connection,
+  request_within_deadline,
   resolve_host,
   sanitize_excerpt,
 )
@@ -39,6 +41,14 @@ from extensions.business.cybersec.red_mesh.constants import (
   FINGERPRINT_TIMEOUT,
 )
 from .conftest import DummyOwner
+
+
+def _open_fds():
+  """Open file descriptors for this process, so a leaked socket is visible."""
+  try:
+    return len(os.listdir("/proc/self/fd"))
+  except OSError:
+    return None
 
 
 def _make_worker(**overrides):
@@ -482,16 +492,25 @@ class _TlsPeer(_Peer):
       .not_valid_after(now + datetime.timedelta(days=1))
       .sign(key, hashes.SHA256())
     )
+    # Written, loaded, then removed: `load_cert_chain` needs a path, but leaving
+    # a private key in /tmp on every suite run is litter the test has no reason
+    # to produce.
     bundle = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
-    bundle.write(cert.public_bytes(serialization.Encoding.PEM))
-    bundle.write(key.private_bytes(
-      serialization.Encoding.PEM,
-      serialization.PrivateFormat.TraditionalOpenSSL,
-      serialization.NoEncryption(),
-    ))
-    bundle.close()
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(bundle.name)
+    try:
+      bundle.write(cert.public_bytes(serialization.Encoding.PEM))
+      bundle.write(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+      ))
+      bundle.close()
+      context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+      context.load_cert_chain(bundle.name)
+    finally:
+      try:
+        os.unlink(bundle.name)
+      except OSError:
+        pass
     cls._context = context
     return context
 
@@ -500,17 +519,12 @@ class _TlsPeer(_Peer):
     try:
       while not self._stop.is_set():
         conn, _addr = self._server.accept()
-        try:
-          conn = context.wrap_socket(conn, server_side=True)
-        except Exception:
-          # A probe that opens a plain TCP connection and closes it, such as
-          # the reachability check, never completes a handshake.
-          try:
-            conn.close()
-          except Exception:
-            pass
-          continue
-        threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+        # Handshake off the accept loop. Inline, a peer that connects and sends
+        # nothing wedges the listener for every probe behind it — the same
+        # "harness silently stops serving" hazard that once made a bounding
+        # assertion pass in 0.02s without serving anything.
+        threading.Thread(target=self._wrap_and_handle, args=(conn, context),
+                         daemon=True).start()
     except Exception:
       pass
     finally:
@@ -518,6 +532,19 @@ class _TlsPeer(_Peer):
         self._server.close()
       except Exception:
         pass
+
+  def _wrap_and_handle(self, conn, context):
+    try:
+      wrapped = context.wrap_socket(conn, server_side=True)
+    except Exception:
+      # A probe that opens a plain TCP connection and closes it, such as the
+      # reachability check, never completes a handshake.
+      try:
+        conn.close()
+      except Exception:
+        pass
+      return
+    self._handle(wrapped)
 
 
 class _RedirectingStallPeer:
@@ -531,6 +558,7 @@ class _RedirectingStallPeer:
 
   def __init__(self, interval=0.5):
     self._interval = interval
+    self.requests_served = 0
     self._stop = threading.Event()
     self._server = socket.socket()
     self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -553,6 +581,7 @@ class _RedirectingStallPeer:
         request = conn.recv(65536)
         if not request:
           return
+        self.requests_served += 1
         path = request.split(b" ")[1] if b" " in request else b"/"
         if path == b"/":
           # No Connection: close — HTTP/1.1 keeps this socket for the next hop.
@@ -653,6 +682,13 @@ class TestRealSocketBounding(unittest.TestCase):
     self.assertLess(
       outcome["elapsed"], budget * 3,
       "the header read is not bounded by the phase budget",
+    )
+    # Lower bound: a peer that silently stopped serving also returns
+    # (None, None) quickly, satisfying every assertion above while proving
+    # nothing about the bound.
+    self.assertGreater(
+      outcome["elapsed"], budget * 0.5,
+      "the probe returned too fast to have been bounded by the deadline",
     )
     self.assertEqual(outcome["result"], (None, None))
 
@@ -794,6 +830,7 @@ class TestRealSocketBounding(unittest.TestCase):
 
     worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
     before = threading.active_count()
+    fds_before = _open_fds()
     with patch("socket.getaddrinfo", side_effect=_slow_then_live):
       for _ in range(3):
         worker._fingerprint_http("http", peer.port)
@@ -807,6 +844,13 @@ class TestRealSocketBounding(unittest.TestCase):
       f"threads {before} -> {threading.active_count()} after 3 probes; the "
       "watchdog is not breaking abandoned requests",
     )
+    # The defect this guards leaked a thread *and* a socket per probe. Asserting
+    # only threads would miss a regression that leaked just the fd.
+    if fds_before is not None:
+      self.assertLessEqual(
+        _open_fds(), fds_before + 1,
+        f"file descriptors {fds_before} -> {_open_fds()} after 3 probes",
+      )
 
   def test_a_redirect_onto_a_stalling_page_does_not_leak(self):
     # HTTP/1.1 is persistent by default, so a same-origin redirect is served on
@@ -820,12 +864,21 @@ class TestRealSocketBounding(unittest.TestCase):
     worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
     budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
     before = threading.active_count()
+    fds_before = _open_fds()
     started = time.monotonic()
     http, _excerpt = worker._fingerprint_http("http", peer.port)
     elapsed = time.monotonic() - started
 
     self.assertIsNone(http, "a stalled redirect hop must not yield evidence")
     self.assertLess(elapsed, budget * 3)
+    # Without these two, a peer that silently stopped serving passes: the probe
+    # returns fast with no evidence and nothing was ever redirected.
+    self.assertGreater(elapsed, budget * 0.5, "the probe was never bounded")
+    self.assertEqual(
+      peer.requests_served, 2,
+      f"the peer served {peer.requests_served} requests; hop 2 never happened, "
+      "so the reused-connection path was not exercised",
+    )
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline and threading.active_count() > before:
       time.sleep(0.25)
@@ -834,6 +887,11 @@ class TestRealSocketBounding(unittest.TestCase):
       f"threads {before} -> {threading.active_count()}; the watchdog cannot "
       "reach a connection reused across a redirect",
     )
+    if fds_before is not None:
+      self.assertLessEqual(
+        _open_fds(), fds_before + 1,
+        f"file descriptors {fds_before} -> {_open_fds()}",
+      )
 
   def test_a_close_delimited_body_is_never_claimed_complete(self):
     # With neither Content-Length nor chunked framing, end-of-message is just a
@@ -1017,6 +1075,40 @@ class TestRealSocketBounding(unittest.TestCase):
       http, _excerpt = worker._fingerprint_http("http", peer.port)
     self.assertIsNotNone(http, "the probe was routed through the environment proxy")
     self.assertEqual(http["title"], "Direct")
+
+  def test_a_watchdog_does_not_outlive_a_request_that_never_started(self):
+    # `finished` is set only in `_issue`'s `finally`. If that thread cannot
+    # start — reachable under thread exhaustion — a `_watch` started beside it
+    # sweeps at 4 Hz for the life of the process. Unlike an abandoned request,
+    # which dies with its own connect attempts, this never clears, and it is
+    # self-amplifying: every later probe donates another immortal watchdog.
+    session = MagicMock()
+    sockets = []
+    real_thread = threading.Thread
+
+    def _fail_the_request_thread(target=None, daemon=None, **kwargs):
+      # Keyed on the thread's identity rather than on call order, so this still
+      # guards the defect if the two starts are ever reordered again.
+      if getattr(target, "__name__", "") == "_issue":
+        raise RuntimeError("can't start new thread")
+      return real_thread(target=target, daemon=daemon, **kwargs)
+
+    before = threading.active_count()
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint."
+      "threading.Thread",
+      side_effect=_fail_the_request_thread,
+    ):
+      with self.assertRaises(RuntimeError):
+        request_within_deadline(session, "http://127.0.0.1/", sockets, max_seconds=1)
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and threading.active_count() > before:
+      time.sleep(0.25)
+    self.assertLessEqual(
+      threading.active_count(), before,
+      "a watchdog outlived a request whose thread never started",
+    )
 
   def test_an_explicit_proxy_still_records_its_socket(self):
     # `trust_env = False` closes the environment route, which is what makes the
