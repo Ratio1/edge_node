@@ -233,6 +233,11 @@ DETERMINISTIC_REASON_TEXTS = {
     "exhaustion, so the model was not consulted; the precomputed insights "
     "below summarize the transported rows only."
   ),
+  "tabular_result": (
+    "Deterministic brief: the query returned tabular/scalar rows with no graph "
+    "entities, so the model was not consulted; the complete result digest "
+    "carries every returned value."
+  ),
 }
 
 

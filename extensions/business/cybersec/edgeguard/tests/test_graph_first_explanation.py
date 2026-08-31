@@ -122,6 +122,35 @@ class IrAndBatchTests(unittest.TestCase):
     self.assertEqual(digest["groups"], [])
     self.assertTrue(digest["coverage"]["complete"])
 
+  def test_result_digest_covers_scalar_only_rows(self):
+    result = {
+      "schema_version": "edgeguard.query_result_evidence.v1",
+      "columns": ["name"],
+      "rows": [
+        {"ordinal": 0, "values": [{"type": "string", "value": "quietsieve"}]},
+        {"ordinal": 1, "values": [{"type": "string", "value": "plaintee"}]},
+        {"ordinal": 2, "values": [{"type": "null"}]},
+      ],
+    }
+    digest = build_result_digest(
+      result,
+      {"nodes": [], "relationships": []},
+      accepted_cypher="MATCH (m:Malware) RETURN m.name AS name LIMIT 10",
+      executed_cypher="MATCH (m:Malware) RETURN m.name AS name LIMIT 10",
+      transport_row_cap=25,
+      truncated=False,
+    )
+
+    self.assertEqual(digest["counts"]["returned_rows"], 3)
+    self.assertEqual(digest["counts"]["nodes"], 0)
+    self.assertEqual(digest["counts"]["relationships"], 0)
+    self.assertTrue(digest["coverage"]["complete"])
+    for group in digest["groups"]:
+      self.assertEqual(group["node_refs"], [])
+      self.assertEqual(group["relationship_refs"], [])
+    values = [group["values"] for group in digest["groups"]]
+    self.assertTrue(any("quietsieve" in json.dumps(value) for value in values))
+
   def test_result_digest_is_stable_and_accounts_for_every_row(self):
     result, catalog = fixtures(duplicates=True, disconnected=True)
     first = build_result_digest(

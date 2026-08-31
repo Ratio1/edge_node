@@ -260,3 +260,24 @@ class Egx2ConfidenceComparisonGateTests(unittest.TestCase):
     brief = self._brief_with_assessment(sheet, "Source-data confidence is low across the result.")
     passed, _detail, _ = brief_gates.grade(brief, sheet)["confidence_comparisons"]
     self.assertTrue(passed)
+
+
+class Egx2TabularReasonTests(unittest.TestCase):
+  def test_run_insight_brief_tabular_result_reason(self):
+    def provider(payload):
+      raise AssertionError("model must not be called for a tabular result")
+
+    result = egx2.run_insight_brief(
+      question="List malware names.",
+      graph={"nodes": [], "relationships": []},
+      model=None,
+      provider_call=provider,
+      allow_model=False,
+      deterministic_reason="tabular_result",
+    )
+    case = result["case_explanation"]
+    self.assertEqual(case["provenance"]["mode"], "deterministic_fallback")
+    self.assertIn("tabular/scalar", case["assessment"]["text"])
+    self.assertIn("digest", case["assessment"]["text"])
+    outcome = result["explanation_trace"]["outcome"]
+    self.assertEqual(outcome, {"status": "fallback", "attempted_calls": 0, "completed_calls": 0, "safe_code": "tabular_result"})

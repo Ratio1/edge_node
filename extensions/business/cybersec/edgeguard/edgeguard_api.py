@@ -2031,11 +2031,10 @@ def _sanitize_query_result_evidence(
         )
       )
     clean_rows.append({"ordinal": ordinal, "values": clean_values})
-  if row_count and not referenced_nodes and not referenced_relationships:
-    raise _ResultEvidenceError(
-      "entity_evidence_required",
-      "CaseExplanation v1 requires at least one resolved node or relationship reference",
-    )
+  # Scalar-only results (no node/relationship/path values) are a valid exact
+  # outcome: the digest represents their rows with empty entity refs and a
+  # complete coverage ledger. The catalog-consistency check below still rejects
+  # any result whose graph entities are not resolvable from the returned rows.
   if referenced_nodes != set(graph_nodes) or referenced_relationships != set(graph_relationships):
     raise _ResultEvidenceError(
       "incomplete_evidence_catalog",
@@ -4049,7 +4048,11 @@ class EdgeguardApiPlugin(BasePlugin):
     deadline: float,
   ) -> Dict[str, Any]:
     graph = packet.get("graph") or {}
-    allow_model = bool(graph.get("nodes")) and digest.get("counts", {}).get("returned_rows") != 0
+    returned_rows = digest.get("counts", {}).get("returned_rows")
+    deterministic_reason = None
+    if not graph.get("nodes") and isinstance(returned_rows, int) and returned_rows > 0:
+      deterministic_reason = "tabular_result"
+    allow_model = bool(graph.get("nodes")) and returned_rows != 0
     if allow_model:
       try:
         _explanation_url, explanation_err = self._explanation_url()
@@ -4067,6 +4070,7 @@ class EdgeguardApiPlugin(BasePlugin):
       model=getattr(self, "cfg_edgeguard_explanation_model", None),
       provider_call=self._call_graph_first_provider,
       allow_model=allow_model,
+      deterministic_reason=deterministic_reason,
     )
     outcome_status = result["explanation_trace"].get("outcome", {}).get("status")
     return self._bounded_graph_first_success({

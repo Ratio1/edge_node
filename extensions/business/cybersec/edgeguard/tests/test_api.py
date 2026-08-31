@@ -2089,6 +2089,107 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
     self.assertEqual(fake_session.run.call_count, 1)
 
+  def test_explain_graph_scalar_only_result_succeeds_under_insight_brief(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, fake_session = _driver_with_results(_Result(
+      [
+        _DriverRecord({"name": "quietsieve"}, {"name": "quietsieve"}),
+        _DriverRecord({"name": "plaintee"}, {"name": "plaintee"}),
+      ],
+      keys=["name"],
+    ))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="List malware names.",
+          cypher="MATCH (m:Malware) RETURN m.name AS name LIMIT 10",
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["executed"])
+    self.assertFalse(result["explained"])
+    self.assertNotIn("validation_errors", result)
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 2)
+    self.assertEqual(result["result_digest"]["counts"]["nodes"], 0)
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
+    self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
+    self.assertEqual(result["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
+    self.assertIn("tabular/scalar", result["case_explanation"]["assessment"]["text"])
+    self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_explain_graph_scalar_only_result_succeeds_under_one_call(self):
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {
+        "content": json.dumps({"text": "The deterministic digest lists the returned malware name values."}),
+        "finish_reason": "stop",
+        "completion_tokens": 12,
+      }
+
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      graph_first_provider=provider,
+    )
+    fake_driver, fake_session = _driver_with_results(_Result(
+      [_DriverRecord({"name": "quietsieve"}, {"name": "quietsieve"})],
+      keys=["name"],
+    ))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="List malware names.",
+          cypher="MATCH (m:Malware) RETURN m.name AS name LIMIT 10",
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["executed"])
+    self.assertTrue(result["explained"])
+    self.assertEqual(len(payloads), 1)
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 1)
+    self.assertEqual(result["result_digest"]["counts"]["nodes"], 0)
+    self.assertTrue(result["result_digest"]["coverage"]["complete"])
+    self.assertEqual(result["analyst_brief"]["strategy"], "one_call")
+    self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_sanitize_query_result_evidence_still_rejects_unresolved_catalog_entities(self):
+    from extensions.business.cybersec.edgeguard.edgeguard_api import (
+      _ResultEvidenceError,
+      _sanitize_query_result_evidence,
+    )
+
+    with self.assertRaises(_ResultEvidenceError) as ctx:
+      _sanitize_query_result_evidence(
+        value={
+          "schema_version": "edgeguard.query_result_evidence.v1",
+          "columns": ["name"],
+          "rows": [{"ordinal": 0, "values": [{"type": "string", "value": "quietsieve"}]}],
+        },
+        row_count=1,
+        expected_columns=["name"],
+        node_refs={},
+        relationship_refs={},
+        graph_nodes={"n:a": {"id": "n:a", "labels": ["Indicator"], "properties": {}}},
+        graph_relationships={},
+        raw_nodes={},
+        raw_relationships={},
+      )
+    self.assertEqual(ctx.exception.code, "incomplete_evidence_catalog")
+
   def test_one_call_prepared_empty_result_returns_complete_zero_call_digest(self):
     plugin = _make_api(edgeguard_explanation_strategy="one_call")
     cypher = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10"
