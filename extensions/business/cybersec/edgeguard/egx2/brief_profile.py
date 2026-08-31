@@ -35,9 +35,9 @@ SYSTEM = (
     "invent or guess names, hashes, domains, or IDs.\n"
     "- Never invent an entity, a number, or a fact not in the sheet. Every count and named entity "
     "must come verbatim from an insight.\n"
-    "- Be brief: at most 2 observations and at most 2 next-checks, each ONE short sentence of at "
-    "most 30 words. Assessment and why-it-matters are one sentence each. This is a quick brief, "
-    "not a report.\n"
+    "- Be brief: stay within the observation and next-check budget stated in the user message, "
+    "each ONE short sentence of at most 30 words. Assessment and why-it-matters are one sentence "
+    "each. This is a quick brief, not a report.\n"
     "- Set confidence.tier to the source-data-confidence tier stated in the sheet; do not change it. "
     "It reflects how sure the sources are of the data, not certainty in any judgment; say so.\n"
     "- Compare confidence between entities ONLY when the sheet states per-member confidence values "
@@ -50,7 +50,8 @@ SYSTEM = (
 USER_TEMPLATE = (
     "INSIGHTS\n{sheet}\n\n"
     "QUESTION: {question}\n\n"
-    "Write the brief as one JSON object of the exact shape in the system prompt. Cite only I# IDs "
+    "Write the brief as one JSON object of the exact shape in the system prompt. Use at most "
+    "{max_observations} observations and at most {max_next_checks} next-checks. Cite only I# IDs "
     "that appear above; name at most 3 example entities per observation."
 )
 
@@ -85,8 +86,16 @@ def render_sheet(sheet):
     return "\n".join(lines)
 
 
-def build_brief_prompt(sheet, question):
-    return {"system": SYSTEM, "user": USER_TEMPLATE.format(sheet=render_sheet(sheet), question=question)}
+def build_brief_prompt(sheet, question, max_observations=2, max_next_checks=2):
+    return {
+        "system": SYSTEM,
+        "user": USER_TEMPLATE.format(
+            sheet=render_sheet(sheet),
+            question=question,
+            max_observations=max_observations,
+            max_next_checks=max_next_checks,
+        ),
+    }
 
 
 # Arm B: the same brief prompt but over EGX/1 numbered facts, no insight sheet.

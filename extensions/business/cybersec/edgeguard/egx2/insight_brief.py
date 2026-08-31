@@ -34,6 +34,11 @@ TEMPERATURE = 0.7
 TOP_P = 0.8
 MAX_OBSERVATIONS = 4
 MAX_NEXT_CHECKS = 3
+# Mode-scaled prompt budgets (observations, next_checks): thorough reads more
+# rows, so it earns a richer brief. Parse caps above stay the superset the
+# public contract allows.
+DEFAULT_BRIEF_BUDGET = (2, 2)
+MODE_BRIEF_BUDGETS = {"thorough": (3, 3)}
 TEXT_LIMIT = 1_000
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -249,6 +254,7 @@ def run_insight_brief(
   provider_call: Callable[[Mapping[str, Any]], Mapping[str, Any]],
   allow_model: bool = True,
   deterministic_reason: Optional[str] = None,
+  mode: Optional[str] = None,
 ) -> dict[str, Any]:
   sheet = insights.build_insight_sheet(graph)
   substantive = [ins for ins in sheet if ins.get("kind") != "confidence"]
@@ -273,7 +279,12 @@ def run_insight_brief(
     )
     return {"case_explanation": case, "explanation_trace": _trace([], "fallback", "model_not_admitted")}
 
-  prompt = brief_profile.build_brief_prompt(sheet, question)
+  max_observations, max_next_checks = MODE_BRIEF_BUDGETS.get(mode or "", DEFAULT_BRIEF_BUDGET)
+  prompt = brief_profile.build_brief_prompt(
+    sheet, question,
+    max_observations=max_observations,
+    max_next_checks=max_next_checks,
+  )
   calls: list[dict[str, Any]] = []
   failure_code: Optional[str] = None
   retry_note = ""

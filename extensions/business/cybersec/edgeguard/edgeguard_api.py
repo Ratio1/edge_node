@@ -4046,6 +4046,7 @@ class EdgeguardApiPlugin(BasePlugin):
     live_retry: Mapping[str, Any],
     request: str,
     deadline: float,
+    mode: Optional[str] = None,
   ) -> Dict[str, Any]:
     graph = packet.get("graph") or {}
     returned_rows = digest.get("counts", {}).get("returned_rows")
@@ -4071,6 +4072,7 @@ class EdgeguardApiPlugin(BasePlugin):
       provider_call=self._call_graph_first_provider,
       allow_model=allow_model,
       deterministic_reason=deterministic_reason,
+      mode=mode,
     )
     outcome_status = result["explanation_trace"].get("outcome", {}).get("status")
     return self._bounded_graph_first_success({
@@ -5264,6 +5266,7 @@ class EdgeguardApiPlugin(BasePlugin):
         live_retry=live_retry,
         request=request,
         deadline=deadline,
+        mode=mode_plan.mode if mode_plan is not None else None,
       )
     if self._active_explanation_strategy() == "one_call":
       return self._run_digest_analyst_brief(
@@ -5697,6 +5700,7 @@ class EdgeguardApiPlugin(BasePlugin):
             provider_call=self._call_graph_first_provider,
             allow_model=False,
             deterministic_reason="transport_truncated",
+            mode=mode_plan.mode if mode_plan is not None else None,
           )
           return self._bounded_graph_first_success({
             "status": STATUS_OK,
@@ -5742,6 +5746,7 @@ class EdgeguardApiPlugin(BasePlugin):
           live_retry=live_retry,
           request=request,
           deadline=deadline,
+          mode=mode_plan.mode if mode_plan is not None else None,
         )
       if self._active_explanation_strategy() == "one_call":
         return self._run_digest_analyst_brief(

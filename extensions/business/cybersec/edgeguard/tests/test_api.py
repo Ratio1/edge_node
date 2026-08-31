@@ -3938,3 +3938,31 @@ class EdgeGuardHealthMetricsTests(unittest.TestCase):
     metrics = self._metrics(plugin)
     self.assertEqual(metrics["total_requests"], workers * calls_per_worker)
     self.assertEqual(metrics["failed_requests"], 0)
+
+
+class EdgeGuardModeBudgetThreadingTests(unittest.TestCase):
+  def test_explain_graph_threads_thorough_mode_into_insight_brief(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _fake_session = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+    stub_result = {
+      "case_explanation": {"schema_version": "edgeguard.case_explanation.v2"},
+      "explanation_trace": {"outcome": {"status": "supported"}},
+    }
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
+          return_value=stub_result,
+        ) as run_brief:
+          plugin.explain_graph(
+            uri="example.com:7687",
+            scheme="bolt+s",
+            username="neo4j",
+            password="secret",
+            request="Explain thoroughly.",
+            cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+            explanation_mode="thorough",
+          )
+
+    self.assertEqual(run_brief.call_args.kwargs["mode"], "thorough")

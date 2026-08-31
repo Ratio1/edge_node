@@ -281,3 +281,68 @@ class Egx2TabularReasonTests(unittest.TestCase):
     self.assertIn("digest", case["assessment"]["text"])
     outcome = result["explanation_trace"]["outcome"]
     self.assertEqual(outcome, {"status": "fallback", "attempted_calls": 0, "completed_calls": 0, "safe_code": "tabular_result"})
+
+
+class Egx2ModeBudgetTests(unittest.TestCase):
+  def test_thorough_mode_prompt_carries_larger_budget(self):
+    graph = sample_graph()
+    sheet = insights.build_insight_sheet(graph)
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"finish_reason": "stop", "completion_tokens": 90, "content": json.dumps(valid_brief(sheet))}
+
+    egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider, mode="thorough")
+    self.assertIn("at most 3 observations", payloads[0]["messages"][1]["content"])
+    self.assertIn("3 next-checks", payloads[0]["messages"][1]["content"])
+
+  def test_default_and_balanced_modes_keep_two_two_budget(self):
+    graph = sample_graph()
+    sheet = insights.build_insight_sheet(graph)
+    for mode in (None, "balanced", "fast"):
+      payloads = []
+
+      def provider(payload):
+        payloads.append(payload)
+        return {"finish_reason": "stop", "completion_tokens": 90, "content": json.dumps(valid_brief(sheet))}
+
+      egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider, mode=mode)
+      with self.subTest(mode=mode):
+        self.assertIn("at most 2 observations", payloads[0]["messages"][1]["content"])
+
+  def test_three_observation_reply_parses_and_five_rejects(self):
+    graph = sample_graph()
+    sheet = insights.build_insight_sheet(graph)
+    top = sheet[0]["id"]
+
+    def brief_with(n):
+      brief = valid_brief(sheet)
+      brief["observations"] = [
+        {"text": f"2 indicators indicate \"quietsieve\" (view {i}).", "insight_ids": [top], "exemplar_entities": ["quietsieve"]}
+        for i in range(n)
+      ]
+      return brief
+
+    def provider_three(payload):
+      return {"finish_reason": "stop", "completion_tokens": 90, "content": json.dumps(brief_with(3))}
+
+    result = egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider_three, mode="thorough")
+    self.assertEqual(result["case_explanation"]["provenance"]["mode"], "model")
+    self.assertEqual(len(result["case_explanation"]["observations"]), 3)
+
+    def provider_five(payload):
+      return {"finish_reason": "stop", "completion_tokens": 90, "content": json.dumps(brief_with(5))}
+
+    result = egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider_five, mode="thorough")
+    self.assertEqual(result["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
+
+  def test_deterministic_paths_accept_mode(self):
+    def provider(payload):
+      raise AssertionError("no model call expected")
+
+    result = egx2.run_insight_brief(
+      question="q", graph=sample_graph(), model=None, provider_call=provider,
+      allow_model=False, deterministic_reason="transport_truncated", mode="thorough",
+    )
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "transport_truncated")
