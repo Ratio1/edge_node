@@ -296,5 +296,39 @@ class TestRegreSSHionConstraint(unittest.TestCase):
     self.assertFalse(self._fires("OpenSSH_9.8p1"))
 
 
+class TestPackageVersionParsing(unittest.TestCase):
+  """
+  `_parse_version` matched the first numeric run in the string, so a
+  Debian/RPM epoch was read as the upstream version: `1:8.9p1-3ubuntu0.10`
+  returned (1,), making an OpenSSH 8.9 host match every CVE for 1.x.
+
+  Latent while `_ssh_identify_library` reduces the banner to "8.9" before the
+  matcher sees it, but live the moment the full distribution package string is
+  carried through — which is the remaining half of RM-064 item 5.
+  """
+
+  def test_an_epoch_is_not_read_as_the_upstream_version(self):
+    from extensions.business.cybersec.red_mesh.cve_db import _parse_version
+    self.assertEqual(_parse_version("1:8.9p1-3ubuntu0.10"), _parse_version("8.9p1"))
+    self.assertEqual(_parse_version("2:1.2.3"), (1, 2, 3))
+
+  def test_ordinary_version_strings_are_unaffected(self):
+    from extensions.business.cybersec.red_mesh.cve_db import _parse_version
+    self.assertEqual(_parse_version("OpenSSH_8.9p1"), (8, 9, 16, 1))
+    self.assertEqual(_parse_version("1.4.3-beta"), (1, 4, 3))
+    self.assertEqual(_parse_version("Apache/2.4.57 (Ubuntu)"), (2, 4, 57))
+
+  def test_an_epoch_prefixed_package_no_longer_matches_1_x_cves(self):
+    fired = {
+      cve_id
+      for finding in check_cves("openssh", "1:8.9p1-3ubuntu0.10")
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+    # 8.9p1 is inside the regreSSHion upper range and outside the ancient ones.
+    self.assertIn("CVE-2024-6387", fired)
+    self.assertNotIn("CVE-2016-6210", fired)   # openssh <7.0
+    self.assertNotIn("CVE-2017-15906", fired)  # openssh <7.6
+
+
 if __name__ == "__main__":
   unittest.main()

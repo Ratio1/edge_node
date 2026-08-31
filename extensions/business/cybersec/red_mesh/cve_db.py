@@ -455,7 +455,15 @@ def _parse_version(version: str):
   """
   if not isinstance(version, str):
     return None
-  m = re.search(r"(\d+(?:\.\d+)*)([a-z]+)?(\d*)", version.strip(), re.IGNORECASE)
+  version = version.strip()
+  # Strip a Debian/RPM epoch before searching. `1:8.9p1-3ubuntu0.10` otherwise
+  # matches on the leading `1` and returns (1,), reading the epoch as the
+  # upstream version — which makes an OpenSSH 8.9 host match every CVE for 1.x.
+  # Latent today because `_ssh_identify_library` reduces the banner to "8.9"
+  # before the matcher sees it, but live the moment the full package string is
+  # carried through, which RM-064 item 5 asks for.
+  version = re.sub(r"^\s*\d+:", "", version)
+  m = re.search(r"(\d+(?:\.\d+)*)([a-z]+)?(\d*)", version, re.IGNORECASE)
   if not m:
     return None
   parts = [int(x) for x in m.group(1).split(".")]
