@@ -298,7 +298,7 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
       cwe_values = tuple(metadata.default_cwe)
     if not owasp_values:
       owasp_values = tuple(metadata.default_owasp)
-    if not cvss_vector and metadata.cvss_template:
+    if not cvss_vector and metadata.cvss_template and _carries_a_weakness(f):
       cvss_vector = metadata.cvss_template
     references = _merge_unique(references, metadata.references)
 
@@ -340,6 +340,27 @@ def _infer_calling_probe_id() -> str:
       return name
     frame = frame.f_back
   return ""
+
+
+def _carries_a_weakness(f) -> bool:
+  """
+  True when a finding describes a weakness a CVSS vector could score.
+
+  The probe registry's `cvss_template` is that probe's *worst case*, applied
+  when a finding brings no vector of its own. Applying it unconditionally gave
+  maximum-impact vectors to findings whose entire point is that a control
+  worked: "MySQL default credentials rejected" at INFO under a 9.8 CRITICAL
+  template, "TLS configuration adequate." at INFO under a 7.5 HIGH one. The
+  reader then sees a severity badge contradicted by the vector printed beside
+  it — measured at 55 INFO/LOW findings carrying a high-impact vector on the
+  client job, none of them with a numeric score to arbitrate.
+
+  INFO is the marker: probes use it both for "we checked and it was fine" and
+  for purely descriptive output. Neither has a weakness to score.
+  """
+  severity = getattr(f, "severity", None)
+  severity = getattr(severity, "value", severity)
+  return str(severity or "").upper() != "INFO"
 
 
 def _get_probe_metadata_safe(probe_id: str | None):

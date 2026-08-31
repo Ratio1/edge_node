@@ -351,3 +351,67 @@ class TestProbeRegistrationCoverage(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestCvssTemplateSeverityGate(unittest.TestCase):
+  """
+  The probe registry's static `cvss_template` was applied unconditionally, with
+  no severity gate, so findings whose whole point is that a control *worked*
+  shipped maximum-impact vectors: "MySQL default credentials rejected" / INFO
+  under a 9.8 CRITICAL template, "TLS configuration adequate." / INFO under a
+  7.5 HIGH template.
+
+  Measured on the client job before the fix: 55 INFO/LOW findings carrying a
+  high-impact vector, and 0 of 661 carrying a numeric score — so the finding
+  card printed a bare contradicting vector beside the severity badge.
+  """
+
+  def setUp(self):
+    self._saved = list_registered_probes()
+    clear_registry_for_tests()
+
+  def tearDown(self):
+    from extensions.business.cybersec.red_mesh.worker import probe_registry
+    clear_registry_for_tests()
+    probe_registry._REGISTRY.update(self._saved)
+
+  CRITICAL_TEMPLATE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
+  def _register(self):
+    @register_probe(
+      display_name="Test default creds",
+      description="Check for default credentials",
+      category=CATEGORY_SERVICE_INFO,
+      default_cwe=(287,),
+      default_owasp=("A07:2021",),
+      cvss_template=self.CRITICAL_TEMPLATE,
+    )
+    def _service_info_test_defaultcreds(self, ip, port):
+      pass
+
+  def _enrich(self, severity):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, enrich_finding_for_probe,
+    )
+    finding = Finding(
+      title="MySQL default credentials rejected",
+      severity=severity,
+      description="The service rejected every default credential.",
+    )
+    return enrich_finding_for_probe(finding, "_service_info_test_defaultcreds")
+
+  def test_a_healthy_control_does_not_inherit_a_maximum_impact_vector(self):
+    from extensions.business.cybersec.red_mesh.findings import Severity
+    self._register()
+    enriched = self._enrich(Severity.INFO)
+    self.assertIsNone(
+      enriched.cvss_vector or None,
+      "an INFO finding reporting that a control worked was given the probe's "
+      "worst-case CVSS vector",
+    )
+
+  def test_a_real_weakness_still_inherits_the_template(self):
+    from extensions.business.cybersec.red_mesh.findings import Severity
+    self._register()
+    enriched = self._enrich(Severity.CRITICAL)
+    self.assertEqual(enriched.cvss_vector, self.CRITICAL_TEMPLATE)
