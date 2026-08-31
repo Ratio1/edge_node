@@ -772,7 +772,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
           "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
           "ENV": {
             "CRDB_DATABASE": "appdb",
-            "CRDB_USER": "app_user",
+            "CRDB_USER": "admin",
             "CRDB_PASSWORD": "secret-password",
             "CRDB_NODE_COUNT": "3",
             "CRDB_HOSTNAMES": "roach1.example,roach2.example,roach3.example",
@@ -852,7 +852,28 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
             ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
           )
 
-  def test_legacy_pipeline_rejects_reserved_user_before_certificate_generation(self):
+  def test_cockroachdb_secure_config_rejects_per_node_global_credentials_before_certificate_generation(self):
+    for key in ("CRDB_DATABASE", "CRDB_USER", "CRDB_PASSWORD"):
+      with self.subTest(key=key):
+        plugin = make_deeploy_plugin()
+        generation_calls = []
+        plugin._generate_cockroachdb_cert_bundle = (
+          lambda *args, **kwargs: generation_calls.append((args, kwargs)) or {}
+        )
+        inputs = self._make_cockroachdb_secure_inputs()
+        inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_b"]["ENV"][
+          key
+        ] = "override"
+
+        with self.assertRaisesRegex(ValueError, key):
+          plugin._prepare_cockroachdb_secure_config(
+            inputs,
+            ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+          )
+
+        self.assertEqual(generation_calls, [])
+
+  def test_legacy_pipeline_rejects_root_user_before_certificate_generation(self):
     plugin = make_deeploy_plugin()
     generation_calls = []
     plugin._generate_cockroachdb_cert_bundle = (
@@ -865,7 +886,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
           "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
           "ENV": {
             "CRDB_DATABASE": "appdb",
-            "CRDB_USER": "admin",
+            "CRDB_USER": "root",
             "CRDB_PASSWORD": "secret-password",
           },
         }],
@@ -873,6 +894,43 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     }
 
     with self.assertRaisesRegex(ValueError, "reserved"):
+      plugin._prepare_cockroachdb_secure_config_for_pipeline(
+        pipeline,
+        ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+      )
+
+    self.assertEqual(generation_calls, [])
+
+  def test_legacy_pipeline_rejects_per_node_global_credentials_before_certificate_generation(self):
+    plugin = make_deeploy_plugin()
+    generation_calls = []
+    plugin._generate_cockroachdb_cert_bundle = (
+      lambda *args, **kwargs: generation_calls.append((args, kwargs))
+    )
+    pipeline = {
+      NetMonCt.PLUGINS: [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          "PER_NODE_CONFIG": {
+            "byIndex": {
+              "0": {
+                "ENV": {
+                  "CRDB_USER": "root",
+                },
+              },
+            },
+          },
+        }],
+      }],
+    }
+
+    with self.assertRaisesRegex(ValueError, "CRDB_USER"):
       plugin._prepare_cockroachdb_secure_config_for_pipeline(
         pipeline,
         ["0xai_node_a", "0xai_node_b", "0xai_node_c"],

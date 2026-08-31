@@ -212,6 +212,99 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
     self.assertEqual(self.deleted, [])
     self.assertEqual(self.deploy_calls, [])
 
+  def test_reconcile_rejects_per_node_cockroachdb_credentials_before_stopping_pipeline(self):
+    """
+    Reconstructed CockroachDB configs keep the normal pre-stop admission guard.
+    """
+    pipeline = self._pipeline(owner="0xOld")
+    pipeline["DEEPLOY_SPECS"]["job_app_type"] = "service"
+    pipeline["DEEPLOY_SPECS"]["current_target_nodes"] = ["node1", "node2", "node3"]
+    pipeline["PLUGINS"][0]["INSTANCES"][0].update({
+      "IMAGE": "ghcr.io/ratio1/r1-meshdb@sha256:" + ("a" * 64),
+      "ENV": {
+        "CRDB_DATABASE": "appdb",
+        "CRDB_USER": "app_user",
+        "CRDB_PASSWORD": "secret-password",
+      },
+      "PER_NODE_CONFIG": {
+        "byNode": {
+          "node1": {"ENV": {"CRDB_USER": "root"}},
+        },
+      },
+    })
+    self._install_pipeline(pipeline)
+    self.plugin._get_online_apps = lambda **kwargs: {
+      "node1": {"app1": {"owner": "0xOld", "deeploy_specs": {"job_id": 10}}}
+    }
+    self.plugin._discover_plugin_instances = lambda **kwargs: [{
+      "app_id": "app1",
+      "instance_id": "inst1",
+      "plugin_signature": "CONTAINER_APP_RUNNER",
+      "plugin_instance": {
+        "instance_conf": copy.deepcopy(pipeline["PLUGINS"][0]["INSTANCES"][0]),
+      },
+      "NODE": "node1",
+      "CHAINSTORE_RESPONSE_KEY": "resp1",
+    }]
+
+    result = self.plugin._reconcile_csp_escrow_job_owner(
+      job_id=10,
+      old_owner="0xOld",
+      new_owner="0xNew",
+    )
+
+    self.assertEqual(result[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("per-node ENV", result[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(self.deleted, [])
+    self.assertEqual(self.deploy_calls, [])
+
+  def test_reconcile_passes_legacy_cockroachdb_compat_context_to_redeploy(self):
+    """
+    Stale-node reconciliation preserves recognized legacy reserved-user jobs.
+    """
+    pipeline = self._pipeline(owner="0xOld")
+    pipeline["DEEPLOY_SPECS"]["job_app_type"] = "service"
+    pipeline["DEEPLOY_SPECS"]["current_target_nodes"] = ["node1", "node2", "node3"]
+    pipeline["PLUGINS"][0]["INSTANCES"][0].update({
+      "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+      "ENV": {
+        "CRDB_DATABASE": "appdb",
+        "CRDB_USER": "admin",
+        "CRDB_PASSWORD": "legacy-password",
+      },
+    })
+    self._install_pipeline(pipeline)
+    self.plugin._get_online_apps = lambda **kwargs: {
+      "node1": {"app1": {"owner": "0xOld", "deeploy_specs": {"job_id": 10}}}
+    }
+    self.plugin._discover_plugin_instances = lambda **kwargs: [{
+      "app_id": "app1",
+      "instance_id": "inst1",
+      "plugin_signature": "CONTAINER_APP_RUNNER",
+      "plugin_instance": {
+        "instance_conf": copy.deepcopy(pipeline["PLUGINS"][0]["INSTANCES"][0]),
+      },
+      "NODE": "node1",
+      "CHAINSTORE_RESPONSE_KEY": "resp1",
+    }]
+    original_build_inputs = self.plugin._build_csp_reconcile_inputs
+
+    def build_inputs(*args, **kwargs):
+      inputs = original_build_inputs(*args, **kwargs)
+      inputs["_source_pipeline"] = kwargs["pipeline"]
+      return inputs
+
+    self.plugin._build_csp_reconcile_inputs = build_inputs
+
+    result = self.plugin._reconcile_csp_escrow_job_owner(
+      job_id=10,
+      old_owner="0xOld",
+      new_owner="0xNew",
+    )
+
+    self.assertEqual(result[DEEPLOY_KEYS.STATUS], "node_update_delivered")
+    self.assertTrue(self.deploy_calls[0]["cockroachdb_legacy_compat_contexts"])
+
 
 if __name__ == "__main__":
   unittest.main()

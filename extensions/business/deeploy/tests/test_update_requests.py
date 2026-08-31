@@ -1364,6 +1364,277 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["deploy"], 0)
     self.assertEqual(called["queued"], 0)
 
+  def test_process_service_update_rejects_per_node_reserved_user_before_payment_or_delete(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+      fixture_plugin
+    )
+    request_plugin["PER_NODE_CONFIG"]["byNode"][nodes[1]]["ENV"]["CRDB_USER"] = "root"
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    phase_calls = []
+    plugin.deeploy_check_payment_and_job_owner = (
+      lambda *args, **kwargs: phase_calls.append("payment") or True
+    )
+    plugin._check_nodes_availability = (
+      lambda inputs: phase_calls.append("nodes") or nodes
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("per-node ENV", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(phase_calls, [])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+
+  def test_process_legacy_service_update_allows_unchanged_expanded_reserved_user(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+      fixture_plugin
+    )
+    for discovered in discovered_instances:
+      discovered[DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]["ENV"]["CRDB_USER"] = "admin"
+    request_plugin["ENV"]["CRDB_USER"] = "admin"
+    request_plugin["ENV"]["CRDB_PASSWORD"] = "sanitized-password"
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(
+      redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0]["IMAGE"],
+      "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+    )
+    self.assertEqual(redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_USER"], "admin")
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
+
+  def test_legacy_service_compatibility_context_covers_all_expanded_reserved_users(self):
+    for reserved_user in ("admin", "node", "public"):
+      with self.subTest(reserved_user=reserved_user):
+        plugin = make_deeploy_plugin()
+        _, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+          plugin
+        )
+        for discovered in discovered_instances:
+          discovered[DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]["ENV"][
+            "CRDB_USER"
+          ] = reserved_user
+        request_plugin["ENV"]["CRDB_USER"] = reserved_user
+
+        contexts = plugin._get_cockroachdb_legacy_compat_contexts_from_discovered(
+          discovered_instances
+        )
+
+        self.assertTrue(
+          plugin._cockroachdb_request_matches_legacy_compat_context(
+            request_plugin,
+            contexts,
+          )
+        )
+        plugin._validate_managed_service_request_admission(
+          "cockroachdb",
+          make_inputs(plugins=[request_plugin]),
+          cockroachdb_legacy_compat_contexts=contexts,
+        )
+
+  def test_process_legacy_service_update_rejects_reserved_user_on_current_image(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+      fixture_plugin
+    )
+    for discovered in discovered_instances:
+      discovered[DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]["ENV"]["CRDB_USER"] = "admin"
+    request_plugin["IMAGE"] = (
+      "ghcr.io/ratio1/r1-meshdb@sha256:"
+      "3be00a63467628d0f5c3382be8ae7a885c5b658762dfd095fba0cb0b5549fab4"
+    )
+    request_plugin["ENV"]["CRDB_USER"] = "admin"
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    phase_calls = []
+    plugin.deeploy_check_payment_and_job_owner = (
+      lambda *args, **kwargs: phase_calls.append("payment") or True
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(phase_calls, [])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+
+  def test_process_legacy_service_update_rejects_any_credential_tuple_change(self):
+    for key, value in (
+      ("CRDB_DATABASE", "otherdb"),
+      ("CRDB_USER", "public"),
+      ("CRDB_PASSWORD", "other-password"),
+    ):
+      with self.subTest(key=key):
+        fixture_plugin = make_deeploy_plugin()
+        nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+          fixture_plugin
+        )
+        for discovered in discovered_instances:
+          discovered[DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]["ENV"]["CRDB_USER"] = "admin"
+        request_plugin["ENV"]["CRDB_USER"] = "admin"
+        request_plugin["ENV"][key] = value
+        plugin, called = self._make_process_update_plugin(
+          discovered_instances=discovered_instances,
+          nodes=nodes,
+          deeploy_specs={
+            DEEPLOY_KEYS.JOB_ID: 11,
+            DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+            DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+          },
+        )
+        phase_calls = []
+        plugin.deeploy_check_payment_and_job_owner = (
+          lambda *args, **kwargs: phase_calls.append("payment") or True
+        )
+
+        response = plugin._process_pipeline_request(
+          {
+            DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+            DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+            DEEPLOY_KEYS.JOB_ID: 11,
+            DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+            DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+            DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+            DEEPLOY_KEYS.TARGET_NODES: nodes,
+            DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+            DEEPLOY_KEYS.PLUGINS: [request_plugin],
+          },
+          is_create=False,
+          async_mode=True,
+        )
+
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+        self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(phase_calls, [])
+        self.assertEqual(called["delete"], 0)
+        self.assertEqual(called["deploy"], 0)
+        self.assertEqual(called["queued"], 0)
+
+  def test_process_legacy_service_update_rejects_inconsistent_discovered_credentials(self):
+    fixture_plugin = make_deeploy_plugin()
+    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(
+      fixture_plugin
+    )
+    for discovered in discovered_instances:
+      discovered[DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]["ENV"]["CRDB_USER"] = "admin"
+    discovered_instances[-1][DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE]["instance_conf"]["ENV"][
+      "CRDB_PASSWORD"
+    ] = "different-replica-password"
+    request_plugin["ENV"]["CRDB_USER"] = "admin"
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=nodes,
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      },
+    )
+    phase_calls = []
+    plugin.deeploy_check_payment_and_job_owner = (
+      lambda *args, **kwargs: phase_calls.append("payment") or True
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: nodes,
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
+        DEEPLOY_KEYS.PLUGINS: [request_plugin],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("inconsistent", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(phase_calls, [])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+
   def test_prepare_single_plugin_instance_update_falls_back_to_instance_conf(self):
     plugin = make_deeploy_plugin()
     fallback_instance = {
