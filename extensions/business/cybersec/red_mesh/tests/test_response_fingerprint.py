@@ -518,6 +518,66 @@ class _TlsPeer(_Peer):
         pass
 
 
+class _RedirectingStallPeer:
+  """
+  Answers `/` with a same-origin 302, then drips headers forever on the target.
+
+  Both hops are served on one persistent connection, which is the point: the
+  second hop reuses the socket the first opened, so nothing new is registered
+  with the deadline watchdog.
+  """
+
+  def __init__(self, interval=0.5):
+    self._interval = interval
+    self._stop = threading.Event()
+    self._server = socket.socket()
+    self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    self._server.bind(("127.0.0.1", 0))
+    self._server.listen(5)
+    self.port = self._server.getsockname()[1]
+    threading.Thread(target=self._serve, daemon=True).start()
+
+  def _serve(self):
+    try:
+      while not self._stop.is_set():
+        conn, _addr = self._server.accept()
+        threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+    except Exception:
+      pass
+
+  def _handle(self, conn):
+    try:
+      while not self._stop.is_set():
+        request = conn.recv(65536)
+        if not request:
+          return
+        path = request.split(b" ")[1] if b" " in request else b"/"
+        if path == b"/":
+          # No Connection: close — HTTP/1.1 keeps this socket for the next hop.
+          conn.sendall(b"HTTP/1.1 302 Found\r\nLocation: /stall\r\nContent-Length: 0\r\n\r\n")
+          continue
+        conn.sendall(b"HTTP/1.1 200 OK\r\n")
+        for index in itertools.count():
+          if self._stop.is_set():
+            return
+          conn.sendall(b"X-Pad-%d: y\r\n" % index)
+          time.sleep(self._interval)
+    except Exception:
+      pass
+    finally:
+      try:
+        conn.close()
+      except Exception:
+        pass
+
+  def close(self):
+    self._stop.set()
+    try:
+      self._server.close()
+    except Exception:
+      pass
+
+
 class TestRealSocketBounding(unittest.TestCase):
   """The bounding guarantees, measured against a real connection."""
 
@@ -725,13 +785,88 @@ class TestRealSocketBounding(unittest.TestCase):
 
     # Give the watchdogs their sweep interval to break the abandoned requests.
     deadline = time.monotonic() + 20
-    while time.monotonic() < deadline and threading.active_count() > before + 2:
+    while time.monotonic() < deadline and threading.active_count() > before:
       time.sleep(0.25)
     self.assertLessEqual(
-      threading.active_count(), before + 2,
+      threading.active_count(), before,
       f"threads {before} -> {threading.active_count()} after 3 probes; the "
       "watchdog is not breaking abandoned requests",
     )
+
+  def test_a_redirect_onto_a_stalling_page_does_not_leak(self):
+    # HTTP/1.1 is persistent by default, so a same-origin redirect is served on
+    # the connection the first hop already opened: `connect()` does not run
+    # again and nothing new is registered. A watchdog scoped to "sockets added
+    # since this hop began" therefore sweeps an empty slice for exactly the
+    # connection that needs breaking, and one 302 leaks two threads and an fd
+    # per port, permanently. This is the shape the slow-connect test misses.
+    peer = _RedirectingStallPeer()
+    self.addCleanup(peer.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+    before = threading.active_count()
+    started = time.monotonic()
+    http, _excerpt = worker._fingerprint_http("http", peer.port)
+    elapsed = time.monotonic() - started
+
+    self.assertIsNone(http, "a stalled redirect hop must not yield evidence")
+    self.assertLess(elapsed, budget * 3)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and threading.active_count() > before:
+      time.sleep(0.25)
+    self.assertLessEqual(
+      threading.active_count(), before,
+      f"threads {before} -> {threading.active_count()}; the watchdog cannot "
+      "reach a connection reused across a redirect",
+    )
+
+  def test_a_close_delimited_body_is_never_claimed_complete(self):
+    # With neither Content-Length nor chunked framing, end-of-message is just a
+    # closed connection — indistinguishable from a severed one. Claiming
+    # completeness there publishes body_sha256 over whatever arrived, attributed
+    # to the target as its whole response.
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def _serve():
+      try:
+        conn, _addr = server.accept()
+        conn.recv(65536)
+        conn.sendall(
+          b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+          b"<html><title>Unframed</title>partial"
+        )
+        conn.close()
+      except Exception:
+        pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+    self.addCleanup(server.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[port])
+    http, _excerpt = worker._fingerprint_http("http", port)
+
+    self.assertIsNotNone(http)
+    self.assertEqual(http["title"], "Unframed")
+    self.assertFalse(
+      http["body_complete"],
+      "a close-delimited body cannot be verified complete",
+    )
+    self.assertIsNone(
+      http["body_sha256"],
+      "a hash was published over a body whose completeness is unverifiable",
+    )
+
+  def test_a_framed_body_is_still_claimed_complete(self):
+    # The guard above must not cost completeness on ordinary framed responses.
+    peer = _Peer.serving(b"<html><title>Framed</title>hello</html>")
+    self.addCleanup(peer.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    http, _excerpt = worker._fingerprint_http("http", peer.port)
+    self.assertTrue(http["body_complete"])
+    self.assertIsNotNone(http["body_sha256"])
 
   def test_a_hostile_charset_cannot_blank_a_ports_evidence(self):
     # The charset comes from the target's own Content-Type. `charset=idna`
@@ -1033,7 +1168,14 @@ class TestHttpCapture(unittest.TestCase):
       body=b"a" * (RESPONSE_BODY_MAX_BYTES + 1),
       **{"Content-Length": str(RESPONSE_BODY_MAX_BYTES + 100)},
     )
-    whole = self._response()
+    # Framed explicitly: completeness is only claimable for a body delimited by
+    # a declared length or chunked encoding. Without either, end-of-message is
+    # a closed connection and cannot be told apart from a severed one, so the
+    # bare mock this used to pass was not a "whole response" in the first place.
+    whole_body = b"<html><title>Acme</title>hello</html>"
+    whole = self._response(
+      body=whole_body, **{"Content-Length": str(len(whole_body))}
+    )
     worker = _make_worker(target="127.0.0.1", comparison_ports=[443])
     results = []
     for response in (truncated, whole):

@@ -441,11 +441,6 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
   # the same failure `read_bounded_response_body._stop` exists to prevent.
   outcome = queue.Queue()
 
-  # Only this hop's sockets. One registry serves every redirect hop, and scoping
-  # by index is what keeps a watchdog off a later hop's connection — not the
-  # shared deadline, which is a weaker argument than it looks.
-  first_socket = len(sockets)
-
   def _watch():
     if finished.wait(max_seconds):
       return
@@ -456,8 +451,19 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
     # socket unguarded and the request unkillable — which relocated the very
     # hang this function exists to close into a daemon thread, and leaked a
     # thread and an fd on every probed port.
+    #
+    # Sweep the *whole* registry, never a per-hop slice. HTTP/1.1 is persistent
+    # by default, so a same-origin redirect is served on the connection hop 1
+    # already opened: `connect()` does not run again, nothing is appended, and a
+    # slice scoped to "sockets added since this hop began" is empty for exactly
+    # the connection that needs breaking. One `302` was enough to leak two
+    # threads and an fd per port, permanently.
+    #
+    # Sweeping everything is safe because a fired watchdog means its own hop
+    # timed out, and every path that observes `expired` raises out of the caller's
+    # redirect loop — so no later hop can be live while this sweeps.
     while True:
-      for sock in list(sockets)[first_socket:]:
+      for sock in list(sockets):
         try:
           sock.shutdown(socket.SHUT_RDWR)
         except Exception:
@@ -756,6 +762,14 @@ class _ResponseFingerprintMixin:
         # with one header while still serving geo-differentiated content, and
         # read as "no divergence".
         body_text = body.decode("utf-8", errors="replace")
+      # A body delimited only by connection close cannot be verified complete:
+      # a severed connection and a clean end-of-message are the same event on
+      # the wire. Claiming completeness there would publish `body_sha256` over
+      # whatever arrived, attributed to the target as its full response. Only a
+      # framed body — declared length or chunked — can carry that claim.
+      framing = (resp.headers.get("Transfer-Encoding") or "").lower()
+      framed = resp.headers.get("Content-Length") is not None or "chunked" in framing
+      body_complete = body_complete and framed
       content_type = normalize_content_type(resp.headers.get("Content-Type"))
       title_match = _TITLE_RE.search(body_text[:5000])
       declared_length = resp.headers.get("Content-Length")
