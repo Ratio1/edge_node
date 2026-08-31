@@ -395,6 +395,30 @@ class _ReportMixin:
       "total_scenarios_vulnerable": scenario_vulnerable,
     }
 
+  def _local_node_address(self):
+    """
+    This node's own address, for finding attribution.
+
+    Mirrors how the report itself is stamped at close-job time: the public IP
+    from `location_data` when geolocation is available, otherwise the local
+    address. Returns None when neither is reachable, so the caller can fall back
+    to a per-worker identifier rather than to a mesh-wide constant.
+    """
+    address = None
+    try:
+      location_data = self.global_shmem.get("location_data") or {}
+      address = location_data.get("ip")
+    except Exception:
+      address = None
+    if not address:
+      getter = getattr(getattr(self, "log", None), "get_localhost_ip", None)
+      if callable(getter):
+        try:
+          address = getter()
+        except Exception:
+          address = None
+    return address or None
+
   @staticmethod
   def _stamp_finding_list(findings, worker_id, node_addr):
     """Stamp _source_worker_id / _source_node_addr on each finding.
@@ -482,9 +506,18 @@ class _ReportMixin:
           # can trace every finding back to the worker/node that
           # produced it. Idempotent via setdefault — re-aggregation
           # does not overwrite existing stamps from Phase 2.
+          # `initiator` is deliberately NOT in this chain. It is the job
+          # *launcher's* address, seeded onto every worker on every
+          # participating node, so falling back to it stamped one address across
+          # the whole mesh: `_compute_node_comparison` then bucketed every
+          # finding under one key, and PDF 3.10 credited a single country with
+          # all of them. Measured on the client job — 10 distinct worker ids,
+          # exactly 1 node address — and on the archived multi-worker runs.
+          # This aggregation merges *this node's* local workers, so this node's
+          # own address is the correct attribution for all of them.
           node_addr = (
             local_job_status.get("node_addr")
-            or local_job_status.get("initiator")
+            or self._local_node_address()
             or str(local_worker_id)
           )
           worker_id = (

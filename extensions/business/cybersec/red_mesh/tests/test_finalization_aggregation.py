@@ -246,6 +246,12 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
     reports = {
       "0xnode_a": {
         "job_id": "j1", "scan_type": "webapp",
+        # Production reports always carry `initiator`, and it is the *launcher's*
+        # address — identical on every participating node. Omitting it here let
+        # the fallback land on the dict key so this assertion passed while
+        # attribution collapsed in the field: the client job shows 10 distinct
+        # worker ids against exactly 1 node address.
+        "initiator": "0xLAUNCHER",
         "local_worker_id": "RM-1-aaaa",
         "service_info": {},
         "graybox_results": {
@@ -263,7 +269,37 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
     # Stamping happens in place on reports during aggregation.
     f = reports["0xnode_a"]["graybox_results"]["443"]["_graybox_idor"]["findings"][0]
     self.assertEqual(f["_source_worker_id"], "RM-1-aaaa")
+    self.assertNotEqual(
+      f["_source_node_addr"], "0xLAUNCHER",
+      "findings were attributed to the job launcher rather than the node that "
+      "produced them, which credits one country with every finding in PDF 3.10",
+    )
     self.assertEqual(f["_source_node_addr"], "0xnode_a")
+
+  def test_the_node_stamps_its_own_address_when_it_knows_it(self):
+    """A node that knows its public address attributes findings to itself."""
+    host = _Host()
+    host.global_shmem = {"location_data": {"ip": "203.0.113.7"}}
+    reports = {
+      "0xnode_b": {
+        "job_id": "j1", "scan_type": "webapp",
+        "initiator": "0xLAUNCHER",
+        "local_worker_id": "RM-1-bbbb",
+        "service_info": {},
+        "graybox_results": {
+          "443": {
+            "_graybox_idor": {
+              "findings": [{"title": "IDOR", "severity": "HIGH"}],
+              "outcome": "completed",
+            },
+          },
+        },
+        "completed_tests": [],
+      },
+    }
+    host._get_aggregated_report(reports, worker_cls=GrayboxLocalWorker)
+    f = reports["0xnode_b"]["graybox_results"]["443"]["_graybox_idor"]["findings"][0]
+    self.assertEqual(f["_source_node_addr"], "203.0.113.7")
 
 
 class TestApiTop10FlatFindingIntegration(unittest.TestCase):
