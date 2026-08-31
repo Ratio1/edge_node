@@ -164,6 +164,16 @@ class TestExcerptSanitization(unittest.TestCase):
       # keeps it out of the redaction.
       "code: internationalization",
       "signature: Jonathan Featherstonehaugh",
+      # The digit must sit in the *value token*, not merely somewhere later on
+      # the line. API error pages carry both a long CamelCase code and an
+      # unrelated number, and a line-scoped digit test redacts the whole
+      # sentence — including the captive-portal and rate-limit pages that are
+      # among the strongest geo-divergence signals this evidence exists to show.
+      "code: internationalization v2",
+      "Error code: InvalidParameterValue (request id 1234)",
+      "Status code: NetworkAuthenticationRequired 511",
+      "code: ServiceUnavailable retry in 30s",
+      "ticket: Reisegepaeckversicherung 2024",
     ):
       with self.subTest(text=text):
         self.assertEqual(sanitize_excerpt(text), text)
@@ -179,6 +189,19 @@ class TestExcerptSanitization(unittest.TestCase):
       ("sig: 9f8b7c6d5e4f3a2b1c0d9e8f", "9f8b7c6d5e4f3a2b1c0d9e8f"),
       ("ticket=ST1a2b3c4d5e6f7g8h9i0j", "ST1a2b3c4d5e6f7g8h9i0j"),
       ('{"code": "4Ab3Xk9Qz2Lm7Pw4Rt8Nv"}', "4Ab3Xk9Qz2Lm7Pw4Rt8Nv"),
+      # A hyphenated UUID is the most common OAuth CSRF `state` shape by far,
+      # and its longest unbroken run is 12 — under the run test — while the hex
+      # rule needs 32 characters with no separators. It needs its own shape.
+      ("state=550e8400-e29b-41d4-a716-446655440000",
+       "550e8400-e29b-41d4-a716-446655440000"),
+      ("ticket: 3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+       "3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
+      # Percent-encoding breaks the run at the front of the value. Anchoring
+      # the lookaheads to the first alphanumeric segment let every one of these
+      # through, including a live Azure Storage SAS credential.
+      ("?sv=2021-06-08&sig=1sxKuFq%2FT6Wm5%2BYd3Nn9Ap0Qr2St4Uv6Wx8Yz0A%3D",
+       "Yd3Nn9Ap0Qr2St4Uv6Wx8Yz0A"),
+      ("sig=abcdefgh%2F1234567890123456", "1234567890123456"),
     ):
       with self.subTest(pair=pair):
         self.assertNotIn(secret, sanitize_excerpt(pair))
@@ -539,6 +562,77 @@ class TestRealSocketBounding(unittest.TestCase):
     response.raw._connection = MagicMock(spec=[])  # a connection, but no `sock`
     release_response_connection(response, log=lambda msg, **kw: reported.append(msg))
     self.assertTrue(reported, "a failed teardown reach was swallowed")
+
+  def test_a_multi_address_target_cannot_multiply_the_budget(self):
+    # `create_connection` applies its timeout per resolved address, so a target
+    # publishing N blackholed A records in its own zone costs N x the budget.
+    # The watchdog cannot help: the socket is registered only after connect()
+    # returns, so during the connect leg there is nothing to shut down. The
+    # guarantee has to be that the probe *returns* on time.
+    blackholes = [
+      (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{n}", 80))
+      for n in range(1, 11)
+    ]
+    worker = _make_worker(target="blackhole.test", comparison_ports=[80])
+    budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+    outcome = {}
+
+    def _probe():
+      started = time.monotonic()
+      outcome["result"] = worker._fingerprint_http("http", 80)
+      outcome["elapsed"] = time.monotonic() - started
+
+    with patch("socket.getaddrinfo", return_value=blackholes):
+      prober = threading.Thread(target=_probe, daemon=True)
+      prober.start()
+      prober.join(timeout=budget * 8)
+
+    self.assertFalse(prober.is_alive(), "_fingerprint_http never returned")
+    self.assertEqual(outcome["result"], (None, None))
+    self.assertLess(
+      outcome["elapsed"], budget * 3,
+      f"{len(blackholes)} A-records held the probe for "
+      f"{outcome.get('elapsed', 0):.1f}s against a {budget}s budget",
+    )
+
+  def test_a_redirect_query_string_cannot_reach_the_log(self):
+    # `redirect_stays_on_target` pins host and port but not path or query, so a
+    # failing hop's urllib3 error text carries a target-supplied credential.
+    logged = []
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[9])
+    worker.P = lambda msg, **kw: logged.append(str(msg))
+    hop = "http://127.0.0.1:9/callback?code=AbCdEf0123456789XyZ&api_key=sk-live-9f8e7d6c"
+    with patch.object(
+      worker, "_target_timeout", return_value=2
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.response_fingerprint."
+      "request_within_deadline",
+      side_effect=requests.ConnectionError(f"Max retries exceeded with url: {hop}"),
+    ):
+      worker._fingerprint_http("http", 9)
+    self.assertTrue(logged, "nothing was logged")
+    joined = "\n".join(logged)
+    self.assertNotIn("AbCdEf0123456789XyZ", joined)
+    self.assertNotIn("sk-live-9f8e7d6c", joined)
+
+  def test_the_probe_session_ignores_environment_proxies(self):
+    # requests.Session defaults to trust_env=True, and HTTPAdapter routes a
+    # proxied request through proxy_manager_for(), which does NOT carry the
+    # recording pool classes. With HTTP_PROXY set in the container the socket
+    # registry stays empty, the watchdog shuts nothing down, and the header
+    # drip hang returns silently with the whole suite green. A proxied request
+    # would also report the proxy's vantage, not this node's, which is the one
+    # thing this module exists to measure.
+    peer = _Peer.serving(b"<html><title>Direct</title>ok</html>")
+    self.addCleanup(peer.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    with patch.dict(
+      "os.environ",
+      {"HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1"},
+    ):
+      http, _excerpt = worker._fingerprint_http("http", peer.port)
+    self.assertIsNotNone(http, "the probe was routed through the environment proxy")
+    self.assertEqual(http["title"], "Direct")
 
   def test_teardown_prefers_the_supported_shutdown_api(self):
     response = MagicMock()

@@ -26,7 +26,7 @@ import threading
 import time
 
 import requests
-from requests.adapters import HTTPAdapter
+from requests.adapters import DEFAULT_POOLBLOCK, HTTPAdapter
 from requests.compat import urljoin, urlparse
 from requests.models import DEFAULT_REDIRECT_LIMIT
 from urllib3.connection import HTTPConnection, HTTPSConnection
@@ -50,6 +50,12 @@ REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 TITLE_MAX_CHARS = 200
 RESPONSE_BODY_MAX_BYTES = 1024 * 1024
+
+# How long past the wall deadline to wait for the watchdog's socket shutdown to
+# unwind the request thread. Long enough that the ordinary bounded case returns
+# its own result rather than a timeout; short enough that a request wedged where
+# the watchdog cannot reach it still releases the scan phase promptly.
+_DEADLINE_GRACE_SECONDS = 1.0
 
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -91,18 +97,39 @@ _REDACTIONS = (
   # Keys that are ordinary English words, so the key alone cannot justify a
   # redaction — `state: California` and `?code=US` are comparison signal, while
   # an OAuth code, a SAML signature and a service ticket are credentials under
-  # exactly the same names. The value decides, on two counts: an unbroken
-  # 16-character alphanumeric run (the same token-versus-prose discriminator the
-  # base64 rule below uses), *and* a digit somewhere in it. The digit is what
-  # separates a generated token from a long word — `code: internationalization`
-  # clears the run test on length alone, and redacting it would destroy exactly
-  # the comparison signal this table has already destroyed once.
+  # exactly the same names. The value has to earn it, in one of two shapes.
+  #
+  # Every lookahead below is scoped to the value *token*: the character classes
+  # exclude whitespace deliberately. A digit test spanning the rest of the line
+  # instead redacts ordinary API error prose, because those pages pair a long
+  # CamelCase code with an unrelated number — `Status code:
+  # NetworkAuthenticationRequired 511` is a captive-portal page, one of the
+  # strongest geo-divergence signals there is, and the value group would eat the
+  # whole sentence with it.
   (
     re.compile(
       r"(?i)(?<![A-Za-z0-9])(code|state|sig|signature|ticket)"
       r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
-      r"(?=[\"']?[A-Za-z0-9_+/\-]*[A-Za-z0-9]{16,})"
-      r"(?=[^\r\n,;&<>}]*[0-9])"
+      r"(?:"
+      # Shape 1: an unbroken 16-character alphanumeric run (the same
+      # token-versus-prose discriminator the base64 rule below uses) *and* a
+      # digit inside that same token. The digit is what separates a generated
+      # token from a long word: `code: internationalization` clears the run test
+      # on length alone.
+      # Scoped by *whitespace*, not by token alphabet. Anchoring these to the
+      # value's first alphanumeric segment let every percent-encoded credential
+      # through — measured ~25% of URL-encoded HMAC signatures, and every Azure
+      # Storage SAS `sig=`, whose `%2F` and `%2B` break the run at the front
+      # while a 25-character run sits later in the value.
+      r"(?=[\"']?[^\s\r\n,;&<>}]*[A-Za-z0-9]{16,})"
+      r"(?=[\"']?[^\s\r\n,;&<>}]*[0-9])"
+      r"|"
+      # Shape 2: a UUID. The most common OAuth CSRF `state` by a wide margin,
+      # and invisible to shape 1 — its longest unbroken run is 12, while the hex
+      # rule needs 32 characters with no separators. No prose has this shape.
+      r"(?=[\"']?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+      r"-[0-9a-fA-F]{12}(?![A-Za-z0-9]))"
+      r")"
       r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;&<>}]+)"
     ),
     r"\1\g<quote>\g<separator>[REDACTED]",
@@ -353,11 +380,25 @@ class _SocketRecordingAdapter(HTTPAdapter):
     self._socket_registry = socket_registry
     super().__init__(**kwargs)
 
-  def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+  def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):
     super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
     self.poolmanager.pool_classes_by_scheme = _socket_recording_pool_classes(
       self._socket_registry
     )
+
+  def proxy_manager_for(self, proxy, **proxy_kwargs):
+    # A proxied request never touches `self.poolmanager` — requests routes it
+    # through a separate ProxyManager built here, which ships stock pool
+    # classes. Without this the socket registry stays empty and the deadline
+    # watchdog has nothing to shut down. `trust_env` is disabled at the call
+    # site so this cannot be reached from the environment, but a control that
+    # silently disappears when someone later sets `session.proxies` is not a
+    # control.
+    manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+    manager.pool_classes_by_scheme = _socket_recording_pool_classes(
+      self._socket_registry
+    )
+    return manager
 
 
 def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
@@ -376,9 +417,21 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
   header block was truncated mid-flight, and `http.client` parses what it has
   into a plausible-looking reply. Recording that as the target's answer would
   turn our own timeout into fabricated evidence.
+
+  The request is issued off-thread so this function returns at the deadline even
+  when the watchdog has nothing to shut down. That case is the connect leg: the
+  socket is registered only once `connect()` returns, and `create_connection`
+  applies its timeout *per resolved address*, so a target publishing N
+  blackholed A records in its own zone costs N x the budget. Measured: 10
+  records held a 4-second probe for 40.04 s. Shutting the socket down cannot fix
+  that — there is no socket yet — so the caller stops waiting instead.
   """
   expired = threading.Event()
   finished = threading.Event()
+  # Unbounded: the issuing thread must never block on a put after this function
+  # has stopped waiting, or it would pin the response and its socket forever —
+  # the same failure `read_bounded_response_body._stop` exists to prevent.
+  outcome = queue.Queue()
 
   def _watch():
     if finished.wait(max_seconds):
@@ -391,23 +444,47 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
         # Already closed, or never connected. Nothing to release.
         pass
 
-  threading.Thread(target=_watch, daemon=True).start()
-  try:
-    response = session.get(url, timeout=max_seconds, **kwargs)
-  except Exception:
+  def _issue():
+    try:
+      response = session.get(url, timeout=max_seconds, **kwargs)
+    except Exception as exc:
+      outcome.put(("error", exc))
+      return
     if expired.is_set():
-      raise requests.Timeout("response fingerprint header deadline exceeded") from None
-    raise
+      # Nobody is waiting for this any more. Close it here or it leaks.
+      try:
+        response.close()
+      except Exception:
+        pass
+      outcome.put(("expired", None))
+      return
+    outcome.put(("ok", response))
+
+  threading.Thread(target=_watch, daemon=True).start()
+  threading.Thread(target=_issue, daemon=True).start()
+  try:
+    kind, payload = outcome.get(timeout=max_seconds + _DEADLINE_GRACE_SECONDS)
+  except queue.Empty:
+    # The request is wedged somewhere the watchdog cannot reach — the connect
+    # leg, before any socket exists to shut down. Returning on time is the
+    # guarantee that matters: the abandoned thread unwinds on its own once its
+    # own connect attempts expire, while the scan phase proceeds.
+    raise requests.Timeout("response fingerprint deadline exceeded") from None
   finally:
     finished.set()
 
-  if expired.is_set():
-    try:
-      response.close()
-    except Exception:
-      pass
-    raise requests.Timeout("response fingerprint header deadline exceeded")
-  return response
+  if kind == "error":
+    if expired.is_set():
+      raise requests.Timeout("response fingerprint deadline exceeded") from None
+    raise payload
+  if kind == "expired" or expired.is_set():
+    if kind == "ok":
+      try:
+        payload.close()
+      except Exception:
+        pass
+    raise requests.Timeout("response fingerprint deadline exceeded")
+  return payload
 
 
 def read_bounded_response_body(response, max_bytes, max_seconds, log=None):
@@ -573,6 +650,13 @@ class _ResponseFingerprintMixin:
     """Issue one GET and reduce the response to comparable attributes."""
     url = f"{scheme}://{self.target}:{port}/"
     session = requests.Session()
+    # An environment proxy would defeat the deadline below: a proxied request is
+    # routed through `proxy_manager_for`, which does not carry the recording
+    # pool classes, so the socket registry stays empty and the watchdog has
+    # nothing to shut down — silently, with every test still green. It would
+    # also report the proxy's vantage rather than this node's, which is the one
+    # thing this module exists to measure.
+    session.trust_env = False
     # Per-call, so concurrent probes never observe each other's sockets.
     sockets = []
     adapter = _SocketRecordingAdapter(sockets)
@@ -615,7 +699,13 @@ class _ResponseFingerprintMixin:
         resp.close()
         resp = None
     except Exception as exc:
-      self.P(f"Response fingerprint GET failed on {url}: {exc}", color='y')
+      # The exception text is scrubbed: it is raised against `current_url`,
+      # which is a target-supplied `Location`. `redirect_stays_on_target` pins
+      # the host and port but not the path or query, so urllib3's
+      # "Max retries exceeded with url: /callback?code=...&api_key=..." would
+      # otherwise write a live credential straight into the node log — the one
+      # thing this module promises does not happen.
+      self.P(f"Response fingerprint GET failed on {url}: {sanitize_excerpt(str(exc))}", color='y')
       if resp is not None:
         resp.close()
       session.close()
