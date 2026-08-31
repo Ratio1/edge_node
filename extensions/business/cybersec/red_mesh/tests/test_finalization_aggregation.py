@@ -444,9 +444,17 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
       "worker_reports": {
         "0xUS": {"start_port": 1, "end_port": 443, "open_ports": [80, 443],
                  "node_ip": "1.1.1.1", "country": "US", "nr_findings": 1,
-                 "finding_counts": {"HIGH": 1}, "finding_signatures": ["sig1"]},
+                 "finding_counts": {"HIGH": 1}, "finding_signatures": ["sig1"],
+                 "response_evidence": {
+                   "target_host": "example.test", "resolved_ips": ["1.1.1.1"],
+                   "ports": {"443": {"reachable": True}},
+                 }},
         "0xIN": {"start_port": 1, "end_port": 443, "open_ports": [80],
-                 "node_ip": "2.2.2.2", "country": "in", "nr_findings": 0},
+                 "node_ip": "2.2.2.2", "country": "in", "nr_findings": 0,
+                 "response_evidence": {
+                   "target_host": "example.test", "resolved_ips": ["2.2.2.2"],
+                   "ports": {"443": {"reachable": False}},
+                 }},
       },
       "worker_scan_metrics": {
         "0xUS": {"scan_metrics": {
@@ -528,6 +536,12 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
     self.assertEqual(comp["0xUS"]["metrics"]["total_duration"], 19.0)
     self.assertEqual(comp["0xUS"]["metrics"]["traffic_windows"][0]["attempts"], 8)
     self.assertEqual(comp["0xUS"]["metrics"]["threads"][0]["local_worker_id"], "thread-1")
+    # Response evidence remains attributable per node rather than merging the
+    # two vantages' values into a shared aggregate.
+    self.assertEqual(comp["0xUS"]["response_evidence"]["resolved_ips"], ["1.1.1.1"])
+    self.assertEqual(comp["0xIN"]["response_evidence"]["resolved_ips"], ["2.2.2.2"])
+    self.assertTrue(comp["0xUS"]["response_evidence"]["ports"]["443"]["reachable"])
+    self.assertFalse(comp["0xIN"]["response_evidence"]["ports"]["443"]["reachable"])
     # Metrics-only node with all-timeout connections -> timeout.
     self.assertEqual(comp["0xBR"]["status"], "timeout")
     # Selected peer that never reported at all -> failed (China-timeout case).
