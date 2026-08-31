@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 from requests.structures import CaseInsensitiveDict
+from urllib3.connection import HTTPConnection, HTTPSConnection
 
 from extensions.business.cybersec.red_mesh.worker import PentestLocalWorker
 from extensions.business.cybersec.red_mesh.worker.response_fingerprint import (
@@ -28,6 +29,7 @@ from extensions.business.cybersec.red_mesh.worker.response_fingerprint import (
   normalize_content_type,
   read_bounded_response_body,
   redirect_stays_on_target,
+  _SocketRecordingAdapter,
   release_response_connection,
   resolve_host,
   sanitize_excerpt,
@@ -689,6 +691,7 @@ class TestRealSocketBounding(unittest.TestCase):
     self.addCleanup(peer.close)
     worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
     budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+    before = threading.active_count()
     outcome = {}
 
     def _probe():
@@ -701,6 +704,18 @@ class TestRealSocketBounding(unittest.TestCase):
     prober.join(timeout=budget * 8)
     self.assertFalse(prober.is_alive(), "_fingerprint_http never returned over TLS")
     self.assertEqual(outcome["result"], (None, None))
+    # Thread count, not just elapsed time. Returning on time is satisfied by the
+    # caller's own bounded wait even when the watchdog is blind, so without this
+    # the test passes with the HTTPS socket registration deleted while leaking
+    # three threads per probe — which is the exact reach it was written to prove.
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and threading.active_count() > before:
+      time.sleep(0.25)
+    self.assertLessEqual(
+      threading.active_count(), before,
+      f"threads {before} -> {threading.active_count()}; the watchdog cannot "
+      "reach the post-handshake TLS socket",
+    )
     # Lower bound too: a handshake that failed instantly also returns
     # (None, None) quickly, which would satisfy the upper bound while proving
     # nothing about the deadline over TLS.
@@ -859,6 +874,47 @@ class TestRealSocketBounding(unittest.TestCase):
       "a hash was published over a body whose completeness is unverifiable",
     )
 
+  def test_a_bogus_framing_header_cannot_buy_a_completeness_claim(self):
+    # Testing header *presence* rather than the framing the parser accepted let
+    # a target claim completeness on a body it severed at will. http.client
+    # discards an unparseable or negative Content-Length and then delimits by
+    # close, and it requires the exact `chunked` token, not a substring.
+    for label, headers in (
+      ("bogus length", b"Content-Length: abc\r\n"),
+      ("negative length", b"Content-Length: -1\r\n"),
+      ("substring encoding", b"Transfer-Encoding: notchunked\r\n"),
+      ("substring encoding 2", b"Transfer-Encoding: chunkedx\r\n"),
+    ):
+      with self.subTest(framing=label):
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        self.addCleanup(server.close)
+
+        def _serve(sock=server, extra=headers):
+          try:
+            conn, _addr = sock.accept()
+            conn.recv(65536)
+            conn.sendall(
+              b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" + extra +
+              b"\r\n<html><title>Severed</title>partial"
+            )
+            conn.close()
+          except Exception:
+            pass
+
+        threading.Thread(target=_serve, daemon=True).start()
+        worker = _make_worker(target="127.0.0.1", comparison_ports=[port])
+        http, _excerpt = worker._fingerprint_http("http", port)
+        self.assertIsNotNone(http)
+        self.assertFalse(
+          http["body_complete"],
+          f"{label} bought a completeness claim on a close-delimited body",
+        )
+        self.assertIsNone(http["body_sha256"])
+
   def test_a_framed_body_is_still_claimed_complete(self):
     # The guard above must not cost completeness on ordinary framed responses.
     peer = _Peer.serving(b"<html><title>Framed</title>hello</html>")
@@ -867,6 +923,41 @@ class TestRealSocketBounding(unittest.TestCase):
     http, _excerpt = worker._fingerprint_http("http", peer.port)
     self.assertTrue(http["body_complete"])
     self.assertIsNotNone(http["body_sha256"])
+
+  def test_a_malformed_location_cannot_blank_a_ports_evidence(self):
+    # `urljoin` raises on an unparseable Location — an unbracketed `[` is
+    # enough — and that ran before the scope guard, so the exception discarded a
+    # 302 already in hand. Since the scanner is deliberately attributable, a
+    # target can recognise the probe and answer every vantage this way: all
+    # vantages record http=None and the comparison reads "no divergence" while
+    # the target serves geo-differentiated content to real users.
+    for location in (b"http://[", b"//[", b"http://[::1", b"http://]"):
+      with self.subTest(location=location):
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        self.addCleanup(server.close)
+
+        def _serve(sock=server, target=location):
+          try:
+            conn, _addr = sock.accept()
+            conn.recv(65536)
+            conn.sendall(
+              b"HTTP/1.1 302 Found\r\nLocation: " + target +
+              b"\r\nServer: nginx-fra1\r\nContent-Length: 0\r\n\r\n"
+            )
+            conn.close()
+          except Exception:
+            pass
+
+        threading.Thread(target=_serve, daemon=True).start()
+        worker = _make_worker(target="127.0.0.1", comparison_ports=[port])
+        http, _excerpt = worker._fingerprint_http("http", port)
+        self.assertIsNotNone(http, "a malformed Location blanked the evidence")
+        self.assertEqual(http["status"], 302)
+        self.assertEqual(http["headers"].get("server"), "nginx-fra1")
 
   def test_a_hostile_charset_cannot_blank_a_ports_evidence(self):
     # The charset comes from the target's own Content-Type. `charset=idna`
@@ -926,6 +1017,28 @@ class TestRealSocketBounding(unittest.TestCase):
       http, _excerpt = worker._fingerprint_http("http", peer.port)
     self.assertIsNotNone(http, "the probe was routed through the environment proxy")
     self.assertEqual(http["title"], "Direct")
+
+  def test_an_explicit_proxy_still_records_its_socket(self):
+    # `trust_env = False` closes the environment route, which is what makes the
+    # proxy_manager_for override unreachable from a normal run — and therefore
+    # untested. requests builds a separate ProxyManager for a proxied request,
+    # with stock pool classes, so without the override the registry stays empty
+    # and the deadline watchdog has nothing to shut down.
+    sockets = []
+    adapter = _SocketRecordingAdapter(sockets)
+    manager = adapter.proxy_manager_for("http://127.0.0.1:1")
+    self.assertEqual(
+      sorted(manager.pool_classes_by_scheme),
+      ["http", "https"],
+      "the proxy manager does not carry the recording pool classes",
+    )
+    for scheme in ("http", "https"):
+      pool_cls = manager.pool_classes_by_scheme[scheme]
+      self.assertIsNot(
+        pool_cls.ConnectionCls,
+        HTTPConnection if scheme == "http" else HTTPSConnection,
+        f"the {scheme} proxy pool uses a stock connection class",
+      )
 
   def test_teardown_prefers_the_supported_shutdown_api(self):
     response = MagicMock()

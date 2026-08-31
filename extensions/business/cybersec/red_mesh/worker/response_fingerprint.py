@@ -113,7 +113,16 @@ _REDACTIONS = (
   # whole sentence with it.
   (
     re.compile(
-      r"(?i)(?<![A-Za-z0-9])(code|state|sig|signature|ticket)"
+      # `_` and `-` are boundaries *here*, unlike the credential-key rule above.
+      # That rule keeps them open so `db_password=` cannot escape; these five are
+      # ordinary English words with no such compound to protect, and treating
+      # `_`/`-` as non-boundaries made the rule fire on `error_code`,
+      # `status_code`, `country_code`, `data-state` and `data-code` — the JSON
+      # error envelopes and markup that carry the geo-restriction verdict itself.
+      # Measured: `{"error_code":"GeoRestriction403Denied"}` and the Akamai edge
+      # identity were destroyed on both vantages at once, which reads as
+      # "identical" — the false negative this whole table is weighed against.
+      r"(?i)(?<![A-Za-z0-9_-])(code|state|sig|signature|ticket)"
       r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
       r"(?:"
       # Shape 1: an unbroken 16-character alphanumeric run (the same
@@ -199,10 +208,17 @@ def excerpt_allowed(content_type):
 
 
 def normalize_content_type(content_type):
-  """Reduce a Content-Type header to its bare media type."""
+  """
+  Reduce a Content-Type header to its bare media type.
+
+  Scrubbed like every other archived field: the value is target-chosen and
+  otherwise reaches the archive verbatim, up to `http.client`'s header-line
+  limit. It is the one field in the `http` dict that used to bypass the
+  module's promise that values are scrubbed before they leave the node.
+  """
   if not content_type:
     return None
-  return content_type.split(";")[0].strip().lower() or None
+  return sanitize_excerpt(content_type.split(";")[0].strip().lower())
 
 
 def resolve_host(host, timeout=None):
@@ -394,6 +410,29 @@ class _SocketRecordingAdapter(HTTPAdapter):
       self._socket_registry
     )
 
+  def build_response(self, req, resp):
+    """
+    Neutralise a `Location` that `requests` itself cannot parse.
+
+    `Session.send` computes `r._next` even when redirects are disabled, and that
+    calls `urlparse` on the raw header. An unbracketed `[` raises `ValueError:
+    Invalid IPv6 URL` out of `send()`, discarding a response already in hand —
+    so one header blanked the port's whole evidence: status, `Server`, TLS
+    identity and excerpt. Guarding our own `urljoin` does not help, because the
+    raise happens first, inside the library.
+
+    The header is dropped rather than kept, since nothing downstream can parse
+    it; everything else the target said is preserved and comparable.
+    """
+    response = super().build_response(req, resp)
+    location = response.headers.get("Location")
+    if location is not None:
+      try:
+        urlparse(location)
+      except Exception:
+        del response.headers["Location"]
+    return response
+
   def proxy_manager_for(self, proxy, **proxy_kwargs):
     # A proxied request never touches `self.poolmanager` — requests routes it
     # through a separate ProxyManager built here, which ships stock pool
@@ -459,9 +498,18 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
     # the connection that needs breaking. One `302` was enough to leak two
     # threads and an fd per port, permanently.
     #
-    # Sweeping everything is safe because a fired watchdog means its own hop
-    # timed out, and every path that observes `expired` raises out of the caller's
-    # redirect loop — so no later hop can be live while this sweeps.
+    # Sweeping everything is *almost always* confined to this hop: four of the
+    # five ways the caller observes `expired` raise out of its redirect loop, so
+    # no later hop is live. The fifth is real and is not worth pretending away —
+    # `_issue` publishes an "ok" response, the caller reads `expired` while it is
+    # still false, and only then does this thread's wait time out, because
+    # `finished` is set *after* the put. This sweep can then land on a body read
+    # or on hop 2's reused keep-alive socket. Measured unreachable in 1900
+    # attempts aimed at the deadline (50 us and 5 us steps, under GIL
+    # contention), and the consequence is a lost or incomplete capture, never
+    # fabricated evidence — `body_complete` goes false and the hash is withheld.
+    # Stated plainly because an invariant asserted here and untrue in the code is
+    # how the last two rewrites of this function began.
     while True:
       for sock in list(sockets):
         try:
@@ -494,8 +542,24 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
       # needs a watchdog to break it.
       finished.set()
 
-  threading.Thread(target=_watch, daemon=True).start()
-  threading.Thread(target=_issue, daemon=True).start()
+  # `_issue` is started first, and `finished` is set if it cannot start at all.
+  # `finished` is otherwise only set in `_issue`'s `finally`, so a `_watch`
+  # started beside a thread that never ran would sweep at 4 Hz for the life of
+  # the process — permanently, unlike an abandoned request, which dies with its
+  # own connect attempts. That failure is reachable exactly under thread
+  # exhaustion, where it is self-amplifying: every later probe donates another
+  # immortal watchdog.
+  try:
+    threading.Thread(target=_issue, daemon=True).start()
+  except Exception:
+    finished.set()
+    raise
+  try:
+    threading.Thread(target=_watch, daemon=True).start()
+  except Exception:
+    # No watchdog available. The caller's own bounded wait below still releases
+    # the scan phase on time; only the socket teardown is lost.
+    pass
   try:
     kind, payload = outcome.get(timeout=max_seconds + _DEADLINE_GRACE_SECONDS)
   except queue.Empty:
@@ -721,7 +785,18 @@ class _ResponseFingerprintMixin:
           break
         if redirect_count >= DEFAULT_REDIRECT_LIMIT:
           raise requests.TooManyRedirects("response fingerprint redirect limit exceeded")
-        next_url = urljoin(resp.url or current_url, location)
+        try:
+          next_url = urljoin(resp.url or current_url, location)
+        except Exception:
+          # `urljoin` raises on an unparseable Location — an unbracketed `[`
+          # is enough. Letting that escape discards a response we already hold,
+          # so one header would blank the port's whole evidence: status,
+          # headers, TLS identity and excerpt. Since RedMesh is deliberately
+          # attributable, a target can recognise the probe and answer every
+          # vantage this way, reading as "no divergence" while it serves
+          # geo-differentiated content to real users. Fail closed the same way
+          # an out-of-scope hop does: keep this response as the evidence.
+          break
         if not redirect_stays_on_target(next_url, self.target, port):
           # Out of scope: keep this last in-scope response as the evidence and
           # never issue the off-target request.
@@ -762,14 +837,6 @@ class _ResponseFingerprintMixin:
         # with one header while still serving geo-differentiated content, and
         # read as "no divergence".
         body_text = body.decode("utf-8", errors="replace")
-      # A body delimited only by connection close cannot be verified complete:
-      # a severed connection and a clean end-of-message are the same event on
-      # the wire. Claiming completeness there would publish `body_sha256` over
-      # whatever arrived, attributed to the target as its full response. Only a
-      # framed body — declared length or chunked — can carry that claim.
-      framing = (resp.headers.get("Transfer-Encoding") or "").lower()
-      framed = resp.headers.get("Content-Length") is not None or "chunked" in framing
-      body_complete = body_complete and framed
       content_type = normalize_content_type(resp.headers.get("Content-Type"))
       title_match = _TITLE_RE.search(body_text[:5000])
       declared_length = resp.headers.get("Content-Length")
@@ -779,6 +846,26 @@ class _ResponseFingerprintMixin:
         declared_length = None
       if declared_length is not None and declared_length < 0:
         declared_length = None
+      # A body delimited only by connection close cannot be verified complete:
+      # a severed connection and a clean end-of-message are the same event on
+      # the wire. Claiming completeness there would publish `body_sha256` over
+      # whatever arrived, attributed to the target as its full response. Only a
+      # framed body — declared length or chunked — can carry that claim.
+      #
+      # Framing is decided by what the parser accepted, never by the presence of
+      # a header. `Content-Length: abc` and `Content-Length: -1` are discarded by
+      # `http.client`, which then delimits by close — but both are non-None to
+      # `.get()`. `Transfer-Encoding` is a comma-separated token list and the
+      # parser requires the exact token, so a substring test admits `notchunked`.
+      # Each of those spellings let a target set `body_complete` on a body it
+      # severed at will. `declared_length` above already does the Content-Length
+      # parse correctly, so it is the authority here.
+      encodings = [
+        token.strip()
+        for token in (resp.headers.get("Transfer-Encoding") or "").lower().split(",")
+      ]
+      framed = declared_length is not None or "chunked" in encodings
+      body_complete = body_complete and framed
       body_length = len(body) if body_complete else declared_length
       # Redact before truncating, so a credential straddling the cap cannot
       # survive as a prefix — the same order sanitize_excerpt uses internally.
