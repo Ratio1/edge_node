@@ -10,6 +10,7 @@ from ..models.event_schema import (
   REDMESH_EVENT_SCHEMA_VERSION,
   RedMeshEvent,
 )
+from ..credential_redaction import redact_credential_text
 from .event_redaction import redact_event_payload, stable_hmac_pseudonym
 
 
@@ -409,9 +410,14 @@ def build_finding_event(
 ):
   job_specs = job_specs or {}
   finding = finding or {}
+  # Redacted here, at the egress boundary, rather than trusting the caller to
+  # have done it. This event leaves the platform for the customer's SIEM —
+  # `deliver_wazuh_event` serialises it verbatim, and `strip_sensitive_fields`
+  # matches key *names*, a list that never included `title`. A credential
+  # reaching this payload is a customer rotation event, not a rendering defect.
   finding_payload = {
     "finding_id": finding.get("finding_id"),
-    "title": finding.get("title"),
+    "title": redact_credential_text(finding.get("title")),
     "severity": _normalized_severity(finding.get("severity")),
     "confidence": finding.get("confidence"),
     "category": finding.get("category"),
@@ -420,7 +426,7 @@ def build_finding_event(
     "attack_ids": finding.get("attack_ids") or [],
     "triage_state": finding.get("triage_state"),
     "fingerprint": finding.get("fingerprint") or finding.get("finding_id"),
-    "evidence": finding.get("evidence"),
+    "evidence": redact_credential_text(finding.get("evidence")),
   }
   return build_redmesh_event(
     event_type=f"redmesh.finding.{event_action}",

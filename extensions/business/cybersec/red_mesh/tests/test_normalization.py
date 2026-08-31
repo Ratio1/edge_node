@@ -407,6 +407,111 @@ class TestGrayboxRedaction(unittest.TestCase):
     self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
 
 
+class TestBlackboxCredentialRedaction(unittest.TestCase):
+  """
+  Default-credential probes interpolate the plaintext pair into `title`, and
+  `_redact_report` only ever touched `evidence` and `accepted_credentials`.
+
+  Measured on the client job `6cc55610`, which carried `redactCredentials: true`:
+  25 finding titles and 19 `vulnerabilities` entries still held a credential
+  pair. The title also reaches the customer's SIEM verbatim, so this is a
+  credential-egress event rather than only a rendering defect.
+  """
+
+  # Exactly the strings the probes emit — worker/service/common.py:480, 751,
+  # 932, 1620 and worker/service/database.py:239, 928, 954.
+  PROBE_OUTPUT = (
+    ("HTTP Basic Auth default credential: admin:hunter2",
+     "GET http://t/adm with admin:hunter2 -> HTTP 200", "hunter2"),
+    ("FTP default credential accepted: ftpuser:s3cr3t",
+     "Accepted credential: ftpuser:s3cr3t", "s3cr3t"),
+    ("SSH default credential accepted: root:toor",
+     "Accepted credential: root:toor", "toor"),
+    ("Telnet default credential accepted: admin:admin1234",
+     "Accepted credential: admin:admin1234", "admin1234"),
+    ("MySQL default credential accepted: root:mysqlpw",
+     "Auth response OK for root:mysqlpw", "mysqlpw"),
+    ("PostgreSQL default credential accepted: postgres:pgpw99",
+     "Auth OK for postgres:pgpw99", "pgpw99"),
+  )
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  @staticmethod
+  def _report(title, evidence, description):
+    return {
+      "service_info": {
+        "22": {
+          "default_creds": {
+            "findings": [{
+              "title": title,
+              "description": description,
+              "remediation": "Rotate the credential.",
+              "evidence": evidence,
+            }],
+            "accepted": ["root:toor"],
+            "accepted_credentials": ["root:toor"],
+          },
+        },
+      },
+      "graybox_results": {},
+      "vulnerabilities": [title],
+    }
+
+  def test_no_probe_leaves_a_password_anywhere_in_the_report(self):
+    for title, evidence, secret in self.PROBE_OUTPUT:
+      with self.subTest(title=title):
+        host = self._host()
+        pair = title.split(": ")[-1]
+        description = f"MySQL on 10.0.0.5:3306 accepts {pair}."
+        redacted = host._redact_report(self._report(title, evidence, description))
+        self.assertNotIn(secret, str(redacted), f"{secret} survived redaction")
+
+  def test_the_host_and_port_are_not_mistaken_for_a_credential(self):
+    # `MySQL on {target}:{port} accepts {cred}` puts a host:port pair in the same
+    # sentence as the credential. Redacting that too would destroy the field
+    # saying which service was affected.
+    host = self._host()
+    redacted = host._redact_report(self._report(
+      "MySQL default credential accepted: root:mysqlpw",
+      "Auth response OK for root:mysqlpw",
+      "MySQL on 10.0.0.5:3306 accepts root:mysqlpw.",
+    ))
+    description = redacted["service_info"]["22"]["default_creds"]["findings"][0]["description"]
+    self.assertIn("10.0.0.5:3306", description)
+    self.assertNotIn("mysqlpw", description)
+
+  def test_the_parallel_vulnerabilities_title_list_is_redacted(self):
+    # `result["vulnerabilities"]` is built from finding titles (findings.py:269)
+    # and redaction never saw it. 19 entries leaked on the client job.
+    host = self._host()
+    redacted = host._redact_report(self._report(
+      "SSH default credential accepted: root:toor",
+      "Accepted credential: root:toor",
+      "The SSH server accepted a well-known default credential.",
+    ))
+    self.assertNotIn("toor", str(redacted.get("vulnerabilities", [])))
+
+  def test_the_http_basic_accepted_key_is_redacted(self):
+    # The probe writes `accepted` (common.py:438,477); redaction read only
+    # `accepted_credentials` — a key-name mismatch, so that list was archived raw.
+    host = self._host()
+    redacted = host._redact_report(self._report(
+      "HTTP Basic Auth default credential: admin:hunter2",
+      "GET http://t/adm with admin:hunter2 -> HTTP 200",
+      "The web server accepted a default credential.",
+    ))
+    accepted = redacted["service_info"]["22"]["default_creds"]["accepted"]
+    self.assertNotIn("toor", str(accepted))
+
+
 class TestFindingCounting(unittest.TestCase):
 
   def test_count_all_findings_walks_all_published_paths(self):

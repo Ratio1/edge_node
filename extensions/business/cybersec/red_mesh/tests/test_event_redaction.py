@@ -121,5 +121,48 @@ class TestRedMeshEventRedaction(unittest.TestCase):
     self.assertFalse(contains_sensitive_value(redacted, ["secret-token", "<script>secret</script>"]))
 
 
+class TestFindingEventCredentialEgress(unittest.TestCase):
+  """
+  `build_finding_event` is an egress boundary: `deliver_wazuh_event` serialises
+  the event verbatim to the customer's SIEM. `strip_sensitive_fields` matches
+  key *names* against a list that never included `title`, and default-credential
+  probes interpolate the plaintext pair into exactly that field — so a leak here
+  is a customer credential-rotation event, not a rendering defect.
+
+  Redaction is asserted at this boundary rather than only upstream, because the
+  caller cannot be trusted to have done it.
+  """
+
+  def test_a_credential_in_a_finding_title_never_reaches_the_event(self):
+    from extensions.business.cybersec.red_mesh.services.event_builder import (
+      build_finding_event,
+    )
+
+    for title, evidence, secret in (
+      ("SSH default credential accepted: root:toor",
+       "Accepted credential: root:toor", "toor"),
+      ("MySQL default credential accepted: root:mysqlpw",
+       "Auth response OK for root:mysqlpw", "mysqlpw"),
+      ("HTTP Basic Auth default credential: admin:hunter2",
+       "GET http://t/a with admin:hunter2 -> HTTP 200", "hunter2"),
+    ):
+      with self.subTest(title=title):
+        event = build_finding_event(
+          {"job_id": "job-1"},
+          finding={
+            "finding_id": "f1",
+            "title": title,
+            "evidence": evidence,
+            "severity": "CRITICAL",
+            "confidence": "certain",
+          },
+          event_action="created",
+          hmac_secret="secret",
+        )
+        serialised = json.dumps(event, default=str)
+        self.assertNotIn(secret, serialised, f"{secret} left the platform")
+        self.assertIn(":***", serialised)
+
+
 if __name__ == "__main__":
   unittest.main()

@@ -12,12 +12,21 @@ import struct as _struct
 
 from ..worker import PentestLocalWorker
 from ..models import UiAggregate
+# Shared with the SIEM event builder, which redacts at the egress boundary
+# rather than trusting its caller. See `credential_redaction` for why the rule
+# is anchored on the credential phrasing rather than on a bare `a:b` shape.
+from ..credential_redaction import (
+  CREDENTIAL_TEXT_FIELDS as _CREDENTIAL_TEXT_FIELDS,
+  redact_credential_text,
+)
 
 
 # Fields stamped per-worker by _stamp_worker_source. Excluded from the
 # dedup signature so the same vulnerability seen by two workers
 # collapses to one finding (with one worker's stamp preserved).
 _DEDUP_EXCLUDE_FIELDS = ("_source_worker_id", "_source_node_addr")
+
+
 _PUBLISH_SAFE_METADATA_KEYS = {
   "api_key_header_name",
   "api_key_location",
@@ -612,28 +621,25 @@ class _ReportMixin:
       for method_key, method_data in methods.items():
         if not isinstance(method_data, dict):
           continue
-        # Redact findings evidence
+        # Redact every probe-authored text field, not just evidence. The
+        # default-credential probes put the pair in `title` first, and the
+        # title is what reaches the SIEM, the PDF cover and the LLM input.
         for finding in method_data.get("findings", []):
           if not isinstance(finding, dict):
             continue
-          evidence = finding.get("evidence", "")
-          if isinstance(evidence, str):
-            evidence = _re.sub(
-              r'(Accepted credential:\s*\S+?):(\S+)',
-              r'\1:***', evidence
-            )
-            evidence = _re.sub(
-              r'(Accepted random creds\s*\S+?):(\S+)',
-              r'\1:***', evidence
-            )
-            finding["evidence"] = evidence
-        # Redact accepted_credentials lists
-        creds = method_data.get("accepted_credentials", [])
-        if isinstance(creds, list):
-          method_data["accepted_credentials"] = [
-            _re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c
-            for c in creds
-          ]
+          for text_key in _CREDENTIAL_TEXT_FIELDS:
+            if isinstance(finding.get(text_key), str):
+              finding[text_key] = redact_credential_text(finding[text_key])
+        # Both key spellings: the HTTP Basic probe writes `accepted`
+        # (common.py:438,477) while this only ever read `accepted_credentials`,
+        # so that list was archived raw.
+        for creds_key in ("accepted_credentials", "accepted"):
+          creds = method_data.get(creds_key)
+          if isinstance(creds, list):
+            method_data[creds_key] = [
+              _re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c
+              for c in creds
+            ]
     # Redact graybox_results credential evidence
     _CRED_RE = _re.compile(r'(\S+?):(\S+)')
     _PASSWORD_RE = _re.compile(r'((?:password|passwd|pwd)["\']?\s*[:=]\s*)(["\']?)[^\s"\'&]+', _re.I)
@@ -700,6 +706,13 @@ class _ReportMixin:
             if isinstance(artifact, dict) else artifact
             for artifact in artifacts
           ]
+    # The parallel title list (findings.py:269) is built from the same titles
+    # and redaction never walked it — 19 entries leaked on the client job.
+    vulnerabilities = redacted.get("vulnerabilities")
+    if isinstance(vulnerabilities, list):
+      redacted["vulnerabilities"] = [
+        redact_credential_text(item) for item in vulnerabilities
+      ]
     return redacted
 
   @staticmethod
