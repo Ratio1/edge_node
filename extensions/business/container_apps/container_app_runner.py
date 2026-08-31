@@ -65,6 +65,7 @@ EXTRA_TUNNELS Feature:
 import docker
 import os
 import requests
+import shlex
 import shutil
 import signal
 import threading
@@ -1548,6 +1549,78 @@ class ContainerAppRunnerPlugin(
     # end if
     return
 
+
+  def run_tunnel_command(self, command):
+    """Launch a main tunnel without a shell or credential-bearing logs."""
+    if not command:
+      return None
+
+    try:
+      if isinstance(command, str):
+        command = shlex.split(command)
+      elif isinstance(command, (list, tuple)):
+        command = [str(part) for part in command]
+      else:
+        raise ValueError("tunnel command must be a string or argument sequence")
+    except ValueError as exc:
+      self.P(f"Invalid tunnel command: {exc}", color='r')
+      return None
+
+    if not command:
+      return None
+
+    token = self.get_cloudflare_token()
+    safe_command = list(command)
+    if self.use_cloudflare():
+      safe_command = self._redact_tunnel_command(safe_command)
+    elif token:
+      safe_command = ["[REDACTED]" if part == str(token) else part for part in safe_command]
+
+    try:
+      self.P(f"Running tunnel command: {' '.join(safe_command)}")
+      popen_kwargs = dict(
+        args=command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+      )
+      if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+      process = subprocess.Popen(**popen_kwargs)
+      self._remember_process_group(process)
+
+      logs_reader = self.LogReader(process.stdout, size=100, daemon=None)
+      err_logs_reader = self.LogReader(process.stderr, size=100, daemon=None)
+      if not hasattr(self, "dct_logs_reader"):
+        self.dct_logs_reader = {}
+      if not hasattr(self, "dct_err_logs_reader"):
+        self.dct_err_logs_reader = {}
+      self.dct_logs_reader["tunnel"] = logs_reader
+      self.dct_err_logs_reader["tunnel"] = err_logs_reader
+      return process
+    except Exception as exc:
+      self.P(f"Error running tunnel command: {type(exc).__name__}")
+      return None
+
+
+  def run_tunnel_engine(self):
+    """Build the primary Cloudflare command as an argument vector."""
+    if not self.use_cloudflare():
+      return super(ContainerAppRunnerPlugin, self).run_tunnel_engine()
+
+    normalized = self._normalized_exposed_ports or self._normalize_exposed_ports_config()
+    main_container_port = self._get_main_container_port(normalized)
+    tunnel_config = self._get_main_tunnel_config()
+    if main_container_port is None or not tunnel_config:
+      return None
+
+    command = self._build_tunnel_command(
+      main_container_port,
+      tunnel_config.get("token"),
+      tunnel_config.get("protocol", "http"),
+    )
+    return self.run_tunnel_command(command)
+
   def _get_main_tunnel_config(self):
     """
     Return the normalized tunnel config for the main exposed port, if enabled.
@@ -1937,7 +2010,9 @@ class ContainerAppRunnerPlugin(
     return True
 
 
-  def _build_tunnel_command(self, container_port, token, protocol="http"):
+  def _build_tunnel_command(
+    self, container_port, token, protocol="http", no_tls_verify=False
+  ):
     """
     Build Cloudflare tunnel command for a specific port.
 
@@ -1949,6 +2024,8 @@ class ContainerAppRunnerPlugin(
         Cloudflare tunnel token
     protocol : str, optional
         Tunnel origin protocol (default "http")
+    no_tls_verify : bool, optional
+        Disable Cloudflare origin TLS verification for this HTTPS tunnel
 
     Returns
     -------
@@ -1961,7 +2038,7 @@ class ContainerAppRunnerPlugin(
       return None
 
     # Return list to avoid shell injection - use list-based subprocess
-    return [
+    command = [
       "cloudflared",
       "tunnel",
       "--no-autoupdate",
@@ -1971,6 +2048,20 @@ class ContainerAppRunnerPlugin(
       "--url",
       f"{protocol}://127.0.0.1:{host_port}"
     ]
+    if no_tls_verify:
+      command.append("--no-tls-verify")
+    return command
+
+
+  def _redact_tunnel_command(self, command):
+    """Return a log-safe copy of a cloudflared command."""
+    redacted = list(command)
+    try:
+      token_index = redacted.index("--token") + 1
+      redacted[token_index] = "[REDACTED]"
+    except (ValueError, IndexError):
+      pass
+    return redacted
 
 
   def _should_start_main_tunnel(self):
@@ -2019,16 +2110,20 @@ class ContainerAppRunnerPlugin(
     if isinstance(tunnel_config, dict):
       token = tunnel_config.get("token")
       protocol = tunnel_config.get("protocol", "http")
+      no_tls_verify = tunnel_config.get("no_tls_verify", False)
     else:
       token = tunnel_config  # legacy compat
       protocol = "http"
+      no_tls_verify = False
 
     if not token:
       self.P(f"No token provided for extra tunnel on port {container_port}", color='r')
       return False
 
     # Build tunnel command
-    command = self._build_tunnel_command(container_port, token, protocol)
+    command = self._build_tunnel_command(
+      container_port, token, protocol, no_tls_verify=no_tls_verify
+    )
     if not command:
       return False
 
@@ -2036,7 +2131,7 @@ class ContainerAppRunnerPlugin(
     try:
       host_port = self._get_host_port_for_container_port(container_port)
       self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...")
-      self.Pd(f"  Command: {' '.join(command)}")
+      self.Pd(f"  Command: {' '.join(self._redact_tunnel_command(command))}")
 
       # Use list-based subprocess to prevent shell injection
       popen_kwargs = dict(

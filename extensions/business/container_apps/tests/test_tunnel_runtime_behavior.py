@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
 from extensions.business.container_apps.tests.support import make_container_app_runner
 
@@ -23,6 +24,7 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
         "token": "token-3002",
         "protocol": "http",
         "engine": "cloudflare",
+        "no_tls_verify": False,
       }
     })
     self.assertEqual(plugin.extra_ports_mapping, {
@@ -62,6 +64,113 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
       "--url",
       "http://127.0.0.1:20005",
     ])
+
+  def test_build_https_tunnel_command_applies_explicit_origin_tls_override(self):
+    plugin = make_container_app_runner()
+    plugin.extra_ports_mapping = {
+      20005: 8080
+    }
+
+    command = plugin._build_tunnel_command(
+      8080,
+      "dashboard-token",
+      protocol="https",
+      no_tls_verify=True,
+    )
+
+    self.assertEqual(command, [
+      "cloudflared",
+      "tunnel",
+      "--no-autoupdate",
+      "run",
+      "--token",
+      "dashboard-token",
+      "--url",
+      "https://127.0.0.1:20005",
+      "--no-tls-verify",
+    ])
+
+  def test_start_extra_tunnel_redacts_token_from_debug_log(self):
+    plugin = make_container_app_runner()
+    plugin.extra_ports_mapping = {20005: 8080}
+    plugin.LogReader = lambda *_args, **_kwargs: object()
+    plugin._remember_process_group = lambda _process: None
+    plugin._record_tunnel_restart_success = lambda _port: None
+    plugin.time = lambda: 1.0
+    process = MagicMock(pid=123, stdout=object(), stderr=object())
+
+    with patch(
+      "extensions.business.container_apps.container_app_runner.subprocess.Popen",
+      return_value=process,
+    ) as popen:
+      started = plugin._start_extra_tunnel(8080, {
+        "token": "dashboard-secret-token",
+        "protocol": "https",
+        "engine": "cloudflare",
+        "no_tls_verify": True,
+      })
+
+    self.assertTrue(started)
+    self.assertIn("dashboard-secret-token", popen.call_args.kwargs["args"])
+    self.assertNotIn("dashboard-secret-token", "\n".join(plugin.logged_messages))
+    self.assertIn("--token [REDACTED]", "\n".join(plugin.logged_messages))
+
+  def test_run_main_tunnel_command_redacts_token_from_log(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "5432": {
+        "is_main_port": True,
+        "token": "main-secret-token",
+        "protocol": "tcp",
+      },
+    }
+    plugin._refresh_normalized_exposed_ports_state()
+    plugin.LogReader = lambda *_args, **_kwargs: object()
+    plugin._remember_process_group = lambda _process: None
+    process = MagicMock(pid=321, stdout=object(), stderr=object())
+    command = "cloudflared tunnel --no-autoupdate run --token main-secret-token --url tcp://127.0.0.1:20001"
+
+    with patch(
+      "extensions.business.container_apps.container_app_runner.subprocess.Popen",
+      return_value=process,
+    ) as popen:
+      started = plugin.run_tunnel_command(command)
+
+    self.assertIs(started, process)
+    self.assertEqual(popen.call_args.kwargs["args"], [
+      "cloudflared", "tunnel", "--no-autoupdate", "run", "--token",
+      "main-secret-token", "--url", "tcp://127.0.0.1:20001",
+    ])
+    self.assertNotIn("shell", popen.call_args.kwargs)
+    self.assertNotIn("main-secret-token", "\n".join(plugin.logged_messages))
+    self.assertIn("--token [REDACTED]", "\n".join(plugin.logged_messages))
+
+  def test_run_main_cloudflare_tunnel_keeps_token_as_one_opaque_argument(self):
+    plugin = make_container_app_runner()
+    token = "main-token; touch /tmp/must-not-run"
+    plugin.cfg_exposed_ports = {
+      "5432": {
+        "is_main_port": True,
+        "token": token,
+        "protocol": "tcp",
+      },
+    }
+    plugin._refresh_normalized_exposed_ports_state()
+    plugin.extra_ports_mapping = {20001: 5432}
+    plugin.LogReader = lambda *_args, **_kwargs: object()
+    plugin._remember_process_group = lambda _process: None
+    process = MagicMock(pid=321, stdout=object(), stderr=object())
+
+    with patch(
+      "extensions.business.container_apps.container_app_runner.subprocess.Popen",
+      return_value=process,
+    ) as popen:
+      started = plugin.run_tunnel_engine()
+
+    self.assertIs(started, process)
+    self.assertEqual(popen.call_args.kwargs["args"][5], token)
+    self.assertNotIn("shell", popen.call_args.kwargs)
+    self.assertNotIn(token, "\n".join(plugin.logged_messages))
 
   def test_normalized_main_tunnel_drives_cloudflare_token(self):
     plugin = make_container_app_runner()
@@ -113,7 +222,29 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
         "token": "extra-token",
         "protocol": "http",
         "engine": "cloudflare",
+        "no_tls_verify": False,
       },
+    })
+
+  def test_validate_extra_tunnels_config_preserves_https_origin_tls_override(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "8080": {
+        "token": "dashboard-token",
+        "protocol": "https",
+        "engine": "cloudflare",
+        "no_tls_verify": True,
+      },
+    }
+
+    plugin._setup_resource_limits_and_ports()
+    plugin._validate_extra_tunnels_config()
+
+    self.assertEqual(plugin.extra_tunnel_configs[8080], {
+      "token": "dashboard-token",
+      "protocol": "https",
+      "engine": "cloudflare",
+      "no_tls_verify": True,
     })
 
 

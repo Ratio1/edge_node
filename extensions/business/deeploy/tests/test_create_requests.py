@@ -118,6 +118,55 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "cockroachdb",
     )
 
+  def test_managed_service_kind_recognizes_exact_r1_meshdb_and_legacy_repositories(self):
+    plugin = make_deeploy_plugin()
+    digest = "sha256:" + ("a" * 64)
+    accepted = (
+      "ghcr.io/ratio1/r1-meshdb:v1.0.0",
+      f"ghcr.io/ratio1/r1-meshdb@{digest}",
+      f"ghcr.io/ratio1/r1-meshdb:v1.0.0@{digest}",
+      "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+      f"ghcr.io/ratio1/deeploy-cockroachdb-service@{digest}",
+      f"ghcr.io/ratio1/deeploy-cockroachdb-service:main@{digest}",
+    )
+    rejected = (
+      "ghcr.io/example/r1-meshdb:latest",
+      "ghcr.io/ratio1/r1-meshdb-helper:latest",
+      "ghcr.io/ratio1/deeploy-cockroachdb-service2:main",
+    )
+
+    for image in accepted:
+      with self.subTest(image=image):
+        self.assertTrue(plugin._is_cockroachdb_plugin_instance({"IMAGE": image}))
+    for image in rejected:
+      with self.subTest(image=image):
+        self.assertFalse(plugin._is_cockroachdb_plugin_instance({"IMAGE": image}))
+        misleading = {
+          "IMAGE": image,
+          "plugin_name": "cockroachdb",
+          "ENV": {"CRDB_NODE_COUNT": "3"},
+        }
+        self.assertFalse(plugin._is_cockroachdb_plugin_instance(misleading))
+
+    candidate = make_plugin_entry("CONTAINER_APP_RUNNER", IMAGE=accepted[1])
+    self.assertEqual(
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[candidate]),
+      ),
+      "cockroachdb",
+    )
+
+    near_match = make_plugin_entry(
+      "CONTAINER_APP_RUNNER",
+      plugin_name="cockroachdb",
+      IMAGE=rejected[1],
+      ENV={"CRDB_NODE_COUNT": "3"},
+    )
+    with self.assertRaisesRegex(ValueError, "service kind.*does not match"):
+      plugin._resolve_deeploy_service_kind(
+        inputs=make_inputs(service_kind="cockroachdb", plugins=[near_match]),
+      )
+
   def test_managed_service_kind_rejects_unsupported_or_conflicting_identity(self):
     plugin = make_deeploy_plugin()
     postgres_plugin = make_plugin_entry(
@@ -723,7 +772,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
           "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
           "ENV": {
             "CRDB_DATABASE": "appdb",
-            "CRDB_USER": "app_user",
+            "CRDB_USER": "admin",
             "CRDB_PASSWORD": "secret-password",
             "CRDB_NODE_COUNT": "3",
             "CRDB_HOSTNAMES": "roach1.example,roach2.example,roach3.example",
@@ -774,7 +823,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_d"]["ENV"])
     self.assertEqual(by_node["0xai_node_d"]["ENV"]["CF_TUNNEL_TOKEN"], "token-d")
 
-  def test_cockroachdb_secure_config_rejects_root_or_unsafe_identifiers(self):
+  def test_cockroachdb_secure_config_rejects_reserved_or_unsafe_identifiers(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
       plugins=[
@@ -794,8 +843,100 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
 
     inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_DATABASE"] = "appdb"
-    with self.assertRaisesRegex(ValueError, "must not be root"):
-      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
+    for reserved_user in ("root", "ROOT", "admin", "AdMiN", "node", "public"):
+      with self.subTest(reserved_user=reserved_user):
+        inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_USER"] = reserved_user
+        with self.assertRaisesRegex(ValueError, "reserved"):
+          plugin._prepare_cockroachdb_secure_config(
+            inputs,
+            ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+          )
+
+  def test_cockroachdb_secure_config_rejects_per_node_global_credentials_before_certificate_generation(self):
+    for key in ("CRDB_DATABASE", "CRDB_USER", "CRDB_PASSWORD"):
+      with self.subTest(key=key):
+        plugin = make_deeploy_plugin()
+        generation_calls = []
+        plugin._generate_cockroachdb_cert_bundle = (
+          lambda *args, **kwargs: generation_calls.append((args, kwargs)) or {}
+        )
+        inputs = self._make_cockroachdb_secure_inputs()
+        inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_b"]["ENV"][
+          key
+        ] = "override"
+
+        with self.assertRaisesRegex(ValueError, key):
+          plugin._prepare_cockroachdb_secure_config(
+            inputs,
+            ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+          )
+
+        self.assertEqual(generation_calls, [])
+
+  def test_legacy_pipeline_rejects_root_user_before_certificate_generation(self):
+    plugin = make_deeploy_plugin()
+    generation_calls = []
+    plugin._generate_cockroachdb_cert_bundle = (
+      lambda *args, **kwargs: generation_calls.append((args, kwargs))
+    )
+    pipeline = {
+      NetMonCt.PLUGINS: [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "root",
+            "CRDB_PASSWORD": "secret-password",
+          },
+        }],
+      }],
+    }
+
+    with self.assertRaisesRegex(ValueError, "reserved"):
+      plugin._prepare_cockroachdb_secure_config_for_pipeline(
+        pipeline,
+        ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+      )
+
+    self.assertEqual(generation_calls, [])
+
+  def test_legacy_pipeline_rejects_per_node_global_credentials_before_certificate_generation(self):
+    plugin = make_deeploy_plugin()
+    generation_calls = []
+    plugin._generate_cockroachdb_cert_bundle = (
+      lambda *args, **kwargs: generation_calls.append((args, kwargs))
+    )
+    pipeline = {
+      NetMonCt.PLUGINS: [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          "PER_NODE_CONFIG": {
+            "byIndex": {
+              "0": {
+                "ENV": {
+                  "CRDB_USER": "root",
+                },
+              },
+            },
+          },
+        }],
+      }],
+    }
+
+    with self.assertRaisesRegex(ValueError, "CRDB_USER"):
+      plugin._prepare_cockroachdb_secure_config_for_pipeline(
+        pipeline,
+        ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+      )
+
+    self.assertEqual(generation_calls, [])
 
   def test_deeploy_status_payload_keeps_cockroachdb_config_unredacted(self):
     payload = {
@@ -1071,6 +1212,69 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     ]
 
     with self.assertRaisesRegex(ValueError, "EXPOSED_PORTS"):
+      plugin._validate_plugins_array(plugins)
+
+  def test_validate_plugins_array_accepts_extra_https_origin_tls_override(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      make_plugin_entry(
+        "CONTAINER_APP_RUNNER",
+        IMAGE="repo/app:latest",
+        PORT=5432,
+        CONTAINER_RESOURCES={"cpu": 1, "memory": "128m"},
+        EXPOSED_PORTS={
+          "5432": {"is_main_port": True, "token": "client-token", "protocol": "tcp"},
+          "8080": {"token": "dashboard-token", "protocol": "https", "no_tls_verify": True},
+        },
+      )
+    ]
+
+    self.assertTrue(plugin._validate_plugins_array(plugins))
+
+  def test_validate_plugins_array_rejects_invalid_origin_tls_override_before_dispatch(self):
+    plugin = make_deeploy_plugin()
+    base_instance = {
+      "IMAGE": "repo/app:latest",
+      "PORT": 5432,
+      "CONTAINER_RESOURCES": {"cpu": 1, "memory": "128m"},
+    }
+
+    invalid_configs = [
+      {"8080": {"token": "dashboard-token", "protocol": "https", "no_tls_verify": "true"}},
+      {"8080": {"token": "dashboard-token", "protocol": "http", "no_tls_verify": True}},
+      {"5432": {"is_main_port": True, "token": "client-token", "protocol": "https", "no_tls_verify": True}},
+    ]
+    for exposed_ports in invalid_configs:
+      plugins = [
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          **base_instance,
+          EXPOSED_PORTS=exposed_ports,
+        )
+      ]
+      with self.subTest(exposed_ports=exposed_ports):
+        with self.assertRaisesRegex(ValueError, "no_tls_verify"):
+          plugin._validate_plugins_array(plugins)
+
+  def test_validate_plugins_array_rejects_invalid_exposed_port_key_before_dispatch(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      make_plugin_entry(
+        "CONTAINER_APP_RUNNER",
+        IMAGE="repo/app:latest",
+        PORT=5432,
+        CONTAINER_RESOURCES={"cpu": 1, "memory": "128m"},
+        EXPOSED_PORTS={
+          "not-a-port": {
+            "token": "dashboard-token",
+            "protocol": "https",
+            "no_tls_verify": True,
+          },
+        },
+      )
+    ]
+
+    with self.assertRaisesRegex(ValueError, "key must be an integer port"):
       plugin._validate_plugins_array(plugins)
 
   def test_prepare_plugins_resolves_shmem_with_app_id(self):
