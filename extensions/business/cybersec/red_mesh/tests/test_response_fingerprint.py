@@ -9,6 +9,7 @@ contract that keeps each vantage's evidence attributable to that vantage.
 import gzip
 import itertools
 import socket
+import ssl
 import threading
 import tracemalloc
 import unittest
@@ -450,6 +451,73 @@ class _Peer:
       pass
 
 
+class _TlsPeer(_Peer):
+  """A `_Peer` behind a real TLS handshake, using an in-memory self-signed cert."""
+
+  _context = None
+
+  @classmethod
+  def _server_context(cls):
+    if cls._context is not None:
+      return cls._context
+    import datetime
+    import tempfile
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+      x509.CertificateBuilder()
+      .subject_name(name)
+      .issuer_name(name)
+      .public_key(key.public_key())
+      .serial_number(x509.random_serial_number())
+      .not_valid_before(now - datetime.timedelta(days=1))
+      .not_valid_after(now + datetime.timedelta(days=1))
+      .sign(key, hashes.SHA256())
+    )
+    bundle = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+    bundle.write(cert.public_bytes(serialization.Encoding.PEM))
+    bundle.write(key.private_bytes(
+      serialization.Encoding.PEM,
+      serialization.PrivateFormat.TraditionalOpenSSL,
+      serialization.NoEncryption(),
+    ))
+    bundle.close()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(bundle.name)
+    cls._context = context
+    return context
+
+  def _serve(self):
+    context = self._server_context()
+    try:
+      while not self._stop.is_set():
+        conn, _addr = self._server.accept()
+        try:
+          conn = context.wrap_socket(conn, server_side=True)
+        except Exception:
+          # A probe that opens a plain TCP connection and closes it, such as
+          # the reachability check, never completes a handshake.
+          try:
+            conn.close()
+          except Exception:
+            pass
+          continue
+        threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+    except Exception:
+      pass
+    finally:
+      try:
+        self._server.close()
+      except Exception:
+        pass
+
+
 class TestRealSocketBounding(unittest.TestCase):
   """The bounding guarantees, measured against a real connection."""
 
@@ -550,6 +618,39 @@ class TestRealSocketBounding(unittest.TestCase):
     self.assertFalse(http["body_complete"])
     self.assertIsNone(http["body_sha256"])
     self.assertLess(outcome["elapsed"], budget * 3)
+
+  def test_the_deadline_holds_over_tls(self):
+    # The HTTPS branch records `self.sock` after `super().connect()`, which is
+    # the TLS socket rather than the raw one — shutting the raw socket down
+    # would not unblock a reader inside the wrapped stream. That reasoning was
+    # only a comment; the tier probes https whenever a certificate is captured,
+    # so it needs a real handshake behind it.
+    peer = _TlsPeer.header_dripping(interval=0.5)
+    self.addCleanup(peer.close)
+    worker = _make_worker(target="127.0.0.1", comparison_ports=[peer.port])
+    budget = worker._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+    outcome = {}
+
+    def _probe():
+      started = time.monotonic()
+      outcome["result"] = worker._fingerprint_http("https", peer.port)
+      outcome["elapsed"] = time.monotonic() - started
+
+    prober = threading.Thread(target=_probe, daemon=True)
+    prober.start()
+    prober.join(timeout=budget * 8)
+    self.assertFalse(prober.is_alive(), "_fingerprint_http never returned over TLS")
+    self.assertEqual(outcome["result"], (None, None))
+    self.assertLess(outcome["elapsed"], budget * 3)
+
+  def test_teardown_falls_through_when_the_supported_shutdown_raises(self):
+    # A supported call that raised has not torn the connection down. Returning
+    # there would leave the peer holding it open - the hang this prevents.
+    response = MagicMock()
+    response.raw = MagicMock(spec=["shutdown", "_connection"])
+    response.raw.shutdown.side_effect = RuntimeError("no")
+    release_response_connection(response, log=lambda *a, **k: None)
+    response.raw._connection.sock.shutdown.assert_called_once()
 
   def test_teardown_reports_when_it_cannot_reach_a_live_connection(self):
     # urllib3 2.3 adds a supported shutdown() and this deployment pins 2.0.7.

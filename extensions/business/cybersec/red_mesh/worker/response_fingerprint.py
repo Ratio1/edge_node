@@ -312,10 +312,13 @@ def release_response_connection(response, log=None):
   if callable(supported):
     try:
       supported()
+      return
     except Exception as exc:
+      # Fall through rather than return: a supported call that raised has not
+      # torn the connection down, and leaving it up is the hang this exists to
+      # prevent. The private path below may still reach the socket.
       if log:
         log(f"Response connection shutdown failed: {exc}", color='y')
-    return
 
   connection = getattr(raw, "_connection", None)
   sock = getattr(connection, "sock", None)
@@ -460,6 +463,12 @@ def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
       return
     outcome.put(("ok", response))
 
+  # One registry serves every redirect hop, so a retired watchdog could in
+  # principle cut a socket a later hop is reading. It cannot: every hop passes
+  # `max_seconds=deadline-now` against the same absolute deadline, so once one
+  # watchdog has fired the caller's own `remaining <= 0` check has already
+  # bailed out of the loop. Safety rests on that shared deadline — giving hops
+  # independent budgets would open this.
   threading.Thread(target=_watch, daemon=True).start()
   threading.Thread(target=_issue, daemon=True).start()
   try:
