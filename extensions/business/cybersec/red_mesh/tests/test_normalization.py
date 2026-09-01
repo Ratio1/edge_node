@@ -829,5 +829,59 @@ class TestGrayboxCredentialRedactionIsNarrow(unittest.TestCase):
                   "that says which service was affected")
 
 
+
+class TestGrayboxRedactionCoverageFloor(unittest.TestCase):
+  """
+  RM-060's invariant: narrowing `_CRED_RE` must not reduce credential coverage.
+
+  Verified by measuring the same matrix against pre-branch `da9920c0` and the
+  narrowed rule: both mask exactly these three shapes and leak exactly the same
+  nine. The narrowing removed over-redaction without removing coverage.
+
+  The nine that leak are RM-051's stated key families (`credential`,
+  `credentials`, `client_credentials`, `csrf_token`, `github_token`,
+  `x_api_key`, `aws_secret_access_key`, `cookie`) plus the I-014 gateway key.
+  They are pre-existing and out of scope here — this class pins the *floor* so a
+  future narrowing cannot quietly drop below it, rather than asserting the gaps
+  are acceptable.
+  """
+
+  MUST_STAY_MASKED = (
+    ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def", "eyJhbGciOiJIUzI1NiJ9"),
+    ("password=Tr0ub4dor", "Tr0ub4dor"),
+    ("admin:hunter2 accepted", "hunter2"),
+    ("https://user:secret@app.test/x", "secret"),
+    ("Accepted credential: ftpuser:s3cr3t", "s3cr3t"),
+    ("candidate service-user:s3cr3t/with/slash worked", "s3cr3t/with/slash"),
+    ("accepted=admin:p@$$:w0rd!", "p@$$:w0rd!"),
+  )
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  def test_the_covered_shapes_stay_covered(self):
+    host = self._host()
+    for text, secret in self.MUST_STAY_MASKED:
+      with self.subTest(text=text):
+        report = {
+          "service_info": {},
+          "graybox_results": {"443": {"_p": {"findings": [
+            {"title": "t", "description": text, "status": "vulnerable"},
+          ]}}},
+        }
+        out = host._redact_report(report)
+        described = out["graybox_results"]["443"]["_p"]["findings"][0]["description"]
+        self.assertNotIn(
+          secret, described,
+          "credential coverage dropped below the pre-branch floor",
+        )
+
+
 if __name__ == '__main__':
   unittest.main()
