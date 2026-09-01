@@ -27,6 +27,7 @@ from ..references import reference_urls as _reference_urls
 from ..models.finding_schema import (
   REDMESH_FINDING_SCHEMA,
   REDMESH_FINDING_SCHEMA_VERSION,
+  normalize_confidence as _normalize_confidence,
 )
 from ..models.finding_identity import (
   content_hash as _content_hash,
@@ -328,7 +329,11 @@ class GrayboxFinding:
     }
     # not_vulnerable findings contribute zero to risk score —
     # override severity to INFO so they don't inflate finding_counts
-    effective_severity = "INFO" if self.status == "not_vulnerable" else self.severity.upper()
+    declared_severity = self.severity.upper()
+    effective_severity = "INFO" if self.status == "not_vulnerable" else declared_severity
+    confidence, confidence_recognised = _normalize_confidence(
+      confidence_map.get(self.status, "tentative"),
+    )
 
     flat = {
       # Both producers stamp the same contract. Until they did, "the finding
@@ -338,6 +343,9 @@ class GrayboxFinding:
       "schema_version": REDMESH_FINDING_SCHEMA_VERSION,
       "probe_type": "graybox",
       "severity": effective_severity,
+      # The declared value survives the INFO override, so coverage evidence can
+      # still say how much the check that passed was worth.
+      "declared_severity": declared_severity,
       "title": self.title,
       "description": f"Scenario {self.scenario_id}: {self.title}",
       "owasp_id": self.owasp,
@@ -369,7 +377,7 @@ class GrayboxFinding:
       # and `references` is a key the LLM input builder, the PDF and the
       # exports all read.
       "references": _reference_urls(self.owasp, self.cwe),
-      "confidence": confidence_map.get(self.status, "tentative"),
+      "confidence": confidence,
       "port": port,
       "protocol": protocol,
       "probe": probe_name,

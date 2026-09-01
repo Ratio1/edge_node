@@ -11,6 +11,7 @@ from ..models.finding_schema import (
   COVERAGE_STATUSES,
   REDMESH_FINDING_SCHEMA,
   REDMESH_FINDING_SCHEMA_VERSION,
+  normalize_confidence as _normalize_confidence,
 )
 from ..models.finding_identity import (
   content_hash as _content_hash,
@@ -96,7 +97,11 @@ class _RiskScoringMixin:
         if not isinstance(finding, dict):
           continue
         severity = finding.get("severity", "INFO").upper()
-        confidence = finding.get("confidence", "firm").lower()
+        # Normalised here and stored normalised below, so the score and the
+        # archived value cannot disagree. The old `.get(confidence, 0.5)`
+        # scored an unrecognised value as `tentative` while the finding kept the
+        # unrecognised string, and nothing said the value was not understood.
+        confidence, _recognised = _normalize_confidence(finding.get("confidence", "firm"))
         weight = RISK_SEVERITY_WEIGHTS.get(severity, 0)
         multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(confidence, 0.5)
         findings_score += weight * multiplier
@@ -267,6 +272,15 @@ class _RiskScoringMixin:
 
     def normalize_flat_finding(finding, port, protocol, probe_name, category):
       item = {k: v for k, v in finding.items()}
+      normalized_confidence, recognised = _normalize_confidence(
+        item.get("confidence", "firm"),
+      )
+      if not recognised and item.get("confidence"):
+        # Keep the raw value rather than overwriting it silently: a probe's typo
+        # should be visible to whoever has to fix the probe.
+        item["declared_confidence"] = item["confidence"]
+      item["confidence"] = normalized_confidence
+      item.setdefault("declared_severity", str(item.get("severity") or "INFO").upper())
       # The same stamp the graybox producer applies. A consumer reads
       # `PassReport.findings` without knowing which half of the scanner wrote
       # each entry, so the contract has to be declared by both or by neither.
@@ -296,6 +310,23 @@ class _RiskScoringMixin:
         item["owasp_top10"] = list(owasp_values)
       if owasp_values and not item.get("owasp_id"):
         item["owasp_id"] = owasp_values[0]
+
+      # The LLM input builder reads `evidence_items` and deliberately drops the
+      # legacy `evidence` string as raw probe output. No blackbox probe fills
+      # `evidence_items`, so every blackbox finding reached the model with no
+      # evidence at all while its evidence sat one key over. Forwarding it here
+      # covers every blackbox probe at once; a probe that builds a real item
+      # keeps it.
+      if not item.get("evidence_items"):
+        evidence_text = item.get("evidence")
+        if isinstance(evidence_text, str) and evidence_text.strip():
+          item["evidence_items"] = [{
+            "kind": "log",
+            "caption": f"{probe_name} evidence",
+            "snippet": evidence_text,
+          }]
+        else:
+          item["evidence_items"] = []
 
       if not item.get("remediation_structured"):
         item["remediation_structured"] = {

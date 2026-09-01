@@ -62,6 +62,12 @@ _KNOWN_FIELDS = (
   "cwe_id",
   "cvss_score",
   "cvss_vector",
+  # What the probe said, beside what took effect. `not_vulnerable` overwrites
+  # severity with INFO, and the original was simply gone — so "we checked for a
+  # CRITICAL issue and it was absent" and "we checked for an INFO nicety and it
+  # was absent" became the same record.
+  "declared_severity",
+  "declared_confidence",
   "affected_assets",
   "evidence_items",
   "evidence_artifacts",
@@ -69,6 +75,21 @@ _KNOWN_FIELDS = (
   "replay_steps",
   "status",
 )
+
+
+def normalize_confidence(value: Any) -> tuple[str, bool]:
+  """Return `(confidence, was_recognised)`.
+
+  An unrecognised value used to fall through
+  `RISK_CONFIDENCE_MULTIPLIERS.get(value, 0.5)` to the same weight as
+  `tentative`, while the finding kept the unrecognised string — so the score and
+  the record disagreed and neither said why. Landing on `tentative` is
+  defensible; doing it invisibly is not, so the caller is told.
+  """
+  text = str(value or "").strip().lower()
+  if text in FINDING_CONFIDENCES:
+    return text, True
+  return "tentative", False
 
 
 # Scenario outcomes that report test coverage rather than a finding. A graybox
@@ -113,6 +134,8 @@ class FlatFinding:
   cwe_id: str = ""
   cvss_score: float | None = None
   cvss_vector: str = ""
+  declared_severity: str = ""
+  declared_confidence: str = ""
   affected_assets: tuple = ()
   evidence_items: tuple = ()
   evidence_artifacts: tuple = ()
