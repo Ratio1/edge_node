@@ -24,6 +24,10 @@ from dataclasses import dataclass, asdict, field
 from typing import Any
 
 from ..references import reference_urls as _reference_urls
+from ..models.finding_schema import (
+  REDMESH_FINDING_SCHEMA,
+  REDMESH_FINDING_SCHEMA_VERSION,
+)
 
 
 # ── Centralised secret scrubber (Subphase 1.6 commit #2) ────────────────
@@ -341,6 +345,11 @@ class GrayboxFinding:
     effective_severity = "INFO" if self.status == "not_vulnerable" else self.severity.upper()
 
     flat = {
+      # Both producers stamp the same contract. Until they did, "the finding
+      # schema" was whatever the reader happened to test against, and a
+      # consumer had no way to tell a v0 archive from a current one.
+      "schema": REDMESH_FINDING_SCHEMA,
+      "schema_version": REDMESH_FINDING_SCHEMA_VERSION,
       "finding_id": finding_id,
       "probe_type": "graybox",
       "severity": effective_severity,

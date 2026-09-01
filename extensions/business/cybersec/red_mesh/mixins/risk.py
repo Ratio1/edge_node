@@ -7,6 +7,10 @@ Pure computation — takes aggregated scan reports and produces risk scores
 
 import math
 
+from ..models.finding_schema import (
+  REDMESH_FINDING_SCHEMA,
+  REDMESH_FINDING_SCHEMA_VERSION,
+)
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
@@ -239,6 +243,11 @@ class _RiskScoringMixin:
 
     def normalize_flat_finding(finding, port, protocol, probe_name, category):
       item = {k: v for k, v in finding.items()}
+      # The same stamp the graybox producer applies. A consumer reads
+      # `PassReport.findings` without knowing which half of the scanner wrote
+      # each entry, so the contract has to be declared by both or by neither.
+      item.setdefault("schema", REDMESH_FINDING_SCHEMA)
+      item.setdefault("schema_version", REDMESH_FINDING_SCHEMA_VERSION)
       cwe_values = normalize_cwe_values(item.get("cwe"))
       if not cwe_values:
         parsed_cwe = parse_cwe_id(item.get("cwe_id"))
