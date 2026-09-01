@@ -28,6 +28,10 @@ from ..models.finding_schema import (
   REDMESH_FINDING_SCHEMA,
   REDMESH_FINDING_SCHEMA_VERSION,
 )
+from ..models.finding_identity import (
+  content_hash as _content_hash,
+  dedup_key as _dedup_key,
+)
 
 
 # ── Centralised secret scrubber (Subphase 1.6 commit #2) ────────────────
@@ -313,26 +317,7 @@ class GrayboxFinding:
     Converts structured graybox fields to the common schema that
     _compute_risk_and_findings() produces for all finding types.
     """
-    import hashlib
-    canon_title = self.title.lower().strip()
     cwe_joined = ", ".join(self.cwe)
-    cwe_canonical = ", ".join(sorted({item.strip() for item in self.cwe if isinstance(item, str) and item.strip()}))
-    evidence_identity = []
-    for item in self.evidence:
-      if not isinstance(item, str):
-        continue
-      if item.startswith(("endpoint=", "path=", "protected_path=", "token_path=", "flow=", "test_id=")):
-        evidence_identity.append(item)
-    # The location is part of identity. Without it, N endpoints exhibiting the
-    # same scenario deduped to a single finding unless an `endpoint=` evidence
-    # string happened to differ — so identity depended on how a probe chose to
-    # phrase its evidence rather than on where the finding actually is.
-    location_identity = f"{self.url or ''}|{self.parameter or ''}|{self.method or ''}"
-    id_input = (
-      f"{port}:{probe_name}:{self.scenario_id}:{cwe_canonical}:"
-      f"{canon_title}:{'|'.join(sorted(evidence_identity))}:{location_identity}"
-    )
-    finding_id = hashlib.sha256(id_input.encode()).hexdigest()[:16]
 
     # Map status -> confidence and effective severity
     confidence_map = {
@@ -350,7 +335,6 @@ class GrayboxFinding:
       # consumer had no way to tell a v0 archive from a current one.
       "schema": REDMESH_FINDING_SCHEMA,
       "schema_version": REDMESH_FINDING_SCHEMA_VERSION,
-      "finding_id": finding_id,
       "probe_type": "graybox",
       "severity": effective_severity,
       "title": self.title,
@@ -409,12 +393,40 @@ class GrayboxFinding:
         if (self.url or self.parameter) else []
       ),
     }
+    # Identity is computed from the assembled finding rather than from a
+    # hand-rolled string, and by the same function the blackbox producer uses.
+    # The old input folded in the lowercased title and a selection of evidence
+    # strings, so rewording a probe's title — or changing how it phrased its
+    # evidence — silently re-identified every finding it had ever produced.
+    #
+    # Computed before `_scrub_flat_finding` runs, and carried rather than
+    # recomputed downstream: the report layer redacts the very fields the hash
+    # is over, so a value re-derived after redaction would never match the one
+    # archived with the finding.
+    flat["dedup_key"] = _dedup_key(flat)
+    flat["content_hash"] = _content_hash(flat)
+    flat["finding_id"] = flat["dedup_key"]
+    flat["finding_signature"] = flat["content_hash"]
     return _scrub_flat_finding(flat, secret_field_names=secret_field_names)
 
   @classmethod
   def flat_from_dict(cls, payload: dict[str, Any], port: int, protocol: str,
                      probe_name: str, *, secret_field_names=()) -> dict[str, Any]:
     """Normalize a persisted graybox finding dict into the flat report contract."""
-    return cls.from_dict(payload).to_flat_finding(
+    flat = cls.from_dict(payload).to_flat_finding(
       port, protocol, probe_name, secret_field_names=secret_field_names,
     )
+    # Identity stamped at production wins over anything recomputed here. This
+    # runs on a *persisted* finding, which may already have been through the
+    # report layer's redaction — and redaction rewrites exactly the fields the
+    # hashes are over, so recomputing would hand the same finding a new identity
+    # and every consumer would read it as a new one.
+    for key in ("dedup_key", "content_hash"):
+      if payload.get(key):
+        flat[key] = payload[key]
+    # The derived pair follows its source, or a carried `dedup_key` would sit
+    # beside a `finding_id` recomputed from redacted fields — two identities for
+    # one finding, disagreeing, in the same dict.
+    flat["finding_id"] = payload.get("finding_id") or flat["dedup_key"]
+    flat["finding_signature"] = payload.get("finding_signature") or flat["content_hash"]
+    return flat

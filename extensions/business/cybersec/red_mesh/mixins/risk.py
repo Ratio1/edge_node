@@ -11,6 +11,10 @@ from ..models.finding_schema import (
   REDMESH_FINDING_SCHEMA,
   REDMESH_FINDING_SCHEMA_VERSION,
 )
+from ..models.finding_identity import (
+  content_hash as _content_hash,
+  dedup_key as _dedup_key,
+)
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
@@ -204,7 +208,6 @@ class _RiskScoringMixin:
       (risk_result, flat_findings) where risk_result is {"score": int, "breakdown": dict}
       and flat_findings is a list of enriched finding dicts.
     """
-    import hashlib
     import math
 
     findings_score = 0.0
@@ -281,44 +284,26 @@ class _RiskScoringMixin:
           asset["url"] = url
         item["affected_assets"] = [asset]
 
-      signature = item.get("finding_signature")
-      if not signature:
-        signature = compute_flat_signature(item, probe_name)
-        item["finding_signature"] = signature
-
-      item["finding_id"] = item.get("finding_id") or signature[:16]
+      # `probe` has to be set before identity is computed: the dedup key
+      # includes it, and it was previously threaded in as a separate argument to
+      # a second signature implementation that could drift from the first — and
+      # had, reading a raw severity string where `Finding.compute_signature`
+      # read `Severity.value`.
+      item["probe"] = probe_name
+      # Stamped once, never recomputed. Identity is computed here, *before* the
+      # report layer redacts `title`, `description`, `evidence`, `url` and
+      # `parameter` — so a consumer that re-derived it from the stored fields
+      # would get a different value for the same finding and read it as a new
+      # one. Preserving what is already present is what makes these values
+      # comparable across the redaction boundary at all.
+      item["dedup_key"] = item.get("dedup_key") or _dedup_key(item)
+      item["content_hash"] = item.get("content_hash") or _content_hash(item)
+      item["finding_signature"] = item.get("finding_signature") or item["content_hash"]
+      item["finding_id"] = item.get("finding_id") or item["dedup_key"]
       item["port"] = port
       item["protocol"] = protocol
-      item["probe"] = probe_name
       item["category"] = category
       return item
-
-    def compute_flat_signature(finding, probe_name):
-      asset_canonical = canonical_asset_string(finding.get("affected_assets"))
-      parts = [
-        probe_name or "",
-        asset_canonical,
-        finding.get("title") or "",
-        finding.get("description") or "",
-        finding.get("severity") or "",
-      ]
-      return hashlib.sha256("\x1e".join(str(p) for p in parts).encode()).hexdigest()
-
-    def canonical_asset_string(assets):
-      if not isinstance(assets, list) or not assets:
-        return ""
-      parts = []
-      for asset in assets:
-        if not isinstance(asset, dict):
-          continue
-        parts.append("|".join([
-          str(asset.get("host") or ""),
-          str(asset.get("port") or ""),
-          str(asset.get("url") or ""),
-          str(asset.get("parameter") or ""),
-          str(asset.get("method") or "").upper(),
-        ]))
-      return "\x1f".join(sorted(parts))
 
     def normalize_cwe_values(values):
       out = []

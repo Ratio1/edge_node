@@ -18,12 +18,13 @@ PRs (PR-1.3 through PR-1.5) migrate probes to populate the new fields
 from the @register_probe decorator metadata + dynamic CVE DB lookup.
 """
 
-import hashlib
 import inspect
 import json
 from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Any
+
+from .models.finding_identity import content_hash as _content_hash
 
 
 class Severity(str, Enum):
@@ -169,25 +170,34 @@ class Finding:
   ) -> str:
     """Compute a stable content-addressed signature.
 
-    A finding's signature is sha256 over (probe_id, asset_canonical,
-    title, description, severity). Two scans of the same target
-    producing the same vulnerability yield the same signature, which
-    is what makes Phase 0's worker dedup and future longitudinal
-    tracking possible.
+    Computed by `models.finding_identity.content_hash`: the finding's
+    dedup key plus its presentation fields. Two scans of the same target
+    producing the same vulnerability yield the same signature, which is
+    what makes worker dedup and longitudinal tracking possible, and a
+    reworded finding keeps its `dedup_key` while this value moves.
 
     Per-worker chain-of-custody fields (set by mixins/report.py
     _stamp_worker_source) are NOT in the signature — they vary across
     workers but represent the same underlying finding.
     """
-    asset_str = asset_canonical or _canonical_asset_string(self.affected_assets)
-    parts = [
-      probe_id or "",
-      asset_str,
-      self.title or "",
-      self.description or "",
-      self.severity.value if isinstance(self.severity, Severity) else str(self.severity),
-    ]
-    return hashlib.sha256("\x1e".join(parts).encode("utf-8")).hexdigest()
+    # Delegates to the shared identity model rather than reimplementing it.
+    # This was the fourth implementation of the same idea, and it had already
+    # drifted from the flat-path one, which read a raw severity string where
+    # this reads `Severity.value` — so the same finding could carry two
+    # different signatures depending on which layer computed it.
+    payload = {
+      "probe": probe_id or "",
+      "title": self.title or "",
+      "description": self.description or "",
+      "severity": (
+        self.severity.value if isinstance(self.severity, Severity)
+        else str(self.severity)
+      ),
+      "owasp_id": self.owasp_id,
+      "cwe_id": self.cwe_id,
+      "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
+    }
+    return _content_hash(payload, asset_canonical=asset_canonical)
 
   def with_signature(self, signature: str) -> "Finding":
     """Return a new Finding with finding_signature set (frozen-safe)."""
@@ -196,26 +206,17 @@ class Finding:
     return Finding(**_revive_finding_dict(data))
 
 
-def _canonical_asset_string(assets: tuple[AffectedAsset, ...]) -> str:
-  """Stable string representation of a list of AffectedAsset entries.
-
-  Order-independent (sorted), and includes only fields that uniquely
-  identify the asset. Used inside compute_signature so two probes
-  emitting findings for the same target produce the same signature
-  regardless of probe-internal asset ordering.
-  """
-  if not assets:
-    return ""
-  parts = []
-  for a in assets:
-    parts.append("|".join([
-      a.host or "",
-      str(a.port if a.port is not None else ""),
-      a.url or "",
-      a.parameter or "",
-      (a.method or "").upper(),
-    ]))
-  return "\x1f".join(sorted(parts))
+def _asset_as_dict(asset) -> dict:
+  """One `AffectedAsset` in the dict shape the shared identity model reads."""
+  if isinstance(asset, dict):
+    return asset
+  return {
+    "host": getattr(asset, "host", "") or "",
+    "port": getattr(asset, "port", None),
+    "url": getattr(asset, "url", "") or "",
+    "parameter": getattr(asset, "parameter", "") or "",
+    "method": getattr(asset, "method", "") or "",
+  }
 
 
 def _revive_finding_dict(data: dict) -> dict:

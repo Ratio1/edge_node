@@ -12,6 +12,9 @@ import struct as _struct
 
 from ..worker import PentestLocalWorker
 from ..models import UiAggregate
+from ..models.finding_identity import (
+  worker_attribution_fields as _worker_attribution_fields,
+)
 # Shared with the SIEM event builder, which redacts at the egress boundary
 # rather than trusting its caller. See `credential_redaction` for why the rule
 # is anchored on the credential phrasing rather than on a bare `a:b` shape.
@@ -24,7 +27,15 @@ from ..credential_redaction import (
 # Fields stamped per-worker by _stamp_worker_source. Excluded from the
 # dedup signature so the same vulnerability seen by two workers
 # collapses to one finding (with one worker's stamp preserved).
-_DEDUP_EXCLUDE_FIELDS = ("_source_worker_id", "_source_node_addr")
+# The same fields `finding_identity.content_hash` excludes, plus this module's
+# two private ones. They were not excluded here, so the fallback hash — used
+# whenever a finding carries no stamped identity — saw the same finding from two
+# nodes as two findings: `_stamp_worker_source` adds `worker_source`,
+# `observed_at` and `node_ip` before this runs, and cross-worker dedup is the
+# one thing this signature exists to do.
+_DEDUP_EXCLUDE_FIELDS = tuple(
+  {"_source_worker_id", "_source_node_addr"} | set(_worker_attribution_fields())
+)
 
 
 _PUBLISH_SAFE_METADATA_KEYS = {
