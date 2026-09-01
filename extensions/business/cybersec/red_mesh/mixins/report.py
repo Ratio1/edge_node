@@ -697,7 +697,33 @@ class _ReportMixin:
     _redact_finding_list(redacted.get("correlation_findings"))
     _redact_finding_list(redacted.get("findings"))
     # Redact graybox_results credential evidence
-    _CRED_RE = _re.compile(r'(\S+?):(\S+)')
+    # URL userinfo: mask the secret half, keep the host. Redacting the whole
+    # thing loses the one field saying which service was affected.
+    _USERINFO_RE = _re.compile(r'(?<=://)([^/@\s:]+):([^/@\s]+)(?=@)')
+    # A bare credential pair, narrowed from the previous `(\S+?):(\S+)`, which
+    # matched *any* `a:b` and so destroyed exactly the data this phase exists to
+    # add: `https://app.test/x` became `https:***`, every curl reproduction and
+    # endpoint URL was annihilated, and `12:04:33` became `12:***`.
+    #
+    # The discrimination is done by the *guards*, not by restricting which
+    # characters a secret may contain. Narrowing the secret charset instead was
+    # tried and reduced coverage: `admin:p@$$:w0rd!` and
+    # `service-user:s3cr3t/with/slash` both leaked, because real passwords
+    # contain exactly the characters a URL does.
+    #
+    # Guards, in order: not already inside a URL or another token; an
+    # identifier-like key; no whitespace or `/` immediately after the colon —
+    # which is what excludes `https://…`, `Content-Type: application/json` and
+    # `PT-A01-01: IDOR`; and a non-numeric secret, which excludes ports
+    # (`app.test:8443`) and clock times (`12:04:33`).
+    _CRED_RE = _re.compile(
+      r'(?<![\w.:/-])'
+      r'([A-Za-z_][\w.-]{0,63})'
+      r':'
+      r'(?![\s/])'
+      r'(?!\d+(?:\D|$))'
+      r'([^\s\'"]{3,64})'
+    )
     _PASSWORD_RE = _re.compile(r'((?:password|passwd|pwd)["\']?\s*[:=]\s*)(["\']?)[^\s"\'&]+', _re.I)
 
     def _redact_graybox_text(value):
@@ -707,6 +733,7 @@ class _ReportMixin:
         value = _scrub_graybox(
           value, secret_field_names=graybox_secret_names,
         )
+      value = _USERINFO_RE.sub(r'\1:***', value)
       value = _CRED_RE.sub(r'\1:***', value)
       value = _PASSWORD_RE.sub(r'\1\2***', value)
       if _scrub_graybox is not None:

@@ -756,5 +756,78 @@ class TestRiskScoreDynamicRange(unittest.TestCase):
         self.assertEqual(normalize_risk_score(bad), 0)
 
 
+
+class TestGrayboxCredentialRedactionIsNarrow(unittest.TestCase):
+  """
+  `_CRED_RE` was `(\\S+?):(\\S+)` — any `a:b` at all — replaced with `a:***`.
+  It therefore destroyed exactly the data RM-060 Phase 5 exists to add:
+
+      curl -i -H 'Accept: */*' https://app.test/api/records/99
+        -> curl -i -H 'Accept: */*' https:***
+      endpoint=https://app.test/api/records/99  ->  endpoint=https:***
+      ... at 12:04:33                           ->  ... at 12:***
+
+  Every reproduction command, every endpoint URL and every timestamp. It also
+  took the host along with the secret in a userinfo URL, losing the one field
+  that says which service was affected.
+
+  RM-060's invariant is that narrowing must not reduce credential coverage, so
+  this asserts both directions.
+  """
+
+  SURVIVE = (
+    "curl -i -H 'Accept: */*' https://app.test/api/records/99",
+    "curl -i -X POST --data-raw '{\"id\": 99}' https://app.test/x",
+    "endpoint=https://app.test/api/records/99",
+    "GET /api/v1/users returned 200 at 12:04:33",
+    "Scenario PT-A01-01: IDOR detected",
+    "Content-Type: application/json",
+    "baseline_size_bytes=1024",
+  )
+
+  REDACT = (
+    ("admin:hunter2 accepted", "hunter2"),
+    ("root:toor", "toor"),
+    ("Accepted credential: ftpuser:s3cr3t", "s3cr3t"),
+  )
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  def _redact(self, text):
+    report = {
+      "service_info": {},
+      "graybox_results": {
+        "443": {"_graybox_test": {"findings": [{
+          "title": "t", "description": text, "status": "vulnerable",
+        }]}}},
+    }
+    out = self._host()._redact_report(report)
+    return out["graybox_results"]["443"]["_graybox_test"]["findings"][0]["description"]
+
+  def test_reproductions_urls_and_timestamps_survive(self):
+    for text in self.SURVIVE:
+      with self.subTest(text=text):
+        self.assertEqual(self._redact(text), text)
+
+  def test_credential_pairs_are_still_redacted(self):
+    for text, secret in self.REDACT:
+      with self.subTest(text=text):
+        self.assertNotIn(secret, self._redact(text))
+
+  def test_url_userinfo_loses_the_secret_and_keeps_the_host(self):
+    out = self._redact("https://user:secret@app.test/x")
+    self.assertNotIn("secret", out)
+    self.assertIn("app.test", out,
+                  "the host was taken along with the secret, losing the field "
+                  "that says which service was affected")
+
+
 if __name__ == '__main__':
   unittest.main()
