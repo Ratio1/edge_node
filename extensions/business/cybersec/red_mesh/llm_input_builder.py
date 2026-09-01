@@ -46,6 +46,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .models.finding_schema import is_coverage_result as _is_coverage_result
+
 
 # ---------------------------------------------------------------------
 # Limits — keep aggressive caps; if the LLM needs more it can ask
@@ -217,7 +219,9 @@ def build_llm_input(
     engagement_summary=_summarize_engagement(engagement),
     scan_summary=_summarize_scan(
       aggregated_report,
-      total_findings=len(finding_dicts),
+      # Same rule as the UI aggregate. The model was told a clean scan had
+      # forty findings and wrote its narrative accordingly.
+      total_findings=sum(1 for f in finding_dicts if not _is_coverage_result(f)),
       included_findings=len(out_findings),
       truncated_findings=len(finding_dicts) - len(out_findings),
     ),

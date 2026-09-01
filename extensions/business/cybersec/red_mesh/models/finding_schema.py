@@ -71,6 +71,24 @@ _KNOWN_FIELDS = (
 )
 
 
+# Scenario outcomes that report test coverage rather than a finding. A graybox
+# probe emits one result per scenario whatever the outcome, so counting these as
+# findings made "how many findings" and "how many scenarios ran" the same number.
+COVERAGE_STATUSES = ("not_vulnerable", "inconclusive")
+
+
+def is_coverage_result(finding: Any) -> bool:
+  """True when this entry reports test coverage rather than a finding.
+
+  One predicate for every counter. `total_findings` was `len(findings)` in three
+  separate places — the UI aggregate, the LLM input and the risk breakdown — so
+  a clean graybox scan reported dozens of findings to all three.
+  """
+  if not isinstance(finding, dict):
+    return False
+  return str(finding.get("status") or "").lower() in COVERAGE_STATUSES
+
+
 @dataclass(frozen=True)
 class FlatFinding:
   """One finding, as it is archived and as every consumer reads it."""

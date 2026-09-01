@@ -15,6 +15,7 @@ from ..models import UiAggregate
 from ..models.finding_identity import (
   worker_attribution_fields as _worker_attribution_fields,
 )
+from ..models.finding_schema import is_coverage_result as _is_coverage_result
 # Shared with the SIEM event builder, which redacts at the egress boundary
 # rather than trusting its caller. See `credential_redaction` for why the rule
 # is anchored on the credential phrasing rather than on a bare `a:b` shape.
@@ -1047,7 +1048,9 @@ class _ReportMixin:
     return UiAggregate(
       total_open_ports=sorted(set(agg.get("open_ports", []))),
       total_services=self._count_services(agg.get("service_info", {})),
-      total_findings=len(findings),
+      # Findings, not scenario results: a graybox scan emits one entry per
+      # scenario whatever the outcome, so `len(findings)` counted the tests run.
+      total_findings=sum(1 for f in findings if not _is_coverage_result(f)),
       findings_count=findings_count if findings_count else None,
       top_findings=top_findings if top_findings else None,
       finding_timeline=finding_timeline if finding_timeline else None,

@@ -8,12 +8,14 @@ Pure computation — takes aggregated scan reports and produces risk scores
 import math
 
 from ..models.finding_schema import (
+  COVERAGE_STATUSES,
   REDMESH_FINDING_SCHEMA,
   REDMESH_FINDING_SCHEMA_VERSION,
 )
 from ..models.finding_identity import (
   content_hash as _content_hash,
   dedup_key as _dedup_key,
+  parse_cwe_list as _parse_cwe_list,
 )
 from ..constants import (
   RISK_SEVERITY_WEIGHTS,
@@ -212,6 +214,7 @@ class _RiskScoringMixin:
 
     findings_score = 0.0
     finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
     cred_count = 0
     flat_findings = []
 
@@ -227,6 +230,24 @@ class _RiskScoringMixin:
       nonlocal findings_score, cred_count
       for finding in findings_list:
         if not isinstance(finding, dict):
+          continue
+        # A scenario that ran and found nothing, or could not decide, is
+        # evidence about coverage — not a finding. Both were scored and counted
+        # here as vulnerabilities, so `total_findings` answered "how many
+        # scenarios ran". `inconclusive` was the sharper half: only
+        # `not_vulnerable` is downgraded to INFO, so an undecided scenario kept
+        # its *declared* severity and counted as a HIGH finding that raised the
+        # risk score. The entry is still archived — a PTES report needs the
+        # coverage evidence — it just is not counted as a finding.
+        status = str(finding.get("status") or "").lower()
+        if status in COVERAGE_STATUSES:
+          coverage_counts[status] = coverage_counts.get(status, 0) + 1
+          flat_findings.append(
+            normalize_flat_finding(
+              finding, port, port_protocols.get(str(port), "unknown"),
+              probe_name, category,
+            )
+          )
           continue
         severity = finding.get("severity", "INFO").upper()
         confidence = finding.get("confidence", "firm").lower()
@@ -251,15 +272,22 @@ class _RiskScoringMixin:
       # each entry, so the contract has to be declared by both or by neither.
       item.setdefault("schema", REDMESH_FINDING_SCHEMA)
       item.setdefault("schema_version", REDMESH_FINDING_SCHEMA_VERSION)
-      cwe_values = normalize_cwe_values(item.get("cwe"))
+      cwe_values = tuple(
+        _parse_cwe_list(item.get("cwe"))
+        if isinstance(item.get("cwe"), (list, tuple)) else ()
+      )
       if not cwe_values:
-        parsed_cwe = parse_cwe_id(item.get("cwe_id"))
-        if parsed_cwe:
-          cwe_values = (parsed_cwe,)
+        # The joined form, not just its first entry. The parser this replaced
+        # stripped one `CWE-` prefix and called `int()` on `"639, CWE-862"`,
+        # which fails — so a multi-CWE finding normalised to nothing at all.
+        cwe_values = tuple(_parse_cwe_list(item.get("cwe_id")))
       if cwe_values and not item.get("cwe"):
         item["cwe"] = list(cwe_values)
       if cwe_values and not item.get("cwe_id"):
-        item["cwe_id"] = f"CWE-{cwe_values[0]}"
+        # Every value, matching the graybox producer's joined form. Printing
+        # only `cwe_values[0]` meant a finding classified under three weaknesses
+        # displayed one, with no sign the others existed.
+        item["cwe_id"] = ", ".join(f"CWE-{value}" for value in cwe_values)
 
       owasp_values = normalize_string_list(item.get("owasp_top10"))
       if not owasp_values and item.get("owasp_id"):
@@ -305,18 +333,6 @@ class _RiskScoringMixin:
       item["category"] = category
       return item
 
-    def normalize_cwe_values(values):
-      out = []
-      raw_values = values if isinstance(values, (list, tuple)) else []
-      for value in raw_values:
-        try:
-          parsed = int(value)
-        except (TypeError, ValueError):
-          continue
-        if parsed > 0 and parsed not in out:
-          out.append(parsed)
-      return tuple(out)
-
     def normalize_string_list(values):
       if isinstance(values, str):
         values = [values]
@@ -328,18 +344,6 @@ class _RiskScoringMixin:
         if text and text not in out:
           out.append(text)
       return tuple(out)
-
-    def parse_cwe_id(value):
-      if not isinstance(value, str):
-        return 0
-      cleaned = value.strip().upper()
-      if cleaned.startswith("CWE-"):
-        cleaned = cleaned[4:]
-      try:
-        parsed = int(cleaned)
-      except (TypeError, ValueError):
-        return 0
-      return parsed if parsed > 0 else 0
 
     def parse_port(port_key):
       """Extract integer port from keys like '80/tcp' or '80'."""
@@ -400,6 +404,18 @@ class _RiskScoringMixin:
             try:
               flat = _GF.flat_from_dict(finding_dict, port, protocol, probe_name)
             except (TypeError, KeyError, ValueError):
+              continue
+
+            # Same rule as the blackbox walk above: a scenario that ran and
+            # found nothing, or could not decide, is coverage evidence rather
+            # than a finding. This is where it bites hardest — every graybox
+            # scenario emits a result whatever the outcome, so a clean scan
+            # produced dozens of "findings", and an `inconclusive` one kept its
+            # declared severity and scored as a real vulnerability.
+            status = str(flat.get("status") or "").lower()
+            if status in COVERAGE_STATUSES:
+              coverage_counts[status] = coverage_counts.get(status, 0) + 1
+              flat_findings.append(flat)
               continue
 
             weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
@@ -509,6 +525,10 @@ class _RiskScoringMixin:
         "credentials_penalty": credentials_penalty,
         "raw_total": round(raw_total, 1),
         "finding_counts": finding_counts,
+        # Coverage stated alongside the findings rather than folded into them:
+        # "we ran 40 scenarios and 1 was vulnerable" and "we found 40 findings"
+        # are different claims, and only the first is true.
+        "coverage_counts": coverage_counts,
       },
     }
     return risk_result, flat_findings
