@@ -403,6 +403,7 @@ class ApiAccessProbes(ProbeBase):
           "authenticated session. Returning 2xx to the wrong principal "
           "leaks data or exposes side effects."
         ),
+        response=resp,
       )
       found_any = True
 

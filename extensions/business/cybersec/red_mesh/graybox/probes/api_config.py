@@ -125,6 +125,7 @@ class ApiConfigProbes(ProbeBase):
           "origins. Never echo an arbitrary Origin alongside "
           "Access-Control-Allow-Credentials: true."
         ),
+        response=resp,
       )
       found_any = True
     if not found_any:
@@ -185,6 +186,7 @@ class ApiConfigProbes(ProbeBase):
             "are appropriate on every API response; "
             "Strict-Transport-Security is mandatory over HTTPS."
           ),
+          response=resp,
         )
       else:
         self.emit_clean(
@@ -233,6 +235,7 @@ class ApiConfigProbes(ProbeBase):
             "deployments. If they must exist, gate them behind a "
             "non-public network or strong authentication."
           ),
+          response=resp,
         )
 
   # ── PT-OAPI8-04 — Verbose error response ─────────────────────────
@@ -290,6 +293,7 @@ class ApiConfigProbes(ProbeBase):
             "Detailed exception traces belong in server logs, not API "
             "responses."
           ),
+          response=resp,
         )
 
   # ── PT-OAPI8-05 — Unexpected methods ─────────────────────────────
@@ -401,6 +405,7 @@ class ApiConfigProbes(ProbeBase):
           "endpoints. Treat the unfiltered spec as if it were the source "
           "code — it advertises every internal route."
         ),
+        response=resp,
       )
       return  # one spec is enough
     self.emit_clean(
@@ -458,6 +463,7 @@ class ApiConfigProbes(ProbeBase):
             "deprecation policy. Live siblings often skip the security "
             "fixes applied to the current version."
           ),
+          response=resp,
         )
 
   # ── PT-OAPI9-03 — Deprecated still live ─────────────────────────
@@ -498,4 +504,5 @@ class ApiConfigProbes(ProbeBase):
             "Return 410 Gone (or a hard redirect to the supported "
             "endpoint) on deprecated paths."
           ),
+          response=resp,
         )
