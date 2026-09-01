@@ -469,13 +469,22 @@ class ProbeBase:
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,
                        replay_steps=None, remediation=None,
-                       rollback_status=""):
+                       rollback_status="", url=None, parameter=None,
+                       method=None):
     """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default.
 
     ``rollback_status`` is set by `run_stateful` for stateful probes;
     leave default for non-stateful findings.
+
+    ``url`` / ``parameter`` / ``method`` record *where* the finding manifests.
+    They are optional so existing probes keep working, but a probe that omits
+    them produces a finding with no machine-readable location — and two
+    endpoints exhibiting the same scenario then collapse to one finding id.
     """
     self.findings.append(GrayboxFinding(
+      url=url,
+      parameter=parameter,
+      method=method,
       scenario_id=scenario_id,
       title=self._scrub_for_emission(title),
       status="vulnerable",

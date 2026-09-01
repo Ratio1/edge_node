@@ -192,3 +192,91 @@ class TestGrayboxFinding(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestGrayboxFindingLocation(unittest.TestCase):
+  """
+  A graybox finding carried no structured location. The endpoint existed only
+  inside a free-text `evidence` string (`endpoint=http://...`) that nothing
+  parsed, and `to_flat_finding` emitted no `affected_assets` at all — so a
+  finding reached the report with no machine-readable answer to "where".
+
+  RM-062's typed contract and dedup key are designed against
+  `affected_assets[].url` / `.parameter`, which is why this has to exist before
+  that contract is written rather than after.
+  """
+
+  def _finding(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    base = dict(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021",
+    )
+    base.update(kwargs)
+    return GrayboxFinding(**base)
+
+  def test_a_location_reaches_affected_assets(self):
+    finding = self._finding(
+      url="https://app.test/api/records/99", parameter="id", method="GET",
+    )
+    flat = finding.to_flat_finding(443, "https", "_graybox_idor")
+    assets = flat.get("affected_assets")
+    self.assertTrue(assets, "the flat finding carries no affected_assets")
+    self.assertEqual(assets[0]["url"], "https://app.test/api/records/99")
+    self.assertEqual(assets[0]["parameter"], "id")
+    self.assertEqual(assets[0]["method"], "GET")
+    self.assertEqual(assets[0]["port"], 443)
+
+  def test_a_finding_without_a_location_still_normalises(self):
+    flat = self._finding().to_flat_finding(443, "https", "_graybox_idor")
+    self.assertEqual(flat.get("affected_assets"), [])
+
+  def test_distinct_endpoints_stay_distinct(self):
+    # The dedup key RM-062 builds must not collapse two endpoints that differ
+    # only by URL. Before the location existed, identity came from the title
+    # plus whichever evidence strings happened to be present.
+    a = self._finding(url="https://app.test/api/records/1").to_flat_finding(
+      443, "https", "_graybox_idor")
+    b = self._finding(url="https://app.test/api/records/2").to_flat_finding(
+      443, "https", "_graybox_idor")
+    self.assertNotEqual(
+      a["finding_id"], b["finding_id"],
+      "two endpoints collapsed to one finding id, so N endpoints would dedup "
+      "to a single finding",
+    )
+
+  def test_the_same_endpoint_still_dedups(self):
+    a = self._finding(url="https://app.test/api/records/1").to_flat_finding(
+      443, "https", "_graybox_idor")
+    b = self._finding(url="https://app.test/api/records/1").to_flat_finding(
+      443, "https", "_graybox_idor")
+    self.assertEqual(a["finding_id"], b["finding_id"])
+
+  def test_a_parameter_alone_distinguishes_two_findings(self):
+    a = self._finding(url="https://app.test/s", parameter="q").to_flat_finding(
+      443, "https", "_graybox_inj")
+    b = self._finding(url="https://app.test/s", parameter="sort").to_flat_finding(
+      443, "https", "_graybox_inj")
+    self.assertNotEqual(a["finding_id"], b["finding_id"])
+
+  def test_the_location_survives_a_dict_round_trip(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    original = self._finding(url="https://app.test/x", parameter="p", method="POST")
+    restored = GrayboxFinding.from_dict(original.to_dict())
+    self.assertEqual(restored.url, "https://app.test/x")
+    self.assertEqual(restored.parameter, "p")
+    self.assertEqual(restored.method, "POST")
+
+  def test_the_probe_boundary_carries_the_location_through(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/api/records/99"],
+      url="https://app.test/api/records/99", parameter="id", method="GET",
+    )
+    self.assertEqual(probe.findings[0].url, "https://app.test/api/records/99")
+    self.assertEqual(probe.findings[0].parameter, "id")

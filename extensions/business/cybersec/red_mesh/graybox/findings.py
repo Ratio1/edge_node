@@ -175,6 +175,17 @@ class GrayboxEvidenceArtifact:
     return asdict(self)
 
 
+def _asset_host(url) -> str:
+  """Host component of a finding's URL, for the affected-asset record."""
+  if not isinstance(url, str) or not url:
+    return ""
+  try:
+    from urllib.parse import urlsplit
+    return (urlsplit(url).hostname or "") or ""
+  except Exception:
+    return ""
+
+
 @dataclass(frozen=True)
 class GrayboxFinding:
   """
@@ -204,6 +215,15 @@ class GrayboxFinding:
   # findings. Renders as a badge in the Navigator UI (Phase 8.3) and in
   # the PDF report when revert_failed (Phase 8.4 red-bordered note).
   rollback_status: str = ""                         # "" | "reverted" | "revert_failed" | "no_revert_needed"
+  # Where the finding manifests. This previously existed only inside a free-text
+  # `evidence` entry (`endpoint=http://...`) that nothing parsed, so a finding
+  # reached the report with no machine-readable answer to "where" — and two
+  # different endpoints could collapse to one finding id. Mapped to
+  # `affected_assets[].url` / `.parameter` by `to_flat_finding`, which is the
+  # shape RM-062's typed contract and dedup key are designed against.
+  url: str | None = None
+  parameter: str | None = None
+  method: str | None = None
 
   @classmethod
   def from_dict(cls, payload: dict[str, Any]) -> "GrayboxFinding":
@@ -260,9 +280,14 @@ class GrayboxFinding:
         continue
       if item.startswith(("endpoint=", "path=", "protected_path=", "token_path=", "flow=", "test_id=")):
         evidence_identity.append(item)
+    # The location is part of identity. Without it, N endpoints exhibiting the
+    # same scenario deduped to a single finding unless an `endpoint=` evidence
+    # string happened to differ — so identity depended on how a probe chose to
+    # phrase its evidence rather than on where the finding actually is.
+    location_identity = f"{self.url or ''}|{self.parameter or ''}|{self.method or ''}"
     id_input = (
       f"{port}:{probe_name}:{self.scenario_id}:{cwe_canonical}:"
-      f"{canon_title}:{'|'.join(sorted(evidence_identity))}"
+      f"{canon_title}:{'|'.join(sorted(evidence_identity))}:{location_identity}"
     )
     finding_id = hashlib.sha256(id_input.encode()).hexdigest()[:16]
 
@@ -302,6 +327,20 @@ class GrayboxFinding:
       "cvss_score": self.cvss_score,
       "cvss_vector": self.cvss_vector,
       "rollback_status": self.rollback_status,
+      # Structured location, in the same shape the blackbox `AffectedAsset`
+      # uses, so both finding types answer "where" the same way. Empty rather
+      # than absent when a probe has not set one, so consumers can distinguish
+      # "no location recorded" from "field missing".
+      "affected_assets": (
+        [{
+          "host": _asset_host(self.url),
+          "port": port,
+          "url": self.url,
+          "parameter": self.parameter,
+          "method": self.method,
+        }]
+        if (self.url or self.parameter) else []
+      ),
     }
     return _scrub_flat_finding(flat, secret_field_names=secret_field_names)
 
