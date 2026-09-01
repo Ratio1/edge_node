@@ -280,3 +280,71 @@ class TestGrayboxFindingLocation(unittest.TestCase):
     )
     self.assertEqual(probe.findings[0].url, "https://app.test/api/records/99")
     self.assertEqual(probe.findings[0].parameter, "id")
+
+
+class TestLocationDerivedFromEvidence(unittest.TestCase):
+  """
+  `endpoint=<url>` is the established convention across the probes — 50 uses —
+  and was the de-facto location before a typed field existed. Promoting it at
+  the emission boundary populates every existing probe at once, rather than
+  relying on 18 call sites each being edited correctly.
+
+  An explicit `url=` always wins; a probe that emits no location key still gets
+  no location, which is the same as before.
+  """
+
+  def _probe(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    return probe
+
+  def _emit(self, evidence, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      evidence, **kwargs,
+    )
+    return probe.findings[0]
+
+  def test_endpoint_evidence_becomes_the_location(self):
+    finding = self._emit(["endpoint=https://app.test/api/records/99", "status=200"])
+    self.assertEqual(finding.url, "https://app.test/api/records/99")
+
+  def test_path_and_protected_path_are_also_recognised(self):
+    for key in ("path", "protected_path", "token_path"):
+      with self.subTest(key=key):
+        self.assertEqual(
+          self._emit([f"{key}=/admin/users"]).url, "/admin/users",
+        )
+
+  def test_an_explicit_url_wins_over_the_evidence(self):
+    finding = self._emit(
+      ["endpoint=https://app.test/from-evidence"],
+      url="https://app.test/explicit",
+    )
+    self.assertEqual(finding.url, "https://app.test/explicit")
+
+  def test_a_parameter_is_derived_when_present(self):
+    finding = self._emit(["endpoint=https://app.test/s", "parameter=sort"])
+    self.assertEqual(finding.parameter, "sort")
+
+  def test_no_location_key_means_no_location(self):
+    finding = self._emit(["status=200", "reason=whatever"])
+    self.assertIsNone(finding.url)
+
+  def test_the_derived_location_reaches_affected_assets(self):
+    finding = self._emit(["endpoint=https://app.test/api/records/99"])
+    flat = finding.to_flat_finding(443, "https", "_graybox_idor")
+    self.assertEqual(flat["affected_assets"][0]["url"],
+                     "https://app.test/api/records/99")
+
+  def test_two_endpoints_from_evidence_alone_stay_distinct(self):
+    a = self._emit(["endpoint=https://app.test/a"]).to_flat_finding(
+      443, "https", "_p")
+    b = self._emit(["endpoint=https://app.test/b"]).to_flat_finding(
+      443, "https", "_p")
+    self.assertNotEqual(a["finding_id"], b["finding_id"])

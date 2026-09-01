@@ -13,6 +13,37 @@ from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
 
 
+
+# `endpoint=<url>` is the established convention across the probes and was the
+# de-facto location before GrayboxFinding carried a typed one. Promoting it here
+# populates every existing probe at once rather than depending on each of the
+# emission call sites being edited correctly, and a probe that passes an
+# explicit url always wins. Ordered by specificity: the first key found is used.
+_LOCATION_EVIDENCE_KEYS = ("endpoint=", "path=", "protected_path=", "token_path=")
+_PARAMETER_EVIDENCE_KEYS = ("parameter=", "param=")
+
+
+def _location_from_evidence(evidence):
+  """Return ``(url, parameter)`` recovered from evidence strings, or (None, None)."""
+  url = parameter = None
+  for item in evidence or ():
+    if not isinstance(item, str):
+      continue
+    if url is None:
+      for key in _LOCATION_EVIDENCE_KEYS:
+        if item.startswith(key):
+          url = item[len(key):].strip() or None
+          break
+    if parameter is None:
+      for key in _PARAMETER_EVIDENCE_KEYS:
+        if item.startswith(key):
+          parameter = item[len(key):].strip() or None
+          break
+    if url is not None and parameter is not None:
+      break
+  return url, parameter
+
+
 class ProbeBase:
   """
   Shared utilities for graybox probe modules.
@@ -481,9 +512,14 @@ class ProbeBase:
     them produces a finding with no machine-readable location — and two
     endpoints exhibiting the same scenario then collapse to one finding id.
     """
+    scrubbed_evidence = self._scrub_for_emission(list(evidence or []))
+    # Derived from the scrubbed evidence, never the raw list: a URL can carry a
+    # token in its query string, and promoting it to a typed field must not
+    # reintroduce what the scrubber just removed.
+    derived_url, derived_parameter = _location_from_evidence(scrubbed_evidence)
     self.findings.append(GrayboxFinding(
-      url=url,
-      parameter=parameter,
+      url=url or derived_url,
+      parameter=parameter or derived_parameter,
       method=method,
       scenario_id=scenario_id,
       title=self._scrub_for_emission(title),
@@ -492,7 +528,7 @@ class ProbeBase:
       owasp=owasp,
       cwe=list(cwe or []),
       attack=self._resolve_attack(scenario_id, attack),
-      evidence=self._scrub_for_emission(list(evidence or [])),
+      evidence=scrubbed_evidence,
       evidence_artifacts=self._scrub_for_emission(list(evidence_artifacts or [])),
       replay_steps=self._scrub_for_emission(list(replay_steps or [])),
       remediation=self._scrub_for_emission(remediation or ""),
