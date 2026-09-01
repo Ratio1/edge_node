@@ -45,6 +45,7 @@ def _location_from_evidence(evidence):
 
 
 _SNAPSHOT_MAX_CHARS = 2048
+_SCRUB_WINDOW_CHARS = _SNAPSHOT_MAX_CHARS * 2
 
 
 def _as_text(value) -> str:
@@ -97,6 +98,14 @@ def _curl_reproduction(response, scrub):
   copied and run, so an Authorization header left in it hands a credential to
   whoever reads the report. Every component is `shlex.quote`d because the URL is
   target-controlled and must not be able to become a second shell command.
+
+  Each component is scrubbed *before* it is quoted. Scrubbing the assembled line
+  let a substitution reach inside the quoting a target had already been sealed
+  into: a URL carrying both a quote character and a scrubber trigger came out
+  with unbalanced quotes. That failed closed — bash rejected the line rather
+  than running anything extra — but it left the reproduction unusable, and it
+  only stayed harmless for as long as no scrubber pattern happened to produce a
+  string that re-parses.
   """
   import shlex
 
@@ -110,20 +119,23 @@ def _curl_reproduction(response, scrub):
   if not url:
     return None
 
+  def _safe(value):
+    return shlex.quote(scrub(str(value)))
+
   parts = ["curl", "-i"]
   # GET is curl's default, so spelling it out is noise in something a reader
   # copies.
   if method != "GET":
     parts += ["-X", method]
   for name, value in _string_items(getattr(request, "headers", None)).items():
-    parts += ["-H", shlex.quote(f"{name}: {value}")]
+    parts += ["-H", _safe(f"{name}: {value}")]
   body = getattr(request, "body", None)
   if body:
     if isinstance(body, bytes):
       body = body.decode("utf-8", "replace")
-    parts += ["--data-raw", shlex.quote(str(body))]
-  parts.append(shlex.quote(url))
-  return scrub(" ".join(parts))
+    parts += ["--data-raw", _safe(body)]
+  parts.append(_safe(url))
+  return " ".join(parts)
 
 
 def _artifact_from_response(response, scrub):
@@ -148,19 +160,22 @@ def _artifact_from_response(response, scrub):
   response_headers = _string_items(getattr(response, "headers", None))
   body = _as_text(getattr(response, "text", ""))
 
-  request_snapshot = "\n".join(
+  # Scrub over a window wider than what is kept, then truncate. Cutting first
+  # split secrets that straddle the boundary, leaving a prefix the pattern no
+  # longer matched — the retained half of an API key is still an API key. Any
+  # secret with a character inside the retained region starts before it, so a
+  # window of twice the limit contains the whole match; the extra is discarded
+  # either way, which keeps the cost bounded on large bodies.
+  request_snapshot = scrub("\n".join(
     [f"{method} {url}"]
     + [f"{name}: {value}" for name, value in request_headers.items()]
     + ([""] + [str(request_body)] if request_body else [])
-  )[:_SNAPSHOT_MAX_CHARS]
-  response_snapshot = "\n".join(
+  )[:_SCRUB_WINDOW_CHARS])[:_SNAPSHOT_MAX_CHARS]
+  response_snapshot = scrub("\n".join(
     [f"HTTP {status}"]
     + [f"{name}: {value}" for name, value in response_headers.items()]
     + ["", body]
-  )[:_SNAPSHOT_MAX_CHARS]
-
-  request_snapshot = scrub(request_snapshot)
-  response_snapshot = scrub(response_snapshot)
+  )[:_SCRUB_WINDOW_CHARS])[:_SNAPSHOT_MAX_CHARS]
 
   latency_ms = 0
   elapsed = getattr(response, "elapsed", None)

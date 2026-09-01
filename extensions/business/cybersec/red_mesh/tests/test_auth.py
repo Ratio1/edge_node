@@ -801,6 +801,41 @@ class TestLoginSuccessDetection(unittest.TestCase):
     )
     self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
 
+  def test_a_change_password_widget_on_the_dashboard_is_not_a_rejection(self):
+    """The mirror failure of the bug above, with the same end result.
+
+    A dashboard that ships a change-password form, a persistent nav login box,
+    or an SPA shell with a hidden password field is a real and common shape. If
+    the password-field assertion fires there, the whole authenticated scan is
+    aborted and every finding behind the login goes unlooked-for — which is what
+    the assertion exists to prevent. Landing on a page we were redirected *to*,
+    away from the login endpoint, is the signal that separates the two.
+    """
+    auth = _make_auth()
+    resp = _mock_response(
+      url="http://testapp.local:8000/dashboard/",
+      history=[MagicMock()],
+      text=(
+        "<h1>Welcome back</h1>"
+        '<form action="/account/password"><input type="password" name="new"></form>'
+      ),
+    )
+    self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
+
+  def test_a_data_type_attribute_is_not_a_password_field(self):
+    """`\\btype` also matched `data-type` — the boundary sits after the hyphen.
+
+    A component-library attribute on any post-login page would then read as a
+    re-rendered login form and abort the scan.
+    """
+    auth = _make_auth()
+    resp = _mock_response(
+      status=200,
+      url="http://testapp.local:8000/auth/login/",
+      text='<input data-type="password-strength" name="q">',
+    )
+    self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
+
   def test_login_failure_multiword(self):
     """'login failed' in body -> failure."""
     auth = _make_auth()

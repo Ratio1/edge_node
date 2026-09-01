@@ -714,14 +714,23 @@ class _ReportMixin:
     # Guards, in order: not already inside a URL or another token; an
     # identifier-like key; no whitespace or `/` immediately after the colon —
     # which is what excludes `https://…`, `Content-Type: application/json` and
-    # `PT-A01-01: IDOR`; and a non-numeric secret, which excludes ports
-    # (`app.test:8443`) and clock times (`12:04:33`).
+    # `PT-A01-01: IDOR`; and a port-shaped secret, which excludes `app.test:8443`
+    # and `app.test:8443/health`.
+    #
+    # That last guard is written as "a port-length digit run that ends the token
+    # or continues as a URL", not as "starts with a digit". The looser form was
+    # tried and silently reopened the hole this whole rule exists to close: every
+    # digit-leading password — `dbuser:1SecretPass`, `root:2024summer`,
+    # `user:007bond` — went out unmasked to the archive, the LLM, the exports and
+    # the client PDF, and the coverage-floor test stayed green because none of
+    # its cases happened to begin with a digit. A five-digit all-numeric secret
+    # is indistinguishable from a port and is deliberately conceded to the port.
     _CRED_RE = _re.compile(
       r'(?<![\w.:/-])'
       r'([A-Za-z_][\w.-]{0,63})'
       r':'
       r'(?![\s/])'
-      r'(?!\d+(?:\D|$))'
+      r'(?!\d{1,5}(?:[/?#\s\'"]|$))'
       r'([^\s\'"]{3,64})'
     )
     _PASSWORD_RE = _re.compile(r'((?:password|passwd|pwd)["\']?\s*[:=]\s*)(["\']?)[^\s"\'&]+', _re.I)
@@ -752,9 +761,28 @@ class _ReportMixin:
         for finding in probe_data.get("findings", []):
           if not isinstance(finding, dict):
             continue
-          for text_key in ("title", "description", "remediation", "error"):
+          # `url` and `parameter` are here because a probe may set them straight
+          # from target-controlled input rather than deriving them from scrubbed
+          # evidence — they were the one location field this walk did not cover,
+          # and they reach the archive, the PDF and every export.
+          for text_key in ("title", "description", "remediation", "error",
+                           "url", "parameter"):
             if isinstance(finding.get(text_key), str):
               finding[text_key] = _redact_graybox_text(finding[text_key])
+          assets = finding.get("affected_assets")
+          if isinstance(assets, list):
+            finding["affected_assets"] = [
+              {
+                **asset,
+                **{
+                  key: _redact_graybox_text(asset[key])
+                  for key in ("host", "url", "parameter")
+                  if isinstance(asset.get(key), str)
+                },
+              }
+              if isinstance(asset, dict) else asset
+              for asset in assets
+            ]
           if isinstance(finding.get("replay_steps"), list):
             finding["replay_steps"] = [
               _redact_graybox_text(step) for step in finding["replay_steps"]

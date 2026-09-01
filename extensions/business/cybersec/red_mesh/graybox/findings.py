@@ -32,19 +32,32 @@ from ..references import reference_urls as _reference_urls
 # AuthDescriptor was active. Configured names (X-Custom-Key, custom query
 # params) are added to the per-call scrub via ``secret_field_names``
 # when ProbeBase.emit_* invokes the scrubber with the live AuthDescriptor.
+# Every value-consuming pattern refuses a value that is already `<redacted>`.
+# Without that the scrubber is not a fixed point: a second pass over
+# `Authorization: <redacted>'` re-matches and swallows the trailing quote,
+# because the placeholder is just as consumable as the secret it replaced. That
+# is how a shell-safe curl reproduction came out with unbalanced quoting — the
+# line is scrubbed once at assembly, again at emission, and again at the storage
+# boundary, and only the first pass was ever meant to change it.
+_ALREADY_REDACTED = r"(?!\s*<redacted>)"
+
 _SCRUB_PATTERNS = (
   # Whole-header redaction: redact the full value, which spans until the
   # next field separator (comma/semicolon/newline) or end of string.
-  (re.compile(r"(?i)\b(authorization)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(cookie)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(set-cookie)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(authorization)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(set-cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
   # JWT (3 base64url chunks separated by dots, leading eyJ).
   (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
    "<jwt-redacted>"),
   # Bearer schema in body / URL: keep prefix only.
   (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"), "Bearer <redacted>"),
   # Common name=value forms (cookie / form / URL query).
-  (re.compile(r"(?i)\b(password|secret|token|api_key|apikey)=([^&\s\";,]+)"),
+  (re.compile(r"(?i)\b(password|secret|token|api_key|apikey)=" + _ALREADY_REDACTED
+              + r"([^&\s\";,]+)"),
    r"\1=<redacted>"),
   # JSON-style key:value.
   (re.compile(r'(?i)"(password|secret|token|api_key|bearer_token|api[\w_-]*key)"\s*:\s*"[^"]+"'),
@@ -109,9 +122,13 @@ def scrub_graybox_secrets(value: Any, *, secret_field_names: tuple[str, ...] = (
         continue
       esc = re.escape(name)
       # name=val → name=<redacted>
-      out = re.sub(rf"(?i)\b({esc})=([^&\s\";]+)", r"\1=<redacted>", out)
+      out = re.sub(
+        rf"(?i)\b({esc})={_ALREADY_REDACTED}([^&\s\";]+)", r"\1=<redacted>", out,
+      )
       # name: val (header form) → name: <redacted>
-      out = re.sub(rf"(?i)\b({esc})\s*:\s*\S+", r"\1: <redacted>", out)
+      out = re.sub(
+        rf"(?i)\b({esc})\s*:{_ALREADY_REDACTED}\s*\S+", r"\1: <redacted>", out,
+      )
       # JSON "name":"val"
       out = re.sub(rf'(?i)"({esc})"\s*:\s*"[^"]+"', r'"\1": "<redacted>"', out)
     return out
@@ -144,7 +161,13 @@ def _scrub_flat_finding(flat: dict, *, secret_field_names=()) -> dict:
   # so the artifacts were scrubbed while the copy handed to the model was not.
   # A new field that carries target output has to be registered here or the
   # storage-boundary scrubber silently does not cover it.
-  for key in ("evidence_artifacts", "evidence_items"):
+  # `affected_assets` carries a copy of `url`/`parameter`, which is the one
+  # location pair a probe may set straight from target-controlled input rather
+  # than deriving from already-scrubbed evidence. It was emitted without being
+  # registered here, so the operator-configured secret names — the whole point
+  # of `secret_field_names` — never reached it, and the value went to the LLM,
+  # the archive, the PDF and the exports in clear.
+  for key in ("evidence_artifacts", "evidence_items", "affected_assets"):
     if key in flat and isinstance(flat[key], list):
       flat[key] = scrub_graybox_secrets(
         flat[key], secret_field_names=secret_field_names,

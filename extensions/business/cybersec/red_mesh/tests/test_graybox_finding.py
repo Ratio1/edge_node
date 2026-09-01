@@ -443,6 +443,48 @@ class TestEvidenceArtifactProduction(unittest.TestCase):
     self.assertEqual(item["kind"], "request_response")
     self.assertTrue(item["caption"])
 
+  def test_a_secret_straddling_the_truncation_boundary_is_still_redacted(self):
+    """Truncating before scrubbing left half a key in the artifact.
+
+    The snapshot is capped at 2048 chars. Cutting first meant a secret that
+    began just before the cap survived as a prefix the pattern no longer
+    matched — and the retained half of an API key is still an API key, now
+    archived under a hash that certifies it as the evidence of record.
+    """
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import (
+      ProbeBase, _SNAPSHOT_MAX_CHARS,
+    )
+    probe = self._probe()
+    probe._scrub_for_emission = ProbeBase._scrub_for_emission.__get__(probe)
+    probe.target_config = None
+    secret = "sk-live-abcdefghijklmnopqrstuvwx"
+    # Land the secret so it begins inside the retained region and ends outside.
+    prefix = "HTTP 200\nContent-Type: application/json\n\n"
+    lead = " token="
+    padding = "a" * (_SNAPSHOT_MAX_CHARS - len(prefix) - len(lead) - 20)
+    body = f"{padding}{lead}{secret} trailing"
+    # Precondition, not decoration: the first version of this test put only two
+    # characters of the secret inside the retained region, so it passed against
+    # the very bug it was written for. Prove the naive snapshot really would
+    # have kept a usable prefix before asserting the real one does not.
+    naive = (prefix + body)[:_SNAPSHOT_MAX_CHARS]
+    self.assertIn(secret[:16], naive, "the fixture no longer straddles the cut")
+    self.assertNotIn(secret, naive, "the fixture no longer straddles the cut")
+    resp = self._response(body=body)
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"], response=resp,
+    )
+    snapshot = probe.findings[0].evidence_artifacts[0].response_snapshot
+    self.assertLessEqual(len(snapshot), _SNAPSHOT_MAX_CHARS)
+    # Any run of the secret long enough to be usable must be gone, not just the
+    # whole string: the leak is the surviving prefix.
+    for length in range(12, len(secret) + 1):
+      self.assertNotIn(
+        secret[:length], snapshot,
+        f"a {length}-char prefix of the secret survived truncation",
+      )
+
   def test_emitting_without_a_response_is_unchanged(self):
     from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
     probe = self._probe()
@@ -451,6 +493,53 @@ class TestEvidenceArtifactProduction(unittest.TestCase):
       ["endpoint=https://app.test/x"],
     )
     self.assertEqual(probe.findings[0].evidence_artifacts, [])
+
+
+class TestLocationFieldsAreScrubbed(unittest.TestCase):
+  """`url` / `parameter` are the one pair a probe may set from raw target input.
+
+  Every other location value is derived from evidence the scrubber has already
+  been over. These two, and the `affected_assets` copy `to_flat_finding` makes
+  of them, were registered with neither scrubbing boundary — so a userinfo
+  credential in a URL was masked in the sibling `evidence` field and shipped
+  intact in `url`, to the LLM, the archive, the PDF and the exports.
+  """
+
+  def _flat(self, *, secret_field_names=(), **kwargs):
+    finding = GrayboxFinding(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021", **kwargs,
+    )
+    return finding.to_flat_finding(
+      port=443, protocol="https", probe_name="_p",
+      secret_field_names=secret_field_names,
+    )
+
+  def test_a_configured_secret_name_is_masked_in_the_location(self):
+    """The generic patterns already cover `to_dict`; the configured names did not.
+
+    `secret_field_names` is how an operator declares their own auth parameter,
+    and it is applied at the storage boundary — which `affected_assets` was
+    never registered with.
+    """
+    flat = self._flat(
+      url="https://app.test/x?corp_key=SEKRET-VALUE-1",
+      secret_field_names=("corp_key",),
+    )
+    self.assertNotIn("SEKRET-VALUE-1", flat["affected_assets"][0]["url"])
+
+  def test_a_configured_secret_name_is_masked_in_the_parameter(self):
+    flat = self._flat(
+      url="https://app.test/x", parameter="corp_key=SEKRET-VALUE-1",
+      secret_field_names=("corp_key",),
+    )
+    self.assertNotIn("SEKRET-VALUE-1", flat["affected_assets"][0]["parameter"])
+
+  def test_an_ordinary_location_is_untouched(self):
+    flat = self._flat(url="https://app.test/api/records/99", parameter="id")
+    asset = flat["affected_assets"][0]
+    self.assertEqual(asset["url"], "https://app.test/api/records/99")
+    self.assertEqual(asset["parameter"], "id")
 
 
 class TestCurlReproduction(unittest.TestCase):
@@ -547,6 +636,36 @@ class TestCurlReproduction(unittest.TestCase):
     tokens = shlex.split(curl)
     self.assertEqual(tokens[-1], resp.request.url)
     self.assertNotIn("rm", tokens)
+
+  def test_redaction_cannot_reach_inside_the_quoting(self):
+    """Scrubbing the assembled line let a substitution unbalance the quotes.
+
+    A URL carrying both a quote character and a scrubber trigger came out as a
+    line `shlex` could not parse at all. That failed closed — the reader gets a
+    syntax error, not an extra command — but the reproduction was useless, and
+    it stayed harmless only while no scrubber pattern produced something that
+    re-parses. Scrubbing each component before quoting removes the class.
+    """
+    import shlex
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    for payload in (
+      "https://app.test/x?token=A'&z=1;touch /tmp/pwned;echo ",
+      "https://app.test/x?api_key=B';rm -rf /tmp/pwned;#",
+      "https://app.test/x?password=C' Authorization: Bearer zzzzzzzzzz '",
+    ):
+      with self.subTest(url=payload):
+        resp = self._response()
+        resp.request.url = payload
+        probe = self._probe(real_scrub=True)
+        ProbeBase.emit_vulnerable(
+          probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+          ["endpoint=x"], response=resp,
+        )
+        curl = self._curl(probe.findings[0])
+        tokens = shlex.split(curl)  # raises if the quoting was corrupted
+        self.assertEqual(tokens[0], "curl")
+        for dangerous in ("rm", "touch"):
+          self.assertNotIn(dangerous, tokens)
 
   def test_a_probes_own_replay_steps_are_kept(self):
     from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase

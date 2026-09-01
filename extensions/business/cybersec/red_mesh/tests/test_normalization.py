@@ -854,6 +854,26 @@ class TestGrayboxRedactionCoverageFloor(unittest.TestCase):
     ("Accepted credential: ftpuser:s3cr3t", "s3cr3t"),
     ("candidate service-user:s3cr3t/with/slash worked", "s3cr3t/with/slash"),
     ("accepted=admin:p@$$:w0rd!", "p@$$:w0rd!"),
+    # Digit-leading secrets. A guard written as "the secret does not start with
+    # a digit" reads as a reasonable way to spare ports, and it silently emptied
+    # this whole family — the five below all went out in plaintext while this
+    # class was green, because every case above happens to begin with a letter.
+    ("could not connect as dbuser:1SecretPass", "1SecretPass"),
+    ("admin:1Password! accepted", "1Password!"),
+    ("root:2024summer worked", "2024summer"),
+    ("user:007bond accepted", "007bond"),
+    ("backup:99RedBalloons accepted", "99RedBalloons"),
+  )
+
+  # The other half of the invariant: the narrowing exists to stop destroying
+  # these, and a fix for the family above must not take them back out.
+  MUST_STAY_INTACT = (
+    "endpoint https://app.test/api/records/99",
+    "service reachable at app.test:8443",
+    "health probe app.test:8443/health",
+    "Content-Type: application/json",
+    "PT-A01-01: IDOR on /records",
+    "observed at 12:04:33 UTC",
   )
 
   @staticmethod
@@ -881,6 +901,82 @@ class TestGrayboxRedactionCoverageFloor(unittest.TestCase):
           secret, described,
           "credential coverage dropped below the pre-branch floor",
         )
+
+  def test_the_narrowing_still_spares_what_it_was_written_for(self):
+    host = self._host()
+    for text in self.MUST_STAY_INTACT:
+      with self.subTest(text=text):
+        report = {
+          "service_info": {},
+          "graybox_results": {"443": {"_p": {"findings": [
+            {"title": "t", "description": text, "status": "vulnerable"},
+          ]}}},
+        }
+        out = host._redact_report(report)
+        described = out["graybox_results"]["443"]["_p"]["findings"][0]["description"]
+        self.assertEqual(
+          text, described,
+          "the redaction rule destroyed non-credential data again",
+        )
+
+
+class TestGrayboxLocationRedactionAtTheReportLayer(unittest.TestCase):
+  """A userinfo credential was masked in `evidence` and shipped in `url`.
+
+  `_redact_report` gained `_USERINFO_RE` for exactly this shape, but only walked
+  the text fields — so the same secret was masked in the sibling `evidence`
+  string and left intact one key over, in `url` and in the `affected_assets`
+  copy the PDF and the exports read.
+  """
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  def _redact(self, finding):
+    report = {
+      "service_info": {},
+      "graybox_results": {"443": {"_p": {"findings": [finding]}}},
+    }
+    out = self._host()._redact_report(report)
+    return out["graybox_results"]["443"]["_p"]["findings"][0]
+
+  def test_a_userinfo_secret_is_masked_in_every_location_copy(self):
+    secret = "supersecretpw"
+    out = self._redact({
+      "title": "t", "status": "vulnerable",
+      "url": f"https://admin:{secret}@app.test/x",
+      "evidence": [f"endpoint=https://admin:{secret}@app.test/x"],
+      "affected_assets": [{
+        "host": "app.test", "port": 443,
+        "url": f"https://admin:{secret}@app.test/x",
+        "parameter": None, "method": "GET",
+      }],
+    })
+    self.assertNotIn(secret, out["url"])
+    self.assertNotIn(secret, out["evidence"][0])
+    self.assertNotIn(secret, out["affected_assets"][0]["url"])
+    # The host survives: it is the one field saying which service was affected.
+    self.assertIn("app.test", out["affected_assets"][0]["url"])
+
+  def test_an_ordinary_location_survives_the_walk(self):
+    out = self._redact({
+      "title": "t", "status": "vulnerable",
+      "url": "https://app.test/api/records/99",
+      "affected_assets": [{
+        "host": "app.test", "port": 443,
+        "url": "https://app.test/api/records/99",
+        "parameter": "id", "method": "GET",
+      }],
+    })
+    self.assertEqual(out["url"], "https://app.test/api/records/99")
+    self.assertEqual(out["affected_assets"][0]["url"], "https://app.test/api/records/99")
+    self.assertEqual(out["affected_assets"][0]["parameter"], "id")
 
 
 if __name__ == '__main__':

@@ -136,6 +136,12 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.request_budget = RequestBudget(
       remaining=budget_total, total=budget_total,
     )
+    # Built before the client so redirect hops are throttled, not just budgeted.
+    self.safety = SafetyControls(
+      request_delay=job_config.scan_min_delay or None,
+      request_delay_max=job_config.scan_max_delay or None,
+      target_is_local=SafetyControls.is_local_target(target_url),
+    )
     self.http_client = GrayboxHttpClient(
       self.target_url,
       allowlist=getattr(job_config, "target_allowlist", None) or [],
@@ -149,14 +155,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       # consults the budget once per logical call, but the client follows up to
       # five redirects and those extra requests were counted by nobody.
       request_budget=self.request_budget,
+      safety=self.safety,
     )
 
     # Modules (composition)
-    self.safety = SafetyControls(
-      request_delay=job_config.scan_min_delay or None,
-      request_delay_max=job_config.scan_max_delay or None,
-      target_is_local=SafetyControls.is_local_target(target_url),
-    )
     self.auth = AuthManager(
       target_url=self.target_url,
       target_config=self.target_config,
