@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact, GrayboxFinding
 
@@ -348,3 +349,105 @@ class TestLocationDerivedFromEvidence(unittest.TestCase):
     b = self._emit(["endpoint=https://app.test/b"]).to_flat_finding(
       443, "https", "_p")
     self.assertNotEqual(a["finding_id"], b["finding_id"])
+
+
+class TestEvidenceArtifactProduction(unittest.TestCase):
+  """
+  `GrayboxEvidenceArtifact` was dead schema: zero constructions anywhere outside
+  tests. And even when populated it never reached the model — `to_flat_finding`
+  emits `evidence_artifacts` while `llm_input_builder` reads `evidence_items`,
+  which nothing produces for a graybox finding. The builder explicitly does not
+  forward the legacy `evidence` string ("raw probe output. Use evidence_items
+  instead"), so the LLM wrote its security narrative with **no evidence at all**.
+
+  Two stacked defects: an absent producer, and a key-name mismatch of the same
+  class as the `accepted` / `accepted_credentials` one.
+  """
+
+  def _probe(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    return probe
+
+  def _response(self, body="secret-free body", status=200, elapsed=0.25):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = body
+    resp.headers = {"Content-Type": "application/json"}
+    resp.url = "https://app.test/api/records/99"
+    resp.request = MagicMock()
+    resp.request.method = "GET"
+    resp.request.url = "https://app.test/api/records/99"
+    resp.request.headers = {"Accept": "application/json"}
+    resp.request.body = None
+    resp.elapsed = MagicMock()
+    resp.elapsed.total_seconds.return_value = elapsed
+    return resp
+
+  def _emit_with_response(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/api/records/99"],
+      response=self._response(**kwargs),
+    )
+    return probe.findings[0]
+
+  def test_the_triggering_response_becomes_an_evidence_artifact(self):
+    finding = self._emit_with_response()
+    self.assertTrue(finding.evidence_artifacts, "no artifact was produced")
+    artifact = finding.evidence_artifacts[0]
+    self.assertIn("GET", artifact.request_snapshot)
+    self.assertIn("200", artifact.response_snapshot)
+
+  def test_the_artifact_records_when_and_how_long(self):
+    artifact = self._emit_with_response(elapsed=0.25).evidence_artifacts[0]
+    self.assertTrue(artifact.captured_at, "no capture timestamp")
+    self.assertEqual(artifact.latency_ms, 250)
+
+  def test_the_artifact_carries_an_integrity_hash(self):
+    artifact = self._emit_with_response().evidence_artifacts[0]
+    self.assertEqual(len(artifact.content_sha256), 64)
+    # The same response hashes the same way; a different one does not.
+    other = self._emit_with_response(body="different body").evidence_artifacts[0]
+    self.assertNotEqual(artifact.content_sha256, other.content_sha256)
+
+  def test_the_snapshots_are_redacted(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    # Restore the real scrubber for this one: the artifact must not become a
+    # new way to archive what the scrubber removes elsewhere.
+    probe._scrub_for_emission = ProbeBase._scrub_for_emission.__get__(probe)
+    probe.target_config = None
+    resp = self._response()
+    resp.request.headers = {"Authorization": "Bearer sk-live-abcdefghijklmnop"}
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"], response=resp,
+    )
+    artifact = probe.findings[0].evidence_artifacts[0]
+    self.assertNotIn("sk-live-abcdefghijklmnop", artifact.request_snapshot)
+
+  def test_the_artifact_reaches_the_llm_under_the_key_it_reads(self):
+    flat = self._emit_with_response().to_flat_finding(443, "https", "_graybox_idor")
+    self.assertTrue(
+      flat.get("evidence_items"),
+      "the LLM input builder reads evidence_items and nothing produces it, so "
+      "the narrative is written with no evidence",
+    )
+    item = flat["evidence_items"][0]
+    self.assertEqual(item["kind"], "request_response")
+    self.assertTrue(item["caption"])
+
+  def test_emitting_without_a_response_is_unchanged(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"],
+    )
+    self.assertEqual(probe.findings[0].evidence_artifacts, [])

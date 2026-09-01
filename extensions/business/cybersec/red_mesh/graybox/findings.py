@@ -137,10 +137,16 @@ def _scrub_flat_finding(flat: dict, *, secret_field_names=()) -> dict:
       flat[key] = scrub_graybox_secrets(
         flat[key], secret_field_names=secret_field_names,
       )
-  if "evidence_artifacts" in flat and isinstance(flat["evidence_artifacts"], list):
-    flat["evidence_artifacts"] = scrub_graybox_secrets(
-      flat["evidence_artifacts"], secret_field_names=secret_field_names,
-    )
+  # Both evidence keys. `evidence_items` is the same payload re-keyed for the
+  # LLM input builder, and it was added here without being added to this list —
+  # so the artifacts were scrubbed while the copy handed to the model was not.
+  # A new field that carries target output has to be registered here or the
+  # storage-boundary scrubber silently does not cover it.
+  for key in ("evidence_artifacts", "evidence_items"):
+    if key in flat and isinstance(flat[key], list):
+      flat[key] = scrub_graybox_secrets(
+        flat[key], secret_field_names=secret_field_names,
+      )
   return flat
 
 
@@ -153,6 +159,12 @@ class GrayboxEvidenceArtifact:
   captured_at: str = ""
   raw_evidence_cid: str = ""
   sensitive: bool = False
+  # How long the triggering request took, and a hash over the captured
+  # request/response pair. The hash is evidence custody: it lets a reader check
+  # an archived snapshot is the one the probe saw, independently of the R1FS
+  # cid, which addresses the blob rather than this record.
+  latency_ms: int = 0
+  content_sha256: str = ""
 
   @classmethod
   def from_value(cls, value: Any) -> "GrayboxEvidenceArtifact":
@@ -166,6 +178,8 @@ class GrayboxEvidenceArtifact:
         captured_at=value.get("captured_at", "") or "",
         raw_evidence_cid=value.get("raw_evidence_cid", "") or "",
         sensitive=bool(value.get("sensitive", False)),
+        latency_ms=int(value.get("latency_ms") or 0),
+        content_sha256=value.get("content_sha256", "") or "",
       )
     if isinstance(value, str):
       return cls(summary=value)
@@ -312,6 +326,20 @@ class GrayboxFinding:
       "evidence": self._flat_evidence_summary(),
       "evidence_artifacts": [
         artifact.to_dict() for artifact in self._normalized_evidence_artifacts()
+      ],
+      # The same artifacts under the key the LLM input builder actually reads.
+      # It consumes `evidence_items` and deliberately does not forward the
+      # legacy `evidence` string ("raw probe output. Use evidence_items
+      # instead"), so with `evidence_artifacts` as the only producer the model
+      # received no evidence at all and wrote its narrative without any.
+      "evidence_items": [
+        {
+          "kind": "request_response",
+          "caption": artifact.summary,
+          "snippet": artifact.response_snapshot,
+          "cid": artifact.raw_evidence_cid,
+        }
+        for artifact in self._normalized_evidence_artifacts()
       ],
       "remediation": self.remediation,
       "confidence": confidence_map.get(self.status, "tentative"),

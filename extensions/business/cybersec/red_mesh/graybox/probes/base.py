@@ -8,7 +8,7 @@ sessions or credentials themselves.
 
 import requests
 
-from ..findings import GrayboxFinding
+from ..findings import GrayboxEvidenceArtifact, GrayboxFinding
 from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
 
@@ -42,6 +42,68 @@ def _location_from_evidence(evidence):
     if url is not None and parameter is not None:
       break
   return url, parameter
+
+
+_SNAPSHOT_MAX_CHARS = 2048
+
+
+def _artifact_from_response(response, scrub):
+  """Build a redacted evidence artifact from the response that triggered a finding.
+
+  `GrayboxEvidenceArtifact` was dead schema — zero constructions outside tests —
+  so a finding carried no request/response evidence at all. Both snapshots go
+  through the caller's scrubber before anything is retained: an artifact must
+  not become a new route for archiving what the scrubber removes elsewhere.
+  """
+  import hashlib
+  from datetime import datetime, timezone
+
+  if response is None:
+    return None
+  request = getattr(response, "request", None)
+  method = getattr(request, "method", "") or ""
+  url = getattr(request, "url", "") or getattr(response, "url", "") or ""
+  request_headers = dict(getattr(request, "headers", {}) or {})
+  request_body = getattr(request, "body", None)
+  status = getattr(response, "status_code", "")
+  response_headers = dict(getattr(response, "headers", {}) or {})
+  body = getattr(response, "text", "") or ""
+
+  request_snapshot = "\n".join(
+    [f"{method} {url}"]
+    + [f"{name}: {value}" for name, value in request_headers.items()]
+    + ([""] + [str(request_body)] if request_body else [])
+  )[:_SNAPSHOT_MAX_CHARS]
+  response_snapshot = "\n".join(
+    [f"HTTP {status}"]
+    + [f"{name}: {value}" for name, value in response_headers.items()]
+    + ["", body]
+  )[:_SNAPSHOT_MAX_CHARS]
+
+  request_snapshot = scrub(request_snapshot)
+  response_snapshot = scrub(response_snapshot)
+
+  latency_ms = 0
+  elapsed = getattr(response, "elapsed", None)
+  if elapsed is not None:
+    try:
+      latency_ms = int(round(float(elapsed.total_seconds()) * 1000))
+    except (TypeError, ValueError, AttributeError):
+      latency_ms = 0
+
+  # Hashed after scrubbing, so the digest describes what is actually retained.
+  digest = hashlib.sha256(
+    (request_snapshot + "\x00" + response_snapshot).encode("utf-8", "replace")
+  ).hexdigest()
+
+  return GrayboxEvidenceArtifact(
+    summary=f"{method} {url} -> HTTP {status}"[:_SNAPSHOT_MAX_CHARS],
+    request_snapshot=request_snapshot,
+    response_snapshot=response_snapshot,
+    captured_at=datetime.now(timezone.utc).isoformat(),
+    latency_ms=latency_ms,
+    content_sha256=digest,
+  )
 
 
 class ProbeBase:
@@ -501,7 +563,7 @@ class ProbeBase:
                        evidence, *, attack=None, evidence_artifacts=None,
                        replay_steps=None, remediation=None,
                        rollback_status="", url=None, parameter=None,
-                       method=None):
+                       method=None, response=None):
     """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default.
 
     ``rollback_status`` is set by `run_stateful` for stateful probes;
@@ -517,6 +579,14 @@ class ProbeBase:
     # token in its query string, and promoting it to a typed field must not
     # reintroduce what the scrubber just removed.
     derived_url, derived_parameter = _location_from_evidence(scrubbed_evidence)
+    artifacts = list(evidence_artifacts or [])
+    # Build one from the triggering response when the probe passes it, so the
+    # finding carries real request/response evidence rather than only a
+    # free-text summary. `evidence_artifacts` remains available for probes that
+    # construct their own.
+    built = _artifact_from_response(response, self._scrub_for_emission)
+    if built is not None:
+      artifacts.append(built)
     self.findings.append(GrayboxFinding(
       url=url or derived_url,
       parameter=parameter or derived_parameter,
@@ -529,7 +599,7 @@ class ProbeBase:
       cwe=list(cwe or []),
       attack=self._resolve_attack(scenario_id, attack),
       evidence=scrubbed_evidence,
-      evidence_artifacts=self._scrub_for_emission(list(evidence_artifacts or [])),
+      evidence_artifacts=self._scrub_for_emission(artifacts),
       replay_steps=self._scrub_for_emission(list(replay_steps or [])),
       remediation=self._scrub_for_emission(remediation or ""),
       rollback_status=rollback_status or "",
