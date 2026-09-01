@@ -34,7 +34,7 @@ from ..credential_redaction import (
 # nodes as two findings: `_stamp_worker_source` adds `worker_source`,
 # `observed_at` and `node_ip` before this runs, and cross-worker dedup is the
 # one thing this signature exists to do.
-_DEDUP_EXCLUDE_FIELDS = tuple(
+_DEDUP_EXCLUDE_FIELDS = frozenset(
   {"_source_worker_id", "_source_node_addr"} | set(_worker_attribution_fields())
 )
 
@@ -1002,11 +1002,20 @@ class _ReportMixin:
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
 
-    # Severity breakdown
-    findings_count = dict(Counter(f.get("severity", "INFO") for f in findings))
+    # Every counter in this object uses the same predicate, or the object
+    # contradicts itself: `total_findings` excluding coverage while the severity
+    # chart counted it produced a header saying one finding above a chart
+    # summing to eleven, in the same payload the PDF and the frontend read.
+    real_findings = [f for f in findings if not _is_coverage_result(f)]
 
-    # Top findings: CRITICAL + HIGH, sorted by severity then confidence, capped at 10
-    crit_high = [f for f in findings if f.get("severity") in ("CRITICAL", "HIGH")]
+    # Severity breakdown
+    findings_count = dict(Counter(f.get("severity", "INFO") for f in real_findings))
+
+    # Top findings: CRITICAL + HIGH, sorted by severity then confidence, capped
+    # at 10. An `inconclusive` scenario keeps its *declared* severity, so
+    # without the filter a scenario that concluded nothing was ranked into the
+    # customer-facing top-findings list as a HIGH.
+    crit_high = [f for f in real_findings if f.get("severity") in ("CRITICAL", "HIGH")]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
       self.CONFIDENCE_ORDER.get(f.get("confidence"), 9),
@@ -1050,7 +1059,7 @@ class _ReportMixin:
       total_services=self._count_services(agg.get("service_info", {})),
       # Findings, not scenario results: a graybox scan emits one entry per
       # scenario whatever the outcome, so `len(findings)` counted the tests run.
-      total_findings=sum(1 for f in findings if not _is_coverage_result(f)),
+      total_findings=len(real_findings),
       findings_count=findings_count if findings_count else None,
       top_findings=top_findings if top_findings else None,
       finding_timeline=finding_timeline if finding_timeline else None,

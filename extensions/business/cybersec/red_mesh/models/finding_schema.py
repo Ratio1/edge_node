@@ -146,20 +146,33 @@ class FlatFinding:
   # ground: it is what makes "the contract does not know this field" different
   # from "this field did not exist", which is the distinction the whitelists
   # erased.
-  extra: dict = field(default_factory=dict)
+  # `compare=False` because two findings with the same identity and different
+  # carrier contents are still the same finding — and because a dict field in
+  # the comparison set makes the whole dataclass unhashable.
+  extra: dict = field(default_factory=dict, compare=False)
 
   def to_dict(self) -> dict:
     """Round-trip back to the archived shape, losing nothing.
 
-    Only keys that were present survive: a producer that never set `remediation`
+    For an instance built by `flat_finding_from_dict`, only the keys the source
+    payload actually carried survive: a producer that never set `remediation`
     must not gain an empty one, or the two producers' outputs stop being
     comparable and every consumer sees fields nobody emitted.
+
+    An instance constructed directly has no such source, so `_present` is empty
+    — and filtering on it returned `{}` for every directly built `FlatFinding`,
+    silently, from the method whose docstring promises to lose nothing. A direct
+    construction emits everything that is not still at its default instead.
     """
     out: dict[str, Any] = {}
     for name in _KNOWN_FIELDS:
-      if name in self._present:
-        value = getattr(self, name)
-        out[name] = list(value) if isinstance(value, tuple) else value
+      value = getattr(self, name)
+      if self._present:
+        if name not in self._present:
+          continue
+      elif value in ((), "", None):
+        continue
+      out[name] = list(value) if isinstance(value, tuple) else value
     out.update(self.extra)
     return out
 

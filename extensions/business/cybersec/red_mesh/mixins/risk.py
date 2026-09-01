@@ -64,145 +64,15 @@ def normalize_risk_score(raw_total):
 class _RiskScoringMixin:
   """Risk scoring and findings extraction methods for PentesterApi01Plugin."""
 
-  def _compute_risk_score(self, aggregated_report):
-    """
-    Compute a 0-100 risk score from an aggregated scan report.
-
-    The score combines four components:
-    A. Finding severity (weighted by confidence)
-    B. Open ports (diminishing returns)
-    C. Attack surface breadth (distinct protocols)
-    D. Default credentials penalty
-
-    Parameters
-    ----------
-    aggregated_report : dict
-      Aggregated report with service_info, web_tests_info, correlation_findings,
-      open_ports, and port_protocols.
-
-    Returns
-    -------
-    dict
-      ``{"score": int, "breakdown": dict}``
-    """
-    import math
-
-    findings_score = 0.0
-    finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-    cred_count = 0
-
-    def process_findings(findings_list):
-      nonlocal findings_score, cred_count
-      for finding in findings_list:
-        if not isinstance(finding, dict):
-          continue
-        severity = finding.get("severity", "INFO").upper()
-        # Normalised here and stored normalised below, so the score and the
-        # archived value cannot disagree. The old `.get(confidence, 0.5)`
-        # scored an unrecognised value as `tentative` while the finding kept the
-        # unrecognised string, and nothing said the value was not understood.
-        confidence, _recognised = _normalize_confidence(finding.get("confidence", "firm"))
-        weight = RISK_SEVERITY_WEIGHTS.get(severity, 0)
-        multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(confidence, 0.5)
-        findings_score += weight * multiplier
-        if severity in finding_counts:
-          finding_counts[severity] += 1
-        title = finding.get("title", "")
-        if isinstance(title, str) and "default credential accepted" in title.lower():
-          cred_count += 1
-
-    # A. Iterate service_info findings
-    service_info = aggregated_report.get("service_info", {})
-    for port_key, probes in service_info.items():
-      if not isinstance(probes, dict):
-        continue
-      for probe_name, probe_data in probes.items():
-        if not isinstance(probe_data, dict):
-          continue
-        process_findings(probe_data.get("findings", []))
-
-    # A. Iterate web_tests_info findings
-    web_tests_info = aggregated_report.get("web_tests_info", {})
-    for port_key, tests in web_tests_info.items():
-      if not isinstance(tests, dict):
-        continue
-      for test_name, test_data in tests.items():
-        if not isinstance(test_data, dict):
-          continue
-        process_findings(test_data.get("findings", []))
-
-    # A. Iterate correlation_findings
-    correlation_findings = aggregated_report.get("correlation_findings", [])
-    if isinstance(correlation_findings, list):
-      process_findings(correlation_findings)
-
-    # A. Iterate graybox_results — uses GrayboxFinding.to_flat_finding()
-    from ..graybox.findings import (
-      FindingRedactionContext,
-      GrayboxFinding as _GF,
-    )
-    from .report import _configured_graybox_secret_names_from_report
-    graybox_secret_names = _configured_graybox_secret_names_from_report(
-      aggregated_report,
-    )
-    graybox_results = aggregated_report.get("graybox_results", {})
-    with FindingRedactionContext(secret_field_names=graybox_secret_names):
-      for port_key, probes in graybox_results.items():
-        if not isinstance(probes, dict):
-          continue
-        for probe_name, probe_data in probes.items():
-          if not isinstance(probe_data, dict):
-            continue
-          for finding_dict in probe_data.get("findings", []):
-            if not isinstance(finding_dict, dict):
-              continue
-            try:
-              flat = _GF.flat_from_dict(finding_dict, 0, "unknown", probe_name)
-            except (TypeError, KeyError, ValueError):
-              continue
-            weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
-            multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
-            findings_score += weight * multiplier
-            if flat["severity"] in finding_counts:
-              finding_counts[flat["severity"]] += 1
-
-    # B. Open ports — diminishing returns: 15 × (1 - e^(-ports/8))
-    open_ports = aggregated_report.get("open_ports", [])
-    nr_ports = len(open_ports) if isinstance(open_ports, list) else 0
-    open_ports_score = 15.0 * (1.0 - math.exp(-nr_ports / 8.0))
-
-    # C. Attack surface breadth — distinct protocols: 10 × (1 - e^(-protocols/4))
-    port_protocols = aggregated_report.get("port_protocols", {})
-    nr_protocols = len(set(port_protocols.values())) if isinstance(port_protocols, dict) else 0
-    breadth_score = 10.0 * (1.0 - math.exp(-nr_protocols / 4.0))
-
-    # D. Default credentials penalty
-    credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
-
-    # Raw total
-    raw_total = findings_score + open_ports_score + breadth_score + credentials_penalty
-
-    # Normalize to 0-100 (log-compressed; see normalize_risk_score)
-    score = normalize_risk_score(raw_total)
-
-    return {
-      "score": score,
-      "breakdown": {
-        "findings_score": round(findings_score, 1),
-        "open_ports_score": round(open_ports_score, 1),
-        "breadth_score": round(breadth_score, 1),
-        "credentials_penalty": credentials_penalty,
-        "raw_total": round(raw_total, 1),
-        "finding_counts": finding_counts,
-      },
-    }
-
   def _compute_risk_and_findings(self, aggregated_report):
     """
     Compute risk score AND extract flat findings in a single walk.
 
-    Extends _compute_risk_score to also produce a flat list of enriched
-    findings from the nested service_info/web_tests_info/correlation structure.
+    The single scoring implementation. A second copy, `_compute_risk_score`,
+    existed with no non-test caller and had already drifted: it received the
+    confidence normalisation but not the coverage exclusion, so the two answered
+    differently for the same report. That is exactly how the four signature
+    implementations drifted, so it was deleted rather than kept in step.
 
     Parameters
     ----------
@@ -349,15 +219,26 @@ class _RiskScoringMixin:
       # had, reading a raw severity string where `Finding.compute_signature`
       # read `Severity.value`.
       item["probe"] = probe_name
-      # Stamped once, never recomputed. Identity is computed here, *before* the
-      # report layer redacts `title`, `description`, `evidence`, `url` and
-      # `parameter` — so a consumer that re-derived it from the stored fields
-      # would get a different value for the same finding and read it as a new
-      # one. Preserving what is already present is what makes these values
-      # comparable across the redaction boundary at all.
-      item["dedup_key"] = item.get("dedup_key") or _dedup_key(item)
-      item["content_hash"] = item.get("content_hash") or _content_hash(item)
-      item["finding_signature"] = item.get("finding_signature") or item["content_hash"]
+      # The probe-time signature wins over anything computed here.
+      #
+      # This walk runs on opposite sides of `_redact_report` depending on the
+      # entry point — `services/finalization.py` before it, the manual-analysis
+      # path in `pentester_api_01.py` after it — so anything derived from the
+      # item in hand is not stable across them. That bites hardest for a
+      # locationless blackbox finding, whose dedup key falls back to the title,
+      # which is precisely what redaction rewrites: the same finding came out
+      # with two different ids depending on which caller asked.
+      #
+      # `enrich_finding_for_probe` stamps `finding_signature` at probe time, on
+      # unredacted values, and nothing downstream recomputes it. Carrying it is
+      # what made identity redaction-invariant before this change, and it still
+      # is. `dedup_key` is computed only for a finding that arrives unstamped.
+      carried = item.get("finding_signature")
+      item["dedup_key"] = (
+        item.get("dedup_key") or (carried[:16] if carried else _dedup_key(item))
+      )
+      item["content_hash"] = item.get("content_hash") or carried or _content_hash(item)
+      item["finding_signature"] = carried or item["content_hash"]
       item["finding_id"] = item.get("finding_id") or item["dedup_key"]
       item["port"] = port
       item["protocol"] = protocol

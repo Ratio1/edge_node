@@ -114,5 +114,144 @@ class TestBlackboxFindingsAreUnaffected(unittest.TestCase):
     )
 
 
+class TestEveryCounterAgreesWithEveryOther(unittest.TestCase):
+  """The risk breakdown was pinned; the three consumer surfaces were not.
+
+  An independent mutation run showed `is_coverage_result -> return False`, and
+  reverting each of the three consumer-side count fixes, all left the full suite
+  green. The predicate the whole of B5 rests on was mutant-tolerant: the tests
+  named the UI and LLM defect in a docstring and asserted only on
+  `risk["breakdown"]`.
+
+  What that missed, measured on 1 vulnerable + 9 not_vulnerable + 1
+  inconclusive: `total_findings: 1` above a severity chart summing to 11, with
+  the inconclusive scenario ranked into the customer-facing top-findings list as
+  a HIGH.
+  """
+
+  def _findings(self):
+    findings = [{
+      "title": "real", "severity": "HIGH", "confidence": "certain",
+      "status": "vulnerable", "finding_id": "a" * 16,
+    }]
+    findings += [{
+      "title": f"clean {i}", "severity": "INFO", "confidence": "firm",
+      "status": "not_vulnerable", "finding_id": f"b{i:015d}",
+    } for i in range(9)]
+    findings.append({
+      "title": "undecided", "severity": "HIGH", "confidence": "tentative",
+      "status": "inconclusive", "finding_id": "c" * 16,
+    })
+    return findings
+
+  def _aggregate(self):
+    """The real `_compute_ui_aggregate`, not a reimplementation of its filter.
+
+    The first version of these two tests recomputed the predicate in the test
+    body and asserted on that — which passes whatever the production code does,
+    the exact tautology this whole review round was about.
+    """
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      # `_count_services` lives on a sibling mixin; the real plugin composes
+      # both. Stubbed rather than reimplemented — this test is about counting
+      # findings, and inventing a service count here would only be noise.
+      _count_services = staticmethod(lambda *_args, **_kwargs: 0)
+
+    passes = [{"findings": self._findings()}]
+    agg = {"open_ports": [443], "service_info": {}, "port_protocols": {"443": "https"}}
+    return MockHost()._compute_ui_aggregate(passes, agg)
+
+  def test_the_ui_aggregate_does_not_contradict_itself(self):
+    ui = self._aggregate()
+    self.assertEqual(ui.total_findings, 1)
+    self.assertEqual(
+      sum((ui.findings_count or {}).values()), ui.total_findings,
+      "the header says one number and the severity chart says another, in the "
+      "same object the PDF and the frontend read",
+    )
+
+  def test_the_top_findings_list_excludes_a_scenario_that_concluded_nothing(self):
+    titles = [f.get("title") for f in (self._aggregate().top_findings or [])]
+    self.assertEqual(titles, ["real"])
+
+  def test_the_llm_scan_summary_is_internally_consistent(self):
+    from extensions.business.cybersec.red_mesh.llm_input_builder import build_llm_input
+
+    payload = build_llm_input(
+      findings=self._findings(), aggregated_report={"target": "app.test"},
+    )
+    summary = payload.scan_summary
+    self.assertEqual(summary["total_findings"], 1)
+    self.assertEqual(summary["included_findings"], 1)
+    self.assertEqual(summary["truncated_findings"], 0)
+    self.assertEqual(
+      summary["included_findings"] + summary["truncated_findings"],
+      summary["total_findings"],
+      "the model is told one total and handed a different number",
+    )
+
+  def test_the_llm_agent_summary_counts_findings_not_scenarios(self):
+    from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import (
+      _RedMeshLlmAgentMixin,
+    )
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      pass
+
+    summary = MockHost()._build_llm_findings_summary(
+      {"findings": self._findings()},
+    )
+    self.assertEqual(summary["total_findings"], 1)
+    self.assertEqual(summary["by_severity"], {"HIGH": 1})
+
+
+class TestTheEgressCanTellThemApart(unittest.TestCase):
+  """Coverage results leave the platform through the same event path.
+
+  `services/finalization.py` emits `redmesh.finding.created` for every entry in
+  the flat list, and the payload carried no `status` — so a SIEM could not
+  distinguish a scenario that concluded nothing from a vulnerability. Because
+  `inconclusive` keeps its *declared* severity, one arrived as a HIGH
+  `finding.created` while the platform's own counts said there were no HIGH
+  findings: two of our own surfaces disagreeing in front of the customer.
+  """
+
+  def _payload(self, finding):
+    from extensions.business.cybersec.red_mesh.services.event_builder import (
+      build_finding_event,
+    )
+    event = build_finding_event(
+      job_specs={"job_id": "job-1", "target": "app.test"},
+      finding=finding,
+      event_action="created",
+      hmac_secret="test-secret",
+    )
+    return (event or {}).get("finding") or {}
+
+  def test_a_coverage_result_says_so(self):
+    payload = self._payload({
+      "finding_id": "c" * 16, "title": "undecided", "severity": "HIGH",
+      "confidence": "tentative", "status": "inconclusive",
+    })
+    self.assertEqual(payload.get("status"), "inconclusive")
+    self.assertTrue(payload.get("is_coverage_result"))
+
+  def test_a_real_finding_is_not_marked_as_coverage(self):
+    payload = self._payload({
+      "finding_id": "a" * 16, "title": "real", "severity": "HIGH",
+      "confidence": "certain", "status": "vulnerable",
+    })
+    self.assertFalse(payload.get("is_coverage_result"))
+
+  def test_a_statusless_blackbox_finding_is_not_marked_as_coverage(self):
+    payload = self._payload({
+      "finding_id": "d" * 16, "title": "Weak TLS", "severity": "MEDIUM",
+      "confidence": "certain",
+    })
+    self.assertFalse(payload.get("is_coverage_result"))
+
+
 if __name__ == "__main__":
   unittest.main()

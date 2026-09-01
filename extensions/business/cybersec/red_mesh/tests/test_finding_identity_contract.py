@@ -325,6 +325,55 @@ class TestIdentitySurvivesRedaction(unittest.TestCase):
     self.assertEqual(flat["content_hash"], "f" * 64)
     self.assertEqual(flat["finding_id"], "0123456789abcdef")
 
+  def test_a_blackbox_finding_keeps_its_id_across_the_redaction_boundary(self):
+    """The walk runs on both sides of `_redact_report` depending on the caller.
+
+    `services/finalization.py` flattens before redaction; the manual-analysis
+    path in `pentester_api_01.py` flattens after it. Anything derived from the
+    item in hand therefore differs between them — and for a locationless
+    blackbox finding the dedup key falls back to the title, which is exactly
+    what redaction rewrites. The probe-time signature is carried instead.
+    """
+    import copy
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+
+    stamped = probe_result(
+      findings=[Finding(
+        severity=Severity.HIGH,
+        title="Default credentials accepted: admin:hunter2",
+        description="d",
+      )],
+      probe_id="_service_info_http",
+    )
+
+    def flatten(probe_output):
+      from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+      class MockHost(_RiskScoringMixin):
+        pass
+
+      _risk, flat = MockHost()._compute_risk_and_findings({
+        "target": "app.test",
+        "port_protocols": {"443": "https"},
+        "service_info": {"443": {"_service_info_http": probe_output}},
+      })
+      return flat[0]
+
+    before = flatten(copy.deepcopy(stamped))
+    redacted = copy.deepcopy(stamped)
+    # What `_redact_report` does: rewrite the text, leave the signature alone.
+    redacted["findings"][0]["title"] = "Default credentials accepted: admin:***"
+    after = flatten(redacted)
+
+    self.assertEqual(
+      before["finding_id"], after["finding_id"],
+      "the same finding got two ids depending on which side of redaction it "
+      "was flattened on",
+    )
+    self.assertEqual(before["finding_signature"], after["finding_signature"])
+
   def test_a_persisted_graybox_finding_keeps_the_identity_it_was_stamped_with(self):
     from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 

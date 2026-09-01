@@ -12,6 +12,7 @@ from ..models.event_schema import (
 )
 from ..credential_redaction import redact_credential_text
 from .event_redaction import redact_event_payload, stable_hmac_pseudonym
+from ..models.finding_schema import is_coverage_result as _is_coverage_result
 
 
 DEFAULT_PRODUCER_NAME = "PENTESTER_API_01"
@@ -427,6 +428,13 @@ def build_finding_event(
     "triage_state": finding.get("triage_state"),
     "fingerprint": finding.get("fingerprint") or finding.get("finding_id"),
     "evidence": redact_credential_text(finding.get("evidence")),
+    # A coverage result — a scenario that ran and found nothing, or could not
+    # decide — is emitted through this same path, and without `status` a SIEM
+    # had no way to tell it from a vulnerability. `inconclusive` keeps its
+    # *declared* severity, so one arrived as a HIGH `finding.created` while the
+    # platform's own counts said there were no HIGH findings.
+    "status": finding.get("status") or "",
+    "is_coverage_result": _is_coverage_result(finding),
   }
   return build_redmesh_event(
     event_type=f"redmesh.finding.{event_action}",

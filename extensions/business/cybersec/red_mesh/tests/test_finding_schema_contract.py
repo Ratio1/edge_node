@@ -129,6 +129,31 @@ class TestTheRoundTripLosesNothing(unittest.TestCase):
     with self.assertRaises(Exception):
       finding.severity = "LOW"      # type: ignore[misc]
     self.assertIsInstance(finding, FlatFinding)
+    # Actually hashable, not just named so: `extra` is a dict, and leaving it in
+    # the comparison set made every instance unhashable while this test passed.
+    self.assertIsInstance(hash(finding), int)
+
+  def test_a_directly_constructed_finding_serialises_its_fields(self):
+    """`to_dict` filtered on the source payload's key set, which is empty for a
+    direct construction — so it returned `{}` from the method whose docstring
+    promises to lose nothing, silently, for the API B1 tells consumers to use.
+    """
+    finding = FlatFinding(
+      finding_id="0123456789abcdef", title="Weak TLS", severity="MEDIUM",
+      confidence="certain", probe="_service_info_ssl", category="service",
+    )
+    payload = finding.to_dict()
+    self.assertEqual(payload["title"], "Weak TLS")
+    self.assertEqual(payload["severity"], "MEDIUM")
+    self.assertEqual(payload["schema"], REDMESH_FINDING_SCHEMA)
+    self.assertEqual(validate_flat_finding(payload), [])
+
+  def test_a_directly_constructed_finding_does_not_invent_empty_fields(self):
+    finding = FlatFinding(
+      finding_id="0123456789abcdef", title="t", severity="LOW",
+      confidence="firm", probe="_p", category="service",
+    )
+    self.assertNotIn("remediation", finding.to_dict())
 
 
 class TestBothProducersEmitTheContract(unittest.TestCase):

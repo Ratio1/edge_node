@@ -210,8 +210,15 @@ def build_llm_input(
     conf = str(f.get("confidence", "")).lower()
     return (severity_rank.get(sev, 99), conf_rank.get(conf, 9))
 
-  finding_dicts.sort(key=_key)
-  truncated = finding_dicts[:max_findings]
+  # Coverage results are dropped before sorting and capping, not counted around
+  # afterwards. Two reasons: `_sanitize_finding` does not carry `status`, so the
+  # predicate cannot be applied to its output at all; and a scenario that
+  # concluded nothing was competing for one of the `max_findings` slots against
+  # real findings, on a declared severity it kept because only `not_vulnerable`
+  # is downgraded to INFO.
+  real_findings = [f for f in finding_dicts if not _is_coverage_result(f)]
+  real_findings.sort(key=_key)
+  truncated = real_findings[:max_findings]
 
   out_findings = [_sanitize_finding(f) for f in truncated]
 
@@ -219,11 +226,11 @@ def build_llm_input(
     engagement_summary=_summarize_engagement(engagement),
     scan_summary=_summarize_scan(
       aggregated_report,
-      # Same rule as the UI aggregate. The model was told a clean scan had
-      # forty findings and wrote its narrative accordingly.
-      total_findings=sum(1 for f in finding_dicts if not _is_coverage_result(f)),
+      # All three from one list, so they cannot disagree. Fixing only
+      # `total_findings` told the model there was one finding and handed it ten.
+      total_findings=len(real_findings),
       included_findings=len(out_findings),
-      truncated_findings=len(finding_dicts) - len(out_findings),
+      truncated_findings=len(real_findings) - len(out_findings),
     ),
     findings=out_findings,
   )
@@ -357,8 +364,12 @@ def _sanitize_finding(f: dict) -> dict:
     "tags": _sanitize_list(f.get("tags"), MAX_TAGS_PER_FINDING, 32),
     "affected_assets": _sanitize_assets(f.get("affected_assets")),
     "evidence_items": _sanitize_evidence(f.get("evidence_items")),
-    # NOTE: legacy `evidence: str` field is *not* forwarded — it's
-    # raw probe output. Use evidence_items instead (Phase 1 schema).
+    # NOTE: the legacy `evidence: str` field is not forwarded *from here*.
+    # `mixins/risk.py` promotes it into an `evidence_items` entry at the
+    # normaliser when a blackbox probe supplied no structured evidence, so it
+    # arrives through the sanitised path above rather than being dropped. Before
+    # that, this policy meant blackbox findings reached the model with no
+    # evidence at all, because nothing populated `evidence_items` for them.
   }
   return out
 

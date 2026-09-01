@@ -24,7 +24,10 @@ from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Any
 
-from .models.finding_identity import content_hash as _content_hash
+from .models.finding_identity import (
+  content_hash as _content_hash,
+  parse_cwe_list as _parse_cwe_list,
+)
 
 
 class Severity(str, Enum):
@@ -283,9 +286,12 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
 
   cwe_values = _normalize_cwe_values(f.cwe)
   if not cwe_values and f.cwe_id:
-    parsed = _parse_cwe_id(f.cwe_id)
-    if parsed:
-      cwe_values = (parsed,)
+    # The joined display form parses here too. The single-value parser this
+    # replaced returned 0 for `"CWE-639, CWE-862"`, so the lookup fell through to
+    # the probe registry's `default_cwe` and stamped the finding with *that* —
+    # a finding carrying `cwe_id: "CWE-639, CWE-862"` and `cwe: (200,)`, wrong
+    # rather than merely absent, all the way to the archive and the exports.
+    cwe_values = tuple(_parse_cwe_list(f.cwe_id))
 
   owasp_values = tuple(x for x in f.owasp_top10 if x)
   if not owasp_values and f.owasp_id:
@@ -384,19 +390,6 @@ def _normalize_cwe_values(values) -> tuple[int, ...]:
     if parsed > 0 and parsed not in out:
       out.append(parsed)
   return tuple(out)
-
-
-def _parse_cwe_id(value: str) -> int:
-  if not isinstance(value, str):
-    return 0
-  cleaned = value.strip().upper()
-  if cleaned.startswith("CWE-"):
-    cleaned = cleaned[4:]
-  try:
-    parsed = int(cleaned)
-  except (TypeError, ValueError):
-    return 0
-  return parsed if parsed > 0 else 0
 
 
 def _merge_unique(existing, extra) -> tuple[str, ...]:

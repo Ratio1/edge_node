@@ -681,7 +681,12 @@ class TestLaunchValidation(unittest.TestCase):
 class TestRiskScoreGraybox(unittest.TestCase):
 
   def test_risk_score_includes_graybox(self):
-    """_compute_risk_score also walks graybox_results."""
+    """The scoring walk covers graybox_results, not just service_info.
+
+    Repointed from `_compute_risk_score`, a second scoring implementation with
+    no non-test caller that had drifted from this one — it kept this test alive
+    while answering differently for the same report.
+    """
     finding = GrayboxFinding(
       scenario_id="PT-A01-01",
       title="IDOR",
@@ -691,7 +696,7 @@ class TestRiskScoreGraybox(unittest.TestCase):
     )
     report = _make_graybox_report([finding.to_dict()])
     host = _make_mixin()
-    result = host._compute_risk_score(report)
+    result, _flat = host._compute_risk_and_findings(report)
     # Should have non-zero findings_score
     self.assertGreater(result["breakdown"]["findings_score"], 0)
     self.assertGreater(result["breakdown"]["finding_counts"]["HIGH"], 0)
