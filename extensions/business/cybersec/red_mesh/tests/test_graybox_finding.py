@@ -611,3 +611,60 @@ class TestEvidenceEnrichmentNeverLosesTheFinding(unittest.TestCase):
     finding = self._emit(MagicMock())[0]
     self.assertEqual(finding.title, "IDOR")
     self.assertEqual(finding.url, "https://app.test/x")
+
+
+class TestFindingReferenceUrls(unittest.TestCase):
+  """
+  A graybox finding carried an OWASP category and CWE ids but no reference URLs,
+  and `to_flat_finding` emitted no `references` key at all — which the LLM input
+  builder reads, alongside the PDF and the exports. A reader got "A01:2021" with
+  nowhere to go.
+
+  URL construction was already duplicated in three places (misp_export,
+  stix_export, tls.py) in three slightly different forms, so this derives from
+  the shared category table instead of adding a fourth copy.
+  """
+
+  def _finding(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    base = dict(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021", cwe=["CWE-639"],
+    )
+    base.update(kwargs)
+    return GrayboxFinding(**base)
+
+  def test_the_owasp_url_is_the_canonical_one(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    urls = reference_urls("A01:2021", ())
+    self.assertIn("https://owasp.org/Top10/A01_2021-Broken_Access_Control/", urls)
+
+  def test_the_cwe_url_is_the_canonical_one(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    urls = reference_urls("", ["CWE-639"])
+    self.assertIn("https://cwe.mitre.org/data/definitions/639.html", urls)
+
+  def test_a_finding_carries_its_references(self):
+    flat = self._finding().to_flat_finding(443, "https", "_graybox_idor")
+    refs = flat.get("references")
+    self.assertTrue(refs, "the flat finding carries no references")
+    self.assertTrue(any("owasp.org" in r for r in refs))
+    self.assertTrue(any("cwe.mitre.org/data/definitions/639" in r for r in refs))
+
+  def test_multiple_cwes_each_get_a_url(self):
+    flat = self._finding(cwe=["CWE-639", "CWE-862"]).to_flat_finding(
+      443, "https", "_graybox_idor")
+    refs = flat["references"]
+    self.assertTrue(any("639.html" in r for r in refs))
+    self.assertTrue(any("862.html" in r for r in refs))
+
+  def test_unknown_or_absent_ids_produce_no_url(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    self.assertEqual(reference_urls("", ()), [])
+    self.assertEqual(reference_urls("A99:2021", ()), [])
+    self.assertEqual(reference_urls("", ["not-a-cwe"]), [])
+
+  def test_references_are_deduplicated_and_ordered(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    urls = reference_urls("A01:2021", ["CWE-639", "CWE-639"])
+    self.assertEqual(len(urls), len(set(urls)))

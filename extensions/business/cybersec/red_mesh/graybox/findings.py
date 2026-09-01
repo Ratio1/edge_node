@@ -23,6 +23,8 @@ import contextvars
 from dataclasses import dataclass, asdict, field
 from typing import Any
 
+from ..references import reference_urls as _reference_urls
+
 
 # ── Centralised secret scrubber (Subphase 1.6 commit #2) ────────────────
 
@@ -342,6 +344,11 @@ class GrayboxFinding:
         for artifact in self._normalized_evidence_artifacts()
       ],
       "remediation": self.remediation,
+      # Canonical documentation links for the category and weaknesses. The flat
+      # finding carried none, so a reader saw "A01:2021" with nowhere to go —
+      # and `references` is a key the LLM input builder, the PDF and the
+      # exports all read.
+      "references": _reference_urls(self.owasp, self.cwe),
       "confidence": confidence_map.get(self.status, "tentative"),
       "port": port,
       "protocol": protocol,
