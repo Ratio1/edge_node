@@ -278,7 +278,14 @@ class GrayboxHttpClient:
     gateway_api_key="",
     gateway_bearer_token="",
     gateway_bearer_refresh_token="",
+    request_budget=None,
+    safety=None,
   ):
+    # The shared per-scan RequestBudget, so redirect hops can be charged where
+    # they are actually issued. Optional: legacy callers and tests construct the
+    # client without one and are unaffected.
+    self._request_budget = request_budget
+    self._safety = safety
     self.target_url = target_url.rstrip("/")
     self.scopes = path_scopes_from_allowlist(target_url, allowlist)
     discovery = getattr(target_config, "discovery", None)
@@ -411,6 +418,9 @@ class GrayboxHttpClient:
 
   def request(self, session, method, url, **kwargs):
     allow_redirects = bool(kwargs.pop("allow_redirects", False))
+    # Cleanup and revert traffic is exempt: budget exhaustion must never prevent
+    # a rollback, which is the existing contract of ProbeBase.cleanup_budget.
+    budget_exempt = bool(kwargs.pop("budget_exempt", False))
     safe_url = self.validate_url(url)
     kwargs = self._with_protected_gateway_auth(kwargs)
     if self._protected_params:
@@ -419,7 +429,19 @@ class GrayboxHttpClient:
       return session.request(method, safe_url, allow_redirects=False, **kwargs)
     current_url = safe_url
     response = None
-    for _ in range(5):
+    for hop in range(5):
+      # Charge every hop *after* the first. A probe consults the shared budget
+      # once per logical call, so the first request is already paid for;
+      # charging it again would double-count every ordinary request. The hops
+      # were charged to nobody at all — measured, one redirecting call issued
+      # five real requests against a single consume, which let a target that
+      # simply redirects push actual traffic to five times the configured cap
+      # while `budget_remaining` reported the cap was being respected.
+      if hop and not budget_exempt and self._request_budget is not None:
+        if not self._request_budget.consume(1):
+          return response
+        if self._safety is not None:
+          self._safety.throttle()
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
       if response.status_code not in (301, 302, 303, 307, 308):
         return response

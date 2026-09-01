@@ -145,6 +145,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       gateway_bearer_refresh_token=getattr(
         job_config, "gateway_bearer_refresh_token", "",
       ) or "",
+      # So redirect hops are charged where they are actually issued. A probe
+      # consults the budget once per logical call, but the client follows up to
+      # five redirects and those extra requests were counted by nobody.
+      request_budget=self.request_budget,
     )
 
     # Modules (composition)

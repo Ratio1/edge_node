@@ -352,5 +352,83 @@ class TestRequestUrlBasePathMatrix(unittest.TestCase):
       normalize_request_url("https://h/app", "../../etc/passwd")
 
 
+class TestRedirectHopBudgetAccounting(unittest.TestCase):
+  """
+  A probe consults the shared budget once per logical call, then
+  `GrayboxHttpClient.request` follows up to five redirects — each a real HTTP
+  request that nobody counted. Measured: one redirecting call issued 5 requests
+  against a single consume, so `budget_remaining` over-reported by 4 and the cap
+  that exists to stop the scanner DoSing a target could be exceeded five-fold by
+  a target that simply redirects.
+
+  Only the *extra* hops are charged here. The probe's own consume covers the
+  first request, so charging it again would double-count every ordinary call.
+  """
+
+  def _redirecting_session(self, hops):
+    calls = {"n": 0}
+    def fake_request(method, url, **kwargs):
+      calls["n"] += 1
+      resp = MagicMock()
+      if calls["n"] <= hops:
+        resp.status_code = 302
+        resp.headers = {"Location": f"/hop{calls['n']}"}
+      else:
+        resp.status_code = 200
+        resp.headers = {}
+      return resp
+    session = MagicMock()
+    session.request.side_effect = fake_request
+    return session, calls
+
+  def test_every_redirect_hop_is_charged_to_the_budget(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    budget = RequestBudget(remaining=10, total=10)
+    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    session, calls = self._redirecting_session(hops=4)
+    client.request(session, "GET", "https://h/start", allow_redirects=True)
+    # 5 real requests: the first plus 4 hops. The probe would have consumed the
+    # first, so the client charges the 4 extra.
+    self.assertEqual(calls["n"], 5)
+    self.assertEqual(budget.remaining, 10 - 4)
+
+  def test_a_chain_stops_when_the_budget_runs_out(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    budget = RequestBudget(remaining=2, total=10)
+    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    session, calls = self._redirecting_session(hops=4)
+    client.request(session, "GET", "https://h/start", allow_redirects=True)
+    # First request, then only as many hops as the budget covers.
+    self.assertEqual(calls["n"], 3)
+    self.assertEqual(budget.remaining, 0)
+    self.assertGreaterEqual(budget.exhausted_count, 1)
+
+  def test_a_non_redirecting_call_is_not_charged(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    budget = RequestBudget(remaining=10, total=10)
+    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    session, calls = self._redirecting_session(hops=0)
+    client.request(session, "GET", "https://h/start", allow_redirects=True)
+    self.assertEqual(calls["n"], 1)
+    self.assertEqual(budget.remaining, 10, "the probe already paid for this one")
+
+  def test_the_cleanup_path_is_exempt(self):
+    # Budget exhaustion must never prevent a revert, which is the existing
+    # contract of ProbeBase.cleanup_budget.
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    budget = RequestBudget(remaining=0, total=10)
+    client = GrayboxHttpClient("https://h", allowlist=["h"], request_budget=budget)
+    session, calls = self._redirecting_session(hops=2)
+    client.request(session, "GET", "https://h/revert", allow_redirects=True,
+                   budget_exempt=True)
+    self.assertEqual(calls["n"], 3, "a revert was blocked by an exhausted budget")
+
+  def test_it_works_without_a_budget_configured(self):
+    client = GrayboxHttpClient("https://h", allowlist=["h"])
+    session, calls = self._redirecting_session(hops=2)
+    client.request(session, "GET", "https://h/start", allow_redirects=True)
+    self.assertEqual(calls["n"], 3)
+
+
 if __name__ == "__main__":
   unittest.main()
