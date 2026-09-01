@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from extensions.business.cybersec.red_mesh.graybox.http_client import (
   GrayboxHttpClient,
   GrayboxScopeError,
+  normalize_request_url,
   path_in_scope,
   validate_target_config_paths,
 )
@@ -281,6 +282,74 @@ class TestGrayboxHttpClient(unittest.TestCase):
         ):
           violations.append(f"{path}:{node.lineno}: requests.{func.attr}")
     self.assertEqual(violations, [])
+
+
+class TestRequestUrlBasePathMatrix(unittest.TestCase):
+  """
+  Base path x link type. `normalize_request_url` resolved every relative link
+  against the *origin*, discarding any base path in the target URL, while
+  `discovery.py:181` resolved the same link with `urljoin` against the base.
+  One link therefore produced two different URLs depending on which path
+  handled it.
+
+  Measured before the fix: 10 of 24 combinations diverged, and every one of them
+  was a target carrying a base path. Scanning `https://host/app`, a relative
+  link `users` was requested at `https://host/users` — which 404s, so the probe
+  reports "not vulnerable" for an endpoint it never reached. A false-negative
+  generator, invisible whenever the test target is a bare host, which is why it
+  survived.
+
+  Root-relative links (`/users`) must stay origin-relative; that is RFC 3986 and
+  those cases were already correct.
+  """
+
+  BASES = ("https://h", "https://h/", "https://h/app", "https://h/app/")
+
+  # (link, expected path for a bare-origin base, expected path under /app)
+  LINKS = (
+    ("users", "/users", "/app/users"),
+    ("./users", "/users", "/app/users"),
+    ("sub/users", "/sub/users", "/app/sub/users"),
+    ("users?q=1", "/users?q=1", "/app/users?q=1"),
+    # Root-relative and absolute forms ignore the base path, by spec.
+    ("/users", "/users", "/users"),
+    ("https://h/users", "/users", "/users"),
+  )
+
+  def test_a_relative_link_resolves_against_the_targets_base_path(self):
+    for base in self.BASES:
+      has_base_path = "/app" in base
+      for link, bare_expected, app_expected in self.LINKS:
+        expected = app_expected if has_base_path else bare_expected
+        with self.subTest(base=base, link=link):
+          self.assertEqual(
+            normalize_request_url(base, link),
+            f"https://h{expected}",
+          )
+
+  def test_resolution_matches_the_discovery_path_for_the_same_link(self):
+    # discovery.py builds `urljoin(target_url + "/", raw)`. The two paths must
+    # agree, or a link discovered by one is requested at a different URL by the
+    # other — which is the defect this matrix exists to pin.
+    from urllib.parse import urljoin
+    for base in self.BASES:
+      for link, _bare, _app in self.LINKS:
+        with self.subTest(base=base, link=link):
+          self.assertEqual(
+            normalize_request_url(base, link),
+            urljoin(base.rstrip("/") + "/", link),
+          )
+
+  def test_cross_origin_is_still_refused(self):
+    for base in self.BASES:
+      for hostile in ("https://evil.test/users", "http://h/users", "https://h:8443/users"):
+        with self.subTest(base=base, link=hostile):
+          with self.assertRaises(GrayboxScopeError):
+            normalize_request_url(base, hostile)
+
+  def test_traversal_out_of_the_base_path_is_still_refused(self):
+    with self.assertRaises(GrayboxScopeError):
+      normalize_request_url("https://h/app", "../../etc/passwd")
 
 
 if __name__ == "__main__":

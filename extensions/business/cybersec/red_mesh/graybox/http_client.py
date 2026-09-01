@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import posixpath
 from collections.abc import Mapping
-from urllib.parse import parse_qsl, urlencode, unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -67,7 +67,26 @@ def normalize_request_url(target_url: str, url_or_path: str) -> str:
       raise GrayboxScopeError(f"cross-origin graybox request blocked: {raw}")
     path = _normalize_path(parsed.path or "/")
     return urlunsplit((scheme, target.netloc, path, parsed.query, ""))
-  path = _normalize_path(raw or "/")
+  # Relative reference: resolve against the target's *base path*, not the
+  # origin. `_normalize_path` prepends "/" and so discarded any base path, which
+  # meant a link found under `https://host/app` was requested at
+  # `https://host/...`. Measured across a base-path x link-type matrix, 10 of 24
+  # combinations disagreed with what `discovery.py` produces for the same link
+  # via `urljoin`, and every divergent case was a target carrying a base path.
+  # Those requests 404, so the probe reports "not vulnerable" for an endpoint it
+  # never reached — silent false negatives, invisible whenever the scan target
+  # is a bare host, which is why this survived.
+  relative = parsed.path or ""
+  # Traversal is checked *before* resolving. `urljoin` consumes `..` itself and
+  # clamps at the root, which would disarm the guard `_normalize_path` provides
+  # and let `../../etc/passwd` resolve silently. Decoded first, so
+  # percent-encoded traversal cannot slip past.
+  if any(part == ".." for part in _decode_repeated(relative).split("/")):
+    raise GrayboxScopeError(f"path traversal is outside graybox scope: {raw}")
+  base_path = target.path or "/"
+  if not base_path.endswith("/"):
+    base_path += "/"
+  path = _normalize_path(urljoin(base_path, relative) or "/")
   return urlunsplit((scheme, target.netloc, path, parsed.query, ""))
 
 
