@@ -753,6 +753,54 @@ class TestLoginSuccessDetection(unittest.TestCase):
     resp = _mock_response(url="http://testapp.local:8000/auth/login/")
     self.assertTrue(self._check(auth, resp, cookies={"token": "jwt-val"}))
 
+
+  def test_a_failed_login_that_re_renders_the_form_is_not_success(self):
+    """
+    The decisive case, and the one cookie-presence could never see.
+
+    Every mainstream framework sets a session cookie on the login page itself,
+    *before* authenticating — Django's `sessionid`, Rails' `_session_id`, PHP's
+    `PHPSESSID`. So a rejected login arrives with a cookie set, and the old
+    final `return has_cookies` read that as success. The scan then proceeds
+    believing it is authenticated while every request is anonymous: findings
+    behind the login are silently missed, and the whole authenticated run is a
+    false negative.
+
+    The response body still rendering a password field is the assertion that
+    distinguishes them, and it needs no configuration.
+    """
+    auth = _make_auth()
+    rejected = _mock_response(
+      status=200,
+      url="http://testapp.local:8000/auth/login/",
+      # Deliberately carries none of the _FORM_AUTH_FAILURE_MARKERS: plenty of
+      # apps re-render the form with no message, or a localised one.
+      text='<form method="post"><input name="user"><input type="password" name="pw"></form>',
+    )
+    self.assertFalse(
+      self._check(auth, rejected, cookies={"sessionid": "set-before-auth"}),
+      "a re-rendered login form was accepted as a successful login because a "
+      "session cookie was present",
+    )
+
+  def test_a_password_field_defeats_even_a_redirect(self):
+    auth = _make_auth()
+    resp = _mock_response(
+      url="http://testapp.local:8000/auth/login/?next=/dashboard/",
+      history=[MagicMock()],
+      text='<input type="password" name="password">',
+    )
+    self.assertFalse(self._check(auth, resp, cookies={"sessionid": "x"}))
+
+  def test_a_genuine_post_login_page_still_succeeds(self):
+    auth = _make_auth()
+    resp = _mock_response(
+      url="http://testapp.local:8000/dashboard/",
+      history=[MagicMock()],
+      text="<h1>Welcome back</h1><a href=/logout>Sign out</a>",
+    )
+    self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
+
   def test_login_failure_multiword(self):
     """'login failed' in body -> failure."""
     auth = _make_auth()

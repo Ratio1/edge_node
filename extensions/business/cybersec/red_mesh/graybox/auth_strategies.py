@@ -121,6 +121,13 @@ _FORM_AUTH_FAILURE_MARKERS = (
   "account locked", "account disabled",
 )
 
+# A password input in the *post-login* response means the form was re-rendered,
+# i.e. the credentials were rejected. Matches `type=password` in any attribute
+# order and with either quoting style, or none.
+_LOGIN_FORM_RE = re.compile(
+  r"""<input[^>]*\btype\s*=\s*["']?password["']?""", re.IGNORECASE
+)
+
 
 class FormAuth(AuthStrategy):
   """Cookie-session login via HTML form (existing legacy behaviour).
@@ -242,6 +249,18 @@ class FormAuth(AuthStrategy):
             return False
       except ValueError:
         pass
+    # A password field still on the page is a real post-login assertion, and it
+    # is the one signal cookie presence could never give. Every mainstream
+    # framework sets a session cookie on the login page *before* authenticating
+    # — Django `sessionid`, Rails `_session_id`, PHP `PHPSESSID` — so a rejected
+    # login arrives with a cookie already set. Trusting that made a failed login
+    # read as success, and the scan then ran anonymously while believing itself
+    # authenticated: every finding behind the login silently absent and reported
+    # as "not vulnerable". The failure-marker list does not cover it either,
+    # because plenty of apps re-render the form with no message, or a localised
+    # one.
+    if _LOGIN_FORM_RE.search(response.text or ""):
+      return False
     has_cookies = bool(session.cookies.get_dict())
     if response.url and "login" not in response.url.lower():
       if has_cookies:

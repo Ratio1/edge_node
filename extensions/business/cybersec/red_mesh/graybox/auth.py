@@ -442,8 +442,13 @@ class AuthManager:
          from anonymous; identity path non-empty when authenticated and
          empty/missing when anonymous).
     """
-    if self._resolve_auth_type() == "form":
-      return True, False
+    # Form auth used to short-circuit here and return success unverified, so
+    # the anonymous-control-delta check below — the only thing that actually
+    # proves the session is authenticated — never ran for it. Combined with
+    # form-login success being inferred from cookie presence, that left form
+    # auth with no verification at all. It now takes the same path as every
+    # other auth type; when no probe path is configured the function still
+    # returns early below, so this only adds verification where it is possible.
     probe_path = self._authenticated_probe_path()
     if not probe_path:
       return True, False
