@@ -451,3 +451,163 @@ class TestEvidenceArtifactProduction(unittest.TestCase):
       ["endpoint=https://app.test/x"],
     )
     self.assertEqual(probe.findings[0].evidence_artifacts, [])
+
+
+class TestCurlReproduction(unittest.TestCase):
+  """
+  A vulnerable finding should carry a command that reproduces it. The evidence
+  artifact captures the triggering request, so the reproduction is derivable
+  rather than something a probe author has to hand-write and keep in sync.
+
+  Redaction matters more here than elsewhere: a curl line is *designed* to be
+  copied and run, so an Authorization header left in it is a credential handed
+  to whoever reads the report.
+  """
+
+  def _probe(self, real_scrub=False):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    if real_scrub:
+      probe._scrub_for_emission = ProbeBase._scrub_for_emission.__get__(probe)
+      probe.target_config = None
+    else:
+      probe._scrub_for_emission = lambda value: value
+    return probe
+
+  def _response(self, method="GET", headers=None, body=None):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = "{}"
+    resp.headers = {"Content-Type": "application/json"}
+    resp.url = "https://app.test/api/records/99"
+    resp.request = MagicMock()
+    resp.request.method = method
+    resp.request.url = "https://app.test/api/records/99"
+    resp.request.headers = headers if headers is not None else {"Accept": "*/*"}
+    resp.request.body = body
+    resp.elapsed = MagicMock()
+    resp.elapsed.total_seconds.return_value = 0.1
+    return resp
+
+  def _emit(self, probe=None, **response_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = probe or self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/api/records/99"],
+      response=self._response(**response_kwargs),
+    )
+    return probe.findings[0]
+
+  def _curl(self, finding):
+    return next(
+      (step for step in finding.replay_steps if step.startswith("curl ")), None,
+    )
+
+  def test_a_vulnerable_finding_carries_a_curl_reproduction(self):
+    curl = self._curl(self._emit())
+    self.assertIsNotNone(curl, "no curl reproduction was generated")
+    self.assertIn("https://app.test/api/records/99", curl)
+
+  def test_the_method_and_body_are_reproduced(self):
+    curl = self._curl(self._emit(method="POST", body='{"id": 99}'))
+    self.assertIn("-X POST", curl)
+    self.assertIn('{"id": 99}', curl)
+
+  def test_a_get_does_not_carry_a_redundant_method_flag(self):
+    self.assertNotIn("-X GET", self._curl(self._emit()))
+
+  def test_the_credential_is_not_handed_to_the_reader(self):
+    probe = self._probe(real_scrub=True)
+    finding = self._emit(
+      probe=probe,
+      headers={"Authorization": "Bearer sk-live-abcdefghijklmnop"},
+    )
+    curl = self._curl(finding)
+    self.assertNotIn("sk-live-abcdefghijklmnop", curl)
+
+  def test_the_command_is_shell_safe(self):
+    # A target-controlled URL must not be able to break out of the quoting and
+    # become a second shell command in something a reader is invited to run.
+    resp = self._response()
+    resp.request.url = "https://app.test/x'; rm -rf /tmp/pwned; echo '"
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=x"], response=resp,
+    )
+    curl = self._curl(probe.findings[0])
+    # Assert the real property rather than the escaping style: a shell parsing
+    # this line recovers the URL as a single argument, and the injected text
+    # never becomes a command of its own.
+    import shlex
+    tokens = shlex.split(curl)
+    self.assertEqual(tokens[-1], resp.request.url)
+    self.assertNotIn("rm", tokens)
+
+  def test_a_probes_own_replay_steps_are_kept(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=x"], replay_steps=["Log in as a regular user."],
+      response=self._response(),
+    )
+    steps = probe.findings[0].replay_steps
+    self.assertIn("Log in as a regular user.", steps)
+    self.assertTrue(any(s.startswith("curl ") for s in steps))
+
+  def test_no_response_means_no_curl(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"], ["endpoint=x"],
+    )
+    self.assertIsNone(self._curl(probe.findings[0]))
+
+
+class TestEvidenceEnrichmentNeverLosesTheFinding(unittest.TestCase):
+  """
+  Evidence is supplementary; the finding is the product. If artifact or curl
+  construction raises, `run_safe` swallows it and the probe emits **no finding
+  at all** — the vulnerability is silently dropped because decorating it failed.
+
+  Caught when wiring the probes: both helpers raised on a response whose
+  attributes were not the expected types, which took out 17 tests and would have
+  taken out real findings against any response shape they did not anticipate.
+  """
+
+  def _emit(self, response):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"], response=response,
+    )
+    return probe.findings
+
+  def test_an_unusable_response_still_yields_the_finding(self):
+    for label, response in (
+      ("bare mock", MagicMock()),
+      ("no request attribute", object()),
+      ("string masquerading as a response", "not-a-response"),
+      ("integer", 7),
+    ):
+      with self.subTest(response=label):
+        findings = self._emit(response)
+        self.assertEqual(
+          len(findings), 1,
+          "the finding was lost because its evidence could not be built",
+        )
+        self.assertEqual(findings[0].status, "vulnerable")
+
+  def test_the_finding_keeps_its_own_content_when_evidence_fails(self):
+    finding = self._emit(MagicMock())[0]
+    self.assertEqual(finding.title, "IDOR")
+    self.assertEqual(finding.url, "https://app.test/x")

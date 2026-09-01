@@ -47,6 +47,85 @@ def _location_from_evidence(evidence):
 _SNAPSHOT_MAX_CHARS = 2048
 
 
+def _as_text(value) -> str:
+  """Coerce a response attribute to text, tolerating types we did not expect."""
+  if isinstance(value, str):
+    return value
+  if isinstance(value, bytes):
+    return value.decode("utf-8", "replace")
+  return ""
+
+
+def _string_items(mapping) -> dict:
+  """Header mapping as plain strings, dropping anything that will not coerce."""
+  out = {}
+  try:
+    items = mapping.items()
+  except Exception:
+    return out
+  try:
+    for name, value in items:
+      if isinstance(name, str) and isinstance(value, (str, bytes)):
+        out[name] = _as_text(value)
+  except Exception:
+    return out
+  return out
+
+
+def _best_effort(builder, *args):
+  """Run an evidence builder, returning None instead of raising.
+
+  Evidence is supplementary; the finding is the product. A builder that raises
+  propagates into `run_safe`, which converts the whole probe run into an error
+  finding — so a response shape we did not anticipate would silently drop the
+  vulnerability rather than merely fail to decorate it. Never let that trade
+  happen.
+  """
+  try:
+    return builder(*args)
+  except Exception:
+    return None
+
+
+def _curl_reproduction(response, scrub):
+  """Build a redacted, shell-safe `curl` line reproducing the triggering request.
+
+  Derived from the captured request rather than hand-written by each probe, so
+  it cannot drift from what was actually sent.
+
+  Redaction matters more here than in a snapshot: this line is *designed* to be
+  copied and run, so an Authorization header left in it hands a credential to
+  whoever reads the report. Every component is `shlex.quote`d because the URL is
+  target-controlled and must not be able to become a second shell command.
+  """
+  import shlex
+
+  if response is None:
+    return None
+  request = getattr(response, "request", None)
+  if request is None:
+    return None
+  method = (getattr(request, "method", "") or "GET").upper()
+  url = getattr(request, "url", "") or getattr(response, "url", "") or ""
+  if not url:
+    return None
+
+  parts = ["curl", "-i"]
+  # GET is curl's default, so spelling it out is noise in something a reader
+  # copies.
+  if method != "GET":
+    parts += ["-X", method]
+  for name, value in _string_items(getattr(request, "headers", None)).items():
+    parts += ["-H", shlex.quote(f"{name}: {value}")]
+  body = getattr(request, "body", None)
+  if body:
+    if isinstance(body, bytes):
+      body = body.decode("utf-8", "replace")
+    parts += ["--data-raw", shlex.quote(str(body))]
+  parts.append(shlex.quote(url))
+  return scrub(" ".join(parts))
+
+
 def _artifact_from_response(response, scrub):
   """Build a redacted evidence artifact from the response that triggered a finding.
 
@@ -63,11 +142,11 @@ def _artifact_from_response(response, scrub):
   request = getattr(response, "request", None)
   method = getattr(request, "method", "") or ""
   url = getattr(request, "url", "") or getattr(response, "url", "") or ""
-  request_headers = dict(getattr(request, "headers", {}) or {})
+  request_headers = _string_items(getattr(request, "headers", None))
   request_body = getattr(request, "body", None)
   status = getattr(response, "status_code", "")
-  response_headers = dict(getattr(response, "headers", {}) or {})
-  body = getattr(response, "text", "") or ""
+  response_headers = _string_items(getattr(response, "headers", None))
+  body = _as_text(getattr(response, "text", ""))
 
   request_snapshot = "\n".join(
     [f"{method} {url}"]
@@ -584,9 +663,15 @@ class ProbeBase:
     # finding carries real request/response evidence rather than only a
     # free-text summary. `evidence_artifacts` remains available for probes that
     # construct their own.
-    built = _artifact_from_response(response, self._scrub_for_emission)
+    built = _best_effort(_artifact_from_response, response, self._scrub_for_emission)
     if built is not None:
       artifacts.append(built)
+    steps = list(replay_steps or [])
+    # Appended after the probe's own steps: those describe the setup a reader
+    # needs, and the curl is the final action that triggers the finding.
+    curl = _best_effort(_curl_reproduction, response, self._scrub_for_emission)
+    if curl:
+      steps.append(curl)
     self.findings.append(GrayboxFinding(
       url=url or derived_url,
       parameter=parameter or derived_parameter,
@@ -600,7 +685,7 @@ class ProbeBase:
       attack=self._resolve_attack(scenario_id, attack),
       evidence=scrubbed_evidence,
       evidence_artifacts=self._scrub_for_emission(artifacts),
-      replay_steps=self._scrub_for_emission(list(replay_steps or [])),
+      replay_steps=self._scrub_for_emission(steps),
       remediation=self._scrub_for_emission(remediation or ""),
       rollback_status=rollback_status or "",
     ))
