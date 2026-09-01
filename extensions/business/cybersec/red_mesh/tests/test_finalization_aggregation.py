@@ -602,3 +602,58 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestAggregatedScanDataRetainsGrayboxResults(unittest.TestCase):
+  """
+  `services/finalization.py:411` round-trips the aggregated report through
+  `AggregatedScanData` before storing it in R1FS. The model had no
+  `graybox_results`, `target` or `scan_type` field, so every graybox result was
+  silently dropped from the archived aggregate — the entire authenticated half
+  of a scan, along with the context saying what was scanned and how.
+
+  The flat findings survive elsewhere (they are extracted before this
+  round-trip), so nothing visibly breaks; what is lost is the structured
+  evidence at its source shape, which is what a reader goes to the aggregate for.
+  """
+
+  AGGREGATE = {
+    "open_ports": [443],
+    "service_info": {},
+    "web_tests_info": {},
+    "completed_tests": ["graybox_probes"],
+    "graybox_results": {
+      "443": {
+        "_graybox_idor": {
+          "findings": [{"title": "IDOR", "severity": "HIGH",
+                        "url": "https://app.test/api/records/99"}],
+          "outcome": "completed",
+        },
+      },
+    },
+    "target": "app.test",
+    "scan_type": "webapp",
+  }
+
+  def _round_trip(self):
+    from extensions.business.cybersec.red_mesh.models import AggregatedScanData
+    return AggregatedScanData.from_dict(self.AGGREGATE).to_dict()
+
+  def test_graybox_results_survive_the_round_trip(self):
+    out = self._round_trip()
+    self.assertIn("graybox_results", out, "the graybox half of the scan was dropped")
+    finding = out["graybox_results"]["443"]["_graybox_idor"]["findings"][0]
+    self.assertEqual(finding["url"], "https://app.test/api/records/99")
+
+  def test_target_and_scan_type_survive_the_round_trip(self):
+    out = self._round_trip()
+    self.assertEqual(out.get("target"), "app.test")
+    self.assertEqual(out.get("scan_type"), "webapp")
+
+  def test_an_aggregate_without_graybox_is_unchanged(self):
+    from extensions.business.cybersec.red_mesh.models import AggregatedScanData
+    bare = {k: v for k, v in self.AGGREGATE.items()
+            if k not in ("graybox_results", "target", "scan_type")}
+    out = AggregatedScanData.from_dict(bare).to_dict()
+    self.assertNotIn("graybox_results", out)
+    self.assertEqual(out["open_ports"], [443])
