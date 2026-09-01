@@ -31,6 +31,7 @@ from ..models.finding_schema import (
 from ..models.finding_identity import (
   content_hash as _content_hash,
   dedup_key as _dedup_key,
+  parse_cwe_list as _parse_cwe_list,
 )
 
 
@@ -341,6 +342,9 @@ class GrayboxFinding:
       "description": f"Scenario {self.scenario_id}: {self.title}",
       "owasp_id": self.owasp,
       "cwe_id": cwe_joined,
+      # The typed list beside the display string. `cwe_id` alone is a joined
+      # form no consumer could parse past the first entry.
+      "cwe": _parse_cwe_list(self.cwe),
       "evidence": self._flat_evidence_summary(),
       "evidence_artifacts": [
         artifact.to_dict() for artifact in self._normalized_evidence_artifacts()

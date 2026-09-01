@@ -109,6 +109,33 @@ def _canonical_cwe(value: Any) -> str:
   return ", ".join(sorted({item.strip() for item in items if item.strip()}))
 
 
+def parse_cwe_list(value: Any) -> list[int]:
+  """Every CWE in `value`, as ints, in order, deduplicated.
+
+  Accepts a list, or the joined display form `"CWE-639, CWE-862"`. The consumer
+  used to strip one `CWE-` prefix and call `int()` on the rest, so a multi-CWE
+  finding parsed to nothing at all and reached the report, the exports and the
+  LLM with no weakness classification. Single-CWE findings parsed fine, which is
+  why it survived — and NVD lists two or three for a large share of entries.
+  """
+  if isinstance(value, (list, tuple)):
+    items = [str(item) for item in value]
+  else:
+    items = _text(value).split(",")
+  out = []
+  for item in items:
+    cleaned = item.strip().upper()
+    if cleaned.startswith("CWE-"):
+      cleaned = cleaned[4:]
+    try:
+      parsed = int(cleaned)
+    except (TypeError, ValueError):
+      continue
+    if parsed > 0 and parsed not in out:
+      out.append(parsed)
+  return out
+
+
 def _classification(finding: dict) -> str:
   return _UNIT.join([
     _text(finding.get("owasp_id")),
