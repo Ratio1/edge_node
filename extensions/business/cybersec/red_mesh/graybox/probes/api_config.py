@@ -347,6 +347,9 @@ class ApiConfigProbes(ProbeBase):
             "DELETE / PUT / PATCH should be present only on resources "
             "that genuinely require them."
           ),
+          url=url,
+          method="OPTIONS",
+          response=resp,
         )
 
   # ── PT-OAPI9-01 — OpenAPI exposed ────────────────────────────────

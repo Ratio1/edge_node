@@ -719,6 +719,61 @@ class TestAuthenticatedSessionHardening(unittest.TestCase):
     self.assertIsNone(AuthManager._traverse_identity_path(None, "any"))
 
 
+class TestFormAuthIsVerifiedLikeEveryOtherAuthType(unittest.TestCase):
+  """The short-circuit removal had no test, so restoring it stayed green.
+
+  `_validate_authenticated_session` used to return `(True, False)` immediately
+  for `auth_type == "form"`, so the anonymous-control delta — the only check
+  that actually proves a session is authenticated — never ran for form auth.
+  Combined with form-login success being inferred from cookie presence, that
+  left the most common auth type with no verification at all.
+  """
+
+  def _auth(self, **auth_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    desc = AuthDescriptor(**{
+      "auth_type": "form",
+      "authenticated_probe_path": "/account",
+      **auth_kwargs,
+    })
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=desc))
+    return AuthManager("http://api.example", cfg, verify_tls=False)
+
+  def _session(self, status=200, body=""):
+    sess = MagicMock()
+    sess.headers = {}
+    sess.params = {}
+    resp = _mock_response(status=status, text=body, content_type="text/html")
+    sess.get.return_value = resp
+    sess.head.return_value = resp
+    sess.post.return_value = resp
+    return sess
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_form_auth_does_not_skip_validation(self, mock_auth_requests):
+    # A 3xx to the probe path is the shape an unauthenticated session produces.
+    # Under the short-circuit this returned success without issuing a request.
+    auth = self._auth()
+    sess = self._session(status=302)
+    sess.get.return_value.headers = {"location": "/login"}
+    valid, _retryable = auth._validate_authenticated_session(sess)
+    self.assertFalse(valid, "form auth was accepted without being validated")
+    self.assertTrue(
+      sess.get.called or sess.head.called,
+      "form auth returned a verdict without issuing the probe request",
+    )
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_form_auth_with_no_probe_path_still_returns_early(self, mock_auth_requests):
+    # The early return that makes removing the short-circuit safe: with nothing
+    # configured to probe, there is no verification to perform.
+    auth = self._auth(authenticated_probe_path="")
+    sess = self._session(status=200)
+    self.assertEqual(auth._validate_authenticated_session(sess), (True, False))
+
+
 class TestLoginSuccessDetection(unittest.TestCase):
 
   def _check(self, auth, response, cookies=None):
@@ -800,6 +855,32 @@ class TestLoginSuccessDetection(unittest.TestCase):
       text="<h1>Welcome back</h1><a href=/logout>Sign out</a>",
     )
     self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
+
+  def test_the_password_field_is_recognised_however_it_is_written(self):
+    """The comment claims "any attribute order and with either quoting style,
+    or none". Every existing case used `type="password"` first and double-quoted,
+    so narrowing the pattern to that one literal stayed green — the tolerance
+    the comment promises was asserted nowhere, and a target re-rendering its form
+    with single quotes would have read as a successful login.
+    """
+    auth = _make_auth()
+    for markup in (
+      '<input type="password" name="pw">',
+      "<input type='password' name='pw'>",
+      "<input type=password name=pw>",
+      '<input name="pw" type="password">',
+      '<input class="c" id="pw" type="password" required>',
+      '<input  type = "password"  name="pw" />',
+      '<INPUT TYPE="PASSWORD" NAME="PW">',
+    ):
+      with self.subTest(markup=markup):
+        resp = _mock_response(
+          status=200, url="http://testapp.local:8000/auth/login/", text=markup,
+        )
+        self.assertFalse(
+          self._check(auth, resp, cookies={"sessionid": "x"}),
+          "a re-rendered login form was read as a successful login",
+        )
 
   def test_a_change_password_widget_on_the_dashboard_is_not_a_rejection(self):
     """The mirror failure of the bug above, with the same end result.

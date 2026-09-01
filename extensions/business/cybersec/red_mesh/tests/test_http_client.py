@@ -327,18 +327,47 @@ class TestRequestUrlBasePathMatrix(unittest.TestCase):
             f"https://h{expected}",
           )
 
-  def test_resolution_matches_the_discovery_path_for_the_same_link(self):
-    # discovery.py builds `urljoin(target_url + "/", raw)`. The two paths must
-    # agree, or a link discovered by one is requested at a different URL by the
-    # other — which is the defect this matrix exists to pin.
-    from urllib.parse import urljoin
+  # (link, expected path for a bare-origin base, expected path under /app).
+  # A parent-relative link is ordinary RFC 3986 resolution and `discovery.py`
+  # produces them routinely. Treating a literal `..` as an attack rejected them
+  # outright, so the probe reported "not vulnerable" for an endpoint it had
+  # refused to request — the same false-negative class the base-path fix above
+  # exists to remove, arrived at from the other direction.
+  PARENT_LINKS = (
+    ("../users", "/users", "/users"),
+    ("../../users", "/users", "/users"),
+    ("a/../b", "/b", "/app/b"),
+    ("./../x", "/x", "/x"),
+  )
+
+  def test_a_parent_relative_link_resolves_rather_than_being_refused(self):
     for base in self.BASES:
-      for link, _bare, _app in self.LINKS:
+      has_base_path = "/app" in base
+      for link, bare_expected, app_expected in self.PARENT_LINKS:
+        expected = app_expected if has_base_path else bare_expected
         with self.subTest(base=base, link=link):
           self.assertEqual(
             normalize_request_url(base, link),
-            urljoin(base.rstrip("/") + "/", link),
+            f"https://h{expected}",
           )
+
+  def test_traversal_past_the_root_clamps_on_origin_instead_of_escaping(self):
+    # The property that makes allowing `..` safe: it cannot change the netloc,
+    # which is what enforces scope. `urljoin` clamps at the origin root.
+    self.assertEqual(
+      normalize_request_url("https://h/app/", "../../../../etc/passwd"),
+      "https://h/etc/passwd",
+    )
+
+  def test_encoded_traversal_is_still_refused(self):
+    # These survive `urljoin` untouched and reach the server as a literal
+    # payload for it to decode. Following a discovered link never needs them.
+    for hostile in ("%2e%2e/users", "..%2fusers", "%252e%252e/users",
+                    "%2E%2E/users", "a/%2e%2e/b"):
+      for base in self.BASES:
+        with self.subTest(base=base, link=hostile):
+          with self.assertRaises(GrayboxScopeError):
+            normalize_request_url(base, hostile)
 
   def test_cross_origin_is_still_refused(self):
     for base in self.BASES:
@@ -347,9 +376,29 @@ class TestRequestUrlBasePathMatrix(unittest.TestCase):
           with self.assertRaises(GrayboxScopeError):
             normalize_request_url(base, hostile)
 
-  def test_traversal_out_of_the_base_path_is_still_refused(self):
-    with self.assertRaises(GrayboxScopeError):
-      normalize_request_url("https://h/app", "../../etc/passwd")
+  def test_the_base_path_was_never_the_scope_boundary(self):
+    """`..` and `/` are two spellings of the same reach, and `/` was always allowed.
+
+    A root-relative link left the base path unconditionally — `/etc/passwd` from
+    a `https://h/app` target resolved and was requested. Refusing `../etc/passwd`
+    while permitting `/etc/passwd` did not constrain anything; it only made the
+    two spellings disagree, and rejected the one `discovery.py` emits. What
+    actually bounds a scan by path is the allowlist, enforced in
+    `GrayboxHttpClient.request` against `path_in_scope`.
+    """
+    self.assertEqual(
+      normalize_request_url("https://h/app", "../../etc/passwd"),
+      normalize_request_url("https://h/app", "/etc/passwd"),
+    )
+
+  def test_the_allowlist_is_what_refuses_a_path_outside_the_scan_scope(self):
+    from extensions.business.cybersec.red_mesh.graybox.http_client import (
+      path_in_scope, path_scopes_from_allowlist,
+    )
+    scopes = path_scopes_from_allowlist("https://h/app", ["https://h/app"])
+    self.assertTrue(scopes, "no path scope was derived from the allowlist")
+    self.assertTrue(any(path_in_scope("/app/users", scope) for scope in scopes))
+    self.assertFalse(any(path_in_scope("/etc/passwd", scope) for scope in scopes))
 
 
 class TestRedirectHopBudgetAccounting(unittest.TestCase):

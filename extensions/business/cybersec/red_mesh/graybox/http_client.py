@@ -77,12 +77,20 @@ def normalize_request_url(target_url: str, url_or_path: str) -> str:
   # never reached — silent false negatives, invisible whenever the scan target
   # is a bare host, which is why this survived.
   relative = parsed.path or ""
-  # Traversal is checked *before* resolving. `urljoin` consumes `..` itself and
-  # clamps at the root, which would disarm the guard `_normalize_path` provides
-  # and let `../../etc/passwd` resolve silently. Decoded first, so
-  # percent-encoded traversal cannot slip past.
-  if any(part == ".." for part in _decode_repeated(relative).split("/")):
-    raise GrayboxScopeError(f"path traversal is outside graybox scope: {raw}")
+  # *Encoded* traversal only. A literal `..` is ordinary relative-reference
+  # resolution (RFC 3986 §5.2): `urljoin` consumes it, clamps at the origin root,
+  # and cannot change the netloc — and the netloc check is what actually enforces
+  # scope. Rejecting it turned `../users` into a `GrayboxScopeError`, so the
+  # probe reported "not vulnerable" for an endpoint it had refused to request:
+  # exactly the silent false negative the base-path fix above exists to remove,
+  # and `discovery.py` produces such links routinely.
+  #
+  # What stays blocked is traversal that survives `urljoin` untouched — `%2e%2e`,
+  # `..%2f` — because those reach the server as a literal payload for it to
+  # decode, and following a discovered link never needs them.
+  decoded = _decode_repeated(relative)
+  if decoded != relative and any(part == ".." for part in decoded.split("/")):
+    raise GrayboxScopeError(f"encoded path traversal is outside graybox scope: {raw}")
   base_path = target.path or "/"
   if not base_path.endswith("/"):
     base_path += "/"
