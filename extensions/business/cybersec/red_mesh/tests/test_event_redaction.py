@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 
 from extensions.business.cybersec.red_mesh.services.event_redaction import (
@@ -161,7 +162,15 @@ class TestFindingEventCredentialEgress(unittest.TestCase):
         )
         serialised = json.dumps(event, default=str)
         self.assertNotIn(secret, serialised, f"{secret} left the platform")
-        self.assertIn(":***", serialised)
+        # Assert the field is present *and* masked. A whole-blob substring
+        # search alone passes if `title` is dropped from the payload entirely,
+        # which would satisfy the test while destroying the evidence.
+        payload = json.loads(serialised) if isinstance(serialised, str) else event
+        flat = json.dumps(payload)
+        self.assertIn(":***", flat)
+        found_title = re.search(r'"title"\s*:\s*"([^"]*)"', flat)
+        self.assertIsNotNone(found_title, "the event carries no title field at all")
+        self.assertIn(":***", found_title.group(1), "the title was dropped, not redacted")
 
 
 if __name__ == "__main__":

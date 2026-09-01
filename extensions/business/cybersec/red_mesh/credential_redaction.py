@@ -27,11 +27,19 @@ CREDENTIAL_CONTEXT_RE = re.compile(
   r"(?:default|accepted|weak|valid)\s+credentials?(?:\s+accepted)?\s*[:=]?\s*"
   r"|accepted\s+random\s+creds\s+"
   r"|auth(?:\s+response)?\s+ok\s+for\s+"
+  # `Auth code 0 for <pair>` — the PostgreSQL trust-auth path at
+  # worker/service/database.py:909, which the first version of this table
+  # missed while enumerating its siblings at :239, :928 and :954.
+  r"|auth\s+code\s+\d+\s+for\s+"
   r"|password\s+auth\s+accepted\s+for\s+"
   r"|\baccepts\s+"
   r"|\bwith\s+"
   r")"
-  r"(?P<user>[^\s:]{1,64}):(?P<secret>\S+?)(?=[\s.,;)\]}]|$)"
+  # The secret runs to whitespace or a closing bracket, and stops at a `.` or
+  # `,` only when that character ends the sentence. Treating every `.` as a
+  # terminator truncated the mask mid-password: `admin:P@ssw0rd.1` became
+  # `admin:***.1`, publishing the tail of the secret.
+  r"(?P<user>[^\s:]{1,64}):(?P<secret>\S+?)(?=[\s;)\]}]|[.,](?:\s|$)|$)"
 )
 
 # Fields on a blackbox finding carrying probe-authored prose, and so capable of

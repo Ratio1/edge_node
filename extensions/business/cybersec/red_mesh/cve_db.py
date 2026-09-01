@@ -52,6 +52,10 @@ CLIENT_SIDE_CVE_IDS = frozenset({
   "CVE-2016-0778",    # roaming client memory disclosure
   "CVE-2020-12062",   # scp duplicate response mishandling
   "CVE-2020-15778",   # scp command injection
+  # NVD: "The client in OpenSSH before 7.2 mishandles failed cookie generation
+  # for untrusted X11 forwarding" — a client weakness, and CRITICAL, so it was
+  # the highest-severity instance of the over-match this set exists to stop.
+  "CVE-2016-1908",
 })
 
 SERVER_APPLICABILITY = "server"
@@ -81,8 +85,15 @@ CVE_DATABASE: list = [
   # `>=8.5p1,<9.8p1` — and a constraint string joins with AND. Encoded as a
   # single `<9.3` it both over-matched (4.4p1 through 8.5p1 are not affected)
   # and under-matched (9.3 through 9.8p1 are).
-  CveEntry("openssh", "<4.4p1", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
-  CveEntry("openssh", ">=8.5p1,<9.8p1", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
+  #
+  # Bounds are written WITHOUT the `p` suffix on purpose. `_SSH_LIBRARY_PATTERNS`
+  # captures `(\d+\.\d+(?:\.\d+)?)`, so the matcher is handed "9.8", never
+  # "9.8p1" — and `_parse_version` encodes the suffix as extra tuple components,
+  # making 9.8 sort *below* 9.8p1. Writing the published `p`-suffixed bounds
+  # here shifted both boundaries by a release: a patched 9.8p1 server reported
+  # CRITICAL, and vulnerable 8.5p1 servers were missed.
+  CveEntry("openssh", "<4.4", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
+  CveEntry("openssh", ">=8.5,<9.8", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
   CveEntry("openssh", ">=6.8,<9.9.2", "CVE-2025-26465", Severity.HIGH, "MitM via VerifyHostKeyDNS bypass", "CWE-305"),
   CveEntry("openssh", "<8.1",  "CVE-2019-6111", Severity.HIGH, "SCP client-side file overwrite", "CWE-20"),
   CveEntry("openssh", "<7.6",  "CVE-2017-15906", Severity.MEDIUM, "Improper write restriction in readonly mode", "CWE-732"),

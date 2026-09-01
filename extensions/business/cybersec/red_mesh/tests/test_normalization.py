@@ -433,6 +433,17 @@ class TestBlackboxCredentialRedaction(unittest.TestCase):
      "Auth response OK for root:mysqlpw", "mysqlpw"),
     ("PostgreSQL default credential accepted: postgres:pgpw99",
      "Auth OK for postgres:pgpw99", "pgpw99"),
+    # Trust-auth path, worker/service/database.py:909 — a phrasing the first
+    # version of the table missed entirely.
+    ("PostgreSQL default credential accepted: postgres:trustpw",
+     "Auth code 0 for postgres:trustpw", "trustpw"),
+    # Punctuated secrets. Every password in the probes' own default lists is
+    # punctuation-free, so a terminator that stopped at `.` truncated the mask
+    # and published the tail without any test noticing.
+    ("SSH default credential accepted: admin:P@ssw0rd.1",
+     "Accepted credential: admin:P@ssw0rd.1", "P@ssw0rd.1"),
+    ("SSH default credential accepted: admin:my.secret.pass",
+     "Accepted credential: admin:my.secret.pass", "my.secret.pass"),
   )
 
   @staticmethod
@@ -458,11 +469,15 @@ class TestBlackboxCredentialRedaction(unittest.TestCase):
             }],
             "accepted": ["root:toor"],
             "accepted_credentials": ["root:toor"],
+            # `findings.py:269` writes this into each *probe result*. An
+            # earlier fixture put it at the top level of the report, a shape
+            # the system never produces, so the regression test passed while
+            # 19 plaintext pairs survived in the real client job.
+            "vulnerabilities": [title],
           },
         },
       },
       "graybox_results": {},
-      "vulnerabilities": [title],
     }
 
   def test_no_probe_leaves_a_password_anywhere_in_the_report(self):
@@ -682,10 +697,6 @@ class TestRiskScoreGraybox(unittest.TestCase):
     self.assertGreater(result["breakdown"]["finding_counts"]["HIGH"], 0)
 
 
-if __name__ == '__main__':
-  unittest.main()
-
-
 class TestRiskScoreDynamicRange(unittest.TestCase):
   """
   The logistic curve pinned at 100 once raw_total passed ~300 — about eight
@@ -738,6 +749,12 @@ class TestRiskScoreDynamicRange(unittest.TestCase):
 
   def test_a_malformed_raw_total_scores_zero_rather_than_raising(self):
     from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
-    for bad in (None, "", "abc", float("nan")):
+    for bad in (None, "", "abc", float("nan"), float("inf"), float("-inf"), -1):
       with self.subTest(raw=bad):
-        self.assertIsInstance(normalize_risk_score(bad), int)
+        # `isinstance(..., int)` alone passes for any constant; the contract is
+        # that unusable input scores zero rather than inventing a risk level.
+        self.assertEqual(normalize_risk_score(bad), 0)
+
+
+if __name__ == '__main__':
+  unittest.main()

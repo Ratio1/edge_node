@@ -349,10 +349,6 @@ class TestProbeRegistrationCoverage(unittest.TestCase):
     )
 
 
-if __name__ == "__main__":
-  unittest.main()
-
-
 class TestCvssTemplateSeverityGate(unittest.TestCase):
   """
   The probe registry's static `cvss_template` was applied unconditionally, with
@@ -415,3 +411,6 @@ class TestCvssTemplateSeverityGate(unittest.TestCase):
     self._register()
     enriched = self._enrich(Severity.CRITICAL)
     self.assertEqual(enriched.cvss_vector, self.CRITICAL_TEMPLATE)
+
+if __name__ == "__main__":
+  unittest.main()

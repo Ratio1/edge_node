@@ -295,6 +295,27 @@ class TestRegreSSHionConstraint(unittest.TestCase):
   def test_the_fixed_release_does_not_fire(self):
     self.assertFalse(self._fires("OpenSSH_9.8p1"))
 
+  def test_the_boundaries_hold_for_the_version_the_matcher_actually_receives(self):
+    # `_SSH_LIBRARY_PATTERNS` captures `(\d+\.\d+(?:\.\d+)?)`, so the matcher
+    # is handed "9.8", never "9.8p1". Writing the published `p`-suffixed bounds
+    # shifted both boundaries by a release: a patched 9.8 reported CRITICAL and
+    # a vulnerable 8.5 was missed.
+    self.assertFalse(self._fires("9.8"), "9.8 is the fixed release")
+    self.assertTrue(self._fires("8.5"), "8.5 is inside the published scope")
+    self.assertTrue(self._fires("9.7"))
+    self.assertFalse(self._fires("8.4"))
+
+  def test_a_client_side_critical_does_not_fire_from_a_server_banner(self):
+    # CVE-2016-1908 is an OpenSSH *client* X11-cookie weakness, and CRITICAL —
+    # the highest-severity instance of the over-match the applicability gate
+    # exists to stop.
+    fired = {
+      cve_id
+      for finding in check_cves("openssh", "4.4")
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+    self.assertNotIn("CVE-2016-1908", fired)
+
 
 class TestPackageVersionParsing(unittest.TestCase):
   """

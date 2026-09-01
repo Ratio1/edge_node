@@ -397,27 +397,22 @@ class _ReportMixin:
 
   def _local_node_address(self):
     """
-    This node's own address, for finding attribution.
+    This node's mesh address, for finding attribution.
 
-    Mirrors how the report itself is stamped at close-job time: the public IP
-    from `location_data` when geolocation is available, otherwise the local
-    address. Returns None when neither is reachable, so the caller can fall back
-    to a per-worker identifier rather than to a mesh-wide constant.
+    It has to be the same *kind* of identifier the comparison buckets on.
+    `_compute_node_comparison` groups findings by `_source_node_addr` and then
+    looks each participating node up in that map, and the participating set is
+    built from `worker_reports` / `selected_peers` keys — mesh addresses, the
+    same `ee_addr` that keys `job_specs["workers"]` at close-job time.
+
+    Returning a public IP here instead left every per-node findings list empty,
+    because an IP never equals a mesh address: worse than the launcher collapse
+    it was meant to fix, which at least matched a real participating node. The
+    IP is already carried separately as `node_ip`, which is the display field —
+    that is the distinction to preserve, not collapse.
     """
-    address = None
-    try:
-      location_data = self.global_shmem.get("location_data") or {}
-      address = location_data.get("ip")
-    except Exception:
-      address = None
-    if not address:
-      getter = getattr(getattr(self, "log", None), "get_localhost_ip", None)
-      if callable(getter):
-        try:
-          address = getter()
-        except Exception:
-          address = None
-    return address or None
+    address = getattr(self, "ee_addr", None)
+    return str(address) if address else None
 
   @staticmethod
   def _stamp_finding_list(findings, worker_id, node_addr):
@@ -647,32 +642,60 @@ class _ReportMixin:
       _scrub_graybox = None
     redacted = deepcopy(report)
     graybox_secret_names = _configured_graybox_secret_names_from_report(redacted)
-    service_info = redacted.get("service_info", {})
-    for port_key, methods in service_info.items():
-      if not isinstance(methods, dict):
-        continue
-      for method_key, method_data in methods.items():
-        if not isinstance(method_data, dict):
+    # `web_tests_info` has the same probe-result shape and is harvested into the
+    # pass report by `_compute_risk_and_findings`, so it needs the same walk. No
+    # web probe interpolates a credential today, which is exactly why it was
+    # missed — this is the gap class that produced the leak, not a live one.
+    def _redact_finding_list(findings):
+      for finding in findings or []:
+        if not isinstance(finding, dict):
           continue
-        # Redact every probe-authored text field, not just evidence. The
-        # default-credential probes put the pair in `title` first, and the
-        # title is what reaches the SIEM, the PDF cover and the LLM input.
-        for finding in method_data.get("findings", []):
-          if not isinstance(finding, dict):
+        for text_key in _CREDENTIAL_TEXT_FIELDS:
+          if isinstance(finding.get(text_key), str):
+            finding[text_key] = redact_credential_text(finding[text_key])
+
+    for section_key in ("service_info", "web_tests_info"):
+      for port_key, methods in (redacted.get(section_key) or {}).items():
+        if not isinstance(methods, dict):
+          continue
+        # Legacy flat shape: findings sitting directly on the port entry rather
+        # than under a probe key. `_stamp_worker_source` handles both shapes and
+        # has a test for it; redaction skipped the flat one because the loop
+        # below requires a dict and a list falls through the `continue`.
+        _redact_finding_list(methods.get("findings"))
+        for method_key, method_data in methods.items():
+          if not isinstance(method_data, dict):
             continue
-          for text_key in _CREDENTIAL_TEXT_FIELDS:
-            if isinstance(finding.get(text_key), str):
-              finding[text_key] = redact_credential_text(finding[text_key])
-        # Both key spellings: the HTTP Basic probe writes `accepted`
-        # (common.py:438,477) while this only ever read `accepted_credentials`,
-        # so that list was archived raw.
-        for creds_key in ("accepted_credentials", "accepted"):
-          creds = method_data.get(creds_key)
-          if isinstance(creds, list):
-            method_data[creds_key] = [
-              _re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c
-              for c in creds
+          # Redact every probe-authored text field, not just evidence. The
+          # default-credential probes put the pair in `title` first, and the
+          # title is what reaches the SIEM, the PDF cover and the LLM input.
+          _redact_finding_list(method_data.get("findings"))
+          # The parallel title list. `findings.py:269` writes it into each
+          # *probe result* — `service_info[<port>][<probe>]["vulnerabilities"]`
+          # — never at the top level of the report, which is where an earlier
+          # version of this redaction looked. Nineteen plaintext pairs survived
+          # in the client job as a result, and the regression test passed
+          # because its fixture used the top-level shape too.
+          vulnerabilities = method_data.get("vulnerabilities")
+          if isinstance(vulnerabilities, list):
+            method_data["vulnerabilities"] = [
+              redact_credential_text(item) for item in vulnerabilities
             ]
+          # Both key spellings: the HTTP Basic probe writes `accepted`
+          # (common.py:438,477) while this only ever read `accepted_credentials`,
+          # so that list was archived raw.
+          for creds_key in ("accepted_credentials", "accepted"):
+            creds = method_data.get(creds_key)
+            if isinstance(creds, list):
+              method_data[creds_key] = [
+                _re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c
+                for c in creds
+              ]
+    # The remaining two published finding paths. `_count_all_findings`
+    # enumerates six; redaction reached two of them, which is how the leak
+    # survived a green suite.
+    _redact_finding_list(redacted.get("correlation_findings"))
+    _redact_finding_list(redacted.get("findings"))
     # Redact graybox_results credential evidence
     _CRED_RE = _re.compile(r'(\S+?):(\S+)')
     _PASSWORD_RE = _re.compile(r'((?:password|passwd|pwd)["\']?\s*[:=]\s*)(["\']?)[^\s"\'&]+', _re.I)
@@ -739,13 +762,6 @@ class _ReportMixin:
             if isinstance(artifact, dict) else artifact
             for artifact in artifacts
           ]
-    # The parallel title list (findings.py:269) is built from the same titles
-    # and redaction never walked it — 19 entries leaked on the client job.
-    vulnerabilities = redacted.get("vulnerabilities")
-    if isinstance(vulnerabilities, list):
-      redacted["vulnerabilities"] = [
-        redact_credential_text(item) for item in vulnerabilities
-      ]
     return redacted
 
   @staticmethod

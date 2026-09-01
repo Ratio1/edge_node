@@ -276,9 +276,19 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
     )
     self.assertEqual(f["_source_node_addr"], "0xnode_a")
 
-  def test_the_node_stamps_its_own_address_when_it_knows_it(self):
-    """A node that knows its public address attributes findings to itself."""
+  def test_the_node_stamps_its_own_mesh_address_not_its_ip(self):
+    """
+    Attribution must use the same kind of identifier the comparison buckets on.
+
+    `_compute_node_comparison` looks findings up against the participating node
+    set, which is built from mesh addresses. Stamping a public IP here left
+    every per-node findings list empty — worse than the launcher collapse it
+    replaced, which at least matched a real participating node. The IP is
+    already carried separately as `node_ip` for display.
+    """
     host = _Host()
+    host.ee_addr = "0xNODE_B"
+    # Present and deliberately ignored: this is the display field, not identity.
     host.global_shmem = {"location_data": {"ip": "203.0.113.7"}}
     reports = {
       "0xnode_b": {
@@ -299,7 +309,12 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
     }
     host._get_aggregated_report(reports, worker_cls=GrayboxLocalWorker)
     f = reports["0xnode_b"]["graybox_results"]["443"]["_graybox_idor"]["findings"][0]
-    self.assertEqual(f["_source_node_addr"], "203.0.113.7")
+    self.assertEqual(f["_source_node_addr"], "0xNODE_B")
+    self.assertNotEqual(
+      f["_source_node_addr"], "203.0.113.7",
+      "a public IP never equals a mesh address, so the comparison would bucket "
+      "this finding under a node that is not in the participating set",
+    )
 
 
 class TestApiTop10FlatFindingIntegration(unittest.TestCase):
