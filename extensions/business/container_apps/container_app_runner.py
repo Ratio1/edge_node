@@ -683,6 +683,7 @@ class ContainerAppRunnerPlugin(
     # Image pull backoff tracking
     self._image_pull_failures = 0
     self._next_image_pull_time = 0
+    self._fixed_volume_setup_pending = False
 
     # Command execution state
     self._commands_started = False
@@ -1286,13 +1287,15 @@ class ContainerAppRunnerPlugin(
     # auto-detect OWNER_UID/OWNER_GID. _ensure_image_available is
     # idempotent; the second call inside start_container will be a cache hit.
     if not self._ensure_image_available():
-      raise RuntimeError(
-        f"Image '{self.cfg_image}' not available; cannot prepare container volumes."
+      self._fixed_volume_setup_pending = True
+      self.P(
+        f"Image '{self.cfg_image}' not available; deferring fixed-volume setup."
       )
 
     self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
-    self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
+    if not self._fixed_volume_setup_pending:
+      self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
     self._configure_system_volume() # always-on /r1en_system control-plane volume
     self._configure_env_overrides_control_dir()
     self._configure_reset_control_dir()
@@ -3707,6 +3710,10 @@ class ContainerAppRunnerPlugin(
         True when restart setup succeeded or was deferred waiting for
         semaphores, False when cleanup or start failed.
     """
+    if self._fixed_volume_setup_pending:
+      self.P("Container initialization is waiting for its image; restart deferred.")
+      return False
+
     self.P("Restarting container from scratch...")
 
     # Preserve state before reset (prevents redundant operations after restart)
@@ -4165,6 +4172,12 @@ class ContainerAppRunnerPlugin(
         self.P("Container is paused (manual stop). Send RESTART command to resume.")
         self._last_paused_log = current_time
       return
+
+    if self._fixed_volume_setup_pending:
+      if not self._ensure_image_available():
+        return
+      self._configure_fixed_size_volumes()
+      self._fixed_volume_setup_pending = False
 
     if self._cleanup_failed:
       if not self._retry_failed_cleanup():
