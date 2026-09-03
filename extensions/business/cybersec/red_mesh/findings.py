@@ -195,7 +195,19 @@ class Finding:
     # drifted from the flat-path one, which read a raw severity string where
     # this reads `Severity.value` — so the same finding could carry two
     # different signatures depending on which layer computed it.
-    payload = {
+    return _content_hash(
+      self._identity_payload(probe_id), asset_canonical=asset_canonical,
+    )
+
+  def _identity_payload(self, probe_id: str) -> dict:
+    """The one projection both identity keys are computed from.
+
+    `content_hash` internally starts from `dedup_key(payload)`, so the two
+    methods must read the same fields or the keys silently decouple — add a
+    field to one projection and not the other and a finding's dedup key stops
+    being the one its signature was built over. One payload, two consumers.
+    """
+    return {
       "probe": probe_id or "",
       "title": self.title or "",
       "description": self.description or "",
@@ -207,7 +219,6 @@ class Finding:
       "cwe_id": self.cwe_id,
       "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
     }
-    return _content_hash(payload, asset_canonical=asset_canonical)
 
   def compute_dedup_key(
     self,
@@ -218,21 +229,28 @@ class Finding:
     """Compute the identity key over the same payload the signature uses.
 
     Identity, not content: `models.finding_identity.dedup_key` reads probe,
-    scenario, normalised asset and classification, and deliberately not the
-    free-text fields. Stamped here so that rewording a finding leaves it alone.
+    scenario, normalised asset and classification from that payload, and
+    deliberately ignores the free-text fields. Stamped so that rewording a
+    finding leaves it alone.
     """
-    return _dedup_key({
-      "probe": probe_id or "",
-      "title": self.title or "",
-      "owasp_id": self.owasp_id,
-      "cwe_id": self.cwe_id,
-      "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
-    }, asset_canonical=asset_canonical)
+    return _dedup_key(
+      self._identity_payload(probe_id), asset_canonical=asset_canonical,
+    )
 
-  def with_signature(self, signature: str) -> "Finding":
-    """Return a new Finding with finding_signature set (frozen-safe)."""
+  def with_identity(self, *, finding_signature: str, dedup_key: str) -> "Finding":
+    """Return a new Finding carrying both identity keys (frozen-safe).
+
+    Replaces `with_signature`, which stamped only the content hash. Its one
+    caller — the CVE matcher — passes an `asset_canonical` override, because a
+    CVE finding is identified by `product:version:cve_id` rather than by an
+    `AffectedAsset`. Stamping only the signature left the dedup key to be
+    recomputed downstream from the *probe* name with no override, so the finding
+    carried a signature built over one identity basis and a dedup key built over
+    another. The keys are stamped together so they cannot disagree.
+    """
     data = asdict(self)
-    data["finding_signature"] = signature
+    data["finding_signature"] = finding_signature
+    data["dedup_key"] = dedup_key
     return Finding(**_revive_finding_dict(data))
 
 

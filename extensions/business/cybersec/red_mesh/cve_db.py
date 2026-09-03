@@ -417,11 +417,19 @@ def _build_finding(entry, product: str, version: str, dynamic_cache):
       compensating="Use host or network controls to reduce exploitability for the affected service.",
     ),
   )
-  return finding.with_signature(
-    finding.compute_signature(
-      probe_id=f"cve:{product}",
-      asset_canonical=f"{product}:{version}:{entry.cve_id}",
-    )
+  # Both keys, over the same basis. A CVE finding is identified by
+  # `product:version:cve_id` rather than by an `AffectedAsset` — that is the
+  # whole reason `asset_canonical` exists. Stamping only the signature left the
+  # dedup key to be recomputed downstream by `enrich_finding_for_probe` from the
+  # *probe* name with no override, so the finding travelled with a signature
+  # built over one identity basis and a dedup key built over another.
+  identity = {
+    "probe_id": f"cve:{product}",
+    "asset_canonical": f"{product}:{version}:{entry.cve_id}",
+  }
+  return finding.with_identity(
+    finding_signature=finding.compute_signature(**identity),
+    dedup_key=finding.compute_dedup_key(**identity),
   )
 
 

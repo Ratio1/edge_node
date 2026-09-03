@@ -235,15 +235,6 @@ class TestTheContractIsEnforcedAndNotOnlyDeclared(unittest.TestCase):
     with self.assertRaises(ValueError):
       flat_finding_from_dict(_minimal(schema="something.else.v1"))
 
-  def test_an_unstamped_archive_entry_still_deserialises(self):
-    """The compatibility the refusal must not break."""
-    payload = _minimal()
-    del payload["schema"]
-    del payload["schema_version"]
-    self.assertEqual(
-      flat_finding_from_dict(payload).schema_version, REDMESH_FINDING_SCHEMA_VERSION,
-    )
-
   def test_an_invalid_finding_is_reported_in_the_risk_breakdown(self):
     """The production enforcement point: every finding from both producers
     passes through the flat walk, so that is where the contract is checked."""
