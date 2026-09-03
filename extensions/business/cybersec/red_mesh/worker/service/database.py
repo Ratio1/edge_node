@@ -1077,7 +1077,9 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           confidence="certain",
         ))
       else:
-        raw["banner"] = "Memcached port open"
+        # The observed response, not a static label — the raw bytes moved out
+        # of `evidence` and this is where they live.
+        raw["banner"] = data[:60].decode('utf-8', errors='replace')
         findings.append(Finding(
           severity=Severity.INFO,
           title="Memcached port open",

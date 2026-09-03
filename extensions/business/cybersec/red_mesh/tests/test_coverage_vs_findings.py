@@ -833,6 +833,16 @@ class TestDedupTiesAreOrderIndependent(unittest.TestCase):
       self.assertTrue(flat[0]["kev"])
       self.assertEqual(flat[0]["epss_score"], 0.9)
 
+  def test_a_malformed_freshness_loses_to_a_real_timestamp(self):
+    """Letters sort after digits, so a garbage `cvss_data_freshness` would
+    otherwise beat every real ISO date and invert "newer enrichment wins"."""
+    real = self._record(True, 0.9, "2026-09-01T00:00:00Z")
+    garbage = self._record(False, 0.1, "not-a-date")
+    for items in ([real, garbage], [garbage, real]):
+      flat = self._run(items)
+      self.assertEqual(len(flat), 1)
+      self.assertTrue(flat[0]["kev"], "the malformed timestamp won the tiebreak")
+
   def test_an_equal_rank_tie_has_the_same_survivor_in_both_orders(self):
     a = {"title": "CVE-2020-1 in x", "severity": "HIGH", "confidence": "certain",
          "description": "wording one"}

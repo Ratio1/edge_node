@@ -371,7 +371,14 @@ class _RiskScoringMixin:
       # tiebreaks: newer NVD enrichment wins (`cvss_data_freshness` is ISO-8601,
       # so lexicographic compare is chronological), then the content signature,
       # which is order-independent by construction.
+      # Trust the freshness only when it looks like a timestamp: letters sort
+      # after digits, so a malformed value ("not-a-date") would beat every real
+      # ISO-8601 date and silently invert "newer enrichment wins". The field is
+      # internally generated today, but a producer bug must lose the tiebreak,
+      # not win it.
       freshness = str(f.get("cvss_data_freshness") or "")
+      if not freshness[:4].isdigit():
+        freshness = ""
       signature = str(f.get("finding_signature") or "")
       return severity, confidence, freshness, signature
 
@@ -408,7 +415,7 @@ class _RiskScoringMixin:
       else:
         signature_best[key] = idx
 
-    cve_best = {}  # (cve_id, port) -> index of best finding
+    cve_best = {}  # (cve_id, port, canonical asset) -> index of best finding
     for idx, f in enumerate(flat_findings):
       if idx in drop_indices:
         continue

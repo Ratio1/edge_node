@@ -201,9 +201,9 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
 
   Line-based and deliberately approximate — it catches the single-line form
   every current producer uses; a volatile value smuggled onto a continuation
-  line slips past it. The allowlist is documented debt, not endorsement: each
-  entry is a site where per-request bytes still reach the dedup key, kept small
-  and burned down rather than grown. Fixing one removes its entry.
+  line slips past it. The allowlist was burned down to empty on 2026-09-03;
+  a new entry is debt being taken on and needs a justification comment and an
+  owner, not a silent add.
   """
 
   # Locals whose interpolation into `evidence` makes it per-request data.

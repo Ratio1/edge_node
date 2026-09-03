@@ -85,7 +85,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     findings += self._tls_check_default_cn(raw)
 
     # Pass 4: Heartbleed (CVE-2014-0160)
-    heartbleed = self._tls_check_heartbleed(target, port)
+    heartbleed = self._tls_check_heartbleed(target, port, raw=raw)
     if heartbleed:
       findings.append(heartbleed)
       # Behavioral version inference: a positive Heartbleed leak proves the
@@ -332,7 +332,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     return findings
 
 
-  def _tls_check_heartbleed(self, target, port):
+  def _tls_check_heartbleed(self, target, port, raw=None):
     """Test for Heartbleed (CVE-2014-0160) by sending a malformed TLS heartbeat.
 
     Builds a raw TLS connection, completes handshake, then sends a heartbeat
@@ -408,6 +408,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           # If server sent back more than we sent (3 bytes of heartbeat msg),
           # it leaked memory
           if resp_len > len(hb_msg):
+            if raw is not None:
+              raw["heartbleed_leaked_bytes"] = resp_len - len(hb_msg)
             return Finding(
               severity=Severity.CRITICAL,
               title="TLS Heartbleed vulnerability (CVE-2014-0160)",
@@ -415,6 +417,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
               description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
                           "An attacker can read up to 64KB of server memory per request, "
                           "potentially exposing private keys, session tokens, and passwords.",
+              # The quantified leak size moved out of `evidence` and into
+              # raw_data below — deleting it entirely lost the impact figure.
               evidence="The heartbeat response was larger than the request payload, returning server memory beyond the sent bytes.",
               remediation="Upgrade OpenSSL to 1.0.1g or later and regenerate all private keys and certificates.",
               owasp_id="A06:2021",

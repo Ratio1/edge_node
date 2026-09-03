@@ -571,11 +571,11 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         sock.close()
 
     # --- DNS zone transfer (AXFR) test ---
-    axfr_findings = self._dns_test_axfr(target, port)
+    axfr_findings = self._dns_test_axfr(target, port, raw=raw)
     findings += axfr_findings
 
     # --- Open recursive resolver test ---
-    resolver_finding = self._dns_test_open_resolver(target, port)
+    resolver_finding = self._dns_test_open_resolver(target, port, raw=raw)
     if resolver_finding:
       findings.append(resolver_finding)
 
@@ -641,7 +641,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         result.append(d)
     return result
 
-  def _dns_test_axfr(self, target, port):
+  def _dns_test_axfr(self, target, port, raw=None):
     """Attempt DNS zone transfer (AXFR) via TCP.
 
     Uses SOA-based zone discovery to find authoritative zones before
@@ -706,13 +706,17 @@ class _ServiceInfraMixin(_ServiceProbeBase):
               cwe_id="CWE-200",
               confidence="certain",
             ))
+            if raw is not None:
+              # The record count moved out of `evidence` (volatile in the dedup
+              # key) and belongs here — deleting it entirely lost the fact.
+              raw.setdefault("axfr_record_counts", {})[domain] = ancount
             break  # One confirmed AXFR is enough
       except Exception:
         continue
 
     return findings
 
-  def _dns_test_open_resolver(self, target, port):
+  def _dns_test_open_resolver(self, target, port, raw=None):
     """Test if DNS server acts as an open recursive resolver.
 
     Returns Finding or None.
@@ -738,6 +742,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         ra = (flags >> 7) & 1  # Recursion Available
 
         if qr == 1 and rcode == 0 and ancount > 0 and ra == 1:
+          if raw is not None:
+            raw["resolver_answer_count"] = ancount
           return Finding(
             severity=Severity.MEDIUM,
             title="DNS open recursive resolver detected",
