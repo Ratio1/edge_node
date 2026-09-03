@@ -141,6 +141,69 @@ class TestDedupDoesNotResurrectCoverage(unittest.TestCase):
     self.assertEqual(with_dup["coverage_counts"], without["coverage_counts"])
 
 
+class TestDedupDoesNotDeleteDistinctFindings(unittest.TestCase):
+  """Dedup must key on content until locations are populated.
+
+  Keying dedup on `dedup_key` reads as the obvious improvement — identity, not
+  content — and it silently deleted findings. `grep -rn affected_assets worker/`
+  returns **zero hits**: no blackbox probe sets a location, so every blackbox
+  finding falls to `dedup_key`'s last-resort branch, whose discriminator is the
+  lowercased *title*. Any probe emitting N findings in a loop under a constant
+  title then collapses to one.
+
+  Measured on the real SRI loop in `worker/web/hardening.py`, which appends up
+  to five findings all titled "External script loaded without SRI": five
+  distinct findings, five distinct content hashes, **one** survivor. Four
+  unsafe CDN scripts vanished from the report, the archive and `finding_counts`.
+
+  RM-061 owns populating url/parameter on blackbox findings. Until it lands, the
+  content hash is the only key that separates these, so dedup stays on it — and
+  this test is what says so, because reverting the one line responsible passed
+  the entire 2311-test suite when it was written.
+  """
+
+  def _sri_findings(self, count=5):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+    findings = [
+      Finding(
+        severity=Severity.MEDIUM,
+        title="External script loaded without SRI",
+        description=f"Script from cdn-{n}.example/s.js has no integrity attribute.",
+        evidence=f'<script src="cdn-{n}.example/s.js" ...> without integrity=',
+        owasp_id="A08:2021", cwe_id="CWE-829", confidence="certain",
+      )
+      for n in "abcde"[:count]
+    ]
+    return probe_result(findings=findings, probe_id="_web_test_hardening")
+
+  def _flatten(self, probe):
+    return _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "web_tests_info": {"443": {"_web_test_hardening": probe}},
+    })
+
+  def test_five_scripts_without_sri_are_five_findings(self):
+    _risk, flat = self._flatten(self._sri_findings())
+    self.assertEqual(
+      len(flat), 5,
+      "findings differing only in which script they name were deduplicated "
+      "away, so the report lost evidence the probe actually gathered",
+    )
+
+  def test_the_severity_counts_agree_with_what_survived(self):
+    risk, flat = self._flatten(self._sri_findings())
+    self.assertEqual(risk["breakdown"]["finding_counts"]["MEDIUM"], len(flat))
+
+  def test_a_genuine_duplicate_still_deduplicates(self):
+    """The control: dedup still has to do its job."""
+    probe = self._sri_findings(count=1)
+    probe = dict(probe, findings=probe["findings"] + [dict(probe["findings"][0])])
+    _risk, flat = self._flatten(probe)
+    self.assertEqual(len(flat), 1)
+
+
 class TestBlackboxFindingsAreUnaffected(unittest.TestCase):
   """Blackbox probes emit no `status` at all, so every entry is a finding."""
 

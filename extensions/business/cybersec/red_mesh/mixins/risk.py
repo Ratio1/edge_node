@@ -387,11 +387,24 @@ class _RiskScoringMixin:
     drop_indices = set()
     signature_best = {}
     for idx, f in enumerate(flat_findings):
-      # Deduplicate on identity, not on content. Keying on `finding_signature`
-      # meant two records of the *same* finding whose wording differed did not
-      # deduplicate — which is the case dedup exists for, and the reason the CVE
-      # title fallback below had to be bolted on to approximate it.
-      signature = f.get("dedup_key") or f.get("finding_signature")
+      # Deduplicate on **content**, not on identity — deliberately, and not yet
+      # the other way round.
+      #
+      # Keying this on `dedup_key` reads as the obvious improvement, and it
+      # silently deleted findings. No blackbox probe sets `affected_assets`
+      # (`grep -rn affected_assets worker/` returns nothing), so every blackbox
+      # finding lands on `dedup_key`'s last-resort branch, whose only
+      # discriminator is the lowercased title — and a probe that emits N
+      # findings in a loop under one constant title collapses to a single
+      # record. Measured on the real SRI loop in `worker/web/hardening.py`: five
+      # unsafe CDN scripts, five distinct content hashes, one survivor.
+      #
+      # RM-061 owns giving blackbox findings a url and parameter. Once identity
+      # can actually distinguish them, this should move to `dedup_key` — the CVE
+      # title fallback below exists to approximate what that would do — but not
+      # before, because losing a finding is worse than keeping a reworded
+      # duplicate.
+      signature = f.get("finding_signature")
       if not signature:
         continue
       key = (signature, f.get("port", 0))
