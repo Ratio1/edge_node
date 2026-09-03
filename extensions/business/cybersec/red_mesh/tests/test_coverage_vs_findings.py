@@ -885,3 +885,35 @@ class TestEachEnrichmentFieldIsContent(unittest.TestCase):
     whose NVD fetches straddle a second, breaking cross-worker dedup."""
     a, b = self._pair(cvss_data_freshness="2026-09-03T00:00:01Z")
     self.assertEqual(a, b)
+
+
+class TestRiskBreakdownDeclaresTheDiagnostics(unittest.TestCase):
+  """Scope B: the contract dataclass mirrors what the risk walk actually emits.
+
+  `RiskBreakdown` declared six numeric fields while the produced dict carried
+  three more — `coverage_counts`, `schema_violations`, `identity_collisions` —
+  so its `from_dict` whitelist would silently drop the diagnostics, and the
+  declared contract lied about the shape every archive stores.
+  """
+
+  def _produced(self):
+    risk, _flat = _Host()._compute_risk_and_findings(
+      _graybox_report(["vulnerable", "not_vulnerable"])
+    )
+    return risk["breakdown"]
+
+  def test_the_dataclass_round_trips_every_produced_field(self):
+    from extensions.business.cybersec.red_mesh.models.shared import RiskBreakdown
+
+    produced = self._produced()
+    restored = RiskBreakdown.from_dict(produced).to_dict()
+    for field in ("coverage_counts", "schema_violations", "identity_collisions"):
+      self.assertIn(field, restored, f"from_dict dropped {field}")
+      self.assertEqual(restored[field], produced[field])
+
+  def test_absent_diagnostics_stay_absent(self):
+    """Older archives predate the fields; from_dict must not invent them."""
+    from extensions.business.cybersec.red_mesh.models.shared import RiskBreakdown
+
+    restored = RiskBreakdown.from_dict({"findings_score": 5.0}).to_dict()
+    self.assertNotIn("schema_violations", restored)
