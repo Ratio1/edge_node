@@ -50,7 +50,15 @@ class _WebHardeningMixin:
       cookies_hdr = resp_main.headers.get("Set-Cookie", "")
       if cookies_hdr:
         for cookie in cookies_hdr.split(","):
-          cookie_name = cookie.strip().split("=")[0] if "=" in cookie else cookie.strip()[:30]
+          # A Set-Cookie without `=` has no name, only content — falling back
+          # to the raw header put arbitrary (potentially secret-shaped) bytes
+          # into the title and evidence, and since the title feeds the
+          # locationless identity fallback, a rotating valueless header
+          # re-keyed the finding on every scan. (Splitting on "," is itself
+          # imperfect — an Expires date contains one — recorded as follow-up.)
+          cookie_name = (
+            cookie.strip().split("=")[0] if "=" in cookie else "(unnamed cookie)"
+          )
           if "Secure" not in cookie:
             findings_list.append(Finding(
               severity=Severity.MEDIUM,

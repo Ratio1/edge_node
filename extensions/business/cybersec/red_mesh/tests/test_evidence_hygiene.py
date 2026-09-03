@@ -295,5 +295,50 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
     self.assertEqual(stale, [], "allowlist entries for lines that no longer exist")
 
 
+class TestAValuelessCookieHeaderStaysOutOfTheFinding(unittest.TestCase):
+  """A Set-Cookie with no `=` has no name — only content.
+
+  `cookie_name` fell back to the first 30 characters of the raw header, which
+  for a malformed or hostile header is arbitrary content: it landed in the
+  *title* (pre-existing) and, after the evidence fix, in `evidence` too. And
+  because the title feeds the locationless identity fallback, a rotating
+  valueless header re-keyed the finding on every scan.
+  """
+
+  def _scan(self, header):
+    resp = MagicMock()
+    resp.headers = {"Set-Cookie": header}
+    resp.status_code = 200
+    resp.text = ""
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
+      return_value=resp,
+    ):
+      return _worker()._web_test_flags("example.com", 443)
+
+  def test_the_header_content_reaches_neither_title_nor_evidence(self):
+    result = self._scan("eyJSECRETJWTPAYLOADxyz")
+    self.assertTrue(result["findings"])
+    for finding in result["findings"]:
+      for field in ("title", "evidence", "description"):
+        self.assertNotIn("eyJSECRET", str(finding.get(field, "")), field)
+
+  def test_the_finding_id_is_stable_across_rotating_valueless_headers(self):
+    from extensions.business.cybersec.red_mesh.mixins.report import (
+      _finding_dedup_key,
+    )
+
+    def keys(result):
+      return sorted(
+        _finding_dedup_key(f) for f in result["findings"]
+      )
+
+    self.assertEqual(keys(self._scan("nonce-run-one")), keys(self._scan("nonce-run-two")))
+
+  def test_a_named_cookie_still_shows_its_name(self):
+    result = self._scan("sessionid=whatever; Path=/")
+    self.assertIn("sessionid", result["findings"][0]["title"])
+
+
 if __name__ == "__main__":
   unittest.main()

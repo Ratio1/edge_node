@@ -20,6 +20,10 @@ The contract this file pins: a **dedup key** over probe + scenario + normalised
 asset (including url and parameter) + classification, and a separate **content
 hash** for change detection. Rewording moves the content hash and leaves the
 dedup key alone.
+
+Those are the *computations* (`models.finding_identity.dedup_key` /
+`content_hash`). The persisted fields are `finding_id` and `finding_signature`
+— one field per concept, no duplicate names.
 """
 
 import unittest

@@ -20,10 +20,17 @@ value:
   `dedup_key`    — *is this the same finding?* Probe, scenario, the normalised
                    asset (including url and parameter, so two endpoints
                    exhibiting one scenario stay two findings), and
-                   classification. No free text.
+                   classification. No free text — except the lowercased title,
+                   folded in as a last resort for a finding with no scenario
+                   and no location, where nothing else distinguishes it.
   `content_hash` — *has this finding changed?* The presentation fields too,
                    minus per-worker custody, which varies across nodes for one
                    underlying finding.
+
+These are the *function* names. The persisted fields they produce are
+`finding_id` and `finding_signature` — the names every consumer reads — with no
+duplicate `dedup_key`/`content_hash` fields beside them: two names for one
+value is how a finding ended up carrying two disagreeing identities twice.
 """
 
 from __future__ import annotations
