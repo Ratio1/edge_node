@@ -743,3 +743,127 @@ class TestFindingTimelineCountsPassesNotOccurrences(unittest.TestCase):
     self.assertEqual(entry["pass_count"], 2)
     self.assertEqual(entry["first_seen"], 1)
     self.assertEqual(entry["last_seen"], 2)
+
+
+class TestCveDedupKeepsEndpointDistinctFindings(unittest.TestCase):
+  """F1 (external review, validated): the CVE fallback keyed `(cve_id, port)`.
+
+  Two findings for one CVE at two *endpoints* on one port collapsed to a single
+  survivor — and input order picked which one, so the report's content depended
+  on worker arrival order. Measured: `/api/upload` survived under one order,
+  `/api/import` under the other. The key now includes the canonical asset
+  string, so endpoint-distinct findings survive while the fallback's original
+  purpose — merging reworded records of one *locationless* CVE — is unchanged
+  (locationless assets canonicalise to the empty string).
+  """
+
+  def _run(self, items):
+    return _Host()._compute_risk_and_findings({
+      "target": "t", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [dict(x) for x in items]}}},
+    })[1]
+
+  def _at(self, path):
+    return {"title": f"CVE-2024-1234 RCE via {path}", "severity": "HIGH",
+            "confidence": "certain", "description": path,
+            "affected_assets": [{"host": "t", "port": 443, "url": path}]}
+
+  def test_two_endpoints_are_two_findings_in_both_orders(self):
+    a, b = self._at("/api/upload"), self._at("/api/import")
+    self.assertEqual(len(self._run([a, b])), 2)
+    self.assertEqual(len(self._run([b, a])), 2)
+
+  def test_reworded_locationless_records_of_one_cve_still_merge(self):
+    a = {"title": "CVE-2024-1234 detected", "severity": "HIGH",
+         "confidence": "certain", "description": "one wording"}
+    b = {"title": "CVE-2024-1234 remote code execution", "severity": "HIGH",
+         "confidence": "certain", "description": "another wording"}
+    self.assertEqual(len(self._run([a, b])), 1)
+
+
+class TestDedupTiesAreOrderIndependent(unittest.TestCase):
+  """F4 (external review, validated): the content signature was blind to
+  enrichment (kev, epss, environmental CVSS, references), so a stale and a
+  freshly-enriched record of one CVE shared a signature and *arrival order*
+  decided which survived — measured, `kev=False/epss=0.1` won under one order.
+
+  Enrichment is content now, so the pair no longer shares a signature; the
+  CVE fallback then decides between them, and its rank ends with
+  `cvss_data_freshness` (newer enrichment wins) and the signature (an
+  order-independent final tiebreak). Freshness is deliberately NOT in the
+  signature itself: it is a fetch timestamp, and hashing it would fork
+  signatures between workers whose NVD fetches straddle a second.
+  """
+
+  def _run(self, items):
+    return _Host()._compute_risk_and_findings({
+      "target": "t", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [dict(x) for x in items]}}},
+    })[1]
+
+  def _record(self, kev, epss, fresh):
+    return {"title": "CVE-2020-1 in x", "severity": "HIGH", "confidence": "certain",
+            "description": "d", "kev": kev, "epss_score": epss,
+            "cvss_data_freshness": fresh}
+
+  def test_the_newer_enrichment_survives_in_both_orders(self):
+    old = self._record(False, 0.1, "2025-01-01T00:00:00Z")
+    new = self._record(True, 0.9, "2026-09-01T00:00:00Z")
+    for items in ([old, new], [new, old]):
+      flat = self._run(items)
+      self.assertEqual(len(flat), 1)
+      self.assertTrue(flat[0]["kev"])
+      self.assertEqual(flat[0]["epss_score"], 0.9)
+
+  def test_an_equal_rank_tie_has_the_same_survivor_in_both_orders(self):
+    a = {"title": "CVE-2020-1 in x", "severity": "HIGH", "confidence": "certain",
+         "description": "wording one"}
+    b = {"title": "CVE-2020-1 in x", "severity": "HIGH", "confidence": "certain",
+         "description": "wording two"}
+    survivor_ab = self._run([a, b])[0]["description"]
+    survivor_ba = self._run([b, a])[0]["description"]
+    self.assertEqual(survivor_ab, survivor_ba)
+
+
+class TestEachEnrichmentFieldIsContent(unittest.TestCase):
+  """Per-field, because the combined test could not isolate them: a mutant
+  dropping `kev` alone survived while epss still distinguished the fixtures."""
+
+  def _pair(self, **difference):
+    from extensions.business.cybersec.red_mesh.models.finding_identity import (
+      content_hash,
+    )
+    base = {"title": "CVE-2020-1 in x", "severity": "HIGH",
+            "confidence": "certain", "description": "d"}
+    return content_hash(dict(base)), content_hash(dict(base, **difference))
+
+  def test_kev_is_content(self):
+    a, b = self._pair(kev=True)
+    self.assertNotEqual(a, b)
+
+  def test_epss_is_content(self):
+    a, b = self._pair(epss_score=0.9)
+    self.assertNotEqual(a, b)
+
+  def test_environmental_cvss_is_content(self):
+    a, b = self._pair(cvss_score_env=9.8)
+    self.assertNotEqual(a, b)
+    a, b = self._pair(cvss_vector_env="CVSS:3.1/AV:N")
+    self.assertNotEqual(a, b)
+
+  def test_references_are_content_but_their_order_is_not(self):
+    from extensions.business.cybersec.red_mesh.models.finding_identity import (
+      content_hash,
+    )
+    base = {"title": "t", "severity": "HIGH", "confidence": "certain"}
+    with_refs = content_hash(dict(base, references=["https://a", "https://b"]))
+    reordered = content_hash(dict(base, references=["https://b", "https://a"]))
+    without = content_hash(dict(base))
+    self.assertEqual(with_refs, reordered)
+    self.assertNotEqual(with_refs, without)
+
+  def test_the_fetch_timestamp_is_deliberately_not_content(self):
+    """Hashing `cvss_data_freshness` would fork signatures between workers
+    whose NVD fetches straddle a second, breaking cross-worker dedup."""
+    a, b = self._pair(cvss_data_freshness="2026-09-03T00:00:01Z")
+    self.assertEqual(a, b)

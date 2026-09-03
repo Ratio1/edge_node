@@ -16,6 +16,7 @@ from ..models.finding_schema import (
   validate_flat_finding as _validate_flat_finding,
 )
 from ..models.finding_identity import (
+  canonical_asset_string as _canonical_asset_string,
   content_hash as _content_hash,
   dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
@@ -361,7 +362,14 @@ class _RiskScoringMixin:
     def finding_rank(f):
       severity = SEVERITY_RANK.get(str(f.get("severity", "INFO")).upper(), 0)
       confidence = CONFIDENCE_RANK.get(str(f.get("confidence", "tentative")).lower(), 0)
-      return severity, confidence
+      # Ties were broken by arrival order — "first wins" — so the report's
+      # content depended on which worker answered first. Two deterministic
+      # tiebreaks: newer NVD enrichment wins (`cvss_data_freshness` is ISO-8601,
+      # so lexicographic compare is chronological), then the content signature,
+      # which is order-independent by construction.
+      freshness = str(f.get("cvss_data_freshness") or "")
+      signature = str(f.get("finding_signature") or "")
+      return severity, confidence, freshness, signature
 
     drop_indices = set()
     signature_best = {}
@@ -416,7 +424,12 @@ class _RiskScoringMixin:
         continue
       cve_id = m.group(0)
       port = f.get("port", 0)
-      key = (cve_id, port)
+      # The endpoint is part of the key. `(cve_id, port)` alone collapsed two
+      # findings for one CVE at two *endpoints* into one survivor chosen by
+      # arrival order. A locationless asset canonicalises to "", so the
+      # fallback's purpose — merging reworded records of one locationless CVE —
+      # is unchanged.
+      key = (cve_id, port, _canonical_asset_string(f.get("affected_assets")))
       # `finding_rank` — severity first, then confidence — the same ordering the
       # signature loop above uses. Ranking on confidence alone let a LOW banner
       # observation marked `certain` evict a CRITICAL RCE marked `tentative`,

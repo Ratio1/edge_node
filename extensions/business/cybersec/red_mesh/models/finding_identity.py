@@ -76,6 +76,17 @@ _CONTENT_FIELDS = (
   "remediation",
   "cvss_score",
   "cvss_vector",
+  # Enrichment is content: a KEV flip or an EPSS move is a material change, and
+  # leaving these out let a stale and a freshly-enriched record of one CVE share
+  # a signature — so *arrival order* decided which survived dedup. Deliberately
+  # NOT `cvss_data_freshness`: it is a fetch timestamp, and hashing it would
+  # fork signatures between workers whose NVD fetches straddle a second (the
+  # fields below are worker-stable — same scan, same scan-local dynamic cache).
+  "kev",
+  "epss_score",
+  "cvss_score_env",
+  "cvss_vector_env",
+  "references",
 )
 
 _UNIT = "\x1f"
@@ -218,7 +229,13 @@ def content_hash(finding: dict, *, asset_canonical: str | None = None) -> str:
   if not isinstance(finding, dict):
     raise TypeError("finding must be a dict")
   parts = [dedup_key(finding, asset_canonical=asset_canonical)]
-  parts.extend(_text(finding.get(name)) for name in _CONTENT_FIELDS)
+  for name in _CONTENT_FIELDS:
+    value = finding.get(name)
+    # Order-independent for list-valued fields: two producers listing the same
+    # references in a different order describe the same content.
+    if isinstance(value, (list, tuple)):
+      value = sorted(_text(item) for item in value)
+    parts.append(_text(value))
   return hashlib.sha256(_RECORD.join(parts).encode("utf-8")).hexdigest()
 
 
