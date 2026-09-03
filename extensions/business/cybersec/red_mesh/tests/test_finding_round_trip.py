@@ -81,7 +81,7 @@ class TestOneFindingSurvivesTheWholePipeline(unittest.TestCase):
       port=443, protocol="https", probe_name="_graybox_access_control",
     )
     archived = self._flatten([_graybox_finding(99)])[0]
-    self.assertEqual(archived["dedup_key"], direct["dedup_key"])
+    self.assertEqual(archived["finding_id"], direct["finding_id"])
     self.assertEqual(archived["finding_id"], direct["finding_id"])
 
   def test_the_flat_finding_validates_against_the_contract(self):
@@ -112,11 +112,11 @@ class TestNEndpointsYieldNFindings(unittest.TestCase):
     scenario on twelve endpoints deduplicated to a single finding."""
     findings = [_graybox_finding(index) for index in range(12)]
     _risk, flat = self._flatten(findings)
-    self.assertEqual(len({f["dedup_key"] for f in flat}), 12)
+    self.assertEqual(len({f["finding_id"] for f in flat}), 12)
 
   def test_the_same_endpoint_twice_is_one_finding(self):
     _risk, flat = self._flatten([_graybox_finding(99), _graybox_finding(99)])
-    self.assertEqual(len({f["dedup_key"] for f in flat}), 1)
+    self.assertEqual(len({f["finding_id"] for f in flat}), 1)
 
   def test_coverage_results_do_not_inflate_the_finding_count(self):
     findings = [_graybox_finding(0)] + [

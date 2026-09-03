@@ -429,7 +429,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache):
   }
   return finding.with_identity(
     finding_signature=finding.compute_signature(**identity),
-    dedup_key=finding.compute_dedup_key(**identity),
+    finding_id=finding.compute_dedup_key(**identity),
   )
 
 

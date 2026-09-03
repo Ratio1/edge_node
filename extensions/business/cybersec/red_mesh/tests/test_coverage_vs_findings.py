@@ -450,9 +450,6 @@ class TestFindingIdsAreDeterministic(unittest.TestCase):
       by_script(self._run(forward)[1]), by_script(self._run(backward)[1]),
     )
 
-  def test_a_finding_with_a_unique_identity_keeps_its_dedup_key_as_its_id(self):
-    _risk, flat = self._run(self._sri(1))
-    self.assertEqual(flat[0]["finding_id"], flat[0]["dedup_key"])
 
 
 class TestTheSameWeaknessOnTwoPortsIsAReportedCollision(unittest.TestCase):

@@ -415,10 +415,11 @@ class GrayboxFinding:
     # recomputed downstream: the report layer redacts the very fields the hash
     # is over, so a value re-derived after redaction would never match the one
     # archived with the finding.
-    flat["dedup_key"] = _dedup_key(flat)
-    flat["content_hash"] = _content_hash(flat)
-    flat["finding_id"] = flat["dedup_key"]
-    flat["finding_signature"] = flat["content_hash"]
+    # Two fields, not four: `finding_id` is the identity, `finding_signature`
+    # the content. The `dedup_key`/`content_hash` twins existed only to derive
+    # these and let the pairs disagree.
+    flat["finding_id"] = _dedup_key(flat)
+    flat["finding_signature"] = _content_hash(flat)
     return _scrub_flat_finding(flat, secret_field_names=secret_field_names)
 
   @classmethod
@@ -433,12 +434,13 @@ class GrayboxFinding:
     # report layer's redaction — and redaction rewrites exactly the fields the
     # hashes are over, so recomputing would hand the same finding a new identity
     # and every consumer would read it as a new one.
-    for key in ("dedup_key", "content_hash"):
-      if payload.get(key):
-        flat[key] = payload[key]
-    # The derived pair follows its source, or a carried `dedup_key` would sit
-    # beside a `finding_id` recomputed from redacted fields — two identities for
-    # one finding, disagreeing, in the same dict.
-    flat["finding_id"] = payload.get("finding_id") or flat["dedup_key"]
-    flat["finding_signature"] = payload.get("finding_signature") or flat["content_hash"]
+    # `dedup_key`/`content_hash` are the pre-collapse names for the same two
+    # values; archives written before the collapse carry only those.
+    flat["finding_id"] = (
+      payload.get("finding_id") or payload.get("dedup_key") or flat["finding_id"]
+    )
+    flat["finding_signature"] = (
+      payload.get("finding_signature") or payload.get("content_hash")
+      or flat["finding_signature"]
+    )
     return flat

@@ -212,17 +212,23 @@ class _RiskScoringMixin:
       # values, and nothing downstream recomputes them. Carrying them is what
       # makes identity redaction-invariant.
       #
-      # `dedup_key` used to be *derived* here as `finding_signature[:16]` when
-      # only the signature was stamped — and the signature is the content hash,
-      # so identity went straight back to being content-addressed on the one
-      # path that ships. Rewording a description moved `finding_id`. The probe
-      # stamps `dedup_key` itself now; the local computation is the fallback for
-      # a finding that arrives unstamped, and never the truncated content hash.
-      carried = item.get("finding_signature")
-      item["dedup_key"] = item.get("dedup_key") or _dedup_key(item)
-      item["content_hash"] = item.get("content_hash") or carried or _content_hash(item)
-      item["finding_signature"] = carried or item["content_hash"]
-      item["finding_id"] = item.get("finding_id") or item["dedup_key"]
+      # Two fields, not four. `finding_id` used to be *derived* here as
+      # `finding_signature[:16]` — content-addressed identity, the defect B2
+      # exists to remove — and later carried a `dedup_key` twin beside it, which
+      # let the pair disagree. The probe stamps `finding_id` itself now; the
+      # local computation is the fallback for a finding that arrives unstamped,
+      # and never the truncated content hash. `dedup_key`/`content_hash` are the
+      # pre-collapse names still present in older archives, honoured as
+      # fallbacks and dropped from the output rather than re-persisted.
+      item["finding_id"] = (
+        item.get("finding_id") or item.get("dedup_key") or _dedup_key(item)
+      )
+      item["finding_signature"] = (
+        item.get("finding_signature") or item.get("content_hash")
+        or _content_hash(item)
+      )
+      item.pop("dedup_key", None)
+      item.pop("content_hash", None)
       item["port"] = port
       item["protocol"] = protocol
       item["category"] = category

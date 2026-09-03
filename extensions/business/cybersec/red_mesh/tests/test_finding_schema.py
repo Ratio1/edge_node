@@ -99,12 +99,12 @@ class TestFindingSignature(unittest.TestCase):
     f = Finding(severity=Severity.HIGH, title="t", description="d")
     sig = f.compute_signature(probe_id="x")
     key = f.compute_dedup_key(probe_id="x")
-    f2 = f.with_identity(finding_signature=sig, dedup_key=key)
+    f2 = f.with_identity(finding_signature=sig, finding_id=key)
     self.assertEqual(f2.finding_signature, sig)
-    self.assertEqual(f2.dedup_key, key)
+    self.assertEqual(f2.finding_id, key)
     # Original immutable, on both keys.
     self.assertEqual(f.finding_signature, "")
-    self.assertEqual(f.dedup_key, "")
+    self.assertEqual(f.finding_id, "")
 
 
 class TestStructuredFields(unittest.TestCase):

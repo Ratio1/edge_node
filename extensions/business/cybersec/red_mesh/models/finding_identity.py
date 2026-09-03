@@ -82,12 +82,20 @@ def canonical_asset_string(assets: Any) -> str:
   `url` and `parameter` are load-bearing: without them every endpoint
   exhibiting one scenario collapsed into a single finding, so a scanner that
   found the same IDOR on twelve endpoints reported it once.
+
+  A `{host, port}`-only asset contributes nothing — it is not a location, it
+  is where the scan pointed (`_has_specific_location` draws the same line).
+  Including it forked identity between the two representations of one finding:
+  stamped at probe time over empty assets, versus a raw dict whose asset the
+  flat walk synthesised — so the pair never deduplicated against each other.
   """
   if not isinstance(assets, (list, tuple)):
     return ""
   parts = []
   for asset in assets:
     if not isinstance(asset, dict):
+      continue
+    if not (asset.get("url") or asset.get("parameter")):
       continue
     parts.append(_UNIT.join([
       _text(asset.get("host")),

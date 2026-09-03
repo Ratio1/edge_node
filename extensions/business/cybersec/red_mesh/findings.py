@@ -123,11 +123,14 @@ class Finding:
   # is set by the report generator at render time.
   finding_signature: str = ""
   # The identity key, stamped beside the content hash rather than derived from
-  # it. Deriving it (`finding_signature[:16]`) made identity content-addressed,
-  # so rewording a description handed the finding a new id and triage state did
-  # not survive the edit. Both are stamped at probe time, on unredacted values,
-  # which is also what keeps them stable across `_redact_report`.
-  dedup_key: str = ""
+  # it (`finding_signature[:16]` made identity content-addressed, so rewording
+  # a description handed the finding a new id). Named `finding_id` — the name
+  # every consumer reads — rather than a `dedup_key` twin that existed only to
+  # derive it: two names for one concept is how "two identities for one
+  # finding, disagreeing in the same dict" happened twice on this branch. Both
+  # keys are stamped at probe time, on unredacted values, which is what keeps
+  # them stable across `_redact_report`.
+  finding_id: str = ""
 
   # Risk scoring extensions
   cvss_version: str = "3.1"
@@ -258,7 +261,7 @@ class Finding:
       self._identity_payload(probe_id), asset_canonical=asset_canonical,
     )
 
-  def with_identity(self, *, finding_signature: str, dedup_key: str) -> "Finding":
+  def with_identity(self, *, finding_signature: str, finding_id: str) -> "Finding":
     """Return a new Finding carrying both identity keys (frozen-safe).
 
     Replaces `with_signature`, which stamped only the content hash. Its one
@@ -271,7 +274,7 @@ class Finding:
     """
     data = asdict(self)
     data["finding_signature"] = finding_signature
-    data["dedup_key"] = dedup_key
+    data["finding_id"] = finding_id
     return Finding(**_revive_finding_dict(data))
 
 
@@ -404,8 +407,8 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
   identity = {}
   if probe_id and not enriched.finding_signature:
     identity["finding_signature"] = enriched.compute_signature(probe_id=probe_id)
-  if probe_id and not enriched.dedup_key:
-    identity["dedup_key"] = enriched.compute_dedup_key(probe_id=probe_id)
+  if probe_id and not enriched.finding_id:
+    identity["finding_id"] = enriched.compute_dedup_key(probe_id=probe_id)
   return replace(enriched, **identity) if identity else enriched
 
 

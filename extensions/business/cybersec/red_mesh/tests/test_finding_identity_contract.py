@@ -319,6 +319,9 @@ class TestIdentitySurvivesRedaction(unittest.TestCase):
     return flat
 
   def test_an_already_stamped_finding_keeps_its_identity(self):
+    # The legacy field names, as a pre-collapse archive entry carries them:
+    # honoured as the identity, resolved to the surviving names, and not
+    # re-persisted under the old ones.
     stamped = {
       "title": "REDACTED after the fact",
       "severity": "HIGH",
@@ -327,9 +330,10 @@ class TestIdentitySurvivesRedaction(unittest.TestCase):
       "content_hash": "f" * 64,
     }
     flat = self._flatten([stamped])[0]
-    self.assertEqual(flat["dedup_key"], "0123456789abcdef")
-    self.assertEqual(flat["content_hash"], "f" * 64)
     self.assertEqual(flat["finding_id"], "0123456789abcdef")
+    self.assertEqual(flat["finding_signature"], "f" * 64)
+    self.assertNotIn("dedup_key", flat)
+    self.assertNotIn("content_hash", flat)
 
   def test_a_blackbox_finding_keeps_its_id_across_the_redaction_boundary(self):
     """The walk runs on both sides of `_redact_report` depending on the caller.
@@ -392,9 +396,8 @@ class TestIdentitySurvivesRedaction(unittest.TestCase):
     flat = GrayboxFinding.flat_from_dict(
       persisted, port=443, protocol="https", probe_name="_graybox_access_control",
     )
-    self.assertEqual(flat["dedup_key"], "0123456789abcdef")
     self.assertEqual(flat["finding_id"], "0123456789abcdef")
-    self.assertEqual(flat["content_hash"], "e" * 64)
+    self.assertEqual(flat["finding_signature"], "e" * 64)
 
   def test_re_flattening_a_redacted_finding_does_not_re_key_it(self):
     original = self._flatten([{
@@ -404,8 +407,8 @@ class TestIdentitySurvivesRedaction(unittest.TestCase):
     redacted = dict(original)
     redacted["title"] = "Default credentials accepted: admin:***"
     reflattened = self._flatten([redacted])[0]
-    self.assertEqual(reflattened["dedup_key"], original["dedup_key"])
-    self.assertEqual(reflattened["content_hash"], original["content_hash"])
+    self.assertEqual(reflattened["finding_id"], original["finding_id"])
+    self.assertEqual(reflattened["finding_signature"], original["finding_signature"])
 
 
 class TestRewordingSurvivesTheRealBlackboxPath(unittest.TestCase):
@@ -452,7 +455,7 @@ class TestRewordingSurvivesTheRealBlackboxPath(unittest.TestCase):
     original = self._flat("admin login accepted")
     reworded = self._flat("admin login accepted (retested)")
     self.assertEqual(
-      original["dedup_key"], reworded["dedup_key"],
+      original["finding_id"], reworded["finding_id"],
       "a wording change gave the finding a new identity, so triage state and "
       "longitudinal tracking do not survive an edit to the description",
     )
@@ -461,8 +464,8 @@ class TestRewordingSurvivesTheRealBlackboxPath(unittest.TestCase):
   def test_rewording_a_finding_does_change_its_content_hash(self):
     """The other half of the contract: change detection still has to work."""
     self.assertNotEqual(
-      self._flat("admin login accepted")["content_hash"],
-      self._flat("admin login accepted (retested)")["content_hash"],
+      self._flat("admin login accepted")["finding_signature"],
+      self._flat("admin login accepted (retested)")["finding_signature"],
     )
 
   def test_the_probe_stamps_both_keys_rather_than_deriving_one(self):
@@ -474,10 +477,10 @@ class TestRewordingSurvivesTheRealBlackboxPath(unittest.TestCase):
       )],
       probe_id="_service_info_ssl",
     )["findings"][0]
-    self.assertTrue(stamped.get("dedup_key"), "no dedup key was stamped at probe time")
+    self.assertTrue(stamped.get("finding_id"), "no identity key was stamped at probe time")
     self.assertTrue(stamped.get("finding_signature"))
     self.assertNotEqual(
-      stamped["dedup_key"], stamped["finding_signature"][:16],
+      stamped["finding_id"], stamped["finding_signature"][:16],
       "the dedup key is still the content hash wearing a different name",
     )
 
@@ -514,7 +517,7 @@ class TestTheCveMatcherStampsOneIdentityNotTwo(unittest.TestCase):
   def test_the_matcher_stamps_a_dedup_key_at_all(self):
     for finding in self._from_production():
       self.assertTrue(
-        finding.dedup_key,
+        finding.finding_id,
         "check_cves emitted a finding with no dedup key, so identity would be "
         "recomputed downstream from the probe name",
       )
@@ -526,7 +529,7 @@ class TestTheCveMatcherStampsOneIdentityNotTwo(unittest.TestCase):
         probe_id=f"cve:{self.PRODUCT}",
         asset_canonical=f"{self.PRODUCT}:{self.VERSION}:{cve_id}",
       )
-      self.assertEqual(finding.dedup_key, expected)
+      self.assertEqual(finding.finding_id, expected)
 
   def test_the_probe_does_not_overwrite_the_stamped_identity(self):
     from extensions.business.cybersec.red_mesh.findings import (
@@ -534,12 +537,166 @@ class TestTheCveMatcherStampsOneIdentityNotTwo(unittest.TestCase):
     )
     for finding in self._from_production():
       enriched = enrich_finding_for_probe(finding, "_service_info_ssh")
-      self.assertEqual(enriched.dedup_key, finding.dedup_key)
+      self.assertEqual(enriched.finding_id, finding.finding_id)
       self.assertEqual(enriched.finding_signature, finding.finding_signature)
 
   def test_each_cve_gets_its_own_identity(self):
     findings = self._from_production()
-    self.assertEqual(len({f.dedup_key for f in findings}), len(findings))
+    self.assertEqual(len({f.finding_id for f in findings}), len(findings))
+
+
+class TestTwoIdentityFieldsNotFour(unittest.TestCase):
+  """Phase 5b: `finding_id` (identity) and `finding_signature` (content) are
+  the only persisted identity fields.
+
+  Every finding used to carry four — `dedup_key`/`content_hash` existed solely
+  to derive the other two, and two names for one concept is how "two identities
+  for one finding, disagreeing in the same dict" happened twice on this branch
+  (the cve_db stamp, and carried-vs-recomputed). A single field cannot disagree
+  with itself. The *functions* stay in `models/finding_identity.py`; the
+  persisted duplicates go.
+  """
+
+  def _blackbox_flat(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    result = probe_result(
+      findings=[Finding(
+        severity=Severity.MEDIUM, title="Weak TLS", description="d",
+        confidence="certain",
+      )],
+      probe_id="_service_info_ssl",
+    )
+    return MockHost()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_ssl": result}},
+    })[1][0]
+
+  def test_a_new_blackbox_finding_carries_exactly_the_two(self):
+    flat = self._blackbox_flat()
+    self.assertNotIn("dedup_key", flat)
+    self.assertNotIn("content_hash", flat)
+    self.assertTrue(flat["finding_id"])
+    self.assertTrue(flat["finding_signature"])
+    self.assertNotEqual(flat["finding_id"], flat["finding_signature"])
+
+  def test_a_new_graybox_finding_carries_exactly_the_two(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+
+    flat = GrayboxFinding(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021", url="https://app.test/x",
+    ).to_flat_finding(port=443, protocol="https", probe_name="_graybox_access_control")
+    self.assertNotIn("dedup_key", flat)
+    self.assertNotIn("content_hash", flat)
+    self.assertTrue(flat["finding_id"])
+    self.assertTrue(flat["finding_signature"])
+
+  def test_an_old_archive_entry_with_only_the_legacy_names_still_resolves(self):
+    """Archives written before the collapse carry `dedup_key`/`content_hash`;
+    identity must come from them, never be recomputed from redacted fields."""
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+
+    persisted = {
+      "scenario_id": "PT-A01-01", "title": "IDOR", "status": "vulnerable",
+      "severity": "HIGH", "owasp": "A01:2021",
+      "url": "https://app.test/api/records/99",
+      "dedup_key": "0123456789abcdef", "content_hash": "e" * 64,
+    }
+    flat = GrayboxFinding.flat_from_dict(
+      persisted, port=443, protocol="https", probe_name="_graybox_access_control",
+    )
+    self.assertEqual(flat["finding_id"], "0123456789abcdef")
+    self.assertEqual(flat["finding_signature"], "e" * 64)
+
+  def test_the_cve_matcher_stamps_finding_id_over_its_own_basis(self):
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+
+    findings = check_cves("openssh", "7.0")
+    self.assertTrue(findings)
+    for finding in findings:
+      cve_id = finding.cve[0]
+      self.assertEqual(
+        finding.finding_id,
+        finding.compute_dedup_key(
+          probe_id="cve:openssh",
+          asset_canonical=f"openssh:7.0:{cve_id}",
+        ),
+      )
+
+
+class TestStampedAndRawRepresentationsShareIdentity(unittest.TestCase):
+  """A synthesised `{host, port}` asset must not contribute to identity.
+
+  Identity is stamped at probe time over `affected_assets = ()`; the flat walk
+  then synthesises `[{host, port}]` for raw dicts before computing its
+  fallback. The synthesised asset carried no location but still fed
+  `canonical_asset_string`, so the same finding arriving stamped (empty assets)
+  and raw (synthesised asset) got different keys — and the two representations
+  of one finding never deduplicated against each other. A host/port-only asset
+  is not a location; `_has_specific_location` already draws that line.
+  """
+
+  def _both(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    stamped = probe_result(
+      findings=[Finding(
+        severity=Severity.MEDIUM, title="Weak TLS", description="d",
+        confidence="certain",
+      )],
+      probe_id="_service_info_http",
+    )["findings"][0]
+    # Classification matches what `enrich_finding_for_probe` stamps from the
+    # registry: classification is legitimately part of identity, so an
+    # UNclassified raw dict is a different identity than its enriched twin —
+    # that residual asymmetry is documented in RM-062, not papered over here.
+    # This pair isolates the asset half: same classification, and the only
+    # remaining difference is the synthesised `{host, port}` asset.
+    raw = {"title": "Weak TLS", "description": "d", "severity": "MEDIUM",
+           "confidence": "certain", "owasp_id": "A05:2021", "cwe_id": "CWE-200"}
+    return MockHost()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [stamped, raw]}}},
+    })
+
+  def test_the_two_representations_share_one_identity(self):
+    _risk, flat = self._both()
+    self.assertEqual(len({f["finding_id"] for f in flat}), 1)
+
+  def test_the_shared_identity_is_reported_as_a_collision(self):
+    """Content dedup still keeps both — enrichment adds real content (registry
+    CVSS template, references) to the stamped twin, so their signatures differ
+    and merging them would discard content. What the identity fix guarantees is
+    that the pair now *shares an id*, so triage resolves both and the overlap
+    is visible in `identity_collisions` instead of silently splitting."""
+    risk, flat = self._both()
+    self.assertEqual(len(flat), 2)
+    self.assertEqual(risk["breakdown"]["identity_collisions"]["count"], 2)
+
+  def test_a_real_location_still_separates_findings(self):
+    """The control — dropping synthesised assets from the canonical string must
+    not merge findings at genuinely different locations."""
+    from extensions.business.cybersec.red_mesh.models.finding_identity import (
+      dedup_key as compute,
+    )
+    at_a = {"probe": "_p", "title": "t", "cwe_id": "CWE-79",
+            "affected_assets": [{"host": "h", "port": 443, "url": "/a"}]}
+    at_b = {"probe": "_p", "title": "t", "cwe_id": "CWE-79",
+            "affected_assets": [{"host": "h", "port": 443, "url": "/b"}]}
+    self.assertNotEqual(compute(at_a), compute(at_b))
 
 
 if __name__ == "__main__":
