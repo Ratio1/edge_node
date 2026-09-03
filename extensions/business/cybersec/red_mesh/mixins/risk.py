@@ -89,10 +89,6 @@ class _RiskScoringMixin:
     """
     import math
 
-    findings_score = 0.0
-    finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-    coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
-    cred_count = 0
     flat_findings = []
     schema_violations = []
 
@@ -105,39 +101,14 @@ class _RiskScoringMixin:
     )
 
     def process_findings(findings_list, port, probe_name, category):
-      nonlocal findings_score, cred_count
+      # Production only. This walk used to score as it produced, in parallel
+      # with a post-dedup recount — three copies of one loop, and their drift
+      # caused real defects twice (coverage rescored after dedup; a padded
+      # confidence scoring 0.5 here and 1.0 there). Scoring now happens exactly
+      # once, after dedup, over `flat_findings`.
       for finding in findings_list:
         if not isinstance(finding, dict):
           continue
-        # A scenario that ran and found nothing, or could not decide, is
-        # evidence about coverage — not a finding. Both were scored and counted
-        # here as vulnerabilities, so `total_findings` answered "how many
-        # scenarios ran". `inconclusive` was the sharper half: only
-        # `not_vulnerable` is downgraded to INFO, so an undecided scenario kept
-        # its *declared* severity and counted as a HIGH finding that raised the
-        # risk score. The entry is still archived — a PTES report needs the
-        # coverage evidence — it just is not counted as a finding.
-        status = str(finding.get("status") or "").lower()
-        if status in COVERAGE_STATUSES:
-          coverage_counts[status] = coverage_counts.get(status, 0) + 1
-          flat_findings.append(
-            normalize_flat_finding(
-              finding, port, port_protocols.get(str(port), "unknown"),
-              probe_name, category,
-            )
-          )
-          continue
-        severity = finding.get("severity", "INFO").upper()
-        confidence = finding.get("confidence", "firm").lower()
-        weight = RISK_SEVERITY_WEIGHTS.get(severity, 0)
-        multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(confidence, 0.5)
-        findings_score += weight * multiplier
-        if severity in finding_counts:
-          finding_counts[severity] += 1
-        title = finding.get("title", "")
-        if isinstance(title, str) and "default credential accepted" in title.lower():
-          cred_count += 1
-
         protocol = port_protocols.get(str(port), "unknown")
         flat_findings.append(
           normalize_flat_finding(finding, port, protocol, probe_name, category)
@@ -201,7 +172,9 @@ class _RiskScoringMixin:
         else:
           item["evidence_items"] = []
 
-      if not item.get("remediation_structured"):
+      # A scenario that concluded nothing has nothing to remediate; the default
+      # text made coverage records read like findings in the PDF.
+      if not item.get("remediation_structured") and not _is_coverage_result(item):
         item["remediation_structured"] = {
           "primary": item.get("remediation")
                      or "Review the finding evidence and apply vendor or platform hardening guidance.",
@@ -209,7 +182,10 @@ class _RiskScoringMixin:
           "compensating": "",
         }
 
-      if not item.get("affected_assets"):
+      # Key absence, not falsiness: `affected_assets: []` is a deliberate
+      # statement — "no location recorded" (the graybox producer documents the
+      # distinction) — and the falsy check replaced it with an invented asset.
+      if "affected_assets" not in item:
         asset = {"host": target, "port": port if port else None}
         url = item.get("url")
         if url:
@@ -347,27 +323,11 @@ class _RiskScoringMixin:
             except (TypeError, KeyError, ValueError):
               continue
 
-            # Same rule as the blackbox walk above: a scenario that ran and
-            # found nothing, or could not decide, is coverage evidence rather
-            # than a finding. This is where it bites hardest — every graybox
-            # scenario emits a result whatever the outcome, so a clean scan
-            # produced dozens of "findings", and an `inconclusive` one kept its
-            # declared severity and scored as a real vulnerability.
-            status = str(flat.get("status") or "").lower()
-            if status in COVERAGE_STATUSES:
-              coverage_counts[status] = coverage_counts.get(status, 0) + 1
-              flat_findings.append(flat)
-              continue
-
-            weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
-            multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
-            findings_score += weight * multiplier
-            if flat["severity"] in finding_counts:
-              finding_counts[flat["severity"]] += 1
-            title = flat.get("title", "")
-            if isinstance(title, str) and "default credential accepted" in title.lower():
-              cred_count += 1
-
+            # Coverage results included: they were appended raw here, which
+            # meant graybox coverage was the one shape that skipped
+            # normalisation — never schema-validated, unlike blackbox coverage.
+            # One producer path for everything; the single scoring walk below
+            # makes the coverage/finding distinction.
             flat_findings.append(
               normalize_flat_finding(flat, port, protocol, probe_name, "graybox")
             )
@@ -381,8 +341,8 @@ class _RiskScoringMixin:
     nr_protocols = len(set(port_protocols.values())) if isinstance(port_protocols, dict) else 0
     breadth_score = 10.0 * (1.0 - math.exp(-nr_protocols / 4.0))
 
-    # D. Default credentials penalty
-    credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
+    # D (default-credentials penalty) is computed after the scoring walk below —
+    # it reads `cred_count`, which only exists once findings are counted.
 
     # Deduplicate finding signatures first. CVE title fallback remains for
     # older findings that represent the same CVE with different descriptions.
@@ -467,37 +427,39 @@ class _RiskScoringMixin:
 
     if drop_indices:
       flat_findings = [f for i, f in enumerate(flat_findings) if i not in drop_indices]
-      # Recalculate scores after dedup.
-      #
-      # This walk has to make the same coverage/finding distinction the two
-      # producing walks make. It did not: they skip `not_vulnerable` and
-      # `inconclusive` before scoring, while this one iterated the flat list —
-      # which holds coverage, deliberately — and scored every entry in it. So
-      # all of B5 held only for as long as nothing deduplicated. Measured on one
-      # real HIGH plus one `inconclusive` HIGH, adding a *duplicate of the real
-      # finding* took `finding_counts["HIGH"]` from 1 to 2 and the findings
-      # score from 25.0 to 37.5: a scenario that concluded nothing came back as
-      # a vulnerability because an unrelated record happened to be redundant.
-      findings_score = 0.0
-      finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-      coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
-      cred_count = 0
-      for f in flat_findings:
-        if _is_coverage_result(f):
-          status = str(f.get("status") or "").lower()
-          coverage_counts[status] = coverage_counts.get(status, 0) + 1
-          continue
-        severity = f.get("severity", "INFO").upper()
-        confidence = f.get("confidence", "firm").lower()
-        weight = RISK_SEVERITY_WEIGHTS.get(severity, 0)
-        multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(confidence, 0.5)
-        findings_score += weight * multiplier
-        if severity in finding_counts:
-          finding_counts[severity] += 1
-        title = f.get("title", "")
-        if isinstance(title, str) and "default credential accepted" in title.lower():
-          cred_count += 1
-      credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
+
+    # The one scoring walk, over what actually survives.
+    #
+    # Three copies of this loop used to coexist — two producing walks scoring as
+    # they went, plus this recount gated on `if drop_indices:` — and their drift
+    # caused real defects twice: coverage was rescored after dedup, and a
+    # whitespace-padded confidence scored 0.5 in the producing walks (raw
+    # string) and 1.0 here (normalised). Scoring once, after dedup, removes the
+    # drift class rather than keeping the copies in step.
+    findings_score = 0.0
+    finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
+    cred_count = 0
+    for f in flat_findings:
+      if _is_coverage_result(f):
+        status = str(f.get("status") or "").lower()
+        coverage_counts[status] = coverage_counts.get(status, 0) + 1
+        continue
+      # `str(... or ...)` rather than `.get(key, default)`: an explicit None
+      # passes straight through a .get default, and `None.upper()` killed the
+      # whole risk computation over one malformed finding.
+      severity = str(f.get("severity") or "INFO").upper()
+      confidence = str(f.get("confidence") or "firm").lower()
+      weight = RISK_SEVERITY_WEIGHTS.get(severity, 0)
+      multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(confidence, 0.5)
+      findings_score += weight * multiplier
+      if severity in finding_counts:
+        finding_counts[severity] += 1
+      title = f.get("title", "")
+      if isinstance(title, str) and "default credential accepted" in title.lower():
+        cred_count += 1
+    # D. Default credentials penalty
+    credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
 
     # `finding_id` is the primary key, so it has to be unique among the findings
     # that actually survive.

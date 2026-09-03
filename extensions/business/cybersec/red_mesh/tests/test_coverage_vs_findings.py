@@ -623,3 +623,89 @@ class TestCveDedupKeepsTheWorstFinding(unittest.TestCase):
     risk, _flat = self._survivors()
     self.assertEqual(risk["breakdown"]["finding_counts"]["CRITICAL"], 1)
     self.assertEqual(risk["breakdown"]["finding_counts"]["LOW"], 0)
+
+
+class TestScoringIsOneWalk(unittest.TestCase):
+  """Phase 3: score once, after dedup, over `flat_findings`.
+
+  Three copies of the scoring loop coexisted — two producing walks and a
+  post-dedup recount — and their drift caused the round-1 coverage bug. The
+  recount is the correct one, so it becomes the only one. The cases below are
+  the observable differences the collapse fixes, plus the crashes the
+  incremental walks carried.
+  """
+
+  def _blackbox(self, finding):
+    return _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [finding]}}},
+    })
+
+  def test_a_none_severity_does_not_crash_the_scan(self):
+    """`finding.get("severity", "INFO").upper()` raises on an explicit None —
+    the default only covers an *absent* key — and the exception killed the
+    whole risk computation, not one finding."""
+    risk, flat = self._blackbox(
+      {"title": "t", "severity": None, "confidence": "certain"},
+    )
+    self.assertEqual(len(flat), 1)
+    violations = risk["breakdown"]["schema_violations"]
+    self.assertTrue(any("severity" in error for error in violations["errors"]))
+
+  def test_a_none_confidence_does_not_crash_the_scan(self):
+    _risk, flat = self._blackbox(
+      {"title": "t", "severity": "MEDIUM", "confidence": None},
+    )
+    self.assertEqual(len(flat), 1)
+    self.assertEqual(flat[0]["confidence"], "tentative")
+
+  def test_a_padded_confidence_scores_as_its_trimmed_value(self):
+    """The incremental walk read the raw string (` certain ` -> 0.5, the
+    unknown-value multiplier); the recount read the normalised one (1.0). The
+    two disagreed whenever dedup did not run. The normalised read is correct."""
+    risk, _flat = self._blackbox(
+      {"title": "t", "severity": "HIGH", "confidence": " certain "},
+    )
+    self.assertEqual(risk["breakdown"]["findings_score"], 25.0)
+
+  def test_an_explicit_empty_asset_list_is_preserved(self):
+    """`affected_assets: []` is a statement — "no location recorded" — and the
+    falsy-check synthesis replaced it with an invented `{host, port}`. Only a
+    truly absent key gets the synthetic asset."""
+    _risk, flat = self._blackbox({
+      "title": "t", "severity": "LOW", "confidence": "firm",
+      "affected_assets": [],
+    })
+    self.assertEqual(flat[0]["affected_assets"], [])
+
+  def test_an_absent_asset_list_still_gets_the_synthetic_host(self):
+    _risk, flat = self._blackbox(
+      {"title": "t", "severity": "LOW", "confidence": "firm"},
+    )
+    self.assertEqual(
+      flat[0]["affected_assets"], [{"host": "app.test", "port": 443}],
+    )
+
+  def test_a_coverage_record_is_not_stamped_with_generic_remediation(self):
+    """A scenario that concluded nothing has nothing to remediate; the default
+    remediation text made coverage records read like findings in the PDF."""
+    _risk, flat = self._blackbox({
+      "title": "t", "severity": "INFO", "confidence": "firm",
+      "status": "not_vulnerable",
+    })
+    self.assertNotIn("remediation_structured", flat[0])
+
+  def test_graybox_coverage_keeps_its_deliberate_empty_assets(self):
+    """The graybox producer emits `affected_assets: []` on purpose when a probe
+    recorded no location; routing coverage through the shared normalisation
+    must not overwrite that with a synthetic asset."""
+    entry = GrayboxFinding(
+      scenario_id="PT-A05-02", title="checked", status="not_vulnerable",
+      severity="INFO", owasp="A05:2021",
+    ).to_dict()
+    _risk, flat = _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "graybox_results": {"443": {"_graybox_misconfig": {"findings": [entry]}}},
+    })
+    self.assertEqual(len(flat), 1)
+    self.assertEqual(flat[0]["affected_assets"], [])
