@@ -563,7 +563,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             severity=Severity.MEDIUM,
             title=f"Redis database contains {count} keys",
             description="Unauthenticated access to a Redis instance with live data.",
-            evidence=f"DBSIZE={count}",
+            evidence="DBSIZE executed without authentication and reported a non-empty keyspace.",
             remediation="Enable authentication and restrict network access.",
             owasp_id="A01:2021",
             cwe_id="CWE-284",
@@ -681,7 +681,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           title="MSSQL prelogin handshake succeeded",
           description=f"SQL Server on {target}:{port} responds to TDS prelogin, "
                       "exposing version metadata and confirming the service is reachable.",
-          evidence=f"Prelogin response: {readable.strip()[:80]}",
+          evidence="The TDS prelogin handshake completed and returned version metadata.",
           remediation="Restrict SQL Server access to trusted networks; use firewall rules.",
           owasp_id="A05:2021",
           cwe_id="CWE-200",
@@ -1082,7 +1082,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           severity=Severity.INFO,
           title="Memcached port open",
           description=f"Memcached port {port} is open on {target} but stats command was not accepted.",
-          evidence=f"Response: {data[:60].decode('utf-8', errors='replace')}",
+          evidence="The port accepted a connection but rejected the stats command.",
           confidence="firm",
         ))
       sock.close()
@@ -1258,7 +1258,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             title=f"CouchDB unauthenticated database listing ({len(dbs)} databases)",
             description=f"/_all_dbs accessible without credentials. "
                         f"{'User databases exposed: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only system databases found.'}",
-            evidence=f"Databases: {', '.join(dbs[:10])}" + (f"... (+{len(dbs)-10} more)" if len(dbs) > 10 else ""),
+            evidence="GET /_all_dbs returned the database list without credentials.",
             remediation="Enable CouchDB authentication via [admins] section in local.ini.",
             owasp_id="A01:2021",
             cwe_id="CWE-284",
@@ -1275,7 +1275,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           severity=Severity.HIGH,
           title="CouchDB admin panel (Fauxton) accessible",
           description=f"/_utils/ on {target}:{port} serves the admin web interface.",
-          evidence=f"GET /_utils/ returned {resp.status_code}, content-length={len(resp.text)}",
+          evidence="GET /_utils/ served the Fauxton admin interface without credentials.",
           remediation="Restrict access to /_utils via reverse proxy or bind to localhost.",
           owasp_id="A01:2021",
           cwe_id="CWE-284",

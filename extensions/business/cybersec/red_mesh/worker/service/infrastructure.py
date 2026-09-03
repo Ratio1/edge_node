@@ -145,7 +145,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           severity=Severity.CRITICAL,
           title="VNC unauthenticated access (security type None)",
           description=f"VNC on {target}:{port} allows connections without authentication.",
-          evidence=f"Banner: {banner}, security types: {type_labels}",
+          evidence=f"The RFB handshake advertised security types: {type_labels}",
           remediation="Disable security type None and require VNC Auth or VeNCrypt.",
           owasp_id="A07:2021",
           cwe_id="CWE-287",
@@ -156,7 +156,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           severity=Severity.MEDIUM,
           title="VNC password auth (DES-based, max 8 chars)",
           description=f"VNC Auth uses DES encryption with a maximum 8-character password.",
-          evidence=f"Banner: {banner}, security types: {type_labels}",
+          evidence=f"The RFB handshake advertised security types: {type_labels}",
           remediation="Use VeNCrypt (TLS) or SSH tunneling instead of plain VNC Auth.",
           owasp_id="A02:2021",
           cwe_id="CWE-326",
@@ -167,15 +167,15 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           severity=Severity.INFO,
           title="VNC VeNCrypt (TLS-secured)",
           description="VeNCrypt provides TLS-secured VNC connections.",
-          evidence=f"Banner: {banner}, security types: {type_labels}",
+          evidence=f"The RFB handshake advertised security types: {type_labels}",
           confidence="certain",
         ))
       if not sec_types:
         findings.append(Finding(
           severity=Severity.MEDIUM,
-          title=f"VNC service exposed: {banner}",
+          title="VNC service exposed (security types unparsed)",
           description="VNC protocol banner detected but security types could not be parsed.",
-          evidence=f"Banner: {banner}",
+          evidence="An RFB banner was received but the security-type list could not be parsed.",
           remediation="Restrict VNC access to trusted networks.",
           confidence="firm",
         ))
@@ -253,7 +253,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           severity=Severity.INFO,
           title="SNMP service responded",
           description=f"SNMP agent on {target}:{port} responded but did not accept 'public' community.",
-          evidence=f"Response: {readable.strip()[:80]}",
+          # The raw response is preserved in raw_data["banner"] just above.
+          evidence="The agent responded to SNMP but rejected the 'public' community string.",
           confidence="firm",
         ))
     except socket.timeout:
@@ -547,7 +548,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
             severity=Severity.LOW,
             title="DNS version disclosure via CHAOS TXT",
             description=f"CHAOS TXT response on {target}:{port} contains version keywords.",
-            evidence=f"Response contains: {readable.strip()[:80]}",
+            evidence="The CHAOS-class TXT response contains version keywords.",
             remediation="Disable version.bind responses in the DNS server configuration.",
             owasp_id="A05:2021",
             cwe_id="CWE-200",
@@ -699,7 +700,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
               title=f"DNS zone transfer (AXFR) allowed for {domain}",
               description=f"DNS on {target}:{port} permits zone transfers for '{domain}'. "
                           "This leaks all DNS records — hostnames, IPs, mail servers, internal infrastructure.",
-              evidence=f"AXFR query returned {ancount} answer records for {domain}.",
+              evidence=f"The AXFR query returned the full record set for {domain}.",
               remediation="Restrict zone transfers to authorized secondary nameservers only (allow-transfer).",
               owasp_id="A01:2021",
               cwe_id="CWE-200",
@@ -742,7 +743,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
             title="DNS open recursive resolver detected",
             description=f"DNS on {target}:{port} recursively resolves queries for external domains. "
                         "Open resolvers can be abused for DNS amplification DDoS attacks.",
-            evidence=f"Recursive query for example.com returned {ancount} answers with RA flag set.",
+            evidence="A recursive query for an external domain was answered with the RA flag set.",
             remediation="Restrict recursive queries to authorized clients only (allow-recursion).",
             owasp_id="A05:2021",
             cwe_id="CWE-406",
@@ -1796,7 +1797,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
               "multiple remote code execution flaws (CVE-2004-1080, CVE-2009-1923, CVE-2009-1924). "
               "It should not be accessible from untrusted networks."
             ),
-            evidence=f"WREPL response ({len(data)} bytes): {data[:24].hex()}",
+            evidence="The response matches the WINS replication protocol (MS-WINSRA).",
             remediation=(
               "Decommission WINS or restrict TCP port 42 to trusted replication partners. "
               "If WINS is required, apply all patches (MS04-045, MS09-039) and set the registry key "
@@ -1817,7 +1818,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
               f"TCP port {port} on {target} returned data that does not match the "
               "WINS replication protocol (MS-WINSRA). Another service may be listening."
             ),
-            evidence=f"Response ({len(data)} bytes): {data[:32].hex()}",
+            evidence="The response does not match the WINS replication protocol.",
             confidence="tentative",
           ))
         elif recv_timed_out:
@@ -1907,7 +1908,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           title="Modbus device responded to identification request",
           description=f"Industrial control system on {target}:{port} is accessible without authentication. "
                       "Modbus has no built-in security — any network access means full device control.",
-          evidence=f"Device ID response: {readable.strip()[:80]}",
+          evidence="The device answered a Modbus Device Identification request.",
           remediation="Isolate Modbus devices on a dedicated OT network; deploy a Modbus-aware firewall.",
           owasp_id="A01:2021",
           cwe_id="CWE-284",

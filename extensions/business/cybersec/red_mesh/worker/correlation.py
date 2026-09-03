@@ -137,7 +137,7 @@ class _CorrelationMixin:
         title=f"Honeypot indicator: {len(open_ports)}/{len(ports_scanned)} ports open ({ratio:.0%})",
         description="An unusually high ratio of open ports suggests this host is a honeypot. "
                     "Real servers rarely expose more than 50% of scanned ports.",
-        evidence=f"open={len(open_ports)}, scanned={len(ports_scanned)}, ratio={ratio:.2f}",
+        evidence="More than half of the scanned ports accepted a TCP connection.",
         remediation="Verify this is a legitimate host before relying on scan results.",
         cwe_id="CWE-345",
         confidence="firm",

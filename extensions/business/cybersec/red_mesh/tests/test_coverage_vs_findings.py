@@ -323,50 +323,68 @@ class TestEveryCounterAgreesWithEveryOther(unittest.TestCase):
     self.assertEqual(summary["by_severity"], {"HIGH": 1})
 
 
-class TestTheEgressCanTellThemApart(unittest.TestCase):
-  """Coverage results leave the platform through the same event path.
+class TestCoverageIsNotEmittedAsAFinding(unittest.TestCase):
+  """F5 (external review; reverses the earlier flag-only decision).
 
-  `services/finalization.py` emits `redmesh.finding.created` for every entry in
-  the flat list, and the payload carried no `status` — so a SIEM could not
-  distinguish a scenario that concluded nothing from a vulnerability. Because
-  `inconclusive` keeps its *declared* severity, one arrived as a HIGH
-  `finding.created` while the platform's own counts said there were no HIGH
-  findings: two of our own surfaces disagreeing in front of the customer.
+  Coverage results stayed in the `redmesh.finding.created` stream, flagged with
+  `status` + `is_coverage_result` — but a HIGH `inconclusive` still arrived in a
+  SIEM as a *created finding*, and a flag a consumer must know to check is a
+  weaker contract than not sending the non-finding at all. The emitter refuses
+  coverage now, at the one seam every caller goes through
+  (`event_hooks.emit_finding_event`); the archive keeps coverage regardless —
+  that decision stands. The flag logic stays for real findings and old events.
   """
 
-  def _payload(self, finding):
+  def _emit(self, finding):
+    from unittest.mock import MagicMock, patch
+    from extensions.business.cybersec.red_mesh.services import event_hooks
+
+    owner = MagicMock()
+    with patch.object(event_hooks, "_event_export_secret",
+                      return_value=("test-secret", None)), \
+         patch.object(event_hooks, "emit_redmesh_event",
+                      return_value={"emitted": True}) as emitted:
+      result = event_hooks.emit_finding_event(
+        owner, {"job_id": "job-1", "target": "app.test"}, finding=finding,
+      )
+    return result, emitted.called
+
+  def test_a_coverage_result_produces_no_finding_event(self):
+    result, emitted = self._emit({
+      "finding_id": "c" * 16, "title": "undecided", "severity": "HIGH",
+      "confidence": "tentative", "status": "inconclusive",
+    })
+    self.assertFalse(emitted, "a scenario that concluded nothing reached the SIEM "
+                              "as a created finding")
+
+  def test_a_real_finding_still_emits(self):
+    _result, emitted = self._emit({
+      "finding_id": "a" * 16, "title": "real", "severity": "HIGH",
+      "confidence": "certain", "status": "vulnerable",
+    })
+    self.assertTrue(emitted)
+
+  def test_a_statusless_blackbox_finding_still_emits(self):
+    _result, emitted = self._emit({
+      "finding_id": "d" * 16, "title": "Weak TLS", "severity": "MEDIUM",
+      "confidence": "certain",
+    })
+    self.assertTrue(emitted)
+
+  def test_a_real_finding_event_still_carries_the_flag_fields(self):
+    """The flag stays for consumers of real findings and historical events."""
     from extensions.business.cybersec.red_mesh.services.event_builder import (
       build_finding_event,
     )
     event = build_finding_event(
       job_specs={"job_id": "job-1", "target": "app.test"},
-      finding=finding,
-      event_action="created",
-      hmac_secret="test-secret",
+      finding={"finding_id": "a" * 16, "title": "real", "severity": "HIGH",
+               "confidence": "certain", "status": "vulnerable"},
+      event_action="created", hmac_secret="test-secret",
     )
-    return (event or {}).get("finding") or {}
-
-  def test_a_coverage_result_says_so(self):
-    payload = self._payload({
-      "finding_id": "c" * 16, "title": "undecided", "severity": "HIGH",
-      "confidence": "tentative", "status": "inconclusive",
-    })
-    self.assertEqual(payload.get("status"), "inconclusive")
-    self.assertTrue(payload.get("is_coverage_result"))
-
-  def test_a_real_finding_is_not_marked_as_coverage(self):
-    payload = self._payload({
-      "finding_id": "a" * 16, "title": "real", "severity": "HIGH",
-      "confidence": "certain", "status": "vulnerable",
-    })
+    payload = (event or {}).get("finding") or {}
     self.assertFalse(payload.get("is_coverage_result"))
 
-  def test_a_statusless_blackbox_finding_is_not_marked_as_coverage(self):
-    payload = self._payload({
-      "finding_id": "d" * 16, "title": "Weak TLS", "severity": "MEDIUM",
-      "confidence": "certain",
-    })
-    self.assertFalse(payload.get("is_coverage_result"))
 
 
 if __name__ == "__main__":

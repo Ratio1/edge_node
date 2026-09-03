@@ -415,8 +415,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
               description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
                           "An attacker can read up to 64KB of server memory per request, "
                           "potentially exposing private keys, session tokens, and passwords.",
-              evidence=f"Heartbeat response size ({resp_len} bytes) > request payload size ({len(hb_msg)} bytes). "
-                       f"Leaked {resp_len - len(hb_msg)} bytes of server memory.",
+              evidence="The heartbeat response was larger than the request payload, returning server memory beyond the sent bytes.",
               remediation="Upgrade OpenSSL to 1.0.1g or later and regenerate all private keys and certificates.",
               owasp_id="A06:2021",
               cwe_id="CWE-126",
@@ -695,7 +694,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           title=f"Service version disclosed: {product} {version}",
           description=f"Banner on {target}:{port} reveals {product} {version}. "
                       "Version disclosure aids attackers in targeting known vulnerabilities.",
-          evidence=f"Banner: {banner_text[:80]}",
+          evidence="The service banner includes the product name and version.",
           remediation="Suppress or genericize the service banner.",
           cwe_id="CWE-200",
           confidence="certain",

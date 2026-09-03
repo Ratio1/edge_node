@@ -213,32 +213,10 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
   _VOLATILE_PREFIXES = ("len_", "len(")
   _VOLATILE_SUFFIXES = ("_count", "count}")
 
-  # path:line-content fingerprints of the known remaining offenders — debt to
-  # burn down, not endorsement. Each still puts per-request or per-run data
-  # into the dedup key. Fixing a site removes its entry (the shrink test
-  # enforces that the entry goes with it).
-  _ALLOWLIST = {
-    ("correlation.py", 'evidence=f"open={len(open_ports)}, scanned={len(ports_scanned)}, ratio={ratio:.2f}",'),
-    ("service/common.py", 'evidence=f"Banner: {banner_text[:120]}",'),
-    ("service/common.py", 'evidence=f"Banner: {banner}",'),
-    ("service/database.py", 'evidence=f"DBSIZE={count}",'),
-    ("service/database.py", 'evidence=f"Prelogin response: {readable.strip()[:80]}",'),
-    ("service/database.py", """evidence=f"Response: {data[:60].decode('utf-8', errors='replace')}","""),
-    ("service/database.py", 'evidence=f"Databases: {\', \'.join(dbs[:10])}" + (f"... (+{len(dbs)-10} more)" if len(dbs) > 10 else ""),'),
-    ("service/database.py", 'evidence=f"GET /_utils/ returned {resp.status_code}, content-length={len(resp.text)}",'),
-    ("service/infrastructure.py", 'evidence=f"Banner: {banner}, security types: {type_labels}",'),
-    ("service/infrastructure.py", 'evidence=f"Banner: {banner}",'),
-    ("service/infrastructure.py", 'evidence=f"Response: {readable.strip()[:80]}",'),
-    ("service/infrastructure.py", 'evidence=f"Response contains: {readable.strip()[:80]}",'),
-    ("service/infrastructure.py", 'evidence=f"AXFR query returned {ancount} answer records for {domain}.",'),
-    ("service/infrastructure.py", 'evidence=f"Recursive query for example.com returned {ancount} answers with RA flag set.",'),
-    ("service/infrastructure.py", 'evidence=f"WREPL response ({len(data)} bytes): {data[:24].hex()}",'),
-    ("service/infrastructure.py", 'evidence=f"Response ({len(data)} bytes): {data[:32].hex()}",'),
-    ("service/infrastructure.py", 'evidence=f"Device ID response: {readable.strip()[:80]}",'),
-    ("service/tls.py", 'evidence=f"Heartbeat response size ({resp_len} bytes) > request payload size ({len(hb_msg)} bytes). "'),
-    ("service/tls.py", 'evidence=f"Banner: {banner_text[:80]}",'),
-    ("web/injection.py", 'evidence=f"Base size={len(resp_base.text)}, true={len(resp_true.text)}, "'),
-  }
+  # Empty by design: every previously-exempt site was fixed 2026-09-03
+  # (closeout plan, Phase 3). A new entry here is debt being taken on — it
+  # needs a justification comment and a burn-down owner, not a silent add.
+  _ALLOWLIST = set()
 
   def _is_volatile(self, line):
     import re

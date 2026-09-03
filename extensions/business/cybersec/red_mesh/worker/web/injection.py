@@ -325,8 +325,7 @@ class _WebInjectionMixin(_InjectionTestBase):
               severity=Severity.HIGH,
               title=f"SQL injection (boolean-blind) via ?{param}=",
               description=f"Response differs between AND 1=1 and AND 1=2.",
-              evidence=f"Base size={len(resp_base.text)}, true={len(resp_true.text)}, "
-                       f"false={len(resp_false.text)}",
+              evidence="Responses for AND 1=1 and AND 1=2 differ in size while the baseline matches the true case.",
               remediation=f"Use parameterized queries for '{param}'.",
               owasp_id="A03:2021",
               cwe_id="CWE-89",
