@@ -87,8 +87,6 @@ class _RiskScoringMixin:
       (risk_result, flat_findings) where risk_result is {"score": int, "breakdown": dict}
       and flat_findings is a list of enriched finding dicts.
     """
-    import math
-
     flat_findings = []
     schema_violations = []
 
@@ -350,8 +348,12 @@ class _RiskScoringMixin:
     # D (default-credentials penalty) is computed after the scoring walk below —
     # it reads `cred_count`, which only exists once findings are counted.
 
-    # Deduplicate finding signatures first. CVE title fallback remains for
-    # older findings that represent the same CVE with different descriptions.
+    # Two dedup passes. First, content signatures: identical records collapse.
+    # Second, the CVE-title pass: records naming one CVE whose *content*
+    # differs — reworded across scans, or observed at different confidence —
+    # which content-keying cannot merge. It is NOT subsumed by identity: for a
+    # locationless finding the identity key folds in the title, so two records
+    # of one CVE under different titles still carry different identities.
     import re as _re_dedup
     CONFIDENCE_RANK = {"certain": 3, "firm": 2, "tentative": 1}
     SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
@@ -367,20 +369,19 @@ class _RiskScoringMixin:
       # Deduplicate on **content**, not on identity — deliberately, and not yet
       # the other way round.
       #
-      # Keying this on `dedup_key` reads as the obvious improvement, and it
-      # silently deleted findings. No blackbox probe sets `affected_assets`
-      # (`grep -rn affected_assets worker/` returns nothing), so every blackbox
-      # finding lands on `dedup_key`'s last-resort branch, whose only
-      # discriminator is the lowercased title — and a probe that emits N
-      # findings in a loop under one constant title collapses to a single
-      # record. Measured on the real SRI loop in `worker/web/hardening.py`: five
-      # unsafe CDN scripts, five distinct content hashes, one survivor.
+      # Keying this on identity (`finding_id`) reads as the obvious
+      # improvement, and it silently deleted findings. No blackbox probe sets a
+      # location, so every blackbox finding lands on the identity model's
+      # last-resort branch, whose only discriminator is the lowercased title —
+      # and a probe that emits N findings in a loop under one constant title
+      # collapses to a single record. Measured on the real SRI loop in
+      # `worker/web/hardening.py`: five unsafe CDN scripts, five distinct
+      # content signatures, one survivor.
       #
       # RM-061 owns giving blackbox findings a url and parameter. Once identity
-      # can actually distinguish them, this should move to `dedup_key` — the CVE
-      # title fallback below exists to approximate what that would do — but not
-      # before, because losing a finding is worse than keeping a reworded
-      # duplicate.
+      # can actually distinguish them, this should move to `finding_id` and the
+      # CVE-title pass below retires with it — but not before, because losing a
+      # finding is worse than keeping a reworded duplicate.
       signature = f.get("finding_signature")
       if not signature:
         continue

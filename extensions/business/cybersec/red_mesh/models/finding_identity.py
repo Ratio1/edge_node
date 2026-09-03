@@ -51,6 +51,9 @@ _WORKER_ATTRIBUTION_FIELDS = frozenset({
   "local_worker_id",
   "finding_id",
   "finding_signature",
+  # Pre-collapse names for the two fields above. New findings no longer carry
+  # them, but archives written before the collapse do, and the report layer's
+  # cross-worker dedup must keep excluding them there — do not trim.
   "dedup_key",
   "content_hash",
   "display_id",
