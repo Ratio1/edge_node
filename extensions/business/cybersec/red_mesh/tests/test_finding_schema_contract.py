@@ -217,5 +217,84 @@ class TestBothProducersEmitTheContract(unittest.TestCase):
     self.assertEqual(flat_findings[0]["probe_specific_detail"], "kept")
 
 
+class TestTheContractIsEnforcedAndNotOnlyDeclared(unittest.TestCase):
+  """B1 defined a contract, tested it, and never ran it.
+
+  `validate_flat_finding` had no production caller at all, so a probe emitting
+  an invalid finding — an unknown severity, a missing required field — produced
+  exactly the silent pass-through B1 exists to end. And `flat_finding_from_dict`
+  read a payload stamped `schema_version: 9.0.0` under v1 assumptions, which is
+  the one failure a version stamp exists to prevent.
+  """
+
+  def test_deserialising_a_future_version_refuses_rather_than_misreads(self):
+    with self.assertRaises(ValueError):
+      flat_finding_from_dict(_minimal(schema_version="9.0.0"))
+
+  def test_deserialising_an_unknown_schema_refuses(self):
+    with self.assertRaises(ValueError):
+      flat_finding_from_dict(_minimal(schema="something.else.v1"))
+
+  def test_an_unstamped_archive_entry_still_deserialises(self):
+    """The compatibility the refusal must not break."""
+    payload = _minimal()
+    del payload["schema"]
+    del payload["schema_version"]
+    self.assertEqual(
+      flat_finding_from_dict(payload).schema_version, REDMESH_FINDING_SCHEMA_VERSION,
+    )
+
+  def test_an_invalid_finding_is_reported_in_the_risk_breakdown(self):
+    """The production enforcement point: every finding from both producers
+    passes through the flat walk, so that is where the contract is checked."""
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    risk, _flat = MockHost()._compute_risk_and_findings({
+      "target": "app.test",
+      "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [{
+        "title": "Weak TLS", "severity": "SEVERE", "confidence": "certain",
+      }]}}},
+    })
+    violations = risk["breakdown"]["schema_violations"]
+    self.assertEqual(violations["count"], 1)
+    self.assertTrue(any("severity" in error for error in violations["errors"]))
+
+  def test_a_valid_scan_reports_no_violations(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    risk, _flat = MockHost()._compute_risk_and_findings({
+      "target": "app.test",
+      "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [{
+        "title": "Weak TLS", "severity": "MEDIUM", "confidence": "certain",
+      }]}}},
+    })
+    self.assertEqual(risk["breakdown"]["schema_violations"]["count"], 0)
+
+  def test_an_invalid_finding_is_still_kept(self):
+    """Reporting a violation must not lose the finding. A probe emitting a bad
+    severity is a bug to surface, not a reason to drop evidence."""
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    _risk, flat = MockHost()._compute_risk_and_findings({
+      "target": "app.test",
+      "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [{
+        "title": "Weak TLS", "severity": "SEVERE", "confidence": "certain",
+      }]}}},
+    })
+    self.assertEqual(len(flat), 1)
+
+
 if __name__ == "__main__":
   unittest.main()

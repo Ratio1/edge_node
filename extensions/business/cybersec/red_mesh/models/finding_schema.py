@@ -212,9 +212,24 @@ def validate_flat_finding(payload: Any) -> list[str]:
 
 
 def flat_finding_from_dict(payload: dict) -> FlatFinding:
-  """Build a `FlatFinding` from an archived dict without discarding anything."""
+  """Build a `FlatFinding` from an archived dict without discarding anything.
+
+  Refuses a schema or version it does not understand. `validate_flat_finding`
+  reported a future version as an error and this constructor read it anyway, so
+  a v9 finding deserialized cleanly under v1 assumptions — which is the failure
+  mode a version stamp exists to prevent. An *absent* stamp is still fine: a
+  finding written before the stamp existed is a v0 finding, not an invalid one.
+  """
   if not isinstance(payload, dict):
     raise TypeError("finding must be a dict")
+
+  schema = payload.get("schema", REDMESH_FINDING_SCHEMA)
+  version = payload.get("schema_version", REDMESH_FINDING_SCHEMA_VERSION)
+  if schema != REDMESH_FINDING_SCHEMA or version != REDMESH_FINDING_SCHEMA_VERSION:
+    raise ValueError(
+      f"unreadable finding schema {schema!r} version {version!r}; "
+      f"this build reads {REDMESH_FINDING_SCHEMA} {REDMESH_FINDING_SCHEMA_VERSION}"
+    )
 
   known = {name: payload[name] for name in _KNOWN_FIELDS if name in payload}
   present = frozenset(known)

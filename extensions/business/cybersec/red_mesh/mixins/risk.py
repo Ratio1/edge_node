@@ -13,6 +13,7 @@ from ..models.finding_schema import (
   REDMESH_FINDING_SCHEMA_VERSION,
   is_coverage_result as _is_coverage_result,
   normalize_confidence as _normalize_confidence,
+  validate_flat_finding as _validate_flat_finding,
 )
 from ..models.finding_identity import (
   content_hash as _content_hash,
@@ -93,6 +94,7 @@ class _RiskScoringMixin:
     coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
     cred_count = 0
     flat_findings = []
+    schema_violations = []
 
     port_protocols = aggregated_report.get("port_protocols") or {}
     target = (
@@ -248,6 +250,17 @@ class _RiskScoringMixin:
       item["port"] = port
       item["protocol"] = protocol
       item["category"] = category
+      # The contract's one production enforcement point. B1 defined
+      # `validate_flat_finding`, tested it thoroughly, and never called it from
+      # anywhere that runs — so a probe emitting an unknown severity or omitting
+      # a required field produced exactly the silent pass-through the contract
+      # exists to end.
+      #
+      # Reported, not raised, and never a reason to drop the finding: a probe
+      # bug is evidence about the probe, and losing the finding to surface it
+      # would be a worse trade than the one being fixed.
+      for error in _validate_flat_finding(item):
+        schema_violations.append(f"{probe_name}: {error}")
       return item
 
     def normalize_string_list(values):
@@ -465,6 +478,13 @@ class _RiskScoringMixin:
         # "we ran 40 scenarios and 1 was vulnerable" and "we found 40 findings"
         # are different claims, and only the first is true.
         "coverage_counts": coverage_counts,
+        # A probe emitting a finding the contract does not accept is a defect in
+        # the probe. Stated here so it is visible in the pass report rather
+        # than absorbed silently by the layer that reads the finding.
+        "schema_violations": {
+          "count": len(schema_violations),
+          "errors": schema_violations[:20],
+        },
       },
     }
     return risk_result, flat_findings
