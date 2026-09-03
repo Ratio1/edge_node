@@ -402,5 +402,79 @@ class TestIdentitySurvivesRedaction(unittest.TestCase):
     self.assertEqual(reflattened["content_hash"], original["content_hash"])
 
 
+class TestRewordingSurvivesTheRealBlackboxPath(unittest.TestCase):
+  """The redaction-invariance fix reintroduced the defect B2 exists to remove.
+
+  Carrying the probe-time `finding_signature` made identity stable across
+  `_redact_report` — but `dedup_key` was then *derived* from it, as its first 16
+  characters, and `finding_signature` is the **content** hash. Identity became
+  content-addressed again by another route, and only on the path that ships:
+  `probe_result` calls `enrich_finding_for_probe`, which stamps
+  `finding_signature` and no `dedup_key`.
+
+  The existing B2 tests miss it because they build finding dicts directly, and
+  an unstamped dict takes the `_dedup_key(item)` branch — the correct one. Every
+  blackbox finding a real probe produces takes the other branch.
+
+  Measured: rewording one description moved `finding_id` from
+  `e038552a47fe4deb` to `d07c5b6427f578b1`. Both keys must be stamped at probe
+  time, independently of each other.
+  """
+
+  def _flat(self, description):
+    from extensions.business.cybersec.red_mesh.findings import Finding, probe_result
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    result = probe_result(
+      findings=[Finding(
+        title="Default credentials accepted", severity="HIGH",
+        confidence="certain", description=description,
+      )],
+      probe_id="_service_info_http",
+    )
+    _risk, flat = MockHost()._compute_risk_and_findings({
+      "target": "app.test",
+      "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": result}},
+    })
+    return flat[0]
+
+  def test_rewording_a_finding_does_not_change_its_identity(self):
+    original = self._flat("admin login accepted")
+    reworded = self._flat("admin login accepted (retested)")
+    self.assertEqual(
+      original["dedup_key"], reworded["dedup_key"],
+      "a wording change gave the finding a new identity, so triage state and "
+      "longitudinal tracking do not survive an edit to the description",
+    )
+    self.assertEqual(original["finding_id"], reworded["finding_id"])
+
+  def test_rewording_a_finding_does_change_its_content_hash(self):
+    """The other half of the contract: change detection still has to work."""
+    self.assertNotEqual(
+      self._flat("admin login accepted")["content_hash"],
+      self._flat("admin login accepted (retested)")["content_hash"],
+    )
+
+  def test_the_probe_stamps_both_keys_rather_than_deriving_one(self):
+    from extensions.business.cybersec.red_mesh.findings import Finding, probe_result
+
+    stamped = probe_result(
+      findings=[Finding(
+        title="Weak TLS", description="", severity="MEDIUM", confidence="certain",
+      )],
+      probe_id="_service_info_ssl",
+    )["findings"][0]
+    self.assertTrue(stamped.get("dedup_key"), "no dedup key was stamped at probe time")
+    self.assertTrue(stamped.get("finding_signature"))
+    self.assertNotEqual(
+      stamped["dedup_key"], stamped["finding_signature"][:16],
+      "the dedup key is still the content hash wearing a different name",
+    )
+
+
 if __name__ == "__main__":
   unittest.main()

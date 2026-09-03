@@ -88,6 +88,59 @@ class TestCountsMeanFindings(unittest.TestCase):
     self.assertLess(nothing, something)
 
 
+class TestDedupDoesNotResurrectCoverage(unittest.TestCase):
+  """Coverage is excluded on the first pass and re-included on the second.
+
+  The scoring walk skips `not_vulnerable` / `inconclusive`, but the entries
+  still go into the flat list — and the post-dedup recalculation loop rebuilds
+  `findings_score` and `finding_counts` by iterating that list with no such
+  skip. So the whole of B5 held only for as long as nothing deduplicated.
+
+  Measured on one real HIGH plus one `inconclusive` HIGH: adding a *duplicate*
+  of the real finding — which changes nothing about what was concluded — took
+  `finding_counts["HIGH"]` from 1 to 2 and the findings score from 25.0 to
+  37.5. The inconclusive scenario came back as a HIGH vulnerability.
+  """
+
+  def _report(self, items):
+    return {
+      "target": "app.test",
+      "port_protocols": {"443": "https"},
+      "graybox_results": {"443": {"_graybox_access_control": {"findings": items}}},
+    }
+
+  def _vulnerable(self):
+    return GrayboxFinding(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021", url="https://app.test/x",
+    ).to_dict()
+
+  def _inconclusive(self):
+    return GrayboxFinding(
+      scenario_id="PT-A02-01", title="undecided", status="inconclusive",
+      severity="HIGH", owasp="A02:2021", url="https://app.test/y",
+    ).to_dict()
+
+  def test_a_duplicate_does_not_promote_an_inconclusive_scenario_to_a_finding(self):
+    risk, _flat = _Host()._compute_risk_and_findings(
+      self._report([self._vulnerable(), dict(self._vulnerable()), self._inconclusive()])
+    )
+    self.assertEqual(risk["breakdown"]["finding_counts"]["HIGH"], 1)
+
+  def test_deduplicating_does_not_change_what_was_concluded(self):
+    """The sharpest form: dedup removes a redundant record, so every count it
+    touches must be unchanged by whether the redundant record was there."""
+    without = _Host()._compute_risk_and_findings(
+      self._report([self._vulnerable(), self._inconclusive()])
+    )[0]["breakdown"]
+    with_dup = _Host()._compute_risk_and_findings(
+      self._report([self._vulnerable(), dict(self._vulnerable()), self._inconclusive()])
+    )[0]["breakdown"]
+    self.assertEqual(with_dup["finding_counts"], without["finding_counts"])
+    self.assertEqual(with_dup["findings_score"], without["findings_score"])
+    self.assertEqual(with_dup["coverage_counts"], without["coverage_counts"])
+
+
 class TestBlackboxFindingsAreUnaffected(unittest.TestCase):
   """Blackbox probes emit no `status` at all, so every entry is a finding."""
 

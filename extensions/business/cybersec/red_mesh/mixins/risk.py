@@ -11,6 +11,7 @@ from ..models.finding_schema import (
   COVERAGE_STATUSES,
   REDMESH_FINDING_SCHEMA,
   REDMESH_FINDING_SCHEMA_VERSION,
+  is_coverage_result as _is_coverage_result,
   normalize_confidence as _normalize_confidence,
 )
 from ..models.finding_identity import (
@@ -229,14 +230,18 @@ class _RiskScoringMixin:
       # which is precisely what redaction rewrites: the same finding came out
       # with two different ids depending on which caller asked.
       #
-      # `enrich_finding_for_probe` stamps `finding_signature` at probe time, on
-      # unredacted values, and nothing downstream recomputes it. Carrying it is
-      # what made identity redaction-invariant before this change, and it still
-      # is. `dedup_key` is computed only for a finding that arrives unstamped.
+      # `enrich_finding_for_probe` stamps both keys at probe time, on unredacted
+      # values, and nothing downstream recomputes them. Carrying them is what
+      # makes identity redaction-invariant.
+      #
+      # `dedup_key` used to be *derived* here as `finding_signature[:16]` when
+      # only the signature was stamped — and the signature is the content hash,
+      # so identity went straight back to being content-addressed on the one
+      # path that ships. Rewording a description moved `finding_id`. The probe
+      # stamps `dedup_key` itself now; the local computation is the fallback for
+      # a finding that arrives unstamped, and never the truncated content hash.
       carried = item.get("finding_signature")
-      item["dedup_key"] = (
-        item.get("dedup_key") or (carried[:16] if carried else _dedup_key(item))
-      )
+      item["dedup_key"] = item.get("dedup_key") or _dedup_key(item)
       item["content_hash"] = item.get("content_hash") or carried or _content_hash(item)
       item["finding_signature"] = carried or item["content_hash"]
       item["finding_id"] = item.get("finding_id") or item["dedup_key"]
@@ -369,7 +374,11 @@ class _RiskScoringMixin:
     drop_indices = set()
     signature_best = {}
     for idx, f in enumerate(flat_findings):
-      signature = f.get("finding_signature")
+      # Deduplicate on identity, not on content. Keying on `finding_signature`
+      # meant two records of the *same* finding whose wording differed did not
+      # deduplicate — which is the case dedup exists for, and the reason the CVE
+      # title fallback below had to be bolted on to approximate it.
+      signature = f.get("dedup_key") or f.get("finding_signature")
       if not signature:
         continue
       key = (signature, f.get("port", 0))
@@ -408,11 +417,26 @@ class _RiskScoringMixin:
 
     if drop_indices:
       flat_findings = [f for i, f in enumerate(flat_findings) if i not in drop_indices]
-      # Recalculate scores after dedup
+      # Recalculate scores after dedup.
+      #
+      # This walk has to make the same coverage/finding distinction the two
+      # producing walks make. It did not: they skip `not_vulnerable` and
+      # `inconclusive` before scoring, while this one iterated the flat list —
+      # which holds coverage, deliberately — and scored every entry in it. So
+      # all of B5 held only for as long as nothing deduplicated. Measured on one
+      # real HIGH plus one `inconclusive` HIGH, adding a *duplicate of the real
+      # finding* took `finding_counts["HIGH"]` from 1 to 2 and the findings
+      # score from 25.0 to 37.5: a scenario that concluded nothing came back as
+      # a vulnerability because an unrelated record happened to be redundant.
       findings_score = 0.0
       finding_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+      coverage_counts = {status: 0 for status in COVERAGE_STATUSES}
       cred_count = 0
       for f in flat_findings:
+        if _is_coverage_result(f):
+          status = str(f.get("status") or "").lower()
+          coverage_counts[status] = coverage_counts.get(status, 0) + 1
+          continue
         severity = f.get("severity", "INFO").upper()
         confidence = f.get("confidence", "firm").lower()
         weight = RISK_SEVERITY_WEIGHTS.get(severity, 0)

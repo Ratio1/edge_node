@@ -26,6 +26,7 @@ from typing import Any
 
 from .models.finding_identity import (
   content_hash as _content_hash,
+  dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
 )
 
@@ -121,6 +122,12 @@ class Finding:
   # Identity (P15) — finding_signature is content-addressed; display_id
   # is set by the report generator at render time.
   finding_signature: str = ""
+  # The identity key, stamped beside the content hash rather than derived from
+  # it. Deriving it (`finding_signature[:16]`) made identity content-addressed,
+  # so rewording a description handed the finding a new id and triage state did
+  # not survive the edit. Both are stamped at probe time, on unredacted values,
+  # which is also what keeps them stable across `_redact_report`.
+  dedup_key: str = ""
 
   # Risk scoring extensions
   cvss_version: str = "3.1"
@@ -201,6 +208,26 @@ class Finding:
       "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
     }
     return _content_hash(payload, asset_canonical=asset_canonical)
+
+  def compute_dedup_key(
+    self,
+    *,
+    probe_id: str,
+    asset_canonical: str | None = None,
+  ) -> str:
+    """Compute the identity key over the same payload the signature uses.
+
+    Identity, not content: `models.finding_identity.dedup_key` reads probe,
+    scenario, normalised asset and classification, and deliberately not the
+    free-text fields. Stamped here so that rewording a finding leaves it alone.
+    """
+    return _dedup_key({
+      "probe": probe_id or "",
+      "title": self.title or "",
+      "owasp_id": self.owasp_id,
+      "cwe_id": self.cwe_id,
+      "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
+    }, asset_canonical=asset_canonical)
 
   def with_signature(self, signature: str) -> "Finding":
     """Return a new Finding with finding_signature set (frozen-safe)."""
@@ -327,12 +354,20 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
     updates["remediation_structured"] = Remediation(primary=primary)
 
   enriched = replace(f, **updates) if updates else f
+  # Both identity keys are stamped here, at probe time, on unredacted values.
+  #
+  # `finding_signature` alone was stamped, and the flat walk then derived the
+  # dedup key from it as `finding_signature[:16]` — which made identity
+  # content-addressed, exactly what the two-key split exists to prevent.
+  # Rewording a description handed the finding a new id, so triage state and
+  # longitudinal tracking did not survive an edit. Stamping both keeps them
+  # independent, and keeps both stable across `_redact_report`.
+  identity = {}
   if probe_id and not enriched.finding_signature:
-    enriched = replace(
-      enriched,
-      finding_signature=enriched.compute_signature(probe_id=probe_id),
-    )
-  return enriched
+    identity["finding_signature"] = enriched.compute_signature(probe_id=probe_id)
+  if probe_id and not enriched.dedup_key:
+    identity["dedup_key"] = enriched.compute_dedup_key(probe_id=probe_id)
+  return replace(enriched, **identity) if identity else enriched
 
 
 def _infer_calling_probe_id() -> str:
