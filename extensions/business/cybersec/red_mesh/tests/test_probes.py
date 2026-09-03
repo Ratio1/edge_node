@@ -767,6 +767,56 @@ class RedMeshOWASPTests(unittest.TestCase):
       info = worker._service_info_memcached("example.com", 11211)
     self._assert_has_finding(info, "Memcached")
 
+  def _memcached_raw(self, response):
+    """Drive the stats-rejected branch and return the probe's raw_data.
+
+    `probe_result` flattens raw_data into the returned dict, so the banner is
+    read straight off the result.
+    """
+    owner, worker = self._build_worker(ports=[11211])
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        pass
+
+      def settimeout(self, timeout):
+        return None
+
+      def connect(self, addr):
+        return None
+
+      def sendall(self, data):
+        self.sent = data
+
+      def recv(self, nbytes):
+        return response
+
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
+      return_value=DummySocket(),
+    ):
+      return worker._service_info_memcached("example.com", 11211)
+
+  def test_memcached_banner_decodes_before_slicing(self):
+    """Slicing the bytes first can cut a multi-byte character in half, and
+    `errors="replace"` turns that into a replacement char instead of a visible
+    failure. The response here straddles the old 60-byte cut point."""
+    # 7 ASCII bytes then 2-byte characters: byte 60 lands mid-character.
+    info = self._memcached_raw(b"ERRORS " + "é".encode("utf-8") * 40)
+
+    self.assertNotIn("�", info["banner"], "a character was cut in half")
+    self.assertEqual(info["banner"], "ERRORS " + "é" * 40)
+
+  def test_memcached_banner_keeps_the_label_when_nothing_came_back(self):
+    """An empty response records neither the observation nor the fact, so the
+    descriptive label stands in rather than an empty string."""
+    info = self._memcached_raw(b"")
+
+    self.assertEqual(info["banner"], "Memcached port open")
+
   def test_service_elasticsearch_metadata(self):
     owner, worker = self._build_worker(ports=[9200])
     resp = MagicMock()
