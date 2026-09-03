@@ -843,6 +843,18 @@ class TestDedupTiesAreOrderIndependent(unittest.TestCase):
       self.assertEqual(len(flat), 1)
       self.assertTrue(flat[0]["kev"], "the malformed timestamp won the tiebreak")
 
+  def test_an_unenriched_record_loses_to_a_real_timestamp(self):
+    """The reachable degraded value is "", not garbage: `cvss_data_freshness`
+    stays empty whenever the dynamic cache is absent, the lookup raised, or the
+    CVE record came back without an id. An unenriched record must lose to an
+    enriched one in both orders — otherwise arrival order decides again."""
+    real = self._record(True, 0.9, "2026-09-01T00:00:00Z")
+    unenriched = self._record(False, 0.1, "")
+    for items in ([real, unenriched], [unenriched, real]):
+      flat = self._run(items)
+      self.assertEqual(len(flat), 1)
+      self.assertTrue(flat[0]["kev"], "the unenriched record won the tiebreak")
+
   def test_an_equal_rank_tie_has_the_same_survivor_in_both_orders(self):
     a = {"title": "CVE-2020-1 in x", "severity": "HIGH", "confidence": "certain",
          "description": "wording one"}
