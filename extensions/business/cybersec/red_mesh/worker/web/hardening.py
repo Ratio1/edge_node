@@ -2,7 +2,7 @@ import re as _re
 import time as _time
 import secrets as _secrets
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
@@ -56,7 +56,10 @@ class _WebHardeningMixin:
               severity=Severity.MEDIUM,
               title=f"Cookie missing Secure flag: {cookie_name}",
               description=f"Cookie will be sent over unencrypted HTTP connections.",
-              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              # The raw Set-Cookie value is a live session token: archiving it is
+              # a credential leak, and a per-request value in `evidence` breaks
+              # cross-worker dedup (evidence is part of the dedup key).
+              evidence=f"Set-Cookie for {cookie_name!r} on {base_url}: no Secure attribute",
               remediation="Add the Secure attribute to this cookie.",
               owasp_id="A05:2021",
               cwe_id="CWE-614",
@@ -67,7 +70,10 @@ class _WebHardeningMixin:
               severity=Severity.MEDIUM,
               title=f"Cookie missing HttpOnly flag: {cookie_name}",
               description=f"Cookie is accessible to JavaScript, enabling theft via XSS.",
-              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              # The raw Set-Cookie value is a live session token: archiving it is
+              # a credential leak, and a per-request value in `evidence` breaks
+              # cross-worker dedup (evidence is part of the dedup key).
+              evidence=f"Set-Cookie for {cookie_name!r} on {base_url}: no HttpOnly attribute",
               remediation="Add the HttpOnly attribute to this cookie.",
               owasp_id="A05:2021",
               cwe_id="CWE-1004",
@@ -78,7 +84,10 @@ class _WebHardeningMixin:
               severity=Severity.MEDIUM,
               title=f"Cookie missing SameSite flag: {cookie_name}",
               description=f"Cookie may be sent with cross-site requests, enabling CSRF.",
-              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              # The raw Set-Cookie value is a live session token: archiving it is
+              # a credential leak, and a per-request value in `evidence` breaks
+              # cross-worker dedup (evidence is part of the dedup key).
+              evidence=f"Set-Cookie for {cookie_name!r} on {base_url}: no SameSite attribute",
               remediation="Add SameSite=Lax or SameSite=Strict to this cookie.",
               owasp_id="A01:2021",
               cwe_id="CWE-1275",
@@ -242,6 +251,20 @@ class _WebHardeningMixin:
     return probe_result(findings=findings_list)
 
 
+  @staticmethod
+  def _redirect_authority(location):
+    """Scheme, host and path of a Location header; never the query or fragment.
+
+    Total function: a target that controls the header must not be able to
+    crash the probe (`urlsplit` raises on malformed IPv6 authorities) or to
+    smuggle a per-request token into `evidence` through the query string.
+    """
+    try:
+      parts = urlsplit(location)
+      return f"{parts.scheme}://{parts.netloc}{parts.path}"
+    except ValueError:
+      return "an unparseable URL"
+
   @register_probe(
     display_name="Open redirect",
     description="Detect open redirect via common redirect parameter names + external host payloads.",
@@ -287,7 +310,14 @@ class _WebHardeningMixin:
             severity=Severity.MEDIUM,
             title="Open redirect via next parameter",
             description="The login endpoint redirects to attacker-controlled URLs via the next parameter.",
-            evidence=f"Location: {location} at {redirect_url}",
+            # Authority + path only: the raw Location can carry a per-request
+            # token or nonce, which is volatile data in the dedup key.
+            # `_redirect_authority` never raises — a hostile header must not
+            # turn a confirmed open redirect into a probe error.
+            evidence=(
+              f"Location points to {self._redirect_authority(location)} "
+              f"for {redirect_url}"
+            ),
             remediation="Validate redirect targets against an allowlist of trusted domains.",
             owasp_id="A01:2021",
             cwe_id="CWE-601",
@@ -538,8 +568,12 @@ class _WebHardeningMixin:
                 title="Account enumeration via login: response size differs",
                 description=f"Login at {path} returns different-sized responses for "
                             "valid vs invalid usernames.",
-                evidence=f"Invalid user: {len_fake} bytes, '{real_user}': {len_real} bytes "
-                         f"(delta {abs(len_real - len_fake)} bytes).",
+                # No username (PII in the archive) and no byte counts
+                # (per-request data in the dedup key): the measured sizes vary
+                # run to run, so two nodes seeing the same weakness never
+                # deduplicated.
+                evidence="Login responses for a valid and an invalid username "
+                         "differ in size by more than 20%.",
                 remediation="Ensure login responses are identical regardless of username validity.",
                 owasp_id="A04:2021",
                 cwe_id="CWE-204",
@@ -619,7 +653,8 @@ class _WebHardeningMixin:
             title=f"No rate limiting on login endpoint ({path})",
             description=f"{attempt_count} rapid login attempts accepted without "
                         "429 response, rate-limit headers, or CAPTCHA challenge.",
-            evidence=f"POST {url} x{attempt_count} with 500ms spacing — all accepted.",
+            evidence="Repeated rapid login attempts were all accepted with no "
+                     "rate limiting signal.",
             remediation="Implement rate limiting on authentication endpoints.",
             owasp_id="A04:2021",
             cwe_id="CWE-307",

@@ -109,9 +109,14 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       if not banner.startswith("RFB"):
         findings.append(Finding(
           severity=Severity.MEDIUM,
-          title=f"VNC service detected (non-standard banner: {banner[:30]})",
+          # The banner is per-connection bytes and the title is the last-resort
+          # identity discriminator for a locationless finding — interpolating
+          # the banner re-keyed this finding on every scan, and put volatile
+          # bytes into the dedup key via `evidence` too. The observed banner is
+          # preserved in raw_data["banner"], where it belongs.
+          title="VNC service detected with a non-standard banner",
           description="VNC port open but banner is non-standard.",
-          evidence=f"Banner: {banner}",
+          evidence="The first bytes read from the socket are not an RFB protocol header.",
           remediation="Restrict VNC access to trusted networks or use SSH tunneling.",
           confidence="tentative",
         ))
@@ -228,7 +233,9 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           title="SNMP default community string 'public' accepted",
           description="SNMP agent responds to the default 'public' community string, "
                       "allowing unauthenticated read access to device configuration and network data.",
-          evidence=f"Response: {readable.strip()[:80]}",
+          # The raw response bytes are per-request data; they are preserved in
+          # raw_data. Evidence states the stable fact the finding rests on.
+          evidence="SNMP GET with community string 'public' returned a valid response.",
           remediation="Change the community string from 'public' to a strong value; migrate to SNMPv3.",
           owasp_id="A07:2021",
           cwe_id="CWE-798",
