@@ -207,6 +207,13 @@ class Finding:
     field to one projection and not the other and a finding's dedup key stops
     being the one its signature was built over. One payload, two consumers.
     """
+    # Every field `finding_identity._CONTENT_FIELDS` names has to be here, or
+    # the content hash is blind to content. It carried seven of the nine and
+    # omitted `confidence`, `status`, `evidence`, `remediation`, `cvss_score`
+    # and `cvss_vector` — so two findings differing only in their evidence, or
+    # only in a CVSS 9.8 against a 4.3, hashed identically and content-keyed
+    # dedup deleted one of them. `dedup_key` reads only the identity subset from
+    # this same payload, so widening it does not move any identity.
     return {
       "probe": probe_id or "",
       "title": self.title or "",
@@ -215,6 +222,12 @@ class Finding:
         self.severity.value if isinstance(self.severity, Severity)
         else str(self.severity)
       ),
+      "confidence": self.confidence or "",
+      "status": getattr(self, "status", "") or "",
+      "evidence": self.evidence or "",
+      "remediation": self.remediation or "",
+      "cvss_score": self.cvss_score,
+      "cvss_vector": self.cvss_vector or "",
       "owasp_id": self.owasp_id,
       "cwe_id": self.cwe_id,
       "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],

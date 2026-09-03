@@ -481,72 +481,59 @@ class TestTheCveMatcherStampsOneIdentityNotTwo(unittest.TestCase):
 
   The CVE matcher identifies a finding by `product:version:cve_id` rather than
   by an `AffectedAsset` — that override is why `dedup_key` accepts
-  `asset_canonical` at all. `cve_db.py` passed it to `compute_signature` and
+  `asset_canonical` at all. `cve_db` passed it to `compute_signature` and
   nothing stamped a `dedup_key`, so `enrich_finding_for_probe` computed one from
-  the *probe* name with no override.
+  the *probe* name with no override. The result was a finding whose
+  `finding_signature` was built over one identity basis and whose `dedup_key`
+  was built over another — the "two identities for one finding, disagreeing, in
+  the same dict" that `graybox/findings.py` writes a comment to prevent.
 
-  The result was a finding whose `finding_signature` was built over one identity
-  basis and whose `dedup_key` was built over another — the "two identities for
-  one finding, disagreeing, in the same dict" that `graybox/findings.py` writes
-  a comment to prevent, and which falsifies `compute_signature`'s own docstring
-  ("the finding's dedup key plus its presentation fields").
+  The first version of this test built the stamped finding itself, by calling
+  `with_identity` inline. That made it a reimplementation of the production
+  code rather than a test of it: deleting the `dedup_key=` argument from
+  `cve_db` left all 2319 tests green. It now goes through `check_cves`, the
+  function the probes actually call.
   """
 
-  def _cve_finding(self):
-    from extensions.business.cybersec.red_mesh.findings import Finding
-    return Finding(
-      title="CVE-2024-1234 in mysql 8.0.1",
-      description="Remote code execution in mysql 8.0.1.",
-      severity="HIGH", confidence="firm", cve=("CVE-2024-1234",),
-    )
+  PRODUCT = "openssh"
+  VERSION = "7.0"
 
-  def _stamped(self):
-    """What `cve_db.build_cve_finding` produces, then enriched by the probe."""
+  def _from_production(self):
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+
+    findings = check_cves(self.PRODUCT, self.VERSION)
+    self.assertTrue(findings, "fixture no longer matches any CVE row")
+    return findings
+
+  def test_the_matcher_stamps_a_dedup_key_at_all(self):
+    for finding in self._from_production():
+      self.assertTrue(
+        finding.dedup_key,
+        "check_cves emitted a finding with no dedup key, so identity would be "
+        "recomputed downstream from the probe name",
+      )
+
+  def test_both_keys_are_built_over_the_same_identity_basis(self):
+    for finding in self._from_production():
+      cve_id = finding.cve[0]
+      expected = finding.compute_dedup_key(
+        probe_id=f"cve:{self.PRODUCT}",
+        asset_canonical=f"{self.PRODUCT}:{self.VERSION}:{cve_id}",
+      )
+      self.assertEqual(finding.dedup_key, expected)
+
+  def test_the_probe_does_not_overwrite_the_stamped_identity(self):
     from extensions.business.cybersec.red_mesh.findings import (
       enrich_finding_for_probe,
     )
-    finding = self._cve_finding()
-    kwargs = {
-      "probe_id": "cve:mysql",
-      "asset_canonical": "mysql:8.0.1:CVE-2024-1234",
-    }
-    stamped = finding.with_identity(
-      finding_signature=finding.compute_signature(**kwargs),
-      dedup_key=finding.compute_dedup_key(**kwargs),
-    )
-    # The CVE finding is appended into a normal probe's findings list, so it
-    # goes through the probe's enrichment on the way out.
-    return enrich_finding_for_probe(stamped, "_service_info_mysql")
+    for finding in self._from_production():
+      enriched = enrich_finding_for_probe(finding, "_service_info_ssh")
+      self.assertEqual(enriched.dedup_key, finding.dedup_key)
+      self.assertEqual(enriched.finding_signature, finding.finding_signature)
 
-  def test_the_stamped_keys_share_one_identity_basis(self):
-    enriched = self._stamped()
-    expected = self._cve_finding().compute_dedup_key(
-      probe_id="cve:mysql", asset_canonical="mysql:8.0.1:CVE-2024-1234",
-    )
-    self.assertEqual(
-      enriched.dedup_key, expected,
-      "the dedup key was recomputed from the probe name, so it no longer "
-      "matches the basis the finding_signature was built over",
-    )
-
-  def test_the_probe_does_not_overwrite_a_stamped_cve_identity(self):
-    self.assertEqual(self._stamped().finding_signature,
-                     self._cve_finding().compute_signature(
-                       probe_id="cve:mysql",
-                       asset_canonical="mysql:8.0.1:CVE-2024-1234"))
-
-  def test_the_same_cve_on_the_same_product_keeps_one_identity(self):
-    self.assertEqual(self._stamped().dedup_key, self._stamped().dedup_key)
-
-  def test_a_different_cve_on_the_same_product_is_a_different_finding(self):
-    from extensions.business.cybersec.red_mesh.findings import Finding
-    other = Finding(
-      title="CVE-2024-9999 in mysql 8.0.1", description="d",
-      severity="HIGH", confidence="firm",
-    ).compute_dedup_key(
-      probe_id="cve:mysql", asset_canonical="mysql:8.0.1:CVE-2024-9999",
-    )
-    self.assertNotEqual(self._stamped().dedup_key, other)
+  def test_each_cve_gets_its_own_identity(self):
+    findings = self._from_production()
+    self.assertEqual(len({f.dedup_key for f in findings}), len(findings))
 
 
 if __name__ == "__main__":

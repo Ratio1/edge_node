@@ -289,3 +289,36 @@ class TestTheContractIsEnforcedAndNotOnlyDeclared(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestNormalisationDoesNotHideTheViolation(unittest.TestCase):
+  """Validation ran on the item *after* the walk repaired it.
+
+  `normalize_flat_finding` maps an unrecognised confidence to `tentative`
+  twenty lines before it validates, so a probe emitting `confidence:
+  "probably"` produced zero schema violations — the exact defect
+  `validate_flat_finding` names in its own docstring. Repairing the value is
+  right; absorbing the fact that it needed repairing is not.
+  """
+
+  def _breakdown(self, confidence):
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    risk, _flat = MockHost()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [{
+        "title": "Weak TLS", "severity": "MEDIUM", "confidence": confidence,
+      }]}}},
+    })
+    return risk["breakdown"]["schema_violations"]
+
+  def test_an_unrecognised_confidence_is_reported(self):
+    violations = self._breakdown("probably")
+    self.assertEqual(violations["count"], 1)
+    self.assertTrue(any("probably" in error for error in violations["errors"]))
+
+  def test_a_recognised_confidence_reports_nothing(self):
+    self.assertEqual(self._breakdown("certain")["count"], 0)

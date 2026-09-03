@@ -261,6 +261,17 @@ class _RiskScoringMixin:
       # would be a worse trade than the one being fixed.
       for error in _validate_flat_finding(item):
         schema_violations.append(f"{probe_name}: {error}")
+      # Validation runs on the normalised item, so a field this walk repairs can
+      # never be reported by it. `confidence` is the case that matters: an
+      # unrecognised value is mapped to `tentative` above, twenty lines before
+      # the check, so a probe emitting `confidence: "probably"` produced zero
+      # schema violations — the one defect `validate_flat_finding` names
+      # explicitly in its own docstring. The repair is still right; it just has
+      # to be reported rather than absorbed.
+      if not recognised and finding.get("confidence"):
+        schema_violations.append(
+          f"{probe_name}: confidence is invalid: {finding['confidence']}"
+        )
       return item
 
     def normalize_string_list(values):
@@ -439,11 +450,14 @@ class _RiskScoringMixin:
       cve_id = m.group(0)
       port = f.get("port", 0)
       key = (cve_id, port)
-      conf = CONFIDENCE_RANK.get(f.get("confidence", "tentative"), 0)
+      # `finding_rank` — severity first, then confidence — the same ordering the
+      # signature loop above uses. Ranking on confidence alone let a LOW banner
+      # observation marked `certain` evict a CRITICAL RCE marked `tentative`,
+      # both naming CVE-2024-1234, so the report carried one LOW where the scan
+      # had found a critical remote code execution.
       if key in cve_best:
         prev_idx = cve_best[key]
-        prev_conf = CONFIDENCE_RANK.get(flat_findings[prev_idx].get("confidence", "tentative"), 0)
-        if conf > prev_conf:
+        if finding_rank(f) > finding_rank(flat_findings[prev_idx]):
           drop_indices.add(prev_idx)
           cve_best[key] = idx
         else:
@@ -500,12 +514,21 @@ class _RiskScoringMixin:
     # produce the same ids, or continuous monitoring reports churn that did not
     # happen. A finding whose identity is already unique keeps its dedup key
     # unchanged, which is what makes the id stable across a rewording.
+    # The discriminator carries the port as well as the content hash. Identity
+    # is stamped at probe time, before the walk knows which port the finding
+    # belongs to, so the same weakness found on 443 and on 8443 arrives with the
+    # same `dedup_key` *and* the same `content_hash` — content alone could not
+    # separate them, and the two assets collided under one id. Two services on
+    # two ports are two findings.
     id_counts = {}
     for f in flat_findings:
       id_counts[f.get("finding_id")] = id_counts.get(f.get("finding_id"), 0) + 1
     for f in flat_findings:
       if id_counts.get(f.get("finding_id"), 0) > 1:
-        discriminator = str(f.get("content_hash") or f.get("finding_signature") or "")[:8]
+        content = str(f.get("content_hash") or f.get("finding_signature") or "")[:8]
+        discriminator = "-".join(
+          part for part in (str(f.get("port") or ""), content) if part
+        )
         if discriminator:
           f["finding_id"] = f"{f['finding_id']}-{discriminator}"
 

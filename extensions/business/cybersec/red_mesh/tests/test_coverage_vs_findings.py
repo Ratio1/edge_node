@@ -494,3 +494,132 @@ class TestCveDedupRespectsTheCoverageBoundary(unittest.TestCase):
   def test_the_coverage_evidence_survives(self):
     risk, _flat = _Host()._compute_risk_and_findings(self._report(self._both()))
     self.assertEqual(risk["breakdown"]["coverage_counts"]["not_vulnerable"], 1)
+
+
+class TestTheIdDistinguishesTheAssetNotJustTheContent(unittest.TestCase):
+  """The same weakness on two ports is two findings, and shared one id.
+
+  Identity is stamped at probe time, before the walk knows which port the
+  finding belongs to, so a `Finding` emitted for 443 and an identical one for
+  8443 carry the same `dedup_key` *and* the same `content_hash`. The
+  disambiguation added for the SRI case keyed only on content, so it could not
+  separate them either.
+
+  `finding_id` is what triage and the STIX `uuid5` seed resolve on, so the two
+  assets collided: remediating the 8443 service would mark the 443 one done.
+  """
+
+  def _two_ports(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+
+    def probe():
+      return probe_result(
+        findings=[Finding(
+          severity=Severity.HIGH, title="Weak TLS", description="d",
+          confidence="certain",
+        )],
+        probe_id="_service_info_ssl",
+      )
+
+    return _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https", "8443": "https"},
+      "service_info": {
+        "443": {"_service_info_ssl": probe()},
+        "8443": {"_service_info_ssl": probe()},
+      },
+    })[1]
+
+  def test_the_same_weakness_on_two_ports_gets_two_ids(self):
+    flat = self._two_ports()
+    self.assertEqual(len(flat), 2)
+    self.assertEqual(
+      len({f["finding_id"] for f in flat}), 2,
+      "two services on two ports shipped under one primary key, so triaging "
+      "one would resolve the other",
+    )
+
+  def test_the_ids_still_do_not_depend_on_scan_order(self):
+    self.assertEqual(
+      {f["port"]: f["finding_id"] for f in self._two_ports()},
+      {f["port"]: f["finding_id"] for f in self._two_ports()},
+    )
+
+
+class TestTheContentHashSeesAllTheContent(unittest.TestCase):
+  """Dedup keys on the content hash, and the content hash was blind.
+
+  `models/finding_identity._CONTENT_FIELDS` names nine fields; the payload
+  `Finding._identity_payload` supplies carries seven of them and omits
+  `confidence`, `status`, `evidence`, `remediation`, `cvss_score` and
+  `cvss_vector`. So two findings differing only in one of those hash the same,
+  and content-keyed dedup deletes one — the exact failure the revert to
+  content-keying exists to prevent, reached through the payload instead of the
+  key choice.
+
+  Measured: two findings differing only in `evidence` left one survivor. Same
+  for `remediation`, and for a CVSS 9.8 against a 4.3.
+  """
+
+  def _survivors(self, **difference):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+    base = dict(
+      severity=Severity.HIGH, title="Weak configuration", description="d",
+      confidence="certain",
+    )
+    probe = probe_result(
+      findings=[Finding(**base), Finding(**base, **difference)],
+      probe_id="_service_info_http",
+    )
+    return _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": probe}},
+    })[1]
+
+  def test_different_evidence_is_different_content(self):
+    self.assertEqual(len(self._survivors(evidence="payload=X")), 2)
+
+  def test_different_remediation_is_different_content(self):
+    self.assertEqual(len(self._survivors(remediation="Rotate the key")), 2)
+
+  def test_a_different_cvss_score_is_different_content(self):
+    self.assertEqual(len(self._survivors(cvss_score=9.8)), 2)
+
+  def test_an_identical_finding_still_deduplicates(self):
+    """The control — widening the payload must not disable dedup."""
+    self.assertEqual(len(self._survivors()), 1)
+
+
+class TestCveDedupKeepsTheWorstFinding(unittest.TestCase):
+  """The CVE fallback ranked on confidence alone and lost the severe finding.
+
+  `finding_rank`, fifteen lines above it, ranks severity first and confidence
+  second. The CVE-title loop compares only `CONFIDENCE_RANK`, so a LOW banner
+  observation marked `certain` evicted a CRITICAL RCE marked `tentative` — both
+  naming CVE-2024-1234. The report then carried one LOW where the scan had
+  found a critical remote code execution.
+  """
+
+  def _survivors(self):
+    findings = [
+      {"title": "CVE-2024-1234: RCE in component", "severity": "CRITICAL",
+       "confidence": "tentative", "description": "exploitable"},
+      {"title": "CVE-2024-1234 banner observed", "severity": "LOW",
+       "confidence": "certain", "description": "version string only"},
+    ]
+    return _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": findings}}},
+    })
+
+  def test_the_critical_finding_is_the_one_that_survives(self):
+    _risk, flat = self._survivors()
+    self.assertEqual([f["severity"] for f in flat], ["CRITICAL"])
+
+  def test_the_counts_report_the_critical(self):
+    risk, _flat = self._survivors()
+    self.assertEqual(risk["breakdown"]["finding_counts"]["CRITICAL"], 1)
+    self.assertEqual(risk["breakdown"]["finding_counts"]["LOW"], 0)
