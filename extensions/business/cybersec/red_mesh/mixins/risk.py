@@ -422,6 +422,16 @@ class _RiskScoringMixin:
     for idx, f in enumerate(flat_findings):
       if idx in drop_indices:
         continue
+      # Coverage results are not findings and must not be deduplicated against
+      # them. This loop was the one place in the function that ignored that
+      # distinction, and it ranks on confidence alone — unlike `finding_rank`
+      # above, which ranks severity first. So a `not_vulnerable` INFO record
+      # naming a CVE and a CRITICAL vulnerability naming the same CVE collapsed
+      # into a single survivor, deleting one of them from the archive, the
+      # counts and every export. Measured: one survivor and `coverage_counts` of
+      # zero, contradicting this module's own "the entry is still archived".
+      if _is_coverage_result(f):
+        continue
       title = f.get("title", "")
       m = _re_dedup.search(r"CVE-\d{4}-\d+", title)
       if not m:
@@ -474,6 +484,30 @@ class _RiskScoringMixin:
         if isinstance(title, str) and "default credential accepted" in title.lower():
           cred_count += 1
       credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
+
+    # `finding_id` is the primary key, so it has to be unique among the findings
+    # that actually survive.
+    #
+    # It derives from `dedup_key`, dedup runs on `finding_signature`, and no
+    # blackbox probe sets a location yet — so findings that differ in content
+    # survive dedup and arrive carrying the *same* id. Measured on the SRI loop:
+    # three survivors, one id. `finding_id` is the triage key, the CStore key,
+    # the `finding_timeline` identity, the `uuid5` seed for STIX, the MISP object
+    # id and the SIEM event fingerprint, so triaging one of those findings would
+    # stamp all three and the timeline would report three passes inside one.
+    #
+    # Disambiguated by content rather than by position: the same scan twice must
+    # produce the same ids, or continuous monitoring reports churn that did not
+    # happen. A finding whose identity is already unique keeps its dedup key
+    # unchanged, which is what makes the id stable across a rewording.
+    id_counts = {}
+    for f in flat_findings:
+      id_counts[f.get("finding_id")] = id_counts.get(f.get("finding_id"), 0) + 1
+    for f in flat_findings:
+      if id_counts.get(f.get("finding_id"), 0) > 1:
+        discriminator = str(f.get("content_hash") or f.get("finding_signature") or "")[:8]
+        if discriminator:
+          f["finding_id"] = f"{f['finding_id']}-{discriminator}"
 
     raw_total = findings_score + open_ports_score + breadth_score + credentials_penalty
     score = normalize_risk_score(raw_total)

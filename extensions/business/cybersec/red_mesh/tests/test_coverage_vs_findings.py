@@ -371,3 +371,126 @@ class TestTheEgressCanTellThemApart(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestEverySurvivingFindingHasItsOwnId(unittest.TestCase):
+  """`finding_id` is the primary key, and three findings shared one.
+
+  `finding_id` derives from `dedup_key`, dedup runs on `finding_signature`, and
+  no blackbox probe sets a location — so findings that differ in content survive
+  dedup and land with the *same* id. On `origin/develop` this could not happen:
+  `finding_id` was `signature[:16]`, which is content-derived and therefore
+  distinct per finding.
+
+  Measured on the SRI loop: three survivors, one unique `finding_id`. It is the
+  triage key (`services/triage.py`), the CStore key, the `finding_timeline`
+  identity, the `uuid5` seed for STIX, the MISP object id and the SIEM event
+  fingerprint — so triaging one SRI finding would stamp all of them, and
+  `finding_timeline` would report three passes inside one pass.
+  """
+
+  def _sri(self, count=3):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+    return probe_result(
+      findings=[
+        Finding(
+          severity=Severity.MEDIUM, title="External script loaded without SRI",
+          description=f"Script from cdn-{n}.example/s.js has no integrity attribute.",
+          evidence=f'<script src="cdn-{n}.example/s.js">',
+          owasp_id="A08:2021", cwe_id="CWE-829", confidence="certain",
+        )
+        for n in "abcde"[:count]
+      ],
+      probe_id="_web_test_hardening",
+    )
+
+  def _flat(self, count=3):
+    return _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "web_tests_info": {"443": {"_web_test_hardening": self._sri(count)}},
+    })[1]
+
+  def test_no_two_surviving_findings_share_an_id(self):
+    flat = self._flat()
+    self.assertEqual(
+      len({f["finding_id"] for f in flat}), len(flat),
+      "distinct findings shipped under one primary key, so triage, the "
+      "finding timeline and every export would conflate them",
+    )
+
+  def test_the_id_does_not_depend_on_the_order_the_probe_emitted(self):
+    """Disambiguation must derive from the finding, not from its position.
+
+    Asserting only that two identical runs agree is too weak: a positional
+    discriminator satisfies it, and that mutant survived. A probe that emits the
+    same findings in a different order — or finds one more of them next pass —
+    must not re-key the ones that did not change, or continuous monitoring
+    reports churn that never happened.
+    """
+    def by_script(findings):
+      return {f["description"].split()[2]: f["finding_id"] for f in findings}
+
+    def flatten(probe):
+      return _Host()._compute_risk_and_findings({
+        "target": "app.test", "port_protocols": {"443": "https"},
+        "web_tests_info": {"443": {"_web_test_hardening": probe}},
+      })[1]
+
+    forward = self._sri(3)
+    backward = dict(forward, findings=list(reversed(forward["findings"])))
+    self.assertEqual(by_script(flatten(forward)), by_script(flatten(backward)))
+
+  def test_a_finding_with_a_unique_identity_keeps_its_dedup_key_as_its_id(self):
+    flat = self._flat(count=1)
+    self.assertEqual(flat[0]["finding_id"], flat[0]["dedup_key"])
+
+
+class TestCveDedupRespectsTheCoverageBoundary(unittest.TestCase):
+  """The CVE-title fallback is the one dedup loop that ignores B5's distinction.
+
+  It walks the whole flat list — coverage entries included — and ranks on
+  confidence alone, unlike `finding_rank` fifteen lines above it, which ranks
+  severity first. So a `not_vulnerable` INFO record naming a CVE can evict, or
+  be evicted by, a real vulnerability naming the same CVE.
+
+  Measured: a `not_vulnerable` scenario and a CRITICAL finding both mentioning
+  CVE-2024-1234 left **one** survivor and `coverage_counts` of zero — the
+  coverage record deleted from the archive, contradicting this module's own
+  "the entry is still archived, a PTES report needs the coverage evidence".
+  """
+
+  def _report(self, items):
+    return {
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "graybox_results": {"443": {"_graybox_components": {"findings": items}}},
+    }
+
+  def _entry(self, scenario, title, status, severity, confidence, path):
+    entry = GrayboxFinding(
+      scenario_id=scenario, title=title, status=status, severity=severity,
+      owasp="A06:2021", url=f"https://app.test/{path}",
+    ).to_dict()
+    entry["confidence"] = confidence
+    return entry
+
+  def _both(self):
+    return [
+      self._entry("PT-A06-01", "CVE-2024-1234 RCE in component", "vulnerable",
+                  "CRITICAL", "firm", "a"),
+      self._entry("PT-A06-02", "CVE-2024-1234 patch verified absent",
+                  "not_vulnerable", "INFO", "certain", "b"),
+    ]
+
+  def test_a_coverage_record_is_not_deduplicated_against_a_finding(self):
+    _risk, flat = _Host()._compute_risk_and_findings(self._report(self._both()))
+    self.assertEqual(len(flat), 2)
+
+  def test_the_real_vulnerability_survives(self):
+    risk, _flat = _Host()._compute_risk_and_findings(self._report(self._both()))
+    self.assertEqual(risk["breakdown"]["finding_counts"]["CRITICAL"], 1)
+
+  def test_the_coverage_evidence_survives(self):
+    risk, _flat = _Host()._compute_risk_and_findings(self._report(self._both()))
+    self.assertEqual(risk["breakdown"]["coverage_counts"]["not_vulnerable"], 1)
