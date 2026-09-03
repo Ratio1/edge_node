@@ -340,5 +340,69 @@ class TestAValuelessCookieHeaderStaysOutOfTheFinding(unittest.TestCase):
     self.assertIn("sessionid", result["findings"][0]["title"])
 
 
+class TestRedirectAuthorityIsHostOnly(unittest.TestCase):
+  """F6 (external review, validated): `parts.netloc` carries userinfo, so
+  `https://user:secret@evil.example/cb` archived the credential — in the fix
+  made for the previous credential leak. And the path carries per-request
+  nonces, churning the dedup key. The redirect *host* is the load-bearing
+  fact; everything else goes.
+  """
+
+  def _authority(self, location):
+    from extensions.business.cybersec.red_mesh.worker.web.hardening import (
+      _WebHardeningMixin,
+    )
+    return _WebHardeningMixin._redirect_authority(location)
+
+  def test_userinfo_never_reaches_the_authority(self):
+    self.assertNotIn("secret", self._authority("https://user:secret@evil.example/cb?t=1"))
+
+  def test_the_host_and_port_survive(self):
+    self.assertEqual(
+      self._authority("https://user:secret@evil.example:8443/cb"),
+      "https://evil.example:8443",
+    )
+
+  def test_a_rotating_path_nonce_does_not_change_the_authority(self):
+    self.assertEqual(
+      self._authority("https://evil.example/cb/nonce-111"),
+      self._authority("https://evil.example/cb/nonce-222"),
+    )
+
+  def test_hostless_shapes_do_not_fabricate_an_authority(self):
+    # No invented "//" for javascript:, no dangling "://" for scheme-relative.
+    self.assertEqual(self._authority("javascript:alert(1)"), "javascript:")
+    self.assertEqual(self._authority("//evil.example/x"), "//evil.example")
+    self.assertEqual(self._authority("http://[bad"), "an unparseable URL")
+
+
+class TestSetCookieParsingSurvivesExpiresDates(unittest.TestCase):
+  """`requests` folds multiple Set-Cookie headers into one comma-joined string,
+  and a bare `split(",")` cuts a lone `Expires=Wed, 21 Oct...` in half — the
+  date fragment then produced a phantom "(unnamed cookie)" finding set.
+  """
+
+  def _scan(self, header):
+    resp = MagicMock()
+    resp.headers = {"Set-Cookie": header}
+    resp.status_code = 200
+    resp.text = ""
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
+      return_value=resp,
+    ):
+      return _worker()._web_test_flags("example.com", 443)
+
+  def test_an_expires_date_does_not_split_the_cookie(self):
+    result = self._scan("sid=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/")
+    names = {f["title"].rsplit(": ", 1)[-1] for f in result["findings"]}
+    self.assertEqual(names, {"sid"}, "the Expires comma produced phantom cookies")
+
+  def test_two_real_cookies_still_yield_two(self):
+    result = self._scan("sid=abc; Path=/, theme=dark; Path=/")
+    names = {f["title"].rsplit(": ", 1)[-1] for f in result["findings"]}
+    self.assertEqual(names, {"sid", "theme"})
+
+
 if __name__ == "__main__":
   unittest.main()

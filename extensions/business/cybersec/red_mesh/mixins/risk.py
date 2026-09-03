@@ -249,9 +249,13 @@ class _RiskScoringMixin:
       # schema violations — the one defect `validate_flat_finding` names
       # explicitly in its own docstring. The repair is still right; it just has
       # to be reported rather than absorbed.
-      if not recognised and finding.get("confidence"):
+      # Key presence, not truthiness: an explicit `None` or `""` is a value the
+      # probe chose and got wrong, and the truthiness guard let both normalise
+      # to `tentative` with zero violations while `"probably"` reported one. An
+      # *absent* key defaulting to `firm` silently stays the documented contract.
+      if not recognised and "confidence" in finding:
         schema_violations.append(
-          f"{probe_name}: confidence is invalid: {finding['confidence']}"
+          f"{probe_name}: confidence is invalid: {finding['confidence']!r}"
         )
       return item
 

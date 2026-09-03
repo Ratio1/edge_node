@@ -49,7 +49,12 @@ class _WebHardeningMixin:
       # Check cookies for Secure/HttpOnly flags
       cookies_hdr = resp_main.headers.get("Set-Cookie", "")
       if cookies_hdr:
-        for cookie in cookies_hdr.split(","):
+        # `requests` folds multiple Set-Cookie headers into one comma-joined
+        # string — but a lone `Expires=Wed, 21 Oct...` contains a comma too, and
+        # a bare split cut the cookie in half, producing a phantom
+        # "(unnamed cookie)" finding set from the date fragment. Split only at a
+        # comma followed by a `name=` token, which an Expires date never is.
+        for cookie in _re.split(r",(?=\s*[^\s;,=]+=)", cookies_hdr):
           # A Set-Cookie without `=` has no name, only content — falling back
           # to the raw header put arbitrary (potentially secret-shaped) bytes
           # into the title and evidence, and since the title feeds the
@@ -269,7 +274,18 @@ class _WebHardeningMixin:
     """
     try:
       parts = urlsplit(location)
-      return f"{parts.scheme}://{parts.netloc}{parts.path}"
+      # `hostname`/`port`, never `netloc`: netloc carries userinfo, so
+      # `https://user:secret@evil.example/cb` archived the credential — inside
+      # the fix made for the previous credential leak. The path goes too: it
+      # carries per-request nonces that churned the dedup key, and the redirect
+      # *host* is the load-bearing fact. Hostless shapes render without a
+      # fabricated authority.
+      host = parts.hostname or ""
+      port = f":{parts.port}" if parts.port else ""
+      if not host:
+        return f"{parts.scheme}:" if parts.scheme else "a URL with no host"
+      prefix = f"{parts.scheme}://" if parts.scheme else "//"
+      return f"{prefix}{host}{port}"
     except ValueError:
       return "an unparseable URL"
 

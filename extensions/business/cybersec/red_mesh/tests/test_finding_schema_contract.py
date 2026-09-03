@@ -322,3 +322,25 @@ class TestNormalisationDoesNotHideTheViolation(unittest.TestCase):
 
   def test_a_recognised_confidence_reports_nothing(self):
     self.assertEqual(self._breakdown("certain")["count"], 0)
+
+  def test_an_explicit_none_or_empty_confidence_is_reported(self):
+    """F9 (external review, validated): the truthiness guard let `None` and
+    `""` normalise to `tentative` with zero violations, while `"probably"`
+    reported one. Key-presence is the right test: an *absent* key defaulting
+    to `firm` silently is the documented contract."""
+    for value in (None, ""):
+      self.assertEqual(self._breakdown(value)["count"], 1, f"confidence={value!r}")
+
+  def test_an_absent_confidence_is_still_silently_defaulted(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class MockHost(_RiskScoringMixin):
+      pass
+
+    risk, _flat = MockHost()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": [{
+        "title": "Weak TLS", "severity": "MEDIUM",
+      }]}}},
+    })
+    self.assertEqual(risk["breakdown"]["schema_violations"]["count"], 0)
