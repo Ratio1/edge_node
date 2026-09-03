@@ -280,13 +280,19 @@ class TestCrossWorkerDedupInTheReportLayer(unittest.TestCase):
       _compact_finding_signature(other),
     )
 
-  def test_a_stamped_finding_defers_to_the_shared_identity(self):
+  def test_a_stamped_finding_defers_to_its_content_signature(self):
+    """`_compact_finding_signature` is a content signature, so it must never
+    fall back to `finding_id`: the id is identity-derived and coarse, and two
+    content-distinct findings sharing it would collapse into one "finding
+    type" in the per-worker counts."""
     from extensions.business.cybersec.red_mesh.mixins.report import (
       _compact_finding_signature,
     )
     finding = _finding()
     finding["finding_id"] = dedup_key(finding)
-    self.assertEqual(_compact_finding_signature(finding), finding["finding_id"])
+    finding["content_hash"] = content_hash(finding)
+    self.assertEqual(_compact_finding_signature(finding), finding["content_hash"])
+    self.assertNotEqual(_compact_finding_signature(finding), finding["finding_id"])
 
 
 class TestIdentitySurvivesRedaction(unittest.TestCase):

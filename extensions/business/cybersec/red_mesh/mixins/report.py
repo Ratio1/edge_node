@@ -262,7 +262,11 @@ def _iter_report_findings(report):
 def _compact_finding_signature(finding):
   """Return a stable compact type signature without worker-attribution fields."""
   if isinstance(finding, dict):
-    explicit = finding.get("finding_signature") or finding.get("finding_id")
+    # Content fields only. Falling back to `finding_id` was correct when the id
+    # was content-derived and is wrong now that it is identity-derived: two
+    # content-distinct findings sharing a coarse identity would collapse into
+    # one "finding type" in the per-worker counts.
+    explicit = finding.get("finding_signature") or finding.get("content_hash")
     if explicit:
       return str(explicit)
 
@@ -906,7 +910,9 @@ class _ReportMixin:
       if not addr:
         continue
       findings_by_node.setdefault(addr, []).append({
-        "signature": f.get("finding_signature") or f.get("finding_id"),
+        # Same content-only rule as `_compact_finding_signature`: an
+        # identity-derived id is not a content signature.
+        "signature": f.get("finding_signature") or f.get("content_hash"),
         "severity": f.get("severity", "INFO"),
         "title": f.get("title", ""),
         "port": f.get("port"),
@@ -1023,18 +1029,24 @@ class _ReportMixin:
     top_findings = crit_high[:10]
 
     # Finding timeline: track persistence across passes (continuous monitoring)
-    finding_timeline = {}
+    # Distinct passes, not occurrences: findings can share an id inside one
+    # pass (identity is coarse until RM-061), and counting occurrences reported
+    # `pass_count: 2` for a single pass — persistence that never happened, in
+    # the surface that exists to measure persistence.
+    finding_passes = {}
     for p in passes:
       pass_nr = p.get("pass_nr", 0)
       for f in (p.get("findings") or []):
         fid = f.get("finding_id")
         if not fid:
           continue
-        if fid not in finding_timeline:
-          finding_timeline[fid] = {"first_seen": pass_nr, "last_seen": pass_nr, "pass_count": 1}
-        else:
-          finding_timeline[fid]["last_seen"] = pass_nr
-          finding_timeline[fid]["pass_count"] += 1
+        finding_passes.setdefault(fid, set()).add(pass_nr)
+    finding_timeline = {
+      fid: {
+        "first_seen": min(nrs), "last_seen": max(nrs), "pass_count": len(nrs),
+      }
+      for fid, nrs in finding_passes.items()
+    }
 
     # Origin-country breakdown for the latest pass: count participating worker
     # nodes per ISO-2 country (empty country grouped under "UN"/Unknown in the UI).

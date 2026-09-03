@@ -461,38 +461,36 @@ class _RiskScoringMixin:
     # D. Default credentials penalty
     credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
 
-    # `finding_id` is the primary key, so it has to be unique among the findings
-    # that actually survive.
+    # `finding_id = dedup_key`, unconditionally — collisions are reported, not
+    # hidden (plan decision 3; this deliberately re-opens E2, the two-port
+    # collision, as an accepted and *visible* trade).
     #
-    # It derives from `dedup_key`, dedup runs on `finding_signature`, and no
-    # blackbox probe sets a location yet — so findings that differ in content
-    # survive dedup and arrive carrying the *same* id. Measured on the SRI loop:
-    # three survivors, one id. `finding_id` is the triage key, the CStore key,
-    # the `finding_timeline` identity, the `uuid5` seed for STIX, the MISP object
-    # id and the SIEM event fingerprint, so triaging one of those findings would
-    # stamp all three and the timeline would report three passes inside one.
-    #
-    # Disambiguated by content rather than by position: the same scan twice must
-    # produce the same ids, or continuous monitoring reports churn that did not
-    # happen. A finding whose identity is already unique keeps its dedup key
-    # unchanged, which is what makes the id stable across a rewording.
-    # The discriminator carries the port as well as the content hash. Identity
-    # is stamped at probe time, before the walk knows which port the finding
-    # belongs to, so the same weakness found on 443 and on 8443 arrives with the
-    # same `dedup_key` *and* the same `content_hash` — content alone could not
-    # separate them, and the two assets collided under one id. Two services on
-    # two ports are two findings.
+    # The collision-detection pass this replaces suffixed every member of a
+    # colliding group, which made the id depend on what else the scan found:
+    # pass 2 finding one SRI script where pass 1 found three re-keyed the
+    # survivor and `finding_timeline` reported a brand-new finding. It also
+    # produced ~29-character ids against the documented 16-hex contract.
+    # Identity stays coarse until RM-061 attaches locations; findings sharing a
+    # `dedup_key` are a probe defect, and the count below is how it is seen.
     id_counts = {}
     for f in flat_findings:
       id_counts[f.get("finding_id")] = id_counts.get(f.get("finding_id"), 0) + 1
-    for f in flat_findings:
-      if id_counts.get(f.get("finding_id"), 0) > 1:
-        content = str(f.get("content_hash") or f.get("finding_signature") or "")[:8]
-        discriminator = "-".join(
-          part for part in (str(f.get("port") or ""), content) if part
-        )
-        if discriminator:
-          f["finding_id"] = f"{f['finding_id']}-{discriminator}"
+    colliding = [f for f in flat_findings if id_counts.get(f.get("finding_id"), 0) > 1]
+    identity_collisions = {
+      "count": len(colliding),
+      "probes": sorted({str(f.get("probe") or "") for f in colliding} - {""}),
+    }
+    if colliding and callable(getattr(self, "P", None)):
+      # The log line is the load-bearing surface — no Navigator consumer reads
+      # the breakdown field yet. Probe names and a count only; never finding
+      # text, which can carry target data.
+      self.P(
+        f"identity collision: {identity_collisions['count']} findings share "
+        f"a finding_id (probes: {', '.join(identity_collisions['probes'])}) — "
+        "the probe emits findings identity cannot distinguish until RM-061 "
+        "attaches locations",
+        color="y",
+      )
 
     raw_total = findings_score + open_ports_score + breadth_score + credentials_penalty
     score = normalize_risk_score(raw_total)
@@ -510,6 +508,9 @@ class _RiskScoringMixin:
         # "we ran 40 scenarios and 1 was vulnerable" and "we found 40 findings"
         # are different claims, and only the first is true.
         "coverage_counts": coverage_counts,
+        # Findings sharing an id — a probe emitting findings identity cannot
+        # distinguish. Reported rather than hidden behind a synthetic suffix.
+        "identity_collisions": identity_collisions,
         # A probe emitting a finding the contract does not accept is a defect in
         # the probe. Stated here so it is visible in the pass report rather
         # than absorbed silently by the layer that reads the finding.

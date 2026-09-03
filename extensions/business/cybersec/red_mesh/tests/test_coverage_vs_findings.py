@@ -373,20 +373,20 @@ if __name__ == "__main__":
   unittest.main()
 
 
-class TestEverySurvivingFindingHasItsOwnId(unittest.TestCase):
-  """`finding_id` is the primary key, and three findings shared one.
+class TestFindingIdsAreDeterministic(unittest.TestCase):
+  """Phase 5a: `finding_id = dedup_key`, unconditionally — collisions reported.
 
-  `finding_id` derives from `dedup_key`, dedup runs on `finding_signature`, and
-  no blackbox probe sets a location — so findings that differ in content survive
-  dedup and land with the *same* id. On `origin/develop` this could not happen:
-  `finding_id` was `signature[:16]`, which is content-derived and therefore
-  distinct per finding.
+  The previous design detected collisions *within a pass* and suffixed every
+  member of a colliding group, which made the id depend on what else the scan
+  found: pass 2 finding one SRI script where pass 1 found three re-keyed the
+  survivor, and `finding_timeline` reported a brand-new finding. It also
+  produced ~29-character ids against a documented 16-hex contract.
 
-  Measured on the SRI loop: three survivors, one unique `finding_id`. It is the
-  triage key (`services/triage.py`), the CStore key, the `finding_timeline`
-  identity, the `uuid5` seed for STIX, the MISP object id and the SIEM event
-  fingerprint — so triaging one SRI finding would stamp all of them, and
-  `finding_timeline` would report three passes inside one pass.
+  Identity is deliberately coarse until RM-061 attaches locations. Findings
+  sharing a `dedup_key` share an id — a *probe defect*, surfaced via
+  `identity_collisions` plus a log line rather than hidden behind a synthetic
+  discriminator. Nothing is ever deleted: all colliding findings stay in
+  `flat_findings`.
   """
 
   def _sri(self, count=3):
@@ -406,45 +406,94 @@ class TestEverySurvivingFindingHasItsOwnId(unittest.TestCase):
       probe_id="_web_test_hardening",
     )
 
-  def _flat(self, count=3):
+  def _run(self, probe):
     return _Host()._compute_risk_and_findings({
       "target": "app.test", "port_protocols": {"443": "https"},
-      "web_tests_info": {"443": {"_web_test_hardening": self._sri(count)}},
-    })[1]
+      "web_tests_info": {"443": {"_web_test_hardening": probe}},
+    })
 
-  def test_no_two_surviving_findings_share_an_id(self):
-    flat = self._flat()
-    self.assertEqual(
-      len({f["finding_id"] for f in flat}), len(flat),
-      "distinct findings shipped under one primary key, so triage, the "
-      "finding timeline and every export would conflate them",
-    )
+  def test_the_id_does_not_depend_on_what_else_the_scan_found(self):
+    """The defect the suffix design shipped: the same finding's id changed when
+    the size of its colliding group changed between passes."""
+    three = {f["description"]: f["finding_id"] for f in self._run(self._sri(3))[1]}
+    one = {f["description"]: f["finding_id"] for f in self._run(self._sri(1))[1]}
+    for description, finding_id in one.items():
+      self.assertEqual(finding_id, three[description])
+
+  def test_colliding_findings_are_all_kept(self):
+    _risk, flat = self._run(self._sri(3))
+    self.assertEqual(len(flat), 3, "reporting a collision must not delete evidence")
+
+  def test_the_collision_is_reported(self):
+    risk, flat = self._run(self._sri(3))
+    collisions = risk["breakdown"]["identity_collisions"]
+    self.assertEqual(collisions["count"], 3)
+    self.assertEqual(collisions["probes"], ["_web_test_hardening"])
+    self.assertEqual(len({f["finding_id"] for f in flat}), 1)
+
+  def test_no_collision_reports_zero(self):
+    risk, _flat = self._run(self._sri(1))
+    self.assertEqual(risk["breakdown"]["identity_collisions"]["count"], 0)
+    self.assertEqual(risk["breakdown"]["identity_collisions"]["probes"], [])
+
+  def test_every_id_is_sixteen_hex_characters(self):
+    import re
+    _risk, flat = self._run(self._sri(3))
+    for f in flat:
+      self.assertRegex(f["finding_id"], r"^[0-9a-f]{16}$")
 
   def test_the_id_does_not_depend_on_the_order_the_probe_emitted(self):
-    """Disambiguation must derive from the finding, not from its position.
-
-    Asserting only that two identical runs agree is too weak: a positional
-    discriminator satisfies it, and that mutant survived. A probe that emits the
-    same findings in a different order — or finds one more of them next pass —
-    must not re-key the ones that did not change, or continuous monitoring
-    reports churn that never happened.
-    """
-    def by_script(findings):
-      return {f["description"].split()[2]: f["finding_id"] for f in findings}
-
-    def flatten(probe):
-      return _Host()._compute_risk_and_findings({
-        "target": "app.test", "port_protocols": {"443": "https"},
-        "web_tests_info": {"443": {"_web_test_hardening": probe}},
-      })[1]
-
     forward = self._sri(3)
     backward = dict(forward, findings=list(reversed(forward["findings"])))
-    self.assertEqual(by_script(flatten(forward)), by_script(flatten(backward)))
+    by_script = lambda flat: {f["description"]: f["finding_id"] for f in flat}
+    self.assertEqual(
+      by_script(self._run(forward)[1]), by_script(self._run(backward)[1]),
+    )
 
   def test_a_finding_with_a_unique_identity_keeps_its_dedup_key_as_its_id(self):
-    flat = self._flat(count=1)
+    _risk, flat = self._run(self._sri(1))
     self.assertEqual(flat[0]["finding_id"], flat[0]["dedup_key"])
+
+
+class TestTheSameWeaknessOnTwoPortsIsAReportedCollision(unittest.TestCase):
+  """Accepted (plan decision 3, re-opening E2 deliberately): port is not in a
+  locationless identity, so the same weakness on 443 and 8443 shares one id.
+  The port-suffix that separated them is what made ids pass-dependent — the
+  worse defect. The collision is reported, and both findings are kept."""
+
+  def _two_ports(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_result,
+    )
+
+    def probe():
+      return probe_result(
+        findings=[Finding(
+          severity=Severity.HIGH, title="Weak TLS", description="d",
+          confidence="certain",
+        )],
+        probe_id="_service_info_ssl",
+      )
+
+    return _Host()._compute_risk_and_findings({
+      "target": "app.test", "port_protocols": {"443": "https", "8443": "https"},
+      "service_info": {
+        "443": {"_service_info_ssl": probe()},
+        "8443": {"_service_info_ssl": probe()},
+      },
+    })
+
+  def test_both_findings_survive_and_the_collision_is_reported(self):
+    risk, flat = self._two_ports()
+    self.assertEqual(len(flat), 2)
+    self.assertEqual(len({f["finding_id"] for f in flat}), 1)
+    self.assertEqual(risk["breakdown"]["identity_collisions"]["count"], 2)
+
+  def test_the_ids_still_do_not_depend_on_scan_order(self):
+    self.assertEqual(
+      {f["port"]: f["finding_id"] for f in self._two_ports()[1]},
+      {f["port"]: f["finding_id"] for f in self._two_ports()[1]},
+    )
 
 
 class TestCveDedupRespectsTheCoverageBoundary(unittest.TestCase):
@@ -494,57 +543,6 @@ class TestCveDedupRespectsTheCoverageBoundary(unittest.TestCase):
   def test_the_coverage_evidence_survives(self):
     risk, _flat = _Host()._compute_risk_and_findings(self._report(self._both()))
     self.assertEqual(risk["breakdown"]["coverage_counts"]["not_vulnerable"], 1)
-
-
-class TestTheIdDistinguishesTheAssetNotJustTheContent(unittest.TestCase):
-  """The same weakness on two ports is two findings, and shared one id.
-
-  Identity is stamped at probe time, before the walk knows which port the
-  finding belongs to, so a `Finding` emitted for 443 and an identical one for
-  8443 carry the same `dedup_key` *and* the same `content_hash`. The
-  disambiguation added for the SRI case keyed only on content, so it could not
-  separate them either.
-
-  `finding_id` is what triage and the STIX `uuid5` seed resolve on, so the two
-  assets collided: remediating the 8443 service would mark the 443 one done.
-  """
-
-  def _two_ports(self):
-    from extensions.business.cybersec.red_mesh.findings import (
-      Finding, Severity, probe_result,
-    )
-
-    def probe():
-      return probe_result(
-        findings=[Finding(
-          severity=Severity.HIGH, title="Weak TLS", description="d",
-          confidence="certain",
-        )],
-        probe_id="_service_info_ssl",
-      )
-
-    return _Host()._compute_risk_and_findings({
-      "target": "app.test", "port_protocols": {"443": "https", "8443": "https"},
-      "service_info": {
-        "443": {"_service_info_ssl": probe()},
-        "8443": {"_service_info_ssl": probe()},
-      },
-    })[1]
-
-  def test_the_same_weakness_on_two_ports_gets_two_ids(self):
-    flat = self._two_ports()
-    self.assertEqual(len(flat), 2)
-    self.assertEqual(
-      len({f["finding_id"] for f in flat}), 2,
-      "two services on two ports shipped under one primary key, so triaging "
-      "one would resolve the other",
-    )
-
-  def test_the_ids_still_do_not_depend_on_scan_order(self):
-    self.assertEqual(
-      {f["port"]: f["finding_id"] for f in self._two_ports()},
-      {f["port"]: f["finding_id"] for f in self._two_ports()},
-    )
 
 
 class TestTheContentHashSeesAllTheContent(unittest.TestCase):
@@ -709,3 +707,42 @@ class TestScoringIsOneWalk(unittest.TestCase):
     })
     self.assertEqual(len(flat), 1)
     self.assertEqual(flat[0]["affected_assets"], [])
+
+
+class TestFindingTimelineCountsPassesNotOccurrences(unittest.TestCase):
+  """With collisions accepted, two findings can share an id inside one pass.
+
+  `finding_timeline` incremented `pass_count` per occurrence, so a same-pass
+  collision reported `pass_count: 2` for a single pass — persistence that never
+  happened, in the continuous-monitoring surface that exists to measure it.
+  """
+
+  def _timeline(self, passes):
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      _count_services = staticmethod(lambda *_args, **_kwargs: 0)
+
+    agg = {"open_ports": [443], "service_info": {}, "port_protocols": {"443": "https"}}
+    return MockHost()._compute_ui_aggregate(passes, agg).finding_timeline
+
+  def _finding(self, finding_id, title):
+    return {"finding_id": finding_id, "title": title, "severity": "MEDIUM",
+            "confidence": "certain", "status": "vulnerable"}
+
+  def test_a_same_pass_collision_is_one_pass(self):
+    timeline = self._timeline([{
+      "pass_nr": 1,
+      "findings": [self._finding("a" * 16, "one"), self._finding("a" * 16, "two")],
+    }])
+    self.assertEqual(timeline["a" * 16]["pass_count"], 1)
+
+  def test_a_finding_seen_in_two_passes_counts_two(self):
+    timeline = self._timeline([
+      {"pass_nr": 1, "findings": [self._finding("a" * 16, "one")]},
+      {"pass_nr": 2, "findings": [self._finding("a" * 16, "one")]},
+    ])
+    entry = timeline["a" * 16]
+    self.assertEqual(entry["pass_count"], 2)
+    self.assertEqual(entry["first_seen"], 1)
+    self.assertEqual(entry["last_seen"], 2)
