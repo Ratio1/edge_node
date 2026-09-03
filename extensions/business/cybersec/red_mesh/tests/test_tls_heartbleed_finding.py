@@ -68,6 +68,8 @@ class TestHeartbleedFindingHasCveField(unittest.TestCase):
       result.cve, ("CVE-2014-0160",),
       "Heartbleed Finding must populate the structured cve field",
     )
+    self.assertIn("CVE-2014-0160", result.title)
+    self.assertEqual(result.cwe_id, "CWE-126")
 
   def test_tls_check_heartbleed_records_the_leak_size_in_raw(self):
     """The quantified leak moved out of `evidence` (volatile in the dedup key)
@@ -97,8 +99,6 @@ class TestHeartbleedFindingHasCveField(unittest.TestCase):
 
     self.assertIsNotNone(result)
     self.assertGreater(raw.get("heartbleed_leaked_bytes", 0), 0)
-    self.assertIn("CVE-2014-0160", result.title)
-    self.assertEqual(result.cwe_id, "CWE-126")
 
   def test_tls_heartbleed_raw_populates_cve_field(self):
     probe = self._make_probe()
