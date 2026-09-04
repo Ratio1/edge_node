@@ -775,11 +775,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
     try:
       ftp_rand = _ftp_connect(ruser, rpass)
+      # See the SSH case: the generated pair is per-run, and `evidence` feeds the
+      # content hash, so it belongs in raw_data rather than in the finding.
+      result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="FTP accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence=f"Accepted random creds {ruser}:{rpass}",
+        evidence="Randomly generated credentials were accepted by the FTP service.",
         remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
@@ -912,11 +915,17 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
         look_for_keys=False, allow_agent=False,
       )
+      # The generated pair goes to raw_data, not into the finding. `evidence` is
+      # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
+      # value that differs every run gave this finding a new finding_signature
+      # on every scan and on every worker: change detection reported a change
+      # each pass and the aggregate carried one copy per worker.
+      result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="SSH accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence=f"Accepted random creds {random_user}:{random_pass}",
+        evidence="Randomly generated credentials were accepted by the SSH service.",
         remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
@@ -1658,11 +1667,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
     success, _, _ = _try_telnet_login(ruser, rpass)
     if success:
+      # See the SSH case: the generated pair is per-run, and `evidence` feeds the
+      # content hash, so it belongs in raw_data rather than in the finding.
+      result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="Telnet accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence=f"Accepted random creds {ruser}:{rpass}",
+        evidence="Randomly generated credentials were accepted by the Telnet service.",
         remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",

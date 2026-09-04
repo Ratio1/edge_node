@@ -306,6 +306,18 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
     # notAfter - notBefore, a property of the certificate and stable across
     # observations, so flagging it would be a false positive.
   )
+  # Values *we* generate per run, so they are volatile by construction rather
+  # than by observation — no target behaviour can make them stable. The three
+  # arbitrary-credential findings (SSH, FTP, Telnet in service/common.py)
+  # interpolated a freshly generated user:pass pair into `evidence`, a
+  # content-hash field, so each of those CRITICAL findings drew a new
+  # finding_signature on every scan and on every worker: change detection
+  # reported a change each pass and the aggregate carried one copy per worker.
+  # The determinism probe cannot see this class — its generic stub never
+  # satisfies the paramiko/ftplib/telnet paths — so it is named here instead.
+  _GENERATED_PER_RUN = (
+    "random_user", "random_pass", "ruser", "rpass", "rand_pass", "fake_user",
+  )
   # Verified false positives and documented debt. Keyed on (path, line number,
   # exact line): the line number stops an entry leaking to an identical line
   # elsewhere in the same file — `infrastructure.py` has 18 `raw["banner"]`
@@ -345,6 +357,8 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
       if any(self._named(name, v) for v in self._VOLATILE):
         return True
       if any(self._named(name, v) for v in self._OBSERVATION_VARYING):
+        return True
+      if any(self._named(name, v) for v in self._GENERATED_PER_RUN):
         return True
     return False
 
