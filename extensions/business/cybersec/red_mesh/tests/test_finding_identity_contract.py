@@ -754,11 +754,22 @@ class TestTheThreeKeysAgreeAboutWhatMoves(unittest.TestCase):
   def test_the_report_key_hashes_everything_the_content_hash_does(self):
     """The containment that makes the classification a hierarchy rather than
     two unrelated lists: anything that is content is also report-content."""
-    for field, value in (("title", "ZZZ"), ("description", "ZZZ"), ("evidence", "ZZZ"),
-                         ("severity", "LOW"), ("confidence", "tentative"),
-                         ("remediation", "ZZZ"), ("kev", True)):
+    checked = (("title", "ZZZ"), ("description", "ZZZ"), ("evidence", "ZZZ"),
+               ("severity", "LOW"), ("confidence", "tentative"),
+               ("remediation", "ZZZ"), ("kev", True))
+    moved_content = 0
+    for field, value in checked:
       _identity, content, report = self._moves(field, value)
       if content:
+        moved_content += 1
         self.assertTrue(
           report, f"{field} moves the content hash but not the report key",
         )
+    # Without this the assertion above is `if False`, and the whole test passes
+    # the moment `_CONTENT_FIELDS` shrinks — which is exactly when the
+    # containment claim would stop being true.
+    self.assertEqual(
+      moved_content, len(checked),
+      "a field that used to be content no longer is; this test cannot make its "
+      "containment claim about fields the content hash has stopped hashing",
+    )

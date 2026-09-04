@@ -163,10 +163,11 @@ def _run_probe(name):
     return None
   try:
     result = method("example.com", 443)
-  except Exception:
-    # A probe the generic stub does not satisfy. Not this test's business: it
-    # reports on findings that were produced, not on probes that ran.
-    return None
+  except Exception as exc:
+    # Returned, not swallowed. A probe that *starts* raising used to be
+    # indistinguishable from one the generic stub never satisfied, so it left
+    # the net silently.
+    return exc
   return result.get("findings") or [] if isinstance(result, dict) else None
 
 
@@ -189,13 +190,28 @@ class TestTwoObservationsOfOneTargetProduceOneFinding(unittest.TestCase):
     offenders = []
     covered = 0
 
+    raised = []
     with _stubbed_network():
       pairs = [(name, _run_probe(name), _run_probe(name)) for name in _probe_names()]
 
     for name, first, second in pairs:
-      if not first or not second or len(first) != len(second):
+      if isinstance(first, Exception) or isinstance(second, Exception):
+        raised.append(f"{name}: {type(first if isinstance(first, Exception) else second).__name__}")
+        continue
+      if not first and not second:
+        continue
+      if len(first or []) != len(second or []):
+        # Worse than a volatile field, and it used to exit through the skip.
+        offenders.append(
+          f"{name}: produced {len(first or [])} findings then "
+          f"{len(second or [])} from identical input"
+        )
         continue
       covered += 1
+      if sorted(map(_finding_dedup_key, first)) != sorted(map(_finding_dedup_key, second)):
+        pass  # fall through to the pairwise report below
+      first = sorted(first, key=_finding_dedup_key)
+      second = sorted(second, key=_finding_dedup_key)
       for a, b in zip(first, second):
         for label, key in (
           ("identity (dedup_key)", dedup_key),
@@ -222,8 +238,16 @@ class TestTwoObservationsOfOneTargetProduceOneFinding(unittest.TestCase):
     )
     # Coverage is a real number, not an implied one. If this drops, the stub
     # stopped satisfying probes it used to reach and the net shrank silently.
+    self.assertEqual(
+      raised, [],
+      "a probe raised under the generic stub. That is either a real break or a "
+      "stub that no longer matches the probe's call signature; either way the "
+      "net silently loses it, so it fails here instead.",
+    )
+    # The measured number, not a token floor. It was 8 against an actual 26,
+    # which let 18 probes drop out of the net without failing anything.
     self.assertGreaterEqual(
-      covered, 8,
-      f"only {covered} probes produced comparable findings under the generic "
-      "stub — the net shrank; widen the stub rather than lowering this bound",
+      covered, 26,
+      f"only {covered} of 26 probes produced comparable findings under the "
+      "generic stub — the net shrank; widen the stub rather than lower this",
     )

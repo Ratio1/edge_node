@@ -154,18 +154,47 @@ def _dedup_finding_list(findings):
 
   Preserves order; first occurrence wins (keeps that worker's stamp).
   No-op for None / non-list inputs.
+
+  Fields excluded from the key because they *move*
+  (`volatile_non_content_fields`) still have to be reconciled onto the
+  survivor rather than taken from whichever worker happened to arrive first.
+  `cvss_data_freshness` is the case: excluding it from the key is what lets two
+  workers whose NVD fetches straddle a second collapse at all, but keeping the
+  first arrival's timestamp then hands `risk.finding_rank` a stale value, and
+  its "newer enrichment wins" tiebreak picks the wrong record. Measured before
+  this reconciliation: a KEV-flagged, EPSS-0.9 record lost to a stale non-KEV
+  one, and reversing the input order reversed the outcome — reintroducing
+  exactly the arrival-order dependence `risk.py` documents itself as fixing.
   """
   if not isinstance(findings, list):
     return findings
-  seen = set()
+  seen = {}
   out = []
   for item in findings:
     key = _finding_dedup_key(item)
     if key in seen:
+      _reconcile_volatile_fields(seen[key], item)
       continue
-    seen.add(key)
+    seen[key] = item
     out.append(item)
   return out
+
+
+def _reconcile_volatile_fields(survivor, dropped):
+  """Carry the newest value of each key-excluded volatile field onto the
+  survivor, so collapsing does not depend on which worker answered first."""
+  if not isinstance(survivor, dict) or not isinstance(dropped, dict):
+    return
+  for field in _volatile_non_content_fields():
+    incoming = dropped.get(field)
+    if incoming is None:
+      continue
+    current = survivor.get(field)
+    # These are ISO-8601 timestamps, so lexicographic compare is chronological;
+    # `str()` keeps a malformed value from raising here, and it loses the
+    # comparison for the same reason `finding_rank` demotes one.
+    if current is None or str(incoming) > str(current):
+      survivor[field] = incoming
 
 
 def _dedup_findings_in_aggregated(aggregated):
