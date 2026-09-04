@@ -195,6 +195,66 @@ class TestBannerFindingsAreRunStable(unittest.TestCase):
     # The observation itself is preserved where it belongs: raw_data.
     self.assertEqual(result_a.get("banner"), "GARBAGE-abc123")
 
+  def test_a_changing_memcached_stats_reply_still_deduplicates(self):
+    """The `stats` reply opens with `uptime` and `time`, which move every
+    second. While it was interpolated into `evidence` — part of the content
+    hash — two workers scanning one server a second apart produced two
+    different signatures, so the finding landed in the report twice."""
+    def scan(uptime, when):
+      reply = (f"STAT pid 1\r\nSTAT uptime {uptime}\r\nSTAT time {when}\r\n"
+               f"STAT version 1.6.21\r\nSTAT curr_connections 7\r\n").encode()
+      sock = MagicMock()
+      sock.recv.return_value = reply
+      with patch(
+        "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
+        return_value=sock,
+      ):
+        return _worker()._service_info_memcached("example.com", 11211)
+
+    a = scan(86412, 1764725101)
+    b = scan(86413, 1764725102)
+    for result in (a, b):
+      stats = [f for f in result["findings"] if "stats accessible" in f.get("title", "")]
+      self.assertTrue(stats, "the stats finding was not produced")
+      for finding in stats:
+        self.assertNotIn("uptime", finding.get("evidence", ""))
+        self.assertNotIn("1764725", finding.get("evidence", ""))
+    self.assertEqual(
+      [f.get("evidence") for f in a["findings"]],
+      [f.get("evidence") for f in b["findings"]],
+      "evidence still moves between two scans a second apart",
+    )
+    # The reply itself is preserved where it belongs: raw_data.
+    self.assertIn("uptime 86412", a.get("banner", ""))
+
+
+class TestVolatileCountsStayOutOfTitles(unittest.TestCase):
+  """`dedup_key` falls back to the title when a finding carries no scenario id
+  and no specific location — which is every finding under `worker/`, since
+  `scenario_id` is set only in `graybox/`. A per-scan count in a title
+  therefore re-keys the finding on every scan, and triage is persisted at
+  `job_id:finding_id`, so the analyst's decision detaches from it.
+  """
+
+  def test_a_redis_keyspace_that_grew_keeps_its_identity(self):
+    def scan(count):
+      probe = _worker()
+      probe._redis_cmd = lambda sock, cmd: f":{count}\r\n" if cmd == "DBSIZE" else ""
+      raw = {}
+      return probe._redis_check_data(MagicMock(), raw), raw
+
+    grown, raw_grown = scan(1201)
+    before, raw_before = scan(1200)
+    self.assertTrue(before and grown, "the DBSIZE finding was not produced")
+    keys = lambda fs: [f.compute_dedup_key(probe_id="_service_info_redis") for f in fs]
+    self.assertEqual(
+      keys(before), keys(grown),
+      "one written key re-keyed the finding and detached its triage",
+    )
+    # The count is not lost — it moves to raw_data and the description.
+    self.assertEqual(raw_before["db_size"], 1200)
+    self.assertIn("1200", before[0].description)
+
 
 class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
   """Ratchet: a new `evidence=f"..."` interpolating per-request data fails here.

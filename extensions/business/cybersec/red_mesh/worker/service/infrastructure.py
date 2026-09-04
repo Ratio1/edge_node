@@ -981,8 +981,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       else:
         findings.append(Finding(
           severity=Severity.MEDIUM,
-          title=f"SMB null session share enumeration ({len(shares)} shares listed)",
-          description="Anonymous user can enumerate available SMB shares.",
+          title="SMB null session share enumeration",
+          description=f"Anonymous user can enumerate {len(shares)} available SMB shares.",
           evidence=f"Shares: {share_names}",
           remediation="Restrict anonymous share enumeration (RestrictNullSessAccess=1).",
           owasp_id="A01:2021",
@@ -1714,8 +1714,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       ))
       findings.append(Finding(
         severity=Severity.INFO,
-        title=f"NetBIOS names discovered ({len(names)} entries)",
-        description=f"Enumerated names: {name_list}",
+        title="NetBIOS names discovered",
+        description=f"Enumerated {len(names)} names: {name_list}",
         evidence=f"Names: {name_list[:300]}",
         confidence="certain",
       ))
@@ -2023,7 +2023,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         if index_count > 0:
           findings.append(Finding(
             severity=Severity.HIGH,
-            title=f"Elasticsearch {index_count} indices accessible",
+            title="Elasticsearch indices accessible without authentication",
             description=f"{index_count} indices listed without authentication.",
             evidence="\n".join(lines[:6]),
             remediation="Enable authentication and restrict index access.",
@@ -2089,8 +2089,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           if private_ips:
             findings.append(Finding(
               severity=Severity.MEDIUM,
-              title=f"Elasticsearch node internal IPs disclosed ({len(private_ips)})",
-              description=f"Node API exposes internal IPs: {', '.join(sorted(private_ips)[:5])}",
+              title="Elasticsearch node internal IPs disclosed",
+              description=f"Node API exposes {len(private_ips)} internal IPs: {', '.join(sorted(private_ips)[:5])}",
               evidence=f"IPs: {', '.join(sorted(private_ips)[:10])}",
               remediation="Restrict /_nodes endpoint access.",
               owasp_id="A01:2021",

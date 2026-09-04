@@ -561,8 +561,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         if count > 0:
           findings.append(Finding(
             severity=Severity.MEDIUM,
-            title=f"Redis database contains {count} keys",
-            description="Unauthenticated access to a Redis instance with live data.",
+            title="Redis database contains live data",
+            description=f"Unauthenticated access to a Redis instance holding {count} keys.",
             evidence="DBSIZE executed without authentication and reported a non-empty keyspace.",
             remediation="Enable authentication and restrict network access.",
             owasp_id="A01:2021",
@@ -590,8 +590,9 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       raw["connected_clients"] = list(ips)
       findings.append(Finding(
         severity=Severity.LOW,
-        title=f"Redis client IPs disclosed ({len(ips)} clients)",
-        description=f"CLIENT LIST reveals connected IPs: {', '.join(sorted(ips)[:5])}",
+        title="Redis client IPs disclosed",
+        description=f"CLIENT LIST reveals {len(ips)} connected client IPs: "
+                    f"{', '.join(sorted(ips)[:5])}",
         evidence=f"IPs: {', '.join(sorted(ips)[:10])}",
         remediation="Rename or disable CLIENT command.",
         confidence="certain",
@@ -1070,7 +1071,11 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           title="Memcached stats accessible without authentication",
           description=f"Memcached on {target}:{port} responds to stats without authentication, "
                       "exposing cache metadata and enabling cache poisoning or data exfiltration.",
-          evidence=f"stats command returned: {raw['banner'][:80]}",
+          # The stats reply itself is in raw_data. It must not go in `evidence`:
+          # it opens with `uptime` and `time`, which change every second, so two
+          # workers scanning one server a second apart produced two different
+          # content hashes and the finding landed in the report twice.
+          evidence="The stats command returned server statistics without authentication.",
           remediation="Bind Memcached to localhost or use SASL authentication; restrict network access.",
           owasp_id="A07:2021",
           cwe_id="CWE-287",
@@ -1268,8 +1273,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           user_dbs = [d for d in dbs if not d.startswith("_")]
           findings.append(Finding(
             severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
-            title=f"CouchDB unauthenticated database listing ({len(dbs)} databases)",
-            description=f"/_all_dbs accessible without credentials. "
+            title="CouchDB unauthenticated database listing",
+            description=f"/_all_dbs accessible without credentials, listing {len(dbs)} databases. "
                         f"{'User databases exposed: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only system databases found.'}",
             evidence="GET /_all_dbs returned the database list without credentials.",
             remediation="Enable CouchDB authentication via [admins] section in local.ini.",
@@ -1379,8 +1384,9 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           user_dbs = [d for d in db_names if d not in ("_internal",)]
           findings.append(Finding(
             severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
-            title=f"InfluxDB unauthenticated access ({len(db_names)} databases)",
-            description=f"SHOW DATABASES succeeded without credentials. "
+            title="InfluxDB unauthenticated access",
+            description=f"SHOW DATABASES succeeded without credentials, returning "
+                        f"{len(db_names)} databases. "
                         f"{'User databases: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only internal databases found.'}",
             evidence=f"Databases: {', '.join(db_names[:10])}",
             remediation="Enable InfluxDB authentication in the configuration ([http] auth-enabled = true).",

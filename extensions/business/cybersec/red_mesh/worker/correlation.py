@@ -134,9 +134,14 @@ class _CorrelationMixin:
     if ratio > 0.5 and len(open_ports) > 20:
       findings.append(Finding(
         severity=Severity.HIGH,
-        title=f"Honeypot indicator: {len(open_ports)}/{len(ports_scanned)} ports open ({ratio:.0%})",
-        description="An unusually high ratio of open ports suggests this host is a honeypot. "
-                    "Real servers rarely expose more than 50% of scanned ports.",
+        # The counts belong in the description, not the title: for a finding
+        # with no scenario id and no specific location the title *is* the
+        # `dedup_key` discriminator, so a per-scan number here re-keys the
+        # finding every scan and detaches the triage recorded against it.
+        title="Honeypot indicator: unusually high open-port ratio",
+        description=f"{len(open_ports)} of {len(ports_scanned)} scanned ports are open "
+                    f"({ratio:.0%}). An unusually high ratio suggests this host is a "
+                    "honeypot; real servers rarely expose more than 50% of scanned ports.",
         evidence="More than half of the scanned ports accepted a TCP connection.",
         remediation="Verify this is a legitimate host before relying on scan results.",
         cwe_id="CWE-345",
@@ -215,9 +220,10 @@ class _CorrelationMixin:
       subnet_list = ", ".join(sorted(subnets.keys()))
       findings.append(Finding(
         severity=Severity.MEDIUM,
-        title=f"Infrastructure leak: {len(subnets)} distinct private subnets detected",
-        description="Internal IPs from multiple /16 subnets were leaked across services, "
-                    "suggesting Docker multi-network architecture or multiple internal zones.",
+        title="Infrastructure leak: internal IPs span multiple private subnets",
+        description=f"Internal IPs from {len(subnets)} distinct /16 subnets were leaked across "
+                    "services, suggesting Docker multi-network architecture or multiple "
+                    "internal zones.",
         evidence=f"Subnets: {subnet_list}",
         remediation="Review network segmentation; ensure internal IPs are not exposed in service responses.",
         cwe_id="CWE-200",
@@ -269,8 +275,8 @@ class _CorrelationMixin:
     if len(offsets) >= 2:
       findings.append(Finding(
         severity=Severity.MEDIUM,
-        title=f"Timezone inconsistency: {len(offsets)} distinct offsets detected",
-        description="Services on this host report different timezone offsets. "
+        title="Timezone inconsistency: services report differing offsets",
+        description=f"Services on this host report {len(offsets)} distinct timezone offsets. "
                     "Real hosts share a single system clock — this may indicate a honeypot or misconfiguration.",
         evidence=f"Offsets: {', '.join(sorted(offsets))}",
         remediation="Investigate timezone configuration across services.",
