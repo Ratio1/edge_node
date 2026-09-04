@@ -257,57 +257,76 @@ class TestVolatileCountsStayOutOfTitles(unittest.TestCase):
 
 
 class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
-  """Ratchet: a volatile value reaching a hashed finding field fails here.
+  """Ratchet: a value that moves between observations must not reach a hashed
+  finding field.
 
-  Three fields, two tiers. A *raw observed value* (banner, cookie, response
-  bytes) is barred from `evidence`, `title` and `description` alike. A
-  *per-scan magnitude* (a count, a length, an age) is barred from `evidence`
-  and `title` but allowed in `description`, which feeds `content_hash` without
-  feeding `dedup_key`.
+  There are **two** dedup paths and both matter. `finding_identity.dedup_key`
+  is the identity key and reads title (as the locationless discriminator), not
+  description. `mixins/report._finding_dedup_key` is a whole-dict JSON key that
+  strips only worker-attribution fields, so `evidence`, `title` **and
+  `description` are all load-bearing** for the cross-worker collapse. An
+  earlier version of this guard claimed description "feeds content_hash without
+  feeding dedup_key" and concluded magnitudes were safe there. That was wrong:
+  two workers a second apart still produced two report rows.
 
-  Line-based and deliberately approximate. Known gaps, none currently live:
-  continuation lines, single-quoted f-strings, `.format()`, `%`, concatenation,
-  and an f-string bound to a local then passed by name. The name vocabulary is
-  a denylist, so `{tokens}` and `{csrf_token}` slip the identifier boundaries.
-  It catches the single-line form every current producer uses; it is a ratchet,
-  not a proof.
+  So the tiers are about *what the value does*, not what field it lands in:
+
+  - `_VOLATILE` / `_OBSERVATION_VARYING`: differs between two observations of
+    one target — raw bytes, timestamps, uptimes, ages, per-connection entropy.
+    Barred from evidence, title and description alike.
+  - magnitudes (`len(...)`, `*count`): barred from evidence and title. Allowed
+    in `description` only when the value is *target-stable* — the same from
+    every worker, like "9 databases exist". That is a judgement this lint
+    cannot make; a count that can move between observations belongs in the
+    tier above and in `raw_data`.
+
+  Line-based and deliberately approximate. Known gaps: continuation lines,
+  single-quoted f-strings, `.format()`, `%`, concatenation, and an f-string
+  bound to a local then passed by name. The name vocabulary is a denylist, so
+  volatile locals it has never seen slip through. It is a ratchet, not a proof.
 
   An allowlist entry is a verified false positive or documented debt. It needs
-  a justification and an owner, not a silent add, and the shrink test below
-  requires the line it names to still exist.
+  a justification and an owner, and the shrink test below requires the line it
+  names to still be reported by the predicate.
   """
 
-  # Raw observed values. These belong in `raw_data` and in no hashed field at
-  # all — not evidence, not title, not description.
+  # Values that differ between two observations of one target. Barred from
+  # every hashed field: evidence, title and description.
   _VOLATILE = (
     "banner", "location", "cookie", "readable", "token", "resp.text", "data",
   )
-  # Per-scan magnitudes. Barred from `evidence` and `title`, but permitted in
-  # `description`: that is the destination this batch chose for them, and
-  # `description` feeds `content_hash` (change detection) without feeding
-  # `dedup_key` (identity). A count that moves is a change worth detecting.
-  _VOLATILE_PREFIXES = ("len_", "len(")
-  _VOLATILE_SUFFIXES = ("_count", "count}")
-  # Magnitudes the `len(`/`count` shapes miss, each having reached a title in
-  # the tree: `uptime_seconds` advances once per second, `tested` varies when a
-  # probe loop breaks early, `age_days` moves at midnight. Same tier as the
-  # counts — out of evidence and title, fine in description. The vocabulary is
-  # a denylist and is known incomplete: `{tokens}` and `{csrf_token}` still
-  # slip the identifier boundaries below.
-
-  # Empty by design: every previously-exempt site was fixed 2026-09-03
-  # (closeout plan, Phase 3). A new entry here is debt being taken on — it
-  # needs a justification comment and a burn-down owner, not a silent add.
+  # Same tier, found the hard way — each of these reached a hashed field and
+  # forked a finding: `uptime_seconds` moves every second, `age_days` and
+  # `days` at midnight, `tested` and `consecutive_401` when a probe loop breaks
+  # early, `entropy`/`full_salt` are per-connection.
+  _OBSERVATION_VARYING = (
+    "uptime_seconds", "age_days", "tested", "consecutive_401",
+    "entropy", "full_salt", "elapsed",
+    # Deliberately NOT a bare "days": `span.days` at tls.py is
+    # notAfter - notBefore, a property of the certificate and stable across
+    # observations, so flagging it would be a false positive.
+  )
+  # Verified false positives and documented debt. Keyed on (path, line number,
+  # exact line): the line number stops an entry leaking to an identical line
+  # elsewhere in the same file — `infrastructure.py` has 18 `raw["banner"]`
+  # sites and several do carry per-connection bytes. The shrink test below
+  # requires each entry to still be reported by the predicate, so an entry
+  # whose site was fixed fails rather than lingering.
   _ALLOWLIST = {
-    # Verified false positive, 2026-09-04: flagged on the *name* `banner`, but
-    # `raw["banner"]` in `_service_info_smb` is one of four deterministic
-    # strings (infrastructure.py :846/:865/:915/:925), the last being the
-    # 4-byte protocol id — constant per server. Keeping it is what
+    # 2026-09-04, owner RM-062: flagged on the *name* `banner`, but
+    # `raw["banner"]` in `_service_info_smb` is one of two reachable
+    # deterministic strings at this site (infrastructure.py :915/:925 — :846
+    # returns early and :865 makes `findings` non-empty). The last is the
+    # 4-byte protocol prefix, constant per server. Keeping it is what
     # distinguishes SMBv1 from SMBv2 from unknown in the finding itself.
-    # Owner: RM-062. Removable only by making the predicate value-aware.
-    ("service/infrastructure.py",
+    # Removable only by making the predicate value-aware.
+    ("service/infrastructure.py", 1002,
      'evidence=f"Banner: {raw.get(\'banner\', \'N/A\')}",'),
   }
+
+  # Magnitudes. Barred from evidence and title; allowed in description when the
+  # value is target-stable (see the class docstring).
+  _MAGNITUDE_PREFIXES = ("len_", "len(")
 
   @staticmethod
   def _named(name, token):
@@ -325,6 +344,8 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
       name = chunk.split("}")[0]
       if any(self._named(name, v) for v in self._VOLATILE):
         return True
+      if any(self._named(name, v) for v in self._OBSERVATION_VARYING):
+        return True
     return False
 
   def _has_magnitude(self, line):
@@ -333,11 +354,9 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
 
     for chunk in line.split("{")[1:]:
       name = chunk.split("}")[0]
-      if any(name.startswith(v) for v in self._VOLATILE_PREFIXES):
+      if any(name.startswith(v) for v in self._MAGNITUDE_PREFIXES):
         return True
-      if re.search(r"(?<![A-Za-z0-9_])[a-z_]*count(?![A-Za-z0-9_])", name):
-        return True
-      if any(self._named(name, v) for v in ("uptime_seconds", "tested", "age_days")):
+      if re.search(r"(?<![A-Za-z0-9_])(?:[a-z]+_)*count(?![A-Za-z0-9_])", name):
         return True
     return False
 
@@ -373,7 +392,7 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
         stripped = line.strip()
         if not self._line_is_offending(stripped):
           continue
-        if (rel, stripped) in self._ALLOWLIST:
+        if (rel, nr, stripped) in self._ALLOWLIST:
           continue
         offenders.append(f"{rel}:{nr}: {stripped}")
     return offenders
@@ -382,11 +401,12 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
     offenders = self._offenders()
     self.assertEqual(
       offenders, [],
-      "per-request data reached `evidence` or `title`. In `evidence` it breaks "
-      "cross-worker dedup and can archive secrets; in `title` it re-keys the "
-      "finding every scan and detaches its triage. Put the stable fact in the "
-      "field and the volatile observation in raw_data/evidence_items, or state "
-      "the count in the description.",
+      "a moving value reached a hashed finding field. `evidence`, `title` and "
+      "`description` all feed the report layer's cross-worker dedup key, and "
+      "`title` additionally feeds identity, so a value there re-keys the "
+      "finding and detaches its triage. State the stable fact in the field and "
+      "put the observation in raw_data/evidence_items. A count belongs in the "
+      "description only if every worker sees the same number.",
     )
 
   def test_the_ratchet_sees_subscripts_and_titles(self):
@@ -405,44 +425,64 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
       self._is_volatile('evidence=f"Cookie {cookie_name} lacks the Secure flag",'),
     )
 
-  def test_counts_are_barred_from_evidence_and_title_but_allowed_in_description(self):
-    """`description` is hashed into `content_hash` but is not part of
-    `dedup_key`, so it is where a per-scan magnitude belongs — that is the
-    destination this batch moved 14 counts to. A raw observed value is barred
-    from all three."""
-    count_line = 'description=f"Holding {count} keys.",'
-    self.assertTrue(self._has_magnitude(count_line))
-    self.assertFalse(self._has_raw_value(count_line))
+  def test_a_moving_value_is_barred_from_every_hashed_field(self):
+    """`description` is in the report layer's whole-dict dedup key just as
+    `evidence` is, so a value that moves between observations forks the finding
+    there too. An earlier version of this guard allowed magnitudes in
+    `description` on the belief that it only fed change detection."""
+    for field in ("evidence", "title", "description"):
+      for name in ("banner[:80]", "uptime_seconds", "age_days", "tested",
+                   "consecutive_401", "entropy:.2f", "elapsed:.1f"):
+        line = f'{field}=f"x {{{name}}} y",'
+        self.assertTrue(self._has_raw_value(line), line)
+        self.assertTrue(self._line_is_offending(line), line)
 
-    raw_line = 'description=f"Expected a banner, got: {banner[:80]}",'
-    self.assertTrue(self._has_raw_value(raw_line))
-    # The wiring, not just the predicates: a raw value in a description is
-    # reported, a count in one is not, and both rules bite in evidence/title.
-    self.assertTrue(self._line_is_offending(raw_line))
-    self.assertFalse(self._line_is_offending(count_line))
-    self.assertTrue(self._line_is_offending('evidence=f"Holding {count} keys.",'))
-    self.assertTrue(self._line_is_offending('title=f"Holding {count} keys",'))
+  def test_a_target_stable_count_is_allowed_only_in_the_description(self):
+    """A count every worker sees identically does not fork the dedup key, and
+    the description is where this batch put them. It stays barred from
+    `evidence` and `title`, which also feed identity."""
+    self.assertFalse(self._line_is_offending('description=f"Holding {len(dbs)} databases.",'))
+    self.assertTrue(self._line_is_offending('evidence=f"Holding {len(dbs)} databases.",'))
+    self.assertTrue(self._line_is_offending('title=f"Holding {len(dbs)} databases",'))
 
-    # The three magnitudes the len()/count shapes do not match.
-    for name in ("uptime_seconds", "tested", "age_days"):
-      self.assertTrue(
-        self._has_magnitude(f'title=f"x {{{name}}} y",'), name,
+  def test_the_count_rule_does_not_fire_on_ordinary_english(self):
+    """`[a-z_]*count` matched `account` and `discount` by backtracking, so an
+    account-related finding could not be written without an allowlist entry."""
+    for benign in ("account", "discount"):
+      self.assertFalse(
+        self._line_is_offending(f'title=f"Weak password for {{{benign}}}",'), benign,
       )
-      self.assertFalse(self._has_raw_value(f'title=f"x {{{name}}} y",'), name)
+
+  def test_a_certificate_property_is_not_treated_as_moving(self):
+    """`span.days` is notAfter - notBefore. It is stable across observations,
+    and a change to it means a different certificate — which should be a
+    different finding. Flagging it would be a false positive."""
+    self.assertFalse(
+      self._line_is_offending('title=f"validity span exceeds 5 years ({span.days} days)",'),
+    )
 
   def test_the_allowlist_only_shrinks(self):
-    """Every allowlist entry must still exist — a fixed site must also drop its
-    entry, or the list quietly becomes a graveyard nobody trusts."""
+    """Every entry must still name a live line *that the predicate still
+    reports*. Existence alone is not enough: an entry naming some ordinary line
+    would sit there forever exempting nothing, and an entry whose site was
+    fixed would linger. Either way the list becomes a graveyard nobody trusts."""
     import pathlib
 
     worker_dir = pathlib.Path(__file__).resolve().parent.parent / "worker"
-    live = set()
+    live = {}
     for path in sorted(worker_dir.rglob("*.py")):
       rel = str(path.relative_to(worker_dir))
-      for line in path.read_text().splitlines():
-        live.add((rel, line.strip()))
-    stale = [entry for entry in self._ALLOWLIST if entry not in live]
-    self.assertEqual(stale, [], "allowlist entries for lines that no longer exist")
+      for nr, line in enumerate(path.read_text().splitlines(), 1):
+        live[(rel, nr)] = line.strip()
+
+    stale = []
+    for entry in self._ALLOWLIST:
+      rel, nr, text = entry
+      if live.get((rel, nr)) != text:
+        stale.append(f"{rel}:{nr} no longer holds that line")
+      elif not self._line_is_offending(text):
+        stale.append(f"{rel}:{nr} is no longer flagged — drop the entry")
+    self.assertEqual(stale, [], "allowlist entries that no longer earn their place")
 
 
 class TestAValuelessCookieHeaderStaysOutOfTheFinding(unittest.TestCase):

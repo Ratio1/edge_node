@@ -495,9 +495,12 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       findings.append(Finding(
         severity=Severity.MEDIUM,
         title="HTTP Basic Auth has no rate limiting",
-        description=f"The server accepted {raw['tested']} authentication attempts without "
+        # Both counts vary when the probe loop breaks early, and `description`
+        # and `evidence` are both in the report layer's dedup key. The attempt
+        # count is in raw_data.
+        description="The server accepted repeated authentication attempts without "
                     "rate-limiting failed logins.",
-        evidence=f"{consecutive_401} consecutive 401 responses without rate limiting.",
+        evidence="Consecutive 401 responses were returned with no rate limiting.",
         remediation="Implement account lockout or rate limiting for failed auth attempts.",
         owasp_id="A07:2021",
         cwe_id="CWE-307",

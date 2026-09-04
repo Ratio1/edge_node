@@ -220,7 +220,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         findings.append(Finding(
           severity=Severity.HIGH,
           title="TLS certificate has expired",
-          description=f"The certificate expired {-days} days ago.",
+          description="The certificate is past its notAfter date.",
           evidence=f"notAfter={expires}",
           remediation="Renew the certificate immediately.",
           owasp_id="A02:2021",
@@ -231,7 +231,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         findings.append(Finding(
           severity=Severity.MEDIUM,
           title="TLS certificate expiring soon",
-          description=f"Certificate expires in {days} days.",
+          description="The certificate expires within 30 days.",
           evidence=f"notAfter={expires}",
           remediation="Renew the certificate before expiry.",
           owasp_id="A02:2021",

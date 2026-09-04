@@ -102,10 +102,13 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                 if entropy < 2.0:
                   findings.append(Finding(
                     severity=Severity.HIGH,
-                    title=f"MySQL salt entropy critically low ({entropy:.2f} bits)",
+                    title="MySQL salt entropy critically low",
                     description="The authentication scramble has abnormally low entropy, "
                                 "suggesting a non-standard or deceptive MySQL service.",
-                    evidence=f"salt_entropy={entropy:.2f}, salt_hex={full_salt.hex()[:40]}",
+                    # The measured entropy and the salt itself are per-connection.
+                    # Both are in raw_data (`salt_entropy`); in the title the entropy
+                    # re-keyed the finding on every scan.
+                    evidence="The authentication scramble fell below the entropy threshold.",
                     remediation="Investigate this MySQL instance — authentication randomness is insufficient.",
                     cwe_id="CWE-330",
                     confidence="firm",
@@ -523,8 +526,11 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       findings.append(Finding(
         severity=Severity.INFO,
         title="Redis uptime under 60s — possible container restart",
-        description=f"Uptime is {uptime_seconds}s. Very low uptime may indicate a recently "
-                    "restarted container or ephemeral instance.",
+        # The exact uptime is in raw_data. It advances every second, and
+        # `description` is part of the report layer's whole-dict dedup key, so
+        # two workers a second apart would report this finding twice.
+        description="Uptime is under 60s, which may indicate a recently restarted "
+                    "container or an ephemeral instance.",
         evidence="INFO server reported an uptime below the 60-second threshold.",
         remediation="Investigate if the service is being automatically restarted.",
         confidence="tentative",
@@ -627,9 +633,9 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             findings.append(Finding(
               severity=Severity.LOW,
               title="Redis RDB save is stale",
-              description=f"The last RDB background save is {age_days} days old, over the "
-                          "1-year threshold. This may indicate disabled persistence, a "
-                          "long-running cache-only instance, or stale data.",
+              description="The last RDB background save is over a year old. This may "
+                          "indicate disabled persistence, a long-running cache-only "
+                          "instance, or stale data.",
               evidence=f"rdb_last_bgsave_time={ts}",
               remediation="Verify persistence configuration; stale saves may indicate data loss risk.",
               cwe_id="CWE-345",
