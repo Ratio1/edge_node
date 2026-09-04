@@ -264,6 +264,59 @@ class TestGrayboxHttpClient(unittest.TestCase):
     self.assertNotIn("data", session.request.call_args_list[1].kwargs)
     self.assertEqual(session.request.call_args_list[2].args[0], "GET")
 
+  def test_a_followed_chain_reports_the_hops_it_consumed(self):
+    """`response.history` must carry the redirect chain this client resolved.
+
+    We follow redirects one `allow_redirects=False` hop at a time so every hop
+    re-enters `validate_url`. `requests` populates `history` only for chains it
+    followed itself, so without an explicit assignment the attribute is
+    permanently empty and every caller reading it concludes no redirect
+    happened — which is how the login-form check in `_is_login_success` came to
+    reject every authenticated session reached via a redirect.
+    """
+    client = GrayboxHttpClient(
+      "https://target.local", allowlist=["/a/", "/b/", "/c/"],
+    )
+    session = MagicMock()
+    first = MagicMock(status_code=302, headers={"Location": "/b/"})
+    second = MagicMock(status_code=302, headers={"Location": "/c/"})
+    final = MagicMock(status_code=200, headers={})
+    session.request.side_effect = [first, second, final]
+
+    result = client.request(session, "GET", "/a/", allow_redirects=True)
+
+    self.assertIs(result, final)
+    self.assertEqual(list(result.history), [first, second])
+
+  def test_a_call_that_was_not_redirected_reports_an_empty_chain(self):
+    """No redirect means no history — the same answer `requests` gives."""
+    client = GrayboxHttpClient("https://target.local", allowlist=["/a/"])
+    session = MagicMock()
+    final = MagicMock(status_code=200, headers={})
+    session.request.side_effect = [final]
+
+    result = client.request(session, "GET", "/a/", allow_redirects=True)
+
+    self.assertEqual(list(result.history), [])
+
+  def test_a_chain_cut_short_by_the_budget_still_reports_its_hops(self):
+    """Budget exhaustion returns the last response we did fetch, chain intact."""
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    client = GrayboxHttpClient(
+      "https://target.local",
+      allowlist=["/a/", "/b/", "/c/"],
+      # The probe already paid for hop 0, so nothing is left for the redirect.
+      request_budget=RequestBudget(remaining=0, total=1),
+    )
+    session = MagicMock()
+    first = MagicMock(status_code=302, headers={"Location": "/b/"})
+    session.request.side_effect = [first]
+
+    result = client.request(session, "GET", "/a/", allow_redirects=True)
+
+    self.assertIs(result, first)
+    self.assertEqual(list(result.history), [])
+
   def test_probe_modules_do_not_call_requests_directly(self):
     root = Path("extensions/business/cybersec/red_mesh/graybox/probes")
     forbidden = {"get", "post", "put", "patch", "delete", "head", "options", "request"}

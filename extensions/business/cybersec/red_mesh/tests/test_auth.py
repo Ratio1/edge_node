@@ -1119,5 +1119,87 @@ class TestAuthManagerLifecycle(unittest.TestCase):
     self.assertIsNone(err)
 
 
+class TestLoginSuccessIsJudgedOnTheRealClientsResponse(unittest.TestCase):
+  """
+  Every other test of `_is_login_success` hands it a response whose `history`
+  was fabricated by `_mock_response`. Behind the real client that attribute was
+  always empty: `GrayboxHttpClient.request` resolves redirects itself, one
+  `allow_redirects=False` hop at a time, so `requests` never populated it. So
+  `navigated_away` was permanently False and the password-field check rejected
+  every post-login page that happened to carry one — a change-password widget, a
+  persistent nav login box, an SPA shell. `authenticate()` returned None, the
+  authenticated scan never ran, and every scenario behind the login reported
+  "not vulnerable".
+
+  This drives FormAuth through a real client so the fabricated state cannot hide
+  the defect.
+  """
+
+  def _run(self, responses, allowlist):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+
+    client = GrayboxHttpClient("http://testapp.local:8000", allowlist=allowlist)
+    underlying = MagicMock()
+    underlying.cookies.get_dict.return_value = {"sessionid": "abc"}
+    underlying.request.side_effect = responses
+
+    strategy = FormAuth(
+      "http://testapp.local:8000",
+      GrayboxTargetConfig(),
+      verify_tls=False,
+      http_client=client,
+    )
+    creds = MagicMock(username="admin", password="hunter2")
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests.Session",
+      return_value=underlying,
+    ):
+      return strategy.authenticate(creds)
+
+  def test_a_dashboard_carrying_a_password_widget_still_authenticates(self):
+    login_form = '<form method="post"><input type="password" name="password"></form>'
+    session = self._run(
+      [
+        _mock_response(
+          status=200, url="http://testapp.local:8000/auth/login/", text=login_form,
+        ),
+        _mock_response(
+          status=302, url="http://testapp.local:8000/auth/login/",
+          headers={"Location": "/dashboard/"},
+        ),
+        _mock_response(
+          status=200, url="http://testapp.local:8000/dashboard/",
+          text='<h1>Welcome back</h1>'
+               '<form action="/account/password">'
+               '<input type="password" name="new"></form>',
+        ),
+      ],
+      allowlist=["/auth/", "/dashboard/"],
+    )
+    self.assertIsNotNone(
+      session,
+      "a dashboard reached by redirect was rejected because it renders a "
+      "change-password field, so the whole authenticated scan was skipped",
+    )
+
+  def test_a_re_rendered_login_form_is_still_rejected(self):
+    """The guard the above must not disarm: no redirect, form still showing."""
+    login_form = '<form method="post"><input type="password" name="password"></form>'
+    self.assertIsNone(
+      self._run(
+        [
+          _mock_response(
+            status=200, url="http://testapp.local:8000/auth/login/", text=login_form,
+          ),
+          _mock_response(
+            status=200, url="http://testapp.local:8000/auth/login/", text=login_form,
+          ),
+        ],
+        allowlist=["/auth/"],
+      ),
+    )
+
+
 if __name__ == '__main__':
   unittest.main()

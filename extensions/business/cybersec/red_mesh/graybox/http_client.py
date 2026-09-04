@@ -109,6 +109,25 @@ def path_in_scope(path: str, scope: str) -> bool:
   return path.startswith(prefix)
 
 
+def _with_history(response, history):
+  """Attach the redirect chain we resolved by hand to the response we return.
+
+  `requests` populates `history` only for redirects it followed itself, and this
+  client follows them one `allow_redirects=False` hop at a time so each one is
+  re-validated against scope. Without this the attribute is permanently empty
+  and every caller that reads it concludes no redirect happened.
+  """
+  if response is not None:
+    try:
+      response.history = list(history)
+    except AttributeError:
+      # A stub response that refuses attribute assignment still gets a correct
+      # status and body; the chain is a best-effort annotation, not a contract
+      # this client can enforce on an arbitrary object.
+      pass
+  return response
+
+
 def path_scopes_from_allowlist(target_url: str, entries) -> list[str]:
   scopes = []
   _target, scheme, hostname, port = _split_target(target_url)
@@ -437,6 +456,17 @@ class GrayboxHttpClient:
       return session.request(method, safe_url, allow_redirects=False, **kwargs)
     current_url = safe_url
     response = None
+    # We resolve redirects ourselves so every hop re-enters `validate_url`, which
+    # means `requests` never populates `response.history` — it only does that for
+    # chains *it* followed. Callers reasonably read `history` as "we were
+    # redirected": `auth_strategies._is_login_success` gates its login-form check
+    # on it, and with an always-empty history that check rejected every
+    # post-login page carrying a password input (a change-password widget, a nav
+    # login box, an SPA shell), so `authenticate()` returned None and the whole
+    # authenticated scan was skipped while every scenario behind the login
+    # reported "not vulnerable". Record the chain we consumed so the attribute
+    # means what the `requests` contract says it means.
+    history = []
     for hop in range(5):
       # Charge every hop *after* the first. A probe consults the shared budget
       # once per logical call, so the first request is already paid for;
@@ -447,18 +477,20 @@ class GrayboxHttpClient:
       # while `budget_remaining` reported the cap was being respected.
       if hop and not budget_exempt and self._request_budget is not None:
         if not self._request_budget.consume(1):
-          return response
+          return _with_history(response, history)
         if self._safety is not None:
           self._safety.throttle()
+      if response is not None:
+        history.append(response)
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
       if response.status_code not in (301, 302, 303, 307, 308):
-        return response
+        return _with_history(response, history)
       location = response.headers.get("Location", "")
       if not location:
-        return response
+        return _with_history(response, history)
       current_url = self.validate_url(location)
       if response.status_code in (301, 302, 303) and method != "HEAD":
         method = "GET"
         kwargs.pop("data", None)
         kwargs.pop("json", None)
-    return response
+    return _with_history(response, history)
