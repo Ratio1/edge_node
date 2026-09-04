@@ -287,15 +287,25 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
       # `{cookie}` but not `{cookie_name}` — the cookie's *name* is stable
       # data, its value is the secret.
       for volatile in self._VOLATILE:
-        if re.match(rf"{re.escape(volatile)}(?![A-Za-z0-9_])", name):
+        # `search`, not `match`: anchoring at the start of the expression made
+        # every subscript and attribute form invisible, so
+        # `{raw['banner'][:80]}` slipped past while `{banner}` was caught. The
+        # explicit boundaries keep the `{cookie_name}` exemption above.
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(volatile)}(?![A-Za-z0-9_])", name):
           return True
       if any(name.startswith(v) for v in self._VOLATILE_PREFIXES):
         return True
-      if re.match(r"[a-z_]*count(?![A-Za-z0-9_])", name):
+      if re.search(r"(?<![A-Za-z0-9_])[a-z_]*count(?![A-Za-z0-9_])", name):
         return True
     return False
 
-  def test_worker_evidence_does_not_interpolate_per_request_data(self):
+  # `evidence` is part of the content hash; `title` is worse — it is
+  # `dedup_key`'s discriminator for any finding with no scenario id and no
+  # specific location, which under worker/ is all of them. A volatile value
+  # there re-keys the finding every scan and detaches its persisted triage.
+  _GUARDED_FIELDS = ("evidence", "title")
+
+  def _offenders(self):
     import pathlib
 
     worker_dir = pathlib.Path(__file__).resolve().parent.parent / "worker"
@@ -304,18 +314,40 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
       rel = str(path.relative_to(worker_dir))
       for nr, line in enumerate(path.read_text().splitlines(), 1):
         stripped = line.strip()
-        if 'evidence=f"' not in stripped:
+        if not any(f'{field}=f"' in stripped for field in self._GUARDED_FIELDS):
           continue
         if not self._is_volatile(stripped):
           continue
         if (rel, stripped) in self._ALLOWLIST:
           continue
         offenders.append(f"{rel}:{nr}: {stripped}")
+    return offenders
+
+  def test_worker_evidence_does_not_interpolate_per_request_data(self):
+    offenders = self._offenders()
     self.assertEqual(
       offenders, [],
-      "per-request data reached `evidence`, which breaks cross-worker dedup "
-      "and can archive secrets; put stable facts in evidence and the volatile "
-      "observation in raw_data/evidence_items",
+      "per-request data reached `evidence` or `title`. In `evidence` it breaks "
+      "cross-worker dedup and can archive secrets; in `title` it re-keys the "
+      "finding every scan and detaches its triage. Put the stable fact in the "
+      "field and the volatile observation in raw_data/evidence_items, or state "
+      "the count in the description.",
+    )
+
+  def test_the_ratchet_sees_subscripts_and_titles(self):
+    """The two shapes this guard was blind to until 2026-09-04, each of which
+    had a live offender in the tree at the time."""
+    self.assertTrue(
+      self._is_volatile("""evidence=f"stats returned: {raw['banner'][:80]}","""),
+      "a subscripted volatile is invisible — `re.match` anchors at the start",
+    )
+    self.assertTrue(
+      self._is_volatile('title=f"Redis database contains {count} keys",'),
+      "a per-scan count in a title is invisible",
+    )
+    # The deliberate exemption must survive: a cookie's *name* is stable data.
+    self.assertFalse(
+      self._is_volatile('evidence=f"Cookie {cookie_name} lacks the Secure flag",'),
     )
 
   def test_the_allowlist_only_shrinks(self):

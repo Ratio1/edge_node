@@ -995,7 +995,9 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         severity=Severity.MEDIUM,
         title="SMB service responded to negotiation probe",
         description=f"SMB on {target}:{port} accepts negotiation requests.",
-        evidence=f"Banner: {raw.get('banner', 'N/A')}",
+        # The banner is already in raw_data; interpolating it here put
+        # per-response bytes into the content hash.
+        evidence="The service answered an SMB negotiation request.",
         remediation="Restrict SMB access to trusted networks; disable SMBv1.",
         owasp_id="A01:2021",
         cwe_id="CWE-284",
