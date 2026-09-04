@@ -31,6 +31,44 @@ class CveEntry:
   severity: Severity
   title: str
   cwe_id: str = ""
+  # "server" | "client" — which component of the product the weakness lives in.
+  # Left empty here and resolved through CLIENT_SIDE_CVE_IDS, so the separate
+  # expansion catalog (a table of plain tuples) is covered by the same rule
+  # rather than needing the field threaded through it too.
+  applicability: str = ""
+
+
+# CVEs whose weakness is in the *client* side of the product. Everything a probe
+# fingerprints is a listening service, so matching these off a server banner
+# asserts a weakness the evidence cannot support: a running sshd says nothing
+# about whether anyone on that host ever runs `scp` or `ssh-add`.
+CLIENT_SIDE_CVE_IDS = frozenset({
+  "CVE-2019-6111",    # scp client-side file overwrite
+  "CVE-2025-26465",   # client VerifyHostKeyDNS bypass
+  "CVE-2023-28531",   # ssh-add destination constraint bypass
+  "CVE-2023-38408",   # ssh-agent PKCS#11 search path code execution
+  "CVE-2016-10009",   # ssh-agent untrusted search path
+  "CVE-2021-28041",   # ssh-agent double free
+  "CVE-2016-0778",    # roaming client memory disclosure
+  "CVE-2020-12062",   # scp duplicate response mishandling
+  "CVE-2020-15778",   # scp command injection
+  # NVD: "The client in OpenSSH before 7.2 mishandles failed cookie generation
+  # for untrusted X11 forwarding" — a client weakness, and CRITICAL, so it was
+  # the highest-severity instance of the over-match this set exists to stop.
+  "CVE-2016-1908",
+})
+
+SERVER_APPLICABILITY = "server"
+CLIENT_APPLICABILITY = "client"
+
+
+def entry_applicability(entry) -> str:
+  """Resolve which component of the product an entry's weakness lives in."""
+  declared = getattr(entry, "applicability", "") or ""
+  if declared:
+    return declared
+  cve_id = getattr(entry, "cve_id", "") or ""
+  return CLIENT_APPLICABILITY if cve_id in CLIENT_SIDE_CVE_IDS else SERVER_APPLICABILITY
 
 
 CVE_DATABASE: list = [
@@ -43,7 +81,19 @@ CVE_DATABASE: list = [
   CveEntry("elasticsearch", ">=7.0.0,<7.17.19", "CVE-2024-23450", Severity.HIGH, "Ingest pipeline DoS via deep nesting", "CWE-400"),
 
   # ── OpenSSH ────────────────────────────────────────────────────────
-  CveEntry("openssh", "<9.3",  "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
+  # Two rows because the published scope is a disjunction — `<4.4p1` OR
+  # `>=8.5p1,<9.8p1` — and a constraint string joins with AND. Encoded as a
+  # single `<9.3` it both over-matched (4.4p1 through 8.5p1 are not affected)
+  # and under-matched (9.3 through 9.8p1 are).
+  #
+  # Bounds are written WITHOUT the `p` suffix on purpose. `_SSH_LIBRARY_PATTERNS`
+  # captures `(\d+\.\d+(?:\.\d+)?)`, so the matcher is handed "9.8", never
+  # "9.8p1" — and `_parse_version` encodes the suffix as extra tuple components,
+  # making 9.8 sort *below* 9.8p1. Writing the published `p`-suffixed bounds
+  # here shifted both boundaries by a release: a patched 9.8p1 server reported
+  # CRITICAL, and vulnerable 8.5p1 servers were missed.
+  CveEntry("openssh", "<4.4", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
+  CveEntry("openssh", ">=8.5,<9.8", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
   CveEntry("openssh", ">=6.8,<9.9.2", "CVE-2025-26465", Severity.HIGH, "MitM via VerifyHostKeyDNS bypass", "CWE-305"),
   CveEntry("openssh", "<8.1",  "CVE-2019-6111", Severity.HIGH, "SCP client-side file overwrite", "CWE-20"),
   CveEntry("openssh", "<7.6",  "CVE-2017-15906", Severity.MEDIUM, "Improper write restriction in readonly mode", "CWE-732"),
@@ -238,7 +288,13 @@ for _product, _constraint, _cve_id, _severity, _title, _cwe_id in EXPANDED_CVE_R
   ))
 
 
-def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
+def check_cves(
+  product: str,
+  version: str,
+  *,
+  applicability: str = SERVER_APPLICABILITY,
+  dynamic_cache=None,
+) -> list:
   """Match version against CVE database. Returns list of Findings.
 
   When ``dynamic_cache`` is a ``DynamicReferenceCache`` instance,
@@ -251,11 +307,19 @@ def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
     dynamic_cache = get_dynamic_reference_cache()
 
   findings = []
+  seen_cves = set()
   for entry in CVE_DATABASE:
     if entry.product != product:
       continue
+    if applicability and entry_applicability(entry) != applicability:
+      continue
     if not _matches_constraint(version, entry.constraint):
       continue
+    # A CVE whose published scope is a disjunction is carried as one row per
+    # range, so it must still be reported once.
+    if entry.cve_id in seen_cves:
+      continue
+    seen_cves.add(entry.cve_id)
     findings.append(_build_finding(entry, product, version, dynamic_cache))
   return findings
 
@@ -353,11 +417,19 @@ def _build_finding(entry, product: str, version: str, dynamic_cache):
       compensating="Use host or network controls to reduce exploitability for the affected service.",
     ),
   )
-  return finding.with_signature(
-    finding.compute_signature(
-      probe_id=f"cve:{product}",
-      asset_canonical=f"{product}:{version}:{entry.cve_id}",
-    )
+  # Both keys, over the same basis. A CVE finding is identified by
+  # `product:version:cve_id` rather than by an `AffectedAsset` — that is the
+  # whole reason `asset_canonical` exists. Stamping only the signature left the
+  # dedup key to be recomputed downstream by `enrich_finding_for_probe` from the
+  # *probe* name with no override, so the finding travelled with a signature
+  # built over one identity basis and a dedup key built over another.
+  identity = {
+    "probe_id": f"cve:{product}",
+    "asset_canonical": f"{product}:{version}:{entry.cve_id}",
+  }
+  return finding.with_identity(
+    finding_signature=finding.compute_signature(**identity),
+    finding_id=finding.compute_dedup_key(**identity),
   )
 
 
@@ -402,7 +474,15 @@ def _parse_version(version: str):
   """
   if not isinstance(version, str):
     return None
-  m = re.search(r"(\d+(?:\.\d+)*)([a-z]+)?(\d*)", version.strip(), re.IGNORECASE)
+  version = version.strip()
+  # Strip a Debian/RPM epoch before searching. `1:8.9p1-3ubuntu0.10` otherwise
+  # matches on the leading `1` and returns (1,), reading the epoch as the
+  # upstream version — which makes an OpenSSH 8.9 host match every CVE for 1.x.
+  # Latent today because `_ssh_identify_library` reduces the banner to "8.9"
+  # before the matcher sees it, but live the moment the full package string is
+  # carried through, which RM-064 item 5 asks for.
+  version = re.sub(r"^\s*\d+:", "", version)
+  m = re.search(r"(\d+(?:\.\d+)*)([a-z]+)?(\d*)", version, re.IGNORECASE)
   if not m:
     return None
   parts = [int(x) for x in m.group(1).split(".")]

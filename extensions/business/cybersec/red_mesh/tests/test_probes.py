@@ -767,6 +767,82 @@ class RedMeshOWASPTests(unittest.TestCase):
       info = worker._service_info_memcached("example.com", 11211)
     self._assert_has_finding(info, "Memcached")
 
+  def _memcached_raw(self, response):
+    """Drive the stats-rejected branch and return the probe's raw_data.
+
+    `probe_result` flattens raw_data into the returned dict, so the banner is
+    read straight off the result.
+    """
+    owner, worker = self._build_worker(ports=[11211])
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        pass
+
+      def settimeout(self, timeout):
+        return None
+
+      def connect(self, addr):
+        return None
+
+      def sendall(self, data):
+        self.sent = data
+
+      def recv(self, nbytes):
+        return response
+
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
+      return_value=DummySocket(),
+    ):
+      return worker._service_info_memcached("example.com", 11211)
+
+  def test_memcached_banner_keeps_only_printable_bytes(self):
+    """Control bytes and escape sequences must not reach an archived field.
+    Filtering per byte also makes the old defect — slicing at a fixed offset
+    and cutting a multi-byte character in half — impossible by construction:
+    this response straddles the 60-byte cut point that used to corrupt it."""
+    # 7 ASCII bytes, a NUL, an ANSI escape, then 2-byte characters.
+    info = self._memcached_raw(
+      b"ERRORS \x00\x1b[31m" + "é".encode("utf-8") * 40,
+    )
+
+    banner = info["banner"]
+    self.assertTrue(banner.startswith("ERRORS"))
+    self.assertNotIn("�", banner, "a character was cut in half")
+    for forbidden in ("\x00", "\x1b", "\r", "\n"):
+      self.assertNotIn(forbidden, banner)
+
+  def test_memcached_banner_is_stripped(self):
+    """Memcached is line-oriented: every real response ends CRLF. Stripping the
+    bytes before the printable filter is what keeps that terminator out — filter
+    first and it becomes "..", which is not whitespace and so survives strip."""
+    self.assertEqual(self._memcached_raw(b"ERROR\r\n")["banner"], "ERROR")
+    self.assertEqual(
+      self._memcached_raw(b"CLIENT_ERROR bad command line format\r\n")["banner"],
+      "CLIENT_ERROR bad command line format",
+    )
+    self.assertEqual(self._memcached_raw(b"   ERROR line   ")["banner"], "ERROR line")
+
+  def test_memcached_banner_falls_back_when_the_answer_is_only_a_terminator(self):
+    """A bare CRLF is a server answering with nothing. It must reach the label,
+    not archive ".." — the filter-then-strip order made this case unreachable."""
+    for nothing in (b"", b"\r\n", b"\t\t", b"   "):
+      self.assertEqual(
+        self._memcached_raw(nothing)["banner"], "Memcached port open",
+        f"{nothing!r} should fall back to the descriptive label",
+      )
+
+  def test_memcached_banner_is_capped(self):
+    """The archived banner is bounded; an unbounded server response must not
+    land in the archive whole."""
+    info = self._memcached_raw(b"E" * 500)
+
+    self.assertEqual(len(info["banner"]), 120)
+
   def test_service_elasticsearch_metadata(self):
     owner, worker = self._build_worker(ports=[9200])
     resp = MagicMock()
@@ -1455,8 +1531,11 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     self.assertIsInstance(result, dict)
     self.assertEqual(result.get("product"), "openssh")
-    # OpenSSH 7.4 is vulnerable to CVE-2024-6387 (regreSSHion, <9.3)
-    self._assert_has_finding(result, "CVE-2024-6387")
+    # CVE-2017-15906 is in scope for 7.4 (`<7.6`). This previously asserted
+    # CVE-2024-6387 on the strength of the old `<9.3` encoding; the published
+    # regreSSHion scope is `<4.4p1` plus `>=8.5p1,<9.8p1`, and 7.4 is in
+    # neither, so the assertion was encoding the over-match.
+    self._assert_has_finding(result, "CVE-2017-15906")
 
   def test_generic_probe_binary_returns_none(self):
     """Generic probe should return None for pure binary banners."""

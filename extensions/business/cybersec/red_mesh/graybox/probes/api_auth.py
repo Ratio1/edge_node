@@ -182,6 +182,7 @@ class ApiAuthProbes(ProbeBase):
           "algorithm against an explicit allowlist before signature "
           "verification."
         ),
+        response=resp,
       )
     else:
       self.emit_clean(

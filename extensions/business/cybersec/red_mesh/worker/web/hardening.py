@@ -2,7 +2,7 @@ import re as _re
 import time as _time
 import secrets as _secrets
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
@@ -49,14 +49,30 @@ class _WebHardeningMixin:
       # Check cookies for Secure/HttpOnly flags
       cookies_hdr = resp_main.headers.get("Set-Cookie", "")
       if cookies_hdr:
-        for cookie in cookies_hdr.split(","):
-          cookie_name = cookie.strip().split("=")[0] if "=" in cookie else cookie.strip()[:30]
+        # `requests` folds multiple Set-Cookie headers into one comma-joined
+        # string — but a lone `Expires=Wed, 21 Oct...` contains a comma too, and
+        # a bare split cut the cookie in half, producing a phantom
+        # "(unnamed cookie)" finding set from the date fragment. Split only at a
+        # comma followed by a `name=` token, which an Expires date never is.
+        for cookie in _re.split(r",(?=\s*[^\s;,=]+=)", cookies_hdr):
+          # A Set-Cookie without `=` has no name, only content — falling back
+          # to the raw header put arbitrary (potentially secret-shaped) bytes
+          # into the title and evidence, and since the title feeds the
+          # locationless identity fallback, a rotating valueless header
+          # re-keyed the finding on every scan. (Splitting on "," is itself
+          # imperfect — an Expires date contains one — recorded as follow-up.)
+          cookie_name = (
+            cookie.strip().split("=")[0] if "=" in cookie else "(unnamed cookie)"
+          )
           if "Secure" not in cookie:
             findings_list.append(Finding(
               severity=Severity.MEDIUM,
               title=f"Cookie missing Secure flag: {cookie_name}",
               description=f"Cookie will be sent over unencrypted HTTP connections.",
-              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              # The raw Set-Cookie value is a live session token: archiving it is
+              # a credential leak, and a per-request value in `evidence` breaks
+              # cross-worker dedup (evidence is part of the dedup key).
+              evidence=f"Set-Cookie for {cookie_name!r} on {base_url}: no Secure attribute",
               remediation="Add the Secure attribute to this cookie.",
               owasp_id="A05:2021",
               cwe_id="CWE-614",
@@ -67,7 +83,10 @@ class _WebHardeningMixin:
               severity=Severity.MEDIUM,
               title=f"Cookie missing HttpOnly flag: {cookie_name}",
               description=f"Cookie is accessible to JavaScript, enabling theft via XSS.",
-              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              # The raw Set-Cookie value is a live session token: archiving it is
+              # a credential leak, and a per-request value in `evidence` breaks
+              # cross-worker dedup (evidence is part of the dedup key).
+              evidence=f"Set-Cookie for {cookie_name!r} on {base_url}: no HttpOnly attribute",
               remediation="Add the HttpOnly attribute to this cookie.",
               owasp_id="A05:2021",
               cwe_id="CWE-1004",
@@ -78,7 +97,10 @@ class _WebHardeningMixin:
               severity=Severity.MEDIUM,
               title=f"Cookie missing SameSite flag: {cookie_name}",
               description=f"Cookie may be sent with cross-site requests, enabling CSRF.",
-              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              # The raw Set-Cookie value is a live session token: archiving it is
+              # a credential leak, and a per-request value in `evidence` breaks
+              # cross-worker dedup (evidence is part of the dedup key).
+              evidence=f"Set-Cookie for {cookie_name!r} on {base_url}: no SameSite attribute",
               remediation="Add SameSite=Lax or SameSite=Strict to this cookie.",
               owasp_id="A01:2021",
               cwe_id="CWE-1275",
@@ -242,6 +264,31 @@ class _WebHardeningMixin:
     return probe_result(findings=findings_list)
 
 
+  @staticmethod
+  def _redirect_authority(location):
+    """Scheme, host and path of a Location header; never the query or fragment.
+
+    Total function: a target that controls the header must not be able to
+    crash the probe (`urlsplit` raises on malformed IPv6 authorities) or to
+    smuggle a per-request token into `evidence` through the query string.
+    """
+    try:
+      parts = urlsplit(location)
+      # `hostname`/`port`, never `netloc`: netloc carries userinfo, so
+      # `https://user:secret@evil.example/cb` archived the credential — inside
+      # the fix made for the previous credential leak. The path goes too: it
+      # carries per-request nonces that churned the dedup key, and the redirect
+      # *host* is the load-bearing fact. Hostless shapes render without a
+      # fabricated authority.
+      host = parts.hostname or ""
+      port = f":{parts.port}" if parts.port else ""
+      if not host:
+        return f"{parts.scheme}:" if parts.scheme else "a URL with no host"
+      prefix = f"{parts.scheme}://" if parts.scheme else "//"
+      return f"{prefix}{host}{port}"
+    except ValueError:
+      return "an unparseable URL"
+
   @register_probe(
     display_name="Open redirect",
     description="Detect open redirect via common redirect parameter names + external host payloads.",
@@ -287,7 +334,14 @@ class _WebHardeningMixin:
             severity=Severity.MEDIUM,
             title="Open redirect via next parameter",
             description="The login endpoint redirects to attacker-controlled URLs via the next parameter.",
-            evidence=f"Location: {location} at {redirect_url}",
+            # Authority + path only: the raw Location can carry a per-request
+            # token or nonce, which is volatile data in the dedup key.
+            # `_redirect_authority` never raises — a hostile header must not
+            # turn a confirmed open redirect into a probe error.
+            evidence=(
+              f"Location points to {self._redirect_authority(location)} "
+              f"for {redirect_url}"
+            ),
             remediation="Validate redirect targets against an allowlist of trusted domains.",
             owasp_id="A01:2021",
             cwe_id="CWE-601",
@@ -538,8 +592,12 @@ class _WebHardeningMixin:
                 title="Account enumeration via login: response size differs",
                 description=f"Login at {path} returns different-sized responses for "
                             "valid vs invalid usernames.",
-                evidence=f"Invalid user: {len_fake} bytes, '{real_user}': {len_real} bytes "
-                         f"(delta {abs(len_real - len_fake)} bytes).",
+                # No username (PII in the archive) and no byte counts
+                # (per-request data in the dedup key): the measured sizes vary
+                # run to run, so two nodes seeing the same weakness never
+                # deduplicated.
+                evidence="Login responses for a valid and an invalid username "
+                         "differ in size by more than 20%.",
                 remediation="Ensure login responses are identical regardless of username validity.",
                 owasp_id="A04:2021",
                 cwe_id="CWE-204",
@@ -619,7 +677,8 @@ class _WebHardeningMixin:
             title=f"No rate limiting on login endpoint ({path})",
             description=f"{attempt_count} rapid login attempts accepted without "
                         "429 response, rate-limit headers, or CAPTCHA challenge.",
-            evidence=f"POST {url} x{attempt_count} with 500ms spacing — all accepted.",
+            evidence="Repeated rapid login attempts were all accepted with no "
+                     "rate limiting signal.",
             remediation="Implement rate limiting on authentication endpoints.",
             owasp_id="A04:2021",
             cwe_id="CWE-307",

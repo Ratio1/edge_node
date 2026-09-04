@@ -407,6 +407,126 @@ class TestGrayboxRedaction(unittest.TestCase):
     self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
 
 
+class TestBlackboxCredentialRedaction(unittest.TestCase):
+  """
+  Default-credential probes interpolate the plaintext pair into `title`, and
+  `_redact_report` only ever touched `evidence` and `accepted_credentials`.
+
+  Measured on the client job `6cc55610`, which carried `redactCredentials: true`:
+  25 finding titles and 19 `vulnerabilities` entries still held a credential
+  pair. The title also reaches the customer's SIEM verbatim, so this is a
+  credential-egress event rather than only a rendering defect.
+  """
+
+  # Exactly the strings the probes emit — worker/service/common.py:480, 751,
+  # 932, 1620 and worker/service/database.py:239, 928, 954.
+  PROBE_OUTPUT = (
+    ("HTTP Basic Auth default credential: admin:hunter2",
+     "GET http://t/adm with admin:hunter2 -> HTTP 200", "hunter2"),
+    ("FTP default credential accepted: ftpuser:s3cr3t",
+     "Accepted credential: ftpuser:s3cr3t", "s3cr3t"),
+    ("SSH default credential accepted: root:toor",
+     "Accepted credential: root:toor", "toor"),
+    ("Telnet default credential accepted: admin:admin1234",
+     "Accepted credential: admin:admin1234", "admin1234"),
+    ("MySQL default credential accepted: root:mysqlpw",
+     "Auth response OK for root:mysqlpw", "mysqlpw"),
+    ("PostgreSQL default credential accepted: postgres:pgpw99",
+     "Auth OK for postgres:pgpw99", "pgpw99"),
+    # Trust-auth path, worker/service/database.py:909 — a phrasing the first
+    # version of the table missed entirely.
+    ("PostgreSQL default credential accepted: postgres:trustpw",
+     "Auth code 0 for postgres:trustpw", "trustpw"),
+    # Punctuated secrets. Every password in the probes' own default lists is
+    # punctuation-free, so a terminator that stopped at `.` truncated the mask
+    # and published the tail without any test noticing.
+    ("SSH default credential accepted: admin:P@ssw0rd.1",
+     "Accepted credential: admin:P@ssw0rd.1", "P@ssw0rd.1"),
+    ("SSH default credential accepted: admin:my.secret.pass",
+     "Accepted credential: admin:my.secret.pass", "my.secret.pass"),
+  )
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  @staticmethod
+  def _report(title, evidence, description):
+    return {
+      "service_info": {
+        "22": {
+          "default_creds": {
+            "findings": [{
+              "title": title,
+              "description": description,
+              "remediation": "Rotate the credential.",
+              "evidence": evidence,
+            }],
+            "accepted": ["root:toor"],
+            "accepted_credentials": ["root:toor"],
+            # `findings.py:269` writes this into each *probe result*. An
+            # earlier fixture put it at the top level of the report, a shape
+            # the system never produces, so the regression test passed while
+            # 19 plaintext pairs survived in the real client job.
+            "vulnerabilities": [title],
+          },
+        },
+      },
+      "graybox_results": {},
+    }
+
+  def test_no_probe_leaves_a_password_anywhere_in_the_report(self):
+    for title, evidence, secret in self.PROBE_OUTPUT:
+      with self.subTest(title=title):
+        host = self._host()
+        pair = title.split(": ")[-1]
+        description = f"MySQL on 10.0.0.5:3306 accepts {pair}."
+        redacted = host._redact_report(self._report(title, evidence, description))
+        self.assertNotIn(secret, str(redacted), f"{secret} survived redaction")
+
+  def test_the_host_and_port_are_not_mistaken_for_a_credential(self):
+    # `MySQL on {target}:{port} accepts {cred}` puts a host:port pair in the same
+    # sentence as the credential. Redacting that too would destroy the field
+    # saying which service was affected.
+    host = self._host()
+    redacted = host._redact_report(self._report(
+      "MySQL default credential accepted: root:mysqlpw",
+      "Auth response OK for root:mysqlpw",
+      "MySQL on 10.0.0.5:3306 accepts root:mysqlpw.",
+    ))
+    description = redacted["service_info"]["22"]["default_creds"]["findings"][0]["description"]
+    self.assertIn("10.0.0.5:3306", description)
+    self.assertNotIn("mysqlpw", description)
+
+  def test_the_parallel_vulnerabilities_title_list_is_redacted(self):
+    # `result["vulnerabilities"]` is built from finding titles (findings.py:269)
+    # and redaction never saw it. 19 entries leaked on the client job.
+    host = self._host()
+    redacted = host._redact_report(self._report(
+      "SSH default credential accepted: root:toor",
+      "Accepted credential: root:toor",
+      "The SSH server accepted a well-known default credential.",
+    ))
+    self.assertNotIn("toor", str(redacted.get("vulnerabilities", [])))
+
+  def test_the_http_basic_accepted_key_is_redacted(self):
+    # The probe writes `accepted` (common.py:438,477); redaction read only
+    # `accepted_credentials` — a key-name mismatch, so that list was archived raw.
+    host = self._host()
+    redacted = host._redact_report(self._report(
+      "HTTP Basic Auth default credential: admin:hunter2",
+      "GET http://t/adm with admin:hunter2 -> HTTP 200",
+      "The web server accepted a default credential.",
+    ))
+    accepted = redacted["service_info"]["22"]["default_creds"]["accepted"]
+    self.assertNotIn("toor", str(accepted))
+
+
 class TestFindingCounting(unittest.TestCase):
 
   def test_count_all_findings_walks_all_published_paths(self):
@@ -561,7 +681,12 @@ class TestLaunchValidation(unittest.TestCase):
 class TestRiskScoreGraybox(unittest.TestCase):
 
   def test_risk_score_includes_graybox(self):
-    """_compute_risk_score also walks graybox_results."""
+    """The scoring walk covers graybox_results, not just service_info.
+
+    Repointed from `_compute_risk_score`, a second scoring implementation with
+    no non-test caller that had drifted from this one — it kept this test alive
+    while answering differently for the same report.
+    """
     finding = GrayboxFinding(
       scenario_id="PT-A01-01",
       title="IDOR",
@@ -571,10 +696,292 @@ class TestRiskScoreGraybox(unittest.TestCase):
     )
     report = _make_graybox_report([finding.to_dict()])
     host = _make_mixin()
-    result = host._compute_risk_score(report)
+    result, _flat = host._compute_risk_and_findings(report)
     # Should have non-zero findings_score
     self.assertGreater(result["breakdown"]["findings_score"], 0)
     self.assertGreater(result["breakdown"]["finding_counts"]["HIGH"], 0)
+
+
+class TestRiskScoreDynamicRange(unittest.TestCase):
+  """
+  The logistic curve pinned at 100 once raw_total passed ~300 — about eight
+  CRITICAL findings — while raw_total grows linearly with finding count. Three
+  real archived runs spanning 46 to 600 findings all scored exactly 100, so a
+  remediation cycle could remove hundreds of findings without moving the number.
+  """
+
+  # (label, raw_total) from the archived runs named in the task.
+  ARCHIVED = (
+    ("R1 blackbox, 46 findings", 609.1),
+    ("client job 6cc55610", 1123.5),
+    ("phase-a-v3, 600 findings", 9006.9),
+  )
+
+  def test_real_runs_that_all_scored_100_are_now_distinguishable(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    scores = [normalize_risk_score(raw) for _label, raw in self.ARCHIVED]
+    self.assertEqual(
+      len(set(scores)), len(scores),
+      f"archived runs still collide: {list(zip([l for l, _ in self.ARCHIVED], scores))}",
+    )
+    for score in scores:
+      self.assertLess(score, 100, "a real run still pins at the ceiling")
+
+  def test_the_score_keeps_rising_past_eight_critical_findings(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    # One CRITICAL/certain finding contributes 40 to raw_total.
+    eight = normalize_risk_score(8 * 40)
+    twenty = normalize_risk_score(20 * 40)
+    hundred = normalize_risk_score(100 * 40)
+    self.assertLess(eight, twenty)
+    self.assertLess(twenty, hundred)
+
+  def test_the_score_is_monotonic_and_bounded(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    previous = -1
+    for raw in (0, 1, 10, 40, 100, 320, 1000, 5000, 20000, 100000):
+      score = normalize_risk_score(raw)
+      self.assertGreaterEqual(score, previous)
+      self.assertGreaterEqual(score, 0)
+      self.assertLessEqual(score, 100)
+      previous = score
+
+  def test_a_single_critical_finding_stays_where_it_was(self):
+    # The low end is anchored so small scans stay comparable with historical
+    # reports: one CRITICAL finding scored 38 under the logistic curve.
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    self.assertAlmostEqual(normalize_risk_score(40), 38, delta=3)
+
+  def test_a_malformed_raw_total_scores_zero_rather_than_raising(self):
+    from extensions.business.cybersec.red_mesh.mixins.risk import normalize_risk_score
+    for bad in (None, "", "abc", float("nan"), float("inf"), float("-inf"), -1):
+      with self.subTest(raw=bad):
+        # `isinstance(..., int)` alone passes for any constant; the contract is
+        # that unusable input scores zero rather than inventing a risk level.
+        self.assertEqual(normalize_risk_score(bad), 0)
+
+
+
+class TestGrayboxCredentialRedactionIsNarrow(unittest.TestCase):
+  """
+  `_CRED_RE` was `(\\S+?):(\\S+)` — any `a:b` at all — replaced with `a:***`.
+  It therefore destroyed exactly the data RM-060 Phase 5 exists to add:
+
+      curl -i -H 'Accept: */*' https://app.test/api/records/99
+        -> curl -i -H 'Accept: */*' https:***
+      endpoint=https://app.test/api/records/99  ->  endpoint=https:***
+      ... at 12:04:33                           ->  ... at 12:***
+
+  Every reproduction command, every endpoint URL and every timestamp. It also
+  took the host along with the secret in a userinfo URL, losing the one field
+  that says which service was affected.
+
+  RM-060's invariant is that narrowing must not reduce credential coverage, so
+  this asserts both directions.
+  """
+
+  SURVIVE = (
+    "curl -i -H 'Accept: */*' https://app.test/api/records/99",
+    "curl -i -X POST --data-raw '{\"id\": 99}' https://app.test/x",
+    "endpoint=https://app.test/api/records/99",
+    "GET /api/v1/users returned 200 at 12:04:33",
+    "Scenario PT-A01-01: IDOR detected",
+    "Content-Type: application/json",
+    "baseline_size_bytes=1024",
+  )
+
+  REDACT = (
+    ("admin:hunter2 accepted", "hunter2"),
+    ("root:toor", "toor"),
+    ("Accepted credential: ftpuser:s3cr3t", "s3cr3t"),
+  )
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  def _redact(self, text):
+    report = {
+      "service_info": {},
+      "graybox_results": {
+        "443": {"_graybox_test": {"findings": [{
+          "title": "t", "description": text, "status": "vulnerable",
+        }]}}},
+    }
+    out = self._host()._redact_report(report)
+    return out["graybox_results"]["443"]["_graybox_test"]["findings"][0]["description"]
+
+  def test_reproductions_urls_and_timestamps_survive(self):
+    for text in self.SURVIVE:
+      with self.subTest(text=text):
+        self.assertEqual(self._redact(text), text)
+
+  def test_credential_pairs_are_still_redacted(self):
+    for text, secret in self.REDACT:
+      with self.subTest(text=text):
+        self.assertNotIn(secret, self._redact(text))
+
+  def test_url_userinfo_loses_the_secret_and_keeps_the_host(self):
+    out = self._redact("https://user:secret@app.test/x")
+    self.assertNotIn("secret", out)
+    self.assertIn("app.test", out,
+                  "the host was taken along with the secret, losing the field "
+                  "that says which service was affected")
+
+
+
+class TestGrayboxRedactionCoverageFloor(unittest.TestCase):
+  """
+  RM-060's invariant: narrowing `_CRED_RE` must not reduce credential coverage.
+
+  Verified by measuring the same matrix against pre-branch `da9920c0` and the
+  narrowed rule: both mask exactly these three shapes and leak exactly the same
+  nine. The narrowing removed over-redaction without removing coverage.
+
+  The nine that leak are RM-051's stated key families (`credential`,
+  `credentials`, `client_credentials`, `csrf_token`, `github_token`,
+  `x_api_key`, `aws_secret_access_key`, `cookie`) plus the I-014 gateway key.
+  They are pre-existing and out of scope here — this class pins the *floor* so a
+  future narrowing cannot quietly drop below it, rather than asserting the gaps
+  are acceptable.
+  """
+
+  MUST_STAY_MASKED = (
+    ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def", "eyJhbGciOiJIUzI1NiJ9"),
+    ("password=Tr0ub4dor", "Tr0ub4dor"),
+    ("admin:hunter2 accepted", "hunter2"),
+    ("https://user:secret@app.test/x", "secret"),
+    ("Accepted credential: ftpuser:s3cr3t", "s3cr3t"),
+    ("candidate service-user:s3cr3t/with/slash worked", "s3cr3t/with/slash"),
+    ("accepted=admin:p@$$:w0rd!", "p@$$:w0rd!"),
+    # Digit-leading secrets. A guard written as "the secret does not start with
+    # a digit" reads as a reasonable way to spare ports, and it silently emptied
+    # this whole family — the five below all went out in plaintext while this
+    # class was green, because every case above happens to begin with a letter.
+    ("could not connect as dbuser:1SecretPass", "1SecretPass"),
+    ("admin:1Password! accepted", "1Password!"),
+    ("root:2024summer worked", "2024summer"),
+    ("user:007bond accepted", "007bond"),
+    ("backup:99RedBalloons accepted", "99RedBalloons"),
+  )
+
+  # The other half of the invariant: the narrowing exists to stop destroying
+  # these, and a fix for the family above must not take them back out.
+  MUST_STAY_INTACT = (
+    "endpoint https://app.test/api/records/99",
+    "service reachable at app.test:8443",
+    "health probe app.test:8443/health",
+    "Content-Type: application/json",
+    "PT-A01-01: IDOR on /records",
+    "observed at 12:04:33 UTC",
+  )
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  def test_the_covered_shapes_stay_covered(self):
+    host = self._host()
+    for text, secret in self.MUST_STAY_MASKED:
+      with self.subTest(text=text):
+        report = {
+          "service_info": {},
+          "graybox_results": {"443": {"_p": {"findings": [
+            {"title": "t", "description": text, "status": "vulnerable"},
+          ]}}},
+        }
+        out = host._redact_report(report)
+        described = out["graybox_results"]["443"]["_p"]["findings"][0]["description"]
+        self.assertNotIn(
+          secret, described,
+          "credential coverage dropped below the pre-branch floor",
+        )
+
+  def test_the_narrowing_still_spares_what_it_was_written_for(self):
+    host = self._host()
+    for text in self.MUST_STAY_INTACT:
+      with self.subTest(text=text):
+        report = {
+          "service_info": {},
+          "graybox_results": {"443": {"_p": {"findings": [
+            {"title": "t", "description": text, "status": "vulnerable"},
+          ]}}},
+        }
+        out = host._redact_report(report)
+        described = out["graybox_results"]["443"]["_p"]["findings"][0]["description"]
+        self.assertEqual(
+          text, described,
+          "the redaction rule destroyed non-credential data again",
+        )
+
+
+class TestGrayboxLocationRedactionAtTheReportLayer(unittest.TestCase):
+  """A userinfo credential was masked in `evidence` and shipped in `url`.
+
+  `_redact_report` gained `_USERINFO_RE` for exactly this shape, but only walked
+  the text fields — so the same secret was masked in the sibling `evidence`
+  string and left intact one key over, in `url` and in the `affected_assets`
+  copy the PDF and the exports read.
+  """
+
+  @staticmethod
+  def _host():
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    return MockHost()
+
+  def _redact(self, finding):
+    report = {
+      "service_info": {},
+      "graybox_results": {"443": {"_p": {"findings": [finding]}}},
+    }
+    out = self._host()._redact_report(report)
+    return out["graybox_results"]["443"]["_p"]["findings"][0]
+
+  def test_a_userinfo_secret_is_masked_in_every_location_copy(self):
+    secret = "supersecretpw"
+    out = self._redact({
+      "title": "t", "status": "vulnerable",
+      "url": f"https://admin:{secret}@app.test/x",
+      "evidence": [f"endpoint=https://admin:{secret}@app.test/x"],
+      "affected_assets": [{
+        "host": "app.test", "port": 443,
+        "url": f"https://admin:{secret}@app.test/x",
+        "parameter": None, "method": "GET",
+      }],
+    })
+    self.assertNotIn(secret, out["url"])
+    self.assertNotIn(secret, out["evidence"][0])
+    self.assertNotIn(secret, out["affected_assets"][0]["url"])
+    # The host survives: it is the one field saying which service was affected.
+    self.assertIn("app.test", out["affected_assets"][0]["url"])
+
+  def test_an_ordinary_location_survives_the_walk(self):
+    out = self._redact({
+      "title": "t", "status": "vulnerable",
+      "url": "https://app.test/api/records/99",
+      "affected_assets": [{
+        "host": "app.test", "port": 443,
+        "url": "https://app.test/api/records/99",
+        "parameter": "id", "method": "GET",
+      }],
+    })
+    self.assertEqual(out["url"], "https://app.test/api/records/99")
+    self.assertEqual(out["affected_assets"][0]["url"], "https://app.test/api/records/99")
+    self.assertEqual(out["affected_assets"][0]["parameter"], "id")
 
 
 if __name__ == '__main__':

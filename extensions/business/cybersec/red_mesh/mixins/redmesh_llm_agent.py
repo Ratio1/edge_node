@@ -14,6 +14,7 @@ import json
 from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
+from ..models.finding_schema import is_coverage_result as _is_coverage_result
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
 from ..services.llm_structured import (
@@ -555,7 +556,14 @@ class _RedMeshLlmAgentMixin(object):
     return services, {"included_services": len(services), "total_services": total_services}
 
   def _build_llm_top_findings(self, aggregated_report: dict, analysis_type: str) -> tuple[list[dict], dict]:
-    findings = self._extract_report_findings(aggregated_report)
+    # Coverage results are dropped before ranking, not just before counting.
+    # `_rank_findings` sorts by severity and an `inconclusive` scenario keeps its
+    # *declared* severity, so a scenario that concluded nothing was ranked into
+    # the model's top-findings list as a HIGH vulnerability.
+    findings = [
+      f for f in self._extract_report_findings(aggregated_report)
+      if not _is_coverage_result(f)
+    ]
     total_findings = len(findings)
     deduped = self._deduplicate_findings(findings)
     ranked = self._rank_findings(deduped)
@@ -602,11 +610,12 @@ class _RedMeshLlmAgentMixin(object):
   def _build_llm_findings_summary(self, aggregated_report: dict) -> dict:
     findings = self._deduplicate_findings(self._extract_report_findings(aggregated_report))
     counts = {}
-    for finding in findings:
+    real_findings = [f for f in findings if not _is_coverage_result(f)]
+    for finding in real_findings:
       severity = str(finding.get("severity") or "UNKNOWN").upper()
       counts[severity] = counts.get(severity, 0) + 1
     return {
-      "total_findings": len(findings),
+      "total_findings": len(real_findings),
       "by_severity": counts,
     }
 
@@ -756,7 +765,12 @@ class _RedMeshLlmAgentMixin(object):
 
     top_owasp = sorted(owasp_counts.items(), key=lambda item: (-item[1], item[0]))
     return {
-      "total_findings": len(findings),
+      # This block summarises *coverage* — it reports `by_status` precisely so
+      # the model can see how much was tested — but `total_findings` named the
+      # scenario count, which is the claim B5 exists to stop making. Both
+      # numbers are now stated, each under its own name.
+      "total_findings": sum(1 for f in findings if not _is_coverage_result(f)),
+      "total_scenario_results": len(findings),
       "by_severity": severity_counts,
       "by_status": status_counts,
       "top_owasp_categories": [

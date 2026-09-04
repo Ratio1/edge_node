@@ -8,9 +8,196 @@ sessions or credentials themselves.
 
 import requests
 
-from ..findings import GrayboxFinding
+from ..findings import GrayboxEvidenceArtifact, GrayboxFinding
 from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
+
+
+
+# `endpoint=<url>` is the established convention across the probes and was the
+# de-facto location before GrayboxFinding carried a typed one. Promoting it here
+# populates every existing probe at once rather than depending on each of the
+# emission call sites being edited correctly, and a probe that passes an
+# explicit url always wins. Ordered by specificity: the first key found is used.
+_LOCATION_EVIDENCE_KEYS = ("endpoint=", "path=", "protected_path=", "token_path=")
+_PARAMETER_EVIDENCE_KEYS = ("parameter=", "param=")
+
+
+def _location_from_evidence(evidence):
+  """Return ``(url, parameter)`` recovered from evidence strings, or (None, None)."""
+  url = parameter = None
+  for item in evidence or ():
+    if not isinstance(item, str):
+      continue
+    if url is None:
+      for key in _LOCATION_EVIDENCE_KEYS:
+        if item.startswith(key):
+          url = item[len(key):].strip() or None
+          break
+    if parameter is None:
+      for key in _PARAMETER_EVIDENCE_KEYS:
+        if item.startswith(key):
+          parameter = item[len(key):].strip() or None
+          break
+    if url is not None and parameter is not None:
+      break
+  return url, parameter
+
+
+_SNAPSHOT_MAX_CHARS = 2048
+_SCRUB_WINDOW_CHARS = _SNAPSHOT_MAX_CHARS * 2
+
+
+def _as_text(value) -> str:
+  """Coerce a response attribute to text, tolerating types we did not expect."""
+  if isinstance(value, str):
+    return value
+  if isinstance(value, bytes):
+    return value.decode("utf-8", "replace")
+  return ""
+
+
+def _string_items(mapping) -> dict:
+  """Header mapping as plain strings, dropping anything that will not coerce."""
+  out = {}
+  try:
+    items = mapping.items()
+  except Exception:
+    return out
+  try:
+    for name, value in items:
+      if isinstance(name, str) and isinstance(value, (str, bytes)):
+        out[name] = _as_text(value)
+  except Exception:
+    return out
+  return out
+
+
+def _best_effort(builder, *args):
+  """Run an evidence builder, returning None instead of raising.
+
+  Evidence is supplementary; the finding is the product. A builder that raises
+  propagates into `run_safe`, which converts the whole probe run into an error
+  finding — so a response shape we did not anticipate would silently drop the
+  vulnerability rather than merely fail to decorate it. Never let that trade
+  happen.
+  """
+  try:
+    return builder(*args)
+  except Exception:
+    return None
+
+
+def _curl_reproduction(response, scrub):
+  """Build a redacted, shell-safe `curl` line reproducing the triggering request.
+
+  Derived from the captured request rather than hand-written by each probe, so
+  it cannot drift from what was actually sent.
+
+  Redaction matters more here than in a snapshot: this line is *designed* to be
+  copied and run, so an Authorization header left in it hands a credential to
+  whoever reads the report. Every component is `shlex.quote`d because the URL is
+  target-controlled and must not be able to become a second shell command.
+
+  Each component is scrubbed *before* it is quoted. Scrubbing the assembled line
+  let a substitution reach inside the quoting a target had already been sealed
+  into: a URL carrying both a quote character and a scrubber trigger came out
+  with unbalanced quotes. That failed closed — bash rejected the line rather
+  than running anything extra — but it left the reproduction unusable, and it
+  only stayed harmless for as long as no scrubber pattern happened to produce a
+  string that re-parses.
+  """
+  import shlex
+
+  if response is None:
+    return None
+  request = getattr(response, "request", None)
+  if request is None:
+    return None
+  method = (getattr(request, "method", "") or "GET").upper()
+  url = getattr(request, "url", "") or getattr(response, "url", "") or ""
+  if not url:
+    return None
+
+  def _safe(value):
+    return shlex.quote(scrub(str(value)))
+
+  parts = ["curl", "-i"]
+  # GET is curl's default, so spelling it out is noise in something a reader
+  # copies.
+  if method != "GET":
+    parts += ["-X", method]
+  for name, value in _string_items(getattr(request, "headers", None)).items():
+    parts += ["-H", _safe(f"{name}: {value}")]
+  body = getattr(request, "body", None)
+  if body:
+    if isinstance(body, bytes):
+      body = body.decode("utf-8", "replace")
+    parts += ["--data-raw", _safe(body)]
+  parts.append(_safe(url))
+  return " ".join(parts)
+
+
+def _artifact_from_response(response, scrub):
+  """Build a redacted evidence artifact from the response that triggered a finding.
+
+  `GrayboxEvidenceArtifact` was dead schema — zero constructions outside tests —
+  so a finding carried no request/response evidence at all. Both snapshots go
+  through the caller's scrubber before anything is retained: an artifact must
+  not become a new route for archiving what the scrubber removes elsewhere.
+  """
+  import hashlib
+  from datetime import datetime, timezone
+
+  if response is None:
+    return None
+  request = getattr(response, "request", None)
+  method = getattr(request, "method", "") or ""
+  url = getattr(request, "url", "") or getattr(response, "url", "") or ""
+  request_headers = _string_items(getattr(request, "headers", None))
+  request_body = getattr(request, "body", None)
+  status = getattr(response, "status_code", "")
+  response_headers = _string_items(getattr(response, "headers", None))
+  body = _as_text(getattr(response, "text", ""))
+
+  # Scrub over a window wider than what is kept, then truncate. Cutting first
+  # split secrets that straddle the boundary, leaving a prefix the pattern no
+  # longer matched — the retained half of an API key is still an API key. Any
+  # secret with a character inside the retained region starts before it, so a
+  # window of twice the limit contains the whole match; the extra is discarded
+  # either way, which keeps the cost bounded on large bodies.
+  request_snapshot = scrub("\n".join(
+    [f"{method} {url}"]
+    + [f"{name}: {value}" for name, value in request_headers.items()]
+    + ([""] + [str(request_body)] if request_body else [])
+  )[:_SCRUB_WINDOW_CHARS])[:_SNAPSHOT_MAX_CHARS]
+  response_snapshot = scrub("\n".join(
+    [f"HTTP {status}"]
+    + [f"{name}: {value}" for name, value in response_headers.items()]
+    + ["", body]
+  )[:_SCRUB_WINDOW_CHARS])[:_SNAPSHOT_MAX_CHARS]
+
+  latency_ms = 0
+  elapsed = getattr(response, "elapsed", None)
+  if elapsed is not None:
+    try:
+      latency_ms = int(round(float(elapsed.total_seconds()) * 1000))
+    except (TypeError, ValueError, AttributeError):
+      latency_ms = 0
+
+  # Hashed after scrubbing, so the digest describes what is actually retained.
+  digest = hashlib.sha256(
+    (request_snapshot + "\x00" + response_snapshot).encode("utf-8", "replace")
+  ).hexdigest()
+
+  return GrayboxEvidenceArtifact(
+    summary=f"{method} {url} -> HTTP {status}"[:_SNAPSHOT_MAX_CHARS],
+    request_snapshot=request_snapshot,
+    response_snapshot=response_snapshot,
+    captured_at=datetime.now(timezone.utc).isoformat(),
+    latency_ms=latency_ms,
+    content_sha256=digest,
+  )
 
 
 class ProbeBase:
@@ -469,13 +656,41 @@ class ProbeBase:
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,
                        replay_steps=None, remediation=None,
-                       rollback_status=""):
+                       rollback_status="", url=None, parameter=None,
+                       method=None, response=None):
     """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default.
 
     ``rollback_status`` is set by `run_stateful` for stateful probes;
     leave default for non-stateful findings.
+
+    ``url`` / ``parameter`` / ``method`` record *where* the finding manifests.
+    They are optional so existing probes keep working, but a probe that omits
+    them produces a finding with no machine-readable location — and two
+    endpoints exhibiting the same scenario then collapse to one finding id.
     """
+    scrubbed_evidence = self._scrub_for_emission(list(evidence or []))
+    # Derived from the scrubbed evidence, never the raw list: a URL can carry a
+    # token in its query string, and promoting it to a typed field must not
+    # reintroduce what the scrubber just removed.
+    derived_url, derived_parameter = _location_from_evidence(scrubbed_evidence)
+    artifacts = list(evidence_artifacts or [])
+    # Build one from the triggering response when the probe passes it, so the
+    # finding carries real request/response evidence rather than only a
+    # free-text summary. `evidence_artifacts` remains available for probes that
+    # construct their own.
+    built = _best_effort(_artifact_from_response, response, self._scrub_for_emission)
+    if built is not None:
+      artifacts.append(built)
+    steps = list(replay_steps or [])
+    # Appended after the probe's own steps: those describe the setup a reader
+    # needs, and the curl is the final action that triggers the finding.
+    curl = _best_effort(_curl_reproduction, response, self._scrub_for_emission)
+    if curl:
+      steps.append(curl)
     self.findings.append(GrayboxFinding(
+      url=url or derived_url,
+      parameter=parameter or derived_parameter,
+      method=method,
       scenario_id=scenario_id,
       title=self._scrub_for_emission(title),
       status="vulnerable",
@@ -483,9 +698,9 @@ class ProbeBase:
       owasp=owasp,
       cwe=list(cwe or []),
       attack=self._resolve_attack(scenario_id, attack),
-      evidence=self._scrub_for_emission(list(evidence or [])),
-      evidence_artifacts=self._scrub_for_emission(list(evidence_artifacts or [])),
-      replay_steps=self._scrub_for_emission(list(replay_steps or [])),
+      evidence=scrubbed_evidence,
+      evidence_artifacts=self._scrub_for_emission(artifacts),
+      replay_steps=self._scrub_for_emission(steps),
       remediation=self._scrub_for_emission(remediation or ""),
       rollback_status=rollback_status or "",
     ))

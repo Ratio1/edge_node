@@ -95,12 +95,16 @@ class TestFindingSignature(unittest.TestCase):
       f2.compute_signature(probe_id="x"),
     )
 
-  def test_with_signature_returns_new_finding(self):
+  def test_with_identity_returns_new_finding(self):
     f = Finding(severity=Severity.HIGH, title="t", description="d")
     sig = f.compute_signature(probe_id="x")
-    f2 = f.with_signature(sig)
+    key = f.compute_dedup_key(probe_id="x")
+    f2 = f.with_identity(finding_signature=sig, finding_id=key)
     self.assertEqual(f2.finding_signature, sig)
-    self.assertEqual(f.finding_signature, "")  # original immutable
+    self.assertEqual(f2.finding_id, key)
+    # Original immutable, on both keys.
+    self.assertEqual(f.finding_signature, "")
+    self.assertEqual(f.finding_id, "")
 
 
 class TestStructuredFields(unittest.TestCase):

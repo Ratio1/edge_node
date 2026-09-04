@@ -155,3 +155,39 @@ def reset_caches() -> None:
   _load_owasp_categories.cache_clear()
   _load_cwe_to_owasp.cache_clear()
   _load_cwe_top25.cache_clear()
+
+
+def reference_urls(owasp_id: str = "", cwe_ids=()) -> list[str]:
+  """Canonical documentation URLs for an OWASP category and CWE ids.
+
+  Findings carried an OWASP code and CWE ids but no links, so a reader got
+  "A01:2021" with nowhere to go. The OWASP slug comes from the shared category
+  table rather than being reconstructed from the code, because the real URL
+  needs the category *name* — `A01_2021-Broken_Access_Control` — which the code
+  alone does not contain.
+
+  Unknown or malformed ids yield nothing rather than a plausible-looking URL
+  that 404s. Order is stable and duplicates are dropped.
+  """
+  urls: list[str] = []
+
+  code = (owasp_id or "").strip()
+  if code:
+    category = owasp_category(code)
+    if category is not None:
+      slug = f"{category.code.replace(':', '_')}-{category.name.replace(' ', '_')}"
+      urls.append(f"https://owasp.org/Top10/{slug}/")
+
+  for raw in cwe_ids or ():
+    if not isinstance(raw, str):
+      continue
+    digits = raw.strip().upper().removeprefix("CWE-")
+    if digits.isdigit():
+      urls.append(f"https://cwe.mitre.org/data/definitions/{digits}.html")
+
+  seen, ordered = set(), []
+  for url in urls:
+    if url not in seen:
+      seen.add(url)
+      ordered.append(url)
+  return ordered

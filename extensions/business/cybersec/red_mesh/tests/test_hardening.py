@@ -429,8 +429,15 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertIn("coverage", payload)
     self.assertIn("attack_surface", payload)
     self.assertNotIn("graybox_results", payload)
-    self.assertEqual(payload["findings_summary"]["total_findings"], 2)
+    # The fixture holds one `vulnerable` and one `inconclusive` scenario.
+    # `total_findings` used to be 2 — the claim RM-062 B5 exists to stop making,
+    # since a scenario that could not decide is coverage evidence, not a
+    # finding. Both numbers are still asserted, each under the name that means
+    # it; nothing is dropped from the payload.
+    self.assertEqual(payload["findings_summary"]["total_findings"], 1)
+    self.assertEqual(payload["findings_summary"]["total_scenario_results"], 2)
     self.assertEqual(payload["findings_summary"]["by_status"]["vulnerable"], 1)
+    self.assertEqual(payload["findings_summary"]["by_status"]["inconclusive"], 1)
     self.assertEqual(payload["coverage"]["routes"]["total_routes"], 3)
     self.assertEqual(payload["probe_summary"]["top_probes"][0]["probe"], "_graybox_authz")
 

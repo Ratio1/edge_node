@@ -66,6 +66,45 @@ def _make_worker(**overrides):
   return worker
 
 
+class TestTheWorkerHandsItsControlsToTheClient(unittest.TestCase):
+  """Structurally the same defect as the `initiator` fixture omission.
+
+  Every budget and throttle test builds `GrayboxHttpClient` directly and passes
+  the controls itself, so all of them pass whether or not the worker — the only
+  thing that constructs the client in production — actually hands them over.
+  The `safety=` parameter was in fact dead: the worker built `SafetyControls`
+  *after* the client and passed only `request_budget`, so `self._safety` was
+  `None` on every production path and redirect hops were counted but never
+  throttled.
+  """
+
+  def _client(self):
+    owner = MagicMock()
+    owner.P = MagicMock()
+    cfg = _make_job_config()
+    with patch("extensions.business.cybersec.red_mesh.graybox.worker.AuthManager"):
+      with patch("extensions.business.cybersec.red_mesh.graybox.worker.DiscoveryModule"):
+        worker = GrayboxLocalWorker(
+          owner=owner, job_id="test-job-1", target_url=cfg.target_url,
+          job_config=cfg, local_id="1", initiator="test-node",
+        )
+    return worker
+
+  def test_the_shared_request_budget_reaches_the_client(self):
+    worker = self._client()
+    self.assertIsNotNone(worker.http_client._request_budget)
+    self.assertIs(worker.http_client._request_budget, worker.request_budget)
+
+  def test_the_safety_controls_reach_the_client(self):
+    worker = self._client()
+    self.assertIsNotNone(
+      worker.http_client._safety,
+      "the client was built without safety controls, so redirect hops are "
+      "budgeted but never throttled",
+    )
+    self.assertIs(worker.http_client._safety, worker.safety)
+
+
 class TestBaseLocalWorkerIntegration(unittest.TestCase):
 
   def test_inherits_base(self):

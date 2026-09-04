@@ -23,6 +23,18 @@ import contextvars
 from dataclasses import dataclass, asdict, field
 from typing import Any
 
+from ..references import reference_urls as _reference_urls
+from ..models.finding_schema import (
+  REDMESH_FINDING_SCHEMA,
+  REDMESH_FINDING_SCHEMA_VERSION,
+  normalize_confidence as _normalize_confidence,
+)
+from ..models.finding_identity import (
+  content_hash as _content_hash,
+  dedup_key as _dedup_key,
+  parse_cwe_list as _parse_cwe_list,
+)
+
 
 # ── Centralised secret scrubber (Subphase 1.6 commit #2) ────────────────
 
@@ -30,19 +42,32 @@ from typing import Any
 # AuthDescriptor was active. Configured names (X-Custom-Key, custom query
 # params) are added to the per-call scrub via ``secret_field_names``
 # when ProbeBase.emit_* invokes the scrubber with the live AuthDescriptor.
+# Every value-consuming pattern refuses a value that is already `<redacted>`.
+# Without that the scrubber is not a fixed point: a second pass over
+# `Authorization: <redacted>'` re-matches and swallows the trailing quote,
+# because the placeholder is just as consumable as the secret it replaced. That
+# is how a shell-safe curl reproduction came out with unbalanced quoting — the
+# line is scrubbed once at assembly, again at emission, and again at the storage
+# boundary, and only the first pass was ever meant to change it.
+_ALREADY_REDACTED = r"(?!\s*<redacted>)"
+
 _SCRUB_PATTERNS = (
   # Whole-header redaction: redact the full value, which spans until the
   # next field separator (comma/semicolon/newline) or end of string.
-  (re.compile(r"(?i)\b(authorization)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(cookie)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(set-cookie)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(authorization)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(set-cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
+   r"\1: <redacted>"),
   # JWT (3 base64url chunks separated by dots, leading eyJ).
   (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
    "<jwt-redacted>"),
   # Bearer schema in body / URL: keep prefix only.
   (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"), "Bearer <redacted>"),
   # Common name=value forms (cookie / form / URL query).
-  (re.compile(r"(?i)\b(password|secret|token|api_key|apikey)=([^&\s\";,]+)"),
+  (re.compile(r"(?i)\b(password|secret|token|api_key|apikey)=" + _ALREADY_REDACTED
+              + r"([^&\s\";,]+)"),
    r"\1=<redacted>"),
   # JSON-style key:value.
   (re.compile(r'(?i)"(password|secret|token|api_key|bearer_token|api[\w_-]*key)"\s*:\s*"[^"]+"'),
@@ -107,9 +132,13 @@ def scrub_graybox_secrets(value: Any, *, secret_field_names: tuple[str, ...] = (
         continue
       esc = re.escape(name)
       # name=val → name=<redacted>
-      out = re.sub(rf"(?i)\b({esc})=([^&\s\";]+)", r"\1=<redacted>", out)
+      out = re.sub(
+        rf"(?i)\b({esc})={_ALREADY_REDACTED}([^&\s\";]+)", r"\1=<redacted>", out,
+      )
       # name: val (header form) → name: <redacted>
-      out = re.sub(rf"(?i)\b({esc})\s*:\s*\S+", r"\1: <redacted>", out)
+      out = re.sub(
+        rf"(?i)\b({esc})\s*:{_ALREADY_REDACTED}\s*\S+", r"\1: <redacted>", out,
+      )
       # JSON "name":"val"
       out = re.sub(rf'(?i)"({esc})"\s*:\s*"[^"]+"', r'"\1": "<redacted>"', out)
     return out
@@ -137,10 +166,22 @@ def _scrub_flat_finding(flat: dict, *, secret_field_names=()) -> dict:
       flat[key] = scrub_graybox_secrets(
         flat[key], secret_field_names=secret_field_names,
       )
-  if "evidence_artifacts" in flat and isinstance(flat["evidence_artifacts"], list):
-    flat["evidence_artifacts"] = scrub_graybox_secrets(
-      flat["evidence_artifacts"], secret_field_names=secret_field_names,
-    )
+  # Both evidence keys. `evidence_items` is the same payload re-keyed for the
+  # LLM input builder, and it was added here without being added to this list —
+  # so the artifacts were scrubbed while the copy handed to the model was not.
+  # A new field that carries target output has to be registered here or the
+  # storage-boundary scrubber silently does not cover it.
+  # `affected_assets` carries a copy of `url`/`parameter`, which is the one
+  # location pair a probe may set straight from target-controlled input rather
+  # than deriving from already-scrubbed evidence. It was emitted without being
+  # registered here, so the operator-configured secret names — the whole point
+  # of `secret_field_names` — never reached it, and the value went to the LLM,
+  # the archive, the PDF and the exports in clear.
+  for key in ("evidence_artifacts", "evidence_items", "affected_assets"):
+    if key in flat and isinstance(flat[key], list):
+      flat[key] = scrub_graybox_secrets(
+        flat[key], secret_field_names=secret_field_names,
+      )
   return flat
 
 
@@ -153,6 +194,12 @@ class GrayboxEvidenceArtifact:
   captured_at: str = ""
   raw_evidence_cid: str = ""
   sensitive: bool = False
+  # How long the triggering request took, and a hash over the captured
+  # request/response pair. The hash is evidence custody: it lets a reader check
+  # an archived snapshot is the one the probe saw, independently of the R1FS
+  # cid, which addresses the blob rather than this record.
+  latency_ms: int = 0
+  content_sha256: str = ""
 
   @classmethod
   def from_value(cls, value: Any) -> "GrayboxEvidenceArtifact":
@@ -166,6 +213,8 @@ class GrayboxEvidenceArtifact:
         captured_at=value.get("captured_at", "") or "",
         raw_evidence_cid=value.get("raw_evidence_cid", "") or "",
         sensitive=bool(value.get("sensitive", False)),
+        latency_ms=int(value.get("latency_ms") or 0),
+        content_sha256=value.get("content_sha256", "") or "",
       )
     if isinstance(value, str):
       return cls(summary=value)
@@ -173,6 +222,17 @@ class GrayboxEvidenceArtifact:
 
   def to_dict(self) -> dict[str, Any]:
     return asdict(self)
+
+
+def _asset_host(url) -> str:
+  """Host component of a finding's URL, for the affected-asset record."""
+  if not isinstance(url, str) or not url:
+    return ""
+  try:
+    from urllib.parse import urlsplit
+    return (urlsplit(url).hostname or "") or ""
+  except Exception:
+    return ""
 
 
 @dataclass(frozen=True)
@@ -204,6 +264,15 @@ class GrayboxFinding:
   # findings. Renders as a badge in the Navigator UI (Phase 8.3) and in
   # the PDF report when revert_failed (Phase 8.4 red-bordered note).
   rollback_status: str = ""                         # "" | "reverted" | "revert_failed" | "no_revert_needed"
+  # Where the finding manifests. This previously existed only inside a free-text
+  # `evidence` entry (`endpoint=http://...`) that nothing parsed, so a finding
+  # reached the report with no machine-readable answer to "where" — and two
+  # different endpoints could collapse to one finding id. Mapped to
+  # `affected_assets[].url` / `.parameter` by `to_flat_finding`, which is the
+  # shape RM-062's typed contract and dedup key are designed against.
+  url: str | None = None
+  parameter: str | None = None
+  method: str | None = None
 
   @classmethod
   def from_dict(cls, payload: dict[str, Any]) -> "GrayboxFinding":
@@ -250,21 +319,7 @@ class GrayboxFinding:
     Converts structured graybox fields to the common schema that
     _compute_risk_and_findings() produces for all finding types.
     """
-    import hashlib
-    canon_title = self.title.lower().strip()
     cwe_joined = ", ".join(self.cwe)
-    cwe_canonical = ", ".join(sorted({item.strip() for item in self.cwe if isinstance(item, str) and item.strip()}))
-    evidence_identity = []
-    for item in self.evidence:
-      if not isinstance(item, str):
-        continue
-      if item.startswith(("endpoint=", "path=", "protected_path=", "token_path=", "flow=", "test_id=")):
-        evidence_identity.append(item)
-    id_input = (
-      f"{port}:{probe_name}:{self.scenario_id}:{cwe_canonical}:"
-      f"{canon_title}:{'|'.join(sorted(evidence_identity))}"
-    )
-    finding_id = hashlib.sha256(id_input.encode()).hexdigest()[:16]
 
     # Map status -> confidence and effective severity
     confidence_map = {
@@ -274,22 +329,55 @@ class GrayboxFinding:
     }
     # not_vulnerable findings contribute zero to risk score —
     # override severity to INFO so they don't inflate finding_counts
-    effective_severity = "INFO" if self.status == "not_vulnerable" else self.severity.upper()
+    declared_severity = self.severity.upper()
+    effective_severity = "INFO" if self.status == "not_vulnerable" else declared_severity
+    confidence, confidence_recognised = _normalize_confidence(
+      confidence_map.get(self.status, "tentative"),
+    )
 
     flat = {
-      "finding_id": finding_id,
+      # Both producers stamp the same contract. Until they did, "the finding
+      # schema" was whatever the reader happened to test against, and a
+      # consumer had no way to tell a v0 archive from a current one.
+      "schema": REDMESH_FINDING_SCHEMA,
+      "schema_version": REDMESH_FINDING_SCHEMA_VERSION,
       "probe_type": "graybox",
       "severity": effective_severity,
+      # The declared value survives the INFO override, so coverage evidence can
+      # still say how much the check that passed was worth.
+      "declared_severity": declared_severity,
       "title": self.title,
       "description": f"Scenario {self.scenario_id}: {self.title}",
       "owasp_id": self.owasp,
       "cwe_id": cwe_joined,
+      # The typed list beside the display string. `cwe_id` alone is a joined
+      # form no consumer could parse past the first entry.
+      "cwe": _parse_cwe_list(self.cwe),
       "evidence": self._flat_evidence_summary(),
       "evidence_artifacts": [
         artifact.to_dict() for artifact in self._normalized_evidence_artifacts()
       ],
+      # The same artifacts under the key the LLM input builder actually reads.
+      # It consumes `evidence_items` and deliberately does not forward the
+      # legacy `evidence` string ("raw probe output. Use evidence_items
+      # instead"), so with `evidence_artifacts` as the only producer the model
+      # received no evidence at all and wrote its narrative without any.
+      "evidence_items": [
+        {
+          "kind": "request_response",
+          "caption": artifact.summary,
+          "snippet": artifact.response_snapshot,
+          "cid": artifact.raw_evidence_cid,
+        }
+        for artifact in self._normalized_evidence_artifacts()
+      ],
       "remediation": self.remediation,
-      "confidence": confidence_map.get(self.status, "tentative"),
+      # Canonical documentation links for the category and weaknesses. The flat
+      # finding carried none, so a reader saw "A01:2021" with nowhere to go —
+      # and `references` is a key the LLM input builder, the PDF and the
+      # exports all read.
+      "references": _reference_urls(self.owasp, self.cwe),
+      "confidence": confidence,
       "port": port,
       "protocol": protocol,
       "probe": probe_name,
@@ -302,13 +390,57 @@ class GrayboxFinding:
       "cvss_score": self.cvss_score,
       "cvss_vector": self.cvss_vector,
       "rollback_status": self.rollback_status,
+      # Structured location, in the same shape the blackbox `AffectedAsset`
+      # uses, so both finding types answer "where" the same way. Empty rather
+      # than absent when a probe has not set one, so consumers can distinguish
+      # "no location recorded" from "field missing".
+      "affected_assets": (
+        [{
+          "host": _asset_host(self.url),
+          "port": port,
+          "url": self.url,
+          "parameter": self.parameter,
+          "method": self.method,
+        }]
+        if (self.url or self.parameter) else []
+      ),
     }
+    # Identity is computed from the assembled finding rather than from a
+    # hand-rolled string, and by the same function the blackbox producer uses.
+    # The old input folded in the lowercased title and a selection of evidence
+    # strings, so rewording a probe's title — or changing how it phrased its
+    # evidence — silently re-identified every finding it had ever produced.
+    #
+    # Computed before `_scrub_flat_finding` runs, and carried rather than
+    # recomputed downstream: the report layer redacts the very fields the hash
+    # is over, so a value re-derived after redaction would never match the one
+    # archived with the finding.
+    # Two fields, not four: `finding_id` is the identity, `finding_signature`
+    # the content. The `dedup_key`/`content_hash` twins existed only to derive
+    # these and let the pairs disagree.
+    flat["finding_id"] = _dedup_key(flat)
+    flat["finding_signature"] = _content_hash(flat)
     return _scrub_flat_finding(flat, secret_field_names=secret_field_names)
 
   @classmethod
   def flat_from_dict(cls, payload: dict[str, Any], port: int, protocol: str,
                      probe_name: str, *, secret_field_names=()) -> dict[str, Any]:
     """Normalize a persisted graybox finding dict into the flat report contract."""
-    return cls.from_dict(payload).to_flat_finding(
+    flat = cls.from_dict(payload).to_flat_finding(
       port, protocol, probe_name, secret_field_names=secret_field_names,
     )
+    # Identity stamped at production wins over anything recomputed here. This
+    # runs on a *persisted* finding, which may already have been through the
+    # report layer's redaction — and redaction rewrites exactly the fields the
+    # hashes are over, so recomputing would hand the same finding a new identity
+    # and every consumer would read it as a new one.
+    # `dedup_key`/`content_hash` are the pre-collapse names for the same two
+    # values; archives written before the collapse carry only those.
+    flat["finding_id"] = (
+      payload.get("finding_id") or payload.get("dedup_key") or flat["finding_id"]
+    )
+    flat["finding_signature"] = (
+      payload.get("finding_signature") or payload.get("content_hash")
+      or flat["finding_signature"]
+    )
+    return flat

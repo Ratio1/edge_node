@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact, GrayboxFinding
 
@@ -192,3 +193,597 @@ class TestGrayboxFinding(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestGrayboxFindingLocation(unittest.TestCase):
+  """
+  A graybox finding carried no structured location. The endpoint existed only
+  inside a free-text `evidence` string (`endpoint=http://...`) that nothing
+  parsed, and `to_flat_finding` emitted no `affected_assets` at all — so a
+  finding reached the report with no machine-readable answer to "where".
+
+  RM-062's typed contract and dedup key are designed against
+  `affected_assets[].url` / `.parameter`, which is why this has to exist before
+  that contract is written rather than after.
+  """
+
+  def _finding(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    base = dict(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021",
+    )
+    base.update(kwargs)
+    return GrayboxFinding(**base)
+
+  def test_a_location_reaches_affected_assets(self):
+    finding = self._finding(
+      url="https://app.test/api/records/99", parameter="id", method="GET",
+    )
+    flat = finding.to_flat_finding(443, "https", "_graybox_idor")
+    assets = flat.get("affected_assets")
+    self.assertTrue(assets, "the flat finding carries no affected_assets")
+    self.assertEqual(assets[0]["url"], "https://app.test/api/records/99")
+    self.assertEqual(assets[0]["parameter"], "id")
+    self.assertEqual(assets[0]["method"], "GET")
+    self.assertEqual(assets[0]["port"], 443)
+
+  def test_a_finding_without_a_location_still_normalises(self):
+    flat = self._finding().to_flat_finding(443, "https", "_graybox_idor")
+    self.assertEqual(flat.get("affected_assets"), [])
+
+  def test_distinct_endpoints_stay_distinct(self):
+    # The dedup key RM-062 builds must not collapse two endpoints that differ
+    # only by URL. Before the location existed, identity came from the title
+    # plus whichever evidence strings happened to be present.
+    a = self._finding(url="https://app.test/api/records/1").to_flat_finding(
+      443, "https", "_graybox_idor")
+    b = self._finding(url="https://app.test/api/records/2").to_flat_finding(
+      443, "https", "_graybox_idor")
+    self.assertNotEqual(
+      a["finding_id"], b["finding_id"],
+      "two endpoints collapsed to one finding id, so N endpoints would dedup "
+      "to a single finding",
+    )
+
+  def test_the_same_endpoint_still_dedups(self):
+    a = self._finding(url="https://app.test/api/records/1").to_flat_finding(
+      443, "https", "_graybox_idor")
+    b = self._finding(url="https://app.test/api/records/1").to_flat_finding(
+      443, "https", "_graybox_idor")
+    self.assertEqual(a["finding_id"], b["finding_id"])
+
+  def test_a_parameter_alone_distinguishes_two_findings(self):
+    a = self._finding(url="https://app.test/s", parameter="q").to_flat_finding(
+      443, "https", "_graybox_inj")
+    b = self._finding(url="https://app.test/s", parameter="sort").to_flat_finding(
+      443, "https", "_graybox_inj")
+    self.assertNotEqual(a["finding_id"], b["finding_id"])
+
+  def test_the_location_survives_a_dict_round_trip(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    original = self._finding(url="https://app.test/x", parameter="p", method="POST")
+    restored = GrayboxFinding.from_dict(original.to_dict())
+    self.assertEqual(restored.url, "https://app.test/x")
+    self.assertEqual(restored.parameter, "p")
+    self.assertEqual(restored.method, "POST")
+
+  def test_the_probe_boundary_carries_the_location_through(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/api/records/99"],
+      url="https://app.test/api/records/99", parameter="id", method="GET",
+    )
+    self.assertEqual(probe.findings[0].url, "https://app.test/api/records/99")
+    self.assertEqual(probe.findings[0].parameter, "id")
+
+
+class TestLocationDerivedFromEvidence(unittest.TestCase):
+  """
+  `endpoint=<url>` is the established convention across the probes — 50 uses —
+  and was the de-facto location before a typed field existed. Promoting it at
+  the emission boundary populates every existing probe at once, rather than
+  relying on 18 call sites each being edited correctly.
+
+  An explicit `url=` always wins; a probe that emits no location key still gets
+  no location, which is the same as before.
+  """
+
+  def _probe(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    return probe
+
+  def _emit(self, evidence, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      evidence, **kwargs,
+    )
+    return probe.findings[0]
+
+  def test_endpoint_evidence_becomes_the_location(self):
+    finding = self._emit(["endpoint=https://app.test/api/records/99", "status=200"])
+    self.assertEqual(finding.url, "https://app.test/api/records/99")
+
+  def test_path_and_protected_path_are_also_recognised(self):
+    for key in ("path", "protected_path", "token_path"):
+      with self.subTest(key=key):
+        self.assertEqual(
+          self._emit([f"{key}=/admin/users"]).url, "/admin/users",
+        )
+
+  def test_an_explicit_url_wins_over_the_evidence(self):
+    finding = self._emit(
+      ["endpoint=https://app.test/from-evidence"],
+      url="https://app.test/explicit",
+    )
+    self.assertEqual(finding.url, "https://app.test/explicit")
+
+  def test_a_parameter_is_derived_when_present(self):
+    finding = self._emit(["endpoint=https://app.test/s", "parameter=sort"])
+    self.assertEqual(finding.parameter, "sort")
+
+  def test_no_location_key_means_no_location(self):
+    finding = self._emit(["status=200", "reason=whatever"])
+    self.assertIsNone(finding.url)
+
+  def test_the_derived_location_reaches_affected_assets(self):
+    finding = self._emit(["endpoint=https://app.test/api/records/99"])
+    flat = finding.to_flat_finding(443, "https", "_graybox_idor")
+    self.assertEqual(flat["affected_assets"][0]["url"],
+                     "https://app.test/api/records/99")
+
+  def test_two_endpoints_from_evidence_alone_stay_distinct(self):
+    a = self._emit(["endpoint=https://app.test/a"]).to_flat_finding(
+      443, "https", "_p")
+    b = self._emit(["endpoint=https://app.test/b"]).to_flat_finding(
+      443, "https", "_p")
+    self.assertNotEqual(a["finding_id"], b["finding_id"])
+
+
+class TestEvidenceArtifactProduction(unittest.TestCase):
+  """
+  `GrayboxEvidenceArtifact` was dead schema: zero constructions anywhere outside
+  tests. And even when populated it never reached the model — `to_flat_finding`
+  emits `evidence_artifacts` while `llm_input_builder` reads `evidence_items`,
+  which nothing produces for a graybox finding. The builder explicitly does not
+  forward the legacy `evidence` string ("raw probe output. Use evidence_items
+  instead"), so the LLM wrote its security narrative with **no evidence at all**.
+
+  Two stacked defects: an absent producer, and a key-name mismatch of the same
+  class as the `accepted` / `accepted_credentials` one.
+  """
+
+  def _probe(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    return probe
+
+  def _response(self, body="secret-free body", status=200, elapsed=0.25):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = body
+    resp.headers = {"Content-Type": "application/json"}
+    resp.url = "https://app.test/api/records/99"
+    resp.request = MagicMock()
+    resp.request.method = "GET"
+    resp.request.url = "https://app.test/api/records/99"
+    resp.request.headers = {"Accept": "application/json"}
+    resp.request.body = None
+    resp.elapsed = MagicMock()
+    resp.elapsed.total_seconds.return_value = elapsed
+    return resp
+
+  def _emit_with_response(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/api/records/99"],
+      response=self._response(**kwargs),
+    )
+    return probe.findings[0]
+
+  def test_the_triggering_response_becomes_an_evidence_artifact(self):
+    finding = self._emit_with_response()
+    self.assertTrue(finding.evidence_artifacts, "no artifact was produced")
+    artifact = finding.evidence_artifacts[0]
+    self.assertIn("GET", artifact.request_snapshot)
+    self.assertIn("200", artifact.response_snapshot)
+
+  def test_the_artifact_records_when_and_how_long(self):
+    artifact = self._emit_with_response(elapsed=0.25).evidence_artifacts[0]
+    self.assertTrue(artifact.captured_at, "no capture timestamp")
+    self.assertEqual(artifact.latency_ms, 250)
+
+  def test_the_artifact_carries_an_integrity_hash(self):
+    artifact = self._emit_with_response().evidence_artifacts[0]
+    self.assertEqual(len(artifact.content_sha256), 64)
+    # The same response hashes the same way; a different one does not.
+    other = self._emit_with_response(body="different body").evidence_artifacts[0]
+    self.assertNotEqual(artifact.content_sha256, other.content_sha256)
+
+  def test_the_snapshots_are_redacted(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    # Restore the real scrubber for this one: the artifact must not become a
+    # new way to archive what the scrubber removes elsewhere.
+    probe._scrub_for_emission = ProbeBase._scrub_for_emission.__get__(probe)
+    probe.target_config = None
+    resp = self._response()
+    resp.request.headers = {"Authorization": "Bearer sk-live-abcdefghijklmnop"}
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"], response=resp,
+    )
+    artifact = probe.findings[0].evidence_artifacts[0]
+    self.assertNotIn("sk-live-abcdefghijklmnop", artifact.request_snapshot)
+
+  def test_the_artifact_reaches_the_llm_under_the_key_it_reads(self):
+    flat = self._emit_with_response().to_flat_finding(443, "https", "_graybox_idor")
+    self.assertTrue(
+      flat.get("evidence_items"),
+      "the LLM input builder reads evidence_items and nothing produces it, so "
+      "the narrative is written with no evidence",
+    )
+    item = flat["evidence_items"][0]
+    self.assertEqual(item["kind"], "request_response")
+    self.assertTrue(item["caption"])
+
+  def test_a_secret_straddling_the_truncation_boundary_is_still_redacted(self):
+    """Truncating before scrubbing left half a key in the artifact.
+
+    The snapshot is capped at 2048 chars. Cutting first meant a secret that
+    began just before the cap survived as a prefix the pattern no longer
+    matched — and the retained half of an API key is still an API key, now
+    archived under a hash that certifies it as the evidence of record.
+    """
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import (
+      ProbeBase, _SNAPSHOT_MAX_CHARS,
+    )
+    probe = self._probe()
+    probe._scrub_for_emission = ProbeBase._scrub_for_emission.__get__(probe)
+    probe.target_config = None
+    secret = "sk-live-abcdefghijklmnopqrstuvwx"
+    # Land the secret so it begins inside the retained region and ends outside.
+    prefix = "HTTP 200\nContent-Type: application/json\n\n"
+    lead = " token="
+    padding = "a" * (_SNAPSHOT_MAX_CHARS - len(prefix) - len(lead) - 20)
+    body = f"{padding}{lead}{secret} trailing"
+    # Precondition, not decoration: the first version of this test put only two
+    # characters of the secret inside the retained region, so it passed against
+    # the very bug it was written for. Prove the naive snapshot really would
+    # have kept a usable prefix before asserting the real one does not.
+    naive = (prefix + body)[:_SNAPSHOT_MAX_CHARS]
+    self.assertIn(secret[:16], naive, "the fixture no longer straddles the cut")
+    self.assertNotIn(secret, naive, "the fixture no longer straddles the cut")
+    resp = self._response(body=body)
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"], response=resp,
+    )
+    snapshot = probe.findings[0].evidence_artifacts[0].response_snapshot
+    self.assertLessEqual(len(snapshot), _SNAPSHOT_MAX_CHARS)
+    # Any run of the secret long enough to be usable must be gone, not just the
+    # whole string: the leak is the surviving prefix.
+    for length in range(12, len(secret) + 1):
+      self.assertNotIn(
+        secret[:length], snapshot,
+        f"a {length}-char prefix of the secret survived truncation",
+      )
+
+  def test_emitting_without_a_response_is_unchanged(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"],
+    )
+    self.assertEqual(probe.findings[0].evidence_artifacts, [])
+
+
+class TestLocationFieldsAreScrubbed(unittest.TestCase):
+  """`url` / `parameter` are the one pair a probe may set from raw target input.
+
+  Every other location value is derived from evidence the scrubber has already
+  been over. These two, and the `affected_assets` copy `to_flat_finding` makes
+  of them, were registered with neither scrubbing boundary — so a userinfo
+  credential in a URL was masked in the sibling `evidence` field and shipped
+  intact in `url`, to the LLM, the archive, the PDF and the exports.
+  """
+
+  def _flat(self, *, secret_field_names=(), **kwargs):
+    finding = GrayboxFinding(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021", **kwargs,
+    )
+    return finding.to_flat_finding(
+      port=443, protocol="https", probe_name="_p",
+      secret_field_names=secret_field_names,
+    )
+
+  def test_a_configured_secret_name_is_masked_in_the_location(self):
+    """The generic patterns already cover `to_dict`; the configured names did not.
+
+    `secret_field_names` is how an operator declares their own auth parameter,
+    and it is applied at the storage boundary — which `affected_assets` was
+    never registered with.
+    """
+    flat = self._flat(
+      url="https://app.test/x?corp_key=SEKRET-VALUE-1",
+      secret_field_names=("corp_key",),
+    )
+    self.assertNotIn("SEKRET-VALUE-1", flat["affected_assets"][0]["url"])
+
+  def test_a_configured_secret_name_is_masked_in_the_parameter(self):
+    flat = self._flat(
+      url="https://app.test/x", parameter="corp_key=SEKRET-VALUE-1",
+      secret_field_names=("corp_key",),
+    )
+    self.assertNotIn("SEKRET-VALUE-1", flat["affected_assets"][0]["parameter"])
+
+  def test_an_ordinary_location_is_untouched(self):
+    flat = self._flat(url="https://app.test/api/records/99", parameter="id")
+    asset = flat["affected_assets"][0]
+    self.assertEqual(asset["url"], "https://app.test/api/records/99")
+    self.assertEqual(asset["parameter"], "id")
+
+
+class TestCurlReproduction(unittest.TestCase):
+  """
+  A vulnerable finding should carry a command that reproduces it. The evidence
+  artifact captures the triggering request, so the reproduction is derivable
+  rather than something a probe author has to hand-write and keep in sync.
+
+  Redaction matters more here than elsewhere: a curl line is *designed* to be
+  copied and run, so an Authorization header left in it is a credential handed
+  to whoever reads the report.
+  """
+
+  def _probe(self, real_scrub=False):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    if real_scrub:
+      probe._scrub_for_emission = ProbeBase._scrub_for_emission.__get__(probe)
+      probe.target_config = None
+    else:
+      probe._scrub_for_emission = lambda value: value
+    return probe
+
+  def _response(self, method="GET", headers=None, body=None):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = "{}"
+    resp.headers = {"Content-Type": "application/json"}
+    resp.url = "https://app.test/api/records/99"
+    resp.request = MagicMock()
+    resp.request.method = method
+    resp.request.url = "https://app.test/api/records/99"
+    resp.request.headers = headers if headers is not None else {"Accept": "*/*"}
+    resp.request.body = body
+    resp.elapsed = MagicMock()
+    resp.elapsed.total_seconds.return_value = 0.1
+    return resp
+
+  def _emit(self, probe=None, **response_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = probe or self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/api/records/99"],
+      response=self._response(**response_kwargs),
+    )
+    return probe.findings[0]
+
+  def _curl(self, finding):
+    return next(
+      (step for step in finding.replay_steps if step.startswith("curl ")), None,
+    )
+
+  def test_a_vulnerable_finding_carries_a_curl_reproduction(self):
+    curl = self._curl(self._emit())
+    self.assertIsNotNone(curl, "no curl reproduction was generated")
+    self.assertIn("https://app.test/api/records/99", curl)
+
+  def test_the_method_and_body_are_reproduced(self):
+    curl = self._curl(self._emit(method="POST", body='{"id": 99}'))
+    self.assertIn("-X POST", curl)
+    self.assertIn('{"id": 99}', curl)
+
+  def test_a_get_does_not_carry_a_redundant_method_flag(self):
+    self.assertNotIn("-X GET", self._curl(self._emit()))
+
+  def test_the_credential_is_not_handed_to_the_reader(self):
+    probe = self._probe(real_scrub=True)
+    finding = self._emit(
+      probe=probe,
+      headers={"Authorization": "Bearer sk-live-abcdefghijklmnop"},
+    )
+    curl = self._curl(finding)
+    self.assertNotIn("sk-live-abcdefghijklmnop", curl)
+
+  def test_the_command_is_shell_safe(self):
+    # A target-controlled URL must not be able to break out of the quoting and
+    # become a second shell command in something a reader is invited to run.
+    resp = self._response()
+    resp.request.url = "https://app.test/x'; rm -rf /tmp/pwned; echo '"
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=x"], response=resp,
+    )
+    curl = self._curl(probe.findings[0])
+    # Assert the real property rather than the escaping style: a shell parsing
+    # this line recovers the URL as a single argument, and the injected text
+    # never becomes a command of its own.
+    import shlex
+    tokens = shlex.split(curl)
+    self.assertEqual(tokens[-1], resp.request.url)
+    self.assertNotIn("rm", tokens)
+
+  def test_redaction_cannot_reach_inside_the_quoting(self):
+    """Scrubbing the assembled line let a substitution unbalance the quotes.
+
+    A URL carrying both a quote character and a scrubber trigger came out as a
+    line `shlex` could not parse at all. That failed closed — the reader gets a
+    syntax error, not an extra command — but the reproduction was useless, and
+    it stayed harmless only while no scrubber pattern produced something that
+    re-parses. Scrubbing each component before quoting removes the class.
+    """
+    import shlex
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    for payload in (
+      "https://app.test/x?token=A'&z=1;touch /tmp/pwned;echo ",
+      "https://app.test/x?api_key=B';rm -rf /tmp/pwned;#",
+      "https://app.test/x?password=C' Authorization: Bearer zzzzzzzzzz '",
+    ):
+      with self.subTest(url=payload):
+        resp = self._response()
+        resp.request.url = payload
+        probe = self._probe(real_scrub=True)
+        ProbeBase.emit_vulnerable(
+          probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+          ["endpoint=x"], response=resp,
+        )
+        curl = self._curl(probe.findings[0])
+        tokens = shlex.split(curl)  # raises if the quoting was corrupted
+        self.assertEqual(tokens[0], "curl")
+        for dangerous in ("rm", "touch"):
+          self.assertNotIn(dangerous, tokens)
+
+  def test_a_probes_own_replay_steps_are_kept(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=x"], replay_steps=["Log in as a regular user."],
+      response=self._response(),
+    )
+    steps = probe.findings[0].replay_steps
+    self.assertIn("Log in as a regular user.", steps)
+    self.assertTrue(any(s.startswith("curl ") for s in steps))
+
+  def test_no_response_means_no_curl(self):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"], ["endpoint=x"],
+    )
+    self.assertIsNone(self._curl(probe.findings[0]))
+
+
+class TestEvidenceEnrichmentNeverLosesTheFinding(unittest.TestCase):
+  """
+  Evidence is supplementary; the finding is the product. If artifact or curl
+  construction raises, `run_safe` swallows it and the probe emits **no finding
+  at all** — the vulnerability is silently dropped because decorating it failed.
+
+  Caught when wiring the probes: both helpers raised on a response whose
+  attributes were not the expected types, which took out 17 tests and would have
+  taken out real findings against any response shape they did not anticipate.
+  """
+
+  def _emit(self, response):
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = ProbeBase.__new__(ProbeBase)
+    probe.findings = []
+    probe._scrub_for_emission = lambda value: value
+    probe._resolve_attack = lambda scenario_id, attack: list(attack or [])
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"], response=response,
+    )
+    return probe.findings
+
+  def test_an_unusable_response_still_yields_the_finding(self):
+    for label, response in (
+      ("bare mock", MagicMock()),
+      ("no request attribute", object()),
+      ("string masquerading as a response", "not-a-response"),
+      ("integer", 7),
+    ):
+      with self.subTest(response=label):
+        findings = self._emit(response)
+        self.assertEqual(
+          len(findings), 1,
+          "the finding was lost because its evidence could not be built",
+        )
+        self.assertEqual(findings[0].status, "vulnerable")
+
+  def test_the_finding_keeps_its_own_content_when_evidence_fails(self):
+    finding = self._emit(MagicMock())[0]
+    self.assertEqual(finding.title, "IDOR")
+    self.assertEqual(finding.url, "https://app.test/x")
+
+
+class TestFindingReferenceUrls(unittest.TestCase):
+  """
+  A graybox finding carried an OWASP category and CWE ids but no reference URLs,
+  and `to_flat_finding` emitted no `references` key at all — which the LLM input
+  builder reads, alongside the PDF and the exports. A reader got "A01:2021" with
+  nowhere to go.
+
+  URL construction was already duplicated in three places (misp_export,
+  stix_export, tls.py) in three slightly different forms, so this derives from
+  the shared category table instead of adding a fourth copy.
+  """
+
+  def _finding(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    base = dict(
+      scenario_id="PT-A01-01", title="IDOR", status="vulnerable",
+      severity="HIGH", owasp="A01:2021", cwe=["CWE-639"],
+    )
+    base.update(kwargs)
+    return GrayboxFinding(**base)
+
+  def test_the_owasp_url_is_the_canonical_one(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    urls = reference_urls("A01:2021", ())
+    self.assertIn("https://owasp.org/Top10/A01_2021-Broken_Access_Control/", urls)
+
+  def test_the_cwe_url_is_the_canonical_one(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    urls = reference_urls("", ["CWE-639"])
+    self.assertIn("https://cwe.mitre.org/data/definitions/639.html", urls)
+
+  def test_a_finding_carries_its_references(self):
+    flat = self._finding().to_flat_finding(443, "https", "_graybox_idor")
+    refs = flat.get("references")
+    self.assertTrue(refs, "the flat finding carries no references")
+    self.assertTrue(any("owasp.org" in r for r in refs))
+    self.assertTrue(any("cwe.mitre.org/data/definitions/639" in r for r in refs))
+
+  def test_multiple_cwes_each_get_a_url(self):
+    flat = self._finding(cwe=["CWE-639", "CWE-862"]).to_flat_finding(
+      443, "https", "_graybox_idor")
+    refs = flat["references"]
+    self.assertTrue(any("639.html" in r for r in refs))
+    self.assertTrue(any("862.html" in r for r in refs))
+
+  def test_unknown_or_absent_ids_produce_no_url(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    self.assertEqual(reference_urls("", ()), [])
+    self.assertEqual(reference_urls("A99:2021", ()), [])
+    self.assertEqual(reference_urls("", ["not-a-cwe"]), [])
+
+  def test_references_are_deduplicated_and_ordered(self):
+    from extensions.business.cybersec.red_mesh.references import reference_urls
+    urls = reference_urls("A01:2021", ["CWE-639", "CWE-639"])
+    self.assertEqual(len(urls), len(set(urls)))

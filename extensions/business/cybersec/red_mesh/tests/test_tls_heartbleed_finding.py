@@ -71,6 +71,35 @@ class TestHeartbleedFindingHasCveField(unittest.TestCase):
     self.assertIn("CVE-2014-0160", result.title)
     self.assertEqual(result.cwe_id, "CWE-126")
 
+  def test_tls_check_heartbleed_records_the_leak_size_in_raw(self):
+    """The quantified leak moved out of `evidence` (volatile in the dedup key)
+    into raw_data. Review found the first version deleted it entirely — the
+    helper had no raw dict, so 'moved to raw_data' was untrue at this site."""
+    probe = self._make_probe()
+
+    fake_raw_after = MagicMock()
+    fake_raw_after.recv.return_value = _build_leak_response()
+
+    fake_tls_sock = MagicMock()
+    fake_tls_sock.version.return_value = "TLSv1.2"
+    fake_tls_sock.unwrap.return_value = fake_raw_after
+
+    fake_ctx = MagicMock()
+    fake_ctx.wrap_socket.return_value = fake_tls_sock
+
+    raw = {}
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.service.tls.ssl.SSLContext",
+      return_value=fake_ctx,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.service.tls.socket.socket",
+      return_value=MagicMock(),
+    ):
+      result = probe._tls_check_heartbleed("10.0.0.1", 8443, raw=raw)
+
+    self.assertIsNotNone(result)
+    self.assertGreater(raw.get("heartbleed_leaked_bytes", 0), 0)
+
   def test_tls_heartbleed_raw_populates_cve_field(self):
     probe = self._make_probe()
 
@@ -136,7 +165,7 @@ class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
     probe._tls_check_expiry = lambda raw: []
     probe._tls_check_default_cn = lambda raw: []
     probe._tls_check_downgrade = lambda t, p: []
-    probe._tls_check_heartbleed = lambda t, p: Finding(
+    probe._tls_check_heartbleed = lambda t, p, raw=None: Finding(
       severity=Severity.CRITICAL,
       title="TLS Heartbleed vulnerability (CVE-2014-0160)",
       cve=("CVE-2014-0160",),
