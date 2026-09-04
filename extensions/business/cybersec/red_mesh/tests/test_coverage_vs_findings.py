@@ -855,6 +855,18 @@ class TestDedupTiesAreOrderIndependent(unittest.TestCase):
       self.assertEqual(len(flat), 1)
       self.assertTrue(flat[0]["kev"], "the unenriched record won the tiebreak")
 
+  def test_short_and_non_ascii_year_prefixes_lose_to_a_real_timestamp(self):
+    """`freshness[:4].isdigit()` is true for "9" and for Arabic-Indic digits,
+    both of which sort above every ASCII ISO date — so both would have won the
+    tiebreak while reading as demoted."""
+    real = self._record(True, 0.9, "2026-09-01T00:00:00Z")
+    for bogus in ("9", "999", "٢٠٢٦-01-01"):
+      for items in ([real, self._record(False, 0.1, bogus)],
+                    [self._record(False, 0.1, bogus), real]):
+        flat = self._run(items)
+        self.assertEqual(len(flat), 1)
+        self.assertTrue(flat[0]["kev"], f"{bogus!r} won the tiebreak")
+
   def test_an_equal_rank_tie_has_the_same_survivor_in_both_orders(self):
     a = {"title": "CVE-2020-1 in x", "severity": "HIGH", "confidence": "certain",
          "description": "wording one"}

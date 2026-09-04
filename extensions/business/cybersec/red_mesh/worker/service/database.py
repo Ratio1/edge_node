@@ -1083,11 +1083,14 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         # (infrastructure.py SNMP/DNS/Modbus): control bytes and escape
         # sequences do not belong in an archived field, and mapping per byte
         # makes the split-a-character-in-half bug impossible rather than merely
-        # unlikely. A server that answers with nothing keeps the descriptive
-        # label — an empty string would record neither the observation nor the
-        # fact.
-        readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
-        raw["banner"] = readable.strip()[:120] or "Memcached port open"
+        # unlikely. Strip the *bytes* first: memcached terminates every line
+        # with CRLF, and filtering before stripping turns that terminator into
+        # ".." — which is not whitespace, so it survives and every banner ends
+        # in dots. It also means a bare-CRLF answer never reaches the fallback
+        # below, which is how a server that answers with nothing keeps the
+        # descriptive label instead of archiving "..".
+        readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data.strip())
+        raw["banner"] = readable[:120] or "Memcached port open"
         findings.append(Finding(
           severity=Severity.INFO,
           title="Memcached port open",

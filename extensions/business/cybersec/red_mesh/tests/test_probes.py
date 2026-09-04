@@ -817,18 +817,31 @@ class RedMeshOWASPTests(unittest.TestCase):
       self.assertNotIn(forbidden, banner)
 
   def test_memcached_banner_is_stripped(self):
-    """The sibling sites strip before slicing; without it the surrounding
-    whitespace of a padded response is archived verbatim."""
-    info = self._memcached_raw(b"   ERROR line   ")
+    """Memcached is line-oriented: every real response ends CRLF. Stripping the
+    bytes before the printable filter is what keeps that terminator out — filter
+    first and it becomes "..", which is not whitespace and so survives strip."""
+    self.assertEqual(self._memcached_raw(b"ERROR\r\n")["banner"], "ERROR")
+    self.assertEqual(
+      self._memcached_raw(b"CLIENT_ERROR bad command line format\r\n")["banner"],
+      "CLIENT_ERROR bad command line format",
+    )
+    self.assertEqual(self._memcached_raw(b"   ERROR line   ")["banner"], "ERROR line")
 
-    self.assertEqual(info["banner"], "ERROR line")
+  def test_memcached_banner_falls_back_when_the_answer_is_only_a_terminator(self):
+    """A bare CRLF is a server answering with nothing. It must reach the label,
+    not archive ".." — the filter-then-strip order made this case unreachable."""
+    for nothing in (b"", b"\r\n", b"\t\t", b"   "):
+      self.assertEqual(
+        self._memcached_raw(nothing)["banner"], "Memcached port open",
+        f"{nothing!r} should fall back to the descriptive label",
+      )
 
-  def test_memcached_banner_keeps_the_label_when_nothing_came_back(self):
-    """An empty response records neither the observation nor the fact, so the
-    descriptive label stands in rather than an empty string."""
-    info = self._memcached_raw(b"")
+  def test_memcached_banner_is_capped(self):
+    """The archived banner is bounded; an unbounded server response must not
+    land in the archive whole."""
+    info = self._memcached_raw(b"E" * 500)
 
-    self.assertEqual(info["banner"], "Memcached port open")
+    self.assertEqual(len(info["banner"]), 120)
 
   def test_service_elasticsearch_metadata(self):
     owner, worker = self._build_worker(ports=[9200])

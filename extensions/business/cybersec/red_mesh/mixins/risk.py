@@ -380,7 +380,10 @@ class _RiskScoringMixin:
       # control. A value that is malformed *and* starts with digits still wins;
       # closing that needs real validation, not a wider prefix check.
       freshness = str(f.get("cvss_data_freshness") or "")
-      if not freshness[:4].isdigit():
+      year = freshness[:4]
+      # `isdigit()` alone is not a four-digit test — it is true for "9" — and it
+      # accepts non-ASCII digits, which sort above every ASCII date.
+      if not (len(year) == 4 and year.isascii() and year.isdigit()):
         freshness = ""
       signature = str(f.get("finding_signature") or "")
       return severity, confidence, freshness, signature
