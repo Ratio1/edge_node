@@ -89,6 +89,11 @@ _CONTENT_FIELDS = (
   "references",
 )
 
+# Left out of `_CONTENT_FIELDS` because the value moves, not because it is
+# uninteresting. See `volatile_non_content_fields()`.
+_VOLATILE_NON_CONTENT_FIELDS = frozenset({"cvss_data_freshness"})
+
+
 _UNIT = "\x1f"
 _RECORD = "\x1e"
 
@@ -242,3 +247,20 @@ def content_hash(finding: dict, *, asset_canonical: str | None = None) -> str:
 def worker_attribution_fields() -> frozenset:
   """Exposed so report-layer dedup excludes the same fields this hash does."""
   return _WORKER_ATTRIBUTION_FIELDS
+
+
+def volatile_non_content_fields() -> frozenset:
+  """Fields left out of `_CONTENT_FIELDS` because they *move*, not because they
+  are uninteresting — so every dedup path has to exclude them, not just this one.
+
+  Most fields absent from `_CONTENT_FIELDS` (tags, impact, steps_to_reproduce)
+  are simply not tracked for change detection, and the report layer is right to
+  hash them: they are content in the "is this the same finding" sense.
+  `cvss_data_freshness` is different. It is a fetch timestamp, excluded above
+  with the reason that hashing it "would fork signatures between workers whose
+  NVD fetches straddle a second". That reasoning holds for the report layer's
+  whole-dict key too — and until 2026-09-04 that key hashed it, so the fork the
+  exclusion exists to prevent happened anyway, one path over. Measured: two
+  workers, one CVE, fetches a second apart, two rows instead of one.
+  """
+  return _VOLATILE_NON_CONTENT_FIELDS

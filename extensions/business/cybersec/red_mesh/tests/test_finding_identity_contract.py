@@ -705,3 +705,60 @@ class TestStampedAndRawRepresentationsShareIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestTheThreeKeysAgreeAboutWhatMoves(unittest.TestCase):
+  """There are three keys over a finding and they do not hash the same fields.
+  That asymmetry has now caused two defects — reasoning about `content_hash`
+  and forgetting `report._finding_dedup_key`:
+
+  - `description` was believed not to affect identity, so per-scan counts were
+    moved into it. The report key hashes it, so they still forked cross-worker.
+  - `evidence_items` was believed to be a safe unhashed channel. Same reason.
+
+  This pins the classification instead of leaving it to be rediscovered. A new
+  `Finding` field lands in one of the buckets below and the test says which.
+  """
+
+  def _keys(self, finding):
+    from extensions.business.cybersec.red_mesh.mixins.report import _finding_dedup_key
+    return (dedup_key(finding), content_hash(finding), _finding_dedup_key(finding))
+
+  def _moves(self, field, value):
+    base = _finding(title="T", description="d", evidence="e")
+    other = dict(base)
+    other[field] = value
+    a, b = self._keys(base), self._keys(other)
+    return tuple(x != y for x, y in zip(a, b))
+
+  def test_a_field_the_content_hash_ignores_because_it_moves_is_ignored_everywhere(self):
+    """`cvss_data_freshness` is a fetch timestamp. `_CONTENT_FIELDS` excludes it
+    so two workers whose NVD lookups straddle a second still collapse. The
+    report layer's whole-dict key hashed it anyway until 2026-09-04, so the
+    fork the exclusion exists to prevent happened one path over."""
+    identity, content, report = self._moves("cvss_data_freshness", "2027-01-01T00:00:00Z")
+    self.assertFalse(identity, "a fetch timestamp must not touch identity")
+    self.assertFalse(content, "a fetch timestamp must not touch the content hash")
+    self.assertFalse(report, "a fetch timestamp must not touch the report key")
+
+  def test_fields_the_content_hash_ignores_because_they_are_untracked_still_key_the_report(self):
+    """The other side of the distinction. Most fields absent from
+    `_CONTENT_FIELDS` are simply not tracked for change detection; they are
+    still content for "is this the same finding", so the report key should hash
+    them. Only the *moving* ones get excluded everywhere."""
+    for field, value in (("impact", "ZZZ"), ("tags", ["z"]), ("steps_to_reproduce", "ZZZ")):
+      identity, content, report = self._moves(field, value)
+      self.assertFalse(content, f"{field} unexpectedly entered the content hash")
+      self.assertTrue(report, f"{field} should still distinguish two findings")
+
+  def test_the_report_key_hashes_everything_the_content_hash_does(self):
+    """The containment that makes the classification a hierarchy rather than
+    two unrelated lists: anything that is content is also report-content."""
+    for field, value in (("title", "ZZZ"), ("description", "ZZZ"), ("evidence", "ZZZ"),
+                         ("severity", "LOW"), ("confidence", "tentative"),
+                         ("remediation", "ZZZ"), ("kev", True)):
+      _identity, content, report = self._moves(field, value)
+      if content:
+        self.assertTrue(
+          report, f"{field} moves the content hash but not the report key",
+        )

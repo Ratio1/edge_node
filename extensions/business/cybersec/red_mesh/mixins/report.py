@@ -14,6 +14,7 @@ from ..worker import PentestLocalWorker
 from ..models import UiAggregate
 from ..models.finding_identity import (
   worker_attribution_fields as _worker_attribution_fields,
+  volatile_non_content_fields as _volatile_non_content_fields,
 )
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 # Shared with the SIEM event builder, which redacts at the egress boundary
@@ -35,7 +36,9 @@ from ..credential_redaction import (
 # `observed_at` and `node_ip` before this runs, and cross-worker dedup is the
 # one thing this signature exists to do.
 _DEDUP_EXCLUDE_FIELDS = frozenset(
-  {"_source_worker_id", "_source_node_addr"} | set(_worker_attribution_fields())
+  {"_source_worker_id", "_source_node_addr"}
+  | set(_worker_attribution_fields())
+  | set(_volatile_non_content_fields())
 )
 
 
