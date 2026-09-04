@@ -494,8 +494,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     if consecutive_401 >= len(self._HTTP_BASIC_CREDS) - 1:
       findings.append(Finding(
         severity=Severity.MEDIUM,
-        title=f"HTTP Basic Auth has no rate limiting ({raw['tested']} attempts accepted)",
-        description="The server does not rate-limit failed authentication attempts.",
+        title="HTTP Basic Auth has no rate limiting",
+        description=f"The server accepted {raw['tested']} authentication attempts without "
+                    "rate-limiting failed logins.",
         evidence=f"{consecutive_401} consecutive 401 responses without rate limiting.",
         remediation="Implement account lockout or rate limiting for failed auth attempts.",
         owasp_id="A07:2021",
@@ -1718,10 +1719,15 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         sock.close()
       except Exception:
         pass
+      # Whatever answered is not rsync, so the reply is arbitrary service
+      # output — a timestamped SMTP/HTTP greeting as easily as anything else.
+      # It belongs in raw_data; in `description` it reached the content hash
+      # and forked the finding between two workers a second apart.
+      raw["banner"] = banner[:120]
       findings.append(Finding(
         severity=Severity.INFO,
         title=f"Port {port} open but no rsync banner",
-        description=f"Expected @RSYNCD banner, got: {banner[:80]}",
+        description="The service did not present an @RSYNCD banner.",
         confidence="tentative",
       ))
       return probe_result(raw_data=raw, findings=findings)

@@ -995,9 +995,11 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         severity=Severity.MEDIUM,
         title="SMB service responded to negotiation probe",
         description=f"SMB on {target}:{port} accepts negotiation requests.",
-        # The banner is already in raw_data; interpolating it here put
-        # per-response bytes into the content hash.
-        evidence="The service answered an SMB negotiation request.",
+        # Not volatile despite the name: `raw["banner"]` here is one of four
+        # deterministic strings set at :846/:865/:915/:925, the last being the
+        # 4-byte protocol id, which is constant per server. Keeping it is what
+        # distinguishes SMBv1 from SMBv2 from unknown in the finding itself.
+        evidence=f"Banner: {raw.get('banner', 'N/A')}",
         remediation="Restrict SMB access to trusted networks; disable SMBv1.",
         owasp_id="A01:2021",
         cwe_id="CWE-284",

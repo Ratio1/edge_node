@@ -243,7 +243,7 @@ class TestVolatileCountsStayOutOfTitles(unittest.TestCase):
       raw = {}
       return probe._redis_check_data(MagicMock(), raw), raw
 
-    grown, raw_grown = scan(1201)
+    grown, _ = scan(1201)
     before, raw_before = scan(1200)
     self.assertTrue(before and grown, "the DBSIZE finding was not produced")
     keys = lambda fs: [f.compute_dedup_key(probe_id="_service_info_redis") for f in fs]
@@ -257,53 +257,110 @@ class TestVolatileCountsStayOutOfTitles(unittest.TestCase):
 
 
 class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
-  """Ratchet: a new `evidence=f"..."` interpolating per-request data fails here.
+  """Ratchet: a volatile value reaching a hashed finding field fails here.
 
-  Line-based and deliberately approximate — it catches the single-line form
-  every current producer uses; a volatile value smuggled onto a continuation
-  line slips past it. The allowlist was burned down to empty on 2026-09-03;
-  a new entry is debt being taken on and needs a justification comment and an
-  owner, not a silent add.
+  Three fields, two tiers. A *raw observed value* (banner, cookie, response
+  bytes) is barred from `evidence`, `title` and `description` alike. A
+  *per-scan magnitude* (a count, a length, an age) is barred from `evidence`
+  and `title` but allowed in `description`, which feeds `content_hash` without
+  feeding `dedup_key`.
+
+  Line-based and deliberately approximate. Known gaps, none currently live:
+  continuation lines, single-quoted f-strings, `.format()`, `%`, concatenation,
+  and an f-string bound to a local then passed by name. The name vocabulary is
+  a denylist, so `{tokens}` and `{csrf_token}` slip the identifier boundaries.
+  It catches the single-line form every current producer uses; it is a ratchet,
+  not a proof.
+
+  An allowlist entry is a verified false positive or documented debt. It needs
+  a justification and an owner, not a silent add, and the shrink test below
+  requires the line it names to still exist.
   """
 
-  # Locals whose interpolation into `evidence` makes it per-request data.
+  # Raw observed values. These belong in `raw_data` and in no hashed field at
+  # all — not evidence, not title, not description.
   _VOLATILE = (
     "banner", "location", "cookie", "readable", "token", "resp.text", "data",
   )
+  # Per-scan magnitudes. Barred from `evidence` and `title`, but permitted in
+  # `description`: that is the destination this batch chose for them, and
+  # `description` feeds `content_hash` (change detection) without feeding
+  # `dedup_key` (identity). A count that moves is a change worth detecting.
   _VOLATILE_PREFIXES = ("len_", "len(")
   _VOLATILE_SUFFIXES = ("_count", "count}")
+  # Magnitudes the `len(`/`count` shapes miss, each having reached a title in
+  # the tree: `uptime_seconds` advances once per second, `tested` varies when a
+  # probe loop breaks early, `age_days` moves at midnight. Same tier as the
+  # counts — out of evidence and title, fine in description. The vocabulary is
+  # a denylist and is known incomplete: `{tokens}` and `{csrf_token}` still
+  # slip the identifier boundaries below.
 
   # Empty by design: every previously-exempt site was fixed 2026-09-03
   # (closeout plan, Phase 3). A new entry here is debt being taken on — it
   # needs a justification comment and a burn-down owner, not a silent add.
-  _ALLOWLIST = set()
+  _ALLOWLIST = {
+    # Verified false positive, 2026-09-04: flagged on the *name* `banner`, but
+    # `raw["banner"]` in `_service_info_smb` is one of four deterministic
+    # strings (infrastructure.py :846/:865/:915/:925), the last being the
+    # 4-byte protocol id — constant per server. Keeping it is what
+    # distinguishes SMBv1 from SMBv2 from unknown in the finding itself.
+    # Owner: RM-062. Removable only by making the predicate value-aware.
+    ("service/infrastructure.py",
+     'evidence=f"Banner: {raw.get(\'banner\', \'N/A\')}",'),
+  }
 
-  def _is_volatile(self, line):
+  @staticmethod
+  def _named(name, token):
+    import re
+    # Identifier boundaries: `cookie` must flag `{cookie.strip()}` and
+    # `{cookie}` but not `{cookie_name}` — the cookie's *name* is stable data,
+    # its value is the secret. `search`, not `match`: anchoring at the start of
+    # the expression made every subscript form invisible, so
+    # `{raw['banner'][:80]}` slipped past while `{banner}` was caught.
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])", name)
+
+  def _has_raw_value(self, line):
+    """Raw observed values — barred from every hashed field."""
+    for chunk in line.split("{")[1:]:
+      name = chunk.split("}")[0]
+      if any(self._named(name, v) for v in self._VOLATILE):
+        return True
+    return False
+
+  def _has_magnitude(self, line):
+    """Per-scan counts and sizes — barred from `evidence` and `title` only."""
     import re
 
     for chunk in line.split("{")[1:]:
       name = chunk.split("}")[0]
-      # Identifier-boundary match: `cookie` must flag `{cookie.strip()}` and
-      # `{cookie}` but not `{cookie_name}` — the cookie's *name* is stable
-      # data, its value is the secret.
-      for volatile in self._VOLATILE:
-        # `search`, not `match`: anchoring at the start of the expression made
-        # every subscript and attribute form invisible, so
-        # `{raw['banner'][:80]}` slipped past while `{banner}` was caught. The
-        # explicit boundaries keep the `{cookie_name}` exemption above.
-        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(volatile)}(?![A-Za-z0-9_])", name):
-          return True
       if any(name.startswith(v) for v in self._VOLATILE_PREFIXES):
         return True
       if re.search(r"(?<![A-Za-z0-9_])[a-z_]*count(?![A-Za-z0-9_])", name):
         return True
+      if any(self._named(name, v) for v in ("uptime_seconds", "tested", "age_days")):
+        return True
     return False
 
-  # `evidence` is part of the content hash; `title` is worse — it is
-  # `dedup_key`'s discriminator for any finding with no scenario id and no
-  # specific location, which under worker/ is all of them. A volatile value
-  # there re-keys the finding every scan and detaches its persisted triage.
+  def _is_volatile(self, line):
+    return self._has_raw_value(line) or self._has_magnitude(line)
+
+  # `evidence` and `description` are both in `_CONTENT_FIELDS`, so both feed
+  # `content_hash`. `title` is worse than either: it is `dedup_key`'s
+  # discriminator for any finding with no scenario id and no specific location,
+  # which under worker/ is all of them, so a volatile value there re-keys the
+  # finding and detaches its persisted triage.
   _GUARDED_FIELDS = ("evidence", "title")
+  # Checked for raw values only — counts are deliberately allowed here.
+  _RAW_VALUE_ONLY_FIELDS = ("description",)
+
+  def _line_is_offending(self, stripped):
+    """The per-line decision, separated so the field wiring is testable without
+    a live offender in the tree to demonstrate it."""
+    if any(f'{field}=f"' in stripped for field in self._GUARDED_FIELDS):
+      return self._is_volatile(stripped)
+    if any(f'{field}=f"' in stripped for field in self._RAW_VALUE_ONLY_FIELDS):
+      return self._has_raw_value(stripped)
+    return False
 
   def _offenders(self):
     import pathlib
@@ -314,9 +371,7 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
       rel = str(path.relative_to(worker_dir))
       for nr, line in enumerate(path.read_text().splitlines(), 1):
         stripped = line.strip()
-        if not any(f'{field}=f"' in stripped for field in self._GUARDED_FIELDS):
-          continue
-        if not self._is_volatile(stripped):
+        if not self._line_is_offending(stripped):
           continue
         if (rel, stripped) in self._ALLOWLIST:
           continue
@@ -349,6 +404,31 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
     self.assertFalse(
       self._is_volatile('evidence=f"Cookie {cookie_name} lacks the Secure flag",'),
     )
+
+  def test_counts_are_barred_from_evidence_and_title_but_allowed_in_description(self):
+    """`description` is hashed into `content_hash` but is not part of
+    `dedup_key`, so it is where a per-scan magnitude belongs — that is the
+    destination this batch moved 14 counts to. A raw observed value is barred
+    from all three."""
+    count_line = 'description=f"Holding {count} keys.",'
+    self.assertTrue(self._has_magnitude(count_line))
+    self.assertFalse(self._has_raw_value(count_line))
+
+    raw_line = 'description=f"Expected a banner, got: {banner[:80]}",'
+    self.assertTrue(self._has_raw_value(raw_line))
+    # The wiring, not just the predicates: a raw value in a description is
+    # reported, a count in one is not, and both rules bite in evidence/title.
+    self.assertTrue(self._line_is_offending(raw_line))
+    self.assertFalse(self._line_is_offending(count_line))
+    self.assertTrue(self._line_is_offending('evidence=f"Holding {count} keys.",'))
+    self.assertTrue(self._line_is_offending('title=f"Holding {count} keys",'))
+
+    # The three magnitudes the len()/count shapes do not match.
+    for name in ("uptime_seconds", "tested", "age_days"):
+      self.assertTrue(
+        self._has_magnitude(f'title=f"x {{{name}}} y",'), name,
+      )
+      self.assertFalse(self._has_raw_value(f'title=f"x {{{name}}} y",'), name)
 
   def test_the_allowlist_only_shrinks(self):
     """Every allowlist entry must still exist — a fixed site must also drop its

@@ -522,9 +522,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     if uptime_seconds is not None and uptime_seconds < 60:
       findings.append(Finding(
         severity=Severity.INFO,
-        title=f"Redis uptime <60s ({uptime_seconds}s) — possible container restart",
-        description="Very low uptime may indicate a recently restarted container or ephemeral instance.",
-        evidence=f"uptime_in_seconds={uptime_seconds}",
+        title="Redis uptime under 60s — possible container restart",
+        description=f"Uptime is {uptime_seconds}s. Very low uptime may indicate a recently "
+                    "restarted container or ephemeral instance.",
+        evidence="INFO server reported an uptime below the 60-second threshold.",
         remediation="Investigate if the service is being automatically restarted.",
         confidence="tentative",
       ))
@@ -625,10 +626,11 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             age_days = int((_time.time() - ts) / 86400)
             findings.append(Finding(
               severity=Severity.LOW,
-              title=f"Redis RDB save is stale ({age_days} days old)",
-              description="The last RDB background save timestamp is over 1 year old. "
-                          "This may indicate disabled persistence, a long-running cache-only instance, or stale data.",
-              evidence=f"rdb_last_bgsave_time={ts}, age={age_days}d",
+              title="Redis RDB save is stale",
+              description=f"The last RDB background save is {age_days} days old, over the "
+                          "1-year threshold. This may indicate disabled persistence, a "
+                          "long-running cache-only instance, or stale data.",
+              evidence=f"rdb_last_bgsave_time={ts}",
               remediation="Verify persistence configuration; stale saves may indicate data loss risk.",
               cwe_id="CWE-345",
               confidence="tentative",
