@@ -90,6 +90,55 @@ class TestLifecycleInit(unittest.TestCase):
     plugin, _, _ = make_lifecycle_runner()
     self.assertEqual(plugin._consecutive_failures, 0)
 
+  def test_initial_image_pull_failure_is_retried_before_volume_setup(self):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin._ContainerAppRunnerPlugin__reset_vars = MagicMock()
+    plugin._apply_per_node_config = MagicMock()
+    plugin._login_to_registry = MagicMock(return_value=True)
+    plugin._setup_resource_limits_and_ports = MagicMock()
+    plugin._ensure_image_available = MagicMock(side_effect=[False, False, True])
+    plugin._configure_volumes = MagicMock()
+    plugin._configure_file_volumes = MagicMock()
+    plugin._configure_fixed_size_volumes = MagicMock()
+    plugin._configure_system_volume = MagicMock()
+    plugin._configure_env_overrides_control_dir = MagicMock()
+    plugin._configure_reset_control_dir = MagicMock()
+    plugin._recover_stale_processing = MagicMock()
+    plugin._recover_env_overrides_processing = MagicMock()
+    plugin._recover_reset_processing = MagicMock()
+    plugin._validate_sync_config = MagicMock()
+    plugin._setup_env_and_ports = MagicMock()
+    plugin._inject_sync_env_vars = MagicMock()
+    plugin._inject_env_overrides_env_vars = MagicMock()
+    plugin._inject_reset_env_vars = MagicMock()
+    plugin._validate_extra_tunnels_config = MagicMock()
+    plugin._validate_runner_config = MagicMock()
+    plugin._load_manual_stop_state = MagicMock(return_value=False)
+    plugin._extra_on_init = MagicMock()
+    plugin._handle_initial_launch = MagicMock()
+
+    plugin.on_init()
+
+    plugin._extra_on_init.assert_called_once_with()
+    self.assertFalse(plugin._restart_container())
+    plugin._configure_fixed_size_volumes.assert_not_called()
+    plugin.container_state = ContainerState.PAUSED
+    plugin.process()
+    self.assertEqual(plugin._ensure_image_available.call_count, 1)
+    plugin.container_state = ContainerState.UNINITIALIZED
+
+    plugin.process()
+    plugin._configure_fixed_size_volumes.assert_not_called()
+    plugin._handle_initial_launch.assert_not_called()
+
+    plugin.process()
+    plugin._configure_fixed_size_volumes.assert_called_once_with()
+    plugin._handle_initial_launch.assert_called_once_with()
+
+    plugin.process()
+    plugin._configure_fixed_size_volumes.assert_called_once_with()
+    self.assertEqual(plugin._ensure_image_available.call_count, 3)
+
 
 # ===========================================================================
 # First Launch

@@ -13,15 +13,24 @@ from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_
 
 
 NETWORK = "deeploy-crdb-verify-full"
-IMAGE = os.environ.get("CRDB_IMAGE", "ghcr.io/ratio1/deeploy-cockroachdb-service:main")
+IMAGE = os.environ.get(
+  "CRDB_IMAGE",
+  "ghcr.io/ratio1/r1-meshdb@sha256:3be00a63467628d0f5c3382be8ae7a885c5b658762dfd095fba0cb0b5549fab4",
+)
 CLIENT_IMAGE = os.environ.get("CRDB_CLIENT_IMAGE", "postgres:16-alpine")
 SNIFFER_IMAGE = os.environ.get("CRDB_SNIFFER_IMAGE", "nicolaka/netshoot:v0.13")
+MAX_OFFSET = os.environ.get("CRDB_MAX_OFFSET", "500ms")
 HOSTNAME = "crdb-client.test"
 NODES = ["verify_crdb_1", "verify_crdb_2", "verify_crdb_3"]
 ALIASES = ["roach1", "roach2", "roach3"]
 RELAY = "verify_crdb_relay"
 CLIENT = "verify_crdb_client"
 PASSWORD = "verify_full_disposable_password"
+
+if "@sha256:" not in IMAGE:
+  raise ValueError("CRDB_IMAGE must be an immutable digest reference")
+if MAX_OFFSET != "500ms":
+  raise ValueError("CRDB_MAX_OFFSET must remain at the production 500ms bound")
 
 
 def run(args, *, check=True, capture=False, input_text=None, timeout=None):
@@ -114,7 +123,7 @@ def start_node(root, index):
     "start", "--certs-dir=/certs", "--store=/cockroach/cockroach-data",
     "--listen-addr=0.0.0.0:26257", f"--advertise-addr={alias}:26257",
     "--http-addr=0.0.0.0:8080", "--join=roach1:26257,roach2:26257,roach3:26257",
-    "--max-offset=2s", "--cache=.1", "--max-sql-memory=.1",
+    f"--max-offset={MAX_OFFSET}", "--cache=.1", "--max-sql-memory=.1",
   )
 
 
@@ -249,7 +258,8 @@ def main():
 
     print(
       "verify-full workflow ok "
-      f"(nodes=3 rows=1000 ca_before={first_fingerprint[:12]} ca_after={second_fingerprint[:12]} capture_bytes={capture.stat().st_size})"
+      f"(nodes=3 rows=1000 max_offset={MAX_OFFSET} ca_before={first_fingerprint[:12]} "
+      f"ca_after={second_fingerprint[:12]} capture_bytes={capture.stat().st_size})"
     )
   finally:
     cleanup(root)
