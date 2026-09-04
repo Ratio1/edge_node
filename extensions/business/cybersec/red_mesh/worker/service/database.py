@@ -1078,14 +1078,16 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         ))
       else:
         # The observed response, not a static label — the raw bytes moved out
-        # of `evidence` and this is where they live. Decode before slicing, as
-        # the sibling branch above does: cutting bytes at a fixed offset can
-        # split a multi-byte sequence, and `errors="replace"` turns that into a
-        # silent replacement character rather than a visible failure. A server
-        # that answers with nothing keeps the descriptive label — an empty
-        # string would record neither the observation nor the fact.
-        observed = data.decode("utf-8", errors="replace").strip()[:120]
-        raw["banner"] = observed or "Memcached port open"
+        # of `evidence` and this is where they live. Filter to printable ASCII
+        # first, the way the other probes storing a response do
+        # (infrastructure.py SNMP/DNS/Modbus): control bytes and escape
+        # sequences do not belong in an archived field, and mapping per byte
+        # makes the split-a-character-in-half bug impossible rather than merely
+        # unlikely. A server that answers with nothing keeps the descriptive
+        # label — an empty string would record neither the observation nor the
+        # fact.
+        readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+        raw["banner"] = readable.strip()[:120] or "Memcached port open"
         findings.append(Finding(
           severity=Severity.INFO,
           title="Memcached port open",

@@ -800,15 +800,28 @@ class RedMeshOWASPTests(unittest.TestCase):
     ):
       return worker._service_info_memcached("example.com", 11211)
 
-  def test_memcached_banner_decodes_before_slicing(self):
-    """Slicing the bytes first can cut a multi-byte character in half, and
-    `errors="replace"` turns that into a replacement char instead of a visible
-    failure. The response here straddles the old 60-byte cut point."""
-    # 7 ASCII bytes then 2-byte characters: byte 60 lands mid-character.
-    info = self._memcached_raw(b"ERRORS " + "é".encode("utf-8") * 40)
+  def test_memcached_banner_keeps_only_printable_bytes(self):
+    """Control bytes and escape sequences must not reach an archived field.
+    Filtering per byte also makes the old defect — slicing at a fixed offset
+    and cutting a multi-byte character in half — impossible by construction:
+    this response straddles the 60-byte cut point that used to corrupt it."""
+    # 7 ASCII bytes, a NUL, an ANSI escape, then 2-byte characters.
+    info = self._memcached_raw(
+      b"ERRORS \x00\x1b[31m" + "é".encode("utf-8") * 40,
+    )
 
-    self.assertNotIn("�", info["banner"], "a character was cut in half")
-    self.assertEqual(info["banner"], "ERRORS " + "é" * 40)
+    banner = info["banner"]
+    self.assertTrue(banner.startswith("ERRORS"))
+    self.assertNotIn("�", banner, "a character was cut in half")
+    for forbidden in ("\x00", "\x1b", "\r", "\n"):
+      self.assertNotIn(forbidden, banner)
+
+  def test_memcached_banner_is_stripped(self):
+    """The sibling sites strip before slicing; without it the surrounding
+    whitespace of a padded response is archived verbatim."""
+    info = self._memcached_raw(b"   ERROR line   ")
+
+    self.assertEqual(info["banner"], "ERROR line")
 
   def test_memcached_banner_keeps_the_label_when_nothing_came_back(self):
     """An empty response records neither the observation nor the fact, so the

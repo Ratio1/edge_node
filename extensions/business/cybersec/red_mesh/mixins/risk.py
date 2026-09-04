@@ -371,17 +371,14 @@ class _RiskScoringMixin:
       # tiebreaks: newer NVD enrichment wins (`cvss_data_freshness` is ISO-8601,
       # so lexicographic compare is chronological), then the content signature,
       # which is order-independent by construction.
-      # Require a four-digit year to enter the comparison at all. This is not
-      # timestamp validation and is not meant to be: letters sort after digits,
-      # so a value like "not-a-date" would beat every real ISO-8601 date and
-      # silently invert "newer enrichment wins". Demoting anything that cannot
-      # open with a year removes that inversion, which is the whole defect.
-      # A malformed value that *does* start with digits ("9999...") still wins,
-      # and is left alone deliberately: the sole producer is `_iso_now()`
-      # (references/dynamic.py), so the only values reachable today are a
-      # well-formed "%Y-%m-%dT%H:%M:%SZ" or "" — no path writes a non-empty
-      # malformed one, and validating against a producer that cannot misbehave
-      # would be speculation.
+      # Demote anything that does not open with a four-digit year: letters sort
+      # after digits, so "not-a-date" would beat every real ISO-8601 timestamp
+      # and invert "newer enrichment wins". Nothing in the current code writes a
+      # malformed non-empty value — but this ranks dicts copied verbatim from
+      # other nodes' worker reports and rehydrated from the persisted
+      # `cvss_cache`, so it guards a deserialization boundary, not a producer we
+      # control. A value that is malformed *and* starts with digits still wins;
+      # closing that needs real validation, not a wider prefix check.
       freshness = str(f.get("cvss_data_freshness") or "")
       if not freshness[:4].isdigit():
         freshness = ""
