@@ -150,8 +150,8 @@ _SCRUB_PATTERNS = (
 
 
 # `endpoint=<url>` is the established convention across the probes and was the
-# de-facto location before GrayboxFinding carried a typed one. Ordered by
-# specificity: the first key found is used.
+# de-facto location before GrayboxFinding carried a typed one. The first key
+# found wins, scanning evidence items in order.
 #
 # Lives here rather than in `probes/base.py` — where it started, and where it
 # only reached probes emitting through `emit_*` — because it is a finding-shaping
@@ -171,23 +171,43 @@ def location_from_evidence(evidence):
   free-text evidence string that pre-RM-062 identity hashed: promoting a known
   key to a typed field keeps identity stable under rewording, where hashing the
   string re-identified every finding whenever a probe changed its phrasing.
+
+  Matched per `;`-separated clause, which is the shape the probes actually emit —
+  16 of the 65 location-bearing literals are composites like
+  `endpoint={path}; param={p}; payload={payload}`. Reading to the end of the
+  string instead swept the tail into the location, and the tail is routinely
+  target-derived: `probed_len={len(response.text)}` (`access_control`), the
+  reflected `Location` header (`injection`), a `repr()` of a record owner field,
+  a status code. Hashed into `affected_assets[].url`, that gave the finding a new
+  identity whenever the target's response moved at all — strictly worse than the
+  collision this derivation exists to fix, because a colliding id is at least
+  stable enough to triage against. It also pushed payloads and response bodies
+  into the LLM prompt, which `llm_input_builder` documents as carrying
+  "host/port/url only".
+
+  Clause matching also finds a key that is not in the first position — which is
+  how `business_logic` and `access_control` write some of their evidence — and
+  makes the parameter keys live at all: no probe emits `param=` first, so before
+  this they matched nothing.
   """
   url = parameter = None
   for item in evidence or ():
     if not isinstance(item, str):
       continue
-    if url is None:
-      for key in _LOCATION_EVIDENCE_KEYS:
-        if item.startswith(key):
-          url = item[len(key):].strip() or None
-          break
-    if parameter is None:
-      for key in _PARAMETER_EVIDENCE_KEYS:
-        if item.startswith(key):
-          parameter = item[len(key):].strip() or None
-          break
-    if url is not None and parameter is not None:
-      break
+    for clause in item.split(";"):
+      clause = clause.strip()
+      if url is None:
+        for key in _LOCATION_EVIDENCE_KEYS:
+          if clause.startswith(key):
+            url = clause[len(key):].strip() or None
+            break
+      if parameter is None:
+        for key in _PARAMETER_EVIDENCE_KEYS:
+          if clause.startswith(key):
+            parameter = clause[len(key):].strip() or None
+            break
+      if url is not None and parameter is not None:
+        return url, parameter
   return url, parameter
 
 

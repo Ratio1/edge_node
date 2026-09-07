@@ -452,6 +452,103 @@ class TestDirectlyConstructedFindingsAlsoDeriveTheirLocation(unittest.TestCase):
     self.assertEqual(flat["finding_id"], "0123456789abcdef")
 
 
+class TestTheDerivedLocationIsALocationAndNotTheWholeClause(unittest.TestCase):
+  """
+  Half the location-bearing evidence in the four direct-construction probes is a
+  `;`-joined composite — `endpoint={path}; param={p}; payload={payload}` and the
+  like, 16 of 65 literals. Taking everything after the prefix to end of string
+  put the payload, the target's `Location` header, a `repr()` of a record owner
+  field and `probed_len={len(response.text)}` into `affected_assets[].url`, and
+  from there into the identity hash.
+
+  That made `finding_id` move whenever the target's response moved — the exact
+  inverse of the property the derivation exists to provide, and worse than the
+  collision it replaced: a colliding id is at least stable enough to triage.
+  It also contradicted `llm_input_builder`'s stated contract that assets carry
+  "host/port/url only — no full request bodies".
+
+  Matching per `;`-separated clause fixes that, and two other things with it: a
+  location key is found when it is not the first clause, and `param=` — which no
+  probe emits in first position, so the parameter keys were dead — starts working.
+  """
+
+  def _finding(self, evidence, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    base = dict(
+      scenario_id="PT-A01-10", title="Query role override", status="vulnerable",
+      severity="HIGH", owasp="A01:2021", cwe=["CWE-639"], evidence=evidence,
+    )
+    base.update(kwargs)
+    return GrayboxFinding(**base).to_flat_finding(443, "https", "_graybox_ac")
+
+  def test_identity_does_not_move_with_the_targets_response(self):
+    """`access_control.py:979` puts the probed response length in its evidence."""
+    a = self._finding(["path=/dash/; param=role=admin; baseline_len=1200; probed_len=1873"])
+    b = self._finding(["path=/dash/; param=role=admin; baseline_len=1200; probed_len=1874"])
+    self.assertEqual(
+      a["finding_id"], b["finding_id"],
+      "one byte of target response changed the finding's identity, so triage "
+      "never sticks and the timeline never accumulates",
+    )
+
+  def test_identity_does_not_move_with_a_reflected_location_header(self):
+    """`injection.py:506` embeds the target's `Location` response header."""
+    a = self._finding(["endpoint=/go; param=next; location=https://evil.example/?sid=abc"])
+    b = self._finding(["endpoint=/go; param=next; location=https://evil.example/?sid=xyz"])
+    self.assertEqual(a["finding_id"], b["finding_id"])
+
+  def test_no_real_composite_leaves_a_clause_tail_in_the_asset(self):
+    """The composite shapes the four probes actually emit, verbatim."""
+    for evidence in (
+      "endpoint=/admin/users; denied_method=GET; accepted_method=PUT; status=200",
+      "endpoint=/profile/edit; persisted_fields=is_admin,role",
+      "endpoint=/api/records/7; field=owner_user_id; before='alice'; after='bob'",
+      "path=/admin; status=200",
+      "path=/dash/; param=role=admin; new_markers=['admin panel']; probed_len=1873",
+      "endpoint=/checkout; submitted_amount=-9999.99; status=500",
+      "endpoint=/go; param=next; location=https://evil.example/x",
+      "endpoint=/api/login; field=password; variant={'$ne': None}; status=200",
+    ):
+      with self.subTest(evidence=evidence):
+        url = self._finding([evidence])["affected_assets"][0]["url"]
+        self.assertNotIn(";", url, f"the asset carries the whole clause: {url!r}")
+        self.assertFalse(url.endswith(" "), f"untrimmed: {url!r}")
+
+  def test_a_location_key_in_a_later_clause_is_found(self):
+    """`business_logic.py:331` and `access_control.py:1122` do not lead with it."""
+    flat = self._finding(["negative_amount_accepted=True; endpoint=/checkout"])
+    self.assertEqual(flat["affected_assets"][0]["url"], "/checkout")
+
+  def test_a_parameter_in_a_later_clause_becomes_the_parameter(self):
+    flat = self._finding(["endpoint=/go; param=next; location=https://evil.example/x"])
+    asset = flat["affected_assets"][0]
+    self.assertEqual(asset["url"], "/go")
+    self.assertEqual(asset["parameter"], "next")
+
+  def test_two_parameters_on_one_endpoint_stay_distinct(self):
+    """The parameter keys were dead, so these used to collapse."""
+    a = self._finding(["endpoint=/search; param=q"])
+    b = self._finding(["endpoint=/search; param=sort"])
+    self.assertNotEqual(a["finding_id"], b["finding_id"])
+
+  def test_a_clean_single_value_is_untouched(self):
+    for evidence, expected in (
+      ("endpoint=https://app.test/api/records/99", "https://app.test/api/records/99"),
+      ("path=/admin/users", "/admin/users"),
+      ("token_path=/api/token/", "/api/token/"),
+    ):
+      with self.subTest(evidence=evidence):
+        self.assertEqual(
+          self._finding([evidence])["affected_assets"][0]["url"], expected,
+        )
+
+  def test_an_explicit_url_still_wins_over_every_clause(self):
+    flat = self._finding(
+      ["endpoint=/from-evidence; status=200"], url="https://app.test/explicit",
+    )
+    self.assertEqual(flat["affected_assets"][0]["url"], "https://app.test/explicit")
+
+
 class TestEvidenceArtifactProduction(unittest.TestCase):
   """
   `GrayboxEvidenceArtifact` was dead schema: zero constructions anywhere outside
