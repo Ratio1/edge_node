@@ -122,6 +122,48 @@ _SCRUB_PATTERNS = (
 )
 
 
+# `endpoint=<url>` is the established convention across the probes and was the
+# de-facto location before GrayboxFinding carried a typed one. Ordered by
+# specificity: the first key found is used.
+#
+# Lives here rather than in `probes/base.py` — where it started, and where it
+# only reached probes emitting through `emit_*` — because it is a finding-shaping
+# concern and `to_flat_finding` has to apply it too. The four probes that append
+# `GrayboxFinding(...)` directly never populate `url`, so without this at the
+# normalisation boundary their findings reach `dedup_key` with no location and
+# collapse onto one identity. The import direction settles the placement anyway:
+# `probes/base.py` imports from here.
+_LOCATION_EVIDENCE_KEYS = ("endpoint=", "path=", "protected_path=", "token_path=")
+_PARAMETER_EVIDENCE_KEYS = ("parameter=", "param=")
+
+
+def location_from_evidence(evidence):
+  """Return ``(url, parameter)`` recovered from evidence strings, or (None, None).
+
+  Reads the structured `key=value` prefixes only. This is deliberately *not* the
+  free-text evidence string that pre-RM-062 identity hashed: promoting a known
+  key to a typed field keeps identity stable under rewording, where hashing the
+  string re-identified every finding whenever a probe changed its phrasing.
+  """
+  url = parameter = None
+  for item in evidence or ():
+    if not isinstance(item, str):
+      continue
+    if url is None:
+      for key in _LOCATION_EVIDENCE_KEYS:
+        if item.startswith(key):
+          url = item[len(key):].strip() or None
+          break
+    if parameter is None:
+      for key in _PARAMETER_EVIDENCE_KEYS:
+        if item.startswith(key):
+          parameter = item[len(key):].strip() or None
+          break
+    if url is not None and parameter is not None:
+      break
+  return url, parameter
+
+
 _FINDING_SECRET_FIELD_NAMES = contextvars.ContextVar(
   "redmesh_graybox_finding_secret_field_names",
   default=(),
@@ -368,6 +410,31 @@ class GrayboxFinding:
     """
     cwe_joined = ", ".join(self.cwe)
 
+    # Recover the location from evidence for probes that never set one. Four
+    # probes append `GrayboxFinding(...)` directly instead of going through
+    # `ProbeBase.emit_*`, which is where this derivation used to happen alone —
+    # 87 of the 93 constructions in the tree — so their findings arrived with an
+    # empty `affected_assets` and `dedup_key` reduced to probe + scenario_id +
+    # classification. Two endpoints exhibiting one scenario then shared a
+    # `finding_id`, and triage keys on `finding_id` alone: marking one remediated
+    # marked the other. Doing it here covers both producers at one site.
+    #
+    # An explicit value always wins; a finding with no location key still gets no
+    # asset, which is what a coverage record should have.
+    url, parameter = self.url, self.parameter
+    if not url or not parameter:
+      derived_url, derived_parameter = location_from_evidence(self.evidence)
+      # Scrubbed before it is promoted, exactly as `emit_vulnerable` does it: a
+      # URL can carry a token in its query string, and turning evidence into a
+      # typed field must not reintroduce what the scrubber removes elsewhere.
+      # `affected_assets` is scrubbed again at the storage boundary, but identity
+      # is computed before that pass and would otherwise hash the secret.
+      names = _merged_secret_field_names(secret_field_names)
+      if not url and derived_url:
+        url = scrub_graybox_secrets(derived_url, secret_field_names=names)
+      if not parameter and derived_parameter:
+        parameter = scrub_graybox_secrets(derived_parameter, secret_field_names=names)
+
     # Map status -> confidence and effective severity
     confidence_map = {
       "vulnerable": "certain",
@@ -443,13 +510,13 @@ class GrayboxFinding:
       # "no location recorded" from "field missing".
       "affected_assets": (
         [{
-          "host": _asset_host(self.url),
+          "host": _asset_host(url),
           "port": port,
-          "url": self.url,
-          "parameter": self.parameter,
+          "url": url,
+          "parameter": parameter,
           "method": self.method,
         }]
-        if (self.url or self.parameter) else []
+        if (url or parameter) else []
       ),
     }
     # Identity is computed from the assembled finding rather than from a

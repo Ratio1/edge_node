@@ -351,6 +351,107 @@ class TestLocationDerivedFromEvidence(unittest.TestCase):
     self.assertNotEqual(a["finding_id"], b["finding_id"])
 
 
+class TestDirectlyConstructedFindingsAlsoDeriveTheirLocation(unittest.TestCase):
+  """
+  The derivation above runs inside `emit_vulnerable`, so it only reaches probes
+  that emit through it. `access_control`, `injection`, `misconfig` and
+  `business_logic` append `GrayboxFinding(...)` straight onto `self.findings` —
+  87 of the 93 constructions in the tree — and never populate `url`. Their
+  findings therefore reached `dedup_key` with an empty `affected_assets`, and
+  identity collapsed to probe + scenario_id + classification.
+
+  That is a regression rather than a standing gap: the pre-RM-062
+  `to_flat_finding` folded the `endpoint=` / `path=` evidence prefixes into its
+  id input directly, so these endpoints used to be distinguishable.
+
+  Deriving in `to_flat_finding` covers both producers at one site. It reads the
+  same structured `key=value` prefixes the emission path does — not the evidence
+  string as free text, which is what RM-062 removed from identity.
+  """
+
+  def _finding(self, **kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    base = dict(
+      scenario_id="PT-A03-01", title="Reflected SQLI in authenticated form",
+      status="vulnerable", severity="HIGH", owasp="A03:2021", cwe=["CWE-89"],
+    )
+    base.update(kwargs)
+    return GrayboxFinding(**base)
+
+  def _flat(self, **kwargs):
+    return self._finding(**kwargs).to_flat_finding(443, "https", "_graybox_injection")
+
+  def test_two_endpoints_in_evidence_stay_distinct(self):
+    """The shape `injection.py` emits once per vulnerable form."""
+    a = self._flat(evidence=["endpoint=https://app.test/admin/users/search",
+                             "field=q", "payload_reflected=True"])
+    b = self._flat(evidence=["endpoint=https://app.test/admin/settings/search",
+                             "field=q", "payload_reflected=True"])
+    self.assertNotEqual(
+      a["finding_id"], b["finding_id"],
+      "two endpoints share one finding_id, so triage applied to one closes the "
+      "other — triage keys on finding_id alone",
+    )
+
+  def test_a_path_prefix_is_recognised_too(self):
+    """`misconfig` records `path=`, not `endpoint=`."""
+    a = self._flat(evidence=["path=/admin/users"])
+    b = self._flat(evidence=["path=/admin/settings"])
+    self.assertNotEqual(a["finding_id"], b["finding_id"])
+
+  def test_the_derived_endpoint_reaches_affected_assets(self):
+    flat = self._flat(evidence=["endpoint=https://app.test/a", "status=200"])
+    self.assertEqual(flat["affected_assets"][0]["url"], "https://app.test/a")
+
+  def test_an_explicit_url_still_wins(self):
+    flat = self._flat(
+      url="https://app.test/explicit",
+      evidence=["endpoint=https://app.test/from-evidence"],
+    )
+    self.assertEqual(flat["affected_assets"][0]["url"], "https://app.test/explicit")
+
+  def test_the_same_endpoint_still_dedups(self):
+    a = self._flat(evidence=["endpoint=https://app.test/a", "status=200"])
+    b = self._flat(evidence=["endpoint=https://app.test/a", "status=500"])
+    self.assertEqual(a["finding_id"], b["finding_id"])
+    self.assertNotEqual(
+      a["finding_signature"], b["finding_signature"],
+      "identity must survive a content change, and content must still move",
+    )
+
+  def test_a_finding_with_no_location_key_gets_no_asset(self):
+    """Unchanged behaviour: coverage records carry no location and need none."""
+    flat = self._flat(evidence=["endpoints_tested=4"])
+    self.assertEqual(flat["affected_assets"], [])
+
+  def test_a_secret_in_the_derived_url_is_redacted_before_it_is_promoted(self):
+    """A URL can carry a token in its query string.
+
+    Promoting evidence to a typed field must not reintroduce what the scrubber
+    removes elsewhere — `emit_vulnerable` derives from the scrubbed list for the
+    same reason.
+    """
+    flat = self._flat(
+      evidence=["endpoint=https://app.test/cb?api_key=ABCDEFG12345&x=1"],
+    )
+    self.assertNotIn("ABCDEFG12345", flat["affected_assets"][0]["url"])
+    self.assertNotIn("ABCDEFG12345", str(flat))
+
+  def test_an_id_stamped_at_production_still_wins_on_the_read_path(self):
+    """Archives keep the identity they were written with."""
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    payload = dict(
+      scenario_id="PT-A03-01", title="Reflected SQLI in authenticated form",
+      status="vulnerable", severity="HIGH", owasp="A03:2021", cwe=["CWE-89"],
+      evidence=["endpoint=https://app.test/a"],
+    )
+    flat = GrayboxFinding.flat_from_dict(
+      dict(payload, finding_id="0123456789abcdef"),
+      443, "https", "_graybox_injection",
+    )
+    self.assertEqual(flat["finding_id"], "0123456789abcdef")
+
+
 class TestEvidenceArtifactProduction(unittest.TestCase):
   """
   `GrayboxEvidenceArtifact` was dead schema: zero constructions anywhere outside

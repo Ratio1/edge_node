@@ -8,40 +8,13 @@ sessions or credentials themselves.
 
 import requests
 
-from ..findings import GrayboxEvidenceArtifact, GrayboxFinding
+from ..findings import (
+  GrayboxEvidenceArtifact,
+  GrayboxFinding,
+  location_from_evidence as _location_from_evidence,
+)
 from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
-
-
-
-# `endpoint=<url>` is the established convention across the probes and was the
-# de-facto location before GrayboxFinding carried a typed one. Promoting it here
-# populates every existing probe at once rather than depending on each of the
-# emission call sites being edited correctly, and a probe that passes an
-# explicit url always wins. Ordered by specificity: the first key found is used.
-_LOCATION_EVIDENCE_KEYS = ("endpoint=", "path=", "protected_path=", "token_path=")
-_PARAMETER_EVIDENCE_KEYS = ("parameter=", "param=")
-
-
-def _location_from_evidence(evidence):
-  """Return ``(url, parameter)`` recovered from evidence strings, or (None, None)."""
-  url = parameter = None
-  for item in evidence or ():
-    if not isinstance(item, str):
-      continue
-    if url is None:
-      for key in _LOCATION_EVIDENCE_KEYS:
-        if item.startswith(key):
-          url = item[len(key):].strip() or None
-          break
-    if parameter is None:
-      for key in _PARAMETER_EVIDENCE_KEYS:
-        if item.startswith(key):
-          parameter = item[len(key):].strip() or None
-          break
-    if url is not None and parameter is not None:
-      break
-  return url, parameter
 
 
 _SNAPSHOT_MAX_CHARS = 2048
