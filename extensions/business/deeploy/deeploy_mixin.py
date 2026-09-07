@@ -4256,6 +4256,11 @@ class _DeeployMixin:
       and isinstance(managed_hostname, str)
       and managed_hostname != client_hostname
     )
+    # Each instance may update the shared allocation below.
+    regeneration_pending = bool(
+      regeneration_id
+      and allocation.get(COCKROACHDB_CERT_GENERATION_ID_KEY) != regeneration_id
+    )
 
     for plugin_instance in cockroachdb_plugins:
       env = plugin_instance.setdefault("ENV", {})
@@ -4264,10 +4269,6 @@ class _DeeployMixin:
       self._canonicalize_per_node_config_key(plugin_instance)
       raw_config = plugin_instance.get(CANONICAL_PER_NODE_CONFIG_KEY)
       existing_complete = self._cockroachdb_cert_bundle_complete(plugin_instance, target_nodes)
-      regeneration_pending = bool(
-        regeneration_id
-        and allocation.get(COCKROACHDB_CERT_GENERATION_ID_KEY) != regeneration_id
-      )
       must_generate = not existing_complete or hostname_changed or regeneration_pending
       cert_bundle = (
         self._generate_cockroachdb_cert_bundle(target_nodes, client_hostname)
