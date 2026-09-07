@@ -450,15 +450,36 @@ class TestDirectlyConstructedFindingsAlsoDeriveTheirLocation(unittest.TestCase):
   def test_a_secret_in_the_derived_url_is_redacted_before_it_is_promoted(self):
     """A URL can carry a token in its query string.
 
-    Promoting evidence to a typed field must not reintroduce what the scrubber
-    removes elsewhere — `emit_vulnerable` derives from the scrubbed list for the
-    same reason.
+    Asserted on the *identity*, not on the output string. `_scrub_flat_finding`
+    scrubs `affected_assets` at the storage boundary anyway, so checking the
+    final text passes whether or not the derived value was scrubbed first — and
+    the point of scrubbing first is that `finding_id` is hashed before that pass.
+    Comparing against the same finding built from an already-redacted url is the
+    assertion that actually pins it.
     """
-    flat = self._flat(
-      evidence=["endpoint=https://app.test/cb?api_key=ABCDEFG12345&x=1"],
+    derived = self._flat(
+      evidence=["endpoint=https://app.test/cb?api_key=ABCDEFG12345&x=1"])
+    explicit = self._flat(
+      url="https://app.test/cb?api_key=<redacted>&x=1",
+      evidence=["endpoint=https://app.test/cb?api_key=ABCDEFG12345&x=1"])
+    self.assertNotIn("ABCDEFG12345", str(derived))
+    self.assertEqual(
+      derived["finding_id"], explicit["finding_id"],
+      "identity was hashed over the unscrubbed url",
     )
-    self.assertNotIn("ABCDEFG12345", flat["affected_assets"][0]["url"])
-    self.assertNotIn("ABCDEFG12345", str(flat))
+
+  def test_an_operator_configured_secret_name_reaches_the_derived_url(self):
+    """`secret_field_names` is the whole point of the merge in the derivation.
+
+    The generic patterns catch `api_key=` on their own, so a fixture using one
+    cannot tell whether the configured names were passed through.
+    """
+    from extensions.business.cybersec.red_mesh.graybox.findings import (
+      FindingRedactionContext,
+    )
+    with FindingRedactionContext(secret_field_names=("corp_key",)):
+      flat = self._flat(evidence=["endpoint=https://app.test/cb?corp_key=SEKRET-VALUE-1"])
+    self.assertNotIn("SEKRET-VALUE-1", flat["affected_assets"][0]["url"])
 
   def test_the_persisted_form_carries_no_id_for_the_read_path_to_honour(self):
     """`flat_from_dict`'s stamped-id branch is dead for graybox — state it.
@@ -477,8 +498,8 @@ class TestDirectlyConstructedFindingsAlsoDeriveTheirLocation(unittest.TestCase):
     """
     from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
     persisted = self._finding(evidence=["endpoint=https://app.test/a"]).to_dict()
-    self.assertNotIn("finding_id", persisted)
-    self.assertNotIn("dedup_key", persisted)
+    for absent in ("finding_id", "dedup_key", "finding_signature", "content_hash"):
+      self.assertNotIn(absent, persisted)
 
     # Recomputed from the persisted form, and equal to the production value.
     from_archive = GrayboxFinding.flat_from_dict(
@@ -540,38 +561,78 @@ class TestTheDerivedLocationIsALocationAndNotTheWholeClause(unittest.TestCase):
     self.assertEqual(a["finding_id"], b["finding_id"])
 
   def test_no_real_composite_leaves_a_clause_tail_in_the_asset(self):
-    """The composite shapes the four probes actually emit, verbatim."""
-    for evidence in (
-      "endpoint=/admin/users; denied_method=GET; accepted_method=PUT; status=200",
-      "endpoint=/profile/edit; persisted_fields=is_admin,role",
-      "endpoint=/api/records/7; field=owner_user_id; before='alice'; after='bob'",
-      "path=/admin; status=200",
-      "path=/dash/; param=role=admin; new_markers=['admin panel']; probed_len=1873",
-      "endpoint=/checkout; submitted_amount=-9999.99; status=500",
-      "endpoint=/go; param=next; location=https://evil.example/x",
-      "endpoint=/api/login; field=password; variant={'$ne': None}; status=200",
+    """The composite shapes the four probes actually emit, verbatim.
+
+    Asserted as an equality rather than "contains no `;`": the weaker form was
+    also satisfied by truncating at `?` or at the first space, either of which
+    would silently mangle a real URL.
+    """
+    for evidence, expected in (
+      ("endpoint=/admin/users; denied_method=GET; accepted_method=PUT; status=200",
+       "/admin/users"),
+      ("endpoint=/profile/edit; persisted_fields=is_admin,role", "/profile/edit"),
+      ("endpoint=/api/records/7; field=owner_user_id; before='alice'", "/api/records/7"),
+      ("path=/admin; status=200", "/admin"),
+      ("path=/dash/; param=role=admin; probed_len=1873", "/dash/"),
+      ("endpoint=/checkout; submitted_amount=-9999.99; status=500", "/checkout"),
+      ("endpoint=/go; param=next; location=https://evil.example/x", "/go"),
+      ("endpoint=/api/login; field=password; variant={'$ne': None}", "/api/login"),
+      # A query string must survive: truncating at `?` would also have passed
+      # the weaker assertion this replaced.
+      ("endpoint=/search?q=1&page=2; status=200", "/search?q=1&page=2"),
+      ("endpoint=/a b; status=200", "/a b"),
     ):
       with self.subTest(evidence=evidence):
-        url = self._finding([evidence])["affected_assets"][0]["url"]
-        self.assertNotIn(";", url, f"the asset carries the whole clause: {url!r}")
-        self.assertFalse(url.endswith(" "), f"untrimmed: {url!r}")
+        self.assertEqual(self._finding([evidence])["affected_assets"][0]["url"], expected)
 
-  def test_a_location_key_in_a_later_clause_is_found(self):
-    """`business_logic.py:331` and `access_control.py:1122` do not lead with it."""
+  def test_a_location_written_after_another_clause_is_not_read(self):
+    """Deliberate: only the clause the probe itself opened is trusted.
+
+    `business_logic.py:331` and `access_control.py:1122` do write the location
+    after another clause, and those findings keep the empty asset they had
+    before. That is the price of not reading later clauses at all — see
+    `test_a_target_cannot_write_its_own_identity`, which is what reading them
+    costs. Status quo, not a regression.
+    """
     flat = self._finding(["negative_amount_accepted=True; endpoint=/checkout"])
-    self.assertEqual(flat["affected_assets"][0]["url"], "/checkout")
+    self.assertEqual(flat["affected_assets"], [])
 
-  def test_a_parameter_in_a_later_clause_becomes_the_parameter(self):
-    flat = self._finding(["endpoint=/go; param=next; location=https://evil.example/x"])
-    asset = flat["affected_assets"][0]
-    self.assertEqual(asset["url"], "/go")
-    self.assertEqual(asset["parameter"], "next")
+  def test_a_target_cannot_write_its_own_identity(self):
+    """Evidence items carry verbatim target output, and nothing escapes `;`.
 
-  def test_two_parameters_on_one_endpoint_stay_distinct(self):
-    """The parameter keys were dead, so these used to collapse."""
-    a = self._finding(["endpoint=/search; param=q"])
-    b = self._finding(["endpoint=/search; param=sort"])
-    self.assertNotEqual(a["finding_id"], b["finding_id"])
+    `misconfig.py:1042` emits `server_returned={me_body!r}` — the target's own
+    response body — and `repr()` escapes quotes but not `;` or `=`. Scanning
+    every clause let a body containing `; param=…` inject a clause into the
+    identity hash: a rotating value gave the finding a new id every scan, and a
+    fixed one merged it with an unrelated finding.
+    """
+    honest = ["token_path=/api/token/", "server_returned={'user': 'alice'}"]
+    hostile = ["token_path=/api/token/",
+               "server_returned={'user': \"x; param=NONCE-8831\"}"]
+    rotated = ["token_path=/api/token/",
+               "server_returned={'user': \"x; param=NONCE-9999\"}"]
+    ids = {self._finding(e)["finding_id"] for e in (honest, hostile, rotated)}
+    self.assertEqual(
+      len(ids), 1,
+      "the target moved the finding's identity by putting `;` in its response",
+    )
+
+  def test_an_evidence_list_naming_two_locations_gets_no_asset(self):
+    """Aggregate findings must not be keyed on whichever path came first.
+
+    `access_control.py:892` passes `evidence=reachable` — one finding covering
+    every reachable admin path. Keying it on the first would mean remediating one
+    of three rotates the id of the finding covering the other two, on every scan,
+    forever. Ambiguous means no asset, which is what these findings had before.
+    """
+    both = self._finding(["path=/admin/; status=200", "path=/manage/; status=200"])
+    reordered = self._finding(["path=/manage/; status=200", "path=/admin/; status=200"])
+    self.assertEqual(both["affected_assets"], [])
+    self.assertEqual(both["finding_id"], reordered["finding_id"])
+
+  def test_one_location_repeated_across_items_is_not_ambiguous(self):
+    flat = self._finding(["path=/admin/; status=200", "path=/admin/; method=POST"])
+    self.assertEqual(flat["affected_assets"][0]["url"], "/admin/")
 
   def test_a_clean_single_value_is_untouched(self):
     for evidence, expected in (

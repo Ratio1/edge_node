@@ -195,12 +195,16 @@ class BusinessLogicProbes(ProbeBase):
             owasp="A06:2021",
             cwe=["CWE-841"],
             attack=["T1078"],
-            # The method belongs in the typed field, not only in evidence: the
-            # loop keys `url` on the path alone, so two configured endpoints on
-            # one path with different verbs shared a finding_id. A missing guard
-            # on GET and on DELETE are two defects with two fixes.
+            # No `method=` here, deliberately. Two configured endpoints on one
+            # path with different verbs do share a finding_id, and stamping
+            # `ep.method` would split them — but the split would be a lie: this
+            # loop issues POST only for POST and a plain GET for everything else
+            # (see the request above), so a `DELETE` entry is probed with GET.
+            # The `method=` evidence line and the replay step already misreport
+            # that; putting it in a typed field would additionally key identity
+            # on a request that was never sent. The probe has to issue the
+            # configured verb before the split is real.
             url=url,
-            method=method,
             evidence=[
               f"endpoint={url}",
               f"method={method}",

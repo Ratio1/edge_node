@@ -160,6 +160,44 @@ class TestTheTwoSsrfVariantsAreSeparateFindings(unittest.TestCase):
     params = {f["affected_assets"][0]["parameter"] for f in (a, b)}
     self.assertEqual(params, {"url", "callback"})
 
+  def test_each_variant_records_the_verb_it_actually_issued(self):
+    """`method` is part of identity, so a wrong literal rotates ids silently.
+
+    `_test_ssrf` issues `session.get`, `_test_ssrf_body_field` issues
+    `session.post`; the typed fields must say so.
+    """
+    a, b = self._both_variants()
+    self.assertEqual(
+      {f["affected_assets"][0]["method"] for f in (a, b)}, {"GET", "POST"},
+    )
+
+  def test_the_variants_stay_distinct_when_the_body_field_matches_the_param(self):
+    """The default config makes this the ordinary case, not the corner one.
+
+    `ssrf_body_fields` defaults to a list beginning `url`, and `ep.param` is
+    commonly `url` too — so `parameter` is identical and `method` is the only
+    thing separating the two findings.
+    """
+    import dataclasses
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig,
+    )
+    probe = _make_probe(ssrf_endpoints=[SsrfEndpoint(path="/api/fetch/", param="url")])
+    probe.target_config = dataclasses.replace(
+      probe.target_config, api_security=ApiSecurityConfig(ssrf_body_fields=["url"]),
+    )
+    session = probe.auth.official_session
+    hit = _mock_response(status=200, text="fetched: http://127.0.0.1:1/internal-probe")
+    session.get.side_effect = [_mock_response(status=200, text="nothing"), hit]
+    probe._test_ssrf()
+    session.post.return_value = hit
+    probe._test_ssrf_body_field()
+
+    flat = [f.to_flat_finding(8000, "http", "_graybox_injection")
+            for f in probe.findings if f.status == "vulnerable"]
+    self.assertEqual(len(flat), 2)
+    self.assertNotEqual(flat[0]["finding_id"], flat[1]["finding_id"])
+
 
 class TestLoginInjection(unittest.TestCase):
 
