@@ -1295,7 +1295,27 @@ class ContainerAppRunnerPlugin(
     self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
     if not self._fixed_volume_setup_pending:
-      self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
+      self._configure_initial_volume_state()
+
+    # Validate extra tunnels configuration
+    self._validate_extra_tunnels_config()
+
+    self._validate_runner_config()
+
+    # Check if container was manually stopped in a previous session
+    if self._load_manual_stop_state():
+      self.P("Container was manually stopped in previous session. Keeping container paused.")
+      self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+
+    self._extra_on_init()
+    self.P(f"{self.__class__.__name__} initialized (version {__VER__})")
+    return
+
+
+  def _configure_initial_volume_state(self):
+    # Fixed-volume recovery cleans all stale mounts, including /r1en_system.
+    # Keep control setup and its environment after that cleanup on retries too.
+    self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
     self._configure_system_volume() # always-on /r1en_system control-plane volume
     self._configure_env_overrides_control_dir()
     self._configure_reset_control_dir()
@@ -1316,20 +1336,6 @@ class ContainerAppRunnerPlugin(
       self._inject_reset_env_vars()
     else:
       self.Pd("Deferring _setup_env_and_ports() until semaphores are ready")
-
-    # Validate extra tunnels configuration
-    self._validate_extra_tunnels_config()
-
-    self._validate_runner_config()
-
-    # Check if container was manually stopped in a previous session
-    if self._load_manual_stop_state():
-      self.P("Container was manually stopped in previous session. Keeping container paused.")
-      self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
-
-    self._extra_on_init()
-    self.P(f"{self.__class__.__name__} initialized (version {__VER__})")
-    return
 
   
   def _extra_on_init(self):
@@ -4176,7 +4182,7 @@ class ContainerAppRunnerPlugin(
     if self._fixed_volume_setup_pending:
       if not self._ensure_image_available():
         return
-      self._configure_fixed_size_volumes()
+      self._configure_initial_volume_state()
       self._fixed_volume_setup_pending = False
 
     if self._cleanup_failed:

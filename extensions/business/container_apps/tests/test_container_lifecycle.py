@@ -11,8 +11,9 @@ docker.from_env()) must patch the docker module to return the mock client.
 
 import unittest
 import subprocess
+import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 from extensions.business.container_apps.tests.support import install_docker_stub_if_needed
 
@@ -90,13 +91,13 @@ class TestLifecycleInit(unittest.TestCase):
     plugin, _, _ = make_lifecycle_runner()
     self.assertEqual(plugin._consecutive_failures, 0)
 
-  def test_initial_image_pull_failure_is_retried_before_volume_setup(self):
+  def _make_initializing_runner(self, image_results):
     plugin, _, _ = make_lifecycle_runner()
     plugin._ContainerAppRunnerPlugin__reset_vars = MagicMock()
     plugin._apply_per_node_config = MagicMock()
     plugin._login_to_registry = MagicMock(return_value=True)
     plugin._setup_resource_limits_and_ports = MagicMock()
-    plugin._ensure_image_available = MagicMock(side_effect=[False, False, True])
+    plugin._ensure_image_available = MagicMock(side_effect=image_results)
     plugin._configure_volumes = MagicMock()
     plugin._configure_file_volumes = MagicMock()
     plugin._configure_fixed_size_volumes = MagicMock()
@@ -117,8 +118,58 @@ class TestLifecycleInit(unittest.TestCase):
     plugin._extra_on_init = MagicMock()
     plugin._handle_initial_launch = MagicMock()
 
+    setup = MagicMock()
+    for name in (
+      '_configure_fixed_size_volumes',
+      '_configure_system_volume',
+      '_configure_env_overrides_control_dir',
+      '_configure_reset_control_dir',
+      '_recover_stale_processing',
+      '_recover_env_overrides_processing',
+      '_recover_reset_processing',
+      '_validate_sync_config',
+      '_setup_env_and_ports',
+      '_inject_sync_env_vars',
+      '_inject_env_overrides_env_vars',
+      '_inject_reset_env_vars',
+      '_handle_initial_launch',
+    ):
+      setup.attach_mock(getattr(plugin, name), name)
+    return plugin, setup
+
+  def _assert_volume_setup_order(self, setup, launched=False):
+    expected = [
+      call._configure_fixed_size_volumes(),
+      call._configure_system_volume(),
+      call._configure_env_overrides_control_dir(),
+      call._configure_reset_control_dir(),
+      call._recover_stale_processing(),
+      call._recover_env_overrides_processing(),
+      call._recover_reset_processing(),
+      call._validate_sync_config(),
+      call._setup_env_and_ports(),
+      call._inject_sync_env_vars(),
+      call._inject_env_overrides_env_vars(),
+      call._inject_reset_env_vars(),
+    ]
+    if launched:
+      expected.append(call._handle_initial_launch())
+    self.assertEqual(setup.mock_calls, expected)
+
+  def test_cached_image_configures_volumes_and_controls_in_order(self):
+    plugin, setup = self._make_initializing_runner([True])
+
     plugin.on_init()
 
+    self._assert_volume_setup_order(setup)
+    self.assertFalse(plugin._fixed_volume_setup_pending)
+
+  def test_initial_image_pull_failure_is_retried_before_volume_setup(self):
+    plugin, setup = self._make_initializing_runner([False, False, True])
+
+    plugin.on_init()
+
+    self.assertEqual(setup.mock_calls, [])
     plugin._extra_on_init.assert_called_once_with()
     self.assertFalse(plugin._restart_container())
     plugin._configure_fixed_size_volumes.assert_not_called()
@@ -128,16 +179,111 @@ class TestLifecycleInit(unittest.TestCase):
     plugin.container_state = ContainerState.UNINITIALIZED
 
     plugin.process()
+    self.assertEqual(setup.mock_calls, [])
     plugin._configure_fixed_size_volumes.assert_not_called()
     plugin._handle_initial_launch.assert_not_called()
 
     plugin.process()
     plugin._configure_fixed_size_volumes.assert_called_once_with()
     plugin._handle_initial_launch.assert_called_once_with()
+    self._assert_volume_setup_order(setup, launched=True)
+    self.assertFalse(plugin._fixed_volume_setup_pending)
 
+    setup.reset_mock()
     plugin.process()
-    plugin._configure_fixed_size_volumes.assert_called_once_with()
+    self.assertEqual(setup.mock_calls, [call._handle_initial_launch()])
     self.assertEqual(plugin._ensure_image_available.call_count, 3)
+
+  def test_image_recovery_waits_for_semaphores_before_environment_setup(self):
+    plugin, _ = self._make_initializing_runner([False, True])
+    plugin.cfg_semaphored_keys = ['provider']
+    plugin._wait_for_semaphores = MagicMock(return_value=False)
+    plugin._handle_initial_launch.side_effect = lambda: (
+      ContainerAppRunnerPlugin._handle_initial_launch(plugin)
+    )
+    plugin.on_init()
+    plugin.process()
+
+    plugin._configure_system_volume.assert_called_once_with()
+    plugin._setup_env_and_ports.assert_not_called()
+    plugin._inject_sync_env_vars.assert_not_called()
+    self.assertFalse(plugin._fixed_volume_setup_pending)
+
+    plugin._wait_for_semaphores.return_value = True
+    plugin._ensure_image_available.side_effect = None
+    plugin._ensure_image_available.return_value = True
+    plugin._configure_dynamic_env = MagicMock()
+    plugin.start_container = MagicMock(return_value=None)
+    plugin.process()
+
+    plugin._configure_system_volume.assert_called_once_with()
+    plugin._setup_env_and_ports.assert_called_once_with()
+    plugin._inject_sync_env_vars.assert_called_once_with()
+    plugin._inject_env_overrides_env_vars.assert_called_once_with()
+    plugin._inject_reset_env_vars.assert_called_once_with()
+    plugin.start_container.assert_called_once_with()
+
+  def test_image_recovery_provisions_controls_and_recovers_request_files(self):
+    for system_available in (True, False):
+      with self.subTest(system_available=system_available), tempfile.TemporaryDirectory() as tmp:
+        plugin, _ = self._make_initializing_runner([False, True])
+        plugin.get_data_folder = lambda: tmp
+        plugin.cfg_fixed_size_volumes = {
+          'data': {'SIZE': '10M', 'MOUNTING_POINT': '/data', 'OWNER_UID': 0, 'OWNER_GID': 0},
+        }
+        for name in (
+          '_configure_fixed_size_volumes', '_configure_system_volume',
+          '_configure_env_overrides_control_dir', '_configure_reset_control_dir',
+          '_recover_stale_processing', '_recover_env_overrides_processing',
+          '_recover_reset_processing', '_validate_sync_config',
+          '_setup_env_and_ports', '_inject_sync_env_vars',
+          '_inject_env_overrides_env_vars', '_inject_reset_env_vars',
+        ):
+          delattr(plugin, name)
+
+        mounted = set()
+
+        def provision(vol, **kwargs):
+          if vol.name == 'r1en_system' and not system_available:
+            raise RuntimeError('system volume unavailable')
+          vol.mount_path.mkdir(parents=True, exist_ok=True)
+          mounted.add(str(vol.mount_path))
+          if vol.name == 'r1en_system':
+            for directory in ('volume-sync', 'env-overrides', 'reset'):
+              control = vol.mount_path / directory
+              control.mkdir()
+              (control / 'request.json.processing').write_text('{}')
+
+        def assert_launch_controls():
+          self.assertEqual(len(mounted), 2 if system_available else 1)
+          for host, spec in plugin.volumes.items():
+            self.assertIn(host, mounted)
+            if spec['bind'] == '/r1en_system':
+              for directory in ('volume-sync', 'env-overrides', 'reset'):
+                control = Path(host) / directory
+                self.assertEqual((control / 'request.json').read_text(), '{}')
+                self.assertFalse((control / 'request.json.processing').exists())
+          for env_key in (
+            'R1_SYSTEM_VOLUME', 'R1_VOLUME_SYNC_DIR', 'R1_ENV_OVERRIDES_DIR', 'R1_RESET_DIR',
+          ):
+            self.assertEqual(env_key in plugin.env, system_available)
+
+        plugin._handle_initial_launch.side_effect = assert_launch_controls
+        with (
+          patch('extensions.business.container_apps.fixed_volume._require_tools'),
+          patch('extensions.business.container_apps.fixed_volume.provision', side_effect=provision),
+          patch(
+            'extensions.business.container_apps.fixed_volume.cleanup_stale_mounts',
+            side_effect=lambda *args, **kwargs: mounted.clear(),
+          ) as cleanup,
+          patch('os.chown'),
+        ):
+          plugin.on_init()
+          self.assertEqual(mounted, set())
+          self.assertEqual(plugin.env, {})
+          plugin.process()
+          cleanup.assert_called_once()
+          plugin._handle_initial_launch.assert_called_once_with()
 
 
 # ===========================================================================
