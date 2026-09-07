@@ -274,6 +274,43 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertNotIn("certificateGenerationId", allocation)
     self.assertNotIn("certificateRegenerationIntentSha256", allocation)
 
+  def test_cockroachdb_regeneration_rotates_every_plugin_and_replays_once(self):
+    plugin = make_deeploy_plugin()
+    inputs = self._make_cockroachdb_secure_inputs()
+    second = copy.deepcopy(inputs[DEEPLOY_KEYS.PLUGINS][0])
+    second[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = "second-database"
+    inputs[DEEPLOY_KEYS.PLUGINS].append(second)
+    nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
+
+    plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+    previous = copy.deepcopy(inputs[DEEPLOY_KEYS.PLUGINS])
+    for operation_id in (
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ):
+      inputs["cockroachdb_certificate_regeneration_id"] = operation_id
+      plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+
+      for index, entry in enumerate(inputs[DEEPLOY_KEYS.PLUGINS]):
+        for node in nodes:
+          with self.subTest(operation_id=operation_id, plugin=index, node=node):
+            env = entry["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
+            old_env = previous[index]["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
+            for key in ("CRDB_CA_CRT", "CRDB_NODE_CRT", "CRDB_NODE_KEY"):
+              self.assertTrue(env[key] != old_env[key], f"{key} did not rotate")
+            if node == nodes[0]:
+              for key in ("CRDB_CLIENT_ROOT_CRT", "CRDB_CLIENT_ROOT_KEY"):
+                self.assertTrue(env[key] != old_env[key], f"{key} did not rotate")
+            for key in ("CRDB_NODE_ID", "CF_TUNNEL_TOKEN"):
+              self.assertEqual(env[key], old_env[key])
+
+      allocation = inputs[DEEPLOY_KEYS.PIPELINE_PARAMS]["deeploy_cockroachdb"]
+      self.assertEqual(allocation["certificateGenerationId"], operation_id)
+      previous = copy.deepcopy(inputs[DEEPLOY_KEYS.PLUGINS])
+      replay = copy.deepcopy(inputs)
+      plugin._prepare_cockroachdb_secure_config(inputs, nodes)
+      self.assertTrue(inputs == replay, "Replaying a completed operation changed the inputs")
+
   def test_cockroachdb_secure_config_regenerates_when_managed_hostname_changes(self):
     plugin = make_deeploy_plugin()
     inputs = self._make_cockroachdb_secure_inputs("old.example.test:26257")
