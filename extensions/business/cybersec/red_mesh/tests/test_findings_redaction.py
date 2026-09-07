@@ -48,6 +48,61 @@ class TestScrubGenericPatterns(unittest.TestCase):
     out = scrub_graybox_secrets("Set-Cookie: token=eyJabcdef")
     self.assertNotIn("eyJabcdef", out)
 
+  def test_every_pair_of_a_multi_cookie_header_is_redacted(self):
+    """A session cookie is redacted wherever it sits in the header.
+
+    The pattern used to stop at the first `;` — a Cookie header's internal pair
+    delimiter, not a field separator — so only the first pair was redacted and a
+    session id in any later position reached the archive verbatim. Analytics and
+    preference cookies are routinely sent first, so "any later position" is the
+    common case rather than the corner one.
+    """
+    out = scrub_graybox_secrets(
+      "Cookie: theme=dark; sessionid=s3cr3tSESSIONVALUE; csrftoken=AbCdEf123456"
+    )
+    self.assertNotIn("s3cr3tSESSIONVALUE", out)
+    self.assertNotIn("AbCdEf123456", out)
+    self.assertNotIn("dark", out)
+
+  def test_cookie_names_survive_redaction(self):
+    """Names are not secrets, and they are what makes the evidence readable."""
+    out = scrub_graybox_secrets("Cookie: theme=dark; sessionid=s3cr3tSESSIONVALUE")
+    self.assertIn("theme=<redacted>", out)
+    self.assertIn("sessionid=<redacted>", out)
+
+  def test_set_cookie_attribute_flags_survive_redaction(self):
+    """The flags are the finding, not the secret.
+
+    `probes/misconfig.py` reports `missing_Secure` / `missing_HttpOnly` /
+    `weak_SameSite`, so redacting a whole `Set-Cookie` line to kill the value
+    would redact the evidence for the cookie-hardening scenarios along with it.
+    """
+    out = scrub_graybox_secrets(
+      "Set-Cookie: sessionid=s3cr3tSESSIONVALUE; Path=/; HttpOnly; Secure; SameSite=Lax"
+    )
+    self.assertNotIn("s3cr3tSESSIONVALUE", out)
+    self.assertIn("sessionid=<redacted>", out)
+    for attribute in ("Path=/", "HttpOnly", "Secure", "SameSite=Lax"):
+      self.assertIn(attribute, out)
+
+  def test_cookie_redaction_is_idempotent(self):
+    """The scrubber runs at assembly, at emission and at the storage boundary.
+
+    `_ALREADY_REDACTED` exists because a pattern that consumed its own
+    placeholder on the second pass corrupted a curl reproduction; a cookie rule
+    that is not a fixed point would do the same.
+    """
+    for header in (
+      "Cookie: theme=dark; sessionid=s3cr3tSESSIONVALUE",
+      "Set-Cookie: sessionid=s3cr3tSESSIONVALUE; Path=/; HttpOnly",
+    ):
+      once = scrub_graybox_secrets(header)
+      self.assertEqual(once, scrub_graybox_secrets(once), header)
+
+  def test_a_cookie_carrying_no_value_is_left_alone(self):
+    out = scrub_graybox_secrets("Cookie: ")
+    self.assertNotIn("<redacted>", out)
+
   def test_bare_jwt_redacted(self):
     out = scrub_graybox_secrets(f"server returned: {SAMPLE_JWT}")
     self.assertNotIn(SAMPLE_JWT, out)

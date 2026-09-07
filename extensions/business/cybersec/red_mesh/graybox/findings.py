@@ -51,15 +51,62 @@ from ..models.finding_identity import (
 # boundary, and only the first pass was ever meant to change it.
 _ALREADY_REDACTED = r"(?!\s*<redacted>)"
 
+# `Set-Cookie` attributes, which are policy metadata rather than credential
+# material. `probes/misconfig.py` reports `missing_Secure` / `missing_HttpOnly` /
+# `weak_SameSite`, so these have to survive the scrubber or the cookie-hardening
+# scenarios lose the evidence for the finding they just raised.
+_COOKIE_ATTRIBUTES = frozenset({
+  "path", "domain", "expires", "max-age", "samesite",
+  "secure", "httponly", "partitioned", "priority", "version", "comment",
+})
+
+
+def _redact_cookie_header(match: "re.Match") -> str:
+  """Redact every cookie value in a header, keeping names and attribute flags.
+
+  A cookie header is a `;`-separated list, and `;` is its *internal* pair
+  delimiter — not a field separator. The previous pattern stopped there, so only
+  the first pair was redacted and a session id in any later position survived
+  verbatim into the archive, the LLM input, the PDF and the exports. Analytics
+  and preference cookies are routinely sent first, which made "any later
+  position" the ordinary case rather than the corner one.
+
+  Per pair rather than whole-header, in both directions: on the response side the
+  attributes are what `misconfig` reports on, and on the request side the names
+  are what make the evidence legible. Names are not secrets; values are, so every
+  pair that is not a known attribute loses its value regardless of what it is
+  called — `sessionid`, `PHPSESSID` and `connect.sid` are not in any generic
+  `name=value` pattern and would otherwise have no second line of defence.
+
+  A pair already carrying the placeholder is left untouched, so the rule is a
+  fixed point: this runs at assembly, at emission and again at the storage
+  boundary, and only the first pass is meant to change anything.
+  """
+  name, value = match.group(1), match.group(2)
+  segments = []
+  for segment in value.split(";"):
+    key, assigned, raw = segment.partition("=")
+    if not assigned or key.strip().lower() in _COOKIE_ATTRIBUTES:
+      segments.append(segment)
+      continue
+    if raw.strip() == "<redacted>" or not raw.strip():
+      segments.append(segment)
+      continue
+    segments.append(f"{key}=<redacted>")
+  return f"{name}:{';'.join(segments)}"
+
+
 _SCRUB_PATTERNS = (
   # Whole-header redaction: redact the full value, which spans until the
-  # next field separator (comma/semicolon/newline) or end of string.
+  # next field separator (comma/newline) or end of string. Cookies are handled
+  # separately below — a semicolon does not end their value.
   (re.compile(r"(?i)\b(authorization)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
    r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
-   r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(set-cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
-   r"\1: <redacted>"),
+  # Both cookie headers, to end of line. `set-cookie` is listed first so the
+  # alternation claims it whole, and the lookbehind keeps the bare `cookie`
+  # branch from matching the tail of `Set-Cookie`.
+  (re.compile(r"(?i)(?<![-\w])(set-cookie|cookie)\s*:([^\r\n]*)"),
+   _redact_cookie_header),
   # JWT (3 base64url chunks separated by dots, leading eyJ).
   (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
    "<jwt-redacted>"),
