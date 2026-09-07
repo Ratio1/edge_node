@@ -195,6 +195,12 @@ class BusinessLogicProbes(ProbeBase):
             owasp="A06:2021",
             cwe=["CWE-841"],
             attack=["T1078"],
+            # The method belongs in the typed field, not only in evidence: the
+            # loop keys `url` on the path alone, so two configured endpoints on
+            # one path with different verbs shared a finding_id. A missing guard
+            # on GET and on DELETE are two defects with two fixes.
+            url=url,
+            method=method,
             evidence=[
               f"endpoint={url}",
               f"method={method}",
