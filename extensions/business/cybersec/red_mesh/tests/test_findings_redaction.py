@@ -103,6 +103,78 @@ class TestScrubGenericPatterns(unittest.TestCase):
     out = scrub_graybox_secrets("Cookie: ")
     self.assertNotIn("<redacted>", out)
 
+  def test_an_assembled_curl_line_survives_a_second_pass(self):
+    """The rule runs to end of line, and a curl line is not a bare header.
+
+    `_curl_reproduction` scrubs each header before `shlex.quote`ing it, so the
+    assembled line already carries `<redacted>` values. It is then scrubbed
+    again at emission and a third time at the storage boundary. A guard that
+    only recognises a value that is *exactly* the placeholder does not fire on
+    the last pair, whose value has the rest of the command glued to it — and the
+    other headers, the URL and the closing quote are eaten. That is precisely
+    the failure `_ALREADY_REDACTED` exists to prevent, one level down.
+    """
+    line = (
+      "curl -i -H 'Cookie: theme=<redacted>; sessionid=<redacted>' "
+      "-H 'Accept: */*' 'https://app.test/a?x=1'"
+    )
+    self.assertEqual(scrub_graybox_secrets(line), line)
+
+  def test_an_opaque_cookie_with_no_name_is_still_redacted(self):
+    """A segment with no `=` is a value, not a free pass."""
+    for header, secret in (
+      ("Cookie: OPAQUESESSIONTOKEN", "OPAQUESESSIONTOKEN"),
+      ("Set-Cookie: OPAQUEVALUE", "OPAQUEVALUE"),
+      ("Cookie: a=1; OPAQUETRAILER", "OPAQUETRAILER"),
+    ):
+      with self.subTest(header=header):
+        self.assertNotIn(secret, scrub_graybox_secrets(header))
+
+  def test_a_custom_cookie_bearing_header_is_still_matched(self):
+    """`X-Auth-Cookie` matched before the rule was rewritten; keep it matching."""
+    out = scrub_graybox_secrets("X-Auth-Cookie: abc123secret")
+    self.assertNotIn("abc123secret", out)
+
+  def test_attribute_names_are_not_privileged_in_a_request_cookie_header(self):
+    """`path` and `secure` are attributes only in a `Set-Cookie` response.
+
+    In a request header they are ordinary cookie names, and the allowlist that
+    protects the response flags would otherwise hand their values a free pass.
+    """
+    out = scrub_graybox_secrets(
+      "Cookie: secure=SECRETVALUE; path=SECRET2; domain=SECRET3; version=SECRET4"
+    )
+    for secret in ("SECRETVALUE", "SECRET2", "SECRET3", "SECRET4"):
+      self.assertNotIn(secret, out)
+
+  def test_a_set_cookie_value_named_like_an_attribute_is_still_redacted(self):
+    """Only pairs *after* the first are attributes; the first is the cookie."""
+    out = scrub_graybox_secrets("Set-Cookie: path=SECRETVALUE; Path=/; HttpOnly")
+    self.assertNotIn("SECRETVALUE", out)
+    self.assertIn("Path=/", out)
+    self.assertIn("HttpOnly", out)
+
+  def test_an_attribute_value_is_kept_but_still_meets_the_generic_patterns(self):
+    """The bound on keeping `Set-Cookie` attributes, stated explicitly.
+
+    Scoping metadata (`Path=/admin`) is preserved so the cookie-hardening
+    evidence stays readable. That is a deliberate exemption from *this* rule
+    only: the returned string still passes through the JWT, Bearer, named-secret
+    and operator-configured patterns, so an attribute carrying anything that
+    looks like a credential is still caught.
+    """
+    kept = scrub_graybox_secrets("Set-Cookie: sid=x; Path=/admin; SameSite=Lax")
+    self.assertIn("Path=/admin", kept)
+    self.assertIn("SameSite=Lax", kept)
+
+    jwt = scrub_graybox_secrets(f"Set-Cookie: sid=x; Path={SAMPLE_JWT}")
+    self.assertNotIn(SAMPLE_JWT, jwt)
+
+    configured = scrub_graybox_secrets(
+      "Set-Cookie: sid=x; Path=SECRETV", secret_field_names=("Path",),
+    )
+    self.assertNotIn("SECRETV", configured)
+
   def test_bare_jwt_redacted(self):
     out = scrub_graybox_secrets(f"server returned: {SAMPLE_JWT}")
     self.assertNotIn(SAMPLE_JWT, out)

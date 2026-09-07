@@ -55,10 +55,24 @@ _ALREADY_REDACTED = r"(?!\s*<redacted>)"
 # material. `probes/misconfig.py` reports `missing_Secure` / `missing_HttpOnly` /
 # `weak_SameSite`, so these have to survive the scrubber or the cookie-hardening
 # scenarios lose the evidence for the finding they just raised.
+#
+# Only meaningful in a `Set-Cookie` *response*, and only after the first pair:
+# a request `Cookie:` header is a flat list where `path` and `secure` are
+# ordinary cookie names, and the first pair of a `Set-Cookie` is the cookie
+# itself however it happens to be named. Applying this set outside those bounds
+# hands real values a free pass.
 _COOKIE_ATTRIBUTES = frozenset({
   "path", "domain", "expires", "max-age", "samesite",
   "secure", "httponly", "partitioned", "priority", "version", "comment",
 })
+
+_REDACTED = "<redacted>"
+
+
+def _redacted_in_place(segment: str) -> str:
+  """Replace a whole segment, preserving the separator spacing around it."""
+  lead = segment[:len(segment) - len(segment.lstrip())]
+  return f"{lead}{_REDACTED}"
 
 
 def _redact_cookie_header(match: "re.Match") -> str:
@@ -71,28 +85,40 @@ def _redact_cookie_header(match: "re.Match") -> str:
   and preference cookies are routinely sent first, which made "any later
   position" the ordinary case rather than the corner one.
 
-  Per pair rather than whole-header, in both directions: on the response side the
-  attributes are what `misconfig` reports on, and on the request side the names
-  are what make the evidence legible. Names are not secrets; values are, so every
-  pair that is not a known attribute loses its value regardless of what it is
-  called — `sessionid`, `PHPSESSID` and `connect.sid` are not in any generic
+  Per pair rather than whole-header, so the `Set-Cookie` attributes survive for
+  `misconfig` to report on and cookie *names* stay legible in evidence. Names are
+  not secrets; values are, so a pair loses its value regardless of what it is
+  called — `sessionid`, `PHPSESSID` and `connect.sid` are in no generic
   `name=value` pattern and would otherwise have no second line of defence.
 
-  A pair already carrying the placeholder is left untouched, so the rule is a
-  fixed point: this runs at assembly, at emission and again at the storage
-  boundary, and only the first pass is meant to change anything.
+  Three things this has to get right, each of which it got wrong first:
+
+  * A segment with no `=` is an opaque *value*, not a free pass. Only a
+    `Set-Cookie` attribute flag past the first pair is safe to keep whole.
+  * The attribute allowlist belongs to the response direction alone. In a request
+    header `secure=…` is a cookie like any other.
+  * The already-redacted guard matches a *prefix*, not the whole value. The rule
+    runs to end of line, and it runs three times — at assembly, at emission and
+    at the storage boundary. In an assembled curl reproduction the last pair's
+    value has the rest of the command glued to it, so an equality check does not
+    fire and the remaining headers, the URL and the closing quote are eaten.
+    A prefix check is the same guarantee `_ALREADY_REDACTED` gives the patterns
+    around it.
   """
   name, value = match.group(1), match.group(2)
+  is_response = name.strip().lower() == "set-cookie"
   segments = []
-  for segment in value.split(";"):
+  for index, segment in enumerate(value.split(";")):
     key, assigned, raw = segment.partition("=")
-    if not assigned or key.strip().lower() in _COOKIE_ATTRIBUTES:
+    if is_response and index and key.strip().lower() in _COOKIE_ATTRIBUTES:
       segments.append(segment)
       continue
-    if raw.strip() == "<redacted>" or not raw.strip():
-      segments.append(segment)
+    if assigned:
+      keep = not raw.strip() or raw.lstrip().startswith(_REDACTED)
+      segments.append(segment if keep else f"{key}={_REDACTED}")
       continue
-    segments.append(f"{key}=<redacted>")
+    keep = not segment.strip() or segment.lstrip().startswith(_REDACTED)
+    segments.append(segment if keep else _redacted_in_place(segment))
   return f"{name}:{';'.join(segments)}"
 
 
@@ -102,10 +128,11 @@ _SCRUB_PATTERNS = (
   # separately below — a semicolon does not end their value.
   (re.compile(r"(?i)\b(authorization)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
    r"\1: <redacted>"),
-  # Both cookie headers, to end of line. `set-cookie` is listed first so the
-  # alternation claims it whole, and the lookbehind keeps the bare `cookie`
-  # branch from matching the tail of `Set-Cookie`.
-  (re.compile(r"(?i)(?<![-\w])(set-cookie|cookie)\s*:([^\r\n]*)"),
+  # Both cookie headers, to end of line. `set-cookie` is listed first so that
+  # leftmost-match plus alternation order claims it whole rather than leaving the
+  # bare `cookie` branch to match its tail — a lookbehind for `-` does the same
+  # job but also stops matching `X-Auth-Cookie:` and friends, which `\b` catches.
+  (re.compile(r"(?i)\b(set-cookie|cookie)\s*:([^\r\n]*)"),
    _redact_cookie_header),
   # JWT (3 base64url chunks separated by dots, leading eyJ).
   (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),

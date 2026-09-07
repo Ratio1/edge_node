@@ -533,6 +533,43 @@ class TestEvidenceArtifactProduction(unittest.TestCase):
     artifact = probe.findings[0].evidence_artifacts[0]
     self.assertNotIn("sk-live-abcdefghijklmnop", artifact.request_snapshot)
 
+  def test_a_cookie_bearing_curl_replay_survives_every_scrub_pass(self):
+    """End to end, on the path that actually assembles a curl line.
+
+    `_curl_reproduction` scrubs each header before quoting it, then the step is
+    scrubbed again at emission and a third time at the storage boundary. A
+    cookie rule that reads to end of line and does not recognise an
+    already-redacted *prefix* eats the remaining headers, the URL and the
+    closing quote — leaving a replay step that is neither runnable nor honest
+    about being truncated. The unit-level idempotency test used bare headers,
+    which is exactly the shape that does not catch it.
+    """
+    from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+    probe = self._probe()
+    probe._scrub_for_emission = ProbeBase._scrub_for_emission.__get__(probe)
+    probe.target_config = None
+    resp = self._response()
+    resp.request.headers = {
+      "Cookie": "theme=dark; sessionid=s3cr3tSESSIONVALUE",
+      "Accept": "*/*",
+    }
+    ProbeBase.emit_vulnerable(
+      probe, "PT-A01-01", "IDOR", "HIGH", "A01:2021", ["CWE-639"],
+      ["endpoint=https://app.test/x"], response=resp,
+    )
+    finding = probe.findings[0]
+    curl = next(step for step in finding.replay_steps if step.startswith("curl"))
+    self.assertNotIn("s3cr3tSESSIONVALUE", curl)
+    self.assertNotIn("theme=dark", curl)
+    # The rest of the command is still there, and the quoting still balances.
+    self.assertIn("Accept", curl)
+    self.assertIn(resp.request.url, curl)
+    self.assertEqual(curl.count("'") % 2, 0, f"unbalanced quoting: {curl}")
+
+    # And the storage-boundary pass does not chew it further.
+    flat = finding.to_flat_finding(443, "https", "_graybox_idor")
+    self.assertIn(curl, flat["replay_steps"])
+
   def test_the_artifact_reaches_the_llm_under_the_key_it_reads(self):
     flat = self._emit_with_response().to_flat_finding(443, "https", "_graybox_idor")
     self.assertTrue(
