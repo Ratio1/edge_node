@@ -132,7 +132,17 @@ _SCRUB_PATTERNS = (
   # leftmost-match plus alternation order claims it whole rather than leaving the
   # bare `cookie` branch to match its tail — a lookbehind for `-` does the same
   # job but also stops matching `X-Auth-Cookie:` and friends, which `\b` catches.
-  (re.compile(r"(?i)\b(set-cookie|cookie)\s*:([^\r\n]*)"),
+  #
+  # The space after the colon is required, and it is load-bearing. `misconfig`
+  # builds its cookie-hardening evidence from the target's cookie *names* —
+  # `f"{cookie.name}:missing_Secure"` — and `_flat_evidence_summary` joins the
+  # list with "; ". Without this, a cookie named `session-cookie` matched, and a
+  # rule that reads to end of line then consumed the whole joined string: a
+  # target could suppress its own PT-A02-04 finding by naming a cookie. Every
+  # real header producer here goes through `f"{name}: {value}"`, so requiring the
+  # separator costs nothing and the generic name=value, JWT and Bearer patterns
+  # still cover a spaceless `Cookie:` appearing inside a response body.
+  (re.compile(r"(?i)\b(set-cookie|cookie)\s*:(?=[ \t])([^\r\n]*)"),
    _redact_cookie_header),
   # JWT (3 base64url chunks separated by dots, leading eyJ).
   (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),

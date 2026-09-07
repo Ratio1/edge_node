@@ -154,6 +154,38 @@ class TestScrubGenericPatterns(unittest.TestCase):
     self.assertIn("Path=/", out)
     self.assertIn("HttpOnly", out)
 
+  def test_a_target_named_cookie_cannot_suppress_the_hardening_evidence(self):
+    """`misconfig.py:222-227` builds evidence from the target's cookie *names*.
+
+    It emits `f"{cookie.name}:missing_Secure"`, and `_flat_evidence_summary`
+    joins the list with `"; "`. A cookie named `session-cookie` — or literally
+    `cookie` — then matches the header rule, and a rule that reads to end of line
+    eats the whole joined string. A target could suppress its own PT-A02-04
+    finding by naming a cookie.
+
+    Every real producer of a cookie *header* in this repo emits `f"{name}: {value}"`
+    with a space; this evidence deliberately has none. That is the discriminator.
+    """
+    for name in ("session-cookie", "cookie", "Cookie"):
+      with self.subTest(cookie_name=name):
+        evidence = (
+          f"{name}:missing_Secure; {name}:missing_HttpOnly; endpoint=/admin"
+        )
+        self.assertEqual(
+          scrub_graybox_secrets(evidence), evidence,
+          "the cookie-hardening evidence was redacted by the cookie rule",
+        )
+
+  def test_a_real_cookie_header_is_still_redacted_after_that_narrowing(self):
+    for header, secret in (
+      ("Cookie: theme=dark; sessionid=SECRETV", "SECRETV"),
+      ("Set-Cookie: sid=SECRETV; Path=/; HttpOnly", "SECRETV"),
+      ("X-Auth-Cookie: SECRETV", "SECRETV"),
+      ("Cookie:  sessionid=SECRETV", "SECRETV"),
+    ):
+      with self.subTest(header=header):
+        self.assertNotIn(secret, scrub_graybox_secrets(header))
+
   def test_an_attribute_value_is_kept_but_still_meets_the_generic_patterns(self):
     """The bound on keeping `Set-Cookie` attributes, stated explicitly.
 
