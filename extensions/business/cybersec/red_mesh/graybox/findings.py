@@ -51,15 +51,168 @@ from ..models.finding_identity import (
 # boundary, and only the first pass was ever meant to change it.
 _ALREADY_REDACTED = r"(?!\s*<redacted>)"
 
+# `Set-Cookie` attributes, which are policy metadata rather than credential
+# material. `probes/misconfig.py` reports `missing_Secure` / `missing_HttpOnly` /
+# `weak_SameSite`, so these have to survive the scrubber or the cookie-hardening
+# scenarios lose the evidence for the finding they just raised.
+#
+# Only meaningful in a `Set-Cookie` *response*, and only after the first pair:
+# a request `Cookie:` header is a flat list where `path` and `secure` are
+# ordinary cookie names, and the first pair of a `Set-Cookie` is the cookie
+# itself however it happens to be named. Applying this set outside those bounds
+# hands real values a free pass.
+# `comment` and `version` are deliberately absent. They are RFC 2965, effectively
+# dead, and their values are free server-chosen text — keeping them whole meant
+# `Set-Cookie: sid=x; Comment=<anything>` walked through. Every name here has a
+# structured or enumerated value instead.
+_COOKIE_ATTRIBUTES = frozenset({
+  "path", "domain", "expires", "max-age", "samesite",
+  "secure", "httponly", "partitioned", "priority",
+})
+
+_REDACTED = "<redacted>"
+
+
+def _redacted_in_place(segment: str) -> str:
+  """Replace a whole segment, preserving the separator spacing around it."""
+  lead = segment[:len(segment) - len(segment.lstrip())]
+  return f"{lead}{_REDACTED}"
+
+
+def _is_a_cookie_header_value(value: str) -> bool:
+  """Whether text after a `cookie:` actually introduces a cookie header.
+
+  `probes/misconfig.py` writes its cookie-hardening evidence as
+  `f"{cookie.name}:missing_Secure"` from a *target-controlled* cookie name, and
+  `_flat_evidence_summary` joins those with "; ". A cookie called
+  `session-cookie` therefore produces text shaped exactly like a header, and a
+  target that can make this rule fire on its own evidence can redact the finding
+  it is the evidence for.
+
+  Two tests, because neither alone holds:
+
+  * The first pair of a real cookie header is a `name=value` (or a lone opaque
+    value). Requiring a separator after the colon instead — the first attempt —
+    stopped redacting a spaceless `Cookie:sessionid=…`, which RFC 7230 permits
+    and which no other pattern covers; `sessionid`, `PHPSESSID` and `connect.sid`
+    appear in none of them.
+  * The name of that first pair must not itself contain a colon. `http.cookiejar`
+    accepts a cookie literally named `Cookie: y`, which makes
+    `Cookie: y:missing_Secure` satisfy both the separator and the `name=value`
+    shape further along the line. A cookie name is the one part of this text the
+    target writes, so the check has to survive the target choosing it.
+
+  Two residuals, both narrow, both preferred to another layer of heuristic:
+
+  * A cookie named exactly `cookie` (or `*-cookie`) whose first reported issue
+    carries a value — `Cookie:weak_SameSite=absent` — still reads as a header,
+    and that one token is redacted. One token of degraded evidence.
+  * A spaceless `Cookie:` whose *first* pair has no `=` (`Cookie:OPAQUETOKEN`)
+    is not redacted, though `Cookie: OPAQUETOKEN` is. Separating it from
+    `cookie:missing_Secure` needs a signal neither string carries. It is a
+    malformed header — RFC 6265 requires `name "=" value` — reachable only by
+    appearing inside a target response body. Closing it would mean guessing, and
+    guessing wrong destroys evidence a target chose the name of.
+  """
+  first = value.split(";")[0]
+  if ":" in first.split("=")[0]:
+    return False
+  return value[:1] in (" ", "\t") or "=" in first
+
+
+def _redact_cookie_header(match: "re.Match") -> str:
+  """Redact every cookie value in a header, keeping names and attribute flags.
+
+  A cookie header is a `;`-separated list, and `;` is its *internal* pair
+  delimiter — not a field separator. The previous pattern stopped there, so only
+  the first pair was redacted and a session id in any later position survived
+  verbatim into the archive, the LLM input, the PDF and the exports. Analytics
+  and preference cookies are routinely sent first, which made "any later
+  position" the ordinary case rather than the corner one.
+
+  Per pair rather than whole-header, so the `Set-Cookie` attributes survive for
+  `misconfig` to report on and cookie *names* stay legible in evidence. Names are
+  not secrets; values are, so a pair loses its value regardless of what it is
+  called — `sessionid`, `PHPSESSID` and `connect.sid` are in no generic
+  `name=value` pattern and would otherwise have no second line of defence.
+
+  Everything below is a defect this had before review found it, kept as the
+  reason each rule is shaped the way it is:
+
+  * A segment with no `=` is an opaque *value*, not a free pass. Only a
+    `Set-Cookie` attribute flag past the first pair is safe to keep whole.
+  * The attribute allowlist belongs to the response direction alone, and only
+    past the first pair. In a request header `secure=…` is a cookie like any
+    other, and a `Set-Cookie`'s first pair is the cookie however it is named.
+  * An attribute value carrying a comma is not trusted, because `urllib3` folds
+    duplicate `Set-Cookie` headers with `", "` — so `Path=/, sessionid=…` is two
+    cookies wearing one segment, and keeping it whole hid the second.
+  * The already-redacted guard tests that the value *is* the placeholder, not
+    that it starts with one: a target picks its own cookie values, and
+    `sid=<redacted>SECRET` walked straight through a prefix test.
+
+  The match stops at an argument-closing `'`, and that is what makes the rest
+  safe. This runs four to six times over one string — assembly, emission,
+  persist, aggregate — and `_curl_reproduction` embeds an already-scrubbed header
+  inside a `shlex.quote`d argument. Reading past the closing quote let a trailing
+  pair swallow the rest of the command: the URL, the later `-H`s and the quote
+  itself, leaving a replay step that will not parse. An empty cookie value
+  (`csrftoken=`, which `http.cookiejar` emits for any cleared cookie) was enough
+  to trigger it. Bounding there makes the value's end the header's end, and that
+  is what lets the guard above be an equality test rather than the prefix test
+  that leaked.
+
+  *Argument-closing*, not any `'`, because the target picks cookie values and
+  `'` is inside RFC 6265's `cookie-octet`. Stopping at the first quote handed a
+  target the same suppression `_is_a_cookie_header_value` exists to deny: one
+  cookie holding a quote ended the match early and every pair after it — the
+  session id among them — reached the archive verbatim. `Set-Cookie: a=x',
+  b=SESSIONSECRET` did it in one response header, no cookiejar round trip.
+
+  `shlex.quote` renders an embedded quote as `'"'"'`, so a `'` that closes an
+  argument is always followed by whitespace or end of string and one inside a
+  value never is. The residue is a cookie value containing `'` immediately before
+  a space, which `cookie-octet` excludes.
+  """
+  name, colon, value = match.group(1), match.group(2), match.group(3)
+  if not _is_a_cookie_header_value(value):
+    return match.group(0)
+  is_response = name.strip().lower() == "set-cookie"
+  segments = []
+  for index, segment in enumerate(value.split(";")):
+    key, assigned, raw = segment.partition("=")
+    if (is_response and index and "," not in raw
+        and key.strip().lower() in _COOKIE_ATTRIBUTES):
+      segments.append(segment)
+      continue
+    if assigned:
+      keep = not raw.strip() or raw.strip() == _REDACTED
+      segments.append(segment if keep else f"{key}={_REDACTED}")
+      continue
+    keep = not segment.strip() or segment.strip() == _REDACTED
+    segments.append(segment if keep else _redacted_in_place(segment))
+  return f"{name}{colon}{';'.join(segments)}"
+
+
 _SCRUB_PATTERNS = (
   # Whole-header redaction: redact the full value, which spans until the
-  # next field separator (comma/semicolon/newline) or end of string.
+  # next field separator (comma/newline) or end of string. Cookies are handled
+  # separately below — a semicolon does not end their value.
   (re.compile(r"(?i)\b(authorization)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
    r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
-   r"\1: <redacted>"),
-  (re.compile(r"(?i)\b(set-cookie)\s*:" + _ALREADY_REDACTED + r"\s*[^,\r\n;]+"),
-   r"\1: <redacted>"),
+  # Both cookie headers, to end of line. `set-cookie` is listed first so that
+  # leftmost-match plus alternation order claims it whole rather than leaving the
+  # bare `cookie` branch to match its tail — a lookbehind for `-` does the same
+  # job but also stops matching `X-Auth-Cookie:` and friends, which `\b` catches.
+  #
+  # Whether the match is really a header is decided in `_is_a_cookie_header_value`
+  # — `misconfig` writes evidence shaped like one from a target-controlled cookie
+  # name, and a target must not be able to suppress its own finding by naming a
+  # cookie. The value stops at an *argument-closing* quote so an already-scrubbed
+  # header embedded in a `shlex.quote`d curl argument cannot swallow the rest of
+  # the command — see `_redact_cookie_header` for why the quote alone is not it.
+  (re.compile(r"(?i)\b(set-cookie|cookie)(\s*:)((?:[^\r\n']|'(?!\s|$))*)"),
+   _redact_cookie_header),
   # JWT (3 base64url chunks separated by dots, leading eyJ).
   (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
    "<jwt-redacted>"),
@@ -73,6 +226,77 @@ _SCRUB_PATTERNS = (
   (re.compile(r'(?i)"(password|secret|token|api_key|bearer_token|api[\w_-]*key)"\s*:\s*"[^"]+"'),
    r'"\1": "<redacted>"'),
 )
+
+
+# `endpoint=<url>` is the established convention across the probes and was the
+# de-facto location before GrayboxFinding carried a typed one. The first key
+# found wins, scanning evidence items in order.
+#
+# Lives here rather than in `probes/base.py` — where it started, and where it
+# only reached probes emitting through `emit_*` — because it is a finding-shaping
+# concern and `to_flat_finding` has to apply it too. The four probes that append
+# `GrayboxFinding(...)` directly never populate `url`, so without this at the
+# normalisation boundary their findings reach `dedup_key` with no location and
+# collapse onto one identity. The import direction settles the placement anyway:
+# `probes/base.py` imports from here.
+_LOCATION_EVIDENCE_KEYS = ("endpoint=", "path=", "protected_path=", "token_path=")
+_PARAMETER_EVIDENCE_KEYS = ("parameter=", "param=")
+
+
+def location_from_evidence(evidence):
+  """Return ``(url, parameter)`` recovered from evidence strings, or (None, None).
+
+  Reads the structured `key=value` prefixes only. This is deliberately *not* the
+  free-text evidence string that pre-RM-062 identity hashed: promoting a known
+  key to a typed field keeps identity stable under rewording, where hashing the
+  string re-identified every finding whenever a probe changed its phrasing.
+
+  Read from the **first `;`-separated clause of each evidence item only**, and
+  only when the whole list agrees on one location. Both halves are deliberate,
+  and each replaced something that was worse:
+
+  *Only the first clause*, because 16 of the 65 location-bearing literals are
+  composites like `endpoint={path}; param={p}; payload={payload}`. Taking the
+  whole item swept the tail into the location, and the tail is routinely
+  target-derived — `probed_len={len(response.text)}`, the reflected `Location`
+  header, a `repr()` of a record owner field, a status code. Hashed into the
+  asset, that gave a finding a new identity whenever the target's response moved.
+
+  *Only the first clause*, also, because scanning every clause let the target
+  write its own identity. Items like `server_returned={body!r}` and
+  `first_token={token}` carry verbatim target output, nothing escapes `;` or `=`,
+  and a body containing `; param=…` therefore injected a clause straight into the
+  hash — enough to rotate a finding's id every scan, or to merge two distinct
+  findings. Confining the match to the clause the probe itself opened closes that.
+  The cost is that a location written after some other clause is not seen; those
+  findings keep the empty asset they had before, which is the status quo rather
+  than a regression.
+
+  *One location or none*, because several probes emit a single finding
+  aggregating N locations (`evidence=reachable` over every reachable admin path).
+  Taking the first would key that finding on whichever path the target exposed
+  first, so remediating one of three would rotate the id of the finding covering
+  the other two — recurring churn rather than the one-time rotation this change
+  otherwise causes. An ambiguous list gets no asset, exactly as before.
+  """
+  urls, parameter = [], None
+  for item in evidence or ():
+    if not isinstance(item, str):
+      continue
+    clause = item.split(";")[0].strip()
+    for key in _LOCATION_EVIDENCE_KEYS:
+      if clause.startswith(key):
+        found = clause[len(key):].strip()
+        if found and found not in urls:
+          urls.append(found)
+        break
+    else:
+      if parameter is None:
+        for key in _PARAMETER_EVIDENCE_KEYS:
+          if clause.startswith(key):
+            parameter = clause[len(key):].strip() or None
+            break
+  return (urls[0] if len(urls) == 1 else None), parameter
 
 
 _FINDING_SECRET_FIELD_NAMES = contextvars.ContextVar(
@@ -321,6 +545,31 @@ class GrayboxFinding:
     """
     cwe_joined = ", ".join(self.cwe)
 
+    # Recover the location from evidence for probes that never set one. Four
+    # probes append `GrayboxFinding(...)` directly instead of going through
+    # `ProbeBase.emit_*`, which is where this derivation used to happen alone —
+    # 87 of the 93 constructions in the tree — so their findings arrived with an
+    # empty `affected_assets` and `dedup_key` reduced to probe + scenario_id +
+    # classification. Two endpoints exhibiting one scenario then shared a
+    # `finding_id`, and triage keys on `finding_id` alone: marking one remediated
+    # marked the other. Doing it here covers both producers at one site.
+    #
+    # An explicit value always wins; a finding with no location key still gets no
+    # asset, which is what a coverage record should have.
+    url, parameter = self.url, self.parameter
+    if not url or not parameter:
+      derived_url, derived_parameter = location_from_evidence(self.evidence)
+      # Scrubbed before it is promoted, exactly as `emit_vulnerable` does it: a
+      # URL can carry a token in its query string, and turning evidence into a
+      # typed field must not reintroduce what the scrubber removes elsewhere.
+      # `affected_assets` is scrubbed again at the storage boundary, but identity
+      # is computed before that pass and would otherwise hash the secret.
+      names = _merged_secret_field_names(secret_field_names)
+      if not url and derived_url:
+        url = scrub_graybox_secrets(derived_url, secret_field_names=names)
+      if not parameter and derived_parameter:
+        parameter = scrub_graybox_secrets(derived_parameter, secret_field_names=names)
+
     # Map status -> confidence and effective severity
     confidence_map = {
       "vulnerable": "certain",
@@ -396,13 +645,13 @@ class GrayboxFinding:
       # "no location recorded" from "field missing".
       "affected_assets": (
         [{
-          "host": _asset_host(self.url),
+          "host": _asset_host(url),
           "port": port,
-          "url": self.url,
-          "parameter": self.parameter,
+          "url": url,
+          "parameter": parameter,
           "method": self.method,
         }]
-        if (self.url or self.parameter) else []
+        if (url or parameter) else []
       ),
     }
     # Identity is computed from the assembled finding rather than from a
