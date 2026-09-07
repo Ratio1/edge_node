@@ -208,6 +208,35 @@ class TestScrubGenericPatterns(unittest.TestCase):
         embedded = f"curl -H '{trailing}' 'https://target.example/x'"
         self.assertEqual(scrub_graybox_secrets(embedded), embedded)
 
+  def test_a_quote_inside_a_cookie_value_does_not_end_the_header(self):
+    """The target picks cookie values, and `'` is inside RFC 6265 `cookie-octet`.
+
+    Stopping the match at the first quote handed a target the suppression
+    `_is_a_cookie_header_value` exists to deny: one cookie holding a quote ended
+    the value early, and every pair after it reached the archive verbatim. The
+    response direction needs no cookiejar round trip — `urllib3` folds duplicate
+    `Set-Cookie` headers, so `a=x', b=SESSIONSECRET` is one header.
+
+    The bound is an *argument-closing* quote, which `shlex.quote` renders as
+    whitespace-or-end after `'` and never inside a value (it emits `'"'"'`).
+    """
+    for header, secret in (
+      ("Cookie: junk=ab'cd; sessionid=SUPERSECRET123", "SUPERSECRET123"),
+      ("Set-Cookie: a=x', b=SESSIONSECRET456; Path=/", "SESSIONSECRET456"),
+    ):
+      with self.subTest(header=header):
+        self.assertNotIn(secret, scrub_graybox_secrets(header))
+
+  def test_a_quoted_cookie_value_still_leaves_the_curl_line_runnable(self):
+    """The quote bound exists for this line; widening it must not break it."""
+    import shlex
+    header = scrub_graybox_secrets("Cookie: junk=ab'cd; sessionid=SECRETSESSION789")
+    self.assertNotIn("SECRETSESSION789", header)
+    line = f"curl -i -H {shlex.quote(header)} 'https://target.example/x'"
+    self.assertEqual(scrub_graybox_secrets(line), line)
+    self.assertIn("https://target.example/x", scrub_graybox_secrets(line))
+    shlex.split(line)  # raises if the quoting was broken
+
   def test_a_cookie_header_with_no_space_after_the_colon_is_still_redacted(self):
     """RFC 7230 permits zero whitespace after the colon.
 

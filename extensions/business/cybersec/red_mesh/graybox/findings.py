@@ -151,18 +151,28 @@ def _redact_cookie_header(match: "re.Match") -> str:
     that it starts with one: a target picks its own cookie values, and
     `sid=<redacted>SECRET` walked straight through a prefix test.
 
-  The match stops at `'`, and that is what makes the rest safe. This runs four to
-  six times over one string — assembly, emission, persist, aggregate — and
-  `_curl_reproduction` embeds an already-scrubbed header inside a `shlex.quote`d
-  argument. Reading past the closing quote let a trailing pair swallow the rest
-  of the command: the URL, the later `-H`s and the quote itself, leaving a replay
-  step that will not parse. An empty cookie value (`csrftoken=`, which
-  `http.cookiejar` emits for any cleared cookie) was enough to trigger it.
-  Bounding at the quote makes the value's end the header's end, and that is what
-  lets the guard above be an equality test rather than the prefix test that
-  leaked. The residue is a cookie value containing a literal `'`, which RFC 6265
-  permits and nothing here emits; it would under-redact a tail rather than
-  destroy a line.
+  The match stops at an argument-closing `'`, and that is what makes the rest
+  safe. This runs four to six times over one string — assembly, emission,
+  persist, aggregate — and `_curl_reproduction` embeds an already-scrubbed header
+  inside a `shlex.quote`d argument. Reading past the closing quote let a trailing
+  pair swallow the rest of the command: the URL, the later `-H`s and the quote
+  itself, leaving a replay step that will not parse. An empty cookie value
+  (`csrftoken=`, which `http.cookiejar` emits for any cleared cookie) was enough
+  to trigger it. Bounding there makes the value's end the header's end, and that
+  is what lets the guard above be an equality test rather than the prefix test
+  that leaked.
+
+  *Argument-closing*, not any `'`, because the target picks cookie values and
+  `'` is inside RFC 6265's `cookie-octet`. Stopping at the first quote handed a
+  target the same suppression `_is_a_cookie_header_value` exists to deny: one
+  cookie holding a quote ended the match early and every pair after it — the
+  session id among them — reached the archive verbatim. `Set-Cookie: a=x',
+  b=SESSIONSECRET` did it in one response header, no cookiejar round trip.
+
+  `shlex.quote` renders an embedded quote as `'"'"'`, so a `'` that closes an
+  argument is always followed by whitespace or end of string and one inside a
+  value never is. The residue is a cookie value containing `'` immediately before
+  a space, which `cookie-octet` excludes.
   """
   name, colon, value = match.group(1), match.group(2), match.group(3)
   if not _is_a_cookie_header_value(value):
@@ -198,9 +208,10 @@ _SCRUB_PATTERNS = (
   # Whether the match is really a header is decided in `_is_a_cookie_header_value`
   # — `misconfig` writes evidence shaped like one from a target-controlled cookie
   # name, and a target must not be able to suppress its own finding by naming a
-  # cookie. The value stops at `'` so an already-scrubbed header embedded in a
-  # `shlex.quote`d curl argument cannot swallow the rest of the command.
-  (re.compile(r"(?i)\b(set-cookie|cookie)(\s*:)([^\r\n']*)"),
+  # cookie. The value stops at an *argument-closing* quote so an already-scrubbed
+  # header embedded in a `shlex.quote`d curl argument cannot swallow the rest of
+  # the command — see `_redact_cookie_header` for why the quote alone is not it.
+  (re.compile(r"(?i)\b(set-cookie|cookie)(\s*:)((?:[^\r\n']|'(?!\s|$))*)"),
    _redact_cookie_header),
   # JWT (3 base64url chunks separated by dots, leading eyJ).
   (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
