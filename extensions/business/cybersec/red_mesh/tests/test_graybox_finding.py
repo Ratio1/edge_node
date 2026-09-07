@@ -420,9 +420,32 @@ class TestDirectlyConstructedFindingsAlsoDeriveTheirLocation(unittest.TestCase):
     )
 
   def test_a_finding_with_no_location_key_gets_no_asset(self):
-    """Unchanged behaviour: coverage records carry no location and need none."""
+    """A finding whose evidence names no location still records none.
+
+    Not a statement about coverage records: six `not_vulnerable`/`inconclusive`
+    sites *do* lead with `endpoint=` or `token_path=` (`misconfig.py:465`,
+    `:942`, `:965`, `:1058`; `injection.py:375`; `access_control.py:204` when
+    `has_content` is false) and now carry an asset. That is harmless — every
+    coverage consumer keys on `status` via `models/finding_schema.is_coverage_result`,
+    never on asset emptiness — but it changes their `finding_id` too, so it is
+    part of the one-time rotation this branch causes.
+    """
     flat = self._flat(evidence=["endpoints_tested=4"])
     self.assertEqual(flat["affected_assets"], [])
+
+  def test_a_coverage_record_that_names_a_location_keeps_its_status(self):
+    """The `misconfig.py:465` shape: `not_vulnerable`, but evidence names a URL."""
+    flat = self._flat(status="not_vulnerable", severity="INFO",
+                      evidence=["endpoint=https://app.test/login"])
+    self.assertEqual(flat["status"], "not_vulnerable")
+    self.assertEqual(flat["affected_assets"][0]["url"], "https://app.test/login")
+    from extensions.business.cybersec.red_mesh.models.finding_schema import (
+      is_coverage_result,
+    )
+    self.assertTrue(
+      is_coverage_result(flat),
+      "gaining an asset must not turn a coverage record into a finding",
+    )
 
   def test_a_secret_in_the_derived_url_is_redacted_before_it_is_promoted(self):
     """A URL can carry a token in its query string.
@@ -437,19 +460,38 @@ class TestDirectlyConstructedFindingsAlsoDeriveTheirLocation(unittest.TestCase):
     self.assertNotIn("ABCDEFG12345", flat["affected_assets"][0]["url"])
     self.assertNotIn("ABCDEFG12345", str(flat))
 
-  def test_an_id_stamped_at_production_still_wins_on_the_read_path(self):
-    """Archives keep the identity they were written with."""
+  def test_the_persisted_form_carries_no_id_for_the_read_path_to_honour(self):
+    """`flat_from_dict`'s stamped-id branch is dead for graybox — state it.
+
+    An earlier version of this test handed `flat_from_dict` a payload with a
+    `finding_id` and asserted the stamp won, and on that basis the PR claimed
+    archived findings were unaffected by the identity change. The payload was
+    fabricated. `GrayboxFinding` has no `finding_id` field, so `to_dict()` — the
+    persistence path at `graybox/worker.py` — never emits one, and `mixins/risk.py`
+    is the only production caller. Identity is therefore always recomputed, and
+    this branch does rotate it once.
+
+    A test whose fixture cannot occur in production proves nothing about
+    production. The stamp is still honoured if a payload ever carries one, which
+    the second half asserts; what changes is the claim built on it.
+    """
     from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
-    payload = dict(
-      scenario_id="PT-A03-01", title="Reflected SQLI in authenticated form",
-      status="vulnerable", severity="HIGH", owasp="A03:2021", cwe=["CWE-89"],
-      evidence=["endpoint=https://app.test/a"],
-    )
-    flat = GrayboxFinding.flat_from_dict(
-      dict(payload, finding_id="0123456789abcdef"),
-      443, "https", "_graybox_injection",
-    )
-    self.assertEqual(flat["finding_id"], "0123456789abcdef")
+    persisted = self._finding(evidence=["endpoint=https://app.test/a"]).to_dict()
+    self.assertNotIn("finding_id", persisted)
+    self.assertNotIn("dedup_key", persisted)
+
+    # Recomputed from the persisted form, and equal to the production value.
+    from_archive = GrayboxFinding.flat_from_dict(
+      persisted, 443, "https", "_graybox_injection")
+    direct = self._flat(evidence=["endpoint=https://app.test/a"])
+    self.assertEqual(from_archive["finding_id"], direct["finding_id"])
+
+    # And a payload that does carry a stamp still wins — the branch is correct,
+    # it is simply unreachable from this producer.
+    stamped = GrayboxFinding.flat_from_dict(
+      dict(persisted, finding_id="0123456789abcdef"),
+      443, "https", "_graybox_injection")
+    self.assertEqual(stamped["finding_id"], "0123456789abcdef")
 
 
 class TestTheDerivedLocationIsALocationAndNotTheWholeClause(unittest.TestCase):
