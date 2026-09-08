@@ -3112,6 +3112,12 @@ class EdgeguardApiPlugin(BasePlugin):
     worker = workers.get(model_key)
     if not isinstance(worker, Mapping):
       return None, "unsupported model key"
+    # A pipeline may list a shipped public model with only its worker address;
+    # the shipped catalog metadata for that key fills in underneath. The set
+    # of served keys is always exactly what the pipeline configured.
+    shipped = self.CONFIG.get("EDGEGUARD_GENERATION_WORKERS", {}).get(model_key, {})
+    if isinstance(shipped, Mapping) and shipped is not worker:
+      return {**shipped, **worker}, None
     return worker, None
 
   def _generation_worker_url(self, model_key: str) -> tuple[Optional[str], Optional[str]]:

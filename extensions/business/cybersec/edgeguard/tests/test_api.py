@@ -764,6 +764,18 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(plugin._default_model_key(), "cybersec_qwen_4b")
     self.assertEqual(plugin.model()["model_key"], "cybersec_qwen_4b")
 
+  def test_pipeline_shorthand_public_entry_keeps_shipped_catalog_metadata(self):
+    plugin = _make_api(edgeguard_generation_workers={
+      "cybersec_qwen_4b": {"SEMAPHORE": "edgeguard_llm_cybersec"},
+    })
+
+    catalog = plugin.models()["models"]
+
+    self.assertEqual([item["model_key"] for item in catalog], ["cybersec_qwen_4b"])
+    self.assertEqual(catalog[0]["model_repo"], "mradermacher/CyberSecQwen-4B-GGUF")
+    self.assertEqual(catalog[0]["prompt_profile"], "cybersec_schema_grounded")
+    self.assertNotIn("base_qwen3_4b", plugin._configured_model_keys())
+
   def test_generate_rejects_unconfigured_model_key(self):
     plugin = _make_api()
 

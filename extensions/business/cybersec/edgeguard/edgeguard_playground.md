@@ -11,16 +11,21 @@ The authenticated Next.js application owns only authentication, input collection
 state/history, API transport, and rendering. It must not connect to Neo4j, address model workers,
 construct prompts, poll inference workers, or rebuild/validate graph explanation evidence.
 
-The edg3 deployment uses one `edgeguard_playground_api` Loopback pipeline containing three
-`LLM_INFERENCE_API` instances and one `EDGEGUARD_API` instance. Only the API has a stable published
-port (`5055`). Each model worker receives a runtime-selected port and publishes `API_HOST` and
-`API_PORT` through a unique semaphore:
+A playground deployment uses one `edgeguard_playground_api` Loopback pipeline containing one
+`LLM_INFERENCE_API` instance per model and one `EDGEGUARD_API` instance. Only the API has a stable
+published port (`5055`). Each model worker receives a runtime-selected port and publishes `API_HOST`
+and `API_PORT` through a unique semaphore.
 
-| Public model key | AI engine | Semaphore |
-| --- | --- | --- |
-| `finetuned_v0_10` | `edgeguard_qwen_4b` | `edgeguard_llm_finetuned` |
-| `base_qwen3_4b` | `base_qwen3_4b` | `edgeguard_llm_base` |
-| `cybersec_qwen_4b` | `cybersec_qwen_4b` | `edgeguard_llm_cybersec` |
+This repository ships two public models. The model a deployment actually wants to evaluate, for
+example a private fine-tuned GGUF, is added by the pipeline alone: its public model key, Hub
+repository, filename, pinned revision and semaphore live in the deployment configuration and are
+never committed here. The placeholders below mark those deployment-supplied values.
+
+| Public model key | AI engine | Semaphore | Source |
+| --- | --- | --- | --- |
+| `<public-model-key>` | `llama_cpp_gguf` + `MODEL_INSTANCE_ID` | `edgeguard_llm_private` | pipeline |
+| `base_qwen3_4b` | `base_qwen3_4b` | `edgeguard_llm_base` | shipped |
+| `cybersec_qwen_4b` | `cybersec_qwen_4b` | `edgeguard_llm_cybersec` | shipped |
 
 `EDGEGUARD_API` resolves the selected worker address from its semaphore for every request. Port
 publication proves only that the worker facade is reachable: worker `/health` also reports whether
@@ -30,10 +35,13 @@ and retryably with `model_not_ready`, before Neo4j or model work. Graph explanat
 `edgeguard_llm_base` with public model key `base_qwen3_4b`; generation routing remains selected by
 the user-facing model key.
 
-Every generation or explanation request carries its public model key through `LLM_INFERENCE_API` to
-the generic llama.cpp engine. A targeted packet is relevant only to the engine whose
-`MODEL_API_KEY` matches exactly. Untargeted legacy packets retain the historical broadcast behavior,
-but a targeted completion can never be overwritten by another model in the shared pipeline.
+Every generation or explanation request carries its public model key to its `LLM_INFERENCE_API`
+worker. The worker resolves that key to the serving process that owns it (the AI engine name, an id
+from `STARTUP_AI_ENGINE_PARAMS`, or a `SERVED_MODELS` alias) and tags the bus request with that
+serving name; a request whose key resolves to no local serving is rejected before dispatch instead of
+waiting for the request timeout. Each LLM serving accepts a tagged packet only when the tag is its own
+serving name. Untagged legacy packets retain the historical broadcast behavior, but a targeted
+completion can never be overwritten by another model in the shared pipeline.
 
 ## Hub-backed model contract
 
@@ -44,9 +52,12 @@ pinned revision are the artifact source of truth; the normal persistent Hub cach
 
 | Worker | Repository | Revision | File |
 | --- | --- | --- | --- |
-| Fine-tuned | `ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf` | `369066092b5eef41c9093474ff7142cc530a853f` | `edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf` |
+| Deployment model | `<hub-org>/<private-gguf-repo>` | `<pinned-commit-sha>` | `<model>.Q4_K_M.gguf` |
 | Base | `MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF` | `aec29f0e8c31130ba811bec2c774c2ef44888f55` | `Qwen3-4B-Instruct-2507.Q4_K_M.gguf` |
 | CyberSec | `mradermacher/CyberSecQwen-4B-GGUF` | `4b369711d408b9fde0efcca155409c072b19a1f6` | `CyberSecQwen-4B.Q4_K_M.gguf` |
+
+The deployment model row is filled in by the operator's pipeline record, which is kept with the
+deployment, not in this repository.
 
 Keep the base engine identity pinned to Qwen3 4B. A future generation receives a separate engine,
 profile, public key, artifact, instance, and semaphore instead of repointing `base_qwen3_4b`.
@@ -88,14 +99,16 @@ fail-closed without exposing raw content.
       "SIGNATURE": "LLM_INFERENCE_API",
       "INSTANCES": [
         {
-          "INSTANCE_ID": "edgeguard_llm_finetuned_v0_10",
-          "AI_ENGINE": "edgeguard_qwen_4b",
-          "SEMAPHORE": "edgeguard_llm_finetuned",
+          "INSTANCE_ID": "edgeguard_llm_private",
+          "AI_ENGINE": "llama_cpp_gguf",
+          "SEMAPHORE": "edgeguard_llm_private",
+          "SERVED_MODELS": ["<public-model-key>"],
           "PORT": null,
           "STARTUP_AI_ENGINE_PARAMS": {
-            "MODEL_NAME": "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf",
-            "MODEL_FILENAME": "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
-            "MODEL_REVISION": "369066092b5eef41c9093474ff7142cc530a853f"
+            "MODEL_INSTANCE_ID": "private-model",
+            "MODEL_NAME": "<hub-org>/<private-gguf-repo>",
+            "MODEL_FILENAME": "<model>.Q4_K_M.gguf",
+            "MODEL_REVISION": "<pinned-commit-sha>"
           }
         },
         {
@@ -129,16 +142,24 @@ fail-closed without exposing raw content.
           "INSTANCE_ID": "edgeguard_api",
           "SEMAPHORE": "edgeguard_api",
           "SEMAPHORED_KEYS": [
-            "edgeguard_llm_finetuned",
+            "edgeguard_llm_private",
             "edgeguard_llm_base",
             "edgeguard_llm_cybersec"
           ],
           "PORT": 5055,
           "EDGEGUARD_GENERATION_WORKERS": {
-            "finetuned_v0_10": {"SEMAPHORE": "edgeguard_llm_finetuned"},
+            "<public-model-key>": {
+              "SEMAPHORE": "edgeguard_llm_private",
+              "PROMPT_PROFILE": "direct_cypher",
+              "DISPLAY_NAME": "<display name>",
+              "MODEL_REPO": "<hub-org>/<private-gguf-repo>",
+              "MODEL_FILE": "<model>.Q4_K_M.gguf",
+              "SOURCE": "private_deployment"
+            },
             "base_qwen3_4b": {"SEMAPHORE": "edgeguard_llm_base"},
             "cybersec_qwen_4b": {"SEMAPHORE": "edgeguard_llm_cybersec"}
           },
+          "EDGEGUARD_DEFAULT_MODEL": "<public-model-key>",
           "EDGEGUARD_EXPLANATION_WORKER": {"SEMAPHORE": "edgeguard_llm_base"},
           "EDGEGUARD_EXPLANATION_MODEL": "base_qwen3_4b",
           "NEO4J_DEFAULT_CONNECTION": {
@@ -154,12 +175,20 @@ fail-closed without exposing raw content.
 }
 ```
 
+Shipped public keys (`base_qwen3_4b`, `cybersec_qwen_4b`) equal their AI engine names, so they need
+no `SERVED_MODELS` alias, and a shorthand `{"SEMAPHORE": ...}` entry keeps the shipped catalog
+metadata. A deployment model runs on the generic `llama_cpp_gguf` engine, needs `MODEL_INSTANCE_ID`
+so it can coexist with other generic instances on the node, and declares its public key through
+`SERVED_MODELS` on its worker and as the key of its `EDGEGUARD_GENERATION_WORKERS` entry. Set
+`EDGEGUARD_DEFAULT_MODEL` explicitly when the deployment model should answer requests that name none.
+
 ## Secrets and deployment
 
 edg3 receives an ignored, mode-`0600` runtime env file containing `EE_HF_TOKEN` and the four
 `EE_NEO4J_*` values. The tracked devcontainer configuration contains no secret and injects that file
 only into edg3 through the generated local devcontainer config. The generic loader reads the Hub
 token from the process environment while the stream pins only repository, filename, and revision.
+The stream itself, with the real model identity, is deployment state and stays out of this repository.
 Never place literal credentials in tracked files, logs, task records, prompts, or responses.
 
 The Next.js Worker App Runner needs only the semaphored `EDGEGUARD_API_BASE_URL` plus its own
