@@ -107,6 +107,98 @@ class TestSsrfProbe(unittest.TestCase):
     self.assertEqual(len(api7), 0)
 
 
+class TestTheTwoSsrfVariantsAreSeparateFindings(unittest.TestCase):
+  """
+  `_test_ssrf` and `_test_ssrf_body_field` both run under `PT-API7-01`, both on
+  the same endpoint, both `CWE-918`, both `API7:2023`. Severity is not part of
+  identity, and neither is the title, so a target vulnerable to both the query
+  parameter and the JSON body field produced two findings under one
+  `finding_id` — and triage on either closed both.
+
+  The distinguishing value is already in each probe's evidence (`ep.param` and
+  `body_field`); it just was not in a typed field that reaches
+  `canonical_asset_string`.
+  """
+
+  def _both_variants(self):
+    import dataclasses
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig,
+    )
+    ep = SsrfEndpoint(path="/api/fetch/", param="url")
+    probe = _make_probe(ssrf_endpoints=[ep])
+    # The config dataclasses are frozen; rebuild rather than mutate.
+    probe.target_config = dataclasses.replace(
+      probe.target_config,
+      api_security=ApiSecurityConfig(ssrf_body_fields=["callback"]),
+    )
+    session = probe.auth.official_session
+
+    hit = _mock_response(
+      status=200, text="fetched: http://127.0.0.1:1/internal-probe data",
+    )
+    session.get.side_effect = [_mock_response(status=200, text="nothing"), hit]
+    probe._test_ssrf()
+    session.post.return_value = hit
+    probe._test_ssrf_body_field()
+
+    vuln = [f for f in probe.findings
+            if f.scenario_id == "PT-API7-01" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 2, "expected one finding per SSRF variant")
+    return [f.to_flat_finding(8000, "http", "_graybox_injection") for f in vuln]
+
+  def test_the_two_variants_do_not_share_a_finding_id(self):
+    a, b = self._both_variants()
+    self.assertNotEqual(
+      a["finding_id"], b["finding_id"],
+      "query-parameter and body-field SSRF on one endpoint share an id, so "
+      "triaging one closes the other",
+    )
+
+  def test_each_variant_names_what_it_injected(self):
+    a, b = self._both_variants()
+    params = {f["affected_assets"][0]["parameter"] for f in (a, b)}
+    self.assertEqual(params, {"url", "callback"})
+
+  def test_each_variant_records_the_verb_it_actually_issued(self):
+    """`method` is part of identity, so a wrong literal rotates ids silently.
+
+    `_test_ssrf` issues `session.get`, `_test_ssrf_body_field` issues
+    `session.post`; the typed fields must say so.
+    """
+    a, b = self._both_variants()
+    self.assertEqual(
+      {f["affected_assets"][0]["method"] for f in (a, b)}, {"GET", "POST"},
+    )
+
+  def test_the_variants_stay_distinct_when_the_body_field_matches_the_param(self):
+    """The default config makes this the ordinary case, not the corner one.
+
+    `ssrf_body_fields` defaults to a list beginning `url`, and `ep.param` is
+    commonly `url` too — so `parameter` is identical and `method` is the only
+    thing separating the two findings.
+    """
+    import dataclasses
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig,
+    )
+    probe = _make_probe(ssrf_endpoints=[SsrfEndpoint(path="/api/fetch/", param="url")])
+    probe.target_config = dataclasses.replace(
+      probe.target_config, api_security=ApiSecurityConfig(ssrf_body_fields=["url"]),
+    )
+    session = probe.auth.official_session
+    hit = _mock_response(status=200, text="fetched: http://127.0.0.1:1/internal-probe")
+    session.get.side_effect = [_mock_response(status=200, text="nothing"), hit]
+    probe._test_ssrf()
+    session.post.return_value = hit
+    probe._test_ssrf_body_field()
+
+    flat = [f.to_flat_finding(8000, "http", "_graybox_injection")
+            for f in probe.findings if f.status == "vulnerable"]
+    self.assertEqual(len(flat), 2)
+    self.assertNotEqual(flat[0]["finding_id"], flat[1]["finding_id"])
+
+
 class TestLoginInjection(unittest.TestCase):
 
   def test_login_injection_no_reflection(self):

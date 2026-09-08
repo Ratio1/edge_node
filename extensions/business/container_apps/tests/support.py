@@ -411,6 +411,7 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   # Image pull backoff
   plugin._image_pull_failures = 0
   plugin._next_image_pull_time = 0
+  plugin._fixed_volume_setup_pending = False
   plugin.cfg_image_pull_max_retries = 100
   plugin.cfg_image_pull_backoff_base = 20
 

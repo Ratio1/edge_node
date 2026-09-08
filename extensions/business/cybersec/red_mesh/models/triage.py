@@ -13,6 +13,34 @@ VALID_TRIAGE_STATUSES = frozenset({
   "reopened",
 })
 
+# The vocabulary `findings.py` used for `Finding.triage_state`, which
+# `services/triage.py` never read. The two overlapped on exactly one value,
+# `false_positive` — so `rulebook_assessment` comparing a `triage_state` against
+# the live closed-status set matched that one and nothing else, and a finding
+# remediated and marked `fixed` kept appearing in the compliance gap list.
+#
+# `confirmed` maps to `open`, not to a closed state: confirming a finding is
+# real is the opposite of closing it.
+_LEGACY_TRIAGE_ALIASES = {
+  "new": "open",
+  "confirmed": "open",
+  "wont_fix": "accepted_risk",
+  "fixed": "remediated",
+}
+
+
+def normalize_triage_status(value) -> str:
+  """Return the live triage status for `value`, or `""` if it is not one.
+
+  Unknown values normalise to empty rather than to a guess. Guessing a closed
+  status would silently drop a finding out of the report; leaving it unmapped
+  keeps it visible, which is the safe direction for a security tool.
+  """
+  text = str(value or "").strip().lower()
+  if text in VALID_TRIAGE_STATUSES:
+    return text
+  return _LEGACY_TRIAGE_ALIASES.get(text, "")
+
 
 @dataclass(frozen=True)
 class FindingTriageState:

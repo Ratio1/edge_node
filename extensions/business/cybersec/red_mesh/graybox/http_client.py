@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import posixpath
 from collections.abc import Mapping
-from urllib.parse import parse_qsl, urlencode, unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -67,7 +67,34 @@ def normalize_request_url(target_url: str, url_or_path: str) -> str:
       raise GrayboxScopeError(f"cross-origin graybox request blocked: {raw}")
     path = _normalize_path(parsed.path or "/")
     return urlunsplit((scheme, target.netloc, path, parsed.query, ""))
-  path = _normalize_path(raw or "/")
+  # Relative reference: resolve against the target's *base path*, not the
+  # origin. `_normalize_path` prepends "/" and so discarded any base path, which
+  # meant a link found under `https://host/app` was requested at
+  # `https://host/...`. Measured across a base-path x link-type matrix, 10 of 24
+  # combinations disagreed with what `discovery.py` produces for the same link
+  # via `urljoin`, and every divergent case was a target carrying a base path.
+  # Those requests 404, so the probe reports "not vulnerable" for an endpoint it
+  # never reached — silent false negatives, invisible whenever the scan target
+  # is a bare host, which is why this survived.
+  relative = parsed.path or ""
+  # *Encoded* traversal only. A literal `..` is ordinary relative-reference
+  # resolution (RFC 3986 §5.2): `urljoin` consumes it, clamps at the origin root,
+  # and cannot change the netloc — and the netloc check is what actually enforces
+  # scope. Rejecting it turned `../users` into a `GrayboxScopeError`, so the
+  # probe reported "not vulnerable" for an endpoint it had refused to request:
+  # exactly the silent false negative the base-path fix above exists to remove,
+  # and `discovery.py` produces such links routinely.
+  #
+  # What stays blocked is traversal that survives `urljoin` untouched — `%2e%2e`,
+  # `..%2f` — because those reach the server as a literal payload for it to
+  # decode, and following a discovered link never needs them.
+  decoded = _decode_repeated(relative)
+  if decoded != relative and any(part == ".." for part in decoded.split("/")):
+    raise GrayboxScopeError(f"encoded path traversal is outside graybox scope: {raw}")
+  base_path = target.path or "/"
+  if not base_path.endswith("/"):
+    base_path += "/"
+  path = _normalize_path(urljoin(base_path, relative) or "/")
   return urlunsplit((scheme, target.netloc, path, parsed.query, ""))
 
 
@@ -80,6 +107,25 @@ def path_in_scope(path: str, scope: str) -> bool:
     return True
   prefix = scope if scope.endswith("/") else scope + "/"
   return path.startswith(prefix)
+
+
+def _with_history(response, history):
+  """Attach the redirect chain we resolved by hand to the response we return.
+
+  `requests` populates `history` only for redirects it followed itself, and this
+  client follows them one `allow_redirects=False` hop at a time so each one is
+  re-validated against scope. Without this the attribute is permanently empty
+  and every caller that reads it concludes no redirect happened.
+  """
+  if response is not None:
+    try:
+      response.history = list(history)
+    except AttributeError:
+      # A stub response that refuses attribute assignment still gets a correct
+      # status and body; the chain is a best-effort annotation, not a contract
+      # this client can enforce on an arbitrary object.
+      pass
+  return response
 
 
 def path_scopes_from_allowlist(target_url: str, entries) -> list[str]:
@@ -259,7 +305,14 @@ class GrayboxHttpClient:
     gateway_api_key="",
     gateway_bearer_token="",
     gateway_bearer_refresh_token="",
+    request_budget=None,
+    safety=None,
   ):
+    # The shared per-scan RequestBudget, so redirect hops can be charged where
+    # they are actually issued. Optional: legacy callers and tests construct the
+    # client without one and are unaffected.
+    self._request_budget = request_budget
+    self._safety = safety
     self.target_url = target_url.rstrip("/")
     self.scopes = path_scopes_from_allowlist(target_url, allowlist)
     discovery = getattr(target_config, "discovery", None)
@@ -392,6 +445,9 @@ class GrayboxHttpClient:
 
   def request(self, session, method, url, **kwargs):
     allow_redirects = bool(kwargs.pop("allow_redirects", False))
+    # Cleanup and revert traffic is exempt: budget exhaustion must never prevent
+    # a rollback, which is the existing contract of ProbeBase.cleanup_budget.
+    budget_exempt = bool(kwargs.pop("budget_exempt", False))
     safe_url = self.validate_url(url)
     kwargs = self._with_protected_gateway_auth(kwargs)
     if self._protected_params:
@@ -400,16 +456,41 @@ class GrayboxHttpClient:
       return session.request(method, safe_url, allow_redirects=False, **kwargs)
     current_url = safe_url
     response = None
-    for _ in range(5):
+    # We resolve redirects ourselves so every hop re-enters `validate_url`, which
+    # means `requests` never populates `response.history` — it only does that for
+    # chains *it* followed. Callers reasonably read `history` as "we were
+    # redirected": `auth_strategies._is_login_success` gates its login-form check
+    # on it, and with an always-empty history that check rejected every
+    # post-login page carrying a password input (a change-password widget, a nav
+    # login box, an SPA shell), so `authenticate()` returned None and the whole
+    # authenticated scan was skipped while every scenario behind the login
+    # reported "not vulnerable". Record the chain we consumed so the attribute
+    # means what the `requests` contract says it means.
+    history = []
+    for hop in range(5):
+      # Charge every hop *after* the first. A probe consults the shared budget
+      # once per logical call, so the first request is already paid for;
+      # charging it again would double-count every ordinary request. The hops
+      # were charged to nobody at all — measured, one redirecting call issued
+      # five real requests against a single consume, which let a target that
+      # simply redirects push actual traffic to five times the configured cap
+      # while `budget_remaining` reported the cap was being respected.
+      if hop and not budget_exempt and self._request_budget is not None:
+        if not self._request_budget.consume(1):
+          return _with_history(response, history)
+        if self._safety is not None:
+          self._safety.throttle()
+      if response is not None:
+        history.append(response)
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
       if response.status_code not in (301, 302, 303, 307, 308):
-        return response
+        return _with_history(response, history)
       location = response.headers.get("Location", "")
       if not location:
-        return response
+        return _with_history(response, history)
       current_url = self.validate_url(location)
       if response.status_code in (301, 302, 303) and method != "HEAD":
         method = "GET"
         kwargs.pop("data", None)
         kwargs.pop("json", None)
-    return response
+    return _with_history(response, history)

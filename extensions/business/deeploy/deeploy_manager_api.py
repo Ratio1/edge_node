@@ -819,6 +819,7 @@ class DeeployManagerApiPlugin(
     keep_managed_action_claim = False
     managed_action = None
     service_kind = None
+    cockroachdb_legacy_compat_contexts = None
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
@@ -870,6 +871,7 @@ class DeeployManagerApiPlugin(
           if job_app_type not in JOB_APP_TYPES_ALL:
             job_app_type = JOB_APP_TYPES.NATIVE
         service_kind = self._resolve_deeploy_service_kind(inputs=inputs)
+        self._validate_managed_service_request_admission(service_kind, inputs)
       self.P(f"Resolved job app type: {job_app_type}")
       # persist job type so downstream mixins can adjust validations (e.g. native app resource checks)
       inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
@@ -936,6 +938,16 @@ class DeeployManagerApiPlugin(
           inputs=inputs,
           deeploy_specs=deeploy_specs_for_update,
           discovered_plugin_instances=discovered_plugin_instances,
+        )
+        cockroachdb_legacy_compat_contexts = (
+          self._get_cockroachdb_legacy_compat_contexts_from_discovered(
+            discovered_plugin_instances,
+          )
+        )
+        self._validate_managed_service_request_admission(
+          service_kind,
+          inputs,
+          cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
         )
         self.P(
           f"Discovered {len(discovered_plugin_instances)} live plugin instance record(s) "
@@ -1120,6 +1132,7 @@ class DeeployManagerApiPlugin(
           job_app_type=job_app_type,
           dct_deeploy_specs=deeploy_specs_payload,
           service_kind=service_kind,
+          cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
         )
         if managed_action and managed_action.get("requires_all_target_responses"):
           response_key_nodes = set(prepared_create_deploy_plan.get("response_keys") or {})
@@ -1194,6 +1207,7 @@ class DeeployManagerApiPlugin(
         skip_create_response_key_reset=skip_create_response_key_reset,
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
+        cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
       )
       persistence_state = self._build_pipeline_persistence_state(
         job_id=job_id,

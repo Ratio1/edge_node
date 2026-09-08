@@ -12,3 +12,9 @@ docker
 aiofiles
 paramiko
 datasets
+
+# urllib3 2.x caps decoded output at the requested read size, which is what
+# bounds a compressed response to a small factor of RESPONSE_BODY_MAX_BYTES in
+# the response-fingerprint path. 1.x has no such buffer, so a downgrade would
+# silently reopen decompression amplification with no test failing (RM-065).
+urllib3>=2.0

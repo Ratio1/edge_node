@@ -11,6 +11,7 @@ from .event_builder import (
   build_finding_event,
   build_lifecycle_event,
 )
+from ..models.finding_schema import is_coverage_result
 from .integration_status import record_integration_status
 from .log_export import deliver_redmesh_event
 from .soc_export_policy import current_integration_cooldown
@@ -352,6 +353,15 @@ def emit_lifecycle_event(
 
 
 def emit_finding_event(owner, job_specs, *, finding, event_action="created", pass_nr=None):
+  # A coverage result is not a finding, and it does not leave the platform as
+  # one. It used to ship flagged (`status` + `is_coverage_result`), but a HIGH
+  # `inconclusive` still arrived in a SIEM as a *created finding*, and a flag a
+  # consumer must know to check is a weaker contract than not sending the
+  # non-finding at all. Guarded here — the one seam every caller goes through —
+  # so no emission path can reintroduce it. The archive keeps coverage
+  # regardless: that is the PTES record, and that decision stands.
+  if is_coverage_result(finding):
+    return _skip_result("coverage_result")
   secret, error = _event_export_secret(owner)
   if error:
     record_integration_status(owner, "wazuh", outcome="failure", error_class=error)

@@ -494,9 +494,13 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     if consecutive_401 >= len(self._HTTP_BASIC_CREDS) - 1:
       findings.append(Finding(
         severity=Severity.MEDIUM,
-        title=f"HTTP Basic Auth has no rate limiting ({raw['tested']} attempts accepted)",
-        description="The server does not rate-limit failed authentication attempts.",
-        evidence=f"{consecutive_401} consecutive 401 responses without rate limiting.",
+        title="HTTP Basic Auth has no rate limiting",
+        # Both counts vary when the probe loop breaks early, and `description`
+        # and `evidence` are both in the report layer's dedup key. The attempt
+        # count is in raw_data.
+        description="The server accepted repeated authentication attempts without "
+                    "rate-limiting failed logins.",
+        evidence="Consecutive 401 responses were returned with no rate limiting.",
         remediation="Implement account lockout or rate limiting for failed auth attempts.",
         owasp_id="A07:2021",
         cwe_id="CWE-307",
@@ -771,11 +775,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
     try:
       ftp_rand = _ftp_connect(ruser, rpass)
+      # See the SSH case: the generated pair is per-run, and `evidence` feeds the
+      # content hash, so it belongs in raw_data rather than in the finding.
+      result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="FTP accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence=f"Accepted random creds {ruser}:{rpass}",
+        evidence="Randomly generated credentials were accepted by the FTP service.",
         remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
@@ -908,11 +915,17 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
         look_for_keys=False, allow_agent=False,
       )
+      # The generated pair goes to raw_data, not into the finding. `evidence` is
+      # a content-hash field (models/finding_identity._CONTENT_FIELDS), so a
+      # value that differs every run gave this finding a new finding_signature
+      # on every scan and on every worker: change detection reported a change
+      # each pass and the aggregate carried one copy per worker.
+      result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="SSH accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence=f"Accepted random creds {random_user}:{random_pass}",
+        evidence="Randomly generated credentials were accepted by the SSH service.",
         remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
@@ -1238,7 +1251,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         severity=Severity.LOW,
         title=f"SMTP banner discloses MTA software: {mta} (aids CVE lookup).",
         description="The SMTP banner reveals the mail transfer agent software and version.",
-        evidence=f"Banner: {banner_text[:120]}",
+        evidence="The SMTP banner names the MTA software and version.",
         remediation="Remove or genericize the SMTP banner to hide MTA version details.",
         owasp_id="A05:2021",
         cwe_id="CWE-200",
@@ -1654,11 +1667,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
     success, _, _ = _try_telnet_login(ruser, rpass)
     if success:
+      # See the SSH case: the generated pair is per-run, and `evidence` feeds the
+      # content hash, so it belongs in raw_data rather than in the finding.
+      result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="Telnet accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
-        evidence=f"Accepted random creds {ruser}:{rpass}",
+        evidence="Randomly generated credentials were accepted by the Telnet service.",
         remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
@@ -1718,10 +1734,15 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         sock.close()
       except Exception:
         pass
+      # Whatever answered is not rsync, so the reply is arbitrary service
+      # output — a timestamped SMTP/HTTP greeting as easily as anything else.
+      # It belongs in raw_data; in `description` it reached the content hash
+      # and forked the finding between two workers a second apart.
+      raw["banner"] = banner[:120]
       findings.append(Finding(
         severity=Severity.INFO,
         title=f"Port {port} open but no rsync banner",
-        description=f"Expected @RSYNCD banner, got: {banner[:80]}",
+        description="The service did not present an @RSYNCD banner.",
         confidence="tentative",
       ))
       return probe_result(raw_data=raw, findings=findings)
@@ -1734,7 +1755,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       severity=Severity.LOW,
       title=f"Rsync service detected (protocol {proto_version})",
       description=f"Rsync daemon is running on {target}:{port}.",
-      evidence=f"Banner: {banner}",
+      evidence="The rsync daemon greeting advertises its protocol version.",
       remediation="Restrict rsync access to trusted networks; require authentication for all modules.",
       cwe_id="CWE-200",
       confidence="certain",

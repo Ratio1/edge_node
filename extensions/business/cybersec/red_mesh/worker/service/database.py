@@ -102,10 +102,13 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                 if entropy < 2.0:
                   findings.append(Finding(
                     severity=Severity.HIGH,
-                    title=f"MySQL salt entropy critically low ({entropy:.2f} bits)",
+                    title="MySQL salt entropy critically low",
                     description="The authentication scramble has abnormally low entropy, "
                                 "suggesting a non-standard or deceptive MySQL service.",
-                    evidence=f"salt_entropy={entropy:.2f}, salt_hex={full_salt.hex()[:40]}",
+                    # The measured entropy and the salt itself are per-connection.
+                    # Both are in raw_data (`salt_entropy`); in the title the entropy
+                    # re-keyed the finding on every scan.
+                    evidence="The authentication scramble fell below the entropy threshold.",
                     remediation="Investigate this MySQL instance — authentication randomness is insufficient.",
                     cwe_id="CWE-330",
                     confidence="firm",
@@ -522,9 +525,13 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     if uptime_seconds is not None and uptime_seconds < 60:
       findings.append(Finding(
         severity=Severity.INFO,
-        title=f"Redis uptime <60s ({uptime_seconds}s) — possible container restart",
-        description="Very low uptime may indicate a recently restarted container or ephemeral instance.",
-        evidence=f"uptime_in_seconds={uptime_seconds}",
+        title="Redis uptime under 60s — possible container restart",
+        # The exact uptime is in raw_data. It advances every second, and
+        # `description` is part of the report layer's whole-dict dedup key, so
+        # two workers a second apart would report this finding twice.
+        description="Uptime is under 60s, which may indicate a recently restarted "
+                    "container or an ephemeral instance.",
+        evidence="INFO server reported an uptime below the 60-second threshold.",
         remediation="Investigate if the service is being automatically restarted.",
         confidence="tentative",
       ))
@@ -561,9 +568,9 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         if count > 0:
           findings.append(Finding(
             severity=Severity.MEDIUM,
-            title=f"Redis database contains {count} keys",
-            description="Unauthenticated access to a Redis instance with live data.",
-            evidence=f"DBSIZE={count}",
+            title="Redis database contains live data",
+            description=f"Unauthenticated access to a Redis instance holding {count} keys.",
+            evidence="DBSIZE executed without authentication and reported a non-empty keyspace.",
             remediation="Enable authentication and restrict network access.",
             owasp_id="A01:2021",
             cwe_id="CWE-284",
@@ -590,8 +597,9 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       raw["connected_clients"] = list(ips)
       findings.append(Finding(
         severity=Severity.LOW,
-        title=f"Redis client IPs disclosed ({len(ips)} clients)",
-        description=f"CLIENT LIST reveals connected IPs: {', '.join(sorted(ips)[:5])}",
+        title="Redis client IPs disclosed",
+        description=f"CLIENT LIST reveals {len(ips)} connected client IPs: "
+                    f"{', '.join(sorted(ips)[:5])}",
         evidence=f"IPs: {', '.join(sorted(ips)[:10])}",
         remediation="Rename or disable CLIENT command.",
         confidence="certain",
@@ -624,10 +632,11 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             age_days = int((_time.time() - ts) / 86400)
             findings.append(Finding(
               severity=Severity.LOW,
-              title=f"Redis RDB save is stale ({age_days} days old)",
-              description="The last RDB background save timestamp is over 1 year old. "
-                          "This may indicate disabled persistence, a long-running cache-only instance, or stale data.",
-              evidence=f"rdb_last_bgsave_time={ts}, age={age_days}d",
+              title="Redis RDB save is stale",
+              description="The last RDB background save is over a year old. This may "
+                          "indicate disabled persistence, a long-running cache-only "
+                          "instance, or stale data.",
+              evidence=f"rdb_last_bgsave_time={ts}",
               remediation="Verify persistence configuration; stale saves may indicate data loss risk.",
               cwe_id="CWE-345",
               confidence="tentative",
@@ -681,7 +690,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           title="MSSQL prelogin handshake succeeded",
           description=f"SQL Server on {target}:{port} responds to TDS prelogin, "
                       "exposing version metadata and confirming the service is reachable.",
-          evidence=f"Prelogin response: {readable.strip()[:80]}",
+          evidence="The TDS prelogin handshake completed and returned version metadata.",
           remediation="Restrict SQL Server access to trusted networks; use firewall rules.",
           owasp_id="A05:2021",
           cwe_id="CWE-200",
@@ -1070,19 +1079,36 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           title="Memcached stats accessible without authentication",
           description=f"Memcached on {target}:{port} responds to stats without authentication, "
                       "exposing cache metadata and enabling cache poisoning or data exfiltration.",
-          evidence=f"stats command returned: {raw['banner'][:80]}",
+          # The stats reply itself is in raw_data. It must not go in `evidence`:
+          # it opens with `uptime` and `time`, which change every second, so two
+          # workers scanning one server a second apart produced two different
+          # content hashes and the finding landed in the report twice.
+          evidence="The stats command returned server statistics without authentication.",
           remediation="Bind Memcached to localhost or use SASL authentication; restrict network access.",
           owasp_id="A07:2021",
           cwe_id="CWE-287",
           confidence="certain",
         ))
       else:
-        raw["banner"] = "Memcached port open"
+        # The observed response, not a static label — the raw bytes moved out
+        # of `evidence` and this is where they live. Filter to printable ASCII
+        # first, the way the other probes storing a response do
+        # (infrastructure.py SNMP/DNS/Modbus): control bytes and escape
+        # sequences do not belong in an archived field, and mapping per byte
+        # makes the split-a-character-in-half bug impossible rather than merely
+        # unlikely. Strip the *bytes* first: memcached terminates every line
+        # with CRLF, and filtering before stripping turns that terminator into
+        # ".." — which is not whitespace, so it survives and every banner ends
+        # in dots. It also means a bare-CRLF answer never reaches the fallback
+        # below, which is how a server that answers with nothing keeps the
+        # descriptive label instead of archiving "..".
+        readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data.strip())
+        raw["banner"] = readable[:120] or "Memcached port open"
         findings.append(Finding(
           severity=Severity.INFO,
           title="Memcached port open",
           description=f"Memcached port {port} is open on {target} but stats command was not accepted.",
-          evidence=f"Response: {data[:60].decode('utf-8', errors='replace')}",
+          evidence="The port accepted a connection but rejected the stats command.",
           confidence="firm",
         ))
       sock.close()
@@ -1255,10 +1281,10 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           user_dbs = [d for d in dbs if not d.startswith("_")]
           findings.append(Finding(
             severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
-            title=f"CouchDB unauthenticated database listing ({len(dbs)} databases)",
-            description=f"/_all_dbs accessible without credentials. "
+            title="CouchDB unauthenticated database listing",
+            description=f"/_all_dbs accessible without credentials, listing {len(dbs)} databases. "
                         f"{'User databases exposed: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only system databases found.'}",
-            evidence=f"Databases: {', '.join(dbs[:10])}" + (f"... (+{len(dbs)-10} more)" if len(dbs) > 10 else ""),
+            evidence="GET /_all_dbs returned the database list without credentials.",
             remediation="Enable CouchDB authentication via [admins] section in local.ini.",
             owasp_id="A01:2021",
             cwe_id="CWE-284",
@@ -1275,7 +1301,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           severity=Severity.HIGH,
           title="CouchDB admin panel (Fauxton) accessible",
           description=f"/_utils/ on {target}:{port} serves the admin web interface.",
-          evidence=f"GET /_utils/ returned {resp.status_code}, content-length={len(resp.text)}",
+          evidence="GET /_utils/ served the Fauxton admin interface without credentials.",
           remediation="Restrict access to /_utils via reverse proxy or bind to localhost.",
           owasp_id="A01:2021",
           cwe_id="CWE-284",
@@ -1366,8 +1392,9 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           user_dbs = [d for d in db_names if d not in ("_internal",)]
           findings.append(Finding(
             severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
-            title=f"InfluxDB unauthenticated access ({len(db_names)} databases)",
-            description=f"SHOW DATABASES succeeded without credentials. "
+            title="InfluxDB unauthenticated access",
+            description=f"SHOW DATABASES succeeded without credentials, returning "
+                        f"{len(db_names)} databases. "
                         f"{'User databases: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only internal databases found.'}",
             evidence=f"Databases: {', '.join(db_names[:10])}",
             remediation="Enable InfluxDB authentication in the configuration ([http] auth-enabled = true).",

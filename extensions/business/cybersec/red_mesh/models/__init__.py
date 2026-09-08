@@ -51,6 +51,7 @@ from extensions.business.cybersec.red_mesh.models.triage import (
   FindingTriageAuditEntry,
   FindingTriageState,
   VALID_TRIAGE_STATUSES,
+  normalize_triage_status,
 )
 from extensions.business.cybersec.red_mesh.models.rulebook import (
   RULEBOOK_ASSESSMENT_SCHEMA,
@@ -123,6 +124,7 @@ __all__ = [
   "FindingTriageState",
   "FindingTriageAuditEntry",
   "VALID_TRIAGE_STATUSES",
+  "normalize_triage_status",
   "RULEBOOK_ASSESSMENT_SCHEMA",
   "RULEBOOK_ASSESSMENT_SCHEMA_VERSION",
   "RULEBOOK_SUBMISSION_CONTRACT_VERSION",

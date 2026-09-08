@@ -119,6 +119,7 @@ class ApiDataProbes(ProbeBase):
             "explicit allowlist of fields per role rather than excluding "
             "individual sensitive ones."
           ),
+          response=resp,
         )
       else:
         self.emit_clean(

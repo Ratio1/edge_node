@@ -10,7 +10,9 @@ from ..models.event_schema import (
   REDMESH_EVENT_SCHEMA_VERSION,
   RedMeshEvent,
 )
+from ..credential_redaction import redact_credential_text
 from .event_redaction import redact_event_payload, stable_hmac_pseudonym
+from ..models.finding_schema import is_coverage_result as _is_coverage_result
 
 
 DEFAULT_PRODUCER_NAME = "PENTESTER_API_01"
@@ -409,9 +411,14 @@ def build_finding_event(
 ):
   job_specs = job_specs or {}
   finding = finding or {}
+  # Redacted here, at the egress boundary, rather than trusting the caller to
+  # have done it. This event leaves the platform for the customer's SIEM —
+  # `deliver_wazuh_event` serialises it verbatim, and `strip_sensitive_fields`
+  # matches key *names*, a list that never included `title`. A credential
+  # reaching this payload is a customer rotation event, not a rendering defect.
   finding_payload = {
     "finding_id": finding.get("finding_id"),
-    "title": finding.get("title"),
+    "title": redact_credential_text(finding.get("title")),
     "severity": _normalized_severity(finding.get("severity")),
     "confidence": finding.get("confidence"),
     "category": finding.get("category"),
@@ -420,7 +427,14 @@ def build_finding_event(
     "attack_ids": finding.get("attack_ids") or [],
     "triage_state": finding.get("triage_state"),
     "fingerprint": finding.get("fingerprint") or finding.get("finding_id"),
-    "evidence": finding.get("evidence"),
+    "evidence": redact_credential_text(finding.get("evidence")),
+    # A coverage result — a scenario that ran and found nothing, or could not
+    # decide — is emitted through this same path, and without `status` a SIEM
+    # had no way to tell it from a vulnerability. `inconclusive` keeps its
+    # *declared* severity, so one arrived as a HIGH `finding.created` while the
+    # platform's own counts said there were no HIGH findings.
+    "status": finding.get("status") or "",
+    "is_coverage_result": _is_coverage_result(finding),
   }
   return build_redmesh_event(
     event_type=f"redmesh.finding.{event_action}",

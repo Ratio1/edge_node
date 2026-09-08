@@ -345,7 +345,13 @@ COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS = [
 
 RISK_SEVERITY_WEIGHTS = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 10, "LOW": 2, "INFO": 0}
 RISK_CONFIDENCE_MULTIPLIERS = {"certain": 1.0, "firm": 0.8, "tentative": 0.5}
-RISK_SIGMOID_K = 0.02
+RISK_SIGMOID_K = 0.02  # retained: legacy logistic constant, no longer used for scoring
+# Raw total that maps to 100. The score is log-compressed rather than logistic,
+# because raw_total grows linearly with finding count and the logistic curve
+# pinned at 100 once it passed ~300 — about eight CRITICAL findings. Three real
+# archived runs spanning 46 to 600 findings all scored exactly 100, so the
+# number could not move across a remediation cycle. See normalize_risk_score.
+RISK_RAW_TOTAL_CEILING = 20000.0
 RISK_CRED_PENALTY_PER = 15
 RISK_CRED_PENALTY_CAP = 30
 

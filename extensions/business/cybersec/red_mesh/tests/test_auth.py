@@ -719,6 +719,61 @@ class TestAuthenticatedSessionHardening(unittest.TestCase):
     self.assertIsNone(AuthManager._traverse_identity_path(None, "any"))
 
 
+class TestFormAuthIsVerifiedLikeEveryOtherAuthType(unittest.TestCase):
+  """The short-circuit removal had no test, so restoring it stayed green.
+
+  `_validate_authenticated_session` used to return `(True, False)` immediately
+  for `auth_type == "form"`, so the anonymous-control delta — the only check
+  that actually proves a session is authenticated — never ran for form auth.
+  Combined with form-login success being inferred from cookie presence, that
+  left the most common auth type with no verification at all.
+  """
+
+  def _auth(self, **auth_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    desc = AuthDescriptor(**{
+      "auth_type": "form",
+      "authenticated_probe_path": "/account",
+      **auth_kwargs,
+    })
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=desc))
+    return AuthManager("http://api.example", cfg, verify_tls=False)
+
+  def _session(self, status=200, body=""):
+    sess = MagicMock()
+    sess.headers = {}
+    sess.params = {}
+    resp = _mock_response(status=status, text=body, content_type="text/html")
+    sess.get.return_value = resp
+    sess.head.return_value = resp
+    sess.post.return_value = resp
+    return sess
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_form_auth_does_not_skip_validation(self, mock_auth_requests):
+    # A 3xx to the probe path is the shape an unauthenticated session produces.
+    # Under the short-circuit this returned success without issuing a request.
+    auth = self._auth()
+    sess = self._session(status=302)
+    sess.get.return_value.headers = {"location": "/login"}
+    valid, _retryable = auth._validate_authenticated_session(sess)
+    self.assertFalse(valid, "form auth was accepted without being validated")
+    self.assertTrue(
+      sess.get.called or sess.head.called,
+      "form auth returned a verdict without issuing the probe request",
+    )
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_form_auth_with_no_probe_path_still_returns_early(self, mock_auth_requests):
+    # The early return that makes removing the short-circuit safe: with nothing
+    # configured to probe, there is no verification to perform.
+    auth = self._auth(authenticated_probe_path="")
+    sess = self._session(status=200)
+    self.assertEqual(auth._validate_authenticated_session(sess), (True, False))
+
+
 class TestLoginSuccessDetection(unittest.TestCase):
 
   def _check(self, auth, response, cookies=None):
@@ -752,6 +807,115 @@ class TestLoginSuccessDetection(unittest.TestCase):
     auth = _make_auth()
     resp = _mock_response(url="http://testapp.local:8000/auth/login/")
     self.assertTrue(self._check(auth, resp, cookies={"token": "jwt-val"}))
+
+
+  def test_a_failed_login_that_re_renders_the_form_is_not_success(self):
+    """
+    The decisive case, and the one cookie-presence could never see.
+
+    Every mainstream framework sets a session cookie on the login page itself,
+    *before* authenticating — Django's `sessionid`, Rails' `_session_id`, PHP's
+    `PHPSESSID`. So a rejected login arrives with a cookie set, and the old
+    final `return has_cookies` read that as success. The scan then proceeds
+    believing it is authenticated while every request is anonymous: findings
+    behind the login are silently missed, and the whole authenticated run is a
+    false negative.
+
+    The response body still rendering a password field is the assertion that
+    distinguishes them, and it needs no configuration.
+    """
+    auth = _make_auth()
+    rejected = _mock_response(
+      status=200,
+      url="http://testapp.local:8000/auth/login/",
+      # Deliberately carries none of the _FORM_AUTH_FAILURE_MARKERS: plenty of
+      # apps re-render the form with no message, or a localised one.
+      text='<form method="post"><input name="user"><input type="password" name="pw"></form>',
+    )
+    self.assertFalse(
+      self._check(auth, rejected, cookies={"sessionid": "set-before-auth"}),
+      "a re-rendered login form was accepted as a successful login because a "
+      "session cookie was present",
+    )
+
+  def test_a_password_field_defeats_even_a_redirect(self):
+    auth = _make_auth()
+    resp = _mock_response(
+      url="http://testapp.local:8000/auth/login/?next=/dashboard/",
+      history=[MagicMock()],
+      text='<input type="password" name="password">',
+    )
+    self.assertFalse(self._check(auth, resp, cookies={"sessionid": "x"}))
+
+  def test_a_genuine_post_login_page_still_succeeds(self):
+    auth = _make_auth()
+    resp = _mock_response(
+      url="http://testapp.local:8000/dashboard/",
+      history=[MagicMock()],
+      text="<h1>Welcome back</h1><a href=/logout>Sign out</a>",
+    )
+    self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
+
+  def test_the_password_field_is_recognised_however_it_is_written(self):
+    """The comment claims "any attribute order and with either quoting style,
+    or none". Every existing case used `type="password"` first and double-quoted,
+    so narrowing the pattern to that one literal stayed green — the tolerance
+    the comment promises was asserted nowhere, and a target re-rendering its form
+    with single quotes would have read as a successful login.
+    """
+    auth = _make_auth()
+    for markup in (
+      '<input type="password" name="pw">',
+      "<input type='password' name='pw'>",
+      "<input type=password name=pw>",
+      '<input name="pw" type="password">',
+      '<input class="c" id="pw" type="password" required>',
+      '<input  type = "password"  name="pw" />',
+      '<INPUT TYPE="PASSWORD" NAME="PW">',
+    ):
+      with self.subTest(markup=markup):
+        resp = _mock_response(
+          status=200, url="http://testapp.local:8000/auth/login/", text=markup,
+        )
+        self.assertFalse(
+          self._check(auth, resp, cookies={"sessionid": "x"}),
+          "a re-rendered login form was read as a successful login",
+        )
+
+  def test_a_change_password_widget_on_the_dashboard_is_not_a_rejection(self):
+    """The mirror failure of the bug above, with the same end result.
+
+    A dashboard that ships a change-password form, a persistent nav login box,
+    or an SPA shell with a hidden password field is a real and common shape. If
+    the password-field assertion fires there, the whole authenticated scan is
+    aborted and every finding behind the login goes unlooked-for — which is what
+    the assertion exists to prevent. Landing on a page we were redirected *to*,
+    away from the login endpoint, is the signal that separates the two.
+    """
+    auth = _make_auth()
+    resp = _mock_response(
+      url="http://testapp.local:8000/dashboard/",
+      history=[MagicMock()],
+      text=(
+        "<h1>Welcome back</h1>"
+        '<form action="/account/password"><input type="password" name="new"></form>'
+      ),
+    )
+    self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
+
+  def test_a_data_type_attribute_is_not_a_password_field(self):
+    """`\\btype` also matched `data-type` — the boundary sits after the hyphen.
+
+    A component-library attribute on any post-login page would then read as a
+    re-rendered login form and abort the scan.
+    """
+    auth = _make_auth()
+    resp = _mock_response(
+      status=200,
+      url="http://testapp.local:8000/auth/login/",
+      text='<input data-type="password-strength" name="q">',
+    )
+    self.assertTrue(self._check(auth, resp, cookies={"sessionid": "abc"}))
 
   def test_login_failure_multiword(self):
     """'login failed' in body -> failure."""
@@ -953,6 +1117,88 @@ class TestAuthManagerLifecycle(unittest.TestCase):
     auth = _make_auth()
     err = auth.preflight_check()
     self.assertIsNone(err)
+
+
+class TestLoginSuccessIsJudgedOnTheRealClientsResponse(unittest.TestCase):
+  """
+  Every other test of `_is_login_success` hands it a response whose `history`
+  was fabricated by `_mock_response`. Behind the real client that attribute was
+  always empty: `GrayboxHttpClient.request` resolves redirects itself, one
+  `allow_redirects=False` hop at a time, so `requests` never populated it. So
+  `navigated_away` was permanently False and the password-field check rejected
+  every post-login page that happened to carry one — a change-password widget, a
+  persistent nav login box, an SPA shell. `authenticate()` returned None, the
+  authenticated scan never ran, and every scenario behind the login reported
+  "not vulnerable".
+
+  This drives FormAuth through a real client so the fabricated state cannot hide
+  the defect.
+  """
+
+  def _run(self, responses, allowlist):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+
+    client = GrayboxHttpClient("http://testapp.local:8000", allowlist=allowlist)
+    underlying = MagicMock()
+    underlying.cookies.get_dict.return_value = {"sessionid": "abc"}
+    underlying.request.side_effect = responses
+
+    strategy = FormAuth(
+      "http://testapp.local:8000",
+      GrayboxTargetConfig(),
+      verify_tls=False,
+      http_client=client,
+    )
+    creds = MagicMock(username="admin", password="hunter2")
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests.Session",
+      return_value=underlying,
+    ):
+      return strategy.authenticate(creds)
+
+  def test_a_dashboard_carrying_a_password_widget_still_authenticates(self):
+    login_form = '<form method="post"><input type="password" name="password"></form>'
+    session = self._run(
+      [
+        _mock_response(
+          status=200, url="http://testapp.local:8000/auth/login/", text=login_form,
+        ),
+        _mock_response(
+          status=302, url="http://testapp.local:8000/auth/login/",
+          headers={"Location": "/dashboard/"},
+        ),
+        _mock_response(
+          status=200, url="http://testapp.local:8000/dashboard/",
+          text='<h1>Welcome back</h1>'
+               '<form action="/account/password">'
+               '<input type="password" name="new"></form>',
+        ),
+      ],
+      allowlist=["/auth/", "/dashboard/"],
+    )
+    self.assertIsNotNone(
+      session,
+      "a dashboard reached by redirect was rejected because it renders a "
+      "change-password field, so the whole authenticated scan was skipped",
+    )
+
+  def test_a_re_rendered_login_form_is_still_rejected(self):
+    """The guard the above must not disarm: no redirect, form still showing."""
+    login_form = '<form method="post"><input type="password" name="password"></form>'
+    self.assertIsNone(
+      self._run(
+        [
+          _mock_response(
+            status=200, url="http://testapp.local:8000/auth/login/", text=login_form,
+          ),
+          _mock_response(
+            status=200, url="http://testapp.local:8000/auth/login/", text=login_form,
+          ),
+        ],
+        allowlist=["/auth/"],
+      ),
+    )
 
 
 if __name__ == '__main__':

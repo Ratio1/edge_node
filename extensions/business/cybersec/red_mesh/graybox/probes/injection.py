@@ -358,6 +358,12 @@ class InjectionProbes(ProbeBase):
           owasp="API7:2023",
           cwe=["CWE-918"],
           attack=["T1190"],
+          # The injected parameter is what separates this from the JSON
+          # body-field variant below: same scenario, same endpoint, same CWE,
+          # and neither severity nor title is part of a finding's identity.
+          url=url,
+          parameter=ep.param,
+          method="GET",
           evidence=[
             f"endpoint={url}",
             f"payload={payload_url}",
@@ -430,6 +436,11 @@ class InjectionProbes(ProbeBase):
             owasp="API7:2023",
             cwe=["CWE-918"],
             attack=["T1190"],
+            # The body field, for the same reason the query variant records its
+            # parameter: one endpoint can be vulnerable through both.
+            url=url,
+            parameter=body_field,
+            method="POST",
             evidence=[f"endpoint={url}", f"body_field={body_field}",
                        f"payload_url={payload_url}",
                        "response_status=200",
