@@ -181,15 +181,44 @@ class BaseInferenceApiPlugin(
     """
     shared = getattr(self, "global_shmem", None)
     manager = shared.get("serving_manager") if isinstance(shared, dict) else None
-    get_processes = getattr(self, "get_serving_processes", None)
     is_available = getattr(manager, "is_avail", None)
-    if not callable(get_processes) or not callable(is_available):
+    if not callable(is_available):
       return False
     try:
-      processes = get_processes()
-      return bool(processes) and all(is_available(process) for process in processes)
+      handles = self._serving_handles()
+      return bool(handles) and all(is_available(handle) for handle in handles)
     except Exception:
       return False
+
+  def _serving_handles(self):
+    """Serving-manager handles for this plugin's engines.
+
+    Mirrors how the orchestrator names servings: an engine whose startup params
+    declare MODEL_INSTANCE_ID runs as the `(engine, instance)` handle, so the
+    plain engine name would never report available for it.
+    """
+    engines = getattr(self, "cfg_ai_engine", None)
+    if isinstance(engines, str):
+      engines = [engines]
+    resolver = getattr(self, "get_serving_process_given_ai_engine", None)
+    if not isinstance(engines, (list, tuple)) or not callable(resolver):
+      get_processes = getattr(self, "get_serving_processes", None)
+      return list(get_processes()) if callable(get_processes) else []
+    engines = [engine for engine in engines if isinstance(engine, str) and engine.strip()]
+    startup_params = getattr(self, "cfg_startup_ai_engine_params", None)
+    if not isinstance(startup_params, dict):
+      startup_params = {}
+    handles = []
+    for engine in engines:
+      params = next(
+        (value for key, value in startup_params.items()
+         if isinstance(key, str) and key.lower() == engine.lower() and isinstance(value, dict)),
+        startup_params if len(engines) == 1 else {},
+      )
+      instance_id = params.get("MODEL_INSTANCE_ID")
+      handle = (engine, instance_id.strip()) if isinstance(instance_id, str) and instance_id.strip() else engine
+      handles.append(resolver(handle))
+    return handles
 
   @staticmethod
   def balanced_endpoint(func):

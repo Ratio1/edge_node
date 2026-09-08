@@ -265,6 +265,19 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     manager.is_avail = lambda _process: True
     self.assertTrue(plugin._serving_ready())
 
+  def test_serving_ready_uses_instance_handle_when_startup_params_name_one(self):
+    plugin = self._make_plugin()
+    plugin.cfg_ai_engine = "llama_cpp_gguf"
+    plugin.cfg_startup_ai_engine_params = {"MODEL_INSTANCE_ID": "worker-a", "MODEL_NAME": "org/private"}
+    plugin.get_serving_process_given_ai_engine = (
+      lambda handle: (handle[0], handle[1]) if isinstance(handle, tuple) else handle
+    )
+    seen = []
+    plugin.global_shmem = {"serving_manager": SimpleNamespace(is_avail=lambda handle: seen.append(handle) or True)}
+
+    self.assertTrue(plugin._serving_ready())
+    self.assertEqual(seen, [("llama_cpp_gguf", "worker-a")])
+
   def _make_plugin(self, **kwargs):
     plugin = BaseInferenceApiPlugin(**kwargs)
     plugin.on_init()
