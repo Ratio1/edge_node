@@ -104,6 +104,47 @@ def _load_llama_cpp_base_class():
   return namespace["LlamaCppBaseServingProcess"]
 
 
+class _FakeLlmServing:
+  ct = types.SimpleNamespace(
+    PAYLOAD_DATA=types.SimpleNamespace(EE_PAYLOAD_PATH="EE_PAYLOAD_PATH"),
+    SIGNATURE="SIGNATURE",
+    JeevesCt=types.SimpleNamespace(JEEVES_CONTENT="JEEVES_CONTENT"),
+  )
+
+  def __init__(self, server_name):
+    self.server_name = server_name
+    self.messages = []
+
+  def P(self, message, *_args, **_kwargs):
+    self.messages.append(str(message))
+
+  @staticmethod
+  def shorten_str(value):
+    return str(value)
+
+  @staticmethod
+  def get_relevant_signatures():
+    return {"LLM_INFERENCE_API"}
+
+  @staticmethod
+  def check_supported_request_type(message_data):
+    return True
+
+
+def _load_llm_serving_relevance_gate():
+  """Compile only `BaseLlmServing.check_relevant_input`, avoiding the torch import chain."""
+  source_path = ROOT / "extensions" / "serving" / "base" / "base_llm_serving.py"
+  source = source_path.read_text(encoding="utf-8")
+  module = ast.parse(source)
+  class_node = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "BaseLlmServing")
+  method = next(node for node in class_node.body if isinstance(node, ast.FunctionDef) and node.name == "check_relevant_input")
+  method_source = ast.get_source_segment(source, method)
+  method_source = "\n".join(line[2:] if line.startswith("  ") else line for line in method_source.splitlines())
+  namespace = {}
+  exec(compile(method_source, str(source_path), "exec"), namespace)  # noqa: S102
+  return namespace["check_relevant_input"]
+
+
 def _load_profile(filename, class_name):
   source_path = PROFILE_DIR / filename
   source = source_path.read_text(encoding="utf-8")
@@ -163,7 +204,6 @@ def _make_llama_cpp_process(**overrides):
     "cfg_model_name": "org/repo",
     "cfg_model_filename": "model.gguf",
     "cfg_model_revision": None,
-    "cfg_model_api_key": None,
     "cfg_model_n_ctx": 1024,
     "cfg_chat_format": None,
     "cfg_draft_model": None,
@@ -191,13 +231,6 @@ class CyberSecQwenEngineTests(unittest.TestCase):
       "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
       "edgeguard-base-qwen3-4b",
     ),
-    "edgeguard_qwen_4b": (
-      "llama_cpp_edgeguard_qwen_4b.py",
-      "LlamaCppEdgeguardQwen4B",
-      "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf",
-      "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
-      "edgeguard-qwen3-4b-cypher",
-    ),
     "cybersec_qwen_4b": (
       "llama_cpp_cybersec_qwen_4b.py",
       "LlamaCppCybersecQwen4B",
@@ -207,22 +240,23 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     ),
   }
 
-  def test_three_model_ai_engine_mappings_use_generic_profiles(self):
+  def test_public_and_generic_ai_engine_mappings(self):
     expected = {
       "base_qwen3_4b": "llama_cpp_base_qwen3_4b",
-      "edgeguard_qwen_4b": "llama_cpp_edgeguard_qwen_4b",
       "cybersec_qwen_4b": "llama_cpp_cybersec_qwen_4b",
+      "llama_cpp_gguf": "llama_cpp_gguf",
     }
     for engine, serving_process in expected.items():
       with self.subTest(engine=engine):
         self.assertEqual(AI_ENGINES[engine]["SERVING_PROCESS"], serving_process)
+    self.assertNotIn("edgeguard_qwen_4b", AI_ENGINES)
     self.assertNotIn("edgeguard_cybersec_qwen_4b", AI_ENGINES)
 
-  def test_three_model_ai_engine_aliases_round_trip_with_instance_ids(self):
+  def test_ai_engine_aliases_round_trip_with_instance_ids(self):
     utils = _load_ai_engine_utils()
     instances = {
       "base_qwen3_4b": "edgeguard-base-qwen3-4b",
-      "edgeguard_qwen_4b": "edgeguard-finetuned-v0-10",
+      "llama_cpp_gguf": "private-model-a",
       "cybersec_qwen_4b": "edgeguard-cybersec-qwen-4b",
     }
     for engine, instance_id in instances.items():
@@ -238,11 +272,6 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         )
 
   def test_profiles_keep_model_identity_and_cpu_bounds(self):
-    api_keys = {
-      "base_qwen3_4b": "base_qwen3_4b",
-      "edgeguard_qwen_4b": "finetuned_v0_10",
-      "cybersec_qwen_4b": "cybersec_qwen_4b",
-    }
     for engine, profile_args in self.PROFILES.items():
       filename, class_name, model_name, model_filename, instance_id = profile_args
       with self.subTest(engine=engine):
@@ -256,25 +285,43 @@ class CyberSecQwenEngineTests(unittest.TestCase):
         self.assertEqual(config["MODEL_NAME"], model_name)
         self.assertEqual(config["MODEL_FILENAME"], model_filename)
         self.assertEqual(config["MODEL_INSTANCE_ID"], instance_id)
-        self.assertEqual(config["MODEL_API_KEY"], api_keys[engine])
+        self.assertNotIn("MODEL_API_KEY", config)
 
-  def test_shared_inference_bus_honors_explicit_model_route(self):
-    process = _make_llama_cpp_process(cfg_model_api_key="base_qwen3_4b")
+  def test_generic_gguf_profile_carries_no_model_identity(self):
+    loaded = _load_profile("llama_cpp_gguf.py", "LlamaCppGguf")
+    config = loaded.config
+    self.assertIs(loaded.cls.CONFIG, config)
+    self.assertEqual(config["DEFAULT_DEVICE"], "cpu")
+    self.assertEqual(config["N_GPU_LAYERS"], 0)
+    for key in ("MODEL_NAME", "MODEL_FILENAME", "MODEL_PATH", "MODEL_REVISION", "MODEL_INSTANCE_ID"):
+      with self.subTest(key=key):
+        self.assertIsNone(config.get(key))
+    self.assertNotIn("MODEL_API_KEY", config)
+    self.assertNotIn("ratio1/", loaded.source)
 
-    self.assertTrue(process._matches_model_route({"JEEVES_CONTENT": {"MODEL": "base_qwen3_4b"}}))
-    self.assertFalse(process._matches_model_route({"JEEVES_CONTENT": {"MODEL": "cybersec_qwen_4b"}}))
-    self.assertTrue(process._matches_model_route({"JEEVES_CONTENT": {}}))
+  def test_llm_serving_relevance_gate_matches_own_server_name(self):
+    check_relevant_input = _load_llm_serving_relevance_gate()
+    serving = _FakeLlmServing(server_name="LLAMA_CPP_GGUF_PRIVATE-MODEL-A")
+
+    def request(content):
+      return {"SIGNATURE": "LLM_INFERENCE_API", "JEEVES_CONTENT": content}
+
+    self.assertTrue(check_relevant_input(serving, request({"TARGET_SERVING_NAME": "llama_cpp_gguf_private-model-a"})))
+    self.assertFalse(check_relevant_input(serving, request({"TARGET_SERVING_NAME": "LLAMA_CPP_CYBERSEC_QWEN_4B"})))
+    self.assertTrue(check_relevant_input(serving, request({"MESSAGES": []})))
+    self.assertTrue(check_relevant_input(serving, request({"TARGET_SERVING_NAME": ""})))
 
   def test_profiles_are_configuration_only_generic_subclasses(self):
     for filename, class_name in (
       ("llama_cpp_base_qwen3_4b.py", "LlamaCppBaseQwen34B"),
-      ("llama_cpp_edgeguard_qwen_4b.py", "LlamaCppEdgeguardQwen4B"),
+      ("llama_cpp_gguf.py", "LlamaCppGguf"),
       ("llama_cpp_cybersec_qwen_4b.py", "LlamaCppCybersecQwen4B"),
     ):
       with self.subTest(filename=filename):
         source = (PROFILE_DIR / filename).read_text(encoding="utf-8")
         self.assertIn("nlp.llama_cpp_base import LlamaCppBaseServingProcess", source)
         self.assertNotIn("llama_cpp_edgeguard_base", source)
+        self.assertNotIn("MODEL_API_KEY", source)
         self.assertNotIn("MODEL_REVISION", source)
         self.assertNotIn("EXPECTED_MODEL_SHA256", source)
         self.assertNotIn("WORKER_MODULE_SHA256", source)
@@ -288,6 +335,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
   def test_edgeguard_specific_serving_modules_are_removed(self):
     self.assertFalse((PROFILE_DIR / "llama_cpp_edgeguard_base.py").exists())
     self.assertFalse((PROFILE_DIR / "llama_cpp_edgeguard_cybersec_qwen_4b.py").exists())
+    self.assertFalse((PROFILE_DIR / "llama_cpp_edgeguard_qwen_4b.py").exists())
 
   def test_production_plugin_loader_resolves_base_qwen3_profile_class(self):
     module_name = (
@@ -315,7 +363,7 @@ class CyberSecQwenEngineTests(unittest.TestCase):
     self.assertIs(class_def.CONFIG, module._CONFIG)
     self.assertEqual(config["MODEL_INSTANCE_ID"], "edgeguard-base-qwen3-4b")
 
-  def test_generic_llama_cpp_loads_all_three_local_profile_paths(self):
+  def test_generic_llama_cpp_loads_all_public_profile_paths(self):
     for engine, profile_args in self.PROFILES.items():
       filename, class_name, model_name, model_filename, _instance_id = profile_args
       loaded = _load_profile(filename, class_name)

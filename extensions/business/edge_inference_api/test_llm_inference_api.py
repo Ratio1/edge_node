@@ -84,6 +84,15 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     plugin.cfg_ai_engine = overrides.get("AI_ENGINE", "llama_cpp_small")
     plugin.cfg_served_models = overrides.get("SERVED_MODELS", [])
     plugin.cfg_startup_ai_engine_params = overrides.get("STARTUP_AI_ENGINE_PARAMS", {})
+    serving_processes = {"llama_cpp_small": "llama_cpp_llama_1b", "llama_cpp_medium": "llama_cpp_llama_3b"}
+
+    def _serving_for(handle):
+      if isinstance(handle, tuple):
+        engine, instance_id = handle
+        return serving_processes.get(engine, engine), instance_id
+      return serving_processes.get(handle, handle)
+
+    plugin.get_serving_process_given_ai_engine = _serving_for
     return plugin
 
   def test_model_capability_uses_explicit_aliases_and_effective_ai_config(self):
@@ -186,7 +195,8 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(payload["JEEVES_CONTENT"]["FREQUENCY_PENALTY"], 0.2)
     self.assertNotIn("MODEL", payload["JEEVES_CONTENT"])
     self.assertNotIn("REPEAT_PENALTY", payload["JEEVES_CONTENT"])
-    self.assertEqual(payload["JEEVES_CONTENT"]["TARGET_MODEL_KEY"], "llama_cpp_small")
+    self.assertEqual(payload["JEEVES_CONTENT"]["TARGET_SERVING_NAME"], "LLAMA_CPP_LLAMA_1B")
+    self.assertNotIn("TARGET_MODEL_KEY", payload["JEEVES_CONTENT"])
 
   def test_compute_payload_kwargs_without_model_has_no_target_key(self):
     plugin = LLMInferenceApiPlugin()
@@ -199,7 +209,48 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
         }
       },
     )
-    self.assertNotIn("TARGET_MODEL_KEY", payload["JEEVES_CONTENT"])
+    self.assertNotIn("TARGET_SERVING_NAME", payload["JEEVES_CONTENT"])
+
+  def test_alias_and_startup_ids_route_to_the_serving_name(self):
+    plugin = self._make_plugin(
+      AI_ENGINE="llama_cpp_medium",
+      SERVED_MODELS=["public-alias"],
+      STARTUP_AI_ENGINE_PARAMS={"MODEL_NAME": "org/private-model", "MODEL_INSTANCE_ID": "worker-a"},
+    )
+
+    for requested in ("public-alias", "org/private-model", "worker-a", "llama_cpp_medium", "PUBLIC-ALIAS"):
+      with self.subTest(requested=requested):
+        self.assertTrue(plugin._can_execute_request({"parameters": {"model": requested}}))  # pylint: disable=protected-access
+        payload = plugin.compute_payload_kwargs_from_predict_params(
+          request_id="req-route",
+          request_data={"parameters": {"messages": [], "model": requested}},
+        )
+        self.assertEqual(payload["JEEVES_CONTENT"]["TARGET_SERVING_NAME"], "LLAMA_CPP_LLAMA_3B_WORKER-A")
+
+  def test_unroutable_model_is_neither_advertised_nor_executable(self):
+    plugin = self._make_plugin(AI_ENGINE="llama_cpp_medium", SERVED_MODELS=["public-alias"])
+
+    self.assertFalse(plugin._can_execute_request({"parameters": {"model": "unknown-model"}}))  # pylint: disable=protected-access
+    self.assertNotIn("unknown-model", plugin._get_local_model_ids())  # pylint: disable=protected-access
+
+  def test_multi_engine_instance_routes_per_engine_and_drops_ambiguous_aliases(self):
+    plugin = self._make_plugin(
+      AI_ENGINE=["llama_cpp_small", "llama_cpp_medium"],
+      SERVED_MODELS=["ambiguous-alias"],
+      STARTUP_AI_ENGINE_PARAMS={
+        "llama_cpp_small": {"MODEL_INSTANCE_ID": "small-a"},
+        "llama_cpp_medium": {"MODEL_NAME": "org/medium"},
+      },
+    )
+
+    self.assertEqual(
+      plugin._get_local_model_ids(),  # pylint: disable=protected-access
+      ["llama_cpp_medium", "llama_cpp_small", "org/medium", "small-a"],
+    )
+    self.assertEqual(plugin._resolve_target_serving_name("small-a"), "LLAMA_CPP_LLAMA_1B_SMALL-A")  # pylint: disable=protected-access
+    self.assertEqual(plugin._resolve_target_serving_name("org/medium"), "LLAMA_CPP_LLAMA_3B")  # pylint: disable=protected-access
+    self.assertIsNone(plugin._resolve_target_serving_name("ambiguous-alias"))  # pylint: disable=protected-access
+    self.assertFalse(plugin._can_execute_request({"parameters": {"model": "ambiguous-alias"}}))  # pylint: disable=protected-access
 
   def test_filter_valid_inference_accepts_lowercase_request_id(self):
     plugin = LLMInferenceApiPlugin()

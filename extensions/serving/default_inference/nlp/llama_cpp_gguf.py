@@ -1,4 +1,10 @@
-"""Unmodified Qwen3 4B GGUF serving profile for EdgeGuard comparisons."""
+"""Generic GGUF llama.cpp serving profile configured entirely by the pipeline.
+
+This profile carries no model identity. The pipeline supplies the Hub repo,
+filename and pinned revision (or a local model path) plus the instance id
+through `STARTUP_AI_ENGINE_PARAMS`, so a private or experimental model can be
+served without adding its identity to this repository.
+"""
 
 from extensions.serving.default_inference.nlp.llama_cpp_base import LlamaCppBaseServingProcess as BaseServingProcess
 
@@ -9,12 +15,9 @@ _CONFIG = {
   **BaseServingProcess.CONFIG,
 
   "DEFAULT_DEVICE": "cpu",
-  "MODEL_NAME": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
-  "MODEL_FILENAME": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
   "MODEL_N_CTX": 4096,
   "N_GPU_LAYERS": 0,
   "N_THREADS": 4,
-  "MODEL_INSTANCE_ID": "edgeguard-base-qwen3-4b",
   "DEFAULT_MAX_TOKENS": 512,
 
   'VALIDATION_RULES': {
@@ -23,5 +26,5 @@ _CONFIG = {
 }
 
 
-class LlamaCppBaseQwen34B(BaseServingProcess):
+class LlamaCppGguf(BaseServingProcess):
   CONFIG = _CONFIG

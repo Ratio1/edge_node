@@ -25,8 +25,9 @@ AI_ENGINES['cybersec_qwen_4b'] = {
   'SERVING_PROCESS': 'llama_cpp_cybersec_qwen_4b'
 }
 
-AI_ENGINES['edgeguard_qwen_4b'] = {
-  'SERVING_PROCESS': 'llama_cpp_edgeguard_qwen_4b'
+# Model identity comes from the pipeline's STARTUP_AI_ENGINE_PARAMS.
+AI_ENGINES['llama_cpp_gguf'] = {
+  'SERVING_PROCESS': 'llama_cpp_gguf'
 }
 
 AI_ENGINES['base_qwen3_4b'] = {

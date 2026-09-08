@@ -33,10 +33,6 @@ _CONFIG = {
   "MODEL_FILENAME": None,
   "MODEL_REVISION": None,
   "MODEL_PATH": None,
-  # Optional OpenAI-compatible `model` routing key. When configured, a
-  # request carrying a different key belongs to another engine sharing the
-  # same inference bus and must be ignored by this process.
-  "MODEL_API_KEY": None,
 
   # Format used to compute the prompt for the model
   "CHAT_FORMAT": None,
@@ -61,36 +57,6 @@ _CONFIG = {
 
 class LlamaCppBaseServingProcess(BaseServingProcess):
   CONFIG = _CONFIG
-
-  def _matches_model_route(self, input_dict):
-    """Keep a semaphore-targeted API request on its intended model engine.
-
-    LLM API plugin instances publish distinct HTTP ports, but their inference
-    payloads share the same internal signature. The standard OpenAI `model`
-    field is therefore also carried on the bus and used as the engine-level
-    discriminator. Requests without a model retain legacy broadcast behavior.
-    """
-    configured = self.cfg_model_api_key
-    if not isinstance(configured, str) or not configured.strip():
-      return True
-    content = input_dict.get("JEEVES_CONTENT", {})
-    if not isinstance(content, dict):
-      return True
-    requested = content.get("MODEL", content.get("model"))
-    if requested is None:
-      return True
-    return isinstance(requested, str) and requested.strip() == configured.strip()
-
-  def check_relevant_input(self, input_dict: dict):
-    if not super().check_relevant_input(input_dict):
-      return False
-    if self._matches_model_route(input_dict):
-      return True
-    self.P(
-      "[DEBUG]Skipping request routed to another model API key",
-      color='y',
-    )
-    return False
 
   def _get_model_path(self):
     model_path = self.cfg_model_path
