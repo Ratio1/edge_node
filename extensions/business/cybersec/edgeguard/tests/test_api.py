@@ -587,12 +587,38 @@ def _graph_first_provider(payload):
   }
 
 
+# A deployment-supplied model entry. The repository ships public models only;
+# this fixture stands in for whatever private or experimental model a pipeline
+# adds to EDGEGUARD_GENERATION_WORKERS. Listed first, so it is the default.
+PRIVATE_MODEL_KEY = "private-model-a"
+PRIVATE_WORKER_SEMAPHORE = "edgeguard_llm_private"
+TEST_GENERATION_WORKERS = {
+  PRIVATE_MODEL_KEY: {
+    "SEMAPHORE": PRIVATE_WORKER_SEMAPHORE,
+    "PATH": "/create_chat_completion",
+    "PROMPT_PROFILE": "direct_cypher",
+    "DISPLAY_NAME": "Private fixture model",
+    "DESCRIPTION": "Deployment-supplied fine-tuned GGUF fixture.",
+    "MODEL_REPO": "example-org/private-fixture-gguf",
+    "MODEL_FILE": "private-fixture.Q4_K_M.gguf",
+    "FORMAT": "GGUF",
+    "QUANTIZATION": "Q4_K_M",
+    "BASE_MODEL": "Qwen/Qwen3-4B-Instruct-2507",
+    "ARTIFACT_SHA256": "0" * 64,
+    "SOURCE": "private_deployment",
+    "MODEL_CARD": {"method": "QLoRA SFT"},
+  },
+  **EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"],
+}
+
+
 def _make_api(**overrides):
   plugin = EdgeguardApiPlugin.__new__(EdgeguardApiPlugin)
   plugin.cfg_edgeguard_generation_workers = overrides.get(
     "edgeguard_generation_workers",
-    EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"],
+    TEST_GENERATION_WORKERS,
   )
+  plugin.cfg_edgeguard_default_model = overrides.get("edgeguard_default_model")
   plugin.cfg_edgeguard_explanation_worker = overrides.get("edgeguard_explanation_worker", {})
   plugin.cfg_edgeguard_explanation_model_url = overrides.get("edgeguard_explanation_model_url")
   plugin.cfg_edgeguard_explanation_model_host = overrides.get("edgeguard_explanation_model_host", "127.0.0.1")
@@ -660,20 +686,20 @@ def _make_api(**overrides):
 class EdgeGuardApiTests(unittest.TestCase):
   def test_worker_runtime_readiness_requires_serving_ready_signal(self):
     plugin = _make_api(worker_semaphore_env={
-      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
     })
     session = MagicMock()
     session.get.return_value = _Response(payload={"result": {"serving_ready": False}})
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=session):
       self.assertFalse(plugin._worker_runtime_ready(
-        EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"]["finetuned_v0_10"]
+        TEST_GENERATION_WORKERS[PRIVATE_MODEL_KEY]
       ))
 
     session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session", return_value=session):
       self.assertTrue(plugin._worker_runtime_ready(
-        EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"]["finetuned_v0_10"]
+        TEST_GENERATION_WORKERS[PRIVATE_MODEL_KEY]
       ))
 
   def test_explain_fails_fast_with_retryable_503_while_model_is_starting(self):
@@ -716,13 +742,36 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(plugin.semaphore_env["API_PORT"], "5055")
     self.assertEqual(plugin.semaphore_env["API_URL"], "http://127.0.0.1:5055")
 
-  def test_edgeguard_ai_engine_is_registered(self):
+  def test_generic_gguf_ai_engine_is_registered_and_no_private_engine_exists(self):
     from extensions.serving.ai_engines.stable import AI_ENGINES
 
-    self.assertEqual(
-      AI_ENGINES["edgeguard_qwen_4b"],
-      {"SERVING_PROCESS": "llama_cpp_edgeguard_qwen_4b"},
-    )
+    self.assertEqual(AI_ENGINES["llama_cpp_gguf"], {"SERVING_PROCESS": "llama_cpp_gguf"})
+    self.assertNotIn("edgeguard_qwen_4b", AI_ENGINES)
+
+  def test_shipped_model_catalog_defaults_are_public_models_only(self):
+    workers = EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"]
+
+    self.assertEqual(list(workers), ["base_qwen3_4b", "cybersec_qwen_4b"])
+    self.assertTrue(all(entry["SOURCE"] == "public_huggingface" for entry in workers.values()))
+    self.assertIsNone(EdgeguardApiPlugin.CONFIG["EDGEGUARD_DEFAULT_MODEL"])
+    self.assertNotIn("ratio1/", json.dumps(EdgeguardApiPlugin.CONFIG))
+
+  def test_default_model_falls_back_to_first_configured_key(self):
+    plugin = _make_api(edgeguard_generation_workers=EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"])
+    self.assertEqual(plugin._default_model_key(), "base_qwen3_4b")
+
+    plugin = _make_api(edgeguard_default_model="cybersec_qwen_4b")
+    self.assertEqual(plugin._default_model_key(), "cybersec_qwen_4b")
+    self.assertEqual(plugin.model()["model_key"], "cybersec_qwen_4b")
+
+  def test_generate_rejects_unconfigured_model_key(self):
+    plugin = _make_api()
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post") as post:
+      result = plugin.generate(request="Show indicators", model_key="not-configured")
+
+    self.assertEqual(result["diagnostics"]["code"], "unsupported_model")
+    post.assert_not_called()
 
   def test_edgeguard_api_owns_generation_endpoint(self):
     self.assertTrue(hasattr(EdgeguardApiPlugin, "generate"))
@@ -738,7 +787,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     plugin = _make_api()
 
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post") as post:
-      result = plugin.generate(request="Show indicators", model_key="finetuned_v0_10")
+      result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
 
     self.assertEqual(result["status"], "error")
     self.assertEqual(result["diagnostics"]["code"], "worker_not_ready")
@@ -746,7 +795,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_generate_uses_semaphore_worker_and_validates_model_output(self):
     plugin = _make_api(worker_semaphore_env={
-      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
     })
     response = _Response(payload={
       "result": {
@@ -768,7 +817,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
       return_value=session,
     ):
-      result = plugin.generate(request="Show indicators", model_key="finetuned_v0_10")
+      result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
 
     self.assertEqual(result["status"], "accepted")
     self.assertEqual(result["accepted_cypher"], "MATCH (i:Indicator) RETURN i LIMIT 10")
@@ -777,13 +826,13 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(session.post.call_args.args[0], "http://127.0.0.1:53001/create_chat_completion")
     self.assertEqual(session.post.call_args.kwargs["json"]["temperature"], 0.0)
     self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 64)
-    self.assertEqual(session.post.call_args.kwargs["json"]["model"], "finetuned_v0_10")
+    self.assertEqual(session.post.call_args.kwargs["json"]["model"], PRIVATE_MODEL_KEY)
     self.assertEqual(result["attempts"][0]["finish_reason"], "stop")
     self.assertEqual(result["attempts"][0]["completion_tokens"], 10)
 
   def test_generate_rejects_length_completion_before_accepting_corrected_query(self):
     plugin = _make_api(worker_semaphore_env={
-      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
     })
     truncated = _Response(payload={
       "result": {
@@ -819,7 +868,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     ):
       result = plugin.generate(
         request="Show indicators and their source reports",
-        model_key="finetuned_v0_10",
+        model_key=PRIVATE_MODEL_KEY,
       )
 
     self.assertTrue(result["accepted"])
@@ -832,7 +881,7 @@ class EdgeGuardApiTests(unittest.TestCase):
 
   def test_generate_fails_fast_while_model_process_is_starting(self):
     plugin = _make_api(worker_semaphore_env={
-      "edgeguard_llm_finetuned": {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
     })
     session = MagicMock()
     session.get.return_value = _Response(payload={"result": {"serving_ready": False}})
@@ -841,7 +890,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
       return_value=session,
     ):
-      result = plugin.generate(request="Show indicators", model_key="finetuned_v0_10")
+      result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
 
     self.assertEqual(result["diagnostics"]["code"], "model_not_ready")
     self.assertTrue(result["diagnostics"]["retryable"])
@@ -971,21 +1020,22 @@ class EdgeGuardApiTests(unittest.TestCase):
     raw_driver.close.assert_called_once_with()
     bridge.close.assert_called_once_with()
 
-  def test_api_model_metadata_uses_v010_graph_intent_artifact(self):
+  def test_api_model_metadata_describes_the_configured_default_model(self):
     plugin = _make_api()
 
     model = plugin.model()
 
-    self.assertEqual(model["model_key"], "finetuned_v0_10")
-    self.assertEqual(model["display_name"], "EdgeGuard Cypher Qwen3 4B v0.10 Graph-Intent GGUF")
-    self.assertEqual(model["model_repo"], "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf")
-    self.assertEqual(model["model_file"], "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf")
+    self.assertEqual(model["model_key"], PRIVATE_MODEL_KEY)
+    self.assertEqual(model["display_name"], "Private fixture model")
+    self.assertEqual(model["model_repo"], "example-org/private-fixture-gguf")
+    self.assertEqual(model["model_file"], "private-fixture.Q4_K_M.gguf")
+    self.assertEqual(model["prompt_profile_id"], "edgeguard_direct_cypher_v0_10")
+    self.assertEqual(model["model_card"], {"method": "QLoRA SFT"})
     self.assertEqual(model["schema_version"], "edgeguard-cypher-schema-v0.10")
-    self.assertEqual(model["quality"]["robustness_expected_labels_covered"], "96.06% (+16.54pp vs v0.9)")
-    self.assertEqual(model["quality"]["robustness_expected_relationships_covered"], "85.83% (+7.87pp vs v0.9)")
-    self.assertEqual(model["quality"]["training_corpus"], "3,588 accepted graph rows (2,868 train / 360 validation / 360 test)")
-    self.assertEqual(model["quality"]["planner_failures"], 0)
     self.assertTrue(model["runtime_harness"]["empty_result_broadening"])
+    for hardcoded_section in ("quality", "fine_tuning", "continuation_of"):
+      self.assertNotIn(hardcoded_section, model)
+    self.assertNotIn("SEMAPHORE", json.dumps(model))
 
   def test_api_models_returns_exact_three_model_catalog_without_backend_urls(self):
     plugin = _make_api()
@@ -993,10 +1043,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     catalog = plugin.models()
 
     self.assertEqual(catalog["schema_version"], "edgeguard.model_catalog.v1")
-    self.assertEqual(catalog["default_model_key"], "finetuned_v0_10")
+    self.assertEqual(catalog["default_model_key"], PRIVATE_MODEL_KEY)
     self.assertEqual(
       [item["model_key"] for item in catalog["models"]],
-      ["finetuned_v0_10", "base_qwen3_4b", "cybersec_qwen_4b"],
+      [PRIVATE_MODEL_KEY, "base_qwen3_4b", "cybersec_qwen_4b"],
     )
     cybersec = catalog["models"][2]
     self.assertEqual(cybersec["display_name"], "CyberSecQwen 4B")
@@ -1026,11 +1076,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("allowed_properties", contract["temporal_policy"])
     self.assertEqual(
       [item["model_key"] for item in contract["profiles"]],
-      ["finetuned_v0_10", "base_qwen3_4b", "cybersec_qwen_4b"],
+      [PRIVATE_MODEL_KEY, "base_qwen3_4b", "cybersec_qwen_4b"],
     )
     profiles = {item["model_key"]: item for item in contract["profiles"]}
     self.assertEqual(
-      profiles["finetuned_v0_10"]["prompt_profile_id"],
+      profiles[PRIVATE_MODEL_KEY]["prompt_profile_id"],
       "edgeguard_direct_cypher_v0_10",
     )
     self.assertEqual(
@@ -1045,7 +1095,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       profiles["cybersec_qwen_4b"]["template_version"],
       "edgeguard-cybersec-schema-grounded-v0.10",
     )
-    self.assertRegex(profiles["finetuned_v0_10"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(profiles[PRIVATE_MODEL_KEY]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
     self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v1")
     self.assertEqual(explanation["profile_id"], "EEL/1")

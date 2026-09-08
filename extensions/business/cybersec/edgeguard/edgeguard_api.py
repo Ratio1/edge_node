@@ -554,12 +554,42 @@ def _tracked_endpoint(func):
     return response
   return wrapper
 
-FINETUNED_MODEL_KEY = "finetuned_v0_10"
-BASE_MODEL_KEY = "base_qwen3_4b"
-CYBERSEC_MODEL_KEY = "cybersec_qwen_4b"
-FINETUNED_PROMPT_PROFILE_ID = "edgeguard_direct_cypher_v0_10"
-BASE_PROMPT_PROFILE_ID = "edgeguard_base_schema_grounded_v0_10"
-CYBERSEC_PROMPT_PROFILE_ID = "edgeguard_cybersec_schema_grounded_v0_10"
+# Prompt profiles are code: they describe how this plugin prompts a worker.
+# Which model runs behind a public model key is deployment configuration
+# (`EDGEGUARD_GENERATION_WORKERS`), never a constant in this repository.
+PROMPT_PROFILE_DIRECT_CYPHER = "direct_cypher"
+PROMPT_PROFILE_SCHEMA_GROUNDED = "schema_grounded"
+PROMPT_PROFILE_CYBERSEC_SCHEMA_GROUNDED = "cybersec_schema_grounded"
+DEFAULT_PROMPT_PROFILE = PROMPT_PROFILE_SCHEMA_GROUNDED
+PROMPT_PROFILES = {
+  PROMPT_PROFILE_DIRECT_CYPHER: {
+    "prompt_profile_id": "edgeguard_direct_cypher_v0_10",
+    "template_version": "edgeguard-direct-cypher-v0.10",
+    "prompt_contract": "one read-only Cypher query string only",
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+  },
+  PROMPT_PROFILE_SCHEMA_GROUNDED: {
+    "prompt_profile_id": "edgeguard_base_schema_grounded_v0_10",
+    "template_version": "edgeguard-base-schema-grounded-v0.10",
+    "prompt_contract": "schema-grounded read-only Cypher query string only",
+    "system_prompt_suffix": (
+      "\nYou are not fine-tuned for this graph. Ground every identifier in the schema list "
+      "before writing the query. Prefer a smaller valid query when uncertain."
+    ),
+    "single_user_message": False,
+  },
+  PROMPT_PROFILE_CYBERSEC_SCHEMA_GROUNDED: {
+    "prompt_profile_id": "edgeguard_cybersec_schema_grounded_v0_10",
+    "template_version": "edgeguard-cybersec-schema-grounded-v0.10",
+    "prompt_contract": "schema-grounded read-only Cypher query string only",
+    "system_prompt_suffix": (
+      "\nYou are security-specialized but not fine-tuned for this graph. Security domain "
+      "knowledge does not override the allowlisted schema. Prefer a smaller valid query when uncertain."
+    ),
+    "single_user_message": True,
+  },
+}
 
 GRAPH_EXPLANATION_PROMPT_CONTRACT = {
   "prompt_version": GRAPH_EXPLANATION_PROMPT_VERSION,
@@ -595,68 +625,6 @@ GRAPH_EXPLANATION_PROMPT_CONTRACT = {
     "Do not emit schema_version or caveats; the server owns those fields and adds deterministic graph-scope caveats.",
     "Keep next pivots to safe intent labels rather than executable Cypher.",
   ],
-}
-
-EDGEGUARD_MODEL_REPO = "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf"
-EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf"
-EDGEGUARD_MODEL_DISPLAY_NAME = "EdgeGuard Cypher Qwen3 4B v0.10 Graph-Intent GGUF"
-EDGEGUARD_MODEL_ARTIFACT_SHA256 = "7f7ed0f4d3341d36204d17343a07e3b6d99ec135a4ce67da66ad09b8eba2a91b"
-EDGEGUARD_SOURCE_ADAPTER_SHA256 = "419161efd86e63cb62c368fd18c6da84c923923d13774f7b6ea57f1196f65fba"
-EDGEGUARD_RUNTIME_HARNESS_VERSION = "EGM-029 v0.10"
-EDGEGUARD_RUNTIME_LIVE_GATE_RESULT = "v0.9 baseline 44 / 45 = 97.78%"
-EDGEGUARD_DATASET = "qwen-prompt-cypher-v0.10-graph-intent-coverage-v1"
-EDGEGUARD_SOURCE_ADAPTER = "EGM-029 v0.10 graph-intent from v0.9"
-EDGEGUARD_ROBUSTNESS_LABEL_COVERAGE = "96.06% (+16.54pp vs v0.9)"
-EDGEGUARD_ROBUSTNESS_RELATIONSHIP_COVERAGE = "85.83% (+7.87pp vs v0.9)"
-EDGEGUARD_ROBUSTNESS_SUBGRAPH_ACCEPTED = "100% (+7.09pp vs v0.9)"
-EDGEGUARD_TEST_LABEL_COVERAGE = "97.50% (+16.25pp vs v0.9)"
-EDGEGUARD_TEST_RELATIONSHIP_COVERAGE = "76.25% (+5.00pp vs v0.9)"
-EDGEGUARD_CORPUS = "3,588 accepted graph rows (2,868 train / 360 validation / 360 test)"
-
-EDGEGUARD_MODEL_CATALOG = [
-  {
-    "model_key": FINETUNED_MODEL_KEY,
-    "display_name": "Finetuned v0.10",
-    "description": "Private Ratio1 EdgeGuard text-to-Cypher Qwen3 4B v0.10 GGUF.",
-    "model_repo": EDGEGUARD_MODEL_REPO,
-    "model_file": EDGEGUARD_MODEL_FILE,
-    "format": "GGUF",
-    "quantization": "Q4_K_M",
-    "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-    "artifact_sha256": EDGEGUARD_MODEL_ARTIFACT_SHA256,
-    "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
-    "prompt_contract": "one read-only Cypher query string only",
-    "source": "private_ratio1",
-  },
-  {
-    "model_key": BASE_MODEL_KEY,
-    "display_name": "Base Qwen3 4B",
-    "description": "Public base Qwen3 4B Instruct GGUF for side-by-side prompt comparison.",
-    "model_repo": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
-    "model_file": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
-    "format": "GGUF",
-    "quantization": "Q4_K_M",
-    "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-    "artifact_sha256": None,
-    "prompt_profile_id": BASE_PROMPT_PROFILE_ID,
-    "prompt_contract": "schema-grounded read-only Cypher query string only",
-    "source": "public_huggingface",
-  },
-]
-
-CYBERSEC_MODEL_CATALOG_ENTRY = {
-  "model_key": CYBERSEC_MODEL_KEY,
-  "display_name": "CyberSecQwen 4B",
-  "description": "Public security-specialized Qwen 4B GGUF for prompt comparison.",
-  "model_repo": "mradermacher/CyberSecQwen-4B-GGUF",
-  "model_file": "CyberSecQwen-4B.Q4_K_M.gguf",
-  "format": "GGUF",
-  "quantization": "Q4_K_M",
-  "base_model": "lablab-ai-amd-developer-hackathon/CyberSecQwen-4B",
-  "artifact_sha256": "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
-  "prompt_profile_id": CYBERSEC_PROMPT_PROFILE_ID,
-  "prompt_contract": "schema-grounded read-only Cypher query string only",
-  "source": "public_huggingface",
 }
 
 CASE_EXPLANATION_RESPONSE_SCHEMA = {
@@ -2982,7 +2950,7 @@ _CONFIG = {
   "EDGEGUARD_EXPLANATION_MODEL_PATH": "/create_chat_completion",
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN": None,
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN_ENV": "EDGEGUARD_EXPLANATION_MODEL_TOKEN",
-  "EDGEGUARD_EXPLANATION_MODEL": BASE_MODEL_KEY,
+  "EDGEGUARD_EXPLANATION_MODEL": "base_qwen3_4b",
   "EDGEGUARD_EXPLANATION_TOKENIZER_PATH": TOKENIZER_DEFAULT_PATH,
   "EDGEGUARD_EXPLANATION_DEFAULT_ROWS": EXPLANATION_DEFAULT_ROWS,
   "EDGEGUARD_EXPLANATION_MAX_ROWS": EXPLANATION_SERVER_MAX_ROWS,
@@ -2995,20 +2963,44 @@ _CONFIG = {
   # degrade deterministically) unless this much request budget remains. Sized
   # from the measured GPU-serving throughput; re-measure on hardware change.
   "EDGEGUARD_INSIGHT_BRIEF_ADMISSION_SECONDS": 240,
+  # Public model key -> worker address (SEMAPHORE/PATH) plus catalog metadata.
+  # The shipped defaults describe public models only. A deployment adds the
+  # models it wants to run (for example a private fine-tuned GGUF) here, in the
+  # pipeline, together with the LLM_INFERENCE_API worker that serves it.
   "EDGEGUARD_GENERATION_WORKERS": {
-    FINETUNED_MODEL_KEY: {
-      "SEMAPHORE": "edgeguard_llm_finetuned",
-      "PATH": "/create_chat_completion",
-    },
-    BASE_MODEL_KEY: {
+    "base_qwen3_4b": {
       "SEMAPHORE": "edgeguard_llm_base",
       "PATH": "/create_chat_completion",
+      "PROMPT_PROFILE": PROMPT_PROFILE_SCHEMA_GROUNDED,
+      "DISPLAY_NAME": "Base Qwen3 4B",
+      "DESCRIPTION": "Public base Qwen3 4B Instruct GGUF for side-by-side prompt comparison.",
+      "MODEL_REPO": "MaziyarPanahi/Qwen3-4B-Instruct-2507-GGUF",
+      "MODEL_FILE": "Qwen3-4B-Instruct-2507.Q4_K_M.gguf",
+      "FORMAT": "GGUF",
+      "QUANTIZATION": "Q4_K_M",
+      "BASE_MODEL": "Qwen/Qwen3-4B-Instruct-2507",
+      "ARTIFACT_SHA256": None,
+      "SOURCE": "public_huggingface",
     },
-    CYBERSEC_MODEL_KEY: {
+    "cybersec_qwen_4b": {
       "SEMAPHORE": "edgeguard_llm_cybersec",
       "PATH": "/create_chat_completion",
+      "PROMPT_PROFILE": PROMPT_PROFILE_CYBERSEC_SCHEMA_GROUNDED,
+      "DISPLAY_NAME": "CyberSecQwen 4B",
+      "DESCRIPTION": "Public security-specialized Qwen 4B GGUF for prompt comparison.",
+      "MODEL_REPO": "mradermacher/CyberSecQwen-4B-GGUF",
+      "MODEL_FILE": "CyberSecQwen-4B.Q4_K_M.gguf",
+      "FORMAT": "GGUF",
+      "QUANTIZATION": "Q4_K_M",
+      "BASE_MODEL": "lablab-ai-amd-developer-hackathon/CyberSecQwen-4B",
+      "ARTIFACT_SHA256": "ac6c98de9919a6891f966f87de6f6b50f7822235bf9c3ab8401ca6a897d02ecc",
+      "SOURCE": "public_huggingface",
     },
   },
+  # Model key used when a /generate request names none. None selects the first
+  # configured key, so a pipeline that adds its own model lists it first or
+  # sets this explicitly.
+  "EDGEGUARD_DEFAULT_MODEL": None,
   "EDGEGUARD_EXPLANATION_WORKER": {
     "SEMAPHORE": "edgeguard_llm_base",
     "PATH": "/create_chat_completion",
@@ -3155,7 +3147,7 @@ class EdgeguardApiPlugin(BasePlugin):
 
   def _worker_readiness(self) -> Dict[str, bool]:
     readiness = {}
-    for model_key in (FINETUNED_MODEL_KEY, BASE_MODEL_KEY, CYBERSEC_MODEL_KEY):
+    for model_key in self._configured_model_keys():
       worker, err = self._generation_worker(model_key)
       readiness[model_key] = bool(
         isinstance(worker, Mapping)
@@ -3499,17 +3491,11 @@ class EdgeguardApiPlugin(BasePlugin):
     retry_index: int = 0,
     retry_limit: int = DEFAULT_SCHEMA_RETRY_LIMIT,
   ) -> list[Dict[str, str]]:
+    profile = self._prompt_profile(model_key)
     system_prompt = build_direct_cypher_system_prompt()
-    if model_key == BASE_MODEL_KEY:
-      system_prompt += (
-        "\nYou are not fine-tuned for this graph. Ground every identifier in the schema list "
-        "before writing the query. Prefer a smaller valid query when uncertain."
-      )
-    elif model_key == CYBERSEC_MODEL_KEY:
-      system_prompt += (
-        "\nYou are security-specialized but not fine-tuned for this graph. Security domain "
-        "knowledge does not override the allowlisted schema. Prefer a smaller valid query when uncertain."
-      )
+    suffix = profile.get("system_prompt_suffix")
+    if isinstance(suffix, str) and suffix:
+      system_prompt += suffix
     user_prompt = normalized_request
     if retry_index:
       user_prompt = build_schema_correction_prompt(
@@ -3519,19 +3505,66 @@ class EdgeguardApiPlugin(BasePlugin):
         retry_index=retry_index,
         retry_limit=retry_limit,
       )
-    if model_key == CYBERSEC_MODEL_KEY:
+    if profile.get("single_user_message"):
       return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{user_prompt}"}]
     return [
       {"role": "system", "content": system_prompt},
       {"role": "user", "content": user_prompt},
     ]
 
+  def _configured_model_keys(self) -> list[str]:
+    """Public model keys declared in EDGEGUARD_GENERATION_WORKERS, in config order."""
+    workers = self.cfg_edgeguard_generation_workers
+    if not isinstance(workers, Mapping):
+      return []
+    return [
+      str(key) for key, worker in workers.items()
+      if isinstance(key, str) and key.strip() and isinstance(worker, Mapping)
+    ]
+
+  def _default_model_key(self) -> Optional[str]:
+    configured = getattr(self, "cfg_edgeguard_default_model", None)
+    keys = self._configured_model_keys()
+    if isinstance(configured, str) and configured.strip():
+      return configured.strip()
+    return keys[0] if keys else None
+
+  def _prompt_profile(self, model_key: str) -> Dict[str, Any]:
+    worker, _err = self._generation_worker(model_key)
+    name = worker.get("PROMPT_PROFILE") if isinstance(worker, Mapping) else None
+    if not isinstance(name, str) or name not in PROMPT_PROFILES:
+      name = DEFAULT_PROMPT_PROFILE
+    return {"name": name, **PROMPT_PROFILES[name]}
+
   def _generation_model_entry(self, model_key: str) -> Optional[Dict[str, Any]]:
-    return next(
-      (dict(item) for item in [*EDGEGUARD_MODEL_CATALOG, CYBERSEC_MODEL_CATALOG_ENTRY]
-       if item.get("model_key") == model_key),
-      None,
-    )
+    """Public catalog view of one configured model: metadata only, no worker addresses."""
+    worker, err = self._generation_worker(model_key)
+    if err or not isinstance(worker, Mapping):
+      return None
+    profile = self._prompt_profile(model_key)
+    entry = {
+      "model_key": model_key,
+      "display_name": worker.get("DISPLAY_NAME") or model_key,
+      "description": worker.get("DESCRIPTION"),
+      "model_repo": worker.get("MODEL_REPO"),
+      "model_file": worker.get("MODEL_FILE"),
+      "format": worker.get("FORMAT"),
+      "quantization": worker.get("QUANTIZATION"),
+      "base_model": worker.get("BASE_MODEL"),
+      "artifact_sha256": worker.get("ARTIFACT_SHA256"),
+      "prompt_profile": profile["name"],
+      "prompt_profile_id": profile["prompt_profile_id"],
+      "prompt_contract": profile["prompt_contract"],
+      "source": worker.get("SOURCE"),
+    }
+    model_card = worker.get("MODEL_CARD")
+    if isinstance(model_card, Mapping):
+      entry["model_card"] = dict(model_card)
+    return entry
+
+  def _model_catalog(self) -> list[Dict[str, Any]]:
+    entries = (self._generation_model_entry(key) for key in self._configured_model_keys())
+    return [entry for entry in entries if entry is not None]
 
   def _cypher_string_literals(self, cypher: str) -> list[str]:
     literals = []
@@ -3652,7 +3685,7 @@ class EdgeguardApiPlugin(BasePlugin):
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
-    selected_key = model_key or modelKey or FINETUNED_MODEL_KEY
+    selected_key = model_key or modelKey or self._default_model_key()
     if benchmark_mode:
       return {
         "status": STATUS_REJECTED,
@@ -4556,15 +4589,18 @@ class EdgeguardApiPlugin(BasePlugin):
       }
     explanation_url, explanation_error = self._explanation_url()
     worker_readiness = self._worker_readiness()
-    generation_ready = all(worker_readiness.values())
+    generation_ready = bool(worker_readiness) and all(worker_readiness.values())
+    default_model = self._generation_model_entry(self._default_model_key() or "") or {}
     explanation_ready = bool(explanation_url) and explanation_error is None and self._explanation_worker_ready()
     return {
       "status": STATUS_OK if generation_ready and explanation_ready else "starting",
       "version": __VER__,
       "schema_version": SCHEMA_VERSION,
       "graph_explanation_schema_version": CASE_EXPLANATION_SCHEMA_VERSION,
-      "model_repo": EDGEGUARD_MODEL_REPO,
-      "model_file": EDGEGUARD_MODEL_FILE,
+      "default_model_key": self._default_model_key(),
+      "model_repo": default_model.get("model_repo"),
+      "model_file": default_model.get("model_file"),
+      "generation_models_configured": len(worker_readiness),
       "generation_orchestrator": "edgeguard_api",
       "generation_workers": worker_readiness,
       "generation_ready": generation_ready,
@@ -4597,8 +4633,8 @@ class EdgeguardApiPlugin(BasePlugin):
   def models(self) -> Dict[str, Any]:
     return {
       "schema_version": "edgeguard.model_catalog.v1",
-      "default_model_key": FINETUNED_MODEL_KEY,
-      "models": [*EDGEGUARD_MODEL_CATALOG, CYBERSEC_MODEL_CATALOG_ENTRY],
+      "default_model_key": self._default_model_key(),
+      "models": self._model_catalog(),
     }
 
   @BasePlugin.endpoint(method="GET")
@@ -4612,32 +4648,20 @@ class EdgeguardApiPlugin(BasePlugin):
       retry_index=1,
       retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
     )
-    profiles = [
-      {
-        "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
-        "model_key": FINETUNED_MODEL_KEY,
-        "template_version": "edgeguard-direct-cypher-v0.10",
-        "system_prompt_sha256": _sha256_text(direct_system_prompt),
+    profiles = []
+    for key in self._configured_model_keys():
+      profile = self._prompt_profile(key)
+      profiles.append({
+        "prompt_profile_id": profile["prompt_profile_id"],
+        "prompt_profile": profile["name"],
+        "model_key": key,
+        "template_version": profile["template_version"],
+        # The bare direct-Cypher template is hashed; profiles that append
+        # grounding guidance are described by template_version instead.
+        "system_prompt_sha256": _sha256_text(direct_system_prompt) if not profile.get("system_prompt_suffix") else None,
         "correction_prompt_sha256": _sha256_text(correction_prompt),
-        "expected_output": "one read-only Cypher query string only",
-      },
-      {
-        "prompt_profile_id": BASE_PROMPT_PROFILE_ID,
-        "model_key": BASE_MODEL_KEY,
-        "template_version": "edgeguard-base-schema-grounded-v0.10",
-        "system_prompt_sha256": None,
-        "correction_prompt_sha256": _sha256_text(correction_prompt),
-        "expected_output": "one schema-grounded read-only Cypher query string only",
-      },
-      {
-        "prompt_profile_id": CYBERSEC_PROMPT_PROFILE_ID,
-        "model_key": CYBERSEC_MODEL_KEY,
-        "template_version": "edgeguard-cybersec-schema-grounded-v0.10",
-        "system_prompt_sha256": None,
-        "correction_prompt_sha256": _sha256_text(correction_prompt),
-        "expected_output": "one schema-grounded read-only Cypher query string only",
-      },
-    ]
+        "expected_output": profile["prompt_contract"],
+      })
     return {
       "schema_version": "edgeguard.prompt_contract.v1",
       "cypher_schema_version": SCHEMA_VERSION,
@@ -4672,19 +4696,14 @@ class EdgeguardApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="GET")
   @_tracked_endpoint
   def model(self) -> Dict[str, Any]:
+    default_key = self._default_model_key()
+    entry = self._generation_model_entry(default_key) if default_key else None
+    if entry is None:
+      entry = {"model_key": default_key}
     return {
-      "model_key": FINETUNED_MODEL_KEY,
-      "display_name": EDGEGUARD_MODEL_DISPLAY_NAME,
-      "model_repo": EDGEGUARD_MODEL_REPO,
-      "model_file": EDGEGUARD_MODEL_FILE,
-      "format": "GGUF",
-      "quantization": "Q4_K_M",
-      "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-      "continuation_of": "ratio1/edgeguard-cypher-qwen3-4b-v0.9-graph-intent-gguf",
-      "artifact_sha256": EDGEGUARD_MODEL_ARTIFACT_SHA256,
+      **entry,
       "schema_version": SCHEMA_VERSION,
       "schema": canonical_schema_surface(),
-      "prompt_profile_id": FINETUNED_PROMPT_PROFILE_ID,
       "guard": {
         "read_only_static": True,
         "schema_compatible": True,
@@ -4713,32 +4732,10 @@ class EdgeguardApiPlugin(BasePlugin):
         "compatibility_mode": "prepared_execution_result",
         "quality": "EGM-056 restores the EEL/1 JSON-CB/1 batched explanation profile.",
       },
-      "fine_tuning": {
-        "method": "QLoRA SFT",
-        "dataset": EDGEGUARD_DATASET,
-        "source_adapter": EDGEGUARD_SOURCE_ADAPTER,
-        "source_adapter_sha256": EDGEGUARD_SOURCE_ADAPTER_SHA256,
-      },
-      "quality": {
-        "generated_live_with_live_repair": "not applicable",
-        "generated_live_with_empty_result_broadening": EDGEGUARD_RUNTIME_LIVE_GATE_RESULT,
-        "robustness_expected_labels_covered": EDGEGUARD_ROBUSTNESS_LABEL_COVERAGE,
-        "robustness_expected_relationships_covered": EDGEGUARD_ROBUSTNESS_RELATIONSHIP_COVERAGE,
-        "robustness_subgraph_accepted": EDGEGUARD_ROBUSTNESS_SUBGRAPH_ACCEPTED,
-        "test_expected_labels_covered": EDGEGUARD_TEST_LABEL_COVERAGE,
-        "test_expected_relationships_covered": EDGEGUARD_TEST_RELATIONSHIP_COVERAGE,
-        "training_corpus": EDGEGUARD_CORPUS,
-        "planner_failures": 0,
-        "scalar_projection_regressions": 0,
-        "promotion_status": "Private v0.10 graph-intent candidate for EdgeGuard playground text-to-Cypher testing.",
-        "live_repair_note": "The v0.10 graph-intent GGUF is the deployed model artifact.",
-        "semantic_fidelity_risk": "Deterministic broadening can return a wider graph than the original request when the first live query is empty.",
-      },
       "runtime_harness": {
-        "version": EDGEGUARD_RUNTIME_HARNESS_VERSION,
         "empty_result_broadening": bool(self.cfg_live_empty_result_broadening),
         "empty_result_broadening_strategy": "first_allowed_label_first_allowed_relationship_type",
-        "weights_note": "The deployed GGUF weights are the v0.10 graph-intent artifact.",
+        "semantic_fidelity_risk": "Deterministic broadening can return a wider graph than the original request when the first live query is empty.",
       },
     }
 
