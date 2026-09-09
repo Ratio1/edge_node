@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
-from .conftest import mock_plugin_modules
+from .conftest import mock_plugin_modules, TEST_CHANNEL_TOKEN
 
 
 mock_plugin_modules()
@@ -50,7 +50,7 @@ class TestPostponedAnalyze(unittest.TestCase):
       "future": MagicMock(),
       "discard_result": False,
     }
-    result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1")
+    result = PentesterApi01Plugin.analyze_job(plugin, TEST_CHANNEL_TOKEN, job_id="job-1")
     self.assertEqual(result["error"], "analysis_busy")
     self.assertEqual(result["status_code"], 409)
     self.assertTrue(result["retryable"])
@@ -207,8 +207,7 @@ class TestPostponedAnalyze(unittest.TestCase):
       "_prepare_manual_analysis",
       return_value=(state, None),
     ):
-      result = PentesterApi01Plugin.analyze_job(
-        plugin,
+      result = PentesterApi01Plugin.analyze_job(plugin, TEST_CHANNEL_TOKEN,
         job_id="job-1",
       )
 
@@ -249,7 +248,7 @@ class TestPostponedAnalyze(unittest.TestCase):
         "extensions.business.cybersec.red_mesh.pentester_api_01._run_manual_analysis_worker",
         return_value=_ManualAnalysisOutcome(sections={}, failed=False),
       ):
-        result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1")
+        result = PentesterApi01Plugin.analyze_job(plugin, TEST_CHANNEL_TOKEN, job_id="job-1")
         manual_future = plugin._manual_analysis_state["future"]
         self.assertEqual(result, "postponed")
         self.assertFalse(manual_future.done())
@@ -439,8 +438,7 @@ class TestPostponedAnalyze(unittest.TestCase):
       "_prepare_manual_analysis",
       side_effect=RuntimeError(f"provider exploded with {SECRET_SENTINEL}"),
     ):
-      result = PentesterApi01Plugin.analyze_job(
-        plugin,
+      result = PentesterApi01Plugin.analyze_job(plugin, TEST_CHANNEL_TOKEN,
         job_id="job-1",
       )
 

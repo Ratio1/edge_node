@@ -11,6 +11,20 @@ from xperimental.utils import color_print
 
 MANUAL_RUN = False
 
+# The channel token every endpoint now checks (RM-075 Phase 2). Tests pass it as the first
+# positional argument after the plugin; the autouse fixture below puts it in the environment.
+TEST_CHANNEL_TOKEN = "test-channel-token-material-at-least-32-bytes"
+
+try:
+  import pytest
+
+  @pytest.fixture(autouse=True)
+  def _channel_token_env(monkeypatch):
+    monkeypatch.setenv("REDMESH_BACKEND_TOKEN", TEST_CHANNEL_TOKEN)
+    yield
+except ImportError:  # unittest-only runs: tests that need the token set it themselves
+  pass
+
 
 
 def install_pymisp_stub():
@@ -145,10 +159,17 @@ def mock_plugin_modules():
 
   # Build a real class to avoid metaclass conflicts
   def endpoint_decorator(*args, **kwargs):
-    if args and callable(args[0]):
-      return args[0]
-    def wrapper(fn):
+    # Mirror the real decorator (fast_api_web_app.py): set the discovery attributes and
+    # return the function, so the authz surface test enumerates exactly what the framework does.
+    def _mark(fn, method="get", require_token=False):
+      fn.__endpoint__ = True
+      fn.__http_method__ = str(method).lower()
+      fn.__require_token__ = require_token
       return fn
+    if args and callable(args[0]):
+      return _mark(args[0])
+    def wrapper(fn):
+      return _mark(fn, kwargs.get("method", "get"), kwargs.get("require_token", False))
     return wrapper
 
   class FakeBasePlugin:

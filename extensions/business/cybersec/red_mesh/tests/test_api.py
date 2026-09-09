@@ -17,8 +17,15 @@ from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
 )
 from extensions.business.cybersec.red_mesh.models import CStoreJobRunning
 
-from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
+from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules, TEST_CHANNEL_TOKEN
 
+
+
+def _stub_launch_actor(plugin):
+  """RM-075: launch endpoints resolve the forwarded actor through a seam; tests bind a known account."""
+  from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+  plugin._resolve_launch_actor = lambda actor=None: (AccountView("tester", "admin", None, True), None)
+  return plugin
 
 class TestPhase1ConfigCID(unittest.TestCase):
   """Phase 1: Job Config CID — extract static config from CStore to R1FS."""
@@ -160,12 +167,14 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.cfg_chainstore_peers = ["node-1"]
     plugin._redact_job_config = staticmethod(lambda d: d)
     plugin._validate_feature_catalog = MagicMock()
+    _stub_launch_actor(plugin)
     return plugin
 
   @classmethod
   def _bind_launch_helpers(cls, plugin):
     """Bind real launch helper methods onto a MagicMock plugin host."""
     cls._mock_plugin_modules()
+    _stub_launch_actor(plugin)
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin._coerce_scan_type = lambda scan_type=None: PentesterApi01Plugin._coerce_scan_type(plugin, scan_type)
@@ -192,8 +201,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
       PentesterApi01Plugin._build_webapp_workers(plugin, active_peers, target_port)
     )
     plugin._announce_launch = lambda **kwargs: PentesterApi01Plugin._announce_launch(plugin, **kwargs)
-    plugin.launch_network_scan = lambda **kwargs: PentesterApi01Plugin.launch_network_scan(plugin, **kwargs)
-    plugin.launch_webapp_scan = lambda **kwargs: PentesterApi01Plugin.launch_webapp_scan(plugin, **kwargs)
+    plugin.launch_network_scan = lambda **kwargs: PentesterApi01Plugin.launch_network_scan(plugin, TEST_CHANNEL_TOKEN, **kwargs)
+    plugin.launch_webapp_scan = lambda **kwargs: PentesterApi01Plugin.launch_webapp_scan(plugin, TEST_CHANNEL_TOKEN, **kwargs)
     return plugin
 
   @classmethod
@@ -221,7 +230,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._bind_launch_helpers(plugin)
     defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
     defaults.update(kwargs)
-    return PentesterApi01Plugin.launch_test(plugin, **defaults)
+    return PentesterApi01Plugin.launch_test(plugin, TEST_CHANNEL_TOKEN, **defaults)
 
   def _launch_network(self, plugin, **kwargs):
     """Call launch_network_scan with mocked base modules."""
@@ -230,7 +239,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._bind_launch_helpers(plugin)
     defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
     defaults.update(kwargs)
-    return PentesterApi01Plugin.launch_network_scan(plugin, **defaults)
+    return PentesterApi01Plugin.launch_network_scan(plugin, TEST_CHANNEL_TOKEN, **defaults)
 
   def _launch_webapp(self, plugin, **kwargs):
     """Call launch_webapp_scan with mocked base modules."""
@@ -246,7 +255,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       authorized=True,
     )
     defaults.update(kwargs)
-    return PentesterApi01Plugin.launch_webapp_scan(plugin, **defaults)
+    return PentesterApi01Plugin.launch_webapp_scan(plugin, TEST_CHANNEL_TOKEN, **defaults)
 
   def test_launch_builds_job_config_and_stores_cid(self):
     """launch_test() builds JobConfig, saves to R1FS, stores job_config_cid in CStore."""
@@ -1205,7 +1214,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.cfg_redmesh_secret_store_key = ""
     plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
 
-    with patch.dict("os.environ", {}, clear=True):
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN, }, clear=True):
       result = self._launch_webapp(
         plugin,
         official_username="admin",
@@ -1563,12 +1572,12 @@ class TestPhase1ConfigCID(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin = MagicMock()
+    _stub_launch_actor(plugin)
     plugin.launch_network_scan = MagicMock(return_value={"route": "network"})
     plugin.launch_webapp_scan = MagicMock(return_value={"route": "webapp"})
 
-    network = PentesterApi01Plugin.launch_test(plugin, target="example.com", authorized=True, scan_type="network")
-    webapp = PentesterApi01Plugin.launch_test(
-      plugin,
+    network = PentesterApi01Plugin.launch_test(plugin, TEST_CHANNEL_TOKEN, target="example.com", authorized=True, scan_type="network")
+    webapp = PentesterApi01Plugin.launch_test(plugin, TEST_CHANNEL_TOKEN,
       target="example.com",
       target_url="https://example.com/app",
       official_username="admin",
@@ -1696,7 +1705,7 @@ class TestPhase4FeatureCatalog(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin = self._build_plugin()
-    response = PentesterApi01Plugin.get_feature_catalog(plugin, scan_type="webapp")
+    response = PentesterApi01Plugin.get_feature_catalog(plugin, TEST_CHANNEL_TOKEN, scan_type="webapp")
 
     self.assertEqual([item["category"] for item in response["catalog"]], ["graybox"])
     self.assertIn("_graybox_access_control", response["all_methods"])
@@ -2909,6 +2918,7 @@ class TestPhase4UiAggregate(unittest.TestCase):
 
   def _make_plugin(self):
     plugin = MagicMock()
+    _stub_launch_actor(plugin)
     Plugin = self._get_plugin_class()
     plugin._count_services = lambda si: Plugin._count_services(plugin, si)
     plugin._dedupe_items = lambda items: Plugin._dedupe_items(items)
@@ -3692,7 +3702,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin = self._build_plugin({})
     plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
 
-    result = Plugin.get_report(plugin, "QmReportCID")
+    result = Plugin.get_report(plugin, TEST_CHANNEL_TOKEN, "QmReportCID")
 
     self.assertEqual(result["report"]["artifact_kind"], "review_submission")
     plugin.r1fs.get_json.assert_called_once_with("QmReportCID", pin=False)
@@ -3720,7 +3730,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       {"fin-job:f-1": {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}},
     ]
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["archive"]["job_id"], "fin-job")
     self.assertEqual(result["archive"]["archive_version"], JOB_ARCHIVE_VERSION)
@@ -3778,7 +3788,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 120.0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="model-job", summary_only=True, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="model-job", summary_only=True, pass_limit=1)
 
     self.assertEqual(result["job_id"], "model-job")
     archive = result["archive"]
@@ -3799,7 +3809,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     running = self._build_running_job("run-job", pass_count=2)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.get_job_archive(plugin, job_id="run-job")
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="run-job")
     self.assertEqual(result["error"], "not_available")
 
   def test_manual_structured_analysis_backfills_legacy_fields(self):
@@ -3865,8 +3875,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       return persisted
 
     with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
-      postponed = Plugin.analyze_job(
-        plugin,
+      postponed = Plugin.analyze_job(plugin, TEST_CHANNEL_TOKEN,
         job_id="job-llm",
       )
       self.assertEqual(postponed, "postponed")
@@ -3900,7 +3909,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
     self.assertEqual(result["error"], "integrity_mismatch")
 
   def test_get_job_archive_unsupported_version(self):
@@ -3921,7 +3930,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
     self.assertEqual(result["error"], "unsupported_archive_version")
 
   def test_normalize_job_record_initializes_job_revision(self):
@@ -4254,7 +4263,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     running = self._build_running_job("run-job", pass_count=8)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.get_job_data(plugin, job_id="run-job")
+    result = Plugin.get_job_data(plugin, TEST_CHANNEL_TOKEN, job_id="run-job")
     self.assertTrue(result["found"])
     refs = result["job"]["pass_reports"]
     self.assertEqual(len(refs), 5)
@@ -4268,7 +4277,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
 
-    result = Plugin.get_job_data(plugin, job_id="fin-job")
+    result = Plugin.get_job_data(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
     self.assertTrue(result["found"])
     self.assertEqual(result["job"]["job_cid"], "QmArchiveCID")
     self.assertEqual(result["job"]["pass_count"], 1)
@@ -4315,7 +4324,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin = self._build_plugin({"model-job": stub})
 
-    result = Plugin.get_job_data(plugin, job_id="model-job")
+    result = Plugin.get_job_data(plugin, TEST_CHANNEL_TOKEN, job_id="model-job")
 
     payload = result["job"]
     self.assertEqual(payload["model_test_summary"]["error_class"], "unknown_error")
@@ -4342,7 +4351,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, TEST_CHANNEL_TOKEN)
     self.assertIn("fin-job", result)
     job = result["fin-job"]
     self.assertEqual(job["job_cid"], "QmArchiveCID")
@@ -4381,7 +4390,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin = self._build_plugin({"model-job": stub})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, TEST_CHANNEL_TOKEN)
 
     job = result["model-job"]
     self.assertEqual(job["model_test_summary"]["error_class"], "unknown_error")
@@ -4402,7 +4411,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     running = self._build_running_job("run-job", pass_count=3)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, TEST_CHANNEL_TOKEN)
     self.assertIn("run-job", result)
     job = result["run-job"]
     # Should have counts
@@ -4440,7 +4449,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="run-job")
+    result = Plugin.get_job_progress(plugin, TEST_CHANNEL_TOKEN, job_id="run-job")
     self.assertEqual(result["status"], "RUNNING")
     self.assertIn("worker-A", result["workers"])
     self.assertEqual(result["workers"]["worker-A"]["worker_state"], "active")
@@ -4490,7 +4499,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       } if hkey == "test-instance:live" else {"job-1": plugin.chainstore_hget.return_value}
     )
 
-    result = Plugin.get_job_status(plugin, job_id="job-1")
+    result = Plugin.get_job_status(plugin, TEST_CHANNEL_TOKEN, job_id="job-1")
 
     self.assertEqual(result["status"], "network_tracked")
     self.assertEqual(result["workers"]["worker-B"]["worker_state"], "unseen")
@@ -4575,7 +4584,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       } if hkey == "test-instance:live" else {"run-job": running}
     )
 
-    result = Plugin.get_job_data(plugin, job_id="run-job")
+    result = Plugin.get_job_data(plugin, TEST_CHANNEL_TOKEN, job_id="run-job")
 
     self.assertIn("workers_reconciled", result["job"])
     self.assertEqual(result["job"]["workers_reconciled"]["worker-A"]["worker_state"], "active")
@@ -4585,7 +4594,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
 
-    result = Plugin.get_job_archive(plugin, job_id="missing-job")
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="missing-job")
     self.assertEqual(result["error"], "not_found")
 
   def test_get_job_archive_r1fs_failure(self):
@@ -4595,7 +4604,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin = self._build_plugin({"fin-job": stub})
     plugin.r1fs.get_json.return_value = None
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
     self.assertEqual(result["error"], "fetch_failed")
 
   def test_get_analysis_finalized_reads_archive(self):
@@ -4624,7 +4633,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
 
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["analysis"], "Archive-backed analysis")
@@ -4662,7 +4671,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
 
     self.assertEqual(result["quick_summary"], "Structured archive headline")
     self.assertIn("Structured archive posture", result["analysis"])
@@ -4694,7 +4703,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
 
     self.assertEqual(result["error"], "No LLM analysis available for this pass")
     self.assertTrue(result["llm_failed"])
@@ -4717,7 +4726,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job")
 
     self.assertEqual(result["error"], "integrity_mismatch")
     self.assertEqual(result["job_id"], "fin-job")
@@ -4762,7 +4771,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job", summary_only=True, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job", summary_only=True, pass_limit=1)
 
     self.assertEqual(result["archive"]["archive_query"]["returned_passes"], 1)
     self.assertTrue(result["archive"]["archive_query"]["summary_only"])
@@ -4786,7 +4795,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job", pass_offset=1, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job", pass_offset=1, pass_limit=1)
 
     self.assertEqual([p["pass_nr"] for p in result["archive"]["passes"]], [2])
     self.assertTrue(result["archive"]["archive_query"]["truncated"])
@@ -4836,8 +4845,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.chainstore_hgetall.side_effect = _chainstore_hgetall
     plugin.chainstore_hset.side_effect = _chainstore_hset
 
-    result = Plugin.update_finding_triage(
-      plugin,
+    result = Plugin.update_finding_triage(plugin, TEST_CHANNEL_TOKEN,
       job_id="fin-job",
       finding_id="f-1",
       status="accepted_risk",
@@ -4864,7 +4872,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       [],
     ]
 
-    result = Plugin.get_job_triage(plugin, job_id="fin-job", finding_id="missing")
+    result = Plugin.get_job_triage(plugin, TEST_CHANNEL_TOKEN, job_id="fin-job", finding_id="missing")
 
     self.assertFalse(result["found"])
     self.assertEqual(result["audit"], [])
@@ -4930,8 +4938,14 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
     self.assertNotIn(expected, str(result))
     launch.assert_not_called()
 
-  def test_authenticated_launch_forwards_navigator_actor_assertion(self):
+  def test_authenticated_launch_derives_attribution_from_the_resolved_actor(self):
+    # RM-075: created_by_* come from the account store via the actor seam, never from the request.
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+
     plugin = MagicMock()
+    plugin._resolve_launch_actor = lambda actor=None: (
+      AccountView("navigator-user-123", "admin", None, True), None
+    )
     token = "valid-backend-token-material-at-least-32-bytes"
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
       "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test",
@@ -4940,11 +4954,14 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
       result = self.Plugin.launch_model_test(
         plugin,
         token,
-        created_by_id="navigator-user-123",
+        actor={"account_id": "navigator-user-123"},
+        created_by_id="spoofed-by-request",
+        created_by_name="spoofed-by-request",
       )
 
     self.assertEqual(result, {"status": "ok"})
     self.assertEqual(launch.call_args.kwargs["created_by_id"], "navigator-user-123")
+    self.assertEqual(launch.call_args.kwargs["created_by_name"], "navigator-user-123")
 
   def test_authenticated_preflight_forwards_navigator_actor_assertion(self):
     plugin = MagicMock()

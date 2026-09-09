@@ -21,7 +21,7 @@ from extensions.business.cybersec.red_mesh.services.engagement_deletion import (
   delete_engagement_data,
 )
 
-from .conftest import mock_plugin_modules
+from .conftest import mock_plugin_modules, TEST_CHANNEL_TOKEN
 
 
 # ---------------------------------------------------------------------
@@ -379,8 +379,7 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     owner = _EndpointOwner(jobs={"abc123": specs})
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(
-        owner, job_id="abc123", delete_documents=True, requested_by="alice",
+      result = Plugin.delete_job_engagement(owner, TEST_CHANNEL_TOKEN, job_id="abc123", delete_documents=True, requested_by="alice",
       )
 
     self.assertTrue(result["ok"])
@@ -402,8 +401,7 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     owner.fail_put = True
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(
-        owner, job_id="abc123", delete_documents=True, requested_by="alice",
+      result = Plugin.delete_job_engagement(owner, TEST_CHANNEL_TOKEN, job_id="abc123", delete_documents=True, requested_by="alice",
       )
 
     self.assertEqual(result["error"], "state_persist_failed")
@@ -416,8 +414,7 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     owner = _EndpointOwner(jobs={"abc123": specs})
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(
-        owner, job_id="abc123", delete_documents=True, requested_by="alice",
+      result = Plugin.delete_job_engagement(owner, TEST_CHANNEL_TOKEN, job_id="abc123", delete_documents=True, requested_by="alice",
       )
 
     self.assertFalse(result["ok"])
@@ -434,7 +431,7 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     })
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(owner, job_id="fin123")
+      result = Plugin.delete_job_engagement(owner, TEST_CHANNEL_TOKEN, job_id="fin123")
 
     self.assertEqual(result["error"], "unsupported_finalized_job")
     self.assertEqual(repo.deleted, [])

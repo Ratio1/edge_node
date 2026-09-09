@@ -1,3 +1,4 @@
+from .conftest import TEST_CHANNEL_TOKEN
 import hashlib
 import json
 import socket
@@ -1979,7 +1980,7 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
       "cases": [],
     }
 
-    result = PentesterApi01Plugin.get_report(plugin, "raw-cid")
+    result = PentesterApi01Plugin.get_report(plugin, TEST_CHANNEL_TOKEN, "raw-cid")
 
     self.assertEqual(result["error"], "forbidden")
     self.assertNotIn("cases", str(result))
@@ -1987,7 +1988,7 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
   def test_raw_evidence_endpoint_reads_by_job_id(self):
     Plugin, plugin = self._raw_evidence_endpoint_plugin()
 
-    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw")
+    result = Plugin.get_raw_model_test_evidence(plugin, TEST_CHANNEL_TOKEN, "job-raw")
 
     self.assertEqual(result["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
     self.assertEqual(result["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)
