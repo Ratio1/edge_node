@@ -205,7 +205,7 @@ PARAM_REF = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 # rejected separately (LABEL_EXPRESSION_UNSAFE) because they widen the match.
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 LABEL_CHAIN = re.compile(
-  r"(?:(?<=\()|(?<![\[\w])" + IDENT + r")\s*(:\s*" + IDENT + r"(?:\s*[|&:]\s*" + IDENT + r")*)"
+  r"(?:(?<=\()|(?<![\[\w])" + IDENT + r"|\))\s*(:\s*" + IDENT + r"(?:\s*[|&:]\s*" + IDENT + r")*)"
 )
 REL_TYPE_REF = re.compile(r"\[[^\]]*:\s*(" + IDENT + r"(?:\s*[|&]\s*" + IDENT + r")*)[^\]]*\]")
 LABEL_EXPRESSION_UNSAFE = re.compile(r":\s*[!%(]|[|&]\s*[!%(]")
@@ -222,7 +222,6 @@ CYPHER_STRING_LITERAL = re.compile(r"'(?:\\.|''|[^'])*'|\"(?:\\.|\"\"|[^\"])*\""
 # A backtick-quoted identifier is opaque text. For analysis it becomes its
 # content when that is a plain identifier, otherwise a placeholder, so quoted
 # text can never read as a clause (`AS \`rows LIMIT 1\``) or hide a name.
-QUOTED_IDENTIFIER = re.compile(r"`((?:``|[^`])+)`")
 QUOTED_PLACEHOLDER = "quoted_identifier__"
 # Comments are rejected outright (checked on literal-stripped text): they can
 # hide or fake a LIMIT and the prompt contract forbids them anyway.
@@ -251,6 +250,7 @@ WILDCARD_PROJECTION = re.compile(r"\.\s*\*")
 BRACKET_ACCESS = re.compile(r"(?:\b(?!IN\b)[A-Za-z_][A-Za-z0-9_]*|\))\s*\[", re.I)
 COLLECT_AGGREGATE = re.compile(r"\bcollect\s*\(", re.I)
 LIMIT_KEYWORD = re.compile(r"\bLIMIT\b", re.I)
+UNION_SPLIT = re.compile(r"\bUNION\b(?:\s+ALL\b)?", re.I)
 # A non-final LIMIT must be a bare integer directly followed by the next clause.
 LIMIT_INTEGER = re.compile(
   r"\bLIMIT\s+(\d+)\s*(?=\b(?:RETURN|WITH|MATCH|OPTIONAL|UNION|UNWIND|WHERE|ORDER|SKIP|CALL)\b)",
@@ -311,15 +311,57 @@ def normalize_schema_token(token: str) -> str:
   return token
 
 
-def _unquote_identifier(match: re.Match[str]) -> str:
-  content = match.group(1).replace("``", "`")
-  return content if re.fullmatch(IDENT, content) else QUOTED_PLACEHOLDER
-
-
 def _analysis_text(cypher: str) -> str:
-  """Analysis-only view of a query: string literals become '' and quoted
-  identifiers become plain identifiers or a placeholder. Never returned or executed."""
-  return QUOTED_IDENTIFIER.sub(_unquote_identifier, CYPHER_STRING_LITERAL.sub("''", str(cypher or "")))
+  """Analysis-only view of a query, produced by one left-to-right pass so a
+  quote inside a backtick identifier (or the reverse) cannot desynchronise the
+  view from the text Neo4j executes. String literals become '', quoted
+  identifiers become plain identifiers or a placeholder, comments become a
+  bare marker. Never returned or executed."""
+  text = str(cypher or "")
+  out: list[str] = []
+  i, n = 0, len(text)
+  while i < n:
+    ch = text[i]
+    if ch in "'\"":
+      j = i + 1
+      while j < n:
+        if text[j] == "\\":
+          j += 2
+          continue
+        if text[j] == ch:
+          if j + 1 < n and text[j + 1] == ch:
+            j += 2
+            continue
+          break
+        j += 1
+      out.append("''")
+      i = j + 1
+    elif ch == "`":
+      j, buf = i + 1, []
+      while j < n:
+        if text[j] == "`":
+          if j + 1 < n and text[j + 1] == "`":
+            buf.append("`")
+            j += 2
+            continue
+          break
+        buf.append(text[j])
+        j += 1
+      content = "".join(buf)
+      out.append(content if re.fullmatch(IDENT, content) else QUOTED_PLACEHOLDER)
+      i = j + 1
+    elif text.startswith("//", i):
+      out.append(" // ")
+      j = text.find("\n", i)
+      i = n if j == -1 else j
+    elif text.startswith("/*", i):
+      out.append(" /* ")
+      j = text.find("*/", i + 2)
+      i = n if j == -1 else j + 2
+    else:
+      out.append(ch)
+      i += 1
+  return "".join(out)
 
 
 def _match_tokens(match: re.Match[str]) -> list[str]:
@@ -524,6 +566,8 @@ def _execution_safety_error(
     return "comments are not allowed"
   if LABEL_EXPRESSION_UNSAFE.search(stripped):
     return "label expressions with negation, wildcard or grouping are not allowed"
+  if PROCEDURE_CALL.search(stripped):
+    return "namespaced function calls are not allowed"
   if PROPERTIES_PROJECTION.search(stripped):
     return "properties() projection is not allowed"
   if WILDCARD_PROJECTION.search(stripped):
@@ -534,21 +578,27 @@ def _execution_safety_error(
     return "materializing collect() aggregation is not allowed"
   if not schema_tokens["labels"] and not schema_tokens["relationship_types"]:
     return "query is not anchored to any allowlisted label or relationship type"
-  if not _scalar_aggregate_only_return(stripped):
-    # Every LIMIT (including UNION branches and WITH stages) must be a bare
-    # integer within the cap, and the final one must end the query.
-    limit_positions = list(LIMIT_KEYWORD.finditer(stripped))
-    cap_text = f" of at most {max_limit} rows" if isinstance(max_limit, int) else ""
-    if not limit_positions:
+  cap_text = f" of at most {max_limit} rows" if isinstance(max_limit, int) else ""
+  for branch in UNION_SPLIT.split(stripped):
+    # Each UNION branch is bounded on its own: scalar-aggregate-only RETURNs
+    # are bounded by construction; every other branch needs integer LIMITs
+    # within the cap, the last of which ends the branch.
+    branch = branch.strip()
+    if _scalar_aggregate_only_return(branch):
+      continue
+    positions = list(LIMIT_KEYWORD.finditer(branch))
+    if not positions:
       return f"add an explicit positive LIMIT{cap_text} to the final RETURN"
-    for position in limit_positions[:-1]:
-      literal = LIMIT_INTEGER.match(stripped, position.start())
+    for position in positions[:-1]:
+      literal = LIMIT_INTEGER.match(branch, position.start())
       if literal is None:
         return "LIMIT must be a single integer literal"
       if isinstance(max_limit, int) and int(literal.group(1)) > max_limit:
         return f"LIMIT exceeds the server row cap of {max_limit} rows"
-    final = FINAL_LIMIT_LITERAL.match(stripped, limit_positions[-1].start())
+    final = FINAL_LIMIT_LITERAL.match(branch, positions[-1].start())
     if final is None:
+      if LIMIT_INTEGER.match(branch, positions[-1].start()):
+        return f"add an explicit positive LIMIT{cap_text} to the final RETURN"
       return "LIMIT must be a single integer literal"
     limit = int(final.group(1))
     if limit < 1:

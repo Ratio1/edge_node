@@ -339,12 +339,20 @@ class EdgeGuardExecutionSafetyTests(unittest.TestCase):
       "MATCH (i:Indicator) RETURN i.value AS v LIMIT 1 + 1000",
       "MATCH (i:Indicator) RETURN i.value AS v LIMIT 1000 + 1",
       "MATCH (i:Indicator) RETURN i.value AS v LIMIT toInteger('5')",
-      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 ORDER BY i.value",
-      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 SKIP 5",
     ]
     for cypher in cases:
       with self.subTest(cypher=cypher):
         self.assert_rejected(cypher, "single integer literal", max_limit=100)
+
+  def test_integer_limit_that_is_not_final_asks_for_a_final_limit(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 ORDER BY i.value",
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 SKIP 5",
+      "MATCH (i:Indicator) WITH i ORDER BY i.value DESC LIMIT 5 RETURN i.value AS value",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "explicit positive LIMIT", max_limit=100)
 
   def test_quoted_identifiers_cannot_read_as_clauses(self):
     self.assert_rejected(
@@ -394,6 +402,53 @@ class EdgeGuardExecutionSafetyTests(unittest.TestCase):
     for cypher in cases:
       with self.subTest(cypher=cypher):
         self.assert_rejected(cypher, "negation, wildcard or grouping", max_limit=100)
+
+  def test_quotes_inside_backticks_cannot_desynchronise_analysis(self):
+    hidden_property = "MATCH (i:Indicator) RETURN i.value AS `a'`, i.private AS b, i.value AS `c'` LIMIT 5"
+    analysis = self._analysis(hidden_property, max_limit=100)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("private", analysis["schema_unknown"]["properties"])
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i.value AS `a'` LIMIT 100000 UNION MATCH (i:Indicator) "
+      "WHERE i.value = 'x' RETURN i.value AS `a'` LIMIT 5",
+      "server row cap of 100",
+      max_limit=100,
+    )
+    self.assert_rejected("MATCH (i:Indicator) RETURN i.value AS `a'` // ' LIMIT 5", "comments", max_limit=100)
+    backtick_in_string = self._analysis("MATCH (i:Indicator) WHERE i.value = 'x`y' RETURN i.value AS v LIMIT 5", max_limit=100)
+    self.assertTrue(backtick_in_string["accepted"], backtick_in_string["validation_feedback"])
+
+  def test_rejects_namespaced_function_calls(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN apoc.cypher.runFirstColumnMany('MATCH (n:ReviewPrivate) RETURN n', {}) AS v LIMIT 5",
+      "MATCH (i:Indicator) RETURN apoc.text.join([i.value], ',') AS v LIMIT 5",
+      "MATCH (i:Indicator) RETURN db.info() AS v LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "namespaced function calls", max_limit=100)
+
+  def test_parenthesised_label_predicate_is_checked(self):
+    analysis = self._analysis("MATCH (i:Indicator)-->(n) WHERE (n):ReviewPrivate RETURN n LIMIT 5", max_limit=100)
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["schema_unknown"]["labels"], ["ReviewPrivate"])
+
+  def test_union_branches_are_bounded_individually(self):
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i.value AS v UNION MATCH (i:Indicator) RETURN count(i) AS v",
+      "explicit positive LIMIT",
+      max_limit=100,
+    )
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN count(i) AS v UNION ALL MATCH (i:Indicator) RETURN i.value AS v",
+      "explicit positive LIMIT",
+      max_limit=100,
+    )
+    accepted = self._analysis(
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 UNION MATCH (i:Indicator) RETURN count(i) AS v",
+      max_limit=100,
+    )
+    self.assertTrue(accepted["accepted"], accepted["validation_feedback"])
 
   def test_map_projection_properties_are_checked(self):
     analysis = self._analysis("MATCH (i:Indicator) RETURN i{.value, .private} AS m LIMIT 5", max_limit=100)
