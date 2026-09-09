@@ -197,12 +197,23 @@ EDGEGUARD_SCHEMA = {
 
 TOKEN = r"`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*"
 PARAM_REF = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
-LABEL_REF = re.compile(r"(?<!\[)\b[A-Za-z_][A-Za-z0-9_]*\s*:\s*(" + TOKEN + r")")
+# Every label in a node pattern's chain: after `(` (anonymous node) or after a
+# variable that is not preceded by `[` or a word character, so `[r:REL]`,
+# `[r :REL]` and `[:A|B]` never match.
+LABEL_CHAIN = re.compile(
+  r"(?:(?<=\()|(?<![\[\w])[A-Za-z_][A-Za-z0-9_]*)\s*((?::\s*(?:" + TOKEN + r")\s*)+)"
+)
 REL_TYPE_REF = re.compile(r"\[[^\]]*:\s*(" + TOKEN + r"(?:\s*\|\s*" + TOKEN + r")*)[^\]]*\]")
-PROPERTY_ACCESS = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*(" + TOKEN + r")(?!\s*\()")
+# Property access with a variable or a parenthesised expression on the left,
+# so `(i).private` is seen; bracket indexing is rejected separately.
+PROPERTY_ACCESS = re.compile(r"(?:\b[A-Za-z_][A-Za-z0-9_]*|\))\s*\.\s*(" + TOKEN + r")(?!\s*\()")
+SCHEMA_TOKEN = re.compile(TOKEN)
 MAP_KEY = re.compile(r"(?<=[{,])\s*(" + TOKEN + r")\s*:")
 PROCEDURE_CALL = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\(")
 CYPHER_STRING_LITERAL = re.compile(r"'(?:\\.|''|[^'])*'|\"(?:\\.|\"\"|[^\"])*\"")
+# Comments are rejected outright (checked on literal-stripped text): they can
+# hide or fake a LIMIT and the prompt contract forbids them anyway.
+CYPHER_COMMENT = re.compile(r"//|/\*")
 FORBIDDEN_OUTPUT = {
   "json_object": re.compile(r"^\s*\{", re.S),
   "markdown_fence": re.compile(r"```"),
@@ -226,7 +237,10 @@ WILDCARD_PROJECTION = re.compile(r"\.\s*\*")
 # IN are not matched.
 BRACKET_ACCESS = re.compile(r"(?:\b(?!IN\b)[A-Za-z_][A-Za-z0-9_]*|\))\s*\[", re.I)
 COLLECT_AGGREGATE = re.compile(r"\bcollect\s*\(", re.I)
-LIMIT_LITERAL = re.compile(r"\bLIMIT\s+(\d+)\b", re.I)
+LIMIT_KEYWORD = re.compile(r"\bLIMIT\b", re.I)
+# The final LIMIT must be a bare integer literal that ends the query, so
+# `LIMIT 1 + 1000` or `LIMIT toInteger(...)` cannot pass as `1`.
+FINAL_LIMIT_LITERAL = re.compile(r"\bLIMIT\s+(\d+)\s*\Z", re.I)
 RETURN_CLAUSE = re.compile(r"\bRETURN\b", re.I)
 RETURN_TERMINATOR = re.compile(r"\b(ORDER\s+BY|SKIP|LIMIT)\b", re.I)
 SCALAR_AGGREGATE_ITEM = re.compile(r"^(?:DISTINCT\s+)?(count|min|max|sum|avg)\s*\(", re.I)
@@ -279,15 +293,20 @@ def normalize_schema_token(token: str) -> str:
   return token
 
 
-def split_schema_union(tokens: str) -> list[str]:
-  return [normalize_schema_token(part.strip()) for part in tokens.split("|") if part.strip()]
+def _analysis_text(cypher: str) -> str:
+  """Analysis-only view of a query: string literals become '' and backticks are
+  removed so quoting cannot hide an identifier. Never returned or executed."""
+  return CYPHER_STRING_LITERAL.sub("''", str(cypher or "")).replace("`", "")
+
+
+def _match_tokens(match: re.Match[str]) -> list[str]:
+  return [normalize_schema_token(token) for token in SCHEMA_TOKEN.findall(match.group(1))]
 
 
 def ordered_schema_identifiers(pattern: re.Pattern[str], cypher: str, allowed: set[str]) -> list[str]:
   values: list[str] = []
-  for match in pattern.finditer(str(cypher or "")):
-    raw_value = match.group(1)
-    for value in split_schema_union(raw_value):
+  for match in pattern.finditer(_analysis_text(cypher)):
+    for value in _match_tokens(match):
       if value in allowed and value not in values:
         values.append(value)
   return values
@@ -303,7 +322,7 @@ def build_empty_result_broadening_cypher(
   query. A label-only or relationship-only fallback is too broad for runtime use.
   """
   allowed = allowed or schema_sets()
-  labels = ordered_schema_identifiers(LABEL_REF, failed_cypher, allowed["labels"])
+  labels = ordered_schema_identifiers(LABEL_CHAIN, failed_cypher, allowed["labels"])
   relationships = ordered_schema_identifiers(REL_TYPE_REF, failed_cypher, allowed["relationship_types"])
   if not labels or not relationships:
     return None
@@ -318,11 +337,14 @@ def build_empty_result_broadening_cypher(
 
 
 def extract_schema_tokens(cypher: str) -> dict[str, set[str]]:
-  property_source = CYPHER_STRING_LITERAL.sub("''", PROCEDURE_CALL.sub("(", cypher))
-  labels = {normalize_schema_token(match.group(1)) for match in LABEL_REF.finditer(cypher)}
+  source = _analysis_text(cypher)
+  property_source = PROCEDURE_CALL.sub("(", source)
+  labels: set[str] = set()
+  for match in LABEL_CHAIN.finditer(source):
+    labels.update(_match_tokens(match))
   relationship_types: set[str] = set()
-  for match in REL_TYPE_REF.finditer(cypher):
-    relationship_types.update(split_schema_union(match.group(1)))
+  for match in REL_TYPE_REF.finditer(source):
+    relationship_types.update(_match_tokens(match))
   properties = {normalize_schema_token(match.group(1)) for match in PROPERTY_ACCESS.finditer(property_source)}
   properties.update(normalize_schema_token(match.group(1)) for match in MAP_KEY.finditer(property_source))
   return {
@@ -343,7 +365,7 @@ def assert_read_only_cypher(text: str, row_id: str = "generated-output", field: 
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} contains a semicolon")
   if WRITE_CYPHER.search(text):
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} contains write Cypher")
-  if CALL_CLAUSE.search(CYPHER_STRING_LITERAL.sub("''", text)):
+  if CALL_CLAUSE.search(_analysis_text(text)):
     raise EdgeGuardCypherGuardError(f"{row_id}: {field} contains a procedure or subquery CALL")
 
 
@@ -473,7 +495,9 @@ def _execution_safety_error(
   """First execution-safety violation for an otherwise read-only query, or
   None. Runs on string-literal-stripped text; messages are the stable
   rejection diagnostics."""
-  stripped = CYPHER_STRING_LITERAL.sub("''", candidate)
+  stripped = _analysis_text(candidate)
+  if CYPHER_COMMENT.search(stripped):
+    return "comments are not allowed"
   if PROPERTIES_PROJECTION.search(stripped):
     return "properties() projection is not allowed"
   if WILDCARD_PROJECTION.search(stripped):
@@ -485,11 +509,19 @@ def _execution_safety_error(
   if not schema_tokens["labels"] and not schema_tokens["relationship_types"]:
     return "query is not anchored to any allowlisted label or relationship type"
   if not _scalar_aggregate_only_return(stripped):
-    limits = [int(match.group(1)) for match in LIMIT_LITERAL.finditer(stripped)]
-    if not limits or limits[-1] < 1:
-      cap_text = f" of at most {max_limit} rows" if isinstance(max_limit, int) else ""
+    # Only the last LIMIT governs the result size; a larger LIMIT inside a
+    # non-final UNION branch is a known non-goal of this check.
+    limit_positions = list(LIMIT_KEYWORD.finditer(stripped))
+    cap_text = f" of at most {max_limit} rows" if isinstance(max_limit, int) else ""
+    if not limit_positions:
       return f"add an explicit positive LIMIT{cap_text} to the final RETURN"
-    if isinstance(max_limit, int) and limits[-1] > max_limit:
+    final = FINAL_LIMIT_LITERAL.match(stripped, limit_positions[-1].start())
+    if final is None:
+      return "LIMIT must be a single integer literal"
+    limit = int(final.group(1))
+    if limit < 1:
+      return f"add an explicit positive LIMIT{cap_text} to the final RETURN"
+    if isinstance(max_limit, int) and limit > max_limit:
       return f"LIMIT exceeds the server row cap of {max_limit} rows"
   return None
 

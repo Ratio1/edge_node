@@ -282,9 +282,87 @@ class EdgeGuardExecutionSafetyTests(unittest.TestCase):
     self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
 
   def test_accepted_cypher_is_never_rewritten(self):
-    cypher = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10"
-    analysis = self._analysis(cypher, max_limit=100)
-    self.assertEqual(analysis["accepted_cypher"], cypher)
+    for cypher in (
+      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
+      "MATCH (i:`Indicator`) RETURN i.value AS value LIMIT 10",
+    ):
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher, max_limit=100)
+        self.assertEqual(analysis["accepted_cypher"], cypher)
+
+  def test_rejects_parenthesized_and_backticked_property_access(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN (i).private AS v LIMIT 5",
+      "MATCH (i:Indicator) RETURN `i`.private AS v LIMIT 5",
+      "MATCH (i:Indicator) RETURN i.`private` AS v LIMIT 5",
+      "MATCH (i:Indicator) WHERE (i).private IS NOT NULL RETURN i.value AS v LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher, max_limit=100)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertIn("private", analysis["schema_unknown"]["properties"], cypher)
+
+  def test_extracts_every_label_in_a_chain(self):
+    cases = [
+      "MATCH (i:Indicator:Nope) RETURN i.value AS v LIMIT 5",
+      "MATCH (:Indicator:Nope) RETURN 1 AS v LIMIT 5",
+      "MATCH (i:Nope:Indicator) RETURN i.value AS v LIMIT 5",
+      "MATCH (i :Indicator :Nope) RETURN i.value AS v LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher, max_limit=100)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertEqual(analysis["schema_unknown"]["labels"], ["Nope"], cypher)
+    tokens = extract_schema_tokens("MATCH (:Indicator:Malware)-[:INDICATES]->() RETURN 1")
+    self.assertEqual(tokens["labels"], {"Indicator", "Malware"})
+    self.assertEqual(tokens["relationship_types"], {"INDICATES"})
+
+  def test_anonymous_labelled_node_anchors_query(self):
+    analysis = self._analysis("MATCH (:Indicator) RETURN count(*) AS total")
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_rejects_comments(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN i.value AS v // LIMIT 1",
+      "MATCH (i:Indicator) RETURN i.value AS v /* LIMIT 1 */",
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 // done",
+      "MATCH (i:Indicator) /* hidden */ RETURN i.value AS v LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "comments are not allowed", max_limit=100)
+
+  def test_limit_must_be_final_integer_literal(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 1 + 1000",
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 1000 + 1",
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT toInteger('5')",
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 ORDER BY i.value",
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 SKIP 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "single integer literal", max_limit=100)
+
+  def test_negative_controls_stay_accepted(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN i.name AS name LIMIT 5",
+      "MATCH (i:Indicator) RETURN count(i) AS total",
+      "MATCH p=(i:Indicator)-[:INDICATES]->(m:Malware) RETURN p LIMIT 5",
+      "MATCH (i:Indicator) WHERE i.indicator_type IN ['hash', 'domain'] RETURN i LIMIT 5",
+      "MATCH (i:Indicator) WHERE i.value = 'http://x' RETURN i LIMIT 5",
+      "MATCH (i:Indicator) WHERE i.value = 'a /* b' RETURN i LIMIT 5",
+      "MATCH (i:Indicator)-[r :INDICATES]->(m:Malware) RETURN i.value AS value LIMIT 5",
+      "MATCH (i:`Indicator`) RETURN i.value AS value LIMIT 5",
+      "MATCH (i:Indicator) RETURN i.value AS value ORDER BY i.value LIMIT 5",
+      "MATCH (i:Indicator) RETURN i.value AS value SKIP 5 LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher, max_limit=100)
+        self.assertTrue(analysis["accepted"], f"{cypher!r}: {analysis['validation_feedback']}")
 
   def test_execution_safety_feedback_reaches_validation_feedback(self):
     analysis = self._analysis("MATCH (i:Indicator) RETURN i.value AS value")
