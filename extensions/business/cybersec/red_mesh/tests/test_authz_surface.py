@@ -129,7 +129,7 @@ class TestInternalCallersDoNotReenterEndpoints(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     names = "|".join(sorted(_endpoints(PentesterApi01Plugin)))
-    pattern = re.compile(r"\b(owner|self|plugin)\.(%s)\(" % names)
+    pattern = re.compile(r"\b(owner|self|plugin)\.(%s)\s*\(" % names)
     root = pathlib.Path(__file__).resolve().parents[1]
     offenders = []
     for path in root.rglob("*.py"):
