@@ -87,5 +87,13 @@ class TestChannelTokenRequired(unittest.TestCase):
     self.assertIn("extras", params)  # has_kwargs is recomputed from this at dispatch
 
 
+
+class TestDeployedTokenWhitespace(unittest.TestCase):
+  def test_trailing_newline_in_the_deployed_secret_does_not_reject_navigator(self):
+    # Navigator trims its copy; the plugin must compare the same bytes.
+    with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": _TOKEN + "\n"}, clear=True):
+      self.assertEqual(_Plugin().echo(_TOKEN), {"ok": True, "value": "", "extras": {}})
+
+
 if __name__ == "__main__":
   unittest.main()

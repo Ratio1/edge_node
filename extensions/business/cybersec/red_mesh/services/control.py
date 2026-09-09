@@ -122,7 +122,8 @@ def stop_and_delete_job(owner, job_id: str):
     return {"status": "success", "job_id": job_id, "cids_deleted": 0, "cids_total": 0}
 
   owner._log_audit_event("scan_stopped", {"job_id": job_id})
-  return owner.purge_job(job_id)
+  # Module-level call: the endpoint method is channel-guarded and takes `token` first (RM-075).
+  return purge_job(owner, job_id)
 
 
 def purge_job(owner, job_id: str):
@@ -498,9 +499,9 @@ def purge_all_jobs(owner):
     use_direct_purge = raw_status in terminal_statuses
     try:
       if use_direct_purge:
-        result = owner.purge_job(job_id)
+        result = purge_job(owner, job_id)
       else:
-        result = owner.stop_and_delete_job(job_id)
+        result = stop_and_delete_job(owner, job_id)
     except Exception as exc:
       owner.P(f"[PURGE_ALL] stop_and_delete_job({job_id}) raised: {exc}; falling back to force-purge.", color='y')
       errors.append({"job_id": job_id, "message": f"{type(exc).__name__}: {exc}"})

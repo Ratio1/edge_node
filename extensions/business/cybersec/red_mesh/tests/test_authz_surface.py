@@ -113,5 +113,56 @@ class TestAuthzSurface(unittest.TestCase):
     self.assertEqual(err["status_code"], 404)
 
 
+
+class TestInternalCallersDoNotReenterEndpoints(unittest.TestCase):
+  """Endpoint methods take `token` first and run the channel guard; code inside the plugin must
+  call the module-level implementations instead. Review round 1 found three such re-entries that
+  the surface test above cannot see (it enumerates decorators, not callers)."""
+
+  ENDPOINT_HOSTS = ("pentester_api_01.py", "services", "mixins", "api_mixins", "worker")
+
+  def test_no_plugin_code_calls_an_endpoint_method(self):
+    import pathlib
+    import re
+
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    names = "|".join(sorted(_endpoints(PentesterApi01Plugin)))
+    pattern = re.compile(r"\b(owner|self|plugin)\.(%s)\(" % names)
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in root.rglob("*.py"):
+      rel = path.relative_to(root)
+      if rel.parts[0] == "tests" or not (rel.parts[0] in self.ENDPOINT_HOSTS or str(rel) in self.ENDPOINT_HOSTS):
+        continue
+      for lineno, line in enumerate(path.read_text().splitlines(), 1):
+        if pattern.search(line) and not line.lstrip().startswith(("def ", "#")):
+          offenders.append(f"{rel}:{lineno}: {line.strip()}")
+    self.assertEqual(offenders, [])
+
+  def test_launch_test_compat_shim_reaches_the_module_launcher_with_attribution(self):
+    from extensions.business.cybersec.red_mesh.services import launch_api
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+
+    plugin = MagicMock()
+    plugin._resolve_launch_actor = lambda actor=None: (AccountView("ops.user", "admin", None, True), None)
+    seen = {}
+    with patch.object(launch_api, "launch_network_scan", side_effect=lambda owner, **kw: seen.update(kw) or {"ok": True}), \
+         patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN}):
+      result = self.Plugin.launch_test(
+        plugin, TEST_CHANNEL_TOKEN, target="example.com", scan_type="network", authorized=True,
+        actor={"account_id": "ops.user"},
+      )
+    self.assertEqual(result, {"ok": True})
+    self.assertEqual((seen.get("created_by_name"), seen.get("created_by_id")), ("ops.user", "ops.user"))
+
+  @classmethod
+  def setUpClass(cls):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    cls.Plugin = PentesterApi01Plugin
+
+
 if __name__ == "__main__":
   unittest.main()

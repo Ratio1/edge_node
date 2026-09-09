@@ -163,7 +163,9 @@ def _backend_auth_error(*, status_code, error, error_class, message):
 
 def validate_backend_token(token):
   """Validate the Navigator-to-edge bearer token without exposing token material."""
-  expected = os.environ.get(BACKEND_TOKEN_ENV, "")
+  # Navigator trims its copy (lib/config/env.ts); a trailing newline in the deployed secret must
+  # not turn into a 403 on every call with no diagnostic.
+  expected = os.environ.get(BACKEND_TOKEN_ENV, "").strip()
   expected_bytes = expected.encode("utf-8")
   if len(expected_bytes) < MIN_BACKEND_TOKEN_BYTES:
     return _backend_auth_error(

@@ -1867,7 +1867,10 @@ def launch_test(
     return validation_error(f"Invalid scan_type: {scan_type}. Valid: {[e.value for e in ScanType]}")
 
   if scan_type_enum == ScanType.WEBAPP:
-    return owner.launch_webapp_scan(
+    # Module-level calls: the endpoint methods are channel-guarded and resolve the actor;
+    # both already happened once at the launch_test endpoint (RM-075).
+    return launch_webapp_scan(
+      owner,
       target_url=target_url,
       excluded_features=excluded_features,
       run_mode=run_mode,
@@ -1921,7 +1924,8 @@ def launch_test(
       comparison_mode=comparison_mode,
     )
 
-  return owner.launch_network_scan(
+  return launch_network_scan(
+    owner,
     target=target,
     start_port=start_port,
     end_port=end_port,

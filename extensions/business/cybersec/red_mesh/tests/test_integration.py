@@ -1823,9 +1823,12 @@ class TestPhase14Purge(unittest.TestCase):
 
     # Mock purge_job to verify delegation
     purge_result = {"status": "success", "job_id": "job-1", "cids_deleted": 3, "cids_total": 3}
-    plugin.purge_job = MagicMock(return_value=purge_result)
+    # Delegation goes to the module-level purge_job, not the channel-guarded endpoint method.
+    from extensions.business.cybersec.red_mesh.services import control as control_module
+    purge_mock = MagicMock(return_value=purge_result)
 
-    result = Plugin.stop_and_delete_job(plugin, TEST_CHANNEL_TOKEN, "job-1")
+    with patch.object(control_module, "purge_job", purge_mock):
+      result = Plugin.stop_and_delete_job(plugin, TEST_CHANNEL_TOKEN, "job-1")
 
     # Verify job was marked stopped before purge
     hset_calls = [
@@ -1839,7 +1842,7 @@ class TestPhase14Purge(unittest.TestCase):
     self.assertTrue(saved_specs["workers"]["node-A"]["canceled"])
 
     # Verify purge was called
-    plugin.purge_job.assert_called_once_with("job-1")
+    purge_mock.assert_called_once_with(plugin, "job-1")
     self.assertEqual(result, purge_result)
 
 
@@ -1860,6 +1863,14 @@ class TestPurgeAllJobs(unittest.TestCase):
   def _make_plugin(self, jobs, live=None, triage=None, triage_audit=None, integrations=None):
     """Build a plugin mock backed by mutable hash dicts keyed by hkey."""
     plugin = MagicMock()
+    # RM-075: production purge_all calls the module-level purge_job / stop_and_delete_job (the endpoint
+    # methods are channel-guarded and take `token` first). Route those seams to the MagicMock
+    # attributes this class stubs and asserts against, with the historical one-argument shape.
+    from extensions.business.cybersec.red_mesh.services import control as control_module
+    for name in ("purge_job", "stop_and_delete_job"):
+      patcher = patch.object(control_module, name, (lambda n: (lambda owner, job_id: getattr(plugin, n)(job_id)))(name))
+      patcher.start()
+      self.addCleanup(patcher.stop)
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "node-A"
     plugin.P = MagicMock()

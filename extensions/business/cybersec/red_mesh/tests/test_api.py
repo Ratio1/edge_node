@@ -1575,6 +1575,14 @@ class TestPhase1ConfigCID(unittest.TestCase):
     _stub_launch_actor(plugin)
     plugin.launch_network_scan = MagicMock(return_value={"route": "network"})
     plugin.launch_webapp_scan = MagicMock(return_value={"route": "webapp"})
+    # RM-075: the compat shim calls the module-level launchers (the endpoint methods are
+    # channel-guarded and take `token` first). Route those seams to the MagicMocks above with
+    # the historical kwargs-only shape so the assertions below stay meaningful.
+    from extensions.business.cybersec.red_mesh.services import launch_api
+    for name in ("launch_network_scan", "launch_webapp_scan"):
+      patcher = patch.object(launch_api, name, (lambda n: (lambda owner, **kw: getattr(plugin, n)(**kw)))(name))
+      patcher.start()
+      self.addCleanup(patcher.stop)
 
     network = PentesterApi01Plugin.launch_test(plugin, TEST_CHANNEL_TOKEN, target="example.com", authorized=True, scan_type="network")
     webapp = PentesterApi01Plugin.launch_test(plugin, TEST_CHANNEL_TOKEN,
