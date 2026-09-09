@@ -52,6 +52,51 @@ def _make_probe(workflow_endpoints=None, record_endpoints=None,
   return probe
 
 
+class TestTheWorkflowProbeReportsAVerbItNeverIssues(unittest.TestCase):
+  """
+  `_test_workflow_bypass` issues POST only for a POST endpoint and a plain GET
+  for every other verb, so a configured `DELETE` entry is probed with GET. The
+  finding nonetheless writes `method=DELETE` into its evidence and
+  `"Send DELETE to /orders/1."` into its replay steps.
+
+  This is why the finding does **not** carry a typed `method`: splitting identity
+  on the configured verb would key a finding on a request that was never sent,
+  and two entries that produce the same request really are one finding. The split
+  becomes real once the probe issues the configured verb — a behavioural change,
+  since DELETE against a live target is destructive, so it is not made here.
+
+  Pinned so that whoever fixes the probe sees what else has to move with it.
+  """
+
+  def test_only_get_is_issued_whatever_the_configured_verb(self):
+    probe = _make_probe(
+      workflow_endpoints=[
+        WorkflowEndpoint(path="/orders/1", method="GET", expected_guard="403"),
+        WorkflowEndpoint(path="/orders/1", method="DELETE", expected_guard="403"),
+      ],
+    )
+    session = probe.auth.regular_session
+    for verb in ("get", "post", "delete", "put", "request"):
+      getattr(session, verb).return_value = _mock_response(status=200)
+    probe._test_workflow_bypass()
+
+    self.assertEqual(session.get.call_count, 2)
+    for verb in ("post", "delete", "put", "request"):
+      self.assertEqual(
+        getattr(session, verb).call_count, 0,
+        f"the probe now issues {verb.upper()}; the finding's method is real, so "
+        "give it a typed `method=` and split the identity",
+      )
+
+    vuln = [f for f in probe.findings
+            if f.scenario_id == "PT-A06-01" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 2)
+    self.assertEqual(
+      [f.method for f in vuln], [None, None],
+      "a typed method here would key identity on a request never sent",
+    )
+
+
 class TestStatefulGating(unittest.TestCase):
 
   def test_stateful_disabled(self):

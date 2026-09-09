@@ -98,6 +98,9 @@ class DeeployManagerApiPlugin(
       self.maybe_stop_tunnel_engine()
     self._init_request_tracking()
     self.__pending_deploy_requests = {}
+    self._pending_managed_update_actions = {}
+    self._applied_managed_update_actions = {}
+    self._managed_update_action_lock = threading.Lock()
     self.__pipeline_persistence_queue = deque()
     self.__pipeline_persistence_lock = threading.Lock()
     self.__pipeline_persistence_event = threading.Event()
@@ -152,6 +155,12 @@ class DeeployManagerApiPlugin(
           )
 
         if ok:
+          self._mark_managed_update_action_applied(
+            job.get('managed_update_action')
+          )
+          self._release_managed_update_action(
+            job.get('managed_update_action_claim_key')
+          )
           self.P(
             f"Persisted deployed pipeline metadata for job {job.get('job_id')}"
             f"{' (' + job.get('app_id') + ')' if job.get('app_id') else ''}."
@@ -160,6 +169,9 @@ class DeeployManagerApiPlugin(
 
         attempts = int(job.get('attempts', 0)) + 1
         if attempts >= 3:
+          self._release_managed_update_action(
+            job.get('managed_update_action_claim_key')
+          )
           self.P(
             f"Failed to persist deployed pipeline metadata for job {job.get('job_id')} after {attempts} attempts.",
             color='r'
@@ -219,6 +231,103 @@ class DeeployManagerApiPlugin(
       f"{' (' + persistence_state.get('app_id') + ')' if persistence_state.get('app_id') else ''}."
     )
     return True
+
+  def _claim_managed_update_action(self, owner, app_id, action):
+    if not action:
+      return None
+    action_kind = action.get("kind")
+    operation_id = action.get("operation_id")
+    intent_hash = action.get("intent_hash")
+    if not action_kind or not operation_id:
+      raise ValueError("Managed service update action is missing its kind or operation id.")
+    lock = getattr(self, "_managed_update_action_lock", None)
+    if lock is None:
+      lock = threading.Lock()
+      self._managed_update_action_lock = lock
+    with lock:
+      pending = getattr(self, "_pending_managed_update_actions", None)
+      if not isinstance(pending, dict):
+        pending = {}
+        self._pending_managed_update_actions = pending
+      key = (owner, app_id)
+      existing = pending.get(key)
+      if existing:
+        if existing == (action_kind, operation_id, intent_hash):
+          raise ValueError(f"{action.get('label', 'Managed service update action')} is already in progress.")
+        raise ValueError("Another managed service update action is already in progress for this job.")
+      pending[key] = (action_kind, operation_id, intent_hash)
+    return key
+
+  def _release_managed_update_action(self, claim_key):
+    lock = getattr(self, "_managed_update_action_lock", None)
+    if claim_key is not None and lock is not None:
+      with lock:
+        pending = getattr(self, "_pending_managed_update_actions", None)
+        if isinstance(pending, dict):
+          pending.pop(claim_key, None)
+    elif claim_key is not None:
+      pending = getattr(self, "_pending_managed_update_actions", None)
+      if isinstance(pending, dict):
+        pending.pop(claim_key, None)
+
+  def _get_applied_managed_update_action(self, owner, app_id, action_kind):
+    lock = getattr(self, "_managed_update_action_lock", None)
+    if lock is None:
+      return None
+    with lock:
+      applied = getattr(self, "_applied_managed_update_actions", None)
+      return applied.get((owner, app_id, action_kind)) if isinstance(applied, dict) else None
+
+  def _mark_managed_update_action_applied(self, operation):
+    if not operation:
+      return
+    owner = operation.get("owner")
+    app_id = operation.get("app_id")
+    action_kind = operation.get("kind")
+    operation_id = operation.get("operation_id")
+    intent_hash = operation.get("intent_hash")
+    if not owner or not app_id or not action_kind or not operation_id:
+      return
+    lock = getattr(self, "_managed_update_action_lock", None)
+    if lock is None:
+      lock = threading.Lock()
+      self._managed_update_action_lock = lock
+    with lock:
+      applied = getattr(self, "_applied_managed_update_actions", None)
+      if not isinstance(applied, dict):
+        applied = {}
+        self._applied_managed_update_actions = applied
+      applied[(owner, app_id, action_kind)] = (operation_id, intent_hash)
+
+  def _get_persisted_deeploy_specs(self, job_id, owner, app_id, action_label="Managed service update"):
+    pipeline = self.get_job_pipeline_from_cstore(
+      job_id,
+      timeout=30,
+      pin=False,
+      raise_on_error=False,
+      show_logs=False,
+    )
+    if not isinstance(pipeline, dict):
+      raise ValueError(
+        f"{action_label} requires the persisted pipeline metadata."
+      )
+    pipeline_owner = pipeline.get(NetMonCt.OWNER.upper()) or pipeline.get(NetMonCt.OWNER)
+    pipeline_app_id = pipeline.get("NAME") or pipeline.get("name")
+    if str(pipeline_owner).lower() != str(owner).lower():
+      raise ValueError("Persisted Deeploy pipeline owner does not match the update request.")
+    if str(pipeline_app_id).lower() != str(app_id).lower():
+      raise ValueError("Persisted Deeploy pipeline app id does not match the update request.")
+    deeploy_specs = (
+      pipeline.get(NetMonCt.DEEPLOY_SPECS.upper())
+      or pipeline.get(NetMonCt.DEEPLOY_SPECS)
+    )
+    if not isinstance(deeploy_specs, dict):
+      raise ValueError(
+        f"{action_label} requires persisted Deeploy specifications."
+      )
+    if str(deeploy_specs.get(DEEPLOY_KEYS.JOB_ID)).lower() != str(job_id).lower():
+      raise ValueError("Persisted Deeploy pipeline job id does not match the update request.")
+    return deeploy_specs
 
 
   def on_request(self, request):
@@ -706,6 +815,11 @@ class DeeployManagerApiPlugin(
     dict
         The response dictionary
     """
+    managed_action_claim_key = None
+    keep_managed_action_claim = False
+    managed_action = None
+    service_kind = None
+    cockroachdb_legacy_compat_contexts = None
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
@@ -756,6 +870,8 @@ class DeeployManagerApiPlugin(
           job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
           if job_app_type not in JOB_APP_TYPES_ALL:
             job_app_type = JOB_APP_TYPES.NATIVE
+        service_kind = self._resolve_deeploy_service_kind(inputs=inputs)
+        self._validate_managed_service_request_admission(service_kind, inputs)
       self.P(f"Resolved job app type: {job_app_type}")
       # persist job type so downstream mixins can adjust validations (e.g. native app resource checks)
       inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
@@ -789,9 +905,8 @@ class DeeployManagerApiPlugin(
         # TODO: Add check if jobType resources match the requested resources.
 
         deployment_nodes = self._check_nodes_availability(inputs)
-        # TODO: Abstract service-specific target-change validation once Deeploy
-        # supports more stateful services beyond CockroachDB.
-        self._validate_cockroachdb_target_change(
+        self._validate_managed_service_target_change(
+          service_kind=service_kind,
           current_nodes=[],
           requested_nodes=deployment_nodes,
           inputs=inputs,
@@ -819,6 +934,21 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances = pipeline_context["discovered_instances"]
         current_nodes = pipeline_context["nodes"]
         deeploy_specs_for_update = pipeline_context["deeploy_specs"]
+        service_kind = self._resolve_deeploy_service_kind(
+          inputs=inputs,
+          deeploy_specs=deeploy_specs_for_update,
+          discovered_plugin_instances=discovered_plugin_instances,
+        )
+        cockroachdb_legacy_compat_contexts = (
+          self._get_cockroachdb_legacy_compat_contexts_from_discovered(
+            discovered_plugin_instances,
+          )
+        )
+        self._validate_managed_service_request_admission(
+          service_kind,
+          inputs,
+          cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
+        )
         self.P(
           f"Discovered {len(discovered_plugin_instances)} live plugin instance record(s) "
           f"for update job_id={job_id}, app_id={app_id}."
@@ -857,9 +987,8 @@ class DeeployManagerApiPlugin(
         if not deployment_targets:
           msg = f"{DEEPLOY_ERRORS.NODES2}: Update request must include at least one target node."
           raise ValueError(msg)
-        # TODO: Route service-specific update constraints through a generic
-        # service policy layer once additional managed services are added.
-        self._validate_cockroachdb_target_change(
+        self._validate_managed_service_target_change(
+          service_kind=service_kind,
           current_nodes=current_nodes,
           requested_nodes=deployment_targets,
           inputs=inputs,
@@ -936,6 +1065,57 @@ class DeeployManagerApiPlugin(
           raise ValueError(msg)
         # TODO: Add check if jobType resources match the requested resources.
 
+        action_request = self._get_managed_service_update_action_request(service_kind, inputs)
+        action_specs = deeploy_specs_for_update
+        applied_operation = None
+        if action_request:
+          applied_operation = self._get_applied_managed_update_action(
+            auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+            app_id,
+            action_request["kind"],
+          )
+          if applied_operation and applied_operation[0] == action_request["operation_id"]:
+            action_specs = {}
+          else:
+            action_specs = self._get_persisted_deeploy_specs(
+              job_id,
+              auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+              app_id,
+              action_label=action_request.get("label", "Managed service update"),
+            )
+        managed_action = self._prepare_managed_service_update_action(
+          service_kind,
+          inputs,
+          action_specs,
+          applied_operation=applied_operation,
+        )
+        if managed_action and managed_action.get("already_applied"):
+          return self._get_response({
+            DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+            DEEPLOY_KEYS.STATUS_DETAILS: self.deepcopy(
+              managed_action.get("already_applied_status_details", {})
+            ),
+            DEEPLOY_KEYS.APP_ID: app_id,
+            DEEPLOY_KEYS.REQUEST: {
+              DEEPLOY_KEYS.APP_ALIAS: app_alias,
+              DEEPLOY_KEYS.TARGET_NODES: deployment_targets,
+              DEEPLOY_KEYS.TARGET_NODES_COUNT: len(deployment_targets),
+              DEEPLOY_KEYS.JOB_APP_TYPE: job_app_type,
+            },
+            DEEPLOY_KEYS.AUTH: auth_result,
+          })
+        managed_action_claim_key = self._claim_managed_update_action(
+          auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+          app_id,
+          managed_action,
+        )
+        self._inherit_managed_service_runtime_config(
+          service_kind,
+          inputs,
+          discovered_plugin_instances,
+          deployment_targets,
+        )
+
         validated_nodes = self._check_nodes_availability(inputs)
         if set(validated_nodes) != set(deployment_targets):
           msg = (
@@ -951,7 +1131,18 @@ class DeeployManagerApiPlugin(
           app_id=app_id,
           job_app_type=job_app_type,
           dct_deeploy_specs=deeploy_specs_payload,
+          service_kind=service_kind,
+          cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
         )
+        if managed_action and managed_action.get("requires_all_target_responses"):
+          response_key_nodes = set(prepared_create_deploy_plan.get("response_keys") or {})
+          if (
+            not prepared_create_deploy_plan.get("enable_chainstore_response")
+            or response_key_nodes != set(validated_nodes)
+          ):
+            raise ValueError(
+              f"{managed_action.get('label', 'Managed service update')} requires response keys for every target node."
+            )
         if prepared_create_deploy_plan.get("enable_chainstore_response"):
           self._reset_chainstore_response_keys(
             prepared_create_deploy_plan.get("response_keys", {}),
@@ -1016,6 +1207,7 @@ class DeeployManagerApiPlugin(
         skip_create_response_key_reset=skip_create_response_key_reset,
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
+        cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
       )
       persistence_state = self._build_pipeline_persistence_state(
         job_id=job_id,
@@ -1089,7 +1281,14 @@ class DeeployManagerApiPlugin(
             'job_id': job_id,
           },
           'persistence': persistence_state,
+          'managed_update_action_claim_key': managed_action_claim_key,
+          'managed_update_action': ({
+            **managed_action,
+            "owner": auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+            "app_id": app_id,
+          } if managed_action else None),
         }
+        keep_managed_action_claim = managed_action_claim_key is not None
         return {'__pending__': pending_state}
 
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
@@ -1120,10 +1319,13 @@ class DeeployManagerApiPlugin(
       }
 
       if self.cfg_deeploy_verbose > 1:
-        self.P(f"Request Result: {result}")
+        self.P(f"Request Result: status={str_status}, app_id={app_id}")
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
+    finally:
+      if managed_action_claim_key is not None and not keep_managed_action_claim:
+        self._release_managed_update_action(managed_action_claim_key)
     
     response = self._get_response({
       **result
@@ -1192,6 +1394,9 @@ class DeeployManagerApiPlugin(
           **pending.get('base_result', {})
         }
       self.__pending_deploy_requests.pop(pending_id, None)
+      self._release_managed_update_action(
+        pending.get('managed_update_action_claim_key')
+      )
       res = self._get_response({
         **result
       })
@@ -1238,9 +1443,47 @@ class DeeployManagerApiPlugin(
           self.P(f"An error occurred while submitting node update for job {job_id}: {e}", color='r')
     # endif nodes changed and success or delivered
 
-    if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-      self._queue_pipeline_persistence(pending.get('persistence'))
+    managed_action = pending.get('managed_update_action')
+    persistence_state = pending.get('persistence')
+    if str_status == DEEPLOY_STATUS.SUCCESS and managed_action:
+      persisted = False
+      if persistence_state:
+        for _ in range(3):
+          persisted = self.persist_job_pipeline_metadata(
+            pipeline=persistence_state['pipeline'],
+            job_id=persistence_state['job_id'],
+            previous_cid=persistence_state.get('previous_cid'),
+            delete_previous=persistence_state.get('delete_previous', False),
+          )
+          if persisted:
+            break
+      if not persisted:
+        if persistence_state:
+          persistence_state['managed_update_action'] = managed_action
+          persistence_state['managed_update_action_claim_key'] = pending.get(
+            'managed_update_action_claim_key'
+          )
+        queued = self._queue_pipeline_persistence(persistence_state)
+        if not queued:
+          self._release_managed_update_action(
+            pending.get('managed_update_action_claim_key')
+          )
+        return {
+          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL,
+          DEEPLOY_KEYS.ERROR: managed_action.get(
+            "persistence_failure_error",
+            "Managed service update succeeded but metadata persistence failed.",
+          ),
+          DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
+          **pending.get('base_result', {})
+        }
+      self._mark_managed_update_action_applied(managed_action)
+    elif str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+      self._queue_pipeline_persistence(persistence_state)
 
+    self._release_managed_update_action(
+      pending.get('managed_update_action_claim_key')
+    )
     return {
       DEEPLOY_KEYS.STATUS: str_status,
       DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
@@ -1424,6 +1667,9 @@ class DeeployManagerApiPlugin(
           Additional pipeline-level parameters forwarded to the data capture thread. `null` falls back to `{}`.
           The provided keys are merged into the pipeline configuration at the top level.
 
+      service_kind : str, optional
+          Stable managed-service identity. Currently supported: `cockroachdb`. Omit for ordinary services.
+
       nonce : str
           The nonce used for signing the request
 
@@ -1549,6 +1795,13 @@ class DeeployManagerApiPlugin(
       pipeline_params : dict, optional
           Additional pipeline-level parameters forwarded to the data capture thread. `null` falls back to `{}`.
           The provided keys are merged into the pipeline configuration at the top level.
+
+      service_kind : str, optional
+          Stable managed-service identity. Existing legacy CockroachDB jobs are detected and backfilled on update.
+
+      cockroachdb_certificate_regeneration_id : str, optional
+          UUIDv4 operation id for an explicit full-fleet CockroachDB TLS certificate regeneration.
+          Valid only for CockroachDB service updates with all-node response confirmation enabled.
 
       nonce : str
           The nonce used for signing the request

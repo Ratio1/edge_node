@@ -230,5 +230,126 @@ class TestGracefulDegradation(unittest.TestCase):
       cache.close()
 
 
+class TestCveApplicability(unittest.TestCase):
+  """
+  `CveEntry` had no component/role dimension, so every CVE tagged `openssh`
+  fired on any OpenSSH artifact — including client-side ones matched off a
+  *listening sshd banner*: SCP client-side file overwrite, client
+  VerifyHostKeyDNS, ssh-add, forwarded ssh-agent. A server banner cannot
+  evidence a client-side weakness.
+  """
+
+  def _ids(self, version, **kwargs):
+    return {
+      cve_id
+      for finding in check_cves("openssh", version, **kwargs)
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+
+  def test_a_listening_server_banner_does_not_raise_client_side_cves(self):
+    fired = self._ids("OpenSSH_8.9p1")
+    # CVE-2019-6111 is an scp *client* file-overwrite; CVE-2025-26465 is a
+    # client-side VerifyHostKeyDNS bypass. Neither is evidenced by sshd.
+    self.assertNotIn("CVE-2019-6111", fired)
+    self.assertNotIn("CVE-2025-26465", fired)
+
+  def test_client_side_cves_are_still_reachable_when_asked_for(self):
+    # 7.9 is inside CVE-2019-6111's `<8.1` range; the gate hides it from a
+    # server query rather than dropping it from the catalog.
+    self.assertNotIn("CVE-2019-6111", self._ids("OpenSSH_7.9"))
+    self.assertIn("CVE-2019-6111", self._ids("OpenSSH_7.9", applicability="client"))
+
+
+class TestRegreSSHionConstraint(unittest.TestCase):
+  """
+  CVE-2024-6387 was encoded as `openssh <9.3`. The published scope is
+  `<4.4p1` plus `>=8.5p1,<9.8p1`, so the single range both over-matched
+  (4.4p1 through 8.5p1 are not vulnerable) and under-matched (9.3 through
+  9.8p1 are).
+  """
+
+  def _fires(self, version):
+    return "CVE-2024-6387" in {
+      cve_id
+      for finding in check_cves("openssh", version)
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+
+  def test_the_vulnerable_ranges_fire(self):
+    for version in ("OpenSSH_4.3", "OpenSSH_8.5p1", "OpenSSH_8.9p1", "OpenSSH_9.7"):
+      with self.subTest(version=version):
+        self.assertTrue(self._fires(version), f"{version} is in the published scope")
+
+  def test_the_unaffected_middle_range_does_not_fire(self):
+    # Over-matching: these sit between the two vulnerable ranges.
+    for version in ("OpenSSH_4.4p1", "OpenSSH_5.0", "OpenSSH_7.4", "OpenSSH_8.4"):
+      with self.subTest(version=version):
+        self.assertFalse(self._fires(version), f"{version} is not in the published scope")
+
+  def test_the_upper_range_is_not_truncated_at_9_3(self):
+    # Under-matching: 9.3 to 9.8p1 are vulnerable and were being missed.
+    for version in ("OpenSSH_9.3", "OpenSSH_9.6"):
+      with self.subTest(version=version):
+        self.assertTrue(self._fires(version), f"{version} is in the published scope")
+
+  def test_the_fixed_release_does_not_fire(self):
+    self.assertFalse(self._fires("OpenSSH_9.8p1"))
+
+  def test_the_boundaries_hold_for_the_version_the_matcher_actually_receives(self):
+    # `_SSH_LIBRARY_PATTERNS` captures `(\d+\.\d+(?:\.\d+)?)`, so the matcher
+    # is handed "9.8", never "9.8p1". Writing the published `p`-suffixed bounds
+    # shifted both boundaries by a release: a patched 9.8 reported CRITICAL and
+    # a vulnerable 8.5 was missed.
+    self.assertFalse(self._fires("9.8"), "9.8 is the fixed release")
+    self.assertTrue(self._fires("8.5"), "8.5 is inside the published scope")
+    self.assertTrue(self._fires("9.7"))
+    self.assertFalse(self._fires("8.4"))
+
+  def test_a_client_side_critical_does_not_fire_from_a_server_banner(self):
+    # CVE-2016-1908 is an OpenSSH *client* X11-cookie weakness, and CRITICAL —
+    # the highest-severity instance of the over-match the applicability gate
+    # exists to stop.
+    fired = {
+      cve_id
+      for finding in check_cves("openssh", "4.4")
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+    self.assertNotIn("CVE-2016-1908", fired)
+
+
+class TestPackageVersionParsing(unittest.TestCase):
+  """
+  `_parse_version` matched the first numeric run in the string, so a
+  Debian/RPM epoch was read as the upstream version: `1:8.9p1-3ubuntu0.10`
+  returned (1,), making an OpenSSH 8.9 host match every CVE for 1.x.
+
+  Latent while `_ssh_identify_library` reduces the banner to "8.9" before the
+  matcher sees it, but live the moment the full distribution package string is
+  carried through — which is the remaining half of RM-064 item 5.
+  """
+
+  def test_an_epoch_is_not_read_as_the_upstream_version(self):
+    from extensions.business.cybersec.red_mesh.cve_db import _parse_version
+    self.assertEqual(_parse_version("1:8.9p1-3ubuntu0.10"), _parse_version("8.9p1"))
+    self.assertEqual(_parse_version("2:1.2.3"), (1, 2, 3))
+
+  def test_ordinary_version_strings_are_unaffected(self):
+    from extensions.business.cybersec.red_mesh.cve_db import _parse_version
+    self.assertEqual(_parse_version("OpenSSH_8.9p1"), (8, 9, 16, 1))
+    self.assertEqual(_parse_version("1.4.3-beta"), (1, 4, 3))
+    self.assertEqual(_parse_version("Apache/2.4.57 (Ubuntu)"), (2, 4, 57))
+
+  def test_an_epoch_prefixed_package_no_longer_matches_1_x_cves(self):
+    fired = {
+      cve_id
+      for finding in check_cves("openssh", "1:8.9p1-3ubuntu0.10")
+      for cve_id in (getattr(finding, "cve", None) or ())
+    }
+    # 8.9p1 is inside the regreSSHion upper range and outside the ancient ones.
+    self.assertIn("CVE-2024-6387", fired)
+    self.assertNotIn("CVE-2016-6210", fired)   # openssh <7.0
+    self.assertNotIn("CVE-2017-15906", fired)  # openssh <7.6
+
+
 if __name__ == "__main__":
   unittest.main()

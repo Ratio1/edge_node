@@ -218,7 +218,14 @@ class TestCveVersionNormalization(unittest.TestCase):
 
   def test_ssh_banner_versions_match_cves(self):
     findings = check_cves("openssh", "OpenSSH_8.9p1 Ubuntu-3")
-    self.assertTrue(any("CVE-2023-38408" in f.cve for f in findings))
+    # A server-side CVE in scope for 8.9p1. This previously asserted
+    # CVE-2023-38408, an ssh-agent PKCS#11 weakness, matched off a listening
+    # sshd banner — the client-side over-match RM-064 item 5 exists to stop.
+    self.assertTrue(any("CVE-2024-6387" in f.cve for f in findings))
+    self.assertFalse(
+      any("CVE-2023-38408" in f.cve for f in findings),
+      "a listening sshd banner cannot evidence an ssh-agent weakness",
+    )
 
   def test_letter_suffix_versions_match_cves(self):
     findings = check_cves("openssl", "OpenSSL 1.0.1f")

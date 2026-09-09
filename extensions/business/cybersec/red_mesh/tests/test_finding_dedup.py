@@ -333,3 +333,59 @@ class TestDedupIntegratesWithAggregateReport(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestCollapsingDoesNotDiscardTheNewerEnrichment(unittest.TestCase):
+  """Excluding `cvss_data_freshness` from the report key is what lets two
+  workers whose NVD fetches straddle a second collapse at all. But the collapse
+  is first-occurrence-wins, and it runs *before* `_compute_risk_and_findings`,
+  so keeping the first arrival's timestamp handed `finding_rank` a stale value
+  and its "newer enrichment wins" tiebreak then picked the wrong record —
+  reintroducing the arrival-order dependence risk.py exists to remove.
+  """
+
+  def _record(self, title, kev, epss, freshness):
+    return {
+      "probe": "_service_info_http", "title": title, "severity": "HIGH",
+      "confidence": "certain", "description": "d",
+      "kev": kev, "epss_score": epss, "cvss_data_freshness": freshness,
+    }
+
+  def _survivor(self, order):
+    from extensions.business.cybersec.red_mesh.mixins.report import _dedup_finding_list
+    from extensions.business.cybersec.red_mesh.mixins.risk import _RiskScoringMixin
+
+    class _Host(_RiskScoringMixin):
+      pass
+
+    collapsed = _dedup_finding_list([dict(item) for item in order])
+    flat = _Host()._compute_risk_and_findings({
+      "target": "t", "port_protocols": {"443": "https"},
+      "service_info": {"443": {"_service_info_http": {"findings": collapsed}}},
+    })[1]
+    return flat
+
+  def test_the_kev_flag_survives_whichever_worker_answered_first(self):
+    stale = self._record("CVE-2020-1 in openssl", True, 0.9, "2025-01-01T00:00:00Z")
+    fresh = self._record("CVE-2020-1 in openssl", True, 0.9, "2026-09-01T00:00:00Z")
+    other = self._record("CVE-2020-1 flaw", False, 0.1, "2026-06-01T00:00:00Z")
+
+    for order in ([stale, fresh, other], [fresh, stale, other], [other, stale, fresh]):
+      flat = self._survivor(order)
+      self.assertEqual(len(flat), 1)
+      self.assertTrue(
+        flat[0]["kev"],
+        "the KEV-flagged record was dropped — the collapse kept a stale "
+        "cvss_data_freshness and inverted the newer-enrichment tiebreak",
+      )
+      self.assertEqual(flat[0]["epss_score"], 0.9)
+
+  def test_the_collapse_carries_the_newest_timestamp_onto_the_survivor(self):
+    from extensions.business.cybersec.red_mesh.mixins.report import _dedup_finding_list
+
+    stale = self._record("CVE-2020-1 in openssl", True, 0.9, "2025-01-01T00:00:00Z")
+    fresh = self._record("CVE-2020-1 in openssl", True, 0.9, "2026-09-01T00:00:00Z")
+    collapsed = _dedup_finding_list([dict(stale), dict(fresh)])
+
+    self.assertEqual(len(collapsed), 1)
+    self.assertEqual(collapsed[0]["cvss_data_freshness"], "2026-09-01T00:00:00Z")

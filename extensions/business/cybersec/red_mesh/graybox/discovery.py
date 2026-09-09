@@ -47,6 +47,12 @@ class DiscoveryModule:
     self.auth = auth_manager
     self.safety = safety
     self._target_host = urlparse(target_url).netloc
+    # Paths in the crawl queue are origin-absolute — `_normalize` resolves every
+    # link against the target's base and returns the whole path — so requests
+    # are built on the origin. Building them on `target_url` instead appended a
+    # path that already carried the base to the base again.
+    _parsed = urlparse(self.target_url)
+    self._origin = f"{_parsed.scheme}://{_parsed.netloc}"
     self._scope_prefix = target_config.discovery.scope_prefix
     self._max_pages = target_config.discovery.max_pages
     self._max_depth = target_config.discovery.max_depth
@@ -61,12 +67,20 @@ class DiscoveryModule:
     Respects scope boundaries and page/depth limits.
     """
     visited = set()
-    to_visit = deque([("/", 0)])
+    # The seed is the target's own root — the base path when the target carries
+    # one, not the origin root — stated in the same origin-absolute form that
+    # every crawled link arrives in.
+    to_visit = deque([(self._normalize("./"), 0)])
 
     if known_routes:
       for route in known_routes:
-        if self._in_scope(route):
-          to_visit.append((route, 0))
+        # Configured routes are relative to the target, so they keep resolving
+        # against its base: with target `https://h/app`, `/api` stays
+        # `/app/api`. The `lstrip` is what keeps it base-relative instead of
+        # origin-absolute — that is the distinction `urljoin` turns on.
+        path = self._normalize(route.lstrip("/"))
+        if path and self._in_scope(path):
+          to_visit.append((path, 0))
 
     all_routes = set()
     all_forms = set()
@@ -84,7 +98,13 @@ class DiscoveryModule:
       if session is None:
         break
 
-      url = self.target_url + path
+      # Origin, not `target_url`: `path` already carries the base, and appending
+      # it to the base doubled it — `https://h/app` + `/app/users` ->
+      # `https://h/app/app/users`. The client's absolute-URL branch preserves
+      # whatever path it is handed, so every crawl request against a base-path
+      # target 404'd and discovery silently under-reported. A bare-host target
+      # hides it, which is what these tests used until now.
+      url = self._origin + path
       try:
         resp = session.get(url, timeout=10, allow_redirects=True)
       except requests.RequestException:
@@ -120,12 +140,20 @@ class DiscoveryModule:
   def discover_result(self, known_routes=None) -> DiscoveryResult:
     """Discover application routes/forms and return a typed result."""
     visited = set()
-    to_visit = deque([("/", 0)])
+    # The seed is the target's own root — the base path when the target carries
+    # one, not the origin root — stated in the same origin-absolute form that
+    # every crawled link arrives in.
+    to_visit = deque([(self._normalize("./"), 0)])
 
     if known_routes:
       for route in known_routes:
-        if self._in_scope(route):
-          to_visit.append((route, 0))
+        # Configured routes are relative to the target, so they keep resolving
+        # against its base: with target `https://h/app`, `/api` stays
+        # `/app/api`. The `lstrip` is what keeps it base-relative instead of
+        # origin-absolute — that is the distinction `urljoin` turns on.
+        path = self._normalize(route.lstrip("/"))
+        if path and self._in_scope(path):
+          to_visit.append((path, 0))
 
     all_routes = set()
     all_forms = set()
@@ -142,7 +170,8 @@ class DiscoveryModule:
       if session is None:
         break
 
-      url = self.target_url + path
+      # Same base-path doubling as the route crawl above.
+      url = self._origin + path
       try:
         resp = session.get(url, timeout=10, allow_redirects=True)
       except requests.RequestException:

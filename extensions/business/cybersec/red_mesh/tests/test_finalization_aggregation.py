@@ -246,6 +246,12 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
     reports = {
       "0xnode_a": {
         "job_id": "j1", "scan_type": "webapp",
+        # Production reports always carry `initiator`, and it is the *launcher's*
+        # address — identical on every participating node. Omitting it here let
+        # the fallback land on the dict key so this assertion passed while
+        # attribution collapsed in the field: the client job shows 10 distinct
+        # worker ids against exactly 1 node address.
+        "initiator": "0xLAUNCHER",
         "local_worker_id": "RM-1-aaaa",
         "service_info": {},
         "graybox_results": {
@@ -263,7 +269,52 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
     # Stamping happens in place on reports during aggregation.
     f = reports["0xnode_a"]["graybox_results"]["443"]["_graybox_idor"]["findings"][0]
     self.assertEqual(f["_source_worker_id"], "RM-1-aaaa")
+    self.assertNotEqual(
+      f["_source_node_addr"], "0xLAUNCHER",
+      "findings were attributed to the job launcher rather than the node that "
+      "produced them, which credits one country with every finding in PDF 3.10",
+    )
     self.assertEqual(f["_source_node_addr"], "0xnode_a")
+
+  def test_the_node_stamps_its_own_mesh_address_not_its_ip(self):
+    """
+    Attribution must use the same kind of identifier the comparison buckets on.
+
+    `_compute_node_comparison` looks findings up against the participating node
+    set, which is built from mesh addresses. Stamping a public IP here left
+    every per-node findings list empty — worse than the launcher collapse it
+    replaced, which at least matched a real participating node. The IP is
+    already carried separately as `node_ip` for display.
+    """
+    host = _Host()
+    host.ee_addr = "0xNODE_B"
+    # Present and deliberately ignored: this is the display field, not identity.
+    host.global_shmem = {"location_data": {"ip": "203.0.113.7"}}
+    reports = {
+      "0xnode_b": {
+        "job_id": "j1", "scan_type": "webapp",
+        "initiator": "0xLAUNCHER",
+        "local_worker_id": "RM-1-bbbb",
+        "service_info": {},
+        "graybox_results": {
+          "443": {
+            "_graybox_idor": {
+              "findings": [{"title": "IDOR", "severity": "HIGH"}],
+              "outcome": "completed",
+            },
+          },
+        },
+        "completed_tests": [],
+      },
+    }
+    host._get_aggregated_report(reports, worker_cls=GrayboxLocalWorker)
+    f = reports["0xnode_b"]["graybox_results"]["443"]["_graybox_idor"]["findings"][0]
+    self.assertEqual(f["_source_node_addr"], "0xNODE_B")
+    self.assertNotEqual(
+      f["_source_node_addr"], "203.0.113.7",
+      "a public IP never equals a mesh address, so the comparison would bucket "
+      "this finding under a node that is not in the participating set",
+    )
 
 
 class TestApiTop10FlatFindingIntegration(unittest.TestCase):
@@ -444,9 +495,17 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
       "worker_reports": {
         "0xUS": {"start_port": 1, "end_port": 443, "open_ports": [80, 443],
                  "node_ip": "1.1.1.1", "country": "US", "nr_findings": 1,
-                 "finding_counts": {"HIGH": 1}, "finding_signatures": ["sig1"]},
+                 "finding_counts": {"HIGH": 1}, "finding_signatures": ["sig1"],
+                 "response_evidence": {
+                   "target_host": "example.test", "resolved_ips": ["1.1.1.1"],
+                   "ports": {"443": {"reachable": True}},
+                 }},
         "0xIN": {"start_port": 1, "end_port": 443, "open_ports": [80],
-                 "node_ip": "2.2.2.2", "country": "in", "nr_findings": 0},
+                 "node_ip": "2.2.2.2", "country": "in", "nr_findings": 0,
+                 "response_evidence": {
+                   "target_host": "example.test", "resolved_ips": ["2.2.2.2"],
+                   "ports": {"443": {"reachable": False}},
+                 }},
       },
       "worker_scan_metrics": {
         "0xUS": {"scan_metrics": {
@@ -528,6 +587,12 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
     self.assertEqual(comp["0xUS"]["metrics"]["total_duration"], 19.0)
     self.assertEqual(comp["0xUS"]["metrics"]["traffic_windows"][0]["attempts"], 8)
     self.assertEqual(comp["0xUS"]["metrics"]["threads"][0]["local_worker_id"], "thread-1")
+    # Response evidence remains attributable per node rather than merging the
+    # two vantages' values into a shared aggregate.
+    self.assertEqual(comp["0xUS"]["response_evidence"]["resolved_ips"], ["1.1.1.1"])
+    self.assertEqual(comp["0xIN"]["response_evidence"]["resolved_ips"], ["2.2.2.2"])
+    self.assertTrue(comp["0xUS"]["response_evidence"]["ports"]["443"]["reachable"])
+    self.assertFalse(comp["0xIN"]["response_evidence"]["ports"]["443"]["reachable"])
     # Metrics-only node with all-timeout connections -> timeout.
     self.assertEqual(comp["0xBR"]["status"], "timeout")
     # Selected peer that never reported at all -> failed (China-timeout case).
@@ -537,3 +602,58 @@ class TestOriginCountryAndComparisonAggregate(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestAggregatedScanDataRetainsGrayboxResults(unittest.TestCase):
+  """
+  `services/finalization.py:411` round-trips the aggregated report through
+  `AggregatedScanData` before storing it in R1FS. The model had no
+  `graybox_results`, `target` or `scan_type` field, so every graybox result was
+  silently dropped from the archived aggregate — the entire authenticated half
+  of a scan, along with the context saying what was scanned and how.
+
+  The flat findings survive elsewhere (they are extracted before this
+  round-trip), so nothing visibly breaks; what is lost is the structured
+  evidence at its source shape, which is what a reader goes to the aggregate for.
+  """
+
+  AGGREGATE = {
+    "open_ports": [443],
+    "service_info": {},
+    "web_tests_info": {},
+    "completed_tests": ["graybox_probes"],
+    "graybox_results": {
+      "443": {
+        "_graybox_idor": {
+          "findings": [{"title": "IDOR", "severity": "HIGH",
+                        "url": "https://app.test/api/records/99"}],
+          "outcome": "completed",
+        },
+      },
+    },
+    "target": "app.test",
+    "scan_type": "webapp",
+  }
+
+  def _round_trip(self):
+    from extensions.business.cybersec.red_mesh.models import AggregatedScanData
+    return AggregatedScanData.from_dict(self.AGGREGATE).to_dict()
+
+  def test_graybox_results_survive_the_round_trip(self):
+    out = self._round_trip()
+    self.assertIn("graybox_results", out, "the graybox half of the scan was dropped")
+    finding = out["graybox_results"]["443"]["_graybox_idor"]["findings"][0]
+    self.assertEqual(finding["url"], "https://app.test/api/records/99")
+
+  def test_target_and_scan_type_survive_the_round_trip(self):
+    out = self._round_trip()
+    self.assertEqual(out.get("target"), "app.test")
+    self.assertEqual(out.get("scan_type"), "webapp")
+
+  def test_an_aggregate_without_graybox_is_unchanged(self):
+    from extensions.business.cybersec.red_mesh.models import AggregatedScanData
+    bare = {k: v for k, v in self.AGGREGATE.items()
+            if k not in ("graybox_results", "target", "scan_type")}
+    out = AggregatedScanData.from_dict(bare).to_dict()
+    self.assertNotIn("graybox_results", out)
+    self.assertEqual(out["open_ports"], [443])

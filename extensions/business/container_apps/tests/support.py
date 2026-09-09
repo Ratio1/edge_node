@@ -196,17 +196,35 @@ def install_dummy_base_plugin():
     ('naeural_core.business.base.web_app', types.ModuleType('naeural_core.business.base.web_app')),
   ]
 
+  missing = object()
+  previous_modules = {
+    name: sys.modules.get(name, missing)
+    for name, _module in module_hierarchy
+  }
   for name, module in module_hierarchy:
-    sys.modules.setdefault(name, module)
+    sys.modules[name] = module
 
+  leaf_name = 'naeural_core.business.base.web_app.base_tunnel_engine_plugin'
+  previous_modules[leaf_name] = sys.modules.get(leaf_name, missing)
   base_tunnel_mod = types.ModuleType('naeural_core.business.base.web_app.base_tunnel_engine_plugin')
   base_tunnel_mod.BaseTunnelEnginePlugin = _DummyBasePlugin
-  sys.modules['naeural_core.business.base.web_app.base_tunnel_engine_plugin'] = base_tunnel_mod
+  sys.modules[leaf_name] = base_tunnel_mod
+
+  def restore_modules():
+    for name, previous_module in previous_modules.items():
+      if previous_module is missing:
+        sys.modules.pop(name, None)
+      else:
+        sys.modules[name] = previous_module
+
+  return restore_modules
 
 
-install_dummy_base_plugin()
-
-from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
+_restore_core_modules = install_dummy_base_plugin()
+try:
+  from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
+finally:
+  _restore_core_modules()
 
 
 def make_container_app_runner():
@@ -393,6 +411,7 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   # Image pull backoff
   plugin._image_pull_failures = 0
   plugin._next_image_pull_time = 0
+  plugin._fixed_volume_setup_pending = False
   plugin.cfg_image_pull_max_retries = 100
   plugin.cfg_image_pull_backoff_base = 20
 

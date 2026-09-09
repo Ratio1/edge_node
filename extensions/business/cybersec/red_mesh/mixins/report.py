@@ -12,12 +12,36 @@ import struct as _struct
 
 from ..worker import PentestLocalWorker
 from ..models import UiAggregate
+from ..models.finding_identity import (
+  worker_attribution_fields as _worker_attribution_fields,
+  volatile_non_content_fields as _volatile_non_content_fields,
+)
+from ..models.finding_schema import is_coverage_result as _is_coverage_result
+# Shared with the SIEM event builder, which redacts at the egress boundary
+# rather than trusting its caller. See `credential_redaction` for why the rule
+# is anchored on the credential phrasing rather than on a bare `a:b` shape.
+from ..credential_redaction import (
+  CREDENTIAL_TEXT_FIELDS as _CREDENTIAL_TEXT_FIELDS,
+  redact_credential_text,
+)
 
 
 # Fields stamped per-worker by _stamp_worker_source. Excluded from the
 # dedup signature so the same vulnerability seen by two workers
 # collapses to one finding (with one worker's stamp preserved).
-_DEDUP_EXCLUDE_FIELDS = ("_source_worker_id", "_source_node_addr")
+# The same fields `finding_identity.content_hash` excludes, plus this module's
+# two private ones. They were not excluded here, so the fallback hash — used
+# whenever a finding carries no stamped identity — saw the same finding from two
+# nodes as two findings: `_stamp_worker_source` adds `worker_source`,
+# `observed_at` and `node_ip` before this runs, and cross-worker dedup is the
+# one thing this signature exists to do.
+_DEDUP_EXCLUDE_FIELDS = frozenset(
+  {"_source_worker_id", "_source_node_addr"}
+  | set(_worker_attribution_fields())
+  | set(_volatile_non_content_fields())
+)
+
+
 _PUBLISH_SAFE_METADATA_KEYS = {
   "api_key_header_name",
   "api_key_location",
@@ -130,18 +154,47 @@ def _dedup_finding_list(findings):
 
   Preserves order; first occurrence wins (keeps that worker's stamp).
   No-op for None / non-list inputs.
+
+  Fields excluded from the key because they *move*
+  (`volatile_non_content_fields`) still have to be reconciled onto the
+  survivor rather than taken from whichever worker happened to arrive first.
+  `cvss_data_freshness` is the case: excluding it from the key is what lets two
+  workers whose NVD fetches straddle a second collapse at all, but keeping the
+  first arrival's timestamp then hands `risk.finding_rank` a stale value, and
+  its "newer enrichment wins" tiebreak picks the wrong record. Measured before
+  this reconciliation: a KEV-flagged, EPSS-0.9 record lost to a stale non-KEV
+  one, and reversing the input order reversed the outcome — reintroducing
+  exactly the arrival-order dependence `risk.py` documents itself as fixing.
   """
   if not isinstance(findings, list):
     return findings
-  seen = set()
+  seen = {}
   out = []
   for item in findings:
     key = _finding_dedup_key(item)
     if key in seen:
+      _reconcile_volatile_fields(seen[key], item)
       continue
-    seen.add(key)
+    seen[key] = item
     out.append(item)
   return out
+
+
+def _reconcile_volatile_fields(survivor, dropped):
+  """Carry the newest value of each key-excluded volatile field onto the
+  survivor, so collapsing does not depend on which worker answered first."""
+  if not isinstance(survivor, dict) or not isinstance(dropped, dict):
+    return
+  for field in _volatile_non_content_fields():
+    incoming = dropped.get(field)
+    if incoming is None:
+      continue
+    current = survivor.get(field)
+    # These are ISO-8601 timestamps, so lexicographic compare is chronological;
+    # `str()` keeps a malformed value from raising here, and it loses the
+    # comparison for the same reason `finding_rank` demotes one.
+    if current is None or str(incoming) > str(current):
+      survivor[field] = incoming
 
 
 def _dedup_findings_in_aggregated(aggregated):
@@ -241,7 +294,11 @@ def _iter_report_findings(report):
 def _compact_finding_signature(finding):
   """Return a stable compact type signature without worker-attribution fields."""
   if isinstance(finding, dict):
-    explicit = finding.get("finding_signature") or finding.get("finding_id")
+    # Content fields only. Falling back to `finding_id` was correct when the id
+    # was content-derived and is wrong now that it is identity-derived: two
+    # content-distinct findings sharing a coarse identity would collapse into
+    # one "finding type" in the per-worker counts.
+    explicit = finding.get("finding_signature") or finding.get("content_hash")
     if explicit:
       return str(explicit)
 
@@ -386,6 +443,25 @@ class _ReportMixin:
       "total_scenarios_vulnerable": scenario_vulnerable,
     }
 
+  def _local_node_address(self):
+    """
+    This node's mesh address, for finding attribution.
+
+    It has to be the same *kind* of identifier the comparison buckets on.
+    `_compute_node_comparison` groups findings by `_source_node_addr` and then
+    looks each participating node up in that map, and the participating set is
+    built from `worker_reports` / `selected_peers` keys — mesh addresses, the
+    same `ee_addr` that keys `job_specs["workers"]` at close-job time.
+
+    Returning a public IP here instead left every per-node findings list empty,
+    because an IP never equals a mesh address: worse than the launcher collapse
+    it was meant to fix, which at least matched a real participating node. The
+    IP is already carried separately as `node_ip`, which is the display field —
+    that is the distinction to preserve, not collapse.
+    """
+    address = getattr(self, "ee_addr", None)
+    return str(address) if address else None
+
   @staticmethod
   def _stamp_finding_list(findings, worker_id, node_addr):
     """Stamp _source_worker_id / _source_node_addr on each finding.
@@ -473,9 +549,18 @@ class _ReportMixin:
           # can trace every finding back to the worker/node that
           # produced it. Idempotent via setdefault — re-aggregation
           # does not overwrite existing stamps from Phase 2.
+          # `initiator` is deliberately NOT in this chain. It is the job
+          # *launcher's* address, seeded onto every worker on every
+          # participating node, so falling back to it stamped one address across
+          # the whole mesh: `_compute_node_comparison` then bucketed every
+          # finding under one key, and PDF 3.10 credited a single country with
+          # all of them. Measured on the client job — 10 distinct worker ids,
+          # exactly 1 node address — and on the archived multi-worker runs.
+          # This aggregation merges *this node's* local workers, so this node's
+          # own address is the correct attribution for all of them.
           node_addr = (
             local_job_status.get("node_addr")
-            or local_job_status.get("initiator")
+            or self._local_node_address()
             or str(local_worker_id)
           )
           worker_id = (
@@ -605,37 +690,97 @@ class _ReportMixin:
       _scrub_graybox = None
     redacted = deepcopy(report)
     graybox_secret_names = _configured_graybox_secret_names_from_report(redacted)
-    service_info = redacted.get("service_info", {})
-    for port_key, methods in service_info.items():
-      if not isinstance(methods, dict):
-        continue
-      for method_key, method_data in methods.items():
-        if not isinstance(method_data, dict):
+    # `web_tests_info` has the same probe-result shape and is harvested into the
+    # pass report by `_compute_risk_and_findings`, so it needs the same walk. No
+    # web probe interpolates a credential today, which is exactly why it was
+    # missed — this is the gap class that produced the leak, not a live one.
+    def _redact_finding_list(findings):
+      for finding in findings or []:
+        if not isinstance(finding, dict):
           continue
-        # Redact findings evidence
-        for finding in method_data.get("findings", []):
-          if not isinstance(finding, dict):
+        for text_key in _CREDENTIAL_TEXT_FIELDS:
+          if isinstance(finding.get(text_key), str):
+            finding[text_key] = redact_credential_text(finding[text_key])
+
+    for section_key in ("service_info", "web_tests_info"):
+      for port_key, methods in (redacted.get(section_key) or {}).items():
+        if not isinstance(methods, dict):
+          continue
+        # Legacy flat shape: findings sitting directly on the port entry rather
+        # than under a probe key. `_stamp_worker_source` handles both shapes and
+        # has a test for it; redaction skipped the flat one because the loop
+        # below requires a dict and a list falls through the `continue`.
+        _redact_finding_list(methods.get("findings"))
+        for method_key, method_data in methods.items():
+          if not isinstance(method_data, dict):
             continue
-          evidence = finding.get("evidence", "")
-          if isinstance(evidence, str):
-            evidence = _re.sub(
-              r'(Accepted credential:\s*\S+?):(\S+)',
-              r'\1:***', evidence
-            )
-            evidence = _re.sub(
-              r'(Accepted random creds\s*\S+?):(\S+)',
-              r'\1:***', evidence
-            )
-            finding["evidence"] = evidence
-        # Redact accepted_credentials lists
-        creds = method_data.get("accepted_credentials", [])
-        if isinstance(creds, list):
-          method_data["accepted_credentials"] = [
-            _re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c
-            for c in creds
-          ]
+          # Redact every probe-authored text field, not just evidence. The
+          # default-credential probes put the pair in `title` first, and the
+          # title is what reaches the SIEM, the PDF cover and the LLM input.
+          _redact_finding_list(method_data.get("findings"))
+          # The parallel title list. `findings.py:269` writes it into each
+          # *probe result* — `service_info[<port>][<probe>]["vulnerabilities"]`
+          # — never at the top level of the report, which is where an earlier
+          # version of this redaction looked. Nineteen plaintext pairs survived
+          # in the client job as a result, and the regression test passed
+          # because its fixture used the top-level shape too.
+          vulnerabilities = method_data.get("vulnerabilities")
+          if isinstance(vulnerabilities, list):
+            method_data["vulnerabilities"] = [
+              redact_credential_text(item) for item in vulnerabilities
+            ]
+          # Both key spellings: the HTTP Basic probe writes `accepted`
+          # (common.py:438,477) while this only ever read `accepted_credentials`,
+          # so that list was archived raw.
+          for creds_key in ("accepted_credentials", "accepted"):
+            creds = method_data.get(creds_key)
+            if isinstance(creds, list):
+              method_data[creds_key] = [
+                _re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c
+                for c in creds
+              ]
+    # The remaining two published finding paths. `_count_all_findings`
+    # enumerates six; redaction reached two of them, which is how the leak
+    # survived a green suite.
+    _redact_finding_list(redacted.get("correlation_findings"))
+    _redact_finding_list(redacted.get("findings"))
     # Redact graybox_results credential evidence
-    _CRED_RE = _re.compile(r'(\S+?):(\S+)')
+    # URL userinfo: mask the secret half, keep the host. Redacting the whole
+    # thing loses the one field saying which service was affected.
+    _USERINFO_RE = _re.compile(r'(?<=://)([^/@\s:]+):([^/@\s]+)(?=@)')
+    # A bare credential pair, narrowed from the previous `(\S+?):(\S+)`, which
+    # matched *any* `a:b` and so destroyed exactly the data this phase exists to
+    # add: `https://app.test/x` became `https:***`, every curl reproduction and
+    # endpoint URL was annihilated, and `12:04:33` became `12:***`.
+    #
+    # The discrimination is done by the *guards*, not by restricting which
+    # characters a secret may contain. Narrowing the secret charset instead was
+    # tried and reduced coverage: `admin:p@$$:w0rd!` and
+    # `service-user:s3cr3t/with/slash` both leaked, because real passwords
+    # contain exactly the characters a URL does.
+    #
+    # Guards, in order: not already inside a URL or another token; an
+    # identifier-like key; no whitespace or `/` immediately after the colon —
+    # which is what excludes `https://…`, `Content-Type: application/json` and
+    # `PT-A01-01: IDOR`; and a port-shaped secret, which excludes `app.test:8443`
+    # and `app.test:8443/health`.
+    #
+    # That last guard is written as "a port-length digit run that ends the token
+    # or continues as a URL", not as "starts with a digit". The looser form was
+    # tried and silently reopened the hole this whole rule exists to close: every
+    # digit-leading password — `dbuser:1SecretPass`, `root:2024summer`,
+    # `user:007bond` — went out unmasked to the archive, the LLM, the exports and
+    # the client PDF, and the coverage-floor test stayed green because none of
+    # its cases happened to begin with a digit. A five-digit all-numeric secret
+    # is indistinguishable from a port and is deliberately conceded to the port.
+    _CRED_RE = _re.compile(
+      r'(?<![\w.:/-])'
+      r'([A-Za-z_][\w.-]{0,63})'
+      r':'
+      r'(?![\s/])'
+      r'(?!\d{1,5}(?:[/?#\s\'"]|$))'
+      r'([^\s\'"]{3,64})'
+    )
     _PASSWORD_RE = _re.compile(r'((?:password|passwd|pwd)["\']?\s*[:=]\s*)(["\']?)[^\s"\'&]+', _re.I)
 
     def _redact_graybox_text(value):
@@ -645,6 +790,7 @@ class _ReportMixin:
         value = _scrub_graybox(
           value, secret_field_names=graybox_secret_names,
         )
+      value = _USERINFO_RE.sub(r'\1:***', value)
       value = _CRED_RE.sub(r'\1:***', value)
       value = _PASSWORD_RE.sub(r'\1\2***', value)
       if _scrub_graybox is not None:
@@ -663,9 +809,28 @@ class _ReportMixin:
         for finding in probe_data.get("findings", []):
           if not isinstance(finding, dict):
             continue
-          for text_key in ("title", "description", "remediation", "error"):
+          # `url` and `parameter` are here because a probe may set them straight
+          # from target-controlled input rather than deriving them from scrubbed
+          # evidence — they were the one location field this walk did not cover,
+          # and they reach the archive, the PDF and every export.
+          for text_key in ("title", "description", "remediation", "error",
+                           "url", "parameter"):
             if isinstance(finding.get(text_key), str):
               finding[text_key] = _redact_graybox_text(finding[text_key])
+          assets = finding.get("affected_assets")
+          if isinstance(assets, list):
+            finding["affected_assets"] = [
+              {
+                **asset,
+                **{
+                  key: _redact_graybox_text(asset[key])
+                  for key in ("host", "url", "parameter")
+                  if isinstance(asset.get(key), str)
+                },
+              }
+              if isinstance(asset, dict) else asset
+              for asset in assets
+            ]
           if isinstance(finding.get("replay_steps"), list):
             finding["replay_steps"] = [
               _redact_graybox_text(step) for step in finding["replay_steps"]
@@ -777,7 +942,9 @@ class _ReportMixin:
       if not addr:
         continue
       findings_by_node.setdefault(addr, []).append({
-        "signature": f.get("finding_signature") or f.get("finding_id"),
+        # Same content-only rule as `_compact_finding_signature`: an
+        # identity-derived id is not a content signature.
+        "signature": f.get("finding_signature") or f.get("content_hash"),
         "severity": f.get("severity", "INFO"),
         "title": f.get("title", ""),
         "port": f.get("port"),
@@ -873,11 +1040,20 @@ class _ReportMixin:
     if scan_type == "webapp":
       graybox_stats = self._extract_graybox_ui_stats(agg, latest)
 
-    # Severity breakdown
-    findings_count = dict(Counter(f.get("severity", "INFO") for f in findings))
+    # Every counter in this object uses the same predicate, or the object
+    # contradicts itself: `total_findings` excluding coverage while the severity
+    # chart counted it produced a header saying one finding above a chart
+    # summing to eleven, in the same payload the PDF and the frontend read.
+    real_findings = [f for f in findings if not _is_coverage_result(f)]
 
-    # Top findings: CRITICAL + HIGH, sorted by severity then confidence, capped at 10
-    crit_high = [f for f in findings if f.get("severity") in ("CRITICAL", "HIGH")]
+    # Severity breakdown
+    findings_count = dict(Counter(f.get("severity", "INFO") for f in real_findings))
+
+    # Top findings: CRITICAL + HIGH, sorted by severity then confidence, capped
+    # at 10. An `inconclusive` scenario keeps its *declared* severity, so
+    # without the filter a scenario that concluded nothing was ranked into the
+    # customer-facing top-findings list as a HIGH.
+    crit_high = [f for f in real_findings if f.get("severity") in ("CRITICAL", "HIGH")]
     crit_high.sort(key=lambda f: (
       self.SEVERITY_ORDER.get(f.get("severity"), 9),
       self.CONFIDENCE_ORDER.get(f.get("confidence"), 9),
@@ -885,18 +1061,24 @@ class _ReportMixin:
     top_findings = crit_high[:10]
 
     # Finding timeline: track persistence across passes (continuous monitoring)
-    finding_timeline = {}
+    # Distinct passes, not occurrences: findings can share an id inside one
+    # pass (identity is coarse until RM-061), and counting occurrences reported
+    # `pass_count: 2` for a single pass — persistence that never happened, in
+    # the surface that exists to measure persistence.
+    finding_passes = {}
     for p in passes:
       pass_nr = p.get("pass_nr", 0)
       for f in (p.get("findings") or []):
         fid = f.get("finding_id")
         if not fid:
           continue
-        if fid not in finding_timeline:
-          finding_timeline[fid] = {"first_seen": pass_nr, "last_seen": pass_nr, "pass_count": 1}
-        else:
-          finding_timeline[fid]["last_seen"] = pass_nr
-          finding_timeline[fid]["pass_count"] += 1
+        finding_passes.setdefault(fid, set()).add(pass_nr)
+    finding_timeline = {
+      fid: {
+        "first_seen": min(nrs), "last_seen": max(nrs), "pass_count": len(nrs),
+      }
+      for fid, nrs in finding_passes.items()
+    }
 
     # Origin-country breakdown for the latest pass: count participating worker
     # nodes per ISO-2 country (empty country grouped under "UN"/Unknown in the UI).
@@ -919,7 +1101,9 @@ class _ReportMixin:
     return UiAggregate(
       total_open_ports=sorted(set(agg.get("open_ports", []))),
       total_services=self._count_services(agg.get("service_info", {})),
-      total_findings=len(findings),
+      # Findings, not scenario results: a graybox scan emits one entry per
+      # scenario whatever the outcome, so `len(findings)` counted the tests run.
+      total_findings=len(real_findings),
       findings_count=findings_count if findings_count else None,
       top_findings=top_findings if top_findings else None,
       finding_timeline=finding_timeline if finding_timeline else None,

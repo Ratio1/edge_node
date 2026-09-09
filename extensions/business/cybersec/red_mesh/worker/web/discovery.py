@@ -58,7 +58,17 @@ class _WebDiscoveryMixin:
           title="Web server returns 200 for random paths",
           description="A request to a non-existent random UUID path returned HTTP 200, "
                       "suggesting a catch-all rule or severely misconfigured server.",
-          evidence=f"GET {base_url}{canary_path} returned 200.",
+          # Not relocated to raw_data, and deliberately so: the canary is a
+          # uuid4 *we* generate, not an observation of the target. It differs
+          # on every run, so in `evidence` it forked the cross-worker dedup
+          # key and this finding was reported once per worker. Any random
+          # path reproduces it, which is the whole point of the check.
+          # `base_url` is stable across workers and runs; only the canary
+          # moved. Dropping both left no record of which scheme and port
+          # showed the catch-all, which an analyst reading a multi-port scan
+          # needs.
+          evidence=f"A request to {base_url} for a randomly generated, "
+                   "non-existent path returned HTTP 200.",
           remediation="Investigate the catch-all behavior; ensure proper 404 responses for unknown paths.",
           cwe_id="CWE-345",
           confidence="firm",
@@ -807,8 +817,11 @@ class _WebDiscoveryMixin:
           findings_list.append(Finding(
             severity=Severity.MEDIUM,
             title=f"Verbose error page: {framework} stack trace exposed",
-            description=f"Error page at {canary} contains {framework} stack trace, "
-                        "leaking internal code structure and potentially secrets.",
+            # `framework` comes from a fixed marker table and is stable; the
+            # canary is a per-run uuid4 and is not.
+            description=f"The error page for a non-existent path contains a "
+                        f"{framework} stack trace, leaking internal code "
+                        "structure and potentially secrets.",
             evidence=f"Marker '{marker}' found in 404 response.",
             remediation="Configure production error handling to return generic error pages.",
             owasp_id="A09:2021",

@@ -18,12 +18,17 @@ PRs (PR-1.3 through PR-1.5) migrate probes to populate the new fields
 from the @register_probe decorator metadata + dynamic CVE DB lookup.
 """
 
-import hashlib
 import inspect
 import json
 from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Any
+
+from .models.finding_identity import (
+  content_hash as _content_hash,
+  dedup_key as _dedup_key,
+  parse_cwe_list as _parse_cwe_list,
+)
 
 
 class Severity(str, Enum):
@@ -117,6 +122,15 @@ class Finding:
   # Identity (P15) — finding_signature is content-addressed; display_id
   # is set by the report generator at render time.
   finding_signature: str = ""
+  # The identity key, stamped beside the content hash rather than derived from
+  # it (`finding_signature[:16]` made identity content-addressed, so rewording
+  # a description handed the finding a new id). Named `finding_id` — the name
+  # every consumer reads — rather than a `dedup_key` twin that existed only to
+  # derive it: two names for one concept is how "two identities for one
+  # finding, disagreeing in the same dict" happened twice on this branch. Both
+  # keys are stamped at probe time, on unredacted values, which is what keeps
+  # them stable across `_redact_report`.
+  finding_id: str = ""
 
   # Risk scoring extensions
   cvss_version: str = "3.1"
@@ -169,53 +183,112 @@ class Finding:
   ) -> str:
     """Compute a stable content-addressed signature.
 
-    A finding's signature is sha256 over (probe_id, asset_canonical,
-    title, description, severity). Two scans of the same target
-    producing the same vulnerability yield the same signature, which
-    is what makes Phase 0's worker dedup and future longitudinal
-    tracking possible.
+    Computed by `models.finding_identity.content_hash`: the finding's
+    dedup key plus its presentation fields. Two scans of the same target
+    producing the same vulnerability yield the same signature, which is
+    what makes worker dedup and longitudinal tracking possible, and a
+    reworded finding keeps its `dedup_key` while this value moves.
 
     Per-worker chain-of-custody fields (set by mixins/report.py
     _stamp_worker_source) are NOT in the signature — they vary across
     workers but represent the same underlying finding.
     """
-    asset_str = asset_canonical or _canonical_asset_string(self.affected_assets)
-    parts = [
-      probe_id or "",
-      asset_str,
-      self.title or "",
-      self.description or "",
-      self.severity.value if isinstance(self.severity, Severity) else str(self.severity),
-    ]
-    return hashlib.sha256("\x1e".join(parts).encode("utf-8")).hexdigest()
+    # Delegates to the shared identity model rather than reimplementing it.
+    # This was the fourth implementation of the same idea, and it had already
+    # drifted from the flat-path one, which read a raw severity string where
+    # this reads `Severity.value` — so the same finding could carry two
+    # different signatures depending on which layer computed it.
+    return _content_hash(
+      self._identity_payload(probe_id), asset_canonical=asset_canonical,
+    )
 
-  def with_signature(self, signature: str) -> "Finding":
-    """Return a new Finding with finding_signature set (frozen-safe)."""
+  def _identity_payload(self, probe_id: str) -> dict:
+    """The one projection both identity keys are computed from.
+
+    `content_hash` internally starts from `dedup_key(payload)`, so the two
+    methods must read the same fields or the keys silently decouple — add a
+    field to one projection and not the other and a finding's dedup key stops
+    being the one its signature was built over. One payload, two consumers.
+    """
+    # Every field `finding_identity._CONTENT_FIELDS` names has to be here, or
+    # the content hash is blind to content. It carried seven of the nine and
+    # omitted `confidence`, `status`, `evidence`, `remediation`, `cvss_score`
+    # and `cvss_vector` — so two findings differing only in their evidence, or
+    # only in a CVSS 9.8 against a 4.3, hashed identically and content-keyed
+    # dedup deleted one of them. `dedup_key` reads only the identity subset from
+    # this same payload, so widening it does not move any identity.
+    return {
+      "probe": probe_id or "",
+      "title": self.title or "",
+      "description": self.description or "",
+      "severity": (
+        self.severity.value if isinstance(self.severity, Severity)
+        else str(self.severity)
+      ),
+      "confidence": self.confidence or "",
+      "status": getattr(self, "status", "") or "",
+      "evidence": self.evidence or "",
+      "remediation": self.remediation or "",
+      "cvss_score": self.cvss_score,
+      "cvss_vector": self.cvss_vector or "",
+      "owasp_id": self.owasp_id,
+      "cwe_id": self.cwe_id,
+      "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
+    }
+
+  def compute_dedup_key(
+    self,
+    *,
+    probe_id: str,
+    asset_canonical: str | None = None,
+  ) -> str:
+    """Compute the identity key over the same payload the signature uses.
+
+    Identity, not content: `models.finding_identity.dedup_key` reads probe,
+    normalised asset and classification from that payload, and ignores
+    `description` and `severity`.
+
+    It does **not** yet ignore the title, and the difference matters here. No
+    blackbox probe sets `affected_assets`, so every `Finding` reaching this
+    method falls to `dedup_key`'s last-resort branch, which folds in the
+    lowercased title to keep two genuinely different findings from one probe
+    from colliding. So rewording a *description* preserves the key — the defect
+    B2 exists to fix — while rewording a *title* still forks it. RM-061 owns
+    giving blackbox findings a url and parameter; until it lands, this is as
+    stable as identity can honestly be.
+    """
+    return _dedup_key(
+      self._identity_payload(probe_id), asset_canonical=asset_canonical,
+    )
+
+  def with_identity(self, *, finding_signature: str, finding_id: str) -> "Finding":
+    """Return a new Finding carrying both identity keys (frozen-safe).
+
+    Replaces `with_signature`, which stamped only the content hash. Its one
+    caller — the CVE matcher — passes an `asset_canonical` override, because a
+    CVE finding is identified by `product:version:cve_id` rather than by an
+    `AffectedAsset`. Stamping only the signature left the dedup key to be
+    recomputed downstream from the *probe* name with no override, so the finding
+    carried a signature built over one identity basis and a dedup key built over
+    another. The keys are stamped together so they cannot disagree.
+    """
     data = asdict(self)
-    data["finding_signature"] = signature
+    data["finding_signature"] = finding_signature
+    data["finding_id"] = finding_id
     return Finding(**_revive_finding_dict(data))
 
 
-def _canonical_asset_string(assets: tuple[AffectedAsset, ...]) -> str:
-  """Stable string representation of a list of AffectedAsset entries.
-
-  Order-independent (sorted), and includes only fields that uniquely
-  identify the asset. Used inside compute_signature so two probes
-  emitting findings for the same target produce the same signature
-  regardless of probe-internal asset ordering.
-  """
-  if not assets:
-    return ""
-  parts = []
-  for a in assets:
-    parts.append("|".join([
-      a.host or "",
-      str(a.port if a.port is not None else ""),
-      a.url or "",
-      a.parameter or "",
-      (a.method or "").upper(),
-    ]))
-  return "\x1f".join(sorted(parts))
+def _asset_as_dict(asset) -> dict:
+  """One `AffectedAsset` in the dict shape the shared identity model reads."""
+  if isinstance(asset, dict):
+    return asset
+  return {
+    "host": getattr(asset, "host", "") or "",
+    "port": getattr(asset, "port", None),
+    "url": getattr(asset, "url", "") or "",
+    "parameter": getattr(asset, "parameter", "") or "",
+    "method": getattr(asset, "method", "") or "",
+  }
 
 
 def _revive_finding_dict(data: dict) -> dict:
@@ -282,9 +355,12 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
 
   cwe_values = _normalize_cwe_values(f.cwe)
   if not cwe_values and f.cwe_id:
-    parsed = _parse_cwe_id(f.cwe_id)
-    if parsed:
-      cwe_values = (parsed,)
+    # The joined display form parses here too. The single-value parser this
+    # replaced returned 0 for `"CWE-639, CWE-862"`, so the lookup fell through to
+    # the probe registry's `default_cwe` and stamped the finding with *that* —
+    # a finding carrying `cwe_id: "CWE-639, CWE-862"` and `cwe: (200,)`, wrong
+    # rather than merely absent, all the way to the archive and the exports.
+    cwe_values = tuple(_parse_cwe_list(f.cwe_id))
 
   owasp_values = tuple(x for x in f.owasp_top10 if x)
   if not owasp_values and f.owasp_id:
@@ -298,7 +374,7 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
       cwe_values = tuple(metadata.default_cwe)
     if not owasp_values:
       owasp_values = tuple(metadata.default_owasp)
-    if not cvss_vector and metadata.cvss_template:
+    if not cvss_vector and metadata.cvss_template and _carries_a_weakness(f):
       cvss_vector = metadata.cvss_template
     references = _merge_unique(references, metadata.references)
 
@@ -320,12 +396,20 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
     updates["remediation_structured"] = Remediation(primary=primary)
 
   enriched = replace(f, **updates) if updates else f
+  # Both identity keys are stamped here, at probe time, on unredacted values.
+  #
+  # `finding_signature` alone was stamped, and the flat walk then derived the
+  # dedup key from it as `finding_signature[:16]` — which made identity
+  # content-addressed, exactly what the two-key split exists to prevent.
+  # Rewording a description handed the finding a new id, so triage state and
+  # longitudinal tracking did not survive an edit. Stamping both keeps them
+  # independent, and keeps both stable across `_redact_report`.
+  identity = {}
   if probe_id and not enriched.finding_signature:
-    enriched = replace(
-      enriched,
-      finding_signature=enriched.compute_signature(probe_id=probe_id),
-    )
-  return enriched
+    identity["finding_signature"] = enriched.compute_signature(probe_id=probe_id)
+  if probe_id and not enriched.finding_id:
+    identity["finding_id"] = enriched.compute_dedup_key(probe_id=probe_id)
+  return replace(enriched, **identity) if identity else enriched
 
 
 def _infer_calling_probe_id() -> str:
@@ -340,6 +424,27 @@ def _infer_calling_probe_id() -> str:
       return name
     frame = frame.f_back
   return ""
+
+
+def _carries_a_weakness(f) -> bool:
+  """
+  True when a finding describes a weakness a CVSS vector could score.
+
+  The probe registry's `cvss_template` is that probe's *worst case*, applied
+  when a finding brings no vector of its own. Applying it unconditionally gave
+  maximum-impact vectors to findings whose entire point is that a control
+  worked: "MySQL default credentials rejected" at INFO under a 9.8 CRITICAL
+  template, "TLS configuration adequate." at INFO under a 7.5 HIGH one. The
+  reader then sees a severity badge contradicted by the vector printed beside
+  it — measured at 55 INFO/LOW findings carrying a high-impact vector on the
+  client job, none of them with a numeric score to arbitrate.
+
+  INFO is the marker: probes use it both for "we checked and it was fine" and
+  for purely descriptive output. Neither has a weakness to score.
+  """
+  severity = getattr(f, "severity", None)
+  severity = getattr(severity, "value", severity)
+  return str(severity or "").upper() != "INFO"
 
 
 def _get_probe_metadata_safe(probe_id: str | None):
@@ -362,19 +467,6 @@ def _normalize_cwe_values(values) -> tuple[int, ...]:
     if parsed > 0 and parsed not in out:
       out.append(parsed)
   return tuple(out)
-
-
-def _parse_cwe_id(value: str) -> int:
-  if not isinstance(value, str):
-    return 0
-  cleaned = value.strip().upper()
-  if cleaned.startswith("CWE-"):
-    cleaned = cleaned[4:]
-  try:
-    parsed = int(cleaned)
-  except (TypeError, ValueError):
-    return 0
-  return parsed if parsed > 0 else 0
 
 
 def _merge_unique(existing, extra) -> tuple[str, ...]:

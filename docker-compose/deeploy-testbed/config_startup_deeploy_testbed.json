@@ -1,5 +1,5 @@
 {
-  "EE_ID": "deeploy_node",
+  "EE_ID": "$EE_ID",
   "SECURED": false,
   "IO_FORMATTER": "",
   "MAIN_LOOP_RESOLUTION": 10,

@@ -174,6 +174,12 @@ class _FakeArtifactRepo:
 
 class _Owner:
   cfg_instance_id = "tenant-a"
+  # Must match `_sample_job_specs()["launcher"]`. Purge and stop_and_delete are
+  # fail-closed on ownership: `_foreign_launcher_error` compares
+  # `job_specs["launcher"]` against the owner's `ee_addr` and refuses when they
+  # differ. This double never set `ee_addr`, so it was None, so every purge test
+  # silently took the refusal path and got back a dict with no "status" key.
+  ee_addr = "operator"
 
   def __init__(self, job_specs=None, archive=None):
     self.job_specs = job_specs or _sample_job_specs()
@@ -1084,6 +1090,29 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review", review_key)])
     self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review:audit", review_key)])
     self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review:submissions", review_key)])
+
+  def test_purge_is_refused_on_a_node_that_did_not_launch_the_job(self):
+    """Purge is fail-closed on ownership. Until the `ee_addr` fixture drift was
+    fixed, every purge test hit this path by accident and asserted against a
+    dict that has no "status" key — so the refusal was the only behaviour
+    covered, and covered by tests that meant to exercise the opposite."""
+    owner = _Owner(job_specs=_sample_job_specs(job_cid=""))
+    owner.ee_addr = "some-other-node"
+    owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
+    owner.records[(f"{owner.cfg_instance_id}:rulebook_review", f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}")] = {
+      "job_id": "job-1",
+    }
+
+    result = purge_job(owner, "job-1")
+
+    self.assertEqual(result["error"], "job_launcher_mismatch")
+    self.assertEqual(result["status_code"], 409)
+    self.assertNotIn("status", result)
+    # Nothing was deleted on the foreign node.
+    self.assertEqual(owner.artifact_repo.deleted, [])
+    self.assertIsNotNone(
+      owner.records[(f"{owner.cfg_instance_id}:rulebook_review", f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}")],
+    )
 
   def test_purge_fails_closed_for_submission_cid_shared_with_another_job(self):
     owner = _Owner(job_specs=_sample_job_specs(job_cid=""))

@@ -15,6 +15,65 @@ CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 ALLOWED_TUNNEL_PROTOCOLS = ("http", "https", "tcp", "ssh", "rdp", "smb")
 
 
+def validate_exposed_ports_origin_tls_options(exposed_ports, main_port=None):
+  """Validate the narrow origin-TLS exception before runtime side effects."""
+  if not isinstance(exposed_ports, dict):
+    raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+
+  try:
+    main_port = int(main_port) if main_port is not None else None
+  except (TypeError, ValueError):
+    main_port = None
+
+  for raw_container_port, raw_config in exposed_ports.items():
+    try:
+      container_port = int(raw_container_port)
+    except (TypeError, ValueError):
+      raise ValueError(f"EXPOSED_PORTS key must be an integer port, got: {raw_container_port}")
+    if container_port < 1 or container_port > 65535:
+      raise ValueError(f"EXPOSED_PORTS key must be a valid port number, got: {container_port}")
+
+    if raw_config is None:
+      raw_config = {}
+    if not isinstance(raw_config, dict):
+      raise ValueError(
+        f"EXPOSED_PORTS[{container_port}] must be a dictionary, got: {type(raw_config)}"
+      )
+    if "no_tls_verify" not in raw_config:
+      continue
+
+    no_tls_verify = raw_config.get("no_tls_verify")
+    if not isinstance(no_tls_verify, bool):
+      raise ValueError(
+        f"EXPOSED_PORTS[{raw_container_port}].no_tls_verify must be a boolean"
+      )
+    if not no_tls_verify:
+      continue
+
+    if raw_config.get("is_main_port") is True or (
+      main_port is not None and container_port == main_port
+    ):
+      raise ValueError(
+        f"EXPOSED_PORTS[{raw_container_port}].no_tls_verify is supported only for non-main tunnels"
+      )
+
+    nested = raw_config.get("tunnel")
+    nested = nested if isinstance(nested, dict) and nested.get("enabled", False) else {}
+    token = raw_config.get("token") or nested.get("token")
+    engine = raw_config.get("engine") or nested.get("engine") or "cloudflare"
+    protocol = raw_config.get("protocol", "http")
+    if not (
+      isinstance(token, str) and token.strip()
+      and isinstance(engine, str) and engine.strip().lower() == "cloudflare"
+      and isinstance(protocol, str) and protocol.strip().lower() == "https"
+    ):
+      raise ValueError(
+        f"EXPOSED_PORTS[{raw_container_port}].no_tls_verify requires a token-backed "
+        "Cloudflare https tunnel"
+      )
+  return True
+
+
 class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
@@ -100,6 +159,8 @@ class _ContainerUtilsMixin:
       "CONTAINER_NAME": self.container_name,
       "EE_CONTAINER_NAME": self.container_name,
       "R1EN_CONTAINER_NAME": self.container_name,
+      "R1EN_APP_ID": self._stream_id,
+      "R1EN_INSTANCE_ID": self.cfg_instance_id,
       "EE_HOST_IP": localhost_ip,
       "R1EN_HOST_IP": localhost_ip,
       "EE_HOST_ID": self.ee_id,
@@ -182,8 +243,10 @@ class _ContainerUtilsMixin:
     exposed_ports : dict
         Raw exposed ports config keyed by container port.
     """
-    if not isinstance(exposed_ports, dict):
-      raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+    validate_exposed_ports_origin_tls_options(
+      exposed_ports,
+      main_port=getattr(self, "cfg_port", None),
+    )
 
     normalized = {}
     main_ports = []
@@ -338,6 +401,19 @@ class _ContainerUtilsMixin:
           f"got '{protocol}'"
         )
 
+      no_tls_verify = config.get("no_tls_verify", False)
+      if not isinstance(no_tls_verify, bool):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].no_tls_verify must be a boolean"
+        )
+      if no_tls_verify and not (
+        token is not None and engine == "cloudflare" and protocol == "https"
+      ):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].no_tls_verify requires a token-backed "
+          "Cloudflare https tunnel"
+        )
+
       normalized[container_port] = {
         "container_port": container_port,
         "is_main_port": is_main_port,
@@ -345,6 +421,7 @@ class _ContainerUtilsMixin:
         "token": token,
         "protocol": protocol,
         "engine": engine,
+        "no_tls_verify": no_tls_verify,
       }
 
     if len(main_ports) > 1:
@@ -1133,36 +1210,65 @@ class _ContainerUtilsMixin:
       3. Semaphore env vars (from paired provider plugins)
       4. cfg_env (user-configured)
       5. local env overrides (host-private, managed via /r1en_system)
+
+    Keys supplied by the default environment are runner-owned and cannot be
+    overridden by dynamic, semaphore, or configured inputs.
     """
     # Environment variables
-    # allow cfg_env to override default env vars
-    self.env = self._get_default_env_vars()
-    self.env.update(self.dynamic_env)
+    default_env = self._get_default_env_vars()
+    protected_env_keys = frozenset(default_env)
+
+    def filter_runner_owned_env_vars(source, env_vars):
+      accepted = {}
+      rejected = []
+      for key, value in env_vars.items():
+        if key in protected_env_keys:
+          rejected.append(key)
+        else:
+          accepted[key] = value
+      if rejected:
+        self.P(
+          "Ignoring runner-owned environment variables from {}: {}".format(
+            source, ", ".join(sorted(rejected))
+          ),
+          color='y',
+        )
+      return accepted
+
+    filtered_dynamic_env = filter_runner_owned_env_vars(
+      "dynamic_env", self.dynamic_env
+    )
+    self.env = dict(default_env)
+    self.env.update(filtered_dynamic_env)
 
     # Add environment variables from semaphored paired plugins
     if hasattr(self, 'semaphore_get_env'):
       semaphore_env = self.semaphore_get_env()
       if semaphore_env:
-        sanitized_semaphore_env = {}
+        sanitized_semaphore_env = {
+          self._sanitize_semaphore_env_var_name(key): value
+          for key, value in semaphore_env.items()
+        }
+        sanitized_semaphore_env = filter_runner_owned_env_vars(
+          "semaphore_env", sanitized_semaphore_env
+        )
         log_lines = [
           "=" * 60,
           "SEMAPHORE ENV INJECTION",
           "=" * 60,
-          f"  Adding {len(semaphore_env)} env vars from semaphored plugins:",
+          f"  Adding {len(sanitized_semaphore_env)} env vars from semaphored plugins:",
         ]
-        for key, value in semaphore_env.items():
-          sanitized_key = self._sanitize_semaphore_env_var_name(key)
-          sanitized_semaphore_env[sanitized_key] = value
-          log_lines.append(f"    {sanitized_key} = {value}")
+        for key, value in sanitized_semaphore_env.items():
+          log_lines.append(f"    {key} = {value}")
         log_lines.append("=" * 60)
         self.Pd("\n".join(log_lines))
         self.env.update(sanitized_semaphore_env)
     # endif semaphore env
 
     if self.cfg_env:
-      self.env.update(self.cfg_env)
+      self.env.update(filter_runner_owned_env_vars("cfg_env", self.cfg_env))
     if self.dynamic_env:
-      self.env.update(self.dynamic_env)
+      self.env.update(filtered_dynamic_env)
     # endif dynamic env
 
     if hasattr(self, "_apply_env_overrides_to_env"):
@@ -1509,6 +1615,7 @@ class _ContainerUtilsMixin:
         "token": token,
         "protocol": port_config.get("protocol", "http"),
         "engine": port_config.get("engine", "cloudflare"),
+        "no_tls_verify": port_config.get("no_tls_verify", False),
       }
 
     self.inverted_ports_mapping = {

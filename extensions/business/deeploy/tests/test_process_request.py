@@ -119,7 +119,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
     plugin.check_and_deploy_pipelines = check_and_deploy_pipelines
     request = {
       DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
-      DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b"],
+      DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
       DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
       DEEPLOY_KEYS.PIPELINE_INPUT_URI: None,
       DEEPLOY_KEYS.PIPELINE_PARAMS: {
@@ -142,9 +142,26 @@ class DeeployProcessRequestTests(unittest.TestCase):
         "byNode": {
           "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
           "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+          "0xai_node_c": {"ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}},
         },
       },
     }
+
+    invalid_request = copy.deepcopy(request)
+    invalid_request[DEEPLOY_KEYS.TARGET_NODES] = ["0xai_node_a", "0xai_node_b"]
+    invalid_res = plugin._process_pipeline_request(invalid_request, is_create=True, async_mode=True)
+    self.assertEqual(invalid_res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertIn("at least 3 target nodes", invalid_res[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(captured, {})
+    self.assertEqual(plugin.bc.submitted, [])
+
+    duplicate_request = copy.deepcopy(request)
+    duplicate_request[DEEPLOY_KEYS.TARGET_NODES] = ["0xai_node_a", "0xai_node_a", "0xai_node_a"]
+    duplicate_res = plugin._process_pipeline_request(duplicate_request, is_create=True, async_mode=True)
+    self.assertEqual(duplicate_res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertIn("distinct addresses", duplicate_res[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(captured, {})
+    self.assertEqual(plugin.bc.submitted, [])
 
     res = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
 
@@ -161,10 +178,124 @@ class DeeployProcessRequestTests(unittest.TestCase):
       prepared_plugin["PER_NODE_CONFIG"]["byNode"]["0xai_node_b"]["ENV"]["CRDB_NODE_ID"],
       "2",
     )
-    self.assertEqual(plugin.bc.submitted, [(97, ["eth_0xai_node_a", "eth_0xai_node_b"])])
+    self.assertEqual(
+      plugin.bc.submitted,
+      [(97, ["eth_0xai_node_a", "eth_0xai_node_b", "eth_0xai_node_c"])],
+    )
     self.assertIn("token-a", str(res[DEEPLOY_KEYS.REQUEST]))
     self.assertIn("token-b", str(res[DEEPLOY_KEYS.REQUEST]))
     self.assertIsInstance(res[DEEPLOY_KEYS.REQUEST]["PER_NODE_CONFIG"], dict)
+
+  def test_create_rejects_reserved_cockroachdb_user_before_payment_or_node_lookup(self):
+    plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)
+    plugin.ct = ct
+    plugin.bc = _BCStub()
+    plugin.deepcopy = copy.deepcopy
+    plugin.sanitize_name = lambda value: str(value).replace("/", "_").replace(" ", "_")
+    plugin.uuid = lambda size=7: "abc1234"[:size]
+    plugin.cfg_deeploy_verbose = 0
+    plugin.queued_persistence = None
+    phase_calls = []
+    plugin.deeploy_check_payment_and_job_owner = (
+      lambda *args, **kwargs: phase_calls.append("payment") or True
+    )
+    plugin._check_nodes_availability = (
+      lambda inputs, **kwargs: phase_calls.append("nodes")
+      or list(inputs[DEEPLOY_KEYS.TARGET_NODES])
+    )
+    plugin.check_and_deploy_pipelines = (
+      lambda **kwargs: phase_calls.append("deploy")
+      or ({}, DEEPLOY_STATUS.COMMAND_DELIVERED, {}, {})
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.PIPELINE_INPUT_URI: None,
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {},
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "service",
+        DEEPLOY_KEYS.JOB_ID: 97,
+        DEEPLOY_KEYS.RETURN_REQUEST: False,
+        DEEPLOY_KEYS.PLUGINS: [{
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          "IMAGE": "ghcr.io/ratio1/r1-meshdb@sha256:" + ("a" * 64),
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "2g", "storage": "8g"},
+          "ENV": {
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "AdMiN",
+            "CRDB_PASSWORD": "secret-password",
+          },
+        }],
+      },
+      is_create=True,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(phase_calls, [])
+    self.assertEqual(plugin.bc.submitted, [])
+
+  def test_create_rejects_per_node_cockroachdb_credentials_before_payment_or_node_lookup(self):
+    plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)
+    plugin.ct = ct
+    plugin.bc = _BCStub()
+    plugin.deepcopy = copy.deepcopy
+    plugin.sanitize_name = lambda value: str(value).replace("/", "_").replace(" ", "_")
+    plugin.uuid = lambda size=7: "abc1234"[:size]
+    plugin.cfg_deeploy_verbose = 0
+    plugin.queued_persistence = None
+    phase_calls = []
+    plugin.deeploy_check_payment_and_job_owner = (
+      lambda *args, **kwargs: phase_calls.append("payment") or True
+    )
+    plugin._check_nodes_availability = (
+      lambda inputs, **kwargs: phase_calls.append("nodes")
+      or list(inputs[DEEPLOY_KEYS.TARGET_NODES])
+    )
+    plugin.check_and_deploy_pipelines = (
+      lambda **kwargs: phase_calls.append("deploy")
+      or ({}, DEEPLOY_STATUS.COMMAND_DELIVERED, {}, {})
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
+        DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.PIPELINE_INPUT_URI: None,
+        DEEPLOY_KEYS.PIPELINE_PARAMS: {},
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "service",
+        DEEPLOY_KEYS.JOB_ID: 97,
+        DEEPLOY_KEYS.RETURN_REQUEST: False,
+        DEEPLOY_KEYS.PLUGINS: [{
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          "IMAGE": "ghcr.io/ratio1/r1-meshdb@sha256:" + ("a" * 64),
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "2g", "storage": "8g"},
+          "ENV": {
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          "PER_NODE_CONFIG": {
+            "byNode": {
+              "0xai_node_b": {"ENV": {"CRDB_USER": "root"}},
+            },
+          },
+        }],
+      },
+      is_create=True,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertIn("per-node ENV", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(phase_calls, [])
+    self.assertEqual(plugin.bc.submitted, [])
 
   def test_error_handler_redacts_secret_request_values(self):
     plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)

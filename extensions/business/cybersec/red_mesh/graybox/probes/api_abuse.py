@@ -226,6 +226,7 @@ class ApiAbuseProbes(ProbeBase):
             "Cap pagination server-side. Reject limit values above a "
             "configured maximum (typically 100–1000)."
           ),
+          response=abuse,
         )
       else:
         self.emit_clean(
@@ -277,6 +278,7 @@ class ApiAbuseProbes(ProbeBase):
             "Enforce a request-body size limit at the reverse-proxy or "
             "framework layer."
           ),
+          response=resp,
         )
 
   # ── PT-OAPI4-03 — no rate limit ────────────────────────────────────
@@ -330,6 +332,7 @@ class ApiAbuseProbes(ProbeBase):
             "window) at the gateway. Return 429 + Retry-After when the "
             "limit is reached."
           ),
+          response=resp,
         )
 
   # ── PT-OAPI6-01 — flow no rate limit (STATEFUL) ────────────────────
