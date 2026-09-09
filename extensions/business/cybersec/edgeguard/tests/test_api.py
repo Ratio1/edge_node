@@ -782,6 +782,33 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(catalog[0]["prompt_profile"], "cybersec_schema_grounded")
     self.assertNotIn("base_qwen3_4b", plugin._configured_model_keys())
 
+  def test_default_model_key_falls_back_when_configured_key_is_unknown(self):
+    plugin = _make_api(edgeguard_default_model="private_model")
+    warnings = []
+    plugin.P = lambda message, *args, **kwargs: warnings.append(str(message))
+
+    self.assertEqual(plugin._default_model_key(), PRIVATE_MODEL_KEY)
+    self.assertEqual(plugin.models()["default_model_key"], PRIVATE_MODEL_KEY)
+    self.assertEqual(plugin.model()["model_key"], PRIVATE_MODEL_KEY)
+    self.assertEqual(len([m for m in warnings if "private_model" in m]), 1)
+
+  def test_unknown_prompt_profile_warns_once_and_falls_back(self):
+    plugin = _make_api(edgeguard_generation_workers={
+      "model-x": {"SEMAPHORE": "edgeguard_llm_private", "PROMPT_PROFILE": "direct-cypher"},
+      "model-y": {"SEMAPHORE": "edgeguard_llm_base"},
+    })
+    warnings = []
+    plugin.P = lambda message, *args, **kwargs: warnings.append(str(message))
+
+    first = plugin._prompt_profile("model-x")
+    plugin._prompt_profile("model-x")
+    silent = plugin._prompt_profile("model-y")
+
+    self.assertEqual(first["name"], "schema_grounded")
+    self.assertEqual(silent["name"], "schema_grounded")
+    self.assertEqual(len([m for m in warnings if "direct-cypher" in m]), 1)
+    self.assertFalse(any("model-y" in m for m in warnings))
+
   def test_generate_rejects_unconfigured_model_key(self):
     plugin = _make_api()
 
@@ -928,10 +955,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     """Run generate() under a fake monotonic clock that each worker call advances."""
     clock = {"now": 1000.0}
     timeouts = []
+    payload_timeouts = []
     queue = list(responses)
 
     def _post(*_args, **kwargs):
       timeouts.append(kwargs.get("timeout"))
+      payload_timeouts.append(kwargs.get("json", {}).get("timeout"))
       clock["now"] += seconds_per_call
       return queue.pop(0)
 
@@ -946,6 +975,7 @@ class EdgeGuardApiTests(unittest.TestCase):
       side_effect=lambda: clock["now"],
     ):
       result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
+    self._last_payload_timeouts = payload_timeouts
     return result, session, timeouts
 
   def test_generate_stops_retrying_when_request_budget_is_exhausted(self):
@@ -978,6 +1008,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["accepted"])
     self.assertEqual(session.post.call_count, 2)
     self.assertEqual(timeouts, [120.0, 90.0])
+    self.assertEqual(self._last_payload_timeouts, [120, 90])
 
   def test_generate_refuses_first_attempt_below_deadline_floor(self):
     plugin = _make_api(

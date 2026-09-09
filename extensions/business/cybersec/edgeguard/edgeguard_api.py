@@ -3535,16 +3535,38 @@ class EdgeguardApiPlugin(BasePlugin):
       if isinstance(key, str) and key.strip() and isinstance(worker, Mapping)
     ]
 
+  def _warn_once(self, flag: str, message: str) -> None:
+    if getattr(self, flag, False):
+      return
+    setattr(self, flag, True)
+    self.P(message, color="r")
+
   def _default_model_key(self) -> Optional[str]:
+    """EDGEGUARD_DEFAULT_MODEL when it names a configured model, else the first
+    configured key. A default that is not in the catalog would be advertised
+    by /models and rejected by /generate, so it is corrected with a warning."""
     configured = getattr(self, "cfg_edgeguard_default_model", None)
     keys = self._configured_model_keys()
     if isinstance(configured, str) and configured.strip():
-      return configured.strip()
+      configured = configured.strip()
+      if configured in keys:
+        return configured
+      self._warn_once(
+        "_warned_default_model_key",
+        f"EDGEGUARD_DEFAULT_MODEL '{configured}' is not a configured model key {keys}; "
+        f"using '{keys[0] if keys else None}'.",
+      )
     return keys[0] if keys else None
 
   def _prompt_profile(self, model_key: str) -> Dict[str, Any]:
     worker, _err = self._generation_worker(model_key)
     name = worker.get("PROMPT_PROFILE") if isinstance(worker, Mapping) else None
+    if name is not None and name not in PROMPT_PROFILES:
+      self._warn_once(
+        f"_warned_prompt_profile_{model_key}",
+        f"Model '{model_key}' declares unknown PROMPT_PROFILE {name!r}; known profiles are "
+        f"{sorted(PROMPT_PROFILES)}. Falling back to '{DEFAULT_PROMPT_PROFILE}'.",
+      )
     if not isinstance(name, str) or name not in PROMPT_PROFILES:
       name = DEFAULT_PROMPT_PROFILE
     return {"name": name, **PROMPT_PROFILES[name]}
@@ -3655,6 +3677,10 @@ class EdgeguardApiPlugin(BasePlugin):
         "prompt_profile_id": model.get("prompt_profile_id"),
       },
     }
+    if timeout is not None:
+      # The worker registers the request with this budget, so an attempt we
+      # abandon does not stay pending there for the worker's own default.
+      payload["timeout"] = max(1, int(timeout))
     started = time.monotonic()
     session = requests.Session()
     session.trust_env = False
