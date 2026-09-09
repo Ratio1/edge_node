@@ -210,6 +210,20 @@ class LLMInferenceApiPlugin(BasePlugin):
           "an alias cannot select one serving.",
           color='r',
         )
+
+    if len(routes) > 1 and not getattr(self, '_warned_ambiguous_model_ids', False):
+      owners = {}
+      for route in routes:
+        for model_id in route['model_ids']:
+          owners.setdefault(model_id, []).append(route['engine'])
+      ambiguous = sorted(model_id for model_id, engines in owners.items() if len(engines) > 1)
+      if ambiguous:
+        self._warned_ambiguous_model_ids = True
+        self.P(
+          f"Model ids {ambiguous} are declared by more than one engine on this LLM_INFERENCE_API "
+          "instance; requests for them go to the first configured engine.",
+          color='r',
+        )
     return routes
 
   def _get_local_model_ids(self):
@@ -220,12 +234,16 @@ class LLMInferenceApiPlugin(BasePlugin):
     return sorted(model_ids)
 
   def _resolve_target_serving_name(self, requested_model):
-    """Map a requested model identifier to the serving that owns it, or None."""
+    """Map a requested model identifier to the serving that owns it, or None.
+
+    The match is exact (case-sensitive), the same contract peer capability
+    matching applies, so a request selects the same model locally and remotely.
+    """
     if not isinstance(requested_model, str) or not requested_model.strip():
       return None
-    wanted = requested_model.strip().lower()
+    wanted = requested_model.strip()
     for route in self._get_local_engine_routes():
-      if any(model_id.lower() == wanted for model_id in route['model_ids']):
+      if wanted in route['model_ids']:
         return route['serving_name']
     return None
 

@@ -218,7 +218,7 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
       STARTUP_AI_ENGINE_PARAMS={"MODEL_NAME": "org/private-model", "MODEL_INSTANCE_ID": "worker-a"},
     )
 
-    for requested in ("public-alias", "org/private-model", "worker-a", "llama_cpp_medium", "PUBLIC-ALIAS"):
+    for requested in ("public-alias", "org/private-model", "worker-a", "llama_cpp_medium"):
       with self.subTest(requested=requested):
         self.assertTrue(plugin._can_execute_request({"parameters": {"model": requested}}))  # pylint: disable=protected-access
         payload = plugin.compute_payload_kwargs_from_predict_params(
@@ -226,6 +226,36 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
           request_data={"parameters": {"messages": [], "model": requested}},
         )
         self.assertEqual(payload["JEEVES_CONTENT"]["TARGET_SERVING_NAME"], "LLAMA_CPP_LLAMA_3B_WORKER-A")
+
+  def test_model_matching_is_exact_on_local_and_peer_paths(self):
+    plugin = self._make_plugin(AI_ENGINE="llama_cpp_medium", SERVED_MODELS=["model-b"])
+    peer = {"capabilities": {"models": ["model-b"]}}
+
+    for requested, expected in (("model-b", True), ("MODEL-B", False)):
+      with self.subTest(requested=requested):
+        request_data = {"parameters": {"model": requested}}
+        self.assertEqual(plugin._can_execute_request(request_data), expected)  # pylint: disable=protected-access
+        self.assertEqual(plugin._capacity_record_can_execute_request(peer, request_data), expected)  # pylint: disable=protected-access
+
+  def test_duplicate_model_ids_resolve_to_first_engine_and_warn(self):
+    plugin = self._make_plugin(
+      AI_ENGINE=["llama_cpp_small", "llama_cpp_medium"],
+      STARTUP_AI_ENGINE_PARAMS={
+        "llama_cpp_small": {"MODEL_NAME": "org/shared"},
+        "llama_cpp_medium": {"MODEL_NAME": "org/shared"},
+      },
+    )
+    warnings = []
+    plugin.P = lambda message, *args, **kwargs: warnings.append(str(message))
+
+    first = plugin._resolve_target_serving_name("org/shared")  # pylint: disable=protected-access
+    second = plugin._resolve_target_serving_name("org/shared")  # pylint: disable=protected-access
+
+    self.assertEqual(first, "LLAMA_CPP_LLAMA_1B")
+    self.assertEqual(second, first)
+    ambiguous = [message for message in warnings if "org/shared" in message]
+    self.assertEqual(len(ambiguous), 1)
+    self.assertIn("first configured engine", ambiguous[0])
 
   def test_unroutable_model_is_neither_advertised_nor_executable(self):
     plugin = self._make_plugin(AI_ENGINE="llama_cpp_medium", SERVED_MODELS=["public-alias"])
