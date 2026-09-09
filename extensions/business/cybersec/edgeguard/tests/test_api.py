@@ -891,6 +891,101 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["attempts"][1]["accepted"])
     self.assertEqual(session.post.call_count, 2)
 
+  def _length_then_stop_responses(self):
+    truncated = _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source)",
+        "FULL_OUTPUT": {
+          "choices": [{
+            "message": {"content": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source)"},
+            "finish_reason": "length",
+          }],
+          "usage": {"completion_tokens": 64},
+        },
+      },
+    })
+    corrected = _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 5",
+        "FULL_OUTPUT": {
+          "choices": [{
+            "message": {"content": "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 5"},
+            "finish_reason": "stop",
+          }],
+          "usage": {"completion_tokens": 24},
+        },
+      },
+    })
+    return truncated, corrected
+
+  def _generate_with_fake_clock(self, plugin, responses, seconds_per_call):
+    """Run generate() under a fake monotonic clock that each worker call advances."""
+    clock = {"now": 1000.0}
+    timeouts = []
+    queue = list(responses)
+
+    def _post(*_args, **kwargs):
+      timeouts.append(kwargs.get("timeout"))
+      clock["now"] += seconds_per_call
+      return queue.pop(0)
+
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = _post
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ), patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.time.monotonic",
+      side_effect=lambda: clock["now"],
+    ):
+      result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
+    return result, session, timeouts
+
+  def test_generate_stops_retrying_when_request_budget_is_exhausted(self):
+    plugin = _make_api(
+      worker_semaphore_env={PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"}},
+      request_timeout_seconds=120,
+    )
+    truncated, _corrected = self._length_then_stop_responses()
+
+    result, session, timeouts = self._generate_with_fake_clock(plugin, [truncated, truncated], 119.5)
+
+    self.assertEqual(session.post.call_count, 1)
+    self.assertEqual(result["status"], "error")
+    self.assertEqual(
+      result["diagnostics"],
+      {"stage": "worker", "code": "generation_deadline_exceeded", "retryable": True},
+    )
+    self.assertEqual(len(result["attempts"]), 1)
+    self.assertEqual(timeouts, [120.0])
+
+  def test_generate_passes_remaining_budget_as_http_timeout(self):
+    plugin = _make_api(
+      worker_semaphore_env={PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"}},
+      request_timeout_seconds=120,
+    )
+    truncated, corrected = self._length_then_stop_responses()
+
+    result, session, timeouts = self._generate_with_fake_clock(plugin, [truncated, corrected], 30.0)
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(session.post.call_count, 2)
+    self.assertEqual(timeouts, [120.0, 90.0])
+
+  def test_generate_refuses_first_attempt_below_deadline_floor(self):
+    plugin = _make_api(
+      worker_semaphore_env={PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"}},
+      request_timeout_seconds=0,
+    )
+
+    result, session, timeouts = self._generate_with_fake_clock(plugin, [], 0.0)
+
+    session.post.assert_not_called()
+    self.assertEqual(result["diagnostics"]["code"], "generation_deadline_exceeded")
+    self.assertEqual(result["attempts"], [])
+    self.assertEqual(timeouts, [])
+
   def test_generate_fails_fast_while_model_process_is_starting(self):
     plugin = _make_api(worker_semaphore_env={
       PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},

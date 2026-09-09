@@ -251,6 +251,9 @@ GENERATION_MAX_TOKENS = 64
 GENERATION_TEMPERATURE = 0.0
 GENERATION_TOP_P = 1.0
 GENERATION_TIMEOUT_SECONDS = 600
+# A generate request has one deadline shared by all correction attempts; an
+# attempt is not started when less than this much budget remains.
+GENERATION_DEADLINE_FLOOR_SECONDS = 1.0
 EXPLANATION_DIAGNOSTIC_SCHEMA_VERSION = "edgeguard.graph_explanation_diagnostic.v1"
 EXPLANATION_DIAGNOSTIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 CANONICAL_INTEGER_RE = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
@@ -1580,6 +1583,10 @@ def _validate_serialized_properties(properties: Any, where: str) -> Optional[Dic
       continue
     return _contract_error("invalid_serialized_property_value", f"{where}.{key}: nested values are not allowed")
   return None
+
+
+class _GenerationDeadlineExceeded(Exception):
+  """Raised inside generate() when the request budget cannot fit another model call."""
 
 
 class _ResultEvidenceError(ValueError):
@@ -3634,6 +3641,7 @@ class EdgeguardApiPlugin(BasePlugin):
     url: str,
     messages: list[Dict[str, str]],
     model: Mapping[str, Any],
+    timeout: Optional[float] = None,
   ) -> tuple[str, Optional[str], float, Dict[str, Any]]:
     payload = {
       "model": model.get("model_key"),
@@ -3654,7 +3662,7 @@ class EdgeguardApiPlugin(BasePlugin):
       url,
       headers={"Content-Type": "application/json"},
       json=payload,
-      timeout=min(GENERATION_TIMEOUT_SECONDS, int(self.cfg_request_timeout_seconds)),
+      timeout=min(GENERATION_TIMEOUT_SECONDS, int(self.cfg_request_timeout_seconds)) if timeout is None else timeout,
     )
     duration_ms = round((time.monotonic() - started) * 1000, 1)
     if response.status_code != 200:
@@ -3691,6 +3699,7 @@ class EdgeguardApiPlugin(BasePlugin):
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
+    deadline = started + min(GENERATION_TIMEOUT_SECONDS, int(self.cfg_request_timeout_seconds))
     selected_key = model_key or modelKey or self._default_model_key()
     if benchmark_mode:
       return {
@@ -3759,6 +3768,9 @@ class EdgeguardApiPlugin(BasePlugin):
     llm_model = model.get("model_file")
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
+        remaining = deadline - time.monotonic()
+        if remaining < GENERATION_DEADLINE_FLOOR_SECONDS:
+          raise _GenerationDeadlineExceeded()
         messages = self._generation_messages(
           selected_key,
           normalized_request,
@@ -3768,7 +3780,7 @@ class EdgeguardApiPlugin(BasePlugin):
           retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
         )
         raw_output, llm_model, timing_ms, completion = self._call_generation_model(
-          url, messages, model,
+          url, messages, model, timeout=remaining,
         )
         validation = analyze_generated_cypher(raw_output, max_limit=int(self.cfg_neo4j_max_rows))
         if completion.get("finish_reason") != "stop":
@@ -3832,6 +3844,9 @@ class EdgeguardApiPlugin(BasePlugin):
           }
         last_candidate = attempt["candidate_cypher"]
         last_feedback = attempt["validation_feedback"] or "The previous output failed validation."
+    except _GenerationDeadlineExceeded:
+      code = "generation_deadline_exceeded"
+      message = "Generation request budget was exhausted before another model call could start."
     except requests.exceptions.Timeout:
       code = "worker_timeout"
       message = "Generation service timed out."
