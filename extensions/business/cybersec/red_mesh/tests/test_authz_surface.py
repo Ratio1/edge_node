@@ -112,6 +112,25 @@ class TestAuthzSurface(unittest.TestCase):
     self.assertIsNone(view)
     self.assertEqual(err["status_code"], 404)
 
+  def test_launch_endpoints_reject_explicitly_non_active_stored_accounts(self):
+    for name in ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test"):
+      for state in (None, "deleting", "", False, 0, [], {}):
+        with self.subTest(endpoint=name, state=state):
+          plugin = object.__new__(self.Plugin)
+          plugin.chainstore_hget = MagicMock(return_value={
+            "type": "simple", "role": "user", "metadata": {"navigatorAccountState": state},
+          })
+          target = f"extensions.business.cybersec.red_mesh.pentester_api_01.{name}"
+          with patch(target, return_value={"unexpected_launch": True}) as launch, \
+               patch.dict("os.environ", {
+                 "REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN,
+                 "R1EN_CSTORE_AUTH_HKEY": "app:auth",
+               }):
+            result = self.endpoints[name](plugin, TEST_CHANNEL_TOKEN, actor={"account_id": "ops.user"})
+          self.assertEqual(result.get("status_code"), 404)
+          self.assertEqual(result.get("error_class"), "actor_not_found")
+          launch.assert_not_called()
+
 
 
 class TestInternalCallersDoNotReenterEndpoints(unittest.TestCase):

@@ -60,7 +60,7 @@ class CstoreAuthAccountReader:
       account_id=account_id,
       role=str(record.get("role") or "user"),
       app_role=app_role if isinstance(app_role, str) else None,
-      active=(state is None or state == ACTIVE_STATE),
+      active=(ACCOUNT_STATE_KEY not in metadata or state == ACTIVE_STATE),
     )
 
 
