@@ -1867,8 +1867,8 @@ def launch_test(
     return validation_error(f"Invalid scan_type: {scan_type}. Valid: {[e.value for e in ScanType]}")
 
   if scan_type_enum == ScanType.WEBAPP:
-    # Module-level calls: the endpoint methods are channel-guarded and resolve the actor;
-    # both already happened once at the launch_test endpoint (RM-075).
+    # The launch_test endpoint already resolved the actor and set account attribution.
+    # Delegate directly to preserve that attribution without a second actor lookup.
     return launch_webapp_scan(
       owner,
       target_url=target_url,

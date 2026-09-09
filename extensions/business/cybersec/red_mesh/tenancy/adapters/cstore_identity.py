@@ -76,6 +76,6 @@ def _parse_record(raw):
   if not isinstance(raw, dict):
     return None
   version = raw.get("schemaVersion", 0)
-  if version not in SUPPORTED_SCHEMA_VERSIONS:
+  if type(version) is not int or version not in SUPPORTED_SCHEMA_VERSIONS:
     return None
   return raw

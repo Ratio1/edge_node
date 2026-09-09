@@ -11,21 +11,6 @@ from xperimental.utils import color_print
 
 MANUAL_RUN = False
 
-# The channel token every endpoint now checks (RM-075 Phase 2). Tests pass it as the first
-# positional argument after the plugin; the autouse fixture below puts it in the environment.
-TEST_CHANNEL_TOKEN = "test-channel-token-material-at-least-32-bytes"
-
-try:
-  import pytest
-
-  @pytest.fixture(autouse=True)
-  def _channel_token_env(monkeypatch):
-    monkeypatch.setenv("REDMESH_BACKEND_TOKEN", TEST_CHANNEL_TOKEN)
-    yield
-except ImportError:  # unittest-only runs: tests that need the token set it themselves
-  pass
-
-
 
 def install_pymisp_stub():
   """Install a small PyMISP stand-in when the optional test dependency is absent."""

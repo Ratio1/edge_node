@@ -145,6 +145,20 @@ class TestCstoreAuthAccountReader(unittest.TestCase):
       with self.assertRaises(IdentityStoreError):
         reader.get_account("a1")
 
+  def test_schema_version_requires_a_supported_integer_not_a_bool_or_container(self):
+    for version in ([], {}, True, False, 1.0, 0.0, "1", None):
+      with self.subTest(version=version):
+        record = _record()
+        record["schemaVersion"] = version
+        reader, _ = _reader({"a1": record})
+        with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+          self.assertIsNone(reader.get_account("a1"))
+    for version in (0, 1):
+      with self.subTest(version=version):
+        reader, _ = _reader({"a1": _record(schema_version=version)})
+        with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+          self.assertIsNotNone(reader.get_account("a1"))
+
 
 if __name__ == "__main__":
   unittest.main()

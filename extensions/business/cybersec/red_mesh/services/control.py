@@ -122,7 +122,7 @@ def stop_and_delete_job(owner, job_id: str):
     return {"status": "success", "job_id": job_id, "cids_deleted": 0, "cids_total": 0}
 
   owner._log_audit_event("scan_stopped", {"job_id": job_id})
-  # Module-level call: the endpoint method is channel-guarded and takes `token` first (RM-075).
+  # Keep internal control flow on the module implementation, below the public API boundary.
   return purge_job(owner, job_id)
 
 

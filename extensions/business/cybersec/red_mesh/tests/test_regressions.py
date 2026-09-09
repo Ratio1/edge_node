@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 from extensions.business.cybersec.red_mesh.services.resilience import run_bounded_retry
 from extensions.business.cybersec.red_mesh.services.triage import _merge_triage_into_archive_dict
 
-from .conftest import mock_plugin_modules, TEST_CHANNEL_TOKEN
+from .conftest import mock_plugin_modules
 
 
 class TestRegressionScenarios(unittest.TestCase):
@@ -102,7 +102,7 @@ class TestRegressionScenarios(unittest.TestCase):
     plugin._normalize_job_record = MagicMock(side_effect=lambda key, value: (key, value))
     plugin._get_all_network_jobs = lambda: Plugin._get_all_network_jobs(plugin)
 
-    first = Plugin.list_network_jobs(plugin, TEST_CHANNEL_TOKEN)
-    second = Plugin.list_network_jobs(plugin, TEST_CHANNEL_TOKEN)
+    first = Plugin.list_network_jobs(plugin)
+    second = Plugin.list_network_jobs(plugin)
 
     self.assertEqual(json.dumps(first, sort_keys=True), json.dumps(second, sort_keys=True))

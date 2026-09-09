@@ -107,7 +107,7 @@ else:
   NativeFastApiPlugin, NativePostponedRequest = object, None
   ipc_manager = None
 
-from .conftest import mock_plugin_modules, TEST_CHANNEL_TOKEN
+from .conftest import mock_plugin_modules
 
 
 mock_plugin_modules()
@@ -193,11 +193,10 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
   def _render_server(self, destination, manager_port, manager_auth):
     from jinja2 import Environment, FileSystemLoader
 
-    # Skip ``self`` and ``token``: with require_token the framework binds the bearer to ``token``
-    # itself (basic_server.j2) and passes only the remaining parameters from the body.
+    # Ordinary requests preserve their original body parameters and need no bearer.
     analyze_parameters = list(
       inspect.signature(PentesterApi01Plugin.analyze_job).parameters.values()
-    )[2:]
+    )[1:]
     status_parameters = [
       inspect.Parameter("job_id", inspect.Parameter.POSITIONAL_OR_KEYWORD),
     ]
@@ -206,7 +205,6 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
         "analyze_job",
         "post",
         analyze_parameters,
-        require_token=True,
       ),
       self._descriptor("get_job_status", "get", status_parameters),
     ]
@@ -242,10 +240,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     shutil.copy2(IPC_MANAGER_PATH, temp_utils / IPC_MANAGER_PATH.name)
 
   @staticmethod
-  def _request(port, method, path, *, token=TEST_CHANNEL_TOKEN, payload=None, timeout=5):
+  def _request(port, method, path, *, payload=None, timeout=5):
     headers = {}
-    if token:
-      headers["Authorization"] = f"Bearer {token}"
     body = None
     if payload is not None:
       headers["Content-Type"] = "application/json"
@@ -334,8 +330,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     self.addCleanup(owner._manual_analysis_executor.shutdown, wait=False)
     harness = _SchedulerHarness.__new__(_SchedulerHarness)
     harness._endpoints = {
-      "analyze_job": lambda token, job_id, analysis_type="", focus_areas=None: (
-        PentesterApi01Plugin.analyze_job(owner, token,
+      "analyze_job": lambda job_id, analysis_type="", focus_areas=None: (
+        PentesterApi01Plugin.analyze_job(owner,
           job_id,
           analysis_type,
           focus_areas,
