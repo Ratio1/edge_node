@@ -395,6 +395,35 @@ class EdgeGuardExecutionSafetyTests(unittest.TestCase):
       with self.subTest(cypher=cypher):
         self.assert_rejected(cypher, "negation, wildcard or grouping", max_limit=100)
 
+  def test_map_projection_properties_are_checked(self):
+    analysis = self._analysis("MATCH (i:Indicator) RETURN i{.value, .private} AS m LIMIT 5", max_limit=100)
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["schema_unknown"]["properties"], ["private"])
+    accepted = self._analysis("MATCH (i:Indicator) RETURN i{.value} AS m LIMIT 5", max_limit=100)
+    self.assertTrue(accepted["accepted"], accepted["validation_feedback"])
+
+  def test_every_limit_must_be_a_bounded_integer(self):
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 1000 UNION MATCH (m:Malware) RETURN m.name AS v LIMIT 5",
+      "server row cap of 100",
+      max_limit=100,
+    )
+    self.assert_rejected(
+      "MATCH (i:Indicator) WITH i LIMIT 1 + 1000 RETURN i.value AS v LIMIT 5",
+      "single integer literal",
+      max_limit=100,
+    )
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 1000 LIMIT 5",
+      "single integer literal",
+      max_limit=100,
+    )
+    accepted = self._analysis(
+      "MATCH (i:Indicator) RETURN i.value AS v LIMIT 5 UNION MATCH (m:Malware) RETURN m.name AS v LIMIT 5",
+      max_limit=100,
+    )
+    self.assertTrue(accepted["accepted"], accepted["validation_feedback"])
+
   def test_negative_controls_stay_accepted(self):
     cases = [
       "MATCH (i:Indicator) RETURN i.name AS name LIMIT 5",

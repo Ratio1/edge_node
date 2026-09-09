@@ -214,6 +214,9 @@ LABEL_EXPRESSION_UNSAFE = re.compile(r":\s*[!%(]|[|&]\s*[!%(]")
 PROPERTY_ACCESS = re.compile(r"(?:\b[A-Za-z_][A-Za-z0-9_]*|\))\s*\.\s*(" + TOKEN + r")(?!\s*\()")
 SCHEMA_TOKEN = re.compile(TOKEN)
 MAP_KEY = re.compile(r"(?<=[{,])\s*(" + TOKEN + r")\s*:")
+# Map projection entries `n{.prop, .other}` read properties without a dot
+# after a variable, so they are extracted separately.
+MAP_PROJECTION_PROPERTY = re.compile(r"(?<=[{,])\s*\.\s*(" + IDENT + r")")
 PROCEDURE_CALL = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\(")
 CYPHER_STRING_LITERAL = re.compile(r"'(?:\\.|''|[^'])*'|\"(?:\\.|\"\"|[^\"])*\"")
 # A backtick-quoted identifier is opaque text. For analysis it becomes its
@@ -248,6 +251,11 @@ WILDCARD_PROJECTION = re.compile(r"\.\s*\*")
 BRACKET_ACCESS = re.compile(r"(?:\b(?!IN\b)[A-Za-z_][A-Za-z0-9_]*|\))\s*\[", re.I)
 COLLECT_AGGREGATE = re.compile(r"\bcollect\s*\(", re.I)
 LIMIT_KEYWORD = re.compile(r"\bLIMIT\b", re.I)
+# A non-final LIMIT must be a bare integer directly followed by the next clause.
+LIMIT_INTEGER = re.compile(
+  r"\bLIMIT\s+(\d+)\s*(?=\b(?:RETURN|WITH|MATCH|OPTIONAL|UNION|UNWIND|WHERE|ORDER|SKIP|CALL)\b)",
+  re.I,
+)
 # The final LIMIT must be a bare integer literal that ends the query, so
 # `LIMIT 1 + 1000` or `LIMIT toInteger(...)` cannot pass as `1`.
 FINAL_LIMIT_LITERAL = re.compile(r"\bLIMIT\s+(\d+)\s*\Z", re.I)
@@ -362,6 +370,7 @@ def extract_schema_tokens(cypher: str) -> dict[str, set[str]]:
     relationship_types.update(_match_tokens(match))
   properties = {normalize_schema_token(match.group(1)) for match in PROPERTY_ACCESS.finditer(property_source)}
   properties.update(normalize_schema_token(match.group(1)) for match in MAP_KEY.finditer(property_source))
+  properties.update(match.group(1) for match in MAP_PROJECTION_PROPERTY.finditer(property_source))
   return {
     "labels": labels,
     "relationship_types": relationship_types,
@@ -526,12 +535,18 @@ def _execution_safety_error(
   if not schema_tokens["labels"] and not schema_tokens["relationship_types"]:
     return "query is not anchored to any allowlisted label or relationship type"
   if not _scalar_aggregate_only_return(stripped):
-    # Only the last LIMIT governs the result size; a larger LIMIT inside a
-    # non-final UNION branch is a known non-goal of this check.
+    # Every LIMIT (including UNION branches and WITH stages) must be a bare
+    # integer within the cap, and the final one must end the query.
     limit_positions = list(LIMIT_KEYWORD.finditer(stripped))
     cap_text = f" of at most {max_limit} rows" if isinstance(max_limit, int) else ""
     if not limit_positions:
       return f"add an explicit positive LIMIT{cap_text} to the final RETURN"
+    for position in limit_positions[:-1]:
+      literal = LIMIT_INTEGER.match(stripped, position.start())
+      if literal is None:
+        return "LIMIT must be a single integer literal"
+      if isinstance(max_limit, int) and int(literal.group(1)) > max_limit:
+        return f"LIMIT exceeds the server row cap of {max_limit} rows"
     final = FINAL_LIMIT_LITERAL.match(stripped, limit_positions[-1].start())
     if final is None:
       return "LIMIT must be a single integer literal"
