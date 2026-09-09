@@ -171,8 +171,10 @@ class LLMInferenceApiPlugin(BasePlugin):
 
     Each route carries the serving name the inference bus will see and the set
     of model identifiers (engine name, startup ids, public aliases) that select
-    it. Only identifiers that resolve to exactly one serving are routable, so
-    ``SERVED_MODELS`` aliases apply to single-engine instances only.
+    it. Only identifiers that resolve to exactly one serving are routable.
+    ``SERVED_MODELS`` may be a list of aliases (they belong to the instance's
+    single engine) or a mapping ``{engine_name: [aliases]}`` that names the
+    engine explicitly, which is required on a multi-engine instance.
     """
     engines = getattr(self, 'cfg_ai_engine', None)
     if isinstance(engines, str):
@@ -193,23 +195,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         'model_ids': model_ids,
       })
 
-    aliases = getattr(self, 'cfg_served_models', [])
-    if isinstance(aliases, str):
-      aliases = [aliases]
-    if isinstance(aliases, (list, tuple, set)):
-      aliases = [str(value).strip() for value in aliases if isinstance(value, str) and value.strip()]
-    else:
-      aliases = []
-    if aliases:
-      if len(routes) == 1:
-        routes[0]['model_ids'].update(aliases)
-      elif not getattr(self, '_warned_ambiguous_served_models', False):
-        self._warned_ambiguous_served_models = True
-        self.P(
-          "SERVED_MODELS aliases are ignored on a multi-engine LLM_INFERENCE_API instance: "
-          "an alias cannot select one serving.",
-          color='r',
-        )
+    self._attach_served_model_aliases(routes, getattr(self, 'cfg_served_models', []))
 
     if len(routes) > 1 and not getattr(self, '_warned_ambiguous_model_ids', False):
       owners = {}
@@ -225,6 +211,56 @@ class LLMInferenceApiPlugin(BasePlugin):
           color='r',
         )
     return routes
+
+  @staticmethod
+  def _clean_aliases(values):
+    if isinstance(values, str):
+      values = [values]
+    if not isinstance(values, (list, tuple, set)):
+      return []
+    return [str(value).strip() for value in values if isinstance(value, str) and value.strip()]
+
+  def _attach_served_model_aliases(self, routes, served_models):
+    """Attach SERVED_MODELS aliases to the engine route they belong to.
+
+    A mapping ``{engine_name: [aliases]}`` names the engine explicitly and works
+    on any instance. A plain list is unambiguous only when the instance runs a
+    single engine; on a multi-engine instance it is ignored with a warning,
+    because accepting it would let whichever serving polls first execute the
+    request.
+    """
+    if isinstance(served_models, dict):
+      unknown = []
+      for engine_name, values in served_models.items():
+        route = next(
+          (item for item in routes
+           if isinstance(engine_name, str) and item['engine'].lower() == engine_name.strip().lower()),
+          None,
+        )
+        if route is None:
+          unknown.append(engine_name)
+          continue
+        route['model_ids'].update(self._clean_aliases(values))
+      if unknown and not getattr(self, '_warned_unknown_served_model_engines', False):
+        self._warned_unknown_served_model_engines = True
+        self.P(
+          f"SERVED_MODELS names engines {unknown} that this LLM_INFERENCE_API instance does not run; "
+          "their aliases are ignored.",
+          color='r',
+        )
+      return
+    aliases = self._clean_aliases(served_models)
+    if not aliases:
+      return
+    if len(routes) == 1:
+      routes[0]['model_ids'].update(aliases)
+    elif not getattr(self, '_warned_ambiguous_served_models', False):
+      self._warned_ambiguous_served_models = True
+      self.P(
+        "SERVED_MODELS is a plain list on a multi-engine LLM_INFERENCE_API instance, so its aliases "
+        "are ignored: use the mapping form {engine_name: [aliases]} to name the engine.",
+        color='r',
+      )
 
   def _get_local_model_ids(self):
     """Return normalized model identifiers this instance can route to a serving."""

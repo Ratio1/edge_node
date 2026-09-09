@@ -237,6 +237,33 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
         self.assertEqual(plugin._can_execute_request(request_data), expected)  # pylint: disable=protected-access
         self.assertEqual(plugin._capacity_record_can_execute_request(peer, request_data), expected)  # pylint: disable=protected-access
 
+  def test_multi_engine_instance_routes_aliases_declared_per_engine(self):
+    plugin = self._make_plugin(
+      AI_ENGINE=["llama_cpp_small", "llama_cpp_medium"],
+      SERVED_MODELS={"llama_cpp_small": ["fast-alias"], "LLAMA_CPP_MEDIUM": ["quality-alias", "second-alias"]},
+    )
+
+    self.assertEqual(
+      plugin._get_local_model_ids(),  # pylint: disable=protected-access
+      ["fast-alias", "llama_cpp_medium", "llama_cpp_small", "quality-alias", "second-alias"],
+    )
+    self.assertEqual(plugin._resolve_target_serving_name("fast-alias"), "LLAMA_CPP_LLAMA_1B")  # pylint: disable=protected-access
+    self.assertEqual(plugin._resolve_target_serving_name("second-alias"), "LLAMA_CPP_LLAMA_3B")  # pylint: disable=protected-access
+    self.assertTrue(plugin._can_execute_request({"parameters": {"model": "quality-alias"}}))  # pylint: disable=protected-access
+
+  def test_alias_mapping_works_on_single_engine_and_warns_on_unknown_engine(self):
+    plugin = self._make_plugin(
+      AI_ENGINE="llama_cpp_medium",
+      SERVED_MODELS={"llama_cpp_medium": ["public-alias"], "llama_cpp_large": ["orphan-alias"]},
+    )
+    warnings = []
+    plugin.P = lambda message, *args, **kwargs: warnings.append(str(message))
+
+    self.assertEqual(plugin._resolve_target_serving_name("public-alias"), "LLAMA_CPP_LLAMA_3B")  # pylint: disable=protected-access
+    self.assertIsNone(plugin._resolve_target_serving_name("orphan-alias"))  # pylint: disable=protected-access
+    plugin._get_local_model_ids()  # pylint: disable=protected-access
+    self.assertEqual(len([m for m in warnings if "llama_cpp_large" in m]), 1)
+
   def test_duplicate_model_ids_resolve_to_first_engine_and_warn(self):
     plugin = self._make_plugin(
       AI_ENGINE=["llama_cpp_small", "llama_cpp_medium"],
@@ -281,6 +308,17 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(plugin._resolve_target_serving_name("org/medium"), "LLAMA_CPP_LLAMA_3B")  # pylint: disable=protected-access
     self.assertIsNone(plugin._resolve_target_serving_name("ambiguous-alias"))  # pylint: disable=protected-access
     self.assertFalse(plugin._can_execute_request({"parameters": {"model": "ambiguous-alias"}}))  # pylint: disable=protected-access
+
+  def test_plain_alias_list_on_multi_engine_instance_warns_with_mapping_hint(self):
+    plugin = self._make_plugin(AI_ENGINE=["llama_cpp_small", "llama_cpp_medium"], SERVED_MODELS=["ambiguous-alias"])
+    warnings = []
+    plugin.P = lambda message, *args, **kwargs: warnings.append(str(message))
+
+    plugin._get_local_model_ids()  # pylint: disable=protected-access
+    plugin._get_local_model_ids()  # pylint: disable=protected-access
+
+    hints = [m for m in warnings if "{engine_name: [aliases]}" in m]
+    self.assertEqual(len(hints), 1)
 
   def test_filter_valid_inference_accepts_lowercase_request_id(self):
     plugin = LLMInferenceApiPlugin()

@@ -40,10 +40,11 @@ worker. The worker resolves that key to the serving process that owns it (the AI
 from `STARTUP_AI_ENGINE_PARAMS`, or a `SERVED_MODELS` alias) and tags the bus request with that
 serving name; a request whose key resolves to no local serving is rejected before dispatch instead of
 waiting for the request timeout. Matching is exact and case-sensitive on both the local and the peer
-path. `SERVED_MODELS` aliases apply to single-engine `LLM_INFERENCE_API` instances only; on an
-instance running several engines they are ignored with a warning, and a model must be requested by
-its engine name or an id from that engine's `STARTUP_AI_ENGINE_PARAMS`. Each LLM serving accepts a
-tagged packet only when the tag is its own serving name. Untagged legacy packets retain the historical broadcast behavior, but a targeted
+path. `SERVED_MODELS` is either a plain list of aliases, which belongs to the instance's single
+engine, or a mapping `{"engine_name": ["alias", ...]}` that names the engine explicitly. An
+instance running several engines must use the mapping form; a plain list there is ignored with a
+warning that says so. Each LLM serving accepts a tagged packet only when the tag is its own serving
+name. Untagged legacy packets retain the historical broadcast behavior, but a targeted
 completion can never be overwritten by another model in the shared pipeline.
 
 ## Hub-backed model contract
