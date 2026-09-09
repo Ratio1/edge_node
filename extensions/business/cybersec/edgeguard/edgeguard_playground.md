@@ -73,6 +73,9 @@ profile, public key, artifact, instance, and semaphore instead of repointing `ba
 - `POST /check_cypher` remains available as a standalone deterministic validator.
 - `POST /neo4j_test` and `POST /neo4j_query` use either the complete API default connection or a
   complete request override. Fields are never merged between those sources.
+- `POST /neo4j_query` returns the operator's complete `rows` by design, including properties such
+  as `raw_data` or credential-shaped keys that the graph packet drops. Forbidden-key redaction
+  applies to the `graph` packet and to every model-bound evidence path, never to the analyst's table.
 - `POST /prepare_graph_explanation` remains a credential-free planning/diagnostic endpoint.
 - `POST /explain_graph` owns Neo4j execution when no execution evidence is supplied, then runs the
   restored EEL/1 + JSON-CB/1 map/reduce explanation contract. Compatibility evidence mode remains supported

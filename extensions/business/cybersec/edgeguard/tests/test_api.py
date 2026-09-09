@@ -1718,6 +1718,36 @@ class EdgeGuardApiTests(unittest.TestCase):
       },
     )
 
+  def test_neo4j_query_returns_complete_rows_by_design(self):
+    """Rows are the operator's table view and stay complete; redaction applies to
+    the graph packet and to model-bound evidence only (PR #477 review, F1 decision)."""
+    plugin = _make_api()
+    node = _GraphNode(
+      "indicator-1",
+      ["Indicator"],
+      {"value": "example.org", "password": "sentinel-password", "raw_data": "sentinel-raw"},
+    )
+    record = _DriverRecord({"i": node}, {"i": dict(node.items())})
+    fake_driver, _session = _driver_with_results(_Result([record], keys=["i"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator) RETURN i LIMIT 10",
+        )
+
+    self.assertTrue(result["executed"])
+    row_properties = dict(result["rows"][0]["i"].items())
+    self.assertEqual(row_properties["password"], "sentinel-password")
+    self.assertEqual(row_properties["raw_data"], "sentinel-raw")
+    graph_properties = result["graph"]["nodes"][0]["properties"]
+    self.assertEqual(graph_properties, {"value": "example.org"})
+    self.assertNotIn("sentinel", json.dumps(result["graph"]))
+
   def test_neo4j_query_broadens_empty_result_once(self):
     plugin = _make_api()
     fake_record = MagicMock()
