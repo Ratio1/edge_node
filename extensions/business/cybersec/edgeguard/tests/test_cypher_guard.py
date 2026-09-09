@@ -346,6 +346,55 @@ class EdgeGuardExecutionSafetyTests(unittest.TestCase):
       with self.subTest(cypher=cypher):
         self.assert_rejected(cypher, "single integer literal", max_limit=100)
 
+  def test_quoted_identifiers_cannot_read_as_clauses(self):
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i AS `rows LIMIT 1`",
+      "explicit positive LIMIT",
+      max_limit=100,
+    )
+    self.assert_rejected(
+      "MATCH (i:Indicator) RETURN i AS `x` LIMIT 1000 AS `LIMIT 1`",
+      "single integer literal",
+      max_limit=100,
+    )
+    accepted = self._analysis("MATCH (i:Indicator) RETURN i.value AS `my value` LIMIT 5", max_limit=100)
+    self.assertTrue(accepted["accepted"], accepted["validation_feedback"])
+    quoted_label = self._analysis("MATCH (i:`Not Allowed`) RETURN i.value AS v LIMIT 5", max_limit=100)
+    self.assertFalse(quoted_label["accepted"])
+
+  def test_label_expressions_check_every_identifier(self):
+    cases = [
+      "MATCH (i:Indicator|ReviewPrivate) RETURN i LIMIT 5",
+      "MATCH (i:Indicator&ReviewPrivate) RETURN i LIMIT 5",
+      "MATCH (i:Indicator|ReviewPrivate:Malware) RETURN i LIMIT 5",
+      "MATCH (i:Indicator)-[:INDICATES&ReviewPrivate]->(m:Malware) RETURN i LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher, max_limit=100)
+        self.assertFalse(analysis["accepted"], cypher)
+        unknown = analysis["schema_unknown"]
+        self.assertIn("ReviewPrivate", unknown.get("labels", []) + unknown.get("relationship_types", []), cypher)
+    for cypher in (
+      "MATCH (i:Indicator|Malware) RETURN i.value AS v LIMIT 5",
+      "MATCH (i:Indicator)-[:INDICATES|SOURCED_FROM]->(m:Malware) RETURN i.value AS v LIMIT 5",
+    ):
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher, max_limit=100)
+        self.assertTrue(analysis["accepted"], f"{cypher!r}: {analysis['validation_feedback']}")
+
+  def test_rejects_negated_wildcard_and_grouped_label_expressions(self):
+    cases = [
+      "MATCH (i:!Indicator) RETURN i LIMIT 5",
+      "MATCH (i:%) RETURN i LIMIT 5",
+      "MATCH (i:(Indicator|Malware)) RETURN i LIMIT 5",
+      "MATCH (i:Indicator|!Malware) RETURN i LIMIT 5",
+      "MATCH (i:Indicator)-[:!INDICATES]->(m:Malware) RETURN i LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        self.assert_rejected(cypher, "negation, wildcard or grouping", max_limit=100)
+
   def test_negative_controls_stay_accepted(self):
     cases = [
       "MATCH (i:Indicator) RETURN i.name AS name LIMIT 5",

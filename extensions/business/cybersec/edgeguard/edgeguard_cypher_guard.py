@@ -200,10 +200,15 @@ PARAM_REF = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 # Every label in a node pattern's chain: after `(` (anonymous node) or after a
 # variable that is not preceded by `[` or a word character, so `[r:REL]`,
 # `[r :REL]` and `[:A|B]` never match.
+# The chain may be a Neo4j 5 label expression: `:A:B`, `:A|B`, `:A&B` and mixes.
+# Every identifier in it is checked. Negation, wildcard and grouping are
+# rejected separately (LABEL_EXPRESSION_UNSAFE) because they widen the match.
+IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 LABEL_CHAIN = re.compile(
-  r"(?:(?<=\()|(?<![\[\w])[A-Za-z_][A-Za-z0-9_]*)\s*((?::\s*(?:" + TOKEN + r")\s*)+)"
+  r"(?:(?<=\()|(?<![\[\w])" + IDENT + r")\s*(:\s*" + IDENT + r"(?:\s*[|&:]\s*" + IDENT + r")*)"
 )
-REL_TYPE_REF = re.compile(r"\[[^\]]*:\s*(" + TOKEN + r"(?:\s*\|\s*" + TOKEN + r")*)[^\]]*\]")
+REL_TYPE_REF = re.compile(r"\[[^\]]*:\s*(" + IDENT + r"(?:\s*[|&]\s*" + IDENT + r")*)[^\]]*\]")
+LABEL_EXPRESSION_UNSAFE = re.compile(r":\s*[!%(]|[|&]\s*[!%(]")
 # Property access with a variable or a parenthesised expression on the left,
 # so `(i).private` is seen; bracket indexing is rejected separately.
 PROPERTY_ACCESS = re.compile(r"(?:\b[A-Za-z_][A-Za-z0-9_]*|\))\s*\.\s*(" + TOKEN + r")(?!\s*\()")
@@ -211,6 +216,11 @@ SCHEMA_TOKEN = re.compile(TOKEN)
 MAP_KEY = re.compile(r"(?<=[{,])\s*(" + TOKEN + r")\s*:")
 PROCEDURE_CALL = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\(")
 CYPHER_STRING_LITERAL = re.compile(r"'(?:\\.|''|[^'])*'|\"(?:\\.|\"\"|[^\"])*\"")
+# A backtick-quoted identifier is opaque text. For analysis it becomes its
+# content when that is a plain identifier, otherwise a placeholder, so quoted
+# text can never read as a clause (`AS \`rows LIMIT 1\``) or hide a name.
+QUOTED_IDENTIFIER = re.compile(r"`((?:``|[^`])+)`")
+QUOTED_PLACEHOLDER = "quoted_identifier__"
 # Comments are rejected outright (checked on literal-stripped text): they can
 # hide or fake a LIMIT and the prompt contract forbids them anyway.
 CYPHER_COMMENT = re.compile(r"//|/\*")
@@ -293,10 +303,15 @@ def normalize_schema_token(token: str) -> str:
   return token
 
 
+def _unquote_identifier(match: re.Match[str]) -> str:
+  content = match.group(1).replace("``", "`")
+  return content if re.fullmatch(IDENT, content) else QUOTED_PLACEHOLDER
+
+
 def _analysis_text(cypher: str) -> str:
-  """Analysis-only view of a query: string literals become '' and backticks are
-  removed so quoting cannot hide an identifier. Never returned or executed."""
-  return CYPHER_STRING_LITERAL.sub("''", str(cypher or "")).replace("`", "")
+  """Analysis-only view of a query: string literals become '' and quoted
+  identifiers become plain identifiers or a placeholder. Never returned or executed."""
+  return QUOTED_IDENTIFIER.sub(_unquote_identifier, CYPHER_STRING_LITERAL.sub("''", str(cypher or "")))
 
 
 def _match_tokens(match: re.Match[str]) -> list[str]:
@@ -498,6 +513,8 @@ def _execution_safety_error(
   stripped = _analysis_text(candidate)
   if CYPHER_COMMENT.search(stripped):
     return "comments are not allowed"
+  if LABEL_EXPRESSION_UNSAFE.search(stripped):
+    return "label expressions with negation, wildcard or grouping are not allowed"
   if PROPERTIES_PROJECTION.search(stripped):
     return "properties() projection is not allowed"
   if WILDCARD_PROJECTION.search(stripped):

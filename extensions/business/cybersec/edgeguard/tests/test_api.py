@@ -462,6 +462,12 @@ def _draft_for_packet(packet):
   return draft
 
 
+def _run_text(call):
+  """Cypher text passed to session.run, whether wrapped in neo4j.Query or not."""
+  query = call.args[0]
+  return getattr(query, "text", query)
+
+
 def _driver_with_results(*results):
   fake_session = MagicMock()
   fake_session.__enter__.return_value = fake_session
@@ -1654,7 +1660,8 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["rows"], [{"value": "1.2.3.4"}])
     self.assertFalse(result["live_retry"]["attempted"])
     mocked_driver.assert_called_once()
-    fake_session.run.assert_called_once_with("MATCH (i:Indicator) RETURN i.value AS value LIMIT 10")
+    self.assertEqual(fake_session.run.call_count, 1)
+    self.assertEqual(_run_text(fake_session.run.call_args), "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10")
     fake_driver.close.assert_called_once()
 
   def test_neo4j_query_projects_returned_path_into_ui_graph(self):
@@ -1781,7 +1788,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     )
     self.assertEqual(fake_session.run.call_count, 2)
     self.assertEqual(
-      fake_session.run.call_args_list[1].args[0],
+      _run_text(fake_session.run.call_args_list[1]),
       "MATCH p=(n:Indicator)-[:INDICATES]-() RETURN p LIMIT 5",
     )
 
@@ -1809,8 +1816,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["rows"], [])
     self.assertFalse(result["live_retry"]["enabled"])
     self.assertFalse(result["live_retry"]["attempted"])
-    fake_session.run.assert_called_once_with(
-      "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10"
+    self.assertEqual(fake_session.run.call_count, 1)
+    self.assertEqual(
+      _run_text(fake_session.run.call_args),
+      "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
     )
 
   def test_neo4j_query_returns_structured_error_when_driver_fails(self):
@@ -1889,7 +1898,8 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["packet"]["executed_cypher"].endswith("LIMIT 10"))
     self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 1)
     self.assertTrue(result["result_digest"]["coverage"]["complete"])
-    fake_session.run.assert_called_once_with("MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10")
+    self.assertEqual(fake_session.run.call_count, 1)
+    self.assertEqual(_run_text(fake_session.run.call_args), "MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10")
     call_payload = captured_payloads[0]
     self.assertEqual(call_payload["model"], "base_qwen3_4b")
     self.assertEqual(call_payload["temperature"], 0.1)
@@ -3370,7 +3380,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertTrue(result["live_retry"]["applied"])
     self.assertEqual(fake_session.run.call_count, 2)
     self.assertEqual(
-      fake_session.run.call_args_list[1].args[0],
+      _run_text(fake_session.run.call_args_list[1]),
       "MATCH p=(n:Indicator)-[:SOURCED_FROM]-() RETURN p LIMIT 25",
     )
 
