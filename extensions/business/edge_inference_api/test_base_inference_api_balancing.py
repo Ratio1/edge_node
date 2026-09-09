@@ -278,6 +278,26 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertTrue(plugin._serving_ready())
     self.assertEqual(seen, [("llama_cpp_gguf", "worker-a")])
 
+  def test_serving_handles_follow_orchestrator_rules(self):
+    plugin = self._make_plugin()
+    plugin.get_serving_process_given_ai_engine = lambda handle: handle
+    cases = [
+      # list AI_ENGINE with a flat block: the orchestrator does not flatten, so no instance id
+      (["llama_cpp_gguf"], {"MODEL_INSTANCE_ID": "private-model"}, ["llama_cpp_gguf"]),
+      # string AI_ENGINE with the block keyed in upper case: exact lowercase key required, so flat
+      ("llama_cpp_gguf", {"LLAMA_CPP_GGUF": {"MODEL_INSTANCE_ID": "private-model"}}, ["llama_cpp_gguf"]),
+      # instance id is used verbatim, trailing space included
+      ("LLAMA_CPP_GGUF", {"MODEL_INSTANCE_ID": "private-model "}, [("llama_cpp_gguf", "private-model ")]),
+      # list AI_ENGINE keyed per engine
+      (["llama_cpp_gguf", "cybersec_qwen_4b"], {"llama_cpp_gguf": {"MODEL_INSTANCE_ID": "a"}},
+       [("llama_cpp_gguf", "a"), "cybersec_qwen_4b"]),
+    ]
+    for ai_engine, startup_params, expected in cases:
+      with self.subTest(ai_engine=ai_engine, startup_params=startup_params):
+        plugin.cfg_ai_engine = ai_engine
+        plugin.cfg_startup_ai_engine_params = startup_params
+        self.assertEqual(plugin._serving_handles(), expected)
+
   def _make_plugin(self, **kwargs):
     plugin = BaseInferenceApiPlugin(**kwargs)
     plugin.on_init()

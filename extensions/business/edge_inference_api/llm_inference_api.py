@@ -86,6 +86,12 @@ Example pipeline configuration:
 """
 
 from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
+from extensions.business.edge_inference_api.serving_handles import (
+  configured_engines,
+  serving_handle,
+  serving_name,
+  startup_params_for_engine,
+)
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -113,22 +119,6 @@ class LLMInferenceApiPlugin(BasePlugin):
   CONFIG = _CONFIG
 
   @staticmethod
-  def _startup_params_for_engine(engine, startup_params, engine_count):
-    """Return the STARTUP_AI_ENGINE_PARAMS block that applies to one engine.
-
-    A single-engine instance may author the block flat; a multi-engine instance
-    keys one block per engine name.
-    """
-    if not isinstance(startup_params, dict):
-      return {}
-    for key, value in startup_params.items():
-      if isinstance(key, str) and key.strip().lower() == engine.lower() and isinstance(value, dict):
-        return value
-    if engine_count == 1:
-      return startup_params
-    return {}
-
-  @staticmethod
   def _model_ids_from_params(params):
     """Collect model identifiers declared in an engine's startup params."""
     model_ids = set()
@@ -146,25 +136,21 @@ class LLMInferenceApiPlugin(BasePlugin):
           model_ids.add(value.rstrip('/').rsplit('/', 1)[-1])
     return model_ids
 
-  def _serving_name_for_engine(self, engine, params):
-    """Return the serving-manager name of the process that runs ``engine``.
-
-    This mirrors how the orchestrator names servings: the AI engine resolves to
-    its SERVING_PROCESS, suffixed with MODEL_INSTANCE_ID when the pipeline
-    declares one. LLM servings compare this against their own ``server_name``.
-    """
-    instance_id = params.get('MODEL_INSTANCE_ID') if isinstance(params, dict) else None
-    handle = engine if not (isinstance(instance_id, str) and instance_id.strip()) else (engine, instance_id.strip())
+  def _serving_name_for_engine(self, engine):
+    """The serving-manager name of the process that runs ``engine``, derived
+    with the orchestrator's rules so LLM servings can match it against their
+    own ``server_name``."""
+    handle = serving_handle(
+      getattr(self, 'cfg_ai_engine', None), engine, getattr(self, 'cfg_startup_ai_engine_params', None),
+    )
     resolver = getattr(self, 'get_serving_process_given_ai_engine', None)
-    serving = handle
+    resolved = handle
     if callable(resolver):
       try:
-        serving = resolver(handle)
+        resolved = resolver(handle)
       except Exception:
-        serving = handle
-    if isinstance(serving, (list, tuple)):
-      return '_'.join(str(part).upper() for part in serving)
-    return str(serving).upper()
+        resolved = handle
+    return serving_name(resolved)
 
   def _get_local_engine_routes(self):
     """Return one route per configured AI engine.
@@ -176,22 +162,16 @@ class LLMInferenceApiPlugin(BasePlugin):
     single engine) or a mapping ``{engine_name: [aliases]}`` that names the
     engine explicitly, which is required on a multi-engine instance.
     """
-    engines = getattr(self, 'cfg_ai_engine', None)
-    if isinstance(engines, str):
-      engines = [engines]
-    if not isinstance(engines, (list, tuple, set)):
-      engines = []
-    engines = [str(value).strip() for value in engines if isinstance(value, str) and value.strip()]
-    startup_params = getattr(self, 'cfg_startup_ai_engine_params', {})
-
+    ai_engine = getattr(self, 'cfg_ai_engine', None)
+    startup_params = getattr(self, 'cfg_startup_ai_engine_params', None)
     routes = []
-    for engine in engines:
-      params = self._startup_params_for_engine(engine, startup_params, len(engines))
+    for engine in configured_engines(ai_engine):
+      params = startup_params_for_engine(ai_engine, engine, startup_params)
       model_ids = {engine}
       model_ids.update(self._model_ids_from_params(params))
       routes.append({
         'engine': engine,
-        'serving_name': self._serving_name_for_engine(engine, params),
+        'serving_name': self._serving_name_for_engine(engine),
         'model_ids': model_ids,
       })
 

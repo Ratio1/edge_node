@@ -284,6 +284,16 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(len(ambiguous), 1)
     self.assertIn("first configured engine", ambiguous[0])
 
+  def test_routing_tag_matches_orchestrator_naming_for_flat_params_on_list_engine(self):
+    plugin = self._make_plugin(
+      AI_ENGINE=["llama_cpp_medium"],
+      STARTUP_AI_ENGINE_PARAMS={"MODEL_INSTANCE_ID": "worker-a", "MODEL_NAME": "org/private"},
+    )
+
+    # a flat block under a list AI_ENGINE is not the engine's block, so no instance suffix
+    self.assertEqual(plugin._resolve_target_serving_name("llama_cpp_medium"), "LLAMA_CPP_LLAMA_3B")  # pylint: disable=protected-access
+    self.assertIsNone(plugin._resolve_target_serving_name("worker-a"))  # pylint: disable=protected-access
+
   def test_unroutable_model_is_neither_advertised_nor_executable(self):
     plugin = self._make_plugin(AI_ENGINE="llama_cpp_medium", SERVED_MODELS=["public-alias"])
 

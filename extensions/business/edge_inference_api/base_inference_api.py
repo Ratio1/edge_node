@@ -101,6 +101,7 @@ Example balanced peer configuration (Node B):
 }
 """
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
+from extensions.business.edge_inference_api.serving_handles import configured_engines, serving_handle
 from extensions.business.mixins.base_agent_mixin import _BaseAgentMixin, BASE_AGENT_MIXIN_CONFIG
 
 from typing import Any, Dict, List, Optional
@@ -191,34 +192,18 @@ class BaseInferenceApiPlugin(
       return False
 
   def _serving_handles(self):
-    """Serving-manager handles for this plugin's engines.
-
-    Mirrors how the orchestrator names servings: an engine whose startup params
-    declare MODEL_INSTANCE_ID runs as the `(engine, instance)` handle, so the
-    plain engine name would never report available for it.
-    """
-    engines = getattr(self, "cfg_ai_engine", None)
-    if isinstance(engines, str):
-      engines = [engines]
+    """Serving-manager handles for this plugin's engines, resolved to serving
+    process names. Derived with the orchestrator's exact rules (see
+    serving_handles.py) so an engine that runs under a MODEL_INSTANCE_ID is
+    checked under its real name."""
+    ai_engine = getattr(self, "cfg_ai_engine", None)
     resolver = getattr(self, "get_serving_process_given_ai_engine", None)
-    if not isinstance(engines, (list, tuple)) or not callable(resolver):
+    engines = configured_engines(ai_engine)
+    if not engines or not callable(resolver):
       get_processes = getattr(self, "get_serving_processes", None)
       return list(get_processes()) if callable(get_processes) else []
-    engines = [engine for engine in engines if isinstance(engine, str) and engine.strip()]
     startup_params = getattr(self, "cfg_startup_ai_engine_params", None)
-    if not isinstance(startup_params, dict):
-      startup_params = {}
-    handles = []
-    for engine in engines:
-      params = next(
-        (value for key, value in startup_params.items()
-         if isinstance(key, str) and key.lower() == engine.lower() and isinstance(value, dict)),
-        startup_params if len(engines) == 1 else {},
-      )
-      instance_id = params.get("MODEL_INSTANCE_ID")
-      handle = (engine, instance_id.strip()) if isinstance(instance_id, str) and instance_id.strip() else engine
-      handles.append(resolver(handle))
-    return handles
+    return [resolver(serving_handle(ai_engine, engine, startup_params)) for engine in engines]
 
   @staticmethod
   def balanced_endpoint(func):
