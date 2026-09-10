@@ -50,12 +50,9 @@ def _valid_id(value):
   return isinstance(value, str) and bool(value.strip())
 
 
-def _valid_context(actor, tenant):
+def _valid_actor(actor):
   if (not isinstance(actor, AccountView) or actor.active is not True
       or not actor.account_id or canonical_account_id(actor.account_id) != actor.account_id):
-    return False
-  if (not isinstance(tenant, TenantPolicyContext) or not _valid_id(tenant.tenant_id)
-      or tenant.active is not True or type(tenant.allow_pentester) is not bool):
     return False
   if not isinstance(actor.tenant_memberships, tuple):
     return False
@@ -71,6 +68,32 @@ def _valid_context(actor, tenant):
   return True
 
 
+def resolve_tenant_roles(actor, tenant_id):
+  """Scope precheck only: return roles or denial without asserting tenant existence/permission."""
+  if not _valid_actor(actor) or not _valid_id(tenant_id):
+    return frozenset(), PolicyDecision(False, 404, "not_found")
+  roles = frozenset(m.role for m in actor.tenant_memberships
+                    if m.tenant_id == tenant_id or (m.tenant_id is None and m.role in _PLATFORM_ROLES))
+  if not roles:
+    return roles, PolicyDecision(False, 404, "not_found")
+  return roles, None
+
+
+def resolve_operation_roles(actor, operation, tenant):
+  """Role precheck on a real active tenant, not final asset/pentesting authorization."""
+  if (not isinstance(tenant, TenantPolicyContext) or tenant.active is not True
+      or type(tenant.allow_pentester) is not bool):
+    return frozenset(), PolicyDecision(False, 404, "not_found")
+  roles, denial = resolve_tenant_roles(actor, tenant.tenant_id)
+  if denial is not None:
+    return roles, denial
+  eligible = frozenset(role for role in roles if isinstance(operation, str)
+                       and operation in _ROLE_OPERATIONS[role])
+  if not eligible:
+    return eligible, PolicyDecision(False, 403, "forbidden")
+  return eligible, None
+
+
 def authorize_tenant_operation(
   actor: AccountView | None,
   operation: str,
@@ -84,14 +107,9 @@ def authorize_tenant_operation(
   existing/preset asset. Empty/unknown owners deny; never build this tuple from request claims.
   No lifecycle, capability-grant or arbitrary object/CID authorization is provided here.
   """
-  if not _valid_context(actor, tenant):
-    return PolicyDecision(False, 404, "not_found")
-  roles = {m.role for m in actor.tenant_memberships
-           if m.tenant_id == tenant.tenant_id or (m.tenant_id is None and m.role in _PLATFORM_ROLES)}
-  if not roles:
-    return PolicyDecision(False, 404, "not_found")
-  if not isinstance(operation, str) or not any(operation in _ROLE_OPERATIONS[role] for role in roles):
-    return PolicyDecision(False, 403, "forbidden")
+  roles, denial = resolve_operation_roles(actor, operation, tenant)
+  if denial is not None:
+    return denial
   if operation in ("tasks:launch", "tasks:update"):
     if (not isinstance(asset_tenant_ids, tuple) or not asset_tenant_ids
         or any(not _valid_id(owner) or owner != tenant.tenant_id for owner in asset_tenant_ids)):

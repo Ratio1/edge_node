@@ -406,3 +406,18 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
   2,510 tests and 615 subtests, with 3 existing skips and 4 warnings. Focused policy/identity/surface/
   config checks passed 50 tests and 308 subtests. No new token or wallet-signing work.
+
+### 2026-09-10T10:51:53Z
+
+- Change: added read-only `tenancy/ports.py`, `adapters/cstore_tenant.py` and `resolution.py`.
+  Stored identity/scope precedes tenant reads, real active tenant/eligible role precedes asset reads,
+  and final policy alone releases immutable context. No endpoint imports or activates this boundary.
+- Critic: core truncates hkey hashes and can swallow read failures as None. Full namespace/IDs are
+  encoded in field keys and validated in records; surfaced errors yield generic unavailable, while
+  None remains not found. Tests pin hash collisions, corrupt bindings, revoked authority, denial
+  ordering and asset-list mutation. Non-task context never carries unvalidated caller asset IDs.
+  Both independent implementation reviews passed without findings; 57,600 main-thread comparisons
+  to the prior policy matched. No atomic snapshot, writer/publication or deployment binding claimed.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,529 tests and 709 subtests, with 3 existing skips and 4 warnings. Focused resolution/policy/identity/
+  surface/config checks passed 69 tests and 402 subtests. Original policy tests remain unchanged.
