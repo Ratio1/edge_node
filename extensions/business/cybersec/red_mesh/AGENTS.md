@@ -443,3 +443,17 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
   2,561 tests and 769 subtests, with 3 existing skips and 4 warnings. Independent paired review,
   Navigator verification and remaining phase evidence are recorded in the hub RM-026 execution plan.
+
+### 2026-09-10 — Persistent Allow Pentester policy control
+
+- BUILDER: `update_tenant_allow_pentester` reuses stored scoped STA/SP authorization and verified
+  administration writes. Desired-state retries reauthorize but preserve attribution when unchanged.
+  Detail capability hints use the same resolved account as authorization; they are not write authority.
+- CRITIC/response: generated FastAPI request models coerce bool fields, so this endpoint accepts
+  `object` and enforces literal booleans in the service. Signature-derived JSON/Pydantic tests pin
+  this boundary. Preserve tenant/publication fields and latest-change actor/time; uncertain writes
+  or response failures are not rollback. Navigator ignores stale user/tenant mutation completions.
+- Verification: full backend regression passed 2,570 tests and 798 subtests (3 existing skips,
+  4 warnings). Paired reviews and Navigator checks are tracked in the hub RM-026 isolation-first plan.
+  This administration control does not enable tenant-isolated jobs; preset assets, subfleet bindings,
+  launch admission and worker checks remain required. The two existing model-token gates are unchanged.

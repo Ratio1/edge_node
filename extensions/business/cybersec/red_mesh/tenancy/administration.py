@@ -133,6 +133,16 @@ class TenantAdministrationService:
     if (any(tenant.get(key) != value for key, value in expected.items() if key not in ("active", "allow_pentester"))
         or type(tenant.get("active")) is not bool or type(tenant.get("allow_pentester")) is not bool):
       raise TenantStoreError("Tenant receipt binding mismatch")
+    if "allow_pentester_changed_by" in tenant or "allow_pentester_changed_at" in tenant:
+      changed_by = tenant.get("allow_pentester_changed_by")
+      if not changed_by or canonical_account_id(changed_by) != changed_by:
+        raise TenantStoreError("Invalid tenant policy attribution")
+      try:
+        changed_at = datetime.fromisoformat(tenant.get("allow_pentester_changed_at"))
+      except (TypeError, ValueError):
+        raise TenantStoreError("Invalid tenant policy timestamp") from None
+      if changed_at.tzinfo != timezone.utc:
+        raise TenantStoreError("Invalid tenant policy timestamp")
 
   @_endpoint
   def prepare_tenant(self, actor, request_id, display_name, domain_id, initial_admin_id):
@@ -182,7 +192,7 @@ class TenantAdministrationService:
         raise AdministrationDenied(409, "initial_admin_required")
       tenant = {**tenant, "active": True}
       self.store.put("tenant", receipt["tenant_id"], record=tenant)
-    return self._detail(tenant)
+    return self._detail(tenant, creator)
 
   def _authorized_tenant(self, actor, tenant_id, operation="reports:view"):
     account = self._actor(actor)
@@ -197,7 +207,7 @@ class TenantAdministrationService:
       tenant_id, tenant["active"], tenant["allow_pentester"]))
     if not decision.allowed:
       raise AdministrationDenied(decision.status_code, decision.error)
-    return tenant
+    return tenant, account
 
   def _validate_tenant(self, tenant):
     if (not all(isinstance(tenant.get(key), str) and tenant[key].strip()
@@ -236,8 +246,16 @@ class TenantAdministrationService:
             "allowPentester": tenant["allow_pentester"], "createdBy": tenant["created_by"],
             "createdAt": tenant["created_at"], "lastActivityAt": None}
 
-  def _detail(self, tenant):
-    return {**self._row(tenant), "assetCount": self.store.count_assets(tenant["tenant_id"])}
+  def _detail(self, tenant, account):
+    detail = {**self._row(tenant), "assetCount": self.store.count_assets(tenant["tenant_id"]),
+              "canUpdateAllowPentester": authorize_tenant_operation(
+                account, "allow_pentester:update", TenantPolicyContext(
+                  tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed}
+    for stored, public in (("allow_pentester_changed_by", "allowPentesterChangedBy"),
+                           ("allow_pentester_changed_at", "allowPentesterChangedAt")):
+      if stored in tenant:
+        detail[public] = tenant[stored]
+    return detail
 
   @_endpoint
   def list_tenants(self, actor):
@@ -255,7 +273,21 @@ class TenantAdministrationService:
 
   @_endpoint
   def get_tenant(self, actor, tenant_id):
-    return self._detail(self._authorized_tenant(actor, tenant_id))
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    return self._detail(tenant, account)
+
+  @_endpoint
+  def update_tenant_allow_pentester(self, actor, tenant_id, allow_pentester):
+    tenant, account = self._authorized_tenant(actor, tenant_id, "allow_pentester:update")
+    if type(allow_pentester) is not bool:
+      raise AdministrationDenied(400, "invalid_request")
+    if tenant["allow_pentester"] is allow_pentester:
+      return self._detail(tenant, account)
+    tenant = {**tenant, "allow_pentester": allow_pentester,
+              "allow_pentester_changed_by": account.account_id,
+              "allow_pentester_changed_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("tenant", tenant_id, record=tenant)
+    return self._detail(tenant, account)
 
   @_endpoint
   def get_tenant_members(self, actor, tenant_id):

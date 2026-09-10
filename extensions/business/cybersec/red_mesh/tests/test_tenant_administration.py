@@ -85,7 +85,9 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(activated["displayName"], "Example")
     self.assertFalse(activated["allowPentester"])
     self.assertEqual((activated["memberCount"], activated["adminCount"], activated["assetCount"]), (1, 1, 0))
-    self.assertEqual(self.service.get_tenant({"account_id": "initial"}, tenant_id)["data"], activated)
+    self.assertTrue(activated["canUpdateAllowPentester"])
+    self.assertEqual(self.service.get_tenant({"account_id": "initial"}, tenant_id)["data"],
+                     {**activated, "canUpdateAllowPentester": False})
     self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).active)
 
   def test_matching_pending_retry_resumes_but_changed_intent_never_writes(self):
@@ -95,6 +97,143 @@ class TestTenantAdministration(unittest.TestCase):
       before = len(self.store.writes)
       self.assertEqual(self.prepare(**changes)["status_code"], 409)
       self.assertEqual(len(self.store.writes), before)
+
+  def test_allow_pentester_desired_state_is_persistent_and_attributed(self):
+    tenant_id = self.create()["tenantId"]
+    before = self.repo.get("tenant", tenant_id)
+    before["retention_policy"] = {"future_extension": "preserve"}
+    self.repo.put("tenant", tenant_id, record=before)
+    result = self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)
+    self.assertTrue(result["success"], result)
+    self.assertTrue(result["data"]["allowPentester"])
+    self.assertTrue(result["data"]["canUpdateAllowPentester"])
+    self.assertEqual(result["data"]["allowPentesterChangedBy"], "creator")
+    self.assertTrue(result["data"]["allowPentesterChangedAt"])
+    self.assertEqual(self.service.get_tenant(self.actor, tenant_id)["data"], result["data"])
+    self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).allow_pentester)
+    stored = self.repo.get("tenant", tenant_id)
+    for field, value in before.items():
+      if field != "allow_pentester":
+        self.assertEqual(stored[field], value, field)
+    self.assertFalse(self.service.update_tenant_allow_pentester(self.actor, tenant_id, False)["data"]["allowPentester"])
+
+  def test_allow_pentester_same_value_reauthorizes_without_rewriting_attribution(self):
+    tenant_id = self.create()["tenantId"]
+    before = len(self.store.writes)
+    unchanged = self.service.update_tenant_allow_pentester(self.actor, tenant_id, False)
+    self.assertTrue(unchanged["success"])
+    self.assertNotIn("allowPentesterChangedBy", unchanged["data"])
+    self.assertEqual(len(self.store.writes), before)
+    changed = self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)
+    self.store.account("second", memberships=[{"role": "super_pentester", "tenant_id": tenant_id}])
+    before = len(self.store.writes)
+    retried = self.service.update_tenant_allow_pentester({"account_id": "second"}, tenant_id, True)
+    self.assertEqual(retried["data"], changed["data"])
+    self.assertEqual(len(self.store.writes), before)
+    self.store.account("second", role="admin", memberships=[])
+    self.assertEqual(self.service.update_tenant_allow_pentester(
+      {"account_id": "second", "role": "super_tenant_admin"}, tenant_id, True)["status_code"], 404)
+    self.assertEqual(len(self.store.writes), before)
+
+  def test_allow_pentester_uses_only_current_in_scope_platform_roles(self):
+    tenant_id = self.create()["tenantId"]
+    for role, scope, status in (("super_tenant_admin", tenant_id, 200),
+                                ("super_pentester", tenant_id, 200),
+                                ("super_pentester", None, 200),
+                                ("super_tenant_admin", "foreign", 404),
+                                ("super_pentester", "foreign", 404),
+                                ("tenant_admin", tenant_id, 403),
+                                ("tenant_pentester", tenant_id, 403),
+                                ("tenant_user", tenant_id, 403)):
+      with self.subTest(role=role, scope=scope):
+        self.store.account("operator", role="admin", memberships=[{"role": role, "tenant_id": scope}])
+        actor = {"account_id": "operator", "role": "super_tenant_admin", "tenant_id": tenant_id}
+        before = len(self.store.writes)
+        result = self.service.update_tenant_allow_pentester(actor, tenant_id, True)
+        self.assertEqual(result["status_code"], status)
+        read = self.service.get_tenant(actor, tenant_id)
+        if status == 404:
+          self.assertEqual(read["status_code"], 404)
+        else:
+          self.assertIs(read["data"]["canUpdateAllowPentester"], status == 200)
+        if status != 200:
+          self.assertEqual(len(self.store.writes), before)
+    self.store.account("operator", memberships=[{"role": "super_pentester", "tenant_id": tenant_id}], active=False)
+    self.assertEqual(self.service.update_tenant_allow_pentester(
+      {"account_id": "operator"}, tenant_id, True)["status_code"], 404)
+
+  def test_allow_pentester_unconfirmed_writes_can_be_retried_without_false_success(self):
+    tenant_id = self.create()["tenantId"]
+    for noop, fail_after in ((True, False), (False, False), (False, True)):
+      with self.subTest(noop=noop, fail_after=fail_after):
+        self.store.noop = False
+        self.store.fail_write = None
+        self.service.update_tenant_allow_pentester(self.actor, tenant_id, False)
+        self.store.noop = noop
+        self.store.fail_write = None if noop else len(self.store.writes) + 1
+        self.store.fail_after_write = fail_after
+        result = self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)
+        self.assertEqual(result, {"success": False, "status": "error", "status_code": 503, "error": "unavailable"})
+        self.store.noop = False
+        self.store.fail_write = None
+        self.assertTrue(self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)["success"])
+
+  def test_allow_pentester_corrupt_latest_change_metadata_denies_reads_and_writes(self):
+    tenant_id = self.create()["tenantId"]
+    original = self.repo.get("tenant", tenant_id)
+    for metadata in ({"allow_pentester_changed_by": "creator"},
+                     {"allow_pentester_changed_at": "2026-09-10T00:00:00+00:00"},
+                     {"allow_pentester_changed_by": {}, "allow_pentester_changed_at": "private-value"},
+                     {"allow_pentester_changed_by": " Creator ", "allow_pentester_changed_at": "2026-09-10"},
+                     {"allow_pentester_changed_by": "creator", "allow_pentester_changed_at": "not-a-time"}):
+      with self.subTest(metadata=metadata):
+        self.repo.put("tenant", tenant_id, record={**original, **metadata})
+        before = len(self.store.writes)
+        self.assertEqual(self.service.get_tenant(self.actor, tenant_id)["status_code"], 503)
+        self.assertEqual(self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)["status_code"], 503)
+        self.assertEqual(len(self.store.writes), before)
+
+  def test_allow_pentester_requires_published_tenant_and_readable_identity(self):
+    prepared = self.prepare()["data"]
+    before = len(self.store.writes)
+    for tenant_id in (prepared["tenantId"], "missing"):
+      self.assertEqual(self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)["status_code"], 404)
+    self.assertEqual(len(self.store.writes), before)
+    self.store.grant("initial", prepared["tenantId"])
+    self.service.activate_tenant(self.actor, self.request)
+    before = len(self.store.writes)
+    with patch.object(self.store, "chainstore_hget", side_effect=RuntimeError("private")):
+      self.assertEqual(self.service.update_tenant_allow_pentester(self.actor, prepared["tenantId"], True),
+                       {"success": False, "status": "error", "status_code": 503, "error": "unavailable"})
+    self.assertEqual(len(self.store.writes), before)
+    # Loss of a publication binding may not be repaired by a policy write.
+    del self.store.data[self.repo._location("domain", ("example",))]
+    self.assertEqual(self.service.update_tenant_allow_pentester(self.actor, prepared["tenantId"], True)["status_code"], 503)
+    self.assertEqual(len(self.store.writes), before)
+
+  def test_allow_pentester_response_failure_is_unconfirmed_not_rollback(self):
+    tenant_id = self.create()["tenantId"]
+    with patch.object(self.store, "chainstore_hgetall", side_effect=RuntimeError("private")):
+      result = self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)
+    self.assertEqual(result, {"success": False, "status": "error", "status_code": 503, "error": "unavailable"})
+    before = len(self.store.writes)
+    observed = self.service.get_tenant(self.actor, tenant_id)["data"]
+    self.assertTrue(observed["allowPentester"])
+    self.assertEqual(self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)["data"], observed)
+    self.assertEqual(len(self.store.writes), before)
+
+  def test_allow_pentester_view_depends_on_shared_facts_not_serving_node(self):
+    tenant_id = self.create()["tenantId"]
+    other_node = FakeAdministrationStore()
+    other_node.data = self.store.data
+    other_node.ee_addr = "serving-node-outside-tenant"
+    other_service = TenantAdministrationService(CstoreAuthAccountReader(other_node),
+                                               CstoreTenantAdministrationStore(other_node, "test-deployment"))
+    changed = self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)
+    self.assertEqual(other_service.get_tenant(self.actor, tenant_id)["data"], changed["data"])
+    self.store.account("creator", role="admin", memberships=[])
+    self.assertEqual(other_service.get_tenant(self.actor, tenant_id)["status_code"], 404)
+    self.assertEqual(other_service.update_tenant_allow_pentester(self.actor, tenant_id, True)["status_code"], 404)
 
   def test_completed_retry_does_not_require_or_restore_initial_admin(self):
     tenant = self.create()
@@ -295,10 +434,41 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     cls.Plugin = PentesterApi01Plugin
 
+  def test_allow_pentester_request_model_preserves_json_types_before_authorization(self):
+    import inspect
+    from pydantic import create_model
+
+    store = FakeAdministrationStore()
+    plugin = object.__new__(self.Plugin)
+    plugin.cfg_tenant_administration_enabled, plugin.cfg_tenancy_namespace = True, "deployment"
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+      setattr(plugin, name, getattr(store, name))
+    # The core's FastAPI template copies these real signature fields into a Pydantic model.
+    fields = {param.name: (param.annotation, param.default) for param in
+              inspect.signature(plugin.update_tenant_allow_pentester).parameters.values()}
+    RequestModel = create_model("AllowPentesterRequest", **fields)
+    actor = {"account_id": "creator"}
+    request_id = str(uuid4())
+    with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
+      tenant_id = plugin.prepare_tenant(actor, request_id, "Tenant", "tenant", "initial")["data"]["tenantId"]
+      store.grant("initial", tenant_id)
+      plugin.activate_tenant(actor, request_id)
+      for value in (True, False, 0, 1, "true", "false", None, [], {}):
+        with self.subTest(value=value):
+          payload = RequestModel.model_validate_json(json.dumps({
+            "actor": actor, "tenant_id": tenant_id, "allow_pentester": value}))
+          before = len(store.writes)
+          result = plugin.update_tenant_allow_pentester(**payload.model_dump())
+          self.assertEqual(result["status_code"], 200 if type(value) is bool else 400)
+          if type(value) is not bool:
+            self.assertEqual(len(store.writes), before)
+      missing = RequestModel.model_validate_json(json.dumps({"actor": actor, "tenant_id": tenant_id}))
+      self.assertEqual(plugin.update_tenant_allow_pentester(**missing.model_dump())["status_code"], 400)
+
   def test_disabled_or_invalid_config_denies_every_administration_method_before_store_access(self):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
-               "check_tenant_domain", "authorize_tenant_membership")
+               "check_tenant_domain", "authorize_tenant_membership", "update_tenant_allow_pentester")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
     for enabled, namespace in ((False, "deployment"), ("true", "deployment"), (True, None), (True, " ")):
       for name in methods:
