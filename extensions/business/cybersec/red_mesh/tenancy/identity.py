@@ -11,18 +11,26 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class AccountView:
-  """The minimum RM-075 needs about a resolved caller.
+class TenantMembership:
+  """A stored role scoped to one tenant, or an explicit full-portfolio platform role."""
 
-  RM-026 Phase 3 widens this with tenant memberships; until then ``role`` and ``app_role`` are the
-  store fields Navigator writes today (``role`` is ``admin``/``user``; ``app_role`` is
-  ``metadata.appRole``, ``pentester`` or ``None``).
+  role: str
+  tenant_id: str | None
+
+
+@dataclass(frozen=True)
+class AccountView:
+  """Resolved caller identity with tenant-bound memberships, not flattened global roles.
+
+  ``role`` and ``app_role`` retain the RM-075 attribution contract. Tenant enforcement must use
+  the membership pairs, not interpret these legacy fields as cross-tenant authorization.
   """
 
   account_id: str
   role: str
   app_role: str | None
   active: bool
+  tenant_memberships: tuple[TenantMembership, ...] = ()
 
   @property
   def created_by(self):

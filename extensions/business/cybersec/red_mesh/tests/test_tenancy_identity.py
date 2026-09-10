@@ -11,6 +11,7 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity impo
 from extensions.business.cybersec.red_mesh.tenancy.identity import (
   AccountView,
   IdentityStoreError,
+  TenantMembership,
   canonical_account_id,
   resolve_actor,
 )
@@ -93,6 +94,19 @@ class TestResolveActor(unittest.TestCase):
 
 
 class TestCstoreAuthAccountReader(unittest.TestCase):
+  def test_memberships_keep_roles_bound_to_their_tenants(self):
+    reader, _ = _reader({"a1": json.dumps(_record(role="admin", metadata={"tenant_memberships": [
+      {"role": "super_tenant_admin", "tenant_id": "tenant-a"},
+      {"role": "tenant_user", "tenant_id": "tenant-b"},
+    ]}))})
+    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+      view, error = resolve_actor({"account_id": "a1", "tenant_id": "other"}, reader)
+    self.assertIsNone(error)
+    self.assertEqual([(m.role, m.tenant_id) for m in view.tenant_memberships], [
+      ("super_tenant_admin", "tenant-a"), ("tenant_user", "tenant-b"),
+    ])
+    self.assertEqual(view.created_by, ("a1", "a1"))
+
   def test_missing_hkey_fails_closed(self):
     reader, store = _reader({"a1": _record()})
     with patch.dict("os.environ", {}, clear=True):
@@ -100,20 +114,95 @@ class TestCstoreAuthAccountReader(unittest.TestCase):
         reader.get_account("a1")
     self.assertEqual(store.calls, [])
 
+  def test_all_normal_membership_roles_preserve_explicit_scope(self):
+    pairs = [
+      ("super_tenant_admin", None), ("super_pentester", None),
+      ("super_tenant_admin", "tenant-a"), ("super_pentester", "tenant-a"),
+      ("tenant_admin", "tenant-a"), ("tenant_pentester", "tenant-a"),
+      ("tenant_user", "tenant-a"),
+    ]
+    for role, tenant_id in pairs:
+      with self.subTest(role=role, tenant_id=tenant_id):
+        reader, _ = _reader({"a1": _record(metadata={"tenant_memberships": [
+          {"role": role, "tenant_id": tenant_id},
+        ]})})
+        with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+          view = reader.get_account("a1")
+        self.assertEqual(view.tenant_memberships, (TenantMembership(role, tenant_id),))
+
+  def test_only_absent_memberships_on_legacy_admin_enable_compatibility(self):
+    reader, _ = _reader({
+      "legacy": _record(role="admin"),
+      "revoked": _record(role="admin", metadata={"tenant_memberships": []}),
+      "ordinary": _record(),
+    })
+    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+      legacy = reader.get_account("legacy")
+      self.assertEqual(reader.get_account("revoked").tenant_memberships, ())
+      self.assertEqual(reader.get_account("ordinary").tenant_memberships, ())
+    self.assertEqual([(m.role, m.tenant_id) for m in legacy.tenant_memberships], [
+      ("super_tenant_admin", None),
+    ])
+
   def test_reads_dict_and_json_string_records(self):
     reader, store = _reader({"a1": _record(role="admin"), "a2": json.dumps(_record(metadata={"appRole": "pentester"}))})
     with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
       a1 = reader.get_account("a1")
       a2 = reader.get_account("a2")
-    self.assertEqual(a1, AccountView("a1", "admin", None, True))
+    self.assertEqual(a1, AccountView("a1", "admin", None, True,
+                                    (TenantMembership("super_tenant_admin", None),)))
     self.assertEqual(a2, AccountView("a2", "user", "pentester", True))
     self.assertEqual(store.calls, [(HKEY, "a1"), (HKEY, "a2")])
+
+  def test_malformed_explicit_memberships_deny_instead_of_restoring_admin(self):
+    valid = {"role": "tenant_user", "tenant_id": "tenant-a"}
+    invalid_values = (
+      None, "admin", {}, 42, [None], [{}],
+      [{"role": "super_tenant_admin"}],
+      [{"tenant_id": "tenant-a"}],
+      [{"role": "unknown", "tenant_id": "tenant-a"}],
+      [{"role": [], "tenant_id": "tenant-a"}],
+      [{"role": "ratio1_deployer", "tenant_id": None}],
+      [{"role": "tenant_user", "tenant_id": None}],
+      [{"role": "tenant_user", "tenant_id": 1}],
+      [{"role": "tenant_user", "tenant_id": "  "}],
+      [valid, {"role": "super_tenant_admin"}],
+    )
+    for memberships in invalid_values:
+      with self.subTest(memberships=memberships):
+        reader, _ = _reader({"a1": _record(role="admin", metadata={
+          "tenant_memberships": memberships,
+        })})
+        with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+          view, error = resolve_actor({"account_id": "a1"}, reader)
+        self.assertIsNone(view)
+        self.assertEqual(error["status_code"], 404)
+        self.assertEqual(error["error_class"], "actor_not_found")
 
   def test_absent_and_tombstoned_are_none(self):
     reader, _ = _reader({"gone": "null"})
     with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
       self.assertIsNone(reader.get_account("missing"))
       self.assertIsNone(reader.get_account("gone"))
+
+  def test_malformed_metadata_is_not_coerced_into_legacy_admin_authority(self):
+    for metadata in (None, [], "{}", True, 0):
+      with self.subTest(metadata=metadata):
+        record = _record(role="admin")
+        record["metadata"] = metadata
+        reader, _ = _reader({"a1": record})
+        with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+          view, error = resolve_actor({"account_id": "a1"}, reader)
+        self.assertIsNone(view)
+        self.assertEqual(error["status_code"], 404)
+
+  def test_absent_metadata_keeps_legacy_compatibility(self):
+    record = _record(role="admin")
+    del record["metadata"]
+    reader, _ = _reader({"a1": record})
+    with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
+      view = reader.get_account("a1")
+    self.assertEqual(view.tenant_memberships, (TenantMembership("super_tenant_admin", None),))
 
   def test_deleting_state_is_not_active(self):
     reader, _ = _reader({"a1": _record(metadata={"navigatorAccountState": "deleting"})})

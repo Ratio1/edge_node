@@ -380,3 +380,15 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: added explicit state-machine retry transitions from `ANALYZING` and `FINALIZING` back to `COLLECTING`; non-launcher nodes continue to skip finalization recovery.
 - Verification: `docker exec rm3 bash -lc 'cd /edge_node && python3 -m unittest extensions.business.cybersec.red_mesh.tests.test_state_machine extensions.business.cybersec.red_mesh.tests.test_api.TestPhase2PassFinalization extensions.business.cybersec.red_mesh.tests.test_api.TestPhase3Archive'` passed with 51 tests.
 - Horizontal insight: launcher-side finalization recovery should re-enter the existing pass aggregation/report/archive path only after worker-owned report artifacts are durable; worker and observer nodes must not mutate launcher-owned finalization state.
+
+### 2026-09-10T09:32:03Z
+
+- Change: RM-026 extends the RM-075 account reader with immutable role/tenant membership pairs;
+  explicit empty memberships never enable legacy admin fallback, and malformed explicit scope or
+  metadata denies the account. No endpoint policy, new token or tenant creation is introduced.
+- Critic: preserve absent versus empty versus malformed scope; do not flatten tenant roles into
+  global roles. Paired review caught Navigator SDK null-metadata normalization; Navigator now checks
+  raw stored metadata and has a real-SDK regression. Both independent reviews pass after correction.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,498 tests and 446 subtests, with 3 existing skips and 4 warnings. Identity/surface/config focused
+  checks passed 38 tests and 139 subtests. Task and paired evidence remain in the hub RM-026 plan.
