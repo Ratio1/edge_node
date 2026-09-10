@@ -468,7 +468,8 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
   def test_disabled_or_invalid_config_denies_every_administration_method_before_store_access(self):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
-               "check_tenant_domain", "authorize_tenant_membership", "update_tenant_allow_pentester")
+               "check_tenant_domain", "authorize_tenant_membership", "update_tenant_allow_pentester",
+               "get_tenant_nodes", "set_tenant_node_assignment")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
     for enabled, namespace in ((False, "deployment"), ("true", "deployment"), (True, None), (True, " ")):
       for name in methods:

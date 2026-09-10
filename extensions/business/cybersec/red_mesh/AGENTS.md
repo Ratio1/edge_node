@@ -457,3 +457,25 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   4 warnings). Paired reviews and Navigator checks are tracked in the hub RM-026 isolation-first plan.
   This administration control does not enable tenant-isolated jobs; preset assets, subfleet bindings,
   launch admission and worker checks remain required. The two existing model-token gates are unchanged.
+
+### 2026-09-10 — Basic persistent tenant-node assignments
+
+- BUILDER: `get_tenant_nodes` and `set_tenant_node_assignment` reuse the gated administration
+  dispatcher and fresh stored tenant publication/identity checks. Reads require `reports:view`;
+  the explicit `node_assignments:manage` operation grants writes only to scoped Super-Tenant Admins.
+  The same resolved account supplies the display hint. Assignments are versioned `tenant_node`
+  records bound to namespace, tenant and exact case-preserving node address, not node aliases.
+- CRITIC/response: activation evaluates deployment peers lazily, after authorization, including
+  unchanged retries; reads, denials and deactivation never evaluate that configuration. Strict
+  object-transport/literal-boolean and Unicode address tests pin cross-language input semantics.
+  Point reads, verified writes and enumeration share assignment validation, including inactive
+  attribution. Filter foreign tenants before physical-key validation; malformed local rows fail
+  closed. Canonical mutations do not scan or repair separate malformed physical rows. Fault fixtures
+  independently encode the documented hash/tuple layout rather than using adapter internals.
+- Same-state retries preserve attribution; changes preserve unknown fields. Uncertain writes can
+  have succeeded and require reconciliation, not assumed rollback. The existing shared hash-wide
+  enumeration cap and owner-accepted CStore consistency limitations still apply. These resource
+  controls do not enable tenant execution or change launch/worker behavior or model-token gates.
+- Verification: focused administration/store/policy/plugin/surface checks passed 81 tests and
+  460 subtests. Full backend regression passed 2,585 tests and 901 subtests, with 3 existing skips
+  and 4 warnings. Paired review and Navigator evidence are tracked in the hub RM-026 execution plan.

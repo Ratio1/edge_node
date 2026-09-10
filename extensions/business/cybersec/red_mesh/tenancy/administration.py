@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from .identity import IdentityStoreError, TenantMembership, canonical_account_id, resolve_actor
 from .policy import TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles
 from .ports import TenantStoreError
+from .nodes import valid_node_address
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -64,9 +65,10 @@ def _domain(value):
 
 
 class TenantAdministrationService:
-  def __init__(self, accounts, store):
+  def __init__(self, accounts, store, configured_peers_reader=None):
     self.accounts = accounts
     self.store = store
+    self.configured_peers_reader = configured_peers_reader
 
   def _actor(self, actor, *, creator=False):
     account, denial = resolve_actor(actor, self.accounts)
@@ -293,6 +295,41 @@ class TenantAdministrationService:
   def get_tenant_members(self, actor, tenant_id):
     self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
     return self._members(tenant_id)
+
+  @_endpoint
+  def get_tenant_nodes(self, actor, tenant_id):
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    assignments = self.store.list_node_assignments(tenant_id)
+    return {"tenantId": tenant_id,
+            "nodes": [{"nodeAddress": row["node_address"]} for row in
+                      sorted(assignments, key=lambda row: row["node_address"]) if row["active"]],
+            "canManageAssignments": authorize_tenant_operation(
+              account, "node_assignments:manage", TenantPolicyContext(
+                tenant_id, tenant["active"], tenant["allow_pentester"])).allowed}
+
+  @_endpoint
+  def set_tenant_node_assignment(self, actor, tenant_id, node_address, active):
+    _, account = self._authorized_tenant(actor, tenant_id, "node_assignments:manage")
+    if not valid_node_address(node_address) or type(active) is not bool:
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("tenant_node", tenant_id, node_address)
+    if active:
+      try:
+        peers = self.configured_peers_reader()
+      except Exception as exc:
+        raise TenantStoreError("Node eligibility is unavailable") from exc
+      if not isinstance(peers, list) or any(not valid_node_address(peer) for peer in peers):
+        raise TenantStoreError("Node eligibility is unavailable")
+      if node_address not in peers:
+        raise AdministrationDenied(400, "ineligible_node")
+    elif row is None:
+      raise AdministrationDenied(404, "not_found")
+    if row is None or row["active"] is not active:
+      row = {**(row or {}), "tenant_id": tenant_id, "node_address": node_address,
+             "active": active, "changed_by": account.account_id,
+             "changed_at": datetime.now(timezone.utc).isoformat()}
+      self.store.put("tenant_node", tenant_id, node_address, record=row)
+    return {"tenantId": tenant_id, "nodeAddress": node_address, "active": active}
 
   @_endpoint
   def check_tenant_domain(self, actor, domain_id):

@@ -5,6 +5,7 @@ Verification is a local read-back, not a distributed transaction or freshness gu
 import json
 
 from ..ports import TenantStoreError
+from ..nodes import validate_node_assignment
 
 MAX_ENUMERATED_RECORDS = 10000
 
@@ -45,6 +46,8 @@ class CstoreTenantAdministrationStore:
         or raw.get("kind") != kind or raw.get("ids") != list(ids)
         or (kind == "tenant" and (len(ids) != 1 or raw.get("tenant_id") != ids[0]))):
       raise TenantStoreError("Invalid tenant storage record")
+    if kind == "tenant_node":
+      validate_node_assignment(raw, ids)
     return raw
 
   def put(self, kind, *ids, record):
@@ -83,7 +86,7 @@ class CstoreTenantAdministrationStore:
       raise TenantStoreError("Tenant storage enumeration is unavailable")
     return records
 
-  def _fields(self, kind):
+  def _fields(self, kind, tenant_id=None):
     for key, raw in self._records().items():
       try:
         field = json.loads(key) if isinstance(key, str) else None
@@ -92,9 +95,16 @@ class CstoreTenantAdministrationStore:
       # A short core hash collision must not expose or corrupt another namespace's rows.
       if (isinstance(field, list) and len(field) >= 3
           and field[:2] == [kind, self._namespace]):
+        if tenant_id is not None and field[2] != tenant_id:
+          continue
         if key != self._location(kind, field[2:])[1]:
           raise TenantStoreError("Invalid tenant storage field")
         yield field[2:], raw
+
+  def list_node_assignments(self, tenant_id):
+    self._location("tenant_node", (tenant_id,))
+    return [self._validate(raw, "tenant_node", ids)
+            for ids, raw in self._fields("tenant_node", tenant_id)]
 
   def list_tenants(self):
     rows = []
