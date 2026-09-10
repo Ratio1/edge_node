@@ -392,3 +392,17 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
   2,498 tests and 446 subtests, with 3 existing skips and 4 warnings. Identity/surface/config focused
   checks passed 38 tests and 139 subtests. Task and paired evidence remain in the hub RM-026 plan.
+
+### 2026-09-10T10:07:36Z
+
+- Change: added the pure existing-active-tenant named-role evaluator in `tenancy/policy.py`.
+  Membership pairs are the only role authority; task decisions require resolved same-tenant assets,
+  and tenant-only pentester authority additionally requires Allow Pentester. No endpoint uses it yet.
+- Critic: scope membership roles before composing permissions; reject malformed context as a whole,
+  and validate asset ownership before revealing the pentesting flag. Context/asset facts must be
+  resolved server-side at future integration points, not constructed from caller claims. Capability
+  exceptions, bootstrap/creation, inactive lifecycle, object/CID binding and audit persistence remain
+  unfinished. Both independent implementation reviews passed without findings.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,510 tests and 615 subtests, with 3 existing skips and 4 warnings. Focused policy/identity/surface/
+  config checks passed 50 tests and 308 subtests. No new token or wallet-signing work.
