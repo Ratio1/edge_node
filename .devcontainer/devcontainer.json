@@ -34,7 +34,11 @@
       "extensions": [
         "ms-python.python",
         "ms-toolsai.jupyter"
-      ]
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/python/bin/python3",
+        "python.terminal.activateEnvironment": false
+      }
     }
   }
 }

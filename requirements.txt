@@ -17,6 +17,8 @@ aiofiles
 aiohttp
 paramiko
 pymisp
+neo4j>=5.28,<6
+websocket-client>=1.8,<2
 # This has been moved to device.py additional_packages list for better compatibility with different devices.
 # llama-cpp-python>=0.2.82
 

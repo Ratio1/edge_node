@@ -86,6 +86,12 @@ Example pipeline configuration:
 """
 
 from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
+from extensions.business.edge_inference_api.serving_handles import (
+  configured_engines,
+  serving_handle,
+  serving_name,
+  startup_params_for_engine,
+)
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -112,37 +118,11 @@ _CONFIG = {
 class LLMInferenceApiPlugin(BasePlugin):
   CONFIG = _CONFIG
 
-  def _get_local_model_ids(self):
-    """Return normalized model identifiers served by this instance.
-
-    Explicit ``SERVED_MODELS`` aliases are combined with the effective
-    per-node AI engine and startup model identifiers. This lets API clients use
-    stable public aliases while retaining useful engine/model ids for backward
-    compatibility.
-    """
+  @staticmethod
+  def _model_ids_from_params(params):
+    """Collect model identifiers declared in an engine's startup params."""
     model_ids = set()
-    configured_aliases = getattr(self, 'cfg_served_models', [])
-    if isinstance(configured_aliases, str):
-      configured_aliases = [configured_aliases]
-    if isinstance(configured_aliases, (list, tuple, set)):
-      model_ids.update(
-        str(value).strip()
-        for value in configured_aliases
-        if isinstance(value, str) and value.strip()
-      )
-
-    ai_engines = getattr(self, 'cfg_ai_engine', None)
-    if isinstance(ai_engines, str):
-      ai_engines = [ai_engines]
-    if isinstance(ai_engines, (list, tuple, set)):
-      model_ids.update(
-        str(value).strip()
-        for value in ai_engines
-        if isinstance(value, str) and value.strip()
-      )
-
-    startup_params = getattr(self, 'cfg_startup_ai_engine_params', {})
-    pending = [startup_params]
+    pending = [params]
     while pending:
       current = pending.pop()
       if not isinstance(current, dict):
@@ -154,7 +134,134 @@ class LLMInferenceApiPlugin(BasePlugin):
           model_ids.add(value.strip())
         elif key == 'MODEL_PATH' and isinstance(value, str) and value.strip():
           model_ids.add(value.rstrip('/').rsplit('/', 1)[-1])
+    return model_ids
+
+  def _serving_name_for_engine(self, engine):
+    """The serving-manager name of the process that runs ``engine``, derived
+    with the orchestrator's rules so LLM servings can match it against their
+    own ``server_name``."""
+    handle = serving_handle(
+      getattr(self, 'cfg_ai_engine', None), engine, getattr(self, 'cfg_startup_ai_engine_params', None),
+    )
+    resolver = getattr(self, 'get_serving_process_given_ai_engine', None)
+    resolved = handle
+    if callable(resolver):
+      try:
+        resolved = resolver(handle)
+      except Exception:
+        resolved = handle
+    return serving_name(resolved)
+
+  def _get_local_engine_routes(self):
+    """Return one route per configured AI engine.
+
+    Each route carries the serving name the inference bus will see and the set
+    of model identifiers (engine name, startup ids, public aliases) that select
+    it. Only identifiers that resolve to exactly one serving are routable.
+    ``SERVED_MODELS`` may be a list of aliases (they belong to the instance's
+    single engine) or a mapping ``{engine_name: [aliases]}`` that names the
+    engine explicitly, which is required on a multi-engine instance.
+    """
+    ai_engine = getattr(self, 'cfg_ai_engine', None)
+    startup_params = getattr(self, 'cfg_startup_ai_engine_params', None)
+    routes = []
+    for engine in configured_engines(ai_engine):
+      params = startup_params_for_engine(ai_engine, engine, startup_params)
+      model_ids = {engine}
+      model_ids.update(self._model_ids_from_params(params))
+      routes.append({
+        'engine': engine,
+        'serving_name': self._serving_name_for_engine(engine),
+        'model_ids': model_ids,
+      })
+
+    self._attach_served_model_aliases(routes, getattr(self, 'cfg_served_models', []))
+
+    if len(routes) > 1 and not getattr(self, '_warned_ambiguous_model_ids', False):
+      owners = {}
+      for route in routes:
+        for model_id in route['model_ids']:
+          owners.setdefault(model_id, []).append(route['engine'])
+      ambiguous = sorted(model_id for model_id, engines in owners.items() if len(engines) > 1)
+      if ambiguous:
+        self._warned_ambiguous_model_ids = True
+        self.P(
+          f"Model ids {ambiguous} are declared by more than one engine on this LLM_INFERENCE_API "
+          "instance; requests for them go to the first configured engine.",
+          color='r',
+        )
+    return routes
+
+  @staticmethod
+  def _clean_aliases(values):
+    if isinstance(values, str):
+      values = [values]
+    if not isinstance(values, (list, tuple, set)):
+      return []
+    return [str(value).strip() for value in values if isinstance(value, str) and value.strip()]
+
+  def _attach_served_model_aliases(self, routes, served_models):
+    """Attach SERVED_MODELS aliases to the engine route they belong to.
+
+    A mapping ``{engine_name: [aliases]}`` names the engine explicitly and works
+    on any instance. A plain list is unambiguous only when the instance runs a
+    single engine; on a multi-engine instance it is ignored with a warning,
+    because accepting it would let whichever serving polls first execute the
+    request.
+    """
+    if isinstance(served_models, dict):
+      unknown = []
+      for engine_name, values in served_models.items():
+        route = next(
+          (item for item in routes
+           if isinstance(engine_name, str) and item['engine'].lower() == engine_name.strip().lower()),
+          None,
+        )
+        if route is None:
+          unknown.append(engine_name)
+          continue
+        route['model_ids'].update(self._clean_aliases(values))
+      if unknown and not getattr(self, '_warned_unknown_served_model_engines', False):
+        self._warned_unknown_served_model_engines = True
+        self.P(
+          f"SERVED_MODELS names engines {unknown} that this LLM_INFERENCE_API instance does not run; "
+          "their aliases are ignored.",
+          color='r',
+        )
+      return
+    aliases = self._clean_aliases(served_models)
+    if not aliases:
+      return
+    if len(routes) == 1:
+      routes[0]['model_ids'].update(aliases)
+    elif not getattr(self, '_warned_ambiguous_served_models', False):
+      self._warned_ambiguous_served_models = True
+      self.P(
+        "SERVED_MODELS is a plain list on a multi-engine LLM_INFERENCE_API instance, so its aliases "
+        "are ignored: use the mapping form {engine_name: [aliases]} to name the engine.",
+        color='r',
+      )
+
+  def _get_local_model_ids(self):
+    """Return normalized model identifiers this instance can route to a serving."""
+    model_ids = set()
+    for route in self._get_local_engine_routes():
+      model_ids.update(route['model_ids'])
     return sorted(model_ids)
+
+  def _resolve_target_serving_name(self, requested_model):
+    """Map a requested model identifier to the serving that owns it, or None.
+
+    The match is exact (case-sensitive), the same contract peer capability
+    matching applies, so a request selects the same model locally and remotely.
+    """
+    if not isinstance(requested_model, str) or not requested_model.strip():
+      return None
+    wanted = requested_model.strip()
+    for route in self._get_local_engine_routes():
+      if wanted in route['model_ids']:
+        return route['serving_name']
+    return None
 
   def _get_balancing_capabilities(self):
     return {'models': self._get_local_model_ids()}
@@ -173,7 +280,7 @@ class LLMInferenceApiPlugin(BasePlugin):
 
   def _can_execute_request(self, request_data):
     requested_model = self._get_requested_model(request_data)
-    return requested_model is None or requested_model in self._get_local_model_ids()
+    return requested_model is None or self._resolve_target_serving_name(requested_model) is not None
 
   def _capacity_record_can_execute_request(self, record, request_data):
     requested_model = self._get_requested_model(request_data)
@@ -786,6 +893,13 @@ class LLMInferenceApiPlugin(BasePlugin):
         jeeves_content['REPETITION_PENALTY'] = repeat_penalty
       jeeves_content.pop('REPEAT_PENALTY', None)
       jeeves_content.pop('MODEL', None)
+      # Tag the request with the serving that owns the requested model: every
+      # LLM serving sees every 'LLM' request, so without this tag whichever
+      # serving polls first executes it regardless of the model the caller
+      # asked for. Admission already guaranteed the model resolves locally.
+      target_serving = self._resolve_target_serving_name(request_parameters.get('model'))
+      if target_serving:
+        jeeves_content['TARGET_SERVING_NAME'] = target_serving
       jeeves_content[LlmCT.REQUEST_ID] = request_id
       jeeves_content[LlmCT.REQUEST_TYPE] = 'LLM'
       return {
@@ -832,24 +946,50 @@ class LLMInferenceApiPlugin(BasePlugin):
 
     def _has_text_result(self, inference):
       text_value = inference.get(LlmCT.TEXT, None)
-      if isinstance(text_value, str) and len(text_value) > 0:
+      if isinstance(text_value, str) and len(text_value.strip()) > 0:
         return True
       full_output = inference.get(LlmCT.FULL_OUTPUT, None)
-      return full_output is not None
+      if isinstance(full_output, list) and len(full_output) == 1:
+        full_output = full_output[0]
+      if not isinstance(full_output, dict):
+        return False
+      choices = full_output.get("choices")
+      if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+      first = choices[0]
+      message = first.get("message")
+      if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str) and len(content.strip()) > 0:
+          return True
+      text = first.get("text")
+      return isinstance(text, str) and len(text.strip()) > 0
+
+    def _fail_invalid_empty_inference(self, inference):
+      request_id = self._extract_request_id_from_inference(inference)
+      if request_id is None:
+        return False
+      if request_id not in self._requests:
+        return False
+      return self._fail_request(
+        request_id=request_id,
+        error_message="Local LLM returned an invalid empty response.",
+      )
 
     def filter_valid_inference(self, inference):
       if not isinstance(inference, dict):
         return False
       if not inference.get("IS_VALID", True):
         if not self._has_text_result(inference=inference):
-          self.P(f"Rejected invalid LLM inference without text output: {self.shorten_str(inference)}")
+          self.P("Rejected invalid LLM inference without text output.")
+          self._fail_invalid_empty_inference(inference)
           return False
         self.P("Accepting text-bearing LLM inference despite IS_VALID=False.")
       request_id = self._extract_request_id_from_inference(inference)
       if request_id is None:
         request_id = self._get_single_pending_request_id()
         if request_id is None:
-          self.P(f"Rejected LLM inference without request id: {self.shorten_str(inference)}")
+          self.P("Rejected text-bearing LLM inference without an unambiguous request id.")
           return False
         self.P(f"Mapped request-id-less LLM inference to pending request {request_id}.")
       inference[LlmCT.REQUEST_ID] = request_id
@@ -863,7 +1003,7 @@ class LLMInferenceApiPlugin(BasePlugin):
           )
           inference[LlmCT.REQUEST_ID] = fallback_request_id
           return True
-        self.P(f"Rejected LLM inference for unknown request id {request_id}: {self.shorten_str(inference)}")
+        self.P(f"Rejected text-bearing LLM inference for unknown request id {request_id}.")
       return is_known
 
     def inference_to_response(self, inference, model_name, input_data=None):

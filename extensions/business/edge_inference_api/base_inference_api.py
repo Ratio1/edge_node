@@ -101,6 +101,7 @@ Example balanced peer configuration (Node B):
 }
 """
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
+from extensions.business.edge_inference_api.serving_handles import configured_engines, serving_handle
 from extensions.business.mixins.base_agent_mixin import _BaseAgentMixin, BASE_AGENT_MIXIN_CONFIG
 
 from typing import Any, Dict, List, Optional
@@ -171,6 +172,38 @@ class BaseInferenceApiPlugin(
   STATUS_COMPLETED = "completed"
   STATUS_FAILED = "failed"
   STATUS_TIMEOUT = "timeout"
+
+  def _serving_ready(self):
+    """Return whether every configured serving process reached READY.
+
+    Publishing the inference API port only proves that the HTTP facade is up.
+    Model processes start separately and can still be loading, so callers must
+    not treat facade reachability as model readiness.
+    """
+    shared = getattr(self, "global_shmem", None)
+    manager = shared.get("serving_manager") if isinstance(shared, dict) else None
+    is_available = getattr(manager, "is_avail", None)
+    if not callable(is_available):
+      return False
+    try:
+      handles = self._serving_handles()
+      return bool(handles) and all(is_available(handle) for handle in handles)
+    except Exception:
+      return False
+
+  def _serving_handles(self):
+    """Serving-manager handles for this plugin's engines, resolved to serving
+    process names. Derived with the orchestrator's exact rules (see
+    serving_handles.py) so an engine that runs under a MODEL_INSTANCE_ID is
+    checked under its real name."""
+    ai_engine = getattr(self, "cfg_ai_engine", None)
+    resolver = getattr(self, "get_serving_process_given_ai_engine", None)
+    engines = configured_engines(ai_engine)
+    if not engines or not callable(resolver):
+      get_processes = getattr(self, "get_serving_processes", None)
+      return list(get_processes()) if callable(get_processes) else []
+    startup_params = getattr(self, "cfg_startup_ai_engine_params", None)
+    return [resolver(serving_handle(ai_engine, engine, startup_params)) for engine in engines]
 
   @staticmethod
   def balanced_endpoint(func):
@@ -2816,6 +2849,7 @@ class BaseInferenceApiPlugin(
         "plugin": self.get_signature(),
         "instance_id": self.get_instance_id(),
         "loopback_enabled": self.cfg_is_loopback_plugin,
+        "serving_ready": self._serving_ready(),
         "uptime": self.get_alive_time(),
         "last_error_time": self.last_handled_error_time,
         "total_errors": len(self._api_errors),

@@ -450,6 +450,15 @@ class BaseLlmServing(
       self.P(f"[DEBUG]No jeeves content found in input: {self.shorten_str(input_dict)}", color='y')
       return False
     self.P(f"[DEBUG]Extracted jeeves content for relevance check: {self.shorten_str(jeeves_content)}", color='g')
+    # Every LLM serving on the node sees every 'LLM' request. A request tagged
+    # with a serving name is relevant only to that serving; untagged requests
+    # keep the legacy any-serving behavior.
+    target_serving = jeeves_content.get('TARGET_SERVING_NAME')
+    if isinstance(target_serving, str) and target_serving.strip():
+      own_name = str(getattr(self, 'server_name', '') or '').strip().upper()
+      if target_serving.strip().upper() != own_name:
+        self.P(f"[DEBUG]Skipping request targeted at serving '{target_serving}' (this serving is '{own_name}')", color='y')
+        return False
     return self.check_supported_request_type(message_data=jeeves_content)
 
   def process_predict_kwargs(self, predict_kwargs: dict):

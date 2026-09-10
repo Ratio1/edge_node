@@ -254,6 +254,50 @@ BaseInferenceApiPlugin = _load_plugin_class()
 
 
 class BaseInferenceApiBalancingTests(unittest.TestCase):
+  def test_serving_ready_requires_every_configured_model_process(self):
+    plugin = self._make_plugin()
+    plugin.get_serving_processes = lambda: ["model-a", "model-b"]
+    manager = SimpleNamespace(is_avail=lambda process: process == "model-a")
+    plugin.global_shmem = {"serving_manager": manager}
+
+    self.assertFalse(plugin._serving_ready())
+
+    manager.is_avail = lambda _process: True
+    self.assertTrue(plugin._serving_ready())
+
+  def test_serving_ready_uses_instance_handle_when_startup_params_name_one(self):
+    plugin = self._make_plugin()
+    plugin.cfg_ai_engine = "llama_cpp_gguf"
+    plugin.cfg_startup_ai_engine_params = {"MODEL_INSTANCE_ID": "worker-a", "MODEL_NAME": "org/private"}
+    plugin.get_serving_process_given_ai_engine = (
+      lambda handle: (handle[0], handle[1]) if isinstance(handle, tuple) else handle
+    )
+    seen = []
+    plugin.global_shmem = {"serving_manager": SimpleNamespace(is_avail=lambda handle: seen.append(handle) or True)}
+
+    self.assertTrue(plugin._serving_ready())
+    self.assertEqual(seen, [("llama_cpp_gguf", "worker-a")])
+
+  def test_serving_handles_follow_orchestrator_rules(self):
+    plugin = self._make_plugin()
+    plugin.get_serving_process_given_ai_engine = lambda handle: handle
+    cases = [
+      # list AI_ENGINE with a flat block: the orchestrator does not flatten, so no instance id
+      (["llama_cpp_gguf"], {"MODEL_INSTANCE_ID": "private-model"}, ["llama_cpp_gguf"]),
+      # string AI_ENGINE with the block keyed in upper case: exact lowercase key required, so flat
+      ("llama_cpp_gguf", {"LLAMA_CPP_GGUF": {"MODEL_INSTANCE_ID": "private-model"}}, ["llama_cpp_gguf"]),
+      # instance id is used verbatim, trailing space included
+      ("LLAMA_CPP_GGUF", {"MODEL_INSTANCE_ID": "private-model "}, [("llama_cpp_gguf", "private-model ")]),
+      # list AI_ENGINE keyed per engine
+      (["llama_cpp_gguf", "cybersec_qwen_4b"], {"llama_cpp_gguf": {"MODEL_INSTANCE_ID": "a"}},
+       [("llama_cpp_gguf", "a"), "cybersec_qwen_4b"]),
+    ]
+    for ai_engine, startup_params, expected in cases:
+      with self.subTest(ai_engine=ai_engine, startup_params=startup_params):
+        plugin.cfg_ai_engine = ai_engine
+        plugin.cfg_startup_ai_engine_params = startup_params
+        self.assertEqual(plugin._serving_handles(), expected)
+
   def _make_plugin(self, **kwargs):
     plugin = BaseInferenceApiPlugin(**kwargs)
     plugin.on_init()
@@ -262,6 +306,40 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
       "predict_async": SimpleNamespace(__balanced_endpoint__=True),
     }
     return plugin
+
+  def test_process_dispatches_structured_inferences_via_handle_structured_inference_batch(self):
+    plugin = self._make_plugin()
+    data = {
+      0: {"slot": "startup-placeholder"},
+      1: {"slot": "completed-request"},
+    }
+    inferences_by_model = {
+      "fake-engine": [
+        {"IS_VALID": False, "text": ""},
+        {"IS_VALID": True, "REQUEST_ID": "req-live", "text": "MATCH (n) RETURN n"},
+      ],
+    }
+    plugin.dataapi_struct_datas = lambda: data
+    plugin.dataapi_struct_datas_inferences = lambda: inferences_by_model
+    plugin.maybe_refresh_metrics = lambda: None
+    plugin._publish_capacity_record = lambda: None
+    plugin._poll_delegated_results = lambda: None
+    plugin._poll_delegated_requests = lambda: None
+    plugin._schedule_pending_requests = lambda: None
+    plugin._retry_same_peer_delegations = lambda: None
+    plugin._reconcile_requests = lambda: None
+    plugin._publish_executor_results = lambda: None
+    plugin._cleanup_balancing_state = lambda: None
+    plugin.cleanup_expired_requests = lambda: None
+    plugin.maybe_save_persistence_data = lambda: None
+    calls = []
+    plugin._handle_structured_inference_batch = (  # pylint: disable=protected-access
+      lambda inferences_by_model, data=None: calls.append((inferences_by_model, data))
+    )
+
+    plugin.process()
+
+    self.assertEqual(calls, [(inferences_by_model, data)])
 
   def test_capacity_publish_uses_soft_state_cstore_options(self):
     plugin = self._make_plugin(
