@@ -421,3 +421,25 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
   2,529 tests and 709 subtests, with 3 existing skips and 4 warnings. Focused resolution/policy/identity/
   surface/config checks passed 69 tests and 402 subtests. Original policy tests remain unchanged.
+
+### 2026-09-10 — RM-026 persistent administration
+
+- BUILDER: seven POST administration endpoints reuse stored identity and tenant policy; source
+  enablement defaults false and deployment namespace is explicit. Backend owns tenant/domain/receipt
+  records; Navigator alone writes account memberships through its SDK. No job isolation is implied.
+- CRITIC: publication is the final active-tenant write and the completion marker. An uncertain
+  successful activation must not make a retry re-grant a removed initial administrator. Pending
+  receipts bind creator, normalized intent and admin incarnation; changed intent conflicts before
+  writes. Shared process locking and strict read-back mitigate local races, not the owner-accepted
+  CStore stale/uncertain distributed state risk documented in the hub RedMesh summary.
+- BUILDER response: tests cover every staged write failing before/after mutation, no-op success,
+  recreated/revoked accounts, concurrent service instances, scoped lists/counts and last observed
+  Tenant Admin protection. Read-back compares serialized JSON types, avoiding Python `True == 1`.
+  Account enumeration returns validated projections only; its 10,000-row cap bounds projection work,
+  not core `hgetall` allocation. Preserve the original policy tests and two model-token gates.
+- Paired critique correction: ordinary tenant reads and membership approvals validate the tenant's
+  creation receipt and domain binding too, not only prepare/activate. Corrupt or missing publication
+  bindings yield unavailable without mutation; six negative binding cases pin this boundary.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,561 tests and 769 subtests, with 3 existing skips and 4 warnings. Independent paired review,
+  Navigator verification and remaining phase evidence are recorded in the hub RM-026 execution plan.

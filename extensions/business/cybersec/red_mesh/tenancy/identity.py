@@ -31,6 +31,7 @@ class AccountView:
   app_role: str | None
   active: bool
   tenant_memberships: tuple[TenantMembership, ...] = ()
+  account_generation: str | None = None
 
   @property
   def created_by(self):

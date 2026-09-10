@@ -150,8 +150,10 @@ class TestCstoreAuthAccountReader(unittest.TestCase):
       a1 = reader.get_account("a1")
       a2 = reader.get_account("a2")
     self.assertEqual(a1, AccountView("a1", "admin", None, True,
-                                    (TenantMembership("super_tenant_admin", None),)))
-    self.assertEqual(a2, AccountView("a2", "user", "pentester", True))
+                                    (TenantMembership("super_tenant_admin", None),),
+                                    account_generation="legacy:2026-01-01T00:00:00Z"))
+    self.assertEqual(a2, AccountView("a2", "user", "pentester", True,
+                                    account_generation="legacy:2026-01-01T00:00:00Z"))
     self.assertEqual(store.calls, [(HKEY, "a1"), (HKEY, "a2")])
 
   def test_malformed_explicit_memberships_deny_instead_of_restoring_admin(self):

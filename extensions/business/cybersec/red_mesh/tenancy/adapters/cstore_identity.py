@@ -21,7 +21,7 @@ Record facts this binds to (Navigator ``lib/auth/cstore.ts``):
 import json
 import os
 
-from ..identity import AccountView, IdentityStoreError, TenantMembership
+from ..identity import AccountView, IdentityStoreError, TenantMembership, canonical_account_id
 
 AUTH_HKEY_ENV = "R1EN_CSTORE_AUTH_HKEY"
 SUPPORTED_SCHEMA_VERSIONS = frozenset({0, 1})
@@ -32,6 +32,7 @@ APP_ROLE_KEY = "appRole"
 MEMBERSHIPS_KEY = "tenant_memberships"
 PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
 TENANT_ROLES = frozenset({"tenant_admin", "tenant_pentester", "tenant_user"})
+MAX_ENUMERATED_ACCOUNTS = 10000
 
 
 class CstoreAuthAccountReader:
@@ -51,6 +52,31 @@ class CstoreAuthAccountReader:
       raw = self._owner.chainstore_hget(hkey=hkey, key=account_id)
     except Exception as exc:  # the store is the boundary; any failure fails closed
       raise IdentityStoreError(str(exc)) from exc
+    return self._view(account_id, raw)
+
+  def list_accounts(self):
+    """Bounded validated projections only; never return credentials or arbitrary metadata.
+
+    This enumerates the local CStore view, not an atomic or globally fresh account snapshot.
+    """
+    hkey = self._hkey()
+    try:
+      records = self._owner.chainstore_hgetall(hkey=hkey)
+    except Exception as exc:
+      raise IdentityStoreError("Account storage cannot be enumerated") from exc
+    if not isinstance(records, dict) or len(records) > MAX_ENUMERATED_ACCOUNTS:
+      raise IdentityStoreError("Account storage enumeration is unavailable")
+    views = []
+    for account_id, raw in records.items():
+      if not isinstance(account_id, str) or canonical_account_id(account_id) != account_id:
+        continue
+      view = self._view(account_id, raw)
+      if view is not None:
+        views.append(view)
+    return views
+
+  @staticmethod
+  def _view(account_id, raw):
     if raw is None or raw == TOMBSTONE:
       return None
     record = _parse_record(raw)
@@ -64,12 +90,17 @@ class CstoreAuthAccountReader:
     memberships = _parse_memberships(metadata, record.get("role"))
     if memberships is None:
       return None
+    generation = metadata.get("navigatorAccountGeneration")
+    if not isinstance(generation, str) or not generation:
+      created_at = record.get("createdAt")
+      generation = f"legacy:{created_at}" if isinstance(created_at, str) and created_at else None
     return AccountView(
       account_id=account_id,
       role=str(record.get("role") or "user"),
       app_role=app_role if isinstance(app_role, str) else None,
       active=(ACCOUNT_STATE_KEY not in metadata or state == ACTIVE_STATE),
       tenant_memberships=memberships,
+      account_generation=generation,
     )
 
 

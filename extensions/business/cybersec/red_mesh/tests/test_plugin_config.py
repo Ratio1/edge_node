@@ -34,6 +34,10 @@ class TestPluginSourceDefaults(unittest.TestCase):
     self.assertIn("PORT", self.config)
     self.assertIsNone(self.config["PORT"])
 
+  def test_tenant_administration_is_explicitly_disabled_and_namespace_unbound(self):
+    self.assertIs(self.config["TENANT_ADMINISTRATION_ENABLED"], False)
+    self.assertIsNone(self.config["TENANCY_NAMESPACE"])
+
 
 if __name__ == "__main__":
   unittest.main()
