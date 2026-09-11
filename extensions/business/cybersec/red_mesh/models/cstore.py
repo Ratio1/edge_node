@@ -11,6 +11,7 @@ CStore models — ephemeral orchestration state.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from ..tenancy.execution import ExecutionBinding, binding_from_record, binding_value
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
 from extensions.business.cybersec.red_mesh.model_test_sanitization import (
@@ -157,9 +158,15 @@ class CStoreJobRunning:
   model_test_summary: dict = None
   model_test_node_selection: dict = None
   model_test_raw_evidence: dict = None
+  execution_binding: ExecutionBinding | None = None
+
+  def __post_init__(self):
+    object.__setattr__(self, "execution_binding", binding_value(self.execution_binding))
 
   def to_dict(self) -> dict:
     payload = asdict(self)
+    if self.execution_binding is not None:
+      payload["execution_binding"] = self.execution_binding.to_dict()
     if payload.get("model_test_raw_evidence") is not None:
       payload["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
         payload.get("model_test_raw_evidence")
@@ -169,6 +176,7 @@ class CStoreJobRunning:
   @classmethod
   def from_dict(cls, d: dict) -> CStoreJobRunning:
     return cls(
+      execution_binding=binding_from_record(d),
       job_id=d["job_id"],
       job_status=d["job_status"],
       job_pass=d.get("job_pass", 1),
@@ -256,9 +264,15 @@ class CStoreJobFinalized:
   model_test_summary: dict = None
   model_test_node_selection: dict = None
   model_test_raw_evidence: dict = None
+  execution_binding: ExecutionBinding | None = None
+
+  def __post_init__(self):
+    object.__setattr__(self, "execution_binding", binding_value(self.execution_binding))
 
   def to_dict(self) -> dict:
     payload = asdict(self)
+    if self.execution_binding is not None:
+      payload["execution_binding"] = self.execution_binding.to_dict()
     if payload.get("model_test_raw_evidence") is not None:
       payload["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
         payload.get("model_test_raw_evidence")
@@ -268,6 +282,7 @@ class CStoreJobFinalized:
   @classmethod
   def from_dict(cls, d: dict) -> CStoreJobFinalized:
     return cls(
+      execution_binding=binding_from_record(d),
       job_id=d["job_id"],
       job_status=d["job_status"],
       target=d["target"],

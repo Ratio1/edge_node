@@ -12,7 +12,8 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .identity import IdentityStoreError, TenantMembership, canonical_account_id, resolve_actor
-from .policy import TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles
+from .policy import TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles, resolve_operation_roles
+from .execution import ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
 from .assets import canonical_digest, normalize_name, normalize_target, valid_digest
@@ -335,6 +336,46 @@ class TenantAdministrationService:
   def get_tenant_members(self, actor, tenant_id):
     self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
     return self._members(tenant_id)
+
+  def resolve_execution_admission(self, actor, tenant_id, asset_id, selected_peers=None):
+    """Resolve current stored facts only; no endpoint, publication, DNS or execution."""
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    policy = TenantPolicyContext(tenant_id, tenant["active"], tenant["allow_pentester"])
+    _, denial = resolve_operation_roles(account, "tasks:launch", policy)
+    if denial:
+      raise AdministrationDenied(denial.status_code, denial.error)
+    if not account.account_generation:
+      raise AdministrationDenied(409, "account_changed")
+    asset = self.store.get("asset", tenant_id, self._asset_id(asset_id))
+    if asset is None or asset["active"] is not True:
+      raise AdministrationDenied(404, "not_found")
+    decision = authorize_tenant_operation(account, "tasks:launch", policy,
+      asset_tenant_ids=(asset["tenant_id"],))
+    if not decision.allowed:
+      raise AdministrationDenied(decision.status_code, decision.error)
+    assignments = self.store.list_node_assignments(tenant_id)
+    try:
+      configured = self.configured_peers_reader()
+    except Exception as exc:
+      raise TenantStoreError("Node eligibility is unavailable") from exc
+    if not isinstance(configured, list) or any(not valid_node_address(peer) for peer in configured):
+      raise TenantStoreError("Node eligibility is unavailable")
+    eligible = {row["node_address"] for row in assignments if row["active"]} & set(configured)
+    if selected_peers is not None and (not isinstance(selected_peers, list)
+        or any(not valid_node_address(peer) for peer in selected_peers)
+        or len(set(selected_peers)) != len(selected_peers)):
+      raise AdministrationDenied(400, "invalid_request")
+    selected = list(selected_peers) if selected_peers else sorted(eligible)
+    if not selected or not set(selected).issubset(eligible):
+      raise AdministrationDenied(400, "ineligible_node")
+    try:
+      return ResolvedExecutionContext({"namespace": self.store.namespace, "tenant_id": tenant_id,
+        "asset_id": asset["asset_id"], "asset_target": asset["target"],
+        "asset_target_digest": asset["target_digest"], "actor_id": account.account_id,
+        "actor_generation": account.account_generation,
+        "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected})
+    except (ValueError, TypeError, RecursionError) as exc:
+      raise TenantStoreError("Invalid stored execution facts") from exc
 
   @_endpoint
   def get_tenant_nodes(self, actor, tenant_id):

@@ -10,9 +10,12 @@ R1FS persistent models — job config, pass reports, and job archive.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
+from ..tenancy.execution import (
+  ExecutionBinding, binding_from_record, binding_value, copy_bound_config, checked_archive_config,
+)
 from extensions.business.cybersec.red_mesh.constants import (
   DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS, JOB_ARCHIVE_VERSION,
   TIMEOUT_PROFILE_STANDARD, normalize_timeout_profile,
@@ -123,13 +126,21 @@ class JobConfig:
   blockchain_attestation_enabled: bool = False
   start_attestation_required: bool = False
   end_attestation_required: bool = False
+  execution_binding: ExecutionBinding | None = None
+
+  def __post_init__(self):
+    object.__setattr__(self, "execution_binding", binding_value(self.execution_binding))
 
   def to_dict(self) -> dict:
-    return _strip_none(asdict(self))
+    payload = asdict(self)
+    if self.execution_binding is not None:
+      payload["execution_binding"] = self.execution_binding.to_dict()
+    return _strip_none(payload)
 
   @classmethod
   def from_dict(cls, d: dict) -> JobConfig:
     return cls(
+      execution_binding=binding_from_record(d),
       target=d["target"],
       start_port=d["start_port"],
       end_port=d["end_port"],
@@ -454,9 +465,18 @@ class JobArchive:
   stix_export: dict = None
   opencti_export: dict = None
   taxii_export: dict = None
+  _execution_binding: ExecutionBinding | None = field(init=False, repr=False)
+
+  def __post_init__(self):
+    object.__setattr__(self, "job_config", copy_bound_config(self.job_config))
+    object.__setattr__(self, "_execution_binding", binding_from_record(self.job_config)
+                       if isinstance(self.job_config, dict) else None)
 
   def to_dict(self) -> dict:
-    return _strip_none(asdict(self))
+    payload = asdict(self)
+    payload.pop("_execution_binding")
+    payload["job_config"] = checked_archive_config(self.job_config, self._execution_binding)
+    return _strip_none(payload)
 
   @classmethod
   def from_dict(cls, d: dict) -> JobArchive:

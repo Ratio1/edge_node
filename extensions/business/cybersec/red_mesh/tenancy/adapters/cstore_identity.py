@@ -90,8 +90,15 @@ class CstoreAuthAccountReader:
     memberships = _parse_memberships(metadata, record.get("role"))
     if memberships is None:
       return None
-    generation = metadata.get("navigatorAccountGeneration")
-    if not isinstance(generation, str) or not generation:
+    if "navigatorAccountGeneration" in metadata:
+      generation = metadata["navigatorAccountGeneration"]
+      if not isinstance(generation, str) or not generation.strip():
+        raise IdentityStoreError("Invalid account generation")
+      try:
+        generation.encode("utf-8", errors="strict")
+      except UnicodeError as exc:
+        raise IdentityStoreError("Invalid account generation") from exc
+    else:
       created_at = record.get("createdAt")
       generation = f"legacy:{created_at}" if isinstance(created_at, str) and created_at else None
     return AccountView(
