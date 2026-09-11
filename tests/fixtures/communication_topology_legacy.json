@@ -1,0 +1,10 @@
+{
+  "COMMANDCONTROL": {
+    "RECV_FROM": "CTRL_CHANNEL",
+    "SEND_TO": "CONFIG_CHANNEL"
+  },
+  "HEARTBEATS": {
+    "RECV_FROM": "CONFIG_CHANNEL",
+    "SEND_TO": "CTRL_CHANNEL"
+  }
+}

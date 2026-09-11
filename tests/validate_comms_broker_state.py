@@ -22,6 +22,15 @@ API_PASS = os.environ.get("ECOMMS_EMQX_PASS", "public")
 API_TOKEN = os.environ.get("ECOMMS_EMQX_TOKEN")
 ROOT_TOPIC = os.environ.get("ECOMMS_ROOT_TOPIC", "naeural_comms_local")
 CTRL_TOPIC = f"{ROOT_TOPIC}/ctrl"
+EXPECTED_TOPOLOGY = os.environ.get(
+  "ECOMMS_EXPECTED_TOPOLOGY", "regrouped",
+).strip().lower()
+if EXPECTED_TOPOLOGY not in {"legacy", "regrouped"}:
+  raise ValueError(
+    "ECOMMS_EXPECTED_TOPOLOGY must be 'legacy' or 'regrouped', got {!r}".format(
+      EXPECTED_TOPOLOGY,
+    )
+  )
 EXPECTED_NODES = {
   "comm_oracle_01": "supervisor",
   "comm_oracle_02": "supervisor",
@@ -166,13 +175,27 @@ def _validate_state(subscriptions, clients):
       row for row in alias_subs
       if alias in _client_id(row) and row.get("topic") == CTRL_TOPIC
     ]
-    command_ctrl_subs = [
+    heartbeat_receiver_marker = (
+      "_HEARTBE" if EXPECTED_TOPOLOGY == "regrouped" else "_COMMAND"
+    )
+    command_receiver_marker = (
+      "_COMMAND" if EXPECTED_TOPOLOGY == "regrouped" else "_HEARTBE"
+    )
+    heartbeat_ctrl_subs = [
       row for row in alias_subs
-      if alias in _client_id(row) and "_COMMAND" in _client_id(row) and row.get("topic") == CTRL_TOPIC
+      if (
+        alias in _client_id(row)
+        and heartbeat_receiver_marker in _client_id(row)
+        and row.get("topic") == CTRL_TOPIC
+      )
     ]
-    heartbeat_config_subs = [
+    command_config_subs = [
       row for row in alias_subs
-      if alias in _client_id(row) and "_HEARTBE" in _client_id(row) and str(row.get("topic", "")).endswith("/config")
+      if (
+        alias in _client_id(row)
+        and command_receiver_marker in _client_id(row)
+        and str(row.get("topic", "")).endswith("/config")
+      )
     ]
     iot_payload_broadcast_subs = [
       row for row in alias_subs
@@ -195,17 +218,33 @@ def _validate_state(subscriptions, clients):
     )
 
     if role == "supervisor":
-      _assert(len(command_ctrl_subs) == 1, f"{alias}: expected exactly one COMMAND ctrl subscription", failures)
+      _assert(
+        len(heartbeat_ctrl_subs) == 1,
+        f"{alias}: expected exactly one {heartbeat_receiver_marker} ctrl subscription",
+        failures,
+      )
       _assert(len(ctrl_subs) == 1, f"{alias}: expected exactly one total ctrl subscription, found {len(ctrl_subs)}", failures)
-      if command_ctrl_subs:
-        _assert(_qos(command_ctrl_subs[0]) == 1, f"{alias}: COMMAND ctrl QoS is not 1", failures)
+      if heartbeat_ctrl_subs:
+        _assert(
+          _qos(heartbeat_ctrl_subs[0]) == 1,
+          f"{alias}: {heartbeat_receiver_marker} ctrl QoS is not 1",
+          failures,
+        )
     else:
-      _assert(len(command_ctrl_subs) == 0, f"{alias}: normal node must not subscribe COMMAND to ctrl", failures)
+      _assert(len(heartbeat_ctrl_subs) == 0, f"{alias}: normal node must not subscribe HEARTBEAT to ctrl", failures)
       _assert(len(ctrl_subs) == 0, f"{alias}: normal node must not have any ctrl subscription: {[_client_id(row) for row in ctrl_subs]}", failures)
 
-    _assert(len(heartbeat_config_subs) == 1, f"{alias}: expected exactly one HEARTBE config subscription", failures)
-    if heartbeat_config_subs:
-      _assert(_qos(heartbeat_config_subs[0]) == 2, f"{alias}: HEARTBE config QoS is not 2", failures)
+    _assert(
+      len(command_config_subs) == 1,
+      f"{alias}: expected exactly one {command_receiver_marker} config subscription",
+      failures,
+    )
+    if command_config_subs:
+      _assert(
+        _qos(command_config_subs[0]) == 2,
+        f"{alias}: {command_receiver_marker} config QoS is not 2",
+        failures,
+      )
     _assert(len(iot_payload_broadcast_subs) == 1, f"{alias}: expected exactly one IoT broadcast payload subscription", failures)
     if iot_payload_broadcast_subs:
       _assert(_qos(iot_payload_broadcast_subs[0]) == 0, f"{alias}: IoT broadcast payload QoS is not 0", failures)
@@ -256,6 +295,7 @@ def main():
         "subscriptions_checked": len(subscriptions),
         "managed_clients_checked": len(managed_clients),
         "ctrl_topic": CTRL_TOPIC,
+        "topology": EXPECTED_TOPOLOGY,
         "status": "ok",
       }, indent=2))
       return 0
