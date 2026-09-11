@@ -15,6 +15,7 @@ from .identity import IdentityStoreError, TenantMembership, canonical_account_id
 from .policy import TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles
 from .ports import TenantStoreError
 from .nodes import valid_node_address
+from .assets import canonical_digest, normalize_name, normalize_target, valid_digest
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -306,6 +307,95 @@ class TenantAdministrationService:
             "canManageAssignments": authorize_tenant_operation(
               account, "node_assignments:manage", TenantPolicyContext(
                 tenant_id, tenant["active"], tenant["allow_pentester"])).allowed}
+
+  @staticmethod
+  def _asset_row(row):
+    if row is None:
+      raise TenantStoreError("Asset readback is unavailable")
+    return {"tenantId": row["tenant_id"], "assetId": row["asset_id"],
+            "displayName": row["display_name"], "target": row["target"], "active": row["active"],
+            "createdBy": row["created_by"], "createdAt": row["created_at"],
+            "changedBy": row["changed_by"], "changedAt": row["changed_at"],
+            "targetDigest": row["target_digest"], "version": canonical_digest(row)}
+
+  @staticmethod
+  def _asset_id(value):
+    if not isinstance(value, str) or not value.startswith("as_"):
+      raise AdministrationDenied(400, "invalid_request")
+    return "as_" + _request_id(value[3:])
+
+  @staticmethod
+  def _asset_permission(account, tenant, operation):
+    return authorize_tenant_operation(account, operation, TenantPolicyContext(
+      tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed
+
+  @_endpoint
+  def list_tenant_assets(self, actor, tenant_id):
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    return {"tenantId": tenant_id,
+            "assets": [self._asset_row(row) for row in sorted(self.store.list_assets(tenant_id),
+                                                              key=lambda row: row["asset_id"])],
+            "canCreateAssets": self._asset_permission(account, tenant, "assets:create"),
+            "canUpdateAssets": self._asset_permission(account, tenant, "assets:update")}
+
+  @_endpoint
+  def get_tenant_asset(self, actor, tenant_id, asset_id):
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    asset_id = self._asset_id(asset_id)
+    row = self.store.get("asset", tenant_id, asset_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    return {"asset": self._asset_row(row),
+            "canUpdateAssets": self._asset_permission(account, tenant, "assets:update")}
+
+  @_endpoint
+  def create_tenant_asset(self, actor, tenant_id, request_id, display_name, target):
+    _, account = self._authorized_tenant(actor, tenant_id, "assets:create")
+    request_id = _request_id(request_id)
+    try:
+      display_name, target = normalize_name(display_name), normalize_target(target)
+    except (ValueError, TypeError, RecursionError):
+      raise AdministrationDenied(400, "invalid_request") from None
+    asset_id = "as_" + request_id
+    intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "asset_id": asset_id,
+              "request_id": request_id, "created_by": account.account_id,
+              "display_name": display_name, "target": target}
+    existing = self.store.get("asset", tenant_id, asset_id)
+    if existing is not None:
+      if existing["create_intent_digest"] != canonical_digest(intent) or existing["created_by"] != account.account_id:
+        raise AdministrationDenied(409, "conflict")
+      return self._asset_row(existing)
+    now = datetime.now(timezone.utc).isoformat()
+    self.store.put("asset", tenant_id, asset_id, record={
+      **intent, "active": True, "create_intent_digest": canonical_digest(intent),
+      "created_at": now, "changed_by": account.account_id, "changed_at": now,
+      "target_digest": canonical_digest(target)})
+    return self._asset_row(self.store.get("asset", tenant_id, asset_id))
+
+  @_endpoint
+  def update_tenant_asset(self, actor, tenant_id, asset_id, expected_version, display_name, target, active):
+    _, account = self._authorized_tenant(actor, tenant_id, "assets:update")
+    asset_id = self._asset_id(asset_id)
+    try:
+      display_name, target = normalize_name(display_name), normalize_target(target)
+      if type(active) is not bool or not valid_digest(expected_version):
+        raise ValueError("Invalid desired state")
+    except (ValueError, TypeError, RecursionError):
+      raise AdministrationDenied(400, "invalid_request") from None
+    row = self.store.get("asset", tenant_id, asset_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    if row["target"]["kind"] != target["kind"]:
+      raise AdministrationDenied(400, "invalid_request")
+    if (row["display_name"], row["target"], row["active"]) == (display_name, target, active):
+      return self._asset_row(row)
+    if canonical_digest(row) != expected_version:
+      raise AdministrationDenied(409, "conflict")
+    self.store.put("asset", tenant_id, asset_id, record={
+      **row, "display_name": display_name, "target": target, "active": active,
+      "target_digest": canonical_digest(target), "changed_by": account.account_id,
+      "changed_at": datetime.now(timezone.utc).isoformat()})
+    return self._asset_row(self.store.get("asset", tenant_id, asset_id))
 
   @_endpoint
   def set_tenant_node_assignment(self, actor, tenant_id, node_address, active):

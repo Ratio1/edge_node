@@ -6,6 +6,7 @@ import json
 
 from ..ports import TenantStoreError
 from ..nodes import validate_node_assignment
+from ..assets import validate_asset
 
 MAX_ENUMERATED_RECORDS = 10000
 
@@ -14,6 +15,10 @@ class CstoreTenantAdministrationStore:
   def __init__(self, owner, namespace):
     self._owner = owner
     self._namespace = namespace
+
+  @property
+  def namespace(self):
+    return self._namespace
 
   def _location(self, kind, ids):
     if (not isinstance(self._namespace, str) or not self._namespace.strip()
@@ -48,6 +53,11 @@ class CstoreTenantAdministrationStore:
       raise TenantStoreError("Invalid tenant storage record")
     if kind == "tenant_node":
       validate_node_assignment(raw, ids)
+    if kind == "asset":
+      try:
+        validate_asset(raw, ids)
+      except (ValueError, TypeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid asset storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):
@@ -106,6 +116,10 @@ class CstoreTenantAdministrationStore:
     return [self._validate(raw, "tenant_node", ids)
             for ids, raw in self._fields("tenant_node", tenant_id)]
 
+  def list_assets(self, tenant_id):
+    self._location("asset", (tenant_id,))
+    return [self._validate(raw, "asset", ids) for ids, raw in self._fields("asset", tenant_id)]
+
   def list_tenants(self):
     rows = []
     for ids, raw in self._fields("tenant"):
@@ -129,20 +143,4 @@ class CstoreTenantAdministrationStore:
     return rows
 
   def count_assets(self, tenant_id):
-    self._location("asset", (tenant_id,))
-    count = 0
-    for ids, raw in self._fields("asset"):
-      if ids[0] != tenant_id:
-        continue
-      try:
-        row = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
-      except (ValueError, UnicodeError, RecursionError) as exc:
-        raise TenantStoreError("Invalid asset storage record") from exc
-      if (len(ids) != 2 or not isinstance(ids[1], str) or not ids[1].strip()
-          or not isinstance(row, dict) or type(row.get("schemaVersion")) is not int
-          or row["schemaVersion"] != 1 or row.get("namespace") != self._namespace
-          or row.get("tenant_id") != tenant_id or row.get("asset_id") != ids[1]
-          or type(row.get("active")) is not bool):
-        raise TenantStoreError("Invalid asset storage record")
-      count += int(row["active"])
-    return count
+    return sum(row["active"] for row in self.list_assets(tenant_id))

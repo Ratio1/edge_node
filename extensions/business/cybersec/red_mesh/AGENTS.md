@@ -479,3 +479,50 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Verification: focused administration/store/policy/plugin/surface checks passed 81 tests and
   460 subtests. Full backend regression passed 2,585 tests and 901 subtests, with 3 existing skips
   and 4 warnings. Paired review and Navigator evidence are tracked in the hub RM-026 execution plan.
+
+### 2026-09-11 — Preset asset administration prerequisite
+
+- BUILDER: four gated POST methods list/get/create/update tenant-bound network, web/API and
+  OpenAI-compatible model presets. Reads reuse fresh stored identity, published tenant and
+  `reports:view`; only scoped STA/SP mutate. Capability hints use the same resolved account.
+  A shared domain validator covers point reads, verified writes, enumeration and active counts,
+  including inactive records. Legacy ownership-only projections fail closed without adoption.
+- CRITIC/response: validate raw ASCII authority before URL normalization and strict UTF-8 at every
+  bounded path-decoding round. Regression vectors reject Unicode hostname repair, bare hexadecimal
+  hosts, ambiguous paths, secrets and nonliteral transport values. No DNS or target requests occur
+  during CRUD. Preserve target kind, unknown stored fields and immutable creation attribution/digest.
+  Create UUID replays reauthorize and return current edited/deactivated state. Complete-record
+  versions reject stale changes; desired-state no-ops preserve attribution, even after uncertain writes.
+- Verification: focused service/store/policy/plugin/surface checks passed 102 tests and 695 subtests.
+  Two unchanged runs of `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests
+  extensions/business/cybersec/red_mesh/test_native_api_semaphore_contract.py -q` each passed
+  2,613 tests and 1,164 subtests, with 3 skips and 4 warnings, but failed the existing fingerprint
+  wall-deadline assertion (approximately 158/160ms versus less than 100ms). The unchanged fingerprint
+  test file alone passed 74 tests and 60 subtests. This is an unresolved full-suite timing gap, not
+  a clean full regression or a proven root cause; no timing assertion was weakened. Final paired
+  review, follow-up checks and Navigator evidence belong in the hub RM-026 execution plan.
+- This slice does not enable tenant launches, preflights or workers. Full-record versions and
+  process-local locking are not distributed CAS; accepted CStore uncertainty and enumeration limits
+  remain. Network ports stay per job; model secondary destinations still require later admission.
+
+### 2026-09-11 — Preset verification follow-up: isolate the deadline fixture
+
+- The preceding unresolved full-suite timing gap was diagnosed rather than accepted as baseline.
+  A comparable archived pre-change checkout passed with the same interpreter/native-runtime fixture;
+  collection-only reductions and the first observer changed reproduction. A lower-perturbation
+  observer reproduced the failure and measured a main-thread generation-2 GC pause of 144.9ms
+  inside `_stop`, beginning about 10.2ms into the reader call. Connection cleanup afterward took
+  only 0.74ms; dynamic mock shutdown was not the measured source of excess latency.
+- CRITIC/response: the deadline test now explicitly collects prior-test cyclic garbage after fixture
+  setup and before starting its stopwatch. GC remains enabled with unchanged thresholds during the
+  timed call; the 200ms blocked iterator, 10ms budget, empty/incomplete result and under-100ms return
+  assertion are unchanged. A post-timing assertion also verifies shutdown was called once. No
+  production code or hard-real-time guarantee changed; the separate real-socket guards remain intact.
+- Verification: the exact deadline test passed; the complete fingerprint file passed 74 tests and
+  60 subtests. The original full backend command including the native semaphore contract then passed
+  2,614 tests and 1,164 subtests, with 3 skips and 4 warnings, in 128.89s. This final run had no
+  instrumentation or exclusions: `/tmp/rm026-assets-backend-full-final.log`. Independent source
+  reviews of the timing correction passed; the reviewed asset product source remained unchanged.
+  Paired Navigator reviews/checks and detailed diagnostic history are recorded in the hub RM-026
+  execution plan. Preset administration still does not enable tenant launch/worker enforcement or
+  global inventory cutover, and the accepted CStore limitations above still apply.

@@ -59,7 +59,7 @@ class TestAdministrationStore(unittest.TestCase):
     owner.records[hkey, '["tenant","deployment-b","other"]'] = {"secret": "other"}
     self.assertEqual([row["tenant_id"] for row in store.list_tenants()], ["tn_a"])
 
-  def test_asset_count_uses_only_strict_active_same_tenant_projections(self):
+  def test_asset_count_rejects_legacy_local_projections_without_adopting_them(self):
     owner = Store()
     hkey = '["redmesh","tenancy",1,"deployment-a"]'
     for tenant, asset, active in (("tn_a", "one", True), ("tn_a", "two", False),
@@ -70,7 +70,10 @@ class TestAdministrationStore(unittest.TestCase):
         "asset_id": asset, "active": active,
       }
     store = CstoreTenantAdministrationStore(owner, "deployment-a")
-    self.assertEqual(store.count_assets("tn_a"), 1)
+    # Asset administration now requires full target/attribution/digest records, including inactive rows.
+    self.assertEqual(store.count_assets("tn_empty"), 0)
+    with self.assertRaises(TenantStoreError):
+      store.count_assets("tn_a")
     owner.records[hkey, '["asset","deployment-a","tn_a","bad"]'] = {
       "schemaVersion": 1, "namespace": "deployment-a", "tenant_id": "tn_b",
       "asset_id": "bad", "active": True,

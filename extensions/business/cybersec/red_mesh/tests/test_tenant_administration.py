@@ -469,7 +469,8 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
                "check_tenant_domain", "authorize_tenant_membership", "update_tenant_allow_pentester",
-               "get_tenant_nodes", "set_tenant_node_assignment")
+               "get_tenant_nodes", "set_tenant_node_assignment", "list_tenant_assets",
+               "get_tenant_asset", "create_tenant_asset", "update_tenant_asset")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
     for enabled, namespace in ((False, "deployment"), ("true", "deployment"), (True, None), (True, " ")):
       for name in methods:
