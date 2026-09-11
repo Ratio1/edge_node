@@ -6,6 +6,7 @@ scoping that keeps the phase off non-comparison jobs, and the aggregation
 contract that keeps each vantage's evidence attributable to that vantage.
 """
 
+import gc
 import gzip
 import itertools
 import os
@@ -1545,12 +1546,16 @@ class TestHttpCapture(unittest.TestCase):
       yield b"late"
 
     response.iter_content.side_effect = delayed_chunks
+    # Collect unrelated prior-test cyclic garbage before measuring the blocked-stream deadline.
+    # GC stays enabled with its normal thresholds throughout the timed call.
+    gc.collect()
     started = time.monotonic()
     body, complete = read_bounded_response_body(response, max_bytes=10, max_seconds=0.01)
     elapsed = time.monotonic() - started
     self.assertEqual(body, b"")
     self.assertFalse(complete)
     self.assertLess(elapsed, 0.1)
+    response.raw.shutdown.assert_called_once_with()
 
 
 class TestAggregationAttribution(unittest.TestCase):
