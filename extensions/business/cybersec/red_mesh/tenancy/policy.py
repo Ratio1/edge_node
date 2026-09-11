@@ -12,7 +12,7 @@ from .identity import AccountView, TenantMembership, canonical_account_id
 # The accepted named-role matrix only. No wildcard authority or capability exceptions.
 _ROLE_OPERATIONS = {
   "super_tenant_admin": frozenset({
-    "node_assignments:manage",
+    "node_assignments:manage", "node_failure_policy:update",
     "tenants:manage", "tenant_users:manage", "assets:create", "assets:update",
     "integrations:manage", "attestation_keys:manage", "allow_pentester:update",
     "tasks:launch", "tasks:update", "reports:view", "reports:export", "evidence:read", "audit:view",
@@ -22,6 +22,7 @@ _ROLE_OPERATIONS = {
     "reports:view", "reports:export", "evidence:read",
   }),
   "tenant_admin": frozenset({
+    "node_failure_policy:update",
     "tenant_users:manage", "integrations:manage", "attestation_keys:manage",
     "reports:view", "reports:export", "audit:view",
   }),

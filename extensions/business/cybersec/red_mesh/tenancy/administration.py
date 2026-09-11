@@ -117,6 +117,7 @@ class TenantAdministrationService:
       "request_id": receipt["request_id"], "display_name": receipt["display_name"],
       "domain_id": receipt["domain_id"], "created_by": receipt["actor_id"],
       "created_at": receipt["created_at"], "active": False, "allow_pentester": False,
+      "node_failure_policy": "stop",
     }
 
   def _reserved_tenant(self, receipt):
@@ -133,7 +134,8 @@ class TenantAdministrationService:
 
   def _assert_tenant_binding(self, tenant, receipt):
     expected = self._tenant_payload(receipt)
-    if (any(tenant.get(key) != value for key, value in expected.items() if key not in ("active", "allow_pentester"))
+    if (any(tenant.get(key) != value for key, value in expected.items()
+            if key not in ("active", "allow_pentester", "node_failure_policy"))
         or type(tenant.get("active")) is not bool or type(tenant.get("allow_pentester")) is not bool):
       raise TenantStoreError("Tenant receipt binding mismatch")
     if "allow_pentester_changed_by" in tenant or "allow_pentester_changed_at" in tenant:
@@ -146,6 +148,24 @@ class TenantAdministrationService:
         raise TenantStoreError("Invalid tenant policy timestamp") from None
       if changed_at.tzinfo != timezone.utc:
         raise TenantStoreError("Invalid tenant policy timestamp")
+    self._node_failure_policy(tenant)
+
+  @staticmethod
+  def _node_failure_policy(tenant):
+    policy = tenant.get("node_failure_policy", "stop")
+    if not isinstance(policy, str) or policy not in ("stop", "continue"):
+      raise TenantStoreError("Invalid node failure policy")
+    if "node_failure_policy_changed_by" in tenant or "node_failure_policy_changed_at" in tenant:
+      changed_by = tenant.get("node_failure_policy_changed_by")
+      if not isinstance(changed_by, str) or not changed_by or canonical_account_id(changed_by) != changed_by:
+        raise TenantStoreError("Invalid node failure policy attribution")
+      try:
+        changed_at = datetime.fromisoformat(tenant.get("node_failure_policy_changed_at"))
+      except (TypeError, ValueError):
+        raise TenantStoreError("Invalid node failure policy timestamp") from None
+      if changed_at.tzinfo != timezone.utc:
+        raise TenantStoreError("Invalid node failure policy timestamp")
+    return policy
 
   @_endpoint
   def prepare_tenant(self, actor, request_id, display_name, domain_id, initial_admin_id):
@@ -251,11 +271,17 @@ class TenantAdministrationService:
 
   def _detail(self, tenant, account):
     detail = {**self._row(tenant), "assetCount": self.store.count_assets(tenant["tenant_id"]),
+              "nodeFailurePolicy": self._node_failure_policy(tenant),
+              "canUpdateNodeFailurePolicy": authorize_tenant_operation(
+                account, "node_failure_policy:update", TenantPolicyContext(
+                  tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed,
               "canUpdateAllowPentester": authorize_tenant_operation(
                 account, "allow_pentester:update", TenantPolicyContext(
                   tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed}
     for stored, public in (("allow_pentester_changed_by", "allowPentesterChangedBy"),
-                           ("allow_pentester_changed_at", "allowPentesterChangedAt")):
+                           ("allow_pentester_changed_at", "allowPentesterChangedAt"),
+                           ("node_failure_policy_changed_by", "nodeFailurePolicyChangedBy"),
+                           ("node_failure_policy_changed_at", "nodeFailurePolicyChangedAt")):
       if stored in tenant:
         detail[public] = tenant[stored]
     return detail
@@ -289,6 +315,19 @@ class TenantAdministrationService:
     tenant = {**tenant, "allow_pentester": allow_pentester,
               "allow_pentester_changed_by": account.account_id,
               "allow_pentester_changed_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("tenant", tenant_id, record=tenant)
+    return self._detail(tenant, account)
+
+  @_endpoint
+  def update_tenant_node_failure_policy(self, actor, tenant_id, node_failure_policy):
+    tenant, account = self._authorized_tenant(actor, tenant_id, "node_failure_policy:update")
+    if not isinstance(node_failure_policy, str) or node_failure_policy not in ("stop", "continue"):
+      raise AdministrationDenied(400, "invalid_request")
+    if self._node_failure_policy(tenant) == node_failure_policy:
+      return self._detail(tenant, account)
+    tenant = {**tenant, "node_failure_policy": node_failure_policy,
+              "node_failure_policy_changed_by": account.account_id,
+              "node_failure_policy_changed_at": datetime.now(timezone.utc).isoformat()}
     self.store.put("tenant", tenant_id, record=tenant)
     return self._detail(tenant, account)
 

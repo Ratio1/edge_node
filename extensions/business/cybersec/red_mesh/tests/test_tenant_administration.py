@@ -128,7 +128,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.store.account("second", memberships=[{"role": "super_pentester", "tenant_id": tenant_id}])
     before = len(self.store.writes)
     retried = self.service.update_tenant_allow_pentester({"account_id": "second"}, tenant_id, True)
-    self.assertEqual(retried["data"], changed["data"])
+    self.assertEqual(retried["data"], {**changed["data"], "canUpdateNodeFailurePolicy": False})
     self.assertEqual(len(self.store.writes), before)
     self.store.account("second", role="admin", memberships=[])
     self.assertEqual(self.service.update_tenant_allow_pentester(
