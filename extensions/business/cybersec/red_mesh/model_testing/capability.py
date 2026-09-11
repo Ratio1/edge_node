@@ -22,6 +22,7 @@ def get_capability_status(owner):
   )
   default_label = default_option.get("label") if isinstance(default_option, dict) else None
   return {
+    "tenant_execution_enabled": getattr(owner, "cfg_tenant_execution_enabled", None) is True,
     "network_scan": {
       "enabled": True,
       "disabled_reason": None,

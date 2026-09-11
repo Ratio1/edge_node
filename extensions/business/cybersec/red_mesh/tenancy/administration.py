@@ -488,7 +488,11 @@ class TenantAdministrationService:
     if row is None:
       raise AdministrationDenied(404, "not_found")
     return {"asset": self._asset_row(row),
-            "canUpdateAssets": self._asset_permission(account, tenant, "assets:update")}
+            "canUpdateAssets": self._asset_permission(account, tenant, "assets:update"),
+            "canLaunchJobs": row["active"] is True and authorize_tenant_operation(
+              account, "tasks:launch", TenantPolicyContext(
+                tenant["tenant_id"], tenant["active"], tenant["allow_pentester"]),
+              asset_tenant_ids=(row["tenant_id"],)).allowed}
 
   @_endpoint
   def create_tenant_asset(self, actor, tenant_id, request_id, display_name, target):

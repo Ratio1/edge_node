@@ -52,11 +52,71 @@ class TestTenantAssetAdministration(unittest.TestCase):
     self.assertRegex(asset["targetDigest"], r"^[a-f0-9]{64}$")
     self.assertEqual(asset["targetDigest"], "b1224a722dc62b2bdc9b43b977f3fcdbc7680551e0979abe3b0522734dca3f6d")
     self.assertEqual(self.service.get_tenant_asset(self.actor, self.tenant, asset["assetId"])["data"],
-                     {"asset": asset, "canUpdateAssets": True})
+                     {"asset": asset, "canUpdateAssets": True, "canLaunchJobs": True})
     self.assertEqual(self.service.list_tenant_assets(self.actor, self.tenant)["data"],
                      {"tenantId": self.tenant, "assets": [asset], "canCreateAssets": True, "canUpdateAssets": True})
     self.assertEqual(self.service.get_tenant_asset({"account_id": "initial"}, self.tenant, asset["assetId"])["data"],
-                     {"asset": asset, "canUpdateAssets": False})
+                     {"asset": asset, "canUpdateAssets": False, "canLaunchJobs": False})
+
+  def test_launch_hint_uses_stored_role_scope_and_allow_pentester_policy(self):
+    asset = self.create()["data"]
+    cases = (
+      ((("super_tenant_admin", None),), True, True),
+      ((("super_tenant_admin", self.tenant),), True, True),
+      ((("super_pentester", None),), True, True),
+      ((("super_pentester", self.tenant),), True, True),
+      ((("tenant_pentester", self.tenant),), False, True),
+      ((("tenant_admin", self.tenant),), False, False),
+      ((("tenant_user", self.tenant),), False, False),
+      ((("tenant_admin", self.tenant), ("tenant_pentester", self.tenant)), False, True),
+      ((("tenant_user", self.tenant), ("super_pentester", None)), True, True),
+      ((("tenant_admin", self.tenant), ("super_pentester", "foreign")), False, False),
+    )
+    for allow_pentester in (False, True):
+      self.assertTrue(self.service.update_tenant_allow_pentester(
+        self.actor, self.tenant, allow_pentester)["success"])
+      for memberships, disabled, enabled in cases:
+        with self.subTest(memberships=memberships, allow_pentester=allow_pentester):
+          self.owner.account("operator", memberships=[
+            {"role": role, "tenant_id": scope} for role, scope in memberships])
+          actor = {"account_id": "operator", "role": "super_tenant_admin",
+                   "tenant_memberships": [{"role": "super_tenant_admin", "tenant_id": None}]}
+          before = len(self.owner.writes)
+          result = self.service.get_tenant_asset(actor, self.tenant, asset["assetId"])
+          self.assertTrue(result["success"], result)
+          self.assertIs(result["data"]["canLaunchJobs"], enabled if allow_pentester else disabled)
+          self.assertEqual(result["data"]["asset"], asset)
+          self.assertEqual(len(self.owner.writes), before)
+
+  def test_launch_hint_never_exposes_foreign_missing_or_unpublished_assets(self):
+    asset = self.create()["data"]
+    self.owner.account("operator", memberships=[{"role": "tenant_pentester", "tenant_id": "foreign"}])
+    result = self.service.get_tenant_asset({"account_id": "operator"}, self.tenant, asset["assetId"])
+    self.assertEqual(result["status_code"], 404, result)
+    self.assertNotIn("data", result)
+    foreign_request = str(uuid4())
+    foreign = self.service.prepare_tenant(self.actor, foreign_request, "Foreign", "foreign", "initial")["data"]["tenantId"]
+    result = self.service.get_tenant_asset(self.actor, foreign, asset["assetId"])
+    self.assertEqual(result["status_code"], 404, result)
+    self.assertNotIn("data", result)
+    self.owner.grant("initial", foreign)
+    self.assertTrue(self.service.activate_tenant(self.actor, foreign_request)["success"])
+    for tenant_id, asset_id in ((foreign, asset["assetId"]), (self.tenant, "as_" + str(uuid4()))):
+      with self.subTest(tenant_id=tenant_id, asset_id=asset_id):
+        result = self.service.get_tenant_asset(self.actor, tenant_id, asset_id)
+        self.assertEqual(result["status_code"], 404, result)
+        self.assertNotIn("data", result)
+    tenant = self.store.get("tenant", self.tenant)
+    with patch.dict(self.owner.data):
+      self.store.put("tenant", self.tenant, record={**tenant, "active": False})
+      result = self.service.get_tenant_asset(self.actor, self.tenant, asset["assetId"])
+      self.assertEqual(result["status_code"], 404, result)
+      self.assertNotIn("data", result)
+    with patch.dict(self.owner.data):
+      del self.owner.data[self.store._location("receipt", (tenant["actor_id"], tenant["request_id"]))]
+      result = self.service.get_tenant_asset(self.actor, self.tenant, asset["assetId"])
+      self.assertEqual(result["status_code"], 503, result)
+      self.assertNotIn("data", result)
 
   def test_create_replay_does_not_write_and_changed_intent_conflicts(self):
     original = self.create()["data"]
@@ -210,6 +270,9 @@ class TestTenantAssetAdministration(unittest.TestCase):
             read()
         with self.assertRaises(TenantStoreError):
           self.store.put("asset", self.tenant, asset["assetId"], record=bad)
+        detail = self.service.get_tenant_asset(self.actor, self.tenant, asset["assetId"])
+        self.assertEqual(detail["status_code"], 503)
+        self.assertNotIn("data", detail)
         self.assertEqual(self.create()["status_code"], 503)
         self.assertEqual(self.service.update_tenant_asset(self.actor, self.tenant, asset["assetId"], asset["version"], "Asset", self.target, False)["status_code"], 503)
         self.assertEqual(len(self.owner.writes), before)
