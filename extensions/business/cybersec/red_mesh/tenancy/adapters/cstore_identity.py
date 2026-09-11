@@ -108,6 +108,7 @@ class CstoreAuthAccountReader:
       active=(ACCOUNT_STATE_KEY not in metadata or state == ACTIVE_STATE),
       tenant_memberships=memberships,
       account_generation=generation,
+      tenant_memberships_present=MEMBERSHIPS_KEY in metadata,
     )
 
 

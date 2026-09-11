@@ -8,6 +8,7 @@ from ..models import CStoreJobRunning, WorkerProgress
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
 from ..services.soc_export_policy import required_soc_launch_error
+from ..tenancy.effective_targets import resolve_model_launch_provider, validate_model_provider
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
 from .catalog import (
   CBRN_SAFETY_V1_ID,
@@ -297,6 +298,7 @@ def preflight_model_test_provider(
   tested_model=None,
   tested_model_secret_payload=None,
   limits=None,
+  execution_context=None,
 ):
   """Validate and transiently exercise a tested-model provider before launch."""
   cfg = get_model_testing_config(owner)
@@ -319,6 +321,10 @@ def preflight_model_test_provider(
   normalized_limits, err = _normalize_limits(limits, cfg)
   if err:
     return {"ok": False, **err}
+  try:
+    tested_model = resolve_model_launch_provider(execution_context, tested_model)
+  except (ValueError, TypeError):
+    return {"ok": False, **_validation_error("Execution target mismatch", error_class="execution_target_mismatch")}
   tested_model_config, err = _validate_provider(
     "tested_model",
     tested_model,
@@ -328,6 +334,10 @@ def preflight_model_test_provider(
   if err:
     return {"ok": False, **err}
   runtime_provider = _runtime_provider(tested_model, tested_model_secret_payload)
+  try:
+    validate_model_provider(execution_context, runtime_provider)
+  except (ValueError, TypeError):
+    return {"ok": False, **_validation_error("Execution target mismatch", error_class="execution_target_mismatch")}
   if not str(runtime_provider.get("api_key") or "").strip():
     return {
       "ok": False,
@@ -387,6 +397,7 @@ def launch_model_test(
   limits=None,
   raw_evidence=None,
   blockchain_attestation_enabled: bool = False,
+  execution_context=None,
 ):
   """Validate Model Testing launch input and fail closed until execution lands."""
   cfg = get_model_testing_config(owner)
@@ -438,6 +449,10 @@ def launch_model_test(
       error_class="unsupported_evaluator_config",
     )
 
+  try:
+    tested_model = resolve_model_launch_provider(execution_context, tested_model)
+  except (ValueError, TypeError):
+    return _validation_error("Execution target mismatch", error_class="execution_target_mismatch")
   tested_model_config, err = _validate_provider(
     "tested_model",
     tested_model,
@@ -451,9 +466,17 @@ def launch_model_test(
   if err:
     return err
 
-  node_selection, err = select_model_test_execution_node(owner, selected_peers)
+  candidates = execution_context.to_dict()["selected_candidates"] if execution_context is not None else selected_peers
+  node_selection, err = select_model_test_execution_node(owner, candidates)
   if err:
-    return err
+    return _validation_error("Execution node unavailable") if execution_context is not None else err
+  execution_binding = None
+  if execution_context is not None:
+    try:
+      execution_binding = execution_context.build_binding(getattr(owner, "ee_addr", ""),
+        [node_selection["selected_execution_node"]])
+    except (ValueError, TypeError):
+      return _validation_error("Execution node unavailable")
 
   job_id = _new_job_id(owner)
   sanitized_config = {
@@ -485,6 +508,8 @@ def launch_model_test(
     "start_attestation_required": bool(blockchain_attestation_enabled),
     "end_attestation_required": bool(blockchain_attestation_enabled),
   }
+  if execution_binding is not None:
+    sanitized_config["execution_binding"] = execution_binding.to_dict()
 
   persisted_config, secret_ref = attach_model_test_provider_secret(
     owner,
@@ -551,6 +576,7 @@ def launch_model_test(
     blockchain_attestation_enabled=bool(blockchain_attestation_enabled),
     start_attestation_required=bool(blockchain_attestation_enabled),
     end_attestation_required=bool(blockchain_attestation_enabled),
+    execution_binding=execution_binding,
   ).to_dict()
   if blockchain_attestation_enabled:
     submit_start_attestation = getattr(owner, "_submit_redmesh_job_start_attestation", None)

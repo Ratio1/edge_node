@@ -22,13 +22,42 @@ from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, m
 
 
 def _stub_launch_actor(plugin):
-  """RM-075: launch endpoints resolve the forwarded actor through a seam; tests bind a known account."""
+  """Known stored legacy account and explicitly initialized compatibility rollout."""
   from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
-  plugin._resolve_launch_actor = lambda actor=None: (AccountView("tester", "admin", None, True), None)
+  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
+  plugin._resolve_launch_actor = lambda actor=None: (
+    AccountView("tester", "admin", None, True, tenant_memberships_present=False), None)
+  plugin.cfg_tenant_execution_enabled = False
+  plugin.cfg_tenant_execution_stage = "compatibility"
+  service = MagicMock()
+  service.read_execution_rollout.return_value = ExecutionRollout("compatibility", False, "compatibility", False)
+  plugin._execution_service = lambda: service
+  def admit(*args):
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin._admit_execution(plugin, *args)
+  plugin._admit_execution = admit
   return plugin
 
 class TestPhase1ConfigCID(unittest.TestCase):
   """Phase 1: Job Config CID — extract static config from CStore to R1FS."""
+
+  def test_bound_compatibility_launch_rejects_opposite_target_fields(self):
+    from .test_tenant_execution_effects import context
+    from extensions.business.cybersec.red_mesh.services.launch_api import launch_test
+    for scan_type, saved, alias in (
+      ("network", {"kind": "network", "address": "192.0.2.1"}, {"target_url": "https://foreign.example"}),
+      ("webapp", {"kind": "webapp", "url": "https://target.example/app", "allowedPathPrefix": "/app"},
+       {"target": "foreign.example"}),
+    ):
+      with self.subTest(scan_type=scan_type):
+        owner = self._build_mock_plugin()
+        self._bind_launch_helpers(owner)
+        result = launch_test(owner, execution_context=context(saved), scan_type=scan_type,
+                            start_port=1, end_port=4, authorized=True, **alias)
+        self.assertEqual(result.get("error"), "validation_error")
+        self.assertEqual(result.get("message"), "Execution target mismatch")
+        owner.r1fs.add_json.assert_not_called()
+        owner.chainstore_hset.assert_not_called()
 
   def test_config_cid_roundtrip(self):
     """JobConfig.from_dict(config.to_dict()) preserves all fields."""
@@ -1775,6 +1804,9 @@ class TestPhase2PassFinalization(unittest.TestCase):
                               llm_enabled=False, r1fs_returns=None):
     """Build a mock plugin pre-configured for _maybe_finalize_pass testing."""
     plugin = MagicMock()
+    # These lifecycle tests assume explicitly verified current/new-pass authority.
+    # Tenant denial and unknown-rollout cases are exercised at the real admission seam.
+    plugin._execution_operation_allowed = MagicMock(return_value=True)
     plugin.ee_addr = "launcher-node"
     plugin.ee_id = "launcher-alias"
     plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
@@ -4950,9 +4982,9 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
     # RM-075: created_by_* come from the account store via the actor seam, never from the request.
     from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
 
-    plugin = MagicMock()
+    plugin = _stub_launch_actor(MagicMock())
     plugin._resolve_launch_actor = lambda actor=None: (
-      AccountView("navigator-user-123", "admin", None, True), None
+      AccountView("navigator-user-123", "admin", None, True, tenant_memberships_present=False), None
     )
     token = "valid-backend-token-material-at-least-32-bytes"
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
@@ -4972,7 +5004,10 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
     self.assertEqual(launch.call_args.kwargs["created_by_name"], "navigator-user-123")
 
   def test_authenticated_preflight_forwards_navigator_actor_assertion(self):
-    plugin = MagicMock()
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+    plugin = _stub_launch_actor(MagicMock())
+    plugin._resolve_launch_actor = lambda actor=None: (
+      AccountView("navigator-user-123", "admin", None, True, tenant_memberships_present=False), None)
     token = "valid-backend-token-material-at-least-32-bytes"
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
       "extensions.business.cybersec.red_mesh.pentester_api_01.preflight_model_test_provider",
@@ -4981,7 +5016,8 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
       result = self.Plugin.preflight_model_test_provider(
         plugin,
         token,
-        created_by_id="navigator-user-123",
+        actor={"account_id": "navigator-user-123"},
+        created_by_id="spoofed-by-request",
       )
 
     self.assertEqual(result, {"status": "ok"})

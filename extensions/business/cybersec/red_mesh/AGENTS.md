@@ -526,3 +526,22 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   Paired Navigator reviews/checks and detailed diagnostic history are recorded in the hub RM-026
   execution plan. Preset administration still does not enable tenant launch/worker enforcement or
   global inventory cutover, and the accepted CStore limitations above still apply.
+
+### 2026-09-11 — B2 tenant execution and archive commit boundaries
+
+- BUILDER: paired launch/worker enforcement preserves the original tenant execution binding through
+  actual worker entry, target/provider effects, config, archives and finalized stubs. The generated
+  HTTP interpreter validates its real route models at import. Source rollout remains disabled.
+- CRITIC/response: archive checks include cached returns and the stub writer's own current read,
+  before terminal shortcuts or revision coercion. Require matching job IDs and exact integer values
+  for present counters; finalized stubs legitimately omit counters. A caller's earlier successful
+  read cannot authorize a later-observed stale commit. Preserve the captured snapshot through that
+  boundary; denied commits never trigger bound cleanup or report success. This is not CStore CAS.
+- Verification: permanent production-finalizer regressions were red before each correction; focused
+  archive/model/legacy checks pass 128 tests/267 subtests. Three cross-assigned reviewers independently
+  pass their non-authored B2 scopes after correction. Full RedMesh regression passes 2,819 tests and
+  1,730 subtests, three existing skips/four warnings; native semaphore contract passes four tests.
+  See the hub's `docs/_plans/2026-09-11-rm-026-complete-execution.md` for phase history and commit tracking.
+- When changing these boundaries, read [tenant-execution-boundary.md](docs/tenant-execution-boundary.md)
+  for compatibility and effect ordering. Tenant reads/caches, launcher lifecycle/takeover and
+  operational activation remain later gates; B2 does not establish tenant-serving readiness.

@@ -32,6 +32,8 @@ class AccountView:
   active: bool
   tenant_memberships: tuple[TenantMembership, ...] = ()
   account_generation: str | None = None
+  # Only the backend account reader can prove absence. Unknown fixtures are not legacy.
+  tenant_memberships_present: bool | None = None
 
   @property
   def created_by(self):

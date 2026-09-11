@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from .identity import IdentityStoreError, TenantMembership, canonical_account_id, resolve_actor
 from .policy import TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles, resolve_operation_roles
-from .execution import ResolvedExecutionContext
+from .execution import CurrentExecutionFacts, ExecutionBinding, ExecutionRollout, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
 from .assets import canonical_digest, normalize_name, normalize_target, valid_digest
@@ -71,6 +71,20 @@ class TenantAdministrationService:
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
+
+  def read_execution_rollout(self, cfg_instance_id, *, enabled, stage):
+    """Read explicit setup state; runtime never initializes or repairs missing controls."""
+    record = self.store.get("execution_rollout", cfg_instance_id)
+    expected = {"schemaVersion", "namespace", "kind", "ids", "stage", "enabled"}
+    if (not isinstance(record, dict) or set(record) != expected
+        or type(record["schemaVersion"]) is not int or record["schemaVersion"] != 1
+        or record["namespace"] != self.store.namespace or record["kind"] != "execution_rollout"
+        or record["ids"] != [cfg_instance_id]):
+      raise TenantStoreError("Unknown execution rollout state")
+    try:
+      return ExecutionRollout(stage, enabled, record["stage"], record["enabled"])
+    except (ValueError, TypeError) as exc:
+      raise TenantStoreError("Invalid execution rollout controls") from exc
 
   def _actor(self, actor, *, creator=False):
     account, denial = resolve_actor(actor, self.accounts)
@@ -220,6 +234,10 @@ class TenantAdministrationService:
 
   def _authorized_tenant(self, actor, tenant_id, operation="reports:view"):
     account = self._actor(actor)
+    return self._authorized_tenant_for_account(account, tenant_id, operation)
+
+  def _authorized_tenant_for_account(self, account, tenant_id, operation="reports:view"):
+    """Private seam for an account resolved once at this operation's trusted entry point."""
     _, denial = resolve_tenant_roles(account, tenant_id)
     if denial:
       raise AdministrationDenied(denial.status_code, denial.error)
@@ -337,9 +355,14 @@ class TenantAdministrationService:
     self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
     return self._members(tenant_id)
 
-  def resolve_execution_admission(self, actor, tenant_id, asset_id, selected_peers=None):
+  def resolve_execution_admission(self, actor, tenant_id, asset_id, selected_peers=None, *,
+                                  expected_target_digest=None):
     """Resolve current stored facts only; no endpoint, publication, DNS or execution."""
-    tenant, account = self._authorized_tenant(actor, tenant_id)
+    return self._resolve_execution_admission_for_account(self._actor(actor), tenant_id, asset_id,
+      selected_peers, expected_target_digest=expected_target_digest)
+
+  def _execution_asset_for_account(self, account, tenant_id, asset_id, expected_target_digest):
+    tenant, account = self._authorized_tenant_for_account(account, tenant_id)
     policy = TenantPolicyContext(tenant_id, tenant["active"], tenant["allow_pentester"])
     _, denial = resolve_operation_roles(account, "tasks:launch", policy)
     if denial:
@@ -353,6 +376,14 @@ class TenantAdministrationService:
       asset_tenant_ids=(asset["tenant_id"],))
     if not decision.allowed:
       raise AdministrationDenied(decision.status_code, decision.error)
+    if expected_target_digest is not None:
+      if not valid_digest(expected_target_digest):
+        raise AdministrationDenied(400, "invalid_request")
+      if expected_target_digest != asset["target_digest"]:
+        raise AdministrationDenied(409, "target_changed")
+    return tenant, asset
+
+  def _execution_eligible_nodes(self, tenant_id):
     assignments = self.store.list_node_assignments(tenant_id)
     try:
       configured = self.configured_peers_reader()
@@ -361,6 +392,12 @@ class TenantAdministrationService:
     if not isinstance(configured, list) or any(not valid_node_address(peer) for peer in configured):
       raise TenantStoreError("Node eligibility is unavailable")
     eligible = {row["node_address"] for row in assignments if row["active"]} & set(configured)
+    return sorted(eligible)
+
+  def _resolve_execution_admission_for_account(self, account, tenant_id, asset_id, selected_peers=None, *,
+                                               expected_target_digest=None):
+    tenant, asset = self._execution_asset_for_account(account, tenant_id, asset_id, expected_target_digest)
+    eligible = self._execution_eligible_nodes(tenant_id)
     if selected_peers is not None and (not isinstance(selected_peers, list)
         or any(not valid_node_address(peer) for peer in selected_peers)
         or len(set(selected_peers)) != len(selected_peers)):
@@ -376,6 +413,31 @@ class TenantAdministrationService:
         "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid stored execution facts") from exc
+
+  def reauthorize_execution(self, binding, *, worker_node=None):
+    """Re-read original execution authority; preserve every field in the saved binding."""
+    try:
+      saved = (binding if isinstance(binding, ExecutionBinding) else ExecutionBinding(binding)).to_dict()
+    except (ValueError, TypeError, RecursionError):
+      raise AdministrationDenied(409, "invalid_execution_binding") from None
+    if saved["namespace"] != self.store.namespace:
+      raise AdministrationDenied(404, "not_found")
+    account = self._actor({"account_id": saved["actor_id"]})
+    if account.account_generation != saved["actor_generation"]:
+      raise AdministrationDenied(409, "account_changed")
+    _, asset = self._execution_asset_for_account(account, saved["tenant_id"], saved["asset_id"],
+      saved["asset_target_digest"])
+    eligible = self._execution_eligible_nodes(saved["tenant_id"])
+    if worker_node is not None and (not valid_node_address(worker_node)
+        or worker_node not in saved["participant_order"] or worker_node not in eligible):
+      raise AdministrationDenied(403, "ineligible_node")
+    try:
+      return CurrentExecutionFacts({"namespace": self.store.namespace, "tenant_id": saved["tenant_id"],
+        "asset_id": asset["asset_id"], "asset_target": asset["target"],
+        "asset_target_digest": asset["target_digest"], "actor_id": account.account_id,
+        "actor_generation": account.account_generation, "eligible_nodes": eligible})
+    except (ValueError, TypeError, RecursionError) as exc:
+      raise TenantStoreError("Invalid current execution facts") from exc
 
   @_endpoint
   def get_tenant_nodes(self, actor, tenant_id):

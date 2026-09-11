@@ -32,6 +32,7 @@ from ..graybox.models.target_config import (
 )
 from ..graybox.http_client import validate_target_config_paths
 from ..repositories import JobStateRepository
+from ..tenancy.effective_targets import resolve_launch_target, validate_effective_config
 from ..graybox.scenario_runtime import (
   GRAYBOX_ASSIGNMENT_MIRROR,
   GRAYBOX_ASSIGNMENT_SLICE,
@@ -986,6 +987,7 @@ def build_webapp_workers(
 def announce_launch(
   owner,
   *,
+  execution_context=None,
   target,
   start_port,
   end_port,
@@ -1077,11 +1079,27 @@ def announce_launch(
   if not scanner_user_agent:
     scanner_user_agent = owner.cfg_scanner_user_agent
 
+  binding = None
+  if execution_context is not None:
+    if not workers:
+      return validation_error("Empty execution assignment")
+    if scan_type == ScanType.NETWORK.value:
+      excluded_ports = set(exceptions or [])
+      for worker in workers.values():
+        ports = worker.get("target_ports") or range(worker.get("start_port", 0), worker.get("end_port", -1) + 1)
+        if not any(port not in excluded_ports for port in ports):
+          return validation_error("Empty execution assignment")
+    try:
+      binding = execution_context.build_binding(owner.ee_addr, list(workers))
+    except ValueError:
+      return validation_error("Invalid execution assignment")
+
   job_id = owner.uuid(8)
   owner.P(f"Launching {job_id=} {target=} with {exceptions=}")
   owner.P(f"Announcing pentest to workers (instance_id {owner.cfg_instance_id})...")
 
   job_config = JobConfig(
+    execution_binding=binding,
     target=target,
     start_port=start_port,
     end_port=end_port,
@@ -1148,6 +1166,7 @@ def announce_launch(
     end_attestation_required=bool(blockchain_attestation_enabled),
   )
 
+  validate_effective_config(job_config.to_dict(), target=target)
   persisted_config, job_config_cid = persist_job_config_with_secrets(
     owner,
     job_id=job_id,
@@ -1162,6 +1181,7 @@ def announce_launch(
 
   assignment_summary = summarize_graybox_worker_assignments(workers) if scan_type == ScanType.WEBAPP.value else {}
   job_specs = CStoreJobRunning(
+    execution_binding=binding,
     job_id=job_id,
     job_status=JOB_STATUS_RUNNING,
     job_pass=1,
@@ -1272,7 +1292,12 @@ def announce_launch(
     "authorization_ref": authorization_ref,
     "has_target_allowlist": bool(target_allowlist),
     "safety_warning_count": len((safety_policy or {}).get("warnings", [])),
+    **({"tenant_id": binding.to_dict()["tenant_id"], "asset_id": binding.to_dict()["asset_id"]}
+       if binding is not None else {}),
   })
+
+  if binding is not None:
+    return {"job_specs": job_specs, "worker": owner.ee_addr, "job_config": persisted_config}
 
   all_network_jobs = _job_repo(owner).list_jobs()
   report = {}
@@ -1293,6 +1318,7 @@ def announce_launch(
 def launch_network_scan(
   owner,
   *,
+  execution_context=None,
   target="",
   start_port=1,
   end_port=65535,
@@ -1329,6 +1355,10 @@ def launch_network_scan(
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
+  try:
+    target = resolve_launch_target(execution_context, "network", target)
+  except ValueError:
+    return validation_error("Execution target mismatch")
   if not target:
     return validation_error("target required for network scan")
 
@@ -1377,7 +1407,10 @@ def launch_network_scan(
   if confirmation_error:
     return confirmation_error
 
-  active_peers, peer_error = resolve_active_peers(owner, selected_peers)
+  if execution_context is not None:
+    active_peers, peer_error = execution_context.to_dict()["selected_candidates"], None
+  else:
+    active_peers, peer_error = resolve_active_peers(owner, selected_peers)
   if peer_error:
     return peer_error
 
@@ -1429,6 +1462,7 @@ def launch_network_scan(
 
   return announce_launch(
     owner,
+    execution_context=execution_context,
     target=target,
     start_port=start_port,
     end_port=end_port,
@@ -1481,6 +1515,7 @@ def launch_network_scan(
 def launch_webapp_scan(
   owner,
   *,
+  execution_context=None,
   target_url="",
   excluded_features=None,
   run_mode="",
@@ -1552,6 +1587,10 @@ def launch_webapp_scan(
   through the same R1FS secret payload as ``official_password`` and are
   blanked from the persisted JobConfig before archive write.
   """
+  try:
+    target_url = resolve_launch_target(execution_context, "webapp", target_url)
+  except ValueError:
+    return validation_error("Execution target mismatch")
   if not target_url:
     return validation_error("target_url required for webapp scan")
   max_weak_attempts, numeric_error = _parse_positive_int(
@@ -1683,7 +1722,10 @@ def launch_webapp_scan(
   if confirmation_error:
     return confirmation_error
 
-  active_peers, peer_error = resolve_active_peers(owner, selected_peers)
+  if execution_context is not None:
+    active_peers, peer_error = execution_context.to_dict()["selected_candidates"], None
+  else:
+    active_peers, peer_error = resolve_active_peers(owner, selected_peers)
   if peer_error:
     return peer_error
 
@@ -1737,6 +1779,7 @@ def launch_webapp_scan(
 
   return announce_launch(
     owner,
+    execution_context=execution_context,
     target=target,
     start_port=target_port,
     end_port=target_port,
@@ -1799,6 +1842,7 @@ def launch_webapp_scan(
 def launch_test(
   owner,
   *,
+  execution_context=None,
   target="",
   start_port=1,
   end_port=65535,
@@ -1866,11 +1910,17 @@ def launch_test(
   except ValueError:
     return validation_error(f"Invalid scan_type: {scan_type}. Valid: {[e.value for e in ScanType]}")
 
+  if execution_context is not None:
+    unused_target = target if scan_type_enum == ScanType.WEBAPP else target_url
+    if unused_target not in (None, ""):
+      return validation_error("Execution target mismatch")
+
   if scan_type_enum == ScanType.WEBAPP:
     # The launch_test endpoint already resolved the actor and set account attribution.
     # Delegate directly to preserve that attribution without a second actor lookup.
     return launch_webapp_scan(
       owner,
+      execution_context=execution_context,
       target_url=target_url,
       excluded_features=excluded_features,
       run_mode=run_mode,
@@ -1926,6 +1976,7 @@ def launch_test(
 
   return launch_network_scan(
     owner,
+    execution_context=execution_context,
     target=target,
     start_port=start_port,
     end_port=end_port,

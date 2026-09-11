@@ -82,8 +82,23 @@ ENDPOINT_FIRST_ARGS = {
 
 
 def _call_launch(endpoint, plugin, **kwargs):
+  _known_rollout(plugin)
   args = (TEST_CHANNEL_TOKEN,) if endpoint.__name__ == "launch_model_test" else ()
   return endpoint(plugin, *args, **kwargs)
+
+
+def _known_rollout(plugin):
+  """These attribution tests use explicit compatibility controls, not absent state."""
+  from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
+  plugin.cfg_instance_id = "fixture-instance"
+  plugin.cfg_tenant_execution_enabled = False
+  plugin.cfg_tenant_execution_stage = "compatibility"
+  service = MagicMock()
+  service.read_execution_rollout.return_value = ExecutionRollout("compatibility", False, "compatibility", False)
+  plugin._execution_service = lambda: service
+  plugin._admit_execution = lambda *args: PentesterApi01Plugin._admit_execution(plugin, *args)
+  return plugin
 
 
 def _endpoints(plugin_cls):
@@ -190,7 +205,8 @@ class TestAuthzSurface(unittest.TestCase):
         # And a resolved actor overrides whatever created_by_* the request carried.
         seen = {}
         plugin = MagicMock()
-        plugin._resolve_launch_actor = lambda actor=None: (AccountView("ops.user", "admin", None, True), None)
+        plugin._resolve_launch_actor = lambda actor=None: (
+          AccountView("ops.user", "admin", None, True, tenant_memberships_present=False), None)
         target = {
           "launch_network_scan": "extensions.business.cybersec.red_mesh.pentester_api_01.launch_network_scan",
           "launch_webapp_scan": "extensions.business.cybersec.red_mesh.pentester_api_01.launch_webapp_scan",
@@ -292,9 +308,12 @@ class TestAuthzSurface(unittest.TestCase):
           launch.assert_not_called()
 
   def test_preflight_accepts_trimmed_configured_token(self):
+    from .test_api import _stub_launch_actor
+    plugin = _stub_launch_actor(MagicMock())
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN + "\n"}, clear=True), \
          patch("extensions.business.cybersec.red_mesh.pentester_api_01.preflight_model_test_provider", return_value={"ok": True}) as preflight:
-      self.assertEqual(self.Plugin.preflight_model_test_provider(MagicMock(), TEST_CHANNEL_TOKEN), {"ok": True})
+      self.assertEqual(self.Plugin.preflight_model_test_provider(
+        plugin, TEST_CHANNEL_TOKEN, actor={"account_id": "tester"}), {"ok": True})
     preflight.assert_called_once()
 
 
@@ -331,7 +350,9 @@ class TestInternalCallersDoNotReenterEndpoints(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
 
     plugin = MagicMock()
-    plugin._resolve_launch_actor = lambda actor=None: (AccountView("ops.user", "admin", None, True), None)
+    _known_rollout(plugin)
+    plugin._resolve_launch_actor = lambda actor=None: (
+      AccountView("ops.user", "admin", None, True, tenant_memberships_present=False), None)
     seen = {}
     with patch.object(launch_api, "launch_network_scan", side_effect=lambda owner, **kw: seen.update(kw) or {"ok": True}):
       result = self.Plugin.launch_test(

@@ -966,7 +966,8 @@ class _RedMeshLlmAgentMixin(object):
       endpoint: str,
       method: str = "POST",
       payload: dict = None,
-      timeout: int = None
+      timeout: int = None,
+      before_provider_call=None,
   ) -> dict:
     """
     Make HTTP request to the LLM Agent API.
@@ -999,6 +1000,8 @@ class _RedMeshLlmAgentMixin(object):
     retries = max(int(getattr(self, "cfg_llm_api_retries", 1) or 1), 1)
 
     def _attempt():
+      if before_provider_call is not None:
+        before_provider_call()
       self.Pd(f"Calling LLM Agent API: {method} {url}")
 
       if method.upper() == "GET":
@@ -1252,6 +1255,7 @@ class _RedMeshLlmAgentMixin(object):
       findings: list,
       aggregated_report: dict,
       engagement: dict | None = None,
+      before_provider_call=None,
   ) -> dict | None:
     """
     Run the Phase 4 structured-LLM call and return the dict form
@@ -1325,11 +1329,14 @@ class _RedMeshLlmAgentMixin(object):
       }
       if response_format is not None:
         payload["response_format"] = response_format
+      if before_provider_call is not None:
+        before_provider_call()
       response = self._call_llm_agent_api(
         endpoint="/chat",
         method="POST",
         payload=payload,
         timeout=structured_timeout,
+        **({"before_provider_call": before_provider_call} if before_provider_call is not None else {}),
       )
       if not isinstance(response, dict) or "error" in response:
         status = response.get("status") if isinstance(response, dict) else "invalid_response"

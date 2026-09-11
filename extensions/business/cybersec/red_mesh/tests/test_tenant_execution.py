@@ -1,11 +1,12 @@
 """Non-HTTP admission facts at real identity/publication/asset/storage seams."""
+import json
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
-from extensions.business.cybersec.red_mesh.tenancy.identity import IdentityStoreError
+from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, IdentityStoreError
 
 from . import test_tenant_asset_administration as fixtures
 
@@ -61,6 +62,139 @@ class TestTenantExecution(unittest.TestCase):
     self.owner.data[("auth", "pentester")]["metadata"]["tenant_memberships"] = []
     with self.assertRaises(AdministrationDenied):
       self.service.resolve_execution_admission(actor, self.tenant, asset["assetId"])
+
+  def test_membership_provenance_distinguishes_absence_empty_and_unknown(self):
+    self.assertIs(self.service.accounts.get_account("creator").tenant_memberships_present, False)
+    self.owner.account("explicit", role="admin", memberships=[])
+    explicit = self.service.accounts.get_account("explicit")
+    self.assertIs(explicit.tenant_memberships_present, True)
+    self.assertEqual(explicit.tenant_memberships, ())
+    self.assertIsNone(AccountView("fixture", "user", None, True).tenant_memberships_present)
+    for malformed in (None, {}, "", False):
+      self.owner.data[("auth", "explicit")]["metadata"]["tenant_memberships"] = malformed
+      self.assertIsNone(self.service.accounts.get_account("explicit"))
+
+  def test_private_admission_reuses_exact_resolved_account_and_digest_is_precondition(self):
+    asset = self.ready()
+    account = self.service.accounts.get_account("creator")
+    before = len(self.owner.writes)
+    with patch.object(self.service.accounts, "get_account", side_effect=AssertionError("Second identity read")), \
+         patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
+         patch("requests.sessions.Session.request", side_effect=AssertionError("No HTTP")):
+      context = self.service._resolve_execution_admission_for_account(
+        account, self.tenant, asset["assetId"], ["node-a"], expected_target_digest=asset["targetDigest"])
+      self.assertEqual(context.to_dict()["actor_id"], "creator")
+      for digest, status in (("0" * 64, 409), ("", 400), (False, 400), ({}, 400)):
+        with self.subTest(digest=digest), self.assertRaises(AdministrationDenied) as denied:
+          self.service._resolve_execution_admission_for_account(
+            account, self.tenant, asset["assetId"], expected_target_digest=digest)
+        self.assertEqual(denied.exception.status_code, status)
+    self.assertEqual(len(self.owner.writes), before)
+    with patch.object(self.service.accounts, "get_account", wraps=self.service.accounts.get_account) as reads:
+      self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"],
+        expected_target_digest=asset["targetDigest"])
+      self.assertEqual(reads.call_count, 1)
+
+  def test_existing_execution_reauthorizes_current_facts_without_rewriting_saved_policy(self):
+    asset = self.ready()
+    binding = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"]).build_binding(
+      "coordinator", ["node-a"])
+    saved = binding.to_dict()
+    self.service.update_tenant_node_failure_policy(self.actor, self.tenant, "continue")
+    row = self.store.get("tenant", self.tenant)
+    self.store.put("tenant", self.tenant, record={**row, "future_policy": {"retain": True}})
+    before = len(self.owner.writes)
+    with patch.object(self.service.accounts, "get_account", wraps=self.service.accounts.get_account) as reads:
+      facts = self.service.reauthorize_execution(binding, worker_node="node-a")
+      self.assertEqual(reads.call_count, 1)
+    self.assertEqual(facts.to_dict()["eligible_nodes"], ["node-a", "node-b"])
+    self.assertNotIn("node_failure_policy", facts.to_dict())
+    self.assertFalse(hasattr(facts, "build_binding"))
+    self.assertEqual(binding.to_dict(), saved)
+    self.assertEqual(self.store.get("tenant", self.tenant)["future_policy"], {"retain": True})
+    self.assertEqual(len(self.owner.writes), before)
+    detached = facts.to_dict()
+    detached["eligible_nodes"].clear()
+    self.assertEqual(facts.to_dict()["eligible_nodes"], ["node-a", "node-b"])
+
+  def test_name_edit_keeps_admission_and_reauthorization_digest_stable(self):
+    asset = self.ready()
+    binding = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"]).build_binding(
+      "coordinator", ["node-a"])
+    updated = self.service.update_tenant_asset(self.actor, self.tenant, asset["assetId"], asset["version"],
+      "Renamed", self.target, True)["data"]
+    self.assertEqual(updated["targetDigest"], asset["targetDigest"])
+    self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"],
+      expected_target_digest=asset["targetDigest"])
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+    self.service.update_tenant_asset(self.actor, self.tenant, asset["assetId"], updated["version"],
+      "Renamed", {"kind": "network", "address": "192.0.2.99"}, True)
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.service.reauthorize_execution(binding)
+    self.assertEqual((denied.exception.status_code, denied.exception.error), (409, "target_changed"))
+
+  def test_existing_execution_rejects_incarnation_revocation_and_ineligible_workers(self):
+    asset = self.ready()
+    self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
+    self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
+    binding = self.service.resolve_execution_admission({"account_id": "pentester"}, self.tenant,
+      asset["assetId"]).build_binding("coordinator", ["node-a"])
+    for worker in ("node-b", "global-only", "coordinator", "", False):
+      with self.subTest(worker=worker), self.assertRaises(AdministrationDenied):
+        self.service.reauthorize_execution(binding, worker_node=worker)
+    self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-a", False)
+    with self.assertRaises(AdministrationDenied):
+      self.service.reauthorize_execution(binding, worker_node="node-a")
+    self.service.reauthorize_execution(binding)
+    self.service.update_tenant_allow_pentester(self.actor, self.tenant, False)
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.service.reauthorize_execution(binding)
+    self.assertEqual(denied.exception.error, "pentesting_disabled")
+    self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
+    raw = self.owner.data[("auth", "pentester")]
+    raw["metadata"]["navigatorAccountGeneration"] = "recreated-account"
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.service.reauthorize_execution(binding)
+    self.assertEqual(denied.exception.error, "account_changed")
+    raw["metadata"]["navigatorAccountGeneration"] = "generation-1"
+    raw["metadata"]["tenant_memberships"] = []
+    with self.assertRaises(AdministrationDenied):
+      self.service.reauthorize_execution(binding)
+
+  def test_existing_execution_checks_namespace_publication_active_asset_and_current_configuration(self):
+    asset = self.ready()
+    binding = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"]).build_binding(
+      "coordinator", ["node-a"])
+    before = len(self.owner.writes)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
+         patch("requests.sessions.Session.request", side_effect=AssertionError("No HTTP")):
+      for malformed in (None, {}, {**binding.to_dict(), "namespace": "foreign"},
+                        {**binding.to_dict(), "unknown_binding_field": True}):
+        with self.subTest(malformed=malformed), self.assertRaises(AdministrationDenied):
+          self.service.reauthorize_execution(malformed)
+      self.service.configured_peers_reader = lambda: ["node-b"]
+      with self.assertRaises(AdministrationDenied):
+        self.service.reauthorize_execution(binding, worker_node="node-a")
+      self.service.configured_peers_reader = lambda: []
+      self.assertEqual(self.service.reauthorize_execution(binding).to_dict()["eligible_nodes"], [])
+      self.service.configured_peers_reader = lambda: ["node-a"]
+      tenant = self.store.get("tenant", self.tenant)
+      domain_key = ('["redmesh","tenancy",1,"deployment"]', '["domain","deployment","tenant"]')
+      domain = self.owner.data.pop(domain_key)
+      with self.assertRaises(TenantStoreError):
+        self.service.reauthorize_execution(binding)
+      self.owner.data[domain_key] = domain
+      tenant_key = ('["redmesh","tenancy",1,"deployment"]',
+                    json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":")))
+      self.owner.data[tenant_key]["active"] = False
+      with self.assertRaises(AdministrationDenied):
+        self.service.reauthorize_execution(binding)
+      self.owner.data[tenant_key] = tenant
+      asset_key = fixtures.asset_location(self.tenant, asset["assetId"])
+      self.owner.data[asset_key]["active"] = False
+      with self.assertRaises(AdministrationDenied):
+        self.service.reauthorize_execution(binding)
+    self.assertEqual(len(self.owner.writes), before)
 
   def test_scope_role_generation_and_asset_denials(self):
     asset = self.ready()
