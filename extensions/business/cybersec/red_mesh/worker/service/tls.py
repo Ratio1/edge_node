@@ -85,7 +85,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     findings += self._tls_check_default_cn(raw)
 
     # Pass 4: Heartbleed (CVE-2014-0160)
-    heartbleed = self._tls_check_heartbleed(target, port)
+    heartbleed = self._tls_check_heartbleed(target, port, raw=raw)
     if heartbleed:
       findings.append(heartbleed)
       # Behavioral version inference: a positive Heartbleed leak proves the
@@ -219,8 +219,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       if days < 0:
         findings.append(Finding(
           severity=Severity.HIGH,
-          title=f"TLS certificate expired ({-days} days ago)",
-          description="The certificate has already expired.",
+          title="TLS certificate has expired",
+          description="The certificate is past its notAfter date.",
           evidence=f"notAfter={expires}",
           remediation="Renew the certificate immediately.",
           owasp_id="A02:2021",
@@ -230,8 +230,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       elif days <= 30:
         findings.append(Finding(
           severity=Severity.MEDIUM,
-          title=f"TLS certificate expiring soon ({days} days)",
-          description=f"Certificate expires in {days} days.",
+          title="TLS certificate expiring soon",
+          description="The certificate expires within 30 days.",
           evidence=f"notAfter={expires}",
           remediation="Renew the certificate before expiry.",
           owasp_id="A02:2021",
@@ -332,7 +332,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     return findings
 
 
-  def _tls_check_heartbleed(self, target, port):
+  def _tls_check_heartbleed(self, target, port, raw=None):
     """Test for Heartbleed (CVE-2014-0160) by sending a malformed TLS heartbeat.
 
     Builds a raw TLS connection, completes handshake, then sends a heartbeat
@@ -408,6 +408,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           # If server sent back more than we sent (3 bytes of heartbeat msg),
           # it leaked memory
           if resp_len > len(hb_msg):
+            if raw is not None:
+              raw["heartbleed_leaked_bytes"] = resp_len - len(hb_msg)
             return Finding(
               severity=Severity.CRITICAL,
               title="TLS Heartbleed vulnerability (CVE-2014-0160)",
@@ -415,8 +417,9 @@ class _ServiceTlsMixin(_ServiceProbeBase):
               description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
                           "An attacker can read up to 64KB of server memory per request, "
                           "potentially exposing private keys, session tokens, and passwords.",
-              evidence=f"Heartbeat response size ({resp_len} bytes) > request payload size ({len(hb_msg)} bytes). "
-                       f"Leaked {resp_len - len(hb_msg)} bytes of server memory.",
+              # The quantified leak size moved out of `evidence` and into
+              # raw_data below — deleting it entirely lost the impact figure.
+              evidence="The heartbeat response was larger than the request payload, returning server memory beyond the sent bytes.",
               remediation="Upgrade OpenSSL to 1.0.1g or later and regenerate all private keys and certificates.",
               owasp_id="A06:2021",
               cwe_id="CWE-126",
@@ -695,7 +698,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           title=f"Service version disclosed: {product} {version}",
           description=f"Banner on {target}:{port} reveals {product} {version}. "
                       "Version disclosure aids attackers in targeting known vulnerabilities.",
-          evidence=f"Banner: {banner_text[:80]}",
+          evidence="The service banner includes the product name and version.",
           remediation="Suppress or genericize the service banner.",
           cwe_id="CWE-200",
           confidence="certain",

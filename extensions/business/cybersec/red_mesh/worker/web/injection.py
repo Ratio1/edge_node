@@ -260,6 +260,7 @@ class _WebInjectionMixin(_InjectionTestBase):
       Structured findings.
     """
     findings_list = []
+    raw = {}
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
 
@@ -325,8 +326,7 @@ class _WebInjectionMixin(_InjectionTestBase):
               severity=Severity.HIGH,
               title=f"SQL injection (boolean-blind) via ?{param}=",
               description=f"Response differs between AND 1=1 and AND 1=2.",
-              evidence=f"Base size={len(resp_base.text)}, true={len(resp_true.text)}, "
-                       f"false={len(resp_false.text)}",
+              evidence="Responses for AND 1=1 and AND 1=2 differ in size while the baseline matches the true case.",
               remediation=f"Use parameterized queries for '{param}'.",
               owasp_id="A03:2021",
               cwe_id="CWE-89",
@@ -346,11 +346,15 @@ class _WebInjectionMixin(_InjectionTestBase):
           requests.get(url_sleep, timeout=5, verify=False)
           elapsed = time.time() - start
           if elapsed >= 2.0:
+            raw.setdefault("time_based_delays", {})[param] = round(elapsed, 1)
             findings_list.append(Finding(
               severity=Severity.HIGH,
               title=f"SQL injection (time-based) via ?{param}=",
-              description=f"SLEEP(2) caused {elapsed:.1f}s delay.",
-              evidence=f"URL: {url_sleep}, elapsed={elapsed:.1f}s",
+              # The measured delay is per-request wall clock; it belongs in
+              # raw_data, not in two fields of the report layer's dedup key.
+              description="A SLEEP(2) payload delayed the response past the "
+                          "2-second threshold.",
+              evidence=f"URL: {url_sleep}",
               remediation=f"Use parameterized queries for '{param}'.",
               owasp_id="A03:2021",
               cwe_id="CWE-89",
@@ -359,7 +363,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         except Exception:
           pass
 
-    return probe_result(findings=findings_list)
+    return probe_result(raw_data=raw, findings=findings_list)
 
 
   # ── SSTI (Server-Side Template Injection) ────────────────────────────

@@ -152,6 +152,18 @@ class AggregatedScanData:
   port_banners: dict = None
   scan_metrics: dict = None         # ScanMetrics.to_dict() — aggregated across all nodes
   correlation_findings: list = None
+  # `services/finalization.py` round-trips the aggregated report through this
+  # model before writing it to R1FS, so a field missing here is a field deleted
+  # from the archive. These three were absent, which silently dropped the entire
+  # authenticated half of a scan plus the context saying what was scanned and
+  # how. The flat findings survive because they are extracted before the
+  # round-trip, so nothing visibly broke — what was lost is the structured
+  # evidence at its source shape, which is what a reader goes to the aggregate
+  # for. `_strip_none` keeps them out of the output when unset, so an aggregate
+  # with no graybox stage is unchanged.
+  graybox_results: dict = None
+  target: str = None
+  scan_type: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -169,4 +181,7 @@ class AggregatedScanData:
       port_banners=d.get("port_banners"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
+      graybox_results=d.get("graybox_results"),
+      target=d.get("target"),
+      scan_type=d.get("scan_type"),
     )

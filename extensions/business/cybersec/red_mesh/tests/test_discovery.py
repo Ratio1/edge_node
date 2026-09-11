@@ -224,5 +224,61 @@ class TestNormalize(unittest.TestCase):
     self.assertEqual(result, "")
 
 
+class TestABasePathTargetIsNotCrawledTwice(unittest.TestCase):
+  """
+  `_normalize` resolves a link against the target's base, so the paths the BFS
+  queues already contain that base. Concatenating them back onto `target_url`
+  doubled it — `https://h/app` + `/app/users` -> `https://h/app/app/users` —
+  and the client's absolute-URL branch preserves whatever path it is handed, so
+  every crawl request against a base-path target 404'd and discovery silently
+  reported fewer routes than exist.
+
+  Every other test in this file targets a bare host, where the base is empty and
+  the doubling cannot appear. That is why the defect survived.
+  """
+
+  def _crawl_a_base_path_target(self):
+    cfg = GrayboxTargetConfig(discovery=DiscoveryConfig())
+    auth = MagicMock()
+    safety = MagicMock()
+    requested = []
+
+    def mock_get(url, **kwargs):
+      requested.append(url)
+      if url == "http://testapp.local:8000/app/":
+        return _mock_response(text='<a href="users">Users</a>')
+      return _mock_response(text="<html></html>")
+
+    session = MagicMock()
+    session.get.side_effect = mock_get
+    auth.official_session = session
+    auth.anon_session = session
+
+    disc = DiscoveryModule(
+      target_url="http://testapp.local:8000/app",
+      auth_manager=auth,
+      safety=safety,
+      target_config=cfg,
+    )
+    routes, _forms = disc.discover()
+    return routes, requested
+
+  def test_no_requested_url_repeats_the_base_path(self):
+    _routes, requested = self._crawl_a_base_path_target()
+    doubled = [url for url in requested if "/app/app/" in url]
+    self.assertEqual(
+      doubled, [],
+      "the base path was concatenated onto a path that already carried it",
+    )
+
+  def test_the_discovered_route_is_actually_fetched(self):
+    routes, requested = self._crawl_a_base_path_target()
+    self.assertIn("/app/users", routes)
+    self.assertIn(
+      "http://testapp.local:8000/app/users", requested,
+      "the crawl queued the route but never requested it at its real URL",
+    )
+
+
 if __name__ == '__main__':
   unittest.main()

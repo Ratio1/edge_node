@@ -17,5 +17,13 @@ aiofiles
 aiohttp
 paramiko
 pymisp
+neo4j>=5.28,<6
+websocket-client>=1.8,<2
 # This has been moved to device.py additional_packages list for better compatibility with different devices.
 # llama-cpp-python>=0.2.82
+
+# urllib3 2.x caps decoded output at the requested read size, which is what
+# bounds a compressed response to a small factor of RESPONSE_BODY_MAX_BYTES in
+# the response-fingerprint path. 1.x has no such buffer, so a downgrade would
+# silently reopen decompression amplification with no test failing (RM-065).
+urllib3>=2.0

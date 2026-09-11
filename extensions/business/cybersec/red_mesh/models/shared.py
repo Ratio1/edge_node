@@ -48,6 +48,14 @@ class RiskBreakdown:
   credentials_penalty: float = 0
   raw_total: float = 0
   finding_counts: dict = None       # { "CRITICAL": 2, "HIGH": 5, ... }
+  # Scan-quality diagnostics the risk walk emits alongside the score. Declared
+  # here so the contract stops lying about the archived shape: the whitelist
+  # below silently dropped all three, and no consumer could learn they existed
+  # from the dataclass. Absent in archives that predate them — `from_dict`
+  # carries None through and `to_dict` strips it, never inventing the fields.
+  coverage_counts: dict = None      # { "not_vulnerable": 9, "inconclusive": 1 }
+  schema_violations: dict = None    # { "count": 0, "errors": [...] }
+  identity_collisions: dict = None  # { "count": 0, "probes": [...] }
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -61,6 +69,9 @@ class RiskBreakdown:
       credentials_penalty=d.get("credentials_penalty", 0),
       raw_total=d.get("raw_total", 0),
       finding_counts=d.get("finding_counts"),
+      coverage_counts=d.get("coverage_counts"),
+      schema_violations=d.get("schema_violations"),
+      identity_collisions=d.get("identity_collisions"),
     )
 
 

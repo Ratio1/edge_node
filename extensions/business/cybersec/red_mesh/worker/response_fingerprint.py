@@ -19,10 +19,21 @@ value can leave the node.
 
 import hashlib
 import ipaddress
+import queue
 import re
 import socket
+import threading
+import time
 
 import requests
+from requests.adapters import DEFAULT_POOLBLOCK, HTTPAdapter
+from requests.compat import urljoin, urlparse
+from requests.models import DEFAULT_REDIRECT_LIMIT
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.util import parse_url
+
+from ..constants import FINGERPRINT_HTTP_TIMEOUT, FINGERPRINT_TIMEOUT
 
 # Excerpts exist so an operator can see *that* two vantages were served
 # different content. A few hundred bytes of the head of the document is
@@ -35,8 +46,21 @@ EXCERPT_CONTENT_TYPES = ("text/html", "text/plain", "application/json")
 # Headers that identify *which* infrastructure answered. These are what
 # actually differ between a CDN edge in Brazil and one in China.
 CAPTURED_HEADERS = ("server", "via", "x-cache", "cf-ray", "x-powered-by", "location")
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 TITLE_MAX_CHARS = 200
+RESPONSE_BODY_MAX_BYTES = 1024 * 1024
+
+# How long past the wall deadline to wait for the watchdog's socket shutdown to
+# unwind the request thread. Long enough that the ordinary bounded case returns
+# its own result rather than a timeout; short enough that a request wedged where
+# the watchdog cannot reach it still releases the scan phase promptly.
+_DEADLINE_GRACE_SECONDS = 1.0
+
+# How often an expired watchdog re-sweeps the socket registry while the request
+# it is breaking is still alive. The socket it needs may not exist yet when the
+# deadline passes.
+_WATCHDOG_SWEEP_SECONDS = 0.25
 
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -48,19 +72,100 @@ _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 #     local part;
 #   - hex precedes base64, because hex is a strict subset of that alphabet.
 _REDACTIONS = (
+  # URL userinfo, first: `https://user:secret@host` carries a credential that
+  # none of the key/value patterns below would recognise. The password half is
+  # optional, because `https://TOKEN@host/` is a credential too — and without
+  # this the e-mail rule would match it first and take the host with it,
+  # destroying the field that makes vantages comparable.
+  (re.compile(r"(?<=://)[^/@\s]+(?::[^/@\s]+)?@"), "[REDACTED]@"),
   (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"), "bearer [REDACTED]"),
   (
     re.compile(
-      r"(?i)\b(authorization|api[-_]?key|apikey|access[-_]?token|token|"
-      r"session[-_]?id|sessionid|session|secret|password|passwd|pwd)\b"
+      # `(?<![A-Za-z0-9])` rather than `\b`: an underscore is a word character,
+      # so `\b` could never match after one and every `db_password=` /
+      # `jwt_secret=` style key escaped this rule entirely.
+      r"(?i)(?<![A-Za-z0-9])(authorization|"
+      r"(?:api|access|refresh|session|client|auth|id|private|secret)[-_]?"
+      r"(?:key|token|secret|id)|"
+      # Session-cookie and SAML names carry no `session`/`token` substring, so
+      # they are named explicitly. Deliberately absent: `code`, `state`, `sig`,
+      # `ticket` — ordinary English words whose inclusion would redact prose,
+      # which is a failure this table has already made once.
+      r"jsessionid|phpsessid|samlresponse|"
+      r"apikey|token|session|secret|password|passwd|pwd)\b"
       # An optional closing quote covers JSON keys such as {"api_key": "..."}.
-      r"[\"']?(\s*[:=]\s*)[\"']?[^\s\"',;&<>]+"
+      r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
+      r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;&<>}]+)"
     ),
-    r"\1\2[REDACTED]",
+    r"\1\g<quote>\g<separator>[REDACTED]",
+  ),
+  # Keys that are ordinary English words, so the key alone cannot justify a
+  # redaction — `state: California` and `?code=US` are comparison signal, while
+  # an OAuth code, a SAML signature and a service ticket are credentials under
+  # exactly the same names. The value has to earn it, in one of two shapes.
+  #
+  # Every lookahead below is scoped to the value *token*: the character classes
+  # exclude whitespace deliberately. A digit test spanning the rest of the line
+  # instead redacts ordinary API error prose, because those pages pair a long
+  # CamelCase code with an unrelated number — `Status code:
+  # NetworkAuthenticationRequired 511` is a captive-portal page, one of the
+  # strongest geo-divergence signals there is, and the value group would eat the
+  # whole sentence with it.
+  (
+    re.compile(
+      # `_` and `-` are boundaries *here*, unlike the credential-key rule above.
+      # That rule keeps them open so `db_password=` cannot escape; these five are
+      # ordinary English words with no such compound to protect, and treating
+      # `_`/`-` as non-boundaries made the rule fire on `error_code`,
+      # `status_code`, `country_code`, `data-state` and `data-code` — the JSON
+      # error envelopes and markup that carry the geo-restriction verdict itself.
+      # Measured: `{"error_code":"GeoRestriction403Denied"}` and the Akamai edge
+      # identity were destroyed on both vantages at once, which reads as
+      # "identical" — the false negative this whole table is weighed against.
+      r"(?i)(?<![A-Za-z0-9_-])(code|state|sig|signature|ticket)"
+      r"(?P<quote>[\"'])?(?P<separator>\s*[:=]\s*)"
+      r"(?:"
+      # Shape 1: an unbroken 16-character alphanumeric run (the same
+      # token-versus-prose discriminator the base64 rule below uses) *and* a
+      # digit inside that same token. The digit is what separates a generated
+      # token from a long word: `code: internationalization` clears the run test
+      # on length alone.
+      # Scoped by *whitespace*, not by token alphabet. Anchoring these to the
+      # value's first alphanumeric segment let every percent-encoded credential
+      # through — measured ~25% of URL-encoded HMAC signatures, and every Azure
+      # Storage SAS `sig=`, whose `%2F` and `%2B` break the run at the front
+      # while a 25-character run sits later in the value.
+      r"(?=[\"']?[^\s\r\n,;&<>}]*[A-Za-z0-9]{16,})"
+      r"(?=[\"']?[^\s\r\n,;&<>}]*[0-9])"
+      r"|"
+      # Shape 2: a UUID. The most common OAuth CSRF `state` by a wide margin,
+      # and invisible to shape 1 — its longest unbroken run is 12, while the hex
+      # rule needs 32 characters with no separators. No prose has this shape.
+      r"(?=[\"']?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+      r"-[0-9a-fA-F]{12}(?![A-Za-z0-9]))"
+      r")"
+      r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;&<>}]+)"
+    ),
+    r"\1\g<quote>\g<separator>[REDACTED]",
   ),
   (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
   (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "[REDACTED_HEX]"),
-  (re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}"), "[REDACTED_B64]"),
+  # A token is distinguished from prose by an unbroken alphanumeric run, not by
+  # its alphabet. Admitting `-` and `_` without that requirement swallowed
+  # ordinary hyphenated titles, CSS class names and paths — which are exactly
+  # the content this evidence exists to compare between vantages.
+  (
+    re.compile(
+      r"(?<![A-Za-z0-9_+/\-])"
+      r"(?=[A-Za-z0-9_+/\-]*[A-Za-z0-9+/]{20,})"
+      r"[A-Za-z0-9_+/\-]{32,}={0,2}"
+      # `=` is deliberately absent from this trailing class: including it made a
+      # long run followed by padding-plus-more unmatchable, silently narrowing
+      # the rule against what develop caught.
+      r"(?![A-Za-z0-9_+/\-])"
+    ),
+    "[REDACTED_B64]",
+  ),
 )
 
 
@@ -103,13 +208,20 @@ def excerpt_allowed(content_type):
 
 
 def normalize_content_type(content_type):
-  """Reduce a Content-Type header to its bare media type."""
+  """
+  Reduce a Content-Type header to its bare media type.
+
+  Scrubbed like every other archived field: the value is target-chosen and
+  otherwise reaches the archive verbatim, up to `http.client`'s header-line
+  limit. It is the one field in the `http` dict that used to bypass the
+  module's promise that values are scrubbed before they leave the node.
+  """
   if not content_type:
     return None
-  return content_type.split(";")[0].strip().lower() or None
+  return sanitize_excerpt(content_type.split(";")[0].strip().lower())
 
 
-def resolve_host(host):
+def resolve_host(host, timeout=None):
   """
   Resolve a target host to its sorted, deduplicated A/AAAA set.
 
@@ -130,12 +242,410 @@ def resolve_host(host):
     return [], None
   except ValueError:
     pass
-  try:
-    infos = socket.getaddrinfo(host, None)
-  except Exception as exc:
-    return [], str(exc)
+  if timeout is None:
+    try:
+      infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+      return [], str(exc)
+  else:
+    result = queue.Queue(maxsize=1)
+
+    def _lookup():
+      try:
+        result.put((socket.getaddrinfo(host, None), None))
+      except Exception as exc:
+        result.put((None, exc))
+
+    threading.Thread(target=_lookup, daemon=True).start()
+    try:
+      infos, error = result.get(timeout=timeout)
+    except queue.Empty:
+      return [], "DNS resolution timed out"
+    if error is not None:
+      return [], str(error)
   addresses = {info[4][0] for info in infos if info[4]}
   return sorted(addresses), None
+
+
+def redirect_stays_on_target(next_url, host, port):
+  """
+  A scan is authorized for one host and port, so a redirect is followed only
+  when it stays there. A target that answers `302 -> http://169.254.169.254/`
+  would otherwise make this node fetch an internal endpoint and archive the
+  response as scan evidence.
+
+  Pinning to the authorized host is the whole control: anything else — public
+  or private — is out of scope by definition. Classifying the hop's IP would
+  add nothing here and would break scanning private targets, which is a normal
+  authorized case.
+
+  Both parsers must agree, because validating with either alone is bypassable.
+  This module reads a URL with `urlparse` while `requests` dials with urllib3's
+  `parse_url`, and the two split authority differently:
+  `http://169.254.169.254\\@authorized-host/` is host `authorized-host` to the
+  first and `169.254.169.254` to the second, so a guard trusting `urlparse`
+  would wave through a hop that fetches cloud metadata. Refusing on
+  disagreement fails closed against that whole class of parser differential
+  rather than against one spelling of it.
+  """
+  try:
+    stdlib = urlparse(next_url)
+    dialed = parse_url(next_url)
+    # `.port` raises on a malformed port; refuse rather than guess.
+    hop_ports = (stdlib.port, dialed.port)
+  except Exception:
+    return False
+  scheme = (stdlib.scheme or "").lower()
+  if scheme not in ("http", "https"):
+    return False
+  expected_host = (host or "").lower()
+  hop_hosts = ((stdlib.hostname or "").lower(), (dialed.host or "").lower())
+  default_port = 443 if scheme == "https" else 80
+  return (
+    all(hop == expected_host for hop in hop_hosts)
+    and all((hop or default_port) == port for hop in hop_ports)
+  )
+
+
+def release_response_connection(response, log=None):
+  """
+  Break a streamed connection without waiting for the reader to finish.
+
+  `response.close()` acquires the same buffer lock the reader thread holds
+  inside `iter_content`, so against a peer that keeps dribbling bytes it blocks
+  well past any deadline — the read timeout never fires, because data keeps
+  arriving. Shutting the socket down instead makes the reader's blocked read
+  fail at once, after which it unwinds on its own and the connection can be
+  released normally by the caller's `finally`.
+
+  urllib3 grew a supported `HTTPResponse.shutdown()` in 2.3, preferred whenever
+  present. Below that floor the only route is through `raw._connection`, and a
+  private reach is exactly what a version bump removes — so failing to find the
+  socket is reported rather than swallowed. Degrading silently to a no-op would
+  restore the hang with the whole suite still green.
+
+  There is deliberately no `response.close()` fallback — that is the blocking
+  call this exists to avoid, and the caller's `finally` already closes the
+  response once the reader has unwound.
+  """
+  raw = getattr(response, "raw", None)
+  supported = getattr(raw, "shutdown", None)
+  if callable(supported):
+    try:
+      supported()
+      return
+    except Exception as exc:
+      # Fall through rather than return: a supported call that raised has not
+      # torn the connection down, and leaving it up is the hang this exists to
+      # prevent. The private path below may still reach the socket.
+      if log:
+        log(f"Response connection shutdown failed: {exc}", color='y')
+
+  connection = getattr(raw, "_connection", None)
+  sock = getattr(connection, "sock", None)
+  if sock is None:
+    # Nothing to shut down. Only alarming when there was a live connection to
+    # reach, which is the shape a urllib3 upgrade would produce.
+    if connection is not None and log:
+      log(
+        "Response connection teardown found no reachable socket; a slow peer "
+        "can hold this connection open",
+        color='r',
+      )
+    return
+  try:
+    sock.shutdown(socket.SHUT_RDWR)
+  except Exception as exc:
+    if log:
+      log(f"Response connection shutdown failed: {exc}", color='y')
+
+
+def _socket_recording_pool_classes(registry):
+  """
+  Pool classes whose connections append their socket to `registry` on connect.
+
+  The header read happens inside `session.get`, before any response object
+  exists, so `release_response_connection` cannot reach it. Recording the socket
+  at connect time is what gives a watchdog something to shut down.
+
+  `PoolManager.pool_classes_by_scheme` is an instance attribute precisely so it
+  can be overridden. The registry is closed over rather than passed as a pool
+  keyword because pool keywords are folded into the connection-pool cache key,
+  which rejects unknown names.
+  """
+  class _RecordingHTTPConnection(HTTPConnection):
+    def connect(self):
+      super().connect()
+      registry.append(self.sock)
+
+  class _RecordingHTTPSConnection(HTTPSConnection):
+    def connect(self):
+      super().connect()
+      # Post-handshake, so this is the TLS socket: shutting it down unblocks a
+      # reader stalled inside the wrapped stream, which the raw socket would not.
+      registry.append(self.sock)
+
+  class _RecordingHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _RecordingHTTPConnection
+
+  class _RecordingHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _RecordingHTTPSConnection
+
+  return {
+    "http": _RecordingHTTPConnectionPool,
+    "https": _RecordingHTTPSConnectionPool,
+  }
+
+
+class _SocketRecordingAdapter(HTTPAdapter):
+  """A transport adapter that exposes the sockets it opens."""
+
+  def __init__(self, socket_registry, **kwargs):
+    self._socket_registry = socket_registry
+    super().__init__(**kwargs)
+
+  def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):
+    super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+    self.poolmanager.pool_classes_by_scheme = _socket_recording_pool_classes(
+      self._socket_registry
+    )
+
+  def build_response(self, req, resp):
+    """
+    Neutralise a `Location` that `requests` itself cannot parse.
+
+    `Session.send` computes `r._next` even when redirects are disabled, and that
+    calls `urlparse` on the raw header. An unbracketed `[` raises `ValueError:
+    Invalid IPv6 URL` out of `send()`, discarding a response already in hand —
+    so one header blanked the port's whole evidence: status, `Server`, TLS
+    identity and excerpt. Guarding our own `urljoin` does not help, because the
+    raise happens first, inside the library.
+
+    The header is dropped rather than kept, since nothing downstream can parse
+    it; everything else the target said is preserved and comparable.
+    """
+    response = super().build_response(req, resp)
+    location = response.headers.get("Location")
+    if location is not None:
+      try:
+        urlparse(location)
+      except Exception:
+        del response.headers["Location"]
+    return response
+
+  def proxy_manager_for(self, proxy, **proxy_kwargs):
+    # A proxied request never touches `self.poolmanager` — requests routes it
+    # through a separate ProxyManager built here, which ships stock pool
+    # classes. Without this the socket registry stays empty and the deadline
+    # watchdog has nothing to shut down. `trust_env` is disabled at the call
+    # site so this cannot be reached from the environment, but a control that
+    # silently disappears when someone later sets `session.proxies` is not a
+    # control.
+    manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+    manager.pool_classes_by_scheme = _socket_recording_pool_classes(
+      self._socket_registry
+    )
+    return manager
+
+
+def request_within_deadline(session, url, sockets, max_seconds, **kwargs):
+  """
+  Issue one GET under a wall-clock deadline the peer cannot reset.
+
+  `requests`' `timeout` is per socket operation, not a deadline: every header
+  line that arrives restarts it, so a peer emitting one line just inside the
+  window holds the read open indefinitely. Measured against a real socket, a
+  4-second budget was still blocked after 50 seconds, and a byte-wise drip
+  inside a single header line reaches hours. Neither `Timeout(total=...)` nor
+  `stop()` helps — the former only recomputes the same per-operation timeout,
+  and the latter cannot interrupt a thread blocked in `socket.readinto`.
+
+  A response that arrives only because the watchdog fired is discarded: the
+  header block was truncated mid-flight, and `http.client` parses what it has
+  into a plausible-looking reply. Recording that as the target's answer would
+  turn our own timeout into fabricated evidence.
+
+  The request is issued off-thread so this function returns at the deadline even
+  when the watchdog has nothing to shut down. That case is the connect leg: the
+  socket is registered only once `connect()` returns, and `create_connection`
+  applies its timeout *per resolved address*, so a target publishing N
+  blackholed A records in its own zone costs N x the budget. Measured: 10
+  records held a 4-second probe for 40.04 s. Shutting the socket down cannot fix
+  that — there is no socket yet — so the caller stops waiting instead.
+  """
+  expired = threading.Event()
+  finished = threading.Event()
+  # Unbounded: the issuing thread must never block on a put after this function
+  # has stopped waiting, or it would pin the response and its socket forever —
+  # the same failure `read_bounded_response_body._stop` exists to prevent.
+  outcome = queue.Queue()
+
+  def _watch():
+    if finished.wait(max_seconds):
+      return
+    expired.set()
+    # Sweep until the issuing thread actually stops, rather than firing once and
+    # retiring. A socket is registered only *after* `connect()` returns, so a
+    # slow connect produces one after this point; a one-shot watchdog left that
+    # socket unguarded and the request unkillable — which relocated the very
+    # hang this function exists to close into a daemon thread, and leaked a
+    # thread and an fd on every probed port.
+    #
+    # Sweep the *whole* registry, never a per-hop slice. HTTP/1.1 is persistent
+    # by default, so a same-origin redirect is served on the connection hop 1
+    # already opened: `connect()` does not run again, nothing is appended, and a
+    # slice scoped to "sockets added since this hop began" is empty for exactly
+    # the connection that needs breaking. One `302` was enough to leak two
+    # threads and an fd per port, permanently.
+    #
+    # Sweeping everything is *almost always* confined to this hop: four of the
+    # five ways the caller observes `expired` raise out of its redirect loop, so
+    # no later hop is live. The fifth is real and is not worth pretending away —
+    # `_issue` publishes an "ok" response, the caller reads `expired` while it is
+    # still false, and only then does this thread's wait time out, because
+    # `finished` is set *after* the put. This sweep can then land on a body read
+    # or on hop 2's reused keep-alive socket. Measured unreachable in 1900
+    # attempts aimed at the deadline (50 us and 5 us steps, under GIL
+    # contention), and the consequence is a lost or incomplete capture, never
+    # fabricated evidence — `body_complete` goes false and the hash is withheld.
+    # Stated plainly because an invariant asserted here and untrue in the code is
+    # how the last two rewrites of this function began.
+    while True:
+      for sock in list(sockets):
+        try:
+          sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+          # Already shut down, already closed, or not yet connected.
+          pass
+      if finished.wait(_WATCHDOG_SWEEP_SECONDS):
+        return
+
+  def _issue():
+    try:
+      try:
+        response = session.get(url, timeout=max_seconds, **kwargs)
+      except Exception as exc:
+        outcome.put(("error", exc))
+        return
+      if expired.is_set():
+        # Nobody is waiting for this any more. Close it here or it leaks.
+        try:
+          response.close()
+        except Exception:
+          pass
+        outcome.put(("expired", None))
+        return
+      outcome.put(("ok", response))
+    finally:
+      # Retiring the watchdog is the issuing thread's job, not the caller's.
+      # When the caller gives up first, this request is still running and still
+      # needs a watchdog to break it.
+      finished.set()
+
+  # `_issue` is started first, and `finished` is set if it cannot start at all.
+  # `finished` is otherwise only set in `_issue`'s `finally`, so a `_watch`
+  # started beside a thread that never ran would sweep at 4 Hz for the life of
+  # the process — permanently, unlike an abandoned request, which dies with its
+  # own connect attempts. That failure is reachable exactly under thread
+  # exhaustion, where it is self-amplifying: every later probe donates another
+  # immortal watchdog.
+  try:
+    threading.Thread(target=_issue, daemon=True).start()
+  except Exception:
+    finished.set()
+    raise
+  try:
+    threading.Thread(target=_watch, daemon=True).start()
+  except Exception:
+    # No watchdog available. The caller's own bounded wait below still releases
+    # the scan phase on time; only the socket teardown is lost.
+    pass
+  try:
+    kind, payload = outcome.get(timeout=max_seconds + _DEADLINE_GRACE_SECONDS)
+  except queue.Empty:
+    # Wedged where the watchdog could not reach at the moment it fired — the
+    # connect leg, before any socket exists. Returning on time is the guarantee
+    # that matters here; the watchdog keeps sweeping until the abandoned request
+    # dies, so it cannot outlive its connect attempts.
+    raise requests.Timeout("response fingerprint deadline exceeded") from None
+
+  if kind == "error":
+    if expired.is_set():
+      raise requests.Timeout("response fingerprint deadline exceeded") from None
+    raise payload
+  if kind == "expired" or expired.is_set():
+    if kind == "ok":
+      try:
+        payload.close()
+      except Exception:
+        pass
+    raise requests.Timeout("response fingerprint deadline exceeded")
+  return payload
+
+
+def read_bounded_response_body(response, max_bytes, max_seconds, log=None):
+  """Read a streamed response without allowing a hostile peer to grow memory forever."""
+  chunks = []
+  total = 0
+  deadline = time.monotonic() + max_seconds
+  events = queue.Queue(maxsize=1)
+  stopped = threading.Event()
+
+  def _read():
+    try:
+      for chunk in response.iter_content(chunk_size=64 * 1024):
+        if stopped.is_set():
+          return
+        events.put(("chunk", chunk))
+      if not stopped.is_set():
+        events.put(("done", None))
+    except Exception:
+      if not stopped.is_set():
+        events.put(("error", None))
+
+  def _stop():
+    """
+    Stop the reader and free it if it is blocked.
+
+    Checking `stopped` before a put is not enough on its own: a put that was
+    already blocked completes the moment this consumer takes an item, refilling
+    the one-slot queue, and the reader can then block on a further put before it
+    observes `stopped`. With no timeout on `Queue.put` that thread would wait
+    forever, pinning a chunk and the response. Draining one slot here releases
+    it, so every exit path must call this rather than only setting the flag.
+    """
+    stopped.set()
+    # Drain first: a reader blocked on the full queue must be released, and the
+    # connection teardown below is not guaranteed to reach it.
+    try:
+      events.get_nowait()
+    except queue.Empty:
+      pass
+    release_response_connection(response, log=log)
+
+  threading.Thread(target=_read, daemon=True).start()
+
+  while True:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+      _stop()
+      return b"".join(chunks), False
+    try:
+      kind, payload = events.get(timeout=remaining_seconds)
+    except queue.Empty:
+      _stop()
+      return b"".join(chunks), False
+    if kind == "done":
+      return b"".join(chunks), True
+    if kind == "error":
+      return b"".join(chunks), False
+    if not payload:
+      continue
+    chunks.append(payload)
+    total += len(payload)
+    if total > max_bytes:
+      _stop()
+      return b"".join(chunks)[:max_bytes], False
 
 
 def certificate_identity(cert_der):
@@ -183,7 +693,10 @@ class _ResponseFingerprintMixin:
     if not ports:
       return
 
-    resolved_ips, resolver_error = resolve_host(self.target)
+    resolved_ips, resolver_error = resolve_host(
+      self.target,
+      timeout=self._target_timeout(FINGERPRINT_HTTP_TIMEOUT),
+    )
     evidence = {
       "target_host": self.target,
       "resolved_ips": resolved_ips,
@@ -204,7 +717,10 @@ class _ResponseFingerprintMixin:
     entry = {"reachable": False, "tls": None, "http": None, "excerpt": None}
 
     try:
-      with socket.create_connection((self.target, port), timeout=self._target_timeout(3)):
+      with socket.create_connection(
+        (self.target, port),
+        timeout=self._target_timeout(FINGERPRINT_TIMEOUT),
+      ):
         entry["reachable"] = True
     except Exception:
       # An unreachable port is itself a comparable result: a target that
@@ -229,36 +745,173 @@ class _ResponseFingerprintMixin:
   def _fingerprint_http(self, scheme, port):
     """Issue one GET and reduce the response to comparable attributes."""
     url = f"{scheme}://{self.target}:{port}/"
+    session = requests.Session()
+    # An environment proxy would defeat the deadline below: a proxied request is
+    # routed through `proxy_manager_for`, which does not carry the recording
+    # pool classes, so the socket registry stays empty and the watchdog has
+    # nothing to shut down — silently, with every test still green. It would
+    # also report the proxy's vantage rather than this node's, which is the one
+    # thing this module exists to measure.
+    session.trust_env = False
+    # Per-call, so concurrent probes never observe each other's sockets.
+    sockets = []
+    adapter = _SocketRecordingAdapter(sockets)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    resp = None
     try:
       user_agent = getattr(self, "scanner_user_agent", "")
       headers = {"User-Agent": user_agent} if user_agent else {}
-      resp = requests.get(
-        url,
-        timeout=self._target_timeout(5),
-        verify=False,
-        allow_redirects=True,
-        headers=headers,
-      )
+      timeout = self._target_timeout(FINGERPRINT_HTTP_TIMEOUT)
+      deadline = time.monotonic() + timeout
+      current_url = url
+      redirect_count = 0
+      while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          raise requests.Timeout("response fingerprint deadline exceeded")
+        resp = request_within_deadline(
+          session,
+          current_url,
+          sockets,
+          max_seconds=remaining,
+          verify=False,
+          allow_redirects=False,
+          headers=headers,
+          stream=True,
+        )
+        location = resp.headers.get("Location")
+        if resp.status_code not in REDIRECT_STATUSES or not location:
+          break
+        if redirect_count >= DEFAULT_REDIRECT_LIMIT:
+          raise requests.TooManyRedirects("response fingerprint redirect limit exceeded")
+        try:
+          next_url = urljoin(resp.url or current_url, location)
+        except Exception:
+          # `urljoin` raises on an unparseable Location — an unbracketed `[`
+          # is enough. Letting that escape discards a response we already hold,
+          # so one header would blank the port's whole evidence: status,
+          # headers, TLS identity and excerpt. Since RedMesh is deliberately
+          # attributable, a target can recognise the probe and answer every
+          # vantage this way, reading as "no divergence" while it serves
+          # geo-differentiated content to real users. Fail closed the same way
+          # an out-of-scope hop does: keep this response as the evidence.
+          break
+        if not redirect_stays_on_target(next_url, self.target, port):
+          # Out of scope: keep this last in-scope response as the evidence and
+          # never issue the off-target request.
+          break
+        current_url = next_url
+        redirect_count += 1
+        resp.close()
+        resp = None
     except Exception as exc:
-      self.P(f"Response fingerprint GET failed on {url}: {exc}", color='y')
+      # The exception text is scrubbed: it is raised against `current_url`,
+      # which is a target-supplied `Location`. `redirect_stays_on_target` pins
+      # the host and port but not the path or query, so urllib3's
+      # "Max retries exceeded with url: /callback?code=...&api_key=..." would
+      # otherwise write a live credential straight into the node log — the one
+      # thing this module promises does not happen.
+      self.P(f"Response fingerprint GET failed on {url}: {sanitize_excerpt(str(exc))}", color='y')
+      if resp is not None:
+        resp.close()
+      session.close()
       return None, None
 
-    content_type = normalize_content_type(resp.headers.get("Content-Type"))
-    title_match = _TITLE_RE.search(resp.text[:5000])
-    http = {
-      "status": resp.status_code,
-      "final_url": resp.url,
-      "redirect_count": len(resp.history),
-      "title": title_match.group(1).strip()[:TITLE_MAX_CHARS] if title_match else None,
-      "content_type": content_type,
-      "body_length": len(resp.content),
-      "body_sha256": hashlib.sha256(resp.content).hexdigest(),
-      "headers": {
-        name: resp.headers.get(name)
-        for name in CAPTURED_HEADERS
-        if resp.headers.get(name)
-      },
-    }
+    try:
+      body, body_complete = read_bounded_response_body(
+        resp,
+        max_bytes=RESPONSE_BODY_MAX_BYTES,
+        max_seconds=max(deadline - time.monotonic(), 0),
+        log=self.P,
+      )
+      encoding = resp.encoding or "utf-8"
+      try:
+        body_text = body.decode(encoding, errors="replace")
+      except (LookupError, UnicodeError):
+        # `UnicodeError` as well as `LookupError`: the charset comes from the
+        # target's own Content-Type, and `charset=idna` or `charset=undefined`
+        # raise UnicodeError rather than LookupError. Letting that escape drops
+        # the whole port's evidence — status, headers, body hash, TLS identity
+        # and excerpt — so a target could blank its own fingerprint per vantage
+        # with one header while still serving geo-differentiated content, and
+        # read as "no divergence".
+        body_text = body.decode("utf-8", errors="replace")
+      content_type = normalize_content_type(resp.headers.get("Content-Type"))
+      title_match = _TITLE_RE.search(body_text[:5000])
+      declared_length = resp.headers.get("Content-Length")
+      try:
+        declared_length = int(declared_length) if declared_length is not None else None
+      except (TypeError, ValueError):
+        declared_length = None
+      if declared_length is not None and declared_length < 0:
+        declared_length = None
+      # A body delimited only by connection close cannot be verified complete:
+      # a severed connection and a clean end-of-message are the same event on
+      # the wire. Claiming completeness there would publish `body_sha256` over
+      # whatever arrived, attributed to the target as its full response. Only a
+      # framed body — declared length or chunked — can carry that claim.
+      #
+      # Framing is decided by what the parser accepted, never by the presence of
+      # a header. `Content-Length: abc` and `Content-Length: -1` are discarded by
+      # `http.client`, which then delimits by close — but both are non-None to
+      # `.get()`. `Transfer-Encoding` is a comma-separated token list and the
+      # parser requires the exact token, so a substring test admits `notchunked`.
+      # Each of those spellings let a target set `body_complete` on a body it
+      # severed at will. `declared_length` above already does the Content-Length
+      # parse correctly, so it is the authority here.
+      encodings = [
+        token.strip()
+        for token in (resp.headers.get("Transfer-Encoding") or "").lower().split(",")
+      ]
+      framed = declared_length is not None or "chunked" in encodings
+      body_complete = body_complete and framed
+      body_length = len(body) if body_complete else declared_length
+      # Redact before truncating, so a credential straddling the cap cannot
+      # survive as a prefix — the same order sanitize_excerpt uses internally.
+      title = sanitize_excerpt(title_match.group(1).strip()) if title_match else None
+      http = {
+        "status": resp.status_code,
+        "final_url": sanitize_excerpt(resp.url),
+        "redirect_count": redirect_count,
+        "title": title[:TITLE_MAX_CHARS] if title else None,
+        "content_type": content_type,
+        "body_length": body_length,
+        # False means body_length is the peer's declared Content-Length and
+        # title is derived from a partial body: both are attacker-influenced
+        # and must not be treated as stable identity when comparing vantages.
+        "body_complete": body_complete,
+        "body_sha256": hashlib.sha256(body).hexdigest() if body_complete else None,
+        # Captured headers are archived too, and `location` routinely carries a
+        # token in its query string — especially on a hop refused as off-target,
+        # whose raw Location would otherwise be stored verbatim.
+        "headers": {
+          name: sanitize_excerpt(resp.headers.get(name))
+          for name in CAPTURED_HEADERS
+          if resp.headers.get(name)
+        },
+      }
 
-    excerpt = sanitize_excerpt(resp.text) if excerpt_allowed(content_type) else None
-    return http, excerpt
+      excerpt = sanitize_excerpt(body_text) if excerpt_allowed(content_type) else None
+      return http, excerpt
+    except Exception as exc:
+      # Reading and reducing the body must not end the scan. This block is no
+      # longer safe-by-construction now that the body is streamed rather than
+      # buffered by requests, and an uncaught error here reaches execute_job's
+      # catch-all and skips every remaining phase.
+      # Scrubbed for the same reason as the GET handler above: the reachable
+      # exception set here is target-influenced.
+      self.P(
+        f"Response fingerprint capture failed on {url}: {sanitize_excerpt(str(exc))}",
+        color='y',
+      )
+      return None, None
+    finally:
+      # Guarded: a raising close would escape both handlers above, leak the
+      # session, and reach execute_job's catch-all — skipping every remaining
+      # scan phase, which is exactly what the handler above exists to prevent.
+      try:
+        resp.close()
+      except Exception:
+        pass
+      session.close()

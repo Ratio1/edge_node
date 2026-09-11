@@ -20,6 +20,7 @@ from ..models import (
   RulebookSubmissionReference,
   RulebookSubmissionRegistry,
   VALID_RULEBOOK_ANSWER_VALUES,
+  normalize_triage_status as _normalize_triage_status,
   VALID_RULEBOOK_CHECK_STATUSES,
   VALID_RULEBOOK_REVIEW_STATES,
 )
@@ -410,10 +411,19 @@ def _severity(finding):
 
 
 def _triage_status(finding, triage_map):
+  """The live triage status, whichever vocabulary the value was written in.
+
+  `triage_state` on a finding used a different vocabulary from the one
+  `_CLOSED_TRIAGE_STATUSES` is written in, and they overlapped on one value — so
+  a finding remediated and marked `fixed` matched nothing and stayed actionable
+  after it had been dealt with.
+  """
   triage = triage_map.get(_finding_id(finding))
   if isinstance(triage, dict):
-    return str(triage.get("status") or "").strip().lower()
-  return str((finding.get("triage") or {}).get("status") or finding.get("triage_state") or "").strip().lower()
+    return _normalize_triage_status(triage.get("status"))
+  return _normalize_triage_status(
+    (finding.get("triage") or {}).get("status") or finding.get("triage_state")
+  )
 
 
 def _is_actionable_finding(finding, triage_map):
