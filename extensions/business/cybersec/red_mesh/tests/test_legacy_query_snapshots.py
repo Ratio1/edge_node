@@ -290,7 +290,7 @@ class TestLegacyQuerySnapshots(unittest.TestCase):
   def test_missing_archive_unknown_finding_and_storage_failure_do_not_recover(self):
     job, owner = legacy_fixture()
     result = query.get_job_archive(owner, "job-1", checked_job=job, **MODE)
-    self.assertEqual(result, {"job_id": "job-1", "error": "not_available"})
+    self.assertEqual(result, {"job_id": "job-1", "success": False, "error": "not_found", "status_code": 404})
     with self.assertRaises(AdministrationDenied):
       triage.get_job_triage(owner, "job-1", checked_job=job, **MODE)
     self.assertEqual(owner.reads, [])

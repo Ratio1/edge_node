@@ -96,7 +96,7 @@ declarations and omission-vs-null/string behavior. Malformed selectors never cro
 Unverifiable assembly makes the entire generated HTTP app unavailable, not merely its launch routes.
 Supervisor survival is not HTTP health. No core/template fork or added dependency is involved.
 
-## Current-reader and artifact construction seams (I1a.1–I1a.3a)
+## Current-reader and artifact construction seams (I1a.1–I1a.3b.1)
 
 `TenantReadAccess` resolves the current stored reader before tenant/job access. Historical reads do
 not reuse the launch actor, launch capability or current compute assignment as reader authority.
@@ -139,9 +139,32 @@ only until endpoint migration. Legacy archives may contain partial unbound confi
 association still applies. Model worker identity comes from captured workers or the finalized stub's
 selected execution node, never the launcher or serving node. This mode is not a client request field.
 
-These seams are **not wired into public read endpoints yet**. I1a.3 must add fresh requester admission,
-paired native/BFF transport, denial propagation and gates for deferred operations. I2 still owns
-browser-wide provider/cache isolation. Passing local tests does not authorize activation or deployment.
+The ten ordinary native reads now use these checked seams: status, data, archive, triage, progress,
+network/local lists, report, audit and analysis. All are POST with a fresh `request_actor` and optional
+explicit `tenant_id`; report additionally requires `job_id`. Omitted scope can enter only proven
+legacy admission. Report replies wrap the unchanged associated payload in `{job_id,cid,report}` with
+the checked execution binding for bound jobs. Associated report and ancestor fetches remain unpinned.
+Audit requires separate `audit:view` authority and filters detached entries by permitted job identity
+before counting or limiting. Checked absence is 404; broken references/storage are sanitized 503.
+
+The generated HTTP guard rejects malformed/ambiguous body fields, explicit null, query fields and
+non-POST methods before IPC. Protected responses are JSON and `no-store`, including errors and native
+RAW/WRAPPED responses; startup rejects incompatible route/model/guard installation. The native core
+and the two existing model-token dependencies are unchanged. Historical actorless GET collectors are
+incompatible and must not be used as a reason to restore an unchecked fallback.
+
+The two list responses use the native supported `on_response` hook plus HTTP-edge restoration so
+legal job aliases such as `error` or `status_code` cannot become native error metadata. The private
+versioned capsule is transport-only, never a reserved job alias or a new public response shape.
+Successful list HTTP replies require a valid capsule before any headers/body are published. RAW lists
+return only the checked mapping (including `{}` when empty); WRAPPED lists retain native metadata
+outside their restored `result`. Genuine denials remain errors, and missing/malformed capsules fail503.
+
+This is **native local wiring, not completed paired read isolation**. I1a.3b.2 must migrate Navigator
+requester/context transport and denial propagation; I1a.3c must gate deferred operations. Dormant
+unchecked service helpers are not authorized public read paths. I2 still owns browser-wide
+provider/cache isolation. Public workspace entry remains closed, and passing local tests does not
+authorize activation or deployment.
 
 ## Local checks
 

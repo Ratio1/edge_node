@@ -197,16 +197,14 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     analyze_parameters = list(
       inspect.signature(PentesterApi01Plugin.analyze_job).parameters.values()
     )[1:]
-    status_parameters = [
-      inspect.Parameter("job_id", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-    ]
+    status_parameters = list(inspect.signature(PentesterApi01Plugin.get_job_status).parameters.values())[1:]
     endpoints = [
       self._descriptor(
         "analyze_job",
         "post",
         analyze_parameters,
       ),
-      self._descriptor("get_job_status", "get", status_parameters),
+      self._descriptor("get_job_status", "post", status_parameters),
     ]
     template_dir = FRAMEWORK_PACKAGE / "business" / "base" / "uvicorn_templates"
     rendered = Environment(loader=FileSystemLoader(str(template_dir))).get_template(
@@ -327,6 +325,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
       )
 
     owner = _Owner(_blocking_worker)
+    from .read_endpoint_fixtures import read_endpoint_fixture
+    read_fixture = self.enterContext(read_endpoint_fixture(bound=False, archived=False))
     self.addCleanup(owner._manual_analysis_executor.shutdown, wait=False)
     harness = _SchedulerHarness.__new__(_SchedulerHarness)
     harness._endpoints = {
@@ -337,7 +337,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
           focus_areas,
         )
       ),
-      "get_job_status": lambda job_id: {"status": "ok", "job_id": job_id},
+      "get_job_status": lambda job_id, request_actor=None, tenant_id=None: (
+        PentesterApi01Plugin.get_job_status(read_fixture.owner, job_id, request_actor, tenant_id)),
     }
     harness._incoming_requests = deque()
     harness.postponed_requests = deque()
@@ -478,12 +479,13 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
 
           status, body, elapsed = self._request(
             port,
-            "GET",
-            "/get_job_status?job_id=job-1",
+            "POST",
+            "/get_job_status",
+            payload={"job_id": "job-1", "request_actor": read_fixture.actor},
           )
           self.assertEqual(status, 200, body)
           self.assertLess(elapsed, 1.0)
-          self.assertEqual(body["result"]["status"], "ok")
+          self.assertEqual(body["result"]["status"], "network_tracked")
 
           busy_status, busy_body, busy_elapsed = self._request(
             port,

@@ -100,6 +100,19 @@ class TestTenantReadAccess(unittest.TestCase):
                          if operation == "get" else ("list", self.store.cfg_instance_id))
         self.assertEqual(self.store.writes, self.writes_before)
 
+  def test_audit_uses_named_permission_and_unknown_operations_never_read_jobs(self):
+    for method in (lambda **kwargs: self.access.get_job(self.actor, self.tenant_id, "job-1", **kwargs),
+                   lambda **kwargs: self.access.list_jobs(self.actor, self.tenant_id, **kwargs)):
+      for operation in ("audit:view", "tasks:launch", None):
+        self.store.reads.clear()
+        with self.assertRaises(AdministrationDenied) as caught:
+          method(operation=operation)
+        self.assertEqual(caught.exception.status_code, 403)
+        self.assert_no_job_read()
+    self.store.account("reader", memberships=[{"role": "tenant_admin", "tenant_id": self.tenant_id}])
+    self.assertEqual(self.access.get_job(self.actor, self.tenant_id, "job-1", operation="audit:view"), self.record)
+    self.assertEqual(self.access.list_jobs(self.actor, self.tenant_id, operation="audit:view"), {"job-1": self.record})
+
   def test_all_saved_task_targets_are_read_without_launch_authority(self):
     targets = [{"kind": "network", "address": "192.0.2.10"},
                {"kind": "webapp", "url": "https://example.com/api", "allowedPathPrefix": "/api"},

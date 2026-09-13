@@ -42,8 +42,8 @@ ENDPOINT_FIRST_ARGS = {
   'get_job_progress': 'job_id',
   'upload_authorization': 'filename',
   'delete_job_engagement': 'job_id',
-  'list_network_jobs': None,
-  'list_local_jobs': None,
+  'list_network_jobs': 'request_actor',
+  'list_local_jobs': 'request_actor',
   'export_misp': 'job_id',
   'export_misp_json': 'job_id',
   'get_misp_export_status': 'job_id',
@@ -167,13 +167,14 @@ class TestAuthzSurface(unittest.TestCase):
         self.assertEqual(plugin.method_calls, [])
 
   def test_ordinary_calls_work_without_any_token_configuration(self):
-    plugin = MagicMock()
-    plugin._get_job_status.return_value = {"job_id": "job-123"}
+    from .read_endpoint_fixtures import read_endpoint_fixture
     with patch.dict("os.environ", {}, clear=True), \
-         patch("extensions.business.cybersec.red_mesh.pentester_api_01.get_capability_status", return_value={"ok": True}):
-      self.assertEqual(self.Plugin.get_capability_status(plugin), {"ok": True})
-      self.assertEqual(self.Plugin.get_job_status(plugin, "job-123"), {"job_id": "job-123"})
-    plugin._get_job_status.assert_called_once_with("job-123")
+         patch("extensions.business.cybersec.red_mesh.pentester_api_01.get_capability_status", return_value={"ok": True}), \
+         read_endpoint_fixture(bound=False) as fixture:
+      self.assertEqual(self.Plugin.get_capability_status(fixture.owner), {"ok": True})
+      result = self.Plugin.get_job_status(fixture.owner, "job-1", request_actor=fixture.actor)
+      self.assertEqual(result["job_id"], "job-1")
+      self.assertEqual(result["job"]["job_status"], "FINALIZED")
 
   def test_protected_operations_deny_before_the_real_account_store_or_downstream_call(self):
     for name in TOKEN_ENDPOINTS:

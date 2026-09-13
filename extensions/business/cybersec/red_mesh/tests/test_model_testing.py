@@ -1973,15 +1973,20 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
     plugin.r1fs.get_json.return_value = {
       "kind": "redmesh_model_test_raw_evidence",
       "job_id": "job-1",
       "cases": [],
     }
 
-    result = PentesterApi01Plugin.get_report(plugin, "raw-cid")
+    from .read_endpoint_fixtures import install_legacy_read_store
+    actor = install_legacy_read_store(self, plugin, PentesterApi01Plugin, jobs={"job-1": {
+      "job_id": "job-1", "workers": {"node-a": {"report_cid": "raw-cid"}}}})
+    result = PentesterApi01Plugin.get_report(plugin, "raw-cid", "job-1", request_actor=actor)
 
-    self.assertEqual(result["error"], "forbidden")
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
+    plugin.r1fs.get_json.assert_called_once_with("raw-cid", pin=False)
     self.assertNotIn("cases", str(result))
 
   def test_raw_evidence_endpoint_reads_by_job_id(self):

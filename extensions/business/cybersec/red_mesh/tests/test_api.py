@@ -3737,14 +3737,19 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin._get_job_from_cstore = lambda job_id: Plugin._get_job_from_cstore(plugin, job_id)
     return plugin
 
+  def _read_actor(self, plugin):
+    from .read_endpoint_fixtures import install_legacy_read_store
+    return install_legacy_read_store(self, plugin, self._get_plugin_class())
+
   def test_get_report_does_not_pin_retrieved_cid(self):
     Plugin = self._get_plugin_class()
-    plugin = self._build_plugin({})
-    plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
+    plugin = self._build_plugin({"report-job": {"job_id": "report-job",
+      "workers": {"node-a": {"report_cid": "QmReportCID"}}}})
+    plugin.r1fs.get_json.return_value = {"job_id": "report-job", "open_ports": [443]}
 
-    result = Plugin.get_report(plugin, "QmReportCID")
+    result = Plugin.get_report(plugin, "QmReportCID", "report-job", request_actor=self._read_actor(plugin))
 
-    self.assertEqual(result["report"]["artifact_kind"], "review_submission")
+    self.assertEqual(result["report"]["open_ports"], [443])
     plugin.r1fs.get_json.assert_called_once_with("QmReportCID", pin=False)
 
   def test_get_job_archive_finalized(self):
@@ -3756,7 +3761,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     archive_data = {
       "archive_version": JOB_ARCHIVE_VERSION,
       "job_id": "fin-job",
-      "passes": [{"findings": [{"finding_id": "f-1", "title": "Issue"}]}],
+      "passes": [{"pass_nr": 1, "findings": [{"finding_id": "f-1", "title": "Issue"}]}],
       "ui_aggregate": {},
       "job_config": {},
       "timeline": [],
@@ -3765,12 +3770,11 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
     plugin.r1fs.get_json.return_value = archive_data
-    plugin.chainstore_hgetall.side_effect = [
-      {"fin-job": stub},
-      {"fin-job:f-1": {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}},
-    ]
+    plugin.chainstore_hget.side_effect = lambda hkey, key: (
+      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}
+      if hkey == "test-instance:triage" and key == "fin-job:f-1" else None)
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["archive"]["job_id"], "fin-job")
     self.assertEqual(result["archive"]["archive_version"], JOB_ARCHIVE_VERSION)
@@ -3828,7 +3832,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 120.0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="model-job", summary_only=True, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, job_id="model-job", summary_only=True, pass_limit=1, request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["job_id"], "model-job")
     archive = result["archive"]
@@ -3844,13 +3848,14 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertNotIn("provider.example", archive_text)
 
   def test_get_job_archive_running(self):
-    """get_job_archive for running job returns not_available error."""
+    """A job without an archive returns typed absence, not an unavailable-storage error."""
     Plugin = self._get_plugin_class()
     running = self._build_running_job("run-job", pass_count=2)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.get_job_archive(plugin, job_id="run-job")
-    self.assertEqual(result["error"], "not_available")
+    result = Plugin.get_job_archive(plugin, job_id="run-job", request_actor=self._read_actor(plugin))
+    self.assertEqual(result["error"], "not_found")
+    self.assertEqual(result["status_code"], 404)
 
   def test_manual_structured_analysis_backfills_legacy_fields(self):
     """Postponed manual analysis updates the pass report for compatibility."""
@@ -3949,8 +3954,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "integrity_mismatch")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_get_job_archive_unsupported_version(self):
     """Unsupported archive versions are rejected explicitly."""
@@ -3970,8 +3975,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "unsupported_archive_version")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_normalize_job_record_initializes_job_revision(self):
     """Legacy records get a normalized integer job_revision."""
@@ -4303,7 +4308,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     running = self._build_running_job("run-job", pass_count=8)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.get_job_data(plugin, job_id="run-job")
+    result = Plugin.get_job_data(plugin, job_id="run-job", request_actor=self._read_actor(plugin))
     self.assertTrue(result["found"])
     refs = result["job"]["pass_reports"]
     self.assertEqual(len(refs), 5)
@@ -4317,7 +4322,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
 
-    result = Plugin.get_job_data(plugin, job_id="fin-job")
+    result = Plugin.get_job_data(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
     self.assertTrue(result["found"])
     self.assertEqual(result["job"]["job_cid"], "QmArchiveCID")
     self.assertEqual(result["job"]["pass_count"], 1)
@@ -4364,7 +4369,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin = self._build_plugin({"model-job": stub})
 
-    result = Plugin.get_job_data(plugin, job_id="model-job")
+    result = Plugin.get_job_data(plugin, job_id="model-job", request_actor=self._read_actor(plugin))
 
     payload = result["job"]
     self.assertEqual(payload["model_test_summary"]["error_class"], "unknown_error")
@@ -4391,7 +4396,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=self._read_actor(plugin))
     self.assertIn("fin-job", result)
     job = result["fin-job"]
     self.assertEqual(job["job_cid"], "QmArchiveCID")
@@ -4430,7 +4435,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin = self._build_plugin({"model-job": stub})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=self._read_actor(plugin))
 
     job = result["model-job"]
     self.assertEqual(job["model_test_summary"]["error_class"], "unknown_error")
@@ -4451,7 +4456,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     running = self._build_running_job("run-job", pass_count=3)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=self._read_actor(plugin))
     self.assertIn("run-job", result)
     job = result["run-job"]
     # Should have counts
@@ -4488,8 +4493,11 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
     }
     plugin.time.return_value = 100.0
+    live_payloads = plugin.chainstore_hgetall.return_value
+    plugin.chainstore_hgetall.return_value = {"run-job": running}
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live_payloads.get(key) if hkey == "test-instance:live" else None
 
-    result = Plugin.get_job_progress(plugin, job_id="run-job")
+    result = Plugin.get_job_progress(plugin, job_id="run-job", request_actor=self._read_actor(plugin))
     self.assertEqual(result["status"], "RUNNING")
     self.assertIn("worker-A", result["workers"])
     self.assertEqual(result["workers"]["worker-A"]["worker_state"], "active")
@@ -4517,6 +4525,7 @@ class TestPhase5Endpoints(unittest.TestCase):
         "worker-B": {"start_port": 11, "end_port": 20, "finished": False, "assignment_revision": 1},
       },
     }
+    stored_job = plugin.chainstore_hget.return_value
     plugin.chainstore_hgetall.side_effect = lambda hkey: (
       {
         "job-1:worker-A": {
@@ -4536,10 +4545,12 @@ class TestPhase5Endpoints(unittest.TestCase):
           "last_seen_at": 100.0,
           "finished": True,
         },
-      } if hkey == "test-instance:live" else {"job-1": plugin.chainstore_hget.return_value}
+      } if hkey == "test-instance:live" else {"job-1": stored_job}
     )
+    live_payloads = plugin.chainstore_hgetall(hkey="test-instance:live")
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live_payloads.get(key) if hkey == "test-instance:live" else None
 
-    result = Plugin.get_job_status(plugin, job_id="job-1")
+    result = Plugin.get_job_status(plugin, job_id="job-1", request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["status"], "network_tracked")
     self.assertEqual(result["workers"]["worker-B"]["worker_state"], "unseen")
@@ -4624,7 +4635,9 @@ class TestPhase5Endpoints(unittest.TestCase):
       } if hkey == "test-instance:live" else {"run-job": running}
     )
 
-    result = Plugin.get_job_data(plugin, job_id="run-job")
+    live_payloads = plugin.chainstore_hgetall(hkey="test-instance:live")
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live_payloads.get(key) if hkey == "test-instance:live" else None
+    result = Plugin.get_job_data(plugin, job_id="run-job", request_actor=self._read_actor(plugin))
 
     self.assertIn("workers_reconciled", result["job"])
     self.assertEqual(result["job"]["workers_reconciled"]["worker-A"]["worker_state"], "active")
@@ -4634,18 +4647,18 @@ class TestPhase5Endpoints(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
 
-    result = Plugin.get_job_archive(plugin, job_id="missing-job")
+    result = Plugin.get_job_archive(plugin, job_id="missing-job", request_actor=self._read_actor(plugin))
     self.assertEqual(result["error"], "not_found")
 
   def test_get_job_archive_r1fs_failure(self):
-    """get_job_archive when R1FS fails returns fetch_failed."""
+    """A broken archive reference returns sanitized unavailable, not absence."""
     Plugin = self._get_plugin_class()
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
     plugin.r1fs.get_json.return_value = None
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "fetch_failed")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_get_analysis_finalized_reads_archive(self):
     """Finalized jobs resolve stored LLM analysis from archive passes after CStore pruning."""
@@ -4673,7 +4686,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["analysis"], "Archive-backed analysis")
@@ -4711,7 +4724,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["quick_summary"], "Structured archive headline")
     self.assertIn("Structured archive posture", result["analysis"])
@@ -4743,9 +4756,10 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
 
-    self.assertEqual(result["error"], "No LLM analysis available for this pass")
+    self.assertEqual(result["error"], "not_found")
+    self.assertEqual(result["status_code"], 404)
     self.assertTrue(result["llm_failed"])
     self.assertEqual(result["pass_nr"], 1)
 
@@ -4766,10 +4780,10 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin))
 
-    self.assertEqual(result["error"], "integrity_mismatch")
-    self.assertEqual(result["job_id"], "fin-job")
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
+    self.assertNotIn("other-job", str(result))
 
   def test_get_job_archive_summary_only(self):
     """Summary mode returns bounded pass-history summaries instead of full pass payloads."""
@@ -4811,7 +4825,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job", summary_only=True, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", summary_only=True, pass_limit=1, request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["archive"]["archive_query"]["returned_passes"], 1)
     self.assertTrue(result["archive"]["archive_query"]["summary_only"])
@@ -4835,7 +4849,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job", pass_offset=1, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", pass_offset=1, pass_limit=1, request_actor=self._read_actor(plugin))
 
     self.assertEqual([p["pass_nr"] for p in result["archive"]["passes"]], [2])
     self.assertTrue(result["archive"]["archive_query"]["truncated"])
@@ -4900,22 +4914,17 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin._log_audit_event.assert_called_once()
 
   def test_get_job_triage_not_found(self):
-    """Triage query returns found=False when no mutable state exists yet."""
+    """An archive-owned finding without mutable state is found=False, without audit history."""
     Plugin = self._get_plugin_class()
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
-    plugin.chainstore_hgetall.side_effect = [
-      {"fin-job": stub},
-      {},
-    ]
-    plugin.chainstore_hget.side_effect = [
-      [],
-    ]
+    plugin.r1fs.get_json.return_value = {"job_id": "fin-job", "job_config": {},
+      "passes": [{"pass_nr": 1, "findings": [{"finding_id": "missing", "title": "Owned finding"}]}]}
 
-    result = Plugin.get_job_triage(plugin, job_id="fin-job", finding_id="missing")
+    result = Plugin.get_job_triage(plugin, job_id="fin-job", finding_id="missing", request_actor=self._read_actor(plugin))
 
     self.assertFalse(result["found"])
-    self.assertEqual(result["audit"], [])
+    self.assertNotIn("audit", result)
 
 
 class TestModelTestingEndpointAuth(unittest.TestCase):

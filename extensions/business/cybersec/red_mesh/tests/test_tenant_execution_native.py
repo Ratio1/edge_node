@@ -25,6 +25,10 @@ ROUTES = (
   "launch_network_scan", "launch_webapp_scan", "launch_test",
   "launch_model_test", "preflight_model_test_provider",
 )
+READ_ROUTES = (
+  "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
+  "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
+)
 SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
 ERROR = "Incompatible generated execution API"
 
@@ -35,29 +39,34 @@ class _Comms:
 
   async def call_plugin(self, name, *args, **kwargs):
     self.calls.append((name, args, kwargs))
+    if name in ("list_network_jobs", "list_local_jobs"):
+      return {"__redmesh_checked_job_list_v1": {"version": 1, "jobs": {}}}
     return {"success": True}
 
 
-@lru_cache(maxsize=1)
-def _render_native():
+@lru_cache(maxsize=4)
+def _render_native(default_route=None):
   """Reuse actual endpoint assembly and template; only method effects are removed."""
   plugin = next(node for node in ast.parse(PLUGIN_PATH.read_text()).body
                 if isinstance(node, ast.ClassDef) and node.name == "PentesterApi01Plugin")
   methods = []
   endpoint_options = {}
   for original in plugin.body:
-    if not isinstance(original, ast.FunctionDef) or original.name not in ROUTES:
+    if not isinstance(original, ast.FunctionDef) or original.name not in ROUTES + READ_ROUTES:
       continue
     method = deepcopy(original)
     decorator = next(item for item in method.decorator_list
-                     if isinstance(item, ast.Call))
+                     if isinstance(item, ast.Call) and getattr(item.func, "attr", None) == "endpoint")
     endpoint_options[method.name] = {
       keyword.arg: ast.literal_eval(keyword.value) for keyword in decorator.keywords
     }
     method.body, method.decorator_list = [ast.Pass()], []
-    assert tuple(arg.arg for arg in method.args.args)[-3:] == SELECTORS
-    if method.name == "preflight_model_test_provider":
-      assert method.args.args[-4].arg == "actor"
+    if method.name in ROUTES:
+      assert tuple(arg.arg for arg in method.args.args)[-3:] == SELECTORS
+      if method.name == "preflight_model_test_provider":
+        assert method.args.args[-4].arg == "actor"
+    else:
+      assert tuple(arg.arg for arg in method.args.args)[-2:] == ("request_actor", "tenant_id")
     methods.append(method)
   native_path = FRAMEWORK_ROOT / "business/default/web_app/fast_api_web_app.py"
   native = next(node for node in ast.parse(native_path.read_text()).body
@@ -75,7 +84,7 @@ def _render_native():
   instance = namespace["Harness"]()
   instance.cfg_endpoints = []
   instance.P = lambda *_args, **_kwargs: None
-  for name in ROUTES:
+  for name in ROUTES + READ_ROUTES:
     method = getattr(namespace["Harness"], name)
     method.__endpoint__ = True
     method.__http_method__ = endpoint_options[name]["method"]
@@ -87,7 +96,7 @@ def _render_native():
     request_timeout=1, api_title=repr("execution fixture"), api_summary=repr("fixture"),
     api_description=repr("fixture"), api_version=repr("fixture"), static_directory=".",
     debug_web_app=False, debug_timings=False, debug_timings_steps=False,
-    default_route=None, profile_rate=0, profile_log_per_request=False,
+    default_route=default_route, profile_rate=0, profile_log_per_request=False,
     node_comm_params=instance._node_comms_jinja_args, html_files=[],
   )
   source = Environment(loader=FileSystemLoader(str(template_dir))).get_template(
@@ -481,6 +490,7 @@ def test_actual_asset_initializer_adds_guard_on_each_render_and_reload(tmp_path)
   generated = tmp_path / "main.py"
   source = generated.read_text()
   assert source.count("validate_generated_execution_api(app, globals())") == 1
+  assert source.count("install_generated_read_api(app, globals())") == 1
   module = types.ModuleType("_rm026_assembled_native_fixture")
   comms = types.ModuleType("naeural_core.utils.uvicorn_fast_api_ipc_manager")
   comms.UvicornPluginComms = _Comms
@@ -490,6 +500,7 @@ def test_actual_asset_initializer_adds_guard_on_each_render_and_reload(tmp_path)
   harness._reload_server()
   assert harness.failed is False
   assert generated.read_text().count("validate_generated_execution_api(app, globals())") == 1
+  assert generated.read_text().count("install_generated_read_api(app, globals())") == 1
 
 
 @pytest.mark.parametrize("fault", (

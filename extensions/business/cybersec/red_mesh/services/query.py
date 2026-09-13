@@ -1,4 +1,5 @@
 from copy import deepcopy
+from collections import deque
 
 from ..models import JobArchive, render_legacy_llm_fields
 from ..model_test_sanitization import (
@@ -13,6 +14,7 @@ from ..tenancy.job_artifacts import (
   MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
 )
 from ..tenancy.ports import TenantStoreError
+from ..tenancy.administration import AdministrationDenied
 from .reconciliation import reconcile_job_workers
 from .triage import get_job_archive_with_triage
 
@@ -291,6 +293,8 @@ def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset:
   result = (get_job_archive_with_triage(owner, job_id) if checked_job is _UNSET
             else get_job_archive_with_triage(owner, job_id, checked_job=checked_job, snapshot_mode=snapshot_mode))
   if "archive" not in result:
+    if checked_job is not _UNSET:
+      return {**result, "success": False, "error": "not_found", "status_code": 404}
     return result
   if result["archive"].get("job_type") == "model_test":
     return result
@@ -329,7 +333,7 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
     if snapshot_mode == "tenant_bound":
       result["execution_binding"] = job["execution_binding"]
     if not analysis:
-      result.update(error="No LLM analysis available for this pass", llm_failed=report.get("llm_failed", False),
+      result.update(success=False, error="not_found", status_code=404, llm_failed=report.get("llm_failed", False),
                     job_status=job.get("job_status"))
       return result
     result.update(completed_at=report.get("date_completed"), report_cid=context["report_cid"],
@@ -615,6 +619,41 @@ def get_job_status(owner, job_id: str, *, checked_job, snapshot_mode="tenant_bou
   if snapshot_mode == "tenant_bound":
     result["execution_binding"] = job["execution_binding"]
   return result
+
+
+def get_job_report(owner, job_id: str, cid: str, *, checked_job, snapshot_mode="tenant_bound"):
+  """Read one ordinary associated report without pinning it or its typed ancestors."""
+  job = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+  if not isinstance(cid, str) or not cid.strip():
+    raise AdministrationDenied(400, "invalid_request")
+  artifacts = TenantJobArtifacts(job, lambda reference: owner.r1fs.get_json(reference, pin=False),
+                                 snapshot_mode=snapshot_mode)
+  result = {"job_id": job_id, "cid": cid, "report": artifacts.report(cid)}
+  if snapshot_mode == "tenant_bound":
+    result["execution_binding"] = job["execution_binding"]
+  return result
+
+
+def get_job_audit(owner, limit: int = 100, *, checked_jobs, snapshot_mode="tenant_bound"):
+  """The caller supplies audit-authorized jobs; filter copied events before totals and limits."""
+  validate_snapshot_mode(snapshot_mode)
+  jobs = _checked_jobs_snapshot(checked_jobs, snapshot_mode)
+  permitted = {job["job_id"] for job in jobs.values()}
+  if type(limit) is not int:
+    raise AdministrationDenied(400, "invalid_request")
+  try:
+    if not isinstance(owner._audit_log, (list, tuple, deque)):
+      raise ValueError("Invalid audit collection")
+    entries = tuple(owner._audit_log)
+    result = []
+    for entry in entries:
+      copied = deepcopy(entry)
+      if (isinstance(copied, dict) and isinstance(copied.get("job_id"), str)
+          and copied["job_id"] in permitted):
+        result.append(copied)
+    return {"audit_log": result[-limit:] if limit > 0 else result, "total": len(result)}
+  except Exception:
+    raise TenantStoreError("Tenant audit is unavailable") from None
 
 
 def list_local_jobs(owner, *, checked_jobs=_UNSET, snapshot_mode="tenant_bound"):

@@ -12,11 +12,13 @@ class TenantReadAccess:
     self.administration = administration
     self.jobs = jobs
 
-  def _authorize(self, actor, tenant_id):
+  def _authorize(self, actor, tenant_id, operation):
     account, denial = resolve_actor(actor, self.administration.accounts)
     if denial:
       raise AdministrationDenied(denial["status_code"], denial["error"])
-    self.administration.authorize_tenant_for_account(account, tenant_id, "reports:view")
+    if operation not in ("reports:view", "audit:view"):
+      raise AdministrationDenied(403, "forbidden")
+    self.administration.authorize_tenant_for_account(account, tenant_id, operation)
 
   def _owns_record(self, record, tenant_id):
     if not isinstance(record, dict):
@@ -41,9 +43,9 @@ class TenantReadAccess:
     except Exception:
       raise TenantStoreError("Tenant job storage is unavailable") from None
 
-  def get_job(self, actor, tenant_id, job_id):
+  def get_job(self, actor, tenant_id, job_id, *, operation="reports:view"):
     """Return a detached raw job only after fresh identity and tenant publication checks."""
-    self._authorize(actor, tenant_id)
+    self._authorize(actor, tenant_id, operation)
     try:
       record = self.jobs.get_job(job_id)
     except Exception:
@@ -53,9 +55,9 @@ class TenantReadAccess:
       raise AdministrationDenied(404, "not_found")
     return snapshot
 
-  def list_jobs(self, actor, tenant_id):
+  def list_jobs(self, actor, tenant_id, *, operation="reports:view"):
     """Filter ownership before validation/projection; never publish a partial corrupt list."""
-    self._authorize(actor, tenant_id)
+    self._authorize(actor, tenant_id, operation)
     try:
       records = self.jobs.list_jobs()
       if not isinstance(records, dict):

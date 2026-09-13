@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
+from .read_endpoint_fixtures import install_legacy_read_store
 
 
 def _install_pymisp_stub():
@@ -135,6 +136,13 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     return PentesterApi01Plugin
+
+  def _read_actor(self, plugin):
+    job = plugin.chainstore_hget.return_value
+    live = plugin.chainstore_hgetall.return_value
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live.get(key) if hkey.endswith(":live") else None
+    jobs = {job["job_id"]: job} if isinstance(job, dict) else {}
+    return install_legacy_read_store(self, plugin, self._get_plugin_class(), jobs=jobs)
 
   def _make_live_hsync_plugin(self, jobs, live_payloads, cfg=None, now=100.0, last_hsync_at=0.0):
     """Build a plugin mock backed by mutable job/live dictionaries."""
@@ -282,7 +290,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
     self.assertEqual(result["job_id"], "job-A")
     self.assertEqual(result["status"], "RUNNING")
     self.assertEqual(len(result["workers"]), 2)
@@ -293,17 +301,15 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(result["workers"]["worker-2"]["worker_state"], "active")
 
   def test_get_job_progress_empty(self):
-    """get_job_progress for non-existent job returns empty workers dict."""
+    """A missing checked job is a typed not-found response, not empty progress success."""
     Plugin = self._get_plugin_class()
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
     plugin.chainstore_hgetall.return_value = {}
     plugin.chainstore_hget.return_value = None
 
-    result = Plugin.get_job_progress(plugin, job_id="nonexistent")
-    self.assertEqual(result["job_id"], "nonexistent")
-    self.assertIsNone(result["status"])
-    self.assertEqual(result["workers"], {})
+    result = Plugin.get_job_progress(plugin, job_id="nonexistent", request_actor=self._read_actor(plugin))
+    self.assertEqual(result, {"success": False, "error": "not_found", "status_code": 404})
 
   def test_get_job_progress_marks_unseen_assigned_worker(self):
     """Assigned workers with no matching :live record are surfaced as unseen."""
@@ -321,7 +327,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["assignment_revision"], 2)
@@ -359,7 +365,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "revision_mismatch")
@@ -397,13 +403,13 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "pass_mismatch")
 
   def test_get_job_progress_ignores_malformed_live_payload(self):
-    """Malformed live rows are ignored instead of crashing reconciliation."""
+    """A live row with unproven worker identity fails the checked read without leaking it."""
     Plugin = self._get_plugin_class()
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
@@ -424,11 +430,9 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.time.return_value = 100.0
     plugin.P = MagicMock()
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
 
-    self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
-    self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "malformed_live")
-    plugin.P.assert_called()
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_publish_live_progress(self):
     """_publish_live_progress writes stage-based progress to CStore :live hset."""
@@ -2446,7 +2450,7 @@ class TestPhase15Listing(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {"job-1": finalized_stub}
     plugin._normalize_job_record = MagicMock(return_value=("job-1", finalized_stub))
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=install_legacy_read_store(self, plugin, Plugin))
     self.assertIn("job-1", result)
     entry = result["job-1"]
 
@@ -2502,7 +2506,7 @@ class TestPhase15Listing(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {"job-2": running_spec}
     plugin._normalize_job_record = MagicMock(return_value=("job-2", running_spec))
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=install_legacy_read_store(self, plugin, Plugin))
     self.assertIn("job-2", result)
     entry = result["job-2"]
 

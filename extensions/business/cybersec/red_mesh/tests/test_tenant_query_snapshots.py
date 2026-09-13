@@ -1,6 +1,8 @@
 """Checked snapshot projections must never recover through global or local state."""
 from copy import deepcopy
+from collections import deque
 import unittest
+from unittest.mock import patch
 
 from extensions.business.cybersec.red_mesh.services import query
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
@@ -65,6 +67,58 @@ class TestTenantQuerySnapshots(unittest.TestCase):
   def setUp(self):
     self.owner = QueryStore()
     self.job = checked_job()
+
+  def test_checked_archive_and_analysis_absence_have_typed_not_found(self):
+    archive = query.get_job_archive(self.owner, "job-1", checked_job=self.job)
+    self.assertEqual(archive["status_code"], 404)
+    self.assertEqual(archive["error"], "not_found")
+    self.job["pass_reports"] = [{"pass_nr": 1, "report_cid": "pass"}]
+    self.owner.artifacts["pass"] = {"pass_nr": 1}
+    analysis = query.get_job_analysis(self.owner, "job-1", checked_job=self.job)
+    self.assertEqual(analysis["status_code"], 404)
+    self.assertEqual(analysis["error"], "not_found")
+
+  def test_audit_filters_the_copied_value_and_captures_membership_before_iteration(self):
+    owned = {"job_id": "job-1", "event": "owned"}
+    self.owner._audit_log = deque([owned, {"job_id": "foreign", "event": "private"}])
+    copying = deepcopy
+    def mutate_during_copy(value):
+      if value is owned:
+        value["job_id"] = "foreign"
+        self.owner._audit_log.clear()
+        self.owner._audit_log.append({"job_id": "job-1", "event": "new"})
+      return copying(value)
+    with patch("extensions.business.cybersec.red_mesh.services.query.deepcopy", side_effect=mutate_during_copy):
+      self.assertEqual(query.get_job_audit(self.owner, checked_jobs={"job-1": self.job}), {"audit_log": [], "total": 0})
+    self.assertEqual(self.owner.reads, [])
+
+  def test_audit_results_are_detached_and_capture_failures_are_sanitized(self):
+    self.owner._audit_log = [{"job_id": "job-1", "details": {"items": [1]}}]
+    result = query.get_job_audit(self.owner, checked_jobs={"job-1": self.job})
+    result["audit_log"][0]["details"]["items"].append(2)
+    self.assertEqual(self.owner._audit_log[0]["details"]["items"], [1])
+    class BrokenLog(list):
+      def __iter__(self):
+        raise RuntimeError("private audit details")
+    for malformed in (None, {}, "invalid", BrokenLog()):
+      self.owner._audit_log = malformed
+      with self.assertRaises(TenantStoreError) as caught:
+        query.get_job_audit(self.owner, checked_jobs={"job-1": self.job})
+      self.assertEqual(str(caught.exception), "Tenant audit is unavailable")
+
+  def test_report_no_pin_mode_is_used_for_the_authorized_leaf_and_ancestors(self):
+    self.job["pass_reports"] = [{"pass_nr": 1, "report_cid": "pass"}]
+    self.owner.artifacts.update({"pass": {"pass_nr": 1, "worker_reports": {"node-a": {"report_cid": "worker"}}},
+                                 "worker": {"job_id": "job-1", "open_ports": [443]}})
+    reads = []
+    def get_json(cid, *, pin):
+      reads.append((cid, pin))
+      return self.owner.artifacts[cid]
+    self.owner.get_json = get_json
+    result = query.get_job_report(self.owner, "job-1", "worker", checked_job=self.job)
+    self.assertEqual(result["execution_binding"], self.job["execution_binding"])
+    self.assertEqual(result["report"]["open_ports"], [443])
+    self.assertEqual(reads, [("pass", False), ("worker", False)])
 
   def test_data_uses_checked_copy_and_only_assigned_progress_keys(self):
     self.job["pass_reports"] = [{"pass_nr": n} for n in range(7)]
