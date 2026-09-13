@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from ..models import JobArchive, render_legacy_llm_fields
 from ..model_test_sanitization import (
   MODEL_TEST_JOB_TYPE,
@@ -7,8 +9,12 @@ from ..model_test_sanitization import (
   sanitize_raw_evidence_metadata,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.job_artifacts import MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot
+from ..tenancy.ports import TenantStoreError
 from .reconciliation import reconcile_job_workers
 from .triage import get_job_archive_with_triage
+
+_UNSET = object()
 
 
 def _job_repo(owner):
@@ -193,14 +199,39 @@ def _augment_model_test_progress(job_specs: dict, workers: dict) -> dict:
   return workers
 
 
-def get_job_data(owner, job_id: str):
+def _checked_live_progress(owner, job):
+  """Point-read only assigned workers and validate the exact detached payload identity."""
+  try:
+    workers = job.get("workers", {})
+    if not isinstance(workers, dict) or len(workers) > MAX_ARTIFACT_REFERENCES:
+      raise ValueError("Invalid assigned workers")
+    participants = set(job["execution_binding"]["participant_order"])
+    result = {}
+    for address, assignment in workers.items():
+      if address not in participants or not isinstance(assignment, dict):
+        raise ValueError("Invalid worker assignment")
+      key = f"{job['job_id']}:{address}"
+      payload = deepcopy(_job_repo(owner).get_live_progress(key))
+      if payload is None:
+        continue
+      if (not isinstance(payload, dict) or payload.get("job_id") != job["job_id"]
+          or payload.get("worker_addr") != address):
+        raise ValueError("Invalid live progress identity")
+      result[key] = payload
+    return result
+  except Exception:
+    raise TenantStoreError("Tenant progress is unavailable") from None
+
+
+def get_job_data(owner, job_id: str, *, checked_job=_UNSET):
   """
   Retrieve job data from CStore.
 
   Finalized/stopped jobs return the lightweight stub as-is. Running jobs keep
   only the most recent pass report references to avoid large response payloads.
   """
-  job_specs = owner._get_job_from_cstore(job_id)
+  scoped = checked_job is not _UNSET
+  job_specs = checked_job_snapshot(checked_job, job_id) if scoped else owner._get_job_from_cstore(job_id)
   if not job_specs:
     return {
       "job_id": job_id,
@@ -218,9 +249,12 @@ def get_job_data(owner, job_id: str):
     }
 
   pass_reports = job_specs.get("pass_reports", [])
+  if scoped and not isinstance(pass_reports, list):
+    raise TenantStoreError("Tenant job is unavailable")
   if isinstance(pass_reports, list) and len(pass_reports) > 5:
     job_specs["pass_reports"] = pass_reports[-5:]
 
+  live_payloads = _checked_live_progress(owner, job_specs) if scoped else None
   if isinstance(job_specs.get("workers"), dict):
     now = None
     time_fn = getattr(owner, "time", None)
@@ -232,7 +266,7 @@ def get_job_data(owner, job_id: str):
     job_specs["workers_reconciled"] = reconcile_job_workers(
       owner,
       job_specs,
-      live_payloads=_job_repo(owner).list_live_progress() or {},
+      live_payloads=live_payloads if scoped else _job_repo(owner).list_live_progress() or {},
       now=now,
     )
 
@@ -243,11 +277,13 @@ def get_job_data(owner, job_id: str):
   }
 
 
-def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset: int = 0, pass_limit: int = 0):
+def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset: int = 0, pass_limit: int = 0,
+                    *, checked_job=_UNSET):
   """
   Retrieve the full archived job payload from R1FS for finalized jobs.
   """
-  result = get_job_archive_with_triage(owner, job_id)
+  result = (get_job_archive_with_triage(owner, job_id) if checked_job is _UNSET
+            else get_job_archive_with_triage(owner, job_id, checked_job=checked_job))
   if "archive" not in result:
     return result
   if result["archive"].get("job_type") == "model_test":
@@ -263,7 +299,7 @@ def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset:
   return result
 
 
-def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None):
+def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None, *, checked_job=_UNSET):
   """
   Retrieve stored LLM analysis for a job or pass report CID.
 
@@ -271,6 +307,24 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
   available after CStore pruning. Running jobs continue to resolve via live
   pass report references in CStore.
   """
+  if checked_job is not _UNSET:
+    job = checked_job_snapshot(checked_job, job_id)
+    context = TenantJobArtifacts(job, _artifact_repo(owner).get_json).analysis_pass(pass_nr=pass_nr, cid=cid)
+    report = context["pass"]
+    analysis = report.get("llm_analysis")
+    summary = report.get("quick_summary")
+    if not analysis:
+      analysis, derived_summary = render_legacy_llm_fields(report.get("llm_report_sections"))
+      summary = summary or derived_summary
+    result = {"job_id": job_id, "execution_binding": job["execution_binding"], "pass_nr": report["pass_nr"]}
+    if not analysis:
+      result.update(error="No LLM analysis available for this pass", llm_failed=report.get("llm_failed", False),
+                    job_status=job.get("job_status"))
+      return result
+    result.update(completed_at=report.get("date_completed"), report_cid=context["report_cid"],
+                  target=job.get("target"), num_workers=len(report.get("worker_reports", {}) or {}),
+                  total_passes=context["total_passes"], analysis=analysis, quick_summary=summary)
+    return result
   if cid:
     try:
       analysis = owner.r1fs.get_json(cid)
@@ -421,13 +475,17 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
     return {"error": str(e), "cid": report_cid, "job_id": job_id}
 
 
-def get_job_progress(owner, job_id: str):
+def get_job_progress(owner, job_id: str, *, checked_job=_UNSET):
   """
   Return real-time progress for all workers in the given job.
   """
-  all_progress = _job_repo(owner).list_live_progress() or {}
-
-  job_specs = _job_repo(owner).get_job(job_id)
+  scoped = checked_job is not _UNSET
+  if scoped:
+    job_specs = checked_job_snapshot(checked_job, job_id)
+    all_progress = _checked_live_progress(owner, job_specs)
+  else:
+    all_progress = _job_repo(owner).list_live_progress() or {}
+    job_specs = _job_repo(owner).get_job(job_id)
   status = None
   scan_type = None
   result = {}
@@ -446,6 +504,8 @@ def get_job_progress(owner, job_id: str):
         worker_addr = key[len(prefix):]
         result[worker_addr] = value
   response = {"job_id": job_id, "status": status, "scan_type": scan_type, "workers": result}
+  if scoped:
+    response["execution_binding"] = job_specs["execution_binding"]
   if isinstance(job_specs, dict) and _is_model_test_specs(job_specs):
     response.update({
       "job_type": MODEL_TEST_JOB_TYPE,
@@ -460,14 +520,39 @@ def get_job_progress(owner, job_id: str):
   return response
 
 
-def list_network_jobs(owner):
+def _checked_jobs_snapshot(checked_jobs):
+  try:
+    if not isinstance(checked_jobs, dict):
+      raise ValueError("Invalid checked job enumeration")
+    items = tuple(checked_jobs.items())
+    result = {}
+    for key, value in items:
+      job = checked_job_snapshot(value, key)
+      for field, kind in (("workers", dict), ("pass_reports", list)):
+        if field in job and not isinstance(job[field], kind):
+          raise ValueError("Invalid job projection")
+      result[key] = job
+    return result
+  except Exception:
+    raise TenantStoreError("Tenant jobs are unavailable") from None
+
+
+def list_network_jobs(owner, *, checked_jobs=_UNSET):
   """
   Return a normalized network-job listing from CStore.
   """
-  raw_network_jobs = _job_repo(owner).list_jobs()
+  scoped = checked_jobs is not _UNSET
+  if scoped:
+    raw_network_jobs = _checked_jobs_snapshot(checked_jobs)
+  else:
+    raw_network_jobs = _job_repo(owner).list_jobs()
   normalized_jobs = {}
   for job_key, job_spec in raw_network_jobs.items():
     normalized_key, normalized_spec = owner._normalize_job_record(job_key, job_spec)
+    if scoped:
+      if normalized_key != job_key:
+        raise TenantStoreError("Tenant jobs are unavailable")
+      normalized_spec = checked_job_snapshot(normalized_spec, job_key)
     if normalized_key and normalized_spec:
       if normalized_spec.get("job_cid"):
         normalized_jobs[normalized_key] = _sanitize_model_test_job_specs(normalized_spec)
@@ -496,13 +581,28 @@ def list_network_jobs(owner):
         else normalized_spec.get("model_test_summary"),
         "model_test_node_selection": normalized_spec.get("model_test_node_selection"),
       }
+      if scoped:
+        normalized_jobs[normalized_key]["execution_binding"] = normalized_spec["execution_binding"]
   return normalized_jobs
 
 
-def list_local_jobs(owner):
+def get_job_status(owner, job_id: str, *, checked_job):
+  """Scoped status uses only the checked stored job, never local completion recovery."""
+  data = get_job_data(owner, job_id, checked_job=checked_job)
+  job = data["job"]
+  return {"job_id": job_id, "target": job.get("target"), "status": "network_tracked", "job": job,
+          "workers": job.get("workers_reconciled"), "execution_binding": job["execution_binding"]}
+
+
+def list_local_jobs(owner, *, checked_jobs=_UNSET):
   """
   Return jobs currently running on the local node.
   """
+  if checked_jobs is not _UNSET:
+    jobs = _checked_jobs_snapshot(checked_jobs)
+    local_ids = set(getattr(owner, "scan_jobs", {})) | set(getattr(owner, "model_test_jobs", {}))
+    return {job_id: get_job_status(owner, job_id, checked_job=job)
+            for job_id, job in jobs.items() if job_id in local_ids}
   local_jobs = {
     job_id: owner._get_job_status(job_id)
     for job_id in getattr(owner, "scan_jobs", {})

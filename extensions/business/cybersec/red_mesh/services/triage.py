@@ -3,9 +3,14 @@ from contextlib import ExitStack
 
 from ..model_testing.artifacts import ModelTestArchive
 from ..model_testing.constants import is_model_test_job
-from ..models import FindingTriageAuditEntry, FindingTriageState, VALID_TRIAGE_STATUSES
+from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.job_artifacts import MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot
+from ..tenancy.ports import TenantStoreError
 from .event_hooks import emit_finding_event
+
+_UNSET = object()
 
 
 def _job_repo(owner):
@@ -64,7 +69,62 @@ def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
   return merged
 
 
-def get_job_triage(owner, job_id: str, finding_id: str = ""):
+def _checked_triage_map(owner, job_id, archive, finding_id=""):
+  """Read state only for archive-owned findings; reports:view does not grant audit:view."""
+  try:
+    passes = archive.get("passes", [])
+    if not isinstance(passes, list) or len(passes) > MAX_ARTIFACT_REFERENCES:
+      raise ValueError("Invalid archived passes")
+    finding_ids = set()
+    count = 0
+    for report in passes:
+      findings = report.get("findings", [])
+      if not isinstance(findings, list):
+        raise ValueError("Invalid archived findings")
+      count += len(findings)
+      if count > MAX_ARTIFACT_REFERENCES:
+        raise ValueError("Finding read budget exceeded")
+      for finding in findings:
+        identifier = finding.get("finding_id")
+        if not isinstance(identifier, str) or not identifier.strip():
+          raise ValueError("Invalid finding identity")
+        finding_ids.add(identifier)
+    if finding_id and finding_id not in finding_ids:
+      raise AdministrationDenied(404, "not_found")
+    result = {}
+    for identifier in ([finding_id] if finding_id else sorted(finding_ids)):
+      state = deepcopy(_job_repo(owner).get_finding_triage(job_id, identifier))
+      if state is None:
+        continue
+      if not isinstance(state, dict) or state.get("job_id") != job_id or state.get("finding_id") != identifier:
+        raise ValueError("Invalid finding state identity")
+      result[identifier] = FindingTriageState.from_dict(state).to_dict()
+    return result
+  except AdministrationDenied:
+    raise
+  except Exception:
+    raise TenantStoreError("Tenant finding state is unavailable") from None
+
+
+def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNSET):
+  if checked_job is not _UNSET:
+    job = checked_job_snapshot(checked_job, job_id)
+    archive = TenantJobArtifacts(job, _artifact_repo(owner).get_json).archive()
+    if archive is None:
+      raise AdministrationDenied(404, "not_found")
+    if is_model_test_job(job):
+      if finding_id:
+        raise AdministrationDenied(404, "not_found")
+      triage_map = {}
+    else:
+      triage_map = _checked_triage_map(owner, job_id, archive, finding_id)
+    result = {"job_id": job_id, "execution_binding": job["execution_binding"]}
+    if finding_id:
+      state = triage_map.get(finding_id)
+      result.update(finding_id=finding_id, found=state is not None, triage=state)
+    else:
+      result["triage"] = triage_map
+    return result
   triage_map = _job_repo(owner).list_job_triage(job_id)
   if finding_id:
     state = triage_map.get(finding_id)
@@ -167,7 +227,20 @@ def _update_finding_triage_locked(owner, job_id: str, finding_id: str, status: s
   }
 
 
-def get_job_archive_with_triage(owner, job_id: str):
+def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET):
+  if checked_job is not _UNSET:
+    job = checked_job_snapshot(checked_job, job_id)
+    payload = TenantJobArtifacts(job, _artifact_repo(owner).get_json).archive()
+    if payload is None:
+      return {"job_id": job_id, "execution_binding": job["execution_binding"], "error": "not_available"}
+    try:
+      model = ModelTestArchive if is_model_test_job(job) else JobArchive
+      archive = model.from_dict(payload).to_dict()
+      triage_map = {} if is_model_test_job(job) else _checked_triage_map(owner, job_id, payload)
+      return {"job_id": job_id, "execution_binding": job["execution_binding"],
+              "archive": _merge_triage_into_archive_dict(archive, triage_map), "triage": triage_map}
+    except Exception:
+      raise TenantStoreError("Tenant archive is unavailable") from None
   job_specs = owner._get_job_from_cstore(job_id)
   if not job_specs:
     return {"error": "not_found", "message": f"Job {job_id} not found."}

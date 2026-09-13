@@ -96,6 +96,38 @@ declarations and omission-vs-null/string behavior. Malformed selectors never cro
 Unverifiable assembly makes the entire generated HTTP app unavailable, not merely its launch routes.
 Supervisor survival is not HTTP health. No core/template fork or added dependency is involved.
 
+## Current-reader and artifact construction seams (I1a.1/I1a.2)
+
+`TenantReadAccess` resolves the current stored reader before tenant/job access. Historical reads do
+not reuse the launch actor, launch capability or current compute assignment as reader authority.
+It captures list membership before processing and returns the exact detached job whose namespace,
+tenant binding and storage key were validated. Foreign/unattributed jobs are absent; recognizable
+local corruption and surfaced storage failures are unavailable. This is not an atomic CStore snapshot.
+
+The optional internal `checked_job`/`checked_jobs` query inputs consume that operation's checked
+snapshots. Explicit invalid inputs never select the separate legacy path. Scoped progress reads
+assigned worker keys, validates job/worker identity, and uses existing pass/revision reconciliation.
+Scoped triage reads only archive-owned finding state; it does not return finding audit history under
+`reports:view`. No global/orphan/local-status fallback is used by these scoped projections.
+
+`TenantJobArtifacts` validates raw archive job/config binding before serializers or descendant reads.
+Only explicit pass/aggregate/worker references authorize ordinary reports; archive/config CIDs,
+raw evidence, secrets, authorization documents and export/rulebook references are not generic report
+downloads. Identity-less scan passes/aggregates inherit their validated parent association. Graybox
+fields remain intact; ordinary model-worker payloads retain the existing producer-sanitized format.
+Analysis is inline associated-pass content, never an arbitrary or pruned CID recovery path.
+
+Per-operation limits are 128 distinct JSON fetches and 10,000 typed reference occurrences, including
+empty typed collection entries. Compatible references share cached validated data; incompatible kinds
+or identities fail unavailable. Limits do not truncate into partial success and are not storage-byte
+or launch-admission limits. Finding-state reads have a separate 10,000-entry bound. All these bounds
+fail as sanitized unavailable errors. Snapshots and artifact helpers are not reusable authorization
+leases or new encryption boundaries.
+
+These seams are **not wired into public read endpoints yet**. I1a.3 must add fresh requester admission,
+paired native/BFF transport, denial propagation and gates for deferred operations. I2 still owns
+browser-wide provider/cache isolation. Passing local tests does not authorize activation or deployment.
+
 ## Local checks
 
 From the edge-node checkout, use its existing `.venv/bin/python -m pytest` with
