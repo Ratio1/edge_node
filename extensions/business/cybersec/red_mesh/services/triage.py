@@ -6,7 +6,9 @@ from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, JobArchive, VALID_TRIAGE_STATUSES
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
-from ..tenancy.job_artifacts import MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot
+from ..tenancy.job_artifacts import (
+  MAX_ARTIFACT_REFERENCES, TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode,
+)
 from ..tenancy.ports import TenantStoreError
 from .event_hooks import emit_finding_event
 
@@ -106,10 +108,11 @@ def _checked_triage_map(owner, job_id, archive, finding_id=""):
     raise TenantStoreError("Tenant finding state is unavailable") from None
 
 
-def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNSET):
+def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked_job is not _UNSET)
   if checked_job is not _UNSET:
-    job = checked_job_snapshot(checked_job, job_id)
-    archive = TenantJobArtifacts(job, _artifact_repo(owner).get_json).archive()
+    job = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+    archive = TenantJobArtifacts(job, _artifact_repo(owner).get_json, snapshot_mode=snapshot_mode).archive()
     if archive is None:
       raise AdministrationDenied(404, "not_found")
     if is_model_test_job(job):
@@ -118,7 +121,9 @@ def get_job_triage(owner, job_id: str, finding_id: str = "", *, checked_job=_UNS
       triage_map = {}
     else:
       triage_map = _checked_triage_map(owner, job_id, archive, finding_id)
-    result = {"job_id": job_id, "execution_binding": job["execution_binding"]}
+    result = {"job_id": job_id}
+    if snapshot_mode == "tenant_bound":
+      result["execution_binding"] = job["execution_binding"]
     if finding_id:
       state = triage_map.get(finding_id)
       result.update(finding_id=finding_id, found=state is not None, triage=state)
@@ -227,18 +232,21 @@ def _update_finding_triage_locked(owner, job_id: str, finding_id: str, status: s
   }
 
 
-def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET):
+def get_job_archive_with_triage(owner, job_id: str, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked_job is not _UNSET)
   if checked_job is not _UNSET:
-    job = checked_job_snapshot(checked_job, job_id)
-    payload = TenantJobArtifacts(job, _artifact_repo(owner).get_json).archive()
+    job = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+    payload = TenantJobArtifacts(job, _artifact_repo(owner).get_json, snapshot_mode=snapshot_mode).archive()
+    result = {"job_id": job_id}
+    if snapshot_mode == "tenant_bound":
+      result["execution_binding"] = job["execution_binding"]
     if payload is None:
-      return {"job_id": job_id, "execution_binding": job["execution_binding"], "error": "not_available"}
+      return {**result, "error": "not_available"}
     try:
       model = ModelTestArchive if is_model_test_job(job) else JobArchive
       archive = model.from_dict(payload).to_dict()
       triage_map = {} if is_model_test_job(job) else _checked_triage_map(owner, job_id, payload)
-      return {"job_id": job_id, "execution_binding": job["execution_binding"],
-              "archive": _merge_triage_into_archive_dict(archive, triage_map), "triage": triage_map}
+      return {**result, "archive": _merge_triage_into_archive_dict(archive, triage_map), "triage": triage_map}
     except Exception:
       raise TenantStoreError("Tenant archive is unavailable") from None
   job_specs = owner._get_job_from_cstore(job_id)

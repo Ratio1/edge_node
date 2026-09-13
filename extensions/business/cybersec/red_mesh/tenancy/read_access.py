@@ -2,8 +2,8 @@
 from copy import deepcopy
 
 from .administration import AdministrationDenied
-from .execution import binding_from_record
-from .identity import resolve_actor
+from .execution import ExecutionRollout, binding_from_record
+from .identity import TenantMembership, resolve_actor
 from .ports import TenantStoreError
 
 
@@ -69,3 +69,88 @@ class TenantReadAccess:
       if snapshot is not None:
         result[job_id] = snapshot
     return result
+
+
+class LegacyReadAccess:
+  """Explicit compatibility reads; omission alone never establishes legacy authority.
+
+  The trusted rollout callback must read current configured and stored controls on each call.
+  Point lookup intentionally retains legacy whole-table/logical-ID semantics, without re-reading
+  global state after the operation's detached snapshots have been checked.
+  """
+
+  def __init__(self, administration, jobs, normalize, read_rollout):
+    self.administration = administration
+    self.jobs = jobs
+    self.normalize = normalize
+    self.read_rollout = read_rollout
+
+  def _authorize(self, actor, operation):
+    account, denial = resolve_actor(actor, self.administration.accounts)
+    if denial:
+      raise AdministrationDenied(denial["status_code"], denial["error"])
+    if account.tenant_memberships_present is not False or operation not in ("reports:view", "audit:view"):
+      raise AdministrationDenied(403, "forbidden")
+    if operation == "audit:view" and TenantMembership("super_tenant_admin", None) not in account.tenant_memberships:
+      raise AdministrationDenied(403, "forbidden")
+    try:
+      rollout = self.read_rollout()
+      if not isinstance(rollout, ExecutionRollout):
+        raise ValueError("Invalid rollout reader result")
+    except Exception:
+      raise TenantStoreError("Legacy read controls are unavailable") from None
+    if not rollout.allows_new(bound=False, membership_key_present=False, selectors_omitted=True):
+      raise AdministrationDenied(403, "forbidden")
+
+  @staticmethod
+  def _reserve_bound_ids(reserved, key, record):
+    for identifier in (key, record.get("job_id")):
+      if isinstance(identifier, str) and identifier.strip():
+        reserved.add(identifier)
+
+  def _snapshots(self):
+    try:
+      records = self.jobs.list_jobs()
+      if not isinstance(records, dict):
+        raise ValueError("Invalid job enumeration")
+      items = tuple(records.items())
+      result = {}
+      logical_ids = set()
+      reserved = set()
+      for key, raw in items:
+        if not isinstance(raw, dict):
+          continue
+        if "execution_binding" in raw:
+          self._reserve_bound_ids(reserved, key, raw)
+          continue
+        snapshot = deepcopy(raw)
+        if "execution_binding" in snapshot:
+          self._reserve_bound_ids(reserved, key, snapshot)
+          continue
+        if not isinstance(key, str) or not key.strip():
+          raise ValueError("Invalid legacy storage key")
+        normalized_key, normalized = self.normalize(key, snapshot, migrate=False)
+        normalized = deepcopy(normalized)
+        if (normalized_key != key or not isinstance(normalized, dict) or "execution_binding" in normalized
+            or not isinstance(normalized.get("job_id"), str) or not normalized["job_id"].strip()
+            or normalized["job_id"] in logical_ids):
+          raise ValueError("Invalid or ambiguous legacy job identity")
+        logical_ids.add(normalized["job_id"])
+        result[key] = normalized
+      if reserved.intersection(logical_ids) or reserved.intersection(result):
+        raise ValueError("Ambiguous legacy and bound job identity")
+      return result
+    except Exception:
+      raise TenantStoreError("Legacy job storage is unavailable") from None
+
+  def get_job(self, actor, job_id, *, operation="reports:view"):
+    self._authorize(actor, operation)
+    snapshots = self._snapshots()
+    for record in snapshots.values():
+      if record["job_id"] == job_id:
+        return record
+    raise AdministrationDenied(404, "not_found")
+
+  def list_jobs(self, actor, *, operation="reports:view"):
+    self._authorize(actor, operation)
+    return self._snapshots()

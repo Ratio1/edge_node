@@ -1,4 +1,4 @@
-"""Bound job artifact integrity, not requester authorization or an authorization lease.
+"""Checked job artifact integrity, not requester authorization or an authorization lease.
 
 Only explicit producer edges are followed. Each operation is limited to 128 JSON reads and
 10,000 reference occurrences; limits fail unavailable rather than returning partial content.
@@ -25,13 +25,23 @@ def _copy(value):
     _unavailable()
 
 
-def checked_job_snapshot(checked_job, job_id=None):
+def validate_snapshot_mode(snapshot_mode, *, snapshot_supplied=True):
+  """Explicit compatibility mode never selects an unchecked storage fallback."""
+  if (not isinstance(snapshot_mode, str) or snapshot_mode not in ("tenant_bound", "legacy_unbound")
+      or snapshot_mode == "legacy_unbound" and not snapshot_supplied):
+    _unavailable()
+
+
+def checked_job_snapshot(checked_job, job_id=None, *, snapshot_mode="tenant_bound"):
   """Validate the detached value supplied by the trusted current-reader boundary."""
+  validate_snapshot_mode(snapshot_mode)
   snapshot = _copy(checked_job)
   try:
     if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("job_id"), str)
-        or not snapshot["job_id"].strip() or job_id is not None and snapshot["job_id"] != job_id
-        or binding_from_record(snapshot) is None):
+        or not snapshot["job_id"].strip() or job_id is not None and snapshot["job_id"] != job_id):
+      _unavailable()
+    if (snapshot_mode == "legacy_unbound" and "execution_binding" in snapshot
+        or snapshot_mode == "tenant_bound" and binding_from_record(snapshot) is None):
       _unavailable()
   except Exception:
     _unavailable()
@@ -53,15 +63,20 @@ def _pass_number(value):
 
 
 class TenantJobArtifacts:
-  def __init__(self, checked_job, read_json):
-    self._job = checked_job_snapshot(checked_job)
+  def __init__(self, checked_job, read_json, *, snapshot_mode="tenant_bound"):
+    self._job = checked_job_snapshot(checked_job, snapshot_mode=snapshot_mode)
     self._job_id = self._job["job_id"]
     self._binding = binding_from_record(self._job)
-    facts = self._binding.to_dict()
-    self._model = facts["asset_target"]["kind"] == "model"
-    if self._model and len(facts["participant_order"]) != 1:
-      _unavailable()
-    self._worker = facts["participant_order"][0] if self._model else None
+    self._worker = None
+    if self._binding is not None:
+      facts = self._binding.to_dict()
+      self._model = facts["asset_target"]["kind"] == "model"
+      if self._model and len(facts["participant_order"]) != 1:
+        _unavailable()
+      self._worker = facts["participant_order"][0] if self._model else None
+    else:
+      from ..model_testing.constants import is_model_test_job
+      self._model = is_model_test_job(self._job)
     self._read_json = read_json
     self._archive_cid = _cid(self._job.get("job_cid"))
     self._config_cid = _cid(self._job.get("job_config_cid"))
@@ -107,6 +122,24 @@ class TenantJobArtifacts:
     self._references[cid] = expected
     return cid
 
+  def _model_worker(self):
+    if self._binding is not None:
+      return self._worker
+    workers = self._collection(self._job, "workers", dict)
+    selection = self._collection(self._job, "model_test_node_selection", dict)
+    selected = selection.get("selected_execution_node")
+    if (selected is not None and (not isinstance(selected, str) or not selected.strip())
+        or len(workers) > 1
+        or any(not isinstance(key, str) or not key.strip() or not isinstance(value, dict)
+               for key, value in workers.items())):
+      _unavailable()
+    worker = next(iter(workers), None)
+    if worker and selected and worker != selected:
+      _unavailable()
+    if not (worker or selected):
+      _unavailable()
+    return worker or selected
+
   def _workers(self, parent, field):
     workers = self._collection(parent, field, dict)
     self._count(len(workers))
@@ -114,7 +147,7 @@ class TenantJobArtifacts:
       if not isinstance(address, str) or not address.strip() or not isinstance(meta, dict):
         _unavailable()
       cid = _cid(meta.get("report_cid"))
-      if self._model and cid and address != self._worker:
+      if self._model and cid and address != self._model_worker():
         _unavailable()
       self._edge(cid, "worker", address if self._model else None)
 
@@ -158,7 +191,7 @@ class TenantJobArtifacts:
         _unavailable()
     except Exception:
       _unavailable()
-    if self._model and config.get("job_id") != self._job_id:
+    if self._model and self._binding is not None and config.get("job_id") != self._job_id:
       _unavailable()
     self._present_identity(config)
     if self._model:
@@ -166,7 +199,7 @@ class TenantJobArtifacts:
       worker = _cid(aggregate.get("worker_result_cid"))
       if worker:
         self._count(1)
-        self._edge(worker, "worker", self._worker)
+        self._edge(worker, "worker", self._model_worker())
     else:
       passes = self._collection(payload, "passes", list)
       self._count(len(passes))

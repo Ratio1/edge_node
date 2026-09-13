@@ -96,7 +96,7 @@ declarations and omission-vs-null/string behavior. Malformed selectors never cro
 Unverifiable assembly makes the entire generated HTTP app unavailable, not merely its launch routes.
 Supervisor survival is not HTTP health. No core/template fork or added dependency is involved.
 
-## Current-reader and artifact construction seams (I1a.1/I1a.2)
+## Current-reader and artifact construction seams (I1a.1–I1a.3a)
 
 `TenantReadAccess` resolves the current stored reader before tenant/job access. Historical reads do
 not reuse the launch actor, launch capability or current compute assignment as reader authority.
@@ -123,6 +123,21 @@ or identities fail unavailable. Limits do not truncate into partial success and 
 or launch-admission limits. Finding-state reads have a separate 10,000-entry bound. All these bounds
 fail as sanitized unavailable errors. Snapshots and artifact helpers are not reusable authorization
 leases or new encryption boundaries.
+
+`LegacyReadAccess` admits only a fresh active stored account with the membership key absent and
+matching current configured/stored compatibility-disabled rollout. An explicit empty/malformed
+membership key is not legacy; audit additionally requires the stored legacy-admin membership.
+It captures and detaches unbound rows before production normalization with `migrate=False`, preserving
+raw listing aliases while point lookups use logical job IDs only. Duplicate logical IDs and collisions
+with recognizable bound/present-null identities fail unavailable. Every present binding is excluded,
+including one appearing during copying. This is not an atomic shared-store snapshot or a job-count cap.
+
+The explicit internal `snapshot_mode="legacy_unbound"` consumes these checked snapshots without
+fabricated bindings. Unknown modes, missing legacy inputs and present bindings fail before fallback.
+Default bound validation is unchanged; omitted default helper inputs retain old unchecked behavior
+only until endpoint migration. Legacy archives may contain partial unbound configs, but typed job/report
+association still applies. Model worker identity comes from captured workers or the finalized stub's
+selected execution node, never the launcher or serving node. This mode is not a client request field.
 
 These seams are **not wired into public read endpoints yet**. I1a.3 must add fresh requester admission,
 paired native/BFF transport, denial propagation and gates for deferred operations. I2 still owns
