@@ -234,10 +234,10 @@ class TenantAdministrationService:
 
   def _authorized_tenant(self, actor, tenant_id, operation="reports:view"):
     account = self._actor(actor)
-    return self._authorized_tenant_for_account(account, tenant_id, operation)
+    return self.authorize_tenant_for_account(account, tenant_id, operation)
 
-  def _authorized_tenant_for_account(self, account, tenant_id, operation="reports:view"):
-    """Private seam for an account resolved once at this operation's trusted entry point."""
+  def authorize_tenant_for_account(self, account, tenant_id, operation="reports:view"):
+    """Internal seam for an account resolved once at this operation's trusted entry point."""
     _, denial = resolve_tenant_roles(account, tenant_id)
     if denial:
       raise AdministrationDenied(denial.status_code, denial.error)
@@ -362,7 +362,7 @@ class TenantAdministrationService:
       selected_peers, expected_target_digest=expected_target_digest)
 
   def _execution_asset_for_account(self, account, tenant_id, asset_id, expected_target_digest):
-    tenant, account = self._authorized_tenant_for_account(account, tenant_id)
+    tenant, account = self.authorize_tenant_for_account(account, tenant_id)
     policy = TenantPolicyContext(tenant_id, tenant["active"], tenant["allow_pentester"])
     _, denial = resolve_operation_roles(account, "tasks:launch", policy)
     if denial:
