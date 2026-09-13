@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
+from ..tenancy.ports import TenantStoreError
 from .config import get_suricata_correlation_config
 from .event_redaction import stable_hmac_pseudonym
 from .integration_status import record_integration_status
@@ -15,6 +18,7 @@ from .scan_guards import reject_model_test_for_scan_operation
 DETECTION_CORRELATION_SCHEMA_VERSION = "1.0.0"
 MAX_EVE_JSONL_BYTES = 25 * 1024 * 1024
 MAX_EVE_EVENTS = 100000
+_UNSET = object()
 
 
 def _utc_timestamp():
@@ -227,14 +231,22 @@ def _load_archive(owner, job_specs):
     return None
 
 
-def get_detection_correlation(owner, job_id):
-  job_specs = owner._get_job_from_cstore(job_id)
+def get_detection_correlation(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "status": "not_found"}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "detection_correlation")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {**unsupported, "found": True}
   summary = job_specs.get("detection_correlation")
+  if checked and summary is not None and (not isinstance(summary, dict)
+      or "job_id" in summary and summary["job_id"] != job_id):
+    raise TenantStoreError("Correlation status is unavailable")
   return {
     "job_id": job_id,
     "found": True,

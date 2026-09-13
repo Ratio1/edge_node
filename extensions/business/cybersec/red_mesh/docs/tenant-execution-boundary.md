@@ -160,8 +160,17 @@ Successful list HTTP replies require a valid capsule before any headers/body are
 return only the checked mapping (including `{}` when empty); WRAPPED lists retain native metadata
 outside their restored `result`. Genuine denials remain errors, and missing/malformed capsules fail503.
 
-This is **native local wiring, not completed paired read isolation**. I1a.3b.2 must migrate Navigator
-requester/context transport and denial propagation; I1a.3c must gate deferred operations. Dormant
+The deferred correlation-status read is now also a checked POST, with `job_id` and `request_actor`
+only. It admits current proven legacy readers, rejects tenant selectors and membership-bearing
+accounts, and projects a detached summary without provider, artifact or write effects. Missing jobs
+return typed 404; malformed or foreign summaries return 503; model jobs return the allowlisted
+`unsupported_job_type` 400 in both RAW and WRAPPED formats. Null summaries remain valid empty status.
+This does not change the correlation mutation or activate tenant integrations. Thirty other deferred
+native operations still require their own admission cutover.
+
+This is **local wiring, not completed application isolation**. Navigator ordinary-read pairing
+I1a.3b.2 is committed; correlation-status support requires its matching Navigator change. Unmatched
+versions fail denied/unavailable, never fall back to actorless GET. I1a.3c remains incomplete. Dormant
 unchecked service helpers are not authorized public read paths. I2 still owns browser-wide
 provider/cache isolation. Public workspace entry remains closed, and passing local tests does not
 authorize activation or deployment.

@@ -94,6 +94,7 @@ _READ_FIELDS = {
   "get_report": (("cid", str, _REQUIRED), ("job_id", str, "")) + _REQUESTER_FIELDS,
   "get_audit_log": (("limit", int, 100),) + _REQUESTER_FIELDS,
   "get_analysis": (("job_id", str, ""), ("cid", str, ""), ("pass_nr", int, None)) + _REQUESTER_FIELDS,
+  "get_detection_correlation": _JOB_FIELD + (("request_actor", dict, None),),
 }
 _READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
@@ -159,15 +160,16 @@ def _read_path(path):
   return isinstance(path, str) and path.rstrip("/") in _READ_PATHS
 
 
-def _read_error_response(status):
+def _read_error_response(status, *, code=None):
   from starlette.responses import JSONResponse
   errors = {400: "invalid_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
             405: "method_not_allowed", 503: "unavailable"}
   status = status if type(status) is int and status in errors else 503
+  error = "unsupported_job_type" if status == 400 and code == "unsupported_job_type" else errors[status]
   headers = {"Cache-Control": "no-store"}
   if status == 405:
     headers["Allow"] = "POST"
-  return JSONResponse({"success": False, "error": errors[status], "status_code": status},
+  return JSONResponse({"success": False, "error": error, "status_code": status},
                        status_code=status, headers=headers)
 
 
@@ -335,6 +337,16 @@ def install_generated_read_api(app, model_namespace) -> None:
 
     async def protected_http(request, error):
       if _read_path(request.scope.get("path")):
+        detail = error.detail
+        if (request.scope.get("path") == "/get_detection_correlation" and error.status_code == 400
+            and isinstance(detail, dict)):
+          typed = (detail.get("success") is False and type(detail.get("status_code")) is int
+                   and detail["status_code"] == 400 and detail.get("error") == "unsupported_job_type")
+          # Native RAW errors collapse the typed payload to its literal error string.
+          raw = (detail.get("detail") == "unsupported_job_type"
+                 and not any(key in detail for key in ("success", "error", "status_code", "result")))
+          if typed or raw:
+            return _read_error_response(400, code="unsupported_job_type")
         return _read_error_response(error.status_code)
       return await original_http(request, error)
 

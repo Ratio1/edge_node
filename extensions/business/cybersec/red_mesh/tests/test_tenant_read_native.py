@@ -27,6 +27,8 @@ def test_read_installation_entrypoint_exists():
 
 @pytest.fixture
 def read_native(request):
+  # Keep lazy Pydantic/FastAPI class imports outside the sys.modules rollback below.
+  __import__("fastapi")
   source, harness = _render_native(getattr(request, "param", None))
   module = types.ModuleType("_rm026_read_native_fixture")
   comms = types.ModuleType("naeural_core.utils.uvicorn_fast_api_ipc_manager")
@@ -66,6 +68,8 @@ async def request(module, name, payload=None, *, raw=None, method="POST", query=
 
 def body_for(name):
   payload = {"request_actor": {"account_id": "Reader.Mixed"}, "tenant_id": "tenant-1"}
+  if name == "get_detection_correlation":
+    payload.pop("tenant_id")
   if name not in ("list_network_jobs", "list_local_jobs", "get_audit_log"):
     payload["job_id"] = "job-1"
   if name == "get_report":
@@ -82,7 +86,7 @@ def assert_json_response(result, status):
   return json.loads(body), calls
 
 
-def test_actual_fifteen_route_installation_preserves_launch_contract(read_native):
+def test_actual_sixteen_route_installation_preserves_launch_contract(read_native):
   from extensions.business.cybersec.red_mesh.tenancy.http_runtime import validate_generated_execution_api
   module, _ = read_native
   install(module)
@@ -122,6 +126,9 @@ def test_raw_faults_are_400_without_ipc_or_body_echo(read_native, name):
   faults = [None, [], "private", True, 1, {**valid, "tenantId": "private"},
     {**valid, "actor": {"account_id": "private"}}, {**valid, "snapshot_mode": "legacy_unbound"},
     {**valid, "extra": "private"}]
+  if name == "get_detection_correlation":
+    faults.extend({**valid, key: value} for key, value in (
+      ("tenant_id", "tenant-1"), ("asset_id", "asset"), ("execution_binding", {})))
   for field in valid:
     faults.extend({**valid, field: value} for value in (None, True, 1, [], "" if field == "request_actor" else {}))
 
@@ -173,7 +180,8 @@ def test_route_model_contract_corruption_fails_at_install(read_native, name, fau
   elif fault == "model":
     module.__dict__.pop(name + "Model")
   elif fault == "extra_field":
-    model.model_fields["extra"] = model.model_fields["tenant_id"]
+    model.model_fields["extra"] = model.model_fields[
+      "request_actor" if name == "get_detection_correlation" else "tenant_id"]
   elif fault == "nullable_actor":
     model.model_fields["request_actor"].annotation = dict | None
   elif fault == "actor_default":
@@ -401,10 +409,15 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
     module.eng = scheduler_comms(fixture, response_format)
     payload = body_for(name)
     payload["request_actor"] = fixture.actor
-    if bound:
+    if bound and name != "get_detection_correlation":
       payload["tenant_id"] = fixture.tenant_id
     else:
-      payload.pop("tenant_id")
+      payload.pop("tenant_id", None)
+    if bound and name == "get_detection_correlation":
+      result, calls = assert_json_response(asyncio.run(request(module, name, payload)), 403)
+      assert result == {"success": False, "error": "forbidden", "status_code": 403}
+      assert calls == 1 and fixture.artifact_reads == []
+      return
     if name == "get_report":
       payload["cid"] = "worker"
     result, calls = assert_json_response(asyncio.run(request(module, name, payload)), 200)

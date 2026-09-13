@@ -28,6 +28,7 @@ ROUTES = (
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
   "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
+  "get_detection_correlation",
 )
 SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
 ERROR = "Incompatible generated execution API"
@@ -65,6 +66,8 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args)[-3:] == SELECTORS
       if method.name == "preflight_model_test_provider":
         assert method.args.args[-4].arg == "actor"
+    elif method.name == "get_detection_correlation":
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "request_actor")
     else:
       assert tuple(arg.arg for arg in method.args.args)[-2:] == ("request_actor", "tenant_id")
     methods.append(method)
