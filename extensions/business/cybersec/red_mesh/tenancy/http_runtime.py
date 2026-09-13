@@ -95,6 +95,10 @@ _READ_FIELDS = {
   "get_audit_log": (("limit", int, 100),) + _REQUESTER_FIELDS,
   "get_analysis": (("job_id", str, ""), ("cid", str, ""), ("pass_nr", int, None)) + _REQUESTER_FIELDS,
   "get_detection_correlation": _JOB_FIELD + (("request_actor", dict, None),),
+  "get_misp_export_status": _JOB_FIELD + (("request_actor", dict, None),),
+  "get_stix_export_status": _JOB_FIELD + (("request_actor", dict, None),),
+  "get_opencti_export_status": _JOB_FIELD + (("request_actor", dict, None),),
+  "get_taxii_export_status": _JOB_FIELD + (("request_actor", dict, None),),
 }
 _READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
@@ -338,7 +342,9 @@ def install_generated_read_api(app, model_namespace) -> None:
     async def protected_http(request, error):
       if _read_path(request.scope.get("path")):
         detail = error.detail
-        if (request.scope.get("path") == "/get_detection_correlation" and error.status_code == 400
+        if (request.scope.get("path") in ("/get_detection_correlation", "/get_misp_export_status",
+            "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status")
+            and error.status_code == 400
             and isinstance(detail, dict)):
           typed = (detail.get("success") is False and type(detail.get("status_code")) is int
                    and detail["status_code"] == 400 and detail.get("error") == "unsupported_job_type")

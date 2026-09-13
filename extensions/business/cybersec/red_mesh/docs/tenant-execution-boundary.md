@@ -165,11 +165,23 @@ only. It admits current proven legacy readers, rejects tenant selectors and memb
 accounts, and projects a detached summary without provider, artifact or write effects. Missing jobs
 return typed 404; malformed or foreign summaries return 503; model jobs return the allowlisted
 `unsupported_job_type` 400 in both RAW and WRAPPED formats. Null summaries remain valid empty status.
-This does not change the correlation mutation or activate tenant integrations. Thirty other deferred
-native operations still require their own admission cutover.
+This does not change the correlation mutation or activate tenant integrations.
+
+MISP, STIX, OpenCTI and TAXII export-status reads also use requester-only checked legacy POSTs.
+They project detached persisted metadata, never build/export/push/publish or fetch the referenced
+artifacts. Missing/null/empty metadata is valid nonexported status; other malformed metadata,
+foreign job identity or response-control fields fail 503 before projection. MISP preserves its
+five-field projection; the other readers preserve nonreserved metadata. Matching embedded job IDs
+remain valid. OpenCTI/TAXII dry-run metadata remains visible with `exported:false`; exported becomes
+true only for `pushed`/`published` respectively. Model jobs retain typed400 in RAW and WRAPPED.
+Their mutation, dry-run, configuration and tenant activation paths are unchanged. Twenty-eight native
+endpoints still require admission/shaping work, including `get_misp_export_config_status` and
+`llm_health`. The former returns deployment configuration; the latter calls provider health and can
+return its host/port/raw response. Neither is an exempt harmless metadata endpoint. Earlier planning
+counts of31 deferred endpoints omitted those two: five checked status reads leave28 from33.
 
 This is **local wiring, not completed application isolation**. Navigator ordinary-read pairing
-I1a.3b.2 is committed; correlation-status support requires its matching Navigator change. Unmatched
+I1a.3b.2 is committed; these five status reads require matching Navigator changes. Unmatched
 versions fail denied/unavailable, never fall back to actorless GET. I1a.3c remains incomplete. Dormant
 unchecked service helpers are not authorized public read paths. I2 still owns browser-wide
 provider/cache isolation. Public workspace entry remains closed, and passing local tests does not

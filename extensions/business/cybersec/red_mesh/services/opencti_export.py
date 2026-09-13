@@ -8,12 +8,18 @@ from urllib.parse import urlsplit
 import requests
 
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
+from ..tenancy.ports import TenantStoreError
 from .auth import AuthError, build_auth_provider, credentials_missing
 from .config import get_opencti_export_config
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
 from .scan_guards import reject_model_test_for_scan_operation
 from .stix_export import build_stix_bundle
+
+
+_UNSET = object()
 
 
 OPENCTI_EXPORT_SCHEMA_VERSION = "1.0.0"
@@ -344,14 +350,25 @@ def probe_opencti(owner):
   }
 
 
-def get_opencti_export_status(owner, job_id):
-  job_specs = owner._get_job_from_cstore(job_id)
+def get_opencti_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "exported": False}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "opencti_export_status")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {**unsupported, "found": True, "exported": False}
   export_meta = job_specs.get("opencti_export")
+  if checked and export_meta is not None:
+    if (not isinstance(export_meta, dict)
+        or "job_id" in export_meta and export_meta["job_id"] != job_id
+        or any(field in export_meta for field in ("success", "error", "status_code", "result",
+               "detail", "exception_metadata", "execution_binding", "found", "exported"))):
+      raise TenantStoreError("Export status is unavailable")
   if not isinstance(export_meta, dict) or not export_meta:
     return {"job_id": job_id, "found": True, "exported": False}
   return {

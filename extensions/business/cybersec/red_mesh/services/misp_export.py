@@ -17,9 +17,15 @@ import time as _time
 from pymisp import MISPEvent, MISPObject, MISPAttribute, PyMISP
 
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
+from ..tenancy.ports import TenantStoreError
 from .misp_config import get_misp_export_config, SEVERITY_LEVELS
 from .event_hooks import emit_export_status_event
 from .scan_guards import reject_model_test_for_scan_operation
+
+
+_UNSET = object()
 
 
 def _job_repo(owner):
@@ -531,20 +537,31 @@ def export_misp_json(owner, job_id, pass_nr=None):
   }
 
 
-def get_misp_export_status(owner, job_id):
+def get_misp_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
   """
   Check whether a job has been exported to MISP.
 
   Reads the misp_export metadata from CStore.
   """
-  job_specs = owner._get_job_from_cstore(job_id)
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not job_specs:
     return {"job_id": job_id, "found": False, "exported": False}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "misp_export_status")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {**unsupported, "found": True, "exported": False}
 
   export_meta = job_specs.get("misp_export")
+  if checked and export_meta is not None:
+    if (not isinstance(export_meta, dict)
+        or "job_id" in export_meta and export_meta["job_id"] != job_id
+        or any(field in export_meta for field in ("success", "error", "status_code", "result",
+               "detail", "exception_metadata", "execution_binding", "found", "exported"))):
+      raise TenantStoreError("Export status is unavailable")
   if not export_meta or not isinstance(export_meta, dict):
     return {"job_id": job_id, "found": True, "exported": False}
 
