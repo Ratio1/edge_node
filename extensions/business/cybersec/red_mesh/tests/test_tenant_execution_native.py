@@ -35,9 +35,7 @@ ACTOR_ONLY_READ_ROUTES = ("get_misp_export_config_status", "llm_health", "update
 LEGACY_JSON_EXPORT_ROUTES = ("export_misp_json",)
 # RM-026 I1b B1: effect endpoints sharing the strict read transport.
 EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle",
-                 "test_event_export", "push_to_opencti", "publish_to_taxii")
-# export_misp joins these in B2's MISP phase, once it is converted from GET to POST: the native
-# renderer looks for a decorator Call, and a bare @BasePlugin.endpoint makes it raise.
+                 "test_event_export", "push_to_opencti", "publish_to_taxii", "export_misp")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
@@ -97,6 +95,7 @@ def _render_native(default_route=None):
         "test_event_export": ("self", "integration_id", "request_actor"),
         "push_to_opencti": ("self", "job_id", "pass_nr", "request_actor"),
         "publish_to_taxii": ("self", "job_id", "pass_nr", "request_actor"),
+        "export_misp": ("self", "job_id", "pass_nr", "request_actor"),
       }[method.name]
       assert tuple(arg.arg for arg in method.args.args) == expected
     else:

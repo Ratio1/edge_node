@@ -169,9 +169,16 @@ def test_an_exception_string_from_a_probe_never_reaches_the_caller():
 
 def test_an_untypeable_outcome_is_not_published_as_success_without_a_reason():
   from extensions.business.cybersec.red_mesh.tenancy.effects import public_effect_result
+  # artifact_write_failed became a publishable delivery code in B2, so it now carries a reason
+  # rather than a null. The invariant under test is that an outcome never publishes as success
+  # without one.
   projected = public_effect_result({"status": "error", "error": "artifact_write_failed",
                                     "job_id": "job-1"})
-  assert projected["status"] == "error" and projected["configuration_error"] is None
+  assert projected["status"] == "error"
+  assert projected["configuration_error"] == "artifact_write_failed"
+  untypable = public_effect_result({"status": "error", "error": "something_unmapped",
+                                    "job_id": "job-1"})
+  assert untypable["status"] == "error" and untypable["configuration_error"] is None
 
 
 def test_revalidation_denies_before_the_effect_when_the_account_is_deactivated():

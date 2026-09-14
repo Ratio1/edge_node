@@ -100,3 +100,42 @@ def test_delivery_endpoints_deny_an_unauthorized_caller_without_effects(name, se
     assert result == {"success": False, "error": "forbidden", "status_code": 403}
     recorder.assert_not_called()
     persist.assert_not_called()
+
+
+def test_a_delivery_failure_publishes_both_the_state_and_the_reason():
+  """Neither half is sufficient alone: without the state a retry duplicates a landed effect,
+  without the code the panel shows nothing actionable."""
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(opencti_export, "_config_error", return_value=None), \
+         patch.object(opencti_export, "build_stix_bundle", return_value=dict(OK_BUNDLE)), \
+         patch.object(opencti_export, "_persist_bundle", return_value="artifact-cid"), \
+         patch.object(opencti_export, "build_auth_provider") as auth, \
+         patch.object(opencti_export.requests, "post", return_value=_Response(502)):
+      auth.return_value.headers.return_value = {}
+      result = fixture.Plugin.push_to_opencti(fixture.owner, "job-1",
+                                              request_actor=fixture.actor)
+  assert result["error"] == "effect_incomplete"
+  assert result["effect_state"] == EffectState.PERSISTED.value
+  assert result["configuration_error"] == "http_502"
+
+
+def test_the_panel_fields_each_delivery_consumer_reads_survive_the_projection():
+  """Pin the projection against its three consumers, as B1's Download-button break taught."""
+  from extensions.business.cybersec.red_mesh.tenancy.effects import public_effect_result
+  opencti = public_effect_result({"status": "ok", "opencti_file_id": "f1",
+                                  "upload_status": "complete", "job_id": "job-1"})
+  for field in ("opencti_file_id", "upload_status"):
+    assert field in opencti, f"OpenCtiExport.tsx reads {field}"
+  taxii = public_effect_result({"status": "ok", "taxii_status_id": "s1", "taxii_status": "complete",
+                                "collection_id": "c1", "success_count": 3, "failure_count": 0,
+                                "pending_count": 0, "job_id": "job-1"})
+  for field in ("taxii_status_id", "taxii_status", "collection_id", "success_count",
+                "failure_count", "pending_count"):
+    assert field in taxii, f"TaxiiExport.tsx reads {field}"
+  misp = public_effect_result({"status": "ok", "findings_exported": 4, "ports_exported": 2,
+                               "event_uuid": "u1", "job_id": "job-1"})
+  for field in ("findings_exported", "ports_exported"):
+    assert field in misp, f"MispExport.tsx reads {field}"
+  # redacted_host is deliberately withheld: it is the real hostname (contract 7).
+  assert "redacted_host" not in public_effect_result(
+    {"status": "ok", "redacted_host": "opencti.internal", "job_id": "job-1"})

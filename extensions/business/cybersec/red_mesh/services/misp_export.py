@@ -19,6 +19,7 @@ from pymisp import MISPEvent, MISPObject, MISPAttribute, PyMISP
 
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
+from ..tenancy.effects import EffectState
 from ..tenancy.job_artifacts import TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
 from .misp_config import get_misp_export_config, SEVERITY_LEVELS
@@ -426,7 +427,8 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
   }
 
 
-def push_to_misp(owner, job_id, pass_nr=None):
+def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
+                 snapshot_mode="tenant_bound", ledger=None):
   """
   Build a MISP event and push it to the configured MISP server.
 
@@ -434,7 +436,8 @@ def push_to_misp(owner, job_id, pass_nr=None):
   event_uuid in CStore), updates the existing event with new pass data.
   """
   cfg = get_misp_export_config(owner)
-  job_specs = owner._get_job_from_cstore(job_id)
+  # Checked snapshot replaces the unscoped global lookup (RM-026 I1b). Seam one of two.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "misp_export")
   if unsupported:
     return unsupported
@@ -454,14 +457,19 @@ def push_to_misp(owner, job_id, pass_nr=None):
     _write_job_record(owner, job_id, job_specs, context="misp_export_status")
 
   if not cfg["ENABLED"]:
-    _record_export_status("skipped")
-    return {"status": "disabled", "error": "MISP export is disabled"}
+    # Deliberately no _record_export_status here. Routing export_misp through _effect_operation
+    # makes this branch live for the first time, and emitting a SOC event plus a job-record write
+    # on a disabled integration would be a new behaviour OpenCTI and TAXII do not have.
+    return {"status": "disabled"}
   if not cfg["MISP_URL"] or not cfg["MISP_API_KEY"]:
     _record_export_status("failed")
-    return {"status": "not_configured", "error": "MISP URL or API key not configured"}
+    return {"status": "not_configured", "error": "missing_credentials"}
 
   # Build the event
-  result = build_misp_event(owner, job_id, pass_nr=pass_nr)
+  # Seam two: build_misp_event reaches the store again through _resolve_pass_data.
+  result = (build_misp_event(owner, job_id, pass_nr=pass_nr) if checked_job is _UNSET
+            else build_misp_event(owner, job_id, pass_nr=pass_nr, checked_job=checked_job,
+                                  snapshot_mode=snapshot_mode))
   if result["status"] != "ok":
     _record_export_status("failed")
     return result
@@ -474,7 +482,8 @@ def push_to_misp(owner, job_id, pass_nr=None):
                   ssl=cfg["MISP_VERIFY_TLS"], timeout=cfg["TIMEOUT"])
   except Exception as exc:
     _record_export_status("failed")
-    return {"status": "error", "error": f"MISP connection failed: {exc}", "retryable": True}
+    # Typed code, not prose: the exception text can carry the configured MISP URL.
+    return {"status": "error", "error": "connection_failed", "retryable": True}
 
   # Check for existing event (re-export / continuous monitoring)
   existing_export = (job_specs or {}).get("misp_export", {})
@@ -490,6 +499,10 @@ def push_to_misp(owner, job_id, pass_nr=None):
           # Add new objects to existing event
           for obj in event.objects:
             misp.add_object(existing_event, obj, pythonify=True)
+            if ledger is not None:
+              # The remote now holds part of this export. A mid-loop failure past this point must
+              # not report "nothing happened" -- a retry would duplicate the objects already added.
+              ledger.record(EffectState.DELIVERED)
           # Update tags
           for tag in event.tags:
             existing_event.add_tag(tag)
@@ -510,8 +523,11 @@ def push_to_misp(owner, job_id, pass_nr=None):
       if isinstance(response_event, dict):
         error_msg = response_event.get("message", response_event.get("errors", str(response_event)))
       _record_export_status("failed")
-      return {"status": "error", "error": f"MISP API error: {error_msg}", "retryable": False}
+      return {"status": "error", "error": "api_error", "retryable": False}
 
+    if ledger is not None:
+      # PyMISP has no status code: a MISPEvent with a uuid is the only acceptance evidence.
+      ledger.record(EffectState.DELIVERED)
     event_uuid = str(response_event.uuid)
     event_id = int(response_event.id) if response_event.id else 0
 

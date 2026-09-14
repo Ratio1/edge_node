@@ -11,6 +11,7 @@ passed *into* the service and mutated as effects land, and stays readable after 
 """
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 
@@ -105,6 +106,12 @@ _PUBLIC_EFFECT_FIELDS = frozenset({
   # export_stix_bundle is the manual-download endpoint: the bundle itself is the payload the UI
   # downloads, and dropping it silently broke the Download button.
   "stix_bundle", "last_exported_at",
+  # B2 delivery results, each read by a live panel. `redacted_host` is deliberately NOT here: it is
+  # the real hostname (contract 7). The panels pick it up from the status endpoint they already call.
+  "opencti_file_id", "upload_status", "pushed_at",           # OpenCtiExport.tsx:73-75
+  "taxii_status_id", "taxii_status", "collection_id",        # TaxiiExport.tsx:78-88
+  "success_count", "failure_count", "pending_count", "published_at",
+  "findings_exported", "ports_exported", "event_uuid",       # MispExport.tsx:62
 })
 
 # Every configuration code the effect services can actually produce. This is deliberately a
@@ -117,7 +124,13 @@ _PUBLIC_CONFIGURATION_ERRORS = frozenset({
   "missing_token", "missing_credentials", "invalid_auth_config",
   # emitted by opencti_export._config_error / taxii_export._config_error
   "missing_url", "missing_server_url", "missing_collection_id", "unsupported_mode",
+  # B2 delivery outcomes. Static codes, no prose, no host: without them every delivery failure
+  # showed the panels' generic fallback.
+  "timeout", "graphql_error", "artifact_write_failed", "connection_failed", "api_error",
 })
+
+# `http_<status>` is generated per response code, so it cannot be a frozenset member.
+_HTTP_STATUS_ERROR = re.compile(r"^http_[1-5][0-9][0-9]$")
 
 
 def public_effect_result(result):
@@ -142,7 +155,8 @@ def public_effect_result(result):
     return {"success": False, "error": code, "status_code": status_code}
   projected = {key: value for key, value in result.items() if key in _PUBLIC_EFFECT_FIELDS}
   if isinstance(error, str):
-    projected["configuration_error"] = error if error in _PUBLIC_CONFIGURATION_ERRORS else None
+    publishable = (error in _PUBLIC_CONFIGURATION_ERRORS or bool(_HTTP_STATUS_ERROR.match(error)))
+    projected["configuration_error"] = error if publishable else None
     if projected["configuration_error"] is None:
       # An outcome we cannot type must not be published as success with no reason.
       projected["status"] = "error"
