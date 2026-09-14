@@ -127,6 +127,12 @@ _EFFECT_FIELDS = {
   "push_to_opencti": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "publish_to_taxii": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "export_misp": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
+  # B3 ingest.
+  "correlate_suricata_eve": _JOB_FIELD + (("eve_jsonl", str, ""), ("pass_nr", int, None),
+                                          ("source_ips", list, None), ("sensor_id", str, ""),
+                                          ("request_actor", dict, None)),
+  "upload_authorization": (("filename", str, ""), ("content_b64", str, ""),
+                           ("request_actor", dict, None)),
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.

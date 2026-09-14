@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import json
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
+from ..tenancy.effects import EffectState
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
 from .config import get_suricata_correlation_config
@@ -19,6 +21,9 @@ DETECTION_CORRELATION_SCHEMA_VERSION = "1.0.0"
 MAX_EVE_JSONL_BYTES = 25 * 1024 * 1024
 MAX_EVE_EVENTS = 100000
 _UNSET = object()
+
+# Structured parse codes that may be published verbatim: no caller content, bounded shape.
+_SAFE_PARSE_ERROR = re.compile(r"^(eve_jsonl_too_large|invalid_jsonl_line_\d{1,7})$")
 
 
 def _utc_timestamp():
@@ -254,8 +259,11 @@ def get_detection_correlation(owner, job_id, *, checked_job=_UNSET, snapshot_mod
   }
 
 
-def correlate_suricata_eve(owner, job_id, *, eve_jsonl="", pass_nr=None, source_ips=None, sensor_id=""):
-  job_specs = owner._get_job_from_cstore(job_id)
+def correlate_suricata_eve(owner, job_id, *, eve_jsonl="", pass_nr=None, source_ips=None,
+                           sensor_id="", checked_job=_UNSET, ledger=None):
+  # Checked snapshot replaces the unscoped global lookup (RM-026 I1b). This read is the entry point
+  # to a job-record write below, so leaving it unscoped left a cross-tenant write reachable.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "suricata", outcome="failure", error_class="job_not_found")
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
@@ -268,8 +276,15 @@ def correlate_suricata_eve(owner, job_id, *, eve_jsonl="", pass_nr=None, source_
   try:
     events = _parse_eve_jsonl(eve_jsonl)
   except ValueError as exc:
-    record_integration_status(owner, "suricata", outcome="failure", error_class=str(exc))
-    return {"status": "error", "error": str(exc), "job_id": job_id}
+    # _parse_eve_jsonl raises only "eve_jsonl_too_large" or "invalid_jsonl_line_<n>" -- structured
+    # codes carrying no caller content, and the line number is useful diagnostics, so it is kept.
+    # The allowlist exists so a future raise that does carry prose cannot reach the caller or the
+    # node-global status record. Earlier revisions called this a plain exception-string leak; the
+    # exposure today is narrower than that, but one added `raise ValueError(f"...{user_text}")`
+    # away.
+    code = str(exc) if _SAFE_PARSE_ERROR.match(str(exc)) else "eve_payload_rejected"
+    record_integration_status(owner, "suricata", outcome="failure", error_class=code)
+    return {"status": "error", "error": code, "job_id": job_id}
 
   archive = _load_archive(owner, job_specs)
   target_values = _target_candidates(job_specs, archive)
@@ -320,7 +335,11 @@ def correlate_suricata_eve(owner, job_id, *, eve_jsonl="", pass_nr=None, source_
       "unmatched_high_signal": len(high_signal_unmatched),
     },
   }
+  if ledger is not None and redacted_matches:
+    ledger.checkpoint()
   artifact_cid = _artifact_repo(owner).put_json(evidence, show_logs=False) if redacted_matches else None
+  if ledger is not None and artifact_cid:
+    ledger.record(EffectState.PERSISTED)
 
   status = "completed" if matches else "empty"
   summary = {
@@ -341,7 +360,15 @@ def correlate_suricata_eve(owner, job_id, *, eve_jsonl="", pass_nr=None, source_
     ),
   }
   job_specs["detection_correlation"] = summary
-  _write_job_record(owner, job_id, job_specs)
+  if ledger is not None:
+    # The job document is mutated on every success path, artifact or not.
+    ledger.checkpoint()
+    ledger.record(EffectState.PERSISTED)
+  written = _write_job_record(owner, job_id, job_specs)
+  if written is None and ledger is not None:
+    # _write_job_record returns None without writing when the binding guard trips. Reporting "ok"
+    # with a summary that was never stored told the caller the opposite of what happened.
+    return {"status": "error", "error": "job_record_not_written", "job_id": job_id}
   record_integration_status(
     owner,
     "suricata",

@@ -113,6 +113,8 @@ def store_authorization_document(
   artifact_repo,
   virus_scan_hook=None,
   now_fn=None,
+  uploaded_by: str | None = None,
+  ledger=None,
 ) -> AuthorizationUploadResult:
   """Validate + store an authorization document via R1FS.
 
@@ -204,8 +206,16 @@ def store_authorization_document(
     "uploaded_at": now_fn(),
     "content_b64": base64.b64encode(raw).decode("ascii"),
   }
+  if uploaded_by:
+    # Derived from admission, never caller-supplied (contract 5). Admission gives an owner for free;
+    # recording it turns RM-078's deferral from a plan sentence into a stored fact. The document is
+    # attributable to an account, not yet scoped to a tenant.
+    envelope["uploaded_by"] = uploaded_by
 
   # 5. Store via R1FS
+  if ledger is not None:
+    # Last revalidation before the only irreversible step in this service.
+    ledger.checkpoint()
   try:
     cid = artifact_repo.put_json(envelope, show_logs=False)
   except Exception as exc:
