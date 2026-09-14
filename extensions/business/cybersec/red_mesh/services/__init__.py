@@ -71,6 +71,7 @@ from .event_redaction import (
 )
 from .integration_status import (
   get_integration_status,
+  get_public_integration_config,
   record_integration_status,
   test_event_export,
 )
@@ -239,6 +240,7 @@ __all__ = [
   "get_job_data",
   "get_job_progress",
   "get_integration_status",
+  "get_public_integration_config",
   "get_detection_correlation",
   "WAZUH_EVENT_GROUPS",
   "SOC_EVENT_STATUS_SCHEMA_VERSION",

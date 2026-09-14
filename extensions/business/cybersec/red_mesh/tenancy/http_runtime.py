@@ -105,6 +105,7 @@ _READ_FIELDS = {
   "llm_health": (("request_actor", dict, None),),
   "update_finding_triage": (("request_actor", dict, None),),
   "export_misp_json": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
+  "get_integration_status": (("request_actor", dict, None),),
 }
 _READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")

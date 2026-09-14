@@ -274,7 +274,160 @@ _STATUS_BUILDERS = {
 }
 
 
+# Public configuration-only projection (RM-026 I1a.3c.8).
+#
+# The owner chose to omit unowned historical event IDs and artifact CIDs from the
+# global integration view while retaining safe configuration/readiness status. This
+# path therefore rebuilds from the same six base builders and never touches
+# _load_status_record/_merge_record, so no persisted history can reach it. The
+# historical producer, record writes and cooldown policy above are unchanged and
+# still serve the internal export policy.
+
+PUBLIC_CONFIG_FIELDS = (
+  "id",
+  "label",
+  "enabled",
+  "configured",
+  "required",
+  "supports_test",
+  "status",
+  "destination_type",
+  "destination_label",
+  "redaction_mode",
+  "configuration_error",
+)
+
+_PUBLIC_CONFIG_STATUSES = frozenset({"disabled", "not_configured", "ready"})
+
+_PUBLIC_REDACTION_MODES = frozenset({"hash_only", "summary", "internal_soc", "custom"})
+
+# Configuration codes the six builders can produce. A delivery-outcome error class
+# can never appear here because records are not read; an unknown code therefore
+# means the builder contract moved, and we fail closed rather than publish it.
+_PUBLIC_CONFIGURATION_ERRORS = frozenset({
+  "missing_hmac_secret",
+  "missing_syslog_host",
+  "missing_http_url",
+  "missing_token",
+  "missing_credentials",
+  "invalid_auth_config",
+})
+
+_PUBLIC_DESTINATION_TYPES = {
+  "event_export": frozenset({"canonical"}),
+  "wazuh": frozenset({"syslog", "http", "wazuh_api"}),
+  "suricata": frozenset({
+    "uploaded_eve_json_or_external_query",
+    "uploaded_eve_json",
+    "external_query",
+  }),
+  "stix": frozenset({"manual_download"}),
+  "opencti": frozenset({"http"}),
+  "taxii": frozenset({"taxii_2.1"}),
+}
+
+_PUBLIC_DESTINATION_LABELS = {
+  "event_export": "redmesh.event.v1",
+  "wazuh": "wazuh",
+  "suricata": "suricata-security-onion",
+  "stix": "stix-2.1",
+  "opencti": "opencti",
+  "taxii": "taxii",
+}
+
+
+class IntegrationConfigUnavailable(Exception):
+  """The builder contract did not match the pinned public configuration shape."""
+
+
+def _public_config_item(integration_id, base):
+  if not isinstance(base, dict):
+    raise IntegrationConfigUnavailable(integration_id)
+
+  enabled = base.get("enabled")
+  configured = base.get("configured")
+  required = base.get("required")
+  supports_test = base.get("supports_test")
+  if any(type(value) is not bool for value in (enabled, configured, required, supports_test)):
+    raise IntegrationConfigUnavailable(integration_id)
+  if supports_test is not (integration_id in _INTEGRATIONS_WITH_TEST):
+    raise IntegrationConfigUnavailable(integration_id)
+  if required and integration_id != "wazuh":
+    raise IntegrationConfigUnavailable(integration_id)
+
+  # Derived from the booleans rather than passed through, so the public status can
+  # only ever be one of the three configuration states.
+  if not enabled:
+    status = "disabled"
+  elif configured:
+    status = "ready"
+  else:
+    status = "not_configured"
+  if status not in _PUBLIC_CONFIG_STATUSES:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  destination_type = base.get("destination_type")
+  if destination_type not in _PUBLIC_DESTINATION_TYPES[integration_id]:
+    raise IntegrationConfigUnavailable(integration_id)
+  if base.get("destination_label") != _PUBLIC_DESTINATION_LABELS[integration_id]:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  redaction_mode = base.get("redaction_mode")
+  if redaction_mode not in _PUBLIC_REDACTION_MODES:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  configuration_error = base.get("last_error_class")
+  if configuration_error is not None:
+    if (not isinstance(configuration_error, str)
+        or configuration_error not in _PUBLIC_CONFIGURATION_ERRORS):
+      raise IntegrationConfigUnavailable(integration_id)
+
+  label = INTEGRATION_LABELS[integration_id]
+  if base.get("id") != integration_id or base.get("label") != label:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  return {
+    "id": integration_id,
+    "label": label,
+    "enabled": enabled,
+    "configured": configured,
+    "required": required,
+    "supports_test": supports_test,
+    "status": status,
+    "destination_type": destination_type,
+    "destination_label": _PUBLIC_DESTINATION_LABELS[integration_id],
+    "redaction_mode": redaction_mode,
+    "configuration_error": configuration_error,
+  }
+
+
+def get_public_integration_config(owner):
+  """Configuration/readiness only: no history, counts, cooldown or stored errors."""
+  integrations = {}
+  for integration_id, builder in _STATUS_BUILDERS.items():
+    # Detached per integration; never _merge_record and never _load_status_record.
+    integrations[integration_id] = _public_config_item(integration_id, builder(owner))
+  if set(integrations) != set(_STATUS_BUILDERS):
+    raise IntegrationConfigUnavailable("integrations")
+  generated_at = _utc_timestamp()
+  if not isinstance(generated_at, str) or not generated_at.endswith("Z"):
+    raise IntegrationConfigUnavailable("generated_at")
+  return {
+    "schema_version": INTEGRATION_STATUS_SCHEMA_VERSION,
+    "generated_at": generated_at,
+    "integrations": integrations,
+  }
+
+
 def get_integration_status(owner):
+  """Historical producer: configuration merged with persisted delivery outcomes.
+
+  Deliberately retained with no production caller as of RM-026 I1a.3c.8. The public
+  endpoint now serves get_public_integration_config instead, and the export policy
+  uses record_integration_status/_load_status_record directly rather than this
+  aggregate. It is kept as F2 groundwork for a tenant-scoped history view, and its
+  merge semantics stay under test; remove it if F2 lands on a different shape.
+  """
   integrations = {}
   for integration_id, builder in _STATUS_BUILDERS.items():
     base = builder(owner)
