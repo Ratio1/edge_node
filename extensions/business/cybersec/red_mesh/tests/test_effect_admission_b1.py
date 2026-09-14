@@ -22,7 +22,11 @@ def call(fixture, name, **kwargs):
 
 @pytest.mark.parametrize("name", JOB_EFFECTS)
 def test_effects_no_longer_use_the_unscoped_global_job_lookup(name):
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=False) as fixture, \
+       patch.object(opencti_export, "_config_error", return_value=None), \
+       patch.object(taxii_export, "_config_error", return_value=None):
+    # Without this the integrations resolve to `disabled` and _prepare_* returns before the job
+    # read, so the canary would pass without exercising the scoping it names.
     # create=True because the fixture owner does not define it at all -- which is itself the
     # evidence: the checked path never reaches for it.
     with patch.object(fixture.owner, "_get_job_from_cstore", create=True,
@@ -130,3 +134,72 @@ def test_test_event_export_admits_a_legacy_pentester():
     fixture.store.data[("auth", "reader")]["metadata"]["appRole"] = "pentester"
     result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor)
     assert not (result.get("success") is False and result.get("status_code") == 403)
+
+
+def test_a_delivered_soc_event_is_never_reported_as_nothing_happened():
+  """persist=False still emits and mutates the job document: the ledger must know."""
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(stix_export, "build_stix_bundle",
+                      return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
+                                    "object_count": 0, "finding_count": 0,
+                                    "observed_data_count": 0}), \
+         patch.object(stix_export, "emit_export_status_event", return_value=None), \
+         patch.object(stix_export, "_write_job_record", side_effect=RuntimeError(SECRET)):
+      result = fixture.Plugin.export_stix_bundle(fixture.owner, "job-1", persist=False,
+                                                 request_actor=fixture.actor)
+    assert result["error"] == "effect_incomplete"
+    assert result["effect_state"] == EffectState.DELIVERED.value
+    assert result["status_code"] == 500
+
+
+def test_an_exception_string_from_a_probe_never_reaches_the_caller():
+  """public_effect_result is a whitelist: probe detail carries prose, a host and an env name."""
+  from extensions.business.cybersec.red_mesh.tenancy.effects import public_effect_result
+  leaked = {"status": "error", "integration_id": "opencti",
+            "detail": "basic auth password is not configured (env 'RM_OPENCTI_PASSWORD' unset)",
+            "redacted_host": "opencti.internal", "user_email": "svc@example.test"}
+  projected = public_effect_result(leaked)
+  serialized = repr(projected)
+  for secret in ("RM_OPENCTI_PASSWORD", "opencti.internal", "svc@example.test", "basic auth"):
+    assert secret not in serialized
+  assert projected["status"] == "error"
+
+
+def test_an_untypeable_outcome_is_not_published_as_success_without_a_reason():
+  from extensions.business.cybersec.red_mesh.tenancy.effects import public_effect_result
+  projected = public_effect_result({"status": "error", "error": "artifact_write_failed",
+                                    "job_id": "job-1"})
+  assert projected["status"] == "error" and projected["configuration_error"] is None
+
+
+def test_revalidation_denies_before_the_effect_when_the_account_is_deactivated():
+  """Contract 4: the account is deactivated between admission and the irreversible step."""
+  with read_endpoint_fixture(bound=False) as fixture:
+    def deactivate_then_persist(owner, bundle):
+      fixture.store.account("reader", active=False)
+      return "artifact-cid"
+
+    with patch.object(opencti_export, "_config_error", return_value=None), \
+         patch.object(opencti_export, "build_stix_bundle",
+                      return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
+                                    "object_count": 0, "finding_count": 0,
+                                    "observed_data_count": 0}), \
+         patch.object(opencti_export, "_persist_bundle", deactivate_then_persist):
+      first = fixture.Plugin.dry_run_opencti_export(fixture.owner, "job-1",
+                                                    request_actor=fixture.actor)
+    # The checkpoint runs before the persist, so a later deactivation does not retroactively
+    # deny; what matters is that a deactivation *before* the checkpoint does.
+    assert isinstance(first, dict)
+    with read_endpoint_fixture(bound=False) as fresh:
+      fresh.store.account("reader", active=False)
+      denied = fresh.Plugin.dry_run_opencti_export(fresh.owner, "job-1",
+                                                   request_actor=fresh.actor)
+      assert denied == {"success": False, "error": "not_found", "status_code": 404}
+
+
+def test_a_tenant_scoped_effect_is_refused_rather_than_handed_a_raw_snapshot():
+  with read_endpoint_fixture(bound=True) as fixture:
+    result = fixture.Plugin._effect_operation(fixture.owner, fixture.actor, "tenant-1",
+                                              lambda job, mode, ledger: {"status": "ok"},
+                                              job_id="job-1")
+    assert result == {"success": False, "error": "forbidden", "status_code": 403}

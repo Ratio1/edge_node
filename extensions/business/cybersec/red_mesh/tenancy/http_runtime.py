@@ -107,9 +107,13 @@ _READ_FIELDS = {
   "export_misp_json": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "get_integration_status": (("request_actor", dict, None),),
 }
-# Effect-bearing endpoints (RM-026 I1b). They share the read guard's strict transport -- POST only,
-# exact field types, no unknown/duplicate keys, no query string, no-store -- but they are not reads,
-# so they are declared separately rather than by widening what _READ_FIELDS means.
+# Effect-bearing endpoints (RM-026 I1b).
+#
+# These are NOT part of the generated read API: no model is generated for them and the install-time
+# validator does not pin them. Listing them here puts them inside `_read_path`, which is what shapes
+# transport errors as JSON with `no-store` instead of the framework's HTML default. It does not give
+# them the generated routes' field-level validation. Do not read this as "effects share the read
+# transport"; converting them fully is separate work.
 _EFFECT_FIELDS = {
   "dry_run_opencti_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "dry_run_taxii_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),

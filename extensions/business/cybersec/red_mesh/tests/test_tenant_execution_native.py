@@ -64,7 +64,7 @@ def _render_native(default_route=None):
   methods = []
   endpoint_options = {}
   for original in plugin.body:
-    if not isinstance(original, ast.FunctionDef) or original.name not in ROUTES + READ_ROUTES:
+    if not isinstance(original, ast.FunctionDef) or original.name not in ROUTES + READ_ROUTES + EFFECT_ROUTES:
       continue
     method = deepcopy(original)
     decorator = next(item for item in method.decorator_list

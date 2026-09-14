@@ -145,6 +145,8 @@ def dry_run_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET, l
   if result.get("status") != "ok":
     return result
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
   if ledger is not None and artifact_cid:
     # The bundle is now on disk. Anything that raises after this point must not be reported

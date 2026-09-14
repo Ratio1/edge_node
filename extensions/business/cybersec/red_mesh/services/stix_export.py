@@ -512,6 +512,8 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job
 
   artifact_cid = None
   if persist:
+    if ledger is not None:
+      ledger.checkpoint()
     artifact_cid = _artifact_repo(owner).put_json(result["bundle"], show_logs=False)
     if ledger is not None and artifact_cid:
       # Bundle on disk. The SOC emission below may still fail; that is "persisted", not "nothing".
@@ -532,6 +534,11 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job
     "observed_data_count": result["observed_data_count"],
   }
   job_specs["stix_export"] = export_meta
+  if ledger is not None:
+    ledger.checkpoint()
+    # The job document is mutated and a SOC event is emitted below whether or not the bundle was
+    # persisted, so `persist=False` must not leave the ledger at NONE.
+    ledger.record(EffectState.PERSISTED)
   emit_export_status_event(
     owner,
     job_specs,
@@ -541,6 +548,10 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job
     destination_label="stix-2.1",
     artifact_refs={"stix_bundle_id": result["bundle_id"], "stix_bundle_cid": artifact_cid},
   )
+  if ledger is not None:
+    # The SOC event has left the node. Anything that fails after this point must not be reported
+    # as "nothing happened", because a retry would duplicate the delivery.
+    ledger.record(EffectState.DELIVERED)
   _write_job_record(owner, job_id, job_specs, context="stix_export")
   record_integration_status(
     owner,

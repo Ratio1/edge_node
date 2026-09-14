@@ -32,10 +32,22 @@ class EffectLedger:
   which is the exact falsehood this type exists to prevent.
   """
 
-  __slots__ = ("_state",)
+  __slots__ = ("_state", "_on_checkpoint")
 
-  def __init__(self):
+  def __init__(self, on_checkpoint=None):
     self._state = EffectState.NONE
+    self._on_checkpoint = on_checkpoint
+
+  def checkpoint(self):
+    """Revalidate immediately before an irreversible step (contract 4).
+
+    Services call this at each named seam. The callback re-resolves the requester and re-checks
+    the job binding, and raises if either has changed since admission -- an account deactivated or
+    a rollout closed mid-operation must not get the effect. When no callback is installed (a direct
+    internal caller) this is a no-op, so internal paths are unaffected.
+    """
+    if self._on_checkpoint is not None:
+      self._on_checkpoint()
 
   @property
   def state(self) -> EffectState:
@@ -82,8 +94,30 @@ _EFFECT_DENIALS = {
 }
 
 
+# Fields an effect result may publish. A whitelist, not a blacklist: stripping only `error` let
+# probe_opencti/probe_taxii's `detail: str(exc)` -- which carries exception prose, the configured
+# host and an env var name -- travel to the browser at HTTP 200. get_public_integration_config
+# already whitelists; this now matches it.
+_PUBLIC_EFFECT_FIELDS = frozenset({
+  "status", "dry_run", "job_id", "pass_nr", "integration_id", "bundle_id", "artifact_cid",
+  "object_count", "finding_count", "observed_data_count", "destination_label", "schema_version",
+  "generated_at", "persisted", "configuration_error",
+})
+
+_PUBLIC_CONFIGURATION_ERRORS = frozenset({
+  "missing_hmac_secret", "missing_syslog_host", "missing_http_url",
+  "missing_token", "missing_credentials", "invalid_auth_config",
+})
+
+
 def public_effect_result(result):
-  """Strip prose and avoid the framework's `error` convention, preserving the outcome."""
+  """Publish only whitelisted fields, and never the framework's `error` key.
+
+  The plugin framework maps any returned dict carrying `error` to HTTP 503, so an ordinary
+  "integration disabled" outcome would reach the caller as a server failure. Typed configuration
+  codes travel as `configuration_error`, validated against the same set the readiness view uses;
+  anything else is dropped rather than published as prose.
+  """
   if not isinstance(result, dict):
     return {"success": False, "error": "unavailable", "status_code": 503}
   # Already a typed denial from the admission layer: pass through untouched.
@@ -96,11 +130,10 @@ def public_effect_result(result):
   if isinstance(error, str) and error in _EFFECT_DENIALS:
     status_code, code = _EFFECT_DENIALS[error]
     return {"success": False, "error": code, "status_code": status_code}
-  projected = {key: value for key, value in result.items() if key != "error"}
-  if status == "not_configured" and isinstance(error, str):
-    projected["configuration_error"] = error
-  elif isinstance(error, str) and status not in (None, "ok", "dry_run"):
-    # An unexpected outcome string must not travel as prose.
-    projected["configuration_error"] = None
-    projected["status"] = "error"
+  projected = {key: value for key, value in result.items() if key in _PUBLIC_EFFECT_FIELDS}
+  if isinstance(error, str):
+    projected["configuration_error"] = error if error in _PUBLIC_CONFIGURATION_ERRORS else None
+    if projected["configuration_error"] is None:
+      # An outcome we cannot type must not be published as success with no reason.
+      projected["status"] = "error"
   return projected

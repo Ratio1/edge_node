@@ -145,6 +145,8 @@ def dry_run_taxii_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET, led
   if result.get("status") != "ok":
     return result
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
   if ledger is not None and artifact_cid:
     ledger.record(EffectState.PERSISTED)
