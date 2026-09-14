@@ -151,6 +151,10 @@ _EFFECT_FIELDS = {
   "update_rulebook_review": _JOB_FIELD + (("profile_id", str, None), ("answers", dict, None),
                                           ("note", str, ""), ("review_state", str, "draft"),
                                           ("request_actor", dict, None)),
+  # B5 assessment generation.
+  "generate_rulebook_assessment": _JOB_FIELD + (("profile_id", str, None), ("pass_nr", int, None),
+                                                ("persist", bool, True), ("force", bool, True),
+                                                ("request_actor", dict, None)),
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.

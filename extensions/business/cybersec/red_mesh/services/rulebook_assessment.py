@@ -342,8 +342,10 @@ def list_rulebook_profiles():
   ]
 
 
-def _resolve_scan_context(owner, job_id, pass_nr=None):
-  job_specs = owner._get_job_from_cstore(job_id)
+def _resolve_scan_context(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
+  # Checked snapshot when the caller was admitted (RM-026 I1b B5): this resolver is the seam
+  # B4 budgeted and did not reach.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     return None, _error("job_not_found", job_id)
 
@@ -776,11 +778,12 @@ def build_rulebook_assessment(
   include_review=True,
   artifact_kind="generated_assessment",
   submission=None,
+  checked_job=_UNSET,
 ):
   profile = _profile(profile_id)
   if not profile:
     return _error("invalid_profile", job_id, profile_id=profile_id)
-  ctx, err = _resolve_scan_context(owner, job_id, pass_nr=pass_nr)
+  ctx, err = _resolve_scan_context(owner, job_id, pass_nr=pass_nr, checked_job=checked_job)
   if err:
     return err
 
@@ -853,13 +856,15 @@ def build_rulebook_assessment(
   }
 
 
-def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None, persist=True, force=True):
+def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None,
+                                 persist=True, force=True, *, checked_job=_UNSET, ledger=None):
   result = build_rulebook_assessment(
     owner,
     job_id,
     profile_id=profile_id,
     pass_nr=pass_nr,
     include_review=not persist,
+    checked_job=checked_job,
   )
   if result.get("status") != "ok":
     profile = _profile(profile_id)
@@ -886,7 +891,12 @@ def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROF
         "cached": True,
       }
 
+    if ledger is not None:
+      # Last revalidation before a content-addressed artifact lands.
+      ledger.checkpoint()
     artifact_cid = _artifact_repo(owner).put_json(result["assessment"], show_logs=False)
+    if ledger is not None and artifact_cid:
+      ledger.record(EffectState.PERSISTED)
     if not artifact_cid:
       failed = _error("artifact_write_failed", job_id, profile_id=profile_id)
       _write_assessment_meta(
