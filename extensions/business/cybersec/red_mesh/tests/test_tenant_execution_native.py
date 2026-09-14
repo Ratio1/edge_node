@@ -114,7 +114,7 @@ def _render_native(default_route=None):
   instance = namespace["Harness"]()
   instance.cfg_endpoints = []
   instance.P = lambda *_args, **_kwargs: None
-  for name in ROUTES + READ_ROUTES:
+  for name in ROUTES + READ_ROUTES + EFFECT_ROUTES:
     method = getattr(namespace["Harness"], name)
     method.__endpoint__ = True
     method.__http_method__ = endpoint_options[name]["method"]

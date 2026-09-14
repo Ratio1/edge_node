@@ -109,11 +109,13 @@ _READ_FIELDS = {
 }
 # Effect-bearing endpoints (RM-026 I1b).
 #
-# These are NOT part of the generated read API: no model is generated for them and the install-time
-# validator does not pin them. Listing them here puts them inside `_read_path`, which is what shapes
-# transport errors as JSON with `no-store` instead of the framework's HTML default. It does not give
-# them the generated routes' field-level validation. Do not read this as "effects share the read
-# transport"; converting them fully is separate work.
+# Listing them here has two effects, and both matter:
+#   1. `_ReadApiGuard` enforces POST-only, no query string, exact field names and exact types on
+#      these paths -- real validation, not decoration. Removing an entry silently loses it.
+#   2. `_read_path` shapes transport errors as JSON with `no-store` instead of the framework's HTML
+#      default, and carries the typed effect_incomplete passthrough.
+# What they do NOT get is the install-time generated-model pinning, which iterates `_READ_FIELDS`
+# only. Converting them to generated routes is separate work.
 _EFFECT_FIELDS = {
   "dry_run_opencti_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "dry_run_taxii_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
@@ -121,7 +123,10 @@ _EFFECT_FIELDS = {
                                       ("request_actor", dict, None)),
   "test_event_export": (("integration_id", str, "event_export"), ("request_actor", dict, None)),
 }
+# "unknown" exists only for RAW responses, where the framework discards the state before the
+# guard sees it. It still tells the caller an effect may have landed.
 _PUBLIC_EFFECT_STATES = ("persisted", "delivered")
+_PUBLISHABLE_EFFECT_STATES = _PUBLIC_EFFECT_STATES + ("unknown",)
 
 _READ_PATHS = {"/" + name: fields
                for name, fields in {**_READ_FIELDS, **_EFFECT_FIELDS}.items()}
@@ -202,7 +207,7 @@ def _read_error_response(status, *, code=None, effect_state=None):
   # "unavailable" would tell the caller nothing happened after a bundle was written or a SOC
   # event delivered, and invite a retry that duplicates it.
   known_effect_error = (status == 500 and code == "effect_incomplete"
-                        and effect_state in _PUBLIC_EFFECT_STATES)
+                        and effect_state in _PUBLISHABLE_EFFECT_STATES)
   if known_effect_error:
     return JSONResponse({"success": False, "error": code, "effect_state": effect_state,
                          "status_code": 500},
@@ -400,13 +405,24 @@ def install_generated_read_api(app, model_namespace) -> None:
                  and not any(key in detail for key in ("success", "error", "status_code", "result")))
           if typed or raw:
             return _read_error_response(400, code="unsupported_job_type")
-        if error.status_code == 500 and isinstance(detail, dict):
-          typed = (detail.get("success") is False and detail.get("error") == "effect_incomplete"
+        if error.status_code == 500:
+          # WRAPPED keeps the typed dict; RAW unwraps it, so `detail` is the bare error string and
+          # the effect_state is destroyed by the framework before we ever see it. Both shapes must
+          # survive, or the control is live in one deployment format and inert in the other.
+          typed = (isinstance(detail, dict) and detail.get("success") is False
+                   and detail.get("error") == "effect_incomplete"
                    and detail.get("status_code") == 500
                    and detail.get("effect_state") in _PUBLIC_EFFECT_STATES)
           if typed:
             return _read_error_response(500, code="effect_incomplete",
                                         effect_state=detail["effect_state"])
+          raw = (detail == "effect_incomplete" or (isinstance(detail, dict)
+                 and detail.get("detail") == "effect_incomplete"
+                 and not any(key in detail for key in ("success", "error", "status_code", "result"))))
+          if raw:
+            # RAW cannot carry the state. "Something landed, do not blindly retry" is the
+            # safety-critical half and it survives; the persisted/delivered distinction does not.
+            return _read_error_response(500, code="effect_incomplete", effect_state="unknown")
         return _read_error_response(error.status_code)
       return await original_http(request, error)
 

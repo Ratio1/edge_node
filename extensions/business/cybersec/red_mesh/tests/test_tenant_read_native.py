@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, LEGACY_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
+from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, EFFECT_ROUTES, LEGACY_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
 
 
 ERROR = "Incompatible generated read API"
@@ -237,7 +237,8 @@ def scheduler_comms(fixture, response_format, metadata=None):
   fixture.owner.cfg_response_format = response_format
   scheduler.on_response = partial(fixture.Plugin.on_response, fixture.owner)
   scheduler._client_queue = queue.Queue()
-  scheduler._endpoints = {name: partial(getattr(fixture.Plugin, name), fixture.owner) for name in READ_ROUTES}
+  scheduler._endpoints = {name: partial(getattr(fixture.Plugin, name), fixture.owner)
+                          for name in READ_ROUTES + EFFECT_ROUTES}
 
   class Comms:
     def __init__(self):

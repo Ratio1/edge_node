@@ -11,6 +11,7 @@ import pytest
 from extensions.business.cybersec.red_mesh.services import opencti_export, stix_export, taxii_export
 from extensions.business.cybersec.red_mesh.tenancy.effects import EffectState
 from .read_endpoint_fixtures import read_endpoint_fixture
+from .test_tenant_read_native import read_native  # noqa: F401  (pytest fixture)
 
 JOB_EFFECTS = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle")
 SECRET = "mock-only-b1-canary"
@@ -301,3 +302,67 @@ def test_a_typed_incomplete_effect_survives_the_transport_guard():
   spoofed = json.loads(http_runtime._read_error_response(
     500, code="effect_incomplete", effect_state="anything").body)
   assert spoofed["status_code"] == 503
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_an_incomplete_effect_survives_real_http_in_both_response_formats(read_native, response_format):
+  """The control must be live in both deployment formats.
+
+  Round 2 found the typed 500 collapsed to 503 because the slice opted its paths into the read
+  guard. Round 3 found the fix worked only in WRAPPED: RAW unwraps the dict, so the framework
+  reduces the detail to the bare error string and destroys the state. Both rounds were invisible to
+  tests that call plugin methods directly, which is why this one goes over the wire.
+  """
+  import asyncio
+  from .test_tenant_read_native import assert_json_response, install, request, scheduler_comms
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(stix_export, "build_stix_bundle",
+                      return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
+                                    "object_count": 0, "finding_count": 0,
+                                    "observed_data_count": 0}), \
+         patch.object(stix_export, "emit_export_status_event",
+                      return_value={"status": "sent", "integration_id": "wazuh"}), \
+         patch.object(stix_export, "_write_job_record", side_effect=RuntimeError(SECRET)):
+      module.eng = scheduler_comms(fixture, response_format)
+      result, calls = assert_json_response(asyncio.run(request(module, "export_stix_bundle",
+        {"job_id": "job-1", "persist": False, "request_actor": fixture.actor})), 500)
+    assert calls == 1
+    assert result["error"] == "effect_incomplete", (
+      "a landed effect was reported as something else over %s" % response_format)
+    assert result["status_code"] == 500
+    # RAW cannot carry the state through the framework; the safety-critical half must still survive.
+    assert result["effect_state"] in ("delivered", "unknown")
+    assert SECRET not in repr(result)
+
+
+def test_the_fields_each_ui_consumer_reads_survive_the_projection():
+  """Pin the whitelist against its consumers.
+
+  Dropping `stix_bundle` broke the STIX Download button and nothing failed. This asserts the
+  contract directly so the field-drop regression cannot recur silently.
+  """
+  from extensions.business.cybersec.red_mesh.tenancy.effects import public_effect_result
+  stix = public_effect_result({
+    "status": "ok", "stix_bundle": {"type": "bundle"}, "bundle_id": "b1", "artifact_cid": "cid",
+    "last_exported_at": "2026-09-14T00:00:00Z", "pass_nr": 1, "object_count": 3,
+    "finding_count": 2, "observed_data_count": 1})
+  # StixExport.tsx reads exactly these.
+  for field in ("status", "stix_bundle", "bundle_id", "artifact_cid", "last_exported_at",
+                "pass_nr", "object_count", "finding_count"):
+    assert field in stix, f"StixExport.tsx reads {field} and the projection drops it"
+  assert stix["stix_bundle"] == {"type": "bundle"}
+
+
+def test_a_disabled_delivery_is_not_recorded_as_sent():
+  """deliver_redmesh_event returns "disabled", never "skipped": gating on the wrong sentinel
+  recorded a delivery when nothing left the node."""
+  from extensions.business.cybersec.red_mesh.services import integration_status as service
+  from extensions.business.cybersec.red_mesh.tenancy.effects import EffectLedger
+  ledger = EffectLedger()
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch("extensions.business.cybersec.red_mesh.services.log_export.deliver_redmesh_event",
+               return_value={"status": "disabled", "error": "disabled"}):
+      service.test_event_export(fixture.owner, integration_id="wazuh", ledger=ledger)
+  assert ledger.state is EffectState.NONE, "a disabled integration was recorded as delivered"

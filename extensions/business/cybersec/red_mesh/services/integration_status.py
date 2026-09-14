@@ -496,7 +496,9 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None):
       # A real send follows: dry_run only affects the status stamp, not the transmission.
       ledger.checkpoint()
     delivered = deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
-    if ledger is not None and isinstance(delivered, dict) and delivered.get("status") != "skipped":
+    # deliver_redmesh_event returns "sent" | "disabled" | "error" -- never "skipped". Gating on
+    # "not skipped" recorded a delivery when the integration was disabled and nothing left the node.
+    if ledger is not None and isinstance(delivered, dict) and delivered.get("status") == "sent":
       ledger.record(EffectState.DELIVERED)
     return delivered
 
