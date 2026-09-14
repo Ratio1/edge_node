@@ -3919,7 +3919,13 @@ class TestPhase5Endpoints(unittest.TestCase):
       job_specs["pass_reports"] = deepcopy(persisted["pass_reports"])
       return persisted
 
-    with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
+    # RM-026 I1b B6 added admission ahead of the preparation step. This test drives the backfill on
+    # a MagicMock plugin that has no account store; stand admission up as satisfied and return None
+    # so the preparation step keeps its real store read. Admission is covered by
+    # test_manual_analysis_b6.py.
+    with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job, \
+         patch.object(Plugin, "_admitted_snapshot",
+                      staticmethod(lambda *a, **k: (None, "legacy_unbound"))):
       postponed = Plugin.analyze_job(plugin,
         job_id="job-llm",
       )

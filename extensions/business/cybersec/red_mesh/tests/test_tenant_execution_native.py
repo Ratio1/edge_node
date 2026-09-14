@@ -39,7 +39,7 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
                  "correlate_suricata_eve", "upload_authorization",
                  "save_rulebook_review_draft", "submit_rulebook_review",
                  "reopen_rulebook_review", "update_rulebook_review",
-                 "generate_rulebook_assessment")
+                 "generate_rulebook_assessment", "analyze_job")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
@@ -114,6 +114,7 @@ def _render_native(default_route=None):
                                    "review_state", "request_actor"),
         "generate_rulebook_assessment": ("self", "job_id", "profile_id", "pass_nr", "persist",
                                          "force", "request_actor"),
+        "analyze_job": ("self", "job_id", "analysis_type", "focus_areas", "request_actor"),
       }[method.name]
       assert tuple(arg.arg for arg in method.args.args) == expected
     else:

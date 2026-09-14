@@ -44,6 +44,16 @@ def _valid_remote_sections():
 
 class TestPostponedAnalyze(unittest.TestCase):
 
+  def setUp(self):
+    # These exercise the busy/executor/drain logic downstream of admission, with a MagicMock
+    # plugin that has no account store. RM-026 I1b B6 added admission ahead of that logic, so
+    # stand it up as satisfied here, returning None so the preparation step still reads the
+    # job from the store exactly as before. Admission is covered by test_manual_analysis_b6.py.
+    patcher = patch.object(PentesterApi01Plugin, "_admitted_snapshot",
+                           staticmethod(lambda *a, **k: (None, "legacy_unbound")))
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
   def test_busy_request_does_not_prepare_or_queue_work(self):
     plugin = MagicMock()
     plugin._manual_analysis_state = {

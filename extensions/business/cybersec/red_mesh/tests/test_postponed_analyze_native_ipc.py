@@ -170,6 +170,25 @@ class _Owner:
   "native Ratio1 runtime source fixture is unavailable",
 )
 class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
+
+  def _bypass_admission_for(self, plugin):
+    """Bypass admission only for the scheduler stub owner, which has no execution service.
+
+    RM-026 I1b B6 added admission ahead of analyze_job. This suite exercises the real postponed
+    scheduler's responsiveness, not admission; read_fixture.owner keeps its real admission so the
+    get_job_status assertions stay meaningful. Admission is covered by test_manual_analysis_b6.py.
+    """
+    real = PentesterApi01Plugin._admitted_snapshot
+
+    def _snapshot(instance, *args, **kwargs):
+      if instance is plugin:
+        return None, "legacy_unbound"
+      return real(instance, *args, **kwargs)
+
+    patcher = patch.object(PentesterApi01Plugin, "_admitted_snapshot", _snapshot)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
   @staticmethod
   def _find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -325,16 +344,18 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
       )
 
     owner = _Owner(_blocking_worker)
+    self._bypass_admission_for(owner)
     from .read_endpoint_fixtures import read_endpoint_fixture
     read_fixture = self.enterContext(read_endpoint_fixture(bound=False, archived=False))
     self.addCleanup(owner._manual_analysis_executor.shutdown, wait=False)
     harness = _SchedulerHarness.__new__(_SchedulerHarness)
     harness._endpoints = {
-      "analyze_job": lambda job_id, analysis_type="", focus_areas=None: (
+      "analyze_job": lambda job_id, analysis_type="", focus_areas=None, request_actor=None: (
         PentesterApi01Plugin.analyze_job(owner,
           job_id,
           analysis_type,
           focus_areas,
+          request_actor,
         )
       ),
       "get_job_status": lambda job_id, request_actor=None, tenant_id=None: (
@@ -444,7 +465,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             payload={"job_id": "job-1"},
           ))
 
-        def _prepare(_plugin, job_id):
+        def _prepare(_plugin, job_id, *, checked_job=None):
           if job_id == "explode":
             raise RuntimeError("native admission failure")
           return dict(state), None
