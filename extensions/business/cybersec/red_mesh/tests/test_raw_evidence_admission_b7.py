@@ -112,6 +112,7 @@ def test_the_denial_keeps_its_status_over_the_wire(read_native, response_format,
     assert actual == status, body
     assert calls == 1
     artifact.assert_not_called()
+    assert _headers[b"cache-control"] == b"no-store"
     detail = json.loads(body)["detail"]
     # WRAPPED keeps the typed dict; RAW unwraps it to `{"detail": "<code>"}`. Both must carry the
     # decision -- a control live in one deployment format and inert in the other is the failure this
@@ -128,3 +129,49 @@ def test_the_route_is_post_only(read_native):
   route = next(route for route in module.app.routes
                if route.path == "/get_raw_model_test_evidence")
   assert route.methods == {"POST"}
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_the_decrypted_payload_is_never_cacheable(read_native, response_format):
+  """This endpoint is off the strict read transport, and the guard is what stamps `no-store` on
+  every other read. It returns the decrypted restricted artifact, so it is the single response on
+  this surface where the header earns its keep -- stamped by a header-only path set that does not
+  drag in the error rebuild."""
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=False) as fixture:
+    module.eng = scheduler_comms(fixture, response_format)
+    status, headers, body, _calls = asyncio.run(request(module, "get_raw_model_test_evidence",
+      {"job_id": "job-1", "request_actor": fixture.actor}))
+    # job-1 is a network scan, so this is the unsupported_job_type answer -- a successful admitted
+    # call. The header must be there regardless of which branch the body came from.
+    assert headers[b"cache-control"] == b"no-store", (status, body)
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_the_typed_codes_are_not_collapsed(read_native, response_format):
+  """Why this endpoint stays off the strict transport. The two formats do NOT behave alike, and the
+  original justification for the choice was written as if they did:
+
+    RAW      -- `_handle_plugin_result` sees a top-level `error` and raises 500 with the code in
+                `detail`. On the guard, `_read_error_response` would rewrite that to
+                `503 {"error": "unavailable"}` and the code would be gone.
+    WRAPPED  -- `on_response` nests the plugin dict under `result`, so no HTTPException is ever
+                raised and the code arrives inside a 200 body. The guard could not collapse what
+                never became an error in the first place.
+
+  Both are asserted rather than assumed symmetric.
+  """
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=False) as fixture:
+    module.eng = scheduler_comms(fixture, response_format)
+    status, _headers, body, _calls = asyncio.run(request(module, "get_raw_model_test_evidence",
+      {"job_id": "job-1", "request_actor": fixture.actor}))
+    payload = json.loads(body)
+    if response_format == "RAW":
+      assert status == 500
+      assert payload["detail"] == {"detail": "unsupported_job_type"}
+    else:
+      assert status == 200
+      assert payload["result"]["error"] == "unsupported_job_type"

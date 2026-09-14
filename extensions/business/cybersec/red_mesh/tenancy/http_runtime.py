@@ -166,6 +166,14 @@ _PUBLISHABLE_EFFECT_STATES = _PUBLIC_EFFECT_STATES + ("unknown",)
 
 _READ_PATHS = {"/" + name: fields
                for name, fields in {**_READ_FIELDS, **_EFFECT_FIELDS}.items()}
+# RM-026 I1b B6/B7: admitted endpoints that must NOT enter the strict transport, because
+# `_read_error_response` rebuilds the body and allowlists only {400,401,403,404,405,503}, which
+# would destroy their typed codes (`analysis_busy` 409 and its five siblings; `unsupported_job_type`
+# and the three `raw_evidence_*` codes). They still need the one thing the guard gives every other
+# read -- `Cache-Control: no-store` -- and `get_raw_model_test_evidence` needs it most of all: it
+# returns the decrypted restricted artifact, the raw prompts and model responses of a model test.
+# Header-only: no field validation, no error rebuild, no status rewriting.
+_NO_STORE_PATHS = ("/analyze_job", "/get_raw_model_test_evidence")
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
 _RULEBOOK_READ_ERRORS = {
   "/get_rulebook_assessment_status": {(400, "invalid_profile"), (400, "unsupported_job_type")},
@@ -279,9 +287,21 @@ class _ReadApiGuard:
   def __init__(self, app):
     self.app = app
 
+  @staticmethod
+  def _no_store_send(send):
+    async def stamped(event):
+      if event["type"] == "http.response.start":
+        event = {**event, "headers": [(key, value) for key, value in event.get("headers", [])
+                                      if key.lower() != b"cache-control"]
+                          + [(b"cache-control", b"no-store")]}
+      return await send(event)
+    return stamped
+
   async def __call__(self, scope, receive, send):
     path = scope.get("path", "")
     if scope.get("type") != "http" or not _read_path(path):
+      if scope.get("type") == "http" and path.rstrip("/") in _NO_STORE_PATHS:
+        return await self.app(scope, receive, self._no_store_send(send))
       return await self.app(scope, receive, send)
     if scope.get("method") != "POST":
       return await _read_error_response(405)(scope, receive, send)

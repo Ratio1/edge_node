@@ -47,10 +47,14 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
 #     analysis_request_unavailable 410, analysis_input_too_large 413, analysis_input_invalid 422,
 #     analysis_timeout 504.
 #   get_raw_model_test_evidence (B7): unsupported_job_type, raw_evidence_unavailable,
-#     raw_evidence_read_failed, raw_evidence_invalid -- all of which the template already answers as
-#     500 with the code in `detail` (basic_server.j2 `_handle_plugin_result`).
+#     raw_evidence_read_failed, raw_evidence_invalid -- which in RAW the template answers as 500 with
+#     the code in `detail` (basic_server.j2 `_handle_plugin_result`) and the guard would rewrite to
+#     `unavailable`. In WRAPPED they ride inside a 200 body and the guard never sees them; the
+#     formats are asserted separately in test_raw_evidence_admission_b7.py rather than assumed alike.
 # The generated server honours a plugin's own `status_code`, and that is what carries the admission
-# 403/404 in both cases. Rendered here so the wire tests exercise the real production route.
+# 403/404 in both cases. They still get `Cache-Control: no-store` via `_NO_STORE_PATHS`, which the
+# guard would otherwise be the only thing to set. Rendered here so the wire tests exercise the real
+# production route.
 UNGUARDED_ROUTES = ("analyze_job", "get_raw_model_test_evidence")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
