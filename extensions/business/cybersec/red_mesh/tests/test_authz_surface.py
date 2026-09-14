@@ -47,7 +47,7 @@ ENDPOINT_FIRST_ARGS = {
   'export_misp': 'job_id',
   'export_misp_json': 'job_id',
   'get_misp_export_status': 'job_id',
-  'get_misp_export_config_status': None,
+  'get_misp_export_config_status': 'request_actor',
   'get_integration_status': None,
   'get_capability_status': None,
   'test_event_export': 'integration_id',

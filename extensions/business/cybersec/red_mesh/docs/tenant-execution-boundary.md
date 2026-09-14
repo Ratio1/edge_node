@@ -202,6 +202,16 @@ All six tenant/binding key aliases are rejected recursively. Optional error clas
 timestamps are validated, as are JSON numbers that would overflow the finite client number range.
 Full backend4,270 tests/2,310subtests pass; evidence belongs to the hub rulebook-read plan.
 
+MISP configuration status is verified as an actor-only POST after paired spec/quality/security review. It
+requires a current stored legacy account with proven absent membership metadata and matching
+configured/stored compatibility controls. Membership-bearing callers and restrictive rollout deny
+before configuration access. No job lookup, enumeration, export or provider call is authorized.
+The existing producer must return exactly four fields: literal enabled/auto_export/misp_configured
+booleans and a known uppercase severity. Extra fields, including credential-bearing additions, fail
+unavailable before transport wrapping. Independent flags and INFO remain valid; errors are static,
+all responses no-store, old GET denied. This leaves25 native endpoints requiring admission.
+Full backend4,530 tests/2,310subtests PASS. This does not make integrations tenant-configurable.
+
 This is **local wiring, not completed application isolation**. Navigator ordinary-read pairing
 I1a.3b.2 is committed; these five status reads require matching Navigator changes. Unmatched
 versions fail denied/unavailable, never fall back to actorless GET. I1a.3c remains incomplete. Dormant

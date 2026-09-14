@@ -101,6 +101,7 @@ _READ_FIELDS = {
   "get_taxii_export_status": _JOB_FIELD + (("request_actor", dict, None),),
   "get_rulebook_assessment_status": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
   "get_rulebook_review": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
+  "get_misp_export_config_status": (("request_actor", dict, None),),
 }
 _READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")

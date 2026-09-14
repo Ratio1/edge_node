@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .test_tenant_execution_native import LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
+from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
 
 
 ERROR = "Incompatible generated read API"
@@ -72,7 +72,7 @@ def body_for(name):
     payload.pop("tenant_id")
   if name in LEGACY_RULEBOOK_ROUTES:
     payload["profile_id"] = "nis2.eu_baseline.v1"
-  if name not in ("list_network_jobs", "list_local_jobs", "get_audit_log"):
+  if name not in ("list_network_jobs", "list_local_jobs", "get_audit_log") + ACTOR_ONLY_READ_ROUTES:
     payload["job_id"] = "job-1"
   if name == "get_report":
     payload["cid"] = "report-1"
@@ -131,6 +131,8 @@ def test_raw_faults_are_400_without_ipc_or_body_echo(read_native, name):
   if name in LEGACY_READ_ROUTES:
     faults.extend({**valid, key: value} for key, value in (
       ("tenant_id", "tenant-1"), ("asset_id", "asset"), ("execution_binding", {})))
+  if name in ACTOR_ONLY_READ_ROUTES:
+    faults.extend({**valid, key: "private"} for key in ("job_id", "profile_id"))
   for field in valid:
     faults.extend({**valid, field: value} for value in (None, True, 1, [], "" if field == "request_actor" else {}))
 
@@ -408,6 +410,8 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
   module, _ = read_native
   install(module)
   with read_endpoint_fixture(bound=bound) as fixture:
+    if name in ACTOR_ONLY_READ_ROUTES:
+      fixture.owner._get_misp_export_config = lambda: fixture.Plugin._get_misp_export_config(fixture.owner)
     module.eng = scheduler_comms(fixture, response_format)
     payload = body_for(name)
     payload["request_actor"] = fixture.actor
@@ -430,7 +434,7 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
       assert actual["job_id"] == "job-1" and actual["cid"] == "worker"
       assert actual["report"]["job_id"] == "job-1"
       assert fixture.artifact_reads == [("archive", {"pin": False}), ("worker", {"pin": False})]
-    if name not in ("list_network_jobs", "list_local_jobs", "get_audit_log"):
+    if name not in ("list_network_jobs", "list_local_jobs", "get_audit_log") + ACTOR_ONLY_READ_ROUTES:
       assert actual["job_id"] == "job-1"
       assert ("execution_binding" in actual) == (bound and name != "get_job_data")
 
