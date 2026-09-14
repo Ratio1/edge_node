@@ -33,6 +33,9 @@ LEGACY_RULEBOOK_ROUTES = ("get_rulebook_assessment_status", "get_rulebook_review
 ACTOR_ONLY_READ_ROUTES = ("get_misp_export_config_status", "llm_health", "update_finding_triage",
                           "get_integration_status")
 LEGACY_JSON_EXPORT_ROUTES = ("export_misp_json",)
+# RM-026 I1b B1: effect endpoints sharing the strict read transport.
+EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle",
+                 "test_event_export")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
@@ -82,6 +85,16 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
     elif method.name in LEGACY_JSON_EXPORT_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor")
+    elif method.name in EFFECT_ROUTES:
+      # Effect endpoints keep their original positional parameters and append request_actor last,
+      # so existing callers are unaffected by admission being added.
+      expected = {
+        "dry_run_opencti_export": ("self", "job_id", "pass_nr", "request_actor"),
+        "dry_run_taxii_export": ("self", "job_id", "pass_nr", "request_actor"),
+        "export_stix_bundle": ("self", "job_id", "pass_nr", "persist", "request_actor"),
+        "test_event_export": ("self", "integration_id", "request_actor"),
+      }[method.name]
+      assert tuple(arg.arg for arg in method.args.args) == expected
     else:
       assert tuple(arg.arg for arg in method.args.args)[-2:] == ("request_actor", "tenant_id")
     methods.append(method)

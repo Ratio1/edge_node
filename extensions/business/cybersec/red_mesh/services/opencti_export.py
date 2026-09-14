@@ -13,6 +13,7 @@ from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
 from .auth import AuthError, build_auth_provider, credentials_missing
 from .config import get_opencti_export_config
+from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
 from .scan_guards import reject_model_test_for_scan_operation
@@ -105,16 +106,20 @@ def _bundle_summary(result, artifact_cid=None):
   }
 
 
-def _prepare_opencti_export(owner, job_id, pass_nr=None):
+def _prepare_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   cfg = get_opencti_export_config(owner)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return None, None, {"status": "disabled", "error": "OpenCTI export is disabled", "job_id": job_id}
   if config_error:
+    # Post-admission: the caller was authorized and the deployment is misconfigured, so recording
+    # the failure is operator visibility rather than a probe amplifier. Admission runs above this.
     record_integration_status(owner, "opencti", outcome="failure", error_class=config_error)
     return None, None, {"status": "not_configured", "error": config_error, "job_id": job_id}
 
-  job_specs = owner._get_job_from_cstore(job_id)
+  # The checked snapshot replaces the unscoped global lookup (RM-026 I1b). The legacy global read
+  # remains only for internal callers that have not yet been converted.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "opencti", outcome="failure", error_class="job_not_found")
     return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
@@ -122,7 +127,10 @@ def _prepare_opencti_export(owner, job_id, pass_nr=None):
   if unsupported:
     return None, None, unsupported
 
-  result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
+  # Never forward this module's own _UNSET: stix_export compares against its own sentinel object,
+  # so a foreign sentinel would be mistaken for a job record.
+  result = (build_stix_bundle(owner, job_id, pass_nr=pass_nr) if checked_job is _UNSET
+            else build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=checked_job))
   if result.get("status") != "ok":
     error = result.get("error") or "stix_build_failed"
     record_integration_status(owner, "opencti", outcome="failure", error_class=error)
@@ -131,12 +139,17 @@ def _prepare_opencti_export(owner, job_id, pass_nr=None):
   return cfg, job_specs, result
 
 
-def dry_run_opencti_export(owner, job_id, pass_nr=None):
-  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr)
+def dry_run_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=None):
+  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr,
+                                                   checked_job=checked_job)
   if result.get("status") != "ok":
     return result
 
   artifact_cid = _persist_bundle(owner, result["bundle"])
+  if ledger is not None and artifact_cid:
+    # The bundle is now on disk. Anything that raises after this point must not be reported
+    # as "nothing happened".
+    ledger.record(EffectState.PERSISTED)
   summary = {
     "schema_version": OPENCTI_EXPORT_SCHEMA_VERSION,
     "status": "dry_run",
@@ -160,12 +173,15 @@ def dry_run_opencti_export(owner, job_id, pass_nr=None):
   return {**summary, "status": "ok", "dry_run": True, "job_id": job_id}
 
 
-def push_to_opencti(owner, job_id, pass_nr=None):
-  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr)
+def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=None):
+  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr,
+                                                   checked_job=checked_job)
   if result.get("status") != "ok":
     return result
   if cfg["PUSH_MODE"] == "dry_run":
-    return dry_run_opencti_export(owner, job_id, pass_nr=pass_nr)
+    # B1 changed the dry run's signature; this B2 call site travels with it.
+    return dry_run_opencti_export(owner, job_id, pass_nr=pass_nr,
+                                  checked_job=checked_job, ledger=ledger)
 
   artifact_cid = _persist_bundle(owner, result["bundle"])
   if not artifact_cid:

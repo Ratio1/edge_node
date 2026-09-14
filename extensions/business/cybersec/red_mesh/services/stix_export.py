@@ -12,6 +12,7 @@ from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
 from .config import get_stix_export_config
+from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .event_redaction import stable_hmac_pseudonym, stable_sha256, strip_sensitive_fields
 from .integration_status import record_integration_status
@@ -60,8 +61,9 @@ def _write_job_record(owner, job_id, job_specs, context):
   return _job_repo(owner).put_job(job_id, job_specs)
 
 
-def _resolve_pass_data(owner, job_id, pass_nr=None):
-  job_specs = owner._get_job_from_cstore(job_id)
+def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
+  # Use the caller's checked snapshot when one was admitted (RM-026 I1b).
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     return None, None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
@@ -378,17 +380,18 @@ def _observed_service_objects(aggregated, *, job_id, pass_nr, first_observed,
   return objects
 
 
-def build_stix_bundle(owner, job_id, pass_nr=None):
+def build_stix_bundle(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   """Build an isolated STIX 2.1 bundle for a RedMesh job/pass."""
   cfg = get_stix_export_config(owner)
-  job_specs = owner._get_job_from_cstore(job_id)
+  # Use the caller's checked snapshot when one was admitted (RM-026 I1b).
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
   if unsupported:
     return unsupported
 
-  job_config, pass_data, aggregated, err = _resolve_pass_data(owner, job_id, pass_nr)
+  job_config, pass_data, aggregated, err = _resolve_pass_data(owner, job_id, pass_nr, checked_job=checked_job)
   if err:
     return err
 
@@ -490,9 +493,11 @@ def build_stix_bundle(owner, job_id, pass_nr=None):
   }
 
 
-def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
+def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job=_UNSET,
+                       ledger=None):
   """Build and optionally persist a STIX 2.1 bundle for manual export."""
-  job_specs = owner._get_job_from_cstore(job_id)
+  # Checked snapshot replaces the unscoped global lookup (RM-026 I1b).
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "stix", outcome="failure", error_class="job_not_found")
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
@@ -500,7 +505,7 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
   if unsupported:
     return unsupported
 
-  result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
+  result = build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=checked_job)
   if result.get("status") != "ok":
     record_integration_status(owner, "stix", outcome="failure", error_class=result.get("error") or "build_failed")
     return result
@@ -508,6 +513,9 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
   artifact_cid = None
   if persist:
     artifact_cid = _artifact_repo(owner).put_json(result["bundle"], show_logs=False)
+    if ledger is not None and artifact_cid:
+      # Bundle on disk. The SOC emission below may still fail; that is "persisted", not "nothing".
+      ledger.record(EffectState.PERSISTED)
     if not artifact_cid:
       record_integration_status(owner, "stix", outcome="failure", error_class="artifact_write_failed")
       return {"status": "error", "error": "artifact_write_failed", "job_id": job_id}

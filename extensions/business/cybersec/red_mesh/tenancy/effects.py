@@ -65,3 +65,42 @@ def classify_effect_failure(state: EffectState) -> dict:
     "effect_state": state.value,
     "status_code": 500,
   }
+
+
+# Public projection for effect results (RM-026 I1b).
+#
+# The plugin framework treats any returned dict carrying an `error` key as a plugin error and maps
+# it to HTTP 503, so a perfectly ordinary "this integration is disabled" outcome would reach the
+# caller as a server failure. `export_misp_json` already avoids this by returning a bare
+# {"status": "disabled"}. These effects do the same, and carry configuration codes under
+# `configuration_error` -- the same field name the integration readiness view uses -- so a typed
+# code is still available without colliding with the framework's error convention.
+
+_EFFECT_DENIALS = {
+  "job_not_found": (404, "not_found"),
+  "unsupported_job_type": (400, "unsupported_job_type"),
+}
+
+
+def public_effect_result(result):
+  """Strip prose and avoid the framework's `error` convention, preserving the outcome."""
+  if not isinstance(result, dict):
+    return {"success": False, "error": "unavailable", "status_code": 503}
+  # Already a typed denial from the admission layer: pass through untouched.
+  if result.get("success") is False and "status_code" in result:
+    return result
+  status = result.get("status")
+  error = result.get("error")
+  if status == "disabled":
+    return {"status": "disabled"}
+  if isinstance(error, str) and error in _EFFECT_DENIALS:
+    status_code, code = _EFFECT_DENIALS[error]
+    return {"success": False, "error": code, "status_code": status_code}
+  projected = {key: value for key, value in result.items() if key != "error"}
+  if status == "not_configured" and isinstance(error, str):
+    projected["configuration_error"] = error
+  elif isinstance(error, str) and status not in (None, "ok", "dry_run"):
+    # An unexpected outcome string must not travel as prose.
+    projected["configuration_error"] = None
+    projected["status"] = "error"
+  return projected

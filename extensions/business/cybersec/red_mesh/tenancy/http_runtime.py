@@ -107,7 +107,18 @@ _READ_FIELDS = {
   "export_misp_json": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "get_integration_status": (("request_actor", dict, None),),
 }
-_READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
+# Effect-bearing endpoints (RM-026 I1b). They share the read guard's strict transport -- POST only,
+# exact field types, no unknown/duplicate keys, no query string, no-store -- but they are not reads,
+# so they are declared separately rather than by widening what _READ_FIELDS means.
+_EFFECT_FIELDS = {
+  "dry_run_opencti_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
+  "dry_run_taxii_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
+  "export_stix_bundle": _JOB_FIELD + (("pass_nr", int, None), ("persist", bool, True),
+                                      ("request_actor", dict, None)),
+  "test_event_export": (("integration_id", str, "event_export"), ("request_actor", dict, None)),
+}
+_READ_PATHS = {"/" + name: fields
+               for name, fields in {**_READ_FIELDS, **_EFFECT_FIELDS}.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
 _RULEBOOK_READ_ERRORS = {
   "/get_rulebook_assessment_status": {(400, "invalid_profile"), (400, "unsupported_job_type")},
