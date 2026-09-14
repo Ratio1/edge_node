@@ -40,14 +40,18 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
                  "save_rulebook_review_draft", "submit_rulebook_review",
                  "reopen_rulebook_review", "update_rulebook_review",
                  "generate_rulebook_assessment")
-# RM-026 I1b B6: `analyze_job` is admitted but deliberately NOT on the strict read transport. It
-# returns typed operational codes -- analysis_busy 409, analysis_state_changed 409 retryable,
-# analysis_request_unavailable 410, analysis_input_too_large 413, analysis_input_invalid 422,
-# analysis_timeout 504 -- and `_read_error_response` allowlists only {400,401,403,404,405,503}, so
-# the guard would collapse every one of them to a generic `unavailable`. The generated server
-# already honours a plugin's own `status_code` (basic_server.j2), which is what carries the
-# admission 403/404. Rendered here so the wire tests exercise the real production route.
-UNGUARDED_EFFECT_ROUTES = ("analyze_job",)
+# RM-026 I1b B6/B7: admitted endpoints deliberately NOT on the strict read transport, because each
+# returns typed codes the guard would destroy -- `_read_error_response` allowlists only
+# {400,401,403,404,405,503} and rebuilds the body from scratch.
+#   analyze_job (B6): analysis_busy 409, analysis_state_changed 409 retryable,
+#     analysis_request_unavailable 410, analysis_input_too_large 413, analysis_input_invalid 422,
+#     analysis_timeout 504.
+#   get_raw_model_test_evidence (B7): unsupported_job_type, raw_evidence_unavailable,
+#     raw_evidence_read_failed, raw_evidence_invalid -- all of which the template already answers as
+#     500 with the code in `detail` (basic_server.j2 `_handle_plugin_result`).
+# The generated server honours a plugin's own `status_code`, and that is what carries the admission
+# 403/404 in both cases. Rendered here so the wire tests exercise the real production route.
+UNGUARDED_ROUTES = ("analyze_job", "get_raw_model_test_evidence")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
@@ -76,7 +80,7 @@ def _render_native(default_route=None):
   methods = []
   endpoint_options = {}
   for original in plugin.body:
-    if not isinstance(original, ast.FunctionDef) or original.name not in ROUTES + READ_ROUTES + EFFECT_ROUTES + UNGUARDED_EFFECT_ROUTES:
+    if not isinstance(original, ast.FunctionDef) or original.name not in ROUTES + READ_ROUTES + EFFECT_ROUTES + UNGUARDED_ROUTES:
       continue
     method = deepcopy(original)
     decorator = next(item for item in method.decorator_list
@@ -97,9 +101,11 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
     elif method.name in LEGACY_JSON_EXPORT_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor")
-    elif method.name in UNGUARDED_EFFECT_ROUTES:
-      assert tuple(arg.arg for arg in method.args.args) == (
-        "self", "job_id", "analysis_type", "focus_areas", "request_actor")
+    elif method.name in UNGUARDED_ROUTES:
+      assert tuple(arg.arg for arg in method.args.args) == {
+        "analyze_job": ("self", "job_id", "analysis_type", "focus_areas", "request_actor"),
+        "get_raw_model_test_evidence": ("self", "job_id", "request_actor"),
+      }[method.name]
     elif method.name in EFFECT_ROUTES:
       # Effect endpoints keep their original positional parameters and append request_actor last,
       # so existing callers are unaffected by admission being added.
@@ -146,7 +152,7 @@ def _render_native(default_route=None):
   instance = namespace["Harness"]()
   instance.cfg_endpoints = []
   instance.P = lambda *_args, **_kwargs: None
-  for name in ROUTES + READ_ROUTES + EFFECT_ROUTES + UNGUARDED_EFFECT_ROUTES:
+  for name in ROUTES + READ_ROUTES + EFFECT_ROUTES + UNGUARDED_ROUTES:
     method = getattr(namespace["Harness"], name)
     method.__endpoint__ = True
     method.__http_method__ = endpoint_options[name]["method"]

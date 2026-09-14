@@ -1991,8 +1991,14 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
 
   def test_raw_evidence_endpoint_reads_by_job_id(self):
     Plugin, plugin = self._raw_evidence_endpoint_plugin()
+    # RM-026 I1b B7: the endpoint admits the requester before reading. Stand up a real legacy
+    # reader so the happy path runs through admission rather than around it.
+    from .read_endpoint_fixtures import install_legacy_read_store
+    actor = install_legacy_read_store(self, plugin, Plugin, jobs={"job-raw": {
+      "job_id": "job-raw", "job_type": "model_test", "scan_type": "model_test",
+      "model_test_summary": {"overall_status": "completed"}}})
 
-    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw")
+    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw", request_actor=actor)
 
     self.assertEqual(result["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
     self.assertEqual(result["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)
