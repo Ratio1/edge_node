@@ -410,7 +410,7 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
   module, _ = read_native
   install(module)
   with read_endpoint_fixture(bound=bound) as fixture:
-    if name in ACTOR_ONLY_READ_ROUTES:
+    if name == "get_misp_export_config_status":
       fixture.owner._get_misp_export_config = lambda: fixture.Plugin._get_misp_export_config(fixture.owner)
     module.eng = scheduler_comms(fixture, response_format)
     payload = body_for(name)
@@ -419,6 +419,11 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
       payload["tenant_id"] = fixture.tenant_id
     else:
       payload.pop("tenant_id", None)
+    if name == "llm_health":
+      result, calls = assert_json_response(asyncio.run(request(module, name, payload)), 503)
+      assert result == {"success": False, "error": "unavailable", "status_code": 503}
+      assert calls == 1 and fixture.artifact_reads == [] and fixture.store.reads == []
+      return
     if bound and name in LEGACY_READ_ROUTES:
       result, calls = assert_json_response(asyncio.run(request(module, name, payload)), 403)
       assert result == {"success": False, "error": "forbidden", "status_code": 403}

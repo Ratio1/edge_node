@@ -77,7 +77,7 @@ ENDPOINT_FIRST_ARGS = {
   'stop_monitoring': 'job_id',
   'analyze_job': 'job_id',
   'get_analysis': 'job_id',
-  'llm_health': None,
+  'llm_health': 'request_actor',
 }
 
 

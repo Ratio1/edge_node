@@ -212,6 +212,15 @@ unavailable before transport wrapping. Independent flags and INFO remain valid; 
 all responses no-store, old GET denied. This leaves25 native endpoints requiring admission.
 Full backend4,530 tests/2,310subtests PASS. This does not make integrations tenant-configurable.
 
+Public `llm_health` is now deny-only POST with an optional `request_actor` object. Every accepted
+body returns static `503 unavailable`; malformed bodies/query fields return400 and old GET405,
+all no-store. It performs no endpoint/domain diagnostic, configuration, identity, rollout, job,
+provider or audit operation. Existing native framing and sanitized status logging remain; internal
+health helpers and the separate LLM-agent API health endpoint are unchanged. No Navigator consumer
+exists. Diagnostic access requires a future approved permission and safe projection, not an ordinary
+read grant. This containment leaves24 native endpoints requiring admission; it is not a working
+health feature or permission to activate workspace entry.
+
 This is **local wiring, not completed application isolation**. Navigator ordinary-read pairing
 I1a.3b.2 is committed; these five status reads require matching Navigator changes. Unmatched
 versions fail denied/unavailable, never fall back to actorless GET. I1a.3c remains incomplete. Dormant
