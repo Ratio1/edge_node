@@ -124,12 +124,17 @@ def test_bound_manual_analysis_is_denied_before_report_reads_or_executor_admissi
   TestPhase1ConfigCID._mock_plugin_modules()
   from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
   owner = MagicMock(cfg_llm_agent_api_port=8080, cfg_request_timeout=120)
-  owner._get_job_from_cstore.return_value = {"job_id": "bound-job", "execution_binding":
+  # RM-026 I1b B6: the preparation step consumes the admitted snapshot and never reads the store
+  # itself. The legacy snapshot set excludes bound records, so this stands for the tenant-bound
+  # snapshot RM-078 will supply -- launch authority must still not be borrowable here.
+  bound = {"job_id": "bound-job", "execution_binding":
     context({"kind": "network", "address": "192.0.2.1"}).build_binding("launcher", ["node-1"]).to_dict()}
   with patch("extensions.business.cybersec.red_mesh.pentester_api_01.get_llm_agent_config",
              return_value={"ENABLED": True}):
-    prepared, error = PentesterApi01Plugin._prepare_manual_analysis(owner, "bound-job")
+    prepared, error = PentesterApi01Plugin._prepare_manual_analysis(owner, "bound-job",
+                                                                    checked_job=bound)
   assert prepared is None and error["status_code"] == 503
+  owner._get_job_from_cstore.assert_not_called()
   owner._collect_bounded_manual_analysis_reports.assert_not_called()
   owner._get_manual_analysis_executor.assert_not_called()
   owner._get_job_config.assert_not_called()
