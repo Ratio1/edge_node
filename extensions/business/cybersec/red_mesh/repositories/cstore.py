@@ -349,11 +349,15 @@ class JobStateRepository:
     return payload
 
   def get_rulebook_review_audit(self, job_id, profile_id):
-    payload = self.owner.chainstore_hget(
+    payload = self.get_rulebook_review_audit_raw(job_id, profile_id)
+    return payload if isinstance(payload, list) else []
+
+  def get_rulebook_review_audit_raw(self, job_id, profile_id):
+    """Preserve malformed versus absent records for checked read boundaries."""
+    return self.owner.chainstore_hget(
       hkey=self._rulebook_review_audit_hkey,
       key=self.rulebook_key(job_id, profile_id),
     )
-    return payload if isinstance(payload, list) else []
 
   def append_rulebook_review_audit(self, entry):
     if isinstance(entry, RulebookReviewAuditEntry):

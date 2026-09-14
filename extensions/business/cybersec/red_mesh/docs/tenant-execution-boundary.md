@@ -180,6 +180,28 @@ endpoints still require admission/shaping work, including `get_misp_export_confi
 return its host/port/raw response. Neither is an exempt harmless metadata endpoint. Earlier planning
 counts of31 deferred endpoints omitted those two: five checked status reads leave28 from33.
 
+Rulebook assessment status and review now use checked legacy POSTs with `job_id`, optional
+`profile_id` and server requester; tenant selectors are not accepted. Omitted/empty profile selects
+the server's canonical default; explicit wire null remains400. The checked job and exact-key
+review/submission/audit records are copied and associated before model coercion. Missing assessment
+or review remains a valid empty state, while corrupt/foreign rows fail503. Historical profile versions,
+failed attempts, pending submissions and revision-zero legacy reviews remain readable.
+Raw audit publication requires explicit state and object-valued answers; it cannot reuse permissive
+model-input defaults without normalization. Checked review inputs keep their separate model defaults.
+
+Staleness uses only checked archive/pass-parent traversal when submission references require it;
+no global job reread, aggregate/config/worker hydration, assessment/submission CID fetch, generation,
+write or provider call occurs. No completed pass means unknown latest-pass information; broken
+referenced artifacts fail503. Invalid profile/model produce400; unfinished review409; unsupported
+submission contract is a successful assessment marker but a typed review503. These exact errors are
+preserved in RAW/WRAPPED without exposing source details. Rulebook mutations are unchanged.
+This two-read slice passed paired cumulative spec, quality and security review, leaving26 native
+endpoints still requiring admission. Explicit metadata/history `last_error:null` fails unavailable before publication;
+absent metadata errors and genuinely nullable pending/submission errors remain supported.
+All six tenant/binding key aliases are rejected recursively. Optional error classification and audit
+timestamps are validated, as are JSON numbers that would overflow the finite client number range.
+Full backend4,270 tests/2,310subtests pass; evidence belongs to the hub rulebook-read plan.
+
 This is **local wiring, not completed application isolation**. Navigator ordinary-read pairing
 I1a.3b.2 is committed; these five status reads require matching Navigator changes. Unmatched
 versions fail denied/unavailable, never fall back to actorless GET. I1a.3c remains incomplete. Dormant

@@ -29,10 +29,12 @@ LEGACY_STATUS_ROUTES = (
   "get_detection_correlation", "get_misp_export_status", "get_stix_export_status",
   "get_opencti_export_status", "get_taxii_export_status",
 )
+LEGACY_RULEBOOK_ROUTES = ("get_rulebook_assessment_status", "get_rulebook_review")
+LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
   "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
-) + LEGACY_STATUS_ROUTES
+) + LEGACY_READ_ROUTES
 SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
 ERROR = "Incompatible generated execution API"
 
@@ -71,6 +73,8 @@ def _render_native(default_route=None):
         assert method.args.args[-4].arg == "actor"
     elif method.name in LEGACY_STATUS_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "request_actor")
+    elif method.name in LEGACY_RULEBOOK_ROUTES:
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "profile_id", "request_actor")
     else:
       assert tuple(arg.arg for arg in method.args.args)[-2:] == ("request_actor", "tenant_id")
     methods.append(method)

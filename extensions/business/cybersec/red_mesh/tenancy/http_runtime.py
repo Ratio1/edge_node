@@ -99,9 +99,16 @@ _READ_FIELDS = {
   "get_stix_export_status": _JOB_FIELD + (("request_actor", dict, None),),
   "get_opencti_export_status": _JOB_FIELD + (("request_actor", dict, None),),
   "get_taxii_export_status": _JOB_FIELD + (("request_actor", dict, None),),
+  "get_rulebook_assessment_status": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
+  "get_rulebook_review": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
 }
 _READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
+_RULEBOOK_READ_ERRORS = {
+  "/get_rulebook_assessment_status": {(400, "invalid_profile"), (400, "unsupported_job_type")},
+  "/get_rulebook_review": {(400, "invalid_profile"), (400, "unsupported_job_type"),
+                           (409, "job_not_finalized"), (503, "submission_contract_unsupported")},
+}
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"
 
 
@@ -168,8 +175,9 @@ def _read_error_response(status, *, code=None):
   from starlette.responses import JSONResponse
   errors = {400: "invalid_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
             405: "method_not_allowed", 503: "unavailable"}
-  status = status if type(status) is int and status in errors else 503
-  error = "unsupported_job_type" if status == 400 and code == "unsupported_job_type" else errors[status]
+  known_rulebook_error = (type(status) is int and (status, code) in _RULEBOOK_READ_ERRORS["/get_rulebook_review"])
+  status = status if type(status) is int and (status in errors or known_rulebook_error) else 503
+  error = code if known_rulebook_error else errors[status]
   headers = {"Cache-Control": "no-store"}
   if status == 405:
     headers["Allow"] = "POST"
@@ -342,6 +350,14 @@ def install_generated_read_api(app, model_namespace) -> None:
     async def protected_http(request, error):
       if _read_path(request.scope.get("path")):
         detail = error.detail
+        if isinstance(detail, dict):
+          for status, code in _RULEBOOK_READ_ERRORS.get(request.scope.get("path"), ()):
+            typed = (detail.get("success") is False and type(detail.get("status_code")) is int
+                     and detail["status_code"] == status and detail.get("error") == code)
+            raw = (detail.get("detail") == code and not any(
+              key in detail for key in ("success", "error", "status_code", "result")))
+            if error.status_code == status and (typed or raw):
+              return _read_error_response(status, code=code)
         if (request.scope.get("path") in ("/get_detection_correlation", "/get_misp_export_status",
             "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status")
             and error.status_code == 400

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .test_tenant_execution_native import LEGACY_STATUS_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
+from .test_tenant_execution_native import LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
 
 
 ERROR = "Incompatible generated read API"
@@ -68,8 +68,10 @@ async def request(module, name, payload=None, *, raw=None, method="POST", query=
 
 def body_for(name):
   payload = {"request_actor": {"account_id": "Reader.Mixed"}, "tenant_id": "tenant-1"}
-  if name in LEGACY_STATUS_ROUTES:
+  if name in LEGACY_READ_ROUTES:
     payload.pop("tenant_id")
+  if name in LEGACY_RULEBOOK_ROUTES:
+    payload["profile_id"] = "nis2.eu_baseline.v1"
   if name not in ("list_network_jobs", "list_local_jobs", "get_audit_log"):
     payload["job_id"] = "job-1"
   if name == "get_report":
@@ -126,7 +128,7 @@ def test_raw_faults_are_400_without_ipc_or_body_echo(read_native, name):
   faults = [None, [], "private", True, 1, {**valid, "tenantId": "private"},
     {**valid, "actor": {"account_id": "private"}}, {**valid, "snapshot_mode": "legacy_unbound"},
     {**valid, "extra": "private"}]
-  if name in LEGACY_STATUS_ROUTES:
+  if name in LEGACY_READ_ROUTES:
     faults.extend({**valid, key: value} for key, value in (
       ("tenant_id", "tenant-1"), ("asset_id", "asset"), ("execution_binding", {})))
   for field in valid:
@@ -181,7 +183,7 @@ def test_route_model_contract_corruption_fails_at_install(read_native, name, fau
     module.__dict__.pop(name + "Model")
   elif fault == "extra_field":
     model.model_fields["extra"] = model.model_fields[
-      "request_actor" if name in LEGACY_STATUS_ROUTES else "tenant_id"]
+      "request_actor" if name in LEGACY_READ_ROUTES else "tenant_id"]
   elif fault == "nullable_actor":
     model.model_fields["request_actor"].annotation = dict | None
   elif fault == "actor_default":
@@ -409,11 +411,11 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
     module.eng = scheduler_comms(fixture, response_format)
     payload = body_for(name)
     payload["request_actor"] = fixture.actor
-    if bound and name not in LEGACY_STATUS_ROUTES:
+    if bound and name not in LEGACY_READ_ROUTES:
       payload["tenant_id"] = fixture.tenant_id
     else:
       payload.pop("tenant_id", None)
-    if bound and name in LEGACY_STATUS_ROUTES:
+    if bound and name in LEGACY_READ_ROUTES:
       result, calls = assert_json_response(asyncio.run(request(module, name, payload)), 403)
       assert result == {"success": False, "error": "forbidden", "status_code": 403}
       assert calls == 1 and fixture.artifact_reads == []
