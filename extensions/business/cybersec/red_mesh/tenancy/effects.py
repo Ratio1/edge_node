@@ -89,6 +89,8 @@ def classify_effect_failure(state: EffectState) -> dict:
 # `configuration_error` -- the same field name the integration readiness view uses -- so a typed
 # code is still available without colliding with the framework's error convention.
 
+_PUBLIC_DISABLED_REASONS = frozenset({"misp_export_disabled"})
+
 _EFFECT_DENIALS = {
   "job_not_found": (404, "not_found"),
   "unsupported_job_type": (400, "unsupported_job_type"),
@@ -150,6 +152,9 @@ def public_effect_result(result):
   status = result.get("status")
   error = result.get("error")
   if status == "disabled":
+    reason = result.get("disabled_reason")
+    if isinstance(reason, str) and reason in _PUBLIC_DISABLED_REASONS:
+      return {"status": "disabled", "disabled_reason": reason}
     return {"status": "disabled"}
   if isinstance(error, str) and error in _EFFECT_DENIALS:
     status_code, code = _EFFECT_DENIALS[error]

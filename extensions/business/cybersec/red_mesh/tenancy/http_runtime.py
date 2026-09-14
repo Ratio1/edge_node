@@ -1,6 +1,7 @@
 """Import-time compatibility checks for native generated execution requests."""
 
 import inspect
+import re
 import json
 
 
@@ -129,6 +130,9 @@ _EFFECT_FIELDS = {
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.
+# Conservative shape check: typed codes only, never prose.
+_PUBLISHABLE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
 _PUBLIC_EFFECT_STATES = ("persisted", "delivered")
 _PUBLISHABLE_EFFECT_STATES = _PUBLIC_EFFECT_STATES + ("unknown",)
 
@@ -202,7 +206,7 @@ def _read_path(path):
   return isinstance(path, str) and path.rstrip("/") in _READ_PATHS
 
 
-def _read_error_response(status, *, code=None, effect_state=None):
+def _read_error_response(status, *, code=None, effect_state=None, configuration_error=None):
   from starlette.responses import JSONResponse
   errors = {400: "invalid_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
             405: "method_not_allowed", 503: "unavailable"}
@@ -213,9 +217,13 @@ def _read_error_response(status, *, code=None, effect_state=None):
   known_effect_error = (status == 500 and code == "effect_incomplete"
                         and effect_state in _PUBLISHABLE_EFFECT_STATES)
   if known_effect_error:
-    return JSONResponse({"success": False, "error": code, "effect_state": effect_state,
-                         "status_code": 500},
-                        status_code=500, headers={"Cache-Control": "no-store"})
+    body = {"success": False, "error": code, "effect_state": effect_state, "status_code": 500}
+    # The reason must survive the rebuild. Without it every post-persist delivery failure -- which
+    # for OpenCTI and TAXII is all of them, since the persist always precedes the outbound call --
+    # reaches the panel with no code at all, and "delivery codes are published" is inert over HTTP.
+    if isinstance(configuration_error, str) and _PUBLISHABLE_CODE.match(configuration_error):
+      body["configuration_error"] = configuration_error
+    return JSONResponse(body, status_code=500, headers={"Cache-Control": "no-store"})
   status = status if type(status) is int and (status in errors or known_rulebook_error) else 503
   error = code if known_rulebook_error else errors[status]
   headers = {"Cache-Control": "no-store"}
@@ -419,7 +427,8 @@ def install_generated_read_api(app, model_namespace) -> None:
                    and detail.get("effect_state") in _PUBLIC_EFFECT_STATES)
           if typed:
             return _read_error_response(500, code="effect_incomplete",
-                                        effect_state=detail["effect_state"])
+                                        effect_state=detail["effect_state"],
+                                        configuration_error=detail.get("configuration_error"))
           raw = (detail == "effect_incomplete" or (isinstance(detail, dict)
                  and detail.get("detail") == "effect_incomplete"
                  and not any(key in detail for key in ("success", "error", "status_code", "result"))))

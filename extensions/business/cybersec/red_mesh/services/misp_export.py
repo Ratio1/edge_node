@@ -466,9 +466,12 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     # Deliberately no _record_export_status here. Routing export_misp through _effect_operation
     # makes this branch live for the first time, and emitting a SOC event plus a job-record write
     # on a disabled integration would be a new behaviour OpenCTI and TAXII do not have.
-    return {"status": "disabled"}
+    return {"status": "disabled", "disabled_reason": "misp_export_disabled"}
   if not cfg["MISP_URL"] or not cfg["MISP_API_KEY"]:
-    _record_export_status("failed")
+    # Twin of the disabled branch above, and equally dead before this slice: _export_to_misp
+    # returned not_configured before push_to_misp was reached. Emitting here would ship the same
+    # behaviour change the plan rejected for its twin -- a SOC event and a job-record write on a
+    # misconfigured integration. The decision applies to both branches, not one.
     return {"status": "not_configured", "error": "missing_credentials"}
 
   # Build the event
@@ -545,8 +548,9 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
       _record_export_status("failed")
       return {"status": "error", "error": "api_error", "retryable": False}
 
-    if ledger is not None:
-      # PyMISP has no status code: a MISPEvent with a uuid is the only acceptance evidence.
+    if ledger is not None and response_event.uuid:
+      # PyMISP has no status code: a MISPEvent *with a uuid* is the only acceptance evidence.
+      # isinstance alone is not enough -- str(None) would publish the string "None" as an id.
       ledger.record(EffectState.DELIVERED)
     event_uuid = str(response_event.uuid)
     event_id = int(response_event.id) if response_event.id else 0

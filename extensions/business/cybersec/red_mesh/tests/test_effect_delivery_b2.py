@@ -242,3 +242,83 @@ def test_misp_never_returns_ok_when_the_remote_rejected_everything(misp_ready):
     with patch.object(service, "PyMISP", return_value=misp):
       result = fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
   assert result.get("status") != "ok", "a fully rejected re-export reported success"
+
+
+@pytest.mark.parametrize("name,service,config", DELIVERIES)
+def test_the_pre_outbound_checkpoint_stops_a_revoked_requester(read_native, name, service, config):
+  """Contract addition 1, which mutation testing showed had no evidence on any service.
+
+  The account is revoked after admission and after the persist, before the outbound call.
+  """
+  with read_endpoint_fixture(bound=False) as fixture:
+    def persist_then_revoke(owner, bundle):
+      fixture.store.account("reader", active=False)
+      return "artifact-cid"
+
+    with patch.object(service, "_config_error", return_value=None), \
+         patch.object(service, "build_stix_bundle", return_value=dict(OK_BUNDLE)), \
+         patch.object(service, "_persist_bundle", persist_then_revoke), \
+         patch.object(service, "build_auth_provider") as auth, \
+         patch.object(service.requests, "post", side_effect=AssertionError(SECRET)) as post:
+      auth.return_value.headers.return_value = {}
+      result = getattr(fixture.Plugin, name)(fixture.owner, "job-1", request_actor=fixture.actor)
+    post.assert_not_called()
+    # The persist landed before the revocation, so the caller must be told so.
+    assert result["error"] == "effect_incomplete"
+    assert result["effect_state"] == EffectState.PERSISTED.value
+
+
+@pytest.mark.parametrize("seam", ("entry", "event_build"))
+def test_misp_reads_the_job_only_through_the_checked_snapshot(misp_ready, seam):
+  """Both MISP scoping seams. Mutation testing showed reverting either left the suite green."""
+  service = misp_ready
+  with read_endpoint_fixture(bound=False) as fixture:
+    if seam == "event_build":
+      # Let the real builder run so the second seam is exercised rather than stubbed away.
+      from extensions.business.cybersec.red_mesh.services import misp_export as real
+      service_build = real.build_misp_event
+      with patch.object(service, "build_misp_event", service_build), \
+           patch.object(fixture.owner, "_get_job_from_cstore", create=True,
+                        side_effect=AssertionError(SECRET)) as unscoped, \
+           patch.object(service, "PyMISP", side_effect=RuntimeError("stop-before-transport")):
+        fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
+      unscoped.assert_not_called()
+      return
+    with patch.object(fixture.owner, "_get_job_from_cstore", create=True,
+                      side_effect=AssertionError(SECRET)) as unscoped, \
+         patch.object(service, "PyMISP", side_effect=RuntimeError("stop-before-transport")):
+      fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
+    unscoped.assert_not_called()
+
+
+def test_misp_records_delivery_only_on_an_accepted_event(misp_ready):
+  """M5: deleting the DELIVERED record after add_event left the suite green."""
+  service = misp_ready
+  from pymisp import MISPEvent
+  accepted = MISPEvent()
+  accepted.uuid = "44444444-4444-4444-4444-444444444444"
+  with read_endpoint_fixture(bound=False) as fixture:
+    misp = type("_Misp", (), {"add_event": lambda self, *a, **k: accepted,
+                              "publish": lambda self, *a, **k: None})()
+    with patch.object(service, "PyMISP", return_value=misp), \
+         patch.object(service, "_write_job_record", side_effect=RuntimeError(SECRET)):
+      result = fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
+  assert result["error"] == "effect_incomplete"
+  assert result["effect_state"] == EffectState.DELIVERED.value, (
+    "the event was accepted by the remote but the ledger did not record a delivery")
+
+
+def test_a_misconfigured_misp_does_not_emit_or_write(misp_ready, monkeypatch):
+  """The twin of the disabled branch: both were dead before this slice, so neither may start
+  emitting a SOC event and writing the job record now that the path is live."""
+  service = misp_ready
+  monkeypatch.setattr(service, "get_misp_export_config",
+                      lambda owner: {**MISP_CONFIG, "MISP_API_KEY": ""})
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(service, "emit_export_status_event",
+                      side_effect=AssertionError(SECRET)) as emit, \
+         patch.object(service, "_write_job_record", side_effect=AssertionError(SECRET)) as write:
+      result = fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
+    emit.assert_not_called()
+    write.assert_not_called()
+  assert result.get("configuration_error") == "missing_credentials"
