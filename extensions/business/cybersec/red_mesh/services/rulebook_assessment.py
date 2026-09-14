@@ -1516,6 +1516,8 @@ def save_rulebook_review_draft(
   answers=None,
   actor="",
   note="",
+  checked_job=_UNSET,
+  ledger=None,
   expected_review_revision=None,
 ):
   profile = _profile(profile_id)
@@ -1534,7 +1536,9 @@ def save_rulebook_review_draft(
     return _error("invalid_review_answer", job_id, profile_id=profile["profile_id"], message=str(exc))
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
     if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
@@ -1720,6 +1724,8 @@ def submit_rulebook_review(
   expected_profile_version=None,
   idempotency_key="",
   actor="",
+  checked_job=_UNSET,
+  ledger=None,
 ):
   profile = _profile(profile_id)
   if not profile:
@@ -1767,7 +1773,9 @@ def submit_rulebook_review(
     )
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
     if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
@@ -2084,6 +2092,8 @@ def reopen_rulebook_review(
   expected_review_revision=None,
   idempotency_key="",
   actor="",
+  checked_job=_UNSET,
+  ledger=None,
 ):
   profile = _profile(profile_id)
   if not profile:
@@ -2109,7 +2119,9 @@ def reopen_rulebook_review(
     return _submission_error("invalid_review_actor", job_id, profile["profile_id"], "A server-derived actor is required.")
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
     if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
@@ -2312,6 +2324,8 @@ def update_rulebook_review(
   reviewer="",
   note="",
   review_state="draft",
+  checked_job=_UNSET,
+  ledger=None,
 ):
   profile = _profile(profile_id)
   if not profile:
@@ -2323,7 +2337,9 @@ def update_rulebook_review(
   except ValueError as exc:
     return _error("invalid_review_answer", job_id, profile_id=profile_id, message=str(exc))
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile_id)
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")

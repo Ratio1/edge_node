@@ -133,6 +133,24 @@ _EFFECT_FIELDS = {
                                           ("request_actor", dict, None)),
   "upload_authorization": (("filename", str, ""), ("content_b64", str, ""),
                            ("request_actor", dict, None)),
+  # B4 rulebook review mutations.
+  "save_rulebook_review_draft": _JOB_FIELD + (("profile_id", str, None), ("answers", dict, None),
+                                              ("note", str, ""),
+                                              ("expected_review_revision", int, None),
+                                              ("request_actor", dict, None)),
+  "submit_rulebook_review": _JOB_FIELD + (("profile_id", str, None),
+                                          ("expected_review_revision", int, None),
+                                          ("expected_pass_nr", int, None),
+                                          ("expected_profile_version", str, None),
+                                          ("idempotency_key", str, ""),
+                                          ("request_actor", dict, None)),
+  "reopen_rulebook_review": _JOB_FIELD + (("profile_id", str, None),
+                                          ("expected_review_revision", int, None),
+                                          ("idempotency_key", str, ""),
+                                          ("request_actor", dict, None)),
+  "update_rulebook_review": _JOB_FIELD + (("profile_id", str, None), ("answers", dict, None),
+                                          ("note", str, ""), ("review_state", str, "draft"),
+                                          ("request_actor", dict, None)),
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.

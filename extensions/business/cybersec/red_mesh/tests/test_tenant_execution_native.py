@@ -36,7 +36,9 @@ LEGACY_JSON_EXPORT_ROUTES = ("export_misp_json",)
 # RM-026 I1b B1: effect endpoints sharing the strict read transport.
 EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle",
                  "test_event_export", "push_to_opencti", "publish_to_taxii", "export_misp",
-                 "correlate_suricata_eve", "upload_authorization")
+                 "correlate_suricata_eve", "upload_authorization",
+                 "save_rulebook_review_draft", "submit_rulebook_review",
+                 "reopen_rulebook_review", "update_rulebook_review")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
@@ -100,6 +102,15 @@ def _render_native(default_route=None):
         "correlate_suricata_eve": ("self", "job_id", "eve_jsonl", "pass_nr", "source_ips",
                                    "sensor_id", "request_actor"),
         "upload_authorization": ("self", "filename", "content_b64", "request_actor"),
+        "save_rulebook_review_draft": ("self", "job_id", "profile_id", "answers", "note",
+                                       "expected_review_revision", "request_actor"),
+        "submit_rulebook_review": ("self", "job_id", "profile_id", "expected_review_revision",
+                                   "expected_pass_nr", "expected_profile_version",
+                                   "idempotency_key", "request_actor"),
+        "reopen_rulebook_review": ("self", "job_id", "profile_id", "expected_review_revision",
+                                   "idempotency_key", "request_actor"),
+        "update_rulebook_review": ("self", "job_id", "profile_id", "answers", "note",
+                                   "review_state", "request_actor"),
       }[method.name]
       assert tuple(arg.arg for arg in method.args.args) == expected
     else:
