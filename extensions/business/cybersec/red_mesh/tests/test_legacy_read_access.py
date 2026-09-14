@@ -84,6 +84,22 @@ class TestLegacyReadAccess(unittest.TestCase):
     self.assertEqual(self.read("get", job_id="without-id")["job_id"], "without-id")
     self.assertEqual(set(self.read()), {"storage-alias", "without-id"})
 
+  def test_export_uses_current_stored_navigator_role_with_admin_precedence(self):
+    for role, app_role, allowed in (("admin", None, True), ("admin", "user", True),
+        ("user", "pentester", True), ("user", None, False), ("user", "admin", False),
+        ("user", "Pentester", False), ("pentester", None, False)):
+      with self.subTest(role=role, app_role=app_role):
+        self.owner.account("reader", role=role)
+        self.owner.data[("auth", "reader")]["metadata"]["appRole"] = app_role
+        self.owner.reads.clear()
+        if allowed:
+          self.assertEqual(self.read("get", permission="reports:export")["job_id"], "job-1")
+        else:
+          with self.assertRaises(AdministrationDenied) as caught:
+            self.read("get", permission="reports:export")
+          self.assertEqual(caught.exception.status_code, 403)
+          self.assert_no_job_read()
+
   def test_explicit_empty_malformed_memberships_and_revocation_never_become_legacy(self):
     for membership in ([], None, {}, "legacy", [{"role": "tenant_user", "tenant_id": "unknown"}]):
       with self.subTest(membership=membership):

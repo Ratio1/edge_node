@@ -224,6 +224,9 @@ class TenantJobArtifacts:
       kind, identity = self._references[cid]
       if kind == "archive":
         self._validate_archive(payload)
+      elif kind == "config":
+        if binding_from_record(payload) != self._binding:
+          _unavailable()
       elif kind == "pass":
         self._pass(payload, identity)
       elif kind == "worker":
@@ -264,6 +267,17 @@ class TenantJobArtifacts:
     if not self._archive_cid:
       return None
     return _copy(self._get(self._archive_cid))
+
+  def job_config(self):
+    """Internal config edge only; it never grants generic report-CID access."""
+    if self._archive_cid:
+      return _copy(self._get(self._archive_cid)["job_config"])
+    if not self._config_cid:
+      return {}
+    if self._config_cid not in self._references:
+      self._count(1)
+      self._references[self._config_cid] = ("config", None)
+    return _copy(self._get(self._config_cid))
 
   def report(self, cid):
     if not isinstance(cid, str) or not cid.strip() or cid in (self._archive_cid, self._config_cid):

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
+from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, LEGACY_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
 
 
 ERROR = "Incompatible generated read API"
@@ -72,6 +72,8 @@ def body_for(name):
     payload.pop("tenant_id")
   if name in LEGACY_RULEBOOK_ROUTES:
     payload["profile_id"] = "nis2.eu_baseline.v1"
+  if name in LEGACY_JSON_EXPORT_ROUTES:
+    payload["pass_nr"] = 1
   if name not in ("list_network_jobs", "list_local_jobs", "get_audit_log") + ACTOR_ONLY_READ_ROUTES:
     payload["job_id"] = "job-1"
   if name == "get_report":
@@ -134,7 +136,8 @@ def test_raw_faults_are_400_without_ipc_or_body_echo(read_native, name):
   if name in ACTOR_ONLY_READ_ROUTES:
     faults.extend({**valid, key: "private"} for key in ("job_id", "profile_id"))
   for field in valid:
-    faults.extend({**valid, field: value} for value in (None, True, 1, [], "" if field == "request_actor" else {}))
+    faults.extend({**valid, field: value} for value in
+      (None, True, "1" if field == "pass_nr" else 1, [], "" if field == "request_actor" else {}))
 
   async def checks():
     for payload in faults:
@@ -435,6 +438,10 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
     assert calls == 1
     actual = result["result"] if response_format == "WRAPPED" else result
     assert isinstance(actual, dict)
+    if name in LEGACY_JSON_EXPORT_ROUTES:
+      assert actual == {"status": "disabled"}
+      assert fixture.artifact_reads == []
+      return
     if name == "get_report":
       assert actual["job_id"] == "job-1" and actual["cid"] == "worker"
       assert actual["report"]["job_id"] == "job-1"

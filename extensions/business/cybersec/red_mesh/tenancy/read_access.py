@@ -91,7 +91,9 @@ class LegacyReadAccess:
     account, denial = resolve_actor(actor, self.administration.accounts)
     if denial:
       raise AdministrationDenied(denial["status_code"], denial["error"])
-    if account.tenant_memberships_present is not False or operation not in ("reports:view", "audit:view"):
+    if account.tenant_memberships_present is not False or operation not in ("reports:view", "audit:view", "reports:export"):
+      raise AdministrationDenied(403, "forbidden")
+    if operation == "reports:export" and account.role != "admin" and account.app_role != "pentester":
       raise AdministrationDenied(403, "forbidden")
     if operation == "audit:view" and TenantMembership("super_tenant_admin", None) not in account.tenant_memberships:
       raise AdministrationDenied(403, "forbidden")

@@ -104,6 +104,7 @@ _READ_FIELDS = {
   "get_misp_export_config_status": (("request_actor", dict, None),),
   "llm_health": (("request_actor", dict, None),),
   "update_finding_triage": (("request_actor", dict, None),),
+  "export_misp_json": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
 }
 _READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
@@ -362,7 +363,7 @@ def install_generated_read_api(app, model_namespace) -> None:
             if error.status_code == status and (typed or raw):
               return _read_error_response(status, code=code)
         if (request.scope.get("path") in ("/get_detection_correlation", "/get_misp_export_status",
-            "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status")
+            "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status", "/export_misp_json")
             and error.status_code == 400
             and isinstance(detail, dict)):
           typed = (detail.get("success") is False and type(detail.get("status_code")) is int

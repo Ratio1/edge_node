@@ -74,6 +74,48 @@ def fixture(kind="network", archived=False):
 
 
 class TestTenantJobArtifacts(unittest.TestCase):
+  def test_internal_config_accessor_rejects_missing_corrupt_and_foreign_records(self):
+    for value in (None, [], "private", {"job_id": "foreign"},
+                  {"execution_binding": None}, {"kind": "redmesh_model_test_raw_evidence"}):
+      with self.subTest(value=value):
+        job, store = fixture()
+        store.rows["config"] = value
+        with self.assertRaises(TenantStoreError):
+          TenantJobArtifacts(job, store.read).job_config()
+        self.assertEqual(store.reads, ["config"])
+
+  def test_internal_config_accessor_preserves_archive_and_absent_edge_defaults(self):
+    job, store = fixture(archived=True)
+    artifacts = TenantJobArtifacts(job, store.read)
+    self.assertEqual(artifacts.job_config(), store.rows["archive"]["job_config"])
+    self.assertEqual(store.reads, ["archive"])
+    job, store = fixture()
+    job.pop("job_config_cid")
+    self.assertEqual(TenantJobArtifacts(job, store.read).job_config(), {})
+    self.assertEqual(store.reads, [])
+
+  def test_internal_config_accessor_shares_fetch_and_reference_budgets(self):
+    job, store = fixture()
+    for budget in ("MAX_ARTIFACT_FETCHES", "MAX_ARTIFACT_REFERENCES"):
+      with self.subTest(budget=budget):
+        artifacts = TenantJobArtifacts(job, store.read)
+        with patch("extensions.business.cybersec.red_mesh.tenancy.job_artifacts." + budget, 0):
+          with self.assertRaises(TenantStoreError):
+            artifacts.job_config()
+    self.assertEqual(store.reads, [])
+
+  def test_internal_config_accessor_is_checked_cached_detached_and_not_a_generic_report(self):
+    job, store = fixture()
+    artifacts = TenantJobArtifacts(job, store.read)
+    config = artifacts.job_config()
+    self.assertEqual(config, store.rows["config"])
+    config["target"] = "changed"
+    self.assertEqual(artifacts.job_config()["target"], "192.0.2.10")
+    self.assertEqual(store.reads, ["config"])
+    with self.assertRaises(AdministrationDenied):
+      artifacts.report("config")
+    self.assertEqual(store.reads, ["config"])
+
   def test_checked_snapshot_rejects_invalid_or_unbound_values(self):
     job, _ = fixture()
     values = [None, {}, [], "job", {**job, "execution_binding": None},

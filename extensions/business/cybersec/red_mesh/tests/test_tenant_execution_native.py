@@ -31,7 +31,8 @@ LEGACY_STATUS_ROUTES = (
 )
 LEGACY_RULEBOOK_ROUTES = ("get_rulebook_assessment_status", "get_rulebook_review")
 ACTOR_ONLY_READ_ROUTES = ("get_misp_export_config_status", "llm_health", "update_finding_triage")
-LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES
+LEGACY_JSON_EXPORT_ROUTES = ("export_misp_json",)
+LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
   "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
@@ -78,6 +79,8 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "profile_id", "request_actor")
     elif method.name in ACTOR_ONLY_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
+    elif method.name in LEGACY_JSON_EXPORT_ROUTES:
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor")
     else:
       assert tuple(arg.arg for arg in method.args.args)[-2:] == ("request_actor", "tenant_id")
     methods.append(method)
