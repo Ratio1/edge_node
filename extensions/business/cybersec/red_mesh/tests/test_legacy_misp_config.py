@@ -28,8 +28,9 @@ def install_config_producer(fixture, config=None):
     assert hkey != owner.cfg_instance_id, "Forbidden job point-read"
     return original_get(hkey=hkey, key=key)
   owner.chainstore_hget = MagicMock(side_effect=read)
+  # _export_to_misp was deleted in RM-026 I1b B2; the canary now names only live attributes.
   for name in ("chainstore_hgetall", "chainstore_hset", "_get_job_from_cstore", "_get_job_state_repository",
-               "_export_to_misp", "_build_misp_json"):
+               "_build_misp_json"):
     setattr(owner, name, MagicMock(side_effect=AssertionError("Forbidden config-read effect: " + name)))
   owner.r1fs.get_json = MagicMock(side_effect=AssertionError("Forbidden artifact read"))
 

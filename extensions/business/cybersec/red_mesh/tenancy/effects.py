@@ -127,6 +127,7 @@ _PUBLIC_CONFIGURATION_ERRORS = frozenset({
   # B2 delivery outcomes. Static codes, no prose, no host: without them every delivery failure
   # showed the panels' generic fallback.
   "timeout", "graphql_error", "artifact_write_failed", "connection_failed", "api_error",
+  "push_failed",
 })
 
 # `http_<status>` is generated per response code, so it cannot be a frozenset member.

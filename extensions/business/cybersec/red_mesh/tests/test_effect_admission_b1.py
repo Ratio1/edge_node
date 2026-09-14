@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-from extensions.business.cybersec.red_mesh.services import opencti_export, stix_export, taxii_export
+from extensions.business.cybersec.red_mesh.services import (
+  misp_export, opencti_export, stix_export, taxii_export)
 from extensions.business.cybersec.red_mesh.tenancy.effects import EffectState
 from .read_endpoint_fixtures import read_endpoint_fixture
 from .test_tenant_read_native import read_native  # noqa: F401  (pytest fixture)
@@ -287,8 +288,16 @@ def test_every_configuration_code_these_services_emit_is_publishable():
     body = source[source.index("def _config_error("):]
     body = body[:body.index("\ndef ", 1)]
     emitted.update(re.findall(r'return "([a-z_]+)"', body))
+  # Delivery producers too, not just _config_error. The security review found the whitelist and the
+  # producers already out of sync: connection faults returned an exception class name that nothing
+  # could publish, so every such failure showed the panels' generic fallback.
+  for module in (opencti_export, taxii_export, misp_export):
+    source = open(module.__file__).read()
+    emitted.update(re.findall(r'"error": "([a-z_]+)"', source))
   # "disabled" is not a configuration error: it short-circuits to a bare {"status": "disabled"}.
-  emitted.discard("disabled")
+  # Not configuration errors: "disabled" short-circuits to a bare status, and the denial codes are
+  # mapped to HTTP statuses by _EFFECT_DENIALS rather than published as a reason.
+  emitted -= {"disabled", "not_configured", "job_not_found", "unsupported_job_type"}
   missing = emitted - _PUBLIC_CONFIGURATION_ERRORS
   assert not missing, f"config codes these services emit but cannot publish: {sorted(missing)}"
 

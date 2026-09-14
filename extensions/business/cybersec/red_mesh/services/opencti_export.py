@@ -238,8 +238,8 @@ def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=N
     record_integration_status(owner, "opencti", outcome="failure", error_class="timeout")
     return {"status": "error", "error": "timeout", "job_id": job_id, "retryable": True}
   except requests.exceptions.RequestException as exc:
-    record_integration_status(owner, "opencti", outcome="failure", error_class=type(exc).__name__)
-    return {"status": "error", "error": type(exc).__name__, "job_id": job_id, "retryable": True}
+    record_integration_status(owner, "opencti", outcome="failure", error_class="connection_failed")
+    return {"status": "error", "error": "connection_failed", "job_id": job_id, "retryable": True}
 
   if response.status_code >= 400:
     error_class = f"http_{response.status_code}"

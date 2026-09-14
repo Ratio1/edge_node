@@ -445,6 +445,10 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
   def _record_export_status(status, artifact_refs=None):
     if not job_specs:
       return
+    if ledger is not None:
+      # A SOC emission plus a job-record write is an effect: revalidate, and record it so a later
+      # failure cannot report "nothing happened" after the event left the node.
+      ledger.checkpoint()
     emit_export_status_event(
       owner,
       job_specs,
@@ -455,6 +459,8 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
       artifact_refs=artifact_refs,
     )
     _write_job_record(owner, job_id, job_specs, context="misp_export_status")
+    if ledger is not None:
+      ledger.record(EffectState.PERSISTED)
 
   if not cfg["ENABLED"]:
     # Deliberately no _record_export_status here. Routing export_misp through _effect_operation
@@ -477,6 +483,10 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
   actual_pass_nr = result["pass_nr"]
 
   # Connect to MISP
+  if ledger is not None:
+    # Last revalidation before anything can reach the third-party server. build_misp_event above
+    # spans an archive fetch and several artifact reads, so the window is real.
+    ledger.checkpoint()
   try:
     misp = PyMISP(cfg["MISP_URL"], cfg["MISP_API_KEY"],
                   ssl=cfg["MISP_VERIFY_TLS"], timeout=cfg["TIMEOUT"])
@@ -497,17 +507,27 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
         existing_event = misp.get_event(existing_uuid, pythonify=True)
         if isinstance(existing_event, MISPEvent) and existing_event.uuid:
           # Add new objects to existing event
+          accepted_objects = 0
           for obj in event.objects:
-            misp.add_object(existing_event, obj, pythonify=True)
-            if ledger is not None:
-              # The remote now holds part of this export. A mid-loop failure past this point must
-              # not report "nothing happened" -- a retry would duplicate the objects already added.
-              ledger.record(EffectState.DELIVERED)
+            added = misp.add_object(existing_event, obj, pythonify=True)
+            if isinstance(added, MISPObject) or (isinstance(added, MISPEvent) and added.uuid):
+              accepted_objects += 1
+              if ledger is not None:
+                # The remote now holds part of this export. A failure past this point must not
+                # report "nothing happened": a retry would duplicate what was already added.
+                ledger.record(EffectState.DELIVERED)
           # Update tags
           for tag in event.tags:
             existing_event.add_tag(tag)
-          misp.update_event(existing_event, pythonify=True)
-          response_event = existing_event
+          updated = misp.update_event(existing_event, pythonify=True)
+          # Acceptance evidence, not the locally held event: assigning existing_event unconditionally
+          # made the isinstance check below vacuous, so a fully rejected re-export reported ok.
+          if isinstance(updated, MISPEvent) and updated.uuid:
+            response_event = updated
+          elif accepted_objects:
+            response_event = existing_event
+          else:
+            response_event = updated
         else:
           # Event deleted on MISP side — create new
           response_event = misp.add_event(event, pythonify=True)
@@ -542,7 +562,7 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     error_str = str(exc)
     retryable = not any(code in error_str for code in ["401", "403", "404"])
     _record_export_status("failed")
-    return {"status": "error", "error": f"MISP push failed: {error_str}", "retryable": retryable}
+    return {"status": "error", "error": "push_failed", "retryable": retryable}
 
   # Store export metadata in CStore
   if actual_pass_nr not in passes_exported:

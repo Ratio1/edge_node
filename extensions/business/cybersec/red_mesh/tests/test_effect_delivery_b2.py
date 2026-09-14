@@ -139,3 +139,106 @@ def test_the_panel_fields_each_delivery_consumer_reads_survive_the_projection():
   # redacted_host is deliberately withheld: it is the real hostname (contract 7).
   assert "redacted_host" not in public_effect_result(
     {"status": "ok", "redacted_host": "opencti.internal", "job_id": "job-1"})
+
+
+# --- MISP: its own seam, because PyMISP is the transport and requests.post does not reach it ---
+
+MISP_CONFIG = {"ENABLED": True, "MISP_URL": "https://misp.test", "MISP_API_KEY": "k",
+               "MISP_VERIFY_TLS": False, "TIMEOUT": 5, "MISP_PUBLISH": False,
+               "MISP_DISTRIBUTION": 0, "MISP_THREAT_LEVEL": 2, "MISP_ANALYSIS": 2}
+
+
+@pytest.fixture
+def misp_ready(monkeypatch):
+  """A MISP export that is configured and whose event builds, so tests reach the transport."""
+  from extensions.business.cybersec.red_mesh.services import misp_export
+  from pymisp import MISPEvent
+  event = MISPEvent()
+  event.uuid = "11111111-1111-1111-1111-111111111111"
+  monkeypatch.setattr(misp_export, "get_misp_export_config", lambda owner: dict(MISP_CONFIG))
+  monkeypatch.setattr(misp_export, "build_misp_event",
+                      lambda *a, **k: {"status": "ok", "event": event, "job_id": "job-1",
+                                       "pass_nr": 1, "findings_exported": 2, "ports_exported": 1})
+  return misp_export
+
+
+@pytest.mark.parametrize("fault,status", (
+  ("actor", 404), ("deleted", 404), ("inactive", 404), ("user", 403),
+  ("memberships", 403), ("rollout", 403), ("identity_store", 503),
+))
+def test_misp_denials_reach_neither_the_server_nor_the_job_record(misp_ready, fault, status):
+  """B1's denial matrix, extended to the endpoint the security review found untested."""
+  service = misp_ready
+  with read_endpoint_fixture(bound=False) as fixture:
+    account = fixture.store.data[("auth", "reader")]
+    actor = fixture.actor
+    if fault == "actor": actor = None
+    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
+    elif fault == "inactive": fixture.store.account("reader", active=False)
+    elif fault == "user": fixture.store.account("reader", role="user")
+    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
+    elif fault == "rollout":
+      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
+        record={"stage": "draining", "enabled": False})
+    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
+
+    with patch.object(service, "PyMISP", side_effect=AssertionError(SECRET)) as transport, \
+         patch.object(service, "emit_export_status_event",
+                      side_effect=AssertionError(SECRET)) as emit, \
+         patch.object(service, "_write_job_record", side_effect=AssertionError(SECRET)) as write:
+      result = fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=actor)
+    assert result["status_code"] == status and result["success"] is False
+    transport.assert_not_called()
+    emit.assert_not_called()
+    write.assert_not_called()
+
+
+def test_misp_does_not_reach_the_server_after_the_requester_is_revoked(misp_ready):
+  """Contract 4 on the least recoverable endpoint.
+
+  The security review demonstrated a revoked requester's payload reaching the MISP server while the
+  identical race against OpenCTI stopped before the outbound call. The window is real: the event
+  build spans an archive fetch and several artifact reads.
+  """
+  service = misp_ready
+  with read_endpoint_fixture(bound=False) as fixture:
+    def build_then_revoke(*args, **kwargs):
+      fixture.store.account("reader", active=False)
+      from pymisp import MISPEvent
+      event = MISPEvent()
+      event.uuid = "22222222-2222-2222-2222-222222222222"
+      return {"status": "ok", "event": event, "job_id": "job-1", "pass_nr": 1}
+
+    with patch.object(service, "build_misp_event", build_then_revoke), \
+         patch.object(service, "PyMISP", side_effect=AssertionError(SECRET)) as transport:
+      result = fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
+    transport.assert_not_called(), "a revoked requester's payload reached the MISP server"
+    assert result["success"] is False
+
+
+def test_misp_transport_failure_after_an_emission_is_not_reported_as_nothing_happened(misp_ready):
+  service = misp_ready
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(service, "PyMISP", side_effect=RuntimeError(SECRET)):
+      result = fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
+  # connection_failed is a typed code, and the prose that could carry the MISP URL is gone.
+  assert result.get("configuration_error") == "connection_failed"
+  assert SECRET not in repr(result) and "misp.test" not in repr(result)
+
+
+def test_misp_never_returns_ok_when_the_remote_rejected_everything(misp_ready):
+  """The re-export branch assigned the locally held event, making the acceptance check vacuous."""
+  service = misp_ready
+  with read_endpoint_fixture(bound=False) as fixture:
+    fixture.job["misp_export"] = {"event_uuid": "33333333-3333-3333-3333-333333333333"}
+    from pymisp import MISPEvent
+    existing = MISPEvent()
+    existing.uuid = "33333333-3333-3333-3333-333333333333"
+    misp = type("_Misp", (), {
+      "get_event": lambda self, *a, **k: existing,
+      "add_object": lambda self, *a, **k: {"errors": "rejected"},
+      "update_event": lambda self, *a, **k: {"errors": "rejected"},
+    })()
+    with patch.object(service, "PyMISP", return_value=misp):
+      result = fixture.Plugin.export_misp(fixture.owner, "job-1", request_actor=fixture.actor)
+  assert result.get("status") != "ok", "a fully rejected re-export reported success"
