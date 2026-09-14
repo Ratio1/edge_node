@@ -114,6 +114,9 @@ _PUBLIC_EFFECT_FIELDS = frozenset({
   "taxii_status_id", "taxii_status", "collection_id",        # TaxiiExport.tsx:78-88
   "success_count", "failure_count", "pending_count", "published_at",
   "findings_exported", "ports_exported", "event_uuid",       # MispExport.tsx:62
+  # B3 ingest. `correlation` is the payload the operator reads: dropping it made a rejected EVE
+  # upload indistinguishable from a successful zero-match correlation, at HTTP 200.
+  "correlation", "cid", "mime", "size_bytes", "sha256", "uploaded_at", "filename",
 })
 
 # Every configuration code the effect services can actually produce. This is deliberately a
@@ -130,7 +133,15 @@ _PUBLIC_CONFIGURATION_ERRORS = frozenset({
   # showed the panels' generic fallback.
   "timeout", "graphql_error", "artifact_write_failed", "connection_failed", "api_error",
   "push_failed",
+  # B3 ingest parse and write outcomes. Structured, bounded, no caller content.
+  "eve_jsonl_too_large", "eve_payload_rejected", "job_record_not_written",
+  # authorization_upload outcome codes: structured, and the prose that accompanied them embedded
+  # R1FS and virus-scan exception text.
+  "invalid_base64", "empty", "too_large", "bad_mime", "virus_detected", "storage_failed",
 })
+
+# invalid_jsonl_line_<n> carries a bounded line index, not caller text.
+_PUBLISHABLE_PARSE_CODE = re.compile(r"^invalid_jsonl_line_\d{1,7}$")
 
 # `http_<status>` is generated per response code, so it cannot be a frozenset member.
 _HTTP_STATUS_ERROR = re.compile(r"^http_[1-5][0-9][0-9]$")
@@ -161,7 +172,9 @@ def public_effect_result(result):
     return {"success": False, "error": code, "status_code": status_code}
   projected = {key: value for key, value in result.items() if key in _PUBLIC_EFFECT_FIELDS}
   if isinstance(error, str):
-    publishable = (error in _PUBLIC_CONFIGURATION_ERRORS or bool(_HTTP_STATUS_ERROR.match(error)))
+    publishable = (error in _PUBLIC_CONFIGURATION_ERRORS
+                   or bool(_HTTP_STATUS_ERROR.match(error))
+                   or bool(_PUBLISHABLE_PARSE_CODE.match(error)))
     projected["configuration_error"] = error if publishable else None
     if projected["configuration_error"] is None:
       # An outcome we cannot type must not be published as success with no reason.

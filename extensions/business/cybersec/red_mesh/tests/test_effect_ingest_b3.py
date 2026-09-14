@@ -77,8 +77,9 @@ def test_a_malformed_payload_publishes_a_structured_code_not_prose():
     result = fixture.Plugin.correlate_suricata_eve(
       fixture.owner, "job-1", eve_jsonl="{not-json}", request_actor=fixture.actor)
   # The line number is useful diagnostics and carries no caller content, so it survives.
-  assert result.get("configuration_error") in (None, "invalid_jsonl_line_1") or \
-    result.get("error") == "invalid_jsonl_line_1"
+  assert result.get("configuration_error") == "invalid_jsonl_line_1", (
+    "a rejected payload must be distinguishable from a zero-match correlation")
+  assert "correlation" not in result
 
 
 def test_an_unsafe_parse_message_cannot_reach_the_caller():
@@ -102,7 +103,11 @@ def test_upload_denials_never_reach_storage(fault, status):
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "user": fixture.store.account("reader", role="user")
     elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
-    with patch.object(authorization_upload, "store_authorization_document",
+    import sys
+    plugin_module = sys.modules[fixture.Plugin.__module__]
+    # Patch the plugin module's binding: it imports the symbol, so patching the service module
+    # binds nothing and assert_not_called would be vacuous.
+    with patch.object(plugin_module, "store_authorization_document",
                       side_effect=AssertionError(SECRET)) as store:
       result = fixture.Plugin.upload_authorization(
         fixture.owner, filename="auth.pdf", content_b64=PDF_B64, request_actor=actor)
@@ -135,3 +140,98 @@ def test_the_uploaded_document_records_its_derived_owner():
   assert captured.get("uploaded_by") == "reader", "the derived account was not recorded"
   # Never caller-supplied (contract 5).
   assert "actor" not in captured
+
+
+# --- Over the wire. The plan required these first; shipping without them let a rejected EVE
+# --- upload become indistinguishable from a successful zero-match correlation in the operator UI.
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_a_rejected_payload_is_distinguishable_from_a_zero_match_over_the_wire(
+    read_native, response_format):
+  """The blocking finding, pinned at the boundary the UI actually reads.
+
+  DetectionCorrelationUpload.tsx checks only res.ok, so if a rejection and a clean correlation
+  both arrive as HTTP 200 with no distinguishing field, the operator is told a truncated EVE log
+  produced zero matches -- in a tool whose own text says a zero match is not proof of
+  non-detection.
+  """
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=False) as fixture:
+    module.eng = scheduler_comms(fixture, response_format)
+    rejected, calls = assert_json_response(asyncio.run(request(module, "correlate_suricata_eve",
+      {"job_id": "job-1", "eve_jsonl": "{not-json}", "request_actor": fixture.actor})), 200)
+    body = rejected["result"] if response_format == "WRAPPED" else rejected
+    assert calls == 1
+    assert body.get("configuration_error") == "invalid_jsonl_line_1"
+    assert body.get("status") == "error"
+    assert "correlation" not in body, "a rejection carried a correlation payload"
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_a_successful_correlation_carries_its_payload_over_the_wire(read_native, response_format):
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=False) as fixture:
+    module.eng = scheduler_comms(fixture, response_format)
+    ok, calls = assert_json_response(asyncio.run(request(module, "correlate_suricata_eve",
+      {"job_id": "job-1", "eve_jsonl": '{"timestamp":"2026-01-01T00:00:00Z"}',
+       "request_actor": fixture.actor})), 200)
+    body = ok["result"] if response_format == "WRAPPED" else ok
+    assert calls == 1
+    assert body.get("status") == "ok"
+    assert "correlation" in body, "the payload the operator reads was dropped by the projection"
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_ingest_denials_survive_both_response_formats(read_native, response_format):
+  module, _ = read_native
+  install(module)
+  for endpoint, body in (("correlate_suricata_eve", {"job_id": "job-1", "eve_jsonl": "{}"}),
+                         ("upload_authorization", {"filename": "a.pdf", "content_b64": PDF_B64})):
+    with read_endpoint_fixture(bound=False) as fixture:
+      fixture.store.account("reader", role="user")
+      module.eng = scheduler_comms(fixture, response_format)
+      result, calls = assert_json_response(asyncio.run(request(module, endpoint,
+        {**body, "request_actor": fixture.actor})), 403)
+      assert calls == 1
+      assert result == {"success": False, "error": "forbidden", "status_code": 403}
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_an_upload_failure_publishes_a_typed_code_not_r1fs_prose(read_native, response_format):
+  """WRAPPED previously returned the R1FS exception text verbatim at HTTP 200 while RAW
+  collapsed it to 503 -- a format divergence as well as a contract-7 leak."""
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=False) as fixture:
+    module.eng = scheduler_comms(fixture, response_format)
+    result, _calls = assert_json_response(asyncio.run(request(module, "upload_authorization",
+      {"filename": "a.txt", "content_b64": "bm90LWEtcGRm", "request_actor": fixture.actor})), 200)
+    body = result["result"] if response_format == "WRAPPED" else result
+    assert body.get("configuration_error") == "bad_mime"
+    assert "message" not in body, "exception prose reached the caller"
+    assert "error" not in body
+
+
+def test_a_bound_job_is_refused_after_admission():
+  """Snapshot exclusion: LegacyReadAccess skips records carrying execution_binding."""
+  with read_endpoint_fixture(bound=True) as fixture:
+    result = fixture.Plugin.correlate_suricata_eve(
+      fixture.owner, "job-1", eve_jsonl="{}", request_actor=fixture.actor)
+  assert result["success"] is False and result["status_code"] in (403, 404)
+
+
+def test_the_parse_allowlist_guards_the_node_global_status_record():
+  """The allowlist's real sink is the shared status record, not the response -- the projection
+  drops an unrecognised code from the response anyway, which made the earlier test inert."""
+  captured = []
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(suricata_correlation, "_parse_eve_jsonl",
+                      side_effect=ValueError("boom " + SECRET)), \
+         patch.object(suricata_correlation, "record_integration_status",
+                      side_effect=lambda *a, **k: captured.append(k.get("error_class"))):
+      fixture.Plugin.correlate_suricata_eve(fixture.owner, "job-1", eve_jsonl="{}",
+                                            request_actor=fixture.actor)
+  assert captured == ["eve_payload_rejected"], captured
+  assert all(SECRET not in str(entry) for entry in captured)

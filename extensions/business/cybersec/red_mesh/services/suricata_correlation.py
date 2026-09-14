@@ -361,11 +361,13 @@ def correlate_suricata_eve(owner, job_id, *, eve_jsonl="", pass_nr=None, source_
   }
   job_specs["detection_correlation"] = summary
   if ledger is not None:
-    # The job document is mutated on every success path, artifact or not.
     ledger.checkpoint()
-    ledger.record(EffectState.PERSISTED)
   written = _write_job_record(owner, job_id, job_specs)
-  if written is None and ledger is not None:
+  if ledger is not None and written is not None:
+    # Record only once the write actually happened. Recording before the attempt made a refused
+    # write report effect_state "persisted" when nothing had landed.
+    ledger.record(EffectState.PERSISTED)
+  if written is None:
     # _write_job_record returns None without writing when the binding guard trips. Reporting "ok"
     # with a summary that was never stored told the caller the opposite of what happened.
     return {"status": "error", "error": "job_record_not_written", "job_id": job_id}
