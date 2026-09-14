@@ -26,6 +26,7 @@ from ..models import (
   VALID_RULEBOOK_REVIEW_STATES,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.effects import EffectState
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode, TenantJobArtifacts
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.ports import TenantStoreError
@@ -1481,10 +1482,17 @@ def _put_review_with_audit(
   state,
   changed_question_ids,
   event_type,
+  ledger=None,
 ):
   previous_answers = (previous.to_dict().get("answers") if previous else {}) or {}
   current_answers = (state.to_dict().get("answers") if state else {}) or {}
+  if ledger is not None:
+    # Revalidate immediately before the review state changes, then record it: this put and the
+    # audit append below are not atomic, so a failure between them must never report "no trace".
+    ledger.checkpoint()
   review_payload = repo.put_rulebook_review(state)
+  if ledger is not None:
+    ledger.record(EffectState.PERSISTED)
   audit_payload = repo.append_rulebook_review_audit(RulebookReviewAuditEntry(
     job_id=job_id,
     profile_id=profile["profile_id"],
@@ -1533,7 +1541,7 @@ def save_rulebook_review_draft(
   try:
     validated_answers = _validate_review_answers(profile, answers)
   except ValueError as exc:
-    return _error("invalid_review_answer", job_id, profile_id=profile["profile_id"], message=str(exc))
+    return _error("invalid_review_answer", job_id, profile_id=profile["profile_id"])
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
     # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
@@ -1609,6 +1617,7 @@ def save_rulebook_review_draft(
         state=state,
         changed_question_ids=changed,
         event_type="rulebook_review_draft_saved",
+        ledger=ledger,
       )
     except Exception:
       return _submission_error(
@@ -2048,6 +2057,7 @@ def submit_rulebook_review(
           state=submitted_state,
           changed_question_ids=[],
           event_type="rulebook_review_submitted",
+          ledger=ledger,
         )
       committed_registry = RulebookSubmissionRegistry(
         contract_version=RULEBOOK_SUBMISSION_CONTRACT_VERSION,
@@ -2208,6 +2218,7 @@ def reopen_rulebook_review(
         state=reopened,
         changed_question_ids=[],
         event_type="rulebook_review_reopened",
+        ledger=ledger,
       )
     except Exception:
       return _submission_error(
@@ -2231,6 +2242,7 @@ def _update_rulebook_review_locked(
   reviewer,
   note,
   review_state,
+  ledger=None,
 ):
   repo = _job_repo(owner)
   previous = repo.get_rulebook_review_model(job_id, profile["profile_id"])
@@ -2285,7 +2297,14 @@ def _update_rulebook_review_locked(
     updated_at=now,
     review_revision=(previous.review_revision if previous else 0) + 1,
   )
+  if ledger is not None:
+    # Twin of _put_review_with_audit's seam. The plan named this as the single most likely place
+    # for the control to land in one helper and be missed in the other -- and the first attempt
+    # missed it at both.
+    ledger.checkpoint()
   review_payload = repo.put_rulebook_review(state)
+  if ledger is not None:
+    ledger.record(EffectState.PERSISTED)
   audit_payload = repo.append_rulebook_review_audit(RulebookReviewAuditEntry(
     job_id=job_id,
     profile_id=profile["profile_id"],
@@ -2335,7 +2354,7 @@ def update_rulebook_review(
   try:
     validated_answers = _validate_review_answers(profile, answers)
   except ValueError as exc:
-    return _error("invalid_review_answer", job_id, profile_id=profile_id, message=str(exc))
+    return _error("invalid_review_answer", job_id, profile_id=profile_id)
   with _submission_lock(owner, job_id, profile["profile_id"]):
     # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
     # point to a review-state write and an append-only audit row.
@@ -2365,4 +2384,5 @@ def update_rulebook_review(
       reviewer,
       note,
       review_state,
+      ledger=ledger,
     )

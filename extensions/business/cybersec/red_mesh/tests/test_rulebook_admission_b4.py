@@ -66,22 +66,58 @@ def test_denials_never_reach_the_review_store_or_allocate_a_lock(name, fault, st
     assert dict(rulebook_assessment._SUBMISSION_LOCKS) == locks_before
 
 
-@pytest.mark.parametrize("name", MUTATIONS)
-def test_the_signer_is_derived_never_supplied(name):
-  """Contract 5, and the point of this slice: the stored reviewer must be the admitted account,
-  not a caller-invented label."""
-  captured = {}
-
-  def capture(owner, job_id, profile_id=None, state=None, **kwargs):
-    captured["reviewer"] = (state or {}).get("reviewer")
-    return {"status": "ok"}
-
+def test_the_stored_signer_is_the_admitted_account():
+  """The end-to-end case: update_rulebook_review reaches the write under this fixture, so the
+  stored reviewer can be read straight off the response."""
   with read_endpoint_fixture(bound=False) as fixture:
-    with patch.object(rulebook_assessment, "_put_review_with_audit", capture):
+    result = fixture.Plugin.update_rulebook_review(
+      fixture.owner, **body_for("update_rulebook_review"), request_actor=fixture.actor)
+  assert result.get("status") == "ok"
+  assert result["review"]["reviewer"] == "reader", (
+    "the stored signer was not the admitted account: %r" % (result["review"]["reviewer"],))
+
+
+@pytest.mark.parametrize("name", MUTATIONS)
+def test_the_derived_signer_is_what_reaches_the_service(name):
+  """The other three hit a precondition before the write under this fixture, so the assertion is
+  made where the derivation happens: the endpoint-to-service boundary.
+
+  The first version of this test was vacuous three ways -- a stub whose signature could not bind, a
+  path that never reached the helper, and an assertion behind `if captured:` -- so substituting the
+  literal "attacker" for the derived signer left all 42 tests green.
+  """
+  import sys
+  seen = {}
+  plugin_module = None
+  with read_endpoint_fixture(bound=False) as fixture:
+    plugin_module = sys.modules[fixture.Plugin.__module__]
+    real = getattr(plugin_module, name)
+
+    def capture(owner, job_id, **kwargs):
+      seen["signer"] = kwargs.get("actor", kwargs.get("reviewer"))
+      return real(owner, job_id, **kwargs)
+
+    with patch.object(plugin_module, name, capture):
       getattr(fixture.Plugin, name)(fixture.owner, **body_for(name),
                                     request_actor=fixture.actor)
-  if captured:
-    assert captured["reviewer"] != "attacker", "a caller-supplied signer survived"
+  assert seen.get("signer") == "reader", (
+    "%s passed %r to the service instead of the admitted account" % (name, seen.get("signer")))
+
+
+def test_a_validation_failure_publishes_a_typed_code_without_echoing_the_body():
+  # Asserted on update_rulebook_review: save_draft hits a submission precondition before answer
+  # validation under this fixture, so the interpolating path is not reachable there. Both call the
+  # same _validate_review_answers and both had the same str(exc) leak, now removed from both.
+  name = "update_rulebook_review"
+  """Contract 7: _validate_review_answers interpolates question_id and answer_value from the
+  request body, and both endpoints passed str(exc) straight into the response message."""
+  probe = "pwn<img src=x>"
+  with read_endpoint_fixture(bound=False) as fixture:
+    result = getattr(fixture.Plugin, name)(
+      fixture.owner, job_id="job-1", profile_id="nis2.eu_baseline.v1",
+      answers={probe: "yes"}, request_actor=fixture.actor)
+  assert probe not in repr(result), "the request body was echoed back in the response"
+  assert result.get("error_code") in ("invalid_review_answer", "invalid_profile")
 
 
 @pytest.mark.parametrize("name", MUTATIONS)
