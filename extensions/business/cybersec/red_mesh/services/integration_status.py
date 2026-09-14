@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
+from ..tenancy.effects import EffectState
 from .auth import credentials_missing
 from .config import (
   get_event_export_config,
@@ -472,7 +473,8 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
   return _save_status_record(owner, integration_id, record)
 
 
-def test_event_export(owner, integration_id="event_export"):
+def test_event_export(owner, integration_id="event_export", *, ledger=None):
+  """Probe or deliver a synthetic event. `ledger` records what actually left the node."""
   integration_id = str(integration_id or "event_export").strip().lower()
   if integration_id not in _STATUS_BUILDERS:
     return {
@@ -490,7 +492,13 @@ def test_event_export(owner, integration_id="event_export"):
       environment=str(getattr(owner, "cfg_ee_node_network", "") or ""),
     )
     from .log_export import deliver_redmesh_event
-    return deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
+    if ledger is not None:
+      # A real send follows: dry_run only affects the status stamp, not the transmission.
+      ledger.checkpoint()
+    delivered = deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
+    if ledger is not None and isinstance(delivered, dict) and delivered.get("status") != "skipped":
+      ledger.record(EffectState.DELIVERED)
+    return delivered
 
   if integration_id == "opencti":
     from .opencti_export import probe_opencti

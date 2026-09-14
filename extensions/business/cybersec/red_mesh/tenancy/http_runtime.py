@@ -121,6 +121,8 @@ _EFFECT_FIELDS = {
                                       ("request_actor", dict, None)),
   "test_event_export": (("integration_id", str, "event_export"), ("request_actor", dict, None)),
 }
+_PUBLIC_EFFECT_STATES = ("persisted", "delivered")
+
 _READ_PATHS = {"/" + name: fields
                for name, fields in {**_READ_FIELDS, **_EFFECT_FIELDS}.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
@@ -191,11 +193,20 @@ def _read_path(path):
   return isinstance(path, str) and path.rstrip("/") in _READ_PATHS
 
 
-def _read_error_response(status, *, code=None):
+def _read_error_response(status, *, code=None, effect_state=None):
   from starlette.responses import JSONResponse
   errors = {400: "invalid_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
             405: "method_not_allowed", 503: "unavailable"}
   known_rulebook_error = (type(status) is int and (status, code) in _RULEBOOK_READ_ERRORS["/get_rulebook_review"])
+  # RM-026 I1b: a partially completed effect must survive the guard. Collapsing it to 503
+  # "unavailable" would tell the caller nothing happened after a bundle was written or a SOC
+  # event delivered, and invite a retry that duplicates it.
+  known_effect_error = (status == 500 and code == "effect_incomplete"
+                        and effect_state in _PUBLIC_EFFECT_STATES)
+  if known_effect_error:
+    return JSONResponse({"success": False, "error": code, "effect_state": effect_state,
+                         "status_code": 500},
+                        status_code=500, headers={"Cache-Control": "no-store"})
   status = status if type(status) is int and (status in errors or known_rulebook_error) else 503
   error = code if known_rulebook_error else errors[status]
   headers = {"Cache-Control": "no-store"}
@@ -389,6 +400,13 @@ def install_generated_read_api(app, model_namespace) -> None:
                  and not any(key in detail for key in ("success", "error", "status_code", "result")))
           if typed or raw:
             return _read_error_response(400, code="unsupported_job_type")
+        if error.status_code == 500 and isinstance(detail, dict):
+          typed = (detail.get("success") is False and detail.get("error") == "effect_incomplete"
+                   and detail.get("status_code") == 500
+                   and detail.get("effect_state") in _PUBLIC_EFFECT_STATES)
+          if typed:
+            return _read_error_response(500, code="effect_incomplete",
+                                        effect_state=detail["effect_state"])
         return _read_error_response(error.status_code)
       return await original_http(request, error)
 

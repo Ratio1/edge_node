@@ -113,7 +113,8 @@ def _prepare_taxii_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   if config_error == "disabled":
     return None, None, {"status": "disabled", "error": "TAXII export is disabled", "job_id": job_id}
   if config_error:
-    # Post-admission operator visibility, not a probe amplifier: admission runs above this.
+    # Operator visibility when reached through _effect_operation. publish_to_taxii still calls this
+    # with no requester until B2, so do not read this as universally post-admission.
     record_integration_status(owner, "taxii", outcome="failure", error_class=config_error)
     return None, None, {"status": "not_configured", "error": config_error, "job_id": job_id}
 
@@ -162,6 +163,11 @@ def dry_run_taxii_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET, led
     **_bundle_summary(result, artifact_cid=artifact_cid),
   }
   job_specs["taxii_export"] = summary
+  if ledger is not None:
+    # The job document is about to be mutated whether or not the bundle persisted, so
+    # revalidate here and record it: a later fault must not report "nothing happened".
+    ledger.checkpoint()
+    ledger.record(EffectState.PERSISTED)
   _write_job_record(owner, job_id, job_specs, context="taxii_dry_run")
   record_integration_status(
     owner,

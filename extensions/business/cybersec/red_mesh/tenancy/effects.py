@@ -81,8 +81,8 @@ def classify_effect_failure(state: EffectState) -> dict:
 
 # Public projection for effect results (RM-026 I1b).
 #
-# The plugin framework treats any returned dict carrying an `error` key as a plugin error and maps
-# it to HTTP 503, so a perfectly ordinary "this integration is disabled" outcome would reach the
+# The plugin framework treats any returned dict carrying an `error` key as a plugin error and raises
+# HTTP 500; the read guard then collapses that to 503, so a perfectly ordinary "this integration is disabled" outcome would reach the
 # caller as a server failure. `export_misp_json` already avoids this by returning a bare
 # {"status": "disabled"}. These effects do the same, and carry configuration codes under
 # `configuration_error` -- the same field name the integration readiness view uses -- so a typed
@@ -102,11 +102,21 @@ _PUBLIC_EFFECT_FIELDS = frozenset({
   "status", "dry_run", "job_id", "pass_nr", "integration_id", "bundle_id", "artifact_cid",
   "object_count", "finding_count", "observed_data_count", "destination_label", "schema_version",
   "generated_at", "persisted", "configuration_error",
+  # export_stix_bundle is the manual-download endpoint: the bundle itself is the payload the UI
+  # downloads, and dropping it silently broke the Download button.
+  "stix_bundle", "last_exported_at",
 })
 
+# Every configuration code the effect services can actually produce. This is deliberately a
+# superset of the readiness view's set: these services emit codes that view never sees
+# (`missing_url`, `missing_server_url`, `missing_collection_id`, `unsupported_mode`). A drift test
+# enumerates the producers and fails if one appears here that is not published, or vice versa.
 _PUBLIC_CONFIGURATION_ERRORS = frozenset({
+  # shared with the readiness projection
   "missing_hmac_secret", "missing_syslog_host", "missing_http_url",
   "missing_token", "missing_credentials", "invalid_auth_config",
+  # emitted by opencti_export._config_error / taxii_export._config_error
+  "missing_url", "missing_server_url", "missing_collection_id", "unsupported_mode",
 })
 
 

@@ -143,7 +143,8 @@ def test_a_delivered_soc_event_is_never_reported_as_nothing_happened():
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
                                     "observed_data_count": 0}), \
-         patch.object(stix_export, "emit_export_status_event", return_value=None), \
+         patch.object(stix_export, "emit_export_status_event",
+                      return_value={"status": "sent", "integration_id": "wazuh"}), \
          patch.object(stix_export, "_write_job_record", side_effect=RuntimeError(SECRET)):
       result = fixture.Plugin.export_stix_bundle(fixture.owner, "job-1", persist=False,
                                                  request_actor=fixture.actor)
@@ -203,3 +204,100 @@ def test_a_tenant_scoped_effect_is_refused_rather_than_handed_a_raw_snapshot():
                                               lambda job, mode, ledger: {"status": "ok"},
                                               job_id="job-1")
     assert result == {"success": False, "error": "forbidden", "status_code": 403}
+
+
+def test_a_skipped_emission_is_not_claimed_as_a_delivery():
+  """emit_export_status_event returns {"status": "skipped"} when SOC export is disabled --
+  the common configuration. Recording DELIVERED there would claim a packet that never left."""
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(stix_export, "build_stix_bundle",
+                      return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
+                                    "object_count": 0, "finding_count": 0,
+                                    "observed_data_count": 0}), \
+         patch.object(stix_export, "emit_export_status_event",
+                      return_value={"status": "skipped", "integration_id": None,
+                                    "error": "missing_hmac_secret"}), \
+         patch.object(stix_export, "_write_job_record", side_effect=RuntimeError(SECRET)):
+      result = fixture.Plugin.export_stix_bundle(fixture.owner, "job-1", persist=False,
+                                                 request_actor=fixture.actor)
+    assert result["effect_state"] == EffectState.PERSISTED.value
+    assert result["effect_state"] != EffectState.DELIVERED.value
+
+
+@pytest.mark.parametrize("name,module", (
+  ("dry_run_opencti_export", "opencti"), ("dry_run_taxii_export", "taxii")))
+def test_a_dry_run_that_mutates_the_job_record_never_reports_nothing_happened(name, module):
+  """The round-1 fix landed only in export_stix_bundle: both dry runs wrote the job record with
+  the ledger still NONE whenever _persist_bundle returned falsy."""
+  service = opencti_export if module == "opencti" else taxii_export
+  with read_endpoint_fixture(bound=False) as fixture:
+    with patch.object(service, "_config_error", return_value=None), \
+         patch.object(service, "build_stix_bundle",
+                      return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
+                                    "object_count": 0, "finding_count": 0,
+                                    "observed_data_count": 0}), \
+         patch.object(service, "_persist_bundle", return_value=None), \
+         patch.object(service, "_write_job_record", side_effect=RuntimeError(SECRET)):
+      result = getattr(fixture.Plugin, name)(fixture.owner, "job-1", request_actor=fixture.actor)
+    assert result["error"] == "effect_incomplete"
+    assert result["effect_state"] == EffectState.PERSISTED.value
+
+
+def test_revalidation_between_admission_and_the_effect_denies_the_effect():
+  """Contract 4, discriminating: the account is deactivated AFTER admission and BEFORE the
+  irreversible step. Without checkpoint() the export would proceed."""
+  with read_endpoint_fixture(bound=False) as fixture:
+    landed = []
+
+    def build_then_revoke(owner, job_id, pass_nr=None, checked_job=None):
+      # Runs after admission, before the persist checkpoint.
+      fixture.store.account("reader", active=False)
+      return {"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
+              "object_count": 0, "finding_count": 0, "observed_data_count": 0}
+
+    with patch.object(opencti_export, "_config_error", return_value=None), \
+         patch.object(opencti_export, "build_stix_bundle", build_then_revoke), \
+         patch.object(opencti_export, "_persist_bundle",
+                      side_effect=lambda *a, **k: landed.append("persisted") or "cid"):
+      result = fixture.Plugin.dry_run_opencti_export(fixture.owner, "job-1",
+                                                     request_actor=fixture.actor)
+    assert landed == [], "the effect ran after the requester was revoked"
+    assert result["success"] is False and result["status_code"] in (404, 500)
+
+
+def test_every_configuration_code_these_services_emit_is_publishable():
+  """Drift guard: the whitelist is a hand-maintained copy, so pin it against the producers.
+
+  Round 2 found it held none of the codes opencti/taxii actually emit, so every real
+  misconfiguration was published as an untyped error with configuration_error null.
+  """
+  import re
+  from extensions.business.cybersec.red_mesh.tenancy.effects import _PUBLIC_CONFIGURATION_ERRORS
+  emitted = set()
+  for module in (opencti_export, taxii_export):
+    source = open(module.__file__).read()
+    body = source[source.index("def _config_error("):]
+    body = body[:body.index("\ndef ", 1)]
+    emitted.update(re.findall(r'return "([a-z_]+)"', body))
+  # "disabled" is not a configuration error: it short-circuits to a bare {"status": "disabled"}.
+  emitted.discard("disabled")
+  missing = emitted - _PUBLIC_CONFIGURATION_ERRORS
+  assert not missing, f"config codes these services emit but cannot publish: {sorted(missing)}"
+
+
+def test_a_typed_incomplete_effect_survives_the_transport_guard():
+  """The guard collapses any status outside its map to 503 'unavailable'. A partially landed
+  effect must be the exception, or the whole mechanism is inert over real HTTP."""
+  from extensions.business.cybersec.red_mesh.tenancy import http_runtime
+  import json
+  plain = json.loads(http_runtime._read_error_response(500).body)
+  assert plain == {"success": False, "error": "unavailable", "status_code": 503}
+  for state in ("persisted", "delivered"):
+    typed = json.loads(http_runtime._read_error_response(
+      500, code="effect_incomplete", effect_state=state).body)
+    assert typed == {"success": False, "error": "effect_incomplete",
+                     "effect_state": state, "status_code": 500}
+  # An unrecognised state must not open a hole.
+  spoofed = json.loads(http_runtime._read_error_response(
+    500, code="effect_incomplete", effect_state="anything").body)
+  assert spoofed["status_code"] == 503

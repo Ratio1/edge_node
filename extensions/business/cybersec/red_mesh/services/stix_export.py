@@ -539,7 +539,7 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job
     # The job document is mutated and a SOC event is emitted below whether or not the bundle was
     # persisted, so `persist=False` must not leave the ledger at NONE.
     ledger.record(EffectState.PERSISTED)
-  emit_export_status_event(
+  emission = emit_export_status_event(
     owner,
     job_specs,
     adapter_type="stix",
@@ -548,9 +548,10 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job
     destination_label="stix-2.1",
     artifact_refs={"stix_bundle_id": result["bundle_id"], "stix_bundle_cid": artifact_cid},
   )
-  if ledger is not None:
-    # The SOC event has left the node. Anything that fails after this point must not be reported
-    # as "nothing happened", because a retry would duplicate the delivery.
+  if ledger is not None and isinstance(emission, dict) and emission.get("status") != "skipped":
+    # Only when something actually left the node. emit_export_status_event never raises and returns
+    # {"status": "skipped"} when SOC export is disabled -- the common configuration -- so recording
+    # DELIVERED unconditionally would claim a delivery that never happened.
     ledger.record(EffectState.DELIVERED)
   _write_job_record(owner, job_id, job_specs, context="stix_export")
   record_integration_status(

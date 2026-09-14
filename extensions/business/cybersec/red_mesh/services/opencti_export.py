@@ -112,8 +112,10 @@ def _prepare_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   if config_error == "disabled":
     return None, None, {"status": "disabled", "error": "OpenCTI export is disabled", "job_id": job_id}
   if config_error:
-    # Post-admission: the caller was authorized and the deployment is misconfigured, so recording
-    # the failure is operator visibility rather than a probe amplifier. Admission runs above this.
+    # When reached through _effect_operation the caller is already authorized, so recording the
+    # failure is operator visibility. NOT yet true of push_to_opencti/publish_to_taxii, which still
+    # call this with no requester -- that is B2's scope, and until then this write is reachable
+    # without admission.
     record_integration_status(owner, "opencti", outcome="failure", error_class=config_error)
     return None, None, {"status": "not_configured", "error": config_error, "job_id": job_id}
 
@@ -163,6 +165,11 @@ def dry_run_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET, l
     **_bundle_summary(result, artifact_cid=artifact_cid),
   }
   job_specs["opencti_export"] = summary
+  if ledger is not None:
+    # The job document is about to be mutated whether or not the bundle persisted, so
+    # revalidate here and record it: a later fault must not report "nothing happened".
+    ledger.checkpoint()
+    ledger.record(EffectState.PERSISTED)
   _write_job_record(owner, job_id, job_specs, context="opencti_dry_run")
   record_integration_status(
     owner,
