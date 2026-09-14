@@ -173,7 +173,7 @@ _READ_PATHS = {"/" + name: fields
 # read -- `Cache-Control: no-store` -- and `get_raw_model_test_evidence` needs it most of all: it
 # returns the decrypted restricted artifact, the raw prompts and model responses of a model test.
 # Header-only: no field validation, no error rebuild, no status rewriting.
-_NO_STORE_PATHS = ("/analyze_job", "/get_raw_model_test_evidence")
+_NO_STORE_PATHS = ("/analyze_job", "/get_raw_model_test_evidence", "/delete_job_engagement")
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
 _RULEBOOK_READ_ERRORS = {
   "/get_rulebook_assessment_status": {(400, "invalid_profile"), (400, "unsupported_job_type")},
