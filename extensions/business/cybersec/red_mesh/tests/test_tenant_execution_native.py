@@ -46,6 +46,9 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
 #   analyze_job (B6): analysis_busy 409, analysis_state_changed 409 retryable,
 #     analysis_request_unavailable 410, analysis_input_too_large 413, analysis_input_invalid 422,
 #     analysis_timeout 504.
+#   delete_job_engagement (B8): job_launcher_mismatch, unsupported_finalized_job, config_not_found,
+#     state_persist_failed, audit_persist_failed -- each carrying the per-stage counts of a partial
+#     GDPR redaction, which a rebuilt body would discard.
 #   get_raw_model_test_evidence (B7): unsupported_job_type, raw_evidence_unavailable,
 #     raw_evidence_read_failed, raw_evidence_invalid -- which in RAW the template answers as 500 with
 #     the code in `detail` (basic_server.j2 `_handle_plugin_result`) and the guard would rewrite to
@@ -55,7 +58,7 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
 # 403/404 in both cases. They still get `Cache-Control: no-store` via `_NO_STORE_PATHS`, which the
 # guard would otherwise be the only thing to set. Rendered here so the wire tests exercise the real
 # production route.
-UNGUARDED_ROUTES = ("analyze_job", "get_raw_model_test_evidence")
+UNGUARDED_ROUTES = ("analyze_job", "get_raw_model_test_evidence", "delete_job_engagement")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
@@ -109,6 +112,7 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == {
         "analyze_job": ("self", "job_id", "analysis_type", "focus_areas", "request_actor"),
         "get_raw_model_test_evidence": ("self", "job_id", "request_actor"),
+        "delete_job_engagement": ("self", "job_id", "delete_documents", "request_actor"),
       }[method.name]
     elif method.name in EFFECT_ROUTES:
       # Effect endpoints keep their original positional parameters and append request_actor last,

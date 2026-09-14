@@ -21,6 +21,7 @@ from extensions.business.cybersec.red_mesh.services.engagement_deletion import (
   delete_engagement_data,
 )
 
+from extensions.business.cybersec.red_mesh.tenancy.effects import EffectLedger
 from .conftest import mock_plugin_modules
 
 
@@ -366,6 +367,10 @@ class _EndpointOwner:
     self.messages.append(message)
 
 
+# RM-026 I1b B8 put admission in front of the endpoint. These exercise the redaction mechanics
+# downstream of it, so they call the redaction directly with the snapshot admission would have
+# supplied. Admission itself, and the fact that the attributed actor can no longer come from the
+# request body, are covered by test_engagement_deletion_admission_b8.py.
 class TestDeleteJobEngagementEndpoint(unittest.TestCase):
 
   def _plugin_class(self):
@@ -379,8 +384,8 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     owner = _EndpointOwner(jobs={"abc123": specs})
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(owner, job_id="abc123", delete_documents=True, requested_by="alice",
-      )
+      result = Plugin._redact_job_engagement(owner, "abc123", True,
+        owner.jobs["abc123"], EffectLedger(), "alice")
 
     self.assertTrue(result["ok"])
     self.assertEqual(result["documents_deleted"], 5)
@@ -401,8 +406,8 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     owner.fail_put = True
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(owner, job_id="abc123", delete_documents=True, requested_by="alice",
-      )
+      result = Plugin._redact_job_engagement(owner, "abc123", True,
+        owner.jobs["abc123"], EffectLedger(), "alice")
 
     self.assertEqual(result["error"], "state_persist_failed")
     self.assertEqual(repo.deleted, [])
@@ -414,8 +419,8 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     owner = _EndpointOwner(jobs={"abc123": specs})
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(owner, job_id="abc123", delete_documents=True, requested_by="alice",
-      )
+      result = Plugin._redact_job_engagement(owner, "abc123", True,
+        owner.jobs["abc123"], EffectLedger(), "alice")
 
     self.assertFalse(result["ok"])
     self.assertEqual(result["documents_deleted"], 4)
@@ -431,7 +436,8 @@ class TestDeleteJobEngagementEndpoint(unittest.TestCase):
     })
 
     with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
-      result = Plugin.delete_job_engagement(owner, job_id="fin123")
+      result = Plugin._redact_job_engagement(owner, "fin123", True,
+        owner.jobs["fin123"], EffectLedger(), "alice")
 
     self.assertEqual(result["error"], "unsupported_finalized_job")
     self.assertEqual(repo.deleted, [])
