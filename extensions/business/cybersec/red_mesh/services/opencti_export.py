@@ -192,7 +192,11 @@ def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=N
     return dry_run_opencti_export(owner, job_id, pass_nr=pass_nr,
                                   checked_job=checked_job, ledger=ledger)
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
+  if ledger is not None and artifact_cid:
+    ledger.record(EffectState.PERSISTED)
   if not artifact_cid:
     record_integration_status(owner, "opencti", outcome="failure", error_class="artifact_write_failed")
     return {"status": "error", "error": "artifact_write_failed", "job_id": job_id}
@@ -213,6 +217,9 @@ def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=N
     "operations": json.dumps(operations),
     "map": json.dumps({"0": ["variables.file"]}),
   }
+  if ledger is not None:
+    # Last revalidation before data leaves the deployment.
+    ledger.checkpoint()
   try:
     headers = build_auth_provider(cfg).headers()
   except AuthError as exc:
@@ -262,6 +269,10 @@ def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=N
 
   upload = ((payload.get("data") or {}).get("uploadImport") or {}) if isinstance(payload, dict) else {}
   opencti_file_id = upload.get("id")
+  if ledger is not None and opencti_file_id:
+    # Evidence of acceptance: 2xx, no GraphQL errors array, and an id for the stored file.
+    # GraphQL returns 200 with an errors array, so status alone is not evidence.
+    ledger.record(EffectState.DELIVERED)
   upload_status = upload.get("uploadStatus")
   pushed_at = _utc_timestamp()
   export_meta = {

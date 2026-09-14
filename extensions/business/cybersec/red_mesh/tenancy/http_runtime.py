@@ -122,6 +122,9 @@ _EFFECT_FIELDS = {
   "export_stix_bundle": _JOB_FIELD + (("pass_nr", int, None), ("persist", bool, True),
                                       ("request_actor", dict, None)),
   "test_event_export": (("integration_id", str, "event_export"), ("request_actor", dict, None)),
+  # B2 external delivery.
+  "push_to_opencti": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
+  "publish_to_taxii": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.

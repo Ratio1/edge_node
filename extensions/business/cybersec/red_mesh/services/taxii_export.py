@@ -187,11 +187,18 @@ def publish_to_taxii(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=
   if result.get("status") != "ok":
     return result
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
+  if ledger is not None and artifact_cid:
+    ledger.record(EffectState.PERSISTED)
   if not artifact_cid:
     record_integration_status(owner, "taxii", outcome="failure", error_class="artifact_write_failed")
     return {"status": "error", "error": "artifact_write_failed", "job_id": job_id}
 
+  if ledger is not None:
+    # Last revalidation before data leaves the deployment.
+    ledger.checkpoint()
   try:
     auth_headers = build_auth_provider(cfg).headers()
   except AuthError as exc:
@@ -236,6 +243,10 @@ def publish_to_taxii(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=
   except ValueError:
     payload = {}
   status_id = payload.get("id") if isinstance(payload, dict) else None
+  if ledger is not None:
+    # 200/201/202 all mean the objects left the node. 202 is pending acceptance, not a failure to
+    # deliver, so it counts: a retry would duplicate them either way.
+    ledger.record(EffectState.DELIVERED)
   published_at = _utc_timestamp()
   export_meta = {
     "schema_version": TAXII_EXPORT_SCHEMA_VERSION,
