@@ -38,7 +38,7 @@ ENDPOINT_FIRST_ARGS = {
   'get_job_data': 'job_id',
   'get_job_archive': 'job_id',
   'get_job_triage': 'job_id',
-  'update_finding_triage': 'job_id',
+  'update_finding_triage': 'request_actor',
   'get_job_progress': 'job_id',
   'upload_authorization': 'filename',
   'delete_job_engagement': 'job_id',

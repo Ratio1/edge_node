@@ -221,6 +221,16 @@ exists. Diagnostic access requires a future approved permission and safe project
 read grant. This containment leaves24 native endpoints requiring admission; it is not a working
 health feature or permission to activate workspace entry.
 
+Public `update_finding_triage` is also deliberately unavailable. It is actor-only POST returning a
+fresh static `503 unavailable` for every accepted body, without resolving identity or touching jobs,
+archives, triage state, submission locks, audit or SOC delivery. Old GET returns405; old mutation
+fields (job/finding/status/note/actor/review date), selectors and malformed bodies return400. All
+responses are JSON/no-store. This withdraws the old mutation input contract, not just its UI button.
+Checked `get_job_triage` reads and internal service persistence/submission fences remain unchanged.
+Hub task RM-076 owns the future tenant-workspace UI and its prior role, audit-return and SOC-effect
+decisions; no legacy-role exception or UI activation is authorized here. With two explicitly contained
+surfaces and18 checked reads,23 native endpoints still require admission work.
+
 This is **local wiring, not completed application isolation**. Navigator ordinary-read pairing
 I1a.3b.2 is committed; these five status reads require matching Navigator changes. Unmatched
 versions fail denied/unavailable, never fall back to actorless GET. I1a.3c remains incomplete. Dormant

@@ -4855,8 +4855,8 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertTrue(result["archive"]["archive_query"]["truncated"])
 
   def test_update_finding_triage_persists_mutable_state(self):
-    """Analyst triage updates stay outside archive storage and append audit history."""
-    Plugin = self._get_plugin_class()
+    """Internal triage service updates stay outside archives and append audit history."""
+    from extensions.business.cybersec.red_mesh.services.triage import update_finding_triage
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
     plugin.r1fs.get_json.return_value = {
@@ -4899,7 +4899,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.chainstore_hgetall.side_effect = _chainstore_hgetall
     plugin.chainstore_hset.side_effect = _chainstore_hset
 
-    result = Plugin.update_finding_triage(plugin,
+    result = update_finding_triage(plugin,
       job_id="fin-job",
       finding_id="f-1",
       status="accepted_risk",

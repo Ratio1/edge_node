@@ -419,7 +419,7 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
       payload["tenant_id"] = fixture.tenant_id
     else:
       payload.pop("tenant_id", None)
-    if name == "llm_health":
+    if name in ("llm_health", "update_finding_triage"):
       result, calls = assert_json_response(asyncio.run(request(module, name, payload)), 503)
       assert result == {"success": False, "error": "unavailable", "status_code": 503}
       assert calls == 1 and fixture.artifact_reads == [] and fixture.store.reads == []

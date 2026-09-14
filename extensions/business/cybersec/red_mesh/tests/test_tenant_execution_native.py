@@ -30,7 +30,7 @@ LEGACY_STATUS_ROUTES = (
   "get_opencti_export_status", "get_taxii_export_status",
 )
 LEGACY_RULEBOOK_ROUTES = ("get_rulebook_assessment_status", "get_rulebook_review")
-ACTOR_ONLY_READ_ROUTES = ("get_misp_export_config_status", "llm_health")
+ACTOR_ONLY_READ_ROUTES = ("get_misp_export_config_status", "llm_health", "update_finding_triage")
 LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",

@@ -103,6 +103,7 @@ _READ_FIELDS = {
   "get_rulebook_review": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
   "get_misp_export_config_status": (("request_actor", dict, None),),
   "llm_health": (("request_actor", dict, None),),
+  "update_finding_triage": (("request_actor", dict, None),),
 }
 _READ_PATHS = {"/" + name: fields for name, fields in _READ_FIELDS.items()}
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
