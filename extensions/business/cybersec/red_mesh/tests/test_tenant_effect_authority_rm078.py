@@ -201,6 +201,70 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
       "job-1")
 
 
+class TestEffectOperationNarrowsRatherThanOpens(unittest.TestCase):
+  """Step 3. `_effect_operation` returned 403 for any non-null tenant_id, with the comment that a
+  tenant-bound snapshot would otherwise reach services raw. Two hazards were bundled there:
+  authority (no tenant role could be granted an effect) and plumbing (the snapshot mode must reach
+  the service that consumes it). Step 1 and 2 settled the first. The second is already threaded --
+  `_admitted_snapshot` returns the mode and every effect lambda forwards it -- so the refusal
+  narrows to the operation, not to the tenant id.
+
+  Deleting the refusal outright would open every effect endpoint to tenant callers at once,
+  including ones whose operations the matrix does not grant. That is what these tests forbid.
+  """
+
+  def setUp(self):
+    from .test_api import TestPhase1ConfigCID
+    TestPhase1ConfigCID._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    self.Plugin = PentesterApi01Plugin
+
+  def _call(self, operation, tenant_id="tn_example"):
+    from types import SimpleNamespace
+    reached = []
+    owner = SimpleNamespace()
+    return self.Plugin._effect_operation(
+      owner, {"account_id": "reader"}, tenant_id,
+      lambda snapshot, mode, ledger: reached.append(mode) or {"ok": True},
+      job_id="job-1", operation=operation), reached
+
+  def test_an_ungranted_operation_is_still_refused_for_a_tenant_caller(self):
+    """reports:export is the default and is NOT one of the three: no owner decision made any
+    export tenant-scoped, so it must stay refused even though the matrix grants it broadly."""
+    for operation in ("reports:export", "reports:view", "tasks:launch", "evidence:read"):
+      with self.subTest(operation=operation):
+        result, reached = self._call(operation)
+        self.assertEqual(result, {"success": False, "error": "forbidden", "status_code": 403})
+        self.assertEqual(reached, [], "the effect ran for an ungranted tenant operation")
+
+  def test_a_granted_operation_is_no_longer_refused_on_the_tenant_id_alone(self):
+    """It proceeds to admission, which is where the account, the tenant and the matrix decide. The
+    point is that the blanket refusal no longer answers before any of that is consulted."""
+    for operation in EFFECT_OPERATIONS:
+      with self.subTest(operation=operation):
+        result, _reached = self._call(operation)
+        # No real store behind this owner, so admission fails -- but with the effect-path failure,
+        # not the blanket 403 that used to short-circuit it.
+        self.assertNotEqual(result, {"success": False, "error": "forbidden", "status_code": 403})
+
+  def test_a_null_tenant_is_unaffected(self):
+    """B1-B10 all pass tenant_id=None and must behave exactly as before."""
+    result, _reached = self._call("reports:export", tenant_id=None)
+    self.assertNotEqual(result, {"success": False, "error": "forbidden", "status_code": 403})
+
+  def test_a_malformed_tenant_id_is_refused_before_anything_else(self):
+    """Narrowing on the operation must not let a malformed selector through on a granted one.
+    `_admitted_snapshot` validates the shape and answers 400 invalid_request, effect-free -- which
+    is the right answer, since a blank or non-string tenant id is a bad request rather than a
+    refused one."""
+    for tenant_id in ("", "   ", 7, [], {}):
+      with self.subTest(tenant_id=tenant_id):
+        result, reached = self._call("jobs:purge", tenant_id=tenant_id)
+        self.assertEqual(result, {"success": False, "error": "invalid_request",
+                                  "status_code": 400}, result)
+        self.assertEqual(reached, [], "the effect ran for a malformed tenant selector")
+
+
 class TestNoEndpointBecameTenantReachable(unittest.TestCase):
   """Requirement 5: the blanket refusal is narrowed, so prove nothing widened past it."""
 
