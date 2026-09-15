@@ -133,6 +133,10 @@ class TenantAdministrationService:
       "domain_id": receipt["domain_id"], "created_by": receipt["actor_id"],
       "created_at": receipt["created_at"], "active": False, "allow_pentester": False,
       "node_failure_policy": "stop",
+      # The tenant's root administrator: the account the tenant was created around. Recorded so a
+      # tenant admin cannot reset the founder's credential and take the tenant over. Tenants created
+      # before this field existed simply do not carry it; absence means "unknown", never "anyone".
+      "root_admin_id": receipt["initial_admin_id"],
     }
 
   def _reserved_tenant(self, receipt):
@@ -149,8 +153,15 @@ class TenantAdministrationService:
 
   def _assert_tenant_binding(self, tenant, receipt):
     expected = self._tenant_payload(receipt)
+    # `root_admin_id` is compared only when the stored record carries it: tenants created before the
+    # field existed must stay bound to their receipt rather than reading as corrupt. A record that
+    # does carry it is held to the receipt exactly, which is what makes a tampered or malformed
+    # founder fail closed -- no separate validation is needed, and an earlier revision's extra check
+    # here was redundant.
+    mutable = ("active", "allow_pentester", "node_failure_policy")
+    optional = () if "root_admin_id" in tenant else ("root_admin_id",)
     if (any(tenant.get(key) != value for key, value in expected.items()
-            if key not in ("active", "allow_pentester", "node_failure_policy"))
+            if key not in mutable and key not in optional)
         or type(tenant.get("active")) is not bool or type(tenant.get("allow_pentester")) is not bool):
       raise TenantStoreError("Tenant receipt binding mismatch")
     if "allow_pentester_changed_by" in tenant or "allow_pentester_changed_at" in tenant:
@@ -286,6 +297,7 @@ class TenantAdministrationService:
             "lifecycle": "active", "memberCount": len({m["accountId"] for m in members}),
             "adminCount": len({m["accountId"] for m in members if m["role"] == "tenant_admin"}),
             "allowPentester": tenant["allow_pentester"], "createdBy": tenant["created_by"],
+            "rootAdminId": tenant.get("root_admin_id"),
             "createdAt": tenant["created_at"], "lastActivityAt": None}
 
   def _detail(self, tenant, account):

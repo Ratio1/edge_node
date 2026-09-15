@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
+from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService, TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_tenant import CstoreTenantReader
@@ -523,3 +523,42 @@ def test_auth_hkey_is_read_from_the_plugin_instance_env_before_the_process_env(m
   assert CstoreAuthAccountReader(owner)._hkey() == "pipeline-hkey"
   owner.cfg_env = None
   assert CstoreAuthAccountReader(owner)._hkey() == "process-hkey"
+
+class TestTenantRootAdministrator(TestTenantAdministration):
+  """RM-026 MVP: the founder is recorded so a tenant admin cannot reset the founder's credential and
+  take the tenant over. Optional by design: tenants created before the field existed do not carry it,
+  and absence must read as "unknown", never as "anyone"."""
+
+  def test_a_created_tenant_records_its_root_administrator(self):
+    activated = self.create()
+    self.assertEqual(activated["rootAdminId"], "initial")
+    detail = self.service.get_tenant(self.actor, activated["tenantId"])["data"]
+    self.assertEqual(detail["rootAdminId"], "initial")
+
+  ENVELOPE = ("schemaVersion", "namespace", "kind", "ids")
+
+  def stored_tenant(self, tenant_id):
+    """The tenant's own fields: `get` returns them wrapped, and putting the wrapper back double-wraps."""
+    stored = self.repo.get("tenant", tenant_id)
+    return {key: value for key, value in stored.items() if key not in self.ENVELOPE}
+
+  def test_a_tenant_without_the_field_reads_as_unknown_rather_than_failing(self):
+    activated = self.create()
+    tenant_id = activated["tenantId"]
+    stored = self.stored_tenant(tenant_id)
+    self.repo.put("tenant", tenant_id, record={k: v for k, v in stored.items() if k != "root_admin_id"})
+    detail = self.service.get_tenant(self.actor, tenant_id)
+    self.assertTrue(detail["success"], detail)
+    self.assertIsNone(detail["data"]["rootAdminId"])
+
+  def test_a_malformed_root_administrator_fails_closed(self):
+    """Pinned on the validator itself. Going through the store would pass for the wrong reason: the
+    receipt binding rejects any changed value, so it would stay green with the validation deleted."""
+    activated = self.create()
+    tenant = self.stored_tenant(activated["tenantId"])
+    for malformed in ("  Mixed Case  ", "", "   ", 7, {}):
+      with self.subTest(root_admin_id=malformed):
+        with self.assertRaises(TenantStoreError):
+          self.service._validate_tenant({**tenant, "root_admin_id": malformed})
+    # The recorded canonical value still validates.
+    self.service._validate_tenant(tenant)
