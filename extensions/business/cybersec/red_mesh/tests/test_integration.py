@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
+from extensions.business.cybersec.red_mesh.tenancy.effects import EffectLedger
 from .read_endpoint_fixtures import install_legacy_read_store
 
 
@@ -1569,6 +1570,25 @@ class TestPhase12LiveProgress(unittest.TestCase):
 
 
 
+# RM-026 I1b B9 put admission in front of the three destructive endpoints, which are now
+# Super-Tenant-Admin-only and tenant-scoped. These exercise the purge mechanics downstream of that
+# on a MagicMock plugin with no account store, so they call the service functions directly with the
+# snapshot admission would have supplied. Admission itself is covered by test_purge_admission_b9.py.
+def _purge_job_service(plugin, job_id, **kwargs):
+  from extensions.business.cybersec.red_mesh.services.control import purge_job
+  return purge_job(plugin, job_id, **kwargs)
+
+
+def _stop_and_delete_service(plugin, job_id, **kwargs):
+  from extensions.business.cybersec.red_mesh.services.control import stop_and_delete_job
+  return stop_and_delete_job(plugin, job_id, **kwargs)
+
+
+def _purge_all_service(plugin, **kwargs):
+  from extensions.business.cybersec.red_mesh.services.control import purge_all_jobs
+  return purge_all_jobs(plugin, **kwargs)
+
+
 class TestPhase14Purge(unittest.TestCase):
   """Phase 14: Job Deletion & Purge."""
 
@@ -1629,7 +1649,7 @@ class TestPhase14Purge(unittest.TestCase):
     # Normalize returns the specs as-is
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # Verify all 5 CIDs were deleted
@@ -1674,7 +1694,7 @@ class TestPhase14Purge(unittest.TestCase):
     }.get(hkey, {})
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # Only archive CID should be deleted (no pass_reports, no config, no workers)
@@ -1711,7 +1731,7 @@ class TestPhase14Purge(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {}
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
@@ -1736,7 +1756,7 @@ class TestPhase14Purge(unittest.TestCase):
 
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["cids_deleted"], 1)
     self.assertEqual(result["cids_failed"], 1)
@@ -1770,7 +1790,7 @@ class TestPhase14Purge(unittest.TestCase):
     }
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # Check that live progress keys for job-1 were deleted
@@ -1799,7 +1819,7 @@ class TestPhase14Purge(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {}
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # CStore tombstone: hset(hkey=instance_id, key=job_id, value=None)
@@ -1832,7 +1852,7 @@ class TestPhase14Purge(unittest.TestCase):
     purge_mock = MagicMock(return_value=purge_result)
 
     with patch.object(control_module, "purge_job", purge_mock):
-      result = Plugin.stop_and_delete_job(plugin, "job-1")
+      result = _stop_and_delete_service(plugin, "job-1")
 
     # Verify job was marked stopped before purge
     hset_calls = [
@@ -1936,7 +1956,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     # FINALIZED/STOPPED jobs route directly to purge_job.
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_total"], 2)
@@ -2006,7 +2026,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_total"], 2)
@@ -2056,7 +2076,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_failed"], 1)
@@ -2099,7 +2119,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.stop_and_delete_job.side_effect = RuntimeError("cannot parse legacy schema")
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_force_purged"], 1)
@@ -2123,7 +2143,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.stop_and_delete_job.return_value = {"status": "error", "message": "not found"}
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_force_purged"], 1)
@@ -2144,7 +2164,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin = self._make_plugin(jobs)
     plugin.r1fs = MagicMock()
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_failed"], 1)
@@ -2167,7 +2187,7 @@ class TestPurgeAllJobs(unittest.TestCase):
       "cids_failed": 1,
     }
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_force_purged"], 0)
@@ -2192,7 +2212,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.delete_file.return_value = True
     plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["cids_deleted"], 1)
@@ -2222,7 +2242,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     }
     plugin.r1fs = MagicMock()
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertIn(orphan_key, plugin._hashes[submission_hkey])
@@ -2245,7 +2265,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.delete_file.return_value = True
     plugin.stop_and_delete_job.side_effect = RuntimeError("legacy parse failure")
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertIn("job-bad", plugin._hashes["test-instance"])
@@ -2325,7 +2345,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
     plugin.stop_and_delete_job.side_effect = RuntimeError("legacy parse failure")
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["cids_failed"], 0)
@@ -2334,11 +2354,20 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.get_json.assert_not_called()
 
   def test_confirm_required(self):
-    """Endpoint refuses to purge without confirm=True."""
+    """Endpoint refuses to purge without confirm=True.
+
+    RM-026 I1b B9 runs admission before the confirmation check, so a denial cannot be used to probe
+    whether confirmation would have been accepted. This plugin has no account store, so admission is
+    stood up as satisfied and the confirmation branch is what stays under test.
+    """
     Plugin = self._get_plugin_class()
     plugin = self._make_plugin({"job-1": {"job_id": "job-1"}})
 
-    result = Plugin.purge_all_redmesh_data(plugin)
+    with patch.object(Plugin, "_effect_operation",
+                      staticmethod(lambda _self, _actor, _tenant, apply_effect, **_kwargs:
+                                   apply_effect({}, "tenant_bound", EffectLedger()))):
+      result = Plugin.purge_all_redmesh_data(plugin, request_actor={"account_id": "reader"},
+                                             tenant_id="tn_example")
     self.assertEqual(result["status"], "error")
     self.assertIn("confirm", result["message"].lower())
     plugin.stop_and_delete_job.assert_not_called()
@@ -2361,7 +2390,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["jobs_total"], 1)
     self.assertEqual(result["jobs_succeeded"], 1)
@@ -2384,7 +2413,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.stop_and_delete_job.side_effect = _success
     plugin.purge_job.side_effect = _success
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_succeeded"], 3)
@@ -2397,7 +2426,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin = self._make_plugin({})
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_total"], 0)

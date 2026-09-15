@@ -66,12 +66,15 @@ def _foreign_launcher_error(owner, job_id, job_specs, action):
   }
 
 
-def stop_and_delete_job(owner, job_id: str):
+def stop_and_delete_job(owner, job_id: str, *, checked_job=None, snapshot_mode=None, ledger=None):
   """
   Stop a running job, mark it stopped, then delegate to purge_job
   for full R1FS + CStore cleanup.
+
+  `checked_job` is the admitted snapshot (RM-026 I1b B9); an internal caller supplies none and
+  keeps the legacy read.
   """
-  raw_job_specs = _job_repo(owner).get_job(job_id)
+  raw_job_specs = checked_job if checked_job is not None else _job_repo(owner).get_job(job_id)
   job_specs = None
   if isinstance(raw_job_specs, dict):
     _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
@@ -127,8 +130,12 @@ def stop_and_delete_job(owner, job_id: str):
   return purge_job(owner, job_id)
 
 
-def purge_job(owner, job_id: str):
-  """Serialize purge with every supported rulebook review mutation for the job."""
+def purge_job(owner, job_id: str, *, checked_job=None, snapshot_mode=None, ledger=None):
+  """Serialize purge with every supported rulebook review mutation for the job.
+
+  `checked_job` is the admitted snapshot (RM-026 I1b B9). `ledger` marks the point past which the
+  deletion is irreversible, so a later failure cannot be reported as "nothing happened".
+  """
   from .rulebook_assessment import _submission_lock, list_rulebook_profiles
 
   with ExitStack() as stack:
@@ -458,7 +465,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   return cids_deleted, cids_failed
 
 
-def purge_all_jobs(owner):
+def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None):
   """
   Purge every RedMesh job on this edge node: stop running jobs, delete all
   R1FS artifacts, tombstone CStore records, and sweep orphan rows in the
@@ -473,7 +480,9 @@ def purge_all_jobs(owner):
   any job whose purge returned ``partial`` keeps its CStore rows intact so
   the operator can retry artifact deletion later.
   """
-  raw_jobs = _job_repo(owner).list_jobs() or {}
+  # The admitted enumeration when one was supplied (RM-026 I1b B9). This is what scopes a
+  # Super-Tenant Admin's "purge everything" to their own tenant rather than the whole node.
+  raw_jobs = (_job_repo(owner).list_jobs() or {}) if checked_jobs is None else checked_jobs
   job_entries = [(jid, payload) for jid, payload in raw_jobs.items() if isinstance(jid, str) and isinstance(payload, dict)]
 
   jobs_total = len(job_entries)
