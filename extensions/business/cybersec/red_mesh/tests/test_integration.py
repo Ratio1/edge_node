@@ -1865,8 +1865,10 @@ class TestPhase14Purge(unittest.TestCase):
     self.assertTrue(saved_specs["workers"]["node-A"]["finished"])
     self.assertTrue(saved_specs["workers"]["node-A"]["canceled"])
 
-    # Verify purge was called
-    purge_mock.assert_called_once_with(plugin, "job-1")
+    # Verify purge was called. The ledger is forwarded so a raise inside the purge cannot report
+    # "nothing happened" after the workers were stopped and the SOC was told (RM-026 I1b B9); the
+    # snapshot is deliberately not forwarded, because the stop above just rewrote the record.
+    purge_mock.assert_called_once_with(plugin, "job-1", ledger=None)
     self.assertEqual(result, purge_result)
 
 

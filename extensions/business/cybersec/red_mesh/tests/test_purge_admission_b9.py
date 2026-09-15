@@ -218,8 +218,6 @@ class TestPurgeScope(PurgeAdmissionCase):
                      "purge_all reached a job outside the admitted tenant: %r" % (seen,))
 
 
-if __name__ == "__main__":
-  unittest.main()
 
 
 class TestPerItemOutcomes(unittest.TestCase):
@@ -308,3 +306,154 @@ class TestPerItemOutcomes(unittest.TestCase):
     self.assertEqual(len(result["outcomes"]), result["jobs_total"])
     purged = [row for row in result["outcomes"] if row["outcome"] == "purged"]
     self.assertEqual(len(purged), result["jobs_succeeded"])
+
+
+class TestSweepsStayInsideTheAdmittedTenant(unittest.TestCase):
+  """The per-job loop was scoped by `checked_jobs`; the sweeps after it were not.
+
+  Every sweep exempted only `failed_job_ids`, which can only contain ids from the *admitted*
+  enumeration. Another tenant's rows are never enumerated, therefore never marked failed, therefore
+  always deleted -- including its job records and its R1FS submission artifacts, reported as
+  `status: "success"` with the victims absent from `outcomes`. Found by review, reproduced against
+  the real function, and pinned here.
+  """
+
+  def setUp(self):
+    from .conftest import mock_plugin_modules
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.services import control
+    self.control = control
+
+  def _run(self, checked_jobs):
+    from unittest.mock import MagicMock
+    self.tombstoned = []
+    hashes = {
+      "test-instance": {"job-a": {"job_id": "job-a"}, "job-b": {"job_id": "job-b"}},
+      "test-instance:live": {"job-b:w1": {"job_id": "job-b"}, "job-a:w1": {"job_id": "job-a"}},
+      "test-instance:triage": {"job-b:f1": {"job_id": "job-b"}},
+      "test-instance:triage:audit": {"job-b:f1": [{"job_id": "job-b"}]},
+    }
+    owner = MagicMock()
+    owner.cfg_instance_id = "test-instance"
+    owner.ee_addr = "node-a"
+    owner.P = lambda *a, **k: None
+    owner._log_audit_event = lambda *a, **k: None
+    owner.chainstore_hgetall.side_effect = lambda *, hkey: hashes.get(hkey, {})
+
+    def _hset(*, hkey, key, value, **_kw):
+      if value is None:
+        self.tombstoned.append((hkey, key))
+
+    owner.chainstore_hset.side_effect = _hset
+    owner._normalize_job_record.side_effect = lambda k, r, **kw: (k, r)
+    admitted = {"job-a": {"job_id": "job-a", "job_status": "FINALIZED", "launcher": "node-a"}}
+    with patch.object(self.control, "purge_job",
+                      Mock(return_value={"status": "success", "cids_deleted": 1})), \
+         patch.object(self.control, "stop_and_delete_job",
+                      Mock(return_value={"status": "success"})):
+      return self.control.purge_all_jobs(
+        owner, checked_jobs=admitted if checked_jobs else None)
+
+  def test_another_tenants_rows_are_never_swept(self):
+    self._run(checked_jobs=True)
+    stray = [row for row in self.tombstoned if "job-b" in str(row)]
+    self.assertEqual(stray, [], "a tenant-scoped purge deleted another tenant's rows: %r" % (stray,))
+
+  def test_the_admitted_tenants_own_rows_are_still_swept(self):
+    """The scoping must not turn the sweep into a no-op -- that would pass the test above for the
+    wrong reason."""
+    self._run(checked_jobs=True)
+    self.assertIn(("test-instance:live", "job-a:w1"), self.tombstoned, self.tombstoned)
+    self.assertIn(("test-instance", "job-a"), self.tombstoned, self.tombstoned)
+
+  def test_an_internal_whole_node_purge_still_sweeps_everything(self):
+    """`checked_jobs=None` is the legacy internal path and keeps its whole-node behaviour."""
+    self._run(checked_jobs=False)
+    self.assertTrue([row for row in self.tombstoned if "job-b" in str(row)],
+                    "the whole-node purge stopped sweeping: %r" % (self.tombstoned,))
+
+
+class TestTheLedgerIsLiveOnThePurgePath(unittest.TestCase):
+  """The three destructive services accepted a `ledger` and never used it, while the docstring
+  claimed it marked the point past which deletion is irreversible. Two consequences the ledger
+  exists to prevent: a raise after R1FS deletion reported `unavailable` 503 -- "nothing happened"
+  with artifacts already gone -- and contract 4's re-admission before the irreversible step never
+  ran on the most destructive path in the system."""
+
+  def setUp(self):
+    from .conftest import mock_plugin_modules
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.services import control
+    from extensions.business.cybersec.red_mesh.tenancy.effects import EffectLedger, EffectState
+    self.control = control
+    self.EffectLedger = EffectLedger
+    self.EffectState = EffectState
+
+  def _owner(self, delete_ok=True):
+    from unittest.mock import MagicMock
+    owner = MagicMock()
+    owner.cfg_instance_id = "test-instance"
+    owner.ee_addr = "node-a"
+    owner.P = lambda *a, **k: None
+    owner._log_audit_event = lambda *a, **k: None
+    owner.chainstore_hgetall.side_effect = lambda *, hkey: {}
+    owner._normalize_job_record.side_effect = lambda k, r, **kw: (k, r)
+    owner.r1fs.delete_file.return_value = delete_ok
+    return owner
+
+  def _job(self):
+    return {"job_id": "job-1", "job_status": "FINALIZED", "launcher": "node-a",
+            "job_cid": "cid-archive", "workers": {}}
+
+  def test_the_requester_is_revalidated_before_the_first_deletion(self):
+    checkpoints = []
+    ledger = self.EffectLedger(on_checkpoint=lambda: checkpoints.append(1))
+    self.control.purge_job(self._owner(), "job-1", checked_job=self._job(), ledger=ledger)
+    self.assertEqual(len(checkpoints), 1, "no re-admission ran before the irreversible delete")
+
+  def test_a_deleted_artifact_is_recorded_so_a_later_raise_cannot_claim_nothing_happened(self):
+    ledger = self.EffectLedger()
+    self.control.purge_job(self._owner(), "job-1", checked_job=self._job(), ledger=ledger)
+    self.assertIs(ledger.state, self.EffectState.DELIVERED,
+                  "an irreversible R1FS delete left the ledger at %r" % (ledger.state,))
+
+  def test_nothing_is_recorded_when_no_artifact_was_deleted(self):
+    """The ledger must stay NONE when the purge deleted nothing, or every failure would falsely
+    claim an effect landed."""
+    ledger = self.EffectLedger()
+    owner = self._owner(delete_ok=False)
+    self.control.purge_job(owner, "job-1", checked_job=self._job(), ledger=ledger)
+    self.assertIs(ledger.state, self.EffectState.NONE)
+
+
+class TestPurgeErrorsCarryNoExceptionProse(unittest.TestCase):
+  """Contract 7. These endpoints became externally reachable as POST in B9, and every failure branch
+  published `f"{type(exc).__name__}: {exc}"` -- the exception text can carry storage paths, CIDs and
+  backend internals. The class name is a typed diagnostic and is kept; the text is not."""
+
+  def setUp(self):
+    from .conftest import mock_plugin_modules
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.services import control
+    self.control = control
+
+  def test_a_storage_failure_publishes_the_class_not_the_message(self):
+    from unittest.mock import MagicMock
+    owner = MagicMock()
+    owner.cfg_instance_id = "test-instance"
+    owner.ee_addr = "node-a"
+    owner.P = lambda *a, **k: None
+    owner._log_audit_event = lambda *a, **k: None
+    owner.chainstore_hgetall.side_effect = lambda *, hkey: {}
+    owner._normalize_job_record.side_effect = lambda k, r, **kw: (k, r)
+    owner.chainstore_hset.side_effect = RuntimeError(SECRET)
+    result = self.control.purge_all_jobs(owner, checked_jobs={
+      "job-1": {"job_id": "job-1", "job_status": "FINALIZED", "launcher": "node-a"}})
+    published = repr(result)
+    self.assertNotIn(SECRET, published, published)
+    self.assertIn("RuntimeError", published,
+                  "the typed diagnostic was stripped along with the prose: %s" % published)
+
+
+if __name__ == "__main__":
+  unittest.main()

@@ -67,15 +67,29 @@ def test_denials_never_stop_a_worker_or_emit_a_lifecycle_event(fault, status):
 
 
 def test_the_stop_reads_no_job_of_its_own():
-  """Admission already read the job under the reader's authority."""
+  """Admission already read the job under the reader's authority.
+
+  Asserted by object identity, not `is not None`: the weaker form passes for any snapshot at all,
+  including one the endpoint fetched itself, which is the defect this is meant to exclude.
+  """
   with read_endpoint_fixture(bound=False, archived=False) as fixture:
     module = sys.modules[fixture.Plugin.__module__]
+    admitted = []
+    real_snapshot = fixture.Plugin._admitted_snapshot
+
+    def _record(instance, *args, **kwargs):
+      snapshot, mode = real_snapshot(instance, *args, **kwargs)
+      admitted.append(snapshot)
+      return snapshot, mode
+
     received = []
-    with patch.object(module, "stop_monitoring",
+    with patch.object(fixture.Plugin, "_admitted_snapshot", _record), \
+         patch.object(module, "stop_monitoring",
                       Mock(side_effect=lambda *a, **k: received.append(k) or {"job_id": "job-1"})):
       fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor)
-    assert received and received[0].get("checked_job") is not None, (
-      "the admitted snapshot does not reach the stop: %r" % (received,))
+    assert len(admitted) == 1 and admitted[0] is not None
+    assert received and received[0].get("checked_job") is admitted[0], (
+      "the stop did not receive the admitted snapshot: %r" % (received,))
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))

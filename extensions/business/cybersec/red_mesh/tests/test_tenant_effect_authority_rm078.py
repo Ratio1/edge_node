@@ -277,8 +277,20 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
              if isinstance(node, ast.Call)
              and getattr(node.func, "attr", None) in ("_effect_operation", "_review_operation")]
     assert calls, "the effect wrappers were renamed; this guard would bind nothing"
+    # `_purge_operation` is the one intended forwarder (B9): it validates the tenant itself and
+    # passes it through. Exempt it by name rather than deleting the assertion -- this guard is what
+    # catches the *next* endpoint opting into tenant scope, and it is inert if left red.
+    forwarders = {"_purge_operation"}
+    enclosing = {}
+    for node in ast.walk(tree):
+      if isinstance(node, ast.FunctionDef):
+        for inner in ast.walk(node):
+          enclosing[id(inner)] = node.name
+    checked = 0
     for call in calls:
       if getattr(call.func, "attr", None) != "_effect_operation":
+        continue
+      if enclosing.get(id(call)) in forwarders:
         continue
       # _effect_operation(self, request_actor, tenant_id, apply_effect, ...)
       tenant_arg = call.args[2]
@@ -286,6 +298,8 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
       self.assertIsNone(tenant_arg.value,
                         "an endpoint opted into tenant scope outside its own slice: "
                         + ast.dump(call))
+      checked += 1
+    self.assertGreater(checked, 0, "the guard checked nothing; it would not catch a widening")
 
 
 if __name__ == "__main__":
