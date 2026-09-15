@@ -9,11 +9,7 @@ The C1 architecture gate rejected an `ownership_revision` explicitly: `_write_jo
 `job_revision`, 38 of 40 call sites pass `expected_revision=None`, and a second counter would vanish
 at finalization because `CStoreJobFinalized` carries no revision field.
 """
-from ..constants import JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED
 from ..models import LauncherLiveness, launcher_liveness_state
-
-# A job in one of these states is finished; ownership liveness is not a question about it.
-TERMINAL_JOB_STATUSES = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED)
 from ..repositories import JobStateRepository
 
 
@@ -72,13 +68,6 @@ def project_ownership(owner, job_specs, *, loss_after):
     candidates = binding.get("participant_order")
     if isinstance(candidates, list) and all(isinstance(node, str) for node in candidates):
       order = list(candidates)
-
-  # A terminal job has no controller to be alive. The heartbeat stops refreshing at finalization but
-  # nothing deletes the row until purge, so without this the projection reads `lost` once the last
-  # heartbeat ages out -- the signal D1 acts on to take over a job that ended normally.
-  if job_specs.get("job_status") in TERMINAL_JOB_STATUSES:
-    return {"launcher": launcher, "launcher_since": None, "liveness": "terminal",
-            "participant_order": order}
 
   job_id = job_specs.get("job_id")
   row = _repo(owner).get_launcher_liveness_model(job_id) if isinstance(job_id, str) else None

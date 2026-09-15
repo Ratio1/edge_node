@@ -491,15 +491,6 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
         except Exception as exc:
           errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
 
-  # The launcher liveness row is keyed by the job id exactly, not by a `{job_id}:` prefix, so the
-  # prefix sweep above cannot reach it. Cleared explicitly, or a force-purged job leaves a row
-  # naming the job and its launcher behind.
-  try:
-    owner.chainstore_hset(hkey=f"{cfg_instance_id}:live:launcher", key=job_id, value=None)
-  except Exception as exc:
-    errors.append({"job_id": job_id, "scope": f"{cfg_instance_id}:live:launcher",
-                   "message": type(exc).__name__})
-
   try:
     owner.chainstore_hset(hkey=cfg_instance_id, key=job_id, value=None)
   except Exception as exc:
@@ -646,7 +637,6 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
 
   cfg_instance_id = owner.cfg_instance_id
   live_hkey = f"{cfg_instance_id}:live"
-  launcher_live_hkey = f"{cfg_instance_id}:live:launcher"
   triage_hkey = f"{cfg_instance_id}:triage"
   triage_audit_hkey = f"{cfg_instance_id}:triage:audit"
   rulebook_review_hkey = f"{cfg_instance_id}:rulebook_review"
@@ -658,21 +648,6 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
     if not isinstance(key, str):
       return None
     return key.split(":", 1)[0]
-
-  def _sweep_launcher_liveness(hkey):
-    """Rows here are keyed by job id, not `{job_id}:{suffix}`, so `_sweep_hash`'s compound-key
-    parsing does not apply. Same allowlist rule: only ids this call was admitted to, and not ones
-    that failed."""
-    rows = owner.chainstore_hgetall(hkey=hkey)
-    if not isinstance(rows, dict):
-      return
-    for key in list(rows):
-      if not isinstance(key, str) or not _in_scope(key):
-        continue
-      try:
-        owner.chainstore_hset(hkey=hkey, key=key, value=None)
-      except Exception as exc:
-        errors.append({"job_id": key, "scope": hkey, "message": type(exc).__name__})
 
   def _sweep_hash(hkey, expected_value_types):
     rows_deleted = 0
@@ -838,10 +813,6 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
     return rows_deleted
 
   _sweep_hash(live_hkey, dict)
-  # The launcher liveness rows, which an earlier revision cleared only on the single-job purge path.
-  # A force-purged job, or an orphan row whose record is already gone, otherwise leaks a row naming
-  # the job and its launcher -- the same residue class B9 closed for the other hsets.
-  _sweep_launcher_liveness(launcher_live_hkey)
   _sweep_hash(triage_hkey, dict)
   _sweep_hash(triage_audit_hkey, list)
   _sweep_hash(rulebook_review_hkey, dict)
