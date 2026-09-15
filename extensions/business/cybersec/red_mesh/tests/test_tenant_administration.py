@@ -505,3 +505,21 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
       self.assertFalse(plugin.check_tenant_domain(actor, "tenant")["data"]["available"])
       self.assertEqual(plugin.authorize_tenant_membership(actor, tenant_id, "initial", "tenant_admin")["data"]["accountId"], "initial")
     self.assertTrue(all(json.loads(hkey)[3] == "deployment" for hkey, _ in store.writes))
+
+
+def test_auth_hkey_is_read_from_the_plugin_instance_env_before_the_process_env(monkeypatch):
+  """RM-026 MVP: deeploy injects R1EN_CSTORE_AUTH_HKEY into the plugin instance ENV
+  (deeploy_mixin.py: env_cfg.setdefault(hkey_name, ...)), which is a container env only for
+  containerized apps. This plugin runs in-process and read os.environ alone, so the injected value
+  never reached it -- the gap tenant-identity-provider.md:183-187 left open. Instance ENV is the
+  deployment's own value and wins; os.environ stays as the fallback."""
+  from types import SimpleNamespace
+  from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import (
+    AUTH_HKEY_ENV, CstoreAuthAccountReader)
+  monkeypatch.delenv(AUTH_HKEY_ENV, raising=False)
+  owner = SimpleNamespace(cfg_env={AUTH_HKEY_ENV: " pipeline-hkey "}, chainstore_hget=lambda **k: None)
+  assert CstoreAuthAccountReader(owner)._hkey() == "pipeline-hkey"
+  monkeypatch.setenv(AUTH_HKEY_ENV, "process-hkey")
+  assert CstoreAuthAccountReader(owner)._hkey() == "pipeline-hkey"
+  owner.cfg_env = None
+  assert CstoreAuthAccountReader(owner)._hkey() == "process-hkey"

@@ -40,7 +40,15 @@ class CstoreAuthAccountReader:
     self._owner = owner
 
   def _hkey(self):
-    hkey = os.environ.get(AUTH_HKEY_ENV, "").strip()
+    # The plugin instance ENV first: deeploy injects the hkey there (a pipeline-level value), and
+    # this plugin runs in-process, so that ENV never becomes os.environ the way it does for a
+    # containerized app. os.environ remains the fallback for node-level configuration.
+    instance_env = getattr(self._owner, "cfg_env", None)
+    hkey = ""
+    if isinstance(instance_env, dict):
+      hkey = str(instance_env.get(AUTH_HKEY_ENV) or "").strip()
+    if not hkey:
+      hkey = os.environ.get(AUTH_HKEY_ENV, "").strip()
     if not hkey:
       raise IdentityStoreError(f"{AUTH_HKEY_ENV} is not configured")
     return hkey
