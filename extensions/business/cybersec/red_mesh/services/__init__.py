@@ -95,7 +95,6 @@ from .event_hooks import (
   emit_lifecycle_event,
   emit_redmesh_event,
 )
-from .ownership import project_ownership, publish_launcher_liveness
 from .control import (
   purge_all_jobs,
   purge_job,
