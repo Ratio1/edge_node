@@ -49,15 +49,6 @@ def _delete_job_record(owner, job_id):
   _job_repo(owner).delete_job(job_id)
 
 
-def delete_launcher_liveness_for_job(repo, job_id):
-  """Drop one job's launcher liveness row. Separate function so both purge paths call the same one."""
-  try:
-    repo.delete_launcher_liveness(job_id)
-  except Exception:
-    # Liveness is ephemeral; failing to clear it must not fail a purge that already deleted data.
-    pass
-
-
 def _foreign_launcher_error(owner, job_id, job_specs, action):
   launcher = job_specs.get("launcher") if isinstance(job_specs, dict) else None
   if not launcher or launcher == getattr(owner, "ee_addr", None):
@@ -334,9 +325,6 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
     for key in all_live:
       if key.startswith(prefix):
         _job_repo(owner).delete_live_progress(key)
-  # A new hset the purge does not know about would leak a row naming the launcher and the job for
-  # every purged job (RM-026 C1a).
-  delete_launcher_liveness_for_job(_job_repo(owner), job_id)
 
   _job_repo(owner).delete_job_triage(job_id)
   _job_repo(owner).delete_job_rulebook_reviews(job_id)
