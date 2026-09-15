@@ -471,12 +471,16 @@ class LauncherLiveness:
       raise ValueError("Invalid launcher liveness job id")
     if not isinstance(launcher, str) or not launcher.strip():
       raise ValueError("Invalid launcher liveness launcher")
-    return cls(
-      job_id=job_id,
-      launcher=launcher,
-      launcher_since=float(d["launcher_since"]),
-      last_seen_at=float(d["last_seen_at"]),
-    )
+    since, last_seen = float(d["launcher_since"]), float(d["last_seen_at"])
+    # Both timestamps are validated here, not only `last_seen_at`. A NaN `launcher_since` was
+    # accepted, carried forward on every subsequent heartbeat, and projected as a live launcher --
+    # and D1 measures its takeover deadline from it, where every NaN comparison is silently False.
+    for value in (since, last_seen):
+      if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        raise ValueError("Invalid launcher liveness timestamp")
+    if since > last_seen:
+      raise ValueError("Launcher liveness cannot start after it was last seen")
+    return cls(job_id=job_id, launcher=launcher, launcher_since=since, last_seen_at=last_seen)
 
 
 def launcher_liveness_state(row, *, now: float, loss_after: float) -> str:

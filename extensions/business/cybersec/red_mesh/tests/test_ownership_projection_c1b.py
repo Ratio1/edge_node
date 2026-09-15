@@ -194,3 +194,47 @@ def test_the_periodic_loop_actually_calls_the_publisher():
   called = {node.func.attr for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
   assert "_maybe_publish_launcher_liveness" in called, sorted(called)
+
+
+class TestTerminalJobsAndMalformedRows:
+  """Three defects the round-2 architecture gate found in the committed C1a/C1b code, each
+  contradicting a claim in my own commit messages."""
+
+  def test_a_finalized_job_is_not_reported_as_a_lost_launcher(self):
+    """C1b's message claimed a finalized job would not have C2 measuring a loss against it. The
+    heartbeat guard only stops *refreshing* the row; nothing deleted it, so 600s after the job ended
+    normally the projection read `lost` -- which is exactly the signal D1 acts on to take over a job
+    that does not need taking over."""
+    from extensions.business.cybersec.red_mesh.services.ownership import project_ownership
+    owner = _owner(now=1_700.0)
+    owner.store["test-instance:live:launcher"] = {
+      "job-1": LauncherLiveness("job-1", "node-a", 900.0, 1_000.0).to_dict()}
+    job = {"job_id": "job-1", "launcher": "node-a", "job_status": "FINALIZED",
+           "execution_binding": _binding()}
+    view = project_ownership(owner, job, loss_after=600.0)
+    assert view["liveness"] == "terminal", view
+
+  def test_a_stopped_job_is_terminal_too(self):
+    from extensions.business.cybersec.red_mesh.services.ownership import project_ownership
+    owner = _owner(now=1_700.0)
+    owner.store["test-instance:live:launcher"] = {
+      "job-1": LauncherLiveness("job-1", "node-a", 900.0, 1_000.0).to_dict()}
+    job = {"job_id": "job-1", "launcher": "node-a", "job_status": "STOPPED",
+           "execution_binding": _binding()}
+    assert project_ownership(owner, job, loss_after=600.0)["liveness"] == "terminal"
+
+  def test_a_non_finite_launcher_since_is_refused_not_carried_forward(self):
+    """`launcher_since` was accepted as NaN, carried forward by every later heartbeat, and projected
+    as a live launcher. D1 measures its deadline from it, and every NaN comparison is silently
+    False -- so the takeover slot would never open."""
+    import pytest
+    for bad in (float("nan"), float("inf"), -1.0):
+      with pytest.raises(ValueError):
+        LauncherLiveness.from_dict({"job_id": "job-1", "launcher": "node-a",
+                                    "launcher_since": bad, "last_seen_at": 1_000.0})
+
+  def test_a_tenure_cannot_start_after_it_was_last_seen(self):
+    import pytest
+    with pytest.raises(ValueError):
+      LauncherLiveness.from_dict({"job_id": "job-1", "launcher": "node-a",
+                                  "launcher_since": 2_000.0, "last_seen_at": 1_000.0})
