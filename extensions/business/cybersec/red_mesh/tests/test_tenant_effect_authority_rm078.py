@@ -98,6 +98,109 @@ class TestTenantEffectAuthority(unittest.TestCase):
           PolicyDecision(False, 404, "not_found"))
 
 
+class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
+  """Step 2: `TenantReadAccess._authorize` refused every operation outside reports:view and
+  audit:view, so the matrix behind it never got a chance to answer. Widening it must admit exactly
+  the three new operations and nothing else."""
+
+  def setUp(self):
+    from uuid import uuid4
+    from unittest.mock import patch
+    from extensions.business.cybersec.red_mesh.repositories import JobStateRepository
+    from extensions.business.cybersec.red_mesh.tenancy.administration import (
+      AdministrationDenied, TenantAdministrationService)
+    from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import (
+      CstoreTenantAdministrationStore)
+    from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import (
+      CstoreAuthAccountReader)
+    from extensions.business.cybersec.red_mesh.tenancy.read_access import TenantReadAccess
+    from .test_execution_binding_models import binding_payload
+    from .test_tenant_read_access import ReadStore
+
+    self.AdministrationDenied = AdministrationDenied
+    env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
+    env.start()
+    self.addCleanup(env.stop)
+    self.store = ReadStore()
+    administration = TenantAdministrationService(
+      CstoreAuthAccountReader(self.store), CstoreTenantAdministrationStore(self.store, "deployment"))
+    request_id = str(uuid4())
+    prepared = administration.prepare_tenant(
+      {"account_id": "creator"}, request_id, "Example", "example", "initial")
+    self.tenant_id = prepared["data"]["tenantId"]
+    self.store.grant("initial", self.tenant_id)
+    administration.activate_tenant({"account_id": "creator"}, request_id)
+    self.store.jobs["job-1"] = {
+      "job_id": "job-1", "job_status": "FINALIZED", "job_cid": "archive-ref",
+      "execution_binding": {**binding_payload(), "tenant_id": self.tenant_id}}
+    self.access = TenantReadAccess(administration, JobStateRepository(self.store))
+    self.actor = {"account_id": "reader"}
+
+  def _as(self, role):
+    self.store.account("reader", memberships=[{"role": role, "tenant_id": self.tenant_id}])
+
+  def _allow_pentester(self, enabled):
+    """Flip the stored switch through the same store the admission path reads."""
+    for (hkey, key), record in self.store.data.items():
+      if (isinstance(record, dict) and record.get("tenant_id") == self.tenant_id
+          and "allow_pentester" in record):
+        record["allow_pentester"] = enabled
+        return
+    raise AssertionError("tenant record not found; this helper would silently do nothing")
+
+  def test_a_super_tenant_admin_is_admitted_to_all_three(self):
+    self._as("super_tenant_admin")
+    # The fixture tenant ships with pentesting off, which is itself the analysis:run gate working;
+    # the administrative two must not depend on it.
+    self._allow_pentester(True)
+    for operation in EFFECT_OPERATIONS:
+      with self.subTest(operation=operation):
+        snapshot = self.access.get_job(self.actor, self.tenant_id, "job-1", operation=operation)
+        self.assertEqual(snapshot["job_id"], "job-1")
+
+  def test_the_pentesting_switch_reaches_the_read_seam(self):
+    """Not just the pure policy function: the switch has to survive the whole admission path, or it
+    is enforced in a unit test and nowhere a caller can reach."""
+    self._as("super_tenant_admin")
+    self._allow_pentester(False)
+    with self.assertRaises(self.AdministrationDenied) as caught:
+      self.access.get_job(self.actor, self.tenant_id, "job-1", operation="analysis:run")
+    self.assertEqual((caught.exception.status_code, caught.exception.error),
+                     (403, "pentesting_disabled"))
+    for operation in ("engagement:delete", "jobs:purge"):
+      with self.subTest(operation=operation):
+        self.assertEqual(
+          self.access.get_job(self.actor, self.tenant_id, "job-1", operation=operation)["job_id"],
+          "job-1")
+
+  def test_a_tenant_user_is_refused_all_three(self):
+    self._as("tenant_user")
+    for operation in EFFECT_OPERATIONS:
+      with self.subTest(operation=operation):
+        with self.assertRaises(self.AdministrationDenied) as caught:
+          self.access.get_job(self.actor, self.tenant_id, "job-1", operation=operation)
+        self.assertEqual(caught.exception.status_code, 403)
+
+  def test_an_unlisted_operation_is_still_refused_outright(self):
+    """Deny-by-default survives the widening: the gate admits a fixed set, not anything the matrix
+    happens to contain, so a future matrix entry cannot reach reads without its own decision."""
+    self._as("super_tenant_admin")
+    for operation in ("tasks:launch", "tenants:manage", "evidence:read", "", None):
+      with self.subTest(operation=operation):
+        with self.assertRaises(self.AdministrationDenied) as caught:
+          self.access.get_job(self.actor, self.tenant_id, "job-1", operation=operation)
+        self.assertEqual(caught.exception.status_code, 403)
+
+  def test_the_existing_read_operations_are_unchanged(self):
+    self._as("tenant_user")
+    self.assertEqual(
+      self.access.get_job(self.actor, self.tenant_id, "job-1")["job_id"], "job-1")
+    self._as("tenant_admin")
+    self.assertEqual(
+      self.access.get_job(self.actor, self.tenant_id, "job-1", operation="audit:view")["job_id"],
+      "job-1")
+
+
 class TestNoEndpointBecameTenantReachable(unittest.TestCase):
   """Requirement 5: the blanket refusal is narrowed, so prove nothing widened past it."""
 

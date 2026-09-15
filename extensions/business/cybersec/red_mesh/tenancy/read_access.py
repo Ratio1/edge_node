@@ -7,6 +7,14 @@ from .identity import TenantMembership, resolve_actor
 from .ports import TenantStoreError
 
 
+# RM-078. A fixed set, not "anything the matrix contains": a future matrix entry must not reach
+# tenant reads without its own decision. `reports:view` and `audit:view` are the original two; the
+# three effect operations are the ones the owner specified, and each endpoint still opts in within
+# its own slice (B6, B8, B9) rather than by appearing here.
+_TENANT_OPERATIONS = frozenset({
+  "reports:view", "audit:view", "analysis:run", "engagement:delete", "jobs:purge"})
+
+
 class TenantReadAccess:
   def __init__(self, administration, jobs):
     self.administration = administration
@@ -16,7 +24,7 @@ class TenantReadAccess:
     account, denial = resolve_actor(actor, self.administration.accounts)
     if denial:
       raise AdministrationDenied(denial["status_code"], denial["error"])
-    if operation not in ("reports:view", "audit:view"):
+    if operation not in _TENANT_OPERATIONS:
       raise AdministrationDenied(403, "forbidden")
     self.administration.authorize_tenant_for_account(account, tenant_id, operation)
 
