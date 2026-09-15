@@ -493,6 +493,18 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
   cids_failed = 0
   failed_job_ids = set()
   errors = []
+  # RM-026 I1b B9, owner decision: a mixed batch reports the partial, and the per-item outcome is
+  # explicit and attributable -- never an aggregate count. The counters below stay for
+  # compatibility, but after an irreversible delete the only question an operator has is *which*
+  # jobs are gone, and a count cannot answer it.
+  outcomes = []
+
+  def _outcome(job_id, outcome, *, cids_deleted=0, cids_failed=0, message=""):
+    row = {"job_id": job_id, "outcome": outcome,
+           "cids_deleted": int(cids_deleted or 0), "cids_failed": int(cids_failed or 0)}
+    if message:
+      row["message"] = str(message)
+    outcomes.append(row)
 
   terminal_statuses = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED)
   for job_id, raw_payload in job_entries:
@@ -504,6 +516,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
         "job_id": job_id,
         "message": owner_error["message"],
       })
+      _outcome(job_id, "refused", message=owner_error["message"])
       continue
     raw_status = raw_payload.get("job_status") if isinstance(raw_payload, dict) else None
     use_direct_purge = raw_status in terminal_statuses
@@ -522,6 +535,8 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
       jobs_force_purged += 1
       if fc_failed:
         failed_job_ids.add(job_id)
+      _outcome(job_id, "force_purged", cids_deleted=fc_deleted, cids_failed=fc_failed,
+               message=f"{type(exc).__name__}")
       continue
 
     if not isinstance(result, dict):
@@ -533,21 +548,28 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
       jobs_force_purged += 1
       if fc_failed:
         failed_job_ids.add(job_id)
+      _outcome(job_id, "force_purged", cids_deleted=fc_deleted, cids_failed=fc_failed,
+               message="unexpected purge response")
       continue
 
     status = result.get("status")
     cids_deleted += int(result.get("cids_deleted", 0) or 0)
     cids_failed += int(result.get("cids_failed", 0) or 0)
 
+    item_deleted = int(result.get("cids_deleted", 0) or 0)
+    item_failed = int(result.get("cids_failed", 0) or 0)
     if status == "success":
       jobs_succeeded += 1
+      _outcome(job_id, "purged", cids_deleted=item_deleted, cids_failed=item_failed)
     elif status == "partial":
       jobs_failed += 1
       failed_job_ids.add(job_id)
-      errors.append({
-        "job_id": job_id,
-        "message": result.get("message") or "purge returned status='partial'",
-      })
+      message = result.get("message") or "purge returned status='partial'"
+      errors.append({"job_id": job_id, "message": message})
+      # "retained", not "failed": a partial purge deliberately keeps the CStore rows so the
+      # operator can retry artifact deletion, which is a different state from a force-wipe.
+      _outcome(job_id, "retained", cids_deleted=item_deleted, cids_failed=item_failed,
+               message=message)
     else:
       errors.append({
         "job_id": job_id,
@@ -560,6 +582,8 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
       jobs_force_purged += 1
       if fc_failed:
         failed_job_ids.add(job_id)
+      _outcome(job_id, "force_purged", cids_deleted=fc_deleted, cids_failed=fc_failed,
+               message=f"purge returned status={status!r}")
 
   cfg_instance_id = owner.cfg_instance_id
   live_hkey = f"{cfg_instance_id}:live"
@@ -778,6 +802,7 @@ def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None)
     "cids_deleted": cids_deleted,
     "cids_failed": cids_failed,
     "integration_status_rows_deleted": integration_status_rows_deleted,
+    "outcomes": outcomes,
     "errors": errors,
   }
 

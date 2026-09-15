@@ -220,3 +220,91 @@ class TestPurgeScope(PurgeAdmissionCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestPerItemOutcomes(unittest.TestCase):
+  """B9 step 2, from the owner's decision (2026-09-14): a mixed batch reports the partial rather
+  than denying wholly, and the per-item outcome must be explicit and attributable, never an
+  aggregate count.
+
+  What shipped reported `jobs_succeeded` / `jobs_failed` counters plus an `errors` list. Failures
+  were attributable; successes were not -- a purged job's id appeared nowhere, so an operator
+  reading a partial result could not tell *which* jobs were gone. After an irreversible delete that
+  is the only question that matters.
+  """
+
+  def setUp(self):
+    from .conftest import mock_plugin_modules
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.services import control
+    self.control = control
+
+  def _owner(self, jobs):
+    from unittest.mock import MagicMock
+    owner = MagicMock()
+    owner.cfg_instance_id = "test-instance"
+    owner.ee_addr = "node-a"
+    owner.P = lambda *a, **k: None
+    owner._log_audit_event = lambda *a, **k: None
+    owner.chainstore_hgetall.side_effect = lambda *, hkey: {}
+    owner._normalize_job_record.side_effect = lambda key, record, **kw: (key, record)
+    return owner
+
+  def _run(self, jobs, purge_results):
+    owner = self._owner(jobs)
+    calls = []
+
+    def _purge(_owner, job_id, **_kwargs):
+      calls.append(job_id)
+      return purge_results[job_id]
+
+    with patch.object(self.control, "purge_job", _purge), \
+         patch.object(self.control, "stop_and_delete_job", _purge):
+      return self.control.purge_all_jobs(owner, checked_jobs=jobs), calls
+
+  def test_every_job_appears_in_the_outcomes_with_its_own_verdict(self):
+    jobs = {
+      "gone": {"job_id": "gone", "job_status": "FINALIZED", "launcher": "node-a"},
+      "kept": {"job_id": "kept", "job_status": "FINALIZED", "launcher": "node-a"},
+    }
+    result, _calls = self._run(jobs, {
+      "gone": {"status": "success", "cids_deleted": 3, "cids_failed": 0},
+      "kept": {"status": "partial", "cids_deleted": 1, "cids_failed": 2,
+               "message": "r1fs delete failed"},
+    })
+    outcomes = {row["job_id"]: row for row in result["outcomes"]}
+    self.assertEqual(set(outcomes), {"gone", "kept"}, result)
+    self.assertEqual(outcomes["gone"]["outcome"], "purged")
+    self.assertEqual(outcomes["gone"]["cids_deleted"], 3)
+    self.assertEqual(outcomes["kept"]["outcome"], "retained")
+    self.assertEqual(outcomes["kept"]["cids_failed"], 2)
+    self.assertIn("r1fs delete failed", outcomes["kept"]["message"])
+    self.assertEqual(result["status"], "partial")
+
+  def test_a_force_purged_job_is_named_as_such_rather_than_counted(self):
+    """Force-purge tombstones a record the current schema cannot parse, with best-effort artifact
+    cleanup. An operator must be able to tell those apart from clean purges by id."""
+    jobs = {"legacy": {"job_id": "legacy", "job_status": "FINALIZED", "launcher": "node-a"}}
+    result, _calls = self._run(jobs, {"legacy": {"status": "unexpected"}})
+    outcomes = {row["job_id"]: row for row in result["outcomes"]}
+    self.assertEqual(outcomes["legacy"]["outcome"], "force_purged", result)
+
+  def test_a_foreign_launcher_job_is_reported_as_refused_and_never_touched(self):
+    jobs = {"theirs": {"job_id": "theirs", "job_status": "FINALIZED", "launcher": "node-b"}}
+    result, calls = self._run(jobs, {})
+    outcomes = {row["job_id"]: row for row in result["outcomes"]}
+    self.assertEqual(outcomes["theirs"]["outcome"], "refused", result)
+    self.assertEqual(calls, [], "a foreign-launcher job was purged")
+
+  def test_the_outcomes_account_for_every_job_and_agree_with_the_counters(self):
+    """The counters stay for compatibility, so they must not be able to drift from the list."""
+    jobs = {name: {"job_id": name, "job_status": "FINALIZED", "launcher": "node-a"}
+            for name in ("a", "b", "c")}
+    result, _calls = self._run(jobs, {
+      "a": {"status": "success", "cids_deleted": 1},
+      "b": {"status": "partial", "cids_failed": 1, "message": "kept"},
+      "c": {"status": "success", "cids_deleted": 2},
+    })
+    self.assertEqual(len(result["outcomes"]), result["jobs_total"])
+    purged = [row for row in result["outcomes"] if row["outcome"] == "purged"]
+    self.assertEqual(len(purged), result["jobs_succeeded"])
