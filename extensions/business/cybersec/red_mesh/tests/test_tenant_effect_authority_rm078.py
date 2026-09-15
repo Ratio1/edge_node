@@ -229,9 +229,10 @@ class TestEffectOperationNarrowsRatherThanOpens(unittest.TestCase):
       job_id="job-1", operation=operation), reached
 
   def test_an_ungranted_operation_is_still_refused_for_a_tenant_caller(self):
-    """reports:export is the default and is NOT one of the three: no owner decision made any
-    export tenant-scoped, so it must stay refused even though the matrix grants it broadly."""
-    for operation in ("reports:export", "reports:view", "tasks:launch", "evidence:read"):
+    """Operations outside _TENANT_EFFECT_OPERATIONS stay refused even though the matrix grants them
+    broadly. reports:export left this list on 2026-09-15: the owner's MVP rescope opted
+    stop_monitoring (which runs as reports:export) into the tenant seam."""
+    for operation in ("reports:view", "tasks:launch", "evidence:read"):
       with self.subTest(operation=operation):
         result, reached = self._call(operation)
         self.assertEqual(result, {"success": False, "error": "forbidden", "status_code": 403})
@@ -280,7 +281,9 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
     # `_purge_operation` is the one intended forwarder (B9): it validates the tenant itself and
     # passes it through. Exempt it by name rather than deleting the assertion -- this guard is what
     # catches the *next* endpoint opting into tenant scope, and it is inert if left red.
-    forwarders = {"_purge_operation"}
+    # `stop_monitoring` opted in under the RM-026 MVP (2026-09-15): it forwards the caller's
+    # explicit selector and "reports:export" is admitted at both tenant seams. Still by name.
+    forwarders = {"_purge_operation", "stop_monitoring"}
     enclosing = {}
     for node in ast.walk(tree):
       if isinstance(node, ast.FunctionDef):

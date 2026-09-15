@@ -137,3 +137,59 @@ def test_the_launcher_mismatch_keeps_its_code_over_the_wire(read_native, respons
     assert status == 409, body
     assert headers[b"cache-control"] == b"no-store"
     assert json.loads(body)["error"] == "job_launcher_mismatch", body
+
+
+# --- RM-026 MVP: stop_monitoring through the tenant seam -------------------------------------------
+# The MVP walkthrough stops a tenant-bound job as a tenant-scoped actor. Until now stop_monitoring
+# passed tenant_id=None to the effect seam (legacy only), and its operation "reports:export" was in
+# neither _TENANT_EFFECT_OPERATIONS nor _TENANT_OPERATIONS, so a tenant member could not stop a job
+# at all. Same admission shape as purge_job; the service receives the admitted snapshot unchanged.
+
+def _stop_ok(fixture):
+  module = sys.modules[fixture.Plugin.__module__]
+  return patch.object(module, "stop_monitoring", Mock(return_value={"success": True, "status_code": 200}))
+
+
+def _membership(fixture, role):
+  fixture.store.account("reader", memberships=[{"role": role, "tenant_id": fixture.tenant_id}])
+
+
+def test_a_tenant_admin_can_stop_a_bound_job_through_the_tenant_seam():
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+    _membership(fixture, "tenant_admin")
+    with _stop_ok(fixture) as stop:
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                              tenant_id=fixture.tenant_id)
+    assert result.get("success") is True, result
+    stop.assert_called_once()
+    assert stop.call_args.kwargs["checked_job"]["job_id"] == "job-1"
+
+
+def test_a_tenant_user_cannot_stop_a_bound_job():
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+    _membership(fixture, "tenant_user")
+    with _stop_ok(fixture) as stop:
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                              tenant_id=fixture.tenant_id)
+    assert (result.get("success"), result.get("status_code")) == (False, 403), result
+    stop.assert_not_called()
+
+
+def test_a_bound_job_is_refused_on_the_legacy_seam():
+  """Omitting the selector must not fall back to legacy authority over a bound job."""
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+    _membership(fixture, "tenant_admin")
+    with _stop_ok(fixture) as stop:
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor)
+    assert result.get("success") is False and result.get("status_code") in (403, 404), result
+    stop.assert_not_called()
+
+
+def test_an_unbound_job_is_not_found_through_a_tenant_selector():
+  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+    _membership(fixture, "tenant_admin")
+    with _stop_ok(fixture) as stop:
+      result = fixture.Plugin.stop_monitoring(fixture.owner, job_id="legacy-alias", stop_type="HARD",
+                                              request_actor=fixture.actor, tenant_id=fixture.tenant_id)
+    assert (result.get("success"), result.get("status_code")) == (False, 404), result
+    stop.assert_not_called()

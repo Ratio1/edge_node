@@ -208,10 +208,13 @@ def test_revalidation_denies_before_the_effect_when_the_account_is_deactivated()
 
 
 def test_a_tenant_scoped_effect_is_refused_rather_than_handed_a_raw_snapshot():
+  """An operation outside _TENANT_EFFECT_OPERATIONS is refused for a tenant caller before any
+  snapshot is read. This used the seam's default operation (reports:export) as the stand-in; the
+  RM-026 MVP admitted that one for stop_monitoring, so the stand-in is now reports:view."""
   with read_endpoint_fixture(bound=True) as fixture:
     result = fixture.Plugin._effect_operation(fixture.owner, fixture.actor, "tenant-1",
                                               lambda job, mode, ledger: {"status": "ok"},
-                                              job_id="job-1")
+                                              job_id="job-1", operation="reports:view")
     assert result == {"success": False, "error": "forbidden", "status_code": 403}
 
 

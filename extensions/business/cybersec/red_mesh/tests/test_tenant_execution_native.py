@@ -139,7 +139,8 @@ def _render_native(default_route=None):
                                    "review_state", "request_actor"),
         "generate_rulebook_assessment": ("self", "job_id", "profile_id", "pass_nr", "persist",
                                          "force", "request_actor"),
-        "stop_monitoring": ("self", "job_id", "stop_type", "request_actor"),
+        # RM-026 MVP: stop_monitoring opted into the tenant seam; the selector is appended last.
+        "stop_monitoring": ("self", "job_id", "stop_type", "request_actor", "tenant_id"),
       }[method.name]
       assert tuple(arg.arg for arg in method.args.args) == expected
     else:

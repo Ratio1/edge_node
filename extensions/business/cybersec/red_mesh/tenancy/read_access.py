@@ -12,7 +12,8 @@ from .ports import TenantStoreError
 # three effect operations are the ones the owner specified, and each endpoint still opts in within
 # its own slice (B6, B8, B9) rather than by appearing here.
 _TENANT_OPERATIONS = frozenset({
-  "reports:view", "audit:view", "analysis:run", "engagement:delete", "jobs:purge"})
+  "reports:view", "audit:view", "analysis:run", "engagement:delete", "jobs:purge",
+  "reports:export"})  # stop_monitoring (RM-026 MVP)
 
 
 class TenantReadAccess:
