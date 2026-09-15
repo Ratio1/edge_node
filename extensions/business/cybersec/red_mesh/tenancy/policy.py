@@ -16,17 +16,21 @@ _ROLE_OPERATIONS = {
     "tenants:manage", "tenant_users:manage", "assets:create", "assets:update",
     "integrations:manage", "attestation_keys:manage", "allow_pentester:update",
     "tasks:launch", "tasks:update", "reports:view", "reports:export", "evidence:read", "audit:view",
+    # RM-078. analysis:run is an operator action and binds to allow_pentester below;
+    # engagement:delete and jobs:purge are administrative and do not.
+    "analysis:run", "engagement:delete", "jobs:purge",
   }),
   "super_pentester": frozenset({
     "assets:create", "assets:update", "allow_pentester:update", "tasks:launch", "tasks:update",
-    "reports:view", "reports:export", "evidence:read",
+    "reports:view", "reports:export", "evidence:read", "analysis:run",
   }),
   "tenant_admin": frozenset({
     "node_failure_policy:update",
     "tenant_users:manage", "integrations:manage", "attestation_keys:manage",
     "reports:view", "reports:export", "audit:view",
   }),
-  "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export"}),
+  "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export",
+                                 "analysis:run"}),
   "tenant_user": frozenset({"reports:view"}),
 }
 _PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
@@ -118,4 +122,10 @@ def authorize_tenant_operation(
       return PolicyDecision(False, 404, "not_found")
     if not roles & _PLATFORM_ROLES and tenant.allow_pentester is not True:
       return PolicyDecision(False, 403, "pentesting_disabled")
+  # RM-078. Unlike tasks:launch, this binds the platform roles too: the owner's decision reads
+  # "scoped STA/SP and Tenant Pentesters subject to Allow Pentester", and a tenant that switched
+  # pentesting off has said something about analysis of its pentest findings as well. Stricter than
+  # the launch gate on purpose; flagged for the owner rather than silently harmonised with it.
+  if operation == "analysis:run" and tenant.allow_pentester is not True:
+    return PolicyDecision(False, 403, "pentesting_disabled")
   return PolicyDecision(True, 200, None)
