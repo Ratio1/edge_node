@@ -2,14 +2,14 @@
     "COMMUNICATION": {
         "INSTANCES": {
             "COMMANDCONTROL": {
-                "RECV_FROM": "CTRL_CHANNEL",
+                "RECV_FROM": "CONFIG_CHANNEL",
                 "SEND_TO": "CONFIG_CHANNEL"
             },
             "DEFAULT": {
                 "SEND_TO": "PAYLOADS_CHANNEL"
             },
             "HEARTBEATS": {
-                "RECV_FROM": "CONFIG_CHANNEL",
+                "RECV_FROM": "CTRL_CHANNEL",
                 "SEND_TO": "CTRL_CHANNEL"
             },
             "NOTIFICATIONS": {
@@ -31,9 +31,17 @@
             },
             "CTRL_CHANNEL": {
                 "TOPIC": "naeural/ctrl",
+                "TARGETED_TOPIC": "naeural/ctrl/{}",
+                "SUBSCRIBE_TARGETED": false,
                 "QOS": 1
             },
             "HOST": "$EE_MQTT_HOST",
+            "HEARTBEAT_AUTH_MODE": "shadow",
+            "HEARTBEAT_AUTH_MAX_IN_FLIGHT": 32,
+            "HEARTBEAT_AUTH_WORKERS": 4,
+            "HEARTBEAT_INGRESS_QUEUE_SIZE": 10000,
+            "HEARTBEAT_INGRESS_WORKER_ENABLED": true,
+            "HEARTBEAT_TARGETED_MIRROR_ENABLED": false,
             "NOTIF_CHANNEL": {
                 "TOPIC": "naeural/notif"
             },
