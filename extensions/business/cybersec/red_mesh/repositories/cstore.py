@@ -6,6 +6,7 @@ from ..models import (
   RulebookReviewAuditEntry,
   RulebookReviewState,
   RulebookSubmissionRegistry,
+  LauncherLiveness,
   WorkerProgress,
 )
 
@@ -126,6 +127,36 @@ class JobStateRepository:
 
   def delete_job(self, job_id):
     self.owner.chainstore_hset(hkey=self._jobs_hkey, key=job_id, value=None)
+    return
+
+  @property
+  def _launcher_live_hkey(self):
+    # Its own hset, not a key inside `:live`: a launcher row then cannot collide with a worker row
+    # (`{job_id}:{worker_addr}`) by construction (RM-026 C1a).
+    return f"{self.owner.cfg_instance_id}:live:launcher"
+
+  def list_launcher_liveness(self):
+    return self.owner.chainstore_hgetall(hkey=self._launcher_live_hkey)
+
+  def get_launcher_liveness(self, job_id):
+    return self.owner.chainstore_hget(hkey=self._launcher_live_hkey, key=job_id)
+
+  def get_launcher_liveness_model(self, job_id):
+    payload = self.get_launcher_liveness(job_id)
+    if not isinstance(payload, dict):
+      return None
+    try:
+      return LauncherLiveness.from_dict(payload)
+    except (KeyError, TypeError, ValueError):
+      # A malformed row is not a live launcher. Reading it as one would hand C2 a false liveness.
+      return None
+
+  def put_launcher_liveness(self, job_id, value):
+    self.owner.chainstore_hset(hkey=self._launcher_live_hkey, key=job_id, value=value)
+    return value
+
+  def delete_launcher_liveness(self, job_id):
+    self.owner.chainstore_hset(hkey=self._launcher_live_hkey, key=job_id, value=None)
     return
 
   def list_live_progress(self):

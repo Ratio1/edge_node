@@ -29,6 +29,8 @@ from extensions.business.cybersec.red_mesh.models.cstore import (
   PassReportRef,
   CStoreJobRunning,
   CStoreJobFinalized,
+  LauncherLiveness,
+  launcher_liveness_state,
   WorkerProgress,
 )
 
@@ -110,6 +112,8 @@ __all__ = [
   "PassReportRef",
   "CStoreJobRunning",
   "CStoreJobFinalized",
+  "LauncherLiveness",
+  "launcher_liveness_state",
   "WorkerProgress",
   # reports
   "ThreadReport",
