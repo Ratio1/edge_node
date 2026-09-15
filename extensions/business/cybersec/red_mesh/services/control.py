@@ -13,6 +13,7 @@ from ..model_testing.constants import (
   selected_model_test_worker_addr,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.effects import EffectState
 from .event_hooks import emit_lifecycle_event
 from .secrets import collect_secret_refs_from_job_config
 from .state_machine import set_job_status
@@ -772,15 +773,21 @@ def purge_all_jobs(owner):
   }
 
 
-def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
+def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT", *, checked_job=None, ledger=None):
   """
   Stop a job (any run mode with HARD stop, continuous-only for SOFT stop).
-  """
-  raw_job_specs = _job_repo(owner).get_job(job_id)
-  if not raw_job_specs:
-    return {"error": "Job not found", "job_id": job_id}
 
-  _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+  `checked_job` is the admitted snapshot (RM-026 I1b B10). It is already normalized, so this does
+  not re-read or re-normalize the record. `ledger` records the stop once it is persisted; an
+  internal caller supplies neither and keeps the legacy behaviour.
+  """
+  if checked_job is None:
+    raw_job_specs = _job_repo(owner).get_job(job_id)
+    if not raw_job_specs:
+      return {"error": "Job not found", "job_id": job_id}
+    _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+  else:
+    job_specs = checked_job
   owner_error = _foreign_launcher_error(owner, job_id, job_specs, "stop_monitoring")
   if owner_error:
     return owner_error
@@ -838,7 +845,12 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
     owner._emit_timeline_event(job_specs, "scheduled_for_stop", "Stop scheduled", actor_type="user")
     owner.P(f"[CONTINUOUS] Soft stop scheduled for job {job_id} (will stop after current pass)")
 
+  # The stop is live on the workers before this write; the record is what makes it durable.
+  if ledger is not None:
+    ledger.checkpoint()
   _write_job_record(owner, job_id, job_specs, context="stop_monitoring")
+  if ledger is not None:
+    ledger.record(EffectState.PERSISTED)
 
   return {
     "job_status": job_specs["job_status"],

@@ -39,7 +39,7 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
                  "correlate_suricata_eve", "upload_authorization",
                  "save_rulebook_review_draft", "submit_rulebook_review",
                  "reopen_rulebook_review", "update_rulebook_review",
-                 "generate_rulebook_assessment")
+                 "generate_rulebook_assessment", "stop_monitoring")
 # RM-026 I1b B6/B7: admitted endpoints deliberately NOT on the strict read transport, because each
 # returns typed codes the guard would destroy -- `_read_error_response` allowlists only
 # {400,401,403,404,405,503} and rebuilds the body from scratch.
@@ -139,6 +139,7 @@ def _render_native(default_route=None):
                                    "review_state", "request_actor"),
         "generate_rulebook_assessment": ("self", "job_id", "profile_id", "pass_nr", "persist",
                                          "force", "request_actor"),
+        "stop_monitoring": ("self", "job_id", "stop_type", "request_actor"),
       }[method.name]
       assert tuple(arg.arg for arg in method.args.args) == expected
     else:

@@ -99,3 +99,27 @@ def test_the_denial_keeps_its_status_over_the_wire(read_native, response_format,
     detail = detail.get("detail", detail)
     code = detail.get("error", detail.get("detail")) if isinstance(detail, dict) else detail
     assert code in ("forbidden", "not_found"), detail
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_the_launcher_mismatch_keeps_its_code_over_the_wire(read_native, response_format):
+  """This endpoint is on the strict transport, which rebuilds error bodies and allowlists only
+  {400,401,403,404,405,503} unless a code is registered in `_TYPED_READ_ERRORS`. Collapsed to
+  `unavailable`, a refusal that means "this node did not launch the job" reads as an outage, and
+  the caller retries against a node that can never serve it.
+
+  This is the third endpoint in the series to need the carve-out, which is why the check was
+  generalised from one hardcoded path to every registered pair.
+  """
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+    module.eng = scheduler_comms(fixture, response_format)
+    fixture.owner.ee_addr = "some-other-node"   # the fixture job was launched by node-a
+    fixture.owner.P = lambda *_args, **_kwargs: None
+    fixture.owner._log_audit_event = lambda *_args, **_kwargs: None
+    status, headers, body, _calls = asyncio.run(request(module, "stop_monitoring",
+      {**BODY, "request_actor": fixture.actor}))
+    assert status == 409, body
+    assert headers[b"cache-control"] == b"no-store"
+    assert json.loads(body)["error"] == "job_launcher_mismatch", body

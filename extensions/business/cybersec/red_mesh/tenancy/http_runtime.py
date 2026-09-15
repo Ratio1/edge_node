@@ -155,6 +155,10 @@ _EFFECT_FIELDS = {
   "generate_rulebook_assessment": _JOB_FIELD + (("profile_id", str, None), ("pass_nr", int, None),
                                                 ("persist", bool, True), ("force", bool, True),
                                                 ("request_actor", dict, None)),
+  # B10 stop monitoring. On the strict transport, unlike B6/B7/B8: its one typed code is registered
+  # in _TYPED_READ_ERRORS, so nothing is lost, and it gains the effect_incomplete passthrough --
+  # which matters here because a failed stop may already have cancelled the workers.
+  "stop_monitoring": _JOB_FIELD + (("stop_type", str, "SOFT"), ("request_actor", dict, None)),
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.
@@ -175,11 +179,18 @@ _READ_PATHS = {"/" + name: fields
 # Header-only: no field validation, no error rebuild, no status rewriting.
 _NO_STORE_PATHS = ("/analyze_job", "/get_raw_model_test_evidence", "/delete_job_engagement")
 _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
-_RULEBOOK_READ_ERRORS = {
+# Typed codes that must survive the guard's error rebuild, keyed by path. Without an entry here a
+# status outside {400,401,403,404,405,503} collapses to `unavailable` and the code is destroyed --
+# the failure B6 shipped and had to revert.
+_TYPED_READ_ERRORS = {
   "/get_rulebook_assessment_status": {(400, "invalid_profile"), (400, "unsupported_job_type")},
   "/get_rulebook_review": {(400, "invalid_profile"), (400, "unsupported_job_type"),
                            (409, "job_not_finalized"), (503, "submission_contract_unsupported")},
+  # B10: the stop is refused because this node did not launch the job. Collapsed to `unavailable`
+  # it reads as an outage, and the caller retries against a node that can never serve it.
+  "/stop_monitoring": {(409, "job_launcher_mismatch")},
 }
+_TYPED_READ_PAIRS = frozenset(pair for pairs in _TYPED_READ_ERRORS.values() for pair in pairs)
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"
 
 
@@ -246,7 +257,9 @@ def _read_error_response(status, *, code=None, effect_state=None, configuration_
   from starlette.responses import JSONResponse
   errors = {400: "invalid_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
             405: "method_not_allowed", 503: "unavailable"}
-  known_rulebook_error = (type(status) is int and (status, code) in _RULEBOOK_READ_ERRORS["/get_rulebook_review"])
+  # Validated against every registered pair, not one path's set: keying the check to a single path
+  # meant a code registered for any other path was silently collapsed anyway.
+  known_typed_error = (type(status) is int and (status, code) in _TYPED_READ_PAIRS)
   # RM-026 I1b: a partially completed effect must survive the guard. Collapsing it to 503
   # "unavailable" would tell the caller nothing happened after a bundle was written or a SOC
   # event delivered, and invite a retry that duplicates it.
@@ -260,8 +273,8 @@ def _read_error_response(status, *, code=None, effect_state=None, configuration_
     if isinstance(configuration_error, str) and _PUBLISHABLE_CODE.match(configuration_error):
       body["configuration_error"] = configuration_error
     return JSONResponse(body, status_code=500, headers={"Cache-Control": "no-store"})
-  status = status if type(status) is int and (status in errors or known_rulebook_error) else 503
-  error = code if known_rulebook_error else errors[status]
+  status = status if type(status) is int and (status in errors or known_typed_error) else 503
+  error = code if known_typed_error else errors[status]
   headers = {"Cache-Control": "no-store"}
   if status == 405:
     headers["Allow"] = "POST"
@@ -447,9 +460,14 @@ def install_generated_read_api(app, model_namespace) -> None:
       if _read_path(request.scope.get("path")):
         detail = error.detail
         if isinstance(detail, dict):
-          for status, code in _RULEBOOK_READ_ERRORS.get(request.scope.get("path"), ()):
-            typed = (detail.get("success") is False and type(detail.get("status_code")) is int
-                     and detail["status_code"] == status and detail.get("error") == code)
+          for status, code in _TYPED_READ_ERRORS.get(request.scope.get("path"), ()):
+            # Two shapes reach here. A denial built by _read_operation carries `success: False`;
+            # a service's own typed refusal carries just the code and its status. Both are gated on
+            # the (status, code) pair being registered for this exact path, so widening the shape
+            # widens nothing a plugin can choose for itself.
+            typed = (type(detail.get("status_code")) is int and detail["status_code"] == status
+                     and detail.get("error") == code
+                     and detail.get("success") in (False, None))
             raw = (detail.get("detail") == code and not any(
               key in detail for key in ("success", "error", "status_code", "result")))
             if error.status_code == status and (typed or raw):
