@@ -193,3 +193,21 @@ def test_an_unbound_job_is_not_found_through_a_tenant_selector():
                                               request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert (result.get("success"), result.get("status_code")) == (False, 404), result
     stop.assert_not_called()
+
+
+def test_a_tenant_bound_record_is_normalized_before_the_service_touches_it():
+  """The tenant read seam returns the detached raw record; the legacy seam normalizes; the service
+  assumes normalized. On a malformed-but-stored record (workers: None) the un-normalized path stopped
+  the worker and then raised after the irreversible step -- a 503 that invites a duplicating retry.
+  Pinned at the seam: what the service receives must already be normalized. (The read fixture cannot
+  run the real service to completion -- no persistence -- so the effect itself is not asserted here.)"""
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+    _membership(fixture, "tenant_admin")
+    fixture.store.jobs["job-1"]["workers"] = None
+    with _stop_ok(fixture) as stop:
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                              tenant_id=fixture.tenant_id)
+    assert result.get("success") is True, result
+    received = stop.call_args.kwargs["checked_job"]
+    assert isinstance(received.get("workers"), dict), received.get("workers")
+    assert received.get("launcher"), received

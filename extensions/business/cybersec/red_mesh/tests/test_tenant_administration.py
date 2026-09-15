@@ -508,11 +508,11 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
 
 
 def test_auth_hkey_is_read_from_the_plugin_instance_env_before_the_process_env(monkeypatch):
-  """RM-026 MVP: deeploy injects R1EN_CSTORE_AUTH_HKEY into the plugin instance ENV
-  (deeploy_mixin.py: env_cfg.setdefault(hkey_name, ...)), which is a container env only for
-  containerized apps. This plugin runs in-process and read os.environ alone, so the injected value
-  never reached it -- the gap tenant-identity-provider.md:183-187 left open. Instance ENV is the
-  deployment's own value and wins; os.environ stays as the fallback."""
+  """RM-026 MVP: the hkey is a pipeline-level value, so the plugin reads its own instance ENV first
+  and falls back to os.environ. Note what this does NOT claim: deeploy's injector
+  (deeploy_mixin._ensure_runner_cstore_auth_env) targets CONTAINERIZED_APPS_SIGNATURES only, so a
+  deeploy-launched PENTESTER_API_01 gets no hkey unless its instance config carries
+  ENV.R1EN_CSTORE_AUTH_HKEY or the host env sets it. Instance ENV wins over the host env."""
   from types import SimpleNamespace
   from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import (
     AUTH_HKEY_ENV, CstoreAuthAccountReader)
