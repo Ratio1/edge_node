@@ -6,8 +6,41 @@ def _config_attr_name(block_name):
   return f"cfg_{block_name.lower()}"
 
 
-def resolve_config_block(owner, block_name, defaults, normalizer=None):
-  """Resolve one shallow nested config block with partial override merge."""
+def tenant_integration_override(owner, tenant_id, integration_id):
+  """One tenant's stored integration override, or {} when there is none.
+
+  Internal resolution, not a caller-facing read: admission happened at the endpoint that supplied
+  the tenant. The plugin owns the store, so this duck-types the accessor the way
+  services/secrets.py reaches the artifact repository, keeping this module testable with a fake
+  owner and free of an adapter import.
+
+  Storage being unavailable yields {} rather than raising, matching how every other config source
+  here degrades. It is not a silent fallback to the node's destination: the caller that wants
+  "a bound job with no tenant config exports nowhere" enforces that on the resolved result, because
+  an absent record and an unreachable store are the same empty override to this function and must
+  not be distinguished into an accidental node-level export.
+  """
+  if tenant_id is None or not integration_id:
+    return {}
+  getter = getattr(type(owner), "_get_tenant_integration_config", None)
+  if not callable(getter):
+    return {}
+  try:
+    stored = getter(owner, tenant_id, integration_id)
+  except Exception:
+    return {}
+  if not isinstance(stored, dict):
+    return {}
+  config = stored.get("config")
+  return dict(config) if isinstance(config, dict) else {}
+
+
+def resolve_config_block(owner, block_name, defaults, normalizer=None, tenant_override=None):
+  """Resolve one shallow nested config block with partial override merge.
+
+  A tenant override is applied last: the tenant's destination wins over the node's, which is the
+  whole point of tenant-scoped integrations.
+  """
   merged = dict(defaults or {})
   override = getattr(owner, _config_attr_name(block_name), None)
   if override is None:
@@ -20,6 +53,8 @@ def resolve_config_block(owner, block_name, defaults, normalizer=None):
       override = config.get(block_name)
   if isinstance(override, dict):
     merged.update(override)
+  if isinstance(tenant_override, dict):
+    merged.update(tenant_override)
 
   if callable(normalizer):
     normalized = normalizer(dict(merged), dict(defaults or {}))
@@ -579,7 +614,7 @@ def get_event_export_config(owner):
   )
 
 
-def get_wazuh_export_config(owner):
+def get_wazuh_export_config(owner, tenant_id=None):
   """Return normalized Wazuh/generic SIEM export config."""
   def _normalize(merged, defaults):
     mode = _normalized_choice(
@@ -659,6 +694,7 @@ def get_wazuh_export_config(owner):
     "WAZUH_EXPORT",
     DEFAULT_WAZUH_EXPORT_CONFIG,
     normalizer=_normalize,
+    tenant_override=tenant_integration_override(owner, tenant_id, "wazuh"),
   )
 
 
@@ -720,7 +756,7 @@ def get_stix_export_config(owner):
   )
 
 
-def get_opencti_export_config(owner):
+def get_opencti_export_config(owner, tenant_id=None):
   """Return normalized OpenCTI export config."""
   def _normalize(merged, defaults):
     return {
@@ -750,10 +786,11 @@ def get_opencti_export_config(owner):
     "OPENCTI_EXPORT",
     DEFAULT_OPENCTI_EXPORT_CONFIG,
     normalizer=_normalize,
+    tenant_override=tenant_integration_override(owner, tenant_id, "opencti"),
   )
 
 
-def get_taxii_export_config(owner):
+def get_taxii_export_config(owner, tenant_id=None):
   """Return normalized TAXII export config."""
   def _normalize(merged, defaults):
     return {
@@ -790,4 +827,5 @@ def get_taxii_export_config(owner):
     "TAXII_EXPORT",
     DEFAULT_TAXII_EXPORT_CONFIG,
     normalizer=_normalize,
+    tenant_override=tenant_integration_override(owner, tenant_id, "taxii"),
   )
