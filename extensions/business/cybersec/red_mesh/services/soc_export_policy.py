@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
+from ..tenancy.integrations import status_tenant
 from .auth import credentials_missing
 from .config import get_event_export_config, get_wazuh_export_config
 
@@ -57,13 +58,20 @@ def retry_after_seconds(cooldown_until, *, now=None):
   return max(0, remaining)
 
 
-def _status_hkey(owner):
-  return f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
+def _status_hkey(owner, tenant_id=None):
+  """Must agree with integration_status._status_hkey; the shared shape is pinned by test."""
+  base = f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
+  if tenant_id is None:
+    return base
+  if not isinstance(tenant_id, str) or not tenant_id.strip() or ":" in tenant_id:
+    raise ValueError("Invalid tenant for integration status")
+  return f"{base}:{tenant_id}"
 
 
-def load_integration_status_record(owner, integration_id):
+def load_integration_status_record(owner, integration_id, tenant_id=None):
   try:
-    payload = owner.chainstore_hget(hkey=_status_hkey(owner), key=integration_id)
+    payload = owner.chainstore_hget(
+      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)), key=integration_id)
   except Exception:
     return {}
   return payload if isinstance(payload, dict) else {}
@@ -160,8 +168,8 @@ def apply_integration_outcome_policy(owner, integration_id, record, *, outcome, 
   return record
 
 
-def current_integration_cooldown(owner, integration_id="wazuh"):
-  record = load_integration_status_record(owner, integration_id)
+def current_integration_cooldown(owner, integration_id="wazuh", tenant_id=None):
+  record = load_integration_status_record(owner, integration_id, tenant_id)
   retry_after = retry_after_seconds(record.get("cooldown_until"))
   if retry_after is None or retry_after <= 0:
     return None

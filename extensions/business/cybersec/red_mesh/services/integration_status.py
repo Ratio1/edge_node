@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 
 from ..tenancy.effects import EffectState
+from ..tenancy.integrations import status_tenant
 from .auth import credentials_missing
 from .config import (
   get_event_export_config,
@@ -38,21 +39,35 @@ def _utc_timestamp():
   return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _status_hkey(owner):
-  return f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
+def _status_hkey(owner, tenant_id=None):
+  """Node history keeps its original key; a tenant's history lives beside it, never merged.
+
+  Callers pass an integration id through status_tenant() first, so the three node-level ids keep
+  the node key even under a tenant-scoped call. Existing deployment history is therefore never
+  stranded or re-attributed to whichever tenant happens to read first.
+  """
+  base = f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
+  if tenant_id is None:
+    return base
+  if not isinstance(tenant_id, str) or not tenant_id.strip() or ":" in tenant_id:
+    raise ValueError("Invalid tenant for integration status")
+  return f"{base}:{tenant_id}"
 
 
-def _load_status_record(owner, integration_id):
+def _load_status_record(owner, integration_id, tenant_id=None):
   try:
-    payload = owner.chainstore_hget(hkey=_status_hkey(owner), key=integration_id)
+    payload = owner.chainstore_hget(
+      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)), key=integration_id)
   except Exception:
     return {}
   return payload if isinstance(payload, dict) else {}
 
 
-def _save_status_record(owner, integration_id, record):
+def _save_status_record(owner, integration_id, record, tenant_id=None):
   try:
-    owner.chainstore_hset(hkey=_status_hkey(owner), key=integration_id, value=record)
+    owner.chainstore_hset(
+      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)),
+      key=integration_id, value=record)
   except Exception:
     return False
   return True
@@ -420,7 +435,7 @@ def get_public_integration_config(owner):
   }
 
 
-def get_integration_status(owner):
+def get_integration_status(owner, tenant_id=None):
   """Historical producer: configuration merged with persisted delivery outcomes.
 
   Deliberately retained with no production caller as of RM-026 I1a.3c.8. The public
@@ -432,7 +447,8 @@ def get_integration_status(owner):
   integrations = {}
   for integration_id, builder in _STATUS_BUILDERS.items():
     base = builder(owner)
-    integrations[integration_id] = _merge_record(base, _load_status_record(owner, integration_id))
+    integrations[integration_id] = _merge_record(
+      base, _load_status_record(owner, integration_id, tenant_id))
   return {
     "schema_version": INTEGRATION_STATUS_SCHEMA_VERSION,
     "generated_at": _utc_timestamp(),
@@ -441,11 +457,11 @@ def get_integration_status(owner):
 
 
 def record_integration_status(owner, integration_id, *, outcome, event_id=None,
-                              artifact_cid=None, error_class=None, dry_run=False):
+                              artifact_cid=None, error_class=None, dry_run=False, tenant_id=None):
   if integration_id not in _STATUS_BUILDERS:
     return False
   now = _utc_timestamp()
-  record = _load_status_record(owner, integration_id)
+  record = _load_status_record(owner, integration_id, tenant_id)
   previous_error_class = record.get("last_error_class")
   if dry_run:
     record["last_dry_run_at"] = now
@@ -470,7 +486,7 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
     record["last_event_id"] = event_id
   if artifact_cid:
     record["last_artifact_cid"] = artifact_cid
-  return _save_status_record(owner, integration_id, record)
+  return _save_status_record(owner, integration_id, record, tenant_id)
 
 
 def test_event_export(owner, integration_id="event_export", *, ledger=None):
