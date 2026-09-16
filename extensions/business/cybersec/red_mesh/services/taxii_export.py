@@ -308,7 +308,7 @@ def publish_to_taxii(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=
   }
 
 
-def probe_taxii(owner):
+def probe_taxii(owner, tenant_id=None):
   """Read-only connectivity probe for the TAXII Test button.
 
   GETs the configured SERVER_URL (the api root) with the integration's
@@ -316,7 +316,7 @@ def probe_taxii(owner):
   read any objects; just validates reachability + auth + that the api
   root exists.
   """
-  cfg = get_taxii_export_config(owner)
+  cfg = get_taxii_export_config(owner, tenant_id)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return {"status": "disabled", "integration_id": "taxii", "error": "disabled"}

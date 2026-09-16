@@ -102,11 +102,11 @@ _READ_FIELDS = {
   "get_taxii_export_status": _JOB_FIELD + (("request_actor", dict, None),),
   "get_rulebook_assessment_status": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
   "get_rulebook_review": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
-  "get_misp_export_config_status": (("request_actor", dict, None),),
+  "get_misp_export_config_status": (("request_actor", dict, None), ("tenant_id", str, None)),
   "llm_health": (("request_actor", dict, None),),
   "update_finding_triage": (("request_actor", dict, None),),
   "export_misp_json": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
-  "get_integration_status": (("request_actor", dict, None),),
+  "get_integration_status": (("request_actor", dict, None), ("tenant_id", str, None)),
 }
 # Effect-bearing endpoints (RM-026 I1b).
 #
@@ -122,7 +122,8 @@ _EFFECT_FIELDS = {
   "dry_run_taxii_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "export_stix_bundle": _JOB_FIELD + (("pass_nr", int, None), ("persist", bool, True),
                                       ("request_actor", dict, None)),
-  "test_event_export": (("integration_id", str, "event_export"), ("request_actor", dict, None)),
+  "test_event_export": (("integration_id", str, "event_export"), ("request_actor", dict, None),
+                        ("tenant_id", str, None)),
   # B2 external delivery.
   "push_to_opencti": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
   "publish_to_taxii": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),

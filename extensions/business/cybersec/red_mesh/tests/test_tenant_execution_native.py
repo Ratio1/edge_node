@@ -30,8 +30,11 @@ LEGACY_STATUS_ROUTES = (
   "get_opencti_export_status", "get_taxii_export_status",
 )
 LEGACY_RULEBOOK_ROUTES = ("get_rulebook_assessment_status", "get_rulebook_review")
-ACTOR_ONLY_READ_ROUTES = ("get_misp_export_config_status", "llm_health", "update_finding_triage",
-                          "get_integration_status")
+ACTOR_ONLY_READ_ROUTES = ("llm_health", "update_finding_triage")
+# RM-081 Phase 3c: job-less reads that may also be tenant-scoped. Unscoped keeps the legacy
+# actor-only path and its rollout gate; scoped goes through the tenant matrix. The selector is
+# appended last, as stop_monitoring's is.
+ACTOR_OR_TENANT_READ_ROUTES = ("get_misp_export_config_status", "get_integration_status")
 LEGACY_JSON_EXPORT_ROUTES = ("export_misp_json",)
 # RM-026 I1b B1: effect endpoints sharing the strict read transport.
 EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle",
@@ -63,7 +66,7 @@ LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
   "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
-) + LEGACY_READ_ROUTES
+) + LEGACY_READ_ROUTES + ACTOR_OR_TENANT_READ_ROUTES
 SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
 ERROR = "Incompatible generated execution API"
 
@@ -106,6 +109,8 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "profile_id", "request_actor")
     elif method.name in ACTOR_ONLY_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
+    elif method.name in ACTOR_OR_TENANT_READ_ROUTES:
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor", "tenant_id")
     elif method.name in LEGACY_JSON_EXPORT_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor")
     elif method.name in UNGUARDED_ROUTES:
@@ -121,7 +126,8 @@ def _render_native(default_route=None):
         "dry_run_opencti_export": ("self", "job_id", "pass_nr", "request_actor"),
         "dry_run_taxii_export": ("self", "job_id", "pass_nr", "request_actor"),
         "export_stix_bundle": ("self", "job_id", "pass_nr", "persist", "request_actor"),
-        "test_event_export": ("self", "integration_id", "request_actor"),
+        # RM-081 Phase 3c: a synthetic delivery goes to the tenant's destination when scoped.
+        "test_event_export": ("self", "integration_id", "request_actor", "tenant_id"),
         "push_to_opencti": ("self", "job_id", "pass_nr", "request_actor"),
         "publish_to_taxii": ("self", "job_id", "pass_nr", "request_actor"),
         "export_misp": ("self", "job_id", "pass_nr", "request_actor"),

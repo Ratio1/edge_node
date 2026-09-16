@@ -18,9 +18,9 @@ from ..services.misp_export import (
 
 class _MispExportMixin:
 
-  def _get_misp_export_config(self):
+  def _get_misp_export_config(self, tenant_id=None):
     """Return MISP config status (no secrets exposed)."""
-    cfg = get_misp_export_config(self)
+    cfg = get_misp_export_config(self, tenant_id)
     return {
       "enabled": cfg["ENABLED"],
       "auto_export": cfg["AUTO_EXPORT"],

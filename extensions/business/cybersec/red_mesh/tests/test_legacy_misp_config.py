@@ -22,7 +22,8 @@ def install_config_producer(fixture, config=None):
   owner.CONFIG = {"MISP_EXPORT": deepcopy(config or {})}
   owner.config_data = {}
   owner.P = MagicMock()
-  owner._get_misp_export_config = MagicMock(side_effect=lambda: _MispExportMixin._get_misp_export_config(owner))
+  owner._get_misp_export_config = MagicMock(
+    side_effect=lambda tenant_id=None: _MispExportMixin._get_misp_export_config(owner, tenant_id))
   original_get = owner.chainstore_hget
   def read(hkey, key):
     assert hkey != owner.cfg_instance_id, "Forbidden job point-read"
@@ -53,7 +54,7 @@ def test_actual_native_actor_only_config_read_preserves_defaults_and_no_store(re
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert actual == DEFAULT and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with()
+    fixture.owner._get_misp_export_config.assert_called_once_with(None)
     assert not any(row[0] == "list" or row[1] == fixture.owner.cfg_instance_id for row in fixture.store.reads)
 
 
@@ -74,7 +75,7 @@ def test_actual_native_rejects_invalid_or_extended_producer_payload_before_wrapp
   install(module)
   with read_endpoint_fixture(bound=False) as fixture:
     install_config_producer(fixture)
-    fixture.owner._get_misp_export_config.side_effect = lambda: deepcopy(produced)
+    fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: deepcopy(produced)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503} and calls == 1
@@ -217,14 +218,14 @@ def test_native_each_request_reauthorizes_after_account_revocation(read_native, 
     fixture.store.account("reader", active=False)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 404)
     assert result == {"success": False, "error": "not_found", "status_code": 404} and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with()
+    fixture.owner._get_misp_export_config.assert_called_once_with(None)
 
 
 def test_valid_producer_payload_is_detached_before_publication():
   with read_endpoint_fixture(bound=False) as fixture:
     install_config_producer(fixture)
     payload = dict(DEFAULT)
-    fixture.owner._get_misp_export_config.side_effect = lambda: payload
+    fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: payload
     result = getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor=fixture.actor)
     assert result == DEFAULT
     result["enabled"] = True

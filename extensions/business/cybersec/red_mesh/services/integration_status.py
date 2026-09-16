@@ -148,7 +148,7 @@ def _merge_record(base, record):
   return merged
 
 
-def _event_export_status(owner):
+def _event_export_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
   cfg = get_event_export_config(owner)
   missing_secret = cfg["SIGN_PAYLOADS"] and not _has_env_secret(cfg["HMAC_SECRET_ENV"])
   configured = bool(cfg["ENABLED"]) and not missing_secret
@@ -169,9 +169,9 @@ def _event_export_status(owner):
   )
 
 
-def _wazuh_status(owner):
-  cfg = get_wazuh_export_config(owner)
-  readiness = wazuh_readiness(owner)
+def _wazuh_status(owner, tenant_id=None):
+  cfg = get_wazuh_export_config(owner, tenant_id)
+  readiness = wazuh_readiness(owner, tenant_id)
   mode = readiness["mode"]
   host = readiness["host"]
   return _base_status(
@@ -198,7 +198,7 @@ def _wazuh_status(owner):
   )
 
 
-def _suricata_status(owner):
+def _suricata_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
   cfg = get_suricata_correlation_config(owner)
   return _base_status(
     "suricata",
@@ -214,7 +214,7 @@ def _suricata_status(owner):
   )
 
 
-def _stix_status(owner):
+def _stix_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
   cfg = get_stix_export_config(owner)
   return _base_status(
     "stix",
@@ -230,8 +230,8 @@ def _stix_status(owner):
   )
 
 
-def _opencti_status(owner):
-  cfg = get_opencti_export_config(owner)
+def _opencti_status(owner, tenant_id=None):
+  cfg = get_opencti_export_config(owner, tenant_id)
   host = _redacted_url_host(cfg["URL"])
   credentials_error = credentials_missing(cfg)
   configured = bool(cfg["ENABLED"]) and bool(host) and credentials_error is None
@@ -252,8 +252,8 @@ def _opencti_status(owner):
   )
 
 
-def _taxii_status(owner):
-  cfg = get_taxii_export_config(owner)
+def _taxii_status(owner, tenant_id=None):
+  cfg = get_taxii_export_config(owner, tenant_id)
   host = _redacted_url_host(cfg["SERVER_URL"])
   credentials_error = credentials_missing(cfg)
   configured = (
@@ -417,12 +417,22 @@ def _public_config_item(integration_id, base):
   }
 
 
-def get_public_integration_config(owner):
-  """Configuration/readiness only: no history, counts, cooldown or stored errors."""
+def get_public_integration_config(owner, tenant_id=None):
+  """Configuration/readiness only: no history, counts, cooldown or stored errors.
+
+  A scoped call resolves the four tenant ids from that tenant's records; the three node-level ids
+  keep coming from node config, so what they report is identical either way and the payload's key
+  set still equals _STATUS_BUILDERS.
+  """
   integrations = {}
   for integration_id, builder in _STATUS_BUILDERS.items():
     # Detached per integration; never _merge_record and never _load_status_record.
-    integrations[integration_id] = _public_config_item(integration_id, builder(owner))
+    # status_tenant() here is a guard, not a behaviour: the three node-level builders ignore the
+    # argument today (pinned by test_node_level_builders_ignore_the_tenant), so passing the raw
+    # tenant would currently be equivalent. It stays so that a builder which starts reading it
+    # cannot silently acquire tenant scope it was never granted.
+    integrations[integration_id] = _public_config_item(
+      integration_id, builder(owner, status_tenant(integration_id, tenant_id)))
   if set(integrations) != set(_STATUS_BUILDERS):
     raise IntegrationConfigUnavailable("integrations")
   generated_at = _utc_timestamp()
@@ -446,7 +456,7 @@ def get_integration_status(owner, tenant_id=None):
   """
   integrations = {}
   for integration_id, builder in _STATUS_BUILDERS.items():
-    base = builder(owner)
+    base = builder(owner, status_tenant(integration_id, tenant_id))
     integrations[integration_id] = _merge_record(
       base, _load_status_record(owner, integration_id, tenant_id))
   return {
@@ -490,7 +500,7 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
   return _save_status_record(owner, integration_id, record, tenant_id)
 
 
-def test_event_export(owner, integration_id="event_export", *, ledger=None):
+def test_event_export(owner, integration_id="event_export", *, ledger=None, tenant_id=None):
   """Probe or deliver a synthetic event. `ledger` records what actually left the node."""
   integration_id = str(integration_id or "event_export").strip().lower()
   if integration_id not in _STATUS_BUILDERS:
@@ -512,7 +522,8 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None):
     if ledger is not None:
       # A real send follows: dry_run only affects the status stamp, not the transmission.
       ledger.checkpoint()
-    delivered = deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
+    delivered = deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True,
+                                      tenant_id=tenant_id)
     # deliver_redmesh_event returns "sent" | "disabled" | "error" -- never "skipped". Gating on
     # "not skipped" recorded a delivery when the integration was disabled and nothing left the node.
     if ledger is not None and isinstance(delivered, dict) and delivered.get("status") == "sent":
@@ -521,11 +532,11 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None):
 
   if integration_id == "opencti":
     from .opencti_export import probe_opencti
-    return probe_opencti(owner)
+    return probe_opencti(owner, tenant_id)
 
   if integration_id == "taxii":
     from .taxii_export import probe_taxii
-    return probe_taxii(owner)
+    return probe_taxii(owner, tenant_id)
 
   if integration_id == "suricata":
     # Suricata correlation is pull-based — the operator uploads EVE JSONL
@@ -555,6 +566,7 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None):
     outcome="success",
     event_id=event["event_id"],
     dry_run=True,
+    tenant_id=tenant_id,
   )
   return {
     "status": "ok",

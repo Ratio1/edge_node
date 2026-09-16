@@ -326,7 +326,7 @@ def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=N
   }
 
 
-def probe_opencti(owner):
+def probe_opencti(owner, tenant_id=None):
   """Read-only connectivity probe for the OpenCTI Test button.
 
   Runs the GraphQL `me {}` query against the configured OpenCTI URL using
@@ -334,7 +334,7 @@ def probe_opencti(owner):
   validates that the URL is reachable, credentials are accepted, and the
   GraphQL schema is responsive.
   """
-  cfg = get_opencti_export_config(owner)
+  cfg = get_opencti_export_config(owner, tenant_id)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return {"status": "disabled", "integration_id": "opencti", "error": "disabled"}
