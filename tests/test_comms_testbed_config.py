@@ -18,6 +18,7 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("127.0.0.1:18883:1883", compose_text)
     self.assertIn("127.0.0.1:18083:18083", compose_text)
     self.assertIn("http://127.0.0.1:18083/status", compose_text)
+    self.assertIn('EMQX_MQTT__IGNORE_LOOP_DELIVER: "true"', compose_text)
     self.assertIn("INSTALL_LOCAL_REQUIREMENTS", compose_text)
     self.assertIn("EE_ETH_ENABLED: \"false\"", compose_text)
     self.assertIn("EE_DAUTH_URL: N/A", compose_text)
@@ -42,14 +43,14 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("EE_NETMON_ACCEPT_LOCAL_SUPERVISOR_SUMMARY: \"1\"", compose_text)
     self.assertNotIn("EE_NETMON_USE_SUMMARY_STATUS", compose_text)
 
-  def test_app_config_has_regrouped_traffic_roles_and_channel_qos(self):
+  def test_app_config_has_crossed_traffic_roles_and_channel_qos(self):
     config = json.loads((REPO_ROOT / ".config_app_comms.json").read_text())
     instances = config["COMMUNICATION"]["INSTANCES"]
     params = config["COMMUNICATION"]["PARAMS"]
 
-    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CONFIG_CHANNEL")
+    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CTRL_CHANNEL")
     self.assertEqual(instances["COMMANDCONTROL"]["SEND_TO"], "CONFIG_CHANNEL")
-    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CTRL_CHANNEL")
+    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CONFIG_CHANNEL")
     self.assertEqual(instances["HEARTBEATS"]["SEND_TO"], "CTRL_CHANNEL")
     self.assertEqual(params["HOST"], "emqx")
     self.assertEqual(params["HEARTBEAT_AUTH_MODE"], "shadow")
@@ -71,9 +72,9 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     instances = config["COMMUNICATION"]["INSTANCES"]
     params = config["COMMUNICATION"]["PARAMS"]
 
-    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CONFIG_CHANNEL")
+    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CTRL_CHANNEL")
     self.assertEqual(instances["COMMANDCONTROL"]["SEND_TO"], "CONFIG_CHANNEL")
-    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CTRL_CHANNEL")
+    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CONFIG_CHANNEL")
     self.assertEqual(instances["HEARTBEATS"]["SEND_TO"], "CTRL_CHANNEL")
     self.assertEqual(params["CTRL_CHANNEL"]["TOPIC"], "naeural/ctrl")
     self.assertEqual(params["CTRL_CHANNEL"]["QOS"], 1)
