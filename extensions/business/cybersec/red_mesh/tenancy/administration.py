@@ -17,6 +17,9 @@ from .execution import CurrentExecutionFacts, ExecutionBinding, ExecutionRollout
 from .ports import TenantStoreError
 from .nodes import valid_node_address
 from .assets import canonical_digest, normalize_name, normalize_target, valid_digest
+from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
+                           normalize_integration_config, public_integration_config,
+                           valid_integration_id)
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -554,6 +557,76 @@ class TenantAdministrationService:
       "target_digest": canonical_digest(target), "changed_by": account.account_id,
       "changed_at": datetime.now(timezone.utc).isoformat()})
     return self._asset_row(self.store.get("asset", tenant_id, asset_id))
+
+  @staticmethod
+  def _integration_row(row):
+    if row is None:
+      raise TenantStoreError("Integration readback is unavailable")
+    return {"tenantId": row["tenant_id"], "integrationId": row["integration_id"],
+            "enabled": row["enabled"],
+            "config": public_integration_config(row["integration_id"], row["config"]),
+            "updatedBy": row["updated_by"], "updatedAt": row["updated_at"],
+            "version": canonical_digest(row)}
+
+  @staticmethod
+  def _integration_id(value):
+    # A node-level id is refused with its own reason rather than a bare not_found, so an operator
+    # who asks for suricata learns it is node-level instead of assuming the tenant is broken.
+    if isinstance(value, str) and value in NODE_LEVEL_INTEGRATION_IDS:
+      raise AdministrationDenied(400, "integration_not_tenant_scoped")
+    if not valid_integration_id(value):
+      raise AdministrationDenied(404, "not_found")
+    return value
+
+  @_endpoint
+  def list_tenant_integrations(self, actor, tenant_id):
+    """Every tenant-scopable id, configured or not, so the surface never hides an unset one."""
+    _, _account = self._authorized_tenant(actor, tenant_id, "integrations:manage")
+    stored = {row["integration_id"]: row for row in self.store.list_integrations(tenant_id)}
+    return {"tenantId": tenant_id,
+            "integrations": [self._integration_row(stored[integration_id])
+                             if integration_id in stored
+                             else {"tenantId": tenant_id, "integrationId": integration_id,
+                                   "enabled": False, "config": None, "updatedBy": None,
+                                   "updatedAt": None, "version": None}
+                             for integration_id in integration_ids()]}
+
+  @_endpoint
+  def get_tenant_integration(self, actor, tenant_id, integration_id):
+    self._authorized_tenant(actor, tenant_id, "integrations:manage")
+    integration_id = self._integration_id(integration_id)
+    row = self.store.get("integration", tenant_id, integration_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    return {"integration": self._integration_row(row)}
+
+  @_endpoint
+  def put_tenant_integration(self, actor, tenant_id, integration_id, enabled, config,
+                             expected_version=None):
+    """Replace one tenant's config for one integration. Absent expected_version means first write."""
+    _, account = self._authorized_tenant(actor, tenant_id, "integrations:manage")
+    integration_id = self._integration_id(integration_id)
+    try:
+      if type(enabled) is not bool:
+        raise ValueError("Invalid desired state")
+      config = normalize_integration_config(integration_id, config)
+      if expected_version is not None and not valid_digest(expected_version):
+        raise ValueError("Invalid expected version")
+    except (ValueError, TypeError, RecursionError):
+      raise AdministrationDenied(400, "invalid_request") from None
+    row = self.store.get("integration", tenant_id, integration_id)
+    if (row is None) != (expected_version is None):
+      raise AdministrationDenied(409, "conflict")
+    if row is not None:
+      if canonical_digest(row) != expected_version:
+        raise AdministrationDenied(409, "conflict")
+      if (row["enabled"], row["config"]) == (enabled, config):
+        return self._integration_row(row)
+    self.store.put("integration", tenant_id, integration_id, record={
+      "tenant_id": tenant_id, "integration_id": integration_id, "enabled": enabled,
+      "config": config, "updated_by": account.account_id,
+      "updated_at": datetime.now(timezone.utc).isoformat()})
+    return self._integration_row(self.store.get("integration", tenant_id, integration_id))
 
   @_endpoint
   def set_tenant_node_assignment(self, actor, tenant_id, node_address, active):

@@ -5,6 +5,7 @@ Verification is a local read-back, not a distributed transaction or freshness gu
 import json
 
 from ..ports import TenantStoreError
+from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
 from ..assets import validate_asset
 
@@ -53,6 +54,8 @@ class CstoreTenantAdministrationStore:
       raise TenantStoreError("Invalid tenant storage record")
     if kind == "tenant_node":
       validate_node_assignment(raw, ids)
+    if kind == "integration":
+      validate_integration(raw, ids)
     if kind == "asset":
       try:
         validate_asset(raw, ids)
@@ -119,6 +122,11 @@ class CstoreTenantAdministrationStore:
   def list_assets(self, tenant_id):
     self._location("asset", (tenant_id,))
     return [self._validate(raw, "asset", ids) for ids, raw in self._fields("asset", tenant_id)]
+
+  def list_integrations(self, tenant_id):
+    self._location("integration", (tenant_id,))
+    return [self._validate(raw, "integration", ids)
+            for ids, raw in self._fields("integration", tenant_id)]
 
   def list_tenants(self):
     rows = []
