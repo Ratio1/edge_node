@@ -35,6 +35,45 @@ def tenant_integration_override(owner, tenant_id, integration_id):
   return dict(config) if isinstance(config, dict) else {}
 
 
+TENANT_INTEGRATION_NOT_CONFIGURED = "tenant_integration_not_configured"
+
+
+def tenant_export_binding(owner, job_specs, integration_id):
+  """Which tenant's destination this job exports to. Returns (tenant_id, error_code).
+
+  Three outcomes, and the third is the one that matters:
+
+  - An unbound job (no `execution_binding`) is legacy: (None, None), node config applies, which is
+    how a compatibility-stage node keeps working.
+  - A bound job whose tenant has a stored record: (tenant_id, None).
+  - A bound job whose tenant has NO record: (tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED). It
+    exports nowhere rather than falling back to the node's destination, because falling back would
+    publish one tenant's findings into whatever SOC the deployment happens to point at.
+
+  The existence check lives here rather than in config resolution on purpose: to
+  tenant_integration_override an absent record and an unreachable store are the same empty dict, so
+  a resolved destination can never prove a tenant configured one.
+  """
+  # Imported here, not at module scope: test_llm_agent_config loads this file standalone by path,
+  # so a package-relative import at the top would break that contract for an unrelated test.
+  from ..tenancy.execution import binding_from_record
+  try:
+    binding = binding_from_record(job_specs) if isinstance(job_specs, dict) else None
+  except Exception:
+    # A malformed binding is not absence: refuse rather than treat the job as legacy.
+    return None, TENANT_INTEGRATION_NOT_CONFIGURED
+  if binding is None:
+    return None, None
+  # ExecutionBinding is a frozen snapshot: its fields are reachable through to_dict(), not as
+  # attributes. getattr(binding, "tenant_id") silently yields None and reads as a malformed binding.
+  tenant_id = binding.to_dict().get("tenant_id")
+  if not isinstance(tenant_id, str) or not tenant_id.strip():
+    return None, TENANT_INTEGRATION_NOT_CONFIGURED
+  if not tenant_integration_override(owner, tenant_id, integration_id):
+    return tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED
+  return tenant_id, None
+
+
 def resolve_config_block(owner, block_name, defaults, normalizer=None, tenant_override=None):
   """Resolve one shallow nested config block with partial override merge.
 

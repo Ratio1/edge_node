@@ -155,7 +155,8 @@ def misp_ready(monkeypatch):
   from pymisp import MISPEvent
   event = MISPEvent()
   event.uuid = "11111111-1111-1111-1111-111111111111"
-  monkeypatch.setattr(misp_export, "get_misp_export_config", lambda owner: dict(MISP_CONFIG))
+  monkeypatch.setattr(misp_export, "get_misp_export_config",
+                      lambda owner, tenant_id=None: dict(MISP_CONFIG))
   monkeypatch.setattr(misp_export, "build_misp_event",
                       lambda *a, **k: {"status": "ok", "event": event, "job_id": "job-1",
                                        "pass_nr": 1, "findings_exported": 2, "ports_exported": 1})
@@ -313,7 +314,7 @@ def test_a_misconfigured_misp_does_not_emit_or_write(misp_ready, monkeypatch):
   emitting a SOC event and writing the job record now that the path is live."""
   service = misp_ready
   monkeypatch.setattr(service, "get_misp_export_config",
-                      lambda owner: {**MISP_CONFIG, "MISP_API_KEY": ""})
+                      lambda owner, tenant_id=None: {**MISP_CONFIG, "MISP_API_KEY": ""})
   with read_endpoint_fixture(bound=False) as fixture:
     with patch.object(service, "emit_export_status_event",
                       side_effect=AssertionError(SECRET)) as emit, \

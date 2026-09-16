@@ -12,7 +12,7 @@ from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
 from .auth import AuthError, build_auth_provider, credentials_missing
-from .config import get_taxii_export_config
+from .config import get_taxii_export_config, tenant_export_binding
 from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
@@ -108,21 +108,28 @@ def _bundle_summary(result, artifact_cid=None):
 
 
 def _prepare_taxii_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
-  cfg = get_taxii_export_config(owner)
+  # The job is resolved before the config: which TAXII server this job publishes to is a property
+  # of the job's tenant, so the destination cannot be read until the job is known.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
+  if not isinstance(job_specs, dict):
+    record_integration_status(owner, "taxii", outcome="failure", error_class="job_not_found")
+    return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
+  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "taxii")
+  if binding_error:
+    record_integration_status(owner, "taxii", outcome="failure", error_class=binding_error,
+                              tenant_id=tenant_id)
+    return None, None, {"status": "not_configured", "error": binding_error, "job_id": job_id}
+  cfg = get_taxii_export_config(owner, tenant_id)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return None, None, {"status": "disabled", "error": "TAXII export is disabled", "job_id": job_id}
   if config_error:
     # Operator visibility when reached through _effect_operation. publish_to_taxii still calls this
     # with no requester until B2, so do not read this as universally post-admission.
-    record_integration_status(owner, "taxii", outcome="failure", error_class=config_error)
+    record_integration_status(owner, "taxii", outcome="failure", error_class=config_error,
+                              tenant_id=tenant_id)
     return None, None, {"status": "not_configured", "error": config_error, "job_id": job_id}
 
-  # Checked snapshot replaces the unscoped global lookup (RM-026 I1b).
-  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
-  if not isinstance(job_specs, dict):
-    record_integration_status(owner, "taxii", outcome="failure", error_class="job_not_found")
-    return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "taxii_export")
   if unsupported:
     return None, None, unsupported

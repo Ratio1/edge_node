@@ -481,6 +481,7 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
     error_class=record.get("last_error_class") or error_class,
     previous_error_class=previous_error_class,
     now=now,
+    tenant_id=tenant_id,
   )
   if event_id:
     record["last_event_id"] = event_id

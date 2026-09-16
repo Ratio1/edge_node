@@ -22,6 +22,7 @@ from ..tenancy.administration import AdministrationDenied
 from ..tenancy.effects import EffectState
 from ..tenancy.job_artifacts import TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
+from .config import tenant_export_binding
 from .misp_config import get_misp_export_config, SEVERITY_LEVELS
 from .event_hooks import emit_export_status_event
 from .scan_guards import reject_model_test_for_scan_operation
@@ -369,7 +370,11 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
   Returns {"status": "ok", "event": <MISPEvent>, "job_id": ..., "pass_nr": ...}
   or {"status": "error", "error": "..."}.
   """
-  cfg = get_misp_export_config(owner)
+  tenant_id, binding_error = tenant_export_binding(
+    owner, checked_job if isinstance(checked_job, dict) else None, "misp")
+  if binding_error:
+    return {"status": "error", "error": binding_error, "job_id": job_id}
+  cfg = get_misp_export_config(owner, tenant_id)
   min_severity = cfg["MIN_SEVERITY"]
   distribution = cfg["MISP_DISTRIBUTION"]
 
@@ -435,12 +440,17 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
   For continuous monitoring jobs, if a MISP event already exists (stored
   event_uuid in CStore), updates the existing event with new pass data.
   """
-  cfg = get_misp_export_config(owner)
   # Checked snapshot replaces the unscoped global lookup (RM-026 I1b). Seam one of two.
+  # It is resolved before the config: which MISP this job publishes to is a property of the job's
+  # tenant, so the destination cannot be read until the job is known.
   job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "misp_export")
   if unsupported:
     return unsupported
+  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "misp")
+  if binding_error:
+    return {"status": "not_configured", "error": binding_error, "job_id": job_id}
+  cfg = get_misp_export_config(owner, tenant_id)
 
   def _record_export_status(status, artifact_refs=None):
     if not job_specs:
