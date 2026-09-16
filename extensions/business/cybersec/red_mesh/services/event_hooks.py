@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from .config import get_event_export_config, get_suricata_correlation_config, get_wazuh_export_config
+from .config import (TENANT_INTEGRATION_NOT_CONFIGURED, get_event_export_config,
+                     get_suricata_correlation_config, get_wazuh_export_config,
+                     tenant_export_binding)
 from .event_builder import (
   build_assessment_window,
   build_attestation_event,
@@ -57,6 +59,20 @@ def _job_specs_for_event(owner, job_specs):
   return specs
 
 
+def _emission_tenant(owner, job_specs):
+  """Which tenant this automatic emission belongs to, and whether it may proceed.
+
+  Returns (tenant_id, skip_reason). The automatic path has no caller to admit: the tenant comes
+  from the job's own execution binding, which the launcher already authorized when the job was
+  created. A bound job whose tenant configured no wazuh destination is skipped rather than emitted
+  to the node's, for the same reason an operator-triggered export is refused.
+  """
+  tenant_id, error = tenant_export_binding(owner, job_specs, "wazuh")
+  if error == TENANT_INTEGRATION_NOT_CONFIGURED:
+    return tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED
+  return tenant_id, None
+
+
 def _event_export_secret(owner):
   cfg = get_event_export_config(owner)
   if not cfg["ENABLED"]:
@@ -67,9 +83,9 @@ def _event_export_secret(owner):
   return "redmesh-event-redaction-fallback", None
 
 
-def _automatic_export_enabled(owner):
+def _automatic_export_enabled(owner, tenant_id=None):
   event_cfg = get_event_export_config(owner)
-  wazuh_cfg = get_wazuh_export_config(owner)
+  wazuh_cfg = get_wazuh_export_config(owner, tenant_id)
   if not event_cfg["ENABLED"]:
     return False, "event_export_disabled"
   if not wazuh_cfg["ENABLED"]:
@@ -169,6 +185,15 @@ def _record_job_soc_status(owner, job_specs, event, result):
     status["last_attestation_event_status"] = result.get("status")
     status["last_attestation_event_id"] = event.get("event_id")
 
+  # A tenant that has not configured a destination is a configuration state, not a delivery
+  # failure: recording it as one would accrue a failure signature and eventually a cooldown for
+  # something that never attempted to send.
+  if (result.get("status") == "skipped"
+      and result.get("error") == TENANT_INTEGRATION_NOT_CONFIGURED):
+    status["integration_status"] = "not_configured"
+    job_specs["soc_event_status"] = status
+    return
+
   if _is_disabled_skip(result):
     status["integration_status"] = "disabled"
     job_specs["soc_event_status"] = status
@@ -261,14 +286,19 @@ def _assessment_window(
 
 def emit_redmesh_event(owner, job_specs, event):
   """Best-effort automatic SOC event delivery. Never raises into scan paths."""
-  enabled, reason = _automatic_export_enabled(owner)
+  tenant_id, unconfigured = _emission_tenant(owner, job_specs)
+  if unconfigured:
+    result = _skip_result(unconfigured)
+    _record_job_soc_status(owner, job_specs, event, result)
+    return result
+  enabled, reason = _automatic_export_enabled(owner, tenant_id)
   if not enabled:
     result = _skip_result(reason)
     _record_job_soc_status(owner, job_specs, event, result)
     return result
 
   try:
-    cooldown = current_integration_cooldown(owner, "wazuh")
+    cooldown = current_integration_cooldown(owner, "wazuh", tenant_id)
     if cooldown:
       result = {
         "status": "error",
@@ -281,7 +311,7 @@ def emit_redmesh_event(owner, job_specs, event):
       }
       _record_job_soc_status(owner, job_specs, event, result)
       return result
-    result = deliver_redmesh_event(owner, event, integration_id="wazuh")
+    result = deliver_redmesh_event(owner, event, integration_id="wazuh", tenant_id=tenant_id)
   except Exception as exc:
     result = {
       "status": "error",
@@ -295,6 +325,7 @@ def emit_redmesh_event(owner, job_specs, event):
       outcome="failure",
       event_id=result.get("event_id"),
       error_class=result["error"],
+      tenant_id=tenant_id,
     )
 
   _record_job_soc_status(owner, job_specs, event, result)

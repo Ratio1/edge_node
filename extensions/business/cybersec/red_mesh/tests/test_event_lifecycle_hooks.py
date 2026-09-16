@@ -59,7 +59,7 @@ class TestEventLifecycleHooks(unittest.TestCase):
 
   @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
   def test_lifecycle_hook_delivers_and_records_job_soc_status(self, deliver):
-    def _sent(_owner, event, integration_id="wazuh"):
+    def _sent(_owner, event, integration_id="wazuh", tenant_id=None):
       return {
         "status": "sent",
         "integration_id": integration_id,
@@ -175,7 +175,7 @@ class TestEventLifecycleHooks(unittest.TestCase):
 
   @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
   def test_repeated_invalid_auth_failures_collapse_history_and_timeline(self, deliver):
-    def _invalid_auth(_owner, event, integration_id="wazuh"):
+    def _invalid_auth(_owner, event, integration_id="wazuh", tenant_id=None):
       return {
         "status": "error",
         "integration_id": integration_id,
@@ -224,7 +224,7 @@ class TestEventLifecycleHooks(unittest.TestCase):
   def test_export_attestation_and_finding_hooks_use_specific_event_types(self, deliver):
     seen = []
 
-    def _sent(_owner, event, integration_id="wazuh"):
+    def _sent(_owner, event, integration_id="wazuh", tenant_id=None):
       seen.append(event["event_type"])
       return {
         "status": "sent",
