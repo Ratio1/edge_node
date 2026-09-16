@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 67
+EXPECTED_ENDPOINTS = 70
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -21,6 +21,10 @@ ENDPOINT_FIRST_ARGS = {
   'get_tenant_asset': 'actor',
   'create_tenant_asset': 'actor',
   'update_tenant_asset': 'actor',
+  # RM-081: tenant integration configuration, same administration seam as assets and nodes.
+  'list_tenant_integrations': 'actor',
+  'get_tenant_integration': 'actor',
+  'put_tenant_integration': 'actor',
   'update_tenant_allow_pentester': 'actor',
   'update_tenant_node_failure_policy': 'actor',
   'get_tenant_members': 'actor',
