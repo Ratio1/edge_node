@@ -60,6 +60,8 @@ services:
     container_name: r1_comms_emqx
     environment:
       EMQX_NODE__NAME: emqx@r1_comms_emqx
+      # Match testnet/mainnet so same-client self-delivery regressions are visible.
+      EMQX_MQTT__IGNORE_LOOP_DELIVER: "true"
       EMQX_LOG__CONSOLE_HANDLER__LEVEL: warning
       EMQX_DASHBOARD__DEFAULT_USERNAME: admin
       EMQX_DASHBOARD__DEFAULT_PASSWORD: public

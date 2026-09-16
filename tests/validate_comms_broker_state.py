@@ -23,7 +23,7 @@ API_TOKEN = os.environ.get("ECOMMS_EMQX_TOKEN")
 ROOT_TOPIC = os.environ.get("ECOMMS_ROOT_TOPIC", "naeural_comms_local")
 CTRL_TOPIC = f"{ROOT_TOPIC}/ctrl"
 EXPECTED_TOPOLOGY = os.environ.get(
-  "ECOMMS_EXPECTED_TOPOLOGY", "regrouped",
+  "ECOMMS_EXPECTED_TOPOLOGY", "legacy",
 ).strip().lower()
 if EXPECTED_TOPOLOGY not in {"legacy", "regrouped"}:
   raise ValueError(
