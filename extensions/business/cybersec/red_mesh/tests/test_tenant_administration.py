@@ -352,7 +352,9 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(members, [{"accountId": "initial", "displayName": "initial", "role": "tenant_admin"},
                                {"accountId": "reader", "displayName": "reader", "role": "tenant_user"}])
     self.assertEqual(self.service.get_tenant(reader, tenant_id)["data"]["memberCount"], 2)
-    self.assertEqual(self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_admin", True)["status_code"], 409)
+    sole = self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_admin", True)
+    # RM-083: the more specific last_tenant_admin wins over last_membership for a sole admin's only row.
+    self.assertEqual((sole["status_code"], sole["error"]), (409, "last_tenant_admin"))
     self.assertEqual(self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_user")["status_code"], 409)
     self.assertEqual(self.service.authorize_tenant_membership(self.actor, tenant_id, "reader", "super_tenant_admin")["status_code"], 400)
     self.assertEqual(self.service.authorize_tenant_membership(reader, tenant_id, "reader", "tenant_admin")["status_code"], 403)
