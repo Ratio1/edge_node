@@ -1,10 +1,11 @@
-"""Configuration-only legacy integration readiness through real builders and native transport.
+"""Configuration-only tenant integration readiness through real builders and native transport.
 
 The owner chose (2026-09-14, RM-026 I1a.3c.8) to omit unowned historical event IDs and
 artifact CIDs from the global integration view while retaining safe configuration and
 readiness status. These tests pin that the public path rebuilds from the six real
 builders, never reads a stored record, and never publishes a history field -- while the
-internal historical producer keeps working for the export policy.
+internal historical producer keeps working for the export policy. RM-084 P1: the read requires the
+caller's tenant; there is no unscoped half.
 """
 import asyncio
 from contextlib import contextmanager, ExitStack
@@ -106,29 +107,32 @@ def assert_public_shape(payload):
 
 
 def test_public_projection_omits_history_and_never_reads_a_stored_record():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
     poison_history(fixture)
     with no_history_or_effects(fixture):
-      payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor)
+      payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
+                                                  tenant_id=fixture.tenant_id)
     assert_public_shape(payload)
     serialized = repr(payload)
     for leaked in ("unowned-event-id", "unowned-artifact-cid", "cooling_down", "delivery_timeout"):
       assert leaked not in serialized
 
 
-@pytest.mark.parametrize("role", ("admin", "pentester", "user"))
-def test_all_three_legacy_roles_are_admitted(role):
-  with read_endpoint_fixture(bound=False) as fixture:
+@pytest.mark.parametrize("role", ("tenant_admin", "tenant_pentester", "super_tenant_admin"))
+def test_every_export_role_is_admitted(role):
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
-    fixture.store.account("reader", role=role)
-    payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor)
+    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+      {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
+    payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
+                                                  tenant_id=fixture.tenant_id)
     assert_public_shape(payload)
 
 
 def test_internal_historical_producer_is_unchanged():
   """The export policy still needs history; only the public view drops it."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
     poison_history(fixture)
     internal = service.get_integration_status(fixture.owner)["integrations"]["wazuh"]
@@ -138,11 +142,12 @@ def test_internal_historical_producer_is_unchanged():
 
 
 def test_enabled_signing_without_secret_reports_configuration_error_not_history():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG = {"EVENT_EXPORT": {"ENABLED": True, "SIGN_PAYLOADS": True,
                                              "HMAC_SECRET_ENV": "REDMESH_ABSENT_SECRET_ENV"}}
     fixture.owner.config_data = {}
-    payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor)
+    payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
+                                                  tenant_id=fixture.tenant_id)
     assert_public_shape(payload)
     item = payload["integrations"]["event_export"]
     assert item["enabled"] is True and item["configured"] is False
@@ -151,7 +156,7 @@ def test_enabled_signing_without_secret_reports_configuration_error_not_history(
 
 
 def test_unknown_builder_error_class_fails_closed_rather_than_publishing_it():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
     original = service._STATUS_BUILDERS["stix"]
 
@@ -161,7 +166,8 @@ def test_unknown_builder_error_class_fails_closed_rather_than_publishing_it():
       return base
 
     with patch.dict(service._STATUS_BUILDERS, {"stix": leaking}):
-      result = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor)
+      result = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
+                                                  tenant_id=fixture.tenant_id)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
 
 
@@ -170,13 +176,13 @@ def test_unknown_builder_error_class_fails_closed_rather_than_publishing_it():
 def test_actual_native_readiness_is_configuration_only(read_native, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
     poison_history(fixture)
     module.eng = scheduler_comms(fixture, response_format)
     with no_history_or_effects(fixture):
       result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT,
-        {"request_actor": fixture.actor})), 200)
+        {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert_public_shape(actual)
     assert calls == 1 and fixture.artifact_reads == []
@@ -185,28 +191,26 @@ def test_actual_native_readiness_is_configuration_only(read_native, response_for
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
 @pytest.mark.parametrize("fault,status", (
   ("actor", 404), ("deleted", 404), ("inactive", 404), ("null_memberships", 404),
-  ("memberships", 403), ("rollout", 403), ("configured", 403),
-  ("rollout_missing", 503), ("identity_store", 503),
+  ("memberships", 404), ("tenant_user", 403), ("other_tenant", 404), ("missing_tenant", 400),
+  ("identity_store", 503),
 ))
 def test_native_admission_denies_before_any_configuration_evaluation(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
     poison_history(fixture)
-    body = {"request_actor": fixture.actor}
+    body = {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
     account = fixture.store.data[("auth", "reader")]
     if fault == "actor": body.pop("request_actor")
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault in ("memberships", "null_memberships"):
       account["metadata"]["tenant_memberships"] = [] if fault == "memberships" else None
-    elif fault == "rollout":
-      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
-        record={"stage": "draining", "enabled": False})
-    elif fault == "configured": fixture.owner.cfg_tenant_execution_enabled = True
-    elif fault == "rollout_missing":
-      fixture.store.data.pop(fixture.tenant_store._location("execution_rollout", (fixture.owner.cfg_instance_id,)))
+    elif fault == "tenant_user":
+      account["metadata"]["tenant_memberships"] = [{"role": "tenant_user", "tenant_id": fixture.tenant_id}]
+    elif fault == "other_tenant": body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
+    elif fault == "missing_tenant": body.pop("tenant_id")
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"
     # Patch the plugin module's own binding: pentester_api_01 imports the function into
     # its namespace at import time, so patching the service module would be vacuous.
@@ -215,16 +219,19 @@ def test_native_admission_denies_before_any_configuration_evaluation(read_native
         side_effect=AssertionError(SECRET)) as projection:
       module.eng = scheduler_comms(fixture, response_format)
       result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, body)), status)
-      assert result == {"success": False, "error": {403: "forbidden", 404: "not_found",
-                                                    503: "unavailable"}[status], "status_code": status}
+      assert result == {"success": False, "error": {400: "invalid_request", 403: "forbidden",
+                                                    404: "not_found", 503: "unavailable"}[status],
+                        "status_code": status}
       assert calls == 1 and fixture.artifact_reads == []
       projection.assert_not_called()
 
 
 def test_repeated_calls_re_admit_against_current_stored_facts():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
-    assert_public_shape(fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor))
+    assert_public_shape(fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
+                                                  tenant_id=fixture.tenant_id))
     fixture.store.account("reader", active=False)
-    assert fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor) == {
+    assert fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
+                                                  tenant_id=fixture.tenant_id) == {
       "success": False, "error": "not_found", "status_code": 404}

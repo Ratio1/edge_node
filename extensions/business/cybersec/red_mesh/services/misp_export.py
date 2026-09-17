@@ -291,6 +291,11 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snaps
       raise TenantStoreError("MISP export unavailable")
     pass_data = selected if archive is not None else artifacts.report(selected["report_cid"])
     job_config = artifacts.job_config()
+    if snapshot_mode == "tenant_bound":
+      # RM-084 P1. TenantJobArtifacts has already required this binding to equal the job's own, and
+      # the event consumes none of it. Checked as foreign ownership below it would refuse every
+      # bound job; nested bindings and every other ownership key are still refused.
+      job_config.pop("execution_binding", None)
     aggregate_cid = pass_data.get("aggregated_report_cid")
     aggregated = artifacts.report(aggregate_cid) if aggregate_cid else {}
     for payload in (job_config, pass_data, aggregated):

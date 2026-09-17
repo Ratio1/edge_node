@@ -96,16 +96,16 @@ _READ_FIELDS = {
   "get_audit_log": (("limit", int, 100),) + _REQUESTER_FIELDS,
   "get_analysis": (("job_id", str, ""), ("cid", str, ""), ("pass_nr", int, None)) + _REQUESTER_FIELDS,
   "get_detection_correlation": _JOB_FIELD + (("request_actor", dict, None),),
-  "get_misp_export_status": _JOB_FIELD + (("request_actor", dict, None),),
-  "get_stix_export_status": _JOB_FIELD + (("request_actor", dict, None),),
-  "get_opencti_export_status": _JOB_FIELD + (("request_actor", dict, None),),
-  "get_taxii_export_status": _JOB_FIELD + (("request_actor", dict, None),),
+  "get_misp_export_status": _JOB_FIELD + _REQUESTER_FIELDS,
+  "get_stix_export_status": _JOB_FIELD + _REQUESTER_FIELDS,
+  "get_opencti_export_status": _JOB_FIELD + _REQUESTER_FIELDS,
+  "get_taxii_export_status": _JOB_FIELD + _REQUESTER_FIELDS,
   "get_rulebook_assessment_status": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
   "get_rulebook_review": _JOB_FIELD + (("profile_id", str, None), ("request_actor", dict, None)),
   "get_misp_export_config_status": (("request_actor", dict, None), ("tenant_id", str, None)),
   "llm_health": (("request_actor", dict, None),),
   "update_finding_triage": (("request_actor", dict, None),),
-  "export_misp_json": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
+  "export_misp_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
   "get_integration_status": (("request_actor", dict, None), ("tenant_id", str, None)),
 }
 # Effect-bearing endpoints (RM-026 I1b).
@@ -118,16 +118,16 @@ _READ_FIELDS = {
 # What they do NOT get is the install-time generated-model pinning, which iterates `_READ_FIELDS`
 # only. Converting them to generated routes is separate work.
 _EFFECT_FIELDS = {
-  "dry_run_opencti_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
-  "dry_run_taxii_export": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
-  "export_stix_bundle": _JOB_FIELD + (("pass_nr", int, None), ("persist", bool, True),
-                                      ("request_actor", dict, None)),
+  "dry_run_opencti_export": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "dry_run_taxii_export": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "export_stix_bundle": _JOB_FIELD + (("pass_nr", int, None), ("persist", bool, True))
+                        + _REQUESTER_FIELDS,
   "test_event_export": (("integration_id", str, "event_export"), ("request_actor", dict, None),
                         ("tenant_id", str, None)),
   # B2 external delivery.
-  "push_to_opencti": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
-  "publish_to_taxii": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
-  "export_misp": _JOB_FIELD + (("pass_nr", int, None), ("request_actor", dict, None)),
+  "push_to_opencti": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "publish_to_taxii": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "export_misp": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
   # B3 ingest.
   "correlate_suricata_eve": _JOB_FIELD + (("eve_jsonl", str, ""), ("pass_nr", int, None),
                                           ("source_ips", list, None), ("sensor_id", str, ""),

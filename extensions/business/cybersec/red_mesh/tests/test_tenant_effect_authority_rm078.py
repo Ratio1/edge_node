@@ -293,7 +293,10 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
     # catches the *next* endpoint opting into tenant scope, and it is inert if left red.
     # `stop_monitoring` opted in under the RM-026 MVP (2026-09-15): it forwards the caller's
     # explicit selector and "reports:export" is admitted at both tenant seams. Still by name.
-    forwarders = {"_purge_operation", "stop_monitoring"}
+    # RM-084 P1 opted the E1 export effects in: each refuses a missing tenant before admission.
+    forwarders = {"_purge_operation", "stop_monitoring", "export_misp", "export_stix_bundle",
+                  "dry_run_opencti_export", "push_to_opencti", "dry_run_taxii_export",
+                  "publish_to_taxii"}
     enclosing = {}
     for node in ast.walk(tree):
       if isinstance(node, ast.FunctionDef):

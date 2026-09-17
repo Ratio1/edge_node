@@ -1,4 +1,5 @@
-"""Current legacy MISP configuration visibility without jobs, exports or secret disclosure."""
+"""Tenant MISP configuration visibility without jobs, exports or secret disclosure (RM-084 P1:
+the tenant is required; there is no unscoped half)."""
 import asyncio
 from copy import deepcopy
 from unittest.mock import MagicMock
@@ -37,24 +38,24 @@ def install_config_producer(fixture, config=None):
 
 
 def test_missing_requester_cannot_read_configuration_or_invoke_the_producer():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
-    result = getattr(fixture.Plugin, ENDPOINT)(fixture.owner)
+    result = getattr(fixture.Plugin, ENDPOINT)(fixture.owner, tenant_id=fixture.tenant_id)
     assert result == {"success": False, "error": "not_found", "status_code": 404}
     fixture.owner._get_misp_export_config.assert_not_called()
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-def test_actual_native_actor_only_config_read_preserves_defaults_and_no_store(read_native, response_format):
+def test_actual_native_tenant_config_read_preserves_defaults_and_no_store(read_native, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     module.eng = scheduler_comms(fixture, response_format)
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 200)
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert actual == DEFAULT and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with(None)
+    fixture.owner._get_misp_export_config.assert_called_once_with(fixture.tenant_id)
     assert not any(row[0] == "list" or row[1] == fixture.owner.cfg_instance_id for row in fixture.store.reads)
 
 
@@ -73,27 +74,26 @@ INVALID_PRODUCERS = (
 def test_actual_native_rejects_invalid_or_extended_producer_payload_before_wrapping(read_native, response_format, produced):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: deepcopy(produced)
     module.eng = scheduler_comms(fixture, response_format)
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 503)
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503} and calls == 1
     assert SECRET not in str(result) and fixture.owner.P.mock_calls == []
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("role,app_role", (("admin", None), ("user", "pentester"), ("user", None)))
-def test_actual_native_preserves_integration_view_for_every_current_legacy_role(read_native, response_format, role, app_role):
+@pytest.mark.parametrize("role", ("tenant_admin", "tenant_pentester", "super_tenant_admin"))
+def test_actual_native_preserves_integration_view_for_every_export_role(read_native, response_format, role):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
-    fixture.store.account("reader", role=role)
-    if app_role:
-      fixture.store.data[("auth", "reader")]["metadata"]["appRole"] = app_role
+  with read_endpoint_fixture(bound=True) as fixture:
+    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+      {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     install_config_producer(fixture)
     module.eng = scheduler_comms(fixture, response_format)
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 200)
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     assert (result["result"] if response_format == "WRAPPED" else result) == DEFAULT and calls == 1
     assert fixture.store.reads[0] == ("get", "auth", "reader")
 
@@ -111,11 +111,11 @@ def test_real_configuration_producer_preserves_independent_flags_and_never_expos
     read_native, response_format, enabled, auto_export, configured, severity, expected):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture, {"ENABLED": enabled, "AUTO_EXPORT": auto_export,
       "MISP_URL": URL, "MISP_API_KEY": SECRET if configured else "", "MIN_SEVERITY": severity})
     module.eng = scheduler_comms(fixture, response_format)
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 200)
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert actual == {"enabled": enabled, "auto_export": auto_export,
                       "misp_configured": configured, "min_severity": expected}
@@ -126,20 +126,17 @@ def test_real_configuration_producer_preserves_independent_flags_and_never_expos
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
 @pytest.mark.parametrize("fault,status", (
   ("missing_actor", 404), ("missing_account", 404), ("inactive", 404), ("identity_store", 503),
-  ("empty_memberships", 403), ("null_memberships", 404), ("malformed_memberships", 404),
-  ("platform_membership", 403), ("configured_stage", 403), ("configured_enabled", 403),
-  ("stored_stage", 403), ("stored_enabled", 403), ("rollout_store", 503),
-  ("missing_rollout", 503), ("malformed_rollout", 503), ("namespace", 503),
+  ("empty_memberships", 404), ("null_memberships", 404), ("malformed_memberships", 404),
+  ("tenant_user", 403), ("other_tenant", 404), ("missing_tenant", 400), ("blank_tenant", 400),
 ))
 def test_native_denials_precede_configuration_and_other_effects(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture, {"MISP_URL": URL, "MISP_API_KEY": SECRET})
-    body = {"request_actor": fixture.actor}
-    rollout_key = fixture.tenant_store._location("execution_rollout", (fixture.owner.cfg_instance_id,))
+    body = {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
     if fault == "missing_actor":
-      body = {}
+      body.pop("request_actor")
     elif fault == "missing_account":
       body["request_actor"] = {"account_id": "missing"}
     elif fault == "inactive":
@@ -149,28 +146,23 @@ def test_native_denials_precede_configuration_and_other_effects(read_native, res
     elif fault.endswith("memberships"):
       fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = {
         "empty_memberships": [], "null_memberships": None, "malformed_memberships": "private"}[fault]
-    elif fault == "platform_membership":
-      fixture.store.account("reader", role="admin", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
-    elif fault == "configured_stage":
-      fixture.owner.cfg_tenant_execution_stage = "draining"
-    elif fault == "configured_enabled":
-      fixture.owner.cfg_tenant_execution_enabled = True
-    elif fault.startswith("stored_"):
-      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
-        record={"stage": "draining" if fault == "stored_stage" else "compatibility", "enabled": fault == "stored_enabled"})
-    elif fault == "rollout_store":
-      fixture.store.fail_hkey = rollout_key[0]
-    elif fault == "missing_rollout":
-      fixture.store.data.pop(rollout_key)
-    elif fault == "malformed_rollout":
-      fixture.store.data[rollout_key] = {"stage": SECRET}
-    elif fault == "namespace":
-      fixture.owner.cfg_tenancy_namespace = None
+    elif fault == "tenant_user":
+      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+        {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
+    elif fault == "other_tenant":
+      body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
+    elif fault == "missing_tenant":
+      body.pop("tenant_id")
+    elif fault == "blank_tenant":
+      body["tenant_id"] = " "
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, body)), status)
-    assert result == {"success": False, "error": {403: "forbidden", 404: "not_found", 503: "unavailable"}[status], "status_code": status}
-    assert calls == 1 and fixture.store.writes == writes and SECRET not in str(result)
+    assert result == {"success": False, "error": {400: "invalid_request", 403: "forbidden", 404: "not_found",
+                                                  503: "unavailable"}[status], "status_code": status}
+    # A blank selector never reaches the plugin: the strict transport refuses it first.
+    assert calls == (0 if fault == "blank_tenant" else 1)
+    assert fixture.store.writes == writes and SECRET not in str(result)
     fixture.owner._get_misp_export_config.assert_not_called()
     fixture.owner.P.assert_not_called()
 
@@ -179,31 +171,33 @@ def test_native_denials_precede_configuration_and_other_effects(read_native, res
 def test_native_configuration_exceptions_are_sanitized_without_logging_secrets(read_native, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     fixture.owner._get_misp_export_config.side_effect = RuntimeError(SECRET)
     module.eng = scheduler_comms(fixture, response_format)
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 503)
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503} and calls == 1
     fixture.owner.P.assert_not_called()
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("fault,status", (("missing", 404), ("inactive", 404), ("member", 403)))
+@pytest.mark.parametrize("fault,status", (("missing", 404), ("inactive", 404), ("member", 404)))
 def test_native_request_actor_claims_cannot_override_current_stored_authority(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     if fault == "inactive":
       fixture.store.account("reader", active=False)
     elif fault == "member":
       fixture.store.account("reader", memberships=[])
     claimed_actor = {"account_id": "missing" if fault == "missing" else "reader",
-                     "role": "admin", "active": True, "tenant_memberships_present": False}
+                     "role": "admin", "active": True,
+                     "tenant_memberships": [{"role": "super_tenant_admin", "tenant_id": None}]}
     module.eng = scheduler_comms(fixture, response_format)
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": claimed_actor})), status)
-    assert result["error"] == ("forbidden" if fault == "member" else "not_found") and calls == 1
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT,
+      {"request_actor": claimed_actor, "tenant_id": fixture.tenant_id})), status)
+    assert result["error"] == "not_found" and calls == 1
     fixture.owner._get_misp_export_config.assert_not_called()
 
 
@@ -211,22 +205,23 @@ def test_native_request_actor_claims_cannot_override_current_stored_authority(re
 def test_native_each_request_reauthorizes_after_account_revocation(read_native, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     module.eng = scheduler_comms(fixture, response_format)
-    assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 200)
+    assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     fixture.store.account("reader", active=False)
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 404)
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 404)
     assert result == {"success": False, "error": "not_found", "status_code": 404} and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with(None)
+    fixture.owner._get_misp_export_config.assert_called_once_with(fixture.tenant_id)
 
 
 def test_valid_producer_payload_is_detached_before_publication():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     payload = dict(DEFAULT)
     fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: payload
-    result = getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor=fixture.actor)
+    result = getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor=fixture.actor,
+                                               tenant_id=fixture.tenant_id)
     assert result == DEFAULT
     result["enabled"] = True
     assert payload == DEFAULT
@@ -236,10 +231,10 @@ def test_valid_producer_payload_is_detached_before_publication():
 def test_native_deployment_metadata_is_separate_from_exact_producer_keys(read_native, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     module.eng = scheduler_comms(fixture, response_format, metadata={"server_node_addr": "fixture-node"})
-    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor})), 200)
+    result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert all(actual[field] == value for field, value in DEFAULT.items()) and calls == 1
     if response_format == "WRAPPED":

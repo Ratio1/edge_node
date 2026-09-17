@@ -1,4 +1,7 @@
-"""Checked legacy export metadata: pure reads, real admission and native transport."""
+"""Checked export metadata: pure reads, real admission and native transport.
+
+RM-084 P1: the endpoints require the caller's tenant. The pure service readers still accept the
+legacy snapshot mode until RM-084 P6 removes it."""
 import asyncio
 from copy import deepcopy
 from unittest.mock import MagicMock, patch
@@ -89,17 +92,19 @@ def test_checked_model_error_is_typed_and_unchecked_compatibility_remains(reader
 
 
 @pytest.mark.parametrize("reader,key,published", CASES)
-@pytest.mark.parametrize("role,app_role", (("admin", None), ("user", "pentester"), ("user", None)))
-def test_native_endpoint_uses_current_legacy_authority(reader, key, published, role, app_role):
-  with read_endpoint_fixture(bound=False) as fixture:
-    fixture.store.account("reader", role=role)
-    if app_role:
-      fixture.store.data[("auth", "reader")]["metadata"]["appRole"] = app_role
+@pytest.mark.parametrize("role", ("tenant_admin", "tenant_pentester", "tenant_user", "super_tenant_admin"))
+def test_endpoint_admits_every_tenant_reader(reader, key, published, role):
+  with read_endpoint_fixture(bound=True) as fixture:
+    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+      {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     writes = list(fixture.store.writes)
-    result = getattr(fixture.Plugin, reader.__name__)(fixture.owner, "job-1", request_actor=fixture.actor)
+    result = getattr(fixture.Plugin, reader.__name__)(fixture.owner, "job-1", request_actor=fixture.actor,
+                                                      tenant_id=fixture.tenant_id)
     assert result == {"job_id": "job-1", "found": True, "exported": False}
     assert fixture.store.reads[0] == ("get", "auth", "reader")
-    assert fixture.store.reads[-1] == ("list", fixture.store.cfg_instance_id)
+    # The tenant reader point-reads the job; it never enumerates the shared job hash.
+    assert fixture.store.reads[-1] == ("get", fixture.store.cfg_instance_id, "job-1")
+    assert not any(row[0] == "list" and row[1] == fixture.store.cfg_instance_id for row in fixture.store.reads)
     assert fixture.store.writes == writes and fixture.artifact_reads == []
 
 
@@ -108,10 +113,11 @@ def test_native_endpoint_uses_current_legacy_authority(reader, key, published, r
 def test_actual_native_empty_status_is_post_and_no_store(read_native, reader, key, published, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__,
-      {"job_id": "job-1", "request_actor": fixture.actor})), 200)
+      {"job_id": "job-1", "request_actor": fixture.actor,
+       "tenant_id": fixture.tenant_id})), 200)
     value = result["result"] if response_format == "WRAPPED" else result
     assert value == {"job_id": "job-1", "found": True, "exported": False}
     assert calls == 1
@@ -119,14 +125,13 @@ def test_actual_native_empty_status_is_post_and_no_store(read_native, reader, ke
 
 @pytest.mark.parametrize("reader,key,published", CASES)
 @pytest.mark.parametrize("fault,status", (
-  ("actorless", 404), ("empty_memberships", 403), ("null_memberships", 404),
-  ("malformed_memberships", 404), ("inactive", 404), ("rollout", 403), ("store", 503),
-  ("bound", 404), ("null_binding", 404), ("missing", 404), ("alias", 404),
-  ("collision", 503), ("foreign_summary", 503), ("model", 400),
+  ("actorless", 404), ("empty_memberships", 404), ("null_memberships", 404),
+  ("malformed_memberships", 404), ("inactive", 404), ("other_tenant", 404), ("no_tenant", 400),
+  ("store", 503), ("unbound", 404), ("missing", 404), ("foreign_summary", 503), ("model", 400),
 ))
 def test_real_account_and_stored_job_denials_have_no_effects(reader, key, published, fault, status):
-  with read_endpoint_fixture(bound=False) as fixture:
-    actor, job_id = fixture.actor, "job-1"
+  with read_endpoint_fixture(bound=True) as fixture:
+    actor, job_id, tenant_id = fixture.actor, "job-1", fixture.tenant_id
     if fault == "actorless":
       actor = None
     elif fault.endswith("memberships"):
@@ -135,28 +140,28 @@ def test_real_account_and_stored_job_denials_have_no_effects(reader, key, publis
       }[fault]
     elif fault == "inactive":
       fixture.store.account("reader", active=False)
-    elif fault == "rollout":
-      fixture.owner.cfg_tenant_execution_stage = "draining"
+    elif fault == "other_tenant":
+      tenant_id = "tn_00000000-0000-4000-8000-000000000000"
+    elif fault == "no_tenant":
+      tenant_id = None
     elif fault == "store":
       fixture.store.fail_hkey = fixture.store.cfg_instance_id
-    elif fault in ("bound", "null_binding"):
-      fixture.job["execution_binding"] = {} if fault == "bound" else None
+    elif fault == "unbound":
+      fixture.job.pop("execution_binding")
     elif fault == "missing":
       fixture.store.jobs.clear()
-    elif fault == "alias":
-      job_id = "legacy-alias"
-    elif fault == "collision":
-      fixture.store.jobs["other"] = {"job_id": "job-1", "execution_binding": None}
     elif fault == "foreign_summary":
       fixture.job[key] = {"job_id": "foreign", "private": "hidden"}
     elif fault == "model":
       fixture.job["job_type"] = "model_test"
     writes = list(fixture.store.writes)
-    result = getattr(fixture.Plugin, reader.__name__)(fixture.owner, job_id, actor)
-    assert result == {"success": False, "error": {400: "unsupported_job_type", 403: "forbidden",
-                       404: "not_found", 503: "unavailable"}[status], "status_code": status}
+    result = getattr(fixture.Plugin, reader.__name__)(fixture.owner, job_id, actor, tenant_id)
+    code = "invalid_request" if fault == "no_tenant" else {400: "unsupported_job_type", 403: "forbidden",
+                                                          404: "not_found", 503: "unavailable"}[status]
+    assert result == {"success": False, "error": code, "status_code": status}
     assert fixture.store.writes == writes and fixture.artifact_reads == []
-    if fault in ("actorless", "empty_memberships", "null_memberships", "malformed_memberships", "inactive", "rollout"):
+    if fault in ("actorless", "empty_memberships", "null_memberships", "malformed_memberships", "inactive",
+                 "other_tenant", "no_tenant"):
       assert not any(row[1] == fixture.store.cfg_instance_id for row in fixture.store.reads)
 
 
@@ -232,25 +237,26 @@ def test_real_producer_metadata_survives_checked_native_transport(read_native, k
     assert expected["status"] == "dry_run"
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.job[key] = deepcopy(job[key])
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__,
-      {"job_id": "job-1", "request_actor": fixture.actor})), 200)
+      {"job_id": "job-1", "request_actor": fixture.actor,
+       "tenant_id": fixture.tenant_id})), 200)
     assert (result["result"] if response_format == "WRAPPED" else result) == expected
     assert calls == 1 and fixture.store.writes == writes and fixture.artifact_reads == []
 
 
 @pytest.mark.parametrize("reader,key,published", CASES)
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("outcome,status", (("model", 400), ("member", 403), ("missing", 404),
-  ("actorless", 404), ("malformed", 503), ("scope", 400)))
+@pytest.mark.parametrize("outcome,status", (("model", 400), ("member", 404), ("tenant_user", 200),
+  ("missing", 404), ("actorless", 404), ("malformed", 503), ("no_tenant", 400), ("blank_tenant", 400)))
 def test_actual_native_denials_are_sanitized_and_no_store(read_native, reader, key, published, response_format, outcome, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
-    payload = {"job_id": "job-1", "request_actor": fixture.actor}
+  with read_endpoint_fixture(bound=True) as fixture:
+    payload = {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
     if outcome == "model":
       fixture.job["job_type"] = "model_test"
     elif outcome == "member":
@@ -261,13 +267,23 @@ def test_actual_native_denials_are_sanitized_and_no_store(read_native, reader, k
       payload.pop("request_actor")
     elif outcome == "malformed":
       fixture.job[key] = {"result": {"private": "hidden"}}
-    elif outcome == "scope":
-      payload["tenant_id"] = "tenant-1"
+    elif outcome == "tenant_user":
+      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+        {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
+    elif outcome == "no_tenant":
+      payload.pop("tenant_id")
+    elif outcome == "blank_tenant":
+      payload["tenant_id"] = ""
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, payload)), status)
-    code = {"model": "unsupported_job_type", "member": "forbidden", "missing": "not_found",
-            "actorless": "not_found", "malformed": "unavailable", "scope": "invalid_request"}[outcome]
+    if outcome == "tenant_user":
+      # reports:view is every tenant role's; a Tenant User reads export status like the others.
+      assert (result["result"] if response_format == "WRAPPED" else result)["found"] is True
+      return
+    code = {"model": "unsupported_job_type", "member": "not_found", "missing": "not_found",
+            "actorless": "not_found", "malformed": "unavailable", "no_tenant": "invalid_request",
+            "blank_tenant": "invalid_request"}[outcome]
     assert result == {"success": False, "error": code, "status_code": status}
-    assert calls == (0 if outcome == "scope" else 1)
+    assert calls == (0 if outcome == "blank_tenant" else 1)
     assert fixture.store.writes == writes and fixture.artifact_reads == []

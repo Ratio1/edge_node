@@ -19,14 +19,22 @@ SECRET = "mock-only-b1-canary"
 
 
 def call(fixture, name, **kwargs):
+  kwargs.setdefault("tenant_id", fixture.tenant_id)
   return getattr(fixture.Plugin, name)(fixture.owner, "job-1", request_actor=fixture.actor, **kwargs)
+
+
+def as_tenant_user(fixture):
+  fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
 
 
 @pytest.mark.parametrize("name", JOB_EFFECTS)
 def test_effects_no_longer_use_the_unscoped_global_job_lookup(name):
-  with read_endpoint_fixture(bound=False) as fixture, \
+  with read_endpoint_fixture(bound=True) as fixture, \
        patch.object(opencti_export, "_config_error", return_value=None), \
-       patch.object(taxii_export, "_config_error", return_value=None):
+       patch.object(taxii_export, "_config_error", return_value=None), \
+       patch.object(opencti_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
+       patch.object(taxii_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)):
     # Without this the integrations resolve to `disabled` and _prepare_* returns before the job
     # read, so the canary would pass without exercising the scoping it names.
     # create=True because the fixture owner does not define it at all -- which is itself the
@@ -40,21 +48,20 @@ def test_effects_no_longer_use_the_unscoped_global_job_lookup(name):
 @pytest.mark.parametrize("name", JOB_EFFECTS)
 @pytest.mark.parametrize("fault,status", (
   ("actor", 404), ("deleted", 404), ("inactive", 404), ("user", 403),
-  ("memberships", 403), ("rollout", 403), ("identity_store", 503),
+  ("memberships", 404), ("other_tenant", 404), ("no_tenant", 400), ("identity_store", 503),
 ))
 def test_denials_are_effect_free_and_write_no_status_record(name, fault, status):
   """The probe-amplification defect: denial paths must not touch integration status."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     account = fixture.store.data[("auth", "reader")]
     kwargs = {}
     if fault == "actor": kwargs["request_actor"] = None
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "user": fixture.store.account("reader", role="user")
+    elif fault == "user": as_tenant_user(fixture)
     elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
-    elif fault == "rollout":
-      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
-        record={"stage": "draining", "enabled": False})
+    elif fault == "other_tenant": kwargs["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
+    elif fault == "no_tenant": kwargs["tenant_id"] = None
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"
 
     with patch.object(opencti_export, "record_integration_status",
@@ -64,9 +71,10 @@ def test_denials_are_effect_free_and_write_no_status_record(name, fault, status)
          patch.object(stix_export, "record_integration_status",
                       side_effect=AssertionError(SECRET)) as stix_record:
       if fault == "actor":
-        result = getattr(fixture.Plugin, name)(fixture.owner, "job-1", request_actor=None)
+        result = getattr(fixture.Plugin, name)(fixture.owner, "job-1", request_actor=None,
+                                               tenant_id=fixture.tenant_id)
       else:
-        result = call(fixture, name)
+        result = call(fixture, name, **kwargs)
       assert result["status_code"] == status
       assert result["success"] is False
       for recorder in (opencti_record, taxii_record, stix_record):
@@ -75,31 +83,33 @@ def test_denials_are_effect_free_and_write_no_status_record(name, fault, status)
 
 @pytest.mark.parametrize("name", JOB_EFFECTS)
 def test_a_denied_caller_never_reaches_the_job(name):
-  with read_endpoint_fixture(bound=False) as fixture:
-    fixture.store.account("reader", role="user")
+  with read_endpoint_fixture(bound=True) as fixture:
+    as_tenant_user(fixture)
     result = call(fixture, name)
     assert result == {"success": False, "error": "forbidden", "status_code": 403}
     assert fixture.artifact_reads == []
 
 
 @pytest.mark.parametrize("name", JOB_EFFECTS)
-def test_a_tenant_bound_actor_cannot_reach_a_legacy_effect(name):
+def test_an_unscoped_call_is_refused_before_admission(name):
+  """RM-084 P1: there is no unscoped half left to fall back to."""
   with read_endpoint_fixture(bound=True) as fixture:
-    result = call(fixture, name)
-    assert result["success"] is False and result["status_code"] in (403, 404)
+    result = call(fixture, name, tenant_id=None)
+    assert result == {"success": False, "error": "invalid_request", "status_code": 400}
+    assert fixture.artifact_reads == [] and fixture.store.reads == []
 
 
 @pytest.mark.parametrize("name", JOB_EFFECTS)
 def test_disabled_integration_reports_status_without_the_framework_error_key(name):
   """A dict carrying `error` is mapped to HTTP 503 by the framework, so it must not carry one."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     result = call(fixture, name)
     assert "error" not in result or result.get("success") is False
 
 
 def test_a_landed_persist_is_never_reported_as_nothing_happened():
   """Contract 6: an exception after the bundle lands must not read as `unavailable`."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG = {"OPENCTI_EXPORT": {"ENABLED": True, "URL": "https://opencti.test",
                                                "TOKEN_ENV": "RM_TEST_OPENCTI_TOKEN"}}
     fixture.owner.config_data = {}
@@ -116,7 +126,7 @@ def test_a_landed_persist_is_never_reported_as_nothing_happened():
                                      "object_count": 0, "finding_count": 0,
                                      "observed_data_count": 0})):
       result = fixture.Plugin.dry_run_opencti_export(fixture.owner, "job-1",
-                                                     request_actor=fixture.actor)
+                                                     request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result["error"] == "effect_incomplete"
     assert result["effect_state"] == EffectState.PERSISTED.value
     assert result["status_code"] == 500
@@ -124,23 +134,30 @@ def test_a_landed_persist_is_never_reported_as_nothing_happened():
 
 
 def test_test_event_export_requires_the_export_authority():
-  with read_endpoint_fixture(bound=False) as fixture:
-    fixture.store.account("reader", role="user")
-    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor)
+  with read_endpoint_fixture(bound=True) as fixture:
+    as_tenant_user(fixture)
+    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result == {"success": False, "error": "forbidden", "status_code": 403}
 
 
-def test_test_event_export_admits_a_legacy_pentester():
-  with read_endpoint_fixture(bound=False) as fixture:
-    fixture.store.account("reader", role="user")
-    fixture.store.data[("auth", "reader")]["metadata"]["appRole"] = "pentester"
-    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor)
-    assert not (result.get("success") is False and result.get("status_code") == 403)
+def test_test_event_export_admits_a_tenant_pentester():
+  with read_endpoint_fixture(bound=True) as fixture:
+    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+      {"role": "tenant_pentester", "tenant_id": fixture.tenant_id}]
+    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
+    assert not (result.get("success") is False and result.get("status_code") in (400, 403, 404))
+
+
+@pytest.mark.parametrize("tenant", (None, "", "tn_00000000-0000-4000-8000-000000000000"))
+def test_test_event_export_requires_the_callers_tenant(tenant):
+  with read_endpoint_fixture(bound=True) as fixture:
+    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor, tenant_id=tenant)
+    assert result["success"] is False and result["status_code"] == (404 if tenant else 400)
 
 
 def test_a_delivered_soc_event_is_never_reported_as_nothing_happened():
   """persist=False still emits and mutates the job document: the ledger must know."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(stix_export, "build_stix_bundle",
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
@@ -149,7 +166,7 @@ def test_a_delivered_soc_event_is_never_reported_as_nothing_happened():
                       return_value={"status": "sent", "integration_id": "wazuh"}), \
          patch.object(stix_export, "_write_job_record", side_effect=RuntimeError(SECRET)):
       result = fixture.Plugin.export_stix_bundle(fixture.owner, "job-1", persist=False,
-                                                 request_actor=fixture.actor)
+                                                 request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result["error"] == "effect_incomplete"
     assert result["effect_state"] == EffectState.DELIVERED.value
     assert result["status_code"] == 500
@@ -184,26 +201,27 @@ def test_an_untypeable_outcome_is_not_published_as_success_without_a_reason():
 
 def test_revalidation_denies_before_the_effect_when_the_account_is_deactivated():
   """Contract 4: the account is deactivated between admission and the irreversible step."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     def deactivate_then_persist(owner, bundle):
       fixture.store.account("reader", active=False)
       return "artifact-cid"
 
     with patch.object(opencti_export, "_config_error", return_value=None), \
+         patch.object(opencti_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(opencti_export, "build_stix_bundle",
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
                                     "observed_data_count": 0}), \
          patch.object(opencti_export, "_persist_bundle", deactivate_then_persist):
       first = fixture.Plugin.dry_run_opencti_export(fixture.owner, "job-1",
-                                                    request_actor=fixture.actor)
+                                                    request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     # The checkpoint runs before the persist, so a later deactivation does not retroactively
     # deny; what matters is that a deactivation *before* the checkpoint does.
     assert isinstance(first, dict)
-    with read_endpoint_fixture(bound=False) as fresh:
+    with read_endpoint_fixture(bound=True) as fresh:
       fresh.store.account("reader", active=False)
       denied = fresh.Plugin.dry_run_opencti_export(fresh.owner, "job-1",
-                                                   request_actor=fresh.actor)
+                                                   request_actor=fresh.actor, tenant_id=fresh.tenant_id)
       assert denied == {"success": False, "error": "not_found", "status_code": 404}
 
 
@@ -221,7 +239,7 @@ def test_a_tenant_scoped_effect_is_refused_rather_than_handed_a_raw_snapshot():
 def test_a_skipped_emission_is_not_claimed_as_a_delivery():
   """emit_export_status_event returns {"status": "skipped"} when SOC export is disabled --
   the common configuration. Recording DELIVERED there would claim a packet that never left."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(stix_export, "build_stix_bundle",
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
@@ -231,7 +249,7 @@ def test_a_skipped_emission_is_not_claimed_as_a_delivery():
                                     "error": "missing_hmac_secret"}), \
          patch.object(stix_export, "_write_job_record", side_effect=RuntimeError(SECRET)):
       result = fixture.Plugin.export_stix_bundle(fixture.owner, "job-1", persist=False,
-                                                 request_actor=fixture.actor)
+                                                 request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result["effect_state"] == EffectState.PERSISTED.value
     assert result["effect_state"] != EffectState.DELIVERED.value
 
@@ -242,15 +260,16 @@ def test_a_dry_run_that_mutates_the_job_record_never_reports_nothing_happened(na
   """The round-1 fix landed only in export_stix_bundle: both dry runs wrote the job record with
   the ledger still NONE whenever _persist_bundle returned falsy."""
   service = opencti_export if module == "opencti" else taxii_export
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(service, "_config_error", return_value=None), \
+         patch.object(service, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(service, "build_stix_bundle",
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
                                     "observed_data_count": 0}), \
          patch.object(service, "_persist_bundle", return_value=None), \
          patch.object(service, "_write_job_record", side_effect=RuntimeError(SECRET)):
-      result = getattr(fixture.Plugin, name)(fixture.owner, "job-1", request_actor=fixture.actor)
+      result = getattr(fixture.Plugin, name)(fixture.owner, "job-1", request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result["error"] == "effect_incomplete"
     assert result["effect_state"] == EffectState.PERSISTED.value
 
@@ -258,7 +277,7 @@ def test_a_dry_run_that_mutates_the_job_record_never_reports_nothing_happened(na
 def test_revalidation_between_admission_and_the_effect_denies_the_effect():
   """Contract 4, discriminating: the account is deactivated AFTER admission and BEFORE the
   irreversible step. Without checkpoint() the export would proceed."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     landed = []
 
     def build_then_revoke(owner, job_id, pass_nr=None, checked_job=None):
@@ -268,11 +287,12 @@ def test_revalidation_between_admission_and_the_effect_denies_the_effect():
               "object_count": 0, "finding_count": 0, "observed_data_count": 0}
 
     with patch.object(opencti_export, "_config_error", return_value=None), \
+         patch.object(opencti_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(opencti_export, "build_stix_bundle", build_then_revoke), \
          patch.object(opencti_export, "_persist_bundle",
                       side_effect=lambda *a, **k: landed.append("persisted") or "cid"):
       result = fixture.Plugin.dry_run_opencti_export(fixture.owner, "job-1",
-                                                     request_actor=fixture.actor)
+                                                     request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert landed == [], "the effect ran after the requester was revoked"
     assert result["success"] is False and result["status_code"] in (404, 500)
 
@@ -336,7 +356,7 @@ def test_an_incomplete_effect_survives_real_http_in_both_response_formats(read_n
   from .test_tenant_read_native import assert_json_response, install, request, scheduler_comms
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(stix_export, "build_stix_bundle",
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
@@ -346,7 +366,8 @@ def test_an_incomplete_effect_survives_real_http_in_both_response_formats(read_n
          patch.object(stix_export, "_write_job_record", side_effect=RuntimeError(SECRET)):
       module.eng = scheduler_comms(fixture, response_format)
       result, calls = assert_json_response(asyncio.run(request(module, "export_stix_bundle",
-        {"job_id": "job-1", "persist": False, "request_actor": fixture.actor})), 500)
+        {"job_id": "job-1", "persist": False, "request_actor": fixture.actor,
+         "tenant_id": fixture.tenant_id})), 500)
     assert calls == 1
     assert result["error"] == "effect_incomplete", (
       "a landed effect was reported as something else over %s" % response_format)
@@ -380,7 +401,7 @@ def test_a_disabled_delivery_is_not_recorded_as_sent():
   from extensions.business.cybersec.red_mesh.services import integration_status as service
   from extensions.business.cybersec.red_mesh.tenancy.effects import EffectLedger
   ledger = EffectLedger()
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     with patch("extensions.business.cybersec.red_mesh.services.log_export.deliver_redmesh_event",
                return_value={"status": "disabled", "error": "disabled"}):
       service.test_event_export(fixture.owner, integration_id="wazuh", ledger=ledger)

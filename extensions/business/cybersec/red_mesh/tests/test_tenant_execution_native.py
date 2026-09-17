@@ -25,17 +25,18 @@ ROUTES = (
   "launch_network_scan", "launch_webapp_scan", "launch_test",
   "launch_model_test", "preflight_model_test_provider",
 )
-LEGACY_STATUS_ROUTES = (
-  "get_detection_correlation", "get_misp_export_status", "get_stix_export_status",
-  "get_opencti_export_status", "get_taxii_export_status",
+LEGACY_STATUS_ROUTES = ("get_detection_correlation",)
+# RM-084 P1: export reads that require a tenant; there is no unscoped half.
+TENANT_EXPORT_STATUS_ROUTES = (
+  "get_misp_export_status", "get_stix_export_status", "get_opencti_export_status",
+  "get_taxii_export_status",
 )
 LEGACY_RULEBOOK_ROUTES = ("get_rulebook_assessment_status", "get_rulebook_review")
 ACTOR_ONLY_READ_ROUTES = ("llm_health", "update_finding_triage")
-# RM-081 Phase 3c: job-less reads that may also be tenant-scoped. Unscoped keeps the legacy
-# actor-only path and its rollout gate; scoped goes through the tenant matrix. The selector is
-# appended last, as stop_monitoring's is.
-ACTOR_OR_TENANT_READ_ROUTES = ("get_misp_export_config_status", "get_integration_status")
-LEGACY_JSON_EXPORT_ROUTES = ("export_misp_json",)
+# Job-less reads with a required tenant (RM-081 Phase 3c added the selector; RM-084 P1 removed the
+# unscoped half). The selector is appended last, as stop_monitoring's is.
+TENANT_JOBLESS_READ_ROUTES = ("get_misp_export_config_status", "get_integration_status")
+TENANT_JSON_EXPORT_ROUTES = ("export_misp_json",)
 # RM-026 I1b B1: effect endpoints sharing the strict read transport.
 EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_bundle",
                  "test_event_export", "push_to_opencti", "publish_to_taxii", "export_misp",
@@ -62,11 +63,13 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
 # guard would otherwise be the only thing to set. Rendered here so the wire tests exercise the real
 # production route.
 UNGUARDED_ROUTES = ("analyze_job", "get_raw_model_test_evidence", "delete_job_engagement")
-LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES + LEGACY_JSON_EXPORT_ROUTES
+LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES
+# RM-084 P1: reads that refuse a missing tenant with 400 instead of taking the unscoped path.
+TENANT_REQUIRED_READ_ROUTES = TENANT_EXPORT_STATUS_ROUTES + TENANT_JOBLESS_READ_ROUTES + TENANT_JSON_EXPORT_ROUTES
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
   "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
-) + LEGACY_READ_ROUTES + ACTOR_OR_TENANT_READ_ROUTES
+) + LEGACY_READ_ROUTES + TENANT_REQUIRED_READ_ROUTES
 SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
 ERROR = "Incompatible generated execution API"
 
@@ -109,10 +112,10 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "profile_id", "request_actor")
     elif method.name in ACTOR_ONLY_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
-    elif method.name in ACTOR_OR_TENANT_READ_ROUTES:
+    elif method.name in TENANT_JOBLESS_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor", "tenant_id")
-    elif method.name in LEGACY_JSON_EXPORT_ROUTES:
-      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor")
+    elif method.name in TENANT_JSON_EXPORT_ROUTES:
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor", "tenant_id")
     elif method.name in UNGUARDED_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == {
         "analyze_job": ("self", "job_id", "analysis_type", "focus_areas", "request_actor"),
@@ -123,14 +126,14 @@ def _render_native(default_route=None):
       # Effect endpoints keep their original positional parameters and append request_actor last,
       # so existing callers are unaffected by admission being added.
       expected = {
-        "dry_run_opencti_export": ("self", "job_id", "pass_nr", "request_actor"),
-        "dry_run_taxii_export": ("self", "job_id", "pass_nr", "request_actor"),
-        "export_stix_bundle": ("self", "job_id", "pass_nr", "persist", "request_actor"),
+        "dry_run_opencti_export": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
+        "dry_run_taxii_export": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
+        "export_stix_bundle": ("self", "job_id", "pass_nr", "persist", "request_actor", "tenant_id"),
         # RM-081 Phase 3c: a synthetic delivery goes to the tenant's destination when scoped.
         "test_event_export": ("self", "integration_id", "request_actor", "tenant_id"),
-        "push_to_opencti": ("self", "job_id", "pass_nr", "request_actor"),
-        "publish_to_taxii": ("self", "job_id", "pass_nr", "request_actor"),
-        "export_misp": ("self", "job_id", "pass_nr", "request_actor"),
+        "push_to_opencti": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
+        "publish_to_taxii": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
+        "export_misp": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
         "correlate_suricata_eve": ("self", "job_id", "eve_jsonl", "pass_nr", "source_ips",
                                    "sensor_id", "request_actor"),
         "upload_authorization": ("self", "filename", "content_b64", "request_actor"),
