@@ -24,6 +24,8 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 
 _ADMINISTRATION_LOCK = RLock()
 _MEMBER_ROLES = TENANT_LOCAL_ROLES
+# RM-083 (owner, 2026-09-17): only a Super-Tenant Admin grants, removes or replaces these.
+_PLATFORM_RESERVED_MEMBER_ROLES = frozenset({"tenant_pentester"})
 
 
 class AdministrationDenied(Exception):
@@ -311,7 +313,11 @@ class TenantAdministrationService:
                   tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed,
               "canUpdateAllowPentester": authorize_tenant_operation(
                 account, "allow_pentester:update", TenantPolicyContext(
-                  tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed}
+                  tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed,
+              "canManageMembers": authorize_tenant_operation(
+                account, "tenant_users:manage", TenantPolicyContext(
+                  tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed,
+              "assignableMemberRoles": self._assignable_member_roles(account, tenant)}
     for stored, public in (("allow_pentester_changed_by", "allowPentesterChangedBy"),
                            ("allow_pentester_changed_at", "allowPentesterChangedAt"),
                            ("node_failure_policy_changed_by", "nodeFailurePolicyChangedBy"),
@@ -657,6 +663,36 @@ class TenantAdministrationService:
     self._actor(actor, creator=True)
     return {"available": self.store.get("domain", _domain(domain_id)) is None}
 
+  def _holds_scoped_super_tenant_admin(self, account, tenant_id):
+    roles, _ = resolve_tenant_roles(account, tenant_id)
+    return "super_tenant_admin" in roles
+
+  def _assignable_member_roles(self, account, tenant):
+    """RM-083. Roles this caller may write in the tenant; tenant_pentester is the platform's to give."""
+    if not authorize_tenant_operation(account, "tenant_users:manage", TenantPolicyContext(
+        tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed:
+      return []
+    if self._holds_scoped_super_tenant_admin(account, tenant["tenant_id"]):
+      return sorted(_MEMBER_ROLES)
+    return sorted(_MEMBER_ROLES - _PLATFORM_RESERVED_MEMBER_ROLES)
+
+  @_endpoint
+  def authorize_tenant_account_creation(self, actor, tenant_id, account_id, role):
+    """RM-083. Every account is born scoped: approve a new account together with its one membership.
+
+    Nothing is written here; the Navigator creates the account with this membership in the same
+    record write, so no unscoped account exists between two steps.
+    """
+    tenant, caller = self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
+    account_id = canonical_account_id(account_id)
+    if not account_id or not isinstance(role, str) or role not in _MEMBER_ROLES:
+      raise AdministrationDenied(400, "invalid_membership")
+    if role not in self._assignable_member_roles(caller, tenant):
+      raise AdministrationDenied(403, "pentester_role_reserved")
+    if self.accounts.get_account(account_id) is not None:
+      raise AdministrationDenied(409, "account_exists")
+    return {"accountId": account_id, "tenantId": tenant_id, "role": role}
+
   @_endpoint
   def authorize_tenant_membership(self, actor, tenant_id, account_id, role, remove=False):
     tenant, caller = self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
@@ -664,6 +700,17 @@ class TenantAdministrationService:
     if not account_id or not isinstance(role, str) or role not in _MEMBER_ROLES or type(remove) is not bool:
       raise AdministrationDenied(400, "invalid_membership")
     target = self._initial_admin(account_id)
+    if not self._holds_scoped_super_tenant_admin(caller, tenant_id):
+      # RM-083. Below the platform, membership administration is confined to the tenant's own members:
+      # attaching an outside account would make it resettable by this tenant's admins (a takeover).
+      if not any(m.tenant_id == tenant_id and m.role in _MEMBER_ROLES for m in target.tenant_memberships):
+        raise AdministrationDenied(403, "not_a_member")
+      # A write replaces every local role the target holds in the tenant, so touching a pentester at
+      # all -- granting, removing or overwriting the role -- is the platform's decision.
+      if (role in _PLATFORM_RESERVED_MEMBER_ROLES
+          or any(m.tenant_id == tenant_id and m.role in _PLATFORM_RESERVED_MEMBER_ROLES
+                 for m in target.tenant_memberships)):
+        raise AdministrationDenied(403, "pentester_role_reserved")
     removes_admin = (role == "tenant_admin" if remove else role != "tenant_admin")
     if removes_admin and TenantMembership("tenant_admin", tenant_id) in target.tenant_memberships:
       others = {member["accountId"] for member in self._members(tenant_id)

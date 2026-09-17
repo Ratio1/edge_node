@@ -87,7 +87,8 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual((activated["memberCount"], activated["adminCount"], activated["assetCount"]), (1, 1, 0))
     self.assertTrue(activated["canUpdateAllowPentester"])
     self.assertEqual(self.service.get_tenant({"account_id": "initial"}, tenant_id)["data"],
-                     {**activated, "canUpdateAllowPentester": False})
+                     {**activated, "canUpdateAllowPentester": False,
+                      "assignableMemberRoles": ["tenant_admin", "tenant_user"]})
     self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).active)
 
   def test_matching_pending_retry_resumes_but_changed_intent_never_writes(self):
@@ -128,7 +129,8 @@ class TestTenantAdministration(unittest.TestCase):
     self.store.account("second", memberships=[{"role": "super_pentester", "tenant_id": tenant_id}])
     before = len(self.store.writes)
     retried = self.service.update_tenant_allow_pentester({"account_id": "second"}, tenant_id, True)
-    self.assertEqual(retried["data"], {**changed["data"], "canUpdateNodeFailurePolicy": False})
+    self.assertEqual(retried["data"], {**changed["data"], "canUpdateNodeFailurePolicy": False,
+                                     "canManageMembers": False, "assignableMemberRoles": []})
     self.assertEqual(len(self.store.writes), before)
     self.store.account("second", role="admin", memberships=[])
     self.assertEqual(self.service.update_tenant_allow_pentester(
@@ -402,6 +404,62 @@ class TestTenantAdministration(unittest.TestCase):
       {"account_id": "initial"}, tenant_id, "initial", "tenant_admin", True)["success"])
     self.assertTrue(self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_admin", True)["success"])
 
+  def test_tenant_admin_edits_only_existing_members_and_never_the_pentester_role(self):
+    # RM-083. Attaching an outside account would make it resettable by this tenant's admins, and the
+    # pentester role is the platform's to grant, remove or overwrite.
+    tenant_id = self.create()["tenantId"]
+    admin = {"account_id": "initial"}
+    self.store.account("outsider")
+    self.store.account("member", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
+    self.store.account("tester", memberships=[{"role": "tenant_pentester", "tenant_id": tenant_id}])
+    self.store.account("elsewhere", memberships=[{"role": "tenant_user", "tenant_id": "tn_other"}])
+    for target in ("outsider", "elsewhere"):
+      with self.subTest(target=target):
+        denied = self.service.authorize_tenant_membership(admin, tenant_id, target, "tenant_user")
+        self.assertEqual((denied["status_code"], denied["error"]), (403, "not_a_member"))
+    for target, role, remove in (("member", "tenant_pentester", False), ("tester", "tenant_user", False),
+                                 ("tester", "tenant_pentester", True), ("tester", "tenant_admin", False)):
+      with self.subTest(target=target, role=role, remove=remove):
+        denied = self.service.authorize_tenant_membership(admin, tenant_id, target, role, remove)
+        self.assertEqual((denied["status_code"], denied["error"]), (403, "pentester_role_reserved"))
+    self.assertTrue(self.service.authorize_tenant_membership(admin, tenant_id, "member", "tenant_admin")["success"])
+    self.assertTrue(self.service.authorize_tenant_membership(admin, tenant_id, "member", "tenant_user", True)["success"])
+    for target, role, remove in (("outsider", "tenant_user", False), ("member", "tenant_pentester", False),
+                                 ("tester", "tenant_pentester", True)):
+      with self.subTest(platform=target, role=role):
+        self.assertTrue(self.service.authorize_tenant_membership(self.actor, tenant_id, target, role, remove)["success"])
+
+  def test_account_creation_is_approved_with_its_one_membership(self):
+    tenant_id = self.create()["tenantId"]
+    admin = {"account_id": "initial"}
+    self.store.account("reader", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
+    self.store.account("taken", memberships=[{"role": "tenant_user", "tenant_id": "tn_other"}])
+    before = copy.deepcopy(self.store.data)
+    self.assertEqual(self.service.authorize_tenant_account_creation(admin, tenant_id, " New ", "tenant_user")["data"],
+                     {"accountId": "new", "tenantId": tenant_id, "role": "tenant_user"})
+    self.assertTrue(self.service.authorize_tenant_account_creation(admin, tenant_id, "new", "tenant_admin")["success"])
+    for actor, account_id, role, expected in (
+        (admin, "new", "tenant_pentester", (403, "pentester_role_reserved")),
+        (admin, "new", "super_tenant_admin", (400, "invalid_membership")),
+        (admin, "taken", "tenant_user", (409, "account_exists")),
+        ({"account_id": "reader"}, "new", "tenant_user", (403, "forbidden")),
+        ({"account_id": "taken"}, "new", "tenant_user", (404, "not_found"))):
+      with self.subTest(actor=actor["account_id"], account_id=account_id, role=role):
+        denied = self.service.authorize_tenant_account_creation(actor, tenant_id, account_id, role)
+        self.assertEqual((denied["status_code"], denied.get("error")), expected)
+    self.assertTrue(self.service.authorize_tenant_account_creation(self.actor, tenant_id, "new", "tenant_pentester")["success"])
+    self.assertEqual(self.store.data, before)
+
+  def test_detail_projects_member_administration_capability(self):
+    tenant_id = self.create()["tenantId"]
+    self.store.account("reader", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
+    expected = {"creator": (True, ["tenant_admin", "tenant_pentester", "tenant_user"]),
+                "initial": (True, ["tenant_admin", "tenant_user"]), "reader": (False, [])}
+    for account_id, (can_manage, roles) in expected.items():
+      with self.subTest(account_id=account_id):
+        detail = self.service.get_tenant({"account_id": account_id}, tenant_id)["data"]
+        self.assertEqual((detail["canManageMembers"], detail["assignableMemberRoles"]), (can_manage, roles))
+
   def test_tenant_without_recorded_founder_keeps_peer_membership_edits(self):
     tenant_id = self.create()["tenantId"]
     stored = self.repo.get("tenant", tenant_id)
@@ -493,7 +551,8 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
   def test_disabled_or_invalid_config_denies_every_administration_method_before_store_access(self):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
-               "check_tenant_domain", "authorize_tenant_membership", "update_tenant_allow_pentester",
+               "check_tenant_domain", "authorize_tenant_membership", "authorize_tenant_account_creation",
+               "update_tenant_allow_pentester",
                "get_tenant_nodes", "set_tenant_node_assignment", "list_tenant_assets",
                "get_tenant_asset", "create_tenant_asset", "update_tenant_asset")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
