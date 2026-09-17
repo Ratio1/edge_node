@@ -1991,14 +1991,15 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
 
   def test_raw_evidence_endpoint_reads_by_job_id(self):
     Plugin, plugin = self._raw_evidence_endpoint_plugin()
-    # RM-026 I1b B7: the endpoint admits the requester before reading. Stand up a real legacy
-    # reader so the happy path runs through admission rather than around it.
-    from .read_endpoint_fixtures import install_legacy_read_store
-    actor = install_legacy_read_store(self, plugin, Plugin, jobs={"job-raw": {
+    # RM-026 I1b B7, RM-084 P2: the endpoint admits the requester in a named tenant before
+    # reading, and `evidence:read` is the gate, so the happy path needs a platform membership.
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin, jobs={"job-raw": {
       "job_id": "job-raw", "job_type": "model_test", "scan_type": "model_test",
       "model_test_summary": {"overall_status": "completed"}}})
 
-    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw", request_actor=actor)
+    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw", request_actor=actor,
+                                                tenant_id=tenant_id)
 
     self.assertEqual(result["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
     self.assertEqual(result["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)

@@ -1,4 +1,8 @@
-"""Checked legacy rulebook reads preserve producer state without acquiring write authority."""
+"""Checked tenant rulebook reads preserve producer state without acquiring write authority.
+
+RM-084 P2: the two endpoints require the caller's tenant (`reports:view`). The pure service readers
+still accept the legacy snapshot mode, which P6 removes with the unscoped reader itself.
+"""
 import asyncio
 from copy import deepcopy
 from unittest.mock import MagicMock
@@ -6,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from .test_rulebook_assessment import _Owner, checked_read_producer
-from .read_endpoint_fixtures import read_endpoint_fixture
+from .read_endpoint_fixtures import as_role, read_endpoint_fixture
 from .test_tenant_read_native import assert_json_response, install, read_native, request, scheduler_comms
 from extensions.business.cybersec.red_mesh.services import rulebook_assessment as service
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
@@ -79,13 +83,16 @@ def test_checked_known_domain_errors_are_typed(reader, profile, job, status, cod
 
 @pytest.mark.parametrize("reader", READERS)
 def test_native_method_requires_current_account_and_uses_checked_job(reader):
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.job["job_status"] = "FINALIZED"
     writes = list(fixture.store.writes)
     method = getattr(fixture.Plugin, reader.__name__)
-    denied = method(fixture.owner, "job-1")
+    tenant_id = as_role(fixture, "tenant_admin")
+    denied = method(fixture.owner, "job-1", tenant_id=tenant_id)
     assert denied == {"success": False, "error": "not_found", "status_code": 404}
-    allowed = method(fixture.owner, "job-1", request_actor=fixture.actor)
+    unscoped = method(fixture.owner, "job-1", request_actor=fixture.actor)
+    assert unscoped == {"success": False, "error": "invalid_request", "status_code": 400}
+    allowed = method(fixture.owner, "job-1", request_actor=fixture.actor, tenant_id=tenant_id)
     assert allowed["job_id"] == "job-1" and allowed["submissions"] == []
     assert fixture.artifact_reads == [] and fixture.store.writes == writes
 
@@ -96,12 +103,22 @@ PRODUCER_STATES = ("missing", "generated", "generation_failed", "draft", "submit
 def install_rulebook_producer(fixture, state):
   """Install real writer state into the native fixture's independent auth/storage namespace."""
   producer = checked_read_producer(state)
+  binding = deepcopy(fixture.job.get("execution_binding"))
   fixture.job.clear()
   fixture.job.update(deepcopy(producer.job_specs))
+  # The producer's job record is unbound; the tenant reader only returns records it owns, so the
+  # fixture's own binding is restored rather than the producer being taught about tenancy.
+  if binding is not None:
+    fixture.job["execution_binding"] = binding
   for (hkey, key), row in producer.records.items():
     if hkey.startswith(producer.cfg_instance_id + ":rulebook_review"):
       fixture.store.data[(fixture.owner.cfg_instance_id + hkey[len(producer.cfg_instance_id):], key)] = deepcopy(row)
-  fixture.artifacts["archive-cid"] = deepcopy(producer.archive)
+  archive = deepcopy(producer.archive)
+  if binding is not None and isinstance(archive.get("job_config"), dict):
+    # A real bound job's archived config carries the same binding as its record; the producer
+    # fixture predates tenancy, so the binding is stamped here rather than taught to the producer.
+    archive["job_config"]["execution_binding"] = deepcopy(binding)
+  fixture.artifacts["archive-cid"] = archive
   fixture.artifacts.update(deepcopy(producer.artifacts))
   return producer
 
@@ -126,13 +143,14 @@ def test_actual_producer_records_preserve_read_projection_without_effects(reader
 def test_actual_native_transports_publish_real_producer_rows(read_native, reader, response_format, state):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     producer = install_rulebook_producer(fixture, state)
     expected = reader(producer, "job-1")
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 200)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     # Native deployment fields may be added around RAW content; the read contract is unchanged.
     assert all(actual[key] == value for key, value in expected.items())
@@ -154,13 +172,14 @@ def test_actual_native_transports_publish_real_producer_rows(read_native, reader
 def test_actual_native_rejects_malformed_selected_metadata_and_history(read_native, reader, response_format, metadata):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_rulebook_producer(fixture, "generated")
     fixture.job["rulebook_assessments"][PROFILE].update(deepcopy(metadata))
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 503)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
     assert calls == 1 and fixture.store.writes == writes and fixture.artifact_reads == []
 
@@ -171,7 +190,7 @@ def test_actual_native_rejects_malformed_selected_metadata_and_history(read_nati
 def test_native_metadata_error_null_is_corruption_not_absence(read_native, reader, response_format, history):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_rulebook_producer(fixture, "generated")
     metadata = fixture.job["rulebook_assessments"][PROFILE]
     if history:
@@ -181,7 +200,8 @@ def test_native_metadata_error_null_is_corruption_not_absence(read_native, reade
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 503)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
     assert calls == 1 and fixture.store.writes == writes and fixture.artifact_reads == []
 
@@ -192,7 +212,7 @@ def test_native_metadata_error_null_is_corruption_not_absence(read_native, reade
 def test_native_absent_metadata_and_nullable_submission_errors_remain_valid(read_native, reader, response_format, state):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     producer = install_rulebook_producer(fixture, state)
     if state == "generated":
       generated = service.generate_rulebook_assessment(producer, "job-1", persist=True, force=True)
@@ -207,7 +227,8 @@ def test_native_absent_metadata_and_nullable_submission_errors_remain_valid(read
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 200)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert actual["submission_error"] is None
     assert actual["submission_operation_state"] == ("submitting" if state == "submission_failed" else None)
@@ -222,7 +243,7 @@ def test_native_absent_metadata_and_nullable_submission_errors_remain_valid(read
 def test_actual_native_preserves_valid_optional_metadata_and_history(read_native, reader, response_format, run_state):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     producer = install_rulebook_producer(fixture, "generated")
     # A second unchanged producer generation records the first artifact as real history.
     generated = service.generate_rulebook_assessment(producer, "job-1", persist=True, force=True)
@@ -239,7 +260,8 @@ def test_actual_native_preserves_valid_optional_metadata_and_history(read_native
     })
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 200)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     if reader is service.get_rulebook_assessment_status:
       assert actual["history"] == metadata["history"]
@@ -257,7 +279,7 @@ def test_actual_native_preserves_valid_optional_metadata_and_history(read_native
 def test_actual_native_rulebook_domain_errors_are_endpoint_local(read_native, reader, response_format, fault, status, code):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     fixture.job["job_status"] = "RUNNING" if fault == "running" else "FINALIZED"
     if fault == "model":
       fixture.job["job_type"] = "model_test"
@@ -267,7 +289,7 @@ def test_actual_native_rulebook_domain_errors_are_endpoint_local(read_native, re
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, {
       "job_id": "job-1", "profile_id": "unknown" if fault == "profile" else PROFILE,
-      "request_actor": fixture.actor})), status)
+      "request_actor": fixture.actor, "tenant_id": as_role(fixture, "tenant_admin")})), status)
     assert result == {"success": False, "error": code, "status_code": status}
     assert calls == 1 and fixture.artifact_reads == []
 
@@ -366,34 +388,51 @@ def test_staleness_uses_checked_pass_parents_only_and_does_not_hide_integrity_er
 
 @pytest.mark.parametrize("reader", READERS)
 @pytest.mark.parametrize("fault,status", (
-  ("empty_memberships", 403), ("null_memberships", 404), ("malformed_memberships", 404),
-  ("inactive", 404), ("rollout", 403), ("store", 503), ("bound", 404),
-  ("missing", 404), ("alias", 404), ("collision", 503),
+  ("none_scope", 404), ("null_memberships", 404), ("malformed_memberships", 404),
+  ("inactive", 404), ("user_role", 200), ("other_tenant", 404), ("store", 503),
+  ("unbound", 404), ("foreign_binding", 404), ("missing", 404), ("collision", 503),
+  ("missing_tenant", 400),
 ))
 def test_real_account_and_job_revocation_denies_before_rulebook_reads(reader, fault, status):
-  with read_endpoint_fixture(bound=False) as fixture:
-    if fault.endswith("memberships"):
+  with read_endpoint_fixture(bound=True) as fixture:
+    job_id, tenant_id = "job-1", as_role(fixture, "tenant_admin")
+    if fault.endswith("memberships") or fault == "none_scope":
       fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = {
-        "empty_memberships": [], "null_memberships": None, "malformed_memberships": "private"}[fault]
+        "none_scope": [], "null_memberships": None, "malformed_memberships": "private"}[fault]
     elif fault == "inactive":
-      fixture.store.account("reader", active=False)
-    elif fault == "rollout":
-      fixture.owner.cfg_tenant_execution_stage = "draining"
+      fixture.store.account("reader", active=False,
+        memberships=[{"role": "tenant_admin", "tenant_id": fixture.tenant_id}])
+    elif fault == "user_role":
+      # `reports:view` is the gate, and a tenant_user holds it: this row records that the read is
+      # open to every member of the owning tenant, unlike the mutations.
+      as_role(fixture, "tenant_user")
+    elif fault == "other_tenant":
+      tenant_id = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
     elif fault == "store":
       fixture.store.fail_hkey = fixture.store.cfg_instance_id
-    elif fault == "bound":
+    elif fault == "unbound":
       fixture.job["execution_binding"] = None
+    elif fault == "foreign_binding":
+      fixture.job["execution_binding"] = {**fixture.job["execution_binding"],
+        "tenant_id": "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"}
     elif fault == "missing":
       fixture.store.jobs.clear()
     elif fault == "collision":
-      fixture.store.jobs["other"] = {"job_id": "job-1", "execution_binding": None}
+      fixture.store.jobs["job-1"] = {**fixture.job, "job_id": "other"}
+    elif fault == "missing_tenant":
+      tenant_id = None
     writes = list(fixture.store.writes)
-    result = getattr(fixture.Plugin, reader.__name__)(fixture.owner,
-      "legacy-alias" if fault == "alias" else "job-1", request_actor=fixture.actor)
-    assert result == {"success": False, "status_code": status,
-                      "error": {403: "forbidden", 404: "not_found", 503: "unavailable"}[status]}
+    result = getattr(fixture.Plugin, reader.__name__)(fixture.owner, job_id,
+      request_actor=fixture.actor, tenant_id=tenant_id)
+    if status == 200:
+      assert result["job_id"] == "job-1"
+    else:
+      assert result == {"success": False, "status_code": status,
+                        "error": {400: "invalid_request", 403: "forbidden", 404: "not_found",
+                                  503: "unavailable"}[status]}
     assert fixture.store.writes == writes and fixture.artifact_reads == []
-    assert not any(":rulebook_review" in row[1] for row in fixture.store.reads)
+    if status != 200:
+      assert not any(":rulebook_review" in row[1] for row in fixture.store.reads)
 
 
 @pytest.mark.parametrize("reader", READERS)
@@ -486,14 +525,15 @@ def test_rulebook_safe_error_allowance_does_not_generalize_to_other_errors(read_
 def test_native_raw_audit_answers_cannot_rely_on_absent_model_coercion(read_native, response_format, field, value):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_rulebook_producer(fixture, "draft")
     audit = fixture.store.data[(fixture.owner.cfg_instance_id + ":rulebook_review:audit", "job-1:" + PROFILE)]
     audit[0][field] = deepcopy(value)
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, "get_rulebook_review", {
-      "job_id": "job-1", "request_actor": fixture.actor})), 503)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
     assert calls == 1 and fixture.store.writes == writes and fixture.artifact_reads == []
 
@@ -502,13 +542,14 @@ def test_native_raw_audit_answers_cannot_rely_on_absent_model_coercion(read_nati
 def test_native_raw_audit_requires_explicit_review_state(read_native, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_rulebook_producer(fixture, "draft")
     audit = fixture.store.data[(fixture.owner.cfg_instance_id + ":rulebook_review:audit", "job-1:" + PROFILE)]
     del audit[0]["review_state"]
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, "get_rulebook_review", {
-      "job_id": "job-1", "request_actor": fixture.actor})), 503)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
     assert calls == 1 and fixture.artifact_reads == []
 
@@ -522,7 +563,7 @@ def test_native_model_coerced_review_defaults_remain_valid_without_optional_audi
     read_native, response_format, answers, expected):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     install_rulebook_producer(fixture, "draft")
     review = fixture.store.data[(fixture.owner.cfg_instance_id + ":rulebook_review", "job-1:" + PROFILE)]
     review["answers"] = deepcopy(answers)
@@ -532,7 +573,8 @@ def test_native_model_coerced_review_defaults_remain_valid_without_optional_audi
     del audit[0]["current_answers"]
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, "get_rulebook_review", {
-      "job_id": "job-1", "request_actor": fixture.actor})), 200)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert actual["review"]["answers"] == expected and actual["review"]["review_state"] == "draft"
     assert actual["audit"] == audit and calls == 1
@@ -566,14 +608,15 @@ def probe_record(fixture, location):
 def test_native_legacy_rulebook_records_reject_all_tenant_authority_markers(read_native, response_format, location, field):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     row = probe_record(fixture, location)
     row[field] = None
     writes = list(fixture.store.writes)
     module.eng = scheduler_comms(fixture, response_format)
     endpoint = "get_rulebook_review" if location == "audit" else "get_rulebook_assessment_status"
     result, calls = assert_json_response(asyncio.run(request(module, endpoint, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 503)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
     assert calls == 1 and fixture.store.writes == writes and fixture.artifact_reads == []
 
@@ -584,12 +627,13 @@ def test_native_legacy_rulebook_records_reject_all_tenant_authority_markers(read
 def test_native_error_class_has_one_string_contract_in_every_published_error(read_native, response_format, location, value):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     row = probe_record(fixture, location)
     row["last_error"] = {"error": "fixture_failure", "error_class": value}
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, "get_rulebook_assessment_status", {
-      "job_id": "job-1", "request_actor": fixture.actor})), 503)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
     assert calls == 1 and fixture.artifact_reads == []
 
@@ -599,11 +643,12 @@ def test_native_error_class_has_one_string_contract_in_every_published_error(rea
 def test_native_raw_audit_updated_at_is_an_optional_finite_number(read_native, response_format, value):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     probe_record(fixture, "audit")["updated_at"] = value
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, "get_rulebook_review", {
-      "job_id": "job-1", "request_actor": fixture.actor})), 503)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
     assert calls == 1 and fixture.artifact_reads == []
 
@@ -613,7 +658,7 @@ def test_native_raw_audit_updated_at_is_an_optional_finite_number(read_native, r
 def test_native_matching_identities_and_valid_optional_fields_remain_visible(read_native, response_format, location):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     row = probe_record(fixture, location)
     row["extension"] = {"nested": [{"job_id": "job-1", "profile_id": PROFILE}]}
     if location == "audit":
@@ -623,7 +668,8 @@ def test_native_matching_identities_and_valid_optional_fields_remain_visible(rea
     module.eng = scheduler_comms(fixture, response_format)
     endpoint = "get_rulebook_review" if location == "audit" else "get_rulebook_assessment_status"
     result, calls = assert_json_response(asyncio.run(request(module, endpoint, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 200)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     if location == "audit":
       assert actual["audit"][0]["updated_at"] == 1.5 and actual["audit"][0]["extension"] == row["extension"]
@@ -639,13 +685,14 @@ def test_native_matching_identities_and_valid_optional_fields_remain_visible(rea
 def test_native_integer_overflow_cannot_publish_nonfinite_consumer_numbers(read_native, response_format, location):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     row = probe_record(fixture, location)
     field = "review_revision" if location in ("review", "audit") else "pass_nr"
     row[field] = 10 ** 309
     module.eng = scheduler_comms(fixture, response_format)
     endpoint = "get_rulebook_review" if location == "audit" else "get_rulebook_assessment_status"
-    native = asyncio.run(request(module, endpoint, {"job_id": "job-1", "request_actor": fixture.actor}))
+    native = asyncio.run(request(module, endpoint, {"job_id": "job-1",
+      "request_actor": fixture.actor, "tenant_id": as_role(fixture, "tenant_admin")}))
     assert native[0] == 503, native[2].decode("utf-8")
     result, calls = assert_json_response(native, 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503}
@@ -657,14 +704,15 @@ def test_native_integer_overflow_cannot_publish_nonfinite_consumer_numbers(read_
 def test_native_large_finite_integer_and_boolean_metadata_are_preserved(read_native, reader, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     metadata = probe_record(fixture, "metadata")
     metadata["pass_nr"] = 10 ** 100
     metadata["auto_enabled"] = False
     metadata["extension"] = {"boolean": True, "negative_finite_integer": -(10 ** 100)}
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, reader.__name__, {
-      "job_id": "job-1", "request_actor": fixture.actor})), 200)
+      "job_id": "job-1", "request_actor": fixture.actor,
+      "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     if reader is service.get_rulebook_assessment_status:
       assert actual["pass_nr"] == 10 ** 100 and actual["auto_enabled"] is False

@@ -195,7 +195,7 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
     """Deny-by-default survives the widening: the gate admits a fixed set, not anything the matrix
     happens to contain, so a future matrix entry cannot reach reads without its own decision."""
     self._as("super_tenant_admin")
-    for operation in ("tasks:launch", "tenants:manage", "evidence:read", "", None):
+    for operation in ("tasks:launch", "tenants:manage", "assets:create", "", None):
       with self.subTest(operation=operation):
         with self.assertRaises(self.AdministrationDenied) as caught:
           self.access.get_job(self.actor, self.tenant_id, "job-1", operation=operation)
@@ -242,7 +242,7 @@ class TestEffectOperationNarrowsRatherThanOpens(unittest.TestCase):
     """Operations outside _TENANT_EFFECT_OPERATIONS stay refused even though the matrix grants them
     broadly. reports:export left this list on 2026-09-15: the owner's MVP rescope opted
     stop_monitoring (which runs as reports:export) into the tenant seam."""
-    for operation in ("reports:view", "tasks:launch", "evidence:read"):
+    for operation in ("reports:view", "tasks:launch", "evidence:read", "tenants:manage"):
       with self.subTest(operation=operation):
         result, reached = self._call(operation)
         self.assertEqual(result, {"success": False, "error": "forbidden", "status_code": 403})
@@ -293,29 +293,39 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
     # catches the *next* endpoint opting into tenant scope, and it is inert if left red.
     # `stop_monitoring` opted in under the RM-026 MVP (2026-09-15): it forwards the caller's
     # explicit selector and "reports:export" is admitted at both tenant seams. Still by name.
-    # RM-084 P1 opted the E1 export effects in: each refuses a missing tenant before admission.
+    # RM-084 P1 opted the E1 export effects in, and P2 the E2 ingest and review mutations: each
+    # refuses a missing tenant before admission. `delete_job_engagement` is the last endpoint on
+    # the unscoped half and opts in with P3, which is what the null-tenant count below pins.
     forwarders = {"_purge_operation", "stop_monitoring", "export_misp", "export_stix_bundle",
                   "dry_run_opencti_export", "push_to_opencti", "dry_run_taxii_export",
-                  "publish_to_taxii"}
+                  "publish_to_taxii", "correlate_suricata_eve", "generate_rulebook_assessment",
+                  "save_rulebook_review_draft", "submit_rulebook_review", "reopen_rulebook_review",
+                  "update_rulebook_review"}
     enclosing = {}
     for node in ast.walk(tree):
       if isinstance(node, ast.FunctionDef):
         for inner in ast.walk(node):
           enclosing[id(inner)] = node.name
-    checked = 0
+    unscoped = 0
     for call in calls:
-      if getattr(call.func, "attr", None) != "_effect_operation":
-        continue
-      if enclosing.get(id(call)) in forwarders:
-        continue
-      # _effect_operation(self, request_actor, tenant_id, apply_effect, ...)
+      wrapper = getattr(call.func, "attr", None)
+      # _effect_operation(self, request_actor, tenant_id, apply_effect, ...) and
+      # _review_operation(self, request_actor, tenant_id, job_id, apply_review, ...)
       tenant_arg = call.args[2]
+      name = enclosing.get(id(call))
+      if name in forwarders or name in ("_effect_operation", "_purge_operation"):
+        # An opted-in endpoint may only forward the caller's own selector, never a fabricated one.
+        self.assertIsInstance(tenant_arg, ast.Name, ast.dump(call))
+        self.assertEqual(tenant_arg.id, "tenant_id", ast.dump(call))
+        continue
       self.assertIsInstance(tenant_arg, ast.Constant, ast.dump(call))
       self.assertIsNone(tenant_arg.value,
                         "an endpoint opted into tenant scope outside its own slice: "
                         + ast.dump(call))
-      checked += 1
-    self.assertGreater(checked, 0, "the guard checked nothing; it would not catch a widening")
+      unscoped += 1
+    self.assertEqual(unscoped, 1,
+                     "the unscoped half changed size outside a phase that says so")
+
 
 
 if __name__ == "__main__":

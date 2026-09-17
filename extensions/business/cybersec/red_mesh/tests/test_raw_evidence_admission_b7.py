@@ -8,10 +8,10 @@ captured. Anyone who could guess a job id could read it.
 Contracts 4 and 6 are vacuous here: this is a read, it lands no effect, and there is nothing to
 revalidate at completion. It gets admission, POST, and a wire assertion, and no further ceremony.
 
-The gate decides itself rather than needing an owner call. `audit:view` requires a
-`super_tenant_admin` membership, which the legacy seam forbids outright -- `_admitted_snapshot`
-requires memberships absent -- so it is unreachable in the legacy half. `reports:export` is the
-strictest gate that can actually be satisfied, and it is what the other restricted exports use.
+RM-084 P2: the endpoint requires the caller's tenant and the gate is `evidence:read`, which the
+matrix grants to the platform roles only -- so a Tenant Admin of the owning tenant is refused the
+decrypted artifact while keeping every other report it can read. The previous `reports:export` gate
+was the strictest one the deleted legacy seam could satisfy, not the right one.
 
 Boundary tests first, and this time the fixture is checked for the ability to express the assertion
 before a failure is read as a defect (B6 closeout).
@@ -30,6 +30,44 @@ from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
 
 SECRET = "mock-only-b7-canary"
 
+# Faults, each expressed on the tenant path. `member` is the P2 acceptance criterion: the owning
+# tenant's administrator holds reports:view and reports:export and still may not read raw evidence.
+FAULTS = (
+  ("actor", 404), ("deleted", 404), ("inactive", 404), ("none_scope", 404),
+  ("member", 403), ("pentester", 403), ("user", 403), ("other_tenant", 404),
+  ("identity_store", 503),
+)
+
+
+def admit(fixture, role="super_tenant_admin"):
+  """Give the reader a membership that holds evidence:read, and return the call's tenant."""
+  fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    {"role": role, "tenant_id": None}]
+  return fixture.tenant_id
+
+
+def apply_fault(fixture, fault):
+  """Return the actor and tenant the call should use. Faults are real store state, not mocks."""
+  memberships = {"member": "tenant_admin", "pentester": "tenant_pentester", "user": "tenant_user"}
+  actor, tenant_id = fixture.actor, admit(fixture)
+  if fault == "actor":
+    actor = None
+  elif fault == "deleted":
+    fixture.store.data.pop(("auth", "reader"))
+  elif fault == "inactive":
+    fixture.store.account("reader", active=False,
+      memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
+  elif fault == "none_scope":
+    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = []
+  elif fault in memberships:
+    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+      {"role": memberships[fault], "tenant_id": fixture.tenant_id}]
+  elif fault == "other_tenant":
+    tenant_id = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
+  elif fault == "identity_store":
+    fixture.store.fail_hkey = "auth"
+  return actor, tenant_id
+
 
 def _no_artifact_read(fixture):
   """Canary on the symbol the plugin actually calls.
@@ -44,27 +82,13 @@ def _no_artifact_read(fixture):
   return patch.object(module, "get_raw_evidence_artifact", Mock(side_effect=RuntimeError(SECRET)))
 
 
-@pytest.mark.parametrize("fault,status", (
-  ("actor", 404), ("deleted", 404), ("inactive", 404), ("user", 403),
-  ("memberships", 403), ("rollout", 403), ("identity_store", 503),
-))
+@pytest.mark.parametrize("fault,status", FAULTS)
 def test_denials_never_resolve_the_secret_key_or_read_the_artifact(fault, status):
-  with read_endpoint_fixture(bound=False) as fixture:
-    account = fixture.store.data[("auth", "reader")]
-    actor = fixture.actor
-    if fault == "actor": actor = None
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
-    elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "user": fixture.store.account("reader", role="user")
-    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
-    elif fault == "rollout":
-      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
-        record={"stage": "draining", "enabled": False})
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
-
+  with read_endpoint_fixture(bound=True) as fixture:
+    actor, tenant_id = apply_fault(fixture, fault)
     with _no_artifact_read(fixture) as artifact:
       result = fixture.Plugin.get_raw_model_test_evidence(
-        fixture.owner, "job-1", request_actor=actor)
+        fixture.owner, "job-1", request_actor=actor, tenant_id=tenant_id)
     assert result.get("status_code") == status
     assert result.get("success") is False
     artifact.assert_not_called()
@@ -75,36 +99,48 @@ def test_a_denial_outranks_the_job_type_check():
   """The unsupported-job-type answer distinguishes a real job from an absent one, so an unadmitted
   caller must never reach it. job-1 is a network scan, so the old code would have answered
   `unsupported_job_type` for a caller with no authority at all."""
-  with read_endpoint_fixture(bound=False) as fixture:
-    fixture.store.account("reader", role="user")
+  with read_endpoint_fixture(bound=True) as fixture:
     result = fixture.Plugin.get_raw_model_test_evidence(
-      fixture.owner, "job-1", request_actor=fixture.actor)
+      fixture.owner, "job-1", request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result.get("status_code") == 403
     assert result.get("error") != "unsupported_job_type"
+
+
+@pytest.mark.parametrize("tenant_id", (None, "", "   "))
+def test_a_missing_tenant_is_refused_before_admission(tenant_id):
+  """There is no unscoped half left: the selector is a bad request, not a fallback."""
+  with read_endpoint_fixture(bound=True) as fixture:
+    admit(fixture)
+    with _no_artifact_read(fixture) as artifact:
+      result = fixture.Plugin.get_raw_model_test_evidence(
+        fixture.owner, "job-1", request_actor=fixture.actor, tenant_id=tenant_id)
+    assert result == {"success": False, "error": "invalid_request", "status_code": 400}
+    artifact.assert_not_called()
+    assert fixture.store.reads == []
 
 
 def test_the_endpoint_reads_no_job_of_its_own():
   """Admission already read the job under the reader's authority; a second unscoped read of the
   same record is the defect this whole phase exists to remove."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = admit(fixture)
     fixture.owner._get_job_from_cstore = Mock(side_effect=RuntimeError(SECRET))
     with _no_artifact_read(fixture):
       fixture.Plugin.get_raw_model_test_evidence(
-        fixture.owner, "job-1", request_actor=fixture.actor)
+        fixture.owner, "job-1", request_actor=fixture.actor, tenant_id=tenant_id)
     fixture.owner._get_job_from_cstore.assert_not_called()
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("fault,status", (("user", 403), ("actor", 404)))
+@pytest.mark.parametrize("fault,status", (("member", 403), ("actor", 404)))
 def test_the_denial_keeps_its_status_over_the_wire(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
-    payload = {"job_id": "job-1", "request_actor": fixture.actor}
-    if fault == "user":
-      fixture.store.account("reader", role="user")
-    else:
+    actor, tenant_id = apply_fault(fixture, fault)
+    payload = {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": tenant_id}
+    if actor is None:
       payload.pop("request_actor")
     with _no_artifact_read(fixture) as artifact:
       actual, _headers, body, calls = asyncio.run(
@@ -139,10 +175,10 @@ def test_the_decrypted_payload_is_never_cacheable(read_native, response_format):
   drag in the error rebuild."""
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     status, headers, body, _calls = asyncio.run(request(module, "get_raw_model_test_evidence",
-      {"job_id": "job-1", "request_actor": fixture.actor}))
+      {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": admit(fixture)}))
     # job-1 is a network scan, so this is the unsupported_job_type answer -- a successful admitted
     # call. The header must be there regardless of which branch the body came from.
     assert headers[b"cache-control"] == b"no-store", (status, body)
@@ -164,10 +200,10 @@ def test_the_typed_codes_are_not_collapsed(read_native, response_format):
   """
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     status, _headers, body, _calls = asyncio.run(request(module, "get_raw_model_test_evidence",
-      {"job_id": "job-1", "request_actor": fixture.actor}))
+      {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": admit(fixture)}))
     payload = json.loads(body)
     if response_format == "RAW":
       assert status == 500

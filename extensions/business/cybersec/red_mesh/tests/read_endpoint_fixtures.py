@@ -14,6 +14,9 @@ from . import test_api as api_fixtures
 from .test_execution_binding_models import binding_payload
 from .test_tenant_read_access import ReadStore
 from .test_tenant_administration import FakeAdministrationStore
+from extensions.business.cybersec.red_mesh.tenancy.policy import PLATFORM_ROLES
+
+_SAME_TENANT = object()
 
 
 def install_legacy_read_store(case, owner, Plugin, *, jobs=None):
@@ -47,6 +50,59 @@ def install_legacy_read_store(case, owner, Plugin, *, jobs=None):
   owner.chainstore_hget, owner.chainstore_hgetall = get, listing
   owner._normalize_job_record = lambda key, record, **kwargs: Plugin._normalize_job_record(owner, key, record, **kwargs)
   return {"account_id": "reader"}
+
+
+def install_tenant_read_store(case, owner, Plugin, *, jobs=None, role="super_tenant_admin"):
+  """Like install_legacy_read_store, but the reader admits through a real tenant (RM-084 P2).
+
+  Every supplied job record is bound to that tenant, since the tenant reader returns only records
+  it owns. Returns `(actor, tenant_id)` for the call under test.
+  """
+  environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
+  environment.start()
+  case.addCleanup(environment.stop)
+  store = FakeAdministrationStore()
+  owner.cfg_tenancy_namespace = "deployment"
+  owner.cfg_chainstore_peers = []
+  tenant_store = CstoreTenantAdministrationStore(store, owner.cfg_tenancy_namespace)
+  administration = TenantAdministrationService(CstoreAuthAccountReader(store), tenant_store)
+  request_id = str(uuid4())
+  prepared = administration.prepare_tenant({"account_id": "creator"}, request_id,
+    "Read fixture", "read-fixture", "initial")
+  assert prepared["success"], prepared
+  tenant_id = prepared["data"]["tenantId"]
+  store.grant("initial", tenant_id)
+  activated = administration.activate_tenant({"account_id": "creator"}, request_id)
+  assert activated["success"], activated
+  store.account("reader", memberships=[
+    {"role": role, "tenant_id": None if role in PLATFORM_ROLES else tenant_id}])
+  binding = {**binding_payload(), "tenant_id": tenant_id}
+  bound = {key: {**record, "execution_binding": deepcopy(binding)}
+           for key, record in (jobs or {}).items()}
+  original_get = getattr(owner, "chainstore_hget", lambda **kwargs: None)
+  original_list = getattr(owner, "chainstore_hgetall", lambda **kwargs: {})
+  # Identity lives under the auth hkey and tenancy under a JSON-encoded one; every other hash
+  # (the plugin's own records) keeps whatever the caller's fixture already installed.
+  def ours(hkey):
+    return hkey == "auth" or hkey.startswith('["redmesh"')
+
+  def get(*, hkey, key):
+    if hkey == owner.cfg_instance_id:
+      return deepcopy(bound.get(key))
+    if ours(hkey):
+      return store.chainstore_hget(hkey=hkey, key=key)
+    return original_get(hkey=hkey, key=key)
+
+  def listing(*, hkey):
+    if hkey == owner.cfg_instance_id:
+      return deepcopy(bound)
+    if ours(hkey):
+      return store.chainstore_hgetall(hkey=hkey)
+    return original_list(hkey=hkey)
+
+  owner.chainstore_hget, owner.chainstore_hgetall = get, listing
+  owner._normalize_job_record = lambda key, record, **kwargs: Plugin._normalize_job_record(owner, key, record, **kwargs)
+  return {"account_id": "reader"}, tenant_id
 
 
 @contextmanager
@@ -104,3 +160,16 @@ def read_endpoint_fixture(*, bound=True, archived=True):
     yield SimpleNamespace(Plugin=Plugin, owner=owner, store=store, actor={"account_id": "reader"},
       tenant_id=tenant_id if bound else None, job=job, artifacts=artifacts, artifact_reads=artifact_reads,
       administration=administration, tenant_store=tenant_store)
+
+
+def as_role(fixture, role, *, tenant_id=_SAME_TENANT):
+  """Replace the fixture reader's memberships with one row (RM-084: the only authority there is).
+
+  A platform role carries `tenant_id: None`; a tenant-local role defaults to the fixture's tenant.
+  Returns the tenant the call should name, so a test reads as one line.
+  """
+  local = tenant_id is _SAME_TENANT
+  row = {"role": role, "tenant_id": None if role in PLATFORM_ROLES
+         else fixture.tenant_id if local else tenant_id}
+  fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [row]
+  return fixture.tenant_id if local or role in PLATFORM_ROLES else tenant_id

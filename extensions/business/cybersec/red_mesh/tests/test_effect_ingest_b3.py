@@ -12,7 +12,7 @@ import pytest
 
 from extensions.business.cybersec.red_mesh.services import authorization_upload, suricata_correlation
 from extensions.business.cybersec.red_mesh.tenancy.effects import EffectState
-from .read_endpoint_fixtures import read_endpoint_fixture
+from .read_endpoint_fixtures import as_role, read_endpoint_fixture
 from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
   assert_json_response, install, read_native, request, scheduler_comms,
 )
@@ -20,31 +20,45 @@ from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
 SECRET = "mock-only-b3-canary"
 PDF_B64 = "JVBERi0xLjQK" + "QQ" * 8  # %PDF-1.4 magic plus filler
 
+# RM-084 P2: correlate_suricata_eve runs as `reports:export` in the caller's tenant. The upload
+# keeps the actor-only seam until P3 gives it `authorization:upload`.
+CORRELATE_FAULTS = (
+  ("actor", 404), ("deleted", 404), ("inactive", 404), ("none_scope", 404),
+  ("user", 403), ("other_tenant", 404), ("identity_store", 503),
+)
 
-@pytest.mark.parametrize("fault,status", (
-  ("actor", 404), ("deleted", 404), ("inactive", 404), ("user", 403),
-  ("memberships", 403), ("rollout", 403), ("identity_store", 503),
-))
+
+def apply_fault(fixture, fault):
+  """Return (actor, tenant_id) for a call that must be refused, from real store state."""
+  actor, tenant_id = fixture.actor, as_role(fixture, "tenant_admin")
+  if fault == "actor":
+    actor = None
+  elif fault == "deleted":
+    fixture.store.data.pop(("auth", "reader"))
+  elif fault == "inactive":
+    fixture.store.account("reader", active=False,
+      memberships=[{"role": "tenant_admin", "tenant_id": fixture.tenant_id}])
+  elif fault == "none_scope":
+    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = []
+  elif fault == "user":
+    as_role(fixture, "tenant_user")
+  elif fault == "other_tenant":
+    tenant_id = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
+  elif fault == "identity_store":
+    fixture.store.fail_hkey = "auth"
+  return actor, tenant_id
+
+
+@pytest.mark.parametrize("fault,status", CORRELATE_FAULTS)
 def test_correlate_denials_never_touch_the_job_or_the_shared_status_record(fault, status):
-  with read_endpoint_fixture(bound=False) as fixture:
-    account = fixture.store.data[("auth", "reader")]
-    actor = fixture.actor
-    if fault == "actor": actor = None
-    elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
-    elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "user": fixture.store.account("reader", role="user")
-    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
-    elif fault == "rollout":
-      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
-        record={"stage": "draining", "enabled": False})
-    elif fault == "identity_store": fixture.store.fail_hkey = "auth"
-
+  with read_endpoint_fixture(bound=True) as fixture:
+    actor, tenant_id = apply_fault(fixture, fault)
     with patch.object(suricata_correlation, "record_integration_status",
                       side_effect=AssertionError(SECRET)) as shared, \
          patch.object(suricata_correlation, "_write_job_record",
                       side_effect=AssertionError(SECRET)) as write:
       result = fixture.Plugin.correlate_suricata_eve(
-        fixture.owner, "job-1", eve_jsonl="{}", request_actor=actor)
+        fixture.owner, "job-1", eve_jsonl="{}", request_actor=actor, tenant_id=tenant_id)
     assert result["status_code"] == status and result["success"] is False
     # The status record is node-global and feeds the cooldown policy: a denial must leave the
     # shared record untouched, not merely leave no job trace.
@@ -53,29 +67,32 @@ def test_correlate_denials_never_touch_the_job_or_the_shared_status_record(fault
 
 
 def test_correlate_no_longer_reads_the_job_unscoped():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, "tenant_admin")
     with patch.object(fixture.owner, "_get_job_from_cstore", create=True,
                       side_effect=AssertionError(SECRET)) as unscoped:
       fixture.Plugin.correlate_suricata_eve(fixture.owner, "job-1", eve_jsonl="{}",
-                                            request_actor=fixture.actor)
+                                            request_actor=fixture.actor, tenant_id=tenant_id)
     unscoped.assert_not_called()
 
 
 def test_a_write_that_did_not_happen_is_not_reported_as_ok():
   """_write_job_record returns None without writing when the binding guard trips. Reporting ok with
   a summary that was never stored told the caller the opposite of what happened."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, "tenant_admin")
     with patch.object(suricata_correlation, "_write_job_record", return_value=None):
       result = fixture.Plugin.correlate_suricata_eve(
         fixture.owner, "job-1", eve_jsonl='{"timestamp":"2026-01-01T00:00:00Z"}',
-        request_actor=fixture.actor)
+        request_actor=fixture.actor, tenant_id=tenant_id)
     assert result.get("status") != "ok"
 
 
 def test_a_malformed_payload_publishes_a_structured_code_not_prose():
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     result = fixture.Plugin.correlate_suricata_eve(
-      fixture.owner, "job-1", eve_jsonl="{not-json}", request_actor=fixture.actor)
+      fixture.owner, "job-1", eve_jsonl="{not-json}", request_actor=fixture.actor,
+      tenant_id=as_role(fixture, "tenant_admin"))
   # The line number is useful diagnostics and carries no caller content, so it survives.
   assert result.get("configuration_error") == "invalid_jsonl_line_1", (
     "a rejected payload must be distinguishable from a zero-match correlation")
@@ -84,11 +101,13 @@ def test_a_malformed_payload_publishes_a_structured_code_not_prose():
 
 def test_an_unsafe_parse_message_cannot_reach_the_caller():
   """The allowlist exists so a future raise carrying caller text cannot be published."""
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, "tenant_admin")
     with patch.object(suricata_correlation, "_parse_eve_jsonl",
                       side_effect=ValueError("boom " + SECRET)):
       result = fixture.Plugin.correlate_suricata_eve(
-        fixture.owner, "job-1", eve_jsonl="{}", request_actor=fixture.actor)
+        fixture.owner, "job-1", eve_jsonl="{}", request_actor=fixture.actor,
+        tenant_id=tenant_id)
   assert SECRET not in repr(result)
 
 
@@ -157,10 +176,11 @@ def test_a_rejected_payload_is_distinguishable_from_a_zero_match_over_the_wire(
   """
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     rejected, calls = assert_json_response(asyncio.run(request(module, "correlate_suricata_eve",
-      {"job_id": "job-1", "eve_jsonl": "{not-json}", "request_actor": fixture.actor})), 200)
+      {"job_id": "job-1", "eve_jsonl": "{not-json}", "request_actor": fixture.actor,
+       "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     body = rejected["result"] if response_format == "WRAPPED" else rejected
     assert calls == 1
     assert body.get("configuration_error") == "invalid_jsonl_line_1"
@@ -172,11 +192,11 @@ def test_a_rejected_payload_is_distinguishable_from_a_zero_match_over_the_wire(
 def test_a_successful_correlation_carries_its_payload_over_the_wire(read_native, response_format):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     ok, calls = assert_json_response(asyncio.run(request(module, "correlate_suricata_eve",
       {"job_id": "job-1", "eve_jsonl": '{"timestamp":"2026-01-01T00:00:00Z"}',
-       "request_actor": fixture.actor})), 200)
+       "request_actor": fixture.actor, "tenant_id": as_role(fixture, "tenant_admin")})), 200)
     body = ok["result"] if response_format == "WRAPPED" else ok
     assert calls == 1
     assert body.get("status") == "ok"
@@ -189,8 +209,12 @@ def test_ingest_denials_survive_both_response_formats(read_native, response_form
   install(module)
   for endpoint, body in (("correlate_suricata_eve", {"job_id": "job-1", "eve_jsonl": "{}"}),
                          ("upload_authorization", {"filename": "a.pdf", "content_b64": PDF_B64})):
-    with read_endpoint_fixture(bound=False) as fixture:
-      fixture.store.account("reader", role="user")
+    scoped = endpoint == "correlate_suricata_eve"
+    with read_endpoint_fixture(bound=scoped) as fixture:
+      if scoped:
+        body = {**body, "tenant_id": as_role(fixture, "tenant_user")}
+      else:
+        fixture.store.account("reader", role="user")
       module.eng = scheduler_comms(fixture, response_format)
       result, calls = assert_json_response(asyncio.run(request(module, endpoint,
         {**body, "request_actor": fixture.actor})), 403)
@@ -214,24 +238,33 @@ def test_an_upload_failure_publishes_a_typed_code_not_r1fs_prose(read_native, re
     assert "error" not in body
 
 
-def test_a_bound_job_is_refused_after_admission():
-  """Snapshot exclusion: LegacyReadAccess skips records carrying execution_binding."""
+@pytest.mark.parametrize("tenant_id", (None, "", "   "))
+def test_a_missing_tenant_is_refused_before_admission(tenant_id):
+  """RM-084 P2: the ingest has no unscoped half; an omitted selector is a bad request.
+
+  This replaces the snapshot-exclusion case, which asserted the opposite: that a tenant-bound job
+  could not be correlated at all."""
   with read_endpoint_fixture(bound=True) as fixture:
-    result = fixture.Plugin.correlate_suricata_eve(
-      fixture.owner, "job-1", eve_jsonl="{}", request_actor=fixture.actor)
-  assert result["success"] is False and result["status_code"] in (403, 404)
+    as_role(fixture, "tenant_admin")
+    with patch.object(suricata_correlation, "_write_job_record",
+                      side_effect=AssertionError(SECRET)) as write:
+      result = fixture.Plugin.correlate_suricata_eve(
+        fixture.owner, "job-1", eve_jsonl="{}", request_actor=fixture.actor, tenant_id=tenant_id)
+    assert result == {"success": False, "error": "invalid_request", "status_code": 400}
+    write.assert_not_called()
 
 
 def test_the_parse_allowlist_guards_the_node_global_status_record():
   """The allowlist's real sink is the shared status record, not the response -- the projection
   drops an unrecognised code from the response anyway, which made the earlier test inert."""
   captured = []
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, "tenant_admin")
     with patch.object(suricata_correlation, "_parse_eve_jsonl",
                       side_effect=ValueError("boom " + SECRET)), \
          patch.object(suricata_correlation, "record_integration_status",
                       side_effect=lambda *a, **k: captured.append(k.get("error_class"))):
       fixture.Plugin.correlate_suricata_eve(fixture.owner, "job-1", eve_jsonl="{}",
-                                            request_actor=fixture.actor)
+                                            request_actor=fixture.actor, tenant_id=tenant_id)
   assert captured == ["eve_payload_rejected"], captured
   assert all(SECRET not in str(entry) for entry in captured)

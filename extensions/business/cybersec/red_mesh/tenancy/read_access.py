@@ -13,7 +13,8 @@ from .ports import TenantStoreError
 # its own slice (B6, B8, B9) rather than by appearing here.
 _TENANT_OPERATIONS = frozenset({
   "reports:view", "audit:view", "analysis:run", "engagement:delete", "jobs:purge",
-  "reports:export"})  # stop_monitoring (RM-026 MVP)
+  "reports:export",  # stop_monitoring (RM-026 MVP)
+  "evidence:read"})  # get_raw_model_test_evidence (RM-084 P2)
 
 
 class TenantReadAccess:

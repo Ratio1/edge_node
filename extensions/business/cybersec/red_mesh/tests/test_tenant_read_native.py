@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, TENANT_EXPORT_STATUS_ROUTES, TENANT_JOBLESS_READ_ROUTES, TENANT_REQUIRED_READ_ROUTES, EFFECT_ROUTES, UNGUARDED_ROUTES, TENANT_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, LEGACY_RULEBOOK_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
+from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, TENANT_EXPORT_STATUS_ROUTES, TENANT_JOBLESS_READ_ROUTES, TENANT_REQUIRED_READ_ROUTES, EFFECT_ROUTES, UNGUARDED_ROUTES, TENANT_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, TENANT_REVIEW_READ_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
 
 
 ERROR = "Incompatible generated read API"
@@ -70,7 +70,7 @@ def body_for(name):
   payload = {"request_actor": {"account_id": "Reader.Mixed"}, "tenant_id": "tenant-1"}
   if name in LEGACY_READ_ROUTES:
     payload.pop("tenant_id")
-  if name in LEGACY_RULEBOOK_ROUTES:
+  if name in TENANT_REVIEW_READ_ROUTES and name != "get_detection_correlation":
     payload["profile_id"] = "nis2.eu_baseline.v1"
   if name in TENANT_JSON_EXPORT_ROUTES:
     payload["pass_nr"] = 1
@@ -457,9 +457,11 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
     if name not in (("list_network_jobs", "list_local_jobs", "get_audit_log")
                     + ACTOR_ONLY_READ_ROUTES + TENANT_JOBLESS_READ_ROUTES):
       assert actual["job_id"] == "job-1"
-      # Export status projections never carry the binding; the job reads that project it do.
+      # Export, rulebook and correlation projections never carry the binding; the job reads that
+      # project it do.
       assert ("execution_binding" in actual) == (bound and name != "get_job_data"
-                                                 and name not in TENANT_EXPORT_STATUS_ROUTES)
+                                                 and name not in TENANT_EXPORT_STATUS_ROUTES
+                                                 and name not in TENANT_REVIEW_READ_ROUTES)
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))

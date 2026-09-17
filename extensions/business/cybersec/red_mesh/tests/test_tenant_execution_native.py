@@ -25,13 +25,13 @@ ROUTES = (
   "launch_network_scan", "launch_webapp_scan", "launch_test",
   "launch_model_test", "preflight_model_test_provider",
 )
-LEGACY_STATUS_ROUTES = ("get_detection_correlation",)
 # RM-084 P1: export reads that require a tenant; there is no unscoped half.
 TENANT_EXPORT_STATUS_ROUTES = (
   "get_misp_export_status", "get_stix_export_status", "get_opencti_export_status",
   "get_taxii_export_status",
 )
-LEGACY_RULEBOOK_ROUTES = ("get_rulebook_assessment_status", "get_rulebook_review")
+# RM-084 P2: rulebook and correlation reads that require a tenant.
+TENANT_REVIEW_READ_ROUTES = ("get_detection_correlation", "get_rulebook_assessment_status", "get_rulebook_review")
 ACTOR_ONLY_READ_ROUTES = ("llm_health", "update_finding_triage")
 # Job-less reads with a required tenant (RM-081 Phase 3c added the selector; RM-084 P1 removed the
 # unscoped half). The selector is appended last, as stop_monitoring's is.
@@ -63,9 +63,10 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
 # guard would otherwise be the only thing to set. Rendered here so the wire tests exercise the real
 # production route.
 UNGUARDED_ROUTES = ("analyze_job", "get_raw_model_test_evidence", "delete_job_engagement")
-LEGACY_READ_ROUTES = LEGACY_STATUS_ROUTES + LEGACY_RULEBOOK_ROUTES + ACTOR_ONLY_READ_ROUTES
+LEGACY_READ_ROUTES = ACTOR_ONLY_READ_ROUTES
 # RM-084 P1: reads that refuse a missing tenant with 400 instead of taking the unscoped path.
-TENANT_REQUIRED_READ_ROUTES = TENANT_EXPORT_STATUS_ROUTES + TENANT_JOBLESS_READ_ROUTES + TENANT_JSON_EXPORT_ROUTES
+TENANT_REQUIRED_READ_ROUTES = (TENANT_EXPORT_STATUS_ROUTES + TENANT_JOBLESS_READ_ROUTES + TENANT_JSON_EXPORT_ROUTES
+                               + TENANT_REVIEW_READ_ROUTES)
 READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
   "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
@@ -106,10 +107,10 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args)[-3:] == SELECTORS
       if method.name == "preflight_model_test_provider":
         assert method.args.args[-4].arg == "actor"
-    elif method.name in LEGACY_STATUS_ROUTES:
-      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "request_actor")
-    elif method.name in LEGACY_RULEBOOK_ROUTES:
-      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "profile_id", "request_actor")
+    elif method.name == "get_detection_correlation":
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "request_actor", "tenant_id")
+    elif method.name in TENANT_REVIEW_READ_ROUTES:
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "profile_id", "request_actor", "tenant_id")
     elif method.name in ACTOR_ONLY_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
     elif method.name in TENANT_JOBLESS_READ_ROUTES:
@@ -119,7 +120,7 @@ def _render_native(default_route=None):
     elif method.name in UNGUARDED_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == {
         "analyze_job": ("self", "job_id", "analysis_type", "focus_areas", "request_actor"),
-        "get_raw_model_test_evidence": ("self", "job_id", "request_actor"),
+        "get_raw_model_test_evidence": ("self", "job_id", "request_actor", "tenant_id"),
         "delete_job_engagement": ("self", "job_id", "delete_documents", "request_actor"),
       }[method.name]
     elif method.name in EFFECT_ROUTES:
@@ -135,19 +136,19 @@ def _render_native(default_route=None):
         "publish_to_taxii": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
         "export_misp": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
         "correlate_suricata_eve": ("self", "job_id", "eve_jsonl", "pass_nr", "source_ips",
-                                   "sensor_id", "request_actor"),
+                                   "sensor_id", "request_actor", "tenant_id"),
         "upload_authorization": ("self", "filename", "content_b64", "request_actor"),
         "save_rulebook_review_draft": ("self", "job_id", "profile_id", "answers", "note",
-                                       "expected_review_revision", "request_actor"),
+                                       "expected_review_revision", "request_actor", "tenant_id"),
         "submit_rulebook_review": ("self", "job_id", "profile_id", "expected_review_revision",
                                    "expected_pass_nr", "expected_profile_version",
-                                   "idempotency_key", "request_actor"),
+                                   "idempotency_key", "request_actor", "tenant_id"),
         "reopen_rulebook_review": ("self", "job_id", "profile_id", "expected_review_revision",
-                                   "idempotency_key", "request_actor"),
+                                   "idempotency_key", "request_actor", "tenant_id"),
         "update_rulebook_review": ("self", "job_id", "profile_id", "answers", "note",
-                                   "review_state", "request_actor"),
+                                   "review_state", "request_actor", "tenant_id"),
         "generate_rulebook_assessment": ("self", "job_id", "profile_id", "pass_nr", "persist",
-                                         "force", "request_actor"),
+                                         "force", "request_actor", "tenant_id"),
         # RM-026 MVP: stop_monitoring opted into the tenant seam; the selector is appended last.
         "stop_monitoring": ("self", "job_id", "stop_type", "request_actor", "tenant_id"),
       }[method.name]
