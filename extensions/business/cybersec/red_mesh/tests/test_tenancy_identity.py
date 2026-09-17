@@ -96,14 +96,14 @@ class TestResolveActor(unittest.TestCase):
 class TestCstoreAuthAccountReader(unittest.TestCase):
   def test_memberships_keep_roles_bound_to_their_tenants(self):
     reader, _ = _reader({"a1": json.dumps(_record(role="admin", metadata={"tenant_memberships": [
-      {"role": "super_tenant_admin", "tenant_id": "tenant-a"},
-      {"role": "tenant_user", "tenant_id": "tenant-b"},
+      {"role": "super_pentester", "tenant_id": "tenant-a"},
+      {"role": "super_pentester", "tenant_id": "tenant-b"},
     ]}))})
     with patch.dict("os.environ", {AUTH_HKEY_ENV: HKEY}, clear=True):
       view, error = resolve_actor({"account_id": "a1", "tenant_id": "other"}, reader)
     self.assertIsNone(error)
     self.assertEqual([(m.role, m.tenant_id) for m in view.tenant_memberships], [
-      ("super_tenant_admin", "tenant-a"), ("tenant_user", "tenant-b"),
+      ("super_pentester", "tenant-a"), ("super_pentester", "tenant-b"),
     ])
     self.assertEqual(view.created_by, ("a1", "a1"))
 
@@ -117,7 +117,7 @@ class TestCstoreAuthAccountReader(unittest.TestCase):
   def test_all_normal_membership_roles_preserve_explicit_scope(self):
     pairs = [
       ("super_tenant_admin", None), ("super_pentester", None),
-      ("super_tenant_admin", "tenant-a"), ("super_pentester", "tenant-a"),
+      ("super_pentester", "tenant-a"),
       ("tenant_admin", "tenant-a"), ("tenant_pentester", "tenant-a"),
       ("tenant_user", "tenant-a"),
     ]
@@ -169,6 +169,12 @@ class TestCstoreAuthAccountReader(unittest.TestCase):
       [{"role": "tenant_user", "tenant_id": 1}],
       [{"role": "tenant_user", "tenant_id": "  "}],
       [valid, {"role": "super_tenant_admin"}],
+      # RM-083: one scope per account.
+      [{"role": "super_tenant_admin", "tenant_id": "tenant-a"}],
+      [valid, {"role": "super_tenant_admin", "tenant_id": None}],
+      [valid, {"role": "super_pentester", "tenant_id": "tenant-a"}],
+      [valid, {"role": "tenant_admin", "tenant_id": "tenant-b"}],
+      [{"role": "super_pentester", "tenant_id": None}, {"role": "super_pentester", "tenant_id": "tenant-a"}],
     )
     for memberships in invalid_values:
       with self.subTest(memberships=memberships):

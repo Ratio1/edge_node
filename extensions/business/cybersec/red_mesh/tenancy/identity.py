@@ -27,8 +27,9 @@ FULL_PORTFOLIO_SUPER_TENANT_ADMIN = TenantMembership("super_tenant_admin", None)
 def holds_platform_role(account, role="super_tenant_admin"):
   """Whether ``account`` holds ``role`` deployment-wide (``tenant_id`` None, no tenant allowlist).
 
-  An allowlisted platform membership (``tenant_id`` set) is deliberately not counted: every caller of
-  this helper gates a deployment-wide action, which an allowlist does not reach.
+  A Super-Tenant Admin is always full-portfolio (RM-083, ``policy.valid_account_scope``). An allowlisted
+  Super-Pentester membership (``tenant_id`` set) is deliberately not counted: every caller of this
+  helper gates a deployment-wide action, which an allowlist does not reach.
   """
   return TenantMembership(role, None) in account.tenant_memberships
 

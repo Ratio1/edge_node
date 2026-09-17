@@ -23,6 +23,11 @@ def account(*memberships):
   ))
 
 
+def in_tenant(role, tenant_id):
+  """The membership giving ``role`` in ``tenant_id``: a Super-Tenant Admin is always full-portfolio."""
+  return (role, None if role == "super_tenant_admin" else tenant_id)
+
+
 class TestTenantPolicy(unittest.TestCase):
   def test_report_authority_stays_inside_membership_tenant(self):
     actor = account(("tenant_user", "a"))
@@ -57,20 +62,19 @@ class TestTenantPolicy(unittest.TestCase):
       for role, allowed in zip(roles, expected):
         with self.subTest(operation=operation, role=role):
           self.assertEqual(
-            authorize_tenant_operation(account((role, "a")), operation,
+            authorize_tenant_operation(account(in_tenant(role, "a")), operation,
                                        TenantPolicyContext("a", True, True), asset_tenant_ids=("a",)),
             PolicyDecision(True, 200, None) if allowed else PolicyDecision(False, 403, "forbidden"),
           )
 
   def test_platform_scope_is_explicit_and_roles_compose_only_in_scope(self):
     tenant = TenantPolicyContext("b", True, True)
-    scoped = account(("super_tenant_admin", "a"), ("tenant_user", "b"))
-    self.assertEqual(authorize_tenant_operation(scoped, "assets:create", tenant),
-                     PolicyDecision(False, 403, "forbidden"))
-    self.assertTrue(authorize_tenant_operation(scoped, "reports:view", tenant).allowed)
-    self.assertEqual(authorize_tenant_operation(account(("super_tenant_admin", "a")),
-                                               "reports:view", tenant),
+    self.assertEqual(authorize_tenant_operation(account(("super_pentester", "a")), "reports:view", tenant),
                      PolicyDecision(False, 404, "not_found"))
+    allowlisted = account(("super_pentester", "a"), ("super_pentester", "b"))
+    self.assertTrue(authorize_tenant_operation(allowlisted, "assets:create", tenant).allowed)
+    self.assertTrue(authorize_tenant_operation(account(("super_tenant_admin", None), ("super_pentester", None)),
+                                             "tenants:manage", tenant).allowed)
     for role in ("super_tenant_admin", "super_pentester"):
       with self.subTest(role=role):
         self.assertTrue(authorize_tenant_operation(account((role, None)), "assets:create", tenant).allowed)
@@ -80,16 +84,30 @@ class TestTenantPolicy(unittest.TestCase):
                                              asset_tenant_ids=("b",)).allowed)
     self.assertFalse(authorize_tenant_operation(combined, "assets:update", tenant).allowed)
 
+  def test_an_account_with_more_than_one_scope_is_denied_as_a_whole(self):
+    # RM-083 (owner): an account is platform-scoped or scoped to one tenant, never both or two.
+    tenant = TenantPolicyContext("b", True, True)
+    for memberships in (
+      (("super_tenant_admin", "b"),),
+      (("super_tenant_admin", None), ("tenant_user", "b")),
+      (("super_pentester", "b"), ("tenant_admin", "b")),
+      (("tenant_admin", "a"), ("tenant_user", "b")),
+      (("super_pentester", None), ("super_pentester", "b")),
+    ):
+      with self.subTest(memberships=memberships):
+        self.assertEqual(authorize_tenant_operation(account(*memberships), "reports:view", tenant),
+                         PolicyDecision(False, 404, "not_found"))
+
   def test_every_task_role_requires_nonempty_same_tenant_assets(self):
     tenant = TenantPolicyContext("a", True, True)
     for role in ("super_tenant_admin", "super_pentester", "tenant_pentester"):
       for operation in ("tasks:launch", "tasks:update"):
         for owners in ((), (None,), ("b",), ("a", "b"), ("a", None), "a", ["a"]):
           with self.subTest(role=role, operation=operation, owners=owners):
-            self.assertEqual(authorize_tenant_operation(account((role, "a")), operation, tenant,
+            self.assertEqual(authorize_tenant_operation(account(in_tenant(role, "a")), operation, tenant,
                                                        asset_tenant_ids=owners),
                              PolicyDecision(False, 404, "not_found"))
-        self.assertTrue(authorize_tenant_operation(account((role, "a")), operation, tenant,
+        self.assertTrue(authorize_tenant_operation(account(in_tenant(role, "a")), operation, tenant,
                                                  asset_tenant_ids=("a", "a")).allowed)
 
   def test_allow_pentester_gates_only_tenant_task_authority_in_selected_scope(self):
@@ -100,14 +118,9 @@ class TestTenantPolicy(unittest.TestCase):
                        PolicyDecision(False, 403, "pentesting_disabled"))
       for role in ("super_tenant_admin", "super_pentester"):
         with self.subTest(operation=operation, role=role):
-          for scope in ("a", None):
-            mixed = account((role, scope), ("tenant_pentester", "a"))
-            self.assertTrue(authorize_tenant_operation(mixed, operation, tenant,
+          for platform in {(role, None), in_tenant(role, "a")}:
+            self.assertTrue(authorize_tenant_operation(account(platform), operation, tenant,
                                                      asset_tenant_ids=("a",)).allowed)
-          outside = account((role, "b"), ("tenant_pentester", "a"))
-          self.assertEqual(authorize_tenant_operation(outside, operation, tenant,
-                                                     asset_tenant_ids=("a",)),
-                           PolicyDecision(False, 403, "pentesting_disabled"))
     self.assertTrue(authorize_tenant_operation(pentester, "reports:view", tenant).allowed)
 
   def test_denial_precedence_does_not_disclose_pentesting_policy_or_asset_ownership(self):
@@ -186,8 +199,7 @@ class TestTenantPolicy(unittest.TestCase):
 class TestIdentityPolicyBoundary(unittest.TestCase):
   def test_real_reader_ignores_forged_role_scope_and_owner_fields(self):
     raw = json.dumps({"role": "admin", "metadata": {"tenant_memberships": [
-      {"role": "super_tenant_admin", "tenant_id": "a"},
-      {"role": "tenant_user", "tenant_id": "b"},
+      {"role": "super_pentester", "tenant_id": "a"},
     ]}})
     store = {"operator": raw}
     reader = CstoreAuthAccountReader(SimpleNamespace(chainstore_hget=lambda **kw: store.get(kw["key"])))
@@ -200,7 +212,7 @@ class TestIdentityPolicyBoundary(unittest.TestCase):
     self.assertIsNone(error)
     self.assertTrue(authorize_tenant_operation(actor, "assets:create", TenantPolicyContext("a", True, True)).allowed)
     self.assertEqual(authorize_tenant_operation(actor, "assets:create", TenantPolicyContext("b", True, True)),
-                     PolicyDecision(False, 403, "forbidden"))
+                     PolicyDecision(False, 404, "not_found"))
 
   def test_fresh_reader_result_revokes_authority_without_legacy_or_policy_cache_fallback(self):
     store = {"operator": json.dumps({"role": "admin"})}

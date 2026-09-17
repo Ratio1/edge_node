@@ -56,7 +56,7 @@ class TestTenantNodeFailurePolicy(unittest.TestCase):
         self.assertEqual(self.service.update_tenant_node_failure_policy(
           self.actor, tenant_id, value)["status_code"], 400)
         self.assertEqual(len(self.store.writes), before)
-    cases = [("super_tenant_admin", tenant_id, 200), ("tenant_admin", tenant_id, 200),
+    cases = [("super_tenant_admin", None, 200), ("tenant_admin", tenant_id, 200),
              ("super_pentester", tenant_id, 403), ("tenant_pentester", tenant_id, 403),
              ("tenant_user", tenant_id, 403), ("super_tenant_admin", "foreign", 404),
              ("tenant_admin", "foreign", 404)]
@@ -68,13 +68,14 @@ class TestTenantNodeFailurePolicy(unittest.TestCase):
         result = self.service.update_tenant_node_failure_policy(actor, tenant_id, "stop")
         self.assertEqual(result["status_code"], status)
         self.assertEqual(len(self.store.writes), before)
-        if scope == tenant_id:
+        if status != 404:
           detail = self.service.get_tenant(actor, tenant_id)["data"]
           self.assertEqual(detail["canUpdateNodeFailurePolicy"], status == 200)
+    # RM-083: a mixed-scope account is denied as a whole, never partially admitted.
     self.store.account("operator", memberships=[{"role": "tenant_user", "tenant_id": tenant_id},
-                                               {"role": "super_tenant_admin", "tenant_id": "foreign"}])
+                                               {"role": "super_tenant_admin", "tenant_id": None}])
     self.assertEqual(self.service.update_tenant_node_failure_policy(
-      {"account_id": "operator"}, tenant_id, "continue")["status_code"], 403)
+      {"account_id": "operator"}, tenant_id, "continue")["status_code"], 404)
 
   def test_corrupt_policy_or_attribution_is_unavailable_without_repair(self):
     tenant_id = self.create()["tenantId"]

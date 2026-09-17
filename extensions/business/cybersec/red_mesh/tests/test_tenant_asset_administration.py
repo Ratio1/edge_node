@@ -62,15 +62,14 @@ class TestTenantAssetAdministration(unittest.TestCase):
     asset = self.create()["data"]
     cases = (
       ((("super_tenant_admin", None),), True, True),
-      ((("super_tenant_admin", self.tenant),), True, True),
+      ((("super_tenant_admin", None), ("super_pentester", None)), True, True),
       ((("super_pentester", None),), True, True),
       ((("super_pentester", self.tenant),), True, True),
       ((("tenant_pentester", self.tenant),), False, True),
       ((("tenant_admin", self.tenant),), False, False),
       ((("tenant_user", self.tenant),), False, False),
       ((("tenant_admin", self.tenant), ("tenant_pentester", self.tenant)), False, True),
-      ((("tenant_user", self.tenant), ("super_pentester", None)), True, True),
-      ((("tenant_admin", self.tenant), ("super_pentester", "foreign")), False, False),
+      ((("super_pentester", "foreign"), ("super_pentester", self.tenant)), True, True),
     )
     for allow_pentester in (False, True):
       self.assertTrue(self.service.update_tenant_allow_pentester(
@@ -95,11 +94,13 @@ class TestTenantAssetAdministration(unittest.TestCase):
     self.assertEqual(result["status_code"], 404, result)
     self.assertNotIn("data", result)
     foreign_request = str(uuid4())
-    foreign = self.service.prepare_tenant(self.actor, foreign_request, "Foreign", "foreign", "initial")["data"]["tenantId"]
+    self.owner.account("initial-foreign")
+    foreign = self.service.prepare_tenant(self.actor, foreign_request, "Foreign", "foreign",
+                                          "initial-foreign")["data"]["tenantId"]
     result = self.service.get_tenant_asset(self.actor, foreign, asset["assetId"])
     self.assertEqual(result["status_code"], 404, result)
     self.assertNotIn("data", result)
-    self.owner.grant("initial", foreign)
+    self.owner.grant("initial-foreign", foreign)
     self.assertTrue(self.service.activate_tenant(self.actor, foreign_request)["success"])
     for tenant_id, asset_id in ((foreign, asset["assetId"]), (self.tenant, "as_" + str(uuid4()))):
       with self.subTest(tenant_id=tenant_id, asset_id=asset_id):

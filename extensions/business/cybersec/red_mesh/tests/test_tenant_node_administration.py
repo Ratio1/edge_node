@@ -32,10 +32,14 @@ class TestTenantNodeAdministration(unittest.TestCase):
 
   def create_tenant(self, domain):
     request = str(uuid4())
-    prepared = self.service.prepare_tenant(self.actor, request, domain, domain, "initial")
+    # RM-083: an account belongs to one tenant, so each further tenant gets its own initial admin.
+    admin = "initial" if domain == "one" else f"initial-{domain}"
+    if admin != "initial":
+      self.owner.account(admin)
+    prepared = self.service.prepare_tenant(self.actor, request, domain, domain, admin)
     self.assertTrue(prepared["success"], prepared)
     tenant = prepared["data"]["tenantId"]
-    self.owner.grant("initial", tenant)
+    self.owner.grant(admin, tenant)
     self.assertTrue(self.service.activate_tenant(self.actor, request)["success"])
     return tenant
 
@@ -143,7 +147,8 @@ class TestTenantNodeAdministration(unittest.TestCase):
     roles = ("super_tenant_admin", "super_pentester", "tenant_admin", "tenant_pentester", "tenant_user")
     for role in roles:
       with self.subTest(role=role):
-        self.owner.account("member", memberships=[{"role": role, "tenant_id": self.tenant}])
+        scope = None if role == "super_tenant_admin" else self.tenant
+        self.owner.account("member", memberships=[{"role": role, "tenant_id": scope}])
         member = {"account_id": "member", "role": "admin", "tenant_id": other}
         reader = Mock(return_value=self.peers)
         self.service.configured_peers_reader = reader
@@ -156,11 +161,12 @@ class TestTenantNodeAdministration(unittest.TestCase):
         if role != "super_tenant_admin":
           reader.assert_not_called()
           self.assertEqual(len(self.owner.writes), before)
+    # RM-083: a mixed-scope account is denied as a whole.
     self.owner.account("member", memberships=[{"role": "tenant_user", "tenant_id": self.tenant},
-                                               {"role": "super_tenant_admin", "tenant_id": other}])
+                                               {"role": "super_tenant_admin", "tenant_id": None}])
     reader = Mock(side_effect=AssertionError("Denied request must not inspect config"))
     self.service.configured_peers_reader = reader
-    self.assertEqual(self.service.set_tenant_node_assignment(member, self.tenant, "Node-A", True)["status_code"], 403)
+    self.assertEqual(self.service.set_tenant_node_assignment(member, self.tenant, "Node-A", True)["status_code"], 404)
     self.owner.account("member", memberships=[{"role": "super_tenant_admin", "tenant_id": other}])
     self.assertEqual(self.service.get_tenant_nodes(member, self.tenant)["status_code"], 404)
     self.assertEqual(self.service.set_tenant_node_assignment(member, self.tenant, "Node-A", False)["status_code"], 404)
@@ -177,7 +183,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])
     self.assertEqual(len(self.owner.writes), before)
     self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A"), row)
-    self.owner.account("second", memberships=[{"role": "super_tenant_admin", "tenant_id": self.tenant}])
+    self.owner.account("second", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
     self.assertTrue(self.service.set_tenant_node_assignment({"account_id": "second"}, self.tenant, "Node-A", False)["success"])
     changed = self.store.get("tenant_node", self.tenant, "Node-A")
     self.assertEqual(changed["changed_by"], "second")
@@ -232,7 +238,9 @@ class TestTenantNodeAdministration(unittest.TestCase):
       self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["status_code"], 503)
     with patch.object(self.owner, "chainstore_hget", side_effect=RuntimeError("private storage")):
       self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["status_code"], 503)
-    pending = self.service.prepare_tenant(self.actor, str(uuid4()), "Pending", "pending", "initial")["data"]["tenantId"]
+    self.owner.account("initial-pending")
+    pending = self.service.prepare_tenant(self.actor, str(uuid4()), "Pending", "pending",
+                                          "initial-pending")["data"]["tenantId"]
     self.assertEqual(self.service.get_tenant_nodes(self.actor, pending)["status_code"], 404)
     self.assertEqual(self.service.set_tenant_node_assignment(self.actor, pending, "Node-A", True)["status_code"], 404)
 

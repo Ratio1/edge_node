@@ -12,7 +12,8 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .identity import IdentityStoreError, TenantMembership, canonical_account_id, holds_platform_role, resolve_actor
-from .policy import TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles, resolve_operation_roles
+from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles,
+                     resolve_operation_roles, valid_account_scope)
 from .execution import CurrentExecutionFacts, ExecutionBinding, ExecutionRollout, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
@@ -216,13 +217,20 @@ class TenantAdministrationService:
       if self.store.get("domain", domain_id) is not None:
         raise AdministrationDenied(409, "domain_conflict")
       admin = self._initial_admin(initial_admin_id)
+      # RM-083. The initial administrator becomes this tenant's account; one that already holds any
+      # scope (platform or another tenant) cannot take a second. Only on first preparation: a retry
+      # finds its own tenant_admin membership already written.
+      if admin.tenant_memberships:
+        raise AdministrationDenied(409, "scope_conflict")
       receipt = {**intent, "actor_id": creator.account_id, "request_id": request_id,
                  "initial_admin_generation": admin.account_generation, "tenant_id": "tn_" + str(uuid4()),
                  "created_at": datetime.now(timezone.utc).isoformat()}
       self.store.put("receipt", creator.account_id, request_id, record=receipt)
       domain, tenant = None, None
     if tenant is None or not tenant["active"]:
-      self._initial_admin(initial_admin_id, receipt["initial_admin_generation"])
+      admin = self._initial_admin(initial_admin_id, receipt["initial_admin_generation"])
+      if admin.tenant_memberships not in ((), (TenantMembership("tenant_admin", receipt["tenant_id"]),)):
+        raise AdministrationDenied(409, "scope_conflict")
       if domain is None:
         self.store.put("domain", domain_id, record=self._binding(receipt))
       if tenant is None:
@@ -663,16 +671,12 @@ class TenantAdministrationService:
     self._actor(actor, creator=True)
     return {"available": self.store.get("domain", _domain(domain_id)) is None}
 
-  def _holds_scoped_super_tenant_admin(self, account, tenant_id):
-    roles, _ = resolve_tenant_roles(account, tenant_id)
-    return "super_tenant_admin" in roles
-
   def _assignable_member_roles(self, account, tenant):
     """RM-083. Roles this caller may write in the tenant; tenant_pentester is the platform's to give."""
     if not authorize_tenant_operation(account, "tenant_users:manage", TenantPolicyContext(
         tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed:
       return []
-    if self._holds_scoped_super_tenant_admin(account, tenant["tenant_id"]):
+    if holds_platform_role(account):
       return sorted(_MEMBER_ROLES)
     return sorted(_MEMBER_ROLES - _PLATFORM_RESERVED_MEMBER_ROLES)
 
@@ -700,7 +704,8 @@ class TenantAdministrationService:
     if not account_id or not isinstance(role, str) or role not in _MEMBER_ROLES or type(remove) is not bool:
       raise AdministrationDenied(400, "invalid_membership")
     target = self._initial_admin(account_id)
-    if not self._holds_scoped_super_tenant_admin(caller, tenant_id):
+    platform_admin = holds_platform_role(caller)
+    if not platform_admin:
       # RM-083. Below the platform, membership administration is confined to the tenant's own members:
       # attaching an outside account would make it resettable by this tenant's admins (a takeover).
       if not any(m.tenant_id == tenant_id and m.role in _MEMBER_ROLES for m in target.tenant_memberships):
@@ -720,9 +725,19 @@ class TenantAdministrationService:
       # RM-082. The root tenant administrator's admin membership is the founder's to give up, or a
       # Super-Tenant Admin's to take; a peer tenant admin removing it is the same takeover the
       # password-reset rule refuses (§Root tenant administrator).
-      caller_roles, _ = resolve_tenant_roles(caller, tenant_id)
       if (tenant.get("root_admin_id") == account_id and caller.account_id != account_id
-          and "super_tenant_admin" not in caller_roles):
+          and not platform_admin):
         raise AdministrationDenied(403, "root_tenant_admin")
+    # RM-083 (owner, 2026-09-17). The write must leave the account with exactly one scope: a platform
+    # account or another tenant's member cannot join this tenant, and a member's last role is not
+    # removable (an account never exists with no scope).
+    current = tuple(target.tenant_memberships)
+    if remove:
+      if current == (TenantMembership(role, tenant_id),):
+        raise AdministrationDenied(409, "last_membership")
+    else:
+      kept = tuple(m for m in current if not (m.tenant_id == tenant_id and m.role in _MEMBER_ROLES))
+      if not valid_account_scope((m.role, m.tenant_id) for m in kept + (TenantMembership(role, tenant_id),)):
+        raise AdministrationDenied(409, "scope_conflict")
     return {"accountId": account_id, "accountGeneration": target.account_generation,
             "tenantId": tenant_id, "role": role, "remove": remove}

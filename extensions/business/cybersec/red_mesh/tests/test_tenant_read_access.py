@@ -132,7 +132,8 @@ class TestTenantReadAccess(unittest.TestCase):
     self.store.account(self.binding["actor_id"], active=False, memberships=[])
     for role in ("tenant_user", "tenant_admin", "tenant_pentester", "super_pentester", "super_tenant_admin"):
       with self.subTest(role=role):
-        self.store.account("reader", memberships=[{"role": role, "tenant_id": self.tenant_id}])
+        scope = None if role == "super_tenant_admin" else self.tenant_id
+        self.store.account("reader", memberships=[{"role": role, "tenant_id": scope}])
         self.assertEqual(self.read("get"), self.record)
         self.assertEqual(self.read("list"), {"job-1": self.record})
     self.assertEqual(self.store.writes, self.writes_before)
@@ -185,14 +186,17 @@ class TestTenantReadAccess(unittest.TestCase):
         self.assert_no_job_read()
 
   def test_unknown_foreign_and_unpublished_tenants_deny_before_jobs(self):
-    pending = self.administration.prepare_tenant({"account_id": "creator"}, str(uuid4()), "Pending", "pending", "initial")
+    self.store.account("initial-pending")
+    pending = self.administration.prepare_tenant({"account_id": "creator"}, str(uuid4()), "Pending", "pending",
+                                                 "initial-pending")
     pending_id = pending["data"]["tenantId"]
-    self.store.grant("reader", pending_id, "tenant_user")
-    self.store.grant("reader", "missing", "tenant_user")
     self.writes_before = list(self.store.writes)
     for operation in ("get", "list"):
       for tenant_id in ("foreign", "missing", pending_id, "", []):
         with self.subTest(operation=operation, tenant_id=tenant_id):
+          # RM-083: one tenant per account, so the reader is made a member of the tenant it probes.
+          if tenant_id in ("missing", pending_id):
+            self.store.account("reader", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
           self.store.reads.clear()
           with self.assertRaises(AdministrationDenied) as raised:
             self.read(operation, tenant_id=tenant_id)

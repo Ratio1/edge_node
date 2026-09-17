@@ -14,6 +14,8 @@ Record facts this binds to (Navigator ``lib/auth/cstore.ts``):
 * ``metadata.appRole == 'pentester'`` is Navigator's third role, layered on cstore's ``user``;
 * tenant memberships remain role/scope pairs; explicit malformed metadata fails closed and explicit
   empty memberships never restore legacy admin authority;
+* RM-083: memberships mixing platform and tenant scope, or naming two tenants, fail closed
+  (``policy.valid_account_scope``);
 * Navigator writes no ``schemaVersion``. An absent value is version 0 (today's shape); a present,
   unrecognised value fails closed. This is not a downgrade vector - stripping the field needs
   cstore write access, which could set ``role: admin`` directly.
@@ -23,7 +25,7 @@ import os
 
 from ..identity import (FULL_PORTFOLIO_SUPER_TENANT_ADMIN, AccountView, IdentityStoreError,
                         TenantMembership, canonical_account_id)
-from ..policy import PLATFORM_ROLES, TENANT_LOCAL_ROLES
+from ..policy import PLATFORM_ROLES, TENANT_LOCAL_ROLES, valid_account_scope
 
 AUTH_HKEY_ENV = "R1EN_CSTORE_AUTH_HKEY"
 SUPPORTED_SCHEMA_VERSIONS = frozenset({0, 1})
@@ -141,6 +143,8 @@ def _parse_memberships(metadata, legacy_role):
     elif not isinstance(tenant_id, str) or not tenant_id.strip():
       return None
     memberships.append(TenantMembership(role, tenant_id))
+  if not valid_account_scope((m.role, m.tenant_id) for m in memberships):
+    return None
   return tuple(memberships)
 
 

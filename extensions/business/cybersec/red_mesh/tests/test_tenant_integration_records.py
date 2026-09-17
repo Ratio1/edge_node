@@ -171,7 +171,8 @@ class TestTenantIntegrationRecords(IntegrationRecordCase):
 
   def test_a_foreign_tenant_admin_reads_nothing(self):
     other = str(uuid4())
-    foreign = self.service.prepare_tenant(self.actor, other, "Other", "other", "initial")["data"]["tenantId"]
+    self.owner.account("initial-other")
+    foreign = self.service.prepare_tenant(self.actor, other, "Other", "other", "initial-other")["data"]["tenantId"]
     self.owner.account("outsider", memberships=[{"role": "tenant_admin", "tenant_id": foreign}])
     self.assertIn(self.service.list_tenant_integrations(
       {"account_id": "outsider"}, self.tenant)["status_code"], (403, 404))

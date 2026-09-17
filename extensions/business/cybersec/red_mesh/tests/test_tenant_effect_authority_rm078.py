@@ -31,6 +31,11 @@ def account(*memberships):
     TenantMembership(role, tenant_id) for role, tenant_id in memberships))
 
 
+def in_tenant(role, tenant_id):
+  """RM-083: a Super-Tenant Admin is always full-portfolio; every other role can be scoped."""
+  return (role, None if role == "super_tenant_admin" else tenant_id)
+
+
 class TestTenantEffectAuthority(unittest.TestCase):
   def test_the_three_operations_the_owner_specified(self):
     """Transcribed from the owner's three decisions, not from what the code happens to allow.
@@ -48,7 +53,7 @@ class TestTenantEffectAuthority(unittest.TestCase):
       for role, allowed in zip(ROLES, expected):
         with self.subTest(operation=operation, role=role):
           self.assertEqual(
-            authorize_tenant_operation(account((role, "a")), operation,
+            authorize_tenant_operation(account(in_tenant(role, "a")), operation,
                                        TenantPolicyContext("a", True, True)),
             PolicyDecision(True, 200, None) if allowed else PolicyDecision(False, 403, "forbidden"))
 
@@ -63,7 +68,7 @@ class TestTenantEffectAuthority(unittest.TestCase):
     """
     for role in ("super_tenant_admin", "super_pentester", "tenant_pentester"):
       with self.subTest(role=role):
-        actor = account((role, "a"))
+        actor = account(in_tenant(role, "a"))
         self.assertTrue(authorize_tenant_operation(
           actor, "analysis:run", TenantPolicyContext("a", True, True)).allowed)
         self.assertEqual(
@@ -73,7 +78,7 @@ class TestTenantEffectAuthority(unittest.TestCase):
   def test_deletion_and_purge_do_not_depend_on_the_pentesting_switch(self):
     """They are administrative, not operator, actions. A tenant that disabled pentesting has not
     thereby forfeited its ability to delete its own data -- and must not gain it either."""
-    actor = account(("super_tenant_admin", "a"))
+    actor = account(("super_tenant_admin", None))
     for operation in ("engagement:delete", "jobs:purge"):
       for allow_pentester in (True, False):
         with self.subTest(operation=operation, allow_pentester=allow_pentester):
@@ -81,8 +86,12 @@ class TestTenantEffectAuthority(unittest.TestCase):
             actor, operation, TenantPolicyContext("a", True, allow_pentester)).allowed)
 
   def test_authority_stays_inside_the_membership_tenant(self):
-    """A Super-Tenant Admin scoped to tenant a cannot purge tenant b."""
-    actor = account(("super_tenant_admin", "a"))
+    """A tenant-scoped Super-Tenant Admin is not a valid account (RM-083); a Super-Pentester
+    allowlisted for tenant a cannot run analysis in tenant b."""
+    self.assertEqual(authorize_tenant_operation(account(("super_tenant_admin", "a")), "jobs:purge",
+                                                TenantPolicyContext("a", True, True)),
+                     PolicyDecision(False, 404, "not_found"))
+    actor = account(("super_pentester", "a"))
     for operation in EFFECT_OPERATIONS:
       with self.subTest(operation=operation):
         self.assertEqual(
@@ -90,7 +99,7 @@ class TestTenantEffectAuthority(unittest.TestCase):
           PolicyDecision(False, 404, "not_found"))
 
   def test_an_inactive_tenant_grants_nothing(self):
-    actor = account(("super_tenant_admin", "a"))
+    actor = account(("super_tenant_admin", None))
     for operation in EFFECT_OPERATIONS:
       with self.subTest(operation=operation):
         self.assertEqual(
@@ -137,7 +146,8 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
     self.actor = {"account_id": "reader"}
 
   def _as(self, role):
-    self.store.account("reader", memberships=[{"role": role, "tenant_id": self.tenant_id}])
+    scope = None if role == "super_tenant_admin" else self.tenant_id
+    self.store.account("reader", memberships=[{"role": role, "tenant_id": scope}])
 
   def _allow_pentester(self, enabled):
     """Flip the stored switch through the same store the admission path reads."""

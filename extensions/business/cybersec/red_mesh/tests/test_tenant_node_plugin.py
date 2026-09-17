@@ -34,10 +34,14 @@ class TestTenantNodePlugin(unittest.TestCase):
 
   def create_tenant(self, domain):
     request = str(uuid4())
-    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, "initial")
+    # RM-083: an account belongs to one tenant, so each further tenant gets its own initial admin.
+    admin = "initial" if domain == "one" else f"initial-{domain}"
+    if admin != "initial":
+      self.storage.account(admin)
+    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, admin)
     self.assertTrue(result["success"], result)
     tenant = result["data"]["tenantId"]
-    self.storage.grant("initial", tenant)
+    self.storage.grant(admin, tenant)
     self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
     return tenant
 
@@ -89,18 +93,19 @@ class TestTenantNodePlugin(unittest.TestCase):
 
   def test_plugin_rechecks_stored_roles_and_scope_before_configuration_access(self):
     foreign = self.create_tenant("two")
+    # RM-083: a tenant-scoped Super-Tenant Admin is not a valid account; only full-portfolio is.
+    self.storage.account("platform", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
+    self.assertTrue(self.plugin.set_tenant_node_assignment({"account_id": "platform"}, self.tenant, "Node-A", True)["success"])
     self.storage.account("scoped", memberships=[{"role": "super_tenant_admin", "tenant_id": self.tenant}])
-    scoped = {"account_id": "scoped"}
-    self.assertTrue(self.plugin.set_tenant_node_assignment(scoped, self.tenant, "Node-A", True)["success"])
-    denied = [({"account_id": "scoped"}, foreign, 404)]
+    denied = [({"account_id": "scoped"}, self.tenant, 404), ({"account_id": "scoped"}, foreign, 404)]
     for role in ("super_pentester", "tenant_admin", "tenant_pentester", "tenant_user"):
       self.storage.account(role, memberships=[{"role": role, "tenant_id": self.tenant}])
       denied.append(({"account_id": role, "role": "super_tenant_admin",
                       "tenant_memberships": [{"role": "super_tenant_admin", "tenant_id": None}]},
                      self.tenant, 403))
     self.storage.account("mixed", memberships=[{"role": "tenant_user", "tenant_id": self.tenant},
-                                              {"role": "super_tenant_admin", "tenant_id": foreign}])
-    denied.append(({"account_id": "mixed"}, self.tenant, 403))
+                                              {"role": "super_tenant_admin", "tenant_id": None}])
+    denied.append(({"account_id": "mixed"}, self.tenant, 404))
     with patch.object(self.Plugin, "cfg_chainstore_peers", new_callable=PropertyMock,
                       create=True, side_effect=RuntimeError("private configuration")) as config:
       for actor, tenant, status in denied:
@@ -111,9 +116,10 @@ class TestTenantNodePlugin(unittest.TestCase):
             self.assertEqual(result["status_code"], status, result)
           self.assertEqual(len(self.storage.writes), before)
           config.assert_not_called()
-      self.storage.account("scoped", memberships=[])
-      self.assertEqual(self.plugin.set_tenant_node_assignment(scoped, self.tenant, "Node-A", True)["status_code"], 404)
-      self.assertEqual(self.plugin.get_tenant_nodes(scoped, self.tenant)["status_code"], 404)
+      self.storage.account("platform", memberships=[])
+      platform = {"account_id": "platform"}
+      self.assertEqual(self.plugin.set_tenant_node_assignment(platform, self.tenant, "Node-A", True)["status_code"], 404)
+      self.assertEqual(self.plugin.get_tenant_nodes(platform, self.tenant)["status_code"], 404)
       config.assert_not_called()
 
   def test_reads_and_removal_do_not_evaluate_plugin_peer_property(self):

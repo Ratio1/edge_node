@@ -177,7 +177,8 @@ class TestTenantAssetPlugin(unittest.TestCase):
     asset = self.create_asset()["data"]
     for role in ("super_tenant_admin", "super_pentester", "tenant_admin", "tenant_pentester", "tenant_user"):
       with self.subTest(role=role):
-        self.storage.account("operator", memberships=[{"role": role, "tenant_id": self.tenant}])
+        scope = None if role == "super_tenant_admin" else self.tenant  # RM-083: STA is full-portfolio
+        self.storage.account("operator", memberships=[{"role": role, "tenant_id": scope}])
         actor = {"account_id": "operator", "role": "super_tenant_admin",
                  "tenant_memberships": [{"role": "super_tenant_admin", "tenant_id": None}]}
         allowed = role in ("super_tenant_admin", "super_pentester")

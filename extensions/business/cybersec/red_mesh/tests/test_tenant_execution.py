@@ -287,8 +287,9 @@ class TestTenantExecution(unittest.TestCase):
   def test_two_published_tenants_never_admit_foreign_assets_or_nodes(self):
     own_asset = self.ready()
     request = str(uuid4())
-    foreign = self.service.prepare_tenant(self.actor, request, "Other", "other", "initial")["data"]["tenantId"]
-    self.owner.grant("initial", foreign)
+    self.owner.account("initial-other")
+    foreign = self.service.prepare_tenant(self.actor, request, "Other", "other", "initial-other")["data"]["tenantId"]
+    self.owner.grant("initial-other", foreign)
     self.assertTrue(self.service.activate_tenant(self.actor, request)["success"])
     foreign_asset = self.service.create_tenant_asset(self.actor, foreign, str(uuid4()), "Other asset", self.target)["data"]
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, foreign, "global-only", True)["success"])

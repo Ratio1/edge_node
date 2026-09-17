@@ -59,6 +59,29 @@ def _valid_id(value):
   return isinstance(value, str) and bool(value.strip())
 
 
+def valid_account_scope(memberships):
+  """RM-083 (owner, 2026-09-17): an account is platform-scoped or tenant-scoped, never both.
+
+  ``memberships`` is an iterable of ``(role, tenant_id)`` pairs whose rows are already individually
+  valid. Valid shapes: no rows; platform rows only, where a Super-Tenant Admin is always full-portfolio
+  and a Super-Pentester is either full-portfolio or allowlisted (not both); or tenant-local rows that
+  all name one tenant. Any other shape makes the account's authority ambiguous, so callers deny it.
+  """
+  rows = [(role, tenant_id) for role, tenant_id in memberships]
+  if not rows:
+    return True
+  roles = {role for role, _ in rows}
+  if roles <= _PLATFORM_ROLES:
+    if any(tenant_id is not None for role, tenant_id in rows if role == "super_tenant_admin"):
+      return False
+    pentester_scopes = {tenant_id is None for role, tenant_id in rows if role == "super_pentester"}
+    return len(pentester_scopes) <= 1
+  if roles & _PLATFORM_ROLES:
+    return False
+  tenants = {tenant_id for _, tenant_id in rows}
+  return len(tenants) == 1 and None not in tenants
+
+
 def _valid_actor(actor):
   if (not isinstance(actor, AccountView) or actor.active is not True
       or not actor.account_id or canonical_account_id(actor.account_id) != actor.account_id):
@@ -74,7 +97,7 @@ def _valid_actor(actor):
         return False
     elif not _valid_id(membership.tenant_id):
       return False
-  return True
+  return valid_account_scope((m.role, m.tenant_id) for m in actor.tenant_memberships)
 
 
 def resolve_tenant_roles(actor, tenant_id):

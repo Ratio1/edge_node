@@ -139,7 +139,7 @@ class TestTenantAdministration(unittest.TestCase):
 
   def test_allow_pentester_uses_only_current_in_scope_platform_roles(self):
     tenant_id = self.create()["tenantId"]
-    for role, scope, status in (("super_tenant_admin", tenant_id, 200),
+    for role, scope, status in (("super_tenant_admin", None, 200),
                                 ("super_pentester", tenant_id, 200),
                                 ("super_pentester", None, 200),
                                 ("super_tenant_admin", "foreign", 404),
@@ -259,12 +259,39 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(self.prepare()["status_code"], 403)
     self.assertEqual(len(self.store.writes), before)
 
+  def test_initial_admin_must_hold_no_scope_but_a_retry_keeps_its_own_membership(self):
+    # RM-083. First preparation refuses an initial admin that already belongs somewhere; a retry after
+    # the Navigator wrote this tenant's admin membership must still resume.
+    for memberships in ([{"role": "tenant_user", "tenant_id": "tn_other"}],
+                        [{"role": "super_pentester", "tenant_id": None}], None):
+      with self.subTest(memberships=memberships):
+        self.setUpStore()
+        if memberships is None:
+          self.store.account("initial", role="admin")
+        else:
+          self.store.account("initial", memberships=memberships)
+        denied = self.prepare()
+        self.assertEqual((denied["status_code"], denied["error"]), (409, "scope_conflict"))
+        self.assertEqual(self.store.writes, [])
+    self.setUpStore()
+    prepared = self.prepare()["data"]
+    self.store.grant("initial", prepared["tenantId"])
+    self.assertEqual(self.prepare()["data"], prepared)
+    self.store.grant("initial", "tn_other", "tenant_user")
+    self.assertEqual(self.prepare()["status_code"], 404)  # a two-tenant account is denied as a whole
+    self.store.account("initial", memberships=[{"role": "tenant_user", "tenant_id": prepared["tenantId"]}])
+    denied = self.prepare()
+    self.assertEqual((denied["status_code"], denied["error"]), (409, "scope_conflict"))
+    self.store.account("initial", memberships=[{"role": "tenant_admin", "tenant_id": prepared["tenantId"]}])
+    self.assertTrue(self.service.activate_tenant(self.actor, self.request)["success"])
+
   def test_creation_is_not_granted_by_scoped_platform_or_browser_roles(self):
-    for memberships in ([], [{"role": "super_tenant_admin", "tenant_id": "allowed"}],
-                        [{"role": "super_pentester", "tenant_id": None}]):
+    # RM-083: a tenant-scoped Super-Tenant Admin is not a valid account at all, so it is unknown (404).
+    for memberships, status in (([], 403), ([{"role": "super_tenant_admin", "tenant_id": "allowed"}], 404),
+                                ([{"role": "super_pentester", "tenant_id": None}], 403)):
       self.store.account("creator", memberships=memberships)
       self.actor["role"] = "super_tenant_admin"
-      self.assertEqual(self.prepare()["status_code"], 403)
+      self.assertEqual(self.prepare()["status_code"], status)
       self.assertEqual(self.store.writes, [])
 
   def test_invalid_payload_and_missing_admin_deny_before_writes(self):
@@ -368,10 +395,11 @@ class TestTenantAdministration(unittest.TestCase):
   def test_read_authority_is_rechecked_and_two_tenant_counts_are_scoped(self):
     first = self.create()
     self.request = str(uuid4())
-    second = self.prepare(domain_id="second", display_name="Second")["data"]
-    self.store.grant("initial", second["tenantId"])
+    self.store.account("initial-2")
+    second = self.prepare(domain_id="second", display_name="Second", initial_admin_id="initial-2")["data"]
+    self.store.grant("initial-2", second["tenantId"])
     self.assertTrue(self.service.activate_tenant(self.actor, self.request)["success"])
-    self.store.account("scoped", memberships=[{"role": "super_tenant_admin", "tenant_id": first["tenantId"]}])
+    self.store.account("scoped", memberships=[{"role": "super_pentester", "tenant_id": first["tenantId"]}])
     self.store.account("second-only", memberships=[{"role": "tenant_user", "tenant_id": second["tenantId"]}])
     visible = self.service.list_tenants({"account_id": "scoped"})["data"]
     self.assertEqual([(row["tenantId"], row["memberCount"]) for row in visible], [(first["tenantId"], 1)])
@@ -385,7 +413,14 @@ class TestTenantAdministration(unittest.TestCase):
     self.store.grant("second", tenant["tenantId"])
     before = copy.deepcopy(self.store.data)
     self.assertTrue(self.service.authorize_tenant_membership(
+      self.actor, tenant["tenantId"], "initial", "tenant_user")["success"])
+    self.store.grant("initial", tenant["tenantId"], "tenant_user")
+    self.assertTrue(self.service.authorize_tenant_membership(
       self.actor, tenant["tenantId"], "initial", "tenant_admin", True)["success"])
+    self.store.data = copy.deepcopy(before)
+    # RM-083: the admin row is the account's only one, so removing it would leave no scope.
+    last = self.service.authorize_tenant_membership(self.actor, tenant["tenantId"], "initial", "tenant_admin", True)
+    self.assertEqual((last["status_code"], last["error"]), (409, "last_membership"))
     self.assertEqual(self.store.data, before)
 
   def test_root_tenant_admin_membership_is_not_a_peer_admin_to_remove(self):
@@ -399,10 +434,18 @@ class TestTenantAdministration(unittest.TestCase):
       with self.subTest(role=role, remove=remove):
         denied = self.service.authorize_tenant_membership(peer, tenant_id, "initial", role, remove)
         self.assertEqual((denied["status_code"], denied["error"]), (403, "root_tenant_admin"))
-    self.assertTrue(self.service.authorize_tenant_membership(peer, tenant_id, "peer", "tenant_admin", True)["success"])
+    self.assertTrue(self.service.authorize_tenant_membership(peer, tenant_id, "peer", "tenant_user")["success"])
     self.assertTrue(self.service.authorize_tenant_membership(
-      {"account_id": "initial"}, tenant_id, "initial", "tenant_admin", True)["success"])
-    self.assertTrue(self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_admin", True)["success"])
+      {"account_id": "initial"}, tenant_id, "initial", "tenant_user")["success"])
+    self.assertTrue(self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_user")["success"])
+    # The founder's removal is still refused for a peer before the last-membership rule is reached.
+    denied = self.service.authorize_tenant_membership(peer, tenant_id, "initial", "tenant_admin", True)
+    self.assertEqual((denied["status_code"], denied["error"]), (403, "root_tenant_admin"))
+    for actor in (peer, {"account_id": "initial"}, self.actor):
+      target = actor["account_id"] if actor is not self.actor else "initial"
+      with self.subTest(actor=actor["account_id"], target=target):
+        last = self.service.authorize_tenant_membership(actor, tenant_id, target, "tenant_admin", True)
+        self.assertEqual((last["status_code"], last["error"]), (409, "last_membership"))
 
   def test_tenant_admin_edits_only_existing_members_and_never_the_pentester_role(self):
     # RM-083. Attaching an outside account would make it resettable by this tenant's admins, and the
@@ -423,11 +466,28 @@ class TestTenantAdministration(unittest.TestCase):
         denied = self.service.authorize_tenant_membership(admin, tenant_id, target, role, remove)
         self.assertEqual((denied["status_code"], denied["error"]), (403, "pentester_role_reserved"))
     self.assertTrue(self.service.authorize_tenant_membership(admin, tenant_id, "member", "tenant_admin")["success"])
-    self.assertTrue(self.service.authorize_tenant_membership(admin, tenant_id, "member", "tenant_user", True)["success"])
+    last = self.service.authorize_tenant_membership(admin, tenant_id, "member", "tenant_user", True)
+    self.assertEqual((last["status_code"], last["error"]), (409, "last_membership"))
     for target, role, remove in (("outsider", "tenant_user", False), ("member", "tenant_pentester", False),
-                                 ("tester", "tenant_pentester", True)):
+                                 ("tester", "tenant_user", False)):
       with self.subTest(platform=target, role=role):
         self.assertTrue(self.service.authorize_tenant_membership(self.actor, tenant_id, target, role, remove)["success"])
+    last = self.service.authorize_tenant_membership(self.actor, tenant_id, "tester", "tenant_pentester", True)
+    self.assertEqual((last["status_code"], last["error"]), (409, "last_membership"))
+
+  def test_membership_writes_never_give_an_account_a_second_scope(self):
+    # RM-083 (owner): an account is platform-scoped or belongs to exactly one tenant.
+    tenant_id = self.create()["tenantId"]
+    self.store.account("elsewhere", memberships=[{"role": "tenant_user", "tenant_id": "tn_other"}])
+    self.store.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
+    self.store.account("allowlisted", memberships=[{"role": "super_pentester", "tenant_id": tenant_id}])
+    self.store.account("legacy", role="admin")
+    before = copy.deepcopy(self.store.data)
+    for target in ("elsewhere", "pentester", "allowlisted", "legacy", "creator"):
+      with self.subTest(target=target):
+        denied = self.service.authorize_tenant_membership(self.actor, tenant_id, target, "tenant_user")
+        self.assertEqual((denied["status_code"], denied["error"]), (409, "scope_conflict"))
+    self.assertEqual(self.store.data, before)
 
   def test_account_creation_is_approved_with_its_one_membership(self):
     tenant_id = self.create()["tenantId"]
@@ -466,6 +526,9 @@ class TestTenantAdministration(unittest.TestCase):
     self.repo.put("tenant", tenant_id, record={k: v for k, v in stored.items() if k != "root_admin_id"})
     self.store.account("peer")
     self.store.grant("peer", tenant_id)
+    self.assertTrue(self.service.authorize_tenant_membership(
+      {"account_id": "peer"}, tenant_id, "initial", "tenant_user")["success"])
+    self.store.grant("initial", tenant_id, "tenant_user")
     self.assertTrue(self.service.authorize_tenant_membership(
       {"account_id": "peer"}, tenant_id, "initial", "tenant_admin", True)["success"])
 

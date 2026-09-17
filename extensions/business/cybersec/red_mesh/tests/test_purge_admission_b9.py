@@ -63,7 +63,8 @@ class PurgeAdmissionCase(unittest.TestCase):
         self.owner, key, record, **kwargs))
 
   def as_role(self, role):
-    self.store.account("reader", memberships=[{"role": role, "tenant_id": self.tenant_id}])
+    scope = None if role == "super_tenant_admin" else self.tenant_id  # RM-083: STA is full-portfolio
+    self.store.account("reader", memberships=[{"role": role, "tenant_id": scope}])
 
   def as_legacy_admin(self):
     self.store.account("reader", role="admin")
