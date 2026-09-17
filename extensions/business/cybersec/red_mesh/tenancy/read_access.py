@@ -3,7 +3,7 @@ from copy import deepcopy
 
 from .administration import AdministrationDenied
 from .execution import ExecutionRollout, binding_from_record
-from .identity import TenantMembership, resolve_actor
+from .identity import holds_platform_role, resolve_actor
 from .ports import TenantStoreError
 
 
@@ -102,9 +102,12 @@ class LegacyReadAccess:
       raise AdministrationDenied(denial["status_code"], denial["error"])
     if account.tenant_memberships_present is not False or operation not in ("reports:view", "audit:view", "reports:export"):
       raise AdministrationDenied(403, "forbidden")
-    if operation == "reports:export" and account.role != "admin" and account.app_role != "pentester":
+    # Legacy accounts only (no memberships key): the adapter derived the platform membership from the
+    # stored `admin` role, so this asks the membership, never the account role (policy.py:5). The
+    # legacy `app_role == pentester` export path is kept deliberately (RM-082 owner decision).
+    if operation == "reports:export" and not holds_platform_role(account) and account.app_role != "pentester":
       raise AdministrationDenied(403, "forbidden")
-    if operation == "audit:view" and TenantMembership("super_tenant_admin", None) not in account.tenant_memberships:
+    if operation == "audit:view" and not holds_platform_role(account):
       raise AdministrationDenied(403, "forbidden")
     try:
       rollout = self.read_rollout()

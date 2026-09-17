@@ -18,6 +18,21 @@ class TenantMembership:
   tenant_id: str | None
 
 
+# The full-portfolio Super-Tenant Admin membership. It is also what the identity adapter derives for a
+# legacy `admin` account with no memberships key, so checking for it is how a legacy surface asks "is
+# this the platform administrator" without reading the account role.
+FULL_PORTFOLIO_SUPER_TENANT_ADMIN = TenantMembership("super_tenant_admin", None)
+
+
+def holds_platform_role(account, role="super_tenant_admin"):
+  """Whether ``account`` holds ``role`` deployment-wide (``tenant_id`` None, no tenant allowlist).
+
+  An allowlisted platform membership (``tenant_id`` set) is deliberately not counted: every caller of
+  this helper gates a deployment-wide action, which an allowlist does not reach.
+  """
+  return TenantMembership(role, None) in account.tenant_memberships
+
+
 @dataclass(frozen=True)
 class AccountView:
   """Resolved caller identity with tenant-bound memberships, not flattened global roles.

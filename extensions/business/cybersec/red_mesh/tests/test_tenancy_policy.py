@@ -218,3 +218,32 @@ class TestIdentityPolicyBoundary(unittest.TestCase):
           actor, _ = resolve_actor({"account_id": "operator"}, reader)
           self.assertEqual(authorize_tenant_operation(actor, "assets:create", tenant),
                            PolicyDecision(False, 404, "not_found"))
+
+
+class TestLegacyRoleNeverAuthorizes(unittest.TestCase):
+  """RM-082. policy.py:5 says the legacy account role and app_role never grant authority; pin it."""
+
+  def test_role_and_app_role_never_change_a_decision(self):
+    from extensions.business.cybersec.red_mesh.tenancy.policy import _ROLE_OPERATIONS
+    operations = sorted(set().union(*_ROLE_OPERATIONS.values()) | {"unknown:operation"})
+    membership_sets = ((), (("tenant_user", "a"),), (("tenant_admin", "a"),), (("tenant_pentester", "a"),),
+                       (("super_pentester", None),), (("super_tenant_admin", None),), (("super_tenant_admin", "b"),))
+    legacy = (("admin", "admin"), ("admin", None), ("user", "pentester"), ("user", None), ("pentester", "user"))
+    for memberships in membership_sets:
+      rows = tuple(TenantMembership(role, tenant_id) for role, tenant_id in memberships)
+      for operation in operations:
+        for allow_pentester in (False, True):
+          context = TenantPolicyContext("a", True, allow_pentester)
+          decisions = {authorize_tenant_operation(AccountView("operator", role, app_role, True, rows),
+                                                  operation, context)
+                       for role, app_role in legacy}
+          with self.subTest(memberships=memberships, operation=operation, allow_pentester=allow_pentester):
+            self.assertEqual(len(decisions), 1, decisions)
+
+  def test_adapter_role_vocabulary_is_the_matrix(self):
+    from extensions.business.cybersec.red_mesh.tenancy.adapters import cstore_identity
+    from extensions.business.cybersec.red_mesh.tenancy.policy import PLATFORM_ROLES, TENANT_LOCAL_ROLES, _ROLE_OPERATIONS
+    self.assertEqual(cstore_identity.PLATFORM_ROLES | cstore_identity.TENANT_ROLES, frozenset(_ROLE_OPERATIONS))
+    self.assertEqual(TENANT_LOCAL_ROLES, frozenset({"tenant_admin", "tenant_pentester", "tenant_user"}))
+    self.assertEqual(PLATFORM_ROLES, frozenset({"super_tenant_admin", "super_pentester"}))
+

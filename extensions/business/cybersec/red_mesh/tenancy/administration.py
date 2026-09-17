@@ -11,8 +11,8 @@ import re
 from threading import RLock
 from uuid import UUID, uuid4
 
-from .identity import IdentityStoreError, TenantMembership, canonical_account_id, resolve_actor
-from .policy import TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles, resolve_operation_roles
+from .identity import IdentityStoreError, TenantMembership, canonical_account_id, holds_platform_role, resolve_actor
+from .policy import TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles, resolve_operation_roles
 from .execution import CurrentExecutionFacts, ExecutionBinding, ExecutionRollout, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
@@ -23,7 +23,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 
 
 _ADMINISTRATION_LOCK = RLock()
-_MEMBER_ROLES = frozenset({"tenant_admin", "tenant_pentester", "tenant_user"})
+_MEMBER_ROLES = TENANT_LOCAL_ROLES
 
 
 class AdministrationDenied(Exception):
@@ -93,7 +93,7 @@ class TenantAdministrationService:
     account, denial = resolve_actor(actor, self.accounts)
     if denial:
       raise AdministrationDenied(denial["status_code"], denial["error"])
-    if creator and TenantMembership("super_tenant_admin", None) not in account.tenant_memberships:
+    if creator and not holds_platform_role(account):
       raise AdministrationDenied(403, "forbidden")
     return account
 
@@ -659,7 +659,7 @@ class TenantAdministrationService:
 
   @_endpoint
   def authorize_tenant_membership(self, actor, tenant_id, account_id, role, remove=False):
-    self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
+    tenant, caller = self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
     account_id = canonical_account_id(account_id)
     if not account_id or not isinstance(role, str) or role not in _MEMBER_ROLES or type(remove) is not bool:
       raise AdministrationDenied(400, "invalid_membership")
@@ -670,5 +670,12 @@ class TenantAdministrationService:
                 if member["role"] == "tenant_admin" and member["accountId"] != account_id}
       if not others:
         raise AdministrationDenied(409, "last_tenant_admin")
+      # RM-082. The root tenant administrator's admin membership is the founder's to give up, or a
+      # Super-Tenant Admin's to take; a peer tenant admin removing it is the same takeover the
+      # password-reset rule refuses (§Root tenant administrator).
+      caller_roles, _ = resolve_tenant_roles(caller, tenant_id)
+      if (tenant.get("root_admin_id") == account_id and caller.account_id != account_id
+          and "super_tenant_admin" not in caller_roles):
+        raise AdministrationDenied(403, "root_tenant_admin")
     return {"accountId": account_id, "accountGeneration": target.account_generation,
             "tenantId": tenant_id, "role": role, "remove": remove}

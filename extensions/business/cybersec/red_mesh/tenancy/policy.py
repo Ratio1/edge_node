@@ -34,6 +34,9 @@ _ROLE_OPERATIONS = {
   "tenant_user": frozenset({"reports:view"}),
 }
 _PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
+# The role vocabularies other modules validate against, derived from the matrix so they cannot drift.
+PLATFORM_ROLES = _PLATFORM_ROLES
+TENANT_LOCAL_ROLES = frozenset(_ROLE_OPERATIONS) - _PLATFORM_ROLES
 
 
 @dataclass(frozen=True)

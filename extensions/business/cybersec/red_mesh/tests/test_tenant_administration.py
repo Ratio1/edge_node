@@ -386,6 +386,31 @@ class TestTenantAdministration(unittest.TestCase):
       self.actor, tenant["tenantId"], "initial", "tenant_admin", True)["success"])
     self.assertEqual(self.store.data, before)
 
+  def test_root_tenant_admin_membership_is_not_a_peer_admin_to_remove(self):
+    # RM-082. A peer tenant admin removing the founder's admin role is the takeover the password
+    # rule refuses; the founder may step down and a Super-Tenant Admin may remove it.
+    tenant_id = self.create()["tenantId"]
+    self.store.account("peer")
+    self.store.grant("peer", tenant_id)
+    peer = {"account_id": "peer"}
+    for role, remove in (("tenant_admin", True), ("tenant_user", False)):
+      with self.subTest(role=role, remove=remove):
+        denied = self.service.authorize_tenant_membership(peer, tenant_id, "initial", role, remove)
+        self.assertEqual((denied["status_code"], denied["error"]), (403, "root_tenant_admin"))
+    self.assertTrue(self.service.authorize_tenant_membership(peer, tenant_id, "peer", "tenant_admin", True)["success"])
+    self.assertTrue(self.service.authorize_tenant_membership(
+      {"account_id": "initial"}, tenant_id, "initial", "tenant_admin", True)["success"])
+    self.assertTrue(self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_admin", True)["success"])
+
+  def test_tenant_without_recorded_founder_keeps_peer_membership_edits(self):
+    tenant_id = self.create()["tenantId"]
+    stored = self.repo.get("tenant", tenant_id)
+    self.repo.put("tenant", tenant_id, record={k: v for k, v in stored.items() if k != "root_admin_id"})
+    self.store.account("peer")
+    self.store.grant("peer", tenant_id)
+    self.assertTrue(self.service.authorize_tenant_membership(
+      {"account_id": "peer"}, tenant_id, "initial", "tenant_admin", True)["success"])
+
   def test_corrupt_receipt_and_tenant_bindings_fail_without_writes(self):
     prepared = self.prepare()["data"]
     original = copy.deepcopy(self.store.data)

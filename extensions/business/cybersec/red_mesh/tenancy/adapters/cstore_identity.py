@@ -21,7 +21,9 @@ Record facts this binds to (Navigator ``lib/auth/cstore.ts``):
 import json
 import os
 
-from ..identity import AccountView, IdentityStoreError, TenantMembership, canonical_account_id
+from ..identity import (FULL_PORTFOLIO_SUPER_TENANT_ADMIN, AccountView, IdentityStoreError,
+                        TenantMembership, canonical_account_id)
+from ..policy import PLATFORM_ROLES, TENANT_LOCAL_ROLES
 
 AUTH_HKEY_ENV = "R1EN_CSTORE_AUTH_HKEY"
 SUPPORTED_SCHEMA_VERSIONS = frozenset({0, 1})
@@ -30,8 +32,7 @@ ACCOUNT_STATE_KEY = "navigatorAccountState"
 ACTIVE_STATE = "active"
 APP_ROLE_KEY = "appRole"
 MEMBERSHIPS_KEY = "tenant_memberships"
-PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
-TENANT_ROLES = frozenset({"tenant_admin", "tenant_pentester", "tenant_user"})
+TENANT_ROLES = TENANT_LOCAL_ROLES
 MAX_ENUMERATED_ACCOUNTS = 10000
 
 
@@ -123,7 +124,7 @@ class CstoreAuthAccountReader:
 def _parse_memberships(metadata, legacy_role):
   """Preserve role/scope pairs; malformed explicit scope must never activate legacy fallback."""
   if MEMBERSHIPS_KEY not in metadata:
-    return (TenantMembership("super_tenant_admin", None),) if legacy_role == "admin" else ()
+    return (FULL_PORTFOLIO_SUPER_TENANT_ADMIN,) if legacy_role == "admin" else ()
   rows = metadata[MEMBERSHIPS_KEY]
   if not isinstance(rows, list):
     return None

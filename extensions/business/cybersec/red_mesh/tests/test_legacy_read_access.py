@@ -178,6 +178,18 @@ class TestLegacyReadAccess(unittest.TestCase):
       self.read()
     self.assert_no_job_read()
 
+  def test_account_role_alone_never_admits_export_or_audit(self):
+    # RM-082. The legacy gates ask for the platform membership the adapter derives, not the role, so an
+    # account view carrying role "admin" without that membership is refused.
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+    view = AccountView("reader", "admin", None, True, (), "generation-1", False)
+    with patch.object(self.accounts, "get_account", return_value=view):
+      for permission in ("reports:export", "audit:view"):
+        with self.subTest(permission=permission), self.assertRaises(AdministrationDenied) as caught:
+          self.read("get", permission=permission)
+        self.assertEqual(caught.exception.status_code, 403)
+    self.assert_no_job_read()
+
   def test_audit_requires_stored_legacy_admin_not_an_ordinary_reader(self):
     with self.assertRaises(AdministrationDenied) as caught:
       self.read(permission="audit:view")
