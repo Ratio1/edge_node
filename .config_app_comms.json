@@ -31,9 +31,17 @@
       },
       "CTRL_CHANNEL": {
         "TOPIC": "naeural_comms_local/ctrl",
+        "TARGETED_TOPIC": "naeural_comms_local/ctrl/{}",
+        "SUBSCRIBE_TARGETED": false,
         "QOS": 1
       },
       "HOST": "emqx",
+      "HEARTBEAT_AUTH_MODE": "shadow",
+      "HEARTBEAT_AUTH_MAX_IN_FLIGHT": 32,
+      "HEARTBEAT_AUTH_WORKERS": 4,
+      "HEARTBEAT_INGRESS_QUEUE_SIZE": 10000,
+      "HEARTBEAT_INGRESS_WORKER_ENABLED": true,
+      "HEARTBEAT_TARGETED_MIRROR_ENABLED": true,
       "NOTIF_CHANNEL": {
         "TOPIC": "naeural_comms_local/notif",
         "QOS": 0

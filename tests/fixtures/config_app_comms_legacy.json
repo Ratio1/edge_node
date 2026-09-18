@@ -17,7 +17,7 @@
       }
     },
     "LOCAL_PARAMS": {
-      "HOST": "deeploy_test_mqtt",
+      "HOST": "emqx",
       "PASS": "",
       "PORT": 1883,
       "USER": "",
@@ -26,14 +26,16 @@
     },
     "PARAMS": {
       "CONFIG_CHANNEL": {
-        "TOPIC": "deeploy_testbed/{}/config"
+        "TOPIC": "naeural_comms_local/{}/config",
+        "QOS": 2
       },
       "CTRL_CHANNEL": {
-        "TOPIC": "deeploy_testbed/ctrl",
-        "TARGETED_TOPIC": "deeploy_testbed/ctrl/{}",
-        "SUBSCRIBE_TARGETED": false
+        "TOPIC": "naeural_comms_local/ctrl",
+        "TARGETED_TOPIC": "naeural_comms_local/ctrl/{}",
+        "SUBSCRIBE_TARGETED": false,
+        "QOS": 1
       },
-      "HOST": "$EE_MQTT_HOST",
+      "HOST": "emqx",
       "HEARTBEAT_AUTH_MODE": "shadow",
       "HEARTBEAT_AUTH_MAX_IN_FLIGHT": 32,
       "HEARTBEAT_AUTH_WORKERS": 4,
@@ -41,17 +43,19 @@
       "HEARTBEAT_INGRESS_WORKER_ENABLED": true,
       "HEARTBEAT_TARGETED_MIRROR_ENABLED": false,
       "NOTIF_CHANNEL": {
-        "TOPIC": "deeploy_testbed/notif"
+        "TOPIC": "naeural_comms_local/notif",
+        "QOS": 0
       },
-      "PASS": "$EE_MQTT",
+      "PASS": "",
       "PAYLOADS_CHANNEL": {
-        "TOPIC": "deeploy_testbed/payloads",
-        "TARGETED_TOPIC": "deeploy_testbed/{}/payloads"
+        "TOPIC": "naeural_comms_local/payloads",
+        "TARGETED_TOPIC": "naeural_comms_local/{}/payloads",
+        "QOS": 0
       },
-      "PORT": "$EE_MQTT_PORT",
+      "PORT": 1883,
       "QOS": 0,
-      "USER": "$EE_MQTT_USER",
-      "SUBTOPIC": "$EE_MQTT_SUBTOPIC",
+      "USER": "",
+      "SUBTOPIC": "address",
       "SECURED": 0,
       "CERT_PATH": ""
     },
@@ -59,15 +63,15 @@
   },
   "FILE_UPLOAD": {
     "CONFIG_UPLOADER": {
-      "ACCESS_KEY": "$EE_MINIO_ACCESS_KEY",
-      "BUCKET_NAME": "$EE_MINIO_UPLOAD_BUCKET",
-      "ENDPOINT": "$EE_MINIO_ENDPOINT",
-      "SECRET_KEY": "$EE_MINIO_SECRET_KEY",
-      "SECURE": "$EE_MINIO_SECURE"
+      "ACCESS_KEY": "",
+      "BUCKET_NAME": "",
+      "ENDPOINT": "",
+      "SECRET_KEY": "",
+      "SECURE": false
     },
     "TYPE": "minio"
   },
   "PAYLOAD_TYPE": "INSTANCE",
-  "SECONDS_HEARTBEAT": 3,
+  "SECONDS_HEARTBEAT": 5,
   "SERVING_IN_PROCESS": true
 }
