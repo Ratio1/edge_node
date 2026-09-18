@@ -37,7 +37,7 @@ def test_denials_never_prepare_or_submit_analysis(fault, status):
     if fault == "actor": actor = None
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "none_scope": account["metadata"]["tenant_memberships"] = []
+    elif fault == "none_scope": account["memberships"] = []
     elif fault == "tenant_user": as_role(fixture, "tenant_user")
     # analysis:run binds Allow Pentester for the platform roles too (RM-078).
     elif fault == "pentesting_off": allow_pentester(fixture, False)

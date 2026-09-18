@@ -1,0 +1,547 @@
+{
+  "schemaVersion": 1,
+  "note": "Parser cases for account record v1 (redmesh-auth.md). value is the raw stored string. password salt/hash are structurally valid bytes, not real argon2id hashes; parsers never verify passwords.",
+  "cases": [
+    {
+      "name": "bootstrap_super_tenant_admin",
+      "field": "root-sta",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"root-sta\",\"state\":\"active\",\"generation\":\"5f0c2b8e-1d4a-4e7b-9c3f-a1b2c3d4e5f6\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"0KlggxgIgpMb1ZzDOsq2eQ==\",\"hash\":\"ucRN/0Y7u1MFxembudXhkZ3iDTDZLUqU+4LyX2Y6/O0=\"},\"memberships\":[{\"role\":\"super_tenant_admin\",\"tenant_id\":null}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"@bootstrap\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"@bootstrap\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "valid",
+      "view": {
+        "accountId": "root-sta",
+        "state": "active",
+        "active": true,
+        "generation": "5f0c2b8e-1d4a-4e7b-9c3f-a1b2c3d4e5f6",
+        "memberships": [
+          {
+            "role": "super_tenant_admin",
+            "tenant_id": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "super_pentester_full_portfolio",
+      "field": "sp-full",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"sp-full\",\"state\":\"active\",\"generation\":\"0e9d8c7b-6a5f-4e3d-8c2b-1a0f9e8d7c6b\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"kF87Q0ymHI5/MPYn/Q7fDw==\",\"hash\":\"3l0Gx/xFndZlekHfHONBDtmcx+3D+av6f5qB28JAxDk=\"},\"memberships\":[{\"role\":\"super_pentester\",\"tenant_id\":null}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"root-sta\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "valid",
+      "view": {
+        "accountId": "sp-full",
+        "state": "active",
+        "active": true,
+        "generation": "0e9d8c7b-6a5f-4e3d-8c2b-1a0f9e8d7c6b",
+        "memberships": [
+          {
+            "role": "super_pentester",
+            "tenant_id": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "super_pentester_allowlisted",
+      "field": "sp.allow",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"sp.allow\",\"state\":\"active\",\"generation\":\"7c1e4a9b-3d2f-4b6a-8e5c-9d0a1b2c3e4f\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"BDHeUxNL5vE+yLrtNdNCQw==\",\"hash\":\"5rAGQn4062iSf6nIHa4vC9wMyYvQHvHzwmeALeci568=\"},\"memberships\":[{\"role\":\"super_pentester\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"super_pentester\",\"tenant_id\":\"tn_8f2c1a7d-5e63-4b90-a1c4-7e9d3f6b0a22\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"root-sta\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "valid",
+      "view": {
+        "accountId": "sp.allow",
+        "state": "active",
+        "active": true,
+        "generation": "7c1e4a9b-3d2f-4b6a-8e5c-9d0a1b2c3e4f",
+        "memberships": [
+          {
+            "role": "super_pentester",
+            "tenant_id": "tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11"
+          },
+          {
+            "role": "super_pentester",
+            "tenant_id": "tn_8f2c1a7d-5e63-4b90-a1c4-7e9d3f6b0a22"
+          }
+        ]
+      }
+    },
+    {
+      "name": "tenant_admin_and_user_one_tenant",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "valid",
+      "view": {
+        "accountId": "acme_admin",
+        "state": "active",
+        "active": true,
+        "generation": "2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d",
+        "memberships": [
+          {
+            "role": "tenant_admin",
+            "tenant_id": "tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11"
+          },
+          {
+            "role": "tenant_user",
+            "tenant_id": "tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11"
+          }
+        ]
+      }
+    },
+    {
+      "name": "deactivated_tenant_user",
+      "field": "acme-viewer",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme-viewer\",\"state\":\"deactivated\",\"generation\":\"9f8e7d6c-5b4a-4c3d-a2e1-f0a9b8c7d6e5\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"krg3toVAt6gvGSFdpe7wNg==\",\"hash\":\"b+VVqjXj2erfmeOGvn6dO/2FHMhbf3YH2I965WQtUuY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T13:30:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\",\"stateChangedAt\":\"2026-09-17T13:30:00.000Z\",\"stateChangedBy\":\"acme_admin\"}",
+      "expect": "valid",
+      "view": {
+        "accountId": "acme-viewer",
+        "state": "deactivated",
+        "active": false,
+        "generation": "9f8e7d6c-5b4a-4c3d-a2e1-f0a9b8c7d6e5",
+        "memberships": [
+          {
+            "role": "tenant_user",
+            "tenant_id": "tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11"
+          }
+        ]
+      }
+    },
+    {
+      "name": "deleting_tenant_pentester",
+      "field": "acme-pt",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme-pt\",\"state\":\"deleting\",\"generation\":\"3c2b1a0f-9e8d-4c7b-b6a5-f4e3d2c1b0a9\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"h8QWnVtrNUIxJ3FmUe/3Cg==\",\"hash\":\"tTNl4LyYgtczdW48gI6eL2pustcZDl709JmwHKxCzFg=\"},\"memberships\":[{\"role\":\"tenant_pentester\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T13:30:00.000Z\",\"updatedBy\":\"root-sta\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\",\"stateChangedAt\":\"2026-09-17T13:30:00.000Z\",\"stateChangedBy\":\"root-sta\"}",
+      "expect": "valid",
+      "view": {
+        "accountId": "acme-pt",
+        "state": "deleting",
+        "active": false,
+        "generation": "3c2b1a0f-9e8d-4c7b-b6a5-f4e3d2c1b0a9",
+        "memberships": [
+          {
+            "role": "tenant_pentester",
+            "tenant_id": "tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11"
+          }
+        ]
+      }
+    },
+    {
+      "name": "none_scope_empty_memberships",
+      "field": "orphan01",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"orphan01\",\"state\":\"active\",\"generation\":\"6d5c4b3a-2f1e-4d0c-9b8a-7f6e5d4c3b2a\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"3unHA3QLX91Pcpo7DOtTkw==\",\"hash\":\"QX0BzThnFIRhZV6rDh4G+DvclsoxopwQklgIpoeIPWU=\"},\"memberships\":[],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"root-sta\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "valid",
+      "view": {
+        "accountId": "orphan01",
+        "state": "active",
+        "active": true,
+        "generation": "6d5c4b3a-2f1e-4d0c-9b8a-7f6e5d4c3b2a",
+        "memberships": []
+      }
+    },
+    {
+      "name": "tombstone",
+      "field": "gone-user",
+      "value": "null",
+      "expect": "tombstone"
+    },
+    {
+      "name": "malformed_json",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,",
+      "expect": "invalid",
+      "reason": "value is not JSON"
+    },
+    {
+      "name": "json_array",
+      "field": "acme_admin",
+      "value": "[]",
+      "expect": "invalid",
+      "reason": "value is not an object"
+    },
+    {
+      "name": "json_null_literal_not_tombstone",
+      "field": "acme_admin",
+      "value": " null",
+      "expect": "invalid",
+      "reason": "JSON null (not the exact string null) is not an object"
+    },
+    {
+      "name": "unknown_top_level_key_role",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\",\"role\":\"admin\"}",
+      "expect": "invalid",
+      "reason": "unknown key"
+    },
+    {
+      "name": "unknown_top_level_key_metadata",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\",\"metadata\":{}}",
+      "expect": "invalid",
+      "reason": "unknown key"
+    },
+    {
+      "name": "schema_version_2",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":2,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "unsupported schemaVersion"
+    },
+    {
+      "name": "schema_version_string",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":\"1\",\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "schemaVersion must be the integer 1"
+    },
+    {
+      "name": "schema_version_bool",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":true,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "schemaVersion must be the integer 1"
+    },
+    {
+      "name": "missing_generation",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "required key missing"
+    },
+    {
+      "name": "account_id_differs_from_field",
+      "field": "acme-admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "accountId must equal the hash field"
+    },
+    {
+      "name": "account_id_not_canonical",
+      "field": "Acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"Acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "accountId must be canonical"
+    },
+    {
+      "name": "account_id_too_short",
+      "field": "ab",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"ab\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "accountId must be 3-64 characters"
+    },
+    {
+      "name": "account_id_leading_dot",
+      "field": ".acme",
+      "value": "{\"schemaVersion\":1,\"accountId\":\".acme\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "accountId must start with a letter or digit"
+    },
+    {
+      "name": "unknown_state",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"disabled\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "state must be active, deactivated or deleting"
+    },
+    {
+      "name": "generation_not_uuid_v4",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"legacy:2026-09-17T12:00:00Z\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "generation must be a lowercase UUID v4"
+    },
+    {
+      "name": "created_at_not_iso_utc",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17 12:00\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "timestamps must be ISO 8601 UTC"
+    },
+    {
+      "name": "updated_by_invalid",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "updatedBy must be a canonical account id or @bootstrap"
+    },
+    {
+      "name": "created_by_not_canonical",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"Bootstrap\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "createdBy must be a canonical account id or @bootstrap"
+    },
+    {
+      "name": "deactivated_without_state_change",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"deactivated\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "non-active state requires stateChangedAt and stateChangedBy"
+    },
+    {
+      "name": "state_changed_at_without_by",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\",\"stateChangedAt\":\"2026-09-17T13:30:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "stateChangedAt and stateChangedBy come together"
+    },
+    {
+      "name": "password_algo_scrypt",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"scrypt\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.algo must be argon2id"
+    },
+    {
+      "name": "password_unknown_key",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\",\"version\":1},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "unknown key in password"
+    },
+    {
+      "name": "password_missing_salt",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "required key missing in password"
+    },
+    {
+      "name": "password_memory_over_bound",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":1048576,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.m must be 8192..262144"
+    },
+    {
+      "name": "password_iterations_over_bound",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":64,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.t must be 1..10"
+    },
+    {
+      "name": "password_parallelism_over_bound",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":16,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.p must be 1..4"
+    },
+    {
+      "name": "password_len_not_32",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":64,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.len must be 32"
+    },
+    {
+      "name": "password_version_not_19",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":16,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.v must be 19"
+    },
+    {
+      "name": "password_salt_wrong_length",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"LXEWQrcmsEQBYnyp\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.salt must decode to 16 bytes"
+    },
+    {
+      "name": "password_hash_not_base64",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"not base64!\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.hash must be base64"
+    },
+    {
+      "name": "memberships_not_list",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":null,\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "memberships must be a list"
+    },
+    {
+      "name": "membership_unknown_role",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"ratio1_deployer\",\"tenant_id\":null}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "unknown role"
+    },
+    {
+      "name": "membership_legacy_role_admin",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"admin\",\"tenant_id\":null}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "unknown role"
+    },
+    {
+      "name": "membership_missing_tenant_id_key",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "membership requires role and tenant_id"
+    },
+    {
+      "name": "membership_extra_key",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\",\"grantedBy\":\"x\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "unknown key in membership"
+    },
+    {
+      "name": "membership_tenant_role_null_tenant",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":null}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "tenant roles require a tenant id"
+    },
+    {
+      "name": "membership_empty_tenant_id",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":\"\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "tenant id must be tn_ + UUID v4"
+    },
+    {
+      "name": "membership_duplicate_row",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "duplicate membership row"
+    },
+    {
+      "name": "scope_platform_and_tenant",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"super_pentester\",\"tenant_id\":null},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "one scope per account"
+    },
+    {
+      "name": "scope_two_tenants",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_8f2c1a7d-5e63-4b90-a1c4-7e9d3f6b0a22\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "one scope per account"
+    },
+    {
+      "name": "scope_sta_allowlisted",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"super_tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "super_tenant_admin is always full portfolio"
+    },
+    {
+      "name": "scope_sp_full_and_allowlisted",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"super_pentester\",\"tenant_id\":null},{\"role\":\"super_pentester\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "super_pentester is full portfolio or allowlisted, not both"
+    },
+    {
+      "name": "password_memory_float_literal",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536.0,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "integers are digit-only literals"
+    },
+    {
+      "name": "password_memory_exponent_literal",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":6.5536e4,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "integers are digit-only literals"
+    },
+    {
+      "name": "password_parallelism_bool",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":true,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "integers are never booleans"
+    },
+    {
+      "name": "password_memory_under_bound",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":4096,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.m must be 8192..262144"
+    },
+    {
+      "name": "password_iterations_zero",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":0,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.t must be 1..10"
+    },
+    {
+      "name": "password_parallelism_zero",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":0,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "password.p must be 1..4"
+    },
+    {
+      "name": "password_salt_unpadded",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "base64 must be padded and canonical"
+    },
+    {
+      "name": "password_hash_url_safe",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"-__7__v_-__7__v_-__7__v_-__7__v_-__7__v_-_8=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "base64 uses the standard alphabet"
+    },
+    {
+      "name": "password_salt_noncanonical_trailing_bits",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nR==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "base64 must re-encode to the input"
+    },
+    {
+      "name": "state_changed_by_bootstrap",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\",\"stateChangedAt\":\"2026-09-17T13:30:00.000Z\",\"stateChangedBy\":\"@bootstrap\"}",
+      "expect": "invalid",
+      "reason": "stateChangedBy must be a canonical account id"
+    },
+    {
+      "name": "password_changed_at_not_iso_utc",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00Z\"}",
+      "expect": "invalid",
+      "reason": "timestamps must be YYYY-MM-DDTHH:MM:SS.sssZ"
+    },
+    {
+      "name": "updated_at_not_calendar_date",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_admin\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"},{\"role\":\"tenant_user\",\"tenant_id\":\"tn_3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-13-45T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "timestamps must be real calendar dates"
+    },
+    {
+      "name": "membership_tenant_id_not_string",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":42}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "tenant id must be tn_ + UUID v4"
+    },
+    {
+      "name": "membership_tenant_id_whitespace",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":\" \"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "tenant id must be tn_ + UUID v4"
+    },
+    {
+      "name": "membership_tenant_id_no_prefix",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[{\"role\":\"tenant_user\",\"tenant_id\":\"3b9d6f0e-2a41-4c1e-9f57-0d8a6b2c4e11\"}],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "tenant id must be tn_ + UUID v4"
+    },
+    {
+      "name": "membership_row_not_object",
+      "field": "acme_admin",
+      "value": "{\"schemaVersion\":1,\"accountId\":\"acme_admin\",\"state\":\"active\",\"generation\":\"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d\",\"password\":{\"algo\":\"argon2id\",\"v\":19,\"m\":65536,\"t\":3,\"p\":1,\"len\":32,\"salt\":\"p+n99LVZuu+xvSCFume2nA==\",\"hash\":\"THpG9+IU+a5Glz6Dq+2THNMP4YOX1vQC5XH/81g/DqY=\"},\"memberships\":[\"tenant_user\"],\"createdAt\":\"2026-09-17T12:00:00.000Z\",\"createdBy\":\"root-sta\",\"updatedAt\":\"2026-09-17T12:00:00.000Z\",\"updatedBy\":\"acme_admin\",\"passwordChangedAt\":\"2026-09-17T12:00:00.000Z\"}",
+      "expect": "invalid",
+      "reason": "membership rows are objects"
+    }
+  ]
+}

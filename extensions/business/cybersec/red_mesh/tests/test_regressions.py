@@ -102,10 +102,10 @@ class TestRegressionScenarios(unittest.TestCase):
     plugin._normalize_job_record = MagicMock(side_effect=lambda key, value: (key, value))
     plugin._get_all_network_jobs = lambda: Plugin._get_all_network_jobs(plugin)
 
-    from .read_endpoint_fixtures import install_legacy_read_store
-    actor = install_legacy_read_store(self, plugin, Plugin)
-    first = Plugin.list_network_jobs(plugin, request_actor=actor)
-    second = Plugin.list_network_jobs(plugin, request_actor=actor)
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin, jobs=jobs)
+    first = Plugin.list_network_jobs(plugin, request_actor=actor, tenant_id=tenant_id)
+    second = Plugin.list_network_jobs(plugin, request_actor=actor, tenant_id=tenant_id)
 
     self.assertIn("job-1", first)
     self.assertEqual(json.dumps(first, sort_keys=True), json.dumps(second, sort_keys=True))

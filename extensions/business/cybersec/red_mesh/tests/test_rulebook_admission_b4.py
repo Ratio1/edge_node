@@ -52,7 +52,7 @@ def apply_fault(fixture, fault):
     fixture.store.account("reader", active=False,
       memberships=[{"role": "tenant_admin", "tenant_id": fixture.tenant_id}])
   elif fault == "none_scope":
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = []
+    fixture.store.data[("auth", "reader")]["memberships"] = []
   elif fault == "user":
     as_role(fixture, "tenant_user")
   elif fault == "other_tenant":

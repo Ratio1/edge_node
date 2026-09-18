@@ -166,7 +166,7 @@ class TestTenantReadAccess(unittest.TestCase):
           self.assert_no_job_read()
       for memberships in (None, {}, [{"role": "tenant_user", "tenant_id": None}], [{"role": "owner", "tenant_id": self.tenant_id}]):
         with self.subTest(operation=operation, memberships=memberships):
-          self.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = memberships
+          self.store.data[("auth", "reader")]["memberships"] = memberships
           self.store.reads.clear()
           with self.assertRaises(AdministrationDenied) as raised:
             self.read(operation)

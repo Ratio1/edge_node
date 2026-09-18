@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
-from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, IdentityStoreError
+from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
 
 from . import test_tenant_asset_administration as fixtures
 
@@ -35,7 +35,7 @@ class TestTenantExecution(unittest.TestCase):
       "schema_version": 1, "namespace": "deployment", "tenant_id": self.tenant,
       "asset_id": asset["assetId"], "asset_target": self.target,
       "asset_target_digest": asset["targetDigest"], "actor_id": "creator",
-      "actor_generation": "generation-1", "node_failure_policy": "stop",
+      "actor_generation": self.owner.data[("auth", "creator")]["generation"], "node_failure_policy": "stop",
       "original_launcher": "coordinator-only", "participant_order": ["node-b"],
     })
     self.assertEqual(len(self.owner.writes), before)
@@ -59,19 +59,19 @@ class TestTenantExecution(unittest.TestCase):
     self.assertEqual(denied.exception.error, "pentesting_disabled")
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
     self.assertEqual(self.service.resolve_execution_admission(actor, self.tenant, asset["assetId"]).to_dict()["actor_id"], "pentester")
-    self.owner.data[("auth", "pentester")]["metadata"]["tenant_memberships"] = []
+    self.owner.data[("auth", "pentester")]["memberships"] = []
     with self.assertRaises(AdministrationDenied):
       self.service.resolve_execution_admission(actor, self.tenant, asset["assetId"])
 
-  def test_membership_provenance_distinguishes_absence_empty_and_unknown(self):
-    self.assertIs(self.service.accounts.get_account("creator").tenant_memberships_present, False)
-    self.owner.account("explicit", role="admin", memberships=[])
+  def test_memberships_are_the_stored_rows_and_a_malformed_list_is_no_account(self):
+    # RM-084 P6: "no memberships key" (the legacy seam) is gone; an empty list is the "none" scope.
+    self.owner.account("explicit", memberships=[])
     explicit = self.service.accounts.get_account("explicit")
-    self.assertIs(explicit.tenant_memberships_present, True)
     self.assertEqual(explicit.tenant_memberships, ())
-    self.assertIsNone(AccountView("fixture", "user", None, True).tenant_memberships_present)
+    # RM-084 P6: an account has membership rows, possibly zero; there is no "unknown" third state.
+    self.assertEqual(AccountView("fixture", True).tenant_memberships, ())
     for malformed in (None, {}, "", False):
-      self.owner.data[("auth", "explicit")]["metadata"]["tenant_memberships"] = malformed
+      self.owner.data[("auth", "explicit")]["memberships"] = malformed
       self.assertIsNone(self.service.accounts.get_account("explicit"))
 
   def test_private_admission_reuses_exact_resolved_account_and_digest_is_precondition(self):
@@ -152,12 +152,13 @@ class TestTenantExecution(unittest.TestCase):
     self.assertEqual(denied.exception.error, "pentesting_disabled")
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
     raw = self.owner.data[("auth", "pentester")]
-    raw["metadata"]["navigatorAccountGeneration"] = "recreated-account"
+    original = raw["generation"]
+    raw["generation"] = str(uuid4())  # the account was recreated, or its password reset
     with self.assertRaises(AdministrationDenied) as denied:
       self.service.reauthorize_execution(binding)
     self.assertEqual(denied.exception.error, "account_changed")
-    raw["metadata"]["navigatorAccountGeneration"] = "generation-1"
-    raw["metadata"]["tenant_memberships"] = []
+    raw["generation"] = original
+    raw["memberships"] = []
     with self.assertRaises(AdministrationDenied):
       self.service.reauthorize_execution(binding)
 
@@ -210,12 +211,13 @@ class TestTenantExecution(unittest.TestCase):
             self.service.resolve_execution_admission({"account_id": "operator", "role": "super_tenant_admin"},
                                                      self.tenant, asset["assetId"])
           self.assertFalse(any(call.args[0] == "asset" for call in reads.call_args_list))
-    self.owner.account("operator", generation="", memberships=[{"role": "super_pentester", "tenant_id": self.tenant}])
-    self.owner.data[("auth", "operator")]["metadata"].pop("navigatorAccountGeneration")
-    self.owner.data[("auth", "operator")].pop("createdAt")
+    # A record with no generation is not an account (RM-084 P6 removed the legacy creation-time
+    # incarnation that used to stand in for one), so it is unknown rather than changed.
+    self.owner.account("operator", memberships=[{"role": "super_pentester", "tenant_id": self.tenant}])
+    self.owner.data[("auth", "operator")].pop("generation")
     with self.assertRaises(AdministrationDenied) as denied:
       self.service.resolve_execution_admission({"account_id": "operator"}, self.tenant, asset["assetId"])
-    self.assertEqual(denied.exception.error, "account_changed")
+    self.assertEqual(denied.exception.status_code, 404)
     self.service.update_tenant_asset(self.actor, self.tenant, asset["assetId"], asset["version"],
                                      asset["displayName"], asset["target"], False)
     with self.assertRaises(AdministrationDenied):
@@ -260,29 +262,18 @@ class TestTenantExecution(unittest.TestCase):
       with self.subTest(invalid=invalid), self.assertRaises(ValueError):
         context.build_binding("coordinator", invalid)
 
-  def test_malformed_stored_generation_is_storage_failure(self):
+  def test_malformed_stored_generation_is_no_account(self):
+    # RM-084 P6: the strict v1 parser refuses the whole record, and a refused record is the same answer
+    # as an absent one -- an enumeration probe cannot tell them apart. It used to be a storage failure.
     asset = self.ready()
-    for generation in (123, False, [], {}, None, "", "   ", "\ud800"):
+    for generation in (123, False, [], {}, None, "", "   ", "\ud800", "generation-1"):
       with self.subTest(generation=repr(generation)):
-        self.owner.data[("auth", "creator")]["metadata"]["navigatorAccountGeneration"] = generation
-        with self.assertRaises(IdentityStoreError):
-          self.service.accounts.get_account("creator")
-        with self.assertRaises(IdentityStoreError):
-          self.service.accounts.list_accounts()
+        self.owner.data[("auth", "creator")]["generation"] = generation
+        self.assertIsNone(self.service.accounts.get_account("creator"))
+        self.assertNotIn("creator", [view.account_id for view in self.service.accounts.list_accounts()])
         with self.assertRaises(AdministrationDenied) as denied:
           self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
-        self.assertEqual(denied.exception.status_code, 503)
-
-  def test_only_absent_generation_may_use_legacy_creation_time(self):
-    asset = self.ready()
-    raw = self.owner.data[("auth", "creator")]
-    raw["metadata"].pop("navigatorAccountGeneration")
-    context = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
-    self.assertEqual(context.to_dict()["actor_generation"], "legacy:2026-01-01")
-    raw.pop("createdAt")
-    with self.assertRaises(AdministrationDenied) as denied:
-      self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
-    self.assertEqual(denied.exception.status_code, 409)
+        self.assertEqual(denied.exception.status_code, 404)
 
   def test_two_published_tenants_never_admit_foreign_assets_or_nodes(self):
     own_asset = self.ready()

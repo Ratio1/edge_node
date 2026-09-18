@@ -27,7 +27,7 @@ ROLES = ("super_tenant_admin", "super_pentester", "tenant_admin", "tenant_pentes
 
 
 def account(*memberships):
-  return AccountView("operator", "admin", "admin", True, tuple(
+  return AccountView("operator", True, tenant_memberships=tuple(
     TenantMembership(role, tenant_id) for role, tenant_id in memberships))
 
 
@@ -246,7 +246,7 @@ class TestEffectOperationNarrowsRatherThanOpens(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     self.Plugin = PentesterApi01Plugin
 
-  def _call(self, operation, tenant_id="tn_example"):
+  def _call(self, operation, tenant_id="tn_7bd2f70d-0000-4000-8000-000000000002"):
     from types import SimpleNamespace
     reached = []
     owner = SimpleNamespace()

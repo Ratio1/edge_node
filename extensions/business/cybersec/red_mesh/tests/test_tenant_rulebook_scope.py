@@ -90,7 +90,7 @@ def test_a_job_owned_by_another_tenant_is_not_found(name, extra):
     other = second_tenant(fixture)
     # A membership that holds the endpoint's own operation in that tenant, so the 404 is the job's
     # ownership and not the role: raw evidence needs a platform role for `evidence:read`.
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": "super_tenant_admin", "tenant_id": None} if (name, extra) in EVIDENCE
       else {"role": "tenant_admin", "tenant_id": other}]
     result = invoke(fixture, name, extra, tenant_id=other)

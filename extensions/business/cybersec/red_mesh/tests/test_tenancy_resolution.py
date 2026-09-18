@@ -13,21 +13,32 @@ from extensions.business.cybersec.red_mesh.tenancy.policy import PolicyDecision,
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.resolution import TenantAuthorizationService
 
+from .test_account_record_v1 import record
+
 
 TENANT_HKEY = '["redmesh","tenancy",1,"deployment-a"]'
-TENANT_KEY = '["tenant","deployment-a","a"]'
-ASSET_KEY = '["asset","deployment-a","a","asset-1"]'
+# Real tenant ids: the v1 account record refuses a membership naming anything else (RM-084 P6).
+T = "tn_12345678-1234-4234-8234-123456789abc"
+T2 = "tn_87654321-4321-4321-8321-cba987654321"
+
+
+def _key(*parts):
+  return json.dumps(list(parts), separators=(",", ":"))
+
+
+TENANT_KEY = _key("tenant", "deployment-a", T)
+ASSET_KEY = _key("asset", "deployment-a", T, "asset-1")
 
 
 class FakeStore:
   def __init__(self):
     self.data = {
-      ("test-auth", "operator"): {"role": "user", "metadata": {"tenant_memberships": [
-        {"role": "tenant_pentester", "tenant_id": "a"},
-      ]}},
-      (TENANT_HKEY, TENANT_KEY): {"schemaVersion": 1, "namespace": "deployment-a", "tenant_id": "a",
+      ("test-auth", "operator"): record("operator", memberships=[
+        {"role": "tenant_pentester", "tenant_id": T},
+      ]),
+      (TENANT_HKEY, TENANT_KEY): {"schemaVersion": 1, "namespace": "deployment-a", "tenant_id": T,
                                 "active": True, "allow_pentester": True},
-      (TENANT_HKEY, ASSET_KEY): {"schemaVersion": 1, "namespace": "deployment-a", "tenant_id": "a",
+      (TENANT_HKEY, ASSET_KEY): {"schemaVersion": 1, "namespace": "deployment-a", "tenant_id": T,
                                "asset_id": "asset-1", "active": True},
     }
     self.reads = []
@@ -55,11 +66,11 @@ class TestTenantResolution(unittest.TestCase):
     store = FakeStore()
     store.data[(TENANT_HKEY, TENANT_KEY)] = json.dumps(store.data[(TENANT_HKEY, TENANT_KEY)])
     context, decision = service(store).authorize(
-      {"account_id": " OPERATOR "}, "tasks:launch", "a", asset_ids=["asset-1"],
+      {"account_id": " OPERATOR "}, "tasks:launch", T, asset_ids=["asset-1"],
     )
     self.assertEqual(decision, PolicyDecision(True, 200, None))
     self.assertEqual(context.account.account_id, "operator")
-    self.assertEqual(context.tenant, TenantPolicyContext("a", True, True))
+    self.assertEqual(context.tenant, TenantPolicyContext(T, True, True))
     self.assertEqual(context.asset_ids, ("asset-1",))
     self.assertEqual(store.reads, [("test-auth", "operator"), (TENANT_HKEY, TENANT_KEY),
                                   (TENANT_HKEY, ASSET_KEY)])
@@ -67,8 +78,8 @@ class TestTenantResolution(unittest.TestCase):
   def test_scope_is_checked_before_any_tenant_or_asset_read(self):
     store = FakeStore()
     context, decision = service(store).authorize(
-      {"account_id": "operator", "role": "super_tenant_admin", "tenant_id": "b", "scope": "*"},
-      "tasks:launch", "b", asset_ids=["asset-1"],
+      {"account_id": "operator", "role": "super_tenant_admin", "tenant_id": T2, "scope": "*"},
+      "tasks:launch", T2, asset_ids=["asset-1"],
     )
     self.assertIsNone(context)
     self.assertEqual(decision, PolicyDecision(False, 404, "not_found"))
@@ -78,10 +89,10 @@ class TestTenantResolution(unittest.TestCase):
     for tenant_exists in (False, True):
       with self.subTest(tenant_exists=tenant_exists):
         store = FakeStore()
-        store.data[("test-auth", "operator")]["metadata"]["tenant_memberships"][0]["role"] = "tenant_user"
+        store.data[("test-auth", "operator")]["memberships"][0]["role"] = "tenant_user"
         if not tenant_exists:
           del store.data[(TENANT_HKEY, TENANT_KEY)]
-        context, decision = service(store).authorize({"account_id": "operator"}, "tasks:launch", "a",
+        context, decision = service(store).authorize({"account_id": "operator"}, "tasks:launch", T,
                                                    asset_ids=["asset-1"])
         self.assertIsNone(context)
         self.assertEqual(decision, PolicyDecision(False, 403, "forbidden") if tenant_exists
@@ -93,7 +104,7 @@ class TestTenantResolution(unittest.TestCase):
       with self.subTest(failed=failed):
         store = FakeStore()
         store.fail_on = failed
-        self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:launch", "a",
+        self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:launch", T,
                                                  asset_ids=["asset-1"]),
                          (None, PolicyDecision(False, 503, "unavailable")))
 
@@ -101,23 +112,23 @@ class TestTenantResolution(unittest.TestCase):
     for namespace in (None, "", " ", True, [], {}):
       with self.subTest(namespace=namespace):
         store = FakeStore()
-        self.assertEqual(service(store, namespace).authorize({"account_id": "operator"}, "reports:view", "a"),
+        self.assertEqual(service(store, namespace).authorize({"account_id": "operator"}, "reports:view", T),
                          (None, PolicyDecision(False, 503, "unavailable")))
         self.assertEqual(store.reads, [("test-auth", "operator")])
 
   def test_non_task_context_never_labels_caller_asset_ids_as_validated(self):
     store = FakeStore()
-    context, decision = service(store).authorize({"account_id": "operator"}, "reports:view", "a",
-                                               asset_ids=["not-checked", {"tenant_id": "b"}])
+    context, decision = service(store).authorize({"account_id": "operator"}, "reports:view", T,
+                                               asset_ids=["not-checked", {"tenant_id": T2}])
     self.assertTrue(decision.allowed)
     self.assertEqual(context.asset_ids, ())
     self.assertEqual(store.reads, [("test-auth", "operator"), (TENANT_HKEY, TENANT_KEY)])
 
   def test_malformed_task_selectors_deny_before_asset_reads(self):
-    for ids in (None, "asset-1", {}, [], [None], [1], [""], [" "], ["asset-1", {"owner": "a"}]):
+    for ids in (None, "asset-1", {}, [], [None], [1], [""], [" "], ["asset-1", {"owner": T}]):
       with self.subTest(ids=ids):
         store = FakeStore()
-        self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:launch", "a", asset_ids=ids),
+        self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:launch", T, asset_ids=ids),
                          (None, PolicyDecision(False, 404, "not_found")))
         self.assertEqual(store.reads, [("test-auth", "operator"), (TENANT_HKEY, TENANT_KEY)])
 
@@ -132,7 +143,7 @@ class TestTenantResolution(unittest.TestCase):
       return original_read(**kwargs)
 
     store.hget = mutating_read
-    context, decision = service(store).authorize({"account_id": "operator"}, "tasks:launch", "a", asset_ids=ids)
+    context, decision = service(store).authorize({"account_id": "operator"}, "tasks:launch", T, asset_ids=ids)
     self.assertTrue(decision.allowed)
     self.assertEqual(context.asset_ids, ("asset-1",))
 
@@ -142,14 +153,14 @@ class TestTenantResolution(unittest.TestCase):
     actor = {"account_id": "operator", "allow_pentester": True, "role": "super_tenant_admin"}
 
     def authorize():
-      return resolver.authorize(actor, "tasks:update", "a", asset_ids=("asset-1",))
+      return resolver.authorize(actor, "tasks:update", T, asset_ids=("asset-1",))
 
     self.assertTrue(authorize()[1].allowed)
     store.data[(TENANT_HKEY, TENANT_KEY)]["allow_pentester"] = False
     self.assertEqual(authorize(), (None, PolicyDecision(False, 403, "pentesting_disabled")))
-    store.data[(TENANT_HKEY, ASSET_KEY)]["tenant_id"] = "b"
+    store.data[(TENANT_HKEY, ASSET_KEY)]["tenant_id"] = T2
     self.assertEqual(authorize(), (None, PolicyDecision(False, 404, "not_found")))
-    store.data[("test-auth", "operator")]["metadata"]["tenant_memberships"] = []
+    store.data[("test-auth", "operator")]["memberships"] = []
     store.reads.clear()
     self.assertEqual(authorize(), (None, PolicyDecision(False, 404, "not_found")))
     self.assertEqual(store.reads, [("test-auth", "operator")])
@@ -159,18 +170,18 @@ class TestTenantResolution(unittest.TestCase):
   def test_invalid_or_silently_unavailable_facts_never_release_context(self):
     # Core can swallow a failed read as None: this must deny, but cannot promise a 503.
     for key in (TENANT_KEY, ASSET_KEY):
-      for change in (None, {"active": False}, {"namespace": "other"}, {"tenant_id": "b"}):
+      for change in (None, {"active": False}, {"namespace": "other"}, {"tenant_id": T2}):
         with self.subTest(key=key, change=change):
           store = FakeStore()
           store.data[(TENANT_HKEY, key)] = (None if change is None
                                           else {**store.data[(TENANT_HKEY, key)], **change})
-          self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:launch", "a",
+          self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:launch", T,
                                                    asset_ids=["asset-1"]),
                            (None, PolicyDecision(False, 404, "not_found")))
 
   def test_one_valid_asset_does_not_authorize_a_missing_second_asset(self):
     store = FakeStore()
-    self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:update", "a",
+    self.assertEqual(service(store).authorize({"account_id": "operator"}, "tasks:update", T,
                                              asset_ids=["asset-1", "missing"]),
                      (None, PolicyDecision(False, 404, "not_found")))
 
@@ -179,25 +190,25 @@ class TestTenantReadBoundary(unittest.TestCase):
   def test_full_field_keys_isolate_namespaces_even_when_hkey_hashes_collide(self):
     # Model a core hkey-prefix collision: both logical hashes share a bucket, but field keys survive.
     fields = {
-      '["tenant","deployment-a","a"]': {"schemaVersion": 1, "namespace": "deployment-a",
-                                          "tenant_id": "a", "active": True, "allow_pentester": False},
-      '["tenant","deployment-b","a"]': {"schemaVersion": 1, "namespace": "deployment-b",
-                                          "tenant_id": "a", "active": True, "allow_pentester": True},
-      '["asset","deployment-a","a","asset-1"]': {"schemaVersion": 1, "namespace": "deployment-a",
-                                                   "tenant_id": "a", "asset_id": "asset-1", "active": True},
+      _key("tenant", "deployment-a", T): {"schemaVersion": 1, "namespace": "deployment-a",
+                                          "tenant_id": T, "active": True, "allow_pentester": False},
+      _key("tenant", "deployment-b", T): {"schemaVersion": 1, "namespace": "deployment-b",
+                                          "tenant_id": T, "active": True, "allow_pentester": True},
+      _key("asset", "deployment-a", T, "asset-1"): {"schemaVersion": 1, "namespace": "deployment-a",
+                                                   "tenant_id": T, "asset_id": "asset-1", "active": True},
     }
     owner = SimpleNamespace(chainstore_hget=lambda *, hkey, key: fields.get(key))
     reader_a = CstoreTenantReader(owner, "deployment-a")
     reader_b = CstoreTenantReader(owner, "deployment-b")
-    self.assertEqual(reader_a.get_tenant_policy("a"), TenantPolicyContext("a", True, False))
-    self.assertEqual(reader_b.get_tenant_policy("a"), TenantPolicyContext("a", True, True))
-    self.assertEqual(reader_a.get_asset_owner("a", "asset-1"), "a")
-    self.assertIsNone(reader_b.get_asset_owner("a", "asset-1"))
+    self.assertEqual(reader_a.get_tenant_policy(T), TenantPolicyContext(T, True, False))
+    self.assertEqual(reader_b.get_tenant_policy(T), TenantPolicyContext(T, True, True))
+    self.assertEqual(reader_a.get_asset_owner(T, "asset-1"), T)
+    self.assertIsNone(reader_b.get_asset_owner(T, "asset-1"))
 
   def test_delimiter_bearing_identifiers_have_unambiguous_exact_keys(self):
     store = FakeStore()
-    selectors = [("x:y", "z", "a"), ("x", "y:z", "a"), ("x", "y", "z:a"),
-                 ('x\",\"y', "z", "a")]
+    selectors = [("x:y", "z", T), ("x", "y:z", T), ("x", "y", "z:a"),
+                 ('x\",\"y', "z", T)]
     for namespace, tenant, asset in selectors:
       CstoreTenantReader(SimpleNamespace(chainstore_hget=store.hget), namespace).get_asset_owner(tenant, asset)
     self.assertEqual(len({key for _, key in store.reads}), len(selectors))
@@ -208,10 +219,10 @@ class TestTenantReadBoundary(unittest.TestCase):
   def test_missing_projection_does_not_fall_back_to_legacy_or_unscoped_keys(self):
     store = FakeStore()
     row = store.data.pop((TENANT_HKEY, TENANT_KEY))
-    store.data[("inst:tenants", "a")] = row
-    store.data[(TENANT_HKEY, "a")] = row
+    store.data[("inst:tenants", T)] = row
+    store.data[(TENANT_HKEY, T)] = row
     self.assertIsNone(CstoreTenantReader(SimpleNamespace(chainstore_hget=store.hget), "deployment-a")
-                      .get_tenant_policy("a"))
+                      .get_tenant_policy(T))
     self.assertEqual(store.reads, [(TENANT_HKEY, TENANT_KEY)])
 
   def test_surfaced_adapter_error_is_typed(self):
@@ -219,7 +230,7 @@ class TestTenantReadBoundary(unittest.TestCase):
     store.fail_on = (TENANT_HKEY, TENANT_KEY)
     reader = CstoreTenantReader(SimpleNamespace(chainstore_hget=store.hget), "deployment-a")
     with self.assertRaises(TenantStoreError):
-      reader.get_tenant_policy("a")
+      reader.get_tenant_policy(T)
 
   def test_invalid_selectors_never_read_storage(self):
     store = FakeStore()
@@ -228,7 +239,7 @@ class TestTenantReadBoundary(unittest.TestCase):
       with self.subTest(selector=selector):
         self.assertIsNone(reader.get_tenant_policy(selector))
         self.assertIsNone(reader.get_asset_owner(selector, "asset-1"))
-        self.assertIsNone(reader.get_asset_owner("a", selector))
+        self.assertIsNone(reader.get_asset_owner(T, selector))
     self.assertEqual(store.reads, [])
 
   def test_tenant_projection_rejects_malformed_version_type_and_identity_bindings(self):
@@ -236,7 +247,7 @@ class TestTenantReadBoundary(unittest.TestCase):
     rows = [None, "null", "[]", "{", b"\xff", [], True, 1]
     for field, values in {
       "schemaVersion": (None, 0, 2, True, 1.0, "1"),
-      "namespace": (None, "deployment-b"), "tenant_id": (None, "b"),
+      "namespace": (None, "deployment-b"), "tenant_id": (None, T2),
       "active": (None, False, 1, "true"), "allow_pentester": (None, 1, "false"),
     }.items():
       for value in values:
@@ -247,14 +258,14 @@ class TestTenantReadBoundary(unittest.TestCase):
         store = FakeStore()
         store.data[(TENANT_HKEY, TENANT_KEY)] = row
         self.assertIsNone(CstoreTenantReader(SimpleNamespace(chainstore_hget=store.hget), "deployment-a")
-                          .get_tenant_policy("a"))
+                          .get_tenant_policy(T))
 
   def test_asset_projection_requires_exact_active_namespace_tenant_and_asset(self):
     original = FakeStore().data[(TENANT_HKEY, ASSET_KEY)]
     rows = [None, "null", "[]", "{", b"\xff", [], True, 1]
     for field, values in {
       "schemaVersion": (None, 0, 2, True, 1.0, "1"),
-      "namespace": (None, "deployment-b"), "tenant_id": (None, "b"),
+      "namespace": (None, "deployment-b"), "tenant_id": (None, T2),
       "asset_id": (None, "asset-2"), "active": (None, False, 1, "true"),
     }.items():
       for value in values:
@@ -265,7 +276,7 @@ class TestTenantReadBoundary(unittest.TestCase):
         store = FakeStore()
         store.data[(TENANT_HKEY, ASSET_KEY)] = row
         self.assertIsNone(CstoreTenantReader(SimpleNamespace(chainstore_hget=store.hget), "deployment-a")
-                          .get_asset_owner("a", "asset-1"))
+                          .get_asset_owner(T, "asset-1"))
 
   def test_bytes_json_and_dict_records_produce_same_valid_projection(self):
     for encode in (lambda row: row, json.dumps, lambda row: json.dumps(row).encode()):
@@ -273,5 +284,5 @@ class TestTenantReadBoundary(unittest.TestCase):
       for key in ((TENANT_HKEY, TENANT_KEY), (TENANT_HKEY, ASSET_KEY)):
         store.data[key] = encode(store.data[key])
       reader = CstoreTenantReader(SimpleNamespace(chainstore_hget=store.hget), "deployment-a")
-      self.assertEqual(reader.get_tenant_policy("a"), TenantPolicyContext("a", True, True))
-      self.assertEqual(reader.get_asset_owner("a", "asset-1"), "a")
+      self.assertEqual(reader.get_tenant_policy(T), TenantPolicyContext(T, True, True))
+      self.assertEqual(reader.get_asset_owner(T, "asset-1"), T)

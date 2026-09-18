@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 from .identity import IdentityStoreError, TenantMembership, canonical_account_id, holds_platform_role, resolve_actor
 from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles,
                      resolve_operation_roles, valid_account_scope)
-from .execution import CurrentExecutionFacts, ExecutionBinding, ExecutionRollout, ResolvedExecutionContext
+from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
 from .assets import canonical_digest, normalize_name, normalize_target, valid_digest
@@ -77,20 +77,6 @@ class TenantAdministrationService:
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
-
-  def read_execution_rollout(self, cfg_instance_id, *, enabled, stage):
-    """Read explicit setup state; runtime never initializes or repairs missing controls."""
-    record = self.store.get("execution_rollout", cfg_instance_id)
-    expected = {"schemaVersion", "namespace", "kind", "ids", "stage", "enabled"}
-    if (not isinstance(record, dict) or set(record) != expected
-        or type(record["schemaVersion"]) is not int or record["schemaVersion"] != 1
-        or record["namespace"] != self.store.namespace or record["kind"] != "execution_rollout"
-        or record["ids"] != [cfg_instance_id]):
-      raise TenantStoreError("Unknown execution rollout state")
-    try:
-      return ExecutionRollout(stage, enabled, record["stage"], record["enabled"])
-    except (ValueError, TypeError) as exc:
-      raise TenantStoreError("Invalid execution rollout controls") from exc
 
   def _actor(self, actor, *, creator=False):
     account, denial = resolve_actor(actor, self.accounts)

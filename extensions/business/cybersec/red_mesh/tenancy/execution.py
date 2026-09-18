@@ -11,48 +11,6 @@ from .nodes import valid_node_address
 _FACT_FIELDS = frozenset({"namespace", "tenant_id", "asset_id", "asset_target",
   "asset_target_digest", "actor_id", "actor_generation", "node_failure_policy"})
 _BINDING_FIELDS = _FACT_FIELDS | {"schema_version", "original_launcher", "participant_order"}
-_ROLLOUT_STAGES = ("compatibility", "draining", "tenant")
-
-
-@dataclass(frozen=True)
-class ExecutionRollout:
-  """Known controls for one operation; config and persisted state cannot relax each other."""
-  configured_stage: str
-  configured_enabled: bool
-  stored_stage: str
-  stored_enabled: bool
-
-  def __post_init__(self):
-    if (self.configured_stage not in _ROLLOUT_STAGES or self.stored_stage not in _ROLLOUT_STAGES
-        or type(self.configured_enabled) is not bool or type(self.stored_enabled) is not bool):
-      raise ValueError("Invalid execution rollout controls")
-
-  @property
-  def stage(self):
-    return _ROLLOUT_STAGES[max(_ROLLOUT_STAGES.index(self.configured_stage),
-                               _ROLLOUT_STAGES.index(self.stored_stage))]
-
-  def _matches(self, stage, enabled):
-    return (self.configured_stage == self.stored_stage == stage
-            and self.configured_enabled is enabled and self.stored_enabled is enabled)
-
-  def allows_new(self, *, bound, membership_key_present=None, selectors_omitted=False):
-    if type(bound) is not bool:
-      return False
-    if bound:
-      return self._matches("tenant", True)
-    return (self._matches("compatibility", False) and membership_key_present is False
-            and selectors_omitted is True)
-
-  def allows_existing(self, *, bound, operation="current", membership_key_present=None):
-    if type(bound) is not bool or operation not in ("current", "new_pass"):
-      return False
-    if operation == "new_pass":
-      return self.allows_new(bound=bound, membership_key_present=membership_key_present,
-        selectors_omitted=True)
-    if self.stage == "draining":
-      return True
-    return self._matches("tenant", True) if bound else self._matches("compatibility", False)
 
 
 def _validate_facts(value, *, failure_policy=True):

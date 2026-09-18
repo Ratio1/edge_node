@@ -12,6 +12,15 @@ skips/four warnings. The separate native semaphore contract passes four tests. T
 reviewers pass their non-authored B2 scopes in resumed round 2. This remains disabled implementation
 work, not tenant-serving activation evidence.
 
+**RM-084 P6 (2026-09-18): the compatibility half of this boundary is gone.** There is no unbound
+launch, no legacy read path and no rollout: `ExecutionRollout`, the `execution_rollout` store record,
+`TENANT_EXECUTION_ENABLED`/`TENANT_EXECUTION_STAGE`, `LegacyReadAccess` and `_admit_actor_only` are
+deleted. Every launch names `tenant_id`, `asset_id` and `expected_target_digest` (an incomplete
+selector is `400 invalid_request`); every job read names `tenant_id`; an unbound record can no longer
+be operated on. Paragraphs below that describe compatibility admission, `legacy_unbound` snapshots or
+rollout stages are the history of how the boundary was built, not current behaviour. The current
+account and authority contract is the hub's `docs/resources/redmesh/contracts/redmesh-auth.md`.
+
 ## Admission and compatibility
 
 The four launch endpoints and model-provider preflight append `tenant_id`, `asset_id` and
@@ -27,18 +36,11 @@ effects. The binding freezes original actor/incarnation, target/digest, failure 
 assigned worker order. Model jobs have one selected worker, not all candidate peers. Bound launch
 responses contain only their own job/config and never enumerate `other_jobs`.
 
-Source controls default to `TENANT_EXECUTION_ENABLED=False` and
-`TENANT_EXECUTION_STAGE="compatibility"`. The configured namespace and instance must also have
-explicit typed `execution_rollout` state in the existing administration store. Runtime never creates
-that state or treats missing/unavailable controls as permission. Tenant administration enablement is
-not execution enablement. M supplies setup/drain/cutover tools; do not manually activate this slice.
-
-Compatibility admission requires matching flag-false compatibility controls, all selectors omitted,
-and proof that the stored membership key is absent. Explicit empty membership, malformed metadata
-and unknown provenance are not legacy. A configured restrictive stage cannot be lowered by a stale
-stored stage; tenant-stage flag-off never falls back to legacy. Draining blocks new admission and
-new passes while current authorized work can settle. Stored JSON `execution_binding: null` is invalid;
-the optional typed Python field's `None` means that serialization omits the field entirely.
+Until RM-084 P6 a staged rollout (`TENANT_EXECUTION_ENABLED`, `TENANT_EXECUTION_STAGE` and a stored
+`execution_rollout` record) gated tenant execution, and a compatibility stage admitted selector-less
+launches for accounts with no membership key. All of that is removed: tenant execution is the only
+execution. Stored JSON `execution_binding: null` is invalid; the optional typed Python field's `None`
+means that serialization omits the field entirely.
 
 ## Execution and external effects
 

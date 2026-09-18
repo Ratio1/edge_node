@@ -95,7 +95,7 @@ def test_checked_model_error_is_typed_and_unchecked_compatibility_remains(reader
 @pytest.mark.parametrize("role", ("tenant_admin", "tenant_pentester", "tenant_user", "super_tenant_admin"))
 def test_endpoint_admits_every_tenant_reader(reader, key, published, role):
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     writes = list(fixture.store.writes)
     result = getattr(fixture.Plugin, reader.__name__)(fixture.owner, "job-1", request_actor=fixture.actor,
@@ -135,7 +135,7 @@ def test_real_account_and_stored_job_denials_have_no_effects(reader, key, publis
     if fault == "actorless":
       actor = None
     elif fault.endswith("memberships"):
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = {
+      fixture.store.data[("auth", "reader")]["memberships"] = {
         "empty_memberships": [], "null_memberships": None, "malformed_memberships": "private",
       }[fault]
     elif fault == "inactive":
@@ -260,7 +260,7 @@ def test_actual_native_denials_are_sanitized_and_no_store(read_native, reader, k
     if outcome == "model":
       fixture.job["job_type"] = "model_test"
     elif outcome == "member":
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = []
+      fixture.store.data[("auth", "reader")]["memberships"] = []
     elif outcome == "missing":
       fixture.store.jobs.clear()
     elif outcome == "actorless":
@@ -268,7 +268,7 @@ def test_actual_native_denials_are_sanitized_and_no_store(read_native, reader, k
     elif outcome == "malformed":
       fixture.job[key] = {"result": {"private": "hidden"}}
     elif outcome == "tenant_user":
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+      fixture.store.data[("auth", "reader")]["memberships"] = [
         {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     elif outcome == "no_tenant":
       payload.pop("tenant_id")

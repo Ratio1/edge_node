@@ -94,17 +94,42 @@ def _call_launch(endpoint, plugin, **kwargs):
 
 
 def _known_rollout(plugin):
-  """These attribution tests use explicit compatibility controls, not absent state."""
-  from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
+  """A launch admitted into a bound tenant execution (RM-084 P6: there is no unbound launch).
+
+  These are attribution tests: what they assert is that the endpoint resolves the account through
+  the real seam and records it, not which tenant it is admitted to. So the account comes from
+  `_resolve_launch_actor` -- the real store reader on a real plugin -- and only the tenant half of the
+  admission is stubbed. Admission itself is covered by `test_tenant_execution*.py`.
+  """
+  from .test_api import _bound_context
   plugin.cfg_instance_id = "fixture-instance"
-  plugin.cfg_tenant_execution_enabled = False
-  plugin.cfg_tenant_execution_stage = "compatibility"
-  service = MagicMock()
-  service.read_execution_rollout.return_value = ExecutionRollout("compatibility", False, "compatibility", False)
-  plugin._execution_service = lambda: service
-  plugin._admit_execution = lambda *args: PentesterApi01Plugin._admit_execution(plugin, *args)
+  plugin._execution_service = lambda: MagicMock()
+
+  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None):
+    account, denial = plugin._resolve_launch_actor(actor)
+    if denial:
+      return None, None, denial
+    return account, _bound_context(), None
+
+  plugin._admit_execution = admit
   return plugin
+
+
+def _account_record(account_id="ops.user", **overrides):
+  """A v1 account record as the Navigator writes it (tenancy/account_record.py)."""
+  record = {
+    "schemaVersion": 1, "accountId": account_id, "state": "active",
+    "generation": "2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d",
+    "password": {"algo": "argon2id", "v": 19, "m": 65536, "t": 3, "p": 1, "len": 32,
+                 "salt": "c2FsdHNhbHRzYWx0c2FsdA==",
+                 "hash": "aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g="},
+    "memberships": [{"role": "super_tenant_admin", "tenant_id": None}],
+    "createdAt": "2026-01-01T00:00:00.000Z", "createdBy": "@bootstrap",
+    "updatedAt": "2026-01-01T00:00:00.000Z", "updatedBy": "@bootstrap",
+    "passwordChangedAt": "2026-01-01T00:00:00.000Z",
+  }
+  record.update(overrides)
+  return record
 
 
 def _endpoints(plugin_cls):
@@ -176,9 +201,10 @@ class TestAuthzSurface(unittest.TestCase):
     from .read_endpoint_fixtures import read_endpoint_fixture
     with patch.dict("os.environ", {}, clear=True), \
          patch("extensions.business.cybersec.red_mesh.pentester_api_01.get_capability_status", return_value={"ok": True}), \
-         read_endpoint_fixture(bound=False) as fixture:
+         read_endpoint_fixture() as fixture:
       self.assertEqual(self.Plugin.get_capability_status(fixture.owner), {"ok": True})
-      result = self.Plugin.get_job_status(fixture.owner, "job-1", request_actor=fixture.actor)
+      result = self.Plugin.get_job_status(fixture.owner, "job-1", request_actor=fixture.actor,
+                                          tenant_id=fixture.tenant_id)
       self.assertEqual(result["job_id"], "job-1")
       self.assertEqual(result["job"]["job_status"], "FINALIZED")
 
@@ -199,7 +225,7 @@ class TestAuthzSurface(unittest.TestCase):
           downstream.assert_not_called()
 
   def test_launch_endpoints_deny_a_missing_or_unknown_actor_before_launching(self):
-    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
 
     for name in ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test"):
       with self.subTest(endpoint=name):
@@ -213,7 +239,7 @@ class TestAuthzSurface(unittest.TestCase):
         seen = {}
         plugin = MagicMock()
         plugin._resolve_launch_actor = lambda actor=None: (
-          AccountView("ops.user", "admin", None, True, tenant_memberships_present=False), None)
+          AccountView("ops.user", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),)), None)
         target = {
           "launch_network_scan": "extensions.business.cybersec.red_mesh.pentester_api_01.launch_network_scan",
           "launch_webapp_scan": "extensions.business.cybersec.red_mesh.pentester_api_01.launch_webapp_scan",
@@ -234,13 +260,13 @@ class TestAuthzSurface(unittest.TestCase):
     self.assertEqual(err["status_code"], 404)
 
   def test_launch_endpoints_reject_explicitly_non_active_stored_accounts(self):
+    # The two real non-active states, and values no writer produces (which make the record malformed).
+    at = {"stateChangedAt": "2026-01-02T00:00:00.000Z", "stateChangedBy": "admin.user"}
     for name in ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test"):
-      for state in (None, "deleting", "", False, 0, [], {}):
+      for state in ("deactivated", "deleting", None, "", False, 0, [], {}):
         with self.subTest(endpoint=name, state=state):
           plugin = object.__new__(self.Plugin)
-          plugin.chainstore_hget = MagicMock(return_value={
-            "type": "simple", "role": "user", "metadata": {"navigatorAccountState": state},
-          })
+          plugin.chainstore_hget = MagicMock(return_value=_account_record(state=state, **at))
           target = f"extensions.business.cybersec.red_mesh.pentester_api_01.{name}"
           with patch(target, return_value={"unexpected_launch": True}) as launch, \
                patch.dict("os.environ", {
@@ -282,10 +308,11 @@ class TestAuthzSurface(unittest.TestCase):
 
   def test_real_active_account_overrides_request_attribution_without_new_token(self):
     for name in LAUNCH_ENDPOINTS:
-      for metadata in ({}, {"navigatorAccountState": "active"}):
-        with self.subTest(endpoint=name, metadata=metadata):
+      for memberships in ([{"role": "super_tenant_admin", "tenant_id": None}],
+                          [{"role": "tenant_pentester", "tenant_id": "tn_00000000-0000-4000-8000-000000000001"}]):
+        with self.subTest(endpoint=name, memberships=memberships):
           plugin = object.__new__(self.Plugin)
-          plugin.chainstore_hget = MagicMock(return_value={"type": "simple", "role": "user", "metadata": metadata})
+          plugin.chainstore_hget = MagicMock(return_value=_account_record(memberships=memberships))
           env = {"R1EN_CSTORE_AUTH_HKEY": "app:auth"}
           if name == "launch_model_test":
             env["REDMESH_BACKEND_TOKEN"] = TEST_CHANNEL_TOKEN + "\n"
@@ -303,7 +330,7 @@ class TestAuthzSurface(unittest.TestCase):
       for version in ([], {}, True, False, 1.0, 0.0, "1", None):
         with self.subTest(endpoint=name, version=version):
           plugin = object.__new__(self.Plugin)
-          plugin.chainstore_hget = MagicMock(return_value={"type": "simple", "schemaVersion": version})
+          plugin.chainstore_hget = MagicMock(return_value=_account_record(schemaVersion=version))
           env = {"R1EN_CSTORE_AUTH_HKEY": "app:auth"}
           if name == "launch_model_test":
             env["REDMESH_BACKEND_TOKEN"] = TEST_CHANNEL_TOKEN
@@ -354,12 +381,12 @@ class TestInternalCallersDoNotReenterEndpoints(unittest.TestCase):
 
   def test_launch_test_compat_shim_reaches_the_module_launcher_with_attribution(self):
     from extensions.business.cybersec.red_mesh.services import launch_api
-    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
 
     plugin = MagicMock()
     _known_rollout(plugin)
     plugin._resolve_launch_actor = lambda actor=None: (
-      AccountView("ops.user", "admin", None, True, tenant_memberships_present=False), None)
+      AccountView("ops.user", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),)), None)
     seen = {}
     with patch.object(launch_api, "launch_network_scan", side_effect=lambda owner, **kw: seen.update(kw) or {"ok": True}):
       result = self.Plugin.launch_test(

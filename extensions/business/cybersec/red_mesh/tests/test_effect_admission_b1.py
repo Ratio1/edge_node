@@ -24,7 +24,7 @@ def call(fixture, name, **kwargs):
 
 
 def as_tenant_user(fixture):
-  fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+  fixture.store.data[("auth", "reader")]["memberships"] = [
     {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
 
 
@@ -59,7 +59,7 @@ def test_denials_are_effect_free_and_write_no_status_record(name, fault, status)
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "user": as_tenant_user(fixture)
-    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
+    elif fault == "memberships": account["memberships"] = []
     elif fault == "other_tenant": kwargs["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "no_tenant": kwargs["tenant_id"] = None
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"
@@ -142,7 +142,7 @@ def test_test_event_export_requires_the_export_authority():
 
 def test_test_event_export_admits_a_tenant_pentester():
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": "tenant_pentester", "tenant_id": fixture.tenant_id}]
     result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert not (result.get("success") is False and result.get("status_code") in (400, 403, 404))

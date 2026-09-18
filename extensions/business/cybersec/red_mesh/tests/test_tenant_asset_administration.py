@@ -69,7 +69,7 @@ class TestTenantAssetAdministration(unittest.TestCase):
       ((("tenant_admin", self.tenant),), False, False),
       ((("tenant_user", self.tenant),), False, False),
       ((("tenant_admin", self.tenant), ("tenant_pentester", self.tenant)), False, True),
-      ((("super_pentester", "foreign"), ("super_pentester", self.tenant)), True, True),
+      ((("super_pentester", "tn_87654321-4321-4321-8321-cba987654321"), ("super_pentester", self.tenant)), True, True),
     )
     for allow_pentester in (False, True):
       self.assertTrue(self.service.update_tenant_allow_pentester(

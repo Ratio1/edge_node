@@ -18,7 +18,7 @@ from extensions.business.cybersec.red_mesh.tenancy.policy import (
 
 
 def account(*memberships):
-  return AccountView("operator", "admin", "admin", True, tuple(
+  return AccountView("operator", True, tenant_memberships=tuple(
     TenantMembership(role, tenant_id) for role, tenant_id in memberships
   ))
 
@@ -198,64 +198,58 @@ class TestTenantPolicy(unittest.TestCase):
 
 class TestIdentityPolicyBoundary(unittest.TestCase):
   def test_real_reader_ignores_forged_role_scope_and_owner_fields(self):
-    raw = json.dumps({"role": "admin", "metadata": {"tenant_memberships": [
-      {"role": "super_pentester", "tenant_id": "a"},
-    ]}})
+    from .test_account_record_v1 import T1, T2, record
+    raw = json.dumps(record("operator", memberships=[{"role": "tenant_pentester", "tenant_id": T1}]))
     store = {"operator": raw}
     reader = CstoreAuthAccountReader(SimpleNamespace(chainstore_hget=lambda **kw: store.get(kw["key"])))
-    forged = {"account_id": " OPERATOR ", "role": "super_tenant_admin", "tenant_id": "b",
+    forged = {"account_id": " OPERATOR ", "role": "super_tenant_admin", "tenant_id": T2,
               "scope": "*", "owner": "operator", "tenant_memberships": [
                 {"role": "super_tenant_admin", "tenant_id": None},
               ]}
     with patch.dict("os.environ", {AUTH_HKEY_ENV: "test-policy-auth"}):
       actor, error = resolve_actor(forged, reader)
     self.assertIsNone(error)
-    self.assertTrue(authorize_tenant_operation(actor, "assets:create", TenantPolicyContext("a", True, True)).allowed)
-    self.assertEqual(authorize_tenant_operation(actor, "assets:create", TenantPolicyContext("b", True, True)),
+    self.assertTrue(authorize_tenant_operation(actor, "reports:export", TenantPolicyContext(T1, True, True)).allowed)
+    self.assertEqual(authorize_tenant_operation(actor, "reports:export", TenantPolicyContext(T2, True, True)),
                      PolicyDecision(False, 404, "not_found"))
 
-  def test_fresh_reader_result_revokes_authority_without_legacy_or_policy_cache_fallback(self):
-    store = {"operator": json.dumps({"role": "admin"})}
+  def test_fresh_reader_result_revokes_authority_without_policy_cache_fallback(self):
+    from .test_account_record_v1 import T2, record
+    platform = [{"role": "super_tenant_admin", "tenant_id": None}]
+    store = {"operator": json.dumps(record("operator", memberships=platform))}
     reader = CstoreAuthAccountReader(SimpleNamespace(chainstore_hget=lambda **kw: store.get(kw["key"])))
-    tenant = TenantPolicyContext("a", True, True)
+    tenant = TenantPolicyContext("tn_12345678-1234-4234-8234-123456789abc", True, True)
+    stamp = {"stateChangedAt": "2026-01-02T00:00:00.000Z", "stateChangedBy": "admin.user"}
     with patch.dict("os.environ", {AUTH_HKEY_ENV: "test-policy-auth"}):
       actor, error = resolve_actor({"account_id": "operator"}, reader)
       self.assertIsNone(error)
       self.assertTrue(authorize_tenant_operation(actor, "assets:create", tenant).allowed)
-      for metadata in ({"tenant_memberships": []}, {"tenant_memberships": None}, None,
-                       {"navigatorAccountState": "deleting"},
-                       {"tenant_memberships": [{"role": "tenant_user", "tenant_id": "b"}]}):
-        with self.subTest(metadata=metadata):
-          store["operator"] = json.dumps({"role": "admin", "metadata": metadata})
+      for revoked in (record("operator", memberships=[]),
+                      {**record("operator"), "memberships": None},
+                      record("operator", memberships=platform, state="deleting", **stamp),
+                      record("operator", memberships=platform, state="deactivated", **stamp),
+                      record("operator", memberships=[{"role": "tenant_user", "tenant_id": T2}])):
+        with self.subTest(revoked=revoked):
+          store["operator"] = json.dumps(revoked)
           actor, _ = resolve_actor({"account_id": "operator"}, reader)
           self.assertEqual(authorize_tenant_operation(actor, "assets:create", tenant),
                            PolicyDecision(False, 404, "not_found"))
 
 
-class TestLegacyRoleNeverAuthorizes(unittest.TestCase):
-  """RM-082. policy.py:5 says the legacy account role and app_role never grant authority; pin it."""
+class TestNoAccountRole(unittest.TestCase):
+  """RM-082 pinned that the account role and `app_role` never grant authority. RM-084 P6 removed them:
+  the resolved identity has no field that could carry one, so the rule no longer needs a sweep."""
 
-  def test_role_and_app_role_never_change_a_decision(self):
-    from extensions.business.cybersec.red_mesh.tenancy.policy import _ROLE_OPERATIONS
-    operations = sorted(set().union(*_ROLE_OPERATIONS.values()) | {"unknown:operation"})
-    membership_sets = ((), (("tenant_user", "a"),), (("tenant_admin", "a"),), (("tenant_pentester", "a"),),
-                       (("super_pentester", None),), (("super_tenant_admin", None),), (("super_tenant_admin", "b"),))
-    legacy = (("admin", "admin"), ("admin", None), ("user", "pentester"), ("user", None), ("pentester", "user"))
-    for memberships in membership_sets:
-      rows = tuple(TenantMembership(role, tenant_id) for role, tenant_id in memberships)
-      for operation in operations:
-        for allow_pentester in (False, True):
-          context = TenantPolicyContext("a", True, allow_pentester)
-          decisions = {authorize_tenant_operation(AccountView("operator", role, app_role, True, rows),
-                                                  operation, context)
-                       for role, app_role in legacy}
-          with self.subTest(memberships=memberships, operation=operation, allow_pentester=allow_pentester):
-            self.assertEqual(len(decisions), 1, decisions)
+  def test_the_resolved_identity_carries_no_account_role(self):
+    from dataclasses import fields
+    self.assertEqual({field.name for field in fields(AccountView)},
+                     {"account_id", "active", "state", "tenant_memberships", "account_generation"})
 
-  def test_adapter_role_vocabulary_is_the_matrix(self):
-    from extensions.business.cybersec.red_mesh.tenancy.adapters import cstore_identity
+  def test_record_role_vocabulary_is_the_matrix(self):
+    from extensions.business.cybersec.red_mesh.tenancy.account_record import MEMBERSHIP_ROLES
     from extensions.business.cybersec.red_mesh.tenancy.policy import PLATFORM_ROLES, TENANT_LOCAL_ROLES, _ROLE_OPERATIONS
-    self.assertEqual(cstore_identity.PLATFORM_ROLES | cstore_identity.TENANT_ROLES, frozenset(_ROLE_OPERATIONS))
+    self.assertEqual(MEMBERSHIP_ROLES, PLATFORM_ROLES | TENANT_LOCAL_ROLES)
+    self.assertLessEqual(MEMBERSHIP_ROLES, frozenset(_ROLE_OPERATIONS))
     self.assertEqual(TENANT_LOCAL_ROLES, frozenset({"tenant_admin", "tenant_pentester", "tenant_user"}))
     self.assertEqual(PLATFORM_ROLES, frozenset({"super_tenant_admin", "super_pentester"}))
 

@@ -60,7 +60,7 @@ def test_denials_never_redact_or_delete_a_document(fault, status):
     if fault == "actor": actor = None
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "none_scope": account["metadata"]["tenant_memberships"] = []
+    elif fault == "none_scope": account["memberships"] = []
     # The owning tenant's own administrator does not hold `engagement:delete` (RM-084 P3).
     elif fault == "tenant_admin": as_role(fixture, "tenant_admin")
     elif fault == "missing_tenant": tenant_id = None

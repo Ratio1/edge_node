@@ -39,7 +39,7 @@ def apply_fault(fixture, fault):
     fixture.store.account("reader", active=False,
       memberships=[{"role": "tenant_admin", "tenant_id": fixture.tenant_id}])
   elif fault == "none_scope":
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = []
+    fixture.store.data[("auth", "reader")]["memberships"] = []
   elif fault == "user":
     as_role(fixture, "tenant_user")
   elif fault == "other_tenant":
@@ -123,7 +123,7 @@ def test_upload_denials_never_reach_storage(fault, status):
     if fault == "actor": actor = None
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "tenant_user": as_role(fixture, "tenant_user")
-    elif fault == "none_scope": account["metadata"]["tenant_memberships"] = []
+    elif fault == "none_scope": account["memberships"] = []
     elif fault == "missing_tenant": tenant_id = None
     import sys
     plugin_module = sys.modules[fixture.Plugin.__module__]

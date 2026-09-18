@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
 from extensions.business.cybersec.red_mesh.tenancy.effects import EffectLedger
-from .read_endpoint_fixtures import install_legacy_read_store
+from .read_endpoint_fixtures import install_tenant_read_store
 
 
 def _install_pymisp_stub():
@@ -139,11 +139,14 @@ class TestPhase12LiveProgress(unittest.TestCase):
     return PentesterApi01Plugin
 
   def _read_actor(self, plugin):
+    """RM-084 P6: the reader admits through a real tenant; the selector is stashed for the call."""
     job = plugin.chainstore_hget.return_value
     live = plugin.chainstore_hgetall.return_value
     plugin.chainstore_hget.side_effect = lambda hkey, key: live.get(key) if hkey.endswith(":live") else None
     jobs = {job["job_id"]: job} if isinstance(job, dict) else {}
-    return install_legacy_read_store(self, plugin, self._get_plugin_class(), jobs=jobs)
+    actor, tenant_id = install_tenant_read_store(self, plugin, self._get_plugin_class(), jobs=jobs)
+    self._tenant_id = tenant_id
+    return actor
 
   def _make_live_hsync_plugin(self, jobs, live_payloads, cfg=None, now=100.0, last_hsync_at=0.0):
     """Build a plugin mock backed by mutable job/live dictionaries."""
@@ -291,7 +294,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["job_id"], "job-A")
     self.assertEqual(result["status"], "RUNNING")
     self.assertEqual(len(result["workers"]), 2)
@@ -309,7 +312,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {}
     plugin.chainstore_hget.return_value = None
 
-    result = Plugin.get_job_progress(plugin, job_id="nonexistent", request_actor=self._read_actor(plugin))
+    result = Plugin.get_job_progress(plugin, job_id="nonexistent", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result, {"success": False, "error": "not_found", "status_code": 404})
 
   def test_get_job_progress_marks_unseen_assigned_worker(self):
@@ -328,7 +331,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["assignment_revision"], 2)
@@ -366,7 +369,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "revision_mismatch")
@@ -404,7 +407,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "pass_mismatch")
@@ -431,7 +434,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.time.return_value = 100.0
     plugin.P = MagicMock()
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin))
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
@@ -2369,7 +2372,7 @@ class TestPurgeAllJobs(unittest.TestCase):
                       staticmethod(lambda _self, _actor, _tenant, apply_effect, **_kwargs:
                                    apply_effect({}, "tenant_bound", EffectLedger()))):
       result = Plugin.purge_all_redmesh_data(plugin, request_actor={"account_id": "reader"},
-                                             tenant_id="tn_example")
+                                             tenant_id="tn_7bd2f70d-0000-4000-8000-000000000002")
     self.assertEqual(result["status"], "error")
     self.assertIn("confirm", result["message"].lower())
     plugin.stop_and_delete_job.assert_not_called()
@@ -2481,7 +2484,9 @@ class TestPhase15Listing(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {"job-1": finalized_stub}
     plugin._normalize_job_record = MagicMock(return_value=("job-1", finalized_stub))
 
-    result = Plugin.list_network_jobs(plugin, request_actor=install_legacy_read_store(self, plugin, Plugin))
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin,
+                                                 jobs=plugin.chainstore_hgetall.return_value)
+    result = Plugin.list_network_jobs(plugin, request_actor=actor, tenant_id=tenant_id)
     self.assertIn("job-1", result)
     entry = result["job-1"]
 
@@ -2537,7 +2542,9 @@ class TestPhase15Listing(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {"job-2": running_spec}
     plugin._normalize_job_record = MagicMock(return_value=("job-2", running_spec))
 
-    result = Plugin.list_network_jobs(plugin, request_actor=install_legacy_read_store(self, plugin, Plugin))
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin,
+                                                 jobs=plugin.chainstore_hgetall.return_value)
+    result = Plugin.list_network_jobs(plugin, request_actor=actor, tenant_id=tenant_id)
     self.assertIn("job-2", result)
     entry = result["job-2"]
 

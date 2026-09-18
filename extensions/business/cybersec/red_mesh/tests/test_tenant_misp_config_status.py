@@ -89,7 +89,7 @@ def test_actual_native_preserves_integration_view_for_every_export_role(read_nat
   module, _ = read_native
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     install_config_producer(fixture)
     module.eng = scheduler_comms(fixture, response_format)
@@ -144,10 +144,10 @@ def test_native_denials_precede_configuration_and_other_effects(read_native, res
     elif fault == "identity_store":
       fixture.store.fail_hkey = "auth"
     elif fault.endswith("memberships"):
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = {
+      fixture.store.data[("auth", "reader")]["memberships"] = {
         "empty_memberships": [], "null_memberships": None, "malformed_memberships": "private"}[fault]
     elif fault == "tenant_user":
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+      fixture.store.data[("auth", "reader")]["memberships"] = [
         {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     elif fault == "other_tenant":
       body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"

@@ -57,7 +57,7 @@ def test_denials_never_stop_a_worker_or_emit_a_lifecycle_event(fault, status):
     if fault == "actor": actor = None
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "none_scope": account["metadata"]["tenant_memberships"] = []
+    elif fault == "none_scope": account["memberships"] = []
     elif fault == "tenant_user": as_role(fixture, "tenant_user")
     elif fault == "missing_tenant": tenant_id = None
     elif fault == "other_tenant": tenant_id = OTHER_TENANT

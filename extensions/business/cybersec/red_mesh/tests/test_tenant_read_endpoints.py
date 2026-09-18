@@ -18,7 +18,7 @@ REQUESTS = {
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
 @pytest.mark.parametrize("name", ("list_network_jobs", "list_local_jobs"))
 def test_supported_response_hook_protects_list_data_without_changing_direct_results(response_format, name):
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture() as fixture:
     fixture.owner.cfg_response_format = response_format
     jobs = {"status_code": {"job_id": "job-1"}, "error": {"job_id": "job-2"}}
     before = deepcopy(jobs)
@@ -38,7 +38,7 @@ def test_supported_response_hook_protects_list_data_without_changing_direct_resu
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
 @pytest.mark.parametrize("status", (403, 404, 503))
 def test_supported_response_hook_preserves_real_denials_and_unrelated_responses(response_format, status):
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture() as fixture:
     fixture.owner.cfg_response_format = response_format
     denied = {"success": False, "error": "forbidden", "status_code": status}
     value = denied if response_format == "RAW" else {"result": denied, "status_code": status}
@@ -58,10 +58,9 @@ def invoke(fixture, name, *, actor=None, tenant_id=None, args=None):
     tenant_id=fixture.tenant_id if tenant_id is None else tenant_id)
 
 
-@pytest.mark.parametrize("bound", (False, True))
 @pytest.mark.parametrize("name", REQUESTS)
-def test_every_endpoint_reads_from_fresh_stored_requester_and_checked_job(bound, name):
-  with read_endpoint_fixture(bound=bound) as fixture:
+def test_every_endpoint_reads_from_fresh_stored_requester_and_checked_job(name):
+  with read_endpoint_fixture() as fixture:
     writes = list(fixture.store.writes)
     result = invoke(fixture, name)
     assert isinstance(result, dict) and "error" not in result, result
@@ -76,14 +75,13 @@ def test_every_endpoint_reads_from_fresh_stored_requester_and_checked_job(bound,
     elif name == "get_audit_log":
       assert result == {"audit_log": [{"job_id": "job-1", "event": "visible"}], "total": 1}
     elif name == "list_network_jobs":
-      assert list(result) == ["job-1" if bound else "legacy-alias"]
+      assert list(result) == ["job-1"]
 
 
-@pytest.mark.parametrize("bound", (False, True))
 @pytest.mark.parametrize("name", REQUESTS)
 @pytest.mark.parametrize("fault", ("revoked", "missing", "malformed", "memberships"))
-def test_denial_precedes_jobs_artifacts_and_audit(bound, name, fault):
-  with read_endpoint_fixture(bound=bound) as fixture:
+def test_denial_precedes_jobs_artifacts_and_audit(name, fault):
+  with read_endpoint_fixture() as fixture:
     if fault == "revoked":
       fixture.store.account("reader", active=False)
     elif fault == "missing":
@@ -101,9 +99,11 @@ def test_denial_precedes_jobs_artifacts_and_audit(bound, name, fault):
 
 @pytest.mark.parametrize("name", REQUESTS)
 def test_tenant_account_selector_omission_never_becomes_legacy(name):
+  # RM-084 P6: omitting the selector used to fall to the legacy read path; there is none, so the
+  # request is malformed whoever makes it.
   with read_endpoint_fixture() as fixture:
-    result = getattr(fixture.Plugin, name)(fixture.owner, *REQUESTS[name], request_actor=fixture.actor)
-    assert result["status_code"] == 403
+    result = getattr(fixture.Plugin, name)(fixture.owner, *REQUESTS[name], request_actor=fixture.actor, tenant_id=None)
+    assert result["status_code"] == 400
     assert fixture.artifact_reads == []
 
 
@@ -123,9 +123,8 @@ def test_point_requests_never_recover_foreign_jobs_or_select_list_response(name)
       assert not any(row[0] == "list" for row in fixture.store.reads)
 
 
-@pytest.mark.parametrize("bound", (False, True))
-def test_absence_is_404_broken_reference_is_503_and_empty_lists_are_success(bound):
-  with read_endpoint_fixture(bound=bound, archived=False) as fixture:
+def test_absence_is_404_broken_reference_is_503_and_empty_lists_are_success():
+  with read_endpoint_fixture(archived=False) as fixture:
     assert invoke(fixture, "get_job_archive")["status_code"] == 404
     fixture.artifacts["pass"].pop("llm_analysis")
     assert invoke(fixture, "get_analysis")["status_code"] == 404
@@ -165,21 +164,21 @@ def test_endpoint_signatures_preserve_all_original_positional_fields():
       assert all(parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for parameter in parameters.values())
 
 
-def test_reused_owner_observes_current_rollout_and_account_each_time():
-  with read_endpoint_fixture(bound=False) as fixture:
-    assert "error" not in invoke(fixture, "get_job_data")
-    fixture.owner.cfg_tenant_execution_stage = "draining"
-    assert invoke(fixture, "get_job_data")["status_code"] == 403
-    fixture.owner.cfg_tenant_execution_stage = "compatibility"
+def test_reused_owner_observes_the_current_account_each_time():
+  with read_endpoint_fixture() as fixture:
     assert "error" not in invoke(fixture, "get_job_data")
     fixture.store.account("reader", active=False)
     assert invoke(fixture, "get_job_data")["status_code"] == 404
+    fixture.store.account("reader", memberships=[{"role": "tenant_admin", "tenant_id": fixture.tenant_id}])
+    assert "error" not in invoke(fixture, "get_job_data")
 
 
-def test_direct_legacy_cannot_access_any_present_binding_or_unassociated_cid():
+def test_a_scoped_read_cannot_reach_a_job_whose_binding_is_absent_or_foreign():
+  # RM-084 P6: the unbound job the legacy path used to serve is, to a scoped caller, not in its tenant.
   for binding in (None, {}, {"namespace": "foreign"}):
-    with read_endpoint_fixture(bound=False) as fixture:
+    with read_endpoint_fixture() as fixture:
       fixture.job["execution_binding"] = deepcopy(binding)
       result = invoke(fixture, "get_report")
       assert result["status_code"] == 404
       assert fixture.artifact_reads == []
+

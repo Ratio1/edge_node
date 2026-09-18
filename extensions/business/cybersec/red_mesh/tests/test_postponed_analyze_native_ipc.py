@@ -351,7 +351,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     owner = _Owner(_blocking_worker)
     self._bypass_admission_for(owner)
     from .read_endpoint_fixtures import read_endpoint_fixture
-    read_fixture = self.enterContext(read_endpoint_fixture(bound=False, archived=False))
+    read_fixture = self.enterContext(read_endpoint_fixture(archived=False))
     self.addCleanup(owner._manual_analysis_executor.shutdown, wait=False)
     harness = _SchedulerHarness.__new__(_SchedulerHarness)
     harness._endpoints = {
@@ -509,7 +509,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/get_job_status",
-            payload={"job_id": "job-1", "request_actor": read_fixture.actor},
+            payload={"job_id": "job-1", "request_actor": read_fixture.actor,
+                     "tenant_id": read_fixture.tenant_id},
           )
           self.assertEqual(status, 200, body)
           self.assertLess(elapsed, 1.0)

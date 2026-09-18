@@ -100,34 +100,28 @@ class TestTenantAssetPlugin(unittest.TestCase):
       dns.assert_not_called()
       http.assert_not_called()
 
-  def test_capability_reports_literal_tenant_execution_flag_without_stored_reads(self):
-    self.plugin.config_data = {"TENANT_EXECUTION_ENABLED": True}
+  def test_capability_reports_tenant_execution_without_stored_reads(self):
+    # RM-084 P6: tenant execution is no longer a rollout a deployment opts into, so the capability
+    # reports the only state there is -- whatever a stale `TENANT_EXECUTION_ENABLED` still says.
     self.plugin.cfg_tenant_administration_enabled = False
     self.plugin.cfg_tenancy_namespace = ""
-    self.plugin.cfg_tenant_execution_stage = "compatibility"
     with patch.object(self.plugin, "chainstore_hget", side_effect=AssertionError("No stored capability reads")), \
          patch.object(self.plugin, "chainstore_hgetall", side_effect=AssertionError("No capability enumeration")), \
          patch.object(self.plugin, "chainstore_hset", side_effect=AssertionError("No capability writes")):
-      baseline = self.plugin.get_capability_status()
-      self.assertIs(baseline["tenant_execution_enabled"], False)
-      for value in (None, False, "false", "true", 0, 1, 0.0, 1.0, [], {}, True):
+      for value in (None, False, "false", True):
         with self.subTest(value=value):
           self.plugin.cfg_tenant_execution_enabled = value
-          status = self.plugin.get_capability_status()
-          self.assertIs(status["tenant_execution_enabled"], value is True)
-          self.assertEqual(status, {**baseline, "tenant_execution_enabled": value is True})
+          self.assertIs(self.plugin.get_capability_status()["tenant_execution_enabled"], True)
 
-  def test_launch_hint_resolves_stored_facts_once_without_node_rollout_or_asset_changes(self):
+  def test_launch_hint_resolves_stored_facts_once_without_node_enumeration_or_asset_changes(self):
     asset = self.create_asset()["data"]
     self.storage.account("operator", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
     self.assertTrue(self.plugin.update_tenant_allow_pentester(self.actor, self.tenant, True)["success"])
     actor = {"account_id": "operator"}
     before = deepcopy(self.storage.data)
     writes = len(self.storage.writes)
-    self.plugin.cfg_tenant_execution_stage = "compatibility"
-    for enabled, peers in ((False, []), (True, ["Node-A"])):
-      with self.subTest(enabled=enabled, peers=peers):
-        self.plugin.cfg_tenant_execution_enabled = enabled
+    for peers in ([], ["Node-A"]):
+      with self.subTest(peers=peers):
         self.plugin.cfg_chainstore_peers = peers
         with patch.object(self.plugin, "chainstore_hget", wraps=self.plugin.chainstore_hget) as reads, \
              patch.object(self.plugin, "chainstore_hgetall", side_effect=AssertionError("No node enumeration")):
@@ -139,7 +133,7 @@ class TestTenantAssetPlugin(unittest.TestCase):
                            [{"hkey": "auth", "key": "operator"}])
           self.assertEqual(Counter(json.loads(call["key"])[0] for call in calls if call["hkey"] != "auth"),
                            {"tenant": 1, "receipt": 1, "domain": 1, "asset": 1})
-        self.assertIs(self.plugin.get_capability_status()["tenant_execution_enabled"], enabled)
+        self.assertIs(self.plugin.get_capability_status()["tenant_execution_enabled"], True)
         self.assertEqual(self.storage.data, before)
         self.assertEqual(len(self.storage.writes), writes)
 

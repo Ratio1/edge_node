@@ -43,7 +43,7 @@ class TestTenantNodeFailurePolicy(unittest.TestCase):
     self.assertEqual(repeated["data"], {**first["data"], "canUpdateAllowPentester": False,
                                         "assignableMemberRoles": ["tenant_admin", "tenant_user"]})
     self.assertEqual(len(self.store.writes), before)
-    self.store.data[("auth", "initial")]["metadata"]["tenant_memberships"] = []
+    self.store.data[("auth", "initial")]["memberships"] = []
     self.assertEqual(self.service.update_tenant_node_failure_policy(
       {"account_id": "initial"}, tenant_id, "continue")["status_code"], 404)
     self.assertEqual(len(self.store.writes), before)

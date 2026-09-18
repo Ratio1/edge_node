@@ -18,18 +18,47 @@ class FakeAdministrationStore:
     self.fail_write = None
     self.fail_after_write = False
     self.noop = False
-    self.account("creator", role="admin")
+    # RM-084 P6: there is no account-role `admin` any more, so the platform creator says what it is
+    # -- a full-portfolio Super-Tenant Admin -- as a stored membership row.
+    self.account("creator", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
     self.account("initial")
 
-  def account(self, name, *, role="user", memberships=None, generation="generation-1", active=True):
-    metadata = {"navigatorAccountGeneration": generation, "navigatorAccountState": "active" if active else "deleting"}
-    if memberships is not None:
-      metadata["tenant_memberships"] = memberships
-    self.data[("auth", name)] = {"role": role, "metadata": metadata, "createdAt": "2026-01-01"}
+  def account(self, name, *, memberships=None, generation=None, active=True, state=None):
+    """A v1 account record, as the Navigator writes it (tenancy/account_record.py).
+
+    `generation` is a UUID v4 because the record rule says so: a test that used a readable label here
+    wrote a record the parser refuses, which showed up as every caller becoming "no such account".
+
+    Rewriting an existing account keeps its generation unless one is given, as the Navigator does for
+    a membership edit: a new generation is a new incarnation, which is its own test (`account_changed`).
+    """
+    at = "2026-01-01T00:00:00.000Z"
+    existing = self.data.get(("auth", name))
+    if generation is None:
+      generation = existing["generation"] if isinstance(existing, dict) and "generation" in existing else str(uuid4())
+    resolved_state = state if state is not None else ("active" if active else "deleting")
+    self.data[("auth", name)] = {
+      "schemaVersion": 1,
+      "accountId": name,
+      "state": resolved_state,
+      "generation": generation,
+      "password": {"algo": "argon2id", "v": 19, "m": 65536, "t": 3, "p": 1, "len": 32,
+                   "salt": "c2FsdHNhbHRzYWx0c2FsdA==",
+                   "hash": "aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g="},
+      "memberships": list(memberships) if memberships is not None else [],
+      "createdAt": at, "createdBy": "@bootstrap",
+      "updatedAt": at, "updatedBy": "@bootstrap",
+      "passwordChangedAt": at,
+    }
+    if resolved_state != "active":
+      self.data[("auth", name)].update(stateChangedAt=at, stateChangedBy="creator")
 
   def grant(self, name, tenant_id, role="tenant_admin"):
-    self.data[("auth", name)]["metadata"].setdefault("tenant_memberships", []).append(
-      {"role": role, "tenant_id": tenant_id})
+    # Idempotent, as the Navigator's writer is: a v1 record refuses a duplicate row outright.
+    rows = self.data[("auth", name)]["memberships"]
+    row = {"role": role, "tenant_id": tenant_id}
+    if row not in rows:
+      rows.append(row)
 
   def chainstore_hget(self, *, hkey, key):
     return copy.deepcopy(self.data.get((hkey, key)))
@@ -132,7 +161,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(retried["data"], {**changed["data"], "canUpdateNodeFailurePolicy": False,
                                      "canManageMembers": False, "assignableMemberRoles": []})
     self.assertEqual(len(self.store.writes), before)
-    self.store.account("second", role="admin", memberships=[])
+    self.store.account("second", memberships=[])
     self.assertEqual(self.service.update_tenant_allow_pentester(
       {"account_id": "second", "role": "super_tenant_admin"}, tenant_id, True)["status_code"], 404)
     self.assertEqual(len(self.store.writes), before)
@@ -148,7 +177,7 @@ class TestTenantAdministration(unittest.TestCase):
                                 ("tenant_pentester", tenant_id, 403),
                                 ("tenant_user", tenant_id, 403)):
       with self.subTest(role=role, scope=scope):
-        self.store.account("operator", role="admin", memberships=[{"role": role, "tenant_id": scope}])
+        self.store.account("operator", memberships=[{"role": role, "tenant_id": scope}])
         actor = {"account_id": "operator", "role": "super_tenant_admin", "tenant_id": tenant_id}
         before = len(self.store.writes)
         result = self.service.update_tenant_allow_pentester(actor, tenant_id, True)
@@ -233,13 +262,13 @@ class TestTenantAdministration(unittest.TestCase):
                                                CstoreTenantAdministrationStore(other_node, "test-deployment"))
     changed = self.service.update_tenant_allow_pentester(self.actor, tenant_id, True)
     self.assertEqual(other_service.get_tenant(self.actor, tenant_id)["data"], changed["data"])
-    self.store.account("creator", role="admin", memberships=[])
+    self.store.account("creator", memberships=[])
     self.assertEqual(other_service.get_tenant(self.actor, tenant_id)["status_code"], 404)
     self.assertEqual(other_service.update_tenant_allow_pentester(self.actor, tenant_id, True)["status_code"], 404)
 
   def test_completed_retry_does_not_require_or_restore_initial_admin(self):
     tenant = self.create()
-    self.store.account("initial", generation="replacement", memberships=[])
+    self.store.account("initial", generation=str(uuid4()), memberships=[])
     row = self.repo.get("tenant", tenant["tenantId"])
     row["allow_pentester"] = True
     self.repo.put("tenant", tenant["tenantId"], record=row)
@@ -247,11 +276,11 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(self.prepare()["data"]["state"], "active")
     self.assertTrue(self.service.activate_tenant(self.actor, self.request)["data"]["allowPentester"])
     self.assertEqual(len(self.store.writes), before)
-    self.assertEqual(self.store.data[("auth", "initial")]["metadata"]["tenant_memberships"], [])
+    self.assertEqual(self.store.data[("auth", "initial")]["memberships"], [])
 
   def test_pending_retry_rechecks_admin_incarnation_and_creator_authority(self):
     self.prepare()
-    self.store.account("initial", generation="replacement")
+    self.store.account("initial", generation=str(uuid4()))
     before = len(self.store.writes)
     self.assertEqual(self.prepare()["status_code"], 409)
     self.assertEqual(self.service.activate_tenant(self.actor, self.request)["status_code"], 409)
@@ -262,12 +291,12 @@ class TestTenantAdministration(unittest.TestCase):
   def test_initial_admin_must_hold_no_scope_but_a_retry_keeps_its_own_membership(self):
     # RM-083. First preparation refuses an initial admin that already belongs somewhere; a retry after
     # the Navigator wrote this tenant's admin membership must still resume.
-    for memberships in ([{"role": "tenant_user", "tenant_id": "tn_other"}],
+    for memberships in ([{"role": "tenant_user", "tenant_id": "tn_995918e9-0000-4000-8000-000000000008"}],
                         [{"role": "super_pentester", "tenant_id": None}], None):
       with self.subTest(memberships=memberships):
         self.setUpStore()
         if memberships is None:
-          self.store.account("initial", role="admin")
+          self.store.account("initial", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
         else:
           self.store.account("initial", memberships=memberships)
         denied = self.prepare()
@@ -277,7 +306,7 @@ class TestTenantAdministration(unittest.TestCase):
     prepared = self.prepare()["data"]
     self.store.grant("initial", prepared["tenantId"])
     self.assertEqual(self.prepare()["data"], prepared)
-    self.store.grant("initial", "tn_other", "tenant_user")
+    self.store.grant("initial", "tn_995918e9-0000-4000-8000-000000000008", "tenant_user")
     self.assertEqual(self.prepare()["status_code"], 404)  # a two-tenant account is denied as a whole
     self.store.account("initial", memberships=[{"role": "tenant_user", "tenant_id": prepared["tenantId"]}])
     denied = self.prepare()
@@ -303,7 +332,7 @@ class TestTenantAdministration(unittest.TestCase):
 
   def test_another_creator_cannot_activate_receipt_or_reuse_reserved_domain(self):
     self.prepare()
-    self.store.account("other", role="admin")
+    self.store.account("other", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
     other = {"account_id": "other"}
     before = len(self.store.writes)
     self.assertEqual(self.service.activate_tenant(other, self.request)["status_code"], 404)
@@ -342,7 +371,7 @@ class TestTenantAdministration(unittest.TestCase):
     tenant = self.create()
     tenant_id = tenant["tenantId"]
     self.store.account("reader", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
-    self.store.account("foreign", memberships=[{"role": "tenant_admin", "tenant_id": "other"}])
+    self.store.account("foreign", memberships=[{"role": "tenant_admin", "tenant_id": "tn_995918e9-0000-4000-8000-000000000008"}])
     self.store.account("disabled", active=False, memberships=[{"role": "tenant_admin", "tenant_id": tenant_id}])
     reader, foreign = {"account_id": "reader"}, {"account_id": "foreign"}
     self.assertEqual(self.service.list_tenants(foreign)["data"], [])
@@ -359,8 +388,8 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(self.service.authorize_tenant_membership(self.actor, tenant_id, "reader", "super_tenant_admin")["status_code"], 400)
     self.assertEqual(self.service.authorize_tenant_membership(reader, tenant_id, "reader", "tenant_admin")["status_code"], 403)
     approval = self.service.authorize_tenant_membership({"account_id": "initial"}, tenant_id, "reader", "tenant_admin")["data"]
-    self.assertEqual(approval, {"accountId": "reader", "accountGeneration": "generation-1", "tenantId": tenant_id,
-                                "role": "tenant_admin", "remove": False})
+    self.assertEqual(approval, {"accountId": "reader", "tenantId": tenant_id, "role": "tenant_admin", "remove": False,
+                                "accountGeneration": self.store.data[("auth", "reader")]["generation"]})
 
   def test_domain_lookup_requires_creator_and_sees_pending_reservation(self):
     self.assertEqual(self.service.check_tenant_domain(self.actor, "example")["data"], {"available": True})
@@ -457,7 +486,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.store.account("outsider")
     self.store.account("member", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
     self.store.account("tester", memberships=[{"role": "tenant_pentester", "tenant_id": tenant_id}])
-    self.store.account("elsewhere", memberships=[{"role": "tenant_user", "tenant_id": "tn_other"}])
+    self.store.account("elsewhere", memberships=[{"role": "tenant_user", "tenant_id": "tn_995918e9-0000-4000-8000-000000000008"}])
     for target in ("outsider", "elsewhere"):
       with self.subTest(target=target):
         denied = self.service.authorize_tenant_membership(admin, tenant_id, target, "tenant_user")
@@ -480,10 +509,10 @@ class TestTenantAdministration(unittest.TestCase):
   def test_membership_writes_never_give_an_account_a_second_scope(self):
     # RM-083 (owner): an account is platform-scoped or belongs to exactly one tenant.
     tenant_id = self.create()["tenantId"]
-    self.store.account("elsewhere", memberships=[{"role": "tenant_user", "tenant_id": "tn_other"}])
+    self.store.account("elsewhere", memberships=[{"role": "tenant_user", "tenant_id": "tn_995918e9-0000-4000-8000-000000000008"}])
     self.store.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.store.account("allowlisted", memberships=[{"role": "super_pentester", "tenant_id": tenant_id}])
-    self.store.account("legacy", role="admin")
+    self.store.account("legacy", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
     before = copy.deepcopy(self.store.data)
     for target in ("elsewhere", "pentester", "allowlisted", "legacy", "creator"):
       with self.subTest(target=target):
@@ -495,7 +524,7 @@ class TestTenantAdministration(unittest.TestCase):
     tenant_id = self.create()["tenantId"]
     admin = {"account_id": "initial"}
     self.store.account("reader", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
-    self.store.account("taken", memberships=[{"role": "tenant_user", "tenant_id": "tn_other"}])
+    self.store.account("taken", memberships=[{"role": "tenant_user", "tenant_id": "tn_995918e9-0000-4000-8000-000000000008"}])
     before = copy.deepcopy(self.store.data)
     self.assertEqual(self.service.authorize_tenant_account_creation(admin, tenant_id, " New ", "tenant_user")["data"],
                      {"accountId": "new", "tenantId": tenant_id, "role": "tenant_user"})

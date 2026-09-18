@@ -38,7 +38,7 @@ def test_saved_network_target_is_derived_and_actual_override_denied_without_dns(
 def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
   from .test_tenant_execution import TestTenantExecution
   from .test_api import TestPhase1ConfigCID
-  from extensions.business.cybersec.red_mesh.tenancy.identity import resolve_actor
+  from extensions.business.cybersec.red_mesh.tenancy.identity import resolve_actor, TenantMembership
   fixture = TestTenantExecution()
   fixture.setUp()
   try:
@@ -46,11 +46,10 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
     owner = TestPhase1ConfigCID._build_mock_plugin()
     TestPhase1ConfigCID._bind_launch_helpers(owner)
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    owner.cfg_tenant_execution_enabled = True
-    owner.cfg_tenant_execution_stage = "tenant"
-    fixture.store.put("execution_rollout", owner.cfg_instance_id, record={"stage": "tenant", "enabled": True})
     owner._execution_service = lambda: fixture.service
     owner._resolve_launch_actor = lambda actor: resolve_actor(actor, fixture.service.accounts)
+    # The launch helpers stub admission for the configuration suites; this one is about admission.
+    owner._admit_execution = lambda *args: PentesterApi01Plugin._admit_execution(owner, *args)
     kwargs = dict(actor=fixture.actor, tenant_id=fixture.tenant, asset_id=asset["assetId"],
                   selected_peers=["node-a"], authorized=True, start_port=1, end_port=4)
     with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
@@ -98,23 +97,22 @@ def test_bound_network_denials_precede_config_and_secret_writes():
     owner.chainstore_hset.assert_not_called()
 
 
-def test_endpoint_admission_uses_one_stored_account_and_explicit_legacy_provenance():
+def test_endpoint_admission_refuses_an_incomplete_selector_after_one_account_read():
+  """RM-084 P6: the unbound launch is gone. A launch naming no tenant, asset or digest is malformed,
+  and it is refused before any tenant admission runs -- still after exactly one account read."""
   from .test_api import TestPhase1ConfigCID
   TestPhase1ConfigCID._mock_plugin_modules()
   from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
-  from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
+  from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
   service = MagicMock()
-  service.read_execution_rollout.return_value = ExecutionRollout("compatibility", False, "compatibility", False)
   actor = {"account_id": "creator"}
-  for provenance, allowed in ((False, True), (True, False), (None, False)):
-    account = AccountView("creator", "admin", None, True, tenant_memberships_present=provenance)
+  for selectors in ((None, None, None), ("tn_x", None, None), ("tn_x", "as_x", " ")):
+    account = AccountView("creator", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
     owner = SimpleNamespace(_resolve_launch_actor=MagicMock(return_value=(account, None)),
-      _execution_service=lambda: service, cfg_instance_id="deployment", cfg_tenant_execution_enabled=False,
-      cfg_tenant_execution_stage="compatibility")
-    result_account, admission, error = PentesterApi01Plugin._admit_execution(owner, actor, None, None, None)
-    assert (error is None) is allowed
-    assert admission is None
+      _execution_service=lambda: service, cfg_instance_id="deployment")
+    result_account, admission, error = PentesterApi01Plugin._admit_execution(owner, actor, *selectors)
+    assert error == {"error": "invalid_request", "status_code": 400}
+    assert result_account is None and admission is None
     owner._resolve_launch_actor.assert_called_once_with(actor)
   service._resolve_execution_admission_for_account.assert_not_called()
 
@@ -140,11 +138,10 @@ def test_bound_manual_analysis_is_denied_before_report_reads_or_executor_admissi
   owner._get_job_config.assert_not_called()
 
 
-def test_worker_fresh_boundary_denies_rollout_unknown_authority_and_binding_swap():
+def test_worker_fresh_boundary_denies_unknown_authority_and_binding_swap():
   from .test_api import TestPhase1ConfigCID
   TestPhase1ConfigCID._mock_plugin_modules()
   from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
   from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
   admission = context({"kind": "network", "address": "192.0.2.1"})
   binding = admission.build_binding("launcher", ["node-1"]).to_dict()
@@ -153,21 +150,17 @@ def test_worker_fresh_boundary_denies_rollout_unknown_authority_and_binding_swap
             "workers": {"node-1": {"assignment_revision": 1}}}
   repo, service = MagicMock(), MagicMock()
   repo.get_job.return_value = record
-  service.read_execution_rollout.return_value = ExecutionRollout("tenant", True, "tenant", True)
   owner = SimpleNamespace(_get_job_state_repository=lambda: repo, _execution_service=lambda: service,
-    ee_addr="node-1", cfg_instance_id="instance", cfg_tenant_execution_enabled=True, cfg_tenant_execution_stage="tenant")
+    ee_addr="node-1", cfg_instance_id="instance")
   owner._execution_operation_allowed = lambda *args, **kwargs: PentesterApi01Plugin._execution_operation_allowed(owner, *args, **kwargs)
   identity = ("job", 1, "node-1", 1)
   PentesterApi01Plugin._require_worker_execution(owner, "job", config, execution_identity=identity)
   service.reauthorize_execution.assert_called_once()
-  for mutation in ("unknown_controls", "unavailable_authority", "binding_swap", "unassigned"):
-    service.read_execution_rollout.side_effect = None
+  for mutation in ("unavailable_authority", "binding_swap", "unassigned"):
     service.reauthorize_execution.side_effect = None
     record["execution_binding"] = binding
     record["workers"] = {"node-1": {"assignment_revision": 1}}
-    if mutation == "unknown_controls":
-      service.read_execution_rollout.side_effect = TenantStoreError("Unknown")
-    elif mutation == "unavailable_authority":
+    if mutation == "unavailable_authority":
       service.reauthorize_execution.side_effect = TenantStoreError("Unavailable")
     elif mutation == "binding_swap":
       record["execution_binding"] = {**binding, "node_failure_policy": "continue"}
@@ -184,7 +177,6 @@ def test_stale_worker_context_denies_before_secret_read_and_local_start(mutation
   TestPhase1ConfigCID._mock_plugin_modules()
   from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
   from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
-  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
   binding = context({"kind": "network", "address": "192.0.2.1"}).build_binding("launcher", ["node-1"]).to_dict()
   config = {"execution_binding": binding, "target": "192.0.2.1", "scan_type": "network"}
   discovered = {"job_id": "job", "job_pass": 2, "job_config_cid": "config-cid", "job_status": "RUNNING",
@@ -208,10 +200,8 @@ def test_stale_worker_context_denies_before_secret_read_and_local_start(mutation
   repo, artifacts, service = MagicMock(), MagicMock(), MagicMock()
   repo.get_job.return_value = current
   artifacts.get_job_config_model.return_value.to_dict.return_value = config
-  service.read_execution_rollout.return_value = ExecutionRollout("tenant", True, "tenant", True)
   owner = SimpleNamespace(_get_job_state_repository=lambda: repo, _execution_service=lambda: service,
-    _artifact_repository=artifacts, ee_addr="node-1", cfg_instance_id="instance",
-    cfg_tenant_execution_enabled=True, cfg_tenant_execution_stage="tenant")
+    _artifact_repository=artifacts, ee_addr="node-1", cfg_instance_id="instance")
   owner._execution_operation_allowed = lambda *args, **kwargs: PentesterApi01Plugin._execution_operation_allowed(owner, *args, **kwargs)
   owner._require_worker_execution = lambda *args, **kwargs: PentesterApi01Plugin._require_worker_execution(owner, *args, **kwargs)
   with patch.object(PentesterApi01Plugin, "_get_artifact_repository", return_value=artifacts), \
@@ -252,7 +242,6 @@ def test_bound_model_worker_cannot_load_another_jobs_credentials_with_same_bindi
   TestPhase1ConfigCID._mock_plugin_modules()
   from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
   from extensions.business.cybersec.red_mesh.model_testing.worker import ModelTestWorker
-  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
   binding = context({"kind": "model", "adapter": "openai_compatible", "model": "fixture",
     "endpointUrl": "https://192.0.2.1/v1/chat/completions"}).build_binding("launcher", ["node-1"]).to_dict()
   config = {"job_id": "other-job", "scan_type": "model_test", "execution_binding": binding,
@@ -261,9 +250,8 @@ def test_bound_model_worker_cannot_load_another_jobs_credentials_with_same_bindi
             "job_status": "RUNNING", "workers": {"node-1": {}}}
   repo, service = MagicMock(), MagicMock()
   repo.get_job.return_value = record
-  service.read_execution_rollout.return_value = ExecutionRollout("tenant", True, "tenant", True)
   owner = SimpleNamespace(_get_job_state_repository=lambda: repo, _execution_service=lambda: service,
-    ee_addr="node-1", cfg_instance_id="instance", cfg_tenant_execution_enabled=True, cfg_tenant_execution_stage="tenant")
+    ee_addr="node-1", cfg_instance_id="instance")
   owner._execution_operation_allowed = lambda *args, **kwargs: PentesterApi01Plugin._execution_operation_allowed(owner, *args, **kwargs)
   owner._require_worker_execution = lambda *args, **kwargs: PentesterApi01Plugin._require_worker_execution(owner, *args, **kwargs)
   for mutation in ("config_id", "stored_id"):
@@ -281,7 +269,6 @@ def _worker_identity_fixture(kind):
   from .test_api import TestPhase1ConfigCID
   TestPhase1ConfigCID._mock_plugin_modules()
   from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-  from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
   target = {"kind": "network", "address": "192.0.2.1"} if kind == "network" else (
     {"kind": "webapp", "url": "https://target.example/api", "allowedPathPrefix": "/api"} if kind == "webapp" else
     {"kind": "model", "adapter": "openai_compatible", "model": "fixture",
@@ -298,12 +285,10 @@ def _worker_identity_fixture(kind):
   repo.get_job.return_value = record
   artifacts.get_job_config.return_value = config
   artifacts.get_job_config_model.return_value.to_dict.return_value = config
-  service.read_execution_rollout.return_value = ExecutionRollout("tenant", True, "tenant", True)
   owner = TestPhase1ConfigCID._build_mock_plugin()
   owner._get_job_state_repository = lambda: repo
   owner._get_artifact_repository = lambda: artifacts
   owner._execution_service = lambda: service
-  owner.cfg_tenant_execution_enabled, owner.cfg_tenant_execution_stage = True, "tenant"
   owner._execution_operation_allowed = lambda *args, **kwargs: PentesterApi01Plugin._execution_operation_allowed(owner, *args, **kwargs)
   owner._require_worker_execution = lambda *args, **kwargs: PentesterApi01Plugin._require_worker_execution(owner, *args, **kwargs)
   return PentesterApi01Plugin, owner, config, record, artifacts
@@ -441,19 +426,32 @@ def test_bound_legacy_wrapper_and_revised_network_batch_cannot_start_workers():
   worker_class.assert_not_called()
 
 
-@pytest.mark.parametrize("mutation", ["pass", "assignment", "missing_guard", "actual_target", "source_config_removed", "matching", "legacy"])
+def test_unbound_network_job_never_starts_a_worker():
+  """RM-084 P6: an unbound job has no tenant to reauthorize against, so no worker starts for it."""
+  from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
+  _plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
+  config.pop("execution_binding")
+  current.pop("execution_binding")
+  deferred = []
+  class DeferredThread:
+    def __init__(self, *, target, daemon):
+      deferred.append(self)
+    def start(self):
+      pass
+  with patch("extensions.business.cybersec.red_mesh.worker.base.threading.Thread", DeferredThread), \
+       pytest.raises(ValueError, match="Execution unavailable"):
+    launch_local_jobs(owner, job_id="job", target="192.0.2.1", launcher="launcher",
+      start_port=10, end_port=20, nr_local_workers_override=1, job_config=config, execution_identity=None)
+  assert deferred == []
+  owner.chainstore_hset.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", ["pass", "assignment", "missing_guard", "actual_target", "source_config_removed", "matching"])
 def test_real_network_worker_rechecks_deferred_thread_before_any_socket(mutation):
   from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
   from extensions.business.cybersec.red_mesh.worker.pentest_worker import PentestLocalWorker
   _plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
   identity = ("job", 2, "node-1", 3)
-  if mutation == "legacy":
-    from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionRollout
-    config.pop("execution_binding")
-    current.pop("execution_binding")
-    identity = None
-    owner.cfg_tenant_execution_enabled, owner.cfg_tenant_execution_stage = False, "compatibility"
-    owner._execution_service().read_execution_rollout.return_value = ExecutionRollout("compatibility", False, "compatibility", False)
   deferred = []
   class DeferredThread:
     def __init__(self, *, target, daemon):
@@ -483,7 +481,7 @@ def test_real_network_worker_rechecks_deferred_thread_before_any_socket(mutation
              side_effect=AssertionError("Recording socket boundary; no network")) as sockets, \
        patch.object(worker.metrics, "start_scan", wraps=worker.metrics.start_scan) as metrics:
     deferred[0].target()
-  if mutation in ("matching", "legacy"):
+  if mutation == "matching":
     sockets.assert_called_once()
     metrics.assert_called_once()
   else:

@@ -2091,6 +2091,7 @@ class _DeeployMixin:
       hkey_name = "R1EN_CSTORE_AUTH_HKEY"
       secret_name = "R1EN_CSTORE_AUTH_SECRET"
       admin_pwd_name = "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"
+      admin_user_name = "REDMESH_BOOTSTRAP_ADMIN_USERNAME"
 
       for plugin in prepared_plugins:
         signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
@@ -2116,8 +2117,15 @@ class _DeeployMixin:
           # endif instance id
           plugin_id = self.sanitize_name(str(instance_id))
           env_cfg.setdefault(hkey_name, f"{app_id}_{plugin_id}:auth")
-          env_cfg.setdefault(secret_name, self.uuid(8))
-          env_cfg.setdefault(admin_pwd_name, self.uuid(16))
+          # RM-084 P6: the auth secret is the argon2 pepper and the session-signing key, and the
+          # Navigator now refuses anything under 32 bytes rather than deriving a weak key from it.
+          # This generated 8 characters, which that rule would reject outright -- a deployment
+          # provisioned here would have come up with authentication unavailable.
+          env_cfg.setdefault(secret_name, self.uuid(48))
+          # The first Super-Tenant Admin is created from these two, once, into an empty store. The
+          # password must satisfy the Navigator's 12-256 character rule.
+          env_cfg.setdefault(admin_pwd_name, self.uuid(24))
+          env_cfg.setdefault(admin_user_name, "redmesh-admin")
           # endif set missing creds
           instance["ENV"] = env_cfg
         # endfor each instance

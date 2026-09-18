@@ -64,13 +64,15 @@ EFFECT_ROUTES = ("dry_run_opencti_export", "dry_run_taxii_export", "export_stix_
 # production route.
 UNGUARDED_ROUTES = ("analyze_job", "get_raw_model_test_evidence", "delete_job_engagement")
 LEGACY_READ_ROUTES = ACTOR_ONLY_READ_ROUTES
-# RM-084 P1: reads that refuse a missing tenant with 400 instead of taking the unscoped path.
-TENANT_REQUIRED_READ_ROUTES = (TENANT_EXPORT_STATUS_ROUTES + TENANT_JOBLESS_READ_ROUTES + TENANT_JSON_EXPORT_ROUTES
-                               + TENANT_REVIEW_READ_ROUTES)
-READ_ROUTES = (
+JOB_READ_ROUTES = (
   "get_job_status", "get_job_data", "get_job_archive", "get_job_triage", "get_job_progress",
   "list_network_jobs", "list_local_jobs", "get_report", "get_audit_log", "get_analysis",
-) + LEGACY_READ_ROUTES + TENANT_REQUIRED_READ_ROUTES
+)
+# Reads that refuse a missing tenant with 400: RM-084 P1 moved the export reads here, and P6 the job
+# reads, whose unscoped legacy path is gone.
+TENANT_REQUIRED_READ_ROUTES = (JOB_READ_ROUTES + TENANT_EXPORT_STATUS_ROUTES + TENANT_JOBLESS_READ_ROUTES
+                               + TENANT_JSON_EXPORT_ROUTES + TENANT_REVIEW_READ_ROUTES)
+READ_ROUTES = LEGACY_READ_ROUTES + TENANT_REQUIRED_READ_ROUTES
 SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
 ERROR = "Incompatible generated execution API"
 

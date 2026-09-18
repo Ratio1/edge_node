@@ -66,8 +66,8 @@ class PurgeAdmissionCase(unittest.TestCase):
     scope = None if role == "super_tenant_admin" else self.tenant_id  # RM-083: STA is full-portfolio
     self.store.account("reader", memberships=[{"role": role, "tenant_id": scope}])
 
-  def as_legacy_admin(self):
-    self.store.account("reader", role="admin")
+  def as_platform_admin(self):
+    self.store.account("reader", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
 
   def no_purge(self):
     """Canaries bound in the plugin's own namespace, where the endpoints read them.
@@ -135,7 +135,7 @@ class TestPurgeAdmission(PurgeAdmissionCase):
     B9 was about tenant-scoped *effect authority* not being expressible, not about legacy admins
     being a different role.
     """
-    self.as_legacy_admin()
+    self.as_platform_admin()
     for name in NAMES:
       with self.subTest(name=name):
         with self.no_purge():
@@ -143,11 +143,17 @@ class TestPurgeAdmission(PurgeAdmissionCase):
         self.assertNotEqual(result.get("status_code"), 403, result)
         self.assertNotIn(SECRET, repr(result))
 
-  def test_a_legacy_non_admin_is_refused(self):
-    """The fallback is keyed to `role == "admin"` exactly; nothing else inherits platform scope."""
-    for role in ("user", "pentester", "viewer"):
-      with self.subTest(role=role):
-        self.store.account("reader", role=role)
+  def test_a_reader_without_the_purge_operation_is_refused(self):
+    """RM-084 P6: there is no account role to inherit platform scope from, so this now says what it
+    always meant -- only a membership holding `jobs:purge` reaches a purge. A Super-Pentester is
+    included deliberately: it is platform-scoped and the matrix still refuses it here."""
+    for memberships in ([],
+                        [{"role": "tenant_user", "tenant_id": self.tenant_id}],
+                        [{"role": "tenant_pentester", "tenant_id": self.tenant_id}],
+                        [{"role": "tenant_admin", "tenant_id": self.tenant_id}],
+                        [{"role": "super_pentester", "tenant_id": None}]):
+      with self.subTest(memberships=memberships):
+        self.store.account("reader", memberships=memberships)
         with self.no_purge() as canaries:
           result = self.call("purge_job")
         self.assertEqual(result.get("success"), False, result)
@@ -156,14 +162,11 @@ class TestPurgeAdmission(PurgeAdmissionCase):
           canary.assert_not_called()
 
   def test_an_omitted_tenant_is_refused_without_consulting_the_store(self):
-    """A null tenant_id routes to LegacyReadAccess everywhere else in this series. That seam happens
-    to refuse `jobs:purge` today, so this guard is belt-and-braces -- which is exactly why the
-    assertion has to be about what the guard *uniquely* does, or it passes with the guard deleted.
-
-    What it uniquely does is refuse before any store access: the decision does not depend on
-    LegacyReadAccess's operation allowlist staying closed in a later change.
+    """An omitted tenant is refused before any store access, even for a full-portfolio Super-Tenant
+    Admin. Until RM-084 P6 a null tenant_id routed to the legacy read seam; that seam is gone, and this
+    pins that purge -- the most destructive operation -- never grows a tenant-less path back.
     """
-    self.as_legacy_admin()  # the account the legacy seam would otherwise resolve
+    self.as_platform_admin()
     for name in NAMES:
       with self.subTest(name=name):
         self.store.reads.clear()
@@ -207,7 +210,7 @@ class TestPurgeScope(PurgeAdmissionCase):
     self.as_role("super_tenant_admin")
     self.store.jobs["foreign-job"] = {
       "job_id": "foreign-job", "job_status": "FINALIZED",
-      "execution_binding": {**binding_payload(), "tenant_id": "tn_someone_else"}}
+      "execution_binding": {**binding_payload(), "tenant_id": "tn_9e1c2d86-0000-4000-8000-000000000003"}}
     module = sys.modules[self.Plugin.__module__]
     seen = {}
     with patch.object(module, "purge_all_jobs",

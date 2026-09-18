@@ -22,7 +22,9 @@ def get_capability_status(owner):
   )
   default_label = default_option.get("label") if isinstance(default_option, dict) else None
   return {
-    "tenant_execution_enabled": getattr(owner, "cfg_tenant_execution_enabled", None) is True,
+    # RM-084 P6: tenant execution is no longer a staged rollout that a deployment opts into, so this
+    # reports the only state there is. The key stays because the capability payload is a contract.
+    "tenant_execution_enabled": True,
     "network_scan": {
       "enabled": True,
       "disabled_reason": None,

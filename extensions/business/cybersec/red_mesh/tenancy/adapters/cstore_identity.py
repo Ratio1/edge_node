@@ -1,40 +1,29 @@
-"""CStore account reader with RM-075 attribution and RM-026 tenant membership integrity.
+"""CStore account reader for the RedMesh v1 account record (RM-084 P6).
 
-Reads the account record Navigator's ``@ratio1/cstore-auth-ts`` writes, server-side, through the
-plugin's ``chainstore_hget``. Needs only ``R1EN_CSTORE_AUTH_HKEY`` - the auth *secret* is the
-password pepper and is never read here. Never reads passwords.
+Reads the record the Navigator writes, server-side, through the plugin's ``chainstore_hget``. Needs
+only ``R1EN_CSTORE_AUTH_HKEY`` -- the auth *secret* is the password pepper and is never read here,
+and neither is a password.
 
-Record facts this binds to (Navigator ``lib/auth/cstore.ts``):
+Parsing lives in ``tenancy/account_record.py`` so that this file is about *reaching* the store and
+that one is about what a record means. What this layer binds to is only the addressing:
 
 * the hash field key is the canonical account id (lower-cased username);
-* an absent field is "no such account"; the literal string ``'null'`` is a tombstone;
-* the value is a JSON object ``{type, password, role, metadata, createdAt, updatedAt}``;
-* ``metadata.navigatorAccountState`` is ``'active'`` or absent for a live account, anything else
-  (``'deleting'``) is not active;
-* ``metadata.appRole == 'pentester'`` is Navigator's third role, layered on cstore's ``user``;
-* tenant memberships remain role/scope pairs; explicit malformed metadata fails closed and explicit
-  empty memberships never restore legacy admin authority;
-* RM-083: memberships mixing platform and tenant scope, or naming two tenants, fail closed
-  (``policy.valid_account_scope``);
-* Navigator writes no ``schemaVersion``. An absent value is version 0 (today's shape); a present,
-  unrecognised value fails closed. This is not a downgrade vector - stripping the field needs
-  cstore write access, which could set ``role: admin`` directly.
+* an absent field is "no such account"; the literal ``'null'`` is a tombstone;
+* absent, tombstoned and malformed are indistinguishable to every caller.
+
+The pre-cutover reader interpreted a deployment-wide ``role``, an ``appRole`` flag and a
+``navigatorAccountState``, and derived a full-portfolio membership for an ``admin`` account that had
+no memberships key -- the legacy bridge. All of it is gone: an account's authority is the membership
+rows it actually holds.
 """
 import json
 import os
 
-from ..identity import (FULL_PORTFOLIO_SUPER_TENANT_ADMIN, AccountView, IdentityStoreError,
-                        TenantMembership, canonical_account_id)
-from ..policy import PLATFORM_ROLES, TENANT_LOCAL_ROLES, valid_account_scope
+from ..account_record import parse_account_record
+from ..identity import AccountView, IdentityStoreError, TenantMembership, canonical_account_id
 
 AUTH_HKEY_ENV = "R1EN_CSTORE_AUTH_HKEY"
-SUPPORTED_SCHEMA_VERSIONS = frozenset({0, 1})
-TOMBSTONE = "null"
-ACCOUNT_STATE_KEY = "navigatorAccountState"
 ACTIVE_STATE = "active"
-APP_ROLE_KEY = "appRole"
-MEMBERSHIPS_KEY = "tenant_memberships"
-TENANT_ROLES = TENANT_LOCAL_ROLES
 MAX_ENUMERATED_ACCOUNTS = 10000
 
 
@@ -88,78 +77,20 @@ class CstoreAuthAccountReader:
 
   @staticmethod
   def _view(account_id, raw):
-    if raw is None or raw == TOMBSTONE:
+    """``AccountView`` for a valid record, ``None`` for absent, tombstoned or malformed.
+
+    The three are one answer on purpose. A caller that could tell them apart could enumerate which
+    account names exist, and all three mean the same thing to authorization anyway: this account
+    grants nothing.
+    """
+    parsed = parse_account_record(raw, account_id)
+    if parsed is None:
       return None
-    record = _parse_record(raw)
-    if record is None:
-      return None
-    metadata = record.get("metadata", {})
-    if not isinstance(metadata, dict):
-      return None
-    state = metadata.get(ACCOUNT_STATE_KEY)
-    app_role = metadata.get(APP_ROLE_KEY)
-    memberships = _parse_memberships(metadata, record.get("role"))
-    if memberships is None:
-      return None
-    if "navigatorAccountGeneration" in metadata:
-      generation = metadata["navigatorAccountGeneration"]
-      if not isinstance(generation, str) or not generation.strip():
-        raise IdentityStoreError("Invalid account generation")
-      try:
-        generation.encode("utf-8", errors="strict")
-      except UnicodeError as exc:
-        raise IdentityStoreError("Invalid account generation") from exc
-    else:
-      created_at = record.get("createdAt")
-      generation = f"legacy:{created_at}" if isinstance(created_at, str) and created_at else None
+    state, generation, memberships = parsed
     return AccountView(
       account_id=account_id,
-      role=str(record.get("role") or "user"),
-      app_role=app_role if isinstance(app_role, str) else None,
-      active=(ACCOUNT_STATE_KEY not in metadata or state == ACTIVE_STATE),
-      tenant_memberships=memberships,
+      active=(state == ACTIVE_STATE),
+      state=state,
+      tenant_memberships=tuple(TenantMembership(role, tenant_id) for role, tenant_id in memberships),
       account_generation=generation,
-      tenant_memberships_present=MEMBERSHIPS_KEY in metadata,
     )
-
-
-def _parse_memberships(metadata, legacy_role):
-  """Preserve role/scope pairs; malformed explicit scope must never activate legacy fallback."""
-  if MEMBERSHIPS_KEY not in metadata:
-    return (FULL_PORTFOLIO_SUPER_TENANT_ADMIN,) if legacy_role == "admin" else ()
-  rows = metadata[MEMBERSHIPS_KEY]
-  if not isinstance(rows, list):
-    return None
-  memberships = []
-  for row in rows:
-    if not isinstance(row, dict) or "role" not in row or "tenant_id" not in row:
-      return None
-    role, tenant_id = row["role"], row["tenant_id"]
-    if not isinstance(role, str) or role not in PLATFORM_ROLES | TENANT_ROLES:
-      return None
-    if tenant_id is None:
-      if role not in PLATFORM_ROLES:
-        return None
-    elif not isinstance(tenant_id, str) or not tenant_id.strip():
-      return None
-    memberships.append(TenantMembership(role, tenant_id))
-  if not valid_account_scope((m.role, m.tenant_id) for m in memberships):
-    return None
-  return tuple(memberships)
-
-
-def _parse_record(raw):
-  """Dict or JSON-encoded dict -> dict, or ``None`` when unparseable / unsupported version."""
-  if isinstance(raw, (bytes, bytearray)):
-    raw = raw.decode("utf-8", errors="replace")
-  if isinstance(raw, str):
-    try:
-      raw = json.loads(raw)
-    except ValueError:
-      return None
-  if not isinstance(raw, dict):
-    return None
-  version = raw.get("schemaVersion", 0)
-  if type(version) is not int or version not in SUPPORTED_SCHEMA_VERSIONS:
-    return None
-  return raw

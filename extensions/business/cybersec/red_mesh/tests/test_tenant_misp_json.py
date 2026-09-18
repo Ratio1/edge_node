@@ -123,12 +123,12 @@ def test_native_admission_denies_before_config_and_artifacts(read_native, respon
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault in ("user", "role_spoof"):
-      account["metadata"]["tenant_memberships"] = [{"role": "tenant_user", "tenant_id": fixture.tenant_id}]
+      account["memberships"] = [{"role": "tenant_user", "tenant_id": fixture.tenant_id}]
       if fault == "role_spoof":
         body["request_actor"] = {"account_id": "reader", "role": "admin",
                                  "tenant_memberships": [{"role": "super_tenant_admin", "tenant_id": None}]}
     elif fault in ("memberships", "null_memberships"):
-      account["metadata"]["tenant_memberships"] = [] if fault == "memberships" else None
+      account["memberships"] = [] if fault == "memberships" else None
     elif fault == "other_tenant": body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "missing_tenant": body.pop("tenant_id")
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"
@@ -287,7 +287,7 @@ def test_native_current_stored_export_roles_and_finite_json_controls(read_native
   with read_endpoint_fixture(bound=True) as fixture:
     install_json_producer(fixture)
     account = fixture.store.data[("auth", "reader")]
-    account["metadata"]["tenant_memberships"] = [
+    account["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     fixture.artifacts["pass"]["optional_metadata"] = {"large": 10**100, "flag": True, "text": "nan", "nothing": None}
     with no_export_effects(fixture):

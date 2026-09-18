@@ -123,7 +123,7 @@ def test_public_projection_omits_history_and_never_reads_a_stored_record():
 def test_every_export_role_is_admitted(role):
   with read_endpoint_fixture(bound=True) as fixture:
     fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": role, "tenant_id": None if role == "super_tenant_admin" else fixture.tenant_id}]
     payload = fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
                                                   tenant_id=fixture.tenant_id)
@@ -206,9 +206,9 @@ def test_native_admission_denies_before_any_configuration_evaluation(read_native
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault in ("memberships", "null_memberships"):
-      account["metadata"]["tenant_memberships"] = [] if fault == "memberships" else None
+      account["memberships"] = [] if fault == "memberships" else None
     elif fault == "tenant_user":
-      account["metadata"]["tenant_memberships"] = [{"role": "tenant_user", "tenant_id": fixture.tenant_id}]
+      account["memberships"] = [{"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     elif fault == "other_tenant": body["tenant_id"] = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "missing_tenant": body.pop("tenant_id")
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"

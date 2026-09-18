@@ -265,18 +265,20 @@ def test_actual_scheduler_list_aliases_and_empty_mapping_preserve_public_shape(r
   module, _ = read_native
   module.ADDITIONAL_FASTAPI_DATA = {"server_node_addr": "renderer-node", "renderer_metadata": {"source": "native"}}
   install(module)
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(archived=False) as fixture:
     fixture.store.jobs.clear()
     fixture.owner.scan_jobs.clear()
-    for index, alias in enumerate(aliases):
-      row = {**deepcopy(fixture.job), "job_id": f"job-list-{index}"}
+    # The tenant reader requires the storage key to be the job id (RM-084 P6 removed the legacy
+    # reader that listed aliased keys), so each envelope-colliding name is the job's own id.
+    for alias in aliases:
+      row = {**deepcopy(fixture.job), "job_id": alias}
       fixture.store.jobs[alias] = row
       fixture.owner.scan_jobs[row["job_id"]] = {}
-    expected = getattr(fixture.Plugin, name)(fixture.owner, request_actor=fixture.actor)
+    expected = getattr(fixture.Plugin, name)(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert set(expected) == set(aliases)
     metadata = {"server_node_addr": "scheduler-node", "scheduler_metadata": {"source": "plugin"}}
     module.eng = scheduler_comms(fixture, response_format, metadata)
-    response = asyncio.run(request(module, name, {"request_actor": fixture.actor}))
+    response = asyncio.run(request(module, name, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id}))
     result, calls = assert_json_response(response, 200)
     assert calls == 1
     if response_format == "WRAPPED":
@@ -331,11 +333,12 @@ def test_nonraw_native_format_keeps_native_wrapped_semantics(read_native, name, 
   from .read_endpoint_fixtures import read_endpoint_fixture
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
-    fixture.store.jobs["status_code"] = fixture.store.jobs.pop("legacy-alias")
-    expected = getattr(fixture.Plugin, name)(fixture.owner, request_actor=fixture.actor)
+  with read_endpoint_fixture() as fixture:
+    fixture.store.jobs["status_code"] = {**fixture.store.jobs.pop("job-1"), "job_id": "status_code"}
+    expected = getattr(fixture.Plugin, name)(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     module.eng = scheduler_comms(fixture, response_format)
-    result, calls = assert_json_response(asyncio.run(request(module, name, {"request_actor": fixture.actor})), 200)
+    result, calls = assert_json_response(asyncio.run(request(
+      module, name, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     assert result == {"result": expected} and calls == 1
 
 
@@ -367,12 +370,12 @@ def test_actual_list_hook_and_chunked_serialization_preserve_headers(read_native
 
   module.app.add_middleware(ChunkedNativeResponse)
   install(module)
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(archived=False) as fixture:
     fixture.job["target"] = "café.example"
-    expected = getattr(fixture.Plugin, name)(fixture.owner, request_actor=fixture.actor)
+    expected = getattr(fixture.Plugin, name)(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     with patch.object(fixture.Plugin, "on_response", wraps=fixture.Plugin.on_response) as hook:
       module.eng = scheduler_comms(fixture, response_format)
-      response = asyncio.run(request(module, name, {"request_actor": fixture.actor}))
+      response = asyncio.run(request(module, name, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id}))
       result, calls = assert_json_response(response, 200)
       hook.assert_called_once()
       assert hook.call_args.args[:2] == (fixture.owner, name)
@@ -386,7 +389,10 @@ def test_actual_list_hook_and_chunked_serialization_preserve_headers(read_native
 
 @pytest.mark.parametrize("name", LIST_ROUTES)
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("outcome", ("forbidden", "not_found", "unavailable"))
+# RM-084 P6: a job read has no reachable 403 any more -- every membership role holds `reports:view`,
+# and omitting the selector, the old forbidden case, is now a malformed request. That 400 is the
+# denial carried through the native layer in its place.
+@pytest.mark.parametrize("outcome", ("invalid_request", "not_found", "unavailable"))
 def test_actual_list_denials_are_not_capsuled_or_relabelled(read_native, name, response_format, outcome):
   from .read_endpoint_fixtures import read_endpoint_fixture
   module, _ = read_native
@@ -395,13 +401,13 @@ def test_actual_list_denials_are_not_capsuled_or_relabelled(read_native, name, r
   with read_endpoint_fixture() as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     payload = {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
-    if outcome == "forbidden":
+    if outcome == "invalid_request":
       payload.pop("tenant_id")
     elif outcome == "not_found":
       payload["request_actor"] = {"account_id": "missing"}
     else:
       fixture.job["execution_binding"]["asset_target_digest"] = "private corruption"
-    expected = {"forbidden": 403, "not_found": 404, "unavailable": 503}[outcome]
+    expected = {"invalid_request": 400, "not_found": 404, "unavailable": 503}[outcome]
     result, calls = assert_json_response(asyncio.run(request(module, name, payload)), expected)
     assert result == {"success": False, "error": outcome, "status_code": expected}
     assert calls == 1 and fixture.artifact_reads == []
@@ -466,7 +472,7 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
 @pytest.mark.parametrize("read_native", (None, "/workspace"), indirect=True)
-@pytest.mark.parametrize("outcome", ("forbidden", "not_found", "unavailable", "missing_requester"))
+@pytest.mark.parametrize("outcome", ("invalid_request", "not_found", "unavailable", "missing_requester"))
 def test_actual_scheduler_denials_survive_native_wrapping_and_default_redirect(read_native, response_format, outcome):
   from .read_endpoint_fixtures import read_endpoint_fixture
   module, _ = read_native
@@ -474,8 +480,8 @@ def test_actual_scheduler_denials_survive_native_wrapping_and_default_redirect(r
   with read_endpoint_fixture() as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     payload = {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
-    expected = {"forbidden": 403, "not_found": 404, "unavailable": 503, "missing_requester": 404}[outcome]
-    if outcome == "forbidden":
+    expected = {"invalid_request": 400, "not_found": 404, "unavailable": 503, "missing_requester": 404}[outcome]
+    if outcome == "invalid_request":
       payload.pop("tenant_id")
     elif outcome == "not_found":
       fixture.store.jobs.clear()

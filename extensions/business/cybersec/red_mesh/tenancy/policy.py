@@ -2,7 +2,8 @@
 
 All inputs must be resolved server-side. This module neither authenticates requests nor proves
 tenant/asset existence or freshness. Endpoint wiring must resolve those facts and enforce the
-returned decision before reads or side effects. Legacy account role/app_role never grant authority.
+returned decision before reads or side effects. Memberships are the only authority: there is no
+account role (RM-084 P6 removed the legacy `role` and `app_role`).
 """
 from dataclasses import dataclass
 

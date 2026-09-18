@@ -95,7 +95,7 @@ def test_a_typed_configuration_failure_keeps_its_code_after_a_persist(name, serv
 @pytest.mark.parametrize("name,service,config", DELIVERIES)
 def test_delivery_endpoints_deny_an_unauthorized_caller_without_effects(name, service, config):
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [
+    fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": "tenant_user", "tenant_id": fixture.tenant_id}]
     with patch.object(service, "record_integration_status",
                       side_effect=AssertionError(SECRET)) as recorder, \
@@ -187,8 +187,8 @@ def test_misp_denials_reach_neither_the_server_nor_the_job_record(misp_ready, fa
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "user":
-      account["metadata"]["tenant_memberships"] = [{"role": "tenant_user", "tenant_id": tenant_id}]
-    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
+      account["memberships"] = [{"role": "tenant_user", "tenant_id": tenant_id}]
+    elif fault == "memberships": account["memberships"] = []
     elif fault == "other_tenant": tenant_id = "tn_00000000-0000-4000-8000-000000000000"
     elif fault == "no_tenant": tenant_id = None
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"

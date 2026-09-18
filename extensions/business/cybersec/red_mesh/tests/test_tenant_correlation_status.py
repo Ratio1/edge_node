@@ -59,7 +59,7 @@ def test_real_admission_denials_never_read_artifacts_or_write(fault, status):
     if fault == "missing_actor":
       actor = None
     elif fault.endswith("memberships") or fault == "none_scope":
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = {
+      fixture.store.data[("auth", "reader")]["memberships"] = {
         "none_scope": [], "null_memberships": None, "malformed_memberships": "private",
       }[fault]
     elif fault == "inactive":
@@ -110,7 +110,7 @@ def test_actual_native_status_wire_and_typed_denials(read_native, response_forma
     elif outcome == "model":
       fixture.job["job_type"] = "model_test"
     elif outcome == "member":
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = []
+      fixture.store.data[("auth", "reader")]["memberships"] = []
     elif outcome == "missing":
       fixture.store.jobs.clear()
     elif outcome == "actorless":

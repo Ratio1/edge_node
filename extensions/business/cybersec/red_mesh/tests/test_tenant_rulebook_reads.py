@@ -397,7 +397,7 @@ def test_real_account_and_job_revocation_denies_before_rulebook_reads(reader, fa
   with read_endpoint_fixture(bound=True) as fixture:
     job_id, tenant_id = "job-1", as_role(fixture, "tenant_admin")
     if fault.endswith("memberships") or fault == "none_scope":
-      fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = {
+      fixture.store.data[("auth", "reader")]["memberships"] = {
         "none_scope": [], "null_memberships": None, "malformed_memberships": "private"}[fault]
     elif fault == "inactive":
       fixture.store.account("reader", active=False,

@@ -1980,10 +1980,11 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
       "cases": [],
     }
 
-    from .read_endpoint_fixtures import install_legacy_read_store
-    actor = install_legacy_read_store(self, plugin, PentesterApi01Plugin, jobs={"job-1": {
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(self, plugin, PentesterApi01Plugin, jobs={"job-1": {
       "job_id": "job-1", "workers": {"node-a": {"report_cid": "raw-cid"}}}})
-    result = PentesterApi01Plugin.get_report(plugin, "raw-cid", "job-1", request_actor=actor)
+    result = PentesterApi01Plugin.get_report(plugin, "raw-cid", "job-1", request_actor=actor,
+                                             tenant_id=tenant_id)
 
     self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
     plugin.r1fs.get_json.assert_called_once_with("raw-cid", pin=False)
