@@ -2505,6 +2505,62 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["deploy"], 1)
     self.assertEqual([context for context, _, _ in validation_calls], ["payment", "nodes"])
 
+  def test_process_repeated_target_replacements_do_not_accumulate_old_nodes(self):
+    specs = {
+      DEEPLOY_KEYS.JOB_ID: 57,
+      DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["0xai_bia2"],
+      DEEPLOY_KEYS.NR_TARGET_NODES: 1,
+    }
+    for targets in (["0xai_bia1"], ["0xai_bia3"], ["0xai_bia2"]):
+      with self.subTest(targets=targets):
+        config = {
+          "IMAGE": "repo/app:1.0",
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        }
+        plugin, called = self._make_process_update_plugin(
+          discovered_instances=[{
+            DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "app-instance",
+            DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_PLUGIN_DATA.NODE: specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES][0],
+            DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {"instance_conf": config},
+          }],
+          nodes=specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES],
+          deeploy_specs=specs,
+        )
+        plugin._check_nodes_availability = lambda inputs: list(targets)
+        response = plugin._process_pipeline_request({
+          DEEPLOY_KEYS.APP_ID: "app-57",
+          DEEPLOY_KEYS.APP_ALIAS: "app",
+          DEEPLOY_KEYS.JOB_ID: 57,
+          DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+          DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+          DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+          DEEPLOY_KEYS.TARGET_NODES: targets,
+          DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+          DEEPLOY_KEYS.PLUGINS: [{
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "app-instance",
+            **config,
+            "PER_NODE_CONFIG": {"byIndex": {"0": {"ENV": {"ROLE": "primary"}}}},
+          }],
+        }, is_create=False, async_mode=True)
+
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+        self.assertEqual(called["delete"], 1)
+        self.assertEqual(called["bc_update"], 1)
+        plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+        specs = plan["deeploy_specs"]
+        self.assertEqual(specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES], targets)
+        self.assertEqual(specs[DEEPLOY_KEYS.NR_TARGET_NODES], 1)
+        self.assertEqual(list(plan["node_plugins_by_addr"]), targets)
+        plugins = plan["node_plugins_by_addr"][targets[0]]
+        instance = plugins[0]["INSTANCES"][0]
+        self.assertEqual(instance["PER_NODE_TARGET_NODES"], targets)
+        self.assertEqual(instance["CHAINSTORE_PEERS"], targets)
+        materialized = plugin._materialize_plugins_for_node(plugins, targets[0], 0)
+        self.assertEqual(materialized[0]["INSTANCES"][0]["ENV"]["ROLE"], "primary")
+
   def test_process_update_uses_persisted_pipeline_when_all_old_nodes_are_offline(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[],
@@ -2586,6 +2642,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["queued"], 1)
     self.assertEqual(called["bc_update"], 1)
     self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["new-node-1"])
+    plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(plan["deeploy_specs"][DEEPLOY_KEYS.CURRENT_TARGET_NODES], ["new-node-1"])
+    self.assertEqual(plan["deeploy_specs"][DEEPLOY_KEYS.NR_TARGET_NODES], 1)
+    instance = plan["node_plugins_by_addr"]["new-node-1"][0]["INSTANCES"][0]
+    self.assertEqual(instance["PER_NODE_TARGET_NODES"], ["new-node-1"])
     redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
     self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(
@@ -3900,15 +3961,14 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instance["ENV"], {"WORKER_NODE": "node-b"})
     self.assertNotIn("perNodeConfig", instance)
 
-  def test_per_node_config_update_uses_persisted_target_node_order(self):
+  def test_per_node_config_order_uses_only_explicit_targets(self):
     plugin = make_deeploy_plugin()
 
     ordered = plugin._ordered_nodes_for_per_node_config(
-      nodes=["0xai_node_b", "0xai_node_a"],
-      dct_deeploy_specs={DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["0xai_node_a", "0xai_node_b"]},
+      nodes=["0xai_node_b", "0xai_node_a", "0xai_node_b"],
     )
 
-    self.assertEqual(ordered, ["0xai_node_a", "0xai_node_b"])
+    self.assertEqual(ordered, ["0xai_node_b", "0xai_node_a"])
 
   def test_update_pipeline_reuses_requested_instance_config_for_duplicate_node_instances(self):
     plugin = make_deeploy_plugin()
@@ -4144,6 +4204,20 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(created["PER_NODE_TARGET_NODES"], expected_nodes)
     self.assertEqual(updated["CHAINSTORE_PEERS"], expected_nodes)
     self.assertEqual(updated["PER_NODE_TARGET_NODES"], expected_nodes)
+    self.assertEqual(base_pipeline["deeploy_specs"][DEEPLOY_KEYS.NR_TARGET_NODES], 3)
+
+    # Only b reports now: a remains a configured target, and c keeps index 2.
+    create_pipelines, update_pipelines, _ = plugin.prepare_create_update_pipelines(
+      base_pipeline=base_pipeline,
+      new_nodes=["0xai_node_c"],
+      update_nodes=["0xai_node_b"],
+      running_apps_for_job={"0xai_node_b": running_apps_for_job["0xai_node_b"]},
+    )
+    self.assertEqual(
+      create_pipelines["0xai_node_c"]["plugins"][0]["INSTANCES"][0]["PER_NODE_TARGET_NODES"],
+      expected_nodes,
+    )
+    self.assertEqual(base_pipeline["deeploy_specs"][DEEPLOY_KEYS.NR_TARGET_NODES], 3)
 
   def test_scale_up_prepare_canonicalizes_persisted_per_node_config(self):
     plugin = make_deeploy_plugin()

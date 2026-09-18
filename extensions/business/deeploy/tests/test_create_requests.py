@@ -2019,7 +2019,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(first_instance["PER_NODE_TARGET_NODES"], ["0xai_node_a", "0xai_node_b"])
     self.assertEqual(second_instance["PER_NODE_TARGET_NODES"], ["0xai_node_a", "0xai_node_b"])
 
-  def test_create_redeploy_uses_persisted_target_order_for_by_index(self):
+  def test_create_redeploy_uses_requested_target_order_for_by_index(self):
     plugin = make_deeploy_plugin()
     plugin.defaultdict = defaultdict
     plugin.time = lambda: 1000
@@ -2085,6 +2085,15 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       by_node["0xai_node_b"]["PER_NODE_CONFIG"]["byIndex"],
     )
 
+    for node, expected_index in (("0xai_node_b", 0), ("0xai_node_a", 1)):
+      self.assertEqual(by_node[node]["PER_NODE_TARGET_NODES"], ["0xai_node_b", "0xai_node_a"])
+      overlay = plugin._overlay_for_node(by_node[node]["PER_NODE_CONFIG"], node, expected_index)
+      self.assertEqual(overlay["ENV"]["NODE_ID"], str(expected_index + 1))
+    self.assertEqual(
+      sent[0]["deeploy_specs"][DEEPLOY_KEYS.CURRENT_TARGET_NODES],
+      ["0xai_node_b", "0xai_node_a"],
+    )
+
   def test_create_partial_redeploy_sends_full_per_node_target_order(self):
     plugin = make_deeploy_plugin()
     plugin.defaultdict = defaultdict
@@ -2128,6 +2137,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
 
     plugin._DeeployMixin__create_pipeline_on_nodes(
       nodes=["0xai_node_b"],
+      full_target_nodes=["0xai_node_a", "0xai_node_b"],
       inputs=inputs,
       app_id="per-node-app",
       app_alias="Per Node App",
