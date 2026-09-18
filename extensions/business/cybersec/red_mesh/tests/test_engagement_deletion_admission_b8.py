@@ -24,13 +24,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from .read_endpoint_fixtures import read_endpoint_fixture
+from .read_endpoint_fixtures import as_role, read_endpoint_fixture
 from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
   install, read_native, request, scheduler_comms,
 )
 
 SECRET = "mock-only-b8-canary"
 BODY = {"job_id": "job-1", "delete_documents": True}
+OTHER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
 
 
 def _no_deletion(fixture):
@@ -48,25 +49,27 @@ def _no_deletion(fixture):
 
 
 @pytest.mark.parametrize("fault,status", (
-  ("actor", 404), ("deleted", 404), ("inactive", 404), ("user", 403),
-  ("memberships", 403), ("rollout", 403), ("identity_store", 503),
+  ("actor", 404), ("deleted", 404), ("inactive", 404), ("none_scope", 404),
+  ("tenant_admin", 403), ("missing_tenant", 400), ("unknown_tenant", 404),
+  ("identity_store", 503),
 ))
 def test_denials_never_redact_or_delete_a_document(fault, status):
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True, role="super_tenant_admin") as fixture:
     account = fixture.store.data[("auth", "reader")]
-    actor = fixture.actor
+    actor, tenant_id = fixture.actor, fixture.tenant_id
     if fault == "actor": actor = None
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "user": fixture.store.account("reader", role="user")
-    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
-    elif fault == "rollout":
-      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
-        record={"stage": "draining", "enabled": False})
+    elif fault == "none_scope": account["metadata"]["tenant_memberships"] = []
+    # The owning tenant's own administrator does not hold `engagement:delete` (RM-084 P3).
+    elif fault == "tenant_admin": as_role(fixture, "tenant_admin")
+    elif fault == "missing_tenant": tenant_id = None
+    elif fault == "unknown_tenant": tenant_id = OTHER_TENANT
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"
 
     with _no_deletion(fixture):
-      result = fixture.Plugin.delete_job_engagement(fixture.owner, **BODY, request_actor=actor)
+      result = fixture.Plugin.delete_job_engagement(fixture.owner, **BODY, request_actor=actor,
+                                                    tenant_id=tenant_id)
     assert result.get("status_code") == status
     assert result.get("success") is False
     assert SECRET not in repr(result)
@@ -76,7 +79,7 @@ def test_a_caller_cannot_supply_the_identity_the_redaction_is_attributed_to():
   """`requested_by` decided the `actor` field of a GDPR deletion audit record from an unverified
   request body. The attribution must come from the resolved account and nowhere else."""
   import inspect
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True, role="super_tenant_admin") as fixture:
     parameters = inspect.signature(fixture.Plugin.delete_job_engagement).parameters
   assert "requested_by" not in parameters, (
     "a caller can still name the actor a deletion is attributed to")
@@ -85,7 +88,7 @@ def test_a_caller_cannot_supply_the_identity_the_redaction_is_attributed_to():
 
 def test_the_audit_record_carries_the_resolved_account():
   """Not just that the caller cannot supply it -- that the resolved identity actually lands."""
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
     # The launcher gate runs before the redaction, and the fixture job is launched by node-a.
     fixture.owner.ee_addr = "node-a"
     module = sys.modules[fixture.Plugin.__module__]
@@ -98,20 +101,21 @@ def test_the_audit_record_carries_the_resolved_account():
     # delete_documents=False skips the JobConfig read; the attribution is what is under test.
     with patch.object(module, "delete_engagement_data", _capture):
       fixture.Plugin.delete_job_engagement(fixture.owner, job_id="job-1", delete_documents=False,
-                                           request_actor=fixture.actor)
+                                           request_actor=fixture.actor,
+                                           tenant_id=fixture.tenant_id)
     assert captured.get("requested_by") == "reader", captured
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("fault,status", (("user", 403), ("actor", 404)))
+@pytest.mark.parametrize("fault,status", (("tenant_admin", 403), ("actor", 404)))
 def test_the_denial_keeps_its_status_over_the_wire(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True, role="super_tenant_admin") as fixture:
     module.eng = scheduler_comms(fixture, response_format)
-    payload = {**BODY, "request_actor": fixture.actor}
-    if fault == "user":
-      fixture.store.account("reader", role="user")
+    payload = {**BODY, "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
+    if fault == "tenant_admin":
+      as_role(fixture, "tenant_admin")
     else:
       payload.pop("request_actor")
     with _no_deletion(fixture):
@@ -139,10 +143,10 @@ def test_failures_do_not_publish_exception_prose(branch, code):
   satisfied by `unavailable` rather than by the prose removal -- vacuous for all four branches it
   claimed to guard. Each branch is now reached on its own terms and its code asserted.
   """
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
     fixture.owner.ee_addr = "node-a"
     fixture.owner.P = lambda *_args, **_kwargs: None
-    fixture.store.jobs["legacy-alias"]["job_config_cid"] = "cfg-cid"
+    fixture.store.jobs["job-1"]["job_config_cid"] = "cfg-cid"
     module = sys.modules[fixture.Plugin.__module__]
     repo = Mock()
     repo.put_job_config = Mock(return_value="new-cid")
@@ -161,23 +165,24 @@ def test_failures_do_not_publish_exception_prose(branch, code):
          patch.object(module, "collect_engagement_document_cids", Mock(return_value=["doc-a"])), \
          patch.object(fixture.Plugin, "_write_job_record", _write):
       result = fixture.Plugin.delete_job_engagement(
-        fixture.owner, **BODY, request_actor=fixture.actor)
+        fixture.owner, **BODY, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result.get("error_code") == code, result
     assert SECRET not in repr(result), result
 
 
-def test_only_a_legacy_admin_may_delete_engagement_data():
-  """The shared reports:export gate admits an admin *or* an app_role pentester, which is right for
-  the rulebook mutations and broader than the owner's B8 decision. This endpoint irreversibly
-  deletes authorization documents, so it takes the narrower of the two."""
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
-    # A legacy pentester: exactly the account the shared reports:export gate would admit.
-    fixture.store.account("reader", role="user")
-    fixture.store.data[("auth", "reader")]["metadata"]["appRole"] = "pentester"
+@pytest.mark.parametrize("role", ("tenant_user", "tenant_pentester", "tenant_admin",
+                                  "super_pentester"))
+def test_only_a_super_tenant_admin_may_delete_engagement_data(role):
+  """The shared reports:export gate admits every role that can export a report, which is right for
+  the rulebook mutations and broader than the owner's B8 decision. RM-084 P3 gave this endpoint the
+  matrix's own `engagement:delete`, held by the Super-Tenant Admin alone -- so a Tenant Admin, and
+  even a platform Super-Pentester, is refused an irreversible deletion of authorization documents."""
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
+    as_role(fixture, role)
     module = sys.modules[fixture.Plugin.__module__]
     with _no_deletion(fixture):
       result = fixture.Plugin.delete_job_engagement(
-        fixture.owner, **BODY, request_actor=fixture.actor)
+        fixture.owner, **BODY, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
       module.delete_engagement_data.assert_not_called()
     assert result == {"success": False, "error": "forbidden", "status_code": 403}, result
 
@@ -191,9 +196,9 @@ def test_the_delivered_state_is_recorded_once_a_document_is_gone():
   Driven by making the audit branch's own logging raise, which is the one way an exception escapes
   after deletion: every other post-delete failure is caught and answered with counts.
   """
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
     fixture.owner.ee_addr = "node-a"
-    fixture.store.jobs["legacy-alias"]["job_config_cid"] = "cfg-cid"
+    fixture.store.jobs["job-1"]["job_config_cid"] = "cfg-cid"
     module = sys.modules[fixture.Plugin.__module__]
     repo = Mock()
     repo.get_job_config = Mock(return_value={"engagement": {"client": "acme"}})
@@ -215,22 +220,22 @@ def test_the_delivered_state_is_recorded_once_a_document_is_gone():
          patch.object(module, "collect_engagement_document_cids", Mock(return_value=["doc-a"])), \
          patch.object(fixture.Plugin, "_write_job_record", _write):
       result = fixture.Plugin.delete_job_engagement(
-        fixture.owner, **BODY, request_actor=fixture.actor)
+        fixture.owner, **BODY, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert repo.delete.call_count == 1, "the document was not deleted, so this proves nothing"
     assert result.get("effect_state") == "delivered", (
       "a deleted document was reported as a merely persisted effect: %r" % (result,))
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("fault,status", (("user", 403), ("actor", 404)))
+@pytest.mark.parametrize("fault,status", (("tenant_admin", 403), ("actor", 404)))
 def test_the_denial_keeps_its_status_over_the_wire(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True, role="super_tenant_admin") as fixture:
     module.eng = scheduler_comms(fixture, response_format)
-    payload = {**BODY, "request_actor": fixture.actor}
-    if fault == "user":
-      fixture.store.account("reader", role="user")
+    payload = {**BODY, "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
+    if fault == "tenant_admin":
+      as_role(fixture, "tenant_admin")
     else:
       payload.pop("request_actor")
     with _no_deletion(fixture):
@@ -258,10 +263,10 @@ def test_failures_do_not_publish_exception_prose(branch, code):
   satisfied by `unavailable` rather than by the prose removal -- vacuous for all four branches it
   claimed to guard. Each branch is now reached on its own terms and its code asserted.
   """
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
     fixture.owner.ee_addr = "node-a"
     fixture.owner.P = lambda *_args, **_kwargs: None
-    fixture.store.jobs["legacy-alias"]["job_config_cid"] = "cfg-cid"
+    fixture.store.jobs["job-1"]["job_config_cid"] = "cfg-cid"
     module = sys.modules[fixture.Plugin.__module__]
     repo = Mock()
     repo.put_job_config = Mock(return_value="new-cid")
@@ -280,23 +285,24 @@ def test_failures_do_not_publish_exception_prose(branch, code):
          patch.object(module, "collect_engagement_document_cids", Mock(return_value=["doc-a"])), \
          patch.object(fixture.Plugin, "_write_job_record", _write):
       result = fixture.Plugin.delete_job_engagement(
-        fixture.owner, **BODY, request_actor=fixture.actor)
+        fixture.owner, **BODY, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert result.get("error_code") == code, result
     assert SECRET not in repr(result), result
 
 
-def test_only_a_legacy_admin_may_delete_engagement_data():
-  """The shared reports:export gate admits an admin *or* an app_role pentester, which is right for
-  the rulebook mutations and broader than the owner's B8 decision. This endpoint irreversibly
-  deletes authorization documents, so it takes the narrower of the two."""
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
-    # A legacy pentester: exactly the account the shared reports:export gate would admit.
-    fixture.store.account("reader", role="user")
-    fixture.store.data[("auth", "reader")]["metadata"]["appRole"] = "pentester"
+@pytest.mark.parametrize("role", ("tenant_user", "tenant_pentester", "tenant_admin",
+                                  "super_pentester"))
+def test_only_a_super_tenant_admin_may_delete_engagement_data(role):
+  """The shared reports:export gate admits every role that can export a report, which is right for
+  the rulebook mutations and broader than the owner's B8 decision. RM-084 P3 gave this endpoint the
+  matrix's own `engagement:delete`, held by the Super-Tenant Admin alone -- so a Tenant Admin, and
+  even a platform Super-Pentester, is refused an irreversible deletion of authorization documents."""
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
+    as_role(fixture, role)
     module = sys.modules[fixture.Plugin.__module__]
     with _no_deletion(fixture):
       result = fixture.Plugin.delete_job_engagement(
-        fixture.owner, **BODY, request_actor=fixture.actor)
+        fixture.owner, **BODY, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
       module.delete_engagement_data.assert_not_called()
     assert result == {"success": False, "error": "forbidden", "status_code": 403}, result
 
@@ -305,13 +311,14 @@ def test_the_service_layer_does_not_publish_exception_prose_either():
   """The plugin's four interpolations were removed first; two more lived in the service and were
   returned verbatim as `DeleteEngagementError.message`. delete_documents=False routes past the
   plugin's own sanitized branch straight into the service, which is how this one stayed hidden."""
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
     fixture.owner.ee_addr = "node-a"
     repo = Mock()
     repo.get_job_config = Mock(side_effect=RuntimeError(SECRET))
     with patch.object(fixture.Plugin, "_get_artifact_repository", return_value=repo):
       result = fixture.Plugin.delete_job_engagement(
-        fixture.owner, job_id="job-1", delete_documents=False, request_actor=fixture.actor)
+        fixture.owner, job_id="job-1", delete_documents=False,
+        request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert SECRET not in repr(result), result
 
 
@@ -319,9 +326,9 @@ def test_the_requester_is_revalidated_before_the_irreversible_delete():
   """`record` does not run the checkpoint callback -- only `checkpoint` does. Without an explicit
   checkpoint the authority established before three storage round-trips would be the only authority
   ever checked, which is not what the sibling effect paths do."""
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
     fixture.owner.ee_addr = "node-a"
-    fixture.store.jobs["legacy-alias"]["job_config_cid"] = "cfg-cid"
+    fixture.store.jobs["job-1"]["job_config_cid"] = "cfg-cid"
     module = sys.modules[fixture.Plugin.__module__]
     deleted = []
     repo = Mock()
@@ -338,7 +345,8 @@ def test_the_requester_is_revalidated_before_the_irreversible_delete():
          patch.object(module, "collect_engagement_document_cids", _revoke_then_collect), \
          patch.object(fixture.Plugin, "_write_job_record", Mock(return_value={"ok": True})):
       result = fixture.Plugin.delete_job_engagement(
-        fixture.owner, job_id="job-1", delete_documents=True, request_actor=fixture.actor)
+        fixture.owner, job_id="job-1", delete_documents=True,
+        request_actor=fixture.actor, tenant_id=fixture.tenant_id)
     assert deleted == [], "a revoked requester's documents were deleted anyway"
     # The sanitized config already landed, so this is an incomplete effect, not a clean denial.
     assert result.get("error_code") == "effect_incomplete" or result.get("error") == "effect_incomplete", result
@@ -352,10 +360,10 @@ def test_a_partial_redaction_reports_its_counts_over_the_wire(read_native, respo
   `error_code`, the response stays 2xx, and every count survives in both formats."""
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_tenant_admin") as fixture:
     fixture.owner.ee_addr = "node-a"
     fixture.owner.P = lambda *_args, **_kwargs: None
-    fixture.store.jobs["legacy-alias"]["job_config_cid"] = "cfg-cid"
+    fixture.store.jobs["job-1"]["job_config_cid"] = "cfg-cid"
     module.eng = scheduler_comms(fixture, response_format)
     plugin_module = sys.modules[fixture.Plugin.__module__]
     repo = Mock()
@@ -379,7 +387,8 @@ def test_a_partial_redaction_reports_its_counts_over_the_wire(read_native, respo
                       Mock(return_value=["doc-a", "doc-b"])), \
          patch.object(fixture.Plugin, "_write_job_record", _write):
       status, headers, body, _calls = asyncio.run(request(module, "delete_job_engagement",
-        {"job_id": "job-1", "delete_documents": True, "request_actor": fixture.actor}))
+        {"job_id": "job-1", "delete_documents": True, "request_actor": fixture.actor,
+         "tenant_id": fixture.tenant_id}))
     assert status == 200, body
     assert headers[b"cache-control"] == b"no-store"
     payload = json.loads(body)

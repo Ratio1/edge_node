@@ -3928,6 +3928,7 @@ class TestPhase5Endpoints(unittest.TestCase):
                         instance._get_job_from_cstore("job-llm"), "legacy_unbound"))):
       postponed = Plugin.analyze_job(plugin,
         job_id="job-llm",
+        tenant_id="tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f",
       )
       self.assertEqual(postponed, "postponed")
       pending_id = plugin._manual_analysis_state["pending_id"]

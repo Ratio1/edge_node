@@ -133,7 +133,7 @@ _EFFECT_FIELDS = {
                                           ("source_ips", list, None), ("sensor_id", str, ""),
                                           ("request_actor", dict, None), ("tenant_id", str, None)),
   "upload_authorization": (("filename", str, ""), ("content_b64", str, ""),
-                           ("request_actor", dict, None)),
+                           ("request_actor", dict, None), ("tenant_id", str, None)),
   # B4 rulebook review mutations.
   "save_rulebook_review_draft": _JOB_FIELD + (("profile_id", str, None), ("answers", dict, None),
                                               ("note", str, ""),
@@ -159,7 +159,8 @@ _EFFECT_FIELDS = {
   # B10 stop monitoring. On the strict transport, unlike B6/B7/B8: its one typed code is registered
   # in _TYPED_READ_ERRORS, so nothing is lost, and it gains the effect_incomplete passthrough --
   # which matters here because a failed stop may already have cancelled the workers.
-  "stop_monitoring": _JOB_FIELD + (("stop_type", str, "SOFT"), ("request_actor", dict, None)),
+  "stop_monitoring": _JOB_FIELD + (("stop_type", str, "SOFT"), ("request_actor", dict, None),
+                                   ("tenant_id", str, None)),
 }
 # "unknown" exists only for RAW responses, where the framework discards the state before the
 # guard sees it. It still tells the caller an effect may have landed.

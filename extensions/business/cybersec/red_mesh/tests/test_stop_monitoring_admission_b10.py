@@ -1,9 +1,10 @@
 """RM-026 I1b B10: admission for stop_monitoring.
 
 Split out of the B9 Controls group by the owner's decision (2026-09-14): it stops monitoring rather
-than deleting, it is already POST, it carries none of the purge machinery, and it is admissible
-through the existing legacy seam — so it is not blocked on RM-078 the way the three destructive
-operations are.
+than deleting, it is already POST and it carries none of the purge machinery.
+
+RM-084 P3 removed the unscoped half: the caller's tenant is required, and the job must be bound to
+it. Every case below therefore names a tenant.
 
 It was reachable with no requester at all. A HARD stop cancels running workers, marks the job
 stopped, emits a `redmesh.job.stopped` lifecycle event to the SOC, and persists the job record; a
@@ -15,17 +16,19 @@ between admission and effect.
 import asyncio
 import json
 import sys
+from copy import deepcopy
 from unittest.mock import Mock, patch
 
 import pytest
 
-from .read_endpoint_fixtures import read_endpoint_fixture
+from .read_endpoint_fixtures import as_role, read_endpoint_fixture
 from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
   install, read_native, request, scheduler_comms,
 )
 
 SECRET = "mock-only-b10-canary"
 BODY = {"job_id": "job-1", "stop_type": "HARD"}
+OTHER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
 
 
 def _no_stop(fixture):
@@ -41,25 +44,28 @@ def _no_stop(fixture):
 
 
 @pytest.mark.parametrize("fault,status", (
-  ("actor", 404), ("deleted", 404), ("inactive", 404), ("user", 403),
-  ("memberships", 403), ("rollout", 403), ("identity_store", 503),
+  ("actor", 404), ("deleted", 404), ("inactive", 404), ("none_scope", 404),
+  ("tenant_user", 403), ("missing_tenant", 400), ("other_tenant", 404),
+  # The "rollout" fault left with the unscoped seam: the execution rollout gated that seam only,
+  # never the tenant reader, so it is no longer a denial for this endpoint. P6 deletes it entirely.
+  ("identity_store", 503),
 ))
 def test_denials_never_stop_a_worker_or_emit_a_lifecycle_event(fault, status):
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
     account = fixture.store.data[("auth", "reader")]
-    actor = fixture.actor
+    actor, tenant_id = fixture.actor, fixture.tenant_id
     if fault == "actor": actor = None
     elif fault == "deleted": fixture.store.data.pop(("auth", "reader"))
     elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "user": fixture.store.account("reader", role="user")
-    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
-    elif fault == "rollout":
-      fixture.tenant_store.put("execution_rollout", fixture.owner.cfg_instance_id,
-        record={"stage": "draining", "enabled": False})
+    elif fault == "none_scope": account["metadata"]["tenant_memberships"] = []
+    elif fault == "tenant_user": as_role(fixture, "tenant_user")
+    elif fault == "missing_tenant": tenant_id = None
+    elif fault == "other_tenant": tenant_id = OTHER_TENANT
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"
 
     with _no_stop(fixture) as stop:
-      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=actor)
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=actor,
+                                              tenant_id=tenant_id)
     assert result.get("status_code") == status
     assert result.get("success") is False
     stop.assert_not_called()
@@ -72,7 +78,7 @@ def test_the_stop_reads_no_job_of_its_own():
   Asserted by object identity, not `is not None`: the weaker form passes for any snapshot at all,
   including one the endpoint fetched itself, which is the defect this is meant to exclude.
   """
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
     module = sys.modules[fixture.Plugin.__module__]
     admitted = []
     real_snapshot = fixture.Plugin._admitted_snapshot
@@ -86,22 +92,27 @@ def test_the_stop_reads_no_job_of_its_own():
     with patch.object(fixture.Plugin, "_admitted_snapshot", _record), \
          patch.object(module, "stop_monitoring",
                       Mock(side_effect=lambda *a, **k: received.append(k) or {"job_id": "job-1"})):
-      fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor)
+      fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                     tenant_id=fixture.tenant_id)
     assert len(admitted) == 1 and admitted[0] is not None
-    assert received and received[0].get("checked_job") is admitted[0], (
+    # The tenant seam hands back the detached raw record, which the endpoint normalizes before the
+    # service sees it -- so the identity to assert is against that normalization of the admitted
+    # snapshot, not a second read of the store.
+    _, expected = fixture.owner._normalize_job_record("job-1", admitted[0])
+    assert received and received[0].get("checked_job") == expected, (
       "the stop did not receive the admitted snapshot: %r" % (received,))
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-@pytest.mark.parametrize("fault,status", (("user", 403), ("actor", 404)))
+@pytest.mark.parametrize("fault,status", (("tenant_user", 403), ("actor", 404)))
 def test_the_denial_keeps_its_status_over_the_wire(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
-    payload = {**BODY, "request_actor": fixture.actor}
-    if fault == "user":
-      fixture.store.account("reader", role="user")
+    payload = {**BODY, "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
+    if fault == "tenant_user":
+      as_role(fixture, "tenant_user")
     else:
       payload.pop("request_actor")
     with _no_stop(fixture) as stop:
@@ -127,13 +138,13 @@ def test_the_launcher_mismatch_keeps_its_code_over_the_wire(read_native, respons
   """
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     fixture.owner.ee_addr = "some-other-node"   # the fixture job was launched by node-a
     fixture.owner.P = lambda *_args, **_kwargs: None
     fixture.owner._log_audit_event = lambda *_args, **_kwargs: None
     status, headers, body, _calls = asyncio.run(request(module, "stop_monitoring",
-      {**BODY, "request_actor": fixture.actor}))
+      {**BODY, "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}))
     assert status == 409, body
     assert headers[b"cache-control"] == b"no-store"
     assert json.loads(body)["error"] == "job_launcher_mismatch", body
@@ -175,19 +186,25 @@ def test_a_tenant_user_cannot_stop_a_bound_job():
     stop.assert_not_called()
 
 
-def test_a_bound_job_is_refused_on_the_legacy_seam():
-  """Omitting the selector must not fall back to legacy authority over a bound job."""
+@pytest.mark.parametrize("tenant_id", (None, "", "   "))
+def test_omitting_the_tenant_is_refused_rather_than_falling_back(tenant_id):
+  """RM-084 P3: there is no unscoped half left to fall back to, so this is a 400 and not a stop."""
   with read_endpoint_fixture(bound=True, archived=False) as fixture:
     _membership(fixture, "tenant_admin")
     with _stop_ok(fixture) as stop:
-      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor)
-    assert result.get("success") is False and result.get("status_code") in (403, 404), result
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                              tenant_id=tenant_id)
+    assert (result.get("success"), result.get("status_code"), result.get("error")) == (
+      False, 400, "invalid_request"), result
     stop.assert_not_called()
 
 
 def test_an_unbound_job_is_not_found_through_a_tenant_selector():
-  with read_endpoint_fixture(bound=False, archived=False) as fixture:
+  """A record with no binding belongs to no tenant, so a tenant caller cannot reach it at all."""
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
     _membership(fixture, "tenant_admin")
+    fixture.store.jobs["legacy-alias"] = {**deepcopy(fixture.job), "job_id": "legacy-alias"}
+    fixture.store.jobs["legacy-alias"].pop("execution_binding")
     with _stop_ok(fixture) as stop:
       result = fixture.Plugin.stop_monitoring(fixture.owner, job_id="legacy-alias", stop_type="HARD",
                                               request_actor=fixture.actor, tenant_id=fixture.tenant_id)

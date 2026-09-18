@@ -165,6 +165,11 @@ class _Owner:
     return NativePostponedRequest(solver_method, dict(method_kwargs or {}))
 
 
+# RM-084 P3 requires a tenant selector ahead of admission; this suite stubs admission itself, so
+# the value only has to travel the transport.
+SCHEDULER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
+
+
 @unittest.skipUnless(
   NATIVE_RUNTIME_SOURCE_AVAILABLE,
   "native Ratio1 runtime source fixture is unavailable",
@@ -350,12 +355,14 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     self.addCleanup(owner._manual_analysis_executor.shutdown, wait=False)
     harness = _SchedulerHarness.__new__(_SchedulerHarness)
     harness._endpoints = {
-      "analyze_job": lambda job_id, analysis_type="", focus_areas=None, request_actor=None: (
+      "analyze_job": lambda job_id, analysis_type="", focus_areas=None, request_actor=None,
+                            tenant_id=None: (
         PentesterApi01Plugin.analyze_job(owner,
           job_id,
           analysis_type,
           focus_areas,
           request_actor,
+          tenant_id,
         )
       ),
       "get_job_status": lambda job_id, request_actor=None, tenant_id=None: (
@@ -462,7 +469,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/analyze_job",
-            payload={"job_id": "job-1"},
+            payload={"job_id": "job-1", "tenant_id": SCHEDULER_TENANT},
           ))
 
         def _prepare(_plugin, job_id, *, checked_job=None):
@@ -486,7 +493,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/analyze_job",
-            payload={"job_id": "explode"},
+            payload={"job_id": "explode", "tenant_id": SCHEDULER_TENANT},
           )
           self.assertEqual(failed_status, 503, failed_body)
           self.assertLess(failed_elapsed, 1.0)
@@ -512,7 +519,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/analyze_job",
-            payload={"job_id": "job-1"},
+            payload={"job_id": "job-1", "tenant_id": SCHEDULER_TENANT},
           )
           self.assertEqual(busy_status, 409, busy_body)
           self.assertLess(busy_elapsed, 1.0)

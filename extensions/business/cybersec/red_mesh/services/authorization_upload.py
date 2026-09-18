@@ -114,6 +114,7 @@ def store_authorization_document(
   virus_scan_hook=None,
   now_fn=None,
   uploaded_by: str | None = None,
+  tenant_id: str | None = None,
   ledger=None,
 ) -> AuthorizationUploadResult:
   """Validate + store an authorization document via R1FS.
@@ -208,9 +209,13 @@ def store_authorization_document(
   }
   if uploaded_by:
     # Derived from admission, never caller-supplied (contract 5). Admission gives an owner for free;
-    # recording it turns RM-078's deferral from a plan sentence into a stored fact. The document is
-    # attributable to an account, not yet scoped to a tenant.
+    # recording it turns RM-078's deferral from a plan sentence into a stored fact.
     envelope["uploaded_by"] = uploaded_by
+  if tenant_id:
+    # RM-084 P3. The tenant that authorized the document, taken from admission rather than the
+    # request. Launch reads it back and refuses a document belonging to another tenant, so a
+    # permission-to-test filed in one workspace cannot authorize a scan in a different one.
+    envelope["tenant_id"] = tenant_id
 
   # 5. Store via R1FS
   if ledger is not None:

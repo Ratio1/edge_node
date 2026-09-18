@@ -119,9 +119,11 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "pass_nr", "request_actor", "tenant_id")
     elif method.name in UNGUARDED_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == {
-        "analyze_job": ("self", "job_id", "analysis_type", "focus_areas", "request_actor"),
+        "analyze_job": ("self", "job_id", "analysis_type", "focus_areas", "request_actor",
+                        "tenant_id"),
         "get_raw_model_test_evidence": ("self", "job_id", "request_actor", "tenant_id"),
-        "delete_job_engagement": ("self", "job_id", "delete_documents", "request_actor"),
+        "delete_job_engagement": ("self", "job_id", "delete_documents", "request_actor",
+                                  "tenant_id"),
       }[method.name]
     elif method.name in EFFECT_ROUTES:
       # Effect endpoints keep their original positional parameters and append request_actor last,
@@ -137,7 +139,8 @@ def _render_native(default_route=None):
         "export_misp": ("self", "job_id", "pass_nr", "request_actor", "tenant_id"),
         "correlate_suricata_eve": ("self", "job_id", "eve_jsonl", "pass_nr", "source_ips",
                                    "sensor_id", "request_actor", "tenant_id"),
-        "upload_authorization": ("self", "filename", "content_b64", "request_actor"),
+        # RM-084 P3: the upload is scoped to the tenant that authorized the document.
+        "upload_authorization": ("self", "filename", "content_b64", "request_actor", "tenant_id"),
         "save_rulebook_review_draft": ("self", "job_id", "profile_id", "answers", "note",
                                        "expected_review_revision", "request_actor", "tenant_id"),
         "submit_rulebook_review": ("self", "job_id", "profile_id", "expected_review_revision",

@@ -19,10 +19,13 @@ _ROLE_OPERATIONS = {
     # RM-078. analysis:run is an operator action and binds to allow_pentester below;
     # engagement:delete and jobs:purge are administrative and do not.
     "analysis:run", "engagement:delete", "jobs:purge",
+    # RM-084 P3. Uploading a permission-to-test document is a pre-engagement step of launching, so
+    # it carries the launch role set and the same Allow Pentester binding analysis:run has.
+    "authorization:upload",
   }),
   "super_pentester": frozenset({
     "assets:create", "assets:update", "allow_pentester:update", "tasks:launch", "tasks:update",
-    "reports:view", "reports:export", "evidence:read", "analysis:run",
+    "reports:view", "reports:export", "evidence:read", "analysis:run", "authorization:upload",
   }),
   "tenant_admin": frozenset({
     "node_failure_policy:update",
@@ -30,7 +33,7 @@ _ROLE_OPERATIONS = {
     "reports:view", "reports:export", "audit:view",
   }),
   "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export",
-                                 "analysis:run"}),
+                                 "analysis:run", "authorization:upload"}),
   "tenant_user": frozenset({"reports:view"}),
 }
 _PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
@@ -152,6 +155,8 @@ def authorize_tenant_operation(
   # "scoped STA/SP and Tenant Pentesters subject to Allow Pentester", and a tenant that switched
   # pentesting off has said something about analysis of its pentest findings as well. Stricter than
   # the launch gate on purpose; flagged for the owner rather than silently harmonised with it.
-  if operation == "analysis:run" and tenant.allow_pentester is not True:
+  # RM-084 P3 puts authorization:upload on the same binding: the document exists to authorize a
+  # pentest, so a tenant with pentesting off has nothing to file one against.
+  if operation in ("analysis:run", "authorization:upload") and tenant.allow_pentester is not True:
     return PolicyDecision(False, 403, "pentesting_disabled")
   return PolicyDecision(True, 200, None)

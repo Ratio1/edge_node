@@ -106,7 +106,8 @@ def install_tenant_read_store(case, owner, Plugin, *, jobs=None, role="super_ten
 
 
 @contextmanager
-def read_endpoint_fixture(*, bound=True, archived=True):
+def read_endpoint_fixture(*, bound=True, archived=True, role="tenant_admin"):
+  """`role` is the bound reader's single membership; a platform role carries `tenant_id: None`."""
   with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
     Plugin = api_fixtures.TestPhase3Archive()._get_plugin_class()
     store = ReadStore()
@@ -120,7 +121,9 @@ def read_endpoint_fixture(*, bound=True, archived=True):
     store.grant("initial", tenant_id)
     activated = administration.activate_tenant({"account_id": "creator"}, request_id)
     assert activated["success"], activated
-    store.account("reader", role="admin", memberships=[{"role": "tenant_admin", "tenant_id": tenant_id}]
+    store.account("reader", role="admin",
+                  memberships=[{"role": role,
+                                "tenant_id": None if role in PLATFORM_ROLES else tenant_id}]
                   if bound else None)
     tenant_store.put("execution_rollout", store.cfg_instance_id,
                      record={"stage": "compatibility", "enabled": False})
@@ -173,3 +176,15 @@ def as_role(fixture, role, *, tenant_id=_SAME_TENANT):
          else fixture.tenant_id if local else tenant_id}
   fixture.store.data[("auth", "reader")]["metadata"]["tenant_memberships"] = [row]
   return fixture.tenant_id if local or role in PLATFORM_ROLES else tenant_id
+
+
+def allow_pentester(fixture, enabled=True):
+  """Flip the fixture tenant's Allow Pentester switch.
+
+  RM-084 P3 binds `analysis:run` and `authorization:upload` to it, so a suite exercising either has
+  to say which side of the switch it is on rather than inherit the default (off).
+  """
+  tenant = fixture.tenant_store.get("tenant", fixture.tenant_id)
+  fixture.tenant_store.put("tenant", fixture.tenant_id,
+                           record={**tenant, "allow_pentester": bool(enabled)})
+  return fixture.tenant_id

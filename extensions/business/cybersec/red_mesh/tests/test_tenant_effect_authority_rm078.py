@@ -57,6 +57,23 @@ class TestTenantEffectAuthority(unittest.TestCase):
                                        TenantPolicyContext("a", True, True)),
             PolicyDecision(True, 200, None) if allowed else PolicyDecision(False, 403, "forbidden"))
 
+  def test_the_authorization_upload_carries_the_launch_roles_and_the_same_switch(self):
+    """RM-084 P3. Filing a permission-to-test document is a pre-engagement step of launching, so it
+    holds the launch role set -- and binds Allow Pentester the way `analysis:run` does, because a
+    tenant with pentesting off has nothing to authorize."""
+    for role, holds in (("super_tenant_admin", True), ("super_pentester", True),
+                        ("tenant_pentester", True), ("tenant_admin", False),
+                        ("tenant_user", False)):
+      with self.subTest(role=role):
+        actor = account(in_tenant(role, "a"))
+        self.assertEqual(
+          authorize_tenant_operation(actor, "authorization:upload",
+                                     TenantPolicyContext("a", True, True)).allowed, holds)
+        self.assertEqual(
+          authorize_tenant_operation(actor, "authorization:upload",
+                                     TenantPolicyContext("a", True, False)),
+          PolicyDecision(False, 403, "pentesting_disabled" if holds else "forbidden"))
+
   def test_manual_analysis_honours_allow_pentester_for_every_scoped_role(self):
     """The owner's words were "scoped STA/SP and Tenant Pentesters subject to Allow Pentester", so
     the switch binds all three, including Super-Tenant Admin.
@@ -293,14 +310,15 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
     # catches the *next* endpoint opting into tenant scope, and it is inert if left red.
     # `stop_monitoring` opted in under the RM-026 MVP (2026-09-15): it forwards the caller's
     # explicit selector and "reports:export" is admitted at both tenant seams. Still by name.
-    # RM-084 P1 opted the E1 export effects in, and P2 the E2 ingest and review mutations: each
-    # refuses a missing tenant before admission. `delete_job_engagement` is the last endpoint on
-    # the unscoped half and opts in with P3, which is what the null-tenant count below pins.
+    # RM-084 P1 opted the E1 export effects in, P2 the E2 ingest and review mutations, and P3
+    # `delete_job_engagement` -- the last one. Each refuses a missing tenant before admission, so
+    # the unscoped count below is now zero and this guard turns into the stronger statement: no
+    # endpoint may reintroduce an unscoped effect.
     forwarders = {"_purge_operation", "stop_monitoring", "export_misp", "export_stix_bundle",
                   "dry_run_opencti_export", "push_to_opencti", "dry_run_taxii_export",
                   "publish_to_taxii", "correlate_suricata_eve", "generate_rulebook_assessment",
                   "save_rulebook_review_draft", "submit_rulebook_review", "reopen_rulebook_review",
-                  "update_rulebook_review"}
+                  "update_rulebook_review", "delete_job_engagement"}
     enclosing = {}
     for node in ast.walk(tree):
       if isinstance(node, ast.FunctionDef):
@@ -323,8 +341,8 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
                         "an endpoint opted into tenant scope outside its own slice: "
                         + ast.dump(call))
       unscoped += 1
-    self.assertEqual(unscoped, 1,
-                     "the unscoped half changed size outside a phase that says so")
+    self.assertEqual(unscoped, 0,
+                     "an endpoint reintroduced an unscoped effect: the half is gone (RM-084 P3)")
 
 
 

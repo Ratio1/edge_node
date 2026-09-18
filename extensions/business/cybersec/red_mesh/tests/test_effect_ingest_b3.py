@@ -12,7 +12,7 @@ import pytest
 
 from extensions.business.cybersec.red_mesh.services import authorization_upload, suricata_correlation
 from extensions.business.cybersec.red_mesh.tenancy.effects import EffectState
-from .read_endpoint_fixtures import as_role, read_endpoint_fixture
+from .read_endpoint_fixtures import allow_pentester, as_role, read_endpoint_fixture
 from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
   assert_json_response, install, read_native, request, scheduler_comms,
 )
@@ -112,16 +112,19 @@ def test_an_unsafe_parse_message_cannot_reach_the_caller():
 
 
 @pytest.mark.parametrize("fault,status", (
-  ("actor", 404), ("inactive", 404), ("user", 403), ("memberships", 403),
+  ("actor", 404), ("inactive", 404), ("tenant_user", 403), ("none_scope", 404),
+  ("missing_tenant", 400),
 ))
 def test_upload_denials_never_reach_storage(fault, status):
-  with read_endpoint_fixture(bound=False) as fixture:
+  # RM-084 P3: the upload is tenant-scoped under `authorization:upload`, bound to Allow Pentester.
+  with read_endpoint_fixture(bound=True, role="tenant_pentester") as fixture:
     account = fixture.store.data[("auth", "reader")]
-    actor = fixture.actor
+    actor, tenant_id = fixture.actor, allow_pentester(fixture)
     if fault == "actor": actor = None
     elif fault == "inactive": fixture.store.account("reader", active=False)
-    elif fault == "user": fixture.store.account("reader", role="user")
-    elif fault == "memberships": account["metadata"]["tenant_memberships"] = []
+    elif fault == "tenant_user": as_role(fixture, "tenant_user")
+    elif fault == "none_scope": account["metadata"]["tenant_memberships"] = []
+    elif fault == "missing_tenant": tenant_id = None
     import sys
     plugin_module = sys.modules[fixture.Plugin.__module__]
     # Patch the plugin module's binding: it imports the symbol, so patching the service module
@@ -129,7 +132,8 @@ def test_upload_denials_never_reach_storage(fault, status):
     with patch.object(plugin_module, "store_authorization_document",
                       side_effect=AssertionError(SECRET)) as store:
       result = fixture.Plugin.upload_authorization(
-        fixture.owner, filename="auth.pdf", content_b64=PDF_B64, request_actor=actor)
+        fixture.owner, filename="auth.pdf", content_b64=PDF_B64, request_actor=actor,
+        tenant_id=tenant_id)
     assert result["status_code"] == status
     store.assert_not_called()
 
@@ -143,7 +147,8 @@ def test_the_uploaded_document_records_its_derived_owner():
       captured.update(envelope)
       return "doc-cid"
 
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True, role="tenant_pentester") as fixture:
+    tenant_id = allow_pentester(fixture)
     # Patch the service the endpoint calls, capturing the envelope it would store.
     real_store = authorization_upload.store_authorization_document
 
@@ -155,8 +160,12 @@ def test_the_uploaded_document_records_its_derived_owner():
     plugin_module = sys.modules[fixture.Plugin.__module__]
     with patch.object(plugin_module, "store_authorization_document", capture):
       fixture.Plugin.upload_authorization(fixture.owner, filename="auth.pdf",
-                                          content_b64=PDF_B64, request_actor=fixture.actor)
+                                          content_b64=PDF_B64, request_actor=fixture.actor,
+                                          tenant_id=tenant_id)
+      stored_tenant = tenant_id
   assert captured.get("uploaded_by") == "reader", "the derived account was not recorded"
+  # RM-084 P3: and the tenant that authorized it, which is what binds it to one workspace.
+  assert captured.get("tenant_id") == stored_tenant, "the authorizing tenant was not recorded"
   # Never caller-supplied (contract 5).
   assert "actor" not in captured
 
@@ -209,12 +218,10 @@ def test_ingest_denials_survive_both_response_formats(read_native, response_form
   install(module)
   for endpoint, body in (("correlate_suricata_eve", {"job_id": "job-1", "eve_jsonl": "{}"}),
                          ("upload_authorization", {"filename": "a.pdf", "content_b64": PDF_B64})):
-    scoped = endpoint == "correlate_suricata_eve"
-    with read_endpoint_fixture(bound=scoped) as fixture:
-      if scoped:
-        body = {**body, "tenant_id": as_role(fixture, "tenant_user")}
-      else:
-        fixture.store.account("reader", role="user")
+    # Both are tenant-scoped now (P2 the ingest, P3 the upload); a tenant_user holds neither.
+    with read_endpoint_fixture(bound=True) as fixture:
+      allow_pentester(fixture)
+      body = {**body, "tenant_id": as_role(fixture, "tenant_user")}
       module.eng = scheduler_comms(fixture, response_format)
       result, calls = assert_json_response(asyncio.run(request(module, endpoint,
         {**body, "request_actor": fixture.actor})), 403)
@@ -228,10 +235,12 @@ def test_an_upload_failure_publishes_a_typed_code_not_r1fs_prose(read_native, re
   collapsed it to 503 -- a format divergence as well as a contract-7 leak."""
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=False) as fixture:
+  with read_endpoint_fixture(bound=True, role="tenant_pentester") as fixture:
     module.eng = scheduler_comms(fixture, response_format)
+    tenant_id = allow_pentester(fixture)
     result, _calls = assert_json_response(asyncio.run(request(module, "upload_authorization",
-      {"filename": "a.txt", "content_b64": "bm90LWEtcGRm", "request_actor": fixture.actor})), 200)
+      {"filename": "a.txt", "content_b64": "bm90LWEtcGRm", "request_actor": fixture.actor,
+       "tenant_id": tenant_id})), 200)
     body = result["result"] if response_format == "WRAPPED" else result
     assert body.get("configuration_error") == "bad_mime"
     assert "message" not in body, "exception prose reached the caller"
