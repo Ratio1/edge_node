@@ -35,6 +35,21 @@ def test_saved_network_target_is_derived_and_actual_override_denied_without_dns(
         validate_effective_config(config, target=invalid)
 
 
+def test_saved_network_hostname_is_the_exact_job_target_without_dns():
+  from extensions.business.cybersec.red_mesh.tenancy.effective_targets import resolve_launch_target, validate_effective_config
+  admission = context({"kind": "network", "address": "scanme.nmap.org"})
+  with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")):
+    assert resolve_launch_target(admission, "network", "") == "scanme.nmap.org"
+    for other in ("SCANME.nmap.org", "45.33.32.156", "http://scanme.nmap.org/"):
+      with pytest.raises(ValueError, match="Execution target mismatch"):
+        resolve_launch_target(admission, "network", other)
+    config = {"scan_type": "network", "target": "scanme.nmap.org",
+              "execution_binding": admission.build_binding("launcher", ["node-1"]).to_dict()}
+    validate_effective_config(config, target="scanme.nmap.org")
+    with pytest.raises(ValueError, match="Execution target mismatch"):
+      validate_effective_config(config, target="45.33.32.156")
+
+
 def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
   from .test_tenant_execution import TestTenantExecution
   from .test_api import TestPhase1ConfigCID

@@ -233,10 +233,21 @@ class TestTenantAssetAdministration(unittest.TestCase):
     self.assertTrue(self.create(request_id=str(uuid4()), target={"kind": "webapp", "url": url, "allowedPathPrefix": "/"})["success"])
     self.assertEqual(self.create(target={"kind": "webapp", "url": url + "a", "allowedPathPrefix": "/"})["status_code"], 400)
 
+  def test_network_target_accepts_a_canonical_hostname(self):
+    target = {"kind": "network", "address": "scanme.nmap.org"}
+    result = self.create(request_id=str(uuid4()), target=target)
+    self.assertTrue(result["success"])
+    self.assertEqual(result["data"]["target"], target)
+
   def test_noncanonical_and_secret_bearing_targets_are_rejected_before_writes(self):
     for target in (None, [], "192.0.2.10", {}, {"kind": "network", "address": 1},
                    {"kind": "network", "address": "192.0.2.0/24"}, {"kind": "network", "address": "::1"},
-                   {"kind": "network", "address": "example.com"}, {**self.target, "port": 443},
+                   {"kind": "network", "address": "Example.com"}, {"kind": "network", "address": "http://example.com"},
+                   {"kind": "network", "address": "example.com:80"}, {"kind": "network", "address": "example.com/"},
+                   {"kind": "network", "address": "example.com."}, {"kind": "network", "address": "a..b"},
+                   {"kind": "network", "address": "127.1"}, {"kind": "network", "address": "010.0.0.1"},
+                   {"kind": "network", "address": "user@example.com"}, {"kind": "network", "address": "b\u00fccher.de"},
+                   {"kind": "network", "address": ""}, {**self.target, "port": 443},
                    {**self.target, "credential_ref": "secret"}, {**self.target, "headers": {}},
                    {"kind": "api", "url": "https://host"}):
       with self.subTest(target=target):

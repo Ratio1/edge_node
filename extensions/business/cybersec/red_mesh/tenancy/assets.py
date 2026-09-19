@@ -62,6 +62,24 @@ def _validated_path(path, *, encoded):
     current = unquote(current, encoding="utf-8", errors="strict")
 
 
+def _normalize_host(value):
+  """Lowercase DNS hostname or canonical dotted IPv4; no DNS lookup."""
+  value.encode("ascii", errors="strict")
+  host = value.lower()
+  if len(host) > 253 or any(re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label) is None
+                            for label in host.split(".")):
+    raise ValueError("Invalid hostname")
+  try:
+    canonical_ip = str(IPv4Address(host))
+  except ValueError:
+    if re.fullmatch(r"(?:[0-9]+|0x[0-9a-f]*)", host.split(".")[-1], re.IGNORECASE):
+      raise ValueError("Ambiguous numeric hostname") from None
+  else:
+    if canonical_ip != host:
+      raise ValueError("Noncanonical IPv4")
+  return host
+
+
 def _normalize_url(value, *, https_only=False):
   raw = _url_text(value)
   match = re.fullmatch(r"(https?)://([^/]+)(/.*)?", raw, flags=re.IGNORECASE | re.ASCII)
@@ -80,19 +98,7 @@ def _normalize_url(value, *, https_only=False):
     match = re.fullmatch(r"([^:]+)(?::([0-9]+))?", authority)
     if match is None:
       raise ValueError("Invalid authority")
-    match[1].encode("ascii", errors="strict")
-    host, port = match[1].lower(), match[2]
-    if len(host) > 253 or any(re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label) is None
-                              for label in host.split(".")):
-      raise ValueError("Invalid hostname")
-    try:
-      canonical_ip = str(IPv4Address(host))
-    except ValueError:
-      if re.fullmatch(r"(?:[0-9]+|0x[0-9a-f]*)", host.split(".")[-1], re.IGNORECASE):
-        raise ValueError("Ambiguous numeric hostname") from None
-    else:
-      if canonical_ip != host:
-        raise ValueError("Noncanonical IPv4")
+    host, port = _normalize_host(match[1]), match[2]
   if port is not None:
     if len(port) > 5 or not 1 <= int(port) <= 65535 or str(int(port)) != port:
       raise ValueError("Invalid port")
@@ -107,7 +113,8 @@ def normalize_target(value):
     raise ValueError("Invalid target")
   if value.get("kind") == "network" and set(value) == {"kind", "address"}:
     address = value["address"]
-    if not isinstance(address, str) or str(IPv4Address(address)) != address:
+    # One host per job: canonical IPv4 or a lowercase hostname each worker resolves at scan time.
+    if not isinstance(address, str) or _normalize_host(address) != address:
       raise ValueError("Invalid target")
     return {"kind": "network", "address": address}
   if value.get("kind") == "webapp" and set(value) == {"kind", "url", "allowedPathPrefix"}:
