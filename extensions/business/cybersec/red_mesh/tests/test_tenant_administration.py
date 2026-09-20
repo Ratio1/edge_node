@@ -373,14 +373,21 @@ class TestTenantAdministration(unittest.TestCase):
     self.store.account("reader", memberships=[{"role": "tenant_user", "tenant_id": tenant_id}])
     self.store.account("foreign", memberships=[{"role": "tenant_admin", "tenant_id": "tn_995918e9-0000-4000-8000-000000000008"}])
     self.store.account("disabled", active=False, memberships=[{"role": "tenant_admin", "tenant_id": tenant_id}])
+    # RM-084 P7: an archived admin is listed but is not cover for the last active one.
+    self.store.account("paused", state="deactivated", memberships=[{"role": "tenant_admin", "tenant_id": tenant_id}])
     reader, foreign = {"account_id": "reader"}, {"account_id": "foreign"}
     self.assertEqual(self.service.list_tenants(foreign)["data"], [])
     self.assertEqual(self.service.get_tenant(foreign, tenant_id)["status_code"], 404)
     self.assertEqual(self.service.get_tenant_members(reader, tenant_id)["status_code"], 403)
     members = self.service.get_tenant_members({"account_id": "initial"}, tenant_id)["data"]
-    self.assertEqual(members, [{"accountId": "initial", "displayName": "initial", "role": "tenant_admin"},
-                               {"accountId": "reader", "displayName": "reader", "role": "tenant_user"}])
-    self.assertEqual(self.service.get_tenant(reader, tenant_id)["data"]["memberCount"], 2)
+    self.assertEqual(members, [{"accountId": "initial", "displayName": "initial", "role": "tenant_admin",
+                                "state": "active"},
+                               {"accountId": "paused", "displayName": "paused", "role": "tenant_admin",
+                                "state": "deactivated"},
+                               {"accountId": "reader", "displayName": "reader", "role": "tenant_user",
+                                "state": "active"}])
+    detail = self.service.get_tenant(reader, tenant_id)["data"]
+    self.assertEqual((detail["memberCount"], detail["adminCount"]), (2, 1))
     sole = self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_admin", True)
     # RM-083: the more specific last_tenant_admin wins over last_membership for a sole admin's only row.
     self.assertEqual((sole["status_code"], sole["error"]), (409, "last_tenant_admin"))
@@ -646,6 +653,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
                "check_tenant_domain", "authorize_tenant_membership", "authorize_tenant_account_creation",
+               "authorize_account_state_change",
                "update_tenant_allow_pentester",
                "get_tenant_nodes", "set_tenant_node_assignment", "list_tenant_assets",
                "get_tenant_asset", "create_tenant_asset", "update_tenant_asset")
@@ -682,6 +690,8 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
       self.assertEqual(plugin.get_tenant_members(actor, tenant_id)["data"][0]["accountId"], "initial")
       self.assertFalse(plugin.check_tenant_domain(actor, "tenant")["data"]["available"])
       self.assertEqual(plugin.authorize_tenant_membership(actor, tenant_id, "initial", "tenant_admin")["data"]["accountId"], "initial")
+      state = plugin.authorize_account_state_change(actor, "initial", "deactivated", tenant_id)
+      self.assertEqual((state["status_code"], state["error"]), (409, "last_tenant_admin"))
     self.assertTrue(all(json.loads(hkey)[3] == "deployment" for hkey, _ in store.writes))
 
 

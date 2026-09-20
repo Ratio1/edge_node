@@ -27,6 +27,11 @@ _ADMINISTRATION_LOCK = RLock()
 _MEMBER_ROLES = TENANT_LOCAL_ROLES
 # RM-083 (owner, 2026-09-17): only a Super-Tenant Admin grants, removes or replaces these.
 _PLATFORM_RESERVED_MEMBER_ROLES = frozenset({"tenant_pentester"})
+_ACTIVE_STATE = "active"
+_DEACTIVATED_STATE = "deactivated"
+# RM-084 P7. The two states an administrator acts on; `deleting` is terminal and hidden everywhere.
+_ACCOUNT_STATES = (_ACTIVE_STATE, _DEACTIVATED_STATE)
+_VISIBLE_MEMBER_STATES = frozenset(_ACCOUNT_STATES)
 
 
 class AdministrationDenied(Exception):
@@ -280,21 +285,31 @@ class TenantAdministrationService:
       raise TenantStoreError("Invalid tenant domain reservation")
 
   def _members(self, tenant_id, accounts=None):
+    """RM-084 P7. Deactivated members stay listed with their state; a tenant admin has to see who is
+    archived to restore them. `deleting` (and any state this reader does not know) stays hidden."""
     members = []
     for account in self.accounts.list_accounts() if accounts is None else accounts:
-      if not account.active:
+      if account.state not in _VISIBLE_MEMBER_STATES:
         continue
       roles = {m.role for m in account.tenant_memberships if m.tenant_id == tenant_id and m.role in _MEMBER_ROLES}
       for role in sorted(roles):
-        members.append({"accountId": account.account_id, "displayName": account.account_id, "role": role})
+        members.append({"accountId": account.account_id, "displayName": account.account_id,
+                        "role": role, "state": account.state})
     return sorted(members, key=lambda member: (member["accountId"], member["role"]))
+
+  def _active_tenant_admins(self, tenant_id, accounts=None):
+    """Accounts holding an active tenant_admin membership in the tenant: what "the last admin" counts."""
+    return {member["accountId"] for member in self._members(tenant_id, accounts)
+            if member["role"] == "tenant_admin" and member["state"] == _ACTIVE_STATE}
 
   def _row(self, tenant, accounts=None):
     # Called only with an authorized published row or the verified activation result.
     members = self._members(tenant["tenant_id"], accounts)
+    # RM-084 P7: an archived member is not a member for counting; the counts state present access.
+    active = [m for m in members if m["state"] == _ACTIVE_STATE]
     return {"tenantId": tenant["tenant_id"], "displayName": tenant["display_name"], "domainId": tenant["domain_id"],
-            "lifecycle": "active", "memberCount": len({m["accountId"] for m in members}),
-            "adminCount": len({m["accountId"] for m in members if m["role"] == "tenant_admin"}),
+            "lifecycle": "active", "memberCount": len({m["accountId"] for m in active}),
+            "adminCount": len({m["accountId"] for m in active if m["role"] == "tenant_admin"}),
             "allowPentester": tenant["allow_pentester"], "createdBy": tenant["created_by"],
             "rootAdminId": tenant.get("root_admin_id"),
             "createdAt": tenant["created_at"], "lastActivityAt": None}
@@ -704,8 +719,7 @@ class TenantAdministrationService:
         raise AdministrationDenied(403, "pentester_role_reserved")
     removes_admin = (role == "tenant_admin" if remove else role != "tenant_admin")
     if removes_admin and TenantMembership("tenant_admin", tenant_id) in target.tenant_memberships:
-      others = {member["accountId"] for member in self._members(tenant_id)
-                if member["role"] == "tenant_admin" and member["accountId"] != account_id}
+      others = self._active_tenant_admins(tenant_id) - {account_id}
       if not others:
         raise AdministrationDenied(409, "last_tenant_admin")
       # RM-082. The root tenant administrator's admin membership is the founder's to give up, or a
@@ -727,3 +741,72 @@ class TenantAdministrationService:
         raise AdministrationDenied(409, "scope_conflict")
     return {"accountId": account_id, "accountGeneration": target.account_generation,
             "tenantId": tenant_id, "role": role, "remove": remove}
+
+  @_endpoint
+  def authorize_account_state_change(self, actor, account_id, state, tenant_id=None):
+    """RM-084 P7. Approve archiving (deactivating) or restoring an account; nothing is written here.
+
+    The rules are `redmesh-auth.md` §9, checked in its order so the first denial is the one the
+    operator sees. The Navigator writes the state with the generation returned here, which is what
+    makes the decision and the write one operation: a record that moved meanwhile is refused there.
+    """
+    caller = self._actor(actor)
+    account_id = canonical_account_id(account_id)
+    if not account_id or state not in _ACCOUNT_STATES:
+      raise AdministrationDenied(400, "invalid_request")
+    target = self.accounts.get_account(account_id)
+    # Not `_initial_admin`: restoring an account means reading one that is deactivated.
+    if target is None or target.state not in _ACCOUNT_STATES:
+      raise AdministrationDenied(404, "not_found")
+    if not target.account_generation:
+      raise AdministrationDenied(409, "account_changed")
+    if target.account_id == caller.account_id:
+      raise AdministrationDenied(403, "self")
+    rows = tuple(target.tenant_memberships)
+    if tenant_id is not None and any(m.tenant_id != tenant_id for m in rows):
+      # The tenant route names the workspace it acts in; a target outside it is not its business.
+      raise AdministrationDenied(404, "not_found")
+    deactivating = state == _DEACTIVATED_STATE and target.state == _ACTIVE_STATE
+
+    if holds_platform_role(caller):
+      if deactivating and holds_platform_role(target) and not self._other_active_platform_admins(account_id):
+        raise AdministrationDenied(409, "last_super_tenant_admin")
+      target_tenants = {m.tenant_id for m in rows if m.tenant_id is not None}
+      for tenant in target_tenants:
+        self._refuse_last_tenant_admin(tenant, account_id, rows, deactivating)
+      return {"accountId": account_id, "accountGeneration": target.account_generation, "state": state}
+
+    # A none-scope account is the platform's alone: a tenant admin cannot even see one.
+    if not rows:
+      raise AdministrationDenied(404, "not_found")
+    scope = {m.tenant_id for m in caller.tenant_memberships if m.tenant_id is not None}
+    if len(scope) != 1:
+      raise AdministrationDenied(404, "not_found")
+    tenant_of_caller = next(iter(scope))
+    try:
+      tenant, _ = self.authorize_tenant_for_account(caller, tenant_of_caller, "tenant_users:manage")
+    except AdministrationDenied:
+      # §9: a caller who may not manage this tenant's users is told nothing about the account.
+      raise AdministrationDenied(404, "not_found")
+    if any(m.tenant_id != tenant_of_caller or m.role not in _MEMBER_ROLES for m in rows):
+      raise AdministrationDenied(403, "not_a_member")
+    if any(m.role in _PLATFORM_RESERVED_MEMBER_ROLES for m in rows):
+      raise AdministrationDenied(403, "pentester_role_reserved")
+    is_admin = TenantMembership("tenant_admin", tenant_of_caller) in rows
+    # RM-082: the founder is not a peer's to archive, and with no recorded founder no tenant admin is.
+    if tenant.get("root_admin_id") == account_id or (tenant.get("root_admin_id") is None and is_admin):
+      raise AdministrationDenied(403, "root_tenant_admin")
+    self._refuse_last_tenant_admin(tenant_of_caller, account_id, rows, deactivating)
+    return {"accountId": account_id, "accountGeneration": target.account_generation, "state": state}
+
+  def _other_active_platform_admins(self, account_id):
+    return {account.account_id for account in self.accounts.list_accounts()
+            if account.state == _ACTIVE_STATE and account.account_id != account_id
+            and holds_platform_role(account)}
+
+  def _refuse_last_tenant_admin(self, tenant_id, account_id, rows, deactivating):
+    """Owner, 2026-09-20: no caller, the platform included, leaves a tenant with no active admin."""
+    if not deactivating or TenantMembership("tenant_admin", tenant_id) not in rows:
+      return
+    if not self._active_tenant_admins(tenant_id) - {account_id}:
+      raise AdministrationDenied(409, "last_tenant_admin")

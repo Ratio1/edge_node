@@ -545,3 +545,22 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - When changing these boundaries, read [tenant-execution-boundary.md](docs/tenant-execution-boundary.md)
   for compatibility and effect ordering. Tenant reads/caches, launcher lifecycle/takeover and
   operational activation remain later gates; B2 does not establish tenant-serving readiness.
+
+### 2026-09-20 — RM-084 P7 account state authorization
+
+- `authorize_account_state_change(actor, account_id, state, tenant_id=None)` approves archiving
+  (`deactivated`) or restoring (`active`) an account per `redmesh-auth.md` §9, in that order, and
+  writes nothing: the Navigator writes the state with the returned `accountGeneration`, so a record
+  that moved meanwhile is refused at the write. The optional `tenant_id` is the workspace a
+  tenant-side caller acts in; a target with rows outside it is `not_found`.
+- `_members` now lists deactivated members with a `state` field (`deleting` stays hidden), so
+  `memberCount`, `adminCount` and every last-admin check count **active** accounts only
+  (`_active_tenant_admins`). Owner, 2026-09-20: `last_tenant_admin` refuses a platform caller too —
+  no tenant is left without an active administrator.
+- Deactivation needed no execution code: `resolve_actor` already 404s an inactive actor and
+  `reauthorize_execution` already compares the generation, so a restored account's old binding is
+  `account_changed`. Pinned by a new case in `test_tenant_execution.py`.
+- Verification: `test_account_state_administration.py` (new, every §9 row incl. founder-unknown and
+  the stale-enumeration last-admin counts), updated `test_tenant_administration.py`,
+  `test_authz_surface.py` and `test_tenant_execution.py`; full RedMesh suite 5,499 tests and 2,478
+  subtests pass, three pre-existing skips.

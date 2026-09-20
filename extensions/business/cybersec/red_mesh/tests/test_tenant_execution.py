@@ -133,6 +133,31 @@ class TestTenantExecution(unittest.TestCase):
       self.service.reauthorize_execution(binding)
     self.assertEqual((denied.exception.status_code, denied.exception.error), (409, "target_changed"))
 
+  def test_an_archived_launcher_loses_its_running_job_and_restoring_does_not_give_it_back(self):
+    """RM-084 P7. Archiving ends a running job's authority (the actor no longer resolves); restoring
+    is a new incarnation, so the binding of the job it was launched under is stale, not revived."""
+    asset = self.ready()
+    self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
+    self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
+    binding = self.service.resolve_execution_admission({"account_id": "pentester"}, self.tenant,
+      asset["assetId"]).build_binding("coordinator", ["node-a"])
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+    self.owner.account("pentester", state="deactivated",
+                       memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.service.reauthorize_execution(binding, worker_node="node-a")
+    self.assertEqual((denied.exception.status_code, denied.exception.error), (404, "not_found"))
+    # The Navigator rotates the generation on every state write, restoring included.
+    self.owner.account("pentester", generation=str(uuid4()),
+                       memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.service.reauthorize_execution(binding, worker_node="node-a")
+    self.assertEqual((denied.exception.status_code, denied.exception.error), (409, "account_changed"))
+    # A job launched after the restore runs on the new incarnation.
+    fresh = self.service.resolve_execution_admission({"account_id": "pentester"}, self.tenant,
+      asset["assetId"]).build_binding("coordinator", ["node-a"])
+    self.service.reauthorize_execution(fresh, worker_node="node-a")
+
   def test_existing_execution_rejects_incarnation_revocation_and_ineligible_workers(self):
     asset = self.ready()
     self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
