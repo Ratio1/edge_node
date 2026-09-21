@@ -3019,6 +3019,105 @@ class TestPhase2PassFinalization(unittest.TestCase):
     event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
     self.assertIn("attestation_failed", event_types)
 
+  def _build_aborted_graybox_plugin(self, *, probes_attempted, job_pass=1, run_mode="SINGLEPASS",
+                                    llm_enabled=True):
+    """One graybox worker whose report carries the abort state the worker records."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=job_pass, run_mode=run_mode,
+                                                    llm_enabled=llm_enabled)
+    job_specs["scan_type"] = "webapp"
+    job_specs["workers"] = {"worker-A": job_specs["workers"]["worker-A"]}
+    report_a = self._sample_node_report(1, 1, [])
+    report_a["scan_metrics"] = {"probes_attempted": probes_attempted, "probes_completed": probes_attempted}
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [], "service_info": {}, "web_tests_info": {}, "completed_tests": ["graybox_auth"],
+      "ports_scanned": 1, "nr_open_ports": 0, "port_protocols": {}, "scan_type": "webapp",
+      "aborted": True, "abort_phase": "authentication", "abort_reason_class": "auth_failed",
+      "abort_reason": "Official authentication failed. Cannot proceed with graybox scan.",
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target_url": "http://app.test", "scan_type": "webapp",
+                                                     "run_mode": run_mode, "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=(
+      {"score": 16, "breakdown": {}},
+      [{"title": "Scan aborted", "severity": "INFO", "status": "inconclusive", "probe": "_graybox_fatal"}],
+    ))
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+    return PentesterApi01Plugin, plugin, job_specs
+
+  def _pass_report_dicts(self, plugin):
+    return [c[0][0] for c in plugin.r1fs.add_json.call_args_list if "pass_nr" in c[0][0]]
+
+  def test_finalization_graybox_abort_before_any_probe_marks_failed(self):
+    """A graybox pass that aborted with no probe attempted is a failed job, not a
+    finished one: FAILED with the reason, no risk score, no LLM stage, archive kept."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(probes_attempted=0)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertEqual(job_specs["failure_class"], "scan_aborted")
+    self.assertEqual(
+      job_specs["failure_message"],
+      "Scan aborted during authentication: Official authentication failed. Cannot proceed with graybox scan.",
+    )
+    self.assertEqual(job_specs["risk_score"], 0)
+    plugin._get_manual_analysis_executor.return_value.submit.assert_not_called()
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("scan_aborted", event_types)
+    self.assertNotIn("scan_completed", event_types)
+    self.assertNotIn("finalized", event_types)
+    scan_aborted_meta = next(c.kwargs["meta"] for c in plugin._emit_timeline_event.call_args_list
+                             if c.args[1] == "scan_aborted")
+    self.assertEqual(scan_aborted_meta["abort_reason_class"], "auth_failed")
+    self.assertEqual(scan_aborted_meta["abort_phase"], "authentication")
+    (pass_report,) = self._pass_report_dicts(plugin)
+    self.assertEqual(pass_report["risk_score"], 0)
+    self.assertNotIn("risk_breakdown", pass_report)
+    self.assertTrue(pass_report["aborted"])
+    self.assertEqual(pass_report["abort_reason_class"], "auth_failed")
+    # The FATAL finding stays: it is the evidence of why nothing ran.
+    self.assertEqual(pass_report["findings"][0]["title"], "Scan aborted")
+
+  def test_finalization_graybox_abort_after_probes_stays_finalized(self):
+    """An abort after probes ran (session lost mid-scan) keeps the completed
+    result; the pass record says a worker aborted so the report can state it."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(probes_attempted=3,
+                                                                                 llm_enabled=False)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertNotIn("failure_class", job_specs)
+    self.assertEqual(job_specs["risk_score"], 16)
+    (pass_report,) = self._pass_report_dicts(plugin)
+    self.assertTrue(pass_report["aborted"])
+    self.assertEqual(pass_report["abort_phase"], "authentication")
+    self.assertEqual(pass_report["risk_score"], 16)
+
+  def test_finalization_graybox_empty_abort_on_later_pass_keeps_monitoring(self):
+    """A monitor whose target is briefly unreachable on pass 2 is not a failed job;
+    the pass is recorded as aborted and the schedule continues."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(
+      probes_attempted=0, job_pass=2, run_mode="CONTINUOUS_MONITORING", llm_enabled=False)
+    job_specs["pass_reports"] = [{"pass_nr": 1, "pass_report_cid": "QmPass1", "risk_score": 40}]
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertNotIn("failure_class", job_specs)
+    event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("pass_aborted", event_types)
+    self.assertNotIn("scan_aborted", event_types)
+    (pass_report,) = self._pass_report_dicts(plugin)
+    self.assertTrue(pass_report["aborted"])
+    self.assertEqual(pass_report["risk_score"], 0)
+
 
 
 class TestPhase4UiAggregate(unittest.TestCase):

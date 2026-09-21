@@ -228,13 +228,30 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
         "job_id": "j1", "scan_type": "webapp",
         "service_info": {}, "graybox_results": {}, "completed_tests": [],
         "aborted": True, "abort_reason": "unauthorized target",
-        "abort_phase": "preflight",
+        "abort_phase": "preflight", "abort_reason_class": "unauthorized_target",
       },
     }
     agg = host._get_aggregated_report(reports, worker_cls=GrayboxLocalWorker)
     self.assertTrue(agg["aborted"])
     self.assertEqual(agg["abort_reason"], "unauthorized target")
     self.assertEqual(agg["abort_phase"], "preflight")
+    self.assertEqual(agg["abort_reason_class"], "unauthorized_target")
+
+  def test_abort_state_survives_the_archive_round_trip(self):
+    """finalization writes the aggregate through AggregatedScanData; a field the
+    model does not carry is a field deleted from the archive."""
+    from extensions.business.cybersec.red_mesh.models.reports import AggregatedScanData
+    agg = {
+      "open_ports": [], "service_info": {}, "web_tests_info": {}, "completed_tests": [],
+      "aborted": True, "abort_reason": "unauthorized target", "abort_phase": "preflight",
+      "abort_reason_class": "unauthorized_target",
+    }
+    out = AggregatedScanData.from_dict(agg).to_dict()
+    for key in ("aborted", "abort_reason", "abort_phase", "abort_reason_class"):
+      self.assertEqual(out[key], agg[key])
+    clean = AggregatedScanData.from_dict({"open_ports": [], "service_info": {}, "web_tests_info": {},
+                                          "completed_tests": []}).to_dict()
+    self.assertNotIn("aborted", clean)
 
   def test_findings_carry_worker_and_node_attribution(self):
     """Every finding in the aggregated report has the four stamp

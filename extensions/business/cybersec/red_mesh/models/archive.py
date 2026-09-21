@@ -361,6 +361,15 @@ class PassReport:
   # Attestation
   redmesh_test_attestation: dict = None
 
+  # Graybox abort state for this pass (from the aggregated report). Absent
+  # (None, stripped) unless a worker raised GrayboxAbort. When it is set and
+  # no probe was attempted, the job is FAILED with failure_class
+  # "scan_aborted"; otherwise the pass is complete but partial.
+  aborted: bool = None
+  abort_reason: str = None
+  abort_phase: str = None
+  abort_reason_class: str = None
+
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
 
@@ -383,6 +392,10 @@ class PassReport:
       scan_metrics=d.get("scan_metrics"),
       worker_scan_metrics=d.get("worker_scan_metrics"),
       redmesh_test_attestation=d.get("redmesh_test_attestation"),
+      aborted=d.get("aborted") or None,
+      abort_reason=d.get("abort_reason") or None,
+      abort_phase=d.get("abort_phase") or None,
+      abort_reason_class=d.get("abort_reason_class") or None,
     )
 
 

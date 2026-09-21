@@ -164,6 +164,14 @@ class AggregatedScanData:
   graybox_results: dict = None
   target: str = None
   scan_type: str = None
+  # Graybox safety-gate abort state, merged across workers by
+  # `GrayboxLocalWorker.get_worker_specific_result_fields`. None (stripped)
+  # on a network scan or a clean graybox run; the same round-trip caveat as
+  # above applies, which is why they are carried here.
+  aborted: bool = None
+  abort_reason: str = None
+  abort_phase: str = None
+  abort_reason_class: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -184,4 +192,8 @@ class AggregatedScanData:
       graybox_results=d.get("graybox_results"),
       target=d.get("target"),
       scan_type=d.get("scan_type"),
+      aborted=d.get("aborted") or None,
+      abort_reason=d.get("abort_reason") or None,
+      abort_phase=d.get("abort_phase") or None,
+      abort_reason_class=d.get("abort_reason_class") or None,
     )
