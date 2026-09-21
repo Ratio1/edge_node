@@ -11,12 +11,21 @@ class TestCombinedCommandControlConfig(unittest.TestCase):
   def _load(self, relative_path):
     return json.loads((REPO_ROOT / relative_path).read_text())
 
-  def _assert_regrouped(self, config):
+  def _assert_crossed(self, config):
     instances = config["COMMUNICATION"]["INSTANCES"]
-    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CONFIG_CHANNEL")
+    self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CTRL_CHANNEL")
     self.assertEqual(instances["COMMANDCONTROL"]["SEND_TO"], "CONFIG_CHANNEL")
-    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CTRL_CHANNEL")
+    self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CONFIG_CHANNEL")
     self.assertEqual(instances["HEARTBEATS"]["SEND_TO"], "CTRL_CHANNEL")
+    self.assertNotIn("RECV_FROM", instances["DEFAULT"])
+    self.assertEqual(instances["DEFAULT"]["SEND_TO"], "PAYLOADS_CHANNEL")
+    for channel in ("CTRL_CHANNEL", "CONFIG_CHANNEL"):
+      publishers = {name for name, value in instances.items() if value.get("SEND_TO") == channel}
+      subscribers = {name for name, value in instances.items() if value.get("RECV_FROM") == channel}
+      self.assertEqual(len(publishers), 1)
+      self.assertEqual(len(subscribers), 1)
+      # EMQX ignore_loop_deliver suppresses same-client self heartbeats.
+      self.assertTrue(publishers.isdisjoint(subscribers), channel)
 
   def _assert_combined_params(self, config, mirror_enabled):
     params = config["COMMUNICATION"]["PARAMS"]
@@ -38,12 +47,12 @@ class TestCombinedCommandControlConfig(unittest.TestCase):
       mirror_enabled,
     )
 
-  def test_comms_testbed_is_regrouped_with_opt_in_targeted_mirror(self):
+  def test_comms_testbed_is_crossed_with_opt_in_targeted_mirror(self):
     config = self._load(".config_app_comms.json")
-    self._assert_regrouped(config)
+    self._assert_crossed(config)
     self._assert_combined_params(config, mirror_enabled=True)
 
-  def test_tracked_runtime_defaults_are_regrouped_but_mirror_off(self):
+  def test_tracked_runtime_defaults_are_crossed_but_mirror_off(self):
     for relative_path in (
       ".config_app.json",
       ".config_app_cluster.json",
@@ -51,7 +60,7 @@ class TestCombinedCommandControlConfig(unittest.TestCase):
     ):
       with self.subTest(relative_path=relative_path):
         config = self._load(relative_path)
-        self._assert_regrouped(config)
+        self._assert_crossed(config)
         self._assert_combined_params(config, mirror_enabled=False)
 
   def test_legacy_fixture_preserves_crossed_roles_for_config_rollback(self):
@@ -60,6 +69,20 @@ class TestCombinedCommandControlConfig(unittest.TestCase):
     self.assertEqual(instances["COMMANDCONTROL"]["RECV_FROM"], "CTRL_CHANNEL")
     self.assertEqual(instances["HEARTBEATS"]["RECV_FROM"], "CONFIG_CHANNEL")
     self._assert_combined_params(fixture, mirror_enabled=False)
+
+  def test_layout_change_preserves_existing_channel_qos(self):
+    for path, expected in (
+      (".config_app.json", (1, 2)),
+      (".config_app_comms.json", (1, 2)),
+      (".config_app_cluster.json", (0, 0)),
+      ("docker-compose/deeploy-testbed/config_app_deeploy_testbed.json", (0, 0)),
+    ):
+      with self.subTest(path=path):
+        params = self._load(path)["COMMUNICATION"]["PARAMS"]
+        self.assertEqual(tuple(
+          params[channel].get("QOS", params["QOS"])
+          for channel in ("CTRL_CHANNEL", "CONFIG_CHANNEL")
+        ), expected)
 
   def test_rollout_docs_name_seed_and_persisted_config_boundaries(self):
     ingress = (REPO_ROOT / "docs" / "heartbeat-ingress-rollout.md").read_text()

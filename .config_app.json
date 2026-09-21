@@ -2,14 +2,14 @@
     "COMMUNICATION": {
         "INSTANCES": {
             "COMMANDCONTROL": {
-                "RECV_FROM": "CONFIG_CHANNEL",
+                "RECV_FROM": "CTRL_CHANNEL",
                 "SEND_TO": "CONFIG_CHANNEL"
             },
             "DEFAULT": {
                 "SEND_TO": "PAYLOADS_CHANNEL"
             },
             "HEARTBEATS": {
-                "RECV_FROM": "CTRL_CHANNEL",
+                "RECV_FROM": "CONFIG_CHANNEL",
                 "SEND_TO": "CTRL_CHANNEL"
             },
             "NOTIFICATIONS": {

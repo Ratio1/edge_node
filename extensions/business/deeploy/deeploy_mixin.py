@@ -793,6 +793,7 @@ class _DeeployMixin:
     dct_deeploy_specs=None,
     service_kind=None,
     cockroachdb_legacy_compat_contexts=None,
+    full_target_nodes=None,
   ):
     """
     Build the exact create payload that will be sent to target nodes.
@@ -833,7 +834,6 @@ class _DeeployMixin:
       reserved_keys={"app_alias", "owner", "is_deeployed", "deeploy_specs"},
     )
     ts = self.time()
-    original_deeploy_specs = self.deepcopy(dct_deeploy_specs) if isinstance(dct_deeploy_specs, dict) else None
     if dct_deeploy_specs:
       dct_deeploy_specs = self.deepcopy(dct_deeploy_specs)
       dct_deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = ts
@@ -872,7 +872,13 @@ class _DeeployMixin:
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
-    per_node_order_nodes = self._ordered_nodes_for_per_node_config(nodes, original_deeploy_specs)
+    # A replacement uses exactly the requested targets. Partial redeploys must
+    # explicitly supply the full deployment order to keep byIndex selectors stable.
+    per_node_order_nodes = self._ordered_nodes_for_per_node_config(
+      nodes if full_target_nodes is None else full_target_nodes,
+    )
+    if any(node not in per_node_order_nodes for node in nodes):
+      raise ValueError("Dispatch nodes must belong to the full deployment target list.")
     dct_deeploy_specs[DEEPLOY_KEYS.NR_TARGET_NODES] = len(per_node_order_nodes)
     dct_deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = self.deepcopy(per_node_order_nodes)
     self._validate_per_node_config_selectors(plugins, per_node_order_nodes)
@@ -955,6 +961,7 @@ class _DeeployMixin:
     dct_deeploy_specs=None,
     prepared_deploy_plan=None,
     skip_response_key_reset=False,
+    full_target_nodes=None,
   ):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
@@ -966,6 +973,7 @@ class _DeeployMixin:
         app_id=app_id,
         job_app_type=job_app_type,
         dct_deeploy_specs=dct_deeploy_specs,
+        full_target_nodes=full_target_nodes,
       )
 
     enable_chainstore_response = bool(prepared_deploy_plan.get("enable_chainstore_response"))
@@ -1174,7 +1182,9 @@ class _DeeployMixin:
           )
           plugins_by_node[addr].append(prepared_plugin)
 
-    unique_nodes = self._ordered_nodes_for_per_node_config(unique_nodes, dct_deeploy_specs)
+    # This path updates a subset without replacing the deployment membership.
+    configured_nodes = (dct_deeploy_specs or {}).get(DEEPLOY_KEYS.CURRENT_TARGET_NODES) or []
+    unique_nodes = self._ordered_nodes_for_per_node_config(configured_nodes + unique_nodes)
     self._validate_per_node_config_selectors(
       [plugin for plugins in plugins_by_node.values() for plugin in plugins],
       unique_nodes,
@@ -1650,7 +1660,8 @@ class _DeeployMixin:
       job_id=job_id,
       discovered_plugin_instances=discovered_instances,
     )
-    durable_nodes = self._ordered_nodes_for_per_node_config(nodes, deeploy_specs)
+    configured_nodes = (deeploy_specs or {}).get(DEEPLOY_KEYS.CURRENT_TARGET_NODES) or []
+    durable_nodes = self._ordered_nodes_for_per_node_config(configured_nodes + nodes)
 
     return {
       "discovered_instances": discovered_instances,
@@ -4476,19 +4487,9 @@ class _DeeployMixin:
         validation_index += 1
     return True
 
-  def _ordered_nodes_for_per_node_config(self, nodes, dct_deeploy_specs=None):
-    nodes = list(nodes or [])
-    persisted_nodes = []
-    if isinstance(dct_deeploy_specs, dict):
-      raw_nodes = dct_deeploy_specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES)
-      if isinstance(raw_nodes, list):
-        persisted_nodes = list(raw_nodes)
-    if persisted_nodes:
-      for node in nodes:
-        if node not in persisted_nodes:
-          persisted_nodes.append(node)
-      return persisted_nodes
-    return nodes
+  def _ordered_nodes_for_per_node_config(self, nodes):
+    """Deduplicate the explicit full target list without restoring historical nodes."""
+    return list(dict.fromkeys(nodes or []))
 
   @staticmethod
   def _validate_plugin_name(plugin_name):
@@ -5741,7 +5742,10 @@ class _DeeployMixin:
     for node in list(update_nodes or []) + list(new_nodes or []):
       if node not in requested_nodes:
         requested_nodes.append(node)
-    chainstore_peers = self._ordered_nodes_for_per_node_config(requested_nodes, deeploy_specs)
+    # Scale-up extends the configured deployment, including temporarily offline
+    # targets; discovery order must not change existing byIndex assignments.
+    configured_nodes = deeploy_specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES) or []
+    chainstore_peers = self._ordered_nodes_for_per_node_config(configured_nodes + requested_nodes)
     job_app_type = None
     if isinstance(deeploy_specs, dict):
       job_app_type = deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
@@ -5755,6 +5759,7 @@ class _DeeployMixin:
     )
     if isinstance(deeploy_specs, dict):
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
+      deeploy_specs[DEEPLOY_KEYS.NR_TARGET_NODES] = len(chainstore_peers)
       deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
     for plugin in base_pipeline.get(NetMonCt.PLUGINS, []):
