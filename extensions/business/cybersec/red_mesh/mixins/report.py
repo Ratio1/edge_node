@@ -773,13 +773,22 @@ class _ReportMixin:
     # the client PDF, and the coverage-floor test stayed green because none of
     # its cases happened to begin with a digit. A five-digit all-numeric secret
     # is indistinguishable from a port and is deliberately conceded to the port.
+    #
+    # That concession only bites graybox text. Blackbox probe text goes through
+    # `credential_redaction.redact_credential_text`, which is phrasing-anchored
+    # and has no port guard, because `("admin", "1234")` is in the default list
+    # (worker/service/common.py:402). Do not "simplify" the blackbox path onto
+    # this rule — it would publish that pair.
+    #
+    # The secret has no upper bound. A `{3,64}` cap was tried and published the
+    # tail of any secret longer than 64 characters: `user:***AAAAAA`.
     _CRED_RE = _re.compile(
       r'(?<![\w.:/-])'
       r'([A-Za-z_][\w.-]{0,63})'
       r':'
       r'(?![\s/])'
       r'(?!\d{1,5}(?:[/?#\s\'"]|$))'
-      r'([^\s\'"]{3,64})'
+      r'([^\s\'"]{3,})'
     )
     _PASSWORD_RE = _re.compile(r'((?:password|passwd|pwd)["\']?\s*[:=]\s*)(["\']?)[^\s"\'&]+', _re.I)
 

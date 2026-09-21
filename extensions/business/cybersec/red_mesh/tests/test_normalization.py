@@ -909,6 +909,22 @@ class TestGrayboxRedactionCoverageFloor(unittest.TestCase):
           "credential coverage dropped below the pre-branch floor",
         )
 
+  def test_a_long_secret_is_masked_to_the_end(self):
+    # `{3,64}` on the secret published the tail of anything longer:
+    # `user:***AAAA…`. `assertNotIn(secret, …)` alone cannot catch that, because
+    # the surviving tail is a substring of the secret, not the whole of it.
+    host = self._host()
+    secret = "A" * 100
+    report = {
+      "service_info": {},
+      "graybox_results": {"443": {"_p": {"findings": [
+        {"title": "t", "description": f"could not connect as dbuser:{secret}", "status": "vulnerable"},
+      ]}}},
+    }
+    out = host._redact_report(report)
+    described = out["graybox_results"]["443"]["_p"]["findings"][0]["description"]
+    self.assertEqual(described, "could not connect as dbuser:***")
+
   def test_the_narrowing_still_spares_what_it_was_written_for(self):
     host = self._host()
     for text in self.MUST_STAY_INTACT:
