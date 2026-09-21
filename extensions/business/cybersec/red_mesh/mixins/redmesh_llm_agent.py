@@ -14,6 +14,7 @@ import json
 from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
+from ..credential_redaction import redact_credential_text
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
@@ -147,6 +148,10 @@ class _RedMeshLlmAgentMixin(object):
     text = str(value)
     if not text:
       return ""
+    # This mixin hand-builds its payload without build_llm_input, so the
+    # shared credential rule runs here (RM-064 Phase 1). Before the cap: a
+    # pair cut in half by the cap is still half a secret.
+    text = redact_credential_text(text)
     # Hard cap before sanitization to bound CPU on pathological input.
     if len(text) > _LLM_UNTRUSTED_HARD_CAP:
       text = text[:_LLM_UNTRUSTED_HARD_CAP]
@@ -754,7 +759,7 @@ class _RedMeshLlmAgentMixin(object):
       severity = str(finding.get("severity") or "UNKNOWN").upper()
       status = str(finding.get("status") or "unknown").lower()
       owasp = str(finding.get("owasp_id") or finding.get("owasp") or "").strip()
-      title = str(finding.get("title") or "").strip()
+      title = redact_credential_text(str(finding.get("title") or "").strip())
       severity_counts[severity] = severity_counts.get(severity, 0) + 1
       status_counts[status] = status_counts.get(status, 0) + 1
       if owasp:
