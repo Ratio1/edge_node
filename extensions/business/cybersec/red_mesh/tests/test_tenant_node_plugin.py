@@ -24,7 +24,6 @@ class TestTenantNodePlugin(unittest.TestCase):
     self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenant_administration_enabled = True
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.cfg_chainstore_peers = ["Node-A", "Node-B"]
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):

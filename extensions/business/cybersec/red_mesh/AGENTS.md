@@ -564,3 +564,18 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   the stale-enumeration last-admin counts), updated `test_tenant_administration.py`,
   `test_authz_surface.py` and `test_tenant_execution.py`; full RedMesh suite 5,499 tests and 2,478
   subtests pass, three pre-existing skips.
+
+### 2026-09-21 — `TENANT_ADMINISTRATION_ENABLED` removed
+
+- The flag (added 2026-09-10 with persistent administration) gated only `_call_tenant_administration`.
+  After RM-084 P6 every launch needs a tenant and an asset, and both are created only through the
+  endpoints it gated, so a deployment left at the default `False` could sign in and do nothing. No
+  deploy path ever set it (2026-09-21 cross-repo PR review). Removed rather than defaulted to true:
+  a flag nobody can safely turn off is not a flag.
+- `_call_tenant_administration` now builds its service through `_execution_service()`, so the
+  namespace check and the service construction exist once. `TENANCY_NAMESPACE` stays the only
+  tenancy precondition; unset still answers `unavailable` (503) before any store access.
+- Tests: `test_plugin_config.py` pins that the key is absent from `_CONFIG`; the two "disabled →
+  503, no storage" tests were narrowed to the namespace cases (`None`, blank, non-string) and
+  renamed `test_missing_namespace_*`; stray `cfg_tenant_administration_enabled` fixture attributes
+  dropped. Dev-node stream configs may still carry the key; the plugin ignores unknown config keys.

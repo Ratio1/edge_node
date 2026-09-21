@@ -24,7 +24,6 @@ class TestNodeFailurePolicyTransport(unittest.TestCase):
     self.addCleanup(env.stop)
     self.store = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenant_administration_enabled = True
     self.plugin.cfg_tenancy_namespace = "policy-transport"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.store, name))
@@ -74,15 +73,13 @@ class TestNodeFailurePolicyTransport(unittest.TestCase):
     }))
     self.assertEqual(method(**request.model_dump())["status_code"], 400)
 
-  def test_disabled_endpoint_never_accesses_storage(self):
+  def test_missing_namespace_never_accesses_storage(self):
     def forbidden_storage(**kwargs):
-      raise AssertionError("Disabled administration must not access storage")
+      raise AssertionError("An unbound namespace must not access storage")
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, forbidden_storage)
-    for enabled, namespace in ((False, "policy-transport"), ("true", "policy-transport"),
-                               (True, None), (True, " ")):
-      with self.subTest(enabled=enabled, namespace=namespace):
-        self.plugin.cfg_tenant_administration_enabled = enabled
+    for namespace in (None, " "):
+      with self.subTest(namespace=namespace):
         self.plugin.cfg_tenancy_namespace = namespace
         result = self.plugin.update_tenant_node_failure_policy(
           actor=self.creator, tenant_id=self.tenant_id, node_failure_policy="continue")

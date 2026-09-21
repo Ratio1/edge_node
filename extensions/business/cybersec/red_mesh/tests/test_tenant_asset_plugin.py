@@ -26,7 +26,6 @@ class TestTenantAssetPlugin(unittest.TestCase):
     self.addCleanup(environment.stop)
     self.storage = FakeAdministrationStore()
     self.plugin = object.__new__(self.Plugin)
-    self.plugin.cfg_tenant_administration_enabled = True
     self.plugin.cfg_tenancy_namespace = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
@@ -103,7 +102,6 @@ class TestTenantAssetPlugin(unittest.TestCase):
   def test_capability_reports_tenant_execution_without_stored_reads(self):
     # RM-084 P6: tenant execution is no longer a rollout a deployment opts into, so the capability
     # reports the only state there is -- whatever a stale `TENANT_EXECUTION_ENABLED` still says.
-    self.plugin.cfg_tenant_administration_enabled = False
     self.plugin.cfg_tenancy_namespace = ""
     with patch.object(self.plugin, "chainstore_hget", side_effect=AssertionError("No stored capability reads")), \
          patch.object(self.plugin, "chainstore_hgetall", side_effect=AssertionError("No capability enumeration")), \

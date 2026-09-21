@@ -624,7 +624,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
 
     store = FakeAdministrationStore()
     plugin = object.__new__(self.Plugin)
-    plugin.cfg_tenant_administration_enabled, plugin.cfg_tenancy_namespace = True, "deployment"
+    plugin.cfg_tenancy_namespace = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(plugin, name, getattr(store, name))
     # The core's FastAPI template copies these real signature fields into a Pydantic model.
@@ -649,7 +649,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
       missing = RequestModel.model_validate_json(json.dumps({"actor": actor, "tenant_id": tenant_id}))
       self.assertEqual(plugin.update_tenant_allow_pentester(**missing.model_dump())["status_code"], 400)
 
-  def test_disabled_or_invalid_config_denies_every_administration_method_before_store_access(self):
+  def test_missing_namespace_denies_every_administration_method_before_store_access(self):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
                "check_tenant_domain", "authorize_tenant_membership", "authorize_tenant_account_creation",
@@ -658,11 +658,11 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
                "get_tenant_nodes", "set_tenant_node_assignment", "list_tenant_assets",
                "get_tenant_asset", "create_tenant_asset", "update_tenant_asset")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
-    for enabled, namespace in ((False, "deployment"), ("true", "deployment"), (True, None), (True, " ")):
+    for namespace in (None, " ", 7):
       for name in methods:
-        with self.subTest(enabled=enabled, namespace=namespace, method=name):
+        with self.subTest(namespace=namespace, method=name):
           plugin = object.__new__(self.Plugin)
-          plugin.cfg_tenant_administration_enabled, plugin.cfg_tenancy_namespace = enabled, namespace
+          plugin.cfg_tenancy_namespace = namespace
           plugin.chainstore_hget = MagicMock(side_effect=AssertionError("No storage access"))
           plugin.chainstore_hset = MagicMock(side_effect=AssertionError("No storage write"))
           result = getattr(plugin, name)(actor={"account_id": "creator"})
@@ -674,7 +674,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
   def test_enabled_real_plugin_creation_and_read_use_server_configuration(self):
     store = FakeAdministrationStore()
     plugin = object.__new__(self.Plugin)
-    plugin.cfg_tenant_administration_enabled, plugin.cfg_tenancy_namespace = True, "deployment"
+    plugin.cfg_tenancy_namespace = "deployment"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(plugin, name, getattr(store, name))
     actor = {"account_id": "creator", "namespace": "browser-ignored"}
