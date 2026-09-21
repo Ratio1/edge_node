@@ -42,6 +42,10 @@ class TestProbePhrasings(unittest.TestCase):
     ("Auth code 0 for postgres:postgres", "postgres:postgres"),
     ("PostgreSQL default credential accepted: postgres:pgpw", "pgpw"),
     ("Auth OK for postgres:pgpw", "pgpw"),
+    # RM-069 shapes: the downgraded title and the evidence with a proof appended.
+    ("SSH default credential accepted: root:toor (inconclusive: service accepts arbitrary credentials)", "toor"),
+    ("Accepted credential: root:toor; authenticated action: exec id -> uid=0(root)", "toor"),
+    ("Accepted credential: ftp:ftp; authenticated action: PWD -> /", "ftp:ftp"),
     # Secrets containing the terminators.
     ("Accepted credential: admin:P@ssw0rd.1", "P@ssw0rd.1"),
     ("Accepted credential: admin:p@$$:w0rd!", "p@$$:w0rd!"),

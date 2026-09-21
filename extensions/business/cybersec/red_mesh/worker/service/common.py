@@ -14,6 +14,90 @@ from ...cve_db import check_cves
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
+
+def _default_credential_findings(protocol, accepted, *, control_accepted, proofs=None):
+  """
+  Build the default-credential findings for one service, gated on the
+  negative control (RM-069).
+
+  A default pair the service accepted proves a default credential in use only
+  when a random pair was *rejected*. A service that accepts anything — a
+  honeypot, a broken PAM stack, a "deceptive service" — says yes to the
+  defaults too, and the client review (2026-08-26, point 2a) rightly asked why
+  that produced CRITICAL default-credential findings beside a CRITICAL
+  "accepts arbitrary credentials" finding on the same port. Each probe already
+  ran the random-pair test; this is where its outcome reaches the verdict.
+
+  `proofs` maps an accepted pair to the output of one harmless authenticated
+  action (`id` over SSH, `PWD` over FTP, `id`/`uname` over Telnet). A pair
+  with a proof is `certain`; a handshake alone is `firm` — the server said
+  yes, but nothing was done with the session.
+
+  The evidence keeps the `Accepted credential: <pair>` lead the redaction rule
+  is anchored on; the proof follows a `;` so the pair still terminates there.
+  """
+  findings = []
+  proofs = proofs or {}
+  for cred in accepted:
+    proof = proofs.get(cred)
+    evidence = f"Accepted credential: {cred}"
+    if proof:
+      evidence += f"; authenticated action: {proof}"
+    if control_accepted:
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title=(
+          f"{protocol} default credential accepted: {cred} "
+          "(inconclusive: service accepts arbitrary credentials)"
+        ),
+        description=(
+          f"The {protocol} server accepted a well-known default credential, but it "
+          "also accepted a randomly generated one, so this does not demonstrate a "
+          "default credential in use. See the \"accepts arbitrary credentials\" "
+          "finding on this port."
+        ),
+        evidence=evidence,
+        remediation="Investigate why the service accepts arbitrary credentials first.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-798",
+        confidence="tentative",
+      ))
+      continue
+    findings.append(Finding(
+      severity=Severity.CRITICAL,
+      title=f"{protocol} default credential accepted: {cred}",
+      description=(
+        f"The {protocol} server accepted a well-known default credential. A randomly "
+        "generated credential was rejected, so the acceptance is specific to this pair."
+        + ("" if proof else " No authenticated action was completed; the handshake alone was observed.")
+      ),
+      evidence=evidence,
+      remediation="Change default passwords immediately and enforce strong credential policies.",
+      owasp_id="A07:2021",
+      cwe_id="CWE-798",
+      confidence="certain" if proof else "firm",
+    ))
+  return findings
+
+
+def _ssh_authenticated_action(client):
+  """One harmless command over an authenticated SSH session; None if it failed."""
+  try:
+    _stdin, stdout, _stderr = client.exec_command("id", timeout=3)
+    output = stdout.read(256).decode("utf-8", errors="replace").strip()
+  except Exception:
+    return None
+  return f"exec id -> {output}" if output else None
+
+
+def _ftp_authenticated_action(ftp):
+  """One harmless command over an authenticated FTP session; None if it failed."""
+  try:
+    cwd = ftp.pwd()
+  except Exception:
+    return None
+  return f"PWD -> {cwd}" if cwd else None
+
 # Default credentials commonly found on exposed SSH services.
 # Kept intentionally small — this is a quick check, not a brute-force.
 _SSH_DEFAULT_CREDS = [
@@ -746,20 +830,15 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         ))
 
     # --- 6. Default credential check ---
+    accepted_creds = []
+    proofs = {}
     for user, passwd in _FTP_DEFAULT_CREDS:
       try:
         ftp_cred = _ftp_connect(user, passwd)
-        result["accepted_credentials"].append(f"{user}:{passwd}")
-        findings.append(Finding(
-          severity=Severity.CRITICAL,
-          title=f"FTP default credential accepted: {user}:{passwd}",
-          description="The FTP server accepted a well-known default credential.",
-          evidence=f"Accepted credential: {user}:{passwd}",
-          remediation="Change default passwords and enforce strong credential policies.",
-          owasp_id="A07:2021",
-          cwe_id="CWE-798",
-          confidence="certain",
-        ))
+        cred = f"{user}:{passwd}"
+        accepted_creds.append(cred)
+        result["accepted_credentials"].append(cred)
+        proofs[cred] = _ftp_authenticated_action(ftp_cred)
         try:
           ftp_cred.quit()
         except Exception:
@@ -770,6 +849,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         pass
 
     # --- 7. Arbitrary credential acceptance test ---
+    # Doubles as the negative control for step 6 (RM-069); the default-credential
+    # findings are built after it so they can be gated on its outcome.
+    control_accepted = False
     import string as _string
     ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
@@ -778,6 +860,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       # See the SSH case: the generated pair is per-run, and `evidence` feeds the
       # content hash, so it belongs in raw_data rather than in the finding.
       result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
+      control_accepted = True
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="FTP accepts arbitrary credentials",
@@ -796,6 +879,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       pass
     except Exception:
       pass
+    result["auth_control"] = {"random_credentials_accepted": control_accepted}
+    findings += _default_credential_findings(
+      "FTP", accepted_creds, control_accepted=control_accepted, proofs=proofs,
+    )
 
     return probe_result(raw_data=result, findings=findings)
 
@@ -885,6 +972,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     # --- 3. Default credential check ---
     accepted_creds = []
+    proofs = {}
 
     for username, password in _SSH_DEFAULT_CREDS:
       try:
@@ -896,7 +984,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           timeout=self._target_timeout(3), auth_timeout=self._target_timeout(3),
           look_for_keys=False, allow_agent=False,
         )
-        accepted_creds.append(f"{username}:{password}")
+        cred = f"{username}:{password}"
+        accepted_creds.append(cred)
+        proofs[cred] = _ssh_authenticated_action(client)
         client.close()
       except paramiko.AuthenticationException:
         continue
@@ -904,6 +994,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         break  # connection issue, stop trying
 
     # --- 4. Arbitrary credential acceptance test ---
+    # Doubles as the negative control for step 3: a service that accepts a
+    # random pair has not demonstrated a default credential in use, whatever
+    # it said to the defaults (RM-069).
+    control_accepted = False
     random_user = f"probe_{random.randint(10000, 99999)}"
     random_pass = f"rnd_{random.randint(10000, 99999)}"
     try:
@@ -921,6 +1015,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       # on every scan and on every worker: change detection reported a change
       # each pass and the aggregate carried one copy per worker.
       result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
+      control_accepted = True
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="SSH accepts arbitrary credentials",
@@ -936,20 +1031,13 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       pass
     except Exception:
       pass
+    result["auth_control"] = {"random_credentials_accepted": control_accepted}
 
     if accepted_creds:
       result["accepted_credentials"] = accepted_creds
-      for cred in accepted_creds:
-        findings.append(Finding(
-          severity=Severity.CRITICAL,
-          title=f"SSH default credential accepted: {cred}",
-          description=f"The SSH server accepted a well-known default credential.",
-          evidence=f"Accepted credential: {cred}",
-          remediation="Change default passwords immediately and enforce strong credential policies.",
-          owasp_id="A07:2021",
-          cwe_id="CWE-798",
-          confidence="certain",
-        ))
+      findings += _default_credential_findings(
+        "SSH", accepted_creds, control_accepted=control_accepted, proofs=proofs,
+      )
 
     # --- 5. Cipher/KEX audit ---
     cipher_findings, weak_labels = self._ssh_check_ciphers(target, port)
@@ -1624,20 +1712,16 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         return False, None, None
 
     system_info_captured = False
+    accepted_creds = []
+    proofs = {}
     for user, passwd in _TELNET_DEFAULT_CREDS:
       success, uid_line, uname_line = _try_telnet_login(user, passwd)
       if success:
-        result["accepted_credentials"].append(f"{user}:{passwd}")
-        findings.append(Finding(
-          severity=Severity.CRITICAL,
-          title=f"Telnet default credential accepted: {user}:{passwd}",
-          description="The Telnet server accepted a well-known default credential.",
-          evidence=f"Accepted credential: {user}:{passwd}",
-          remediation="Change default passwords immediately and enforce strong credential policies.",
-          owasp_id="A07:2021",
-          cwe_id="CWE-798",
-          confidence="certain",
-        ))
+        cred = f"{user}:{passwd}"
+        accepted_creds.append(cred)
+        result["accepted_credentials"].append(cred)
+        # The `id`/`uname` capture above is the authenticated action.
+        proofs[cred] = " | ".join(p for p in (uid_line, uname_line) if p) or None
         # Check for root access
         if uid_line and "uid=0" in uid_line:
           findings.append(Finding(
@@ -1662,6 +1746,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           system_info_captured = True
 
     # --- 5. Arbitrary credential acceptance test ---
+    # Doubles as the negative control for step 4 (RM-069); the default-credential
+    # findings are built after it so they can be gated on its outcome.
+    control_accepted = False
     import string as _string
     ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
@@ -1670,6 +1757,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       # See the SSH case: the generated pair is per-run, and `evidence` feeds the
       # content hash, so it belongs in raw_data rather than in the finding.
       result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
+      control_accepted = True
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="Telnet accepts arbitrary credentials",
@@ -1680,6 +1768,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         cwe_id="CWE-287",
         confidence="certain",
       ))
+    result["auth_control"] = {"random_credentials_accepted": control_accepted}
+    findings += _default_credential_findings(
+      "Telnet", accepted_creds, control_accepted=control_accepted, proofs=proofs,
+    )
 
     return probe_result(raw_data=result, findings=findings)
 
