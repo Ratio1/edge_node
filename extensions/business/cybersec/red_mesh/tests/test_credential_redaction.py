@@ -92,6 +92,19 @@ class TestGuards(unittest.TestCase):
       with self.subTest(text=text):
         self.assertEqual(redact_credential_text(text), text)
 
+  def test_a_label_after_an_ambiguous_lead_is_not_an_empty_secret(self):
+    # The empty-secret allowance once turned every `with <word>: <text>` into
+    # `<word>:*** <text>` — found by the closeout e2e on a graybox report
+    # line. An empty secret ends the text or precedes ` (`; a label does not.
+    for text in (
+      "Scenarios with vulnerability: 7",
+      "Compared with baseline: status 200",
+      "Endpoint responded with error: timeout",
+      "Auth OK for postgres: trust mode",
+    ):
+      with self.subTest(text=text):
+        self.assertEqual(redact_credential_text(text), text)
+
   def test_every_pair_in_a_list_is_masked(self):
     # Each match needs its own lead, so the second and later pairs of a
     # comma-separated list used to survive.

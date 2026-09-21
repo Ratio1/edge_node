@@ -27,13 +27,16 @@ import re
 # default list, so a port-shaped secret after a lead must still be masked. The
 # cost is that a probe writing `with host:8443` (no path) would be over-masked;
 # no emitter does, and the tests pin the URL form.
-# `\S*?`, not `\S+?`: an empty secret is still a secret. `("root", "")` is a
-# live MySQL default and `("admin", "")` an HTTP Basic one; printing `root:`
-# tells the reader the password is blank, which is the whole pair. The
-# `(?![\s/])` guard still applies, so `with https://…` and `Content-Type:
-# application/json` are untouched, but `Auth OK for root:` becomes `root:***`.
+# An empty secret is still a secret. `("root", "")` is a live MySQL default
+# and `("admin", "")` an HTTP Basic one; printing `root:` tells the reader the
+# password is blank, which is the whole pair. The probes print it at the end of
+# the text or before ` (anonymous)`, so the empty form is accepted only there:
+# accepting it anywhere turned every `with <word>: <text>` label into
+# `<word>:*** <text>` (found by the closeout e2e). `with https://…` stays
+# untouched through `(?![/])`, and `Auth OK for root:` becomes `root:***`.
 _PAIR_TEMPLATE = (
-  r"(?P<user>[^\s:]{1,64}):(?![/])%s(?P<secret>\S*?)(?=[\s;)\]}]|[.,](?:\s|$)|$)"
+  r"(?P<user>[^\s:]{1,64}):(?![/])%s(?P<secret>\S+?|(?=\s*(?:$|\()))"
+  r"(?=[\s;)\]}]|[.,](?:\s|$)|$)"
 )
 _PAIR = _PAIR_TEMPLATE % ""
 # A pair whose secret is not already the mask. The continuation rule below
