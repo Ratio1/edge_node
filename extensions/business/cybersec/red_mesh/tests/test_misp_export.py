@@ -562,6 +562,32 @@ class TestGetMispExportStatus(unittest.TestCase):
     self.assertTrue(result["exported"])
     self.assertEqual(result["event_uuid"], "uuid-123")
     self.assertEqual(result["passes_exported"], [1])
+    # Recorded before the floor was stored: undisclosed, not defaulted.
+    self.assertIsNone(result["min_severity"])
+    self.assertIsNone(result["findings_exported"])
+
+  def test_exported_status_surfaces_the_severity_floor(self):
+    # RM-064 item 7: the export omits findings below `MIN_SEVERITY` and the
+    # report never said so. The floor and the counts it produced are part of
+    # the export record now.
+    owner = _make_integration_owner(job_specs={
+      "job_id": "j1",
+      "job_cid": "cid",
+      "misp_export": {
+        "event_uuid": "uuid-123",
+        "event_id": 42,
+        "misp_url": "https://misp.test",
+        "last_exported_at": 1712600000.0,
+        "passes_exported": [1],
+        "min_severity": "LOW",
+        "findings_exported": 56,
+        "findings_total": 61,
+      },
+    })
+    result = get_misp_export_status(owner, "j1")
+    self.assertEqual(result["min_severity"], "LOW")
+    self.assertEqual(result["findings_exported"], 56)
+    self.assertEqual(result["findings_total"], 61)
 
   def test_model_test_status_reports_unsupported(self):
     owner = _make_integration_owner(job_specs={
@@ -633,12 +659,25 @@ class TestPushToMisp(unittest.TestCase):
     mock_misp.add_event.return_value = response_event
 
     owner = self._setup_owner()
+    written = []
+    # The service dispatches through `type(owner)._write_job_record`, so the
+    # capture has to sit on the (per-factory) class, not the instance.
+    type(owner)._write_job_record = lambda self, job_key, job_specs, context="": (
+      written.append(job_specs) or job_specs
+    )
     result = push_to_misp(owner, "test_job_1")
 
     self.assertEqual(result["status"], "ok")
     self.assertEqual(result["event_uuid"], "new-uuid-456")
     self.assertEqual(result["event_id"], 99)
     mock_misp.add_event.assert_called_once()
+    # The stored record carries the severity floor this export applied and
+    # the counts it produced (RM-064 item 7), so the report can disclose them.
+    stored = written[-1]["misp_export"]
+    self.assertEqual(stored["min_severity"], "LOW")
+    self.assertIsInstance(stored["findings_exported"], int)
+    self.assertIsInstance(stored["findings_total"], int)
+    self.assertLessEqual(stored["findings_exported"], stored["findings_total"])
 
   @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
   def test_connection_error(self, MockPyMISP):

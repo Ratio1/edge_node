@@ -1116,6 +1116,9 @@ class TestGrayboxAbortBehavior(unittest.TestCase):
     self.assertTrue(worker.state["aborted"])
     self.assertEqual(worker.state["abort_phase"], "authentication")
     self.assertIn("authentication failed", worker.state["abort_reason"].lower())
+    # The class travels on the report, not only in metrics: finalization needs
+    # it to name the failure without parsing the reason text.
+    self.assertEqual(worker.state["abort_reason_class"], "auth_failed")
 
   def test_abort_records_metric_counter(self):
     """record_abort is called exactly once on abort."""

@@ -197,6 +197,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "aborted": False,
       "abort_reason": "",
       "abort_phase": "",
+      # The GrayboxAbort reason class (auth_failed, preflight_error, ...).
+      # It used to reach only the metrics; finalization needs it on the
+      # report to name a failed job without parsing the reason text.
+      "abort_reason_class": "",
       "graybox_assignment": (
         self.assignment.to_dict() if self.assignment.is_valid else {}
       ),
@@ -314,6 +318,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self.state["aborted"] = True
       self.state["abort_reason"] = exc.reason
       self.state["abort_phase"] = self._phase
+      self.state["abort_reason_class"] = exc.reason_class
       self.metrics.record_abort(
         phase=self._phase, reason_class=exc.reason_class,
       )
@@ -754,4 +759,5 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "aborted": any,
       "abort_reason": _first_non_empty_str,
       "abort_phase": _first_non_empty_str,
+      "abort_reason_class": _first_non_empty_str,
     }

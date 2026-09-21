@@ -1,4 +1,5 @@
 import random
+import re
 from copy import deepcopy
 from functools import partial
 
@@ -15,6 +16,7 @@ from ..constants import (
   RUN_MODE_CONTINUOUS_MONITORING,
   RUN_MODE_SINGLEPASS,
 )
+from ..credential_redaction import redact_credential_text
 from ..models import (
   AggregatedScanData,
   PassReport,
@@ -271,6 +273,87 @@ def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, mess
   owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
 
 
+def _pass_abort_state(aggregated, node_reports):
+  """
+  The graybox abort state of a pass, or None when no worker aborted.
+
+  `empty` is True when the abort left nothing tested: no worker attempted a
+  probe. The graybox worker records `aborted` on its report when a safety
+  gate (preflight, authorization, authentication, session refresh) raises
+  GrayboxAbort; before this the launcher never read it, so a scan that
+  failed to log in finalized as a completed job with a risk score computed
+  from its own "Scan aborted" finding. The rule keys on the abort plus the
+  probe count, not on the reason class, so a future degraded mode that runs
+  anonymous scenarios after a failed login (RM-060) still counts as a scan.
+  """
+  if not isinstance(aggregated, dict) or not aggregated.get("aborted"):
+    return None
+  probes_attempted = 0
+  for report in (node_reports or {}).values():
+    metrics = report.get("scan_metrics") if isinstance(report, dict) else None
+    if isinstance(metrics, dict):
+      probes_attempted += int(metrics.get("probes_attempted") or 0)
+  return {
+    "aborted": True,
+    "abort_reason": str(aggregated.get("abort_reason") or ""),
+    "abort_phase": str(aggregated.get("abort_phase") or ""),
+    "abort_reason_class": str(aggregated.get("abort_reason_class") or "unknown"),
+    "empty": probes_attempted == 0,
+  }
+
+
+_ABORT_REASON_MAX_CHARS = 240
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _abort_reason_text(reason):
+  """
+  The abort reason as it may be printed on the job record, the timeline, the
+  archive, the PDF and the console.
+
+  The worker composes it from strings it controls, but two callers embed an
+  exception text or the operator's target URL, and in the mesh it arrives
+  from another node's report. Same treatment as the LLM boundary gives the
+  same field (`_sanitize_untrusted_text`): credential redaction, control
+  bytes stripped, a hard cap.
+  """
+  text = redact_credential_text(str(reason or ""))
+  text = " ".join(_CONTROL_CHARS_RE.sub(" ", text).split())
+  return text[:_ABORT_REASON_MAX_CHARS] or "no reason recorded"
+
+
+def _mark_scan_aborted(owner, job_key, job_specs, *, job_id, pass_nr, abort_state):
+  """Mirror of `_mark_attestation_failed` for a first pass that tested nothing."""
+  phase = abort_state["abort_phase"] or "unknown"
+  message = f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}"
+  job_specs["failure_class"] = "scan_aborted"
+  job_specs["failure_message"] = message
+  set_job_status(job_specs, JOB_STATUS_FAILED)
+  owner._emit_timeline_event(
+    job_specs,
+    "scan_aborted",
+    message,
+    actor_type="system",
+    meta={
+      "pass_nr": pass_nr,
+      "failure_class": "scan_aborted",
+      "abort_phase": phase,
+      "abort_reason_class": abort_state["abort_reason_class"],
+    },
+  )
+  emit_lifecycle_event(
+    owner,
+    job_specs,
+    event_type="redmesh.job.failed",
+    event_action="failed",
+    event_outcome="failure",
+    pass_nr=pass_nr,
+  )
+  _write_job_record(owner, job_key, job_specs, context="scan_aborted")
+  owner._build_job_archive(job_key, job_specs)
+  owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
+
+
 def _ensure_rulebook_assessment_after_pass(owner, job_specs, *, job_id, pass_nr):
   try:
     result = ensure_rulebook_assessment(owner, job_id, pass_nr=pass_nr)
@@ -393,10 +476,26 @@ def maybe_finalize_pass(owner):
       risk_score = 0
       flat_findings = []
       risk_result = None
+      abort_state = _pass_abort_state(aggregated, node_reports)
+      empty_abort = bool(abort_state and abort_state["empty"])
       if aggregated:
         risk_result, flat_findings = owner._compute_risk_and_findings(aggregated)
         risk_score = risk_result["score"]
-        job_specs["risk_score"] = risk_score
+        if empty_abort:
+          # Nothing was tested, so there is nothing to score. The flat findings
+          # are kept: the "Scan aborted" record is the evidence of why.
+          risk_score = 0
+          risk_result = None
+          owner.P(
+            f"[ABORT] {job_id} pass {job_pass} aborted during "
+            f"{abort_state['abort_phase'] or 'unknown'} with no probe attempted; "
+            "no risk score and no analysis",
+            color='y',
+          )
+        # A monitor's headline score stays at its last scored pass; only the
+        # pass record says this one tested nothing.
+        if not (empty_abort and job_pass > 1):
+          job_specs["risk_score"] = risk_score
         owner.P(f"Risk score for job {job_id} pass {job_pass}: {risk_score}/100")
 
       job_config = owner._get_job_config(job_specs, resolve_secrets=False)
@@ -406,7 +505,9 @@ def maybe_finalize_pass(owner):
       llm_report_sections = None
       structured_llm_failed = None
       analysis_allowed = _execution_operation_allowed(owner, job_specs, config=job_config)
-      if llm_cfg["ENABLED"] and aggregated and not analysis_allowed:
+      if empty_abort:
+        pass  # no analysis of a scan that tested nothing
+      elif llm_cfg["ENABLED"] and aggregated and not analysis_allowed:
         structured_llm_failed = True
       elif llm_cfg["ENABLED"] and aggregated:
         if resumed_automatic_analysis:
@@ -503,7 +604,9 @@ def maybe_finalize_pass(owner):
         or job_status == JOB_STATUS_SCHEDULED_FOR_STOP
         or job_pass >= MAX_CONTINUOUS_PASSES
       )
-      should_submit_attestation = bool(required_attestation and terminal_after_pass)
+      # A scan that tested nothing gets no on-chain "0 vulnerabilities" record;
+      # the job fails below instead.
+      should_submit_attestation = bool(required_attestation and terminal_after_pass and not empty_abort)
       if not should_submit_attestation:
         pass
       elif run_mode == RUN_MODE_CONTINUOUS_MONITORING and not terminal_after_pass:
@@ -566,7 +669,7 @@ def maybe_finalize_pass(owner):
             network=owner.REDMESH_ATTESTATION_NETWORK,
             pass_nr=job_pass,
           )
-      if required_attestation and terminal_after_pass and not (
+      if required_attestation and terminal_after_pass and not empty_abort and not (
         isinstance(redmesh_test_attestation, dict) and redmesh_test_attestation.get("tx_hash")
       ):
         required_attestation_failed = True
@@ -611,6 +714,8 @@ def maybe_finalize_pass(owner):
         scan_metrics=pass_metrics,
         worker_scan_metrics=worker_scan_metrics if worker_scan_metrics else None,
         redmesh_test_attestation=redmesh_test_attestation,
+        **({k: abort_state[k] for k in ("aborted", "abort_reason", "abort_phase", "abort_reason_class")}
+           if abort_state else {}),
       )
 
       pass_report_cid = artifacts.put_pass_report(pass_report, show_logs=False)
@@ -663,6 +768,27 @@ def maybe_finalize_pass(owner):
           message="Required terminal blockchain attestation was not submitted",
         )
         continue
+
+      if empty_abort and job_pass <= 1:
+        _mark_scan_aborted(
+          owner, job_key, job_specs, job_id=job_id, pass_nr=job_pass, abort_state=abort_state,
+        )
+        continue
+      if empty_abort:
+        # A monitor whose target was unreachable for one pass is not a failed
+        # job; the pass says so and the schedule continues.
+        owner._emit_timeline_event(
+          job_specs,
+          "pass_aborted",
+          f"Pass {job_pass} aborted during {abort_state['abort_phase'] or 'unknown'}: "
+          f"{_abort_reason_text(abort_state['abort_reason'])}",
+          actor_type="system",
+          meta={
+            "pass_nr": job_pass,
+            "abort_phase": abort_state["abort_phase"],
+            "abort_reason_class": abort_state["abort_reason_class"],
+          },
+        )
 
       if run_mode == RUN_MODE_SINGLEPASS:
         set_job_status(job_specs, JOB_STATUS_FINALIZED)

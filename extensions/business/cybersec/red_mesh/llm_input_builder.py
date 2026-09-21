@@ -46,6 +46,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .credential_redaction import redact_credential_text
 from .models.finding_schema import is_coverage_result as _is_coverage_result
 
 
@@ -96,13 +97,16 @@ def _sanitize(value: Any, max_chars: int = 0) -> str:
 
   Steps:
     1. Coerce to str.
-    2. Strip control + zero-width chars.
-    3. Replace prompt-injection sentinels with neutralized markers.
-    4. Length-cap (when max_chars > 0).
+    2. Mask credential pairs (RM-064: this builder has three callers and only
+       one of them redacted the report first; the narrative the model writes
+       is persisted separately, so the rule has to run here).
+    3. Strip control + zero-width chars.
+    4. Replace prompt-injection sentinels with neutralized markers.
+    5. Length-cap (when max_chars > 0).
   """
   if value is None:
     return ""
-  s = str(value)
+  s = redact_credential_text(str(value))
   s = _BAD_CHARS.sub("", s)
   for pat in _INJECTION_PATTERNS:
     # Replace the matched pattern with a textual escape so the model

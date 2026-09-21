@@ -514,6 +514,24 @@ class TestBlackboxCredentialRedaction(unittest.TestCase):
     ))
     self.assertNotIn("toor", str(redacted.get("vulnerabilities", [])))
 
+  def test_a_pair_under_a_field_redaction_never_enumerated_is_masked(self):
+    # Deny-by-default (RM-064 Phase 1). Every field-allowlist in this method
+    # carries a comment naming a field that leaked because it was not on the
+    # list. The property under test is "any string, any key", not today's list.
+    host = self._host()
+    report = self._report(
+      "SSH default credential accepted: root:toor",
+      "Accepted credential: root:toor",
+      "The SSH server accepted a well-known default credential.",
+    )
+    finding = report["service_info"]["22"]["default_creds"]["findings"][0]
+    finding["novel_field"] = "Accepted credential: root:toor"
+    finding["evidence_items"] = [{"note": "Auth OK for root:toor"}]
+    report["service_info"]["22"]["default_creds"]["novel_probe_field"] = "with root:toor"
+    report["never_seen_section"] = {"x": ["Weak credentials root:toor"]}
+    redacted = host._redact_report(report)
+    self.assertNotIn("toor", str(redacted))
+
   def test_the_http_basic_accepted_key_is_redacted(self):
     # The probe writes `accepted` (common.py:438,477); redaction read only
     # `accepted_credentials` — a key-name mismatch, so that list was archived raw.
@@ -908,6 +926,22 @@ class TestGrayboxRedactionCoverageFloor(unittest.TestCase):
           secret, described,
           "credential coverage dropped below the pre-branch floor",
         )
+
+  def test_a_long_secret_is_masked_to_the_end(self):
+    # `{3,64}` on the secret published the tail of anything longer:
+    # `user:***AAAA…`. `assertNotIn(secret, …)` alone cannot catch that, because
+    # the surviving tail is a substring of the secret, not the whole of it.
+    host = self._host()
+    secret = "A" * 100
+    report = {
+      "service_info": {},
+      "graybox_results": {"443": {"_p": {"findings": [
+        {"title": "t", "description": f"could not connect as dbuser:{secret}", "status": "vulnerable"},
+      ]}}},
+    }
+    out = host._redact_report(report)
+    described = out["graybox_results"]["443"]["_p"]["findings"][0]["description"]
+    self.assertEqual(described, "could not connect as dbuser:***")
 
   def test_the_narrowing_still_spares_what_it_was_written_for(self):
     host = self._host()

@@ -899,6 +899,31 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertNotIn(secret, serialized)
     self.assertIn("<redacted-hex-token>", serialized)
 
+  def test_generated_assessment_masks_default_credential_pairs_in_evidence_refs(self):
+    # RM-064 Phase 1, reopened 2026-09-03: the delivered PDF's §3.7.3 printed both
+    # default-credential pairs in cleartext because this module's own sanitiser
+    # only matched keyword-prefixed assignments, never a bare `user:secret` pair
+    # in a finding title. The evidence refs must go through the shared rule.
+    archive = _sample_archive()
+    archive["passes"][0]["findings"].append({
+      "finding_id": "finding-ssh-default-1",
+      "severity": "CRITICAL",
+      "title": "SSH default credential accepted: svc-account:Hunter2-Pl4in",
+      "description": "Password auth accepted for svc-account:Hunter2-Pl4in on app.example.test:22.",
+      "evidence": "Accepted credential: svc-account:Hunter2-Pl4in",
+      "probe": "_ssh_default_credentials",
+      "category": "auth",
+      "status": "vulnerable",
+    })
+    owner = _Owner(archive=archive)
+
+    result = generate_rulebook_assessment(owner, "job-1")
+
+    self.assertEqual(result["status"], "ok")
+    serialized = json.dumps(owner.artifacts[result["artifact_cid"]], sort_keys=True)
+    self.assertNotIn("Hunter2-Pl4in", serialized)
+    self.assertIn("svc-account:***", serialized)
+
   def test_future_registry_contract_returns_stable_upgrade_error_for_writes(self):
     owner = _Owner()
     hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"

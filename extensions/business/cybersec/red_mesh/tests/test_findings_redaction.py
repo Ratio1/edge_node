@@ -400,6 +400,23 @@ class TestToFlatFindingScrubs(unittest.TestCase):
     self.assertIn("/api/users/2", haystack)
     self.assertIn("PT-OAPI1-01", haystack)
 
+  def test_storage_boundary_pass_masks_a_pair_under_a_key_it_never_enumerated(self):
+    # Deny-by-default (RM-064 Phase 1). `_scrub_flat_finding` lists five text
+    # keys plus three artifact keys, and its comments record two fields that
+    # leaked for not being on that list. The property is "any key", so the
+    # fixture uses one the flat contract does not have today.
+    from extensions.business.cybersec.red_mesh.graybox.findings import _scrub_flat_finding
+
+    flat = _scrub_flat_finding({
+      "title": "Weak credentials accepted",
+      "severity": "HIGH",
+      "novel_field": "Accepted credential: svc:Hunter2-Pl4in",
+      "evidence_items": [{"note": "Auth OK for svc:Hunter2-Pl4in"}],
+    })
+    self.assertNotIn("Hunter2-Pl4in", str(flat))
+    self.assertEqual(flat["novel_field"], "Accepted credential: svc:***")
+    self.assertEqual(flat["evidence_items"][0]["note"], "Auth OK for svc:***")
+
   def test_flatten_context_scrubs_configured_names(self):
     f = GrayboxFinding(
       scenario_id="PT-OAPI1-01",

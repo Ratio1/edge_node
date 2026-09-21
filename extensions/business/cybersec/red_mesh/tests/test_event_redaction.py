@@ -172,6 +172,31 @@ class TestFindingEventCredentialEgress(unittest.TestCase):
         self.assertIsNotNone(found_title, "the event carries no title field at all")
         self.assertIn(":***", found_title.group(1), "the title was dropped, not redacted")
 
+  def test_every_string_on_the_finding_payload_is_walked(self):
+    # Deny-by-default: `title` and `evidence` were redacted by name, and the
+    # comment above records why that list was two short. The whole payload is
+    # walked now, so a pair reaching any string field — here two that no probe
+    # would ever put one in — is masked without that field being enumerated.
+    from extensions.business.cybersec.red_mesh.services.event_builder import (
+      build_finding_event,
+    )
+
+    event = build_finding_event(
+      {"job_id": "job-1"},
+      finding={
+        "finding_id": "f1",
+        "title": "clean",
+        "severity": "CRITICAL",
+        "triage_state": "Accepted credential: root:toor",
+        "attack_ids": ["Auth OK for root:toor"],
+      },
+      event_action="created",
+      hmac_secret="secret",
+    )
+    serialised = json.dumps(event, default=str)
+    self.assertNotIn("toor", serialised)
+    self.assertIn("root:***", serialised)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -10,7 +10,7 @@ from ..models.event_schema import (
   REDMESH_EVENT_SCHEMA_VERSION,
   RedMeshEvent,
 )
-from ..credential_redaction import redact_credential_text
+from ..credential_redaction import redact_credential_strings, redact_credential_text
 from .event_redaction import redact_event_payload, stable_hmac_pseudonym
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 
@@ -436,6 +436,10 @@ def build_finding_event(
     "status": finding.get("status") or "",
     "is_coverage_result": _is_coverage_result(finding),
   }
+  # `title` and `evidence` above are redacted by name because the tests pin
+  # them; this walk is the deny-by-default backstop for every other string on
+  # the payload, so a field added later is masked without being enumerated.
+  redact_credential_strings(finding_payload)
   return build_redmesh_event(
     event_type=f"redmesh.finding.{event_action}",
     event_action=event_action,

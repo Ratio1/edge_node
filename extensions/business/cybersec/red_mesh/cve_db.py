@@ -288,12 +288,124 @@ for _product, _constraint, _cve_id, _severity, _title, _cwe_id in EXPANDED_CVE_R
   ))
 
 
+@dataclass(frozen=True)
+class DistroPackage:
+  """A distribution build of a product, as a banner announces it.
+
+  `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10` is upstream 8.9p1 at Ubuntu revision
+  3ubuntu0.10. The upstream version alone is what the matcher compared
+  before RM-070; the revision is where the distribution's backported fixes
+  live, so it is the only thing that can say whether a CVE the upstream
+  version matches has in fact been patched on this host.
+  """
+  distro: str      # "ubuntu" | "debian"
+  upstream: str    # "8.9p1"
+  revision: str    # "3ubuntu0.10", "5+deb11u2"
+
+
+_DISTRO_PACKAGE_RE = re.compile(
+  r"[_\s/](?P<upstream>\d[\w.]*?)\s+(?P<distro>Ubuntu|Debian)-(?P<revision>[\w.+~]+)",
+  re.IGNORECASE,
+)
+
+
+def parse_distro_package(text):
+  """The distribution package a banner or version string announces, or None.
+
+  None means "no distribution suffix": an upstream build, or a distribution
+  that does not stamp its revision into the banner. It does not mean
+  "not backported"; that state is `unknown` below.
+  """
+  if not isinstance(text, str):
+    return None
+  m = _DISTRO_PACKAGE_RE.search(text)
+  if not m:
+    return None
+  return DistroPackage(
+    distro=m.group("distro").lower(),
+    upstream=m.group("upstream"),
+    revision=m.group("revision"),
+  )
+
+
+def _revision_chunks(revision: str):
+  # dpkg's ordering, reduced to what package revisions use: alternate
+  # non-digit and digit runs, digits compare numerically, `~` sorts before
+  # anything (so `1~rc1` < `1`), and a missing chunk sorts before a present
+  # one. `0.10` > `0.3`, which `_parse_version` cannot say: it reads
+  # `3ubuntu0.10` and `3ubuntu0.3` as the same tuple.
+  return [
+    (int(chunk) if chunk.isdigit() else chunk)
+    for chunk in re.findall(r"\d+|[^\d]+", revision or "")
+  ]
+
+
+def _compare_debian_revision(a: str, b: str) -> int:
+  """-1, 0 or 1 as package revision `a` sorts before, equal to or after `b`."""
+  left, right = _revision_chunks(a), _revision_chunks(b)
+  for x, y in zip(left, right):
+    if x == y:
+      continue
+    if isinstance(x, int) and isinstance(y, int):
+      return -1 if x < y else 1
+    x_text, y_text = str(x), str(y)
+    # `~` sorts before the empty string, which sorts before everything else.
+    if x_text.startswith("~") != y_text.startswith("~"):
+      return -1 if x_text.startswith("~") else 1
+    return -1 if x_text < y_text else 1
+  if len(left) == len(right):
+    return 0
+  longer = left if len(left) > len(right) else right
+  extra = longer[min(len(left), len(right))]
+  if isinstance(extra, str) and extra.startswith("~"):
+    return 1 if longer is right else -1
+  return -1 if longer is right else 1
+
+
+# Distribution security updates that fix a CVE by backport without moving the
+# upstream version: (product, distro) -> cve_id -> rows of
+# (upstream, first fixed revision, advisory). A host whose package is at or
+# past the fixed revision is not vulnerable, whatever the upstream version
+# says. Static and deliberately small — the rows here are the ones needed to
+# stop the false positives observed on real scans; a USN/DSA/OVAL feed is the
+# follow-up recorded on RM-070. Any (product, CVE) with no row is `unknown`,
+# never silently `fixed`.
+BACKPORT_FIXES = {
+  ("openssh", "ubuntu"): {
+    # USN-6859-1 (2024-07-01): regreSSHion.
+    "CVE-2024-6387": (
+      ("8.9p1", "3ubuntu0.10", "USN-6859-1"),   # 22.04 LTS
+      ("9.6p1", "3ubuntu13.3", "USN-6859-1"),   # 24.04 LTS
+    ),
+  },
+}
+
+BACKPORT_FIXED = "fixed"
+BACKPORT_NOT_FIXED = "not_fixed"
+BACKPORT_UNKNOWN = "unknown"
+
+
+def backport_status(product: str, cve_id: str, package) -> str:
+  """`fixed`, `not_fixed` or `unknown` for a CVE on a distribution package."""
+  if package is None:
+    return ""
+  rows = BACKPORT_FIXES.get((product, package.distro), {}).get(cve_id, ())
+  for upstream, fixed_revision, _advisory in rows:
+    if upstream != package.upstream:
+      continue
+    if _compare_debian_revision(package.revision, fixed_revision) >= 0:
+      return BACKPORT_FIXED
+    return BACKPORT_NOT_FIXED
+  return BACKPORT_UNKNOWN
+
+
 def check_cves(
   product: str,
   version: str,
   *,
   applicability: str = SERVER_APPLICABILITY,
   dynamic_cache=None,
+  package=None,
 ) -> list:
   """Match version against CVE database. Returns list of Findings.
 
@@ -302,6 +414,11 @@ def check_cves(
   status, FIRST EPSS score, and OWASP Top 10 mapping (looked up via
   the static cwe_to_owasp table). When no cache is provided, the
   legacy behavior is preserved (static severity only).
+
+  ``package`` is the ``DistroPackage`` the banner announced, when it
+  announced one. A CVE the distribution has fixed by backport at or below
+  the package's revision is not reported; every other match on a
+  distribution package states its backport status explicitly (RM-070).
   """
   if dynamic_cache is None:
     dynamic_cache = get_dynamic_reference_cache()
@@ -320,7 +437,10 @@ def check_cves(
     if entry.cve_id in seen_cves:
       continue
     seen_cves.add(entry.cve_id)
-    findings.append(_build_finding(entry, product, version, dynamic_cache))
+    status = backport_status(product, entry.cve_id, package)
+    if status == BACKPORT_FIXED:
+      continue
+    findings.append(_build_finding(entry, product, version, dynamic_cache, backport_status=status))
   return findings
 
 
@@ -339,7 +459,7 @@ def get_dynamic_reference_cache():
   return _CURRENT_DYNAMIC_CACHE.get()
 
 
-def _build_finding(entry, product: str, version: str, dynamic_cache):
+def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = ""):
   """Construct a Finding for a matched CveEntry, optionally enriched
   via the dynamic reference cache."""
   # Parse the legacy "CWE-22" format into an int CWE id for the
@@ -388,16 +508,38 @@ def _build_finding(entry, product: str, version: str, dynamic_cache):
     if epss_rec and epss_rec.cve_id and epss_rec.score is not None:
       epss_score = float(epss_rec.score)
 
+  # What the distribution package says about this match, stated rather than
+  # left to the reader (RM-070). `not_fixed` is the one case the evidence
+  # supports beyond the upstream version, so it is the one case that is not
+  # `tentative`.
+  if backport_status == BACKPORT_NOT_FIXED:
+    backport_note = (
+      " The distribution package is below the revision that carries the fix, "
+      "so the backport does not apply."
+    )
+    confidence = "firm"
+  elif backport_status == BACKPORT_UNKNOWN:
+    backport_note = (
+      " Backport status unknown: a distribution package was detected but no "
+      "advisory data covers this CVE for it, so the fix may already be applied."
+    )
+    confidence = "tentative"
+  else:
+    backport_note = (
+      " NOTE: Linux distributions backport security fixes without changing "
+      "the upstream version number — this may be a false positive."
+    )
+    confidence = "tentative"
+
   finding = Finding(
     severity=severity,
     title=f"{entry.cve_id}: {entry.title} ({product} {version})",
-    description=f"{product} {version} is vulnerable to {entry.cve_id}. "
-                "NOTE: Linux distributions backport security fixes without changing "
-                "the upstream version number — this may be a false positive.",
+    description=f"{product} {version} is vulnerable to {entry.cve_id}.{backport_note}",
     evidence=f"Detected version: {version}, affected: {entry.constraint}",
     remediation=f"Upgrade {product} to a patched version, or verify backport status with the OS vendor.",
     cwe_id=entry.cwe_id,
-    confidence="tentative",
+    confidence=confidence,
+    backport_status=backport_status,
     # Phase 1 / Phase 2 enriched fields
     cvss_score=cvss_score,
     cvss_vector=cvss_vector,

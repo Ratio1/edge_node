@@ -23,6 +23,7 @@ import contextvars
 from dataclasses import dataclass, asdict, field
 from typing import Any
 
+from ..credential_redaction import redact_credential_strings
 from ..references import reference_urls as _reference_urls
 from ..models.finding_schema import (
   REDMESH_FINDING_SCHEMA,
@@ -406,7 +407,12 @@ def _scrub_flat_finding(flat: dict, *, secret_field_names=()) -> dict:
       flat[key] = scrub_graybox_secrets(
         flat[key], secret_field_names=secret_field_names,
       )
-  return flat
+  # Deny-by-default backstop: the two lists above are the pattern-based scrub
+  # (secrets by shape and by configured name); this walks every remaining
+  # string with the phrasing-anchored credential rule, so a field added to the
+  # flat contract without being registered above is masked rather than stored
+  # raw — the failure mode the two comments above each record once.
+  return redact_credential_strings(flat)
 
 
 @dataclass(frozen=True)

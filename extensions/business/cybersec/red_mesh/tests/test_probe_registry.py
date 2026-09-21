@@ -412,5 +412,54 @@ class TestCvssTemplateSeverityGate(unittest.TestCase):
     enriched = self._enrich(Severity.CRITICAL)
     self.assertEqual(enriched.cvss_vector, self.CRITICAL_TEMPLATE)
 
+  def test_an_inherited_template_is_scored(self):
+    # RM-064 item 3: all 61 findings on the client job carried a vector with
+    # `cvss_score` null, so the card printed a bare vector beside the badge
+    # with no number to arbitrate.
+    from extensions.business.cybersec.red_mesh.findings import Severity
+    self._register()
+    enriched = self._enrich(Severity.CRITICAL)
+    self.assertEqual(enriched.cvss_score, 9.8)
+
+  def test_a_template_whose_band_contradicts_the_label_is_withheld(self):
+    # The template is the probe's worst case; 91 of 168 statically resolvable
+    # `Finding(...)` sites in `worker/` carry a label in a different band from
+    # their probe's template (measured 2026-09-21). Printing that vector beside
+    # the badge is the contradiction the client reported. No vector beats a
+    # wrong one; a probe that wants a vector on such a finding sets its own.
+    from extensions.business.cybersec.red_mesh.findings import Severity
+    self._register()
+    enriched = self._enrich(Severity.MEDIUM)
+    self.assertEqual(enriched.cvss_vector, "")
+    self.assertIsNone(enriched.cvss_score)
+
+  def test_a_probe_supplied_vector_is_kept_and_scored(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, enrich_finding_for_probe,
+    )
+    self._register()
+    finding = Finding(
+      title="Anonymous FTP read", severity=Severity.MEDIUM,
+      description="Anonymous login allowed.",
+      cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    )
+    enriched = enrich_finding_for_probe(finding, "_service_info_test_defaultcreds")
+    self.assertEqual(enriched.cvss_vector, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N")
+    self.assertEqual(enriched.cvss_score, 5.3)
+
+  def test_a_supplied_score_is_not_overwritten(self):
+    # CVE-derived findings carry the NVD score; the vector-derived one must
+    # not replace it.
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, enrich_finding_for_probe,
+    )
+    self._register()
+    finding = Finding(
+      title="CVE-x", severity=Severity.CRITICAL, description="d",
+      cvss_vector=self.CRITICAL_TEMPLATE, cvss_score=9.6,
+    )
+    enriched = enrich_finding_for_probe(finding, "_service_info_test_defaultcreds")
+    self.assertEqual(enriched.cvss_score, 9.6)
+
 if __name__ == "__main__":
   unittest.main()
