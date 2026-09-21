@@ -165,6 +165,9 @@ class Finding:
   verified_by: str = ""
   triage_state: str = TRIAGE_NEW
   exploitability_status: str = ""        # forward-compat for VEX export
+  # CVE findings on a distribution package (RM-070): "" (upstream build, not
+  # applicable) | "unknown" | "not_fixed". `fixed` matches are not emitted.
+  backport_status: str = ""
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data

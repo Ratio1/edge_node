@@ -10,7 +10,7 @@ from datetime import datetime
 import paramiko
 
 from ...findings import Finding, Severity, probe_result, probe_error
-from ...cve_db import check_cves
+from ...cve_db import check_cves, parse_distro_package
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -1050,7 +1050,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       if ssh_lib and ssh_version:
         result["ssh_library"] = ssh_lib
         result["ssh_version"] = ssh_version
-        findings += check_cves(ssh_lib, ssh_version)
+        # The distribution package, when the banner announces one
+        # (`OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`). `_ssh_identify_library` keeps
+        # returning the bare upstream version the matcher compares; the
+        # package is what decides whether a matched CVE was backported (RM-070).
+        package = parse_distro_package(result["banner"])
+        if package is not None:
+          result["ssh_package"] = f"{package.upstream} {package.distro}-{package.revision}"
+        findings += check_cves(ssh_lib, ssh_version, package=package)
 
         # --- 7. libssh auth bypass (CVE-2018-10933) ---
         if ssh_lib == "libssh":
