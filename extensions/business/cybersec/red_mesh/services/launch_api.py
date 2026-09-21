@@ -905,6 +905,7 @@ def build_comparison_workers(active_peers, start_port, end_port, full_mirror=Fal
       "target_ports": target_ports,
       "finished": False,
       "result": None,
+      "assignment_revision": 1,
     }
   return workers
 
@@ -928,6 +929,7 @@ def build_network_workers(owner, active_peers, start_port, end_port, distributio
         "end_port": end_port,
         "finished": False,
         "result": None,
+        "assignment_revision": 1,
       }
     return workers, None
 
@@ -943,6 +945,7 @@ def build_network_workers(owner, active_peers, start_port, end_port, distributio
       "end_port": current_end,
       "finished": False,
       "result": None,
+      "assignment_revision": 1,
     }
     current_start = current_end + 1
   return workers, None

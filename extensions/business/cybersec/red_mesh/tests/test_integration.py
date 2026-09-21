@@ -811,6 +811,54 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(startup_progress["started_at"], 100.0)
     self.assertEqual(plugin._active_execution_identities["job-1"], ("job-1", 2, "node-A", 2))
 
+  def test_maybe_launch_jobs_starts_bound_network_job_on_first_announcement(self):
+    """A tenant-bound network launch is picked up at revision 1, before any reannounce."""
+    from extensions.business.cybersec.red_mesh.services.launch_api import build_network_workers
+    from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
+
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_check_jobs_each = 15
+    plugin.ee_addr = "node-A"
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+    plugin._active_execution_identities = {}
+    plugin._execution_live_meta = {}
+    plugin._foreign_jobs_logged = set()
+    plugin._PentesterApi01Plugin__last_checked_jobs = 0
+    plugin.time.return_value = 100.0
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin.P = MagicMock()
+    plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
+    plugin._remember_execution_identity = lambda job_id, identity, started_at: Plugin._remember_execution_identity(
+      plugin, job_id, identity, started_at
+    )
+
+    binding = binding_payload()
+    plugin._get_job_config.return_value = {"scan_type": "network", "execution_binding": binding}
+    workers, error = build_network_workers(plugin, ["node-A"], 1, 100, "MIRROR")
+    self.assertIsNone(error)
+    job_specs = {
+      "job_id": "job-1",
+      "target": "10.0.0.1",
+      "scan_type": "network",
+      "job_pass": 1,
+      "launcher": "node-launcher",
+      "launcher_alias": "rm1",
+      "execution_binding": binding,
+      "workers": workers,
+    }
+    plugin.chainstore_hgetall.return_value = {"job-1": job_specs}
+
+    with patch("extensions.business.cybersec.red_mesh.pentester_api_01.launch_local_jobs") as mocked_launch:
+      Plugin._maybe_launch_jobs(plugin)
+
+    mocked_launch.assert_called_once()
+    self.assertEqual(mocked_launch.call_args.kwargs["execution_identity"], ("job-1", 1, "node-A", 1))
+    self.assertEqual(plugin._active_execution_identities["job-1"], ("job-1", 1, "node-A", 1))
+
   def test_maybe_launch_jobs_skips_duplicate_execution_identity(self):
     """A repeated announce of the same execution identity does not relaunch."""
     Plugin = self._get_plugin_class()
