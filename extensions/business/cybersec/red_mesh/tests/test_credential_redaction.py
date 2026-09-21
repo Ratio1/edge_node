@@ -51,6 +51,22 @@ class TestProbePhrasings(unittest.TestCase):
     ("Accepted credential: admin:p@$$:w0rd!", "p@$$:w0rd!"),
   )
 
+  # Empty secrets: `("root", "")` (database.py:175) and `("admin", "")`
+  # (common.py:402) are live defaults. `root:` says the password is blank.
+  EMPTY_SECRET = (
+    "MySQL default credential accepted: root:",
+    "Auth response OK for root:",
+    "Auth OK for postgres:",
+    "Accepted credential: admin:",
+    "FTP default credential accepted: ftp: (anonymous)",
+  )
+
+  def test_an_empty_secret_is_still_masked(self):
+    for text in self.EMPTY_SECRET:
+      with self.subTest(text=text):
+        out = redact_credential_text(text)
+        self.assertRegex(out, r"\b(root|postgres|admin|ftp):\*\*\*")
+
   def test_secret_is_masked_and_user_kept(self):
     for text, secret in self.CASES:
       with self.subTest(text=text):

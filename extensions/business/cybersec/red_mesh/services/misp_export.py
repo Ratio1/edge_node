@@ -429,10 +429,9 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     "event": event,
     "job_id": job_id,
     "pass_nr": actual_pass_nr,
-    # The floor applied and what it left out, for the export record.
+    # The floor applied, for the export record; the counts below it were
+    # already here.
     "min_severity": min_severity,
-    "findings_exported": len(filtered_findings),
-    "findings_total": len(findings),
     "target": target,
     "findings_exported": len(filtered_findings),
     "findings_total": len(findings),

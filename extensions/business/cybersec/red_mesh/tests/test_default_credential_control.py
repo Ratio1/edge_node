@@ -16,6 +16,9 @@ import paramiko
 
 from extensions.business.cybersec.red_mesh.findings import Severity
 from extensions.business.cybersec.red_mesh.worker.service.common import (
+  CONTROL_ACCEPTED,
+  CONTROL_NOT_RUN,
+  CONTROL_REJECTED,
   _default_credential_findings,
   _ftp_authenticated_action,
   _ssh_authenticated_action,
@@ -26,7 +29,7 @@ class TestDefaultCredentialVerdict(unittest.TestCase):
 
   def test_control_rejected_and_proof_present_is_a_certain_critical(self):
     findings = _default_credential_findings(
-      "SSH", ["root:toor"], control_accepted=False,
+      "SSH", ["root:toor"], control=CONTROL_REJECTED,
       proofs={"root:toor": "exec id -> uid=0(root) gid=0(root)"},
     )
     self.assertEqual(len(findings), 1)
@@ -37,7 +40,7 @@ class TestDefaultCredentialVerdict(unittest.TestCase):
     self.assertIn("Accepted credential: root:toor; authenticated action: exec id ->", f.evidence)
 
   def test_control_rejected_without_proof_is_firm_not_certain(self):
-    f = _default_credential_findings("FTP", ["ftp:ftp"], control_accepted=False)[0]
+    f = _default_credential_findings("FTP", ["ftp:ftp"], control=CONTROL_REJECTED)[0]
     self.assertEqual(f.severity, Severity.CRITICAL)
     self.assertEqual(f.confidence, "firm")
     self.assertIn("handshake alone", f.description)
@@ -47,7 +50,7 @@ class TestDefaultCredentialVerdict(unittest.TestCase):
     # Two contradictory CRITICALs on one port — "default credential accepted"
     # beside "accepts arbitrary credentials" — is what the client saw.
     f = _default_credential_findings(
-      "Telnet", ["admin:admin"], control_accepted=True,
+      "Telnet", ["admin:admin"], control=CONTROL_ACCEPTED,
       proofs={"admin:admin": "uid=1000(admin)"},
     )[0]
     self.assertEqual(f.severity, Severity.INFO)
@@ -55,9 +58,19 @@ class TestDefaultCredentialVerdict(unittest.TestCase):
     self.assertIn("(inconclusive: service accepts arbitrary credentials)", f.title)
     self.assertIn("accepts arbitrary credentials", f.description)
 
+  def test_a_control_that_did_not_run_caps_confidence_and_says_so(self):
+    # A dropped or rate-limited control is not a passed control.
+    f = _default_credential_findings(
+      "SSH", ["root:toor"], control=CONTROL_NOT_RUN,
+      proofs={"root:toor": "exec id -> uid=0(root)"},
+    )[0]
+    self.assertEqual(f.severity, Severity.CRITICAL)
+    self.assertEqual(f.confidence, "firm")
+    self.assertIn("control could not be run", f.description)
+
   def test_no_accepted_pairs_yields_nothing(self):
-    self.assertEqual(_default_credential_findings("SSH", [], control_accepted=False), [])
-    self.assertEqual(_default_credential_findings("SSH", [], control_accepted=True), [])
+    self.assertEqual(_default_credential_findings("SSH", [], control=CONTROL_REJECTED), [])
+    self.assertEqual(_default_credential_findings("SSH", [], control=CONTROL_ACCEPTED), [])
 
 
 class TestAuthenticatedActions(unittest.TestCase):
@@ -129,7 +142,7 @@ class TestSshProbeWiring(unittest.TestCase):
   def test_default_pair_accepted_and_random_rejected_stands_as_critical(self):
     result = self._run(lambda user, password: (user, password) == ("root", "root"))
     titles = {f["title"]: f for f in result["findings"]}
-    self.assertEqual(result["auth_control"], {"random_credentials_accepted": False})
+    self.assertEqual(result["auth_control"], {"random_credentials": "rejected"})
     self.assertIn("SSH default credential accepted: root:root", titles)
     f = titles["SSH default credential accepted: root:root"]
     self.assertEqual(f["severity"], "CRITICAL")
@@ -137,10 +150,21 @@ class TestSshProbeWiring(unittest.TestCase):
     self.assertIn("authenticated action: exec id -> uid=0(root)", f["evidence"])
     self.assertNotIn("SSH accepts arbitrary credentials", titles)
 
+  def test_a_dropped_control_is_recorded_as_not_run(self):
+    def accept(user, password):
+      if user.startswith("probe_"):
+        raise OSError("connection reset")   # the control attempt itself failed
+      return (user, password) == ("root", "root")
+    result = self._run(accept)
+    self.assertEqual(result["auth_control"], {"random_credentials": "not_run"})
+    f = next(f for f in result["findings"] if f["title"] == "SSH default credential accepted: root:root")
+    self.assertEqual(f["severity"], "CRITICAL")
+    self.assertEqual(f["confidence"], "firm")
+
   def test_everything_accepted_downgrades_the_default_pairs(self):
     result = self._run(lambda user, password: True)
     findings = result["findings"]
-    self.assertEqual(result["auth_control"], {"random_credentials_accepted": True})
+    self.assertEqual(result["auth_control"], {"random_credentials": "accepted"})
     self.assertTrue(any(f["title"] == "SSH accepts arbitrary credentials" and f["severity"] == "CRITICAL"
                         for f in findings))
     defaults = [f for f in findings if "default credential accepted" in f["title"]]

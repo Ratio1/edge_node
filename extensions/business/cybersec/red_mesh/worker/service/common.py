@@ -15,7 +15,12 @@ from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
 
-def _default_credential_findings(protocol, accepted, *, control_accepted, proofs=None):
+CONTROL_REJECTED = "rejected"
+CONTROL_ACCEPTED = "accepted"
+CONTROL_NOT_RUN = "not_run"
+
+
+def _default_credential_findings(protocol, accepted, *, control, proofs=None):
   """
   Build the default-credential findings for one service, gated on the
   negative control (RM-069).
@@ -27,6 +32,12 @@ def _default_credential_findings(protocol, accepted, *, control_accepted, proofs
   that produced CRITICAL default-credential findings beside a CRITICAL
   "accepts arbitrary credentials" finding on the same port. Each probe already
   ran the random-pair test; this is where its outcome reaches the verdict.
+
+  `control` is the random-pair outcome: `rejected` (the control passed),
+  `accepted` (the service takes anything) or `not_run` (the attempt itself
+  failed — connection dropped, rate limit, timeout). The third state exists
+  because a control that never ran is not a control that passed: a finding
+  built over it is capped at `firm` and says so.
 
   `proofs` maps an accepted pair to the output of one harmless authenticated
   action (`id` over SSH, `PWD` over FTP, `id`/`uname` over Telnet). A pair
@@ -43,7 +54,7 @@ def _default_credential_findings(protocol, accepted, *, control_accepted, proofs
     evidence = f"Accepted credential: {cred}"
     if proof:
       evidence += f"; authenticated action: {proof}"
-    if control_accepted:
+    if control == CONTROL_ACCEPTED:
       findings.append(Finding(
         severity=Severity.INFO,
         title=(
@@ -63,19 +74,27 @@ def _default_credential_findings(protocol, accepted, *, control_accepted, proofs
         confidence="tentative",
       ))
       continue
+    if control == CONTROL_NOT_RUN:
+      control_note = (
+        " The random-credential control could not be run (the attempt failed before "
+        "the server answered), so acceptance of arbitrary credentials is not excluded."
+      )
+      confidence = "firm"
+    else:
+      control_note = " A randomly generated credential was rejected, so the acceptance is specific to this pair."
+      confidence = "certain" if proof else "firm"
     findings.append(Finding(
       severity=Severity.CRITICAL,
       title=f"{protocol} default credential accepted: {cred}",
       description=(
-        f"The {protocol} server accepted a well-known default credential. A randomly "
-        "generated credential was rejected, so the acceptance is specific to this pair."
+        f"The {protocol} server accepted a well-known default credential.{control_note}"
         + ("" if proof else " No authenticated action was completed; the handshake alone was observed.")
       ),
       evidence=evidence,
       remediation="Change default passwords immediately and enforce strong credential policies.",
       owasp_id="A07:2021",
       cwe_id="CWE-798",
-      confidence="certain" if proof else "firm",
+      confidence=confidence,
     ))
   return findings
 
@@ -855,7 +874,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 7. Arbitrary credential acceptance test ---
     # Doubles as the negative control for step 6 (RM-069); the default-credential
     # findings are built after it so they can be gated on its outcome.
-    control_accepted = False
+    control = CONTROL_NOT_RUN
     import string as _string
     ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
@@ -864,7 +883,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       # See the SSH case: the generated pair is per-run, and `evidence` feeds the
       # content hash, so it belongs in raw_data rather than in the finding.
       result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
-      control_accepted = True
+      control = CONTROL_ACCEPTED
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="FTP accepts arbitrary credentials",
@@ -880,12 +899,12 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       except Exception:
         pass
     except (ftplib.error_perm, ftplib.error_reply):
-      pass
+      control = CONTROL_REJECTED
     except Exception:
-      pass
-    result["auth_control"] = {"random_credentials_accepted": control_accepted}
+      pass  # the control did not run; stays CONTROL_NOT_RUN
+    result["auth_control"] = {"random_credentials": control}
     findings += _default_credential_findings(
-      "FTP", accepted_creds, control_accepted=control_accepted, proofs=proofs,
+      "FTP", accepted_creds, control=control, proofs=proofs,
     )
 
     return probe_result(raw_data=result, findings=findings)
@@ -1001,7 +1020,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # Doubles as the negative control for step 3: a service that accepts a
     # random pair has not demonstrated a default credential in use, whatever
     # it said to the defaults (RM-069).
-    control_accepted = False
+    control = CONTROL_NOT_RUN
     random_user = f"probe_{random.randint(10000, 99999)}"
     random_pass = f"rnd_{random.randint(10000, 99999)}"
     try:
@@ -1019,7 +1038,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       # on every scan and on every worker: change detection reported a change
       # each pass and the aggregate carried one copy per worker.
       result["arbitrary_credentials_accepted"] = f"{random_user}:{random_pass}"
-      control_accepted = True
+      control = CONTROL_ACCEPTED
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="SSH accepts arbitrary credentials",
@@ -1032,15 +1051,15 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       ))
       client.close()
     except paramiko.AuthenticationException:
-      pass
+      control = CONTROL_REJECTED
     except Exception:
-      pass
-    result["auth_control"] = {"random_credentials_accepted": control_accepted}
+      pass  # the control did not run; stays CONTROL_NOT_RUN
+    result["auth_control"] = {"random_credentials": control}
 
     if accepted_creds:
       result["accepted_credentials"] = accepted_creds
       findings += _default_credential_findings(
-        "SSH", accepted_creds, control_accepted=control_accepted, proofs=proofs,
+        "SSH", accepted_creds, control=control, proofs=proofs,
       )
 
     # --- 5. Cipher/KEX audit ---
@@ -1759,7 +1778,10 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 5. Arbitrary credential acceptance test ---
     # Doubles as the negative control for step 4 (RM-069); the default-credential
     # findings are built after it so they can be gated on its outcome.
-    control_accepted = False
+    # `_try_telnet_login` returns False both for a rejected login and for a
+    # failed attempt, so Telnet cannot report `not_run`; a dropped control reads
+    # as rejected here. Known limitation, recorded on RM-069.
+    control = CONTROL_REJECTED
     import string as _string
     ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
@@ -1768,7 +1790,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       # See the SSH case: the generated pair is per-run, and `evidence` feeds the
       # content hash, so it belongs in raw_data rather than in the finding.
       result["arbitrary_credentials_accepted"] = f"{ruser}:{rpass}"
-      control_accepted = True
+      control = CONTROL_ACCEPTED
       findings.append(Finding(
         severity=Severity.CRITICAL,
         title="Telnet accepts arbitrary credentials",
@@ -1779,9 +1801,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         cwe_id="CWE-287",
         confidence="certain",
       ))
-    result["auth_control"] = {"random_credentials_accepted": control_accepted}
+    result["auth_control"] = {"random_credentials": control}
     findings += _default_credential_findings(
-      "Telnet", accepted_creds, control_accepted=control_accepted, proofs=proofs,
+      "Telnet", accepted_creds, control=control, proofs=proofs,
     )
 
     return probe_result(raw_data=result, findings=findings)
