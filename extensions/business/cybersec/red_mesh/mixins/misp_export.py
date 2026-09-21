@@ -10,17 +10,17 @@ Exposes four endpoints:
 
 from ..services.misp_config import get_misp_export_config
 from ..services.misp_export import (
+  _UNSET,
   export_misp_json,
   get_misp_export_status,
-  push_to_misp,
 )
 
 
 class _MispExportMixin:
 
-  def _get_misp_export_config(self):
+  def _get_misp_export_config(self, tenant_id=None):
     """Return MISP config status (no secrets exposed)."""
-    cfg = get_misp_export_config(self)
+    cfg = get_misp_export_config(self, tenant_id)
     return {
       "enabled": cfg["ENABLED"],
       "auto_export": cfg["AUTO_EXPORT"],
@@ -28,34 +28,20 @@ class _MispExportMixin:
       "min_severity": cfg["MIN_SEVERITY"],
     }
 
-  def _export_to_misp(self, job_id, pass_nr=None):
-    """Push job results to configured MISP instance."""
-    cfg = get_misp_export_config(self)
-    if not cfg["ENABLED"]:
-      self.P("[MISP] MISP export is disabled. Skipping.", color='y')
-      return {"status": "disabled"}
-    if not cfg["MISP_URL"] or not cfg["MISP_API_KEY"]:
-      self.P("[MISP] MISP URL or API key not configured. Skipping.", color='y')
-      return {"status": "not_configured", "error": "MISP URL or API key not configured"}
-    try:
-      result = push_to_misp(self, job_id, pass_nr=pass_nr)
-      if result.get("status") == "ok":
-        self.P(
-          f"[MISP] Export success for job {job_id}: "
-          f"event {result.get('event_uuid')}, "
-          f"{result.get('findings_exported')} findings, "
-          f"{result.get('ports_exported')} ports",
-          color='g'
-        )
-      else:
-        self.P(f"[MISP] Export failed for job {job_id}: {result.get('error')}", color='y')
-      return result
-    except Exception as exc:
-      self.P(f"[MISP] Export exception for job {job_id}: {exc}", color='r')
-      return {"status": "error", "error": str(exc), "retryable": True}
-
-  def _build_misp_json(self, job_id, pass_nr=None):
+  def _build_misp_json(self, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
     """Build MISP JSON for download (no MISP server required)."""
+    if checked_job is not _UNSET:
+      from ..tenancy.administration import AdministrationDenied
+      from ..tenancy.job_artifacts import checked_job_snapshot
+      job = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+      if pass_nr is not None and (type(pass_nr) is not int or pass_nr < 1):
+        raise AdministrationDenied(400, "invalid_request")
+      cfg = get_misp_export_config(self)
+      if not cfg["ENABLED"]:
+        return {"status": "disabled"}
+      return export_misp_json(self, job_id, pass_nr=pass_nr, checked_job=job, snapshot_mode=snapshot_mode)
+    from ..tenancy.job_artifacts import validate_snapshot_mode
+    validate_snapshot_mode(snapshot_mode, snapshot_supplied=False)
     cfg = get_misp_export_config(self)
     if not cfg["ENABLED"]:
       return {"status": "disabled"}

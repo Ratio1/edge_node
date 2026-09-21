@@ -39,6 +39,7 @@ def _make_job_config(**overrides):
   cfg.scan_min_delay = 0.0
   cfg.scan_max_delay = 0.0
   cfg.authorized = True
+  cfg.execution_binding = None
   assignments, error = build_graybox_worker_assignments(["node-1"])
   if error is None:
     for key, value in assignments["node-1"].items():

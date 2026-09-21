@@ -99,7 +99,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
   """
 
   def __init__(self, owner, job_id, target_url, job_config,
-               local_id="1", initiator=""):
+               local_id="1", initiator="", execution_identity=None):
     parsed = urlparse(target_url)
 
     super().__init__(
@@ -112,6 +112,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
 
     self.target_url = target_url.rstrip("/")
     self.job_config = job_config
+    self._execution_identity = execution_identity
     self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
     self._port_key = str(self._port)
 
@@ -156,6 +157,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       # five redirects and those extra requests were counted by nobody.
       request_budget=self.request_budget,
       safety=self.safety,
+      execution_binding=getattr(job_config, "execution_binding", None),
     )
 
     # Modules (composition)
@@ -281,8 +283,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
     "scan finished cleanly" from "scan was terminated at a safety gate."
     """
     discovery_result = DiscoveryResult()
+    execution_authorized = self.job_config.execution_binding is None
     self.metrics.start_scan(1)
     try:
+      if not execution_authorized:
+        guard = getattr(self.owner, "_require_worker_execution", None)
+        if not callable(guard):
+          raise ValueError("Execution unavailable")
+        guard(self.job_id, self.job_config.to_dict(), execution_identity=self._execution_identity)
+        execution_authorized = True
       self._run_preflight_phase()
       if self._check_stopped():
         return
@@ -319,7 +328,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
     except Exception as exc:
       self._record_fatal(self._sanitize_error(str(exc)))
     finally:
-      self._safe_cleanup()
+      if execution_authorized:
+        self._safe_cleanup()
       if self._phase_open and self._phase:
         self.metrics.phase_end(self._phase)
         self._phase_open = False

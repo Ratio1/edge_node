@@ -8,12 +8,19 @@ from urllib.parse import urlsplit
 import requests
 
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
+from ..tenancy.ports import TenantStoreError
 from .auth import AuthError, build_auth_provider, credentials_missing
-from .config import get_opencti_export_config
+from .config import tenant_export_binding, get_opencti_export_config
+from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
 from .scan_guards import reject_model_test_for_scan_operation
 from .stix_export import build_stix_bundle
+
+
+_UNSET = object()
 
 
 OPENCTI_EXPORT_SCHEMA_VERSION = "1.0.0"
@@ -99,24 +106,39 @@ def _bundle_summary(result, artifact_cid=None):
   }
 
 
-def _prepare_opencti_export(owner, job_id, pass_nr=None):
-  cfg = get_opencti_export_config(owner)
+def _prepare_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
+  # The job is resolved before the config: which OpenCTI this job publishes to is a property of the
+  # job's tenant, so the destination cannot be read until the job is known.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
+  if not isinstance(job_specs, dict):
+    record_integration_status(owner, "opencti", outcome="failure", error_class="job_not_found")
+    return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
+  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "opencti")
+  if binding_error:
+    record_integration_status(owner, "opencti", outcome="failure", error_class=binding_error,
+                              tenant_id=tenant_id)
+    return None, None, {"status": "not_configured", "error": binding_error, "job_id": job_id}
+  cfg = get_opencti_export_config(owner, tenant_id)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return None, None, {"status": "disabled", "error": "OpenCTI export is disabled", "job_id": job_id}
   if config_error:
-    record_integration_status(owner, "opencti", outcome="failure", error_class=config_error)
+    # When reached through _effect_operation the caller is already authorized, so recording the
+    # failure is operator visibility. NOT yet true of push_to_opencti/publish_to_taxii, which still
+    # call this with no requester -- that is B2's scope, and until then this write is reachable
+    # without admission.
+    record_integration_status(owner, "opencti", outcome="failure", error_class=config_error,
+                              tenant_id=tenant_id)
     return None, None, {"status": "not_configured", "error": config_error, "job_id": job_id}
 
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not isinstance(job_specs, dict):
-    record_integration_status(owner, "opencti", outcome="failure", error_class="job_not_found")
-    return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "opencti_export")
   if unsupported:
     return None, None, unsupported
 
-  result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
+  # Never forward this module's own _UNSET: stix_export compares against its own sentinel object,
+  # so a foreign sentinel would be mistaken for a job record.
+  result = (build_stix_bundle(owner, job_id, pass_nr=pass_nr) if checked_job is _UNSET
+            else build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=checked_job))
   if result.get("status") != "ok":
     error = result.get("error") or "stix_build_failed"
     record_integration_status(owner, "opencti", outcome="failure", error_class=error)
@@ -125,12 +147,19 @@ def _prepare_opencti_export(owner, job_id, pass_nr=None):
   return cfg, job_specs, result
 
 
-def dry_run_opencti_export(owner, job_id, pass_nr=None):
-  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr)
+def dry_run_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=None):
+  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr,
+                                                   checked_job=checked_job)
   if result.get("status") != "ok":
     return result
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
+  if ledger is not None and artifact_cid:
+    # The bundle is now on disk. Anything that raises after this point must not be reported
+    # as "nothing happened".
+    ledger.record(EffectState.PERSISTED)
   summary = {
     "schema_version": OPENCTI_EXPORT_SCHEMA_VERSION,
     "status": "dry_run",
@@ -142,6 +171,11 @@ def dry_run_opencti_export(owner, job_id, pass_nr=None):
     **_bundle_summary(result, artifact_cid=artifact_cid),
   }
   job_specs["opencti_export"] = summary
+  if ledger is not None:
+    # The job document is about to be mutated whether or not the bundle persisted, so
+    # revalidate here and record it: a later fault must not report "nothing happened".
+    ledger.checkpoint()
+    ledger.record(EffectState.PERSISTED)
   _write_job_record(owner, job_id, job_specs, context="opencti_dry_run")
   record_integration_status(
     owner,
@@ -154,14 +188,21 @@ def dry_run_opencti_export(owner, job_id, pass_nr=None):
   return {**summary, "status": "ok", "dry_run": True, "job_id": job_id}
 
 
-def push_to_opencti(owner, job_id, pass_nr=None):
-  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr)
+def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=None):
+  cfg, job_specs, result = _prepare_opencti_export(owner, job_id, pass_nr=pass_nr,
+                                                   checked_job=checked_job)
   if result.get("status") != "ok":
     return result
   if cfg["PUSH_MODE"] == "dry_run":
-    return dry_run_opencti_export(owner, job_id, pass_nr=pass_nr)
+    # B1 changed the dry run's signature; this B2 call site travels with it.
+    return dry_run_opencti_export(owner, job_id, pass_nr=pass_nr,
+                                  checked_job=checked_job, ledger=ledger)
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
+  if ledger is not None and artifact_cid:
+    ledger.record(EffectState.PERSISTED)
   if not artifact_cid:
     record_integration_status(owner, "opencti", outcome="failure", error_class="artifact_write_failed")
     return {"status": "error", "error": "artifact_write_failed", "job_id": job_id}
@@ -182,6 +223,9 @@ def push_to_opencti(owner, job_id, pass_nr=None):
     "operations": json.dumps(operations),
     "map": json.dumps({"0": ["variables.file"]}),
   }
+  if ledger is not None:
+    # Last revalidation before data leaves the deployment.
+    ledger.checkpoint()
   try:
     headers = build_auth_provider(cfg).headers()
   except AuthError as exc:
@@ -200,8 +244,8 @@ def push_to_opencti(owner, job_id, pass_nr=None):
     record_integration_status(owner, "opencti", outcome="failure", error_class="timeout")
     return {"status": "error", "error": "timeout", "job_id": job_id, "retryable": True}
   except requests.exceptions.RequestException as exc:
-    record_integration_status(owner, "opencti", outcome="failure", error_class=type(exc).__name__)
-    return {"status": "error", "error": type(exc).__name__, "job_id": job_id, "retryable": True}
+    record_integration_status(owner, "opencti", outcome="failure", error_class="connection_failed")
+    return {"status": "error", "error": "connection_failed", "job_id": job_id, "retryable": True}
 
   if response.status_code >= 400:
     error_class = f"http_{response.status_code}"
@@ -231,6 +275,10 @@ def push_to_opencti(owner, job_id, pass_nr=None):
 
   upload = ((payload.get("data") or {}).get("uploadImport") or {}) if isinstance(payload, dict) else {}
   opencti_file_id = upload.get("id")
+  if ledger is not None and opencti_file_id:
+    # Evidence of acceptance: 2xx, no GraphQL errors array, and an id for the stored file.
+    # GraphQL returns 200 with an errors array, so status alone is not evidence.
+    ledger.record(EffectState.DELIVERED)
   upload_status = upload.get("uploadStatus")
   pushed_at = _utc_timestamp()
   export_meta = {
@@ -278,7 +326,7 @@ def push_to_opencti(owner, job_id, pass_nr=None):
   }
 
 
-def probe_opencti(owner):
+def probe_opencti(owner, tenant_id=None):
   """Read-only connectivity probe for the OpenCTI Test button.
 
   Runs the GraphQL `me {}` query against the configured OpenCTI URL using
@@ -286,7 +334,7 @@ def probe_opencti(owner):
   validates that the URL is reachable, credentials are accepted, and the
   GraphQL schema is responsive.
   """
-  cfg = get_opencti_export_config(owner)
+  cfg = get_opencti_export_config(owner, tenant_id)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return {"status": "disabled", "integration_id": "opencti", "error": "disabled"}
@@ -344,14 +392,25 @@ def probe_opencti(owner):
   }
 
 
-def get_opencti_export_status(owner, job_id):
-  job_specs = owner._get_job_from_cstore(job_id)
+def get_opencti_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "exported": False}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "opencti_export_status")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {**unsupported, "found": True, "exported": False}
   export_meta = job_specs.get("opencti_export")
+  if checked and export_meta is not None:
+    if (not isinstance(export_meta, dict)
+        or "job_id" in export_meta and export_meta["job_id"] != job_id
+        or any(field in export_meta for field in ("success", "error", "status_code", "result",
+               "detail", "exception_metadata", "execution_binding", "found", "exported"))):
+      raise TenantStoreError("Export status is unavailable")
   if not isinstance(export_meta, dict) or not export_meta:
     return {"job_id": job_id, "found": True, "exported": False}
   return {

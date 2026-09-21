@@ -597,6 +597,7 @@ class TestLaunchValidation(unittest.TestCase):
       with patch("extensions.business.cybersec.red_mesh.graybox.worker.AuthManager"):
         with patch("extensions.business.cybersec.red_mesh.graybox.worker.DiscoveryModule"):
           cfg = MagicMock()
+          cfg.execution_binding = None
           cfg.target_url = "http://test.local:8000"
           cfg.target_config = None
           cfg.verify_tls = True
@@ -623,6 +624,7 @@ class TestLaunchValidation(unittest.TestCase):
       with patch(f"{worker_module}.AuthManager"):
         with patch(f"{worker_module}.DiscoveryModule"):
           cfg = MagicMock()
+          cfg.execution_binding = None
           cfg.target_url = "http://test.local:8000"
           cfg.target_config = None
           cfg.verify_tls = True

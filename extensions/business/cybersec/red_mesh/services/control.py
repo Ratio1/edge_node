@@ -13,6 +13,7 @@ from ..model_testing.constants import (
   selected_model_test_worker_addr,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.effects import EffectState
 from .event_hooks import emit_lifecycle_event
 from .secrets import collect_secret_refs_from_job_config
 from .state_machine import set_job_status
@@ -65,12 +66,15 @@ def _foreign_launcher_error(owner, job_id, job_specs, action):
   }
 
 
-def stop_and_delete_job(owner, job_id: str):
+def stop_and_delete_job(owner, job_id: str, *, checked_job=None, snapshot_mode=None, ledger=None):
   """
   Stop a running job, mark it stopped, then delegate to purge_job
   for full R1FS + CStore cleanup.
+
+  `checked_job` is the admitted snapshot (RM-026 I1b B9); an internal caller supplies none and
+  keeps the legacy read.
   """
-  raw_job_specs = _job_repo(owner).get_job(job_id)
+  raw_job_specs = checked_job if checked_job is not None else _job_repo(owner).get_job(job_id)
   job_specs = None
   if isinstance(raw_job_specs, dict):
     _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
@@ -88,6 +92,10 @@ def stop_and_delete_job(owner, job_id: str):
   owner.scan_jobs.pop(job_id, None)
 
   if isinstance(job_specs, dict):
+    # Contract 4 before the first irreversible act. Everything below -- worker cancellation, the
+    # SOC lifecycle event, the record write -- is unrecoverable by the caller.
+    if ledger is not None:
+      ledger.checkpoint()
     workers_map = job_specs.setdefault("workers", {})
     if is_model_test_job(job_specs):
       selected_worker = selected_model_test_worker_addr(job_specs, fallback=getattr(owner, "ee_addr", None))
@@ -117,34 +125,50 @@ def stop_and_delete_job(owner, job_id: str):
       pass_nr=job_specs.get("job_pass"),
     )
     _write_job_record(owner, job_id, job_specs, context="stop_and_delete")
+    # The workers are stopped and the SOC has been told. A later raise inside the purge must not
+    # reach the caller as "nothing happened" -- a retry would stop an already-stopped job and
+    # deliver a second stop event.
+    if ledger is not None:
+      ledger.record(EffectState.DELIVERED)
   else:
     owner._log_audit_event("scan_stopped", {"job_id": job_id})
     return {"status": "success", "job_id": job_id, "cids_deleted": 0, "cids_total": 0}
 
   owner._log_audit_event("scan_stopped", {"job_id": job_id})
-  return owner.purge_job(job_id)
+  # Keep internal control flow on the module implementation, below the public API boundary.
+  # The snapshot is deliberately NOT forwarded: the record was just rewritten by the stop above, so
+  # the admitted copy is stale here and the purge must read the current one. The ledger is
+  # forwarded, because what it records survives that re-read.
+  return purge_job(owner, job_id, ledger=ledger)
 
 
-def purge_job(owner, job_id: str):
-  """Serialize purge with every supported rulebook review mutation for the job."""
+def purge_job(owner, job_id: str, *, checked_job=None, snapshot_mode=None, ledger=None):
+  """Serialize purge with every supported rulebook review mutation for the job.
+
+  `checked_job` is the admitted snapshot (RM-026 I1b B9). `ledger` marks the point past which the
+  deletion is irreversible, so a later failure cannot be reported as "nothing happened".
+  """
   from .rulebook_assessment import _submission_lock, list_rulebook_profiles
 
   with ExitStack() as stack:
     for profile in sorted(list_rulebook_profiles(), key=lambda item: item["profile_id"]):
       stack.enter_context(_submission_lock(owner, job_id, profile["profile_id"]))
-    return _purge_job_locked(owner, job_id)
+    return _purge_job_locked(owner, job_id, checked_job=checked_job, ledger=ledger)
 
 
-def _purge_job_locked(owner, job_id: str):
+def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
   """
   Purge a job: delete all R1FS artifacts, clean up live progress keys,
   then tombstone the CStore entry.
   """
-  raw = _job_repo(owner).get_job(job_id)
-  if not isinstance(raw, dict):
-    return {"status": "error", "message": f"Job {job_id} not found."}
-
-  _, job_specs = owner._normalize_job_record(job_id, raw)
+  # The admitted snapshot when one was supplied (RM-026 I1b B9); it is already normalized.
+  if checked_job is not None:
+    job_specs = checked_job
+  else:
+    raw = _job_repo(owner).get_job(job_id)
+    if not isinstance(raw, dict):
+      return {"status": "error", "message": f"Job {job_id} not found."}
+    _, job_specs = owner._normalize_job_record(job_id, raw)
   owner_error = _foreign_launcher_error(owner, job_id, job_specs, "purge")
   if owner_error:
     return owner_error
@@ -261,6 +285,11 @@ def _purge_job_locked(owner, job_id: str):
   owner.P(f"[PURGE] Total CIDs collected: {len(cids)}: {sorted(cids)}")
 
   deleted, failed = 0, 0
+  # Contract 4 at the last seam before anything is destroyed: re-admit the requester, so an account
+  # deactivated or a binding changed mid-purge does not get the effect. `record` alone does not run
+  # the checkpoint callback -- only `checkpoint` does.
+  if ledger is not None and cids:
+    ledger.checkpoint()
   # R1FS deletion acknowledges local/relay unpin and garbage-collection requests.
   # The relay sweep can take up to 24 hours, and reading here can rehydrate the CID.
   for cid in cids:
@@ -268,6 +297,9 @@ def _purge_job_locked(owner, job_id: str):
       success = artifacts.delete(cid, show_logs=True, raise_on_error=False, purge=True)
       if success:
         deleted += 1
+        # Irreversible. A later raise must not reach the caller as "nothing happened".
+        if ledger is not None:
+          ledger.record(EffectState.DELIVERED)
         owner.P(f"[PURGE] Deleted CID {cid}")
       else:
         failed += 1
@@ -354,7 +386,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
   try:
     submission_rows = owner.chainstore_hgetall(hkey=submission_hkey) or {}
   except Exception as exc:
-    errors.append({"job_id": job_id, "scope": submission_hkey, "message": f"{type(exc).__name__}: {exc}"})
+    errors.append({"job_id": job_id, "scope": submission_hkey, "message": type(exc).__name__})
     owner.P(f"[PURGE_ALL_FORCE] Could not inspect submission registry for {job_id}; retaining rows.", color='r')
     return 0, 1
   if not isinstance(submission_rows, dict):
@@ -381,7 +413,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
           other_submission_cids.update(_collect_cids_from_raw(other_payload))
       shared_submission_cids = job_submission_cids & other_submission_cids
     except Exception as exc:
-      errors.append({"job_id": job_id, "scope": owner.cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
+      errors.append({"job_id": job_id, "scope": owner.cfg_instance_id, "message": type(exc).__name__})
       owner.P(f"[PURGE_ALL_FORCE] Could not inspect shared CID references for {job_id}; retaining rows.", color='r')
       return 0, len(job_submission_cids)
   cids.update(job_submission_cids - shared_submission_cids)
@@ -413,7 +445,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
       if cid in job_submission_cids:
         failed_submission_cids.add(cid)
       owner.P(f"[PURGE_ALL_FORCE] Failed to delete CID {cid} ({job_id}): {exc}", color='r')
-      errors.append({"job_id": job_id, "scope": "r1fs", "message": f"{type(exc).__name__}: {exc}"})
+      errors.append({"job_id": job_id, "scope": "r1fs", "message": type(exc).__name__})
 
   if failed_submission_cids:
     owner.P(
@@ -436,7 +468,7 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
     try:
       rows = owner.chainstore_hgetall(hkey=hkey)
     except Exception as exc:
-      errors.append({"job_id": job_id, "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
+      errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
       continue
     if not isinstance(rows, dict):
       continue
@@ -445,18 +477,18 @@ def _force_purge_job_locked(owner, job_id, raw_payload, errors):
         try:
           owner.chainstore_hset(hkey=hkey, key=key, value=None)
         except Exception as exc:
-          errors.append({"job_id": job_id, "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
+          errors.append({"job_id": job_id, "scope": hkey, "message": type(exc).__name__})
 
   try:
     owner.chainstore_hset(hkey=cfg_instance_id, key=job_id, value=None)
   except Exception as exc:
-    errors.append({"job_id": job_id, "scope": cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
+    errors.append({"job_id": job_id, "scope": cfg_instance_id, "message": type(exc).__name__})
 
   owner.P(f"[PURGE_ALL_FORCE] Force-purged {job_id}: {cids_deleted}/{len(cids)} CIDs deleted.")
   return cids_deleted, cids_failed
 
 
-def purge_all_jobs(owner):
+def purge_all_jobs(owner, *, checked_jobs=None, snapshot_mode=None, ledger=None):
   """
   Purge every RedMesh job on this edge node: stop running jobs, delete all
   R1FS artifacts, tombstone CStore records, and sweep orphan rows in the
@@ -471,7 +503,24 @@ def purge_all_jobs(owner):
   any job whose purge returned ``partial`` keeps its CStore rows intact so
   the operator can retry artifact deletion later.
   """
-  raw_jobs = _job_repo(owner).list_jobs() or {}
+  # The admitted enumeration when one was supplied (RM-026 I1b B9). This is what scopes a
+  # Super-Tenant Admin's "purge everything" to their own tenant rather than the whole node.
+  raw_jobs = (_job_repo(owner).list_jobs() or {}) if checked_jobs is None else checked_jobs
+  # RM-026 I1b B9. Every sweep below must operate on an ALLOWLIST of the ids this call was admitted
+  # to, never on "everything not known to have failed". `checked_jobs` scopes the per-job loop to
+  # one tenant, and rows belonging to another tenant are therefore never enumerated, never marked
+  # failed, and -- under the old exemption -- always deleted. A Super-Tenant Admin scoped to tenant
+  # A could destroy tenant B's rows, job records and R1FS submission artifacts, reported as
+  # `status: "success"` with the victims absent from `outcomes`.
+  # `None` keeps the legacy whole-node behaviour for an internal caller.
+  swept_ids = None if checked_jobs is None else {
+    job_id for job_id in raw_jobs if isinstance(job_id, str)}
+
+  def _in_scope(job_id):
+    """A row may be swept only when this call was admitted to its job and that job did not fail."""
+    if job_id in failed_job_ids:
+      return False
+    return swept_ids is None or job_id in swept_ids
   job_entries = [(jid, payload) for jid, payload in raw_jobs.items() if isinstance(jid, str) and isinstance(payload, dict)]
 
   jobs_total = len(job_entries)
@@ -482,6 +531,18 @@ def purge_all_jobs(owner):
   cids_failed = 0
   failed_job_ids = set()
   errors = []
+  # RM-026 I1b B9, owner decision: a mixed batch reports the partial, and the per-item outcome is
+  # explicit and attributable -- never an aggregate count. The counters below stay for
+  # compatibility, but after an irreversible delete the only question an operator has is *which*
+  # jobs are gone, and a count cannot answer it.
+  outcomes = []
+
+  def _outcome(job_id, outcome, *, cids_deleted=0, cids_failed=0, message=""):
+    row = {"job_id": job_id, "outcome": outcome,
+           "cids_deleted": int(cids_deleted or 0), "cids_failed": int(cids_failed or 0)}
+    if message:
+      row["message"] = str(message)
+    outcomes.append(row)
 
   terminal_statuses = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED)
   for job_id, raw_payload in job_entries:
@@ -493,17 +554,18 @@ def purge_all_jobs(owner):
         "job_id": job_id,
         "message": owner_error["message"],
       })
+      _outcome(job_id, "refused", message=owner_error["message"])
       continue
     raw_status = raw_payload.get("job_status") if isinstance(raw_payload, dict) else None
     use_direct_purge = raw_status in terminal_statuses
     try:
       if use_direct_purge:
-        result = owner.purge_job(job_id)
+        result = purge_job(owner, job_id)
       else:
-        result = owner.stop_and_delete_job(job_id)
+        result = stop_and_delete_job(owner, job_id)
     except Exception as exc:
       owner.P(f"[PURGE_ALL] stop_and_delete_job({job_id}) raised: {exc}; falling back to force-purge.", color='y')
-      errors.append({"job_id": job_id, "message": f"{type(exc).__name__}: {exc}"})
+      errors.append({"job_id": job_id, "message": type(exc).__name__})
       fc_deleted, fc_failed = _force_purge_job(owner, job_id, raw_payload, errors)
       cids_deleted += fc_deleted
       cids_failed += fc_failed
@@ -511,6 +573,8 @@ def purge_all_jobs(owner):
       jobs_force_purged += 1
       if fc_failed:
         failed_job_ids.add(job_id)
+      _outcome(job_id, "force_purged", cids_deleted=fc_deleted, cids_failed=fc_failed,
+               message=f"{type(exc).__name__}")
       continue
 
     if not isinstance(result, dict):
@@ -522,21 +586,28 @@ def purge_all_jobs(owner):
       jobs_force_purged += 1
       if fc_failed:
         failed_job_ids.add(job_id)
+      _outcome(job_id, "force_purged", cids_deleted=fc_deleted, cids_failed=fc_failed,
+               message="unexpected purge response")
       continue
 
     status = result.get("status")
     cids_deleted += int(result.get("cids_deleted", 0) or 0)
     cids_failed += int(result.get("cids_failed", 0) or 0)
 
+    item_deleted = int(result.get("cids_deleted", 0) or 0)
+    item_failed = int(result.get("cids_failed", 0) or 0)
     if status == "success":
       jobs_succeeded += 1
+      _outcome(job_id, "purged", cids_deleted=item_deleted, cids_failed=item_failed)
     elif status == "partial":
       jobs_failed += 1
       failed_job_ids.add(job_id)
-      errors.append({
-        "job_id": job_id,
-        "message": result.get("message") or "purge returned status='partial'",
-      })
+      message = result.get("message") or "purge returned status='partial'"
+      errors.append({"job_id": job_id, "message": message})
+      # "retained", not "failed": a partial purge deliberately keeps the CStore rows so the
+      # operator can retry artifact deletion, which is a different state from a force-wipe.
+      _outcome(job_id, "retained", cids_deleted=item_deleted, cids_failed=item_failed,
+               message=message)
     else:
       errors.append({
         "job_id": job_id,
@@ -549,6 +620,8 @@ def purge_all_jobs(owner):
       jobs_force_purged += 1
       if fc_failed:
         failed_job_ids.add(job_id)
+      _outcome(job_id, "force_purged", cids_deleted=fc_deleted, cids_failed=fc_failed,
+               message=f"purge returned status={status!r}")
 
   cfg_instance_id = owner.cfg_instance_id
   live_hkey = f"{cfg_instance_id}:live"
@@ -575,14 +648,19 @@ def purge_all_jobs(owner):
       if expected_value_types is not None and not isinstance(value, expected_value_types):
         continue
       job_id_prefix = _job_id_from_compound_key(key)
-      if job_id_prefix and job_id_prefix in failed_job_ids:
+      # An unattributable row (no parsable job id) is swept only on a whole-node purge; under a
+      # tenant scope it cannot be shown to belong to the admitted tenant, so it is left alone.
+      if job_id_prefix:
+        if not _in_scope(job_id_prefix):
+          continue
+      elif swept_ids is not None:
         continue
       try:
         owner.chainstore_hset(hkey=hkey, key=key, value=None)
         rows_deleted += 1
       except Exception as exc:
         owner.P(f"[PURGE_ALL] failed to tombstone {hkey}/{key}: {exc}", color='r')
-        errors.append({"job_id": job_id_prefix or "", "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
+        errors.append({"job_id": job_id_prefix or "", "scope": hkey, "message": type(exc).__name__})
     return rows_deleted
 
   def _sweep_submission_hash():
@@ -598,7 +676,7 @@ def purge_all_jobs(owner):
       errors.append({
         "job_id": "",
         "scope": rulebook_review_submissions_hkey,
-        "message": f"{type(exc).__name__}: {exc}",
+        "message": type(exc).__name__,
       })
       return 0
     if not isinstance(initial_rows, dict):
@@ -640,7 +718,7 @@ def purge_all_jobs(owner):
         errors.append({
           "job_id": "",
           "scope": rulebook_review_submissions_hkey,
-          "message": f"{type(exc).__name__}: {exc}",
+          "message": type(exc).__name__,
         })
         return 0
       if not isinstance(rows, dict):
@@ -659,13 +737,17 @@ def purge_all_jobs(owner):
         if isinstance(raw_failed_job, dict):
           protected_cids.update(_collect_cids_from_raw(raw_failed_job))
       for key, value in rows.items():
-        if _job_id_from_compound_key(key) in failed_job_ids:
+        # Protect the CIDs of every row this call may not sweep -- a failed job, and under a tenant
+        # scope any row belonging to another tenant. Protecting only failures would delete an
+        # artifact shared with a tenant whose rows were never enumerated.
+        row_job_id = _job_id_from_compound_key(key)
+        if not row_job_id or not _in_scope(row_job_id):
           protected_cids.update(_collect_rulebook_submission_cids(value))
 
       for key in initial_keys:
         value = rows.get(key)
         job_id_prefix = _job_id_from_compound_key(key)
-        if not job_id_prefix or job_id_prefix in failed_job_ids or not isinstance(value, dict):
+        if not job_id_prefix or not _in_scope(job_id_prefix) or not isinstance(value, dict):
           continue
         row_cids = _collect_rulebook_submission_cids(value)
         shared_cids = row_cids & protected_cids
@@ -690,7 +772,7 @@ def purge_all_jobs(owner):
               errors.append({
                 "job_id": job_id_prefix,
                 "scope": "r1fs",
-                "message": f"{type(exc).__name__}: {exc}",
+                "message": type(exc).__name__,
               })
             deletion_results[cid] = success
             if success:
@@ -714,7 +796,7 @@ def purge_all_jobs(owner):
           errors.append({
             "job_id": job_id_prefix,
             "scope": rulebook_review_submissions_hkey,
-            "message": f"{type(exc).__name__}: {exc}",
+            "message": type(exc).__name__,
           })
     return rows_deleted
 
@@ -733,13 +815,13 @@ def purge_all_jobs(owner):
     for key, value in list(surviving.items()):
       if not isinstance(key, str) or not isinstance(value, dict):
         continue
-      if key in failed_job_ids:
+      if not _in_scope(key):
         continue
       try:
         owner.chainstore_hset(hkey=cfg_instance_id, key=key, value=None)
       except Exception as exc:
         owner.P(f"[PURGE_ALL] failed to tombstone job record {key}: {exc}", color='r')
-        errors.append({"job_id": key, "scope": cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
+        errors.append({"job_id": key, "scope": cfg_instance_id, "message": type(exc).__name__})
 
   status = "success" if jobs_failed == 0 and cids_failed == 0 else "partial"
 
@@ -767,24 +849,35 @@ def purge_all_jobs(owner):
     "cids_deleted": cids_deleted,
     "cids_failed": cids_failed,
     "integration_status_rows_deleted": integration_status_rows_deleted,
+    "outcomes": outcomes,
     "errors": errors,
   }
 
 
-def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
+def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT", *, checked_job=None, ledger=None):
   """
   Stop a job (any run mode with HARD stop, continuous-only for SOFT stop).
-  """
-  raw_job_specs = _job_repo(owner).get_job(job_id)
-  if not raw_job_specs:
-    return {"error": "Job not found", "job_id": job_id}
 
-  _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+  `checked_job` is the admitted snapshot (RM-026 I1b B10). It is already normalized, so this does
+  not re-read or re-normalize the record. `ledger` records the stop once it is persisted; an
+  internal caller supplies neither and keeps the legacy behaviour.
+  """
+  if checked_job is None:
+    raw_job_specs = _job_repo(owner).get_job(job_id)
+    if not raw_job_specs:
+      return {"error": "Job not found", "job_id": job_id}
+    _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+  else:
+    job_specs = checked_job
   owner_error = _foreign_launcher_error(owner, job_id, job_specs, "stop_monitoring")
   if owner_error:
     return owner_error
   stop_type = str(stop_type).upper()
   is_continuous = job_specs.get("run_mode") == RUN_MODE_CONTINUOUS_MONITORING
+  # Contract 4 before anything irreversible. An earlier revision checkpointed after the workers
+  # were already cancelled and the SOC notified, which is too late to be a control.
+  if ledger is not None:
+    ledger.checkpoint()
 
   if stop_type != "HARD" and not is_continuous:
     return {"error": "SOFT stop is only supported for CONTINUOUS_MONITORING jobs", "job_id": job_id}
@@ -838,6 +931,11 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
     owner.P(f"[CONTINUOUS] Soft stop scheduled for job {job_id} (will stop after current pass)")
 
   _write_job_record(owner, job_id, job_specs, context="stop_monitoring")
+  if ledger is not None:
+    # DELIVERED, not PERSISTED: by this point a HARD stop has already cancelled the workers and
+    # emitted redmesh.job.stopped to the SOC. Reporting a merely persisted effect would invite a
+    # retry that stops an already-stopped job and delivers a second stop event.
+    ledger.record(EffectState.DELIVERED if stop_type == "HARD" else EffectState.PERSISTED)
 
   return {
     "job_status": job_specs["job_status"],

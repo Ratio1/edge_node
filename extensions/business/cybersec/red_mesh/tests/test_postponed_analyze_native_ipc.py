@@ -165,11 +165,35 @@ class _Owner:
     return NativePostponedRequest(solver_method, dict(method_kwargs or {}))
 
 
+# RM-084 P3 requires a tenant selector ahead of admission; this suite stubs admission itself, so
+# the value only has to travel the transport.
+SCHEDULER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
+
+
 @unittest.skipUnless(
   NATIVE_RUNTIME_SOURCE_AVAILABLE,
   "native Ratio1 runtime source fixture is unavailable",
 )
 class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
+
+  def _bypass_admission_for(self, plugin):
+    """Bypass admission only for the scheduler stub owner, which has no execution service.
+
+    RM-026 I1b B6 added admission ahead of analyze_job. This suite exercises the real postponed
+    scheduler's responsiveness, not admission; read_fixture.owner keeps its real admission so the
+    get_job_status assertions stay meaningful. Admission is covered by test_manual_analysis_b6.py.
+    """
+    real = PentesterApi01Plugin._admitted_snapshot
+
+    def _snapshot(instance, *args, **kwargs):
+      if instance is plugin:
+        return None, "legacy_unbound"
+      return real(instance, *args, **kwargs)
+
+    patcher = patch.object(PentesterApi01Plugin, "_admitted_snapshot", _snapshot)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
   @staticmethod
   def _find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -193,19 +217,18 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
   def _render_server(self, destination, manager_port, manager_auth):
     from jinja2 import Environment, FileSystemLoader
 
+    # Ordinary requests preserve their original body parameters and need no bearer.
     analyze_parameters = list(
       inspect.signature(PentesterApi01Plugin.analyze_job).parameters.values()
     )[1:]
-    status_parameters = [
-      inspect.Parameter("job_id", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-    ]
+    status_parameters = list(inspect.signature(PentesterApi01Plugin.get_job_status).parameters.values())[1:]
     endpoints = [
       self._descriptor(
         "analyze_job",
         "post",
         analyze_parameters,
       ),
-      self._descriptor("get_job_status", "get", status_parameters),
+      self._descriptor("get_job_status", "post", status_parameters),
     ]
     template_dir = FRAMEWORK_PACKAGE / "business" / "base" / "uvicorn_templates"
     rendered = Environment(loader=FileSystemLoader(str(template_dir))).get_template(
@@ -239,10 +262,8 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
     shutil.copy2(IPC_MANAGER_PATH, temp_utils / IPC_MANAGER_PATH.name)
 
   @staticmethod
-  def _request(port, method, path, *, token="", payload=None, timeout=5):
+  def _request(port, method, path, *, payload=None, timeout=5):
     headers = {}
-    if token:
-      headers["Authorization"] = f"Bearer {token}"
     body = None
     if payload is not None:
       headers["Content-Type"] = "application/json"
@@ -328,18 +349,24 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
       )
 
     owner = _Owner(_blocking_worker)
+    self._bypass_admission_for(owner)
+    from .read_endpoint_fixtures import read_endpoint_fixture
+    read_fixture = self.enterContext(read_endpoint_fixture(archived=False))
     self.addCleanup(owner._manual_analysis_executor.shutdown, wait=False)
     harness = _SchedulerHarness.__new__(_SchedulerHarness)
     harness._endpoints = {
-      "analyze_job": lambda job_id, analysis_type="", focus_areas=None: (
-        PentesterApi01Plugin.analyze_job(
-          owner,
+      "analyze_job": lambda job_id, analysis_type="", focus_areas=None, request_actor=None,
+                            tenant_id=None: (
+        PentesterApi01Plugin.analyze_job(owner,
           job_id,
           analysis_type,
           focus_areas,
+          request_actor,
+          tenant_id,
         )
       ),
-      "get_job_status": lambda job_id: {"status": "ok", "job_id": job_id},
+      "get_job_status": lambda job_id, request_actor=None, tenant_id=None: (
+        PentesterApi01Plugin.get_job_status(read_fixture.owner, job_id, request_actor, tenant_id)),
     }
     harness._incoming_requests = deque()
     harness.postponed_requests = deque()
@@ -442,10 +469,10 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/analyze_job",
-            payload={"job_id": "job-1"},
+            payload={"job_id": "job-1", "tenant_id": SCHEDULER_TENANT},
           ))
 
-        def _prepare(_plugin, job_id):
+        def _prepare(_plugin, job_id, *, checked_job=None):
           if job_id == "explode":
             raise RuntimeError("native admission failure")
           return dict(state), None
@@ -466,7 +493,7 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
             port,
             "POST",
             "/analyze_job",
-            payload={"job_id": "explode"},
+            payload={"job_id": "explode", "tenant_id": SCHEDULER_TENANT},
           )
           self.assertEqual(failed_status, 503, failed_body)
           self.assertLess(failed_elapsed, 1.0)
@@ -480,18 +507,20 @@ class TestPostponedAnalyzeNativeIpc(unittest.TestCase):
 
           status, body, elapsed = self._request(
             port,
-            "GET",
-            "/get_job_status?job_id=job-1",
+            "POST",
+            "/get_job_status",
+            payload={"job_id": "job-1", "request_actor": read_fixture.actor,
+                     "tenant_id": read_fixture.tenant_id},
           )
           self.assertEqual(status, 200, body)
           self.assertLess(elapsed, 1.0)
-          self.assertEqual(body["result"]["status"], "ok")
+          self.assertEqual(body["result"]["status"], "network_tracked")
 
           busy_status, busy_body, busy_elapsed = self._request(
             port,
             "POST",
             "/analyze_job",
-            payload={"job_id": "job-1"},
+            payload={"job_id": "job-1", "tenant_id": SCHEDULER_TENANT},
           )
           self.assertEqual(busy_status, 409, busy_body)
           self.assertLess(busy_elapsed, 1.0)

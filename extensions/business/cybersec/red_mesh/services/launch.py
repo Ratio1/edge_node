@@ -6,6 +6,7 @@ from ..constants import (
   ScanType,
 )
 from ..models import JobConfig
+from ..tenancy.effective_targets import validate_effective_config
 from .scan_strategy import get_scan_strategy
 
 
@@ -21,6 +22,7 @@ def _launch_network_jobs(
   job_config,
   nr_local_workers_override=None,
   target_ports=None,
+  execution_identity=None,
 ):
   exceptions = job_config.get("exceptions", [])
   if not isinstance(exceptions, list):
@@ -81,6 +83,13 @@ def _launch_network_jobs(
 
   local_jobs = {}
   for index, batch in enumerate(batches):
+    if "execution_binding" in job_config:
+      try:
+        owner._require_worker_execution(job_id, job_config, execution_identity=execution_identity)
+      except ValueError:
+        if local_jobs:
+          break  # Keep tracking work already started; admit no further batch.
+        raise
     try:
       owner.P("Launching {} requested by {} for target {} - {} ports. Port order {}".format(
         job_id, launcher, target, len(batch), port_order
@@ -102,6 +111,8 @@ def _launch_network_jobs(
         scanner_user_agent=scanner_user_agent,
         timeout_profile=timeout_profile,
         comparison_ports=comparison_ports if index == 0 else None,
+        **({"execution_config": job_config, "execution_identity": execution_identity}
+           if "execution_binding" in job_config else {}),
       )
       batch_job.start()
       local_jobs[batch_job.local_worker_id] = batch_job
@@ -128,6 +139,7 @@ def _launch_webapp_job(
   job_id,
   launcher,
   job_config,
+  execution_identity=None,
 ):
   job_config_obj = JobConfig.from_dict(job_config)
   worker = strategy.worker_cls(
@@ -137,6 +149,7 @@ def _launch_webapp_job(
     job_config=job_config_obj,
     local_id="1",
     initiator=launcher,
+    **({"execution_identity": execution_identity} if "execution_binding" in job_config else {}),
   )
   worker.start()
   return {worker.local_worker_id: worker}
@@ -153,7 +166,19 @@ def launch_local_jobs(
   job_config,
   nr_local_workers_override=None,
   target_ports=None,
+  execution_identity=None,
 ):
+  validate_effective_config(job_config, target=target)
+  require_execution = getattr(owner, "_require_worker_execution", None)
+  if callable(require_execution):
+    worker = require_execution(job_id, job_config,
+      **({"execution_identity": execution_identity} if "execution_binding" in job_config else {}))
+    if "execution_binding" in job_config and job_config.get("scan_type", "network") == "network":
+      if (not isinstance(worker, dict) or worker.get("start_port") != start_port
+          or worker.get("end_port") != end_port or worker.get("target_ports") != target_ports):
+        raise ValueError("Execution unavailable")
+  elif "execution_binding" in job_config:
+    raise ValueError("Execution unavailable")
   strategy = get_scan_strategy(job_config.get("scan_type", ScanType.NETWORK.value))
   if strategy.scan_type == ScanType.WEBAPP:
     return _launch_webapp_job(
@@ -162,6 +187,7 @@ def launch_local_jobs(
       job_id=job_id,
       launcher=launcher,
       job_config=job_config,
+      execution_identity=execution_identity,
     )
 
   return _launch_network_jobs(
@@ -175,4 +201,5 @@ def launch_local_jobs(
     job_config=job_config,
     nr_local_workers_override=nr_local_workers_override,
     target_ports=target_ports,
+    execution_identity=execution_identity,
   )

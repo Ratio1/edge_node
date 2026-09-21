@@ -499,6 +499,19 @@ class TestBuildMispEventIntegration(unittest.TestCase):
 
 class TestExportMispJson(unittest.TestCase):
 
+  def test_invalid_explicit_snapshot_and_mode_never_fall_back_to_unchecked_lookup(self):
+    from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExportMixin
+    from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+    for builder in (build_misp_event, export_misp_json, _MispExportMixin._build_misp_json):
+      for kwargs in ({"checked_job": None}, {"checked_job": {}},
+                     {"snapshot_mode": "legacy_unbound"}, {"snapshot_mode": "invalid"}):
+        with self.subTest(builder=builder.__name__, kwargs=kwargs):
+          owner = _make_integration_owner({"ENABLED": False})
+          with patch.object(owner, "_get_job_from_cstore", side_effect=AssertionError("unchecked lookup")) as lookup:
+            with self.assertRaises(TenantStoreError):
+              builder(owner, "test_job_1", **kwargs)
+            lookup.assert_not_called()
+
   def test_returns_misp_dict(self):
     owner = _make_integration_owner({"ENABLED": True})
     result = export_misp_json(owner, "test_job_1")

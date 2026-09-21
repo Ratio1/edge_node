@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "source": "edge-node extensions/business/cybersec/red_mesh/tenancy/policy.py _ROLE_OPERATIONS",
+  "platformRoles": [
+    "super_pentester",
+    "super_tenant_admin"
+  ],
+  "tenantRoles": [
+    "tenant_admin",
+    "tenant_pentester",
+    "tenant_user"
+  ],
+  "operations": {
+    "super_pentester": [
+      "allow_pentester:update",
+      "analysis:run",
+      "assets:create",
+      "assets:update",
+      "authorization:upload",
+      "evidence:read",
+      "reports:export",
+      "reports:view",
+      "tasks:launch",
+      "tasks:update"
+    ],
+    "super_tenant_admin": [
+      "allow_pentester:update",
+      "analysis:run",
+      "assets:create",
+      "assets:update",
+      "attestation_keys:manage",
+      "audit:view",
+      "authorization:upload",
+      "engagement:delete",
+      "evidence:read",
+      "integrations:manage",
+      "jobs:purge",
+      "node_assignments:manage",
+      "node_failure_policy:update",
+      "reports:export",
+      "reports:view",
+      "tasks:launch",
+      "tasks:update",
+      "tenant_users:manage",
+      "tenants:manage"
+    ],
+    "tenant_admin": [
+      "attestation_keys:manage",
+      "audit:view",
+      "integrations:manage",
+      "node_failure_policy:update",
+      "reports:export",
+      "reports:view",
+      "tenant_users:manage"
+    ],
+    "tenant_pentester": [
+      "analysis:run",
+      "authorization:upload",
+      "reports:export",
+      "reports:view",
+      "tasks:launch",
+      "tasks:update"
+    ],
+    "tenant_user": [
+      "reports:view"
+    ]
+  }
+}

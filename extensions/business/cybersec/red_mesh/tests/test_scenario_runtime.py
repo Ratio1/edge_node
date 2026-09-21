@@ -124,6 +124,7 @@ def _make_api_auth_probe(*, allowed_scenario_ids=None, unverified_api_auth=False
 def _make_worker(*, assigned_scenario_ids=None):
   owner = MagicMock()
   cfg = MagicMock()
+  cfg.execution_binding = None
   cfg.scan_type = "webapp"
   cfg.target_url = "http://testapp.local:8000"
   cfg.target_config = None

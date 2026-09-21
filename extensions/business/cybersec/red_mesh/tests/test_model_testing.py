@@ -1973,21 +1973,34 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
     plugin.r1fs.get_json.return_value = {
       "kind": "redmesh_model_test_raw_evidence",
       "job_id": "job-1",
       "cases": [],
     }
 
-    result = PentesterApi01Plugin.get_report(plugin, "raw-cid")
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(self, plugin, PentesterApi01Plugin, jobs={"job-1": {
+      "job_id": "job-1", "workers": {"node-a": {"report_cid": "raw-cid"}}}})
+    result = PentesterApi01Plugin.get_report(plugin, "raw-cid", "job-1", request_actor=actor,
+                                             tenant_id=tenant_id)
 
-    self.assertEqual(result["error"], "forbidden")
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
+    plugin.r1fs.get_json.assert_called_once_with("raw-cid", pin=False)
     self.assertNotIn("cases", str(result))
 
   def test_raw_evidence_endpoint_reads_by_job_id(self):
     Plugin, plugin = self._raw_evidence_endpoint_plugin()
+    # RM-026 I1b B7, RM-084 P2: the endpoint admits the requester in a named tenant before
+    # reading, and `evidence:read` is the gate, so the happy path needs a platform membership.
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin, jobs={"job-raw": {
+      "job_id": "job-raw", "job_type": "model_test", "scan_type": "model_test",
+      "model_test_summary": {"overall_status": "completed"}}})
 
-    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw")
+    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw", request_actor=actor,
+                                                tenant_id=tenant_id)
 
     self.assertEqual(result["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
     self.assertEqual(result["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)

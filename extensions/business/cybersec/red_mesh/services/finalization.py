@@ -1,4 +1,6 @@
 import random
+from copy import deepcopy
+from functools import partial
 
 from ..constants import (
   JOB_STATUS_ANALYZING,
@@ -21,12 +23,13 @@ from ..models import (
   render_legacy_llm_fields,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.execution import binding_from_record
 from .config import get_attestation_config
 from .config import get_llm_agent_config
 from .event_hooks import (
-  emit_attestation_status_event,
-  emit_finding_event,
-  emit_lifecycle_event,
+  emit_attestation_status_event as _emit_attestation_status_event,
+  emit_finding_event as _emit_finding_event,
+  emit_lifecycle_event as _emit_lifecycle_event,
 )
 from .rulebook_assessment import ensure_rulebook_assessment
 from .scan_strategy import coerce_scan_type, get_scan_strategy
@@ -52,6 +55,60 @@ def _write_job_record(owner, job_key, job_specs, context):
   if callable(write_job_record):
     return write_job_record(owner, job_key, job_specs, context=context)
   return job_specs
+
+
+def _execution_operation_allowed(owner, job_specs, *, operation="current", config=None):
+  """Check current bound ownership for effects; local report finalization is separate."""
+  checker = getattr(type(owner), "_execution_operation_allowed", None)
+  if callable(checker):
+    checker = checker.__get__(owner, type(owner))
+  else:
+    checker = owner.__dict__.get("_execution_operation_allowed")
+  if not callable(checker):
+    return "execution_binding" not in job_specs and operation == "current"
+  try:
+    if "execution_binding" in job_specs:
+      current = _job_repo(owner).get_job(job_specs["job_id"])
+      if (not isinstance(current, dict)
+          or _execution_identity(current) != _execution_identity(job_specs)
+          or current.get("launcher") != owner.ee_addr
+          or is_terminal_job_status(current.get("job_status"))):
+        return False
+      job_specs = current
+    return checker(job_specs, operation=operation, config=config) is True
+  except Exception:
+    return False
+
+
+def _execution_identity(job_specs):
+  for field, default, minimum in (("job_pass", 1, 1), ("job_revision", 0, 0)):
+    value = job_specs.get(field, default)
+    if type(value) is not int or value < minimum:
+      raise ValueError("Invalid execution revision")
+  return (
+    job_specs.get("job_id"), job_specs.get("launcher"), job_specs.get("job_pass", 1),
+    job_specs.get("job_revision", 0), binding_from_record(job_specs),
+  )
+
+
+def _check_automatic_analysis_authority(owner, job_specs):
+  if not _execution_operation_allowed(owner, job_specs):
+    raise RuntimeError("Automatic analysis execution unavailable")
+
+
+def emit_attestation_status_event(owner, job_specs, **kwargs):
+  if _execution_operation_allowed(owner, job_specs):
+    return _emit_attestation_status_event(owner, job_specs, **kwargs)
+
+
+def emit_finding_event(owner, job_specs, **kwargs):
+  if _execution_operation_allowed(owner, job_specs):
+    return _emit_finding_event(owner, job_specs, **kwargs)
+
+
+def emit_lifecycle_event(owner, job_specs, **kwargs):
+  if _execution_operation_allowed(owner, job_specs):
+    return _emit_lifecycle_event(owner, job_specs, **kwargs)
 
 
 def _all_workers_finished_with_reports(workers):
@@ -109,6 +166,12 @@ def _automatic_analysis_report_identity(workers):
 def _automatic_analysis_state_matches(job_specs, state):
   if not isinstance(job_specs, dict) or not isinstance(state, dict):
     return False
+  if state.get("execution_identity") is not None:
+    try:
+      if _execution_identity(job_specs) != state["execution_identity"]:
+        return False
+    except (ValueError, TypeError):
+      return False
   return (
     job_specs.get("job_id") == state.get("job_id")
     and job_specs.get("job_pass", 1) == state.get("pass_nr")
@@ -136,6 +199,8 @@ def _poll_automatic_analysis(owner, all_jobs):
   invalidated = (
     not _automatic_analysis_state_matches(current_job, state)
     or is_terminal_job_status((current_job or {}).get("job_status"))
+    or (state.get("execution_identity") is not None
+        and not _execution_operation_allowed(owner, current_job))
   )
   if invalidated:
     state["discard_result"] = True
@@ -295,6 +360,8 @@ def maybe_finalize_pass(owner):
       set_job_status(job_specs, JOB_STATUS_COLLECTING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_collecting")
 
+      # Retain completed/partial reports even when new execution is denied.
+      # Provider work and external emissions each require their own fresh check.
       node_reports = owner._collect_node_reports(workers)
       worker_finding_summaries = {
         addr: owner._summarize_worker_findings(report)
@@ -332,13 +399,16 @@ def maybe_finalize_pass(owner):
         job_specs["risk_score"] = risk_score
         owner.P(f"Risk score for job {job_id} pass {job_pass}: {risk_score}/100")
 
-      job_config = owner._get_job_config(job_specs)
+      job_config = owner._get_job_config(job_specs, resolve_secrets=False)
       llm_cfg = get_llm_agent_config(owner)
       llm_text = None
       summary_text = None
       llm_report_sections = None
       structured_llm_failed = None
-      if llm_cfg["ENABLED"] and aggregated:
+      analysis_allowed = _execution_operation_allowed(owner, job_specs, config=job_config)
+      if llm_cfg["ENABLED"] and aggregated and not analysis_allowed:
+        structured_llm_failed = True
+      elif llm_cfg["ENABLED"] and aggregated:
         if resumed_automatic_analysis:
           llm_report_sections = automatic_completion["sections"]
           structured_llm_failed = automatic_completion["failed"]
@@ -346,7 +416,14 @@ def maybe_finalize_pass(owner):
           set_job_status(job_specs, JOB_STATUS_ANALYZING)
           job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
           try:
+            if not _execution_operation_allowed(owner, job_specs, config=job_config):
+              raise RuntimeError("Automatic analysis execution unavailable")
             executor = owner._get_manual_analysis_executor()
+            provider_options = {}
+            if "execution_binding" in job_specs:
+              provider_options["before_provider_call"] = partial(
+                _check_automatic_analysis_authority, owner, deepcopy(job_specs),
+              )
             # HTTP work yields with PostponedRequest. Automatic work has no
             # request to postpone, so process() yields by checking this future
             # on later turns.
@@ -359,6 +436,7 @@ def maybe_finalize_pass(owner):
                 job_config.get("engagement")
                 if isinstance(job_config, dict) else None
               ),
+              **provider_options,
             )
             owner._automatic_analysis_state = {
               "job_id": job_id,
@@ -368,6 +446,9 @@ def maybe_finalize_pass(owner):
               "pass_date_completed": pass_date_completed,
               "future": future,
               "discard_result": False,
+              "execution_identity": (
+                _execution_identity(job_specs) if "execution_binding" in job_specs else None
+              ),
             }
             return
           except Exception as exc:
@@ -437,7 +518,7 @@ def maybe_finalize_pass(owner):
           )
           should_submit_attestation = False
 
-      if should_submit_attestation:
+      if should_submit_attestation and _execution_operation_allowed(owner, job_specs):
         try:
           attestation_node_ips = [
             r.get("node_ip") for r in node_reports.values()
@@ -508,6 +589,10 @@ def maybe_finalize_pass(owner):
       pass_metrics = None
       if node_metrics:
         pass_metrics = node_metrics[0] if len(node_metrics) == 1 else owner._merge_worker_metrics(node_metrics)
+
+      if llm_report_sections is not None and not _execution_operation_allowed(owner, job_specs, config=job_config):
+        llm_report_sections = llm_text = summary_text = None
+        llm_failed = True
 
       pass_report = PassReport(
         pass_nr=job_pass,
@@ -687,6 +772,9 @@ def maybe_finalize_pass(owner):
         owner.lst_completed_jobs.remove(job_id)
 
     elif run_mode == RUN_MODE_CONTINUOUS_MONITORING and all_finished and next_pass_at and owner.time() >= next_pass_at:
+      job_config = owner._get_job_config(job_specs, resolve_secrets=False)
+      if not _execution_operation_allowed(owner, job_specs, operation="new_pass", config=job_config):
+        continue
       job_specs["job_pass"] = job_pass + 1
       job_specs["next_pass_at"] = None
       owner._emit_timeline_event(job_specs, "pass_started", f"Pass {job_pass + 1} started")

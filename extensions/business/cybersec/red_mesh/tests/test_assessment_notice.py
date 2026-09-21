@@ -119,7 +119,7 @@ class TestAssessmentNotice(unittest.TestCase):
   def test_hook_applies_suricata_window_config_without_suppression_control(self, deliver):
     seen_events = []
 
-    def _sent(_owner, event, integration_id="wazuh"):
+    def _sent(_owner, event, integration_id="wazuh", tenant_id=None):
       seen_events.append(event)
       return {
         "status": "sent",

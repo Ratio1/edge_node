@@ -249,6 +249,26 @@ def validate_target_config_paths(target_url: str, target_config: dict, allowlist
   return errors
 
 
+class _ScopedAdapter(requests.adapters.BaseAdapter):
+  """Check the prepared URL and Host at the final boundary, including auth retries."""
+
+  def __init__(self, adapter, client):
+    self._adapter = adapter
+    self._client = client
+
+  def send(self, request, **kwargs):
+    self._client._validate_bound_url(request.url)
+    self._client._validate_bound_headers(request.headers)
+    self._client.validate_url(request.url)
+    response = self._adapter.send(request, **kwargs)
+    # Requests auth hooks can retry through response.connection.send directly.
+    response.connection = self
+    return response
+
+  def close(self):
+    self._adapter.close()
+
+
 class ScopedSession:
   """Small proxy that preserves the ``requests.Session`` API used by probes."""
 
@@ -257,6 +277,9 @@ class ScopedSession:
     object.__setattr__(self, "_client", client)
 
   def __getattr__(self, name):
+    if (self._client._bound_target is not None
+        and name in {"get_adapter", "adapters", "resolve_redirects"}):
+      raise GrayboxScopeError("bound graybox sessions do not expose raw transport")
     return getattr(self._session, name)
 
   def __setattr__(self, name, value):
@@ -265,8 +288,21 @@ class ScopedSession:
     else:
       setattr(self._session, name, value)
 
+  def __enter__(self):
+    if self._client._bound_target is not None:
+      return self
+    return self._session.__enter__()
+
+  def __exit__(self, *args):
+    self.close()
+
   def request(self, method, url, **kwargs):
     return self._client.request(self._session, method, url, **kwargs)
+
+  def send(self, request, **kwargs):
+    if self._client._bound_target is not None:
+      raise GrayboxScopeError("bound graybox sessions require the scoped request interface")
+    return self._session.send(request, **kwargs)
 
   def get(self, url, **kwargs):
     return self.request("GET", url, **kwargs)
@@ -307,7 +343,17 @@ class GrayboxHttpClient:
     gateway_bearer_refresh_token="",
     request_budget=None,
     safety=None,
+    execution_binding=None,
   ):
+    # Imported lazily: asset validation itself uses this module's path helper.
+    from ..tenancy.execution import binding_value
+    binding = binding_value(execution_binding)
+    self._bound_target = None
+    if binding is not None:
+      target = binding.to_dict()["asset_target"]
+      if target["kind"] != "webapp":
+        raise GrayboxScopeError("graybox requires a webapp execution target")
+      self._bound_target = (target["url"], target["allowedPathPrefix"])
     # The shared per-scan RequestBudget, so redirect hops can be charged where
     # they are actually issued. Optional: legacy callers and tests construct the
     # client without one and are unaffected.
@@ -432,16 +478,68 @@ class GrayboxHttpClient:
     ))
 
   def wrap_session(self, session):
-    if isinstance(session, ScopedSession):
+    if (isinstance(session, ScopedSession)
+        and (session._client is self or self._bound_target is None)):
       return session
     return ScopedSession(session, self)
 
+  def _guard_transport(self, session):
+    if self._bound_target is None:
+      return
+    while isinstance(session, ScopedSession):
+      session = session._session
+    if not isinstance(session, requests.Session):
+      raise GrayboxScopeError("bound graybox requests require a guarded requests session")
+    for prefix, adapter in list(session.adapters.items()):
+      if not isinstance(adapter, _ScopedAdapter) or adapter._client is not self:
+        session.mount(prefix, _ScopedAdapter(adapter, self))
+
   def validate_url(self, url_or_path: str) -> str:
     url = normalize_request_url(self.target_url, url_or_path)
+    self._validate_bound_url(url)
     path = urlsplit(url).path
     if self.scopes and not any(path_in_scope(path, scope) for scope in self.scopes):
       raise GrayboxScopeError(f"out-of-scope graybox request blocked: {path}")
     return url
+
+  def _validate_bound_url(self, url):
+    if self._bound_target is None:
+      return
+    from ..tenancy.assets import normalize_target
+    target_url, prefix = self._bound_target
+    try:
+      parsed = urlsplit(url)
+      normalize_target({
+        "kind": "webapp", "url": urlunsplit(parsed._replace(query="", fragment="")),
+        "allowedPathPrefix": prefix,
+      })
+      if _split_target(url)[1:] != _split_target(target_url)[1:]:
+        raise ValueError("Different execution origin")
+    except (TypeError, ValueError, UnicodeError) as exc:
+      raise GrayboxScopeError("request is outside the bound graybox target") from exc
+
+  def _validate_bound_headers(self, headers):
+    """Keep virtual-host routing within the origin, before and after header merging."""
+    if self._bound_target is None or headers is None:
+      return
+    from ..tenancy.assets import _normalize_url
+    try:
+      target_url, _prefix = self._bound_target
+      scheme = urlsplit(target_url).scheme
+      if any(not isinstance(name, str) for name in headers):
+        raise ValueError("Ambiguous header names")
+      hosts = [(name, value) for name, value in headers.items()
+               if name.strip().lower() == "host"]
+      if len(hosts) > 1:
+        raise ValueError("Ambiguous Host headers")
+      for name, value in hosts:
+        if name != name.strip() or not isinstance(value, str):
+          raise ValueError("Invalid Host header")
+        origin, path = _normalize_url(f"{scheme}://{value}/")
+        if path != "/" or _split_target(origin)[1:] != _split_target(target_url)[1:]:
+          raise ValueError("Different execution authority")
+    except (AttributeError, TypeError, ValueError, UnicodeError) as exc:
+      raise GrayboxScopeError("Host header is outside the bound graybox target") from exc
 
   def request(self, session, method, url, **kwargs):
     allow_redirects = bool(kwargs.pop("allow_redirects", False))
@@ -449,6 +547,10 @@ class GrayboxHttpClient:
     # a rollback, which is the existing contract of ProbeBase.cleanup_budget.
     budget_exempt = bool(kwargs.pop("budget_exempt", False))
     safe_url = self.validate_url(url)
+    self._guard_transport(session)
+    if self._bound_target is not None:
+      self._validate_bound_headers(session.headers)
+      self._validate_bound_headers(kwargs.get("headers"))
     kwargs = self._with_protected_gateway_auth(kwargs)
     if self._protected_params:
       safe_url = self._without_protected_query_values(safe_url, self._protected_params)
@@ -482,13 +584,19 @@ class GrayboxHttpClient:
           self._safety.throttle()
       if response is not None:
         history.append(response)
+      if hop and self._bound_target is not None:
+        self._validate_bound_headers(session.headers)
+        self._validate_bound_headers(kwargs.get("headers"))
       response = session.request(method, current_url, allow_redirects=False, **kwargs)
       if response.status_code not in (301, 302, 303, 307, 308):
         return _with_history(response, history)
       location = response.headers.get("Location", "")
       if not location:
         return _with_history(response, history)
-      current_url = self.validate_url(location)
+      previous_url = getattr(response, "url", None)
+      if not isinstance(previous_url, str) or not previous_url:
+        previous_url = current_url
+      current_url = self.validate_url(urljoin(previous_url, location))
       if response.status_code in (301, 302, 303) and method != "HEAD":
         method = "GET"
         kwargs.pop("data", None)

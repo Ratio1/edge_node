@@ -380,3 +380,202 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: added explicit state-machine retry transitions from `ANALYZING` and `FINALIZING` back to `COLLECTING`; non-launcher nodes continue to skip finalization recovery.
 - Verification: `docker exec rm3 bash -lc 'cd /edge_node && python3 -m unittest extensions.business.cybersec.red_mesh.tests.test_state_machine extensions.business.cybersec.red_mesh.tests.test_api.TestPhase2PassFinalization extensions.business.cybersec.red_mesh.tests.test_api.TestPhase3Archive'` passed with 51 tests.
 - Horizontal insight: launcher-side finalization recovery should re-enter the existing pass aggregation/report/archive path only after worker-owned report artifacts are durable; worker and observer nodes must not mutate launcher-owned finalization state.
+
+### 2026-09-10T09:32:03Z
+
+- Change: RM-026 extends the RM-075 account reader with immutable role/tenant membership pairs;
+  explicit empty memberships never enable legacy admin fallback, and malformed explicit scope or
+  metadata denies the account. No endpoint policy, new token or tenant creation is introduced.
+- Critic: preserve absent versus empty versus malformed scope; do not flatten tenant roles into
+  global roles. Paired review caught Navigator SDK null-metadata normalization; Navigator now checks
+  raw stored metadata and has a real-SDK regression. Both independent reviews pass after correction.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,498 tests and 446 subtests, with 3 existing skips and 4 warnings. Identity/surface/config focused
+  checks passed 38 tests and 139 subtests. Task and paired evidence remain in the hub RM-026 plan.
+
+### 2026-09-10T10:07:36Z
+
+- Change: added the pure existing-active-tenant named-role evaluator in `tenancy/policy.py`.
+  Membership pairs are the only role authority; task decisions require resolved same-tenant assets,
+  and tenant-only pentester authority additionally requires Allow Pentester. No endpoint uses it yet.
+- Critic: scope membership roles before composing permissions; reject malformed context as a whole,
+  and validate asset ownership before revealing the pentesting flag. Context/asset facts must be
+  resolved server-side at future integration points, not constructed from caller claims. Capability
+  exceptions, bootstrap/creation, inactive lifecycle, object/CID binding and audit persistence remain
+  unfinished. Both independent implementation reviews passed without findings.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,510 tests and 615 subtests, with 3 existing skips and 4 warnings. Focused policy/identity/surface/
+  config checks passed 50 tests and 308 subtests. No new token or wallet-signing work.
+
+### 2026-09-10T10:51:53Z
+
+- Change: added read-only `tenancy/ports.py`, `adapters/cstore_tenant.py` and `resolution.py`.
+  Stored identity/scope precedes tenant reads, real active tenant/eligible role precedes asset reads,
+  and final policy alone releases immutable context. No endpoint imports or activates this boundary.
+- Critic: core truncates hkey hashes and can swallow read failures as None. Full namespace/IDs are
+  encoded in field keys and validated in records; surfaced errors yield generic unavailable, while
+  None remains not found. Tests pin hash collisions, corrupt bindings, revoked authority, denial
+  ordering and asset-list mutation. Non-task context never carries unvalidated caller asset IDs.
+  Both independent implementation reviews passed without findings; 57,600 main-thread comparisons
+  to the prior policy matched. No atomic snapshot, writer/publication or deployment binding claimed.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,529 tests and 709 subtests, with 3 existing skips and 4 warnings. Focused resolution/policy/identity/
+  surface/config checks passed 69 tests and 402 subtests. Original policy tests remain unchanged.
+
+### 2026-09-10 — RM-026 persistent administration
+
+- BUILDER: seven POST administration endpoints reuse stored identity and tenant policy; source
+  enablement defaults false and deployment namespace is explicit. Backend owns tenant/domain/receipt
+  records; Navigator alone writes account memberships through its SDK. No job isolation is implied.
+- CRITIC: publication is the final active-tenant write and the completion marker. An uncertain
+  successful activation must not make a retry re-grant a removed initial administrator. Pending
+  receipts bind creator, normalized intent and admin incarnation; changed intent conflicts before
+  writes. Shared process locking and strict read-back mitigate local races, not the owner-accepted
+  CStore stale/uncertain distributed state risk documented in the hub RedMesh summary.
+- BUILDER response: tests cover every staged write failing before/after mutation, no-op success,
+  recreated/revoked accounts, concurrent service instances, scoped lists/counts and last observed
+  Tenant Admin protection. Read-back compares serialized JSON types, avoiding Python `True == 1`.
+  Account enumeration returns validated projections only; its 10,000-row cap bounds projection work,
+  not core `hgetall` allocation. Preserve the original policy tests and two model-token gates.
+- Paired critique correction: ordinary tenant reads and membership approvals validate the tenant's
+  creation receipt and domain binding too, not only prepare/activate. Corrupt or missing publication
+  bindings yield unavailable without mutation; six negative binding cases pin this boundary.
+- Verification: `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed
+  2,561 tests and 769 subtests, with 3 existing skips and 4 warnings. Independent paired review,
+  Navigator verification and remaining phase evidence are recorded in the hub RM-026 execution plan.
+
+### 2026-09-10 — Persistent Allow Pentester policy control
+
+- BUILDER: `update_tenant_allow_pentester` reuses stored scoped STA/SP authorization and verified
+  administration writes. Desired-state retries reauthorize but preserve attribution when unchanged.
+  Detail capability hints use the same resolved account as authorization; they are not write authority.
+- CRITIC/response: generated FastAPI request models coerce bool fields, so this endpoint accepts
+  `object` and enforces literal booleans in the service. Signature-derived JSON/Pydantic tests pin
+  this boundary. Preserve tenant/publication fields and latest-change actor/time; uncertain writes
+  or response failures are not rollback. Navigator ignores stale user/tenant mutation completions.
+- Verification: full backend regression passed 2,570 tests and 798 subtests (3 existing skips,
+  4 warnings). Paired reviews and Navigator checks are tracked in the hub RM-026 isolation-first plan.
+  This administration control does not enable tenant-isolated jobs; preset assets, subfleet bindings,
+  launch admission and worker checks remain required. The two existing model-token gates are unchanged.
+
+### 2026-09-10 — Basic persistent tenant-node assignments
+
+- BUILDER: `get_tenant_nodes` and `set_tenant_node_assignment` reuse the gated administration
+  dispatcher and fresh stored tenant publication/identity checks. Reads require `reports:view`;
+  the explicit `node_assignments:manage` operation grants writes only to scoped Super-Tenant Admins.
+  The same resolved account supplies the display hint. Assignments are versioned `tenant_node`
+  records bound to namespace, tenant and exact case-preserving node address, not node aliases.
+- CRITIC/response: activation evaluates deployment peers lazily, after authorization, including
+  unchanged retries; reads, denials and deactivation never evaluate that configuration. Strict
+  object-transport/literal-boolean and Unicode address tests pin cross-language input semantics.
+  Point reads, verified writes and enumeration share assignment validation, including inactive
+  attribution. Filter foreign tenants before physical-key validation; malformed local rows fail
+  closed. Canonical mutations do not scan or repair separate malformed physical rows. Fault fixtures
+  independently encode the documented hash/tuple layout rather than using adapter internals.
+- Same-state retries preserve attribution; changes preserve unknown fields. Uncertain writes can
+  have succeeded and require reconciliation, not assumed rollback. The existing shared hash-wide
+  enumeration cap and owner-accepted CStore consistency limitations still apply. These resource
+  controls do not enable tenant execution or change launch/worker behavior or model-token gates.
+- Verification: focused administration/store/policy/plugin/surface checks passed 81 tests and
+  460 subtests. Full backend regression passed 2,585 tests and 901 subtests, with 3 existing skips
+  and 4 warnings. Paired review and Navigator evidence are tracked in the hub RM-026 execution plan.
+
+### 2026-09-11 — Preset asset administration prerequisite
+
+- BUILDER: four gated POST methods list/get/create/update tenant-bound network, web/API and
+  OpenAI-compatible model presets. Reads reuse fresh stored identity, published tenant and
+  `reports:view`; only scoped STA/SP mutate. Capability hints use the same resolved account.
+  A shared domain validator covers point reads, verified writes, enumeration and active counts,
+  including inactive records. Legacy ownership-only projections fail closed without adoption.
+- CRITIC/response: validate raw ASCII authority before URL normalization and strict UTF-8 at every
+  bounded path-decoding round. Regression vectors reject Unicode hostname repair, bare hexadecimal
+  hosts, ambiguous paths, secrets and nonliteral transport values. No DNS or target requests occur
+  during CRUD. Preserve target kind, unknown stored fields and immutable creation attribution/digest.
+  Create UUID replays reauthorize and return current edited/deactivated state. Complete-record
+  versions reject stale changes; desired-state no-ops preserve attribution, even after uncertain writes.
+- Verification: focused service/store/policy/plugin/surface checks passed 102 tests and 695 subtests.
+  Two unchanged runs of `.venv/bin/python -m pytest extensions/business/cybersec/red_mesh/tests
+  extensions/business/cybersec/red_mesh/test_native_api_semaphore_contract.py -q` each passed
+  2,613 tests and 1,164 subtests, with 3 skips and 4 warnings, but failed the existing fingerprint
+  wall-deadline assertion (approximately 158/160ms versus less than 100ms). The unchanged fingerprint
+  test file alone passed 74 tests and 60 subtests. This is an unresolved full-suite timing gap, not
+  a clean full regression or a proven root cause; no timing assertion was weakened. Final paired
+  review, follow-up checks and Navigator evidence belong in the hub RM-026 execution plan.
+- This slice does not enable tenant launches, preflights or workers. Full-record versions and
+  process-local locking are not distributed CAS; accepted CStore uncertainty and enumeration limits
+  remain. Network ports stay per job; model secondary destinations still require later admission.
+
+### 2026-09-11 — Preset verification follow-up: isolate the deadline fixture
+
+- The preceding unresolved full-suite timing gap was diagnosed rather than accepted as baseline.
+  A comparable archived pre-change checkout passed with the same interpreter/native-runtime fixture;
+  collection-only reductions and the first observer changed reproduction. A lower-perturbation
+  observer reproduced the failure and measured a main-thread generation-2 GC pause of 144.9ms
+  inside `_stop`, beginning about 10.2ms into the reader call. Connection cleanup afterward took
+  only 0.74ms; dynamic mock shutdown was not the measured source of excess latency.
+- CRITIC/response: the deadline test now explicitly collects prior-test cyclic garbage after fixture
+  setup and before starting its stopwatch. GC remains enabled with unchanged thresholds during the
+  timed call; the 200ms blocked iterator, 10ms budget, empty/incomplete result and under-100ms return
+  assertion are unchanged. A post-timing assertion also verifies shutdown was called once. No
+  production code or hard-real-time guarantee changed; the separate real-socket guards remain intact.
+- Verification: the exact deadline test passed; the complete fingerprint file passed 74 tests and
+  60 subtests. The original full backend command including the native semaphore contract then passed
+  2,614 tests and 1,164 subtests, with 3 skips and 4 warnings, in 128.89s. This final run had no
+  instrumentation or exclusions: `/tmp/rm026-assets-backend-full-final.log`. Independent source
+  reviews of the timing correction passed; the reviewed asset product source remained unchanged.
+  Paired Navigator reviews/checks and detailed diagnostic history are recorded in the hub RM-026
+  execution plan. Preset administration still does not enable tenant launch/worker enforcement or
+  global inventory cutover, and the accepted CStore limitations above still apply.
+
+### 2026-09-11 — B2 tenant execution and archive commit boundaries
+
+- BUILDER: paired launch/worker enforcement preserves the original tenant execution binding through
+  actual worker entry, target/provider effects, config, archives and finalized stubs. The generated
+  HTTP interpreter validates its real route models at import. Source rollout remains disabled.
+- CRITIC/response: archive checks include cached returns and the stub writer's own current read,
+  before terminal shortcuts or revision coercion. Require matching job IDs and exact integer values
+  for present counters; finalized stubs legitimately omit counters. A caller's earlier successful
+  read cannot authorize a later-observed stale commit. Preserve the captured snapshot through that
+  boundary; denied commits never trigger bound cleanup or report success. This is not CStore CAS.
+- Verification: permanent production-finalizer regressions were red before each correction; focused
+  archive/model/legacy checks pass 128 tests/267 subtests. Three cross-assigned reviewers independently
+  pass their non-authored B2 scopes after correction. Full RedMesh regression passes 2,819 tests and
+  1,730 subtests, three existing skips/four warnings; native semaphore contract passes four tests.
+  See the hub's `docs/_plans/2026-09-11-rm-026-complete-execution.md` for phase history and commit tracking.
+- When changing these boundaries, read [tenant-execution-boundary.md](docs/tenant-execution-boundary.md)
+  for compatibility and effect ordering. Tenant reads/caches, launcher lifecycle/takeover and
+  operational activation remain later gates; B2 does not establish tenant-serving readiness.
+
+### 2026-09-20 — RM-084 P7 account state authorization
+
+- `authorize_account_state_change(actor, account_id, state, tenant_id=None)` approves archiving
+  (`deactivated`) or restoring (`active`) an account per `redmesh-auth.md` §9, in that order, and
+  writes nothing: the Navigator writes the state with the returned `accountGeneration`, so a record
+  that moved meanwhile is refused at the write. The optional `tenant_id` is the workspace a
+  tenant-side caller acts in; a target with rows outside it is `not_found`.
+- `_members` now lists deactivated members with a `state` field (`deleting` stays hidden), so
+  `memberCount`, `adminCount` and every last-admin check count **active** accounts only
+  (`_active_tenant_admins`). Owner, 2026-09-20: `last_tenant_admin` refuses a platform caller too —
+  no tenant is left without an active administrator.
+- Deactivation needed no execution code: `resolve_actor` already 404s an inactive actor and
+  `reauthorize_execution` already compares the generation, so a restored account's old binding is
+  `account_changed`. Pinned by a new case in `test_tenant_execution.py`.
+- Verification: `test_account_state_administration.py` (new, every §9 row incl. founder-unknown and
+  the stale-enumeration last-admin counts), updated `test_tenant_administration.py`,
+  `test_authz_surface.py` and `test_tenant_execution.py`; full RedMesh suite 5,499 tests and 2,478
+  subtests pass, three pre-existing skips.
+
+### 2026-09-21 — `TENANT_ADMINISTRATION_ENABLED` removed
+
+- The flag (added 2026-09-10 with persistent administration) gated only `_call_tenant_administration`.
+  After RM-084 P6 every launch needs a tenant and an asset, and both are created only through the
+  endpoints it gated, so a deployment left at the default `False` could sign in and do nothing. No
+  deploy path ever set it (2026-09-21 cross-repo PR review). Removed rather than defaulted to true:
+  a flag nobody can safely turn off is not a flag.
+- `_call_tenant_administration` now builds its service through `_execution_service()`, so the
+  namespace check and the service construction exist once. `TENANCY_NAMESPACE` stays the only
+  tenancy precondition; unset still answers `unavailable` (503) before any store access.
+- Tests: `test_plugin_config.py` pins that the key is absent from `_CONFIG`; the two "disabled →
+  503, no storage" tests were narrowed to the namespace cases (`None`, blank, non-string) and
+  renamed `test_missing_namespace_*`; stray `cfg_tenant_administration_enabled` fixture attributes
+  dropped. Dev-node stream configs may still carry the key; the plugin ignores unknown config keys.

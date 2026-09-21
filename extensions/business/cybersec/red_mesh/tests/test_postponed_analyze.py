@@ -42,7 +42,31 @@ def _valid_remote_sections():
   }
 
 
+# Admission stand-in for the MagicMock plugins below, which have no account store. It returns a
+# snapshot without touching `_get_job_from_cstore`, so the `assert_not_called` checks in this class
+# still mean "the preparation step issued no store read of its own".
+_ADMITTED_SNAPSHOT = {"job_id": "job-1", "workers": {}, "pass_reports": []}
+
+
+def _admitted_stub(*_args, **_kwargs):
+  return dict(_ADMITTED_SNAPSHOT), "legacy_unbound"
+
+
+TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
+
+
 class TestPostponedAnalyze(unittest.TestCase):
+
+  def setUp(self):
+    # These exercise the busy/executor/drain logic downstream of admission, with a MagicMock
+    # plugin that has no account store. RM-026 I1b B6 added admission ahead of that logic, so
+    # stand it up as satisfied here and hand back a snapshot directly. That a real admitted
+    # snapshot reaches the preparation step is covered by test_manual_analysis_b6.py. RM-084 P3
+    # also requires a tenant selector ahead of admission, so every call below names TENANT.
+    patcher = patch.object(PentesterApi01Plugin, "_admitted_snapshot",
+                           staticmethod(_admitted_stub))
+    patcher.start()
+    self.addCleanup(patcher.stop)
 
   def test_busy_request_does_not_prepare_or_queue_work(self):
     plugin = MagicMock()
@@ -50,7 +74,7 @@ class TestPostponedAnalyze(unittest.TestCase):
       "future": MagicMock(),
       "discard_result": False,
     }
-    result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1")
+    result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1", tenant_id=TENANT)
     self.assertEqual(result["error"], "analysis_busy")
     self.assertEqual(result["status_code"], 409)
     self.assertTrue(result["retryable"])
@@ -207,9 +231,9 @@ class TestPostponedAnalyze(unittest.TestCase):
       "_prepare_manual_analysis",
       return_value=(state, None),
     ):
-      result = PentesterApi01Plugin.analyze_job(
-        plugin,
+      result = PentesterApi01Plugin.analyze_job(plugin,
         job_id="job-1",
+        tenant_id=TENANT,
       )
 
     self.assertEqual(result["error"], "analysis_executor_failed")
@@ -249,7 +273,7 @@ class TestPostponedAnalyze(unittest.TestCase):
         "extensions.business.cybersec.red_mesh.pentester_api_01._run_manual_analysis_worker",
         return_value=_ManualAnalysisOutcome(sections={}, failed=False),
       ):
-        result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1")
+        result = PentesterApi01Plugin.analyze_job(plugin, job_id="job-1", tenant_id=TENANT)
         manual_future = plugin._manual_analysis_state["future"]
         self.assertEqual(result, "postponed")
         self.assertFalse(manual_future.done())
@@ -439,9 +463,9 @@ class TestPostponedAnalyze(unittest.TestCase):
       "_prepare_manual_analysis",
       side_effect=RuntimeError(f"provider exploded with {SECRET_SENTINEL}"),
     ):
-      result = PentesterApi01Plugin.analyze_job(
-        plugin,
+      result = PentesterApi01Plugin.analyze_job(plugin,
         job_id="job-1",
+        tenant_id=TENANT,
       )
 
     self.assertEqual(result["error"], "analysis_executor_failed")
