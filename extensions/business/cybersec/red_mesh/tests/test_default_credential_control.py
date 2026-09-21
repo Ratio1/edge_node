@@ -67,13 +67,13 @@ class TestAuthenticatedActions(unittest.TestCase):
     stdout = MagicMock()
     stdout.read.return_value = b"uid=0(root) gid=0(root)\n"
     client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
-    self.assertEqual(_ssh_authenticated_action(client), "exec id -> uid=0(root) gid=0(root)")
-    client.exec_command.assert_called_once_with("id", timeout=3)
+    self.assertEqual(_ssh_authenticated_action(client, 4.5), "exec id -> uid=0(root) gid=0(root)")
+    client.exec_command.assert_called_once_with("id", timeout=4.5)
 
   def test_ssh_action_failure_is_none_not_an_exception(self):
     client = MagicMock()
     client.exec_command.side_effect = paramiko.SSHException("no channel")
-    self.assertIsNone(_ssh_authenticated_action(client))
+    self.assertIsNone(_ssh_authenticated_action(client, 3))
 
   def test_ftp_action_records_the_working_directory(self):
     ftp = MagicMock()

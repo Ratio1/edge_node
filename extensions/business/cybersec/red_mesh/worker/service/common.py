@@ -80,10 +80,14 @@ def _default_credential_findings(protocol, accepted, *, control_accepted, proofs
   return findings
 
 
-def _ssh_authenticated_action(client):
-  """One harmless command over an authenticated SSH session; None if it failed."""
+def _ssh_authenticated_action(client, timeout):
+  """One harmless command over an authenticated SSH session; None if it failed.
+
+  `timeout` comes from the caller's `_target_timeout(...)` so the wait is
+  profiled like every other network wait in `worker/`.
+  """
   try:
-    _stdin, stdout, _stderr = client.exec_command("id", timeout=3)
+    _stdin, stdout, _stderr = client.exec_command("id", timeout=timeout)
     output = stdout.read(256).decode("utf-8", errors="replace").strip()
   except Exception:
     return None
@@ -986,7 +990,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         )
         cred = f"{username}:{password}"
         accepted_creds.append(cred)
-        proofs[cred] = _ssh_authenticated_action(client)
+        proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
         client.close()
       except paramiko.AuthenticationException:
         continue
