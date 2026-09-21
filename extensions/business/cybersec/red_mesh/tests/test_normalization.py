@@ -514,6 +514,24 @@ class TestBlackboxCredentialRedaction(unittest.TestCase):
     ))
     self.assertNotIn("toor", str(redacted.get("vulnerabilities", [])))
 
+  def test_a_pair_under_a_field_redaction_never_enumerated_is_masked(self):
+    # Deny-by-default (RM-064 Phase 1). Every field-allowlist in this method
+    # carries a comment naming a field that leaked because it was not on the
+    # list. The property under test is "any string, any key", not today's list.
+    host = self._host()
+    report = self._report(
+      "SSH default credential accepted: root:toor",
+      "Accepted credential: root:toor",
+      "The SSH server accepted a well-known default credential.",
+    )
+    finding = report["service_info"]["22"]["default_creds"]["findings"][0]
+    finding["novel_field"] = "Accepted credential: root:toor"
+    finding["evidence_items"] = [{"note": "Auth OK for root:toor"}]
+    report["service_info"]["22"]["default_creds"]["novel_probe_field"] = "with root:toor"
+    report["never_seen_section"] = {"x": ["Weak credentials root:toor"]}
+    redacted = host._redact_report(report)
+    self.assertNotIn("toor", str(redacted))
+
   def test_the_http_basic_accepted_key_is_redacted(self):
     # The probe writes `accepted` (common.py:438,477); redaction read only
     # `accepted_credentials` — a key-name mismatch, so that list was archived raw.

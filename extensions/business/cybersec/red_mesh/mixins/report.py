@@ -874,6 +874,15 @@ class _ReportMixin:
             if isinstance(artifact, dict) else artifact
             for artifact in artifacts
           ]
+    # Deny-by-default over the whole report, after the enumerated walks above.
+    # Every list of keys in this method carries a comment naming a field that
+    # leaked for not being on it — `vulnerabilities`, `accepted`,
+    # `web_tests_info`, the flat shape. The enumerated walks stay because they
+    # apply the shape-based rules (`_CRED_RE`, userinfo, `accepted` lists);
+    # this pass applies the phrasing rule to every remaining string so the
+    # next field added is masked rather than archived raw.
+    from ..credential_redaction import redact_credential_strings
+    redact_credential_strings(redacted)
     return redacted
 
   @staticmethod

@@ -10,6 +10,8 @@ import unittest
 
 from extensions.business.cybersec.red_mesh.credential_redaction import (
   CREDENTIAL_TEXT_FIELDS,
+  IDENTITY_KEYS,
+  redact_credential_strings,
   redact_credential_text,
 )
 
@@ -105,6 +107,46 @@ class TestGuards(unittest.TestCase):
       set(CREDENTIAL_TEXT_FIELDS),
       {"title", "description", "remediation", "evidence", "error"},
     )
+
+
+class TestDenyByDefaultWalk(unittest.TestCase):
+  """`redact_credential_strings` masks every string, whatever key it is under."""
+
+  def test_a_pair_under_a_never_seen_key_is_masked(self):
+    finding = {
+      "title": "clean",
+      "novel_field": "Accepted credential: root:toor",
+      "nested": {"deeper": ["Auth OK for pg:pgpw", ("Weak credentials a:b",)]},
+      "count": 3,
+      "flag": None,
+    }
+    out = redact_credential_strings(finding)
+    self.assertIs(out, finding, "dicts are redacted in place")
+    self.assertEqual(finding["novel_field"], "Accepted credential: root:***")
+    self.assertEqual(finding["nested"]["deeper"][0], "Auth OK for pg:***")
+    self.assertEqual(finding["nested"]["deeper"][1], ("Weak credentials a:***",))
+    self.assertEqual(finding["count"], 3)
+    self.assertIsNone(finding["flag"])
+
+  def test_identity_keys_are_skipped(self):
+    # Contrived on purpose: an identity value never matches the rule, so the
+    # skip is documentation, not a safety property. Pin it anyway.
+    finding = {"finding_id": "Accepted credential: root:toor", "severity": "CRITICAL"}
+    redact_credential_strings(finding)
+    self.assertEqual(finding["finding_id"], "Accepted credential: root:toor")
+    self.assertIn("finding_id", IDENTITY_KEYS)
+
+  def test_non_credential_report_data_is_untouched(self):
+    report = {
+      "open_ports": [22, 443],
+      "port_banners": {"22": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10"},
+      "url": "https://user@app.test:8443/health",
+      "observed": "12:04:33 UTC",
+    }
+    import copy
+    before = copy.deepcopy(report)
+    redact_credential_strings(report)
+    self.assertEqual(report, before)
 
 
 if __name__ == "__main__":

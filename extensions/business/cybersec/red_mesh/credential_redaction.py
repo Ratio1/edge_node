@@ -85,3 +85,51 @@ def redact_credential_text(value):
     if masked == text:
       return text
     text = masked
+
+
+# Keys whose subtree is policy-bound or an identity, never probe prose:
+# hashes, ids, enums. The walker below skips them. They are listed for
+# clarity rather than safety — a hex hash or `CRITICAL` cannot match a
+# phrasing-anchored rule anyway — so a key missing from this list is
+# masked, not leaked. That is the point.
+IDENTITY_KEYS = frozenset({
+  "finding_id", "finding_signature", "dedup_key", "content_hash", "fingerprint",
+  "dedupe_fingerprint", "cid", "artifact_cid", "schema", "schema_version",
+  "severity", "confidence", "status", "category", "kind",
+  "owasp_id", "cwe_id", "cve_id", "cvss_vector", "scenario_id",
+  "probe", "probe_name", "_source_probe",
+})
+
+
+def redact_credential_strings(obj, *, allow_keys=IDENTITY_KEYS):
+  """Apply `redact_credential_text` to every string in `obj`, in place.
+
+  Deny-by-default over *fields*: dicts, lists and tuples are walked and every
+  string leaf goes through the rule unless it sits under a key in
+  `allow_keys`. The three field-allowlist scrubbers this backs
+  (`_scrub_flat_finding`, `_redact_report`, `build_finding_event`) each
+  carry a comment naming a field that leaked because it was not on their
+  list — `evidence_items`, `affected_assets`, `vulnerabilities`, `accepted`,
+  `web_tests_info`. The next field added leaks by default under an
+  allowlist; under this walk it is masked by default.
+
+  Safe to run over whole reports because the rule is phrasing-anchored:
+  `host:port`, URLs and timestamps carry no lead and pass through unchanged.
+  Dicts and lists are mutated in place and returned; tuples and strings are
+  returned as new values.
+  """
+  if isinstance(obj, str):
+    return redact_credential_text(obj)
+  if isinstance(obj, dict):
+    for key, value in obj.items():
+      if key in allow_keys:
+        continue
+      obj[key] = redact_credential_strings(value, allow_keys=allow_keys)
+    return obj
+  if isinstance(obj, list):
+    for index, value in enumerate(obj):
+      obj[index] = redact_credential_strings(value, allow_keys=allow_keys)
+    return obj
+  if isinstance(obj, tuple):
+    return tuple(redact_credential_strings(value, allow_keys=allow_keys) for value in obj)
+  return obj
