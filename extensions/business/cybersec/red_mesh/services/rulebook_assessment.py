@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from ..constants import JOB_STATUS_FINALIZED
+from ..credential_redaction import redact_credential_text
 from ..models import (
   RULEBOOK_ASSESSMENT_SCHEMA,
   RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
@@ -271,6 +272,11 @@ def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
     text = str(value)
   else:
     text = str(value)
+  # Shared credential-pair rule first. The patterns below match keyword-prefixed
+  # assignments, PEM keys and bearer tokens; none of them matches a bare
+  # `user:secret` pair in a finding title, which is how the delivered §3.7.3
+  # printed two default-credential pairs in cleartext (RM-064, 2026-09-03).
+  text = redact_credential_text(text)
   for raw in sorted(set(redaction_values or []), key=len, reverse=True):
     if raw:
       text = text.replace(raw, stable_hmac_pseudonym(raw, hmac_secret, prefix="target"))
