@@ -3084,6 +3084,31 @@ class TestPhase2PassFinalization(unittest.TestCase):
     # The FATAL finding stays: it is the evidence of why nothing ran.
     self.assertEqual(pass_report["findings"][0]["title"], "Scan aborted")
 
+  def test_finalization_graybox_empty_abort_submits_no_attestation(self):
+    """An on-chain "0 vulnerabilities" record for a scan that never logged in is
+    worse than no record; the terminal attestation is not submitted."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(probes_attempted=0,
+                                                                                 llm_enabled=False)
+    job_specs["blockchain_attestation_enabled"] = True
+    job_specs["end_attestation_required"] = True
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value={"tx_hash": "0xend"})
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    plugin._submit_redmesh_test_attestation.assert_not_called()
+    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertEqual(job_specs["failure_class"], "scan_aborted")
+
+  def test_finalization_abort_reason_is_bounded_and_printable(self):
+    """The reason can embed an exception or the operator's URL; the failure
+    message is capped and stripped of control bytes like the LLM boundary does."""
+    from extensions.business.cybersec.red_mesh.services.finalization import _abort_reason_text
+    self.assertEqual(_abort_reason_text("Login page 404\x00\x1b[31m at http://t\n"), "Login page 404 [31m at http://t")
+    self.assertEqual(_abort_reason_text(""), "no reason recorded")
+    self.assertEqual(_abort_reason_text(None), "no reason recorded")
+    self.assertNotIn("toor", _abort_reason_text("Accepted credential: root:toor"))
+    self.assertEqual(len(_abort_reason_text("x" * 1000)), 240)
+
   def test_finalization_graybox_abort_after_probes_stays_finalized(self):
     """An abort after probes ran (session lost mid-scan) keeps the completed
     result; the pass record says a worker aborted so the report can state it."""
@@ -3106,11 +3131,14 @@ class TestPhase2PassFinalization(unittest.TestCase):
     PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(
       probes_attempted=0, job_pass=2, run_mode="CONTINUOUS_MONITORING", llm_enabled=False)
     job_specs["pass_reports"] = [{"pass_nr": 1, "pass_report_cid": "QmPass1", "risk_score": 40}]
+    job_specs["risk_score"] = 40
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     self.assertEqual(job_specs["job_status"], "RUNNING")
     self.assertNotIn("failure_class", job_specs)
+    # The headline score is the last scored pass, not the pass that tested nothing.
+    self.assertEqual(job_specs["risk_score"], 40)
     event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
     self.assertIn("pass_aborted", event_types)
     self.assertNotIn("scan_aborted", event_types)

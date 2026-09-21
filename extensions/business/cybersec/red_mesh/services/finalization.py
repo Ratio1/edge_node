@@ -1,4 +1,5 @@
 import random
+import re
 from copy import deepcopy
 from functools import partial
 
@@ -301,13 +302,30 @@ def _pass_abort_state(aggregated, node_reports):
   }
 
 
+_ABORT_REASON_MAX_CHARS = 240
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _abort_reason_text(reason):
+  """
+  The abort reason as it may be printed on the job record, the timeline, the
+  archive, the PDF and the console.
+
+  The worker composes it from strings it controls, but two callers embed an
+  exception text or the operator's target URL, and in the mesh it arrives
+  from another node's report. Same treatment as the LLM boundary gives the
+  same field (`_sanitize_untrusted_text`): credential redaction, control
+  bytes stripped, a hard cap.
+  """
+  text = redact_credential_text(str(reason or ""))
+  text = " ".join(_CONTROL_CHARS_RE.sub(" ", text).split())
+  return text[:_ABORT_REASON_MAX_CHARS] or "no reason recorded"
+
+
 def _mark_scan_aborted(owner, job_key, job_specs, *, job_id, pass_nr, abort_state):
   """Mirror of `_mark_attestation_failed` for a first pass that tested nothing."""
   phase = abort_state["abort_phase"] or "unknown"
-  # The worker composes the reason from strings it controls, never target
-  # content; the redaction is defence in depth on a field every consumer prints.
-  reason = redact_credential_text(abort_state["abort_reason"]) or "no reason recorded"
-  message = f"Scan aborted during {phase}: {reason}"
+  message = f"Scan aborted during {phase}: {_abort_reason_text(abort_state['abort_reason'])}"
   job_specs["failure_class"] = "scan_aborted"
   job_specs["failure_message"] = message
   set_job_status(job_specs, JOB_STATUS_FAILED)
@@ -474,7 +492,10 @@ def maybe_finalize_pass(owner):
             "no risk score and no analysis",
             color='y',
           )
-        job_specs["risk_score"] = risk_score
+        # A monitor's headline score stays at its last scored pass; only the
+        # pass record says this one tested nothing.
+        if not (empty_abort and job_pass > 1):
+          job_specs["risk_score"] = risk_score
         owner.P(f"Risk score for job {job_id} pass {job_pass}: {risk_score}/100")
 
       job_config = owner._get_job_config(job_specs, resolve_secrets=False)
@@ -583,7 +604,9 @@ def maybe_finalize_pass(owner):
         or job_status == JOB_STATUS_SCHEDULED_FOR_STOP
         or job_pass >= MAX_CONTINUOUS_PASSES
       )
-      should_submit_attestation = bool(required_attestation and terminal_after_pass)
+      # A scan that tested nothing gets no on-chain "0 vulnerabilities" record;
+      # the job fails below instead.
+      should_submit_attestation = bool(required_attestation and terminal_after_pass and not empty_abort)
       if not should_submit_attestation:
         pass
       elif run_mode == RUN_MODE_CONTINUOUS_MONITORING and not terminal_after_pass:
@@ -646,7 +669,7 @@ def maybe_finalize_pass(owner):
             network=owner.REDMESH_ATTESTATION_NETWORK,
             pass_nr=job_pass,
           )
-      if required_attestation and terminal_after_pass and not (
+      if required_attestation and terminal_after_pass and not empty_abort and not (
         isinstance(redmesh_test_attestation, dict) and redmesh_test_attestation.get("tx_hash")
       ):
         required_attestation_failed = True
@@ -758,7 +781,7 @@ def maybe_finalize_pass(owner):
           job_specs,
           "pass_aborted",
           f"Pass {job_pass} aborted during {abort_state['abort_phase'] or 'unknown'}: "
-          f"{redact_credential_text(abort_state['abort_reason']) or 'no reason recorded'}",
+          f"{_abort_reason_text(abort_state['abort_reason'])}",
           actor_type="system",
           meta={
             "pass_nr": job_pass,
