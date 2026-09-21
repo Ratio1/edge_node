@@ -429,6 +429,10 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     "event": event,
     "job_id": job_id,
     "pass_nr": actual_pass_nr,
+    # The floor applied and what it left out, for the export record.
+    "min_severity": min_severity,
+    "findings_exported": len(filtered_findings),
+    "findings_total": len(findings),
     "target": target,
     "findings_exported": len(filtered_findings),
     "findings_total": len(findings),
@@ -593,6 +597,13 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     "misp_url": cfg["MISP_URL"],
     "last_exported_at": _time.time(),
     "passes_exported": sorted(passes_exported),
+    # The severity floor this export applied, and what it left out. The client
+    # report never said the MISP export omits INFO findings — 56 objects against
+    # 61 findings on job 6cc55610 — because nothing recorded the floor at export
+    # time (RM-064 item 7). Recorded here so the report can disclose it.
+    "min_severity": result.get("min_severity"),
+    "findings_exported": result.get("findings_exported"),
+    "findings_total": result.get("findings_total"),
   }
 
   if job_specs:
@@ -704,4 +715,9 @@ def get_misp_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="
     "misp_url": export_meta.get("misp_url"),
     "last_exported_at": export_meta.get("last_exported_at"),
     "passes_exported": export_meta.get("passes_exported", []),
+    # Absent on exports recorded before the floor was stored; the report treats
+    # None as "undisclosed" rather than inventing the default.
+    "min_severity": export_meta.get("min_severity"),
+    "findings_exported": export_meta.get("findings_exported"),
+    "findings_total": export_meta.get("findings_total"),
   }
