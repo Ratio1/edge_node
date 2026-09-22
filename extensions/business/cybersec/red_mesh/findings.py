@@ -50,6 +50,10 @@ SOURCE_AI = "ai"
 SOURCE_MANUAL = "manual"
 ALLOWED_SOURCES = frozenset({SOURCE_AUTOMATED, SOURCE_AI, SOURCE_MANUAL})
 
+# Where a finding's severity label comes from (RM-086 item 5).
+SEVERITY_SOURCE_CVSS = "cvss"
+SEVERITY_SOURCE_PROBE_POLICY = "probe_policy"
+
 TRIAGE_NEW = "new"
 TRIAGE_CONFIRMED = "confirmed"
 TRIAGE_FALSE_POSITIVE = "false_positive"
@@ -168,6 +172,12 @@ class Finding:
   # CVE findings on a distribution package (RM-070): "" (upstream build, not
   # applicable) | "unknown" | "not_fixed". `fixed` matches are not emitted.
   backport_status: str = ""
+  # "cvss" when a vector is attached (probe-supplied, or the registry template
+  # whose band agrees with the label), "probe_policy" when the label is the
+  # probe author's call with no vector to ground it. Stamped by
+  # `enrich_finding_for_probe`; the report labels the latter as policy instead
+  # of printing a bare badge (RM-086 item 5).
+  severity_source: str = ""
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data
@@ -406,6 +416,12 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
     derived_score = cvss31_base_score(cvss_vector)
     if derived_score is not None:
       updates["cvss_score"] = derived_score
+  # Not in `_CONTENT_FIELDS`: a label's provenance is metadata about the
+  # finding, so stamping it must not move `finding_signature`.
+  if not f.severity_source:
+    updates["severity_source"] = (
+      SEVERITY_SOURCE_CVSS if cvss_vector else SEVERITY_SOURCE_PROBE_POLICY
+    )
   if references != f.references:
     updates["references"] = references
   if f.remediation_structured is None:
