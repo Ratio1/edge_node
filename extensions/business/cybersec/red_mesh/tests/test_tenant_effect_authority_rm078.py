@@ -318,7 +318,8 @@ class TestNoEndpointBecameTenantReachable(unittest.TestCase):
                   "dry_run_opencti_export", "push_to_opencti", "dry_run_taxii_export",
                   "publish_to_taxii", "correlate_suricata_eve", "generate_rulebook_assessment",
                   "save_rulebook_review_draft", "submit_rulebook_review", "reopen_rulebook_review",
-                  "update_rulebook_review", "delete_job_engagement"}
+                  "update_rulebook_review", "delete_job_engagement",
+                  "approve_report", "reopen_report_review"}
     enclosing = {}
     for node in ast.walk(tree):
       if isinstance(node, ast.FunctionDef):

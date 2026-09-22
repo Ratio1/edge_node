@@ -95,6 +95,11 @@ from .event_hooks import (
   emit_lifecycle_event,
   emit_redmesh_event,
 )
+from .report_review import (
+  approve_report,
+  get_report_review,
+  reopen_report_review,
+)
 from .control import (
   purge_all_jobs,
   purge_job,
@@ -265,6 +270,9 @@ __all__ = [
   "list_network_jobs",
   "list_rulebook_profiles",
   "reopen_rulebook_review",
+  "approve_report",
+  "get_report_review",
+  "reopen_report_review",
   "save_rulebook_review_draft",
   "submit_rulebook_review",
   "maybe_finalize_pass",

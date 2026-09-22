@@ -3,6 +3,8 @@ from ..models import (
   CStoreJobRunning,
   FindingTriageAuditEntry,
   FindingTriageState,
+  ReportReviewAuditEntry,
+  ReportReviewState,
   RulebookReviewAuditEntry,
   RulebookReviewState,
   RulebookSubmissionRegistry,
@@ -60,6 +62,16 @@ class JobStateRepository:
   @property
   def _rulebook_review_submissions_hkey(self):
     return f"{self.owner.cfg_instance_id}:rulebook_review:submissions"
+
+  # Report-level review (RM-086 item 4): its own hashes, keyed by job id, like
+  # the rulebook review; never on the job record, never in the archive.
+  @property
+  def _report_review_hkey(self):
+    return f"{self.owner.cfg_instance_id}:report_review"
+
+  @property
+  def _report_review_audit_hkey(self):
+    return f"{self.owner.cfg_instance_id}:report_review:audit"
 
   def get_job(self, job_id):
     return self.owner.chainstore_hget(hkey=self._jobs_hkey, key=job_id)
@@ -402,6 +414,42 @@ class JobStateRepository:
       for key, value in payload.items()
       if isinstance(key, str) and key.startswith(prefix) and isinstance(value, dict)
     }
+
+  def get_report_review(self, job_id):
+    return self.owner.chainstore_hget(hkey=self._report_review_hkey, key=job_id)
+
+  def get_report_review_model(self, job_id):
+    payload = self.get_report_review(job_id)
+    if not isinstance(payload, dict):
+      return None
+    return ReportReviewState.from_dict(payload)
+
+  def put_report_review(self, review):
+    if isinstance(review, ReportReviewState):
+      payload = review.to_dict()
+    else:
+      payload = ReportReviewState.from_dict(review).to_dict()
+    self.owner.chainstore_hset(hkey=self._report_review_hkey, key=payload["job_id"], value=payload)
+    return payload
+
+  def get_report_review_audit(self, job_id):
+    payload = self.owner.chainstore_hget(hkey=self._report_review_audit_hkey, key=job_id)
+    return payload if isinstance(payload, list) else []
+
+  def append_report_review_audit(self, entry):
+    if isinstance(entry, ReportReviewAuditEntry):
+      payload = entry.to_dict()
+    else:
+      payload = ReportReviewAuditEntry.from_dict(entry).to_dict()
+    audit_log = list(self.get_report_review_audit(payload["job_id"]))
+    audit_log.append(payload)
+    self.owner.chainstore_hset(hkey=self._report_review_audit_hkey, key=payload["job_id"], value=audit_log)
+    return audit_log
+
+  def delete_job_report_review(self, job_id):
+    for hkey in (self._report_review_hkey, self._report_review_audit_hkey):
+      self.owner.chainstore_hset(hkey=hkey, key=job_id, value=None)
+    return
 
   def delete_job_rulebook_reviews(self, job_id):
     prefix = f"{job_id}:"

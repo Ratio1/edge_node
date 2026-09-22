@@ -22,6 +22,8 @@ READS = (
   ("get_detection_correlation", {}),
   ("get_rulebook_assessment_status", {"profile_id": PROFILE}),
   ("get_rulebook_review", {"profile_id": PROFILE}),
+  # Report-level review (RM-086 item 4) runs through the same admission seams.
+  ("get_report_review", {}),
 )
 MUTATIONS = (
   ("generate_rulebook_assessment", {"profile_id": PROFILE, "persist": False}),
@@ -30,6 +32,8 @@ MUTATIONS = (
   ("reopen_rulebook_review", {"profile_id": PROFILE}),
   ("update_rulebook_review", {"profile_id": PROFILE, "answers": {}}),
   ("correlate_suricata_eve", {"eve_jsonl": "{}"}),
+  ("approve_report", {"expected_review_revision": 0}),
+  ("reopen_report_review", {"expected_review_revision": 0}),
 )
 EVIDENCE = (("get_raw_model_test_evidence", {}),)
 ALL = READS + MUTATIONS + EVIDENCE
@@ -173,6 +177,8 @@ def test_the_platform_roles_are_admitted_to_raw_evidence(name, extra, role):
   ("save_rulebook_review_draft", {"profile_id": PROFILE, "answers": {}},
    "review_revision_conflict"),
   ("submit_rulebook_review", {"profile_id": PROFILE}, "submission_pass_stale"),
+  ("approve_report", {}, "review_revision_conflict"),
+  ("reopen_report_review", {}, "review_revision_conflict"),
 ))
 def test_a_typed_review_conflict_code_survives_the_tenant_path(name, extra, code):
   """The revision fence is the reason these four keep their own response shape; scoping them must
