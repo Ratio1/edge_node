@@ -34,6 +34,7 @@ from .rulebook_assessment import (
   DEFAULT_RULEBOOK_PROFILE_ID,
   build_rulebook_assessment,
   generate_rulebook_assessment,
+  get_rulebook_artifact,
   get_rulebook_assessment_status,
   get_rulebook_review,
   list_rulebook_profiles,
@@ -94,6 +95,11 @@ from .event_hooks import (
   emit_finding_event,
   emit_lifecycle_event,
   emit_redmesh_event,
+)
+from .report_review import (
+  approve_report,
+  get_report_review,
+  reopen_report_review,
 )
 from .control import (
   purge_all_jobs,
@@ -219,6 +225,7 @@ __all__ = [
   "generate_rulebook_assessment",
   "get_misp_export_status",
   "get_opencti_export_status",
+  "get_rulebook_artifact",
   "get_rulebook_assessment_status",
   "get_rulebook_review",
   "get_stix_export_status",
@@ -265,6 +272,9 @@ __all__ = [
   "list_network_jobs",
   "list_rulebook_profiles",
   "reopen_rulebook_review",
+  "approve_report",
+  "get_report_review",
+  "reopen_report_review",
   "save_rulebook_review_draft",
   "submit_rulebook_review",
   "maybe_finalize_pass",

@@ -78,7 +78,7 @@ class TestSsrfProbe(unittest.TestCase):
     probe._test_ssrf()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-API7-01" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "MEDIUM")
+    self.assertEqual(vuln[0].severity, "HIGH")
     self.assertIn("CWE-918", vuln[0].cwe)
 
   def test_ssrf_respects_runtime_assignment_gate(self):
@@ -302,7 +302,7 @@ class TestStoredXss(unittest.TestCase):
 
     vuln = [f for f in probe.findings if f.scenario_id == "PT-A03-02" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
     self.assertIn("CWE-79", vuln[0].cwe)
 
   def test_stored_xss_escaped(self):
@@ -437,7 +437,7 @@ class TestPathTraversal(unittest.TestCase):
     probe._test_path_traversal()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-A03-03" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
     self.assertIn("CWE-22", vuln[0].cwe)
 
   def test_path_traversal_safe(self):
@@ -530,7 +530,7 @@ class TestCommandInjectionPTA0307(unittest.TestCase):
     f = [x for x in probe.findings if x.scenario_id == "PT-A03-07"]
     self.assertEqual(len(f), 1)
     self.assertEqual(f[0].status, "vulnerable")
-    self.assertEqual(f[0].severity, "CRITICAL")
+    self.assertEqual(f[0].severity, "HIGH")
 
   def test_pt_a03_07_not_vulnerable_when_no_uid_marker(self):
     ep = ReflectiveEndpoint(path="/api/exec/", param="cmd")

@@ -9,6 +9,7 @@ OS mismatches, infrastructure leaks, and timezone drift.
 import ipaddress
 
 from ..findings import Finding, Severity, probe_result
+from .. import cvss_vectors as V
 from .probe_registry import register_probe, CATEGORY_CORRELATION
 
 
@@ -319,6 +320,7 @@ class _CorrelationMixin:
     if has_open_redirect and has_metadata:
       findings.append(Finding(
         severity=Severity.MEDIUM,
+        cvss_vector=V.OPEN_REDIRECT,
         title="Open redirect may enable SSRF to cloud metadata",
         description="An open redirect was found alongside accessible cloud metadata "
                     "endpoints. If internal services follow redirects, an attacker "

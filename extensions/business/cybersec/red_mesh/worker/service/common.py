@@ -10,6 +10,7 @@ from datetime import datetime
 import paramiko
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ...cve_db import check_cves, parse_distro_package
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -85,6 +86,7 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None):
       confidence = "certain" if proof else "firm"
     findings.append(Finding(
       severity=Severity.CRITICAL,
+      cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
       title=f"{protocol} default credential accepted: {cred}",
       description=(
         f"The {protocol} server accepted a well-known default credential.{control_note}"
@@ -362,6 +364,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     if "PUT" in dangerous:
       findings.append(Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.UNAUTHENTICATED_WRITE,
         title="HTTP PUT method enabled (potential unauthorized file upload).",
         description="The PUT method allows uploading files to the server.",
         evidence=f"PUT {url} returned status < 400.",
@@ -373,6 +376,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     if "DELETE" in dangerous:
       findings.append(Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.UNAUTHENTICATED_WRITE,
         title="HTTP DELETE method enabled (potential unauthorized file deletion).",
         description="The DELETE method allows removing resources from the server.",
         evidence=f"DELETE {url} returned status < 400.",
@@ -601,6 +605,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     if consecutive_401 >= len(self._HTTP_BASIC_CREDS) - 1:
       findings.append(Finding(
         severity=Severity.MEDIUM,
+        cvss_vector=V.BRUTE_FORCE_UNTHROTTLED,
         title="HTTP Basic Auth has no rate limiting",
         # Both counts vary when the probe loop breaks early, and `description`
         # and `evidence` are both in the report layer's dedup key. The attempt
@@ -698,6 +703,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       result["anonymous_access"] = True
       findings.append(Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.SENSITIVE_DATA_EXPOSED,
         title="FTP allows anonymous login.",
         description="The FTP server permits unauthenticated access via anonymous login.",
         evidence="Anonymous login succeeded.",
@@ -771,6 +777,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           result["write_access"] = True
           findings.append(Finding(
             severity=Severity.CRITICAL,
+            cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
             title="FTP anonymous write access enabled (file upload possible).",
             description="Anonymous users can upload files to the FTP server.",
             evidence="STOR command succeeded with anonymous session.",
@@ -807,6 +814,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           if resp and (resp.startswith("250") or resp.startswith("200")):
             findings.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.SENSITIVE_DATA_EXPOSED,
               title=f"FTP directory traversal: CWD to '{test_dir}' succeeded.",
               description="The FTP server allows changing to directories outside the intended root.",
               evidence=f"CWD '{test_dir}' returned: {resp}",
@@ -886,6 +894,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       control = CONTROL_ACCEPTED
       findings.append(Finding(
         severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
         title="FTP accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
         evidence="Randomly generated credentials were accepted by the FTP service.",
@@ -1041,6 +1050,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       control = CONTROL_ACCEPTED
       findings.append(Finding(
         severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
         title="SSH accepts arbitrary credentials",
         description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
         evidence="Randomly generated credentials were accepted by the SSH service.",
@@ -1146,6 +1156,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           if key_bits < 2048:
             findings.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.WEAK_CRYPTO_BREAKABLE,
               title=f"SSH RSA key is critically weak ({key_bits}-bit)",
               description=f"The server's RSA host key is only {key_bits}-bit, which is trivially factorable.",
               evidence=f"RSA key size: {key_bits} bits",
@@ -1158,6 +1169,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           elif key_bits < 3072:
             findings.append(Finding(
               severity=Severity.LOW,
+              cvss_vector=V.WEAK_CRYPTO_MARGINAL,
               title=f"SSH RSA key below NIST recommendation ({key_bits}-bit)",
               description=f"The server's RSA host key is {key_bits}-bit. NIST recommends >=3072-bit after 2023.",
               evidence=f"RSA key size: {key_bits} bits",
@@ -1176,6 +1188,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       if "ssh-dss" in key_types:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.WEAK_TRANSPORT,
           title="SSH DSA host key offered (ssh-dss)",
           description="The SSH server offers DSA host keys, which are limited to 1024-bit and considered weak.",
           evidence=f"Key types: {', '.join(sorted(key_types))}",
@@ -1193,6 +1206,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         cipher_list = ", ".join(sorted(weak_ciphers))
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.WEAK_TRANSPORT,
           title=f"SSH weak ciphers: {cipher_list}",
           description="The SSH server offers ciphers considered cryptographically weak.",
           evidence=f"Weak ciphers offered: {cipher_list}",
@@ -1207,6 +1221,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         kex_list = ", ".join(sorted(weak_kex))
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.WEAK_TRANSPORT,
           title=f"SSH weak key exchange: {kex_list}",
           description="The SSH server offers key-exchange algorithms with known weaknesses.",
           evidence=f"Weak KEX offered: {kex_list}",
@@ -1247,6 +1262,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           transport.close()
           return Finding(
             severity=Severity.CRITICAL,
+            cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
             title="libssh auth bypass (CVE-2018-10933)",
             description="Server accepted SSH2_MSG_USERAUTH_SUCCESS from client, "
                         "bypassing authentication entirely. Full shell access possible.",
@@ -1367,6 +1383,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       mta = version_match.group(0).strip()
       findings.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"SMTP banner discloses MTA software: {mta} (aids CVE lookup).",
         description="The SMTP banner reveals the mail transfer agent software and version.",
         evidence="The SMTP banner names the MTA software and version.",
@@ -1404,6 +1421,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         self._emit_metadata("container_ids", {"id": hostname, "source": f"smtp:{port}"})
         findings.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"SMTP hostname leaks container ID: {hostname} (infrastructure disclosure).",
           description="The EHLO response reveals a container ID or internal hostname.",
           evidence=f"Hostname: {hostname}",
@@ -1416,6 +1434,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         self._emit_metadata("container_ids", {"id": hostname, "source": f"smtp_k8s:{port}"})
         findings.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"SMTP hostname matches Kubernetes pod name pattern: {hostname}",
           description="The EHLO hostname resembles a Kubernetes pod name (deployment-replicaset-podid).",
           evidence=f"Hostname: {hostname}",
@@ -1428,6 +1447,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         self._emit_metadata("container_ids", {"id": hostname, "source": f"smtp_internal:{port}"})
         findings.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"SMTP hostname uses cloud-internal DNS suffix: {hostname}",
           description="The EHLO hostname ends with '.internal', indicating AWS/GCP internal DNS.",
           evidence=f"Hostname: {hostname}",
@@ -1466,6 +1486,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if code == 235:
           findings.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.UNAUTHENTICATED_WRITE,
             title="SMTP AUTH LOGIN accepted without credentials.",
             description="The SMTP server accepted AUTH LOGIN without providing actual credentials.",
             evidence=f"AUTH LOGIN returned code {code}.",
@@ -1499,6 +1520,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           if code_rcpt == 250:
             findings.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.UNAUTHENTICATED_WRITE,
               title="SMTP open relay detected (accepts mail to external domains without auth).",
               description="The SMTP server relays mail to external domains without authentication.",
               evidence="RCPT TO:<probe@external-domain.test> accepted (code 250).",
@@ -1586,6 +1608,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     findings.append(Finding(
       severity=Severity.MEDIUM,
+      cvss_vector=V.WEAK_TRANSPORT,
       title="Telnet service is running (unencrypted remote access).",
       description="Telnet transmits all data including credentials in cleartext.",
       evidence=f"Telnet port {port} is open on {target}.",
@@ -1878,6 +1901,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     findings.append(Finding(
       severity=Severity.LOW,
+      cvss_vector=V.INFO_DISCLOSURE_LOW,
       title=f"Rsync service detected (protocol {proto_version})",
       description=f"Rsync daemon is running on {target}:{port}.",
       evidence="The rsync daemon greeting advertises its protocol version.",
@@ -1919,7 +1943,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       if modules:
         mod_names = ", ".join(m["name"] for m in modules)
         findings.append(Finding(
-          severity=Severity.HIGH,
+          severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
           title=f"Rsync module enumeration successful: {mod_names}",
           description=f"Rsync on {target}:{port} exposes {len(modules)} module(s). "
                       "Exposed modules may allow file read/write.",
@@ -1951,6 +1976,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         if "@RSYNCD: OK" in resp:
           findings.append(Finding(
             severity=Severity.CRITICAL,
+            cvss_vector=V.UNAUTHENTICATED_READ_WRITE,
             title=f"Rsync module '{mod['name']}' accessible without authentication",
             description=f"Module '{mod['name']}' on {target}:{port} allows unauthenticated access. "
                         "An attacker can read or write arbitrary files within this module.",

@@ -328,6 +328,7 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
 
   _job_repo(owner).delete_job_triage(job_id)
   _job_repo(owner).delete_job_rulebook_reviews(job_id)
+  _job_repo(owner).delete_job_report_review(job_id)
   _delete_job_record(owner, job_id)
 
   owner.P(f"Purged job {job_id}: {deleted}/{len(cids)} CIDs deleted.")

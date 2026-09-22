@@ -7,6 +7,7 @@ import ssl
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ...cve_db import check_cves
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -128,6 +129,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     if proto and proto.upper() in ("SSLV2", "SSLV3", "TLSV1", "TLSV1.1"):
       findings.append(Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.WEAK_CRYPTO_BREAKABLE,
         title=f"Obsolete TLS protocol: {proto}",
         description=f"Server negotiated {proto} with cipher {cipher}. "
                     f"SSLv2/v3 and TLS 1.0/1.1 are deprecated and vulnerable.",
@@ -140,6 +142,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     if cipher and any(w in cipher.lower() for w in ("rc4", "des", "null", "export")):
       findings.append(Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.WEAK_CRYPTO_BREAKABLE,
         title=f"Weak TLS cipher: {cipher}",
         description=f"Cipher {cipher} is considered cryptographically weak.",
         evidence=f"cipher={cipher}",
@@ -170,6 +173,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       if "self-signed" in err_msg or "self signed" in err_msg:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.CERT_UNTRUSTED,
           title="Self-signed TLS certificate",
           description="The server presents a self-signed certificate that browsers will reject.",
           evidence=str(e),
@@ -181,6 +185,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       elif "hostname mismatch" in err_msg:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.CERT_UNTRUSTED,
           title="TLS certificate hostname mismatch",
           description=f"Certificate CN/SAN does not match {target}.",
           evidence=str(e),
@@ -192,6 +197,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       else:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.CERT_UNTRUSTED,
           title="TLS certificate validation failed",
           description="Certificate chain could not be verified.",
           evidence=str(e),
@@ -218,7 +224,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       raw["cert_days_remaining"] = days
       if days < 0:
         findings.append(Finding(
-          severity=Severity.HIGH,
+          severity=Severity.MEDIUM,
+          cvss_vector=V.CERT_UNTRUSTED,
           title="TLS certificate has expired",
           description="The certificate is past its notAfter date.",
           evidence=f"notAfter={expires}",
@@ -229,7 +236,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         ))
       elif days <= 30:
         findings.append(Finding(
-          severity=Severity.MEDIUM,
+          severity=Severity.LOW,
+          cvss_vector=V.CERT_HYGIENE,
           title="TLS certificate expiring soon",
           description="The certificate expires within 30 days.",
           evidence=f"notAfter={expires}",
@@ -253,6 +261,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     if any(p in cn_lower for p in placeholders) or len(cn.strip()) <= 1:
       findings.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.CERT_HYGIENE,
         title=f"TLS certificate placeholder CN: {cn}",
         description="Certificate uses a default/placeholder common name.",
         evidence=f"CN={cn}",
@@ -295,6 +304,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         algo_name = algo.name.upper()
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.WEAK_TRANSPORT,
           title=f"TLS certificate signed with weak algorithm: {algo_name}",
           description=f"The certificate uses {algo_name} for its signature, which is cryptographically weak.",
           evidence=f"signature_algorithm={algo_name}",
@@ -318,7 +328,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       span = cert.not_valid_after_utc - cert.not_valid_before_utc
       if span.days > 5 * 365:
         findings.append(Finding(
-          severity=Severity.MEDIUM,
+          severity=Severity.LOW,
+          cvss_vector=V.CERT_HYGIENE,
           title=f"TLS certificate validity span exceeds 5 years ({span.days} days)",
           description="Certificates valid for more than 5 years violate CA/Browser Forum baseline requirements.",
           evidence=f"not_before={cert.not_valid_before_utc}, not_after={cert.not_valid_after_utc}, span={span.days}d",
@@ -411,7 +422,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
             if raw is not None:
               raw["heartbleed_leaked_bytes"] = resp_len - len(hb_msg)
             return Finding(
-              severity=Severity.CRITICAL,
+              severity=Severity.HIGH,
+              cvss_vector=V.SENSITIVE_DATA_EXPOSED,
               title="TLS Heartbleed vulnerability (CVE-2014-0160)",
               cve=("CVE-2014-0160",),
               description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
@@ -520,7 +532,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         resp_payload_len = struct.unpack(">H", response[3:5])[0]
         if resp_payload_len > len(hb_msg):
           return Finding(
-            severity=Severity.CRITICAL,
+            severity=Severity.HIGH,
+            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title="TLS Heartbleed vulnerability (CVE-2014-0160)",
             cve=("CVE-2014-0160",),
             description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
@@ -558,7 +571,8 @@ class _ServiceTlsMixin(_ServiceProbeBase):
       tls_sock.close()
       if negotiated and "SSL" in negotiated:
         findings.append(Finding(
-          severity=Severity.HIGH,
+          severity=Severity.LOW,
+          cvss_vector=V.SSLV3_POODLE,
           title="Server accepts SSLv3 — vulnerable to POODLE (CVE-2014-3566)",
           description=f"TLS on {target}:{port} accepts SSLv3 connections. "
                       "The POODLE attack allows decrypting SSLv3 traffic using CBC cipher padding oracles.",
@@ -590,6 +604,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         if "CBC" in cipher_name.upper():
           findings.append(Finding(
             severity=Severity.MEDIUM,
+            cvss_vector=V.WEAK_TRANSPORT,
             title="TLS 1.0 with CBC cipher — BEAST risk (CVE-2011-3389)",
             description=f"TLS on {target}:{port} accepts TLS 1.0 with CBC-mode cipher '{cipher_name}'. "
                         "The BEAST attack exploits predictable IVs in TLS 1.0 CBC mode.",
@@ -695,6 +710,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
         raw["version"] = version
         findings.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"Service version disclosed: {product} {version}",
           description=f"Banner on {target}:{port} reveals {product} {version}. "
                       "Version disclosure aids attackers in targeting known vulnerabilities.",

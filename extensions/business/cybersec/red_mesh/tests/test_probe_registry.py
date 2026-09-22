@@ -461,5 +461,126 @@ class TestCvssTemplateSeverityGate(unittest.TestCase):
     enriched = enrich_finding_for_probe(finding, "_service_info_test_defaultcreds")
     self.assertEqual(enriched.cvss_score, 9.6)
 
+
+class SeveritySourceTests(unittest.TestCase):
+  """RM-086 item 5: the letter promised every probe-assigned severity is labelled as policy.
+
+  Withholding a contradicting template (above) left the finding with a badge
+  and nothing saying where the badge came from. `severity_source` records it.
+  """
+
+  CRITICAL_TEMPLATE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
+  def setUp(self):
+    self._saved = list_registered_probes()
+    clear_registry_for_tests()
+
+  def tearDown(self):
+    from extensions.business.cybersec.red_mesh.worker import probe_registry
+    clear_registry_for_tests()
+    probe_registry._REGISTRY.update(self._saved)
+
+  def _register(self):
+    @register_probe(
+      display_name="Test default creds",
+      description="Check for default credentials",
+      category=CATEGORY_SERVICE_INFO,
+      default_cwe=(287,),
+      default_owasp=("A07:2021",),
+      cvss_template=self.CRITICAL_TEMPLATE,
+    )
+    def _service_info_test_defaultcreds(self, ip, port):
+      pass
+
+  def _enrich(self, severity, **fields):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, enrich_finding_for_probe,
+    )
+    finding = Finding(title="T", severity=severity, description="d", **fields)
+    return enrich_finding_for_probe(finding, "_service_info_test_defaultcreds")
+
+  def test_an_agreeing_template_makes_the_label_cvss_sourced(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      SEVERITY_SOURCE_CVSS, Severity,
+    )
+    self._register()
+    self.assertEqual(self._enrich(Severity.CRITICAL).severity_source, SEVERITY_SOURCE_CVSS)
+
+  def test_a_withheld_template_leaves_the_label_as_probe_policy(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      SEVERITY_SOURCE_PROBE_POLICY, Severity,
+    )
+    self._register()
+    enriched = self._enrich(Severity.MEDIUM)
+    self.assertEqual(enriched.cvss_vector, "")
+    self.assertEqual(enriched.severity_source, SEVERITY_SOURCE_PROBE_POLICY)
+
+  def test_a_probe_supplied_vector_is_cvss_sourced(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      SEVERITY_SOURCE_CVSS, Severity,
+    )
+    self._register()
+    enriched = self._enrich(
+      Severity.MEDIUM, cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    )
+    self.assertEqual(enriched.severity_source, SEVERITY_SOURCE_CVSS)
+
+  def test_an_nvd_score_without_a_vector_is_cvss_sourced(self):
+    # `cve_db._build_finding` passes NVD's score and qualitative tier; the
+    # vector can be empty. That label is CVSS-backed, not the probe author's.
+    from extensions.business.cybersec.red_mesh.findings import (
+      SEVERITY_SOURCE_CVSS, Severity,
+    )
+    self._register()
+    enriched = self._enrich(Severity.MEDIUM, cvss_score=7.5)
+    self.assertEqual(enriched.cvss_vector, "")
+    self.assertEqual(enriched.severity_source, SEVERITY_SOURCE_CVSS)
+
+  def test_a_supplied_vector_whose_band_disagrees_is_not_cvss_sourced(self):
+    # "cvss" promises the vector backs the label. A probe-supplied 5.3 (MEDIUM)
+    # vector on a CRITICAL label is printed, but the label is still policy.
+    from extensions.business.cybersec.red_mesh.findings import (
+      SEVERITY_SOURCE_PROBE_POLICY, Severity,
+    )
+    self._register()
+    enriched = self._enrich(
+      Severity.CRITICAL, cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    )
+    self.assertEqual(enriched.cvss_score, 5.3)
+    self.assertEqual(enriched.severity_source, SEVERITY_SOURCE_PROBE_POLICY)
+
+  def test_a_preset_source_is_kept(self):
+    from extensions.business.cybersec.red_mesh.findings import Severity
+    self._register()
+    self.assertEqual(self._enrich(Severity.MEDIUM, severity_source="manual").severity_source, "manual")
+
+  def test_the_source_does_not_move_the_signature(self):
+    from dataclasses import replace
+    from extensions.business.cybersec.red_mesh.findings import Severity
+    self._register()
+    enriched = self._enrich(Severity.MEDIUM)
+    unstamped = replace(enriched, severity_source="", finding_signature="")
+    self.assertEqual(
+      enriched.finding_signature,
+      unstamped.compute_signature(probe_id="_service_info_test_defaultcreds"),
+    )
+
+  def test_source_and_backport_status_are_known_flat_fields(self):
+    from extensions.business.cybersec.red_mesh.models.finding_schema import (
+      flat_finding_from_dict,
+    )
+    flat = flat_finding_from_dict({
+      "finding_id": "abc", "title": "T", "severity": "HIGH", "confidence": "firm",
+      "probe": "p", "category": "c",
+      "severity_source": "probe_policy", "backport_status": "unknown",
+    })
+    self.assertEqual(flat.severity_source, "probe_policy")
+    self.assertEqual(flat.backport_status, "unknown")
+    self.assertEqual(flat.extra, {})
+    out = flat.to_dict()
+    self.assertEqual(out["severity_source"], "probe_policy")
+    self.assertEqual(out["backport_status"], "unknown")
+
+
 if __name__ == "__main__":
   unittest.main()

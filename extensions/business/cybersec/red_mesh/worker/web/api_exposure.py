@@ -1,6 +1,7 @@
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
@@ -49,6 +50,7 @@ class _WebApiExposureMixin:
       if resp.status_code == 200 and "__schema" in resp.text:
         findings_list.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
           title="GraphQL introspection enabled",
           description=f"GraphQL endpoint at {graphql_url} exposes the full schema "
                       "via introspection, revealing all types, queries, and mutations.",
@@ -109,6 +111,13 @@ class _WebApiExposureMixin:
       ("/latest/meta-data", "Alibaba Cloud ECS", {}),
       ("/opc/v2/instance/", "Oracle Cloud", {}),
     ]
+    if self._host_is_catch_all(base_url):
+      # A bare 200 is the whole check; on a catch-all host it is meaningless
+      # (the client job carried seven provider CRITICALs from one aiohttp
+      # server). Withhold rather than assert, and say so (RM-086 item 1).
+      for path, _provider, _headers in metadata_paths:
+        self._withhold_on_catch_all(base_url, "_web_test_metadata_endpoints", path)
+      return probe_result(findings=findings_list)
     try:
       for path, provider, extra_headers in metadata_paths:
         url = base_url.rstrip("/") + path
@@ -192,6 +201,7 @@ class _WebApiExposureMixin:
             if resp.status_code == 200 and any(m in body_lower for m in self._SSRF_MARKERS):
               findings_list.append(Finding(
                 severity=Severity.CRITICAL,
+                cvss_vector=V.SSRF_TO_INTERNAL,
                 title=f"SSRF: parameter '{param}' fetches internal resources",
                 description=f"Injecting a metadata URL into the '{param}' parameter at "
                             f"{path} returned cloud metadata content, indicating SSRF.",
@@ -246,6 +256,12 @@ class _WebApiExposureMixin:
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
     candidate_paths = ["/api/", "/api/health", "/api/status"]
+    if self._host_is_catch_all(base_url):
+      # "Accepts invalid token" is inferred from a 2xx alone; a catch-all host
+      # answers 2xx to anything, so the inference is void (RM-086 item 1).
+      for path in candidate_paths:
+        self._withhold_on_catch_all(base_url, "_web_test_api_auth_bypass", path)
+      return probe_result(findings=findings_list)
     try:
       for path in candidate_paths:
         url = base_url.rstrip("/") + path
@@ -258,6 +274,7 @@ class _WebApiExposureMixin:
         if resp.status_code in (200, 204):
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.INJECTION_DATA_ACCESS,
             title=f"API auth bypass: {path} accepts invalid token",
             description=f"API endpoint {url} returned success with a fabricated Bearer token, "
                         "indicating missing or broken authentication middleware.",

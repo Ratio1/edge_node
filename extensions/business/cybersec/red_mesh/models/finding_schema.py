@@ -68,6 +68,11 @@ _KNOWN_FIELDS = (
   # was absent" became the same record.
   "declared_severity",
   "declared_confidence",
+  # Read by name on the finding card: the policy label and the backport caveat
+  # (RM-086 item 5). Both rode in `extra` before, which the renderer never
+  # opened, so the caveat the letter promised was recorded and not shown.
+  "severity_source",
+  "backport_status",
   "affected_assets",
   "evidence_items",
   "evidence_artifacts",
@@ -142,6 +147,8 @@ class FlatFinding:
   references: tuple = ()
   replay_steps: tuple = ()
   status: str = ""
+  severity_source: str = ""
+  backport_status: str = ""
   # Verbatim carrier for anything the contract does not name. Not a dumping
   # ground: it is what makes "the contract does not know this field" different
   # from "this field did not exist", which is the distinction the whitelists

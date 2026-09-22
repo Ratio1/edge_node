@@ -67,6 +67,12 @@ from extensions.business.cybersec.red_mesh.models.rulebook import (
   VALID_RULEBOOK_REVIEW_STATES,
   VALID_RULEBOOK_SUBMISSION_STATES,
 )
+from extensions.business.cybersec.red_mesh.models.report_review import (
+  REPORT_REVIEW_CONTRACT_VERSION,
+  ReportReviewAuditEntry,
+  ReportReviewState,
+  VALID_REPORT_REVIEW_STATES,
+)
 from extensions.business.cybersec.red_mesh.models.engagement import (
   ASSET_EXPOSURES,
   AuthorizationRef,
@@ -137,6 +143,11 @@ __all__ = [
   "VALID_RULEBOOK_CHECK_STATUSES",
   "VALID_RULEBOOK_REVIEW_STATES",
   "VALID_RULEBOOK_SUBMISSION_STATES",
+  # report review (RM-086 item 4)
+  "REPORT_REVIEW_CONTRACT_VERSION",
+  "ReportReviewState",
+  "ReportReviewAuditEntry",
+  "VALID_REPORT_REVIEW_STATES",
   # engagement
   "Contact",
   "EngagementContext",

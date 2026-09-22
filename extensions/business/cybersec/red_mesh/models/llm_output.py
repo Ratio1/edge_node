@@ -124,6 +124,10 @@ class LlmReportSections:
   # Technical narrative (PTES §4.4, §4.7)
   attack_chain_narratives: tuple[str, ...] = ()
   coverage_gaps: tuple[str, ...] = ()
+  # Matters an external scan of one target cannot assess at all (other hosts,
+  # secret storage, governance), kept apart from the scan's own limitations
+  # (RM-086 item 6). Additive: outputs written before the key render one list.
+  out_of_scope: tuple[str, ...] = ()
   conclusion: str = ""
 
   # Provenance — must round-trip through dump_for_scan_record so the
@@ -145,6 +149,7 @@ class LlmReportSections:
       },
       "attack_chain_narratives": list(self.attack_chain_narratives),
       "coverage_gaps": list(self.coverage_gaps),
+      "out_of_scope": list(self.out_of_scope),
       "conclusion": self.conclusion,
       "model": self.model,
       "generated_at": self.generated_at,
@@ -170,6 +175,7 @@ class LlmReportSections:
       strategic_roadmap=roadmap,
       attack_chain_narratives=tuple(_str_list(d.get("attack_chain_narratives"))),
       coverage_gaps=tuple(_str_list(d.get("coverage_gaps"))),
+      out_of_scope=tuple(_str_list(d.get("out_of_scope"))),
       conclusion=str(d.get("conclusion", "")),
       model=str(d.get("model", "")),
       generated_at=str(d.get("generated_at", "")),
@@ -212,6 +218,7 @@ def render_legacy_llm_fields(sections: dict | LlmReportSections | None) -> tuple
   _append_legacy_roadmap(blocks, parsed.strategic_roadmap)
   _append_legacy_list_section(blocks, "Attack Chain Narratives", parsed.attack_chain_narratives)
   _append_legacy_list_section(blocks, "Coverage Gaps", parsed.coverage_gaps)
+  _append_legacy_list_section(blocks, "Outside Engagement Scope", parsed.out_of_scope)
   _append_legacy_section(blocks, "Conclusion", parsed.conclusion)
 
   markdown = "\n\n".join(blocks).strip()
@@ -522,6 +529,7 @@ def _validate_narrative_against_findings(
     " ".join(output.recommendation_summary),
     " ".join(output.attack_chain_narratives),
     " ".join(output.coverage_gaps),
+    " ".join(output.out_of_scope),
     output.conclusion,
   )
   llm_cves: set[str] = set()

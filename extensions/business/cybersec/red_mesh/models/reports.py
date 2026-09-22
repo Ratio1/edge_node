@@ -48,6 +48,7 @@ class ThreadReport:
   web_tested: bool = False
   port_protocols: dict = None       # { "80": "http", "22": "ssh" }
   port_banners: dict = None         # { "22": "SSH-2.0-OpenSSH_8.9" }
+  catch_all_withheld: dict = None   # { base_url: [ {probe, path} ] } (RM-086 item 1)
   scan_metrics: dict = None         # ScanMetrics.to_dict() — raw thread-level metrics
   correlation_findings: list = None
 
@@ -76,6 +77,7 @@ class ThreadReport:
       web_tested=d.get("web_tested", False),
       port_protocols=d.get("port_protocols"),
       port_banners=d.get("port_banners"),
+      catch_all_withheld=d.get("catch_all_withheld"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
     )
@@ -104,6 +106,7 @@ class NodeReport:
   web_tested: bool = False
   port_protocols: dict = None
   port_banners: dict = None
+  catch_all_withheld: dict = None
   scan_metrics: dict = None         # ScanMetrics.to_dict() — aggregated across threads
   correlation_findings: list = None
 
@@ -128,6 +131,7 @@ class NodeReport:
       web_tested=d.get("web_tested", False),
       port_protocols=d.get("port_protocols"),
       port_banners=d.get("port_banners"),
+      catch_all_withheld=d.get("catch_all_withheld"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
     )
@@ -150,6 +154,7 @@ class AggregatedScanData:
   nr_open_ports: int = 0
   port_protocols: dict = None
   port_banners: dict = None
+  catch_all_withheld: dict = None
   scan_metrics: dict = None         # ScanMetrics.to_dict() — aggregated across all nodes
   correlation_findings: list = None
   # `services/finalization.py` round-trips the aggregated report through this
@@ -187,6 +192,7 @@ class AggregatedScanData:
       nr_open_ports=d.get("nr_open_ports", 0),
       port_protocols=d.get("port_protocols"),
       port_banners=d.get("port_banners"),
+      catch_all_withheld=d.get("catch_all_withheld"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
       graybox_results=d.get("graybox_results"),

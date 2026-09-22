@@ -104,7 +104,7 @@ class ApiDataProbes(ProbeBase):
       if leaks:
         self.emit_vulnerable(
           "PT-OAPI3-01", "API response leaks sensitive properties",
-          "HIGH", "API3:2023", ["CWE-213", "CWE-915"],
+          "MEDIUM", "API3:2023", ["CWE-213", "CWE-915"],
           [f"endpoint={url}", "response_status=200",
            "sensitive_fields_present=" + ",".join(sorted(leaks))],
           replay_steps=[

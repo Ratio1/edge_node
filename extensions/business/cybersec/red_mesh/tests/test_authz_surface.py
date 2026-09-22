@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 72
+EXPECTED_ENDPOINTS = 76  # +1 typed rulebook artifact read (RM-086)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -65,11 +65,15 @@ ENDPOINT_FIRST_ARGS = {
   'get_stix_export_status': 'job_id',
   'generate_rulebook_assessment': 'job_id',
   'get_rulebook_assessment_status': 'job_id',
+  'get_rulebook_artifact': 'job_id',
   'get_rulebook_review': 'job_id',
   'save_rulebook_review_draft': 'job_id',
   'submit_rulebook_review': 'job_id',
   'reopen_rulebook_review': 'job_id',
   'update_rulebook_review': 'job_id',
+  'get_report_review': 'job_id',
+  'approve_report': 'job_id',
+  'reopen_report_review': 'job_id',
   'dry_run_opencti_export': 'job_id',
   'push_to_opencti': 'job_id',
   'get_opencti_export_status': 'job_id',

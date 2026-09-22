@@ -98,7 +98,7 @@ class TestCors(unittest.TestCase):
     probe._test_cors()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-A02-02" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "MEDIUM")
+    self.assertEqual(vuln[0].severity, "LOW")
 
 
 class TestSecurityHeaders(unittest.TestCase):
@@ -257,7 +257,7 @@ class TestSessionFixation(unittest.TestCase):
     probe._test_session_fixation()
     vuln = [f for f in probe.findings if f.scenario_id == "PT-A07-03" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
     self.assertIn("CWE-384", vuln[0].cwe)
 
   def test_session_fixation_rotated(self):
@@ -353,7 +353,7 @@ class TestAccountEnumerationTimingPTA0217(unittest.TestCase):
     f = [x for x in probe.findings if x.scenario_id == "PT-A02-17"]
     self.assertEqual(len(f), 1)
     self.assertEqual(f[0].status, "vulnerable")
-    self.assertEqual(f[0].severity, "HIGH")
+    self.assertEqual(f[0].severity, "MEDIUM")
 
   def test_pt_a02_17_not_vulnerable_when_timings_match(self):
     # Both groups ~50ms — no enumeration signal

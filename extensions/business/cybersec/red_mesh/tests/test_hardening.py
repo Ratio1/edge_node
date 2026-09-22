@@ -88,6 +88,37 @@ class TestAttestationHelpers(unittest.TestCase):
     self.assertEqual(result["tx_hash"], "0xtxhash")
     self.assertEqual(host.bc.submit_attestation.call_count, 2)
 
+  def test_submit_job_start_attestation_records_its_network(self):
+    # RM-086 item 3: the archived start record is what the PDF links from, and
+    # it carried no network — the client's base-sepolia tx linked to mainnet.
+    from extensions.business.cybersec.red_mesh.mixins.attestation import _AttestationMixin
+
+    class MockHost(_AttestationMixin):
+      REDMESH_ATTESTATION_DOMAIN = "0x" + ("11" * 32)
+      REDMESH_ATTESTATION_NETWORK = "base-sepolia"
+
+      def __init__(self):
+        self.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "0xprivate", "RETRIES": 2}
+        self.ee_addr = "0xlauncher"
+        self.bc = MagicMock()
+        self.bc.eth_address = "0xsender"
+        self.bc.submit_attestation.return_value = "0xtxhash"
+        self.bc.node_addr_to_eth_addr.return_value = "0x" + ("ab" * 20)
+        self.bc.eth_hash_message.return_value = "0x" + ("22" * 32)
+
+      def P(self, *_args, **_kwargs):
+        return None
+
+    host = MockHost()
+    result = host._submit_redmesh_job_start_attestation(
+      job_id="jobid123",
+      job_specs={"target": "10.0.0.5", "run_mode": "SINGLEPASS"},
+      workers={"0xlauncher": {}},
+    )
+
+    self.assertEqual(result["tx_hash"], "0xtxhash")
+    self.assertEqual(result["network"], "base-sepolia")
+
 
 class TestLlmRetryHardening(unittest.TestCase):
 

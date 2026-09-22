@@ -73,7 +73,7 @@ class TestApi3PropertyExposure(unittest.TestCase):
     vuln = [f for f in p.findings
             if f.scenario_id == "PT-OAPI3-01" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
     leaked = next(e for e in vuln[0].evidence if e.startswith("sensitive_fields_present="))
     self.assertIn("password_hash", leaked)
 

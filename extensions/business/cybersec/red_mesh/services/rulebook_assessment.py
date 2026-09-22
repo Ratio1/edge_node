@@ -1194,6 +1194,49 @@ def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PR
   return result
 
 
+_RULEBOOK_ARTIFACT_KINDS = ("generated_assessment", "review_submission")
+
+
+def get_rulebook_artifact(owner, job_id, cid, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, *,
+                          checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  """Read one stored rulebook artifact that the checked job itself records for this profile.
+
+  The typed read RM-026 left to I1b: `get_report` serves ordinary report edges only, so a rulebook
+  CID is authorized here, against the job's metadata row, its history and the submission registry,
+  and never through the generic report path. There is no unchecked half.
+  """
+  if checked_job is _UNSET:
+    raise TypeError("get_rulebook_artifact requires a checked job")
+  validate_snapshot_mode(snapshot_mode)
+  profile = _profile(profile_id)
+  if not profile:
+    raise AdministrationDenied(400, "invalid_profile")
+  job_specs = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+  if reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_artifact"):
+    raise AdministrationDenied(400, "unsupported_job_type")
+  if not isinstance(cid, str) or not cid.strip():
+    raise AdministrationDenied(400, "invalid_request")
+  meta = _checked_profile_metadata(job_specs, job_id, profile["profile_id"])
+  _, registry, _, _ = _checked_review_records(owner, job_id, profile["profile_id"])
+  # The legacy submission reference is the metadata artifact, so it needs no entry of its own.
+  recorded = {meta.get("artifact_cid")}
+  recorded.update(row.get("artifact_cid") for row in meta.get("history", ()))
+  recorded.update(reference["cid"] for reference in registry.to_dict()["submissions"])
+  if cid not in recorded:
+    raise AdministrationDenied(404, "not_found")
+  artifact = copy.deepcopy(_artifact_repo(owner).get_json(cid))
+  # A recorded CID that storage cannot return, or that names another job or profile, is corruption
+  # or an outage -- as for report edges -- never a success and never "absent".
+  if (not isinstance(artifact, dict) or artifact.get("artifact_kind") not in _RULEBOOK_ARTIFACT_KINDS
+      or artifact.get("job_id") != job_id or not isinstance(artifact.get("profile"), dict)
+      or artifact["profile"].get("profile_id") != profile["profile_id"]
+      or "submission" in artifact and (not isinstance(artifact["submission"], dict)
+                                       or artifact["submission"].get("profile_id") != profile["profile_id"])):
+    _read_unavailable()
+  return {"job_id": job_id, "profile_id": profile["profile_id"], "cid": cid,
+          "artifact_kind": artifact["artifact_kind"], "report": artifact}
+
+
 def _submission_lock(owner, job_id, profile_id):
   key = f"{getattr(owner, 'cfg_instance_id', '')}:{job_id}:{profile_id}"
   with _SUBMISSION_LOCKS_GUARD:

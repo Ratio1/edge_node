@@ -6,6 +6,7 @@ import struct
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ...cve_db import check_cves
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -109,6 +110,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       if not banner.startswith("RFB"):
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
           # The banner is per-connection bytes and the title is the last-resort
           # identity discriminator for a locationless finding — interpolating
           # the banner re-keyed this finding on every scan, and put volatile
@@ -154,6 +156,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       if 2 in sec_types:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.WEAK_TRANSPORT,
           title="VNC password auth (DES-based, max 8 chars)",
           description=f"VNC Auth uses DES encryption with a maximum 8-character password.",
           evidence=f"The RFB handshake advertised security types: {type_labels}",
@@ -173,6 +176,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       if not sec_types:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
           title="VNC service exposed (security types unparsed)",
           description="VNC protocol banner detected but security types could not be parsed.",
           evidence="An RFB banner was received but the security-type list could not be parsed.",
@@ -425,7 +429,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         self._emit_metadata("os_claims", f"snmp:{port}", sys_descr)
         if self._is_ics_indicator(sys_descr):
           walk_findings.append(Finding(
-            severity=Severity.HIGH,
+            severity=Severity.MEDIUM,
+            cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
             title="SNMP exposes ICS/SCADA device identity",
             description=f"sysDescr contains ICS keywords: {sys_descr[:120]}",
             evidence=f"sysDescr={sys_descr[:120]}",
@@ -443,6 +448,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           self._emit_metadata("internal_ips", {"ip": str(addr), "source": f"snmp_interface:{port}"})
           walk_findings.append(Finding(
             severity=Severity.MEDIUM,
+            cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
             title=f"SNMP leaks internal IP address {addr}",
             description="Interface IP from ipAddrTable is RFC1918, revealing internal topology.",
             evidence=f"ipAddrEntry={resp_val}",
@@ -525,6 +531,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
                   raw["banner"] = f"DNS version: {txt}"
                   findings.append(Finding(
                     severity=Severity.LOW,
+                    cvss_vector=V.INFO_DISCLOSURE_LOW,
                     title=f"DNS version disclosure: {txt}",
                     description=f"CHAOS TXT version.bind query reveals DNS software version.",
                     evidence=f"version.bind TXT: {txt}",
@@ -546,6 +553,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           raw["banner"] = readable.strip()[:80]
           findings.append(Finding(
             severity=Severity.LOW,
+            cvss_vector=V.INFO_DISCLOSURE_LOW,
             title="DNS version disclosure via CHAOS TXT",
             description=f"CHAOS TXT response on {target}:{port} contains version keywords.",
             evidence="The CHAOS-class TXT response contains version keywords.",
@@ -697,6 +705,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           if resp_tid == tid and rcode == 0 and ancount > 0:
             findings.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.SENSITIVE_DATA_EXPOSED,
               title=f"DNS zone transfer (AXFR) allowed for {domain}",
               description=f"DNS on {target}:{port} permits zone transfers for '{domain}'. "
                           "This leaks all DNS records — hostnames, IPs, mail servers, internal infrastructure.",
@@ -746,6 +755,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
             raw["resolver_answer_count"] = ancount
           return Finding(
             severity=Severity.MEDIUM,
+            cvss_vector=V.OPEN_RESOLVER,
             title="DNS open recursive resolver detected",
             description=f"DNS on {target}:{port} recursively resolves queries for external domains. "
                         "Open resolvers can be abused for DNS amplification DDoS attacks.",
@@ -846,6 +856,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         raw["banner"] = "SMB response too short"
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
           title="SMB service responded to negotiation probe",
           description=f"SMB on {target}:{port} accepts negotiation requests.",
           evidence=f"Response: {(resp_data or b'').hex()[:48]}",
@@ -900,6 +911,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         # SMBv1 is a security concern
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.WEAK_TRANSPORT,
           title="SMBv1 protocol supported (legacy, attack surface for MS17-010)",
           description=f"SMB on {target}:{port} supports SMBv1, which is vulnerable to "
                       "EternalBlue (MS17-010) and other SMBv1-specific attacks.",
@@ -928,6 +940,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       if raw["signing_required"] is False:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.NTLM_RELAY,
           title="SMB signing not required (relay attacks possible)",
           description=f"SMB on {target}:{port} does not require message signing, "
                       "allowing SMB relay / NTLM relay attacks.",
@@ -949,6 +962,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
       findings.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"Samba version disclosed: {samba_version}",
         description=f"Samba {samba_version} detected on {target}:{port}.",
         evidence=f"Samba version: {samba_version}",
@@ -970,6 +984,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       if admin_shares:
         findings.append(Finding(
           severity=Severity.HIGH,
+          cvss_vector=V.SENSITIVE_DATA_EXPOSED,
           title=f"SMB admin shares accessible via null session: {', '.join(admin_shares)}",
           description="Administrative shares are accessible without authentication.",
           evidence=f"Shares: {share_names}",
@@ -981,6 +996,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       else:
         findings.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
           title="SMB null session share enumeration",
           description=f"Anonymous user can enumerate {len(shares)} available SMB shares.",
           evidence=f"Shares: {share_names}",
@@ -993,6 +1009,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     if not findings:
       findings.append(Finding(
         severity=Severity.MEDIUM,
+        cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
         title="SMB service responded to negotiation probe",
         description=f"SMB on {target}:{port} accepts negotiation requests.",
         # Not volatile despite the name: `raw["banner"]` here is one of four
@@ -1704,7 +1721,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         for n, s, _f in names
       )
       findings.append(Finding(
-        severity=Severity.HIGH,
+        severity=Severity.MEDIUM,
+        cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
         title="NetBIOS name enumeration successful",
         description=(
           f"{probe_label} responded to a wildcard node-status query, "
@@ -1823,6 +1841,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           raw["banner"] = f"Port {port} responded ({len(data)} bytes, non-WREPL)"
           findings.append(Finding(
             severity=Severity.LOW,
+            cvss_vector=V.INFO_DISCLOSURE_LOW,
             title=f"Service on port {port} responded but is not standard WINS",
             description=(
               f"TCP port {port} on {target} returned data that does not match the "
@@ -1991,6 +2010,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           raw["tagline"] = data.get("tagline")
           findings.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title=f"Elasticsearch cluster metadata exposed",
             description=f"Cluster '{raw['cluster_name']}' version {raw['version']} accessible without auth.",
             evidence=f"cluster={raw['cluster_name']}, version={raw['version']}",
@@ -2003,6 +2023,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           if 'cluster_name' in resp.text:
             findings.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.SENSITIVE_DATA_EXPOSED,
               title="Elasticsearch cluster metadata exposed",
               description=f"Cluster metadata accessible at {base_url}.",
               evidence=resp.text[:200],
@@ -2027,6 +2048,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
         if index_count > 0:
           findings.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title="Elasticsearch indices accessible without authentication",
             description=f"{index_count} indices listed without authentication.",
             evidence="\n".join(lines[:6]),
@@ -2080,7 +2102,8 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
           if public_ips:
             findings.append(Finding(
-              severity=Severity.CRITICAL,
+              severity=Severity.MEDIUM,
+              cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
               title=f"Elasticsearch leaks real public IP: {', '.join(sorted(public_ips)[:3])}",
               description="The _nodes endpoint exposes public IP addresses, potentially revealing "
                           "the real infrastructure behind NAT/VPN/honeypot.",
@@ -2093,6 +2116,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
           if private_ips:
             findings.append(Finding(
               severity=Severity.MEDIUM,
+              cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
               title="Elasticsearch node internal IPs disclosed",
               description=f"Node API exposes {len(private_ips)} internal IPs: {', '.join(sorted(private_ips)[:5])}",
               evidence=f"IPs: {', '.join(sorted(private_ips)[:10])}",
@@ -2119,6 +2143,7 @@ class _ServiceInfraMixin(_ServiceProbeBase):
                 if major <= 8:
                   findings.append(Finding(
                     severity=Severity.MEDIUM,
+                    cvss_vector=V.UNSUPPORTED_SOFTWARE,
                     title=f"Elasticsearch running on EOL JVM: Java {jvm_version}",
                     description=f"Java {jvm_version} is end-of-life and no longer receives security patches.",
                     evidence=f"jvm.version={jvm_version}",

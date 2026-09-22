@@ -22,6 +22,8 @@ READS = (
   ("get_detection_correlation", {}),
   ("get_rulebook_assessment_status", {"profile_id": PROFILE}),
   ("get_rulebook_review", {"profile_id": PROFILE}),
+  # Report-level review (RM-086 item 4) runs through the same admission seams.
+  ("get_report_review", {}),
 )
 MUTATIONS = (
   ("generate_rulebook_assessment", {"profile_id": PROFILE, "persist": False}),
@@ -30,9 +32,14 @@ MUTATIONS = (
   ("reopen_rulebook_review", {"profile_id": PROFILE}),
   ("update_rulebook_review", {"profile_id": PROFILE, "answers": {}}),
   ("correlate_suricata_eve", {"eve_jsonl": "{}"}),
+  ("approve_report", {"expected_review_revision": 0}),
+  ("reopen_report_review", {"expected_review_revision": 0}),
 )
 EVIDENCE = (("get_raw_model_test_evidence", {}),)
-ALL = READS + MUTATIONS + EVIDENCE
+# The typed rulebook artifact read answers 404 for a CID the job does not record, so its
+# role matrix seeds one (below) instead of joining READS.
+ARTIFACT = (("get_rulebook_artifact", {"cid": "rulebook", "profile_id": PROFILE}),)
+ALL = READS + MUTATIONS + EVIDENCE + ARTIFACT
 
 # The operation each endpoint runs as, and therefore which roles hold it.
 VIEW_ROLES = ("tenant_user", "tenant_pentester", "tenant_admin", "super_pentester",
@@ -59,6 +66,14 @@ def second_tenant(fixture):
   fixture.store.grant("other-admin", tenant_id)
   assert fixture.administration.activate_tenant({"account_id": "creator"}, request_id)["success"]
   return tenant_id
+
+
+def record_artifact(fixture, name):
+  """Give the artifact read a CID the job records, so a denial is admission's and not the CID check's."""
+  if name == "get_rulebook_artifact":
+    fixture.job["rulebook_assessments"] = {PROFILE: {"artifact_cid": "rulebook"}}
+    fixture.artifacts["rulebook"] = {"artifact_kind": "generated_assessment", "job_id": "job-1",
+                                     "profile": {"profile_id": PROFILE}}
 
 
 def assert_denied(result, status, error):
@@ -93,6 +108,7 @@ def test_a_job_owned_by_another_tenant_is_not_found(name, extra):
     fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": "super_tenant_admin", "tenant_id": None} if (name, extra) in EVIDENCE
       else {"role": "tenant_admin", "tenant_id": other}]
+    record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=other)
     assert_denied(result, 404, "not_found")
     assert fixture.artifact_reads == []
@@ -103,6 +119,7 @@ def test_a_tenant_the_caller_does_not_belong_to_is_not_found(name, extra):
   with read_endpoint_fixture(bound=True) as fixture:
     other = second_tenant(fixture)
     as_role(fixture, "tenant_admin")  # a member of the fixture tenant only
+    record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=other)
     assert_denied(result, 404, "not_found")
     assert fixture.artifact_reads == []
@@ -112,6 +129,7 @@ def test_a_tenant_the_caller_does_not_belong_to_is_not_found(name, extra):
 def test_an_unknown_tenant_is_not_found(name, extra):
   with read_endpoint_fixture(bound=True) as fixture:
     as_role(fixture, "super_tenant_admin")  # authorized everywhere; the tenant does not exist
+    record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=OTHER_TENANT)
     assert_denied(result, 404, "not_found")
     assert fixture.artifact_reads == []
@@ -150,6 +168,16 @@ def test_every_tenant_role_reads_review_state(name, extra, role):
     assert_admitted(result)
 
 
+@pytest.mark.parametrize("name,extra", ARTIFACT)
+@pytest.mark.parametrize("role", VIEW_ROLES)
+def test_every_tenant_role_reads_a_recorded_rulebook_artifact(name, extra, role):
+  with read_endpoint_fixture(bound=True) as fixture:
+    record_artifact(fixture, name)
+    tenant_id = as_role(fixture, role)
+    result = invoke(fixture, name, extra, tenant_id=tenant_id)
+    assert result.get("cid") == "rulebook" and result.get("report") == fixture.artifacts["rulebook"], result
+
+
 @pytest.mark.parametrize("name,extra", MUTATIONS)
 @pytest.mark.parametrize("role", EXPORT_ROLES)
 def test_every_export_role_is_admitted_to_the_mutations(name, extra, role):
@@ -173,6 +201,8 @@ def test_the_platform_roles_are_admitted_to_raw_evidence(name, extra, role):
   ("save_rulebook_review_draft", {"profile_id": PROFILE, "answers": {}},
    "review_revision_conflict"),
   ("submit_rulebook_review", {"profile_id": PROFILE}, "submission_pass_stale"),
+  ("approve_report", {}, "review_revision_conflict"),
+  ("reopen_report_review", {}, "review_revision_conflict"),
 ))
 def test_a_typed_review_conflict_code_survives_the_tenant_path(name, extra, code):
   """The revision fence is the reason these four keep their own response shape; scoping them must
