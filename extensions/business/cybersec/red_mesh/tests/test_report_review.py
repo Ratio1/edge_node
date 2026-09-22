@@ -261,6 +261,75 @@ class TestReportReviewNis2Gate(unittest.TestCase):
     self.assertTrue(ref["cid"].startswith("QmRulebook"), ref)
 
 
+class TestReportReviewSupersededByNis2(unittest.TestCase):
+  """An approval rests on the NIS2 submission current when it was given (owner decision,
+  RM-088): once the NIS2 review is reopened or resubmitted, the approval no longer
+  counts and the pass reads `reopened`, a derived state; the stored row stays approved."""
+
+  def setUp(self):
+    self.owner = checked_read_producer("submitted")
+    self.owner.job_specs = {**self.owner.job_specs, "pass_count": 3}
+    approved = approve_report(self.owner, "job-1", expected_review_revision=0, actor="alice")
+    self.assertEqual(approved["review_status"], "approved", approved)
+    self.approved_ref = approved["review"]["nis2_submission_ref"]
+
+  def _nis2_revision(self):
+    from extensions.business.cybersec.red_mesh.services.rulebook_assessment import get_rulebook_review
+    return get_rulebook_review(self.owner, "job-1")["review_revision"]
+
+  def _reopen_nis2(self):
+    from extensions.business.cybersec.red_mesh.services.rulebook_assessment import reopen_rulebook_review
+    result = reopen_rulebook_review(self.owner, "job-1", expected_review_revision=self._nis2_revision(),
+                                    idempotency_key="reopen-1", actor="fixture-reviewer")
+    self.assertEqual(result["status"], "ok", result)
+
+  def _resubmit_nis2(self):
+    from extensions.business.cybersec.red_mesh.services.rulebook_assessment import submit_rulebook_review
+    result = submit_rulebook_review(self.owner, "job-1", expected_review_revision=self._nis2_revision(),
+                                    expected_pass_nr=3, expected_profile_version="1.0.0",
+                                    idempotency_key="resubmit-1", actor="fixture-reviewer")
+    self.assertIsNone(result.get("error"), result)
+
+  def test_a_reopened_nis2_review_reopens_the_approval(self):
+    self._reopen_nis2()
+    view = get_report_review(self.owner, "job-1")
+    self.assertEqual(view["review_status"], "reopened")
+    self.assertIsNone(view["review"])
+    self.assertEqual(view["review_revision"], 1)
+    self.assertEqual(view["reopened"]["review"]["state"], "approved")
+    self.assertEqual(view["reopened"]["code"], "nis2_review_changed")
+    self.assertEqual(view["reopened"]["detail"], {
+      "approved_submission_revision": self.approved_ref["revision"], "current_submission_revision": None})
+    self.assertEqual([item["code"] for item in view["approve_blocked"]], ["nis2_review_not_submitted"])
+    from extensions.business.cybersec.red_mesh.services.query import get_job_data, list_network_jobs
+    self.owner.records[(self.owner.cfg_instance_id, "job-1")] = self.owner.job_specs
+    self.assertEqual(list_network_jobs(self.owner)["job-1"]["review"]["review_status"], "reopened")
+    self.assertEqual(get_job_data(self.owner, "job-1")["job"]["review"]["review_status"], "reopened")
+
+  def test_a_resubmitted_nis2_review_needs_a_fresh_approval(self):
+    self._reopen_nis2()
+    self._resubmit_nis2()
+    view = get_report_review(self.owner, "job-1")
+    self.assertEqual(view["review_status"], "reopened")
+    self.assertTrue(view["can_approve"], view)
+    detail = view["reopened"]["detail"]
+    self.assertEqual(detail["approved_submission_revision"], self.approved_ref["revision"])
+    self.assertGreater(detail["current_submission_revision"], self.approved_ref["revision"])
+    again = approve_report(self.owner, "job-1", expected_review_revision=1, actor="bob")
+    self.assertFalse(again.get("idempotent_replay"), again)
+    self.assertEqual(again["review_status"], "approved", again)
+    self.assertEqual(again["review_revision"], 2)
+    self.assertGreater(again["review"]["nis2_submission_ref"]["revision"], self.approved_ref["revision"])
+    self.assertIsNone(again["reopened"])
+
+  def test_a_rejection_is_not_superseded_by_nis2(self):
+    reject_report(self.owner, "job-1", expected_review_revision=1, note="Wrong target", actor="bob")
+    self._reopen_nis2()
+    view = get_report_review(self.owner, "job-1")
+    self.assertEqual(view["review_status"], "rejected")
+    self.assertIsNone(view["reopened"])
+
+
 class TestReportReviewOnTheJobsList(unittest.TestCase):
 
   def _list(self, owner):

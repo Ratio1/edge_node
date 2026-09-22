@@ -117,26 +117,66 @@ def approve_blocked_reasons(owner, job_id, job_specs, nis2=_UNSET):
   return []
 
 
+def _reopened(review, nis2, blocked):
+  """Why an approval no longer counts, or None (owner decision, RM-088).
+
+  An approval rests on the NIS2 submission that was current when it was given.
+  When NIS2 is in play and the gate now blocks, or the current submission is not
+  the one recorded, the approval is reopened: a derived state, never stored.
+  Rejections are not NIS2-gated and are never reopened.
+  """
+  if review is None or review.state != "approved" or nis2 is None:
+    return None
+  recorded = review.nis2_submission_ref or None
+  current = nis2["submission"]
+  if (
+    not blocked and current and recorded
+    and current["revision"] == recorded["revision"] and current["cid"] == recorded["cid"]
+  ):
+    return None
+  return {
+    "review": review.to_dict(),
+    "code": "nis2_review_changed",
+    "detail": {
+      "approved_submission_revision": recorded["revision"] if recorded else None,
+      "current_submission_revision": current["revision"] if current else None,
+    },
+  }
+
+
+def _effective(owner, job_id, job_specs, review):
+  """`(review_status, approve_blocked, reopened)` for the latest pass's row."""
+  finalized = job_specs.get("job_status") == JOB_STATUS_FINALIZED
+  nis2 = current_rulebook_submission(owner, job_id, job_specs) if finalized else None
+  blocked = approve_blocked_reasons(owner, job_id, job_specs, nis2)
+  reopened = _reopened(review, nis2, blocked)
+  if reopened is not None:
+    status = "reopened"
+  elif review is not None:
+    status = review.state
+  else:
+    status = "pending" if finalized else None
+  return status, blocked, reopened
+
+
 def _view(owner, job_id, job_specs, rows):
   """The one read shape: the latest pass's verdict, the gate, and earlier passes as history."""
   latest_pass_nr = _latest_pass_nr(job_specs)
   review = rows.get(latest_pass_nr)
-  finalized = job_specs.get("job_status") == JOB_STATUS_FINALIZED
-  if review is not None:
-    review_status = review.state
-  else:
-    review_status = "pending" if finalized else None
-  blocked = approve_blocked_reasons(owner, job_id, job_specs)
+  review_status, blocked, reopened = _effective(owner, job_id, job_specs, review)
   return {
     "status": "ok",
     "job_id": job_id,
     "review_contract_version": REPORT_REVIEW_CONTRACT_VERSION,
     "review_status": review_status,
     "latest_pass_nr": latest_pass_nr,
-    "review": review.to_dict() if review is not None else None,
+    # A reopened approval is shown under `reopened`, not as the verdict; the
+    # fence still follows the stored row's revision.
+    "review": review.to_dict() if review is not None and reopened is None else None,
     "review_revision": review.review_revision if review is not None else 0,
     "can_approve": not blocked,
     "approve_blocked": blocked,
+    "reopened": reopened,
     "history": [rows[nr].to_dict() for nr in sorted(rows, reverse=True) if nr != latest_pass_nr],
   }
 
@@ -253,6 +293,7 @@ def _decide(owner, job_id, verdict, *, expected_review_revision, note, actor,
                     "The report review changed. Reload before deciding.",
                     current_review_revision=current)
     submission_ref = ""
+    reopened = None
     if verdict == "approved":
       nis2 = current_rulebook_submission(owner, job_id, job_specs)
       blocked = approve_blocked_reasons(owner, job_id, job_specs, nis2)
@@ -262,7 +303,9 @@ def _decide(owner, job_id, verdict, *, expected_review_revision, note, actor,
       if nis2 is not None:
         submission_ref = {"profile_id": nis2["profile_id"], "revision": nis2["submission"]["revision"],
                           "cid": nis2["submission"]["cid"]}
-    if review is not None and review.state == verdict:
+      reopened = _reopened(review, nis2, blocked)
+    # Approving a reopened approval writes a fresh one against the current submission.
+    if review is not None and review.state == verdict and reopened is None:
       result = _view(owner, job_id, job_specs, rows)
       result["idempotent_replay"] = True
       return result
@@ -302,10 +345,11 @@ def reject_report(owner, job_id, *, expected_review_revision=None, note="", acto
 
 
 def review_summaries(owner, jobs):
-  """`{job_id: summary | None}` for the jobs list: one keyed read per listed job, no NIS2 read.
+  """`{job_id: summary | None}` for the jobs list: one keyed read per listed job.
 
   Keyed reads, not a hash enumeration: a tenant-scoped list must only touch
-  the rows of the jobs it was admitted to.
+  the rows of the jobs it was admitted to. An approved row also reads its NIS2
+  basis (keyed) so the list shows `reopened` exactly when the job page does.
 
   A finalized scan job gets `{review_status, pass_nr, reviewer, decided_at}` for
   its latest pass; anything else (not finalized, model test) gets `None`. An
@@ -328,6 +372,10 @@ def review_summaries(owner, jobs):
     except ValueError:
       review = None
     if review is not None:
-      summary.update(review_status=review.state, reviewer=review.reviewer, decided_at=review.decided_at)
+      status = review.state
+      if status == "approved":
+        # Only an approval can be reopened; its NIS2 basis is two more keyed reads.
+        status, _, _ = _effective(owner, job_id, job_specs, review)
+      summary.update(review_status=status, reviewer=review.reviewer, decided_at=review.decided_at)
     summaries[job_id] = summary
   return summaries
