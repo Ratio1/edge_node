@@ -120,6 +120,21 @@ class TestModelTestingCapability(unittest.TestCase):
     self.assertNotIn("REDMESH_EVALUATOR_API_KEY", str(status))
     self.assertNotIn("raw-secret-name", str(status))
 
+  def test_capability_status_publishes_the_comparison_bundle(self):
+    # RM-086 item 2: the launch form names the mirrored bundle and shows the
+    # effective scope before launch, so the list has to be knowable up front.
+    from extensions.business.cybersec.red_mesh.constants import (
+      COMMON_PORTS, COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS,
+    )
+    status = get_capability_status(_owner(cfg_model_testing={"ENABLED": False}))
+    ports = status["network_scan"]["comparison_ports"]
+    self.assertEqual(ports, sorted(COMMON_PORTS))
+    self.assertEqual(ports, sorted(set(ports)))
+    self.assertEqual(
+      status["graybox_scan"]["comparison_bundle_feature_ids"],
+      list(COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS),
+    )
+
   def test_capability_status_omits_llm_evaluator_without_credentials_when_enabled(self):
     owner = _owner(cfg_model_testing={
       "ENABLED": True,
