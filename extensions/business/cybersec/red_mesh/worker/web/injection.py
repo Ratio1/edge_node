@@ -1,3 +1,4 @@
+import json as _json
 import re as _re
 import time
 import requests
@@ -5,6 +6,33 @@ from urllib.parse import quote
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
+
+
+# Top-level keys a Spring Boot Actuator response carries, per endpoint.
+_ACTUATOR_KEYS = frozenset({
+  "_links", "propertySources", "activeProfiles", "beans", "contexts",
+  "mappings", "dispatcherServlets",
+})
+_ACTUATOR_HEALTH_STATES = frozenset({"UP", "DOWN", "OUT_OF_SERVICE", "UNKNOWN"})
+
+
+def _looks_like_actuator_body(text):
+  """True for a JSON object shaped like a Spring Actuator or Jolokia response.
+
+  Used only on a catch-all host, where a 200 with `{` in the first bytes is
+  not product validation (RM-086 item 1). Elsewhere the looser check stands.
+  """
+  try:
+    data = _json.loads(text)
+  except Exception:
+    return False
+  if not isinstance(data, dict):
+    return False
+  if _ACTUATOR_KEYS & set(data):
+    return True
+  if str(data.get("status", "")).upper() in _ACTUATOR_HEALTH_STATES:
+    return True
+  return "request" in data and "value" in data  # Jolokia envelope
 
 
 class _InjectionTestBase:
@@ -855,14 +883,22 @@ class _WebInjectionMixin(_InjectionTestBase):
         "product": "JBoss",
         "cve": None,
         "check": lambda resp: resp.status_code in (200, 500),
+        # The only check here a bare 200 satisfies; the others read the body
+        # or need a 500. On a catch-all host the 200 branch is withheld
+        # (RM-086 item 1); a 500 still counts.
+        "status_only_on_200": True,
         "desc": "JBoss JMXInvokerServlet exposed — Java deserialization attack surface.",
       },
     ]
 
+    catch_all = self._host_is_catch_all(base_url)
     for ep in deser_endpoints:
       try:
         url = base_url.rstrip("/") + ep["path"]
         resp = requests.get(url, timeout=self._target_timeout(4), verify=False)
+        if catch_all and ep.get("status_only_on_200") and resp.status_code == 200:
+          self._withhold_on_catch_all(base_url, "_web_test_java_deserialization", ep["path"])
+          continue
         if ep["check"](resp):
           title = f"Java deserialization endpoint: {ep['path']}"
           if ep["cve"]:
@@ -931,6 +967,7 @@ class _WebInjectionMixin(_InjectionTestBase):
       ("/jolokia", "Jolokia JMX-over-HTTP — RCE risk via MBean manipulation"),
     ]
 
+    catch_all = self._host_is_catch_all(base_url)
     for path, desc in actuator_paths:
       try:
         url = base_url.rstrip("/") + path
@@ -939,6 +976,9 @@ class _WebInjectionMixin(_InjectionTestBase):
           # Validate it's actually an actuator/Spring endpoint
           ct = resp.headers.get("Content-Type", "").lower()
           body = resp.text[:2000]
+          if catch_all and not _looks_like_actuator_body(resp.text):
+            self._withhold_on_catch_all(base_url, "_web_test_spring_actuator", path)
+            continue
           if "json" in ct or "actuator" in body.lower() or "{" in body[:10]:
             sev = Severity.HIGH
             if path in ("/actuator/health",):

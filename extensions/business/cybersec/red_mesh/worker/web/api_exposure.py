@@ -109,6 +109,13 @@ class _WebApiExposureMixin:
       ("/latest/meta-data", "Alibaba Cloud ECS", {}),
       ("/opc/v2/instance/", "Oracle Cloud", {}),
     ]
+    if self._host_is_catch_all(base_url):
+      # A bare 200 is the whole check; on a catch-all host it is meaningless
+      # (the client job carried seven provider CRITICALs from one aiohttp
+      # server). Withhold rather than assert, and say so (RM-086 item 1).
+      for path, _provider, _headers in metadata_paths:
+        self._withhold_on_catch_all(base_url, "_web_test_metadata_endpoints", path)
+      return probe_result(findings=findings_list)
     try:
       for path, provider, extra_headers in metadata_paths:
         url = base_url.rstrip("/") + path
@@ -246,6 +253,12 @@ class _WebApiExposureMixin:
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
     candidate_paths = ["/api/", "/api/health", "/api/status"]
+    if self._host_is_catch_all(base_url):
+      # "Accepts invalid token" is inferred from a 2xx alone; a catch-all host
+      # answers 2xx to anything, so the inference is void (RM-086 item 1).
+      for path in candidate_paths:
+        self._withhold_on_catch_all(base_url, "_web_test_api_auth_bypass", path)
+      return probe_result(findings=findings_list)
     try:
       for path in candidate_paths:
         url = base_url.rstrip("/") + path

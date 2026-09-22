@@ -7,10 +7,59 @@ from ...cve_db import check_cves
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
+CATCH_ALL_TITLE = "Web server returns 200 for random paths"
+
+
+def web_base_url(target, port):
+  """The scheme://host[:port] every web probe builds for `port`."""
+  scheme = "https" if port in (443, 8443) else "http"
+  if port in (80, 443):
+    return f"{scheme}://{target}"
+  return f"{scheme}://{target}:{port}"
+
+
 class _WebDiscoveryMixin:
   """
   Enumerate exposed files, admin panels, and homepage secrets (OWASP WSTG-INFO).
   """
+
+  def _host_is_catch_all(self, base_url):
+    """True when `base_url` answers 200 to a random, non-existent path.
+
+    Memoised per base_url in `state["catch_all_hosts"]`, so the canary runs once
+    per scheme/host/port whichever probe asks first: probe order follows the
+    feature catalog and discovery may be excluded. The status-only sites
+    (accessible resource, cloud metadata, API auth bypass, JMXInvokerServlet,
+    Spring Actuator) read it to withhold findings that rest on a bare 200 — the
+    client's job reported ASP.NET, Spring, WordPress and JBoss exposures on one
+    aiohttp host that 200s everything (RM-086 item 1). Body-validated probes
+    never consult it.
+    """
+    memo = self.state.setdefault("catch_all_hosts", {})
+    if base_url in memo:
+      return memo[base_url]
+    result = False
+    try:
+      canary_path = f"/{_uuid.uuid4().hex}"
+      canary_resp = requests.get(base_url + canary_path, timeout=self._target_timeout(2), verify=False)
+      result = canary_resp.status_code == 200
+    except Exception:
+      result = False
+    memo[base_url] = result
+    return result
+
+  def _withhold_on_catch_all(self, base_url, probe, path):
+    """Record a status-only check withheld because `base_url` is a catch-all host.
+
+    The list is exported on the worker report and named on the catch-all finding
+    once every web probe has run, so the reader sees which checks were not
+    raised and can validate them by hand instead of reading a withheld finding
+    as an absent weakness.
+    """
+    withheld = self.state.setdefault("catch_all_withheld", {}).setdefault(base_url, [])
+    entry = {"probe": probe, "path": path}
+    if entry not in withheld:
+      withheld.append(entry)
 
   @register_probe(
     display_name="Common admin / debug endpoint discovery",
@@ -43,38 +92,31 @@ class _WebDiscoveryMixin:
       Structured findings from endpoint checks.
     """
     findings_list = []
-    scheme = "https" if port in (443, 8443) else "http"
-    base_url = f"{scheme}://{target}"
-    if port not in (80, 443):
-      base_url = f"{scheme}://{target}:{port}"
+    base_url = web_base_url(target, port)
 
     # --- Catch-all detection: 200-for-all ---
-    try:
-      canary_path = f"/{_uuid.uuid4().hex}"
-      canary_resp = requests.get(base_url + canary_path, timeout=self._target_timeout(2), verify=False)
-      if canary_resp.status_code == 200:
-        findings_list.append(Finding(
-          severity=Severity.HIGH,
-          title="Web server returns 200 for random paths",
-          description="A request to a non-existent random UUID path returned HTTP 200, "
-                      "suggesting a catch-all rule or severely misconfigured server.",
-          # Not relocated to raw_data, and deliberately so: the canary is a
-          # uuid4 *we* generate, not an observation of the target. It differs
-          # on every run, so in `evidence` it forked the cross-worker dedup
-          # key and this finding was reported once per worker. Any random
-          # path reproduces it, which is the whole point of the check.
-          # `base_url` is stable across workers and runs; only the canary
-          # moved. Dropping both left no record of which scheme and port
-          # showed the catch-all, which an analyst reading a multi-port scan
-          # needs.
-          evidence=f"A request to {base_url} for a randomly generated, "
-                   "non-existent path returned HTTP 200.",
-          remediation="Investigate the catch-all behavior; ensure proper 404 responses for unknown paths.",
-          cwe_id="CWE-345",
-          confidence="firm",
-        ))
-    except Exception:
-      pass
+    catch_all = self._host_is_catch_all(base_url)
+    if catch_all:
+      findings_list.append(Finding(
+        severity=Severity.HIGH,
+        title=CATCH_ALL_TITLE,
+        description="A request to a non-existent random UUID path returned HTTP 200, "
+                    "suggesting a catch-all rule or severely misconfigured server.",
+        # Not relocated to raw_data, and deliberately so: the canary is a
+        # uuid4 *we* generate, not an observation of the target. It differs
+        # on every run, so in `evidence` it forked the cross-worker dedup
+        # key and this finding was reported once per worker. Any random
+        # path reproduces it, which is the whole point of the check.
+        # `base_url` is stable across workers and runs; only the canary
+        # moved. Dropping both left no record of which scheme and port
+        # showed the catch-all, which an analyst reading a multi-port scan
+        # needs.
+        evidence=f"A request to {base_url} for a randomly generated, "
+                 "non-existent path returned HTTP 200.",
+        remediation="Investigate the catch-all behavior; ensure proper 404 responses for unknown paths.",
+        cwe_id="CWE-345",
+        confidence="firm",
+      ))
 
     # Severity depends on what the path exposes
     _PATH_META = {
@@ -106,6 +148,13 @@ class _WebDiscoveryMixin:
       "/elmah.axd": (Severity.HIGH, "CWE-215", "A09:2021",
         ".NET ELMAH error log viewer exposed — reveals stack traces and request data."),
     }
+
+    if catch_all:
+      # Every check below is a bare 200; on this host that proves nothing, so
+      # none is requested and each is recorded as withheld instead.
+      for path in _PATH_META:
+        self._withhold_on_catch_all(base_url, "_web_test_common", path)
+      return probe_result(findings=findings_list)
 
     try:
       for path, (severity, cwe, owasp, desc) in _PATH_META.items():
