@@ -1346,9 +1346,12 @@ def current_rulebook_submission(owner, job_id, job_specs, profile_id=DEFAULT_RUL
   if not meta.get("artifact_cid") and review is None and not references:
     return None
   latest = max(references, key=lambda item: int(item.get("revision", 0) or 0), default=None)
-  if _effective_review_state(registry_payload.get("pending"), latest, review) == "submitted":
+  pass_nr = int((latest or {}).get("pass_nr", 0) or 0)
+  # A submission that names no pass (a legacy `reviewed` row whose record lost
+  # its pass number) cannot vouch for any pass: it reads as not submitted.
+  if pass_nr > 0 and _effective_review_state(registry_payload.get("pending"), latest, review) == "submitted":
     result["submission"] = {
-      "pass_nr": int(latest.get("pass_nr", 0) or 0),
+      "pass_nr": pass_nr,
       "revision": int(latest.get("revision", 0) or 0),
       "cid": str(latest.get("cid") or ""),
     }

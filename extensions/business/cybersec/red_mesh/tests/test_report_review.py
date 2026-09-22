@@ -227,6 +227,28 @@ class TestReportReviewNis2Gate(unittest.TestCase):
       "detail": {"profile_id": "nis2.eu_baseline.v1", "submitted_pass_nr": 3, "latest_pass_nr": 4},
     }])
 
+  def test_a_failed_submission_keeps_the_gate_shut(self):
+    # The registry holds a pending entry with its error; the NIS2 view reads draft.
+    owner = self._owner("submission_failed")
+    self.assertEqual(self._codes(get_report_review(owner, "job-1")), ["nis2_review_not_submitted"])
+
+  def test_an_unreadable_nis2_registry_keeps_the_gate_shut(self):
+    owner = self._owner("submitted")
+    owner.chainstore_hset(f"{owner.cfg_instance_id}:rulebook_review:submissions",
+                          "job-1:nis2.eu_baseline.v1", {"contract_version": "9.9.9"})
+    self.assertEqual(self._codes(get_report_review(owner, "job-1")), ["nis2_review_not_submitted"])
+
+  def test_a_legacy_reviewed_state_counts_as_submitted_for_its_pass(self):
+    owner = self._owner("legacy")
+    self.assertTrue(get_report_review(owner, "job-1")["can_approve"])
+
+  def test_a_legacy_reviewed_state_with_no_recorded_pass_is_not_submitted(self):
+    owner = self._owner("legacy")
+    meta = dict(owner.job_specs["rulebook_assessments"]["nis2.eu_baseline.v1"])
+    meta.pop("pass_nr"); meta.pop("latest_pass_nr")
+    owner.job_specs = {**owner.job_specs, "rulebook_assessments": {"nis2.eu_baseline.v1": meta}}
+    self.assertEqual(self._codes(get_report_review(owner, "job-1")), ["nis2_review_not_submitted"])
+
   def test_a_current_submission_admits_approve_and_is_recorded(self):
     owner = self._owner("submitted")
     view = get_report_review(owner, "job-1")
