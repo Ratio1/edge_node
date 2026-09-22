@@ -16,7 +16,9 @@ import re
 from contextvars import ContextVar
 from dataclasses import dataclass
 from .cve_catalog_expansion import EXPANDED_CVE_ROWS
-from .findings import Finding, Remediation, Severity
+from .cve_cvss_vectors import CVE_CVSS_VECTORS
+from .cvss import cvss31_base_score
+from .findings import Finding, Remediation, Severity, _template_band_agrees
 from .references import cwe_to_owasp
 
 CVE_DB_LAST_UPDATED = "2026-05-08"
@@ -507,6 +509,18 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       kev = bool(kev_rec.in_kev)
     if epss_rec and epss_rec.cve_id and epss_rec.score is not None:
       epss_score = float(epss_rec.score)
+
+  # No live NVD record (production runs without the dynamic cache): the NVD
+  # vector fetched into the static table, so the label is CVSS-backed. Only
+  # when its band is the catalog label; a disagreeing vector is withheld, as a
+  # probe template is (RM-064), and listed by `test_cve_cvss_vectors.py` (RM-087).
+  if not cvss_vector and cvss_score is None:
+    static_vector = CVE_CVSS_VECTORS.get(entry.cve_id, "")
+    if static_vector and _template_band_agrees(static_vector, severity):
+      cvss_vector = static_vector
+      cvss_score = cvss31_base_score(static_vector)
+      cvss_version = static_vector.split("/", 1)[0].removeprefix("CVSS:")
+      cvss_freshness = ""  # static, not fetched at scan time
 
   # What the distribution package says about this match, stated rather than
   # left to the reader (RM-070). `not_fixed` is the one case the evidence
