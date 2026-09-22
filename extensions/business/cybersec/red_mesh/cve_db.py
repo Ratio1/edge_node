@@ -75,10 +75,10 @@ def entry_applicability(entry) -> str:
 
 CVE_DATABASE: list = [
   # ── Elasticsearch ──────────────────────────────────────────────────
-  CveEntry("elasticsearch", "<1.2",   "CVE-2014-3120", Severity.CRITICAL, "MVEL scripting RCE", "CWE-94"),
+  CveEntry("elasticsearch", "<1.2",   "CVE-2014-3120", Severity.HIGH, "MVEL scripting RCE", "CWE-94"),
   CveEntry("elasticsearch", "<1.4.3", "CVE-2015-1427", Severity.CRITICAL, "Groovy sandbox escape RCE", "CWE-94"),
   CveEntry("elasticsearch", "<1.4.5", "CVE-2015-3337", Severity.HIGH, "Directory traversal via site plugin", "CWE-22"),
-  CveEntry("elasticsearch", "<5.6.5", "CVE-2017-11480", Severity.MEDIUM, "XSS via URL access control bypass", "CWE-79"),
+  CveEntry("elasticsearch", "<5.6.5", "CVE-2017-11480", Severity.HIGH, "XSS via URL access control bypass", "CWE-79"),
   CveEntry("elasticsearch", "<6.4.3", "CVE-2018-17244", Severity.MEDIUM, "Security bypass in token generation", "CWE-287"),
   CveEntry("elasticsearch", ">=7.0.0,<7.17.19", "CVE-2024-23450", Severity.HIGH, "Ingest pipeline DoS via deep nesting", "CWE-400"),
 
@@ -94,19 +94,19 @@ CVE_DATABASE: list = [
   # making 9.8 sort *below* 9.8p1. Writing the published `p`-suffixed bounds
   # here shifted both boundaries by a release: a patched 9.8p1 server reported
   # CRITICAL, and vulnerable 8.5p1 servers were missed.
-  CveEntry("openssh", "<4.4", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
-  CveEntry("openssh", ">=8.5,<9.8", "CVE-2024-6387", Severity.CRITICAL, "regreSSHion: signal handler race RCE", "CWE-362"),
-  CveEntry("openssh", ">=6.8,<9.9.2", "CVE-2025-26465", Severity.HIGH, "MitM via VerifyHostKeyDNS bypass", "CWE-305"),
-  CveEntry("openssh", "<8.1",  "CVE-2019-6111", Severity.HIGH, "SCP client-side file overwrite", "CWE-20"),
+  CveEntry("openssh", "<4.4", "CVE-2024-6387", Severity.HIGH, "regreSSHion: signal handler race RCE", "CWE-362"),
+  CveEntry("openssh", ">=8.5,<9.8", "CVE-2024-6387", Severity.HIGH, "regreSSHion: signal handler race RCE", "CWE-362"),
+  CveEntry("openssh", ">=6.8,<9.9.2", "CVE-2025-26465", Severity.MEDIUM, "MitM via VerifyHostKeyDNS bypass", "CWE-305"),
+  CveEntry("openssh", "<8.1",  "CVE-2019-6111", Severity.MEDIUM, "SCP client-side file overwrite", "CWE-20"),
   CveEntry("openssh", "<7.6",  "CVE-2017-15906", Severity.MEDIUM, "Improper write restriction in readonly mode", "CWE-732"),
   CveEntry("openssh", "<7.0",  "CVE-2016-6210", Severity.MEDIUM, "User enumeration via timing", "CWE-200"),
 
   # ── Redis ──────────────────────────────────────────────────────────
   CveEntry("redis", "<6.0.8",  "CVE-2021-32761", Severity.HIGH, "Integer overflow in BITFIELD", "CWE-190"),
   CveEntry("redis", "<6.2.7",  "CVE-2022-24735", Severity.HIGH, "Lua sandbox escape via EVAL", "CWE-94"),
-  CveEntry("redis", "<7.0.5",  "CVE-2022-35951", Severity.HIGH, "Integer overflow in XAUTOCLAIM", "CWE-190"),
+  CveEntry("redis", "<7.0.5",  "CVE-2022-35951", Severity.CRITICAL, "Integer overflow in XAUTOCLAIM", "CWE-190"),
   CveEntry("redis", "<6.2.16", "CVE-2024-31449", Severity.HIGH, "Lua bit library stack buffer overflow RCE", "CWE-121"),
-  CveEntry("redis", "<7.2.7",  "CVE-2024-46981", Severity.HIGH, "Lua GC use-after-free RCE", "CWE-416"),
+  CveEntry("redis", "<7.2.7",  "CVE-2024-46981", Severity.CRITICAL, "Lua GC use-after-free RCE", "CWE-416"),
 
   # ── MySQL ──────────────────────────────────────────────────────────
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
@@ -114,31 +114,31 @@ CVE_DATABASE: list = [
   CveEntry("mysql", ">=5.7,<5.7.15",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6664", Severity.HIGH, "Privilege escalation via mysqld_safe", "CWE-269"),
   CveEntry("mysql", ">=8.0,<8.0.23",  "CVE-2021-2022", Severity.MEDIUM, "InnoDB buffer pool corruption", "CWE-787"),
-  CveEntry("mysql", ">=5.7,<5.7.44",  "CVE-2024-20973", Severity.HIGH, "Optimizer DoS via low-privilege network attack", "CWE-404"),
+  CveEntry("mysql", ">=5.7,<5.7.44",  "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
 
   # ── PostgreSQL (new) ───────────────────────────────────────────────
   CveEntry("postgresql", "<17.3",  "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89"),
   CveEntry("postgresql", "<17.1",  "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
-  CveEntry("postgresql", "<17.1",  "CVE-2024-10976", Severity.HIGH, "Row security policy bypass via role confusion", "CWE-862"),
+  CveEntry("postgresql", "<17.1",  "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
 
   # ── MongoDB (new) ──────────────────────────────────────────────────
-  CveEntry("mongodb", "<4.4.30", "CVE-2024-8207", Severity.HIGH, "Privilege escalation via untrusted library load", "CWE-284"),
+  CveEntry("mongodb", "<4.4.30", "CVE-2024-8207", Severity.MEDIUM, "Privilege escalation via untrusted library load", "CWE-284"),
 
   # ── Exim ───────────────────────────────────────────────────────────
-  CveEntry("exim", "<4.98",   "CVE-2024-39929", Severity.CRITICAL, "RFC 2231 header parsing bypass — malware delivery", "CWE-20"),
+  CveEntry("exim", "<4.98",   "CVE-2024-39929", Severity.MEDIUM, "RFC 2231 header parsing bypass — malware delivery", "CWE-20"),
   CveEntry("exim", "<4.97.1", "CVE-2023-42115", Severity.CRITICAL, "AUTH out-of-bounds write", "CWE-787"),
-  CveEntry("exim", "<4.96.1", "CVE-2023-42116", Severity.HIGH, "NTLM challenge stack buffer overflow", "CWE-121"),
-  CveEntry("exim", "<4.96.1", "CVE-2023-42114", Severity.HIGH, "NTLM challenge out-of-bounds read", "CWE-125"),
-  CveEntry("exim", "<4.94.2", "CVE-2021-27216", Severity.HIGH, "Privilege escalation via symlink attack", "CWE-59"),
+  CveEntry("exim", "<4.96.1", "CVE-2023-42116", Severity.CRITICAL, "NTLM challenge stack buffer overflow", "CWE-121"),
+  CveEntry("exim", "<4.96.1", "CVE-2023-42114", Severity.MEDIUM, "NTLM challenge out-of-bounds read", "CWE-125"),
+  CveEntry("exim", "<4.94.2", "CVE-2021-27216", Severity.MEDIUM, "Privilege escalation via symlink attack", "CWE-59"),
 
   # ── Apache httpd ───────────────────────────────────────────────────
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38475", Severity.CRITICAL, "mod_rewrite escaping flaw — SSRF / RCE", "CWE-116"),
   CveEntry("apache", ">=2.4.0,<2.4.60",  "CVE-2024-38476", Severity.CRITICAL, "Backend header exploit — SSRF / local script exec", "CWE-829"),
   CveEntry("apache", ">=2.4.49,<2.4.51", "CVE-2021-41773", Severity.CRITICAL, "Path traversal + RCE", "CWE-22"),
   CveEntry("apache", ">=2.4.0,<2.4.52",  "CVE-2021-44790", Severity.CRITICAL, "mod_lua buffer overflow", "CWE-787"),
-  CveEntry("apache", ">=2.4.0,<2.4.62",  "CVE-2024-40725", Severity.HIGH, "HTTP request smuggling via mod_proxy", "CWE-444"),
-  CveEntry("apache", "<2.4.49",           "CVE-2021-40438", Severity.HIGH, "mod_proxy SSRF", "CWE-918"),
-  CveEntry("apache", "<2.2.34",           "CVE-2017-7679", Severity.HIGH, "mod_mime buffer overread", "CWE-126"),
+  CveEntry("apache", ">=2.4.0,<2.4.62",  "CVE-2024-40725", Severity.MEDIUM, "HTTP request smuggling via mod_proxy", "CWE-444"),
+  CveEntry("apache", "<2.4.49",           "CVE-2021-40438", Severity.CRITICAL, "mod_proxy SSRF", "CWE-918"),
+  CveEntry("apache", "<2.2.34",           "CVE-2017-7679", Severity.CRITICAL, "mod_mime buffer overread", "CWE-126"),
 
   # ── nginx ──────────────────────────────────────────────────────────
   CveEntry("nginx", "<1.17.7", "CVE-2019-20372", Severity.MEDIUM, "HTTP request smuggling", "CWE-444"),
@@ -150,9 +150,9 @@ CVE_DATABASE: list = [
   CveEntry("postfix", "<3.5.23", "CVE-2023-51764", Severity.MEDIUM, "SMTP smuggling via pipelining", "CWE-345"),
 
   # ── OpenSSL ────────────────────────────────────────────────────────
-  CveEntry("openssl", "<1.1.1",  "CVE-2020-1971", Severity.HIGH, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
+  CveEntry("openssl", "<1.1.1",  "CVE-2020-1971", Severity.MEDIUM, "NULL dereference in GENERAL_NAME_cmp", "CWE-476"),
   CveEntry("openssl", "<3.0.7",  "CVE-2022-3602", Severity.HIGH, "X.509 email address buffer overflow", "CWE-120"),
-  CveEntry("openssl", ">=3.2.0,<3.2.4",  "CVE-2024-12797", Severity.HIGH, "RPK verification bypass enabling MitM", "CWE-392"),
+  CveEntry("openssl", ">=3.2.0,<3.2.4",  "CVE-2024-12797", Severity.MEDIUM, "RPK verification bypass enabling MitM", "CWE-392"),
   CveEntry("openssl", "<3.0.14", "CVE-2024-4741", Severity.HIGH, "SSL_free_buffers use-after-free", "CWE-416"),
 
   # ── ProFTPD ────────────────────────────────────────────────────────
@@ -164,8 +164,8 @@ CVE_DATABASE: list = [
 
   # ── Memcached (new) ────────────────────────────────────────────────
   CveEntry("memcached", "<1.4.33", "CVE-2016-8704", Severity.CRITICAL, "process_bin_append integer overflow RCE", "CWE-190"),
-  CveEntry("memcached", "<1.4.33", "CVE-2016-8705", Severity.HIGH, "process_bin_update integer overflow RCE", "CWE-190"),
-  CveEntry("memcached", "<1.4.33", "CVE-2016-8706", Severity.CRITICAL, "SASL auth integer overflow RCE", "CWE-190"),
+  CveEntry("memcached", "<1.4.33", "CVE-2016-8705", Severity.CRITICAL, "process_bin_update integer overflow RCE", "CWE-190"),
+  CveEntry("memcached", "<1.4.33", "CVE-2016-8706", Severity.HIGH, "SASL auth integer overflow RCE", "CWE-190"),
 
   # ── VNC (new) ──────────────────────────────────────────────────────
   CveEntry("tightvnc", "<=1.3.10", "CVE-2019-15678", Severity.CRITICAL, "rfbServerCutText heap buffer overflow RCE", "CWE-122"),
@@ -174,16 +174,16 @@ CVE_DATABASE: list = [
 
   # ── Samba (new — for SMB deep enumeration) ─────────────────────────
   CveEntry("samba", ">=4.16.0,<4.17.12", "CVE-2023-3961", Severity.CRITICAL, "Pipe name validation bypass — root socket access", "CWE-22"),
-  CveEntry("samba", "<4.13.17", "CVE-2021-44142", Severity.CRITICAL, "vfs_fruit heap overflow RCE", "CWE-787"),
+  CveEntry("samba", "<4.13.17", "CVE-2021-44142", Severity.HIGH, "vfs_fruit heap overflow RCE", "CWE-787"),
   CveEntry("samba", ">=3.5.0,<4.6.4", "CVE-2017-7494", Severity.CRITICAL, "SambaCry — writable share RCE via shared library upload", "CWE-94"),
 
   # ── Asterisk / FreePBX (new — for SIP probe) ──────────────────────
   CveEntry("asterisk", "<20.11.0", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
-  CveEntry("asterisk", "<18.24.0", "CVE-2023-49786", Severity.HIGH, "PJSIP request smuggling via multipart parser", "CWE-444"),
+  CveEntry("asterisk", "<18.24.0", "CVE-2023-49786", Severity.MEDIUM, "PJSIP request smuggling via multipart parser", "CWE-444"),
 
   # ── OpenSMTPD ────────────────────────────────────────────────────
   CveEntry("opensmtpd", "<6.6.2",  "CVE-2020-7247", Severity.CRITICAL, "RCE via crafted MAIL FROM command", "CWE-78"),
-  CveEntry("opensmtpd", "<6.6.4",  "CVE-2020-8794", Severity.HIGH, "Out-of-bounds read in MTA bounce handling", "CWE-125"),
+  CveEntry("opensmtpd", "<6.6.4",  "CVE-2020-8794", Severity.CRITICAL, "Out-of-bounds read in MTA bounce handling", "CWE-125"),
 
   # ── libssh ───────────────────────────────────────────────────────
   CveEntry("libssh", "<0.7.6",  "CVE-2018-10933", Severity.CRITICAL, "Authentication bypass via MSG_USERAUTH_SUCCESS", "CWE-287"),
@@ -191,7 +191,7 @@ CVE_DATABASE: list = [
 
   # ── Dropbear ─────────────────────────────────────────────────────
   CveEntry("dropbear", "<2018.76", "CVE-2018-15599", Severity.MEDIUM, "Username enumeration via response size", "CWE-203"),
-  CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.HIGH, "Format string vulnerability in dbclient", "CWE-134"),
+  CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.CRITICAL, "Format string vulnerability in dbclient", "CWE-134"),
 
   # ── Erlang OTP SSH ──────────────────────────────────────────────
   CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
@@ -200,7 +200,7 @@ CVE_DATABASE: list = [
   CveEntry("couchdb", "<3.2.2",           "CVE-2022-24706", Severity.CRITICAL, "Default Erlang cookie RCE via cluster protocol", "CWE-1188"),
   CveEntry("couchdb", ">=3.0.0,<3.1.2",   "CVE-2021-38295", Severity.HIGH, "Privilege escalation via cluster API", "CWE-269"),
   CveEntry("couchdb", "<2.1.1",           "CVE-2017-12635", Severity.CRITICAL, "Admin creation race condition bypass", "CWE-269"),
-  CveEntry("couchdb", "<2.1.1",           "CVE-2017-12636", Severity.CRITICAL, "OS command injection via query server config", "CWE-78"),
+  CveEntry("couchdb", "<2.1.1",           "CVE-2017-12636", Severity.HIGH, "OS command injection via query server config", "CWE-78"),
 
   # ── InfluxDB ────────────────────────────────────────────────────
   CveEntry("influxdb", "<1.7.6",  "CVE-2019-20933", Severity.CRITICAL, "JWT auth bypass via empty shared secret", "CWE-287"),
@@ -217,11 +217,11 @@ CVE_DATABASE: list = [
 
   # ── WordPress ──────────────────────────────────────────────────
   CveEntry("wordpress", "<4.7.1",         "CVE-2016-10033", Severity.CRITICAL, "PHPMailer RCE via wp_mail()", "CWE-78"),
-  CveEntry("wordpress", "<4.7.4",         "CVE-2017-8295", Severity.HIGH, "Host header password reset hijack", "CWE-640"),
+  CveEntry("wordpress", "<4.7.4",         "CVE-2017-8295", Severity.MEDIUM, "Host header password reset hijack", "CWE-640"),
   CveEntry("wordpress", ">=4.7.0,<4.7.2", "CVE-2017-1001000", Severity.HIGH, "REST API content injection", "CWE-284"),
 
   # ── Joomla ─────────────────────────────────────────────────────
-  CveEntry("joomla", ">=4.0.0,<4.2.8",   "CVE-2023-23752", Severity.HIGH, "Unauthenticated information disclosure via REST API", "CWE-284"),
+  CveEntry("joomla", ">=4.0.0,<4.2.8",   "CVE-2023-23752", Severity.MEDIUM, "Unauthenticated information disclosure via REST API", "CWE-284"),
 
   # ── Django ─────────────────────────────────────────────────────
   CveEntry("django", "<1.11.5",          "CVE-2017-12794", Severity.MEDIUM, "Debug page XSS via invalid URL parameter", "CWE-79"),
@@ -232,13 +232,13 @@ CVE_DATABASE: list = [
   # ── Apache Struts2 ─────────────────────────────────────────────
   CveEntry("struts2", ">=2.3.5,<2.3.32",   "CVE-2017-5638", Severity.CRITICAL, "S2-045: OGNL injection via Content-Type header RCE", "CWE-94"),
   CveEntry("struts2", ">=2.5.0,<2.5.10.1", "CVE-2017-5638", Severity.CRITICAL, "S2-045: OGNL injection via Content-Type header RCE", "CWE-94"),
-  CveEntry("struts2", ">=2.3.5,<2.3.33",   "CVE-2017-9805", Severity.CRITICAL, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
-  CveEntry("struts2", ">=2.5.0,<2.5.13",   "CVE-2017-9805", Severity.CRITICAL, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
+  CveEntry("struts2", ">=2.3.5,<2.3.33",   "CVE-2017-9805", Severity.HIGH, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
+  CveEntry("struts2", ">=2.5.0,<2.5.13",   "CVE-2017-9805", Severity.HIGH, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
   CveEntry("struts2", ">=2.0.0,<2.5.26",   "CVE-2020-17530", Severity.CRITICAL, "S2-061: Forced OGNL evaluation via tag attributes", "CWE-94"),
 
   # ── Oracle WebLogic ──────────────────────────────────────────
-  CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2017-10271", Severity.CRITICAL, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
-  CveEntry("weblogic", ">=12.1.3.0,<12.1.3.1", "CVE-2017-10271", Severity.CRITICAL, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
+  CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2017-10271", Severity.HIGH, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
+  CveEntry("weblogic", ">=12.1.3.0,<12.1.3.1", "CVE-2017-10271", Severity.HIGH, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
   CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
   CveEntry("weblogic", ">=12.1.3.0,<12.2.1.5", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
   CveEntry("weblogic", ">=12.2.1.3,<12.2.1.4", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
@@ -274,7 +274,7 @@ CVE_DATABASE: list = [
   CveEntry("bind", "<9.16.42",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
   CveEntry("bind", "<9.18.24",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
   CveEntry("bind", "<9.11.31",  "CVE-2021-25216", Severity.CRITICAL, "GSSAPI SPNEGO buffer overflow RCE", "CWE-120"),
-  CveEntry("bind", "<9.11.19",  "CVE-2020-8617", Severity.HIGH, "TSIG validity check assertion failure DoS", "CWE-617"),
+  CveEntry("bind", "<9.11.19",  "CVE-2020-8617", Severity.MEDIUM, "TSIG validity check assertion failure DoS", "CWE-617"),
   CveEntry("bind", "<9.10.4",   "CVE-2016-2776", Severity.HIGH, "Crafted query buffer.c assertion failure DoS", "CWE-617"),
 ]
 
@@ -511,9 +511,10 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
       epss_score = float(epss_rec.score)
 
   # No live NVD record (production runs without the dynamic cache): the NVD
-  # vector fetched into the static table, so the label is CVSS-backed. Only
-  # when its band is the catalog label; a disagreeing vector is withheld, as a
-  # probe template is (RM-064), and listed by `test_cve_cvss_vectors.py` (RM-087).
+  # vector fetched into the static table, so the label is CVSS-backed (RM-087).
+  # Catalog labels are NVD's band (`test_cve_cvss_vectors.py`); the band check
+  # still guards a refetched table that moved ahead of the catalog, withholding
+  # the vector as a disagreeing probe template is (RM-064).
   if not cvss_vector and cvss_score is None:
     static_vector = CVE_CVSS_VECTORS.get(entry.cve_id, "")
     if static_vector and _template_band_agrees(static_vector, severity):
