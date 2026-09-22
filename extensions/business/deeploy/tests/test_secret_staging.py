@@ -118,6 +118,7 @@ class DeeploySecretBundleTests(unittest.TestCase):
       _pipeline(),
       {},
       self.plugin._load_dauth_job_secret_bundle(7),
+      prior_pipeline=_pipeline(),
     )
 
     env = bundle["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]["ENV"]
@@ -140,6 +141,34 @@ class DeeploySecretBundleTests(unittest.TestCase):
         pipeline,
         {},
         self.plugin._load_dauth_job_secret_bundle(7),
+        prior_pipeline=_pipeline(),
+      )
+
+  def test_reconstruction_rejects_prior_value_after_instance_reordering(self):
+    prior_pipeline = _pipeline()
+    prior_pipeline["PLUGINS"][0]["INSTANCES"].append({
+      "INSTANCE_ID": "other",
+      "ENV": {"CF_TUNNEL_TOKEN": DEEPLOY_DAUTH_SECRET_PLACEHOLDER},
+    })
+    current_pipeline = copy.deepcopy(prior_pipeline)
+    current_pipeline["PLUGINS"][0]["INSTANCES"].reverse()
+    prior_bundle = {
+      "job_id": "7",
+      "job_secrets": {
+        "PLUGINS": [{"INSTANCES": [
+          {"ENV": {"CF_TUNNEL_TOKEN": "prior-token"}},
+          {"ENV": {"CF_TUNNEL_TOKEN": "other-token"}},
+        ]}],
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, "CF_TUNNEL_TOKEN"):
+      self.plugin._build_complete_dauth_job_secret_bundle(
+        7,
+        current_pipeline,
+        {},
+        prior_bundle,
+        prior_pipeline=prior_pipeline,
       )
 
 

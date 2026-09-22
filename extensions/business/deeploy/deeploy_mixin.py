@@ -835,10 +835,11 @@ class _DeeployMixin:
       deeploy_specs=dct_deeploy_specs,
       expected_service_kind=service_kind,
     )
+    secure_config_nodes = full_target_nodes or nodes
     self._prepare_managed_service_secure_config(
       service_kind,
       inputs,
-      nodes,
+      secure_config_nodes,
       cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
     )
     plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
@@ -1079,6 +1080,7 @@ class _DeeployMixin:
     job_id,
     pipeline_configs,
     prior_bundle,
+    prior_pipeline=None,
   ):
     """Redact exact command metadata and reconstruct its complete bundle."""
     redacted_configs = {}
@@ -1098,6 +1100,7 @@ class _DeeployMixin:
       redacted_pipeline=representative,
       new_job_secrets=merged_new_secrets,
       prior_bundle=prior_bundle,
+      prior_pipeline=prior_pipeline,
     )
     return redacted_configs, bundle
 
@@ -1546,6 +1549,16 @@ class _DeeployMixin:
     )
     return cockroachdb_legacy_compat_contexts
 
+  def _load_csp_reconcile_secret_bundle(self, job_id, pipeline):
+    prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+    if isinstance(prior_bundle, dict):
+      return prior_bundle
+    if list(self._iter_deeploy_dauth_placeholder_paths(pipeline)):
+      raise ValueError(
+        "Cannot reconcile a redacted pipeline without its dAuth secret bundle"
+      )
+    return {"job_id": str(job_id), "job_secrets": {}}
+
   # Repairs Deeploy's off-chain pipeline metadata and live node configs after
   # PoAI Manager moves a CSP escrow to a new owner on-chain.
   def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner):
@@ -1598,6 +1611,7 @@ class _DeeployMixin:
     pipeline_to_persist = migrated_pipeline
     response_keys = {}
     node_update_delivered = False
+    staging_state = None
 
     if stale_nodes:
       discovered_instances = self._discover_plugin_instances(
@@ -1647,27 +1661,96 @@ class _DeeployMixin:
           "stale_nodes": stale_nodes,
         }
 
-      self.delete_pipeline_from_nodes(
-        job_id=job_id,
-        owner=None,
-        target_nodes=target_nodes,
-        allow_missing=True,
-        discovered_instances=discovered_instances,
+      service_kind = self._resolve_deeploy_service_kind(
+        inputs=inputs,
+        deeploy_specs=deeploy_specs,
+        discovered_plugin_instances=discovered_instances,
       )
-      _, _, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
-        owner=new_owner,
+      prepared_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+        nodes=target_nodes,
+        inputs=inputs,
+        app_id=migrated_pipeline.get("NAME"),
+        job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+        dct_deeploy_specs=deeploy_specs,
+        service_kind=service_kind,
+        cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
+        full_target_nodes=deeploy_specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES),
+      )
+      skip_response_key_reset = False
+      if prepared_deploy_plan.get("enable_chainstore_response"):
+        self._reset_chainstore_response_keys(
+          prepared_deploy_plan.get("response_keys", {}),
+          context=f"CSP reconciliation pipeline '{migrated_pipeline.get('NAME')}'",
+        )
+        skip_response_key_reset = True
+      prepared_pipeline_configs = self._build_create_pipeline_configs(
         inputs=inputs,
         app_id=migrated_pipeline.get("NAME"),
         app_alias=migrated_pipeline.get("APP_ALIAS") or migrated_pipeline.get("NAME"),
         app_type=migrated_pipeline.get("TYPE", "void"),
-        update_nodes=target_nodes,
-        new_nodes=[],
-        discovered_plugin_instances=discovered_instances,
-        dct_deeploy_specs=deeploy_specs,
-        job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
-        wait_for_responses=False,
-        cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
+        owner=new_owner,
+        prepared_deploy_plan=prepared_deploy_plan,
       )
+      try:
+        prior_bundle = self._load_csp_reconcile_secret_bundle(job_id, pipeline)
+        prepared_pipeline_configs, complete_secret_bundle = (
+          self._redact_pipeline_configs_and_build_secret_bundle(
+            job_id=job_id,
+            pipeline_configs=prepared_pipeline_configs,
+            prior_bundle=prior_bundle,
+            prior_pipeline=pipeline,
+          )
+        )
+        node_plugins_by_addr = prepared_deploy_plan.get("node_plugins_by_addr", {})
+        for node, pipeline_config in prepared_pipeline_configs.items():
+          if node in node_plugins_by_addr:
+            node_plugins_by_addr[node] = self.deepcopy(
+              pipeline_config.get(self.ct.CONFIG_STREAM.K_PLUGINS, [])
+            )
+        pipeline_to_persist = next(iter(prepared_pipeline_configs.values()))
+        staging_state = self.stage_job_pipeline_and_secrets(
+          pipeline=pipeline_to_persist,
+          job_id=job_id,
+          secret_bundle=complete_secret_bundle,
+        )
+      except Exception as exc:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: f"Failed to stage reconciled pipeline metadata: {exc}",
+        }
+
+      try:
+        self.delete_pipeline_from_nodes(
+          job_id=job_id,
+          owner=None,
+          target_nodes=target_nodes,
+          allow_missing=True,
+          discovered_instances=discovered_instances,
+        )
+        _, _, response_keys, _ = self.check_and_deploy_pipelines(
+          owner=new_owner,
+          inputs=inputs,
+          app_id=migrated_pipeline.get("NAME"),
+          app_alias=migrated_pipeline.get("APP_ALIAS") or migrated_pipeline.get("NAME"),
+          app_type=migrated_pipeline.get("TYPE", "void"),
+          update_nodes=[],
+          new_nodes=target_nodes,
+          discovered_plugin_instances=[],
+          dct_deeploy_specs_create=prepared_deploy_plan.get("deeploy_specs"),
+          prepared_create_deploy_plan=prepared_deploy_plan,
+          prepared_pipeline_configs=prepared_pipeline_configs,
+          skip_create_response_key_reset=skip_response_key_reset,
+          job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+          wait_for_responses=False,
+        )
+      except Exception as exc:
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: f"Failed to replace reconciled pipeline: {exc}",
+        }
       node_update_delivered = True
 
     if isinstance(pipeline_to_persist, dict):
@@ -1679,17 +1762,26 @@ class _DeeployMixin:
       pipeline_to_persist = migrated_pipeline
 
     if pipeline_changed or node_update_delivered:
-      saved = self.persist_job_pipeline_metadata(
-        pipeline=pipeline_to_persist,
-        job_id=job_id,
-        previous_cid=pipeline_cid,
-        delete_previous=True,
-      )
-      if not saved:
+      try:
+        if staging_state is None:
+          prior_bundle = self._load_csp_reconcile_secret_bundle(job_id, pipeline)
+          staging_state = self.stage_job_pipeline_and_secrets(
+            pipeline=pipeline_to_persist,
+            job_id=job_id,
+            secret_bundle=prior_bundle,
+          )
+      except Exception as exc:
         return {
           DEEPLOY_KEYS.STATUS: "failed",
           DEEPLOY_KEYS.JOB_ID: job_id,
-          DEEPLOY_KEYS.ERROR: "Failed to persist reconciled pipeline metadata",
+          DEEPLOY_KEYS.ERROR: f"Failed to stage reconciled pipeline metadata: {exc}",
+        }
+      if not self.commit_staged_job_pipeline_and_secrets(staging_state):
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: "Failed to commit reconciled pipeline metadata",
         }
 
     if node_update_delivered:
@@ -4660,6 +4752,7 @@ class _DeeployMixin:
     redacted_pipeline,
     new_job_secrets,
     prior_bundle=None,
+    prior_pipeline=None,
   ):
     """Reconstruct the complete current bundle from exact placeholder paths."""
     prior_job_secrets = {}
@@ -4676,6 +4769,12 @@ class _DeeployMixin:
       found, value = self._get_dauth_secret_fragment_value(new_job_secrets, path)
       if not found:
         found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, path)
+        if found and not self._same_dauth_secret_path_identity(
+          path,
+          redacted_pipeline,
+          prior_pipeline,
+        ):
+          found = False
       if (
         not found
         or value is None
@@ -4696,6 +4795,54 @@ class _DeeployMixin:
       "job_id": str(job_id),
       "job_secrets": complete,
     }
+
+  def _dauth_secret_path_identity(self, pipeline, path):
+    """Return the plugin identity owning a secret path."""
+    if not isinstance(pipeline, dict):
+      return None
+    normalized_path = [str(part).upper() if not isinstance(part, int) else part for part in path]
+    try:
+      plugins_pos = normalized_path.index("PLUGINS")
+      plugin_idx = normalized_path[plugins_pos + 1]
+    except (ValueError, IndexError):
+      return None
+    if not isinstance(plugin_idx, int):
+      return None
+    plugins = pipeline.get("PLUGINS", pipeline.get("plugins"))
+    if not isinstance(plugins, list) or plugin_idx >= len(plugins):
+      return None
+    plugin = plugins[plugin_idx]
+    if not isinstance(plugin, dict):
+      return None
+    signature = plugin.get("SIGNATURE", plugin.get("signature"))
+    if not isinstance(signature, str) or not signature:
+      return None
+
+    instance_id = None
+    if "INSTANCES" in normalized_path[plugins_pos + 2:]:
+      instances_pos = normalized_path.index("INSTANCES", plugins_pos + 2)
+      try:
+        instance_idx = normalized_path[instances_pos + 1]
+      except IndexError:
+        return None
+      instances = plugin.get("INSTANCES", plugin.get("instances"))
+      if (
+        not isinstance(instance_idx, int)
+        or not isinstance(instances, list)
+        or instance_idx >= len(instances)
+        or not isinstance(instances[instance_idx], dict)
+      ):
+        return None
+      instance = instances[instance_idx]
+      instance_id = instance.get("INSTANCE_ID", instance.get("instance_id"))
+      if instance_id in [None, ""]:
+        return None
+    return signature.upper(), None if instance_id is None else str(instance_id)
+
+  def _same_dauth_secret_path_identity(self, path, pipeline, prior_pipeline):
+    current_identity = self._dauth_secret_path_identity(pipeline, path)
+    prior_identity = self._dauth_secret_path_identity(prior_pipeline, path)
+    return current_identity is not None and current_identity == prior_identity
 
   def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):
     if not job_secrets:
@@ -5646,6 +5793,7 @@ class _DeeployMixin:
         job_id=job_id,
         pipeline_configs=prepared_create_configs,
         prior_bundle=prior_bundle,
+        prior_pipeline=base_pipeline,
       )
     )
     for node, pipeline in update_pipelines.items():

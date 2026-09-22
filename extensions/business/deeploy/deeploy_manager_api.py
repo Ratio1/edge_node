@@ -1198,11 +1198,21 @@ class DeeployManagerApiPlugin(
         prepared_deploy_plan=prepared_create_deploy_plan,
       )
       prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+      prior_pipeline = None
+      if isinstance(prior_bundle, dict):
+        prior_pipeline = self.get_job_pipeline_from_cstore(
+          job_id,
+          timeout=30,
+          pin=False,
+          raise_on_error=False,
+          show_logs=False,
+        )
       prepared_pipeline_configs, complete_secret_bundle = (
         self._redact_pipeline_configs_and_build_secret_bundle(
           job_id=job_id,
           pipeline_configs=prepared_pipeline_configs,
           prior_bundle=prior_bundle,
+          prior_pipeline=prior_pipeline,
         )
       )
       node_plugins_by_addr = prepared_create_deploy_plan.get("node_plugins_by_addr", {})
