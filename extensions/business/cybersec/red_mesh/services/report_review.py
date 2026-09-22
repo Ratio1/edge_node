@@ -23,6 +23,7 @@ from ..models.report_review import (
 )
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.effects import EffectState
+from ..tenancy.identity import canonical_account_id
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from .rulebook_assessment import (
   _job_repo,
@@ -57,7 +58,12 @@ def _latest_pass_nr(job_specs):
   """The newest completed pass on the job record; 1 when nothing says otherwise.
 
   Read from the record rather than the archive so a read never opens an
-  artifact, and so the read fixture's record-only jobs behave like real ones.
+  artifact. A finalized record is the pruned `CStoreJobFinalized`, which
+  carries `pass_count` and no `pass_reports`; `pass_reports` is read for a
+  record that still has them. Today nothing takes a FINALIZED job back to
+  RUNNING, so on a real job this value is frozen at approval time and the
+  `newer_scan_pass` staleness only fires once a re-run path exists (contract
+  §State model).
   """
   numbers = []
   for entry in job_specs.get("pass_reports") or []:
@@ -68,14 +74,11 @@ def _latest_pass_nr(job_specs):
         continue
   if numbers:
     return max(numbers)
-  for key in ("current_pass", "pass_count"):
-    try:
-      value = int(job_specs.get(key))
-    except (TypeError, ValueError):
-      continue
-    if value > 0:
-      return value
-  return 1
+  try:
+    value = int(job_specs.get("pass_count"))
+  except (TypeError, ValueError):
+    return 1
+  return value if value > 0 else 1
 
 
 def _validated_expected_revision(value, job_id):
@@ -140,6 +143,11 @@ def get_report_review(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenan
   try:
     review = repo.get_report_review_model(job_id)
   except ValueError:
+    if checked_job is not _UNSET:
+      # `_read_operation` does not project through `_public_review_result`, so
+      # a dict with an `error` key would be collapsed by the read guard; the
+      # rulebook read raises the same denial here.
+      raise AdministrationDenied(503, "review_contract_unsupported")
     return _error("review_contract_unsupported", job_id,
                   "Report review contract version is not supported by this backend.")
   return _view(job_id, review, _latest_pass_nr(job_specs))
@@ -149,8 +157,11 @@ def _admit_mutation(owner, job_id, expected_review_revision, actor, checked_job,
   expected, err = _validated_expected_revision(expected_review_revision, job_id)
   if err:
     return None, None, None, err
-  hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-report-review")
-  signer = _safe_text(actor or "", hmac_secret=hmac_secret, max_len=200)
+  # The actor is the admitted account id, already canonical; validating it
+  # rather than passing it through `_safe_text` keeps an id that happens to
+  # look like an IP or a token (`10.0.0.1`, 32 hex chars) from being stored as
+  # a pseudonym and printed as such in C.5.
+  signer = canonical_account_id(actor)
   if not signer:
     return None, None, None, _error("invalid_review_actor", job_id,
                                     "A server-derived review actor is required.")

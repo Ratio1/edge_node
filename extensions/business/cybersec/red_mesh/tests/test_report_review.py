@@ -47,9 +47,26 @@ class TestReportReview(unittest.TestCase):
 
   def test_approve_is_refused_without_a_server_derived_actor(self):
     owner = _Owner()
-    result = approve_report(owner, "job-1", expected_review_revision=0, actor="")
-    self.assertEqual(result["error"], "invalid_review_actor")
+    for actor in ("", None, "Not An Id!"):
+      result = approve_report(owner, "job-1", expected_review_revision=0, actor=actor)
+      self.assertEqual(result["error"], "invalid_review_actor")
     self.assertIsNone(get_report_review(owner, "job-1")["review"])
+
+  def test_an_account_id_shaped_like_an_ip_is_stored_as_itself(self):
+    # `_safe_text` would pseudonymise it; the signer is validated as an id instead.
+    owner = _Owner()
+    view = approve_report(owner, "job-1", expected_review_revision=0, actor="10.0.0.1")
+    self.assertEqual(view["review"]["reviewer"], "10.0.0.1")
+
+  def test_purge_removes_the_row_through_the_job_purge(self):
+    from extensions.business.cybersec.red_mesh.services.control import purge_job
+    owner = _Owner()
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
+    result = purge_job(owner, "job-1")
+    self.assertEqual(result["status"], "success", result)
+    self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:report_review", "job-1")])
+    self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:report_review:audit", "job-1")])
 
   def test_approve_is_refused_on_a_job_that_is_not_finalized(self):
     owner = _Owner(job_specs=_sample_job_specs(job_status="RUNNING"))
@@ -100,9 +117,12 @@ class TestReportReview(unittest.TestCase):
     )
 
   def test_a_newer_pass_makes_the_approval_stale_and_re_approval_re_pins_it(self):
+    # A finalized record is the pruned CStoreJobFinalized: `pass_count`, no
+    # `pass_reports`. Nothing re-runs a FINALIZED job today, so this pins the
+    # rule for the day a re-run path exists (contract §State model).
     owner = _Owner()
     approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
-    owner.job_specs = _sample_job_specs(pass_reports=[{"pass_nr": 1}, {"pass_nr": 2}])
+    owner.job_specs = _sample_job_specs(pass_count=2)
     view = get_report_review(owner, "job-1")
     self.assertTrue(view["stale"])
     self.assertEqual(view["stale_reasons"], ["newer_scan_pass"])

@@ -51,10 +51,29 @@ class TestOutOfScope(unittest.TestCase):
     self.assertEqual(properties["out_of_scope"]["maxItems"], properties["coverage_gaps"]["maxItems"])
     self.assertNotIn("out_of_scope", schema.get("required", []))
 
-  def test_both_prompts_define_the_split(self):
-    for prompt in (LEGACY_SYSTEM_PROMPT, LOCAL_CYBERSECQWEN_PROMPT):
+  def test_every_prompt_defines_the_split(self):
+    from extensions.business.cybersec.red_mesh.services.llm_structured import (
+      LOCAL_REPORT_CHUNKS, REMOTE_RICH_USER_PROMPT_TEMPLATE,
+    )
+    chunk_prompts = [chunk.prompt for chunk in LOCAL_REPORT_CHUNKS if "coverage_gaps" in chunk.prompt]
+    self.assertTrue(chunk_prompts)
+    for prompt in (LEGACY_SYSTEM_PROMPT, LOCAL_CYBERSECQWEN_PROMPT, REMOTE_RICH_USER_PROMPT_TEMPLATE,
+                   *chunk_prompts):
       self.assertIn("out_of_scope", prompt)
       self.assertIn("coverage_gaps", prompt)
+
+  def test_a_fabricated_cve_in_out_of_scope_is_caught(self):
+    from extensions.business.cybersec.red_mesh.models.llm_output import validate_llm_output
+    sections = LlmReportSections.from_dict({
+      "executive_headline": "One HIGH finding.", "background_draft": "Scope.",
+      "overall_posture": "Posture.", "recommendation_summary": ["Patch."],
+      "attack_chain_narratives": [], "coverage_gaps": [],
+      "out_of_scope": ["CVE-2099-99999 on the mail relay is not assessed."],
+      "conclusion": "Done.",
+    })
+    result = validate_llm_output(sections, findings=[])
+    self.assertTrue(any("CVE-2099-99999" in str(issue) for issue in getattr(result, "issues", result)),
+                    result)
 
 
 if __name__ == "__main__":

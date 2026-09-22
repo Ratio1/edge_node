@@ -529,6 +529,7 @@ def _validate_narrative_against_findings(
     " ".join(output.recommendation_summary),
     " ".join(output.attack_chain_narratives),
     " ".join(output.coverage_gaps),
+    " ".join(output.out_of_scope),
     output.conclusion,
   )
   llm_cves: set[str] = set()

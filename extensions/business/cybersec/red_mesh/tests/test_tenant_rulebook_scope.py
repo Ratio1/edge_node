@@ -178,6 +178,7 @@ def test_the_platform_roles_are_admitted_to_raw_evidence(name, extra, role):
    "review_revision_conflict"),
   ("submit_rulebook_review", {"profile_id": PROFILE}, "submission_pass_stale"),
   ("approve_report", {}, "review_revision_conflict"),
+  ("reopen_report_review", {}, "review_revision_conflict"),
 ))
 def test_a_typed_review_conflict_code_survives_the_tenant_path(name, extra, code):
   """The revision fence is the reason these four keep their own response shape; scoping them must
