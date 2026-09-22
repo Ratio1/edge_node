@@ -102,6 +102,8 @@ _READ_FIELDS = {
   "get_taxii_export_status": _JOB_FIELD + _REQUESTER_FIELDS,
   "get_rulebook_assessment_status": _JOB_FIELD + (("profile_id", str, None),) + _REQUESTER_FIELDS,
   "get_rulebook_review": _JOB_FIELD + (("profile_id", str, None),) + _REQUESTER_FIELDS,
+  "get_rulebook_artifact": _JOB_FIELD + (("cid", str, _REQUIRED), ("profile_id", str, None))
+                           + _REQUESTER_FIELDS,
   "get_misp_export_config_status": (("request_actor", dict, None), ("tenant_id", str, None)),
   "llm_health": (("request_actor", dict, None),),
   "update_finding_triage": (("request_actor", dict, None),),
@@ -186,6 +188,7 @@ _LIST_METHODS = ("list_network_jobs", "list_local_jobs")
 # the failure B6 shipped and had to revert.
 _TYPED_READ_ERRORS = {
   "/get_rulebook_assessment_status": {(400, "invalid_profile"), (400, "unsupported_job_type")},
+  "/get_rulebook_artifact": {(400, "invalid_profile"), (400, "unsupported_job_type")},
   "/get_rulebook_review": {(400, "invalid_profile"), (400, "unsupported_job_type"),
                            (409, "job_not_finalized"), (503, "submission_contract_unsupported")},
   # B10: the stop is refused because this node did not launch the job. Collapsed to `unavailable`

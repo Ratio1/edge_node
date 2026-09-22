@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, TENANT_EXPORT_STATUS_ROUTES, TENANT_JOBLESS_READ_ROUTES, TENANT_REQUIRED_READ_ROUTES, EFFECT_ROUTES, UNGUARDED_ROUTES, TENANT_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, TENANT_REVIEW_READ_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
+from .test_tenant_execution_native import ACTOR_ONLY_READ_ROUTES, TENANT_EXPORT_STATUS_ROUTES, TENANT_JOBLESS_READ_ROUTES, TENANT_REQUIRED_READ_ROUTES, EFFECT_ROUTES, UNGUARDED_ROUTES, TENANT_JSON_EXPORT_ROUTES, LEGACY_READ_ROUTES, TENANT_REVIEW_READ_ROUTES, TENANT_ARTIFACT_READ_ROUTES, READ_ROUTES, REPO_ROOT, ROUTES, _Comms, _render_native
 
 
 ERROR = "Incompatible generated read API"
@@ -72,6 +72,8 @@ def body_for(name):
     payload.pop("tenant_id")
   if name in TENANT_REVIEW_READ_ROUTES and name != "get_detection_correlation":
     payload["profile_id"] = "nis2.eu_baseline.v1"
+  if name in TENANT_ARTIFACT_READ_ROUTES:
+    payload.update(cid="rulebook", profile_id="nis2.eu_baseline.v1")
   if name in TENANT_JSON_EXPORT_ROUTES:
     payload["pass_nr"] = 1
   if name not in (("list_network_jobs", "list_local_jobs", "get_audit_log")
@@ -448,6 +450,11 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
       return
     if name == "get_report":
       payload["cid"] = "worker"
+    if name in TENANT_ARTIFACT_READ_ROUTES:
+      # Only a CID the job's own rulebook metadata records is served.
+      fixture.job["rulebook_assessments"] = {payload["profile_id"]: {"artifact_cid": "rulebook"}}
+      fixture.artifacts["rulebook"] = {"artifact_kind": "generated_assessment", "job_id": "job-1",
+                                       "profile": {"profile_id": payload["profile_id"]}}
     result, calls = assert_json_response(asyncio.run(request(module, name, payload)), 200)
     assert calls == 1
     actual = result["result"] if response_format == "WRAPPED" else result
@@ -460,6 +467,9 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
       assert actual["job_id"] == "job-1" and actual["cid"] == "worker"
       assert actual["report"]["job_id"] == "job-1"
       assert fixture.artifact_reads == [("archive", {"pin": False}), ("worker", {"pin": False})]
+    if name in TENANT_ARTIFACT_READ_ROUTES:
+      assert actual["cid"] == "rulebook" and actual["report"] == fixture.artifacts["rulebook"]
+      assert [cid for cid, _ in fixture.artifact_reads] == ["rulebook"]
     if name not in (("list_network_jobs", "list_local_jobs", "get_audit_log")
                     + ACTOR_ONLY_READ_ROUTES + TENANT_JOBLESS_READ_ROUTES):
       assert actual["job_id"] == "job-1"
@@ -467,7 +477,8 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
       # project it do.
       assert ("execution_binding" in actual) == (bound and name != "get_job_data"
                                                  and name not in TENANT_EXPORT_STATUS_ROUTES
-                                                 and name not in TENANT_REVIEW_READ_ROUTES)
+                                                 and name not in TENANT_REVIEW_READ_ROUTES
+                                                 and name not in TENANT_ARTIFACT_READ_ROUTES)
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))

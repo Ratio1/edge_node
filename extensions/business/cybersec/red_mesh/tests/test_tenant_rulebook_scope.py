@@ -36,7 +36,10 @@ MUTATIONS = (
   ("reopen_report_review", {"expected_review_revision": 0}),
 )
 EVIDENCE = (("get_raw_model_test_evidence", {}),)
-ALL = READS + MUTATIONS + EVIDENCE
+# The typed rulebook artifact read answers 404 for a CID the job does not record, so its
+# role matrix seeds one (below) instead of joining READS.
+ARTIFACT = (("get_rulebook_artifact", {"cid": "rulebook", "profile_id": PROFILE}),)
+ALL = READS + MUTATIONS + EVIDENCE + ARTIFACT
 
 # The operation each endpoint runs as, and therefore which roles hold it.
 VIEW_ROLES = ("tenant_user", "tenant_pentester", "tenant_admin", "super_pentester",
@@ -152,6 +155,18 @@ def test_every_tenant_role_reads_review_state(name, extra, role):
     result = invoke(fixture, name, extra, tenant_id=tenant_id)
     assert result.get("job_id") == "job-1", result
     assert_admitted(result)
+
+
+@pytest.mark.parametrize("name,extra", ARTIFACT)
+@pytest.mark.parametrize("role", VIEW_ROLES)
+def test_every_tenant_role_reads_a_recorded_rulebook_artifact(name, extra, role):
+  with read_endpoint_fixture(bound=True) as fixture:
+    fixture.job["rulebook_assessments"] = {PROFILE: {"artifact_cid": "rulebook"}}
+    fixture.artifacts["rulebook"] = {"artifact_kind": "generated_assessment", "job_id": "job-1",
+                                     "profile": {"profile_id": PROFILE}}
+    tenant_id = as_role(fixture, role)
+    result = invoke(fixture, name, extra, tenant_id=tenant_id)
+    assert result.get("cid") == "rulebook" and result.get("report") == fixture.artifacts["rulebook"], result
 
 
 @pytest.mark.parametrize("name,extra", MUTATIONS)

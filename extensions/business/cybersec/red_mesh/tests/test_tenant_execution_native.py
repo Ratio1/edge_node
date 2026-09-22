@@ -32,6 +32,8 @@ TENANT_EXPORT_STATUS_ROUTES = (
 )
 # RM-084 P2: rulebook and correlation reads that require a tenant.
 TENANT_REVIEW_READ_ROUTES = ("get_detection_correlation", "get_rulebook_assessment_status", "get_rulebook_review")
+# The typed rulebook artifact read: a job-recorded CID, never through get_report.
+TENANT_ARTIFACT_READ_ROUTES = ("get_rulebook_artifact",)
 ACTOR_ONLY_READ_ROUTES = ("llm_health", "update_finding_triage")
 # Job-less reads with a required tenant (RM-081 Phase 3c added the selector; RM-084 P1 removed the
 # unscoped half). The selector is appended last, as stop_monitoring's is.
@@ -71,7 +73,8 @@ JOB_READ_ROUTES = (
 # Reads that refuse a missing tenant with 400: RM-084 P1 moved the export reads here, and P6 the job
 # reads, whose unscoped legacy path is gone.
 TENANT_REQUIRED_READ_ROUTES = (JOB_READ_ROUTES + TENANT_EXPORT_STATUS_ROUTES + TENANT_JOBLESS_READ_ROUTES
-                               + TENANT_JSON_EXPORT_ROUTES + TENANT_REVIEW_READ_ROUTES)
+                               + TENANT_JSON_EXPORT_ROUTES + TENANT_REVIEW_READ_ROUTES
+                               + TENANT_ARTIFACT_READ_ROUTES)
 READ_ROUTES = LEGACY_READ_ROUTES + TENANT_REQUIRED_READ_ROUTES
 SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
 ERROR = "Incompatible generated execution API"
@@ -113,6 +116,9 @@ def _render_native(default_route=None):
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "request_actor", "tenant_id")
     elif method.name in TENANT_REVIEW_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "profile_id", "request_actor", "tenant_id")
+    elif method.name in TENANT_ARTIFACT_READ_ROUTES:
+      assert tuple(arg.arg for arg in method.args.args) == ("self", "job_id", "cid", "profile_id",
+                                                            "request_actor", "tenant_id")
     elif method.name in ACTOR_ONLY_READ_ROUTES:
       assert tuple(arg.arg for arg in method.args.args) == ("self", "request_actor")
     elif method.name in TENANT_JOBLESS_READ_ROUTES:
