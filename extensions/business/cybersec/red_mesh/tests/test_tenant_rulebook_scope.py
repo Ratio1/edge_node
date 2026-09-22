@@ -68,6 +68,14 @@ def second_tenant(fixture):
   return tenant_id
 
 
+def record_artifact(fixture, name):
+  """Give the artifact read a CID the job records, so a denial is admission's and not the CID check's."""
+  if name == "get_rulebook_artifact":
+    fixture.job["rulebook_assessments"] = {PROFILE: {"artifact_cid": "rulebook"}}
+    fixture.artifacts["rulebook"] = {"artifact_kind": "generated_assessment", "job_id": "job-1",
+                                     "profile": {"profile_id": PROFILE}}
+
+
 def assert_denied(result, status, error):
   # Mutation denials also carry `status: "error"` for the panels; the typed triple is the contract.
   assert (result.get("success"), result.get("status_code"), result.get("error")) == (False, status, error), result
@@ -100,6 +108,7 @@ def test_a_job_owned_by_another_tenant_is_not_found(name, extra):
     fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": "super_tenant_admin", "tenant_id": None} if (name, extra) in EVIDENCE
       else {"role": "tenant_admin", "tenant_id": other}]
+    record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=other)
     assert_denied(result, 404, "not_found")
     assert fixture.artifact_reads == []
@@ -110,6 +119,7 @@ def test_a_tenant_the_caller_does_not_belong_to_is_not_found(name, extra):
   with read_endpoint_fixture(bound=True) as fixture:
     other = second_tenant(fixture)
     as_role(fixture, "tenant_admin")  # a member of the fixture tenant only
+    record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=other)
     assert_denied(result, 404, "not_found")
     assert fixture.artifact_reads == []
@@ -119,6 +129,7 @@ def test_a_tenant_the_caller_does_not_belong_to_is_not_found(name, extra):
 def test_an_unknown_tenant_is_not_found(name, extra):
   with read_endpoint_fixture(bound=True) as fixture:
     as_role(fixture, "super_tenant_admin")  # authorized everywhere; the tenant does not exist
+    record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=OTHER_TENANT)
     assert_denied(result, 404, "not_found")
     assert fixture.artifact_reads == []
@@ -161,9 +172,7 @@ def test_every_tenant_role_reads_review_state(name, extra, role):
 @pytest.mark.parametrize("role", VIEW_ROLES)
 def test_every_tenant_role_reads_a_recorded_rulebook_artifact(name, extra, role):
   with read_endpoint_fixture(bound=True) as fixture:
-    fixture.job["rulebook_assessments"] = {PROFILE: {"artifact_cid": "rulebook"}}
-    fixture.artifacts["rulebook"] = {"artifact_kind": "generated_assessment", "job_id": "job-1",
-                                     "profile": {"profile_id": PROFILE}}
+    record_artifact(fixture, name)
     tenant_id = as_role(fixture, role)
     result = invoke(fixture, name, extra, tenant_id=tenant_id)
     assert result.get("cid") == "rulebook" and result.get("report") == fixture.artifacts["rulebook"], result
