@@ -39,6 +39,7 @@ from extensions.business.deeploy.deeploy_const import (
   JOB_APP_TYPES,
 )
 from extensions.business.deeploy.deeploy_manager_api import DeeployManagerApiPlugin
+from extensions.business.deeploy.deeploy_mixin import DEEPLOY_DAUTH_SECRET_PLACEHOLDER
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
 
 
@@ -104,6 +105,9 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "persisted": 0,
       "bc_update": 0,
       "stage": 0,
+      "committed": 0,
+      "staged_pipeline": None,
+      "staged_secret_bundle": None,
     }
     plugin.bc = types.SimpleNamespace(
       node_addr_to_eth_addr=lambda node: node,
@@ -131,6 +135,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin._load_dauth_job_secret_bundle = lambda job_id: None
     def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
       called["stage"] += 1
+      called["staged_pipeline"] = copy.deepcopy(pipeline)
+      called["staged_secret_bundle"] = copy.deepcopy(secret_bundle)
       return {
         "job_id": str(job_id),
         "pipeline": copy.deepcopy(pipeline),
@@ -685,7 +691,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     for index, node in enumerate(nodes):
       emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
       overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
-      self.assertEqual(overlay["ENV"]["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
+      self.assertEqual(
+        overlay["ENV"]["CRDB_NODE_KEY"],
+        DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+      )
+      stored_env = (
+        called["staged_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
+        ["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
+      )
+      self.assertEqual(stored_env["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
     self.assertEqual(called["delete"], 1)
     self.assertEqual(called["deploy"], 1)
 
@@ -754,7 +768,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     for index, node in enumerate(nodes):
       emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
       overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
-      self.assertEqual(overlay["ENV"]["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
+      self.assertEqual(
+        overlay["ENV"]["CRDB_NODE_KEY"],
+        DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+      )
+      stored_env = (
+        called["staged_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
+        ["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
+      )
+      self.assertEqual(stored_env["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 1)
 
@@ -784,10 +806,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       claim,
     )
 
-  def test_cockroachdb_regeneration_reports_persistence_failure_after_three_attempts(self):
+  def test_cockroachdb_regeneration_reports_staging_commit_failure(self):
     plugin, called = self._make_process_update_plugin(discovered_instances=[])
-    plugin.persist_job_pipeline_metadata = (
-      lambda **kwargs: called.__setitem__("persisted", called["persisted"] + 1) or False
+    plugin.commit_staged_job_pipeline_and_secrets = (
+      lambda state: called.__setitem__("committed", called["committed"] + 1) or False
     )
     operation = {
       "owner": "0xOwner",
@@ -806,12 +828,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     result = plugin.finalize_pending_request_pipeline(
       pending={
         "confirm": {"nodes_changed": False},
-        "persistence": {
-          "pipeline": {"NAME": "cockroachdb_422ce92"},
-          "job_id": 11,
-          "previous_cid": "old-cid",
-          "delete_previous": True,
-        },
+        "staging": {"job_id": "11", "staged_cid": "new-cid"},
         "managed_update_action_claim_key": claim_key,
         "managed_update_action": operation,
         "base_result": {},
@@ -822,16 +839,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     self.assertEqual(result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
     self.assertIn("metadata persistence failed", result[DEEPLOY_KEYS.ERROR])
-    self.assertEqual(called["persisted"], 3)
-    self.assertEqual(called["queued"], 1)
-    self.assertEqual(
-      plugin._pending_managed_update_actions,
-      {
-        ("0xOwner", "cockroachdb_422ce92"): (
-          operation["kind"], operation["operation_id"], operation["intent_hash"]
-        ),
-      },
-    )
+    self.assertEqual(called["committed"], 1)
+    self.assertEqual(called["persisted"], 0)
+    self.assertEqual(called["queued"], 0)
+    self.assertEqual(plugin._pending_managed_update_actions, {})
 
   def test_process_cockroachdb_regeneration_replay_uses_recent_confirmed_success(self):
     fixture_plugin = make_deeploy_plugin()
@@ -879,14 +890,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "certificateGenerationId": regeneration_id,
       "certificateRegenerationIntentSha256": intent_hash,
     })
-    durable_pipeline = {}
+    durable_pipeline = {
+      "OWNER": "0xOwner",
+      "NAME": "cockroachdb_422ce92",
+      "DEEPLOY_SPECS": applied_specs,
+    }
 
-    def persist_regeneration(**kwargs):
-      called["persisted"] += 1
-      durable_pipeline.update(copy.deepcopy(kwargs["pipeline"]))
+    def commit_regeneration(state):
+      called["committed"] += 1
       return True
 
-    plugin.persist_job_pipeline_metadata = persist_regeneration
+    plugin.commit_staged_job_pipeline_and_secrets = commit_regeneration
     operation = {
       "owner": "0xOwner",
       "app_id": "cockroachdb_422ce92",
@@ -903,16 +917,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.finalize_pending_request_pipeline(
       pending={
         "confirm": {"nodes_changed": False},
-        "persistence": {
-          "pipeline": {
-            "OWNER": "0xOwner",
-            "NAME": "cockroachdb_422ce92",
-            "DEEPLOY_SPECS": applied_specs,
-          },
-          "job_id": 11,
-          "previous_cid": "old-cid",
-          "delete_previous": True,
-        },
+        "staging": {"job_id": "11", "staged_cid": "new-cid"},
         "managed_update_action_claim_key": claim_key,
         "managed_update_action": operation,
         "base_result": {},
@@ -920,7 +925,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       dct_status={f"response-{index}": {"node": node} for index, node in enumerate(nodes)},
       str_status=DEEPLOY_STATUS.SUCCESS,
     )
-    self.assertEqual(called["persisted"], 1)
+    self.assertEqual(called["committed"], 1)
+    self.assertEqual(called["persisted"], 0)
     called["queued"] = 0
     plugin._applied_managed_update_actions = {}
     plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: copy.deepcopy(durable_pipeline)

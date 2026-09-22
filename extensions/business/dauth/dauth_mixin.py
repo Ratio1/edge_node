@@ -21,9 +21,6 @@ from .dauth_registry import (
 from ratio1.const.base import dAuth
 
 
-from extensions.business.dauth.dauth_registry import dauth_registry_write_kwargs
-
-
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
 DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
