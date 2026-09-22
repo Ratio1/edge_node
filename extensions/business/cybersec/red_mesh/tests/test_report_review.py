@@ -262,6 +262,13 @@ class TestReportReviewOnTheJobsList(unittest.TestCase):
     owner.job_specs = _sample_job_specs(pass_count=2)
     self.assertEqual(self._list(owner)["job-1"]["review"]["review_status"], "pending")
 
+  def test_the_finalized_job_read_carries_the_same_summary(self):
+    from extensions.business.cybersec.red_mesh.services.query import get_job_data
+    owner = _Owner()
+    reject_report(owner, "job-1", expected_review_revision=0, note="Duplicates", actor="bob")
+    review = get_job_data(owner, "job-1")["job"]["review"]
+    self.assertEqual((review["review_status"], review["pass_nr"], review["reviewer"]), ("rejected", 1, "bob"))
+
   def test_a_running_job_lists_no_review(self):
     owner = _Owner(job_specs=_sample_job_specs(job_status="RUNNING", job_cid=None))
     self.assertIsNone(self._list(owner)["job-1"]["review"])

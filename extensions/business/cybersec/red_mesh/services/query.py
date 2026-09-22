@@ -250,10 +250,13 @@ def get_job_data(owner, job_id: str, *, checked_job=_UNSET, snapshot_mode="tenan
   job_specs = _sanitize_model_test_job_specs(job_specs)
 
   if job_specs.get("job_cid"):
+    # A reviewable (finalized scan) job carries its report review summary for
+    # the job meta block; anything else passes through untouched.
+    review = review_summaries(owner, {job_id: job_specs})[job_id]
     return {
       "job_id": job_id,
       "found": True,
-      "job": job_specs,
+      "job": {**job_specs, "review": review} if review is not None else job_specs,
     }
 
   pass_reports = job_specs.get("pass_reports", [])
