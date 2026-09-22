@@ -16,7 +16,7 @@ from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.effects import EffectState
 from .event_hooks import emit_lifecycle_event
 from .secrets import collect_secret_refs_from_job_config
-from .state_machine import set_job_status
+from .state_machine import is_terminal_job_status, set_job_status
 
 
 def _job_repo(owner):
@@ -875,6 +875,16 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT", *, checked_job=
     return owner_error
   stop_type = str(stop_type).upper()
   is_continuous = job_specs.get("run_mode") == RUN_MODE_CONTINUOUS_MONITORING
+  # A job that already ended has nothing to stop. Refused with its own code (a monitor that stopped
+  # on a worker failure is the live case); left to set_job_status it raised, and the effect seam
+  # reported the invalid transition as `unavailable`, inviting a retry that can never succeed.
+  if is_terminal_job_status(job_specs.get("job_status")):
+    return {
+      "error": "job_not_running",
+      "message": f"Job is already {job_specs.get('job_status')}.",
+      "status_code": 409,
+      "job_id": job_id,
+    }
   # Contract 4 before anything irreversible. An earlier revision checkpointed after the workers
   # were already cancelled and the SOC notified, which is too late to be a control.
   if ledger is not None:

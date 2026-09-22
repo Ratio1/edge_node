@@ -150,6 +150,29 @@ def test_the_launcher_mismatch_keeps_its_code_over_the_wire(read_native, respons
     assert json.loads(body)["error"] == "job_launcher_mismatch", body
 
 
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_a_stop_on_a_job_that_already_ended_keeps_its_code_over_the_wire(read_native, response_format):
+  """Found live (RM-088): a SOFT stop on a monitor that had already stopped raised inside the
+  service (`STOPPED -> SCHEDULED_FOR_STOP` is not a transition) and the effect seam reported it as
+  `unavailable`, which invites a retry that can never succeed. The job's end is checked before the
+  ledger checkpoint, so nothing is stopped, persisted or emitted, and the code survives the guard."""
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+    module.eng = scheduler_comms(fixture, response_format)
+    fixture.store.jobs["job-1"].update(job_status="STOPPED", run_mode="CONTINUOUS_MONITORING")
+    fixture.owner.ee_addr = "node-a"   # the fixture job's launcher: the stop is ours to refuse
+    fixture.owner.P = lambda *_args, **_kwargs: None
+    fixture.owner._log_audit_event = lambda *_args, **_kwargs: None
+    fixture.owner.scan_jobs = {}
+    status, headers, body, _calls = asyncio.run(request(module, "stop_monitoring",
+      {**BODY, "stop_type": "SOFT", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}))
+    assert status == 409, body
+    assert headers[b"cache-control"] == b"no-store"
+    assert json.loads(body)["error"] == "job_not_running", body
+    assert fixture.store.jobs["job-1"]["job_status"] == "STOPPED"
+
+
 # --- RM-026 MVP: stop_monitoring through the tenant seam -------------------------------------------
 # The MVP walkthrough stops a tenant-bound job as a tenant-scoped actor. Until now stop_monitoring
 # passed tenant_id=None to the effect seam (legacy only), and its operation "reports:export" was in
