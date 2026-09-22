@@ -1,5 +1,5 @@
 """
-CVSS v3.1 base vectors for probe findings, one per kind of weakness.
+CVSS v3.1 base vectors for probe and graybox findings, one per kind of weakness.
 
 A probe's registry `cvss_template` is one vector for everything the probe
 reports, and one probe reports findings from CRITICAL to LOW. Where the
@@ -12,6 +12,10 @@ Each constant's band is asserted in `tests/test_cvss_coverage.py`, and every
 non-INFO `Finding(` under `worker/` must either pass one of these or inherit
 an agreeing template (RM-087). Temporal and environmental metrics are not
 used: the scanner does not know exploit maturity or the target's context.
+
+Graybox scenarios name theirs in `graybox/scenario_catalog.py`. Those tests run
+as a logged-in regular user, so a weakness they find needs that login:
+`PR:L`, which caps an unscoped vector at 8.8 (HIGH).
 """
 
 # --- CRITICAL ---------------------------------------------------------------
@@ -53,6 +57,28 @@ WEAK_CRYPTO_BREAKABLE = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N"  # 7.4
 CORS_CREDENTIALED = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N"  # 8.1
 # Active mixed content: a script fetched over HTTP on an HTTPS page.
 MIXED_CONTENT_ACTIVE = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:H/A:N"  # 8.0
+# A regular user reaches a function or data reserved for another role and can
+# act on it: function-level bypass, role override, mass assignment of a role.
+AUTHZ_BYPASS_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"  # 8.1
+# A regular user deletes another user's object.
+OBJECT_DELETE_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:H"  # 8.1
+# A regular user changes another user's object, or its owner; the response
+# shows part of it.
+OBJECT_TAMPER_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N"  # 7.1
+# SQL injection reachable after login.
+INJECTION_DATA_ACCESS_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N"  # 7.1
+# Command injection reachable after login.
+RCE_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"  # 8.8
+# Template injection indicated after login, execution not confirmed (AC:H).
+RCE_UNCONFIRMED_AUTHENTICATED = "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H"  # 7.5
+# Server-side request forgery reaching internal resources, after login.
+SSRF_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N"  # 8.5
+# Cross-site request forgery on a state-changing form (NVD's usual vector).
+CSRF = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H"  # 8.8
+# Authentication an attacker defeats under a condition the scan did not
+# establish: a weak or unsigned token, a guessable password, a reset token
+# that is predictable or still valid. Account takeover once it holds (AC:H).
+AUTH_DEFEATABLE = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N"  # 7.4
 
 # --- MEDIUM -----------------------------------------------------------------
 
@@ -79,6 +105,28 @@ OPEN_REDIRECT = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"  # 6.1
 UNSUPPORTED_SOFTWARE = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L"  # 5.6
 # A third-party script loaded without Subresource Integrity.
 SRI_SCRIPT_MISSING = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:L/I:L/A:N"  # 4.7
+# A regular user reads data that is not theirs: another user's object, a
+# path outside the web root, properties the API should not return.
+DATA_EXPOSED_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"  # 6.5
+# A regular user skips a workflow step or submits a value the business rules
+# forbid (a negative amount).
+BUSINESS_LOGIC_BYPASS = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N"  # 6.5
+# A regular user repeats a business flow without limit or uniqueness check.
+BUSINESS_FLOW_ABUSE = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:N"  # 4.3
+# Input of an unexpected type accepted after login (JSON type confusion).
+INPUT_VALIDATION_BYPASS = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N"  # 5.4
+# Script or header injection reflected to a logged-in victim (NVD's usual
+# authenticated XSS vector; header injection leads to response splitting).
+XSS_AUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N"  # 5.4
+# Script injection on a page served before login (NVD's usual XSS vector).
+XSS_UNAUTHENTICATED = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"  # 6.1
+# Session identifier not rotated at login: fixation needs a victim to log in
+# on a planted identifier.
+SESSION_FIXATION = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:N"  # 6.8
+# A token that stays valid after logout: useful only to whoever already holds it.
+SESSION_NOT_REVOKED = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N"  # 4.8
+# An API that returns or accepts unbounded amounts of data for a regular user.
+RESOURCE_UNBOUNDED = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L"  # 4.3
 
 # --- LOW --------------------------------------------------------------------
 
@@ -89,7 +137,8 @@ INFO_DISCLOSURE_LOW = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N"  # 3.7
 WEAK_CRYPTO_MARGINAL = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N"  # 3.7
 # Certificate hygiene: placeholder names, long validity, near expiry.
 CERT_HYGIENE = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"  # 3.1
-# A defence-in-depth header missing where the rest of the page is sound.
+# A defence-in-depth header or cookie attribute missing where the rest of the
+# page is sound.
 MISSING_HEADER_LOW = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"  # 3.1
 # A third-party stylesheet loaded without Subresource Integrity.
 SRI_STYLESHEET_MISSING = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:N/I:L/A:N"  # 3.1
@@ -97,3 +146,8 @@ SRI_STYLESHEET_MISSING = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:N/I:L/A:N"  # 3.1
 DATA_DURABILITY = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:L"  # 3.7
 # POODLE (CVE-2014-3566), the NVD vector.
 SSLV3_POODLE = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:L/I:N/A:N"  # 3.4
+# CORS that allows any origin without credentials: only what the page shows
+# a visitor without a session is readable cross-origin.
+CORS_UNCREDENTIALED = "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"  # 3.1
+# No request rate limit on an API endpoint for a regular user.
+RATE_LIMIT_MISSING = "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:L"  # 3.1

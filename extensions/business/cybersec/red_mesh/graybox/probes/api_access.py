@@ -5,11 +5,13 @@ import re
 import requests
 
 from .base import ProbeBase
+from ... import cvss_vectors as V
 
 
-# Sensitive-field-name patterns that escalate a BOLA finding to CRITICAL
-# when present in the leaked response (Subphase 2.1 design § FP guards +
-# severity). Field NAMES only — values never inspected here; the
+# Sensitive-field-name patterns reported as `pii_fields=` evidence on a BOLA
+# finding (Subphase 2.1 design § FP guards). They no longer raise its label:
+# a regular user's read scores 6.5 MEDIUM with or without them (RM-087).
+# Field NAMES only — values never inspected here; the
 # centralised scrubber strips secret values at the storage boundary.
 _BOLA_PII_FIELD_PATTERNS = (
   re.compile(r"(?i)\b(email|e_mail)\b"),
@@ -57,9 +59,7 @@ class ApiAccessProbes(ProbeBase):
     ``owner_field`` mismatches the authenticated username (or
     ``tenant_field`` mismatches the expected tenant).
 
-    Severity:
-      HIGH by default.
-      CRITICAL when leaked response contains PII-ish field NAMES.
+    Severity: MEDIUM, the band of a regular user's read (RM-087).
     """
     api_security = self.target_config.api_security
     endpoints = api_security.object_endpoints
@@ -182,7 +182,6 @@ class ApiAccessProbes(ProbeBase):
 
     if owner_mismatch or tenant_mismatch:
       sensitive_fields = self._collect_sensitive_field_names(data)
-      severity = "CRITICAL" if sensitive_fields else "HIGH"
       evidence = [
         f"endpoint={url}",
         "response_status=200",
@@ -205,7 +204,7 @@ class ApiAccessProbes(ProbeBase):
         "even though the requester is not the owner.",
       ]
       self.emit_vulnerable(
-        "PT-OAPI1-01", title, severity, owasp, cwe, evidence,
+        "PT-OAPI1-01", title, "MEDIUM", owasp, cwe, evidence,
         replay_steps=replay,
         remediation=(
           "Enforce per-object authorization on the endpoint: verify that "
@@ -376,11 +375,12 @@ class ApiAccessProbes(ProbeBase):
         found_any = True
         continue
 
-      # Severity: HIGH baseline; CRITICAL when path matches /admin or
-      # function_endpoint is explicitly tagged privilege=admin.
-      privilege = (ep.privilege or "").lower()
-      severity = "CRITICAL" if (privilege == "admin"
-                                  or "/admin" in ep.path.lower()) else "HIGH"
+      # A read, so confidentiality only: a regular user's needs a login
+      # (PR:L, 6.5 MEDIUM), an anonymous one does not (7.5 HIGH).
+      severity, vector = (
+        ("HIGH", V.SENSITIVE_DATA_EXPOSED) if principal == "anonymous"
+        else ("MEDIUM", V.DATA_EXPOSED_AUTHENTICATED)
+      )
       evidence = [
         f"endpoint={url}", f"principal={principal}",
         f"response_status={status}",
@@ -395,6 +395,7 @@ class ApiAccessProbes(ProbeBase):
       ]
       self.emit_vulnerable(
         scenario_id, title, severity, owasp, cwe, evidence,
+        cvss_vector=vector,
         replay_steps=replay,
         remediation=(
           "Add the appropriate authorization decorator/middleware on the "
@@ -573,10 +574,6 @@ class ApiAccessProbes(ProbeBase):
       def revert(base, _revert_url=revert_url, _ep=ep):
         return self._revert_function_endpoint(session, _revert_url, _ep)
 
-      privilege = (ep.privilege or "").lower()
-      severity = ("CRITICAL"
-                  if privilege == "admin" or "/admin" in ep.path.lower()
-                  else "HIGH")
       self.run_stateful(
         "PT-OAPI5-04",
         baseline_fn=baseline,
@@ -584,7 +581,7 @@ class ApiAccessProbes(ProbeBase):
         verify_fn=verify,
         revert_fn=revert,
         finding_kwargs={
-          "title": title, "owasp": owasp, "severity": severity,
+          "title": title, "owasp": owasp, "severity": "HIGH",
           "cwe": ["CWE-285", "CWE-862"],
           "evidence": [f"endpoint={url}", f"method={method}",
                        "principal=regular"],

@@ -5,6 +5,7 @@ import re
 import requests
 
 from .base import ProbeBase
+from ... import cvss_vectors as V
 
 
 _DEBUG_BODY_MARKERS = (
@@ -103,9 +104,9 @@ class ApiConfigProbes(ProbeBase):
       wildcard_with_creds = acao == "*" and acac == "true"
 
       if wildcard_with_creds or (origin_echoes_evil and acac == "true"):
-        severity = "HIGH"
+        severity, vector = "HIGH", V.CORS_CREDENTIALED
       elif acao == "*":
-        severity = "LOW"
+        severity, vector = "LOW", V.CORS_UNCREDENTIALED
       else:
         self.emit_clean(
           "PT-OAPI8-01", "API permissive CORS configuration", "API8:2023",
@@ -120,6 +121,7 @@ class ApiConfigProbes(ProbeBase):
         severity, "API8:2023", ["CWE-942"],
         [f"endpoint={url}", f"acao={acao}", f"acac={acac}",
          f"sent_origin=https://evil.example"],
+        cvss_vector=vector,
         remediation=(
           "Replace permissive CORS with an explicit allowlist of trusted "
           "origins. Never echo an arbitrary Origin alongside "
@@ -394,6 +396,7 @@ class ApiConfigProbes(ProbeBase):
             private.append(p)
             break
       severity = "MEDIUM" if private else "LOW"
+      vector = V.INFO_DISCLOSURE_MEDIUM if private else V.INFO_DISCLOSURE_LOW
       ev = [f"path={url}", f"status={resp.status_code}",
              f"spec_paths_count={len(spec_paths)}",
              f"private_paths_count={len(private)}"]
@@ -402,6 +405,7 @@ class ApiConfigProbes(ProbeBase):
       self.emit_vulnerable(
         "PT-OAPI9-01", "API OpenAPI/Swagger specification publicly exposed",
         severity, "API9:2023", ["CWE-1059", "CWE-538"], ev,
+        cvss_vector=vector,
         remediation=(
           "Gate the OpenAPI/Swagger doc behind authentication, or "
           "publish only a curated subset of the spec covering public "

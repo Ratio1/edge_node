@@ -630,8 +630,12 @@ class ProbeBase:
                        evidence, *, attack=None, evidence_artifacts=None,
                        replay_steps=None, remediation=None,
                        rollback_status="", url=None, parameter=None,
-                       method=None, response=None):
+                       method=None, response=None, cvss_vector=""):
     """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default.
+
+    ``cvss_vector`` is needed only where the label varies at run time: the
+    catalog's vector is the scenario's, and a probe that reports it at another
+    severity passes the vector of the weakness that severity stands for.
 
     ``rollback_status`` is set by `run_stateful` for stateful probes;
     leave default for non-stateful findings.
@@ -676,6 +680,7 @@ class ProbeBase:
       replay_steps=self._scrub_for_emission(steps),
       remediation=self._scrub_for_emission(remediation or ""),
       rollback_status=rollback_status or "",
+      cvss_vector=cvss_vector or "",
     ))
 
   def emit_clean(self, scenario_id, title, owasp, evidence,

@@ -24,6 +24,8 @@ from dataclasses import dataclass, asdict, field
 from typing import Any
 
 from ..credential_redaction import redact_credential_strings
+from ..cvss import cvss31_base_score
+from ..findings import _template_band_agrees
 from ..references import reference_urls as _reference_urls
 from ..models.finding_schema import (
   REDMESH_FINDING_SCHEMA,
@@ -35,6 +37,7 @@ from ..models.finding_identity import (
   dedup_key as _dedup_key,
   parse_cwe_list as _parse_cwe_list,
 )
+from .scenario_catalog import graybox_scenario
 
 
 # ── Centralised secret scrubber (Subphase 1.6 commit #2) ────────────────
@@ -589,6 +592,7 @@ class GrayboxFinding:
     confidence, confidence_recognised = _normalize_confidence(
       confidence_map.get(self.status, "tentative"),
     )
+    cvss_vector, cvss_score, severity_source = self._cvss(declared_severity)
 
     flat = {
       # Both producers stamp the same contract. Until they did, "the finding
@@ -642,8 +646,8 @@ class GrayboxFinding:
       "status": self.status,
       "replay_steps": list(self.replay_steps),
       "attack_ids": list(self.attack),
-      "cvss_score": self.cvss_score,
-      "cvss_vector": self.cvss_vector,
+      "cvss_score": cvss_score,
+      "cvss_vector": cvss_vector,
       "rollback_status": self.rollback_status,
       # Structured location, in the same shape the blackbox `AffectedAsset`
       # uses, so both finding types answer "where" the same way. Empty rather
@@ -673,9 +677,28 @@ class GrayboxFinding:
     # Two fields, not four: `finding_id` is the identity, `finding_signature`
     # the content. The `dedup_key`/`content_hash` twins existed only to derive
     # these and let the pairs disagree.
+    if severity_source:
+      flat["severity_source"] = severity_source
     flat["finding_id"] = _dedup_key(flat)
     flat["finding_signature"] = _content_hash(flat)
     return _scrub_flat_finding(flat, secret_field_names=secret_field_names)
+
+  def _cvss(self, declared_severity: str) -> tuple[str, float | None, str]:
+    """The finding's CVSS vector, score and `severity_source` (RM-087).
+
+    Only a vulnerable finding reports a weakness, so only it is scored: a
+    passed check or an inconclusive one carries no vector and no source, as a
+    blackbox INFO finding does. The vector is the probe's own when it set one,
+    else the scenario's from the catalog. As for blackbox findings (RM-064), a
+    vector whose band is not the label is withheld and the label is policy:
+    `run_stateful` raising a failed revert to CRITICAL is the case today.
+    """
+    if self.status != "vulnerable":
+      return "", None, ""
+    vector = self.cvss_vector or (graybox_scenario(self.scenario_id) or {}).get("cvss_vector", "")
+    if not vector or not _template_band_agrees(vector, declared_severity):
+      return "", None, "probe_policy"
+    return vector, cvss31_base_score(vector), "cvss"
 
   @classmethod
   def flat_from_dict(cls, payload: dict[str, Any], port: int, protocol: str,

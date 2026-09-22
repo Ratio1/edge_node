@@ -5,6 +5,7 @@ Injection probes — A03 + A05 + API7.
 import re
 
 from .base import ProbeBase
+from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
 
 
@@ -104,6 +105,7 @@ class InjectionProbes(ProbeBase):
           title=f"Reflected {label.upper()} in login form",
           status="vulnerable",
           severity="HIGH" if label == "sqli" else "MEDIUM",
+          cvss_vector=V.INJECTION_DATA_ACCESS if label == "sqli" else V.XSS_UNAUTHENTICATED,
           owasp="A05:2021" if label == "sqli" else "A03:2021",
           cwe=[cwe],
           evidence=[
@@ -197,6 +199,8 @@ class InjectionProbes(ProbeBase):
         title=f"Reflected {label.upper()} in authenticated form",
         status="vulnerable",
         severity="HIGH" if label == "sqli" else "MEDIUM",
+        cvss_vector=(V.INJECTION_DATA_ACCESS_AUTHENTICATED if label == "sqli"
+                     else V.XSS_AUTHENTICATED),
         owasp="A03:2021",
         cwe=[cwe],
         evidence=[
@@ -285,7 +289,7 @@ class InjectionProbes(ProbeBase):
           scenario_id="PT-A03-02",
           title="Stored cross-site scripting (XSS)",
           status="vulnerable",
-          severity="HIGH",
+          severity="MEDIUM",
           owasp="A03:2021",
           cwe=["CWE-79"],
           attack=["T1059.007"],
@@ -354,7 +358,7 @@ class InjectionProbes(ProbeBase):
           scenario_id="PT-API7-01",
           title="Server-side request forgery",
           status="vulnerable",
-          severity="MEDIUM",
+          severity="HIGH",
           owasp="API7:2023",
           cwe=["CWE-918"],
           attack=["T1190"],
@@ -641,7 +645,7 @@ class InjectionProbes(ProbeBase):
         scenario_id="PT-A03-03",
         title="Path traversal — file content disclosed",
         status="vulnerable",
-        severity="HIGH",
+        severity="MEDIUM",
         owasp="A03:2021",
         cwe=["CWE-22"],
         attack=["T1083"],
@@ -702,7 +706,7 @@ class InjectionProbes(ProbeBase):
         scenario_id="PT-A03-04",
         title="Reflected XSS — payload echoed unescaped",
         status="vulnerable",
-        severity="HIGH",
+        severity="MEDIUM",
         owasp="A03:2021",
         cwe=["CWE-79"],
         attack=["T1059.007"],
@@ -833,7 +837,7 @@ class InjectionProbes(ProbeBase):
         scenario_id="PT-A03-07",
         title="OS command injection — shell metacharacters honored",
         status="vulnerable",
-        severity="CRITICAL",
+        severity="HIGH",
         owasp="A03:2021",
         cwe=["CWE-78"],
         attack=["T1059.004"],
@@ -898,7 +902,7 @@ class InjectionProbes(ProbeBase):
         scenario_id="PT-A03-12",
         title="HTTP header injection via CRLF",
         status="vulnerable",
-        severity="HIGH",
+        severity="MEDIUM",
         owasp="A03:2021",
         cwe=["CWE-93", "CWE-113"],
         attack=["T1190"],
