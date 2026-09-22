@@ -272,10 +272,13 @@ class DeeploySecretRevealTests(unittest.TestCase):
     inputs = reveal_inputs()
     plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: ("0xOwner", inputs)
     plugin.deeploy_get_auth_result = lambda request_inputs: reveal_auth()
+    validation_calls = []
     pipeline = {
       "PLUGINS": [{"INSTANCES": [{"ENV": {"TOKEN": "__R1_DAUTH_SECRET__"}}]}],
     }
-    plugin._validate_job_secret_reveal_access = lambda **kwargs: ("7", "cid-7", pipeline)
+    plugin._validate_job_secret_reveal_access = lambda **kwargs: (
+      validation_calls.append(kwargs) or ("7", "cid-7", pipeline)
+    )
     plugin._request_dauth_job_secret_reveal = lambda **kwargs: {"PLUGINS": []}
     plugin._resolve_dauth_job_secrets_for_reveal = lambda **kwargs: {"PLUGINS": [{"resolved": True}]}
     plugin._get_pipeline_from_cstore = lambda job_id: "cid-7"
@@ -288,6 +291,7 @@ class DeeploySecretRevealTests(unittest.TestCase):
     self.assertEqual(response[DEEPLOY_KEYS.PIPELINE], {"PLUGINS": [{"resolved": True}]})
     self.assertNotIn("job_secrets", response)
     self.assertNotIn(DEEPLOY_KEYS.PIPELINE_CID, response)
+    self.assertEqual(len(validation_calls), 2)
 
 
 if __name__ == "__main__":

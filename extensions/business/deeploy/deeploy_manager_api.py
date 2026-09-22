@@ -2349,7 +2349,11 @@ class DeeployManagerApiPlugin(
         pipeline=pipeline,
         job_secrets=job_secrets,
       )
-      if self._get_pipeline_from_cstore(job_id) != pipeline_cid:
+      final_job_id, final_pipeline_cid, _ = self._validate_job_secret_reveal_access(
+        inputs=inputs,
+        auth_result=auth_result,
+      )
+      if final_job_id != job_id or final_pipeline_cid != pipeline_cid:
         raise ValueError("Persisted pipeline changed while revealing job secrets.")
       result = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
