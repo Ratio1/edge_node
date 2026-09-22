@@ -1,8 +1,8 @@
-"""Report-level review record (RM-086 item 4).
+"""Report review record (RM-088, contract 2.0.0).
 
-One row per job: a named account approved the report as a whole, or withdrew
-that approval. No draft, no submission snapshot, no idempotency key; the
-revision fence is the whole concurrency story. Contract:
+One row per job and scan pass: a named account approved or rejected the report
+for that pass. An absent row is `pending`. No draft, no submission snapshot, no
+idempotency key; the revision fence is the whole concurrency story. Contract:
 `docs/resources/redmesh/contracts/report-review.md` in project-red-mesh.
 """
 from __future__ import annotations
@@ -12,9 +12,9 @@ from dataclasses import asdict, dataclass
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
 
 
-REPORT_REVIEW_CONTRACT_VERSION = "1.0.0"
+REPORT_REVIEW_CONTRACT_VERSION = "2.0.0"
 
-VALID_REPORT_REVIEW_STATES = frozenset({"approved", "reopened"})
+VALID_REPORT_REVIEW_STATES = frozenset({"approved", "rejected"})
 
 
 def _int_at_least_zero(value) -> int:
@@ -24,17 +24,27 @@ def _int_at_least_zero(value) -> int:
     return 0
 
 
+def _submission_ref(value):
+  """`{profile_id, revision, cid}` of the NIS2 submission an approval rested on, or ""."""
+  if not isinstance(value, dict) or not value.get("cid"):
+    return ""
+  return {
+    "profile_id": str(value.get("profile_id") or "")[:120],
+    "revision": _int_at_least_zero(value.get("revision")),
+    "cid": str(value.get("cid"))[:200],
+  }
+
+
 @dataclass(frozen=True)
 class ReportReviewState:
   job_id: str
+  pass_nr: int
   state: str = "approved"
   review_revision: int = 0
   reviewer: str = ""
   note: str = ""
-  approved_at: str = ""
-  approved_pass_nr: int = 0
-  reopened_at: str = ""
-  reopened_by: str = ""
+  decided_at: str = ""
+  nis2_submission_ref: object = ""
   contract_version: str = REPORT_REVIEW_CONTRACT_VERSION
 
   def to_dict(self) -> dict:
@@ -48,16 +58,18 @@ class ReportReviewState:
     version = str(payload.get("contract_version") or REPORT_REVIEW_CONTRACT_VERSION)
     if version != REPORT_REVIEW_CONTRACT_VERSION:
       raise ValueError(f"Unsupported report review contract version: {version}")
+    pass_nr = _int_at_least_zero(payload.get("pass_nr"))
+    if pass_nr < 1:
+      raise ValueError("Report review requires a pass number")
     return cls(
       job_id=str(payload["job_id"]),
+      pass_nr=pass_nr,
       state=state,
       review_revision=_int_at_least_zero(payload.get("review_revision")),
       reviewer=str(payload.get("reviewer") or "")[:200],
       note=str(payload.get("note") or "")[:1000],
-      approved_at=str(payload.get("approved_at") or "")[:40],
-      approved_pass_nr=_int_at_least_zero(payload.get("approved_pass_nr")),
-      reopened_at=str(payload.get("reopened_at") or "")[:40],
-      reopened_by=str(payload.get("reopened_by") or "")[:200],
+      decided_at=str(payload.get("decided_at") or "")[:40],
+      nis2_submission_ref=_submission_ref(payload.get("nis2_submission_ref")),
       contract_version=version,
     )
 
@@ -70,7 +82,7 @@ class ReportReviewAuditEntry:
   reviewer: str = ""
   note: str = ""
   review_revision: int = 0
-  approved_pass_nr: int = 0
+  pass_nr: int = 0
   timestamp: str = ""
 
   def to_dict(self) -> dict:
@@ -85,6 +97,6 @@ class ReportReviewAuditEntry:
       reviewer=str(payload.get("reviewer") or "")[:200],
       note=str(payload.get("note") or "")[:1000],
       review_revision=_int_at_least_zero(payload.get("review_revision")),
-      approved_pass_nr=_int_at_least_zero(payload.get("approved_pass_nr")),
+      pass_nr=_int_at_least_zero(payload.get("pass_nr")),
       timestamp=str(payload.get("timestamp") or "")[:40],
     )

@@ -1,19 +1,19 @@
-"""Report-level review: approve or reopen a job's report as a whole (RM-086 item 4).
+"""Report review: a per-pass verdict on a job's report (RM-088, contract 2.0.0).
 
-RM-064 made the PDF's Final label require a reviewer, and the only reviewer the
-platform recorded was the NIS2 rulebook review's, so a job without a NIS2
-assessment could never reach Final. This is the sign-off for the report itself.
+RM-064 made the PDF's Final label require a reviewer. This is that reviewer: a
+named account approves or rejects the report for the job's latest scan pass. A
+pass without a verdict is `pending`. Approve is gated: where the job has a NIS2
+readiness assessment, the NIS2 review for the same pass must be submitted
+first, and every reason approve is refused is named (`approve_blocked`).
 
 It mirrors the rulebook review's admission (the endpoints run through
 `_read_operation` / `_review_operation`), server-derived actor, revision fence,
 lock, audit row and audit event, and deliberately not its submission machinery:
-no draft, no R1FS snapshot, no pending registry, no idempotency key. One row in
-its own chainstore hash, never on the job record and never in the archive.
+no draft, no R1FS snapshot, no pending registry, no idempotency key. One row per
+pass in its own chainstore hash, never on the job record and never in the archive.
 Contract: `docs/resources/redmesh/contracts/report-review.md` (project-red-mesh).
 """
 from __future__ import annotations
-
-from dataclasses import replace
 
 from ..constants import JOB_STATUS_FINALIZED
 from ..models.report_review import (
@@ -27,6 +27,7 @@ from ..tenancy.identity import canonical_account_id
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from .rulebook_assessment import (
   _job_repo,
+  current_rulebook_submission,
   _owner_time,
   _safe_text,
   _submission_lock,
@@ -39,7 +40,7 @@ _UNSET = object()
 _LOCK_SCOPE = "report_review"
 
 EVENT_APPROVED = "report_review_approved"
-EVENT_REOPENED = "report_review_reopened"
+EVENT_REJECTED = "report_review_rejected"
 
 
 def _error(code, job_id, message, *, retryable=False, **extra):
@@ -61,9 +62,8 @@ def _latest_pass_nr(job_specs):
   artifact. A finalized record is the pruned `CStoreJobFinalized`, which
   carries `pass_count` and no `pass_reports`; `pass_reports` is read for a
   record that still has them. Today nothing takes a FINALIZED job back to
-  RUNNING, so on a real job this value is frozen at approval time and the
-  `newer_scan_pass` staleness only fires once a re-run path exists (contract
-  §State model).
+  RUNNING, so on a real job this value is frozen and a newer pass only appears
+  once a re-run path exists (contract §State model).
   """
   numbers = []
   for entry in job_specs.get("pass_reports") or []:
@@ -94,28 +94,50 @@ def _validated_expected_revision(value, job_id):
   return revision, None
 
 
-def _view(job_id, review, latest_pass_nr):
-  """The one read shape: the row, the newest pass, and whether the approval still covers it."""
-  stale_reasons = []
-  if (
-    review is not None
-    and review.state == "approved"
-    and latest_pass_nr is not None
-    and review.approved_pass_nr
-    and latest_pass_nr > review.approved_pass_nr
-  ):
-    stale_reasons.append("newer_scan_pass")
-  approved = review is not None and review.state == "approved" and not stale_reasons
+def approve_blocked_reasons(owner, job_id, job_specs, nis2=_UNSET):
+  """Every reason the latest pass cannot be approved; empty means approvable (contract §Approve gate).
+
+  `nis2` is `current_rulebook_submission`'s answer when the caller already has it.
+  """
+  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    return [{"code": "job_not_finalized", "detail": {"job_status": job_specs.get("job_status")}}]
+  if nis2 is _UNSET:
+    nis2 = current_rulebook_submission(owner, job_id, job_specs)
+  if nis2 is None:
+    return []
+  latest = _latest_pass_nr(job_specs)
+  submission = nis2["submission"]
+  if submission is None:
+    return [{"code": "nis2_review_not_submitted",
+             "detail": {"profile_id": nis2["profile_id"], "pass_nr": latest}}]
+  if submission["pass_nr"] < latest:
+    return [{"code": "nis2_submission_stale",
+             "detail": {"profile_id": nis2["profile_id"], "submitted_pass_nr": submission["pass_nr"],
+                        "latest_pass_nr": latest}}]
+  return []
+
+
+def _view(owner, job_id, job_specs, rows):
+  """The one read shape: the latest pass's verdict, the gate, and earlier passes as history."""
+  latest_pass_nr = _latest_pass_nr(job_specs)
+  review = rows.get(latest_pass_nr)
+  finalized = job_specs.get("job_status") == JOB_STATUS_FINALIZED
+  if review is not None:
+    review_status = review.state
+  else:
+    review_status = "pending" if finalized else None
+  blocked = approve_blocked_reasons(owner, job_id, job_specs)
   return {
     "status": "ok",
     "job_id": job_id,
     "review_contract_version": REPORT_REVIEW_CONTRACT_VERSION,
+    "review_status": review_status,
+    "latest_pass_nr": latest_pass_nr,
     "review": review.to_dict() if review is not None else None,
     "review_revision": review.review_revision if review is not None else 0,
-    "latest_pass_nr": latest_pass_nr,
-    "stale": bool(stale_reasons),
-    "stale_reasons": stale_reasons,
-    "approved": approved,
+    "can_approve": not blocked,
+    "approve_blocked": blocked,
+    "history": [rows[nr].to_dict() for nr in sorted(rows, reverse=True) if nr != latest_pass_nr],
   }
 
 
@@ -135,22 +157,25 @@ def _job_for(owner, job_id, checked_job, snapshot_mode, *, checked_raise):
   return job_specs, None
 
 
+def _unsupported(job_id):
+  return _error("review_contract_unsupported", job_id,
+                "Report review contract version is not supported by this backend.")
+
+
 def get_report_review(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
   job_specs, err = _job_for(owner, job_id, checked_job, snapshot_mode, checked_raise=True)
   if err:
     return err
-  repo = _job_repo(owner)
   try:
-    review = repo.get_report_review_model(job_id)
+    rows = _job_repo(owner).list_job_report_review_models(job_id, _latest_pass_nr(job_specs))
   except ValueError:
     if checked_job is not _UNSET:
       # `_read_operation` does not project through `_public_review_result`, so
       # a dict with an `error` key would be collapsed by the read guard; the
       # rulebook read raises the same denial here.
       raise AdministrationDenied(503, "review_contract_unsupported")
-    return _error("review_contract_unsupported", job_id,
-                  "Report review contract version is not supported by this backend.")
-  return _view(job_id, review, _latest_pass_nr(job_specs))
+    return _unsupported(job_id)
+  return _view(owner, job_id, job_specs, rows)
 
 
 def _admit_mutation(owner, job_id, expected_review_revision, actor, checked_job, snapshot_mode):
@@ -187,10 +212,10 @@ def _write(owner, repo, state, event_type, ledger):
     job_id=state.job_id,
     event_type=event_type,
     state=state.state,
-    reviewer=state.reviewer if event_type == EVENT_APPROVED else state.reopened_by,
+    reviewer=state.reviewer,
     note=state.note,
     review_revision=state.review_revision,
-    approved_pass_nr=state.approved_pass_nr,
+    pass_nr=state.pass_nr,
     timestamp=_utc_timestamp(_owner_time(owner)),
   ))
   if hasattr(owner, "_log_audit_event"):
@@ -198,84 +223,111 @@ def _write(owner, repo, state, event_type, ledger):
       "job_id": state.job_id,
       "state": state.state,
       "review_revision": state.review_revision,
-      "approved_pass_nr": state.approved_pass_nr,
+      "pass_nr": state.pass_nr,
     })
   return payload
 
 
-def approve_report(owner, job_id, *, expected_review_revision=None, note="", actor="",
-                   checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None):
-  """Approve the report as a whole, pinned to the newest pass at approval time.
-
-  A second approve at the same revision while the approval still covers the
-  newest pass is a replay and returns the current view; after a newer pass it
-  is a fresh approval that re-pins the pass.
-  """
+def _decide(owner, job_id, verdict, *, expected_review_revision, note, actor,
+            checked_job, snapshot_mode, ledger):
+  """Write `verdict` for the latest pass under the fence; shared by approve and reject."""
+  hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-report-review")
+  safe_note = _safe_text(note or "", hmac_secret=hmac_secret, max_len=1000).strip()
+  if verdict == "rejected" and not safe_note:
+    return _error("note_required", job_id, "A rejection needs a note saying why.")
   expected, signer, job_specs, err = _admit_mutation(
     owner, job_id, expected_review_revision, actor, checked_job, snapshot_mode)
   if err:
     return err
-  hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-report-review")
-  safe_note = _safe_text(note or "", hmac_secret=hmac_secret, max_len=1000)
   with _submission_lock(owner, job_id, _LOCK_SCOPE):
     repo = _job_repo(owner)
+    latest = _latest_pass_nr(job_specs)
     try:
-      review = repo.get_report_review_model(job_id)
+      rows = repo.list_job_report_review_models(job_id, latest)
     except ValueError:
-      return _error("review_contract_unsupported", job_id,
-                    "Report review contract version is not supported by this backend.")
+      return _unsupported(job_id)
+    review = rows.get(latest)
     current = review.review_revision if review is not None else 0
     if expected != current:
       return _error("review_revision_conflict", job_id,
-                    "The report review changed. Reload before approving.",
+                    "The report review changed. Reload before deciding.",
                     current_review_revision=current)
-    latest = _latest_pass_nr(job_specs)
-    if review is not None and review.state == "approved" and review.approved_pass_nr >= latest:
-      result = _view(job_id, review, latest)
+    submission_ref = ""
+    if verdict == "approved":
+      nis2 = current_rulebook_submission(owner, job_id, job_specs)
+      blocked = approve_blocked_reasons(owner, job_id, job_specs, nis2)
+      if blocked:
+        return _error("approve_blocked", job_id, "The report cannot be approved yet.",
+                      approve_blocked=blocked)
+      if nis2 is not None:
+        submission_ref = {"profile_id": nis2["profile_id"], "revision": nis2["submission"]["revision"],
+                          "cid": nis2["submission"]["cid"]}
+    if review is not None and review.state == verdict:
+      result = _view(owner, job_id, job_specs, rows)
       result["idempotent_replay"] = True
       return result
     state = ReportReviewState(
       job_id=job_id,
-      state="approved",
+      pass_nr=latest,
+      state=verdict,
       review_revision=current + 1,
       reviewer=signer,
       note=safe_note,
-      approved_at=_utc_timestamp(_owner_time(owner)),
-      approved_pass_nr=latest,
-      reopened_at="",
-      reopened_by="",
+      decided_at=_utc_timestamp(_owner_time(owner)),
+      nis2_submission_ref=submission_ref,
     )
-    _write(owner, repo, state, EVENT_APPROVED, ledger)
-    return _view(job_id, state, latest)
+    _write(owner, repo, state, EVENT_APPROVED if verdict == "approved" else EVENT_REJECTED, ledger)
+    rows[latest] = state
+    return _view(owner, job_id, job_specs, rows)
 
 
-def reopen_report_review(owner, job_id, *, expected_review_revision=None, actor="",
-                         checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None):
-  """Withdraw an approval. The row keeps who approved and when; the state flips."""
-  expected, signer, job_specs, err = _admit_mutation(
-    owner, job_id, expected_review_revision, actor, checked_job, snapshot_mode)
-  if err:
-    return err
-  with _submission_lock(owner, job_id, _LOCK_SCOPE):
-    repo = _job_repo(owner)
+def approve_report(owner, job_id, *, expected_review_revision=None, note="", actor="",
+                   checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None):
+  """Approve the report for the latest pass. Refused with `approve_blocked` while the gate says no.
+
+  An approve over an existing approval at the current revision is a replay and
+  writes nothing.
+  """
+  return _decide(owner, job_id, "approved", expected_review_revision=expected_review_revision,
+                 note=note, actor=actor, checked_job=checked_job, snapshot_mode=snapshot_mode,
+                 ledger=ledger)
+
+
+def reject_report(owner, job_id, *, expected_review_revision=None, note="", actor="",
+                  checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None):
+  """Reject the report for the latest pass; the note saying why is required."""
+  return _decide(owner, job_id, "rejected", expected_review_revision=expected_review_revision,
+                 note=note, actor=actor, checked_job=checked_job, snapshot_mode=snapshot_mode,
+                 ledger=ledger)
+
+
+def review_summaries(owner, jobs):
+  """`{job_id: summary | None}` for the jobs list: one keyed read per listed job, no NIS2 read.
+
+  Keyed reads, not a hash enumeration: a tenant-scoped list must only touch
+  the rows of the jobs it was admitted to.
+
+  A finalized scan job gets `{review_status, pass_nr, reviewer, decided_at}` for
+  its latest pass; anything else (not finalized, model test) gets `None`. An
+  unreadable row lists as `pending` rather than failing the whole list.
+  """
+  repo = _job_repo(owner)
+  summaries = {}
+  for job_id, job_specs in jobs.items():
+    if (
+      not isinstance(job_specs, dict)
+      or job_specs.get("job_status") != JOB_STATUS_FINALIZED
+      or reject_model_test_for_scan_operation(job_specs, job_id, _LOCK_SCOPE)
+    ):
+      summaries[job_id] = None
+      continue
+    latest = _latest_pass_nr(job_specs)
+    summary = {"review_status": "pending", "pass_nr": latest, "reviewer": "", "decided_at": ""}
     try:
-      review = repo.get_report_review_model(job_id)
+      review = repo.get_report_review_model(job_id, latest)
     except ValueError:
-      return _error("review_contract_unsupported", job_id,
-                    "Report review contract version is not supported by this backend.")
-    current = review.review_revision if review is not None else 0
-    if expected != current:
-      return _error("review_revision_conflict", job_id,
-                    "The report review changed. Reload before reopening.",
-                    current_review_revision=current)
-    if review is None or review.state != "approved":
-      return _error("not_approved", job_id, "There is no approval to reopen.")
-    state = replace(
-      review,
-      state="reopened",
-      review_revision=current + 1,
-      reopened_at=_utc_timestamp(_owner_time(owner)),
-      reopened_by=signer,
-    )
-    _write(owner, repo, state, EVENT_REOPENED, ledger)
-    return _view(job_id, state, _latest_pass_nr(job_specs))
+      review = None
+    if review is not None:
+      summary.update(review_status=review.state, reviewer=review.reviewer, decided_at=review.decided_at)
+    summaries[job_id] = summary
+  return summaries

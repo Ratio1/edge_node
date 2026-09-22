@@ -16,6 +16,7 @@ from ..tenancy.job_artifacts import (
 from ..tenancy.ports import TenantStoreError
 from ..tenancy.administration import AdministrationDenied
 from .reconciliation import reconcile_job_workers
+from .report_review import review_summaries
 from .triage import get_job_archive_with_triage
 
 _UNSET = object()
@@ -607,6 +608,8 @@ def list_network_jobs(owner, *, checked_jobs=_UNSET, snapshot_mode="tenant_bound
       }
       if scoped and snapshot_mode == "tenant_bound":
         normalized_jobs[normalized_key]["execution_binding"] = normalized_spec["execution_binding"]
+  for job_id, summary in review_summaries(owner, normalized_jobs).items():
+    normalized_jobs[job_id]["review"] = summary
   return normalized_jobs
 
 

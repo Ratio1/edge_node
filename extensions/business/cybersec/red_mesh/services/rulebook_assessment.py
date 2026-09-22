@@ -1310,6 +1310,51 @@ def _submission_reference_view(reference, *, latest_pass_nr, profile_version):
   }
 
 
+def _effective_review_state(pending, latest_reference, review):
+  """`submitted` only when a submission exists, none is in flight, and the review was not reopened."""
+  if not pending and latest_reference and review and review.review_state in {"submitted", "reviewed"}:
+    return "submitted"
+  return "draft"
+
+
+def current_rulebook_submission(owner, job_id, job_specs, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
+  """What the report review's approve gate needs to know about the NIS2 review (RM-088).
+
+  Returns `None` when NIS2 is not in play for the job: no generated assessment
+  on the record, no review row and no submission (a review can be drafted and
+  submitted without the record pointer, so all three count). Otherwise
+  `{profile_id, assessment_pass_nr, submission}`, where `submission` is
+  `{pass_nr, revision, cid}` of the latest submission while the review is
+  effectively submitted, else `None`. Reads CStore only, never an artifact.
+  An unreadable review or registry reads as not submitted: the gate stays shut.
+  """
+  profile = _profile(profile_id)
+  if not profile:
+    return None
+  meta = _profile_meta(job_specs, profile_id)
+  result = {"profile_id": profile_id, "assessment_pass_nr": _meta_pass_nr(meta), "submission": None}
+  repo = _job_repo(owner)
+  try:
+    review = repo.get_rulebook_review_model(job_id, profile_id)
+    registry_payload = _submission_registry(repo, job_id, profile_id).to_dict()
+  except ValueError:
+    return result
+  references = list(registry_payload.get("submissions") or [])
+  legacy_reference = _legacy_submission_reference(job_specs, profile, review)
+  if legacy_reference and not any(item.get("cid") == legacy_reference["cid"] for item in references):
+    references.append(legacy_reference)
+  if not meta.get("artifact_cid") and review is None and not references:
+    return None
+  latest = max(references, key=lambda item: int(item.get("revision", 0) or 0), default=None)
+  if _effective_review_state(registry_payload.get("pending"), latest, review) == "submitted":
+    result["submission"] = {
+      "pass_nr": int(latest.get("pass_nr", 0) or 0),
+      "revision": int(latest.get("revision", 0) or 0),
+      "cid": str(latest.get("cid") or ""),
+    }
+  return result
+
+
 def _submission_public_state(owner, job_id, job_specs, profile, review, *, registry=_UNSET,
                              checked_job=_UNSET, snapshot_mode="tenant_bound"):
   repo = _job_repo(owner)
@@ -1343,9 +1388,7 @@ def _submission_public_state(owner, job_id, job_specs, profile, review, *, regis
   pending = registry_payload.get("pending")
   latest = views[0] if views else None
   migration_required = bool(review and review.review_state == "reviewed" and legacy_reference is None)
-  effective_state = "draft"
-  if not pending and latest and review and review.review_state in {"submitted", "reviewed"}:
-    effective_state = "submitted"
+  effective_state = _effective_review_state(pending, latest, review)
   operation_state = None
   if pending:
     operation_state = "failed" if pending.get("last_error") else "submitting"
