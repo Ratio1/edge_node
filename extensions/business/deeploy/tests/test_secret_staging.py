@@ -77,6 +77,9 @@ class _SecretStagingPlugin(_DeeployMixin, _DeeployJobMixin):
   def Pd(self, *args, **kwargs):
     return
 
+  def P(self, *args, **kwargs):
+    return
+
 
 def _pipeline(token=DEEPLOY_DAUTH_SECRET_PLACEHOLDER):
   return {
@@ -170,6 +173,63 @@ class DeeploySecretBundleTests(unittest.TestCase):
         prior_bundle,
         prior_pipeline=prior_pipeline,
       )
+
+  def test_scale_up_reuses_prior_secret_for_generated_instance_identity(self):
+    base_pipeline = _pipeline()
+    generated_pipeline = _pipeline()
+    generated_pipeline["PLUGINS"][0]["INSTANCES"][0]["INSTANCE_ID"] = "generated-car"
+    captured = {}
+
+    self.plugin.get_job_base_pipeline_from_r1fs = lambda *args, **kwargs: base_pipeline
+
+    def prepare_create_update_pipelines(
+      base_pipeline,
+      new_nodes,
+      update_nodes,
+      running_apps_for_job,
+      generated_instance_identity_aliases=None,
+    ):
+      generated_instance_identity_aliases[
+        ("CONTAINER_APP_RUNNER", "generated-car")
+      ] = ("CONTAINER_APP_RUNNER", "car")
+      return {"new-node": {}}, {}, {}
+
+    self.plugin.prepare_create_update_pipelines = prepare_create_update_pipelines
+    self.plugin._build_scale_up_create_pipeline_configs = (
+      lambda create_pipelines, owner: {"new-node": copy.deepcopy(generated_pipeline)}
+    )
+
+    def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
+      captured["pipeline"] = copy.deepcopy(pipeline)
+      captured["bundle"] = copy.deepcopy(secret_bundle)
+      return {"job_id": str(job_id), "staged_cid": "staged-cid"}
+
+    self.plugin.stage_job_pipeline_and_secrets = stage_job_pipeline_and_secrets
+    self.plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
+    self.plugin._start_create_update_pipelines = lambda **kwargs: captured.update(
+      dispatched=copy.deepcopy(kwargs["prepared_create_configs"])
+    )
+
+    self.plugin.scale_up_job(
+      new_nodes=["new-node"],
+      update_nodes=[],
+      job_id=7,
+      owner="owner",
+      running_apps_for_job={},
+      wait_for_responses=False,
+    )
+
+    staged_instance = captured["pipeline"]["PLUGINS"][0]["INSTANCES"][0]
+    bundled_env = captured["bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]["ENV"]
+    dispatched_instance = captured["dispatched"]["new-node"]["PLUGINS"][0]["INSTANCES"][0]
+    self.assertEqual(staged_instance["INSTANCE_ID"], "generated-car")
+    self.assertEqual(staged_instance["ENV"]["CF_TUNNEL_TOKEN"], DEEPLOY_DAUTH_SECRET_PLACEHOLDER)
+    self.assertEqual(bundled_env["CF_TUNNEL_TOKEN"], "prior-token")
+    self.assertEqual(dispatched_instance["INSTANCE_ID"], "generated-car")
+    self.assertEqual(
+      dispatched_instance["ENV"]["CF_TUNNEL_TOKEN"],
+      DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+    )
 
 
 class DeeploySecretStagingTests(unittest.TestCase):

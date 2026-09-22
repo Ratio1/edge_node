@@ -1086,6 +1086,7 @@ class _DeeployMixin:
     pipeline_configs,
     prior_bundle,
     prior_pipeline=None,
+    current_identity_aliases=None,
   ):
     """Redact exact command metadata and reconstruct its complete bundle."""
     redacted_configs = {}
@@ -1106,6 +1107,7 @@ class _DeeployMixin:
       new_job_secrets=merged_new_secrets,
       prior_bundle=prior_bundle,
       prior_pipeline=prior_pipeline,
+      current_identity_aliases=current_identity_aliases,
     )
     return redacted_configs, bundle
 
@@ -4915,6 +4917,7 @@ class _DeeployMixin:
     new_job_secrets,
     prior_bundle=None,
     prior_pipeline=None,
+    current_identity_aliases=None,
   ):
     """Reconstruct the complete current bundle from exact placeholder paths."""
     prior_job_secrets = {}
@@ -4935,6 +4938,7 @@ class _DeeployMixin:
           path,
           redacted_pipeline,
           prior_pipeline,
+          current_identity_aliases=current_identity_aliases,
         ):
           found = False
       if (
@@ -5001,9 +5005,20 @@ class _DeeployMixin:
         return None
     return signature.upper(), None if instance_id is None else str(instance_id)
 
-  def _same_dauth_secret_path_identity(self, path, pipeline, prior_pipeline):
+  def _same_dauth_secret_path_identity(
+    self,
+    path,
+    pipeline,
+    prior_pipeline,
+    current_identity_aliases=None,
+  ):
     current_identity = self._dauth_secret_path_identity(pipeline, path)
     prior_identity = self._dauth_secret_path_identity(prior_pipeline, path)
+    if isinstance(current_identity_aliases, dict):
+      current_identity = current_identity_aliases.get(
+        current_identity,
+        current_identity,
+      )
     return current_identity is not None and current_identity == prior_identity
 
   def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):
@@ -5939,11 +5954,15 @@ class _DeeployMixin:
       expected_nodes=update_nodes,
       running_apps_for_job=running_apps_for_job,
     )
+    generated_instance_identity_aliases = {}
     create_pipelines, update_pipelines, chainstore_response_keys = (
       self.prepare_create_update_pipelines(base_pipeline,
                                             new_nodes,
                                             update_nodes,
-                                            running_apps_for_job))
+                                            running_apps_for_job,
+                                            generated_instance_identity_aliases=(
+                                              generated_instance_identity_aliases
+                                            )))
 
     prepared_create_configs = self._build_scale_up_create_pipeline_configs(
       create_pipelines=create_pipelines,
@@ -5956,6 +5975,7 @@ class _DeeployMixin:
         pipeline_configs=prepared_create_configs,
         prior_bundle=prior_bundle,
         prior_pipeline=base_pipeline,
+        current_identity_aliases=generated_instance_identity_aliases,
       )
     )
     for node, pipeline in update_pipelines.items():
@@ -6390,7 +6410,14 @@ class _DeeployMixin:
       "pipeline_params": self.deepcopy(pipeline_params),
     }
 
-  def prepare_create_update_pipelines(self, base_pipeline, new_nodes, update_nodes, running_apps_for_job):
+  def prepare_create_update_pipelines(
+    self,
+    base_pipeline,
+    new_nodes,
+    update_nodes,
+    running_apps_for_job,
+    generated_instance_identity_aliases=None,
+  ):
     """
     Prepare the create and update pipelines.
     Running Apps for job example:
@@ -6462,7 +6489,18 @@ class _DeeployMixin:
         for instance in plugin_instances:
           instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
           instance["PER_NODE_TARGET_NODES"] = self.deepcopy(chainstore_peers)
+          source_instance_id = instance.get(self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID)
           instance_id = self._generate_plugin_instance_id(signature=plugin_signature)
+          if (
+            isinstance(generated_instance_identity_aliases, dict)
+            and source_instance_id not in [None, ""]
+          ):
+            generated_instance_identity_aliases[
+              (str(plugin_signature).upper(), str(instance_id))
+            ] = (
+              str(plugin_signature).upper(),
+              str(source_instance_id),
+            )
           chainstore_response_key = self._generate_chainstore_response_key(
             instance_id=instance_id)
           instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id

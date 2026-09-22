@@ -4240,11 +4240,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     }
 
+    generated_instance_identity_aliases = {}
     create_pipelines, update_pipelines, _response_keys = plugin.prepare_create_update_pipelines(
       base_pipeline=base_pipeline,
       new_nodes=["0xai_node_c"],
       update_nodes=["0xai_node_a", "0xai_node_b"],
       running_apps_for_job=running_apps_for_job,
+      generated_instance_identity_aliases=generated_instance_identity_aliases,
     )
 
     expected_nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
@@ -4255,6 +4257,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(updated["CHAINSTORE_PEERS"], expected_nodes)
     self.assertEqual(updated["PER_NODE_TARGET_NODES"], expected_nodes)
     self.assertEqual(base_pipeline["deeploy_specs"][DEEPLOY_KEYS.NR_TARGET_NODES], 3)
+    self.assertEqual(
+      generated_instance_identity_aliases[
+        ("CONTAINER_APP_RUNNER", created["INSTANCE_ID"])
+      ],
+      ("CONTAINER_APP_RUNNER", "stale-instance"),
+    )
 
     # Only b reports now: a remains a configured target, and c keeps index 2.
     create_pipelines, update_pipelines, _ = plugin.prepare_create_update_pipelines(
