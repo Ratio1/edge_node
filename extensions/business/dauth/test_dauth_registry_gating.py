@@ -10,6 +10,8 @@ from ratio1.const.base import dAuth
 
 from extensions.business.dauth.dauth_mixin import (
   DAUTH_JOB_SECRETS_CSTORE_HKEY,
+  DAUTH_SECRET_REVEAL_ACTION,
+  DAUTH_VIEW_SECRETS_PERMISSION,
   DEEPLOY_JOBS_CSTORE_HKEY,
   _DauthMixin,
 )
@@ -200,11 +202,21 @@ class _FakeConst:
 
 class _FakeBC:
 
-  def __init__(self, *, dauth_oracle=True, protocol_oracles=None, valid_signature=True):
+  def __init__(
+    self,
+    *,
+    dauth_oracle=True,
+    protocol_oracles=None,
+    valid_signature=True,
+    wallet_signature_valid=True,
+  ):
     self.dauth_oracle = dauth_oracle
     self.protocol_oracles = protocol_oracles or ["node-oracle"]
     self.valid_signature = valid_signature
+    self.wallet_signature_valid = wallet_signature_valid
     self.encrypt_calls = []
+    self.escrow_owner = "0xOWNER"
+    self.escrow_permissions = 0
     self.node_eth = {
       "node-oracle": "0xORACLE",
       "node-runner": "0xRUNNER",
@@ -253,6 +265,25 @@ class _FakeBC:
     self.encrypt_calls.append((str_data, str_recipient))
     return "encrypted-secret-bundle"
 
+  @staticmethod
+  def is_valid_eth_address(address):
+    return isinstance(address, str) and address.startswith("0x")
+
+  def eth_verify_payload_signature(self, payload, **kwargs):  # pylint: disable=unused-argument
+    if not self.wallet_signature_valid:
+      return None
+    return payload.get("EE_ETH_SENDER")
+
+  def get_user_escrow_details(self, address):  # pylint: disable=unused-argument
+    return {
+      "isActive": True,
+      "escrowOwner": self.escrow_owner,
+      "permissions": self.escrow_permissions,
+    }
+
+  def get_job_details(self, job_id):  # pylint: disable=unused-argument
+    return {"escrowOwner": self.escrow_owner}
+
 
 class _FakeR1FS:
 
@@ -267,13 +298,20 @@ class _DauthHarness(_DauthMixin):
   pass
 
 
-def _make_dauth_harness(*, dauth_oracle=True, protocol_oracles=None, valid_signature=True):
+def _make_dauth_harness(
+  *,
+  dauth_oracle=True,
+  protocol_oracles=None,
+  valid_signature=True,
+  wallet_signature_valid=True,
+):
   plugin = _DauthHarness()
   plugin.const = _FakeConst
   plugin.bc = _FakeBC(
     dauth_oracle=dauth_oracle,
     protocol_oracles=protocol_oracles,
     valid_signature=valid_signature,
+    wallet_signature_valid=wallet_signature_valid,
   )
   plugin.deepcopy = deepcopy
   plugin.json_dumps = json.dumps
@@ -378,6 +416,76 @@ class DauthRegistrySecretGatingTests(unittest.TestCase):
 
 
 class DauthJobSecretEndpointTests(unittest.TestCase):
+
+  def _prepare_reveal(self, wallet_sender="0xOWNER"):
+    plugin = _make_dauth_harness()
+    bundle = {
+      "job_id": "7",
+      "pipeline_cid": "cid-7",
+      "job_secrets": {"PLUGINS": [{"INSTANCES": [{"ENV": {"TOKEN": "secret"}}]}]},
+    }
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = bundle
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
+    plugin._r1fs_data["cid-7"] = {
+      "OWNER": "0xOWNER",
+      "DEEPLOY_SPECS": {"current_target_nodes": ["node-runner"]},
+    }
+    wallet_request = {
+      "action": DAUTH_SECRET_REVEAL_ACTION,
+      "job_id": "7",
+      "nonce": REQUEST_NONCE,
+      "EE_ETH_SENDER": wallet_sender,
+      "EE_ETH_SIGN": "wallet-signature",
+    }
+    body = {
+      "EE_SENDER": "node-oracle",
+      "EE_ETH_SENDER": "0xORACLE",
+      "EE_SIGN": "relay-signature",
+      "nonce": REQUEST_NONCE,
+      "wallet_request": wallet_request,
+    }
+    return plugin, body, bundle
+
+  def test_reveal_secrets_allows_escrow_owner_and_encrypts_for_relay_oracle(self):
+    plugin, body, bundle = self._prepare_reveal()
+
+    response = plugin.process_dauth_reveal_secret_request(body)
+
+    self.assertEqual(response["status"], "success")
+    self.assertEqual(response["job_id"], "7")
+    self.assertNotIn("pipeline_cid", response)
+    self.assertNotIn("job_secrets", response)
+    self.assertEqual(plugin.bc.encrypt_calls, [(json.dumps(bundle), "node-oracle")])
+
+  def test_reveal_secrets_allows_delegate_with_view_secrets_permission(self):
+    plugin, body, _ = self._prepare_reveal(wallet_sender="0xDELEGATE")
+    plugin.bc.escrow_permissions = DAUTH_VIEW_SECRETS_PERMISSION
+
+    response = plugin.process_dauth_reveal_secret_request(body)
+
+    self.assertEqual(response["status"], "success")
+
+  def test_reveal_secrets_rejects_delegate_without_view_secrets_permission(self):
+    plugin, body, _ = self._prepare_reveal(wallet_sender="0xDELEGATE")
+    plugin.bc.escrow_permissions = 1 << 0
+
+    with self.assertRaisesRegex(ValueError, "lacks view-secrets permission"):
+      plugin.process_dauth_reveal_secret_request(body)
+
+  def test_reveal_secrets_rejects_invalid_wallet_signature(self):
+    plugin, body, _ = self._prepare_reveal()
+    plugin.bc.wallet_signature_valid = False
+
+    with self.assertRaisesRegex(ValueError, "signature is invalid"):
+      plugin.process_dauth_reveal_secret_request(body)
+
+  def test_reveal_secrets_rejects_non_oracle_relay(self):
+    plugin, body, _ = self._prepare_reveal()
+    body["EE_SENDER"] = "node-other"
+    body["EE_ETH_SENDER"] = "0xOTHER"
+
+    with self.assertRaisesRegex(ValueError, "not an oracle"):
+      plugin.process_dauth_reveal_secret_request(body)
 
   def test_secret_request_nonce_accepts_only_last_120_seconds(self):
     plugin = _make_dauth_harness()
@@ -749,15 +857,21 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.process_dauth_get_secret_request = lambda body: (_ for _ in ()).throw(
       ValueError("get failed")
     )
+    plugin.process_dauth_reveal_secret_request = lambda body: (_ for _ in ()).throw(
+      ValueError("reveal failed")
+    )
     body = {"nonce": REQUEST_NONCE}
 
     add_response = plugin.add_secrets(body)
     get_response = plugin.get_secrets(body)
+    reveal_response = plugin.reveal_job_secrets(body)
 
     self.assertEqual(add_response["nonce"], REQUEST_NONCE)
     self.assertEqual(add_response["error"], "add failed")
     self.assertEqual(get_response["nonce"], REQUEST_NONCE)
     self.assertEqual(get_response["error"], "get failed")
+    self.assertEqual(reveal_response["nonce"], REQUEST_NONCE)
+    self.assertEqual(reveal_response["error"], "reveal failed")
 
   def test_registry_lookup_is_cached_between_hourly_lifecycle_refreshes(self):
     plugin = self._make_manager(dauth_oracle=True)

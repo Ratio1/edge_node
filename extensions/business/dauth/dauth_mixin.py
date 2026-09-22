@@ -24,6 +24,9 @@ from ratio1.const.base import dAuth
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
 DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
+DAUTH_SECRET_REVEAL_ACTION = "reveal_job_secrets"
+DAUTH_VIEW_SECRETS_PERMISSION = 1 << 4
+DEEPLOY_WALLET_MESSAGE_PREFIX = "Please sign this message for Deeploy: "
 
 
 def version_to_int(version):
@@ -261,6 +264,74 @@ class _DauthMixin(object):
     _, pipeline = self._load_dauth_job_pipeline_record(job_id)
     return pipeline
 
+  def _load_current_dauth_secret_bundle(self, job_id, pipeline_cid, pipeline):
+    secret_bundle = self._load_dauth_job_secret_bundle(job_id)
+    if not isinstance(secret_bundle, dict):
+      raise ValueError(f"No dAuth secret bundle found for job {job_id}.")
+    if DAUTH_SECRET_PIPELINE_CID_KEY not in secret_bundle:
+      secret_bundle = self._bind_legacy_secret_bundle(
+        job_id=job_id,
+        pipeline_cid=pipeline_cid,
+        pipeline=pipeline,
+        secret_bundle=secret_bundle,
+      )
+    if secret_bundle.get(DAUTH_SECRET_PIPELINE_CID_KEY) != pipeline_cid:
+      raise ValueError(f"dAuth secret bundle generation mismatch for job {job_id}.")
+    current_pipeline_cid = self.chainstore_hget(
+      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
+      key=job_id,
+    )
+    if current_pipeline_cid != pipeline_cid:
+      raise ValueError(f"dAuth pipeline generation changed for job {job_id}.")
+    return secret_bundle
+
+  def _verify_dauth_reveal_wallet_request(self, wallet_request, job_id, pipeline_cid, pipeline):
+    if not isinstance(wallet_request, dict):
+      raise ValueError("Wallet reveal request is required.")
+
+    bcct = self.const.BASE_CT.BCctbase
+    claimed_sender = wallet_request.get(bcct.ETH_SENDER)
+    if not isinstance(claimed_sender, str) or not self.bc.is_valid_eth_address(claimed_sender):
+      raise ValueError("Wallet reveal sender is invalid.")
+    recovered_sender = self.bc.eth_verify_payload_signature(
+      payload=wallet_request,
+      message_prefix=DEEPLOY_WALLET_MESSAGE_PREFIX,
+      no_hash=True,
+      indent=1,
+      verify_safe=True,
+    )
+    if not isinstance(recovered_sender, str) or recovered_sender.lower() != claimed_sender.lower():
+      raise ValueError("Wallet reveal signature is invalid.")
+    self._validate_dauth_secret_request_nonce(wallet_request)
+
+    if wallet_request.get("action") != DAUTH_SECRET_REVEAL_ACTION:
+      raise ValueError("Wallet reveal action is invalid.")
+    if self._normalize_dauth_job_id(wallet_request.get("job_id")) != job_id:
+      raise ValueError("Wallet reveal job ID does not match the relay request.")
+    escrow_details = self.bc.get_user_escrow_details(claimed_sender)
+    if not isinstance(escrow_details, dict) or not escrow_details.get("isActive"):
+      raise ValueError("Wallet reveal sender has no active escrow.")
+    escrow_owner = escrow_details.get("escrowOwner")
+    if not isinstance(escrow_owner, str):
+      raise ValueError("Wallet reveal escrow owner is invalid.")
+    is_owner = escrow_owner.lower() == claimed_sender.lower()
+    permissions = escrow_details.get("permissions", 0)
+    try:
+      can_view_secrets = bool(int(permissions) & DAUTH_VIEW_SECRETS_PERMISSION)
+    except (TypeError, ValueError):
+      can_view_secrets = False
+    if not is_owner and not can_view_secrets:
+      raise ValueError("Wallet reveal sender lacks view-secrets permission.")
+
+    pipeline_owner = pipeline.get("OWNER", pipeline.get("owner")) if isinstance(pipeline, dict) else None
+    if not isinstance(pipeline_owner, str) or pipeline_owner.lower() != escrow_owner.lower():
+      raise ValueError("Wallet reveal sender does not own the persisted pipeline.")
+    job = self.bc.get_job_details(job_id=int(job_id))
+    job_owner = job.get("escrowOwner") if isinstance(job, dict) else None
+    if not isinstance(job_owner, str) or job_owner.lower() != escrow_owner.lower():
+      raise ValueError("Wallet reveal sender does not own the on-chain job.")
+    return claimed_sender
+
   def _pipeline_runner_nodes(self, pipeline):
     if not isinstance(pipeline, dict):
       return []
@@ -411,24 +482,11 @@ class _DauthMixin(object):
     if normalized_requester not in normalized_runner_nodes:
       raise ValueError(f"Sender {requester} is not running job {job_id}.")
 
-    secret_bundle = self._load_dauth_job_secret_bundle(job_id)
-    if not isinstance(secret_bundle, dict):
-      raise ValueError(f"No dAuth secret bundle found for job {job_id}.")
-    if DAUTH_SECRET_PIPELINE_CID_KEY not in secret_bundle:
-      secret_bundle = self._bind_legacy_secret_bundle(
-        job_id=job_id,
-        pipeline_cid=pipeline_cid,
-        pipeline=pipeline,
-        secret_bundle=secret_bundle,
-      )
-    if secret_bundle.get(DAUTH_SECRET_PIPELINE_CID_KEY) != pipeline_cid:
-      raise ValueError(f"dAuth secret bundle generation mismatch for job {job_id}.")
-    current_pipeline_cid = self.chainstore_hget(
-      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
-      key=job_id,
+    secret_bundle = self._load_current_dauth_secret_bundle(
+      job_id=job_id,
+      pipeline_cid=pipeline_cid,
+      pipeline=pipeline,
     )
-    if current_pipeline_cid != pipeline_cid:
-      raise ValueError(f"dAuth pipeline generation changed for job {job_id}.")
     encrypted_secret_bundle = self.bc.encrypt_str(
       str_data=self.json_dumps(secret_bundle),
       str_recipient=requester,
@@ -436,6 +494,43 @@ class _DauthMixin(object):
     if not isinstance(encrypted_secret_bundle, str) or not encrypted_secret_bundle:
       raise ValueError(f"Failed to encrypt dAuth secrets for job {job_id}.")
 
+    return {
+      "status": "success",
+      "job_id": job_id,
+      self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
+      "encrypted_secret_bundle": encrypted_secret_bundle,
+    }
+
+  def process_dauth_reveal_secret_request(self, body):
+    requester, requester_eth = self._verify_signed_dauth_body(body)
+    request_nonce = self._validate_dauth_secret_request_nonce(body)
+    if not self._is_protocol_oracle_eth(requester_eth):
+      raise ValueError(f"Sender {requester_eth} is not an oracle.")
+
+    wallet_request = body.get("wallet_request")
+    job_id = self._normalize_dauth_job_id(
+      wallet_request.get("job_id") if isinstance(wallet_request, dict) else None
+    )
+    pipeline_cid, pipeline = self._load_dauth_job_pipeline_record(job_id)
+    if not pipeline_cid or not isinstance(pipeline, dict):
+      raise ValueError(f"No persisted pipeline found for job {job_id}.")
+    self._verify_dauth_reveal_wallet_request(
+      wallet_request=wallet_request,
+      job_id=job_id,
+      pipeline_cid=pipeline_cid,
+      pipeline=pipeline,
+    )
+    secret_bundle = self._load_current_dauth_secret_bundle(
+      job_id=job_id,
+      pipeline_cid=pipeline_cid,
+      pipeline=pipeline,
+    )
+    encrypted_secret_bundle = self.bc.encrypt_str(
+      str_data=self.json_dumps(secret_bundle),
+      str_recipient=requester,
+    )
+    if not isinstance(encrypted_secret_bundle, str) or not encrypted_secret_bundle:
+      raise ValueError(f"Failed to encrypt dAuth secrets for job {job_id}.")
     return {
       "status": "success",
       "job_id": job_id,

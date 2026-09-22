@@ -12,6 +12,10 @@ from math import isfinite
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
+from extensions.business.dauth.dauth_mixin import (
+  DAUTH_SECRET_REVEAL_ACTION,
+  DAUTH_VIEW_SECRETS_PERMISSION,
+)
 from extensions.business.dauth.dauth_registry import dauth_registry_write_kwargs
 from naeural_core import constants as ct
 from ratio1.bc.base import compact_canonical_sha256
@@ -69,6 +73,7 @@ PREFERRED_NODE_ALIAS_MAX_LENGTH = 128
 PREFERRED_NODE_DESCRIPTION_MAX_LENGTH = 512
 DEEPLOY_DAUTH_SECRET_PLACEHOLDER = dAuth.DAUTH_SECRET_PLACEHOLDER
 DEEPLOY_DAUTH_JOB_SECRETS_HKEY = "DAUTH_JOB_SECRETS"
+DEEPLOY_DAUTH_SECRET_REVEAL_MAX_AGE_SECONDS = 120
 DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES = (
   ("CLOUDFLARE_TOKEN",),
   ("NGROK_AUTH_TOKEN",),
@@ -1558,6 +1563,163 @@ class _DeeployMixin:
         "Cannot reconcile a redacted pipeline without its dAuth secret bundle"
       )
     return {"job_id": str(job_id), "job_secrets": {}}
+
+  def _validate_job_secret_reveal_access(self, inputs, auth_result):
+    """Authorize one wallet-signed reveal against the current job generation."""
+    if inputs.get("action") != DAUTH_SECRET_REVEAL_ACTION:
+      raise ValueError("Invalid job-secret reveal action.")
+
+    nonce = inputs.get(DEEPLOY_KEYS.NONCE)
+    if not isinstance(nonce, str) or not nonce:
+      raise ValueError("Job-secret reveal nonce is required.")
+    try:
+      request_time = int(nonce, 16) / 1000
+    except (TypeError, ValueError) as exc:
+      raise ValueError("Job-secret reveal nonce is invalid.") from exc
+    request_age = self.time() - request_time
+    if request_age < 0:
+      raise ValueError("Job-secret reveal nonce is from the future.")
+    if request_age > DEEPLOY_DAUTH_SECRET_REVEAL_MAX_AGE_SECONDS:
+      raise ValueError("Job-secret reveal nonce is expired.")
+
+    sender = auth_result.get(DEEPLOY_KEYS.SENDER)
+    escrow_owner = auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER)
+    escrow_details = self.bc.get_user_escrow_details(sender)
+    if not isinstance(escrow_details, dict) or not escrow_details.get("isActive"):
+      raise ValueError("Job-secret reveal sender has no active escrow.")
+    details_owner = escrow_details.get("escrowOwner")
+    if not isinstance(details_owner, str) or details_owner.lower() != str(escrow_owner).lower():
+      raise ValueError("Job-secret reveal escrow owner is invalid.")
+    is_owner = isinstance(sender, str) and sender.lower() == details_owner.lower()
+    try:
+      can_view_secrets = bool(int(escrow_details.get("permissions", 0)) & DAUTH_VIEW_SECRETS_PERMISSION)
+    except (TypeError, ValueError):
+      can_view_secrets = False
+    if not is_owner and not can_view_secrets:
+      raise ValueError("Job-secret reveal sender lacks view-secrets permission.")
+
+    job_id = str(inputs.get(DEEPLOY_KEYS.JOB_ID, "")).strip()
+    if not job_id:
+      raise ValueError("Job ID is required for job-secret reveal.")
+    current_pipeline_cid = self._get_pipeline_from_cstore(job_id)
+    if not current_pipeline_cid:
+      raise ValueError(f"No persisted pipeline found for job {job_id}.")
+
+    pipeline = self.get_pipeline_from_r1fs(
+      current_pipeline_cid,
+      timeout=30,
+      pin=False,
+      raise_on_error=False,
+      show_logs=False,
+    )
+    if not isinstance(pipeline, dict):
+      raise ValueError(f"Pipeline payload for job {job_id} could not be loaded.")
+    pipeline_owner = pipeline.get(NetMonCt.OWNER.upper())
+    if not isinstance(pipeline_owner, str) or pipeline_owner.lower() != details_owner.lower():
+      raise ValueError("Job-secret reveal sender does not own the persisted pipeline.")
+
+    job = self.bc.get_job_details(job_id=int(job_id))
+    job_owner = job.get("escrowOwner") if isinstance(job, dict) else None
+    if not isinstance(job_owner, str) or job_owner.lower() != details_owner.lower():
+      raise ValueError("Job-secret reveal sender does not own the on-chain job.")
+    return job_id, current_pipeline_cid, pipeline
+
+  def _request_dauth_job_secret_reveal(self, wallet_request, job_id, pipeline_cid):
+    """Relay an authorized wallet request and decrypt the dAuth response."""
+    network = self.bc.get_evm_network()
+    dauth_url = self.bc.get_network_data(network)[dAuth.EvmNetData.DAUTH_URL_KEY]
+    reveal_url = dauth_url.replace("/get_auth_data", "/reveal_job_secrets")
+
+    relay_body = {
+      "wallet_request": self.deepcopy(wallet_request),
+      dAuth.DAUTH_NONCE: hex(int(self.time() * 1000)),
+    }
+    self.bc.sign(relay_body)
+    response = self.requests.post(
+      reveal_url,
+      json={"body": relay_body},
+      timeout=(10, 60),
+    )
+    if response.status_code != 200:
+      raise RuntimeError(
+        f"dAuth job-secret reveal failed with HTTP status {response.status_code}."
+      )
+    try:
+      response_data = response.json()
+    except (TypeError, ValueError) as exc:
+      raise ValueError("dAuth job-secret reveal response is not valid JSON.") from exc
+    result = response_data.get("result") if isinstance(response_data, dict) else None
+    if not isinstance(result, dict):
+      raise ValueError("dAuth job-secret reveal response result must be a dictionary.")
+
+    verification = self.bc.verify(result, return_full_info=True)
+    if not getattr(verification, "valid", False):
+      raise ValueError("dAuth job-secret reveal response signature is invalid.")
+    signer = getattr(verification, "sender", None)
+    try:
+      signer_eth = self.bc.node_address_to_eth_address(signer)
+      signer_is_dauth_oracle = self.bc.is_dauth_oracle(node_address_eth=signer_eth)
+    except Exception as exc:
+      raise ValueError("dAuth job-secret reveal response signer is not authorized.") from exc
+    if not signer_is_dauth_oracle:
+      raise ValueError("dAuth job-secret reveal response signer is not authorized.")
+
+    if result.get(dAuth.DAUTH_NONCE) != relay_body[dAuth.DAUTH_NONCE]:
+      raise ValueError("dAuth job-secret reveal response nonce does not match the request.")
+    if result.get("error") not in [None, ""]:
+      raise RuntimeError("dAuth job-secret reveal was rejected.")
+    if result.get(DEEPLOY_KEYS.STATUS) != DEEPLOY_STATUS.SUCCESS:
+      raise ValueError("dAuth job-secret reveal response status is invalid.")
+    if str(result.get(DEEPLOY_KEYS.JOB_ID, "")).strip() != job_id:
+      raise ValueError("dAuth job-secret reveal response job ID does not match the request.")
+    encrypted_bundle = result.get("encrypted_secret_bundle")
+    if not isinstance(encrypted_bundle, str) or not encrypted_bundle:
+      raise ValueError("dAuth encrypted job-secret bundle is invalid.")
+    try:
+      secret_bundle = json.loads(self.bc.decrypt_str(encrypted_bundle, signer))
+    except Exception as exc:
+      raise ValueError("dAuth job-secret bundle decryption failed.") from exc
+    if not isinstance(secret_bundle, dict):
+      raise ValueError("dAuth job-secret bundle must be a dictionary.")
+    if str(secret_bundle.get(DEEPLOY_KEYS.JOB_ID, "")).strip() != job_id:
+      raise ValueError("dAuth job-secret bundle job ID does not match the request.")
+    if secret_bundle.get(DEEPLOY_KEYS.PIPELINE_CID) != pipeline_cid:
+      raise ValueError("dAuth job-secret bundle pipeline generation is stale.")
+    job_secrets = secret_bundle.get("job_secrets")
+    if not isinstance(job_secrets, dict):
+      raise ValueError("dAuth job-secret bundle payload is invalid.")
+    if self._get_pipeline_from_cstore(job_id) != pipeline_cid:
+      raise ValueError("Persisted pipeline changed while revealing job secrets.")
+    return job_secrets
+
+  def _resolve_dauth_job_secrets_for_reveal(self, pipeline, job_secrets):
+    """Resolve exact placeholder paths in a transient pipeline copy."""
+    if not isinstance(pipeline, dict):
+      raise ValueError("Persisted pipeline payload is invalid.")
+    if not isinstance(job_secrets, dict):
+      raise ValueError("dAuth job-secret bundle payload is invalid.")
+
+    resolved_pipeline = self.deepcopy(pipeline)
+    unresolved = []
+    for path in self._iter_deeploy_dauth_placeholder_paths(resolved_pipeline):
+      found, value = self._get_dauth_secret_fragment_value(job_secrets, path)
+      if (
+        not found
+        or value is None
+        or value == DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+        or isinstance(value, (dict, list))
+      ):
+        unresolved.append("/".join(str(part) for part in path))
+        continue
+      self._set_dauth_secret_fragment_value(resolved_pipeline, path, value)
+
+    if unresolved:
+      raise ValueError(
+        "dAuth job-secret bundle is missing values for: {}".format(
+          ", ".join(unresolved)
+        )
+      )
+    return resolved_pipeline
 
   # Repairs Deeploy's off-chain pipeline metadata and live node configs after
   # PoAI Manager moves a CSP escrow to a new owner on-chain.

@@ -2324,6 +2324,43 @@ class DeeployManagerApiPlugin(
     })
     return response
 
+  @BasePlugin.endpoint(method="post")
+  # /reveal_job_secrets
+  def reveal_job_secrets(self, request: dict = None):
+    """Return a transient resolved view of the current persisted pipeline."""
+    if request is None:
+      request = {}
+    try:
+      _, inputs = self.deeploy_verify_and_get_inputs(
+        request,
+        request_type="reveal job secrets",
+      )
+      auth_result = self.deeploy_get_auth_result(inputs)
+      job_id, pipeline_cid, pipeline = self._validate_job_secret_reveal_access(
+        inputs=inputs,
+        auth_result=auth_result,
+      )
+      job_secrets = self._request_dauth_job_secret_reveal(
+        wallet_request=request,
+        job_id=job_id,
+        pipeline_cid=pipeline_cid,
+      )
+      resolved_pipeline = self._resolve_dauth_job_secrets_for_reveal(
+        pipeline=pipeline,
+        job_secrets=job_secrets,
+      )
+      if self._get_pipeline_from_cstore(job_id) != pipeline_cid:
+        raise ValueError("Persisted pipeline changed while revealing job secrets.")
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PIPELINE: resolved_pipeline,
+        DEEPLOY_KEYS.AUTH: auth_result,
+      }
+    except Exception as exc:
+      result = self.__handle_error(exc, request)
+    return self._get_response(result)
+
   def is_deeploy_warmed_up(self):
     return (self.time() - self.__warmup_start_time) > self.cfg_warmup_delay
 
