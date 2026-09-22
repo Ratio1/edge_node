@@ -34,7 +34,7 @@ def get_capability_status(owner):
       # (`compute_comparison_port_tier`). Published so the launch form can name
       # the bundle and show the effective scope before launch: the client's
       # 1-1024 scan probed 1242 ports with nothing saying why (RM-086 item 2).
-      "comparison_ports": sorted(COMMON_PORTS),
+      "comparison_ports": sorted(set(COMMON_PORTS)),
     },
     "graybox_scan": {
       "enabled": True,

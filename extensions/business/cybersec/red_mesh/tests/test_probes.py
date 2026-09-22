@@ -3124,7 +3124,8 @@ class TestOWASPFullCoverage(unittest.TestCase):
 
     def fake_request(url, *args, **kwargs):
       resp = MagicMock()
-      resp.status_code = 200
+      # A real server 404s the random canary path; the login paths answer 200.
+      resp.status_code = 404 if _re.search(r"/[0-9a-f]{32}$", url) else 200
       resp.text = "invalid credentials"
       resp.headers = {}
       return resp
@@ -5369,6 +5370,19 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     paths = {e["path"] for e in worker.state["catch_all_withheld"]["http://example.com"]}
     self.assertIn("/env", paths)
     self.assertNotIn("/actuator", paths)
+
+  def test_rate_limiting_is_withheld_on_a_catch_all_host(self):
+    # Its precondition is "login path is not a 404", which every phantom path
+    # on a catch-all host satisfies; the review round found it emitting
+    # "No rate limiting on login endpoint (/login)" for a non-existent /login.
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.hardening.requests.post",
+               side_effect=self._all(200)):
+      result = worker._web_test_rate_limiting("example.com", 80)
+    self.assertEqual(result["findings"], [])
+    paths = {e["path"] for e in worker.state["catch_all_withheld"]["http://example.com"]}
+    self.assertEqual(paths, {"/login", "/api/login", "/auth/login"})
 
   def test_the_canary_runs_once_per_host(self):
     worker = self._build_worker()

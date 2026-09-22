@@ -525,6 +525,30 @@ class SeveritySourceTests(unittest.TestCase):
     )
     self.assertEqual(enriched.severity_source, SEVERITY_SOURCE_CVSS)
 
+  def test_an_nvd_score_without_a_vector_is_cvss_sourced(self):
+    # `cve_db._build_finding` passes NVD's score and qualitative tier; the
+    # vector can be empty. That label is CVSS-backed, not the probe author's.
+    from extensions.business.cybersec.red_mesh.findings import (
+      SEVERITY_SOURCE_CVSS, Severity,
+    )
+    self._register()
+    enriched = self._enrich(Severity.MEDIUM, cvss_score=7.5)
+    self.assertEqual(enriched.cvss_vector, "")
+    self.assertEqual(enriched.severity_source, SEVERITY_SOURCE_CVSS)
+
+  def test_a_supplied_vector_whose_band_disagrees_is_not_cvss_sourced(self):
+    # "cvss" promises the vector backs the label. A probe-supplied 5.3 (MEDIUM)
+    # vector on a CRITICAL label is printed, but the label is still policy.
+    from extensions.business.cybersec.red_mesh.findings import (
+      SEVERITY_SOURCE_PROBE_POLICY, Severity,
+    )
+    self._register()
+    enriched = self._enrich(
+      Severity.CRITICAL, cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    )
+    self.assertEqual(enriched.cvss_score, 5.3)
+    self.assertEqual(enriched.severity_source, SEVERITY_SOURCE_PROBE_POLICY)
+
   def test_a_preset_source_is_kept(self):
     from extensions.business.cybersec.red_mesh.findings import Severity
     self._register()

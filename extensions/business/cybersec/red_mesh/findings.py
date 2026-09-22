@@ -417,10 +417,18 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
     if derived_score is not None:
       updates["cvss_score"] = derived_score
   # Not in `_CONTENT_FIELDS`: a label's provenance is metadata about the
-  # finding, so stamping it must not move `finding_signature`.
+  # finding, so stamping it must not move `finding_signature`. "cvss" means the
+  # vector truly backs the label: an attached vector whose band is the label
+  # (the template gate above guarantees that for templates; a probe- or
+  # CVE-supplied vector is checked here the same way), or a score the probe
+  # supplied with no vector (NVD gives `cve_db` a score and a qualitative tier;
+  # `CvssRecord.vector` may be empty). Anything else is the probe author's call.
   if not f.severity_source:
+    vector_backs_label = bool(cvss_vector) and _template_band_agrees(cvss_vector, f.severity)
+    score_without_vector = not cvss_vector and f.cvss_score is not None
     updates["severity_source"] = (
-      SEVERITY_SOURCE_CVSS if cvss_vector else SEVERITY_SOURCE_PROBE_POLICY
+      SEVERITY_SOURCE_CVSS if (vector_backs_label or score_without_vector)
+      else SEVERITY_SOURCE_PROBE_POLICY
     )
   if references != f.references:
     updates["references"] = references

@@ -644,6 +644,14 @@ class _WebHardeningMixin:
     password = "WrongPassword123!"
     attempt_count = 5
 
+    if self._host_is_catch_all(base_url):
+      # The precondition below is "the login path is not a 404"; a catch-all
+      # host passes it for paths that do not exist, so five accepted attempts
+      # against a phantom endpoint prove nothing (RM-086 item 1).
+      for path in login_paths:
+        self._withhold_on_catch_all(base_url, "_web_test_rate_limiting", path)
+      return probe_result(findings=findings_list)
+
     for path in login_paths:
       url = base_url.rstrip("/") + path
       try:
