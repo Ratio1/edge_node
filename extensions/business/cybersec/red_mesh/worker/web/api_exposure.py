@@ -1,6 +1,7 @@
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
@@ -49,6 +50,7 @@ class _WebApiExposureMixin:
       if resp.status_code == 200 and "__schema" in resp.text:
         findings_list.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
           title="GraphQL introspection enabled",
           description=f"GraphQL endpoint at {graphql_url} exposes the full schema "
                       "via introspection, revealing all types, queries, and mutations.",
@@ -199,6 +201,7 @@ class _WebApiExposureMixin:
             if resp.status_code == 200 and any(m in body_lower for m in self._SSRF_MARKERS):
               findings_list.append(Finding(
                 severity=Severity.CRITICAL,
+                cvss_vector=V.SSRF_TO_INTERNAL,
                 title=f"SSRF: parameter '{param}' fetches internal resources",
                 description=f"Injecting a metadata URL into the '{param}' parameter at "
                             f"{path} returned cloud metadata content, indicating SSRF.",
@@ -271,6 +274,7 @@ class _WebApiExposureMixin:
         if resp.status_code in (200, 204):
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.INJECTION_DATA_ACCESS,
             title=f"API auth bypass: {path} accepts invalid token",
             description=f"API endpoint {url} returned success with a fabricated Bearer token, "
                         "indicating missing or broken authentication middleware.",

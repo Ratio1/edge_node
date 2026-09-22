@@ -5,6 +5,7 @@ import struct
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ...cve_db import check_cves
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -68,6 +69,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
           findings.append(Finding(
             severity=Severity.LOW,
+            cvss_vector=V.INFO_DISCLOSURE_LOW,
             title=f"MySQL version disclosed: {version}",
             description=f"MySQL {version} handshake received on {target}:{port}.",
             evidence=f"version={version}, auth_plugin={raw['auth_plugin']}",
@@ -102,6 +104,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                 if entropy < 2.0:
                   findings.append(Finding(
                     severity=Severity.HIGH,
+                    cvss_vector=V.WEAK_CRYPTO_BREAKABLE,
                     title="MySQL salt entropy critically low",
                     description="The authentication scramble has abnormally low entropy, "
                                 "suggesting a non-standard or deceptive MySQL service.",
@@ -371,6 +374,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           sock.close()
           return Finding(
             severity=Severity.CRITICAL,
+            cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
             description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
                         "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
@@ -476,6 +480,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     if resp.startswith("+PONG"):
       return [Finding(
         severity=Severity.CRITICAL,
+        cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
         title="Redis unauthenticated access",
         description="Redis responded to PING without authentication.",
         evidence=f"Response: {resp.strip()[:80]}",
@@ -516,6 +521,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     if raw["version"]:
       findings.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"Redis version disclosed: {raw['version']}",
         description=f"Redis {raw['version']} on {raw['os'] or 'unknown OS'}.",
         evidence=f"version={raw['version']}, os={raw['os']}",
@@ -546,6 +552,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     raw["config_writable"] = True
     findings.append(Finding(
       severity=Severity.CRITICAL,
+      cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
       title="Redis CONFIG command accessible (RCE vector)",
       description="CONFIG GET is accessible, allowing attackers to write arbitrary files "
                   "via CONFIG SET dir / CONFIG SET dbfilename + SAVE.",
@@ -568,6 +575,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         if count > 0:
           findings.append(Finding(
             severity=Severity.MEDIUM,
+            cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
             title="Redis database contains live data",
             description=f"Unauthenticated access to a Redis instance holding {count} keys.",
             evidence="DBSIZE executed without authentication and reported a non-empty keyspace.",
@@ -597,6 +605,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       raw["connected_clients"] = list(ips)
       findings.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title="Redis client IPs disclosed",
         description=f"CLIENT LIST reveals {len(ips)} connected client IPs: "
                     f"{', '.join(sorted(ips)[:5])}",
@@ -620,6 +629,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           if ts == 0:
             findings.append(Finding(
               severity=Severity.LOW,
+              cvss_vector=V.DATA_DURABILITY,
               title="Redis has never performed an RDB save",
               description="rdb_last_bgsave_time is 0, meaning no background save has ever been performed. "
                           "This may indicate a cache-only instance with persistence disabled, or an ephemeral deployment.",
@@ -632,6 +642,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
             age_days = int((_time.time() - ts) / 86400)
             findings.append(Finding(
               severity=Severity.LOW,
+              cvss_vector=V.DATA_DURABILITY,
               title="Redis RDB save is stale",
               description="The last RDB background save is over a year old. This may "
                           "indicate disabled persistence, a long-running cache-only "
@@ -781,6 +792,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         if auth_code == 0:
           findings.append(Finding(
             severity=Severity.CRITICAL,
+            cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title="PostgreSQL trust authentication (no password)",
             description=f"PostgreSQL on {target}:{port} accepts connections without any password (auth code 0).",
             evidence=f"Auth response code: {auth_code}",
@@ -833,6 +845,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         raw["auth_type"] = "ok_text"
         findings.append(Finding(
           severity=Severity.CRITICAL,
+          cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
           title="PostgreSQL trust authentication (no password)",
           description=f"PostgreSQL on {target}:{port} accepted connection without authentication.",
           evidence="Text response contained AuthenticationOk",
@@ -846,6 +859,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       if pg_version:
         findings.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"PostgreSQL version disclosed: {pg_version}",
           description=f"PostgreSQL on {target}:{port} reports version {pg_version}.",
           evidence=f"server_version parameter: {pg_version}",
@@ -1003,6 +1017,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           if key == 'server_version':
             findings.append(Finding(
               severity=Severity.LOW,
+              cvss_vector=V.INFO_DISCLOSURE_LOW,
               title=f"PostgreSQL version disclosed: {val}",
               description=f"PostgreSQL reports version {val} (via authenticated session).",
               evidence=f"server_version parameter: {val}",
@@ -1061,6 +1076,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         raw["version"] = ver_match.group(1)
         findings.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"Memcached version disclosed: {raw['version']}",
           description=f"Memcached on {target}:{port} reveals version via VERSION command.",
           evidence=f"VERSION {raw['version']}",
@@ -1163,6 +1179,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           raw["version"] = mongo_version
           findings.append(Finding(
             severity=Severity.LOW,
+            cvss_vector=V.INFO_DISCLOSURE_LOW,
             title=f"MongoDB version disclosed: {mongo_version}",
             description=f"MongoDB on {target}:{port} reports version {mongo_version}.",
             evidence=f"buildInfo version: {mongo_version}",
@@ -1260,6 +1277,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     if raw["version"]:
       findings.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"CouchDB version disclosed: {raw['version']}",
         description=f"CouchDB on {target}:{port} reports version {raw['version']}.",
         evidence=f"GET / → version={raw['version']}",
@@ -1281,6 +1299,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           user_dbs = [d for d in dbs if not d.startswith("_")]
           findings.append(Finding(
             severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
+            cvss_vector="" if user_dbs else V.SENSITIVE_DATA_EXPOSED,
             title="CouchDB unauthenticated database listing",
             description=f"/_all_dbs accessible without credentials, listing {len(dbs)} databases. "
                         f"{'User databases exposed: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only system databases found.'}",
@@ -1299,6 +1318,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       if resp.ok and ("fauxton" in resp.text.lower() or "couchdb" in resp.text.lower()):
         findings.append(Finding(
           severity=Severity.HIGH,
+          cvss_vector=V.ADMIN_INTERFACE_EXPOSED,
           title="CouchDB admin panel (Fauxton) accessible",
           description=f"/_utils/ on {target}:{port} serves the admin web interface.",
           evidence="GET /_utils/ served the Fauxton admin interface without credentials.",
@@ -1362,6 +1382,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
       raw["version"] = version
       findings.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"InfluxDB version disclosed: {version}",
         description=f"InfluxDB on {target}:{port} reports version {version}.",
         evidence=f"X-Influxdb-Version: {version}",
@@ -1392,6 +1413,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
           user_dbs = [d for d in db_names if d not in ("_internal",)]
           findings.append(Finding(
             severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
+            cvss_vector=V.UNAUTHENTICATED_READ_WRITE if user_dbs else V.SENSITIVE_DATA_EXPOSED,
             title="InfluxDB unauthenticated access",
             description=f"SHOW DATABASES succeeded without credentials, returning "
                         f"{len(db_names)} databases. "

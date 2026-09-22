@@ -2028,7 +2028,7 @@ class TestScannerEnhancements(unittest.TestCase):
   # --- Item 1: TLS validity period ---
 
   def test_tls_validity_period_10yr(self):
-    """Certificate with 10-year validity should flag MEDIUM."""
+    """Certificate with 10-year validity is flagged LOW: hygiene, not a weakness (RM-087)."""
     _, worker = self._build_worker(ports=[443])
     try:
       from cryptography import x509
@@ -2053,7 +2053,7 @@ class TestScannerEnhancements(unittest.TestCase):
 
       findings = worker._tls_check_validity_period(cert_der)
       self.assertEqual(len(findings), 1)
-      self.assertEqual(findings[0].severity, "MEDIUM")
+      self.assertEqual(findings[0].severity, "LOW")
       self.assertIn("validity span", findings[0].title.lower())
     except ImportError:
       self.skipTest("cryptography library not available")
@@ -2590,8 +2590,9 @@ class TestPhase17aQuickWins(unittest.TestCase):
 
   # ---- 17a-5: ES IP classification + JVM ----
 
-  def test_es_nodes_public_ip_critical(self):
-    """Public IP from _nodes endpoint is flagged CRITICAL."""
+  def test_es_nodes_public_ip_medium(self):
+    """Public IP from _nodes endpoint is flagged MEDIUM: an address disclosure,
+    CVSS 5.3 (RM-087; it was CRITICAL)."""
     _, worker = self._build_worker(ports=[9200])
     worker.state["scan_metadata"] = {"internal_ips": []}
     raw = {}
@@ -2609,9 +2610,10 @@ class TestPhase17aQuickWins(unittest.TestCase):
       findings = worker._es_check_nodes("http://10.0.0.1:9200", raw)
     titles = [f.title for f in findings]
     severities = [f.severity for f in findings]
-    # Public IP should be CRITICAL
     self.assertTrue(any("public ip" in t.lower() for t in titles), f"Expected public IP finding, got: {titles}")
-    self.assertIn("CRITICAL", severities)
+    public = next(f for f in findings if "public ip" in f.title.lower())
+    self.assertEqual(public.severity, "MEDIUM")
+    self.assertNotIn("CRITICAL", severities)
     # JVM EOL
     self.assertTrue(any("eol jvm" in t.lower() for t in titles), f"Expected EOL JVM finding, got: {titles}")
     self.assertEqual(raw.get("jvm_version"), "1.7.0_55")

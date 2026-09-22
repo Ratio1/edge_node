@@ -332,7 +332,7 @@ class TestNoNewVolatileEvidenceInterpolations(unittest.TestCase):
     # 4-byte protocol prefix, constant per server. Keeping it is what
     # distinguishes SMBv1 from SMBv2 from unknown in the finding itself.
     # Removable only by making the predicate value-aware.
-    ("service/infrastructure.py", 1002,
+    ("service/infrastructure.py", 1019,
      'evidence=f"Banner: {raw.get(\'banner\', \'N/A\')}",'),
   }
 

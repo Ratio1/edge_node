@@ -3,6 +3,7 @@ import uuid as _uuid
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ...cve_db import check_cves
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
@@ -149,6 +150,13 @@ class _WebDiscoveryMixin:
         ".NET ELMAH error log viewer exposed — reveals stack traces and request data."),
     }
 
+    # Rows whose label is not the template's HIGH band; the others inherit it.
+    _PATH_CVSS = {
+      "/admin": V.INFO_DISCLOSURE_MEDIUM,
+      "/xmlrpc.php": V.BRUTE_FORCE_UNTHROTTLED,
+      "/wp-login.php": V.INFO_DISCLOSURE_LOW,
+    }
+
     if catch_all:
       # Every check below is a bare 200; on this host that proves nothing, so
       # none is requested and each is recorded as withheld instead.
@@ -163,6 +171,7 @@ class _WebDiscoveryMixin:
         if resp.status_code == 200:
           findings_list.append(Finding(
             severity=severity,
+            cvss_vector=_PATH_CVSS.get(path, ""),
             title=f"Accessible resource: {path}",
             description=desc,
             evidence=f"GET {url} returned 200 OK.",
@@ -226,6 +235,8 @@ class _WebDiscoveryMixin:
         if marker in text:
           findings_list.append(Finding(
             severity=severity,
+            # A credential in page source grants access; SECRET keeps the template.
+            cvss_vector=V.UNAUTHENTICATED_READ_WRITE if severity == Severity.CRITICAL else "",
             title=title,
             description=f"The string '{marker}' was found in the HTML source of {base_url}.",
             evidence=f"Marker '{marker}' present in first 10KB of response.",
@@ -283,6 +294,7 @@ class _WebDiscoveryMixin:
         raw["technologies"].append(server)
         findings_list.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"Server header disclosed: {server}",
           description=f"Server header reveals software: {server}.",
           evidence=f"Server: {server}",
@@ -299,6 +311,7 @@ class _WebDiscoveryMixin:
         raw["technologies"].append(powered_by)
         findings_list.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"X-Powered-By disclosed: {powered_by}",
           description=f"X-Powered-By header reveals technology: {powered_by}.",
           evidence=f"X-Powered-By: {powered_by}",
@@ -320,6 +333,7 @@ class _WebDiscoveryMixin:
         raw["technologies"].append(generator)
         findings_list.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"Generator meta tag: {generator}",
           description=f"HTML meta generator reveals CMS/framework: {generator}.",
           evidence=f'<meta name="generator" content="{generator}">',
@@ -531,6 +545,7 @@ class _WebDiscoveryMixin:
       raw["version"] = wp_version
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"WordPress {wp_version} detected",
         description=f"WordPress {wp_version} identified on {target}:{port}.",
         evidence="Detection via generator tag or wp-content paths.",
@@ -604,6 +619,7 @@ class _WebDiscoveryMixin:
       raw["version"] = drupal_version
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"Drupal {drupal_version} detected",
         description=f"Drupal {drupal_version} identified on {target}:{port}.",
         evidence="Detection via CHANGELOG.txt or generator tag.",
@@ -637,6 +653,7 @@ class _WebDiscoveryMixin:
       raw["version"] = joomla_version
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"Joomla {joomla_version} detected",
         description=f"Joomla {joomla_version} identified on {target}:{port}.",
         evidence="Detection via /administrator/ page.",
@@ -654,7 +671,8 @@ class _WebDiscoveryMixin:
         )
         if resp.ok and ("password" in resp.text.lower() or '"db"' in resp.text.lower() or '"dbtype"' in resp.text.lower()):
           findings_list.append(Finding(
-            severity=Severity.HIGH,
+            severity=Severity.MEDIUM,
+            cvss_vector=V.INFO_DISCLOSURE_MEDIUM,
             title="CVE-2023-23752: Joomla unauthenticated config disclosure",
             description="Joomla REST API exposes application configuration "
                         "including database credentials without authentication.",
@@ -680,6 +698,7 @@ class _WebDiscoveryMixin:
         laravel_detected = True
         findings_list.append(Finding(
           severity=Severity.HIGH,
+          cvss_vector=V.SENSITIVE_DATA_EXPOSED,
           title="Laravel Ignition debug endpoint exposed",
           description="/_ignition/health-check is accessible, indicating Laravel's "
                       "debug error handler is enabled in production.",
@@ -716,6 +735,7 @@ class _WebDiscoveryMixin:
         if resp.status_code != 404:
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
+            cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title="CVE-2021-3129: Laravel Ignition RCE endpoint accessible",
             description="/_ignition/execute-solution accepts POST requests. "
                         "With Ignition < 2.5.2, this enables unauthenticated RCE "
@@ -734,6 +754,7 @@ class _WebDiscoveryMixin:
       raw["version"] = "unknown"
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title="Laravel framework detected",
         description=f"Laravel framework identified on {target}:{port}.",
         evidence="Detection via Ignition endpoint or error page markers.",
@@ -754,6 +775,7 @@ class _WebDiscoveryMixin:
     if eol_date:
       findings.append(Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.RCE_UNCONFIRMED,
         title=f"{cms_name} {version} is end-of-life (EOL since {eol_date})",
         description=f"This {cms_name} version no longer receives security patches.",
         evidence=f"Version: {version}, EOL: {eol_date}",
@@ -790,6 +812,7 @@ class _WebDiscoveryMixin:
         version = ver_match.group(1) if ver_match else "unknown"
         findings.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"WordPress plugin version exposed: {name} {version}",
           description=f"Plugin {name} detected via readme.txt. "
                       "Version disclosure aids targeted exploit search.",
@@ -884,6 +907,7 @@ class _WebDiscoveryMixin:
         if match and not findings_list:
           findings_list.append(Finding(
             severity=Severity.LOW,
+            cvss_vector=V.INFO_DISCLOSURE_LOW,
             title=f"Internal path leaked in error page",
             description="Error page reveals filesystem paths.",
             evidence=f"Path pattern: {match.group(0)}",
@@ -903,6 +927,7 @@ class _WebDiscoveryMixin:
         if marker in body:
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title=f"Debug mode enabled: {framework}",
             description=f"Debug interface detected on homepage, exposing internal "
                         "state, SQL queries, and configuration.",
@@ -922,6 +947,7 @@ class _WebDiscoveryMixin:
       if resp.status_code == 200 and "djdt" in resp.text.lower():
         findings_list.append(Finding(
           severity=Severity.HIGH,
+          cvss_vector=V.SENSITIVE_DATA_EXPOSED,
           title="Debug mode enabled: Django Debug Toolbar endpoint",
           description="Django Debug Toolbar is accessible at /__debug__/.",
           evidence="GET /__debug__/ returned 200 with djdt content.",
@@ -1024,6 +1050,7 @@ class _WebDiscoveryMixin:
         if resp.ok and ("login" in resp.text.lower() or "WebLogic" in resp.text):
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.ADMIN_INTERFACE_EXPOSED,
             title="WebLogic admin console exposed",
             description="The WebLogic administration console is accessible without IP restriction.",
             evidence=f"GET {base_url}/console/ → {resp.status_code}",
@@ -1042,6 +1069,7 @@ class _WebDiscoveryMixin:
             "portal" in resp.text.lower() or "console" in resp.text.lower()):
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
+            cvss_vector=V.UNAUTHENTICATED_FULL_CONTROL,
             title="CVE-2020-14882: WebLogic console auth bypass confirmed",
             description="WebLogic console authentication can be bypassed via "
                         "double-encoded path traversal, enabling unauthenticated "
@@ -1089,6 +1117,7 @@ class _WebDiscoveryMixin:
       raw["version"] = tomcat_version
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"Apache Tomcat {tomcat_version} detected",
         description=f"Apache Tomcat {tomcat_version} identified on {target}:{port}.",
         evidence="Detection via default page, error page, or Server header.",
@@ -1104,6 +1133,7 @@ class _WebDiscoveryMixin:
           if resp.status_code in (200, 401, 403):
             findings_list.append(Finding(
               severity=Severity.HIGH if resp.status_code == 200 else Severity.MEDIUM,
+              cvss_vector=V.ADMIN_INTERFACE_EXPOSED if resp.status_code == 200 else "",
               title=f"Tomcat Manager accessible: {mgr_path}",
               description=f"Tomcat Manager at {mgr_path} returned {resp.status_code}.",
               evidence=f"GET {base_url}{mgr_path} → {resp.status_code}",
@@ -1142,6 +1172,7 @@ class _WebDiscoveryMixin:
       raw["version"] = jboss_version
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title=f"{raw['java_server']} {jboss_version} detected",
         description=f"{raw['java_server']} {jboss_version} identified on {target}:{port}.",
         evidence=f"Detection via X-Powered-By header or welcome page.",
@@ -1155,6 +1186,7 @@ class _WebDiscoveryMixin:
         if eol_date:
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.RCE_UNCONFIRMED,
             title=f"JBoss AS {jboss_version} is end-of-life (EOL since {eol_date})",
             description=f"JBoss AS {jboss_version} no longer receives security patches.",
             evidence=f"Version: {jboss_version}, EOL: {eol_date}",
@@ -1171,6 +1203,7 @@ class _WebDiscoveryMixin:
         if resp.status_code in (200, 401):
           findings_list.append(Finding(
             severity=Severity.HIGH if resp.status_code == 200 else Severity.MEDIUM,
+            cvss_vector=V.ADMIN_INTERFACE_EXPOSED if resp.status_code == 200 else "",
             title="JBoss JMX console exposed",
             description=f"JMX console at /jmx-console/ returned {resp.status_code}.",
             evidence=f"GET {base_url}/jmx-console/ → {resp.status_code}",
@@ -1222,6 +1255,7 @@ class _WebDiscoveryMixin:
       spring_evidence.append("Spring MVC indicators detected")
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title="Spring Framework detected",
         description=f"Spring Framework identified on {target}:{port}.",
         evidence="Whitelabel Error Page, X-Application-Context header, "
@@ -1256,6 +1290,7 @@ class _WebDiscoveryMixin:
       raw["framework"] = "Struts2"
       findings_list.append(Finding(
         severity=Severity.LOW,
+        cvss_vector=V.INFO_DISCLOSURE_LOW,
         title="Apache Struts2 framework detected",
         description=f"Struts2 indicators found on {target}:{port}.",
         evidence=f"Detection via {struts_evidence}.",
@@ -1265,6 +1300,7 @@ class _WebDiscoveryMixin:
       # Advisory: flag critical Struts2 CVEs when version is unknown
       findings_list.append(Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.RCE_UNCONFIRMED,
         title="Struts2 detected — critical RCE CVEs likely applicable",
         description="Apache Struts2 was detected but the version could not be "
                     "extracted. Most Struts2 versions are affected by at least one "
@@ -1290,6 +1326,7 @@ class _WebDiscoveryMixin:
         raw["version"] = raw.get("version") or jetty_version
         findings_list.append(Finding(
           severity=Severity.LOW,
+          cvss_vector=V.INFO_DISCLOSURE_LOW,
           title=f"Eclipse Jetty {jetty_version} detected",
           description=f"Jetty {jetty_version} identified on {target}:{port} via Server header.",
           evidence=f"Server: {srv}",
