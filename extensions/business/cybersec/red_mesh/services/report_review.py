@@ -15,7 +15,6 @@ Contract: `docs/resources/redmesh/contracts/report-review.md` (project-red-mesh)
 """
 from __future__ import annotations
 
-from ..constants import JOB_STATUS_FINALIZED
 from ..models.report_review import (
   REPORT_REVIEW_CONTRACT_VERSION,
   ReportReviewAuditEntry,
@@ -28,6 +27,7 @@ from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from .rulebook_assessment import (
   _job_repo,
   current_rulebook_submission,
+  reviewable_job,
   _owner_time,
   _safe_text,
   _submission_lock,
@@ -99,7 +99,7 @@ def approve_blocked_reasons(owner, job_id, job_specs, nis2=_UNSET):
 
   `nis2` is `current_rulebook_submission`'s answer when the caller already has it.
   """
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+  if not reviewable_job(job_specs):
     return [{"code": "job_not_finalized", "detail": {"job_status": job_specs.get("job_status")}}]
   if nis2 is _UNSET:
     nis2 = current_rulebook_submission(owner, job_id, job_specs)
@@ -146,7 +146,7 @@ def _reopened(review, nis2, blocked):
 
 def _effective(owner, job_id, job_specs, review):
   """`(review_status, approve_blocked, reopened)` for the latest pass's row."""
-  finalized = job_specs.get("job_status") == JOB_STATUS_FINALIZED
+  finalized = reviewable_job(job_specs)
   nis2 = current_rulebook_submission(owner, job_id, job_specs) if finalized else None
   blocked = approve_blocked_reasons(owner, job_id, job_specs, nis2)
   reopened = _reopened(review, nis2, blocked)
@@ -233,7 +233,7 @@ def _admit_mutation(owner, job_id, expected_review_revision, actor, checked_job,
   job_specs, err = _job_for(owner, job_id, checked_job, snapshot_mode, checked_raise=False)
   if err:
     return None, None, None, err
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+  if not reviewable_job(job_specs):
     return None, None, None, _error("job_not_finalized", job_id,
                                     "Only a finalized job's report can be reviewed.",
                                     job_status=job_specs.get("job_status"))
@@ -360,7 +360,7 @@ def review_summaries(owner, jobs):
   for job_id, job_specs in jobs.items():
     if (
       not isinstance(job_specs, dict)
-      or job_specs.get("job_status") != JOB_STATUS_FINALIZED
+      or not reviewable_job(job_specs)
       or reject_model_test_for_scan_operation(job_specs, job_id, _LOCK_SCOPE)
     ):
       summaries[job_id] = None

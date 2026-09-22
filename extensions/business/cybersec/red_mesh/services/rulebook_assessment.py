@@ -10,7 +10,12 @@ import time as _time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from ..constants import JOB_STATUS_FINALIZED
+from ..constants import (
+  JOB_STATUS_FAILED,
+  JOB_STATUS_FINALIZED,
+  JOB_STATUS_STOPPED,
+  RUN_MODE_CONTINUOUS_MONITORING,
+)
 from ..credential_redaction import redact_credential_text
 from ..models import (
   RULEBOOK_ASSESSMENT_SCHEMA,
@@ -1237,6 +1242,25 @@ def get_rulebook_artifact(owner, job_id, cid, profile_id=DEFAULT_RULEBOOK_PROFIL
           "artifact_kind": artifact["artifact_kind"], "report": artifact}
 
 
+def reviewable_job(job_specs):
+  """Whether a job has a completed pass a human can review (NIS2 and report review alike).
+
+  A finalized job is. A continuous monitor is from its first completed pass on,
+  also while it keeps running: completed passes sit in `pass_reports` until it
+  stops, and a stopped monitor has its archive (owner decision, RM-088). A
+  single pass that is still running or was stopped mid-run is not; nor is a
+  failed job.
+  """
+  status = job_specs.get("job_status")
+  if status == JOB_STATUS_FINALIZED:
+    return True
+  if job_specs.get("run_mode") != RUN_MODE_CONTINUOUS_MONITORING or status == JOB_STATUS_FAILED:
+    return False
+  if status == JOB_STATUS_STOPPED and job_specs.get("job_cid"):
+    return True
+  return any(isinstance(entry, dict) and entry.get("pass_nr") for entry in job_specs.get("pass_reports") or [])
+
+
 def _submission_lock(owner, job_id, profile_id):
   key = f"{getattr(owner, 'cfg_instance_id', '')}:{job_id}:{profile_id}"
   with _SUBMISSION_LOCKS_GUARD:
@@ -1450,7 +1474,7 @@ def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, *
       "error": "model_test_not_supported",
       "error_class": unsupported.get("error_class") or unsupported.get("error"),
     }
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+  if not reviewable_job(job_specs):
     if checked:
       raise AdministrationDenied(409, "job_not_finalized")
     return _error(
@@ -1654,7 +1678,7 @@ def save_rulebook_review_draft(
     job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -1892,7 +1916,7 @@ def submit_rulebook_review(
     job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -2239,7 +2263,7 @@ def reopen_rulebook_review(
     job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -2473,7 +2497,7 @@ def update_rulebook_review(
         "error": "model_test_not_supported",
         "error_class": unsupported.get("error_class") or unsupported.get("error"),
       }
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error(
         "job_not_finalized",
         job_id,

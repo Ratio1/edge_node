@@ -261,6 +261,70 @@ class TestReportReviewNis2Gate(unittest.TestCase):
     self.assertTrue(ref["cid"].startswith("QmRulebook"), ref)
 
 
+def _continuous(job_status="RUNNING", passes=(1,), **extra):
+  """A continuous monitor's record: completed passes live in `pass_reports` until it stops."""
+  return _sample_job_specs(
+    run_mode="CONTINUOUS_MONITORING", job_status=job_status, job_cid=None,
+    pass_reports=[{"pass_nr": nr, "report_cid": f"pass-{nr}"} for nr in passes], **extra)
+
+
+class TestReportReviewContinuousJobs(unittest.TestCase):
+  """Owner decision (RM-088): a continuous monitor is reviewable per completed pass, also while
+  it runs; a new pass reads pending and earlier verdicts stay as history."""
+
+  def test_a_running_monitor_reviews_its_latest_completed_pass(self):
+    owner = _Owner(job_specs=_continuous(passes=(1, 2)))
+    view = get_report_review(owner, "job-1")
+    self.assertEqual((view["review_status"], view["latest_pass_nr"], view["can_approve"]), ("pending", 2, True))
+    approved = approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    self.assertEqual((approved["review_status"], approved["review"]["pass_nr"]), ("approved", 2), approved)
+
+  def test_the_next_completed_pass_reads_pending_with_the_verdict_as_history(self):
+    owner = _Owner(job_specs=_continuous(passes=(1,)))
+    approve_report(owner, "job-1", expected_review_revision=0, actor="alice")
+    owner.job_specs = _continuous(passes=(1, 2))
+    view = get_report_review(owner, "job-1")
+    self.assertEqual((view["review_status"], view["latest_pass_nr"]), ("pending", 2))
+    self.assertEqual([(row["pass_nr"], row["state"]) for row in view["history"]], [(1, "approved")])
+    from extensions.business.cybersec.red_mesh.services.query import list_network_jobs
+    owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
+    self.assertEqual(list_network_jobs(owner)["job-1"]["review"],
+                     {"review_status": "pending", "pass_nr": 2, "reviewer": "", "decided_at": ""})
+
+  def test_a_running_monitors_job_data_carries_its_review(self):
+    from extensions.business.cybersec.red_mesh.services.query import get_job_data
+    owner = _Owner(job_specs=_continuous(passes=(1,)))
+    reject_report(owner, "job-1", expected_review_revision=0, note="Too noisy", actor="bob")
+    self.assertEqual(get_job_data(owner, "job-1")["job"]["review"]["review_status"], "rejected")
+    single = _Owner(job_specs=_sample_job_specs(job_status="RUNNING", job_cid=None))
+    self.assertNotIn("review", get_job_data(single, "job-1")["job"])
+
+  def test_a_stopped_monitor_with_its_archive_is_reviewable(self):
+    owner = _Owner(job_specs=_sample_job_specs(run_mode="CONTINUOUS_MONITORING", job_status="STOPPED",
+                                               job_cid="archive-cid", pass_count=3))
+    view = get_report_review(owner, "job-1")
+    self.assertEqual((view["review_status"], view["latest_pass_nr"]), ("pending", 3))
+
+  def test_nothing_without_a_completed_pass_is_reviewable(self):
+    cases = {
+      "monitor before its first pass": _continuous(passes=()),
+      "failed monitor": _continuous(job_status="FAILED"),
+      "running single pass": _sample_job_specs(job_status="RUNNING"),
+      "single pass stopped mid-run": _sample_job_specs(job_status="STOPPED", job_cid=None),
+    }
+    for name, specs in cases.items():
+      with self.subTest(name):
+        owner = _Owner(job_specs=specs)
+        self.assertIsNone(get_report_review(owner, "job-1")["review_status"])
+        self.assertEqual(approve_report(owner, "job-1", expected_review_revision=0, actor="alice")["error"],
+                         "job_not_finalized")
+
+  def test_the_nis2_review_of_a_running_monitor_is_readable(self):
+    from extensions.business.cybersec.red_mesh.services.rulebook_assessment import get_rulebook_review
+    owner = _Owner(job_specs=_continuous(passes=(1,)))
+    self.assertNotEqual(get_rulebook_review(owner, "job-1").get("error"), "job_not_finalized")
+
+
 class TestReportReviewSupersededByNis2(unittest.TestCase):
   """An approval rests on the NIS2 submission current when it was given (owner decision,
   RM-088): once the NIS2 review is reopened or resubmitted, the approval no longer
