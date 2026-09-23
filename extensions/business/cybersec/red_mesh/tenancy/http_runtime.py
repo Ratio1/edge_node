@@ -193,7 +193,8 @@ _TYPED_READ_ERRORS = {
                            (409, "job_not_finalized"), (503, "submission_contract_unsupported")},
   # B10: the stop is refused because this node did not launch the job. Collapsed to `unavailable`
   # it reads as an outage, and the caller retries against a node that can never serve it.
-  "/stop_monitoring": {(409, "job_launcher_mismatch")},
+  # `job_not_running`: the job already ended, so the stop has nothing to do and a retry never will.
+  "/stop_monitoring": {(409, "job_launcher_mismatch"), (409, "job_not_running")},
 }
 _TYPED_READ_PAIRS = frozenset(pair for pairs in _TYPED_READ_ERRORS.values() for pair in pairs)
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"

@@ -195,6 +195,14 @@ class TestTenantQuerySnapshots(unittest.TestCase):
       with self.subTest(value=value), self.assertRaises(TenantStoreError):
         query.list_network_jobs(self.owner, checked_jobs=value)
 
+  def test_checked_list_reads_only_the_admitted_jobs_report_review_row(self):
+    # RM-088: the review join is one keyed read per listed finalized job, never the whole hash.
+    job = {**self.job, "job_status": "FINALIZED", "job_cid": "archive", "pass_count": 2}
+    result = query.list_network_jobs(self.owner, checked_jobs={"job-1": job})
+    self.assertEqual(result["job-1"]["review"],
+                     {"review_status": "pending", "pass_nr": 2, "reviewer": "", "decided_at": ""})
+    self.assertEqual(self.owner.reads, [("jobs:report_review", "job-1:2")])
+
   def test_malformed_listing_projection_is_unavailable_not_partial(self):
     for field, value in (("workers", []), ("workers", None), ("pass_reports", {}), ("pass_reports", None)):
       with self.subTest(field=field, value=value), self.assertRaises(TenantStoreError):

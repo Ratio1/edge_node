@@ -415,21 +415,41 @@ class JobStateRepository:
       if isinstance(key, str) and key.startswith(prefix) and isinstance(value, dict)
     }
 
-  def get_report_review(self, job_id):
-    return self.owner.chainstore_hget(hkey=self._report_review_hkey, key=job_id)
+  @staticmethod
+  def report_review_key(job_id, pass_nr):
+    return f"{job_id}:{int(pass_nr)}"
 
-  def get_report_review_model(self, job_id):
-    payload = self.get_report_review(job_id)
+  def get_report_review(self, job_id, pass_nr):
+    return self.owner.chainstore_hget(hkey=self._report_review_hkey,
+                                      key=self.report_review_key(job_id, pass_nr))
+
+  def get_report_review_model(self, job_id, pass_nr):
+    payload = self.get_report_review(job_id, pass_nr)
     if not isinstance(payload, dict):
       return None
     return ReportReviewState.from_dict(payload)
+
+  def list_job_report_review_models(self, job_id, latest_pass_nr):
+    """Every pass's row for one job, by pass number, through keyed reads of passes 1..latest.
+
+    Keyed rather than a hash enumeration, so a tenant-scoped read touches only
+    this job's rows.
+    """
+    rows = {}
+    for pass_nr in range(1, int(latest_pass_nr) + 1):
+      model = self.get_report_review_model(job_id, pass_nr)
+      if model is not None:
+        rows[pass_nr] = model
+    return rows
 
   def put_report_review(self, review):
     if isinstance(review, ReportReviewState):
       payload = review.to_dict()
     else:
       payload = ReportReviewState.from_dict(review).to_dict()
-    self.owner.chainstore_hset(hkey=self._report_review_hkey, key=payload["job_id"], value=payload)
+    self.owner.chainstore_hset(hkey=self._report_review_hkey,
+                               key=self.report_review_key(payload["job_id"], payload["pass_nr"]),
+                               value=payload)
     return payload
 
   def get_report_review_audit(self, job_id):
@@ -447,8 +467,12 @@ class JobStateRepository:
     return audit_log
 
   def delete_job_report_review(self, job_id):
-    for hkey in (self._report_review_hkey, self._report_review_audit_hkey):
-      self.owner.chainstore_hset(hkey=hkey, key=job_id, value=None)
+    prefix = f"{job_id}:"
+    payload = self.owner.chainstore_hgetall(hkey=self._report_review_hkey) or {}
+    for key in list(payload if isinstance(payload, dict) else {}):
+      if isinstance(key, str) and (key == job_id or key.startswith(prefix)):
+        self.owner.chainstore_hset(hkey=self._report_review_hkey, key=key, value=None)
+    self.owner.chainstore_hset(hkey=self._report_review_audit_hkey, key=job_id, value=None)
     return
 
   def delete_job_rulebook_reviews(self, job_id):

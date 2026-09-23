@@ -33,7 +33,7 @@ MUTATIONS = (
   ("update_rulebook_review", {"profile_id": PROFILE, "answers": {}}),
   ("correlate_suricata_eve", {"eve_jsonl": "{}"}),
   ("approve_report", {"expected_review_revision": 0}),
-  ("reopen_report_review", {"expected_review_revision": 0}),
+  ("reject_report", {"expected_review_revision": 0, "note": "no"}),
 )
 EVIDENCE = (("get_raw_model_test_evidence", {}),)
 # The typed rulebook artifact read answers 404 for a CID the job does not record, so its
@@ -202,7 +202,7 @@ def test_the_platform_roles_are_admitted_to_raw_evidence(name, extra, role):
    "review_revision_conflict"),
   ("submit_rulebook_review", {"profile_id": PROFILE}, "submission_pass_stale"),
   ("approve_report", {}, "review_revision_conflict"),
-  ("reopen_report_review", {}, "review_revision_conflict"),
+  ("reject_report", {"note": "no"}, "review_revision_conflict"),
 ))
 def test_a_typed_review_conflict_code_survives_the_tenant_path(name, extra, code):
   """The revision fence is the reason these four keep their own response shape; scoping them must

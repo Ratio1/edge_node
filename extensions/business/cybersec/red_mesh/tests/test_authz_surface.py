@@ -73,7 +73,7 @@ ENDPOINT_FIRST_ARGS = {
   'update_rulebook_review': 'job_id',
   'get_report_review': 'job_id',
   'approve_report': 'job_id',
-  'reopen_report_review': 'job_id',
+  'reject_report': 'job_id',
   'dry_run_opencti_export': 'job_id',
   'push_to_opencti': 'job_id',
   'get_opencti_export_status': 'job_id',

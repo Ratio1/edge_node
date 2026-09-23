@@ -16,6 +16,7 @@ from ..tenancy.job_artifacts import (
 from ..tenancy.ports import TenantStoreError
 from ..tenancy.administration import AdministrationDenied
 from .reconciliation import reconcile_job_workers
+from .report_review import review_summaries
 from .triage import get_job_archive_with_triage
 
 _UNSET = object()
@@ -247,6 +248,13 @@ def get_job_data(owner, job_id: str, *, checked_job=_UNSET, snapshot_mode="tenan
     }
 
   job_specs = _sanitize_model_test_job_specs(job_specs)
+
+  # A reviewable job (finalized, or a monitor with a completed pass) carries its
+  # report review summary for the job meta block; anything else passes through
+  # untouched. Read before `pass_reports` is trimmed below.
+  review = review_summaries(owner, {job_id: job_specs})[job_id]
+  if review is not None:
+    job_specs = {**job_specs, "review": review}
 
   if job_specs.get("job_cid"):
     return {
@@ -567,6 +575,9 @@ def list_network_jobs(owner, *, checked_jobs=_UNSET, snapshot_mode="tenant_bound
   else:
     raw_network_jobs = _job_repo(owner).list_jobs()
   normalized_jobs = {}
+  # The review join reads the full record (a running monitor's completed passes
+  # are in `pass_reports`, which the listing projection drops).
+  review_specs = {}
   for job_key, job_spec in raw_network_jobs.items():
     if scoped and snapshot_mode == "legacy_unbound":
       # The trusted reader already normalized the captured row without migrating its alias key.
@@ -578,6 +589,7 @@ def list_network_jobs(owner, *, checked_jobs=_UNSET, snapshot_mode="tenant_bound
         raise TenantStoreError("Tenant jobs are unavailable")
       normalized_spec = checked_job_snapshot(normalized_spec, job_key)
     if normalized_key and normalized_spec:
+      review_specs[normalized_key] = normalized_spec
       if normalized_spec.get("job_cid"):
         normalized_jobs[normalized_key] = _sanitize_model_test_job_specs(normalized_spec)
         continue
@@ -607,6 +619,8 @@ def list_network_jobs(owner, *, checked_jobs=_UNSET, snapshot_mode="tenant_bound
       }
       if scoped and snapshot_mode == "tenant_bound":
         normalized_jobs[normalized_key]["execution_binding"] = normalized_spec["execution_binding"]
+  for job_id, summary in review_summaries(owner, review_specs).items():
+    normalized_jobs[job_id]["review"] = summary
   return normalized_jobs
 
 

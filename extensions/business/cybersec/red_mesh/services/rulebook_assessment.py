@@ -10,7 +10,12 @@ import time as _time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from ..constants import JOB_STATUS_FINALIZED
+from ..constants import (
+  JOB_STATUS_FAILED,
+  JOB_STATUS_FINALIZED,
+  JOB_STATUS_STOPPED,
+  RUN_MODE_CONTINUOUS_MONITORING,
+)
 from ..credential_redaction import redact_credential_text
 from ..models import (
   RULEBOOK_ASSESSMENT_SCHEMA,
@@ -1237,6 +1242,25 @@ def get_rulebook_artifact(owner, job_id, cid, profile_id=DEFAULT_RULEBOOK_PROFIL
           "artifact_kind": artifact["artifact_kind"], "report": artifact}
 
 
+def reviewable_job(job_specs):
+  """Whether a job has a completed pass a human can review (NIS2 and report review alike).
+
+  A finalized job is. A continuous monitor is from its first completed pass on,
+  also while it keeps running: completed passes sit in `pass_reports` until it
+  stops, and a stopped monitor has its archive (owner decision, RM-088). A
+  single pass that is still running or was stopped mid-run is not; nor is a
+  failed job.
+  """
+  status = job_specs.get("job_status")
+  if status == JOB_STATUS_FINALIZED:
+    return True
+  if job_specs.get("run_mode") != RUN_MODE_CONTINUOUS_MONITORING or status == JOB_STATUS_FAILED:
+    return False
+  if status == JOB_STATUS_STOPPED and job_specs.get("job_cid"):
+    return True
+  return any(isinstance(entry, dict) and entry.get("pass_nr") for entry in job_specs.get("pass_reports") or [])
+
+
 def _submission_lock(owner, job_id, profile_id):
   key = f"{getattr(owner, 'cfg_instance_id', '')}:{job_id}:{profile_id}"
   with _SUBMISSION_LOCKS_GUARD:
@@ -1310,6 +1334,54 @@ def _submission_reference_view(reference, *, latest_pass_nr, profile_version):
   }
 
 
+def _effective_review_state(pending, latest_reference, review):
+  """`submitted` only when a submission exists, none is in flight, and the review was not reopened."""
+  if not pending and latest_reference and review and review.review_state in {"submitted", "reviewed"}:
+    return "submitted"
+  return "draft"
+
+
+def current_rulebook_submission(owner, job_id, job_specs, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
+  """What the report review's approve gate needs to know about the NIS2 review (RM-088).
+
+  Returns `None` when NIS2 is not in play for the job: no generated assessment
+  on the record, no review row and no submission (a review can be drafted and
+  submitted without the record pointer, so all three count). Otherwise
+  `{profile_id, assessment_pass_nr, submission}`, where `submission` is
+  `{pass_nr, revision, cid}` of the latest submission while the review is
+  effectively submitted, else `None`. Reads CStore only, never an artifact.
+  An unreadable review or registry reads as not submitted: the gate stays shut.
+  """
+  profile = _profile(profile_id)
+  if not profile:
+    return None
+  meta = _profile_meta(job_specs, profile_id)
+  result = {"profile_id": profile_id, "assessment_pass_nr": _meta_pass_nr(meta), "submission": None}
+  repo = _job_repo(owner)
+  try:
+    review = repo.get_rulebook_review_model(job_id, profile_id)
+    registry_payload = _submission_registry(repo, job_id, profile_id).to_dict()
+  except ValueError:
+    return result
+  references = list(registry_payload.get("submissions") or [])
+  legacy_reference = _legacy_submission_reference(job_specs, profile, review)
+  if legacy_reference and not any(item.get("cid") == legacy_reference["cid"] for item in references):
+    references.append(legacy_reference)
+  if not meta.get("artifact_cid") and review is None and not references:
+    return None
+  latest = max(references, key=lambda item: int(item.get("revision", 0) or 0), default=None)
+  pass_nr = int((latest or {}).get("pass_nr", 0) or 0)
+  # A submission that names no pass (a legacy `reviewed` row whose record lost
+  # its pass number) cannot vouch for any pass: it reads as not submitted.
+  if pass_nr > 0 and _effective_review_state(registry_payload.get("pending"), latest, review) == "submitted":
+    result["submission"] = {
+      "pass_nr": pass_nr,
+      "revision": int(latest.get("revision", 0) or 0),
+      "cid": str(latest.get("cid") or ""),
+    }
+  return result
+
+
 def _submission_public_state(owner, job_id, job_specs, profile, review, *, registry=_UNSET,
                              checked_job=_UNSET, snapshot_mode="tenant_bound"):
   repo = _job_repo(owner)
@@ -1343,9 +1415,7 @@ def _submission_public_state(owner, job_id, job_specs, profile, review, *, regis
   pending = registry_payload.get("pending")
   latest = views[0] if views else None
   migration_required = bool(review and review.review_state == "reviewed" and legacy_reference is None)
-  effective_state = "draft"
-  if not pending and latest and review and review.review_state in {"submitted", "reviewed"}:
-    effective_state = "submitted"
+  effective_state = _effective_review_state(pending, latest, review)
   operation_state = None
   if pending:
     operation_state = "failed" if pending.get("last_error") else "submitting"
@@ -1404,7 +1474,7 @@ def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, *
       "error": "model_test_not_supported",
       "error_class": unsupported.get("error_class") or unsupported.get("error"),
     }
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+  if not reviewable_job(job_specs):
     if checked:
       raise AdministrationDenied(409, "job_not_finalized")
     return _error(
@@ -1608,7 +1678,7 @@ def save_rulebook_review_draft(
     job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -1846,7 +1916,7 @@ def submit_rulebook_review(
     job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -2193,7 +2263,7 @@ def reopen_rulebook_review(
     job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -2427,7 +2497,7 @@ def update_rulebook_review(
         "error": "model_test_not_supported",
         "error_class": unsupported.get("error_class") or unsupported.get("error"),
       }
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error(
         "job_not_finalized",
         job_id,

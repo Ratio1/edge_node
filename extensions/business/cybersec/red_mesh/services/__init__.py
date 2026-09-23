@@ -99,7 +99,7 @@ from .event_hooks import (
 from .report_review import (
   approve_report,
   get_report_review,
-  reopen_report_review,
+  reject_report,
 )
 from .control import (
   purge_all_jobs,
@@ -274,7 +274,7 @@ __all__ = [
   "reopen_rulebook_review",
   "approve_report",
   "get_report_review",
-  "reopen_report_review",
+  "reject_report",
   "save_rulebook_review_draft",
   "submit_rulebook_review",
   "maybe_finalize_pass",
