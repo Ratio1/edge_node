@@ -195,9 +195,6 @@ _TYPED_READ_ERRORS = {
   # it reads as an outage, and the caller retries against a node that can never serve it.
   # `job_not_running`: the job already ended, so the stop has nothing to do and a retry never will.
   "/stop_monitoring": {(409, "job_launcher_mismatch"), (409, "job_not_running")},
-  # RM-090: the tenant has no MISP record. Collapsed to `unavailable` it read as an outage
-  # ("Tenant execution authorization is temporarily unavailable") for a configuration state.
-  "/export_misp_json": {(409, "tenant_integration_not_configured")},
 }
 _TYPED_READ_PAIRS = frozenset(pair for pairs in _TYPED_READ_ERRORS.values() for pair in pairs)
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"

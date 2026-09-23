@@ -49,6 +49,8 @@ def tenant_export_binding(owner, job_specs, integration_id):
   - A bound job whose tenant has NO record: (tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED). It
     exports nowhere rather than falling back to the node's destination, because falling back would
     publish one tenant's findings into whatever SOC the deployment happens to point at.
+    A JSON download is the exception: it has no destination and renders with the backend defaults
+    (misp_export._json_export_config, RM-093).
 
   The existence check lives here rather than in config resolution on purpose: to
   tenant_integration_override an absent record and an unreachable store are the same empty dict, so

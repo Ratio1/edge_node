@@ -58,10 +58,12 @@ def install_json_producer(fixture, *, enabled=True):
   fixture.artifacts["aggregate"].update(_sample_aggregated())
 
 
+@pytest.mark.parametrize("enabled", (False, True))
 @pytest.mark.parametrize("archived", (False, True))
-def test_public_download_uses_real_misp_producer_with_checked_job(archived):
+def test_public_download_uses_real_misp_producer_with_checked_job(archived, enabled):
+  """The node's ENABLED flag gates push and auto-export, not a download (RM-093)."""
   with read_endpoint_fixture(bound=True, archived=archived) as fixture:
-    install_json_producer(fixture)
+    install_json_producer(fixture, enabled=enabled)
     result = fixture.Plugin.export_misp_json(fixture.owner, "job-1", request_actor=fixture.actor,
                                              tenant_id=fixture.tenant_id)
     assert result["status"] == "ok" and result["job_id"] == "job-1" and result["pass_nr"] == 1
@@ -151,7 +153,9 @@ def test_native_admission_denies_before_config_and_artifacts(read_native, respon
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
 @pytest.mark.parametrize("enabled", (False, True))
-def test_native_disabled_precedes_model_family_and_enabled_model_is_typed400(read_native, response_format, enabled):
+def test_native_model_family_is_typed400_whatever_the_node_enabled_flag(read_native, response_format, enabled):
+  """A download ignores the node's ENABLED flag (RM-093), so the model-family refusal is the
+  first and only answer for a model_test job."""
   module, _ = read_native
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
@@ -160,11 +164,8 @@ def test_native_disabled_precedes_model_family_and_enabled_model_is_typed400(rea
     with no_export_effects(fixture):
       module.eng = scheduler_comms(fixture, response_format)
       result, _ = assert_json_response(asyncio.run(request(module, ENDPOINT,
-        {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 400 if enabled else 200)
-      if enabled:
-        assert result == {"success": False, "error": "unsupported_job_type", "status_code": 400}
-      else:
-        assert (result["result"] if response_format == "WRAPPED" else result) == {"status": "disabled"}
+        {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 400)
+      assert result == {"success": False, "error": "unsupported_job_type", "status_code": 400}
       assert fixture.artifact_reads == []
 
 
@@ -210,10 +211,10 @@ def test_native_artifact_corruption_never_reaches_pymisp_or_effects(read_native,
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-def test_native_download_without_a_tenant_misp_record_is_a_typed_409(read_native, response_format, monkeypatch):
-  """RM-090: the download reported "Tenant execution authorization is temporarily
-  unavailable" because the tenant had no MISP record and the typed cause was
-  collapsed to `unavailable`. It is a configuration state, not an outage."""
+def test_native_download_without_a_tenant_misp_record_uses_backend_defaults(read_native, response_format, monkeypatch):
+  """RM-093 (supersedes the RM-090 typed 409): a download has no destination, so a bound tenant
+  without a MISP record still gets its JSON, rendered with the backend defaults (floor LOW,
+  distribution 0) and never with the node's values."""
   from extensions.business.cybersec.red_mesh.services import misp_export
   from extensions.business.cybersec.red_mesh.services.config import TENANT_INTEGRATION_NOT_CONFIGURED
   monkeypatch.setattr(misp_export, "tenant_export_binding",
@@ -222,15 +223,17 @@ def test_native_download_without_a_tenant_misp_record_is_a_typed_409(read_native
   module, _ = read_native
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
-    install_json_producer(fixture)
-    with no_export_effects(fixture), \
-         patch.object(misp_export, "build_misp_event", side_effect=AssertionError(SECRET)) as build:
+    install_json_producer(fixture, enabled=False)
+    # Node values that would show if they leaked: a HIGH floor exports 2 of the 4 sample findings.
+    fixture.owner.CONFIG["MISP_EXPORT"].update({"MIN_SEVERITY": "HIGH", "MISP_DISTRIBUTION": 3})
+    with no_export_effects(fixture):
       module.eng = scheduler_comms(fixture, response_format)
       result, _ = assert_json_response(asyncio.run(request(module, ENDPOINT,
-        {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 409)
-      assert result == {"success": False, "error": TENANT_INTEGRATION_NOT_CONFIGURED, "status_code": 409}
-      build.assert_not_called()
-      assert fixture.artifact_reads == []
+        {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
+      actual = result["result"] if response_format == "WRAPPED" else result
+      assert actual["status"] == "ok" and actual["job_id"] == "job-1"
+      assert actual["findings_exported"] == 3 and actual["findings_total"] == 4
+      assert actual["misp_event"]["distribution"] == "0"
 
 
 def test_a_failed_read_logs_its_exception_class_only():

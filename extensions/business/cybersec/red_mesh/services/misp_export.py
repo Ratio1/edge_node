@@ -23,7 +23,7 @@ from ..tenancy.effects import EffectState
 from ..tenancy.job_artifacts import TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
 from .config import tenant_export_binding
-from .misp_config import get_misp_export_config, SEVERITY_LEVELS
+from .misp_config import DEFAULT_MISP_EXPORT_CONFIG, get_misp_export_config, SEVERITY_LEVELS
 from .event_hooks import emit_export_status_event
 from .scan_guards import reject_model_test_for_scan_operation
 
@@ -371,18 +371,38 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snaps
 
 # ── Public API ──
 
-def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+def _json_export_config(owner, job_specs):
+  """The MISP config a JSON download renders with: the tenant's record when it has one, node
+  config for a legacy unbound job, and the backend defaults for a bound tenant without a record.
+
+  A download has no destination, so the "exports nowhere" rule of tenant_export_binding does not
+  apply (RM-093). The defaults are used rather than node config so a tenant's output never carries
+  another deployment's severity floor or distribution.
+  """
+  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "misp")
+  if binding_error:
+    return dict(DEFAULT_MISP_EXPORT_CONFIG)
+  return get_misp_export_config(owner, tenant_id)
+
+
+def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound",
+                     export_config=None):
   """
   Build a MISPEvent from a job's scan results.
+
+  `export_config` is the resolved MISP config to render with (severity floor, distribution). When
+  it is None the job's tenant record is required, as for a push.
 
   Returns {"status": "ok", "event": <MISPEvent>, "job_id": ..., "pass_nr": ...}
   or {"status": "error", "error": "..."}.
   """
-  tenant_id, binding_error = tenant_export_binding(
-    owner, checked_job if isinstance(checked_job, dict) else None, "misp")
-  if binding_error:
-    return {"status": "error", "error": binding_error, "job_id": job_id}
-  cfg = get_misp_export_config(owner, tenant_id)
+  cfg = export_config
+  if cfg is None:
+    tenant_id, binding_error = tenant_export_binding(
+      owner, checked_job if isinstance(checked_job, dict) else None, "misp")
+    if binding_error:
+      return {"status": "error", "error": binding_error, "job_id": job_id}
+    cfg = get_misp_export_config(owner, tenant_id)
   min_severity = cfg["MIN_SEVERITY"]
   distribution = cfg["MISP_DISTRIBUTION"]
 
@@ -498,9 +518,9 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
 
   # Build the event
   # Seam two: build_misp_event reaches the store again through _resolve_pass_data.
-  result = (build_misp_event(owner, job_id, pass_nr=pass_nr) if checked_job is _UNSET
+  result = (build_misp_event(owner, job_id, pass_nr=pass_nr, export_config=cfg) if checked_job is _UNSET
             else build_misp_event(owner, job_id, pass_nr=pass_nr, checked_job=checked_job,
-                                  snapshot_mode=snapshot_mode))
+                                  snapshot_mode=snapshot_mode, export_config=cfg))
   if result["status"] != "ok":
     _record_export_status("failed")
     return result
@@ -639,10 +659,12 @@ def export_misp_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
   """
   Build a MISP event and return it as a JSON-serializable dict.
 
-  No MISP server connection needed.
+  No MISP server connection, tenant MISP record or ENABLED flag needed: a bound tenant without a
+  record renders with the backend defaults (RM-093).
   """
+  cfg = _json_export_config(owner, checked_job if isinstance(checked_job, dict) else None)
   result = build_misp_event(owner, job_id, pass_nr=pass_nr,
-    checked_job=checked_job, snapshot_mode=snapshot_mode)
+    checked_job=checked_job, snapshot_mode=snapshot_mode, export_config=cfg)
   if checked_job is not _UNSET and (not isinstance(result, dict)
       or result.get("status") != "ok" or result.get("job_id") != job_id):
     raise TenantStoreError("MISP export unavailable")

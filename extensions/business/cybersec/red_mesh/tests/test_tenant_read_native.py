@@ -460,8 +460,10 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
     actual = result["result"] if response_format == "WRAPPED" else result
     assert isinstance(actual, dict)
     if name in TENANT_JSON_EXPORT_ROUTES:
-      assert actual == {"status": "disabled"}
-      assert fixture.artifact_reads == []
+      # A download renders even on a node with MISP export off (RM-093); the fixture's one
+      # finding has no severity, so the LOW floor exports none of it.
+      assert actual["status"] == "ok" and actual["job_id"] == "job-1"
+      assert (actual["findings_exported"], actual["findings_total"]) == (0, 1)
       return
     if name == "get_report":
       assert actual["job_id"] == "job-1" and actual["cid"] == "worker"
