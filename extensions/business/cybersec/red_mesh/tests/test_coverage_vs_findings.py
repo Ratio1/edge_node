@@ -681,15 +681,35 @@ class TestScoringIsOneWalk(unittest.TestCase):
     )
     self.assertEqual(risk["breakdown"]["findings_score"], 25.0)
 
-  def test_an_explicit_empty_asset_list_is_preserved(self):
-    """`affected_assets: []` is a statement — "no location recorded" — and the
-    falsy-check synthesis replaced it with an invented `{host, port}`. Only a
-    truly absent key gets the synthetic asset."""
+  def test_a_blackbox_empty_asset_list_gets_the_scanned_host_and_port(self):
+    """Every blackbox `Finding` serialises `affected_assets: []` (asdict of an
+    empty tuple), so a key-absence guard never fired and every blackbox finding
+    in a real run reached the report with no location at all. For blackbox,
+    `[]` means "the probe set none", and the scanned host and port are where it
+    was observed."""
     _risk, flat = self._blackbox({
       "title": "t", "severity": "LOW", "confidence": "firm",
       "affected_assets": [],
     })
-    self.assertEqual(flat[0]["affected_assets"], [])
+    self.assertEqual(
+      flat[0]["affected_assets"], [{"host": "app.test", "port": 443}],
+    )
+
+  def test_the_synthetic_asset_does_not_move_the_finding_id(self):
+    """A `{host, port}`-only asset is not an identity dimension, so the id the
+    walk derives is the same with and without the synthesis."""
+    from extensions.business.cybersec.red_mesh.models.finding_identity import (
+      canonical_asset_string,
+    )
+    _risk, flat = self._blackbox({
+      "title": "t", "severity": "LOW", "confidence": "firm",
+      "affected_assets": [],
+    })
+    self.assertEqual(canonical_asset_string(flat[0]["affected_assets"]), "")
+    _risk, bare = self._blackbox({
+      "title": "t", "severity": "LOW", "confidence": "firm",
+    })
+    self.assertEqual(flat[0]["finding_id"], bare[0]["finding_id"])
 
   def test_an_absent_asset_list_still_gets_the_synthetic_host(self):
     _risk, flat = self._blackbox(

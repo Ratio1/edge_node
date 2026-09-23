@@ -1023,5 +1023,65 @@ class TestGrayboxLocationRedactionAtTheReportLayer(unittest.TestCase):
     self.assertEqual(out["affected_assets"][0]["parameter"], "id")
 
 
+
+class TestAnAcceptedCredentialFloorsTheScore(unittest.TestCase):
+  """An accepted default credential is direct access. Log-compressed against a
+  20000 ceiling it moved 0f1a2559's score by one point (59 -> 60, HIGH), which
+  read as "barely matters". Owner decision 2026-09-23: floor at 80 (CRITICAL).
+  """
+
+  def _risk(self, findings):
+    report = {
+      "target": "app.test", "port_protocols": {"22": "ssh"},
+      "service_info": {"22": {"_service_info_ssh": {"findings": findings}}},
+    }
+    risk, _flat = _make_mixin()._compute_risk_and_findings(report)
+    return risk
+
+  _CRED = {
+    "title": "SSH default credential accepted: root:<redacted>",
+    "severity": "CRITICAL", "confidence": "certain",
+  }
+
+  def test_one_accepted_credential_scores_critical(self):
+    risk = self._risk([dict(self._CRED)])
+    # 40 (finding) + 15 (penalty) + 2.2 (port, breadth) = 57.2, which alone
+    # normalises to 41.
+    self.assertEqual(risk["breakdown"]["raw_total"], 57.2)
+    self.assertEqual(risk["score"], 80)
+    self.assertTrue(risk["breakdown"]["credential_floor_applied"])
+
+  def test_without_a_credential_the_score_is_unchanged(self):
+    risk = self._risk([{
+      "title": "Outdated OpenSSH", "severity": "CRITICAL", "confidence": "certain",
+    }])
+    # raw 42.2: 100 * log10(43.2) / log10(20001) = 38.0.
+    self.assertEqual(risk["breakdown"]["raw_total"], 42.2)
+    self.assertEqual(risk["score"], 38)
+    self.assertFalse(risk["breakdown"]["credential_floor_applied"])
+
+  def test_the_breakdown_states_the_constants_it_scored_with(self):
+    constants = self._risk([dict(self._CRED)])["breakdown"]["constants"]
+    self.assertEqual(
+      constants["severity_weights"],
+      {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 10, "LOW": 2, "INFO": 0},
+    )
+    self.assertEqual(
+      constants["confidence_multipliers"],
+      {"certain": 1.0, "firm": 0.8, "tentative": 0.5},
+    )
+    self.assertEqual(constants["raw_total_ceiling"], 20000.0)
+    self.assertEqual(constants["credential_penalty_per"], 15)
+    self.assertEqual(constants["credential_penalty_cap"], 30)
+    self.assertEqual(constants["credential_score_floor"], 80)
+
+  def test_the_archived_breakdown_keeps_the_new_fields(self):
+    from extensions.business.cybersec.red_mesh.models.shared import RiskBreakdown
+    breakdown = self._risk([dict(self._CRED)])["breakdown"]
+    restored = RiskBreakdown.from_dict(breakdown).to_dict()
+    self.assertTrue(restored["credential_floor_applied"])
+    self.assertEqual(restored["constants"]["credential_score_floor"], 80)
+
+
 if __name__ == '__main__':
   unittest.main()

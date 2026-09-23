@@ -132,6 +132,68 @@ def normalize_target(value):
   raise ValueError("Invalid target")
 
 
+_PORT_SCOPE_MAX_RANGES = 64
+_PORT_SCOPE_PART = re.compile(r"(\d{1,5})(?:-(\d{1,5}))?")
+
+
+def port_scope_ranges(value):
+  """`authorized_ports` as sorted, merged inclusive (low, high) ranges."""
+  if not isinstance(value, str):
+    raise ValueError("Invalid port scope")
+  ranges = []
+  for part in value.replace(" ", "").split(","):
+    match = _PORT_SCOPE_PART.fullmatch(part)
+    if not match:
+      raise ValueError("Invalid port scope")
+    low, high = int(match[1]), int(match[2] or match[1])
+    if not 1 <= low <= high <= 65535:
+      raise ValueError("Invalid port scope")
+    ranges.append((low, high))
+  if len(ranges) > _PORT_SCOPE_MAX_RANGES:
+    raise ValueError("Invalid port scope")
+  merged = []
+  for low, high in sorted(ranges):
+    if merged and low <= merged[-1][1] + 1:
+      merged[-1] = (merged[-1][0], max(high, merged[-1][1]))
+    else:
+      merged.append((low, high))
+  return merged
+
+
+def format_port_ranges(ranges):
+  return ",".join(str(low) if low == high else f"{low}-{high}" for low, high in ranges)
+
+
+def collapse_ports(ports):
+  """Sorted distinct ports as inclusive (low, high) runs."""
+  ranges = []
+  for port in sorted(set(ports)):
+    if ranges and port == ranges[-1][1] + 1:
+      ranges[-1] = (ranges[-1][0], port)
+    else:
+      ranges.append((port, port))
+  return ranges
+
+
+def normalize_port_scope(value):
+  """The ports a network asset's authorization covers, canonical, or None.
+
+  Kept on the asset row beside `target`, never inside it: the target is
+  `{kind, address}` exactly and its digest is the asset's identity, which the
+  execution binding re-checks. A scope change is an audited asset update.
+  """
+  if value is None or (isinstance(value, str) and not value.strip()):
+    return None
+  return format_port_ranges(port_scope_ranges(value))
+
+
+def ports_outside_scope(ports, scope):
+  """Sorted ports in `ports` that `scope` does not cover."""
+  ranges = port_scope_ranges(scope)
+  return sorted(port for port in set(ports)
+                if not any(low <= port <= high for low, high in ranges))
+
+
 def validate_asset(row, ids):
   if (len(ids) != 2 or row.get("tenant_id") != ids[0] or row.get("asset_id") != ids[1]
       or ids[1] != "as_" + canonical_uuid(row.get("request_id"))
@@ -147,5 +209,8 @@ def validate_asset(row, ids):
   for field in ("created_at", "changed_at"):
     if not isinstance(row.get(field), str) or datetime.fromisoformat(row[field]).tzinfo != timezone.utc:
       raise ValueError("Invalid asset timestamp")
+  if "authorized_ports" in row and (row["target"]["kind"] != "network"
+      or normalize_port_scope(row["authorized_ports"]) != row["authorized_ports"]):
+    raise ValueError("Invalid asset port scope")
   # Unknown stored fields are preserved, but must still form a valid JSON version/readback value.
   canonical_digest(row)

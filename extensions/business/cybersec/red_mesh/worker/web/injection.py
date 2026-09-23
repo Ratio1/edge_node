@@ -4,7 +4,8 @@ import time
 import requests
 from urllib.parse import quote
 
-from ...findings import Finding, Severity, probe_result, probe_error
+from ...findings import Evidence, Finding, Severity, probe_result, probe_error
+from ..response_fingerprint import sanitize_excerpt
 from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
@@ -35,6 +36,28 @@ def _looks_like_actuator_body(text):
     return True
   return "request" in data and "value" in data  # Jolokia envelope
 
+
+
+def _traversal_evidence(url, text, needles):
+  """The response excerpt behind a traversal finding.
+
+  The finding used to assert "body contains markers" and show none of it. The
+  window starts at the line holding the first marker because `sanitize_excerpt`
+  keeps only the first 512 bytes, and the marker can sit deep in a page. A line
+  boundary, not a fixed lead: a fixed lead could cut a `password=` key off an
+  earlier line while keeping its value, and redaction is key-anchored. Redaction
+  runs before truncation inside `sanitize_excerpt`. No content-type gate: the
+  marker already matched in the decoded text, and a file served as
+  octet-stream is exactly the case worth showing. The URL goes in the caption
+  because a non-empty `evidence_items` stops the flat walk forwarding the
+  legacy `evidence` string.
+  """
+  positions = [text.find(n) for n in needles if n in text]
+  start = text.rfind("\n", 0, min(positions)) + 1 if positions else 0
+  snippet = sanitize_excerpt(text[start:])
+  if not snippet:
+    return ()
+  return (Evidence(kind="request_response", caption=f"GET {url}", snippet=snippet),)
 
 class _InjectionTestBase:
   """Shared execution engine for injection-style web tests."""
@@ -122,6 +145,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             title=f"Path traversal: /etc/passwd via path",
             description=f"Server returned /etc/passwd content via path traversal.",
             evidence=f"URL: {url}, body contains passwd markers",
+            evidence_items=_traversal_evidence(url, resp.text, unix_needles),
             remediation="Sanitize path components; use a web application firewall.",
             owasp_id="A01:2021",
             cwe_id="CWE-22",
@@ -135,6 +159,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             title=f"Path traversal: win.ini via path",
             description=f"Server returned Windows system file content.",
             evidence=f"URL: {url}, body contains win.ini markers",
+            evidence_items=_traversal_evidence(url, resp.text, win_needles),
             remediation="Sanitize path components.",
             owasp_id="A01:2021",
             cwe_id="CWE-22",
@@ -166,6 +191,7 @@ class _WebInjectionMixin(_InjectionTestBase):
               title=f"Path traversal via ?{param}= parameter",
               description=f"Parameter '{param}' allows reading system files.",
               evidence=f"URL: {url}",
+              evidence_items=_traversal_evidence(url, resp.text, needles),
               remediation=f"Validate and sanitize the '{param}' parameter.",
               owasp_id="A01:2021",
               cwe_id="CWE-22",

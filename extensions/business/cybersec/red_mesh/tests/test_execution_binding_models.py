@@ -147,3 +147,28 @@ class TestExecutionBindingModels(unittest.TestCase):
         archive.job_config["execution_binding"] = binding_payload()
         with self.assertRaises(ValueError):
           archive.to_dict()
+
+
+class TestResolvedContextCarriesThePortScope(unittest.TestCase):
+  """The asset's authorized port scope reaches the launch gate through the resolved context and
+  stays out of the stored binding: the scope is launch-time policy, not execution identity."""
+
+  def setUp(self):
+    self.facts = {key: value for key, value in binding_payload().items()
+                  if key not in ("schema_version", "original_launcher", "participant_order")}
+
+  def _context(self, **extra):
+    from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
+    return ResolvedExecutionContext({**self.facts, "selected_candidates": ["node-a"], **extra})
+
+  def test_the_scope_is_carried_and_kept_out_of_the_binding(self):
+    context = self._context(asset_authorized_ports="1-1024")
+    self.assertEqual(context.to_dict()["asset_authorized_ports"], "1-1024")
+    binding = context.build_binding("coordinator", ["node-a"]).to_dict()
+    self.assertNotIn("asset_authorized_ports", binding)
+    self.assertEqual(binding, self._context().build_binding("coordinator", ["node-a"]).to_dict())
+
+  def test_a_non_canonical_or_null_scope_is_refused(self):
+    for scope in ("1024-1", "22, 80", None, 80):
+      with self.subTest(scope=scope), self.assertRaises(ValueError):
+        self._context(asset_authorized_ports=scope)

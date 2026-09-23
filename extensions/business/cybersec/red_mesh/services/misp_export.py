@@ -79,7 +79,7 @@ _SEVERITY_TO_THREAT_LEVEL = {
 def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
                       report_cid, distribution, findings, open_ports,
                       port_banners, port_protocols, quick_summary,
-                      tls_data=None):
+                      tls_data=None, redmesh_release=None):
   """
   Construct a MISPEvent from RedMesh scan data.
 
@@ -123,6 +123,9 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
   # Risk score as comment attribute
   event.add_attribute("comment", f"RedMesh risk score: {risk_score}/100",
                       comment="Risk assessment")
+  backend = (redmesh_release or {}).get("backend") or "not recorded"
+  event.add_attribute("comment", f"RedMesh release: backend {backend}",
+                      comment="Scanner release")
 
   # ── ip-port objects ──
   banners = port_banners or {}
@@ -422,6 +425,7 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     port_protocols=port_protocols,
     quick_summary=quick_summary,
     tls_data=tls_data,
+    redmesh_release=job_config.get("redmesh_release"),
   )
 
   return {

@@ -267,6 +267,27 @@ class TestBuildMispEvent(unittest.TestCase):
     # Threat level should be 1 (High) because CRITICAL finding exists
     self.assertEqual(event.threat_level_id, 1)
 
+  def _release_comments(self, **kwargs):
+    event = _build_misp_event(
+      target="10.0.0.1", scan_type="network", task_name="",
+      job_id="job1", risk_score=50, report_cid="cid123",
+      distribution=0, findings=[], open_ports=[], port_banners={},
+      port_protocols={}, quick_summary=None, **kwargs,
+    )
+    return [a.value for a in event.attributes
+            if a.type == "comment" and "release" in str(a.value).lower()]
+
+  def test_the_event_names_the_backend_release(self):
+    self.assertEqual(
+      self._release_comments(redmesh_release={"backend": "0.10.0"}),
+      ["RedMesh release: backend 0.10.0"],
+    )
+
+  def test_a_job_without_a_recorded_release_says_so(self):
+    self.assertEqual(
+      self._release_comments(), ["RedMesh release: backend not recorded"],
+    )
+
   def test_tags_present(self):
     event = _build_misp_event(
       target="10.0.0.1", scan_type="network", task_name="",
