@@ -165,6 +165,15 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertIn("root:x:0:0", snippet)
     self.assertTrue(findings[0]["evidence"])
 
+  def test_path_traversal_excerpt_starts_at_the_marker_line(self):
+    """A fixed lead before the marker could cut a `password=` key off while its
+    value stayed in the window, and the key-anchored redaction rules then miss
+    it. The window opens at the start of the line holding the marker."""
+    body = ("x" * 200) + "\nsecret_password=" + ("hunter2!" * 12) + "\nroot:x:0:0:root:/root:/bin/bash\n"
+    snippet = self._traversal_findings(body)[0]["evidence_items"][0]["snippet"]
+    self.assertTrue(snippet.startswith("root:x:0:0"))
+    self.assertNotIn("hunter2", snippet)
+
   def test_path_traversal_excerpt_is_redacted(self):
     body = "root:x:0:0:root:/root:/bin/bash\nmirror=https://svc:hunter2@repo.test/\n"
     findings = self._traversal_findings(body)

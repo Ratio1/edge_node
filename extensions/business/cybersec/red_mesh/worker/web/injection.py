@@ -38,17 +38,14 @@ def _looks_like_actuator_body(text):
 
 
 
-# Characters kept before the first marker, so the excerpt opens on the matched file
-# content rather than on whatever page chrome preceded it.
-_TRAVERSAL_EXCERPT_LEAD_CHARS = 128
-
-
 def _traversal_evidence(url, text, needles):
   """The response excerpt behind a traversal finding.
 
   The finding used to assert "body contains markers" and show none of it. The
-  window starts just before the first marker because `sanitize_excerpt` keeps
-  only the first 512 bytes, and the marker can sit deep in a page. Redaction
+  window starts at the line holding the first marker because `sanitize_excerpt`
+  keeps only the first 512 bytes, and the marker can sit deep in a page. A line
+  boundary, not a fixed lead: a fixed lead could cut a `password=` key off an
+  earlier line while keeping its value, and redaction is key-anchored. Redaction
   runs before truncation inside `sanitize_excerpt`. No content-type gate: the
   marker already matched in the decoded text, and a file served as
   octet-stream is exactly the case worth showing. The URL goes in the caption
@@ -56,7 +53,7 @@ def _traversal_evidence(url, text, needles):
   legacy `evidence` string.
   """
   positions = [text.find(n) for n in needles if n in text]
-  start = max(0, min(positions) - _TRAVERSAL_EXCERPT_LEAD_CHARS) if positions else 0
+  start = text.rfind("\n", 0, min(positions)) + 1 if positions else 0
   snippet = sanitize_excerpt(text[start:])
   if not snippet:
     return ()
