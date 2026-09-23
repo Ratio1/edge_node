@@ -359,7 +359,11 @@ def _sanitize_finding(f: dict) -> dict:
     "cwe_id": _sanitize(f.get("cwe_id", ""), 32),
     "cvss_vector": _sanitize(f.get("cvss_vector", ""), 120),
     "cvss_score": _safe_float(f.get("cvss_score")),
-    "kev": bool(f.get("kev", False)),
+    # KEV is a fact only when the dynamic reference cache consulted it; its
+    # fetch timestamp is `cvss_data_freshness`. Otherwise it is unknown, not
+    # "not listed" (RM-090: the cache is not wired in production yet).
+    "kev": bool(f.get("kev", False)) if f.get("cvss_data_freshness") else None,
+    "kev_evaluated": bool(f.get("cvss_data_freshness")),
     "epss_score": _safe_float(f.get("epss_score")),
     "cve": _sanitize_list(f.get("cve"), MAX_REFERENCES_PER_FINDING, 32),
     "cwe": [int(x) for x in (f.get("cwe") or []) if isinstance(x, int) and x > 0][:8],

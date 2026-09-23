@@ -550,6 +550,9 @@ class _RiskScoringMixin:
         # Findings sharing an id — a probe emitting findings identity cannot
         # distinguish. Reported rather than hidden behind a synthetic suffix.
         "identity_collisions": identity_collisions,
+        # Whether NVD/KEV/EPSS were consulted for this pass. The report says
+        # "not evaluated" rather than implying a clean KEV check when false.
+        "reference_data_enabled": bool(aggregated_report.get("reference_data")),
         # A probe emitting a finding the contract does not accept is a defect in
         # the probe. Stated here so it is visible in the pass report rather
         # than absorbed silently by the layer that reads the finding.
