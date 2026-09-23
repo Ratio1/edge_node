@@ -61,6 +61,12 @@ class TestOutOfScope(unittest.TestCase):
                    *chunk_prompts):
       self.assertIn("out_of_scope", prompt)
       self.assertIn("coverage_gaps", prompt)
+      # RM-090: job 6d342bab got "did not verify other services" and "impact on
+      # host-internal files is unknown" — true of any scan, so worth nothing.
+      self.assertIn("must name a concrete fact from the context", " ".join(prompt.split()))
+      self.assertNotIn("four or five useful limitations", prompt)
+      self.assertNotIn("coverage_gaps: one to three", prompt)
+      self.assertNotIn("coverage_gaps is one to three", prompt)
 
   def test_a_fabricated_cve_in_out_of_scope_is_caught(self):
     from extensions.business.cybersec.red_mesh.models.llm_output import validate_llm_output
