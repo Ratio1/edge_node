@@ -1990,6 +1990,7 @@ def launch_test(
   blockchain_attestation_enabled=False,
   comparison_mode=False,
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
+  authorization_update=None,
 ):
   """Compatibility shim that routes to scan-type-specific launch endpoints."""
   try:
@@ -2098,4 +2099,5 @@ def launch_test(
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,
     timeout_profile=timeout_profile,
+    authorization_update=authorization_update,
   )

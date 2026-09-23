@@ -309,7 +309,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
         return payload
     return None
 
-  def _launch(self, plugin, **kwargs):
+  def _launch(self, plugin, authorized_ports=None, **kwargs):
     """Call launch_test with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -317,7 +317,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
     defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True)
     defaults.update(kwargs)
     kind = "webapp" if defaults.get("scan_type") == "webapp" else "network"
-    _stub_launch_actor(plugin, kind, defaults.get("target_url") if kind == "webapp" else defaults.get("target"))
+    _stub_launch_actor(plugin, kind, defaults.get("target_url") if kind == "webapp" else defaults.get("target"),
+                       authorized_ports=authorized_ports)
     return PentesterApi01Plugin.launch_test(plugin, **defaults)
 
   def _launch_network(self, plugin, authorized_ports=None, **kwargs):
@@ -418,6 +419,36 @@ class TestPhase1ConfigCID(unittest.TestCase):
     result = self._launch_network(plugin, end_port=65535, comparison_mode=True)
     self.assertNotIn("error", result)
     self.assertNotIn("authorized_ports", self._latest_job_config(plugin))
+
+  def test_launch_test_widened_with_an_update_records_it(self):
+    """launch_test must reach the same widen path as launch_network_scan, so a
+    test-typed launch can be authorized past the asset scope, not just refused."""
+    plugin = self._build_mock_plugin(job_id="scope-test-1")
+    result = self._launch(plugin, authorized_ports="1-1024", end_port=1100,
+                          authorization_update=dict(self._UPDATE))
+    self.assertNotIn("error", result)
+    config = self._latest_job_config(plugin)
+    self.assertEqual(config["authorization_update"], {
+      **self._UPDATE, "out_of_scope_ports": "1025-1100",
+    })
+    audit = [call for call in plugin._log_audit_event.call_args_list if call[0][0] == "scan_launched"]
+    self.assertEqual(audit[-1][0][1]["authorization_update_reference"], "AUTH-2026-017")
+
+  def test_launch_test_widened_without_an_update_is_refused(self):
+    plugin = self._build_mock_plugin(job_id="scope-test-2")
+    result = self._launch(plugin, authorized_ports="1-1024", end_port=1100)
+    self.assertEqual(result["error"], "scope_exceeds_authorization")
+    self.assertEqual(result["status_code"], 400)
+    self.assertEqual(result["out_of_scope_ports"], "1025-1100")
+    self.assertIsNone(self._latest_job_config(plugin))
+
+  def test_launch_test_in_scope_is_unchanged(self):
+    plugin = self._build_mock_plugin(job_id="scope-test-3")
+    result = self._launch(plugin, authorized_ports="1-1024")
+    self.assertNotIn("error", result)
+    config = self._latest_job_config(plugin)
+    self.assertEqual(config["authorized_ports"], "1-1024")
+    self.assertNotIn("authorization_update", config)
 
   def test_the_plugin_version_is_the_recorded_release(self):
     from extensions.business.cybersec.red_mesh import pentester_api_01
