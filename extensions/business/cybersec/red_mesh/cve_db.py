@@ -58,6 +58,13 @@ CLIENT_SIDE_CVE_IDS = frozenset({
   # for untrusted X11 forwarding" — a client weakness, and CRITICAL, so it was
   # the highest-severity instance of the over-match this set exists to stop.
   "CVE-2016-1908",
+  # Dropbear: "Format string vulnerability in the dbclient in Dropbear SSH
+  # before 2016.74" (NVD) — the client binary. It was the cover CRITICAL of the
+  # client rerun (job 6d342bab) on a dropbear *server* banner.
+  "CVE-2016-7406",
+  # PostgreSQL: PQescapeLiteral / PQescapeIdentifier quoting in libpq, reached
+  # through psql — the client library, not the listening server.
+  "CVE-2025-1094",
 })
 
 SERVER_APPLICABILITY = "server"
@@ -96,8 +103,10 @@ CVE_DATABASE: list = [
   # CRITICAL, and vulnerable 8.5p1 servers were missed.
   CveEntry("openssh", "<4.4", "CVE-2024-6387", Severity.HIGH, "regreSSHion: signal handler race RCE", "CWE-362"),
   CveEntry("openssh", ">=8.5,<9.8", "CVE-2024-6387", Severity.HIGH, "regreSSHion: signal handler race RCE", "CWE-362"),
-  CveEntry("openssh", ">=6.8,<9.9.2", "CVE-2025-26465", Severity.MEDIUM, "MitM via VerifyHostKeyDNS bypass", "CWE-305"),
-  CveEntry("openssh", "<8.1",  "CVE-2019-6111", Severity.MEDIUM, "SCP client-side file overwrite", "CWE-20"),
+  CveEntry("openssh", ">=6.8,<9.9.2", "CVE-2025-26465", Severity.MEDIUM, "MitM via VerifyHostKeyDNS bypass", "CWE-305",
+           applicability=CLIENT_APPLICABILITY),
+  CveEntry("openssh", "<8.1",  "CVE-2019-6111", Severity.MEDIUM, "SCP client-side file overwrite", "CWE-20",
+           applicability=CLIENT_APPLICABILITY),
   CveEntry("openssh", "<7.6",  "CVE-2017-15906", Severity.MEDIUM, "Improper write restriction in readonly mode", "CWE-732"),
   CveEntry("openssh", "<7.0",  "CVE-2016-6210", Severity.MEDIUM, "User enumeration via timing", "CWE-200"),
 
@@ -117,7 +126,8 @@ CVE_DATABASE: list = [
   CveEntry("mysql", ">=5.7,<5.7.44",  "CVE-2024-20973", Severity.MEDIUM, "Optimizer DoS via low-privilege network attack", "CWE-404"),
 
   # ── PostgreSQL (new) ───────────────────────────────────────────────
-  CveEntry("postgresql", "<17.3",  "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89"),
+  CveEntry("postgresql", "<17.3",  "CVE-2025-1094", Severity.HIGH, "libpq quoting SQL injection leading to RCE", "CWE-89",
+           applicability=CLIENT_APPLICABILITY),
   CveEntry("postgresql", "<17.1",  "CVE-2024-10979", Severity.HIGH, "PL/Perl env variable manipulation to RCE", "CWE-94"),
   CveEntry("postgresql", "<17.1",  "CVE-2024-10976", Severity.MEDIUM, "Row security policy bypass via role confusion", "CWE-862"),
 
@@ -191,7 +201,8 @@ CVE_DATABASE: list = [
 
   # ── Dropbear ─────────────────────────────────────────────────────
   CveEntry("dropbear", "<2018.76", "CVE-2018-15599", Severity.MEDIUM, "Username enumeration via response size", "CWE-203"),
-  CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.CRITICAL, "Format string vulnerability in dbclient", "CWE-134"),
+  CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.CRITICAL, "Format string vulnerability in dbclient", "CWE-134",
+           applicability=CLIENT_APPLICABILITY),
 
   # ── Erlang OTP SSH ──────────────────────────────────────────────
   CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
@@ -385,12 +396,15 @@ BACKPORT_FIXES = {
 BACKPORT_FIXED = "fixed"
 BACKPORT_NOT_FIXED = "not_fixed"
 BACKPORT_UNKNOWN = "unknown"
+# The banner announced no distribution package at all, so there is nothing to
+# assess. Stated rather than left as "" so a report can always print a state.
+BACKPORT_UNKNOWN_NO_PACKAGE = "unknown_no_package"
 
 
 def backport_status(product: str, cve_id: str, package) -> str:
-  """`fixed`, `not_fixed` or `unknown` for a CVE on a distribution package."""
+  """`fixed`, `not_fixed`, `unknown` or `unknown_no_package` for a CVE on a distribution package."""
   if package is None:
-    return ""
+    return BACKPORT_UNKNOWN_NO_PACKAGE
   rows = BACKPORT_FIXES.get((product, package.distro), {}).get(cve_id, ())
   for upstream, fixed_revision, _advisory in rows:
     if upstream != package.upstream:
@@ -540,11 +554,15 @@ def _build_finding(entry, product: str, version: str, dynamic_cache, backport_st
     )
     confidence = "tentative"
   else:
+    # BACKPORT_UNKNOWN_NO_PACKAGE, or "" from a caller that passed no status.
     backport_note = (
-      " NOTE: Linux distributions backport security fixes without changing "
-      "the upstream version number — this may be a false positive."
+      " No distribution package was announced in the banner, so backport "
+      "status could not be assessed. NOTE: Linux distributions backport "
+      "security fixes without changing the upstream version number — this "
+      "may be a false positive."
     )
     confidence = "tentative"
+    backport_status = backport_status or BACKPORT_UNKNOWN_NO_PACKAGE
 
   finding = Finding(
     severity=severity,

@@ -361,5 +361,46 @@ class TestPackageVersionParsing(unittest.TestCase):
     self.assertNotIn("CVE-2017-15906", fired)  # openssh <7.6
 
 
+class TestClientSideApplicabilityAcrossProducts(unittest.TestCase):
+  """
+  The client rerun (job 6d342bab) fingerprinted `dropbear_2015.67` and the
+  cover CRITICAL was CVE-2016-7406 — a format string in `dbclient`, the SSH
+  *client*. The applicability rule was keyed on OpenSSH CVE ids only, so the
+  same over-match the client had already rejected for OpenSSH came back for
+  the next product.
+  """
+
+  @staticmethod
+  def _ids(findings):
+    return {cve_id for f in findings for cve_id in (getattr(f, "cve", None) or ())}
+
+  def test_a_dropbear_server_banner_does_not_raise_the_dbclient_cve(self):
+    fired = self._ids(check_cves("dropbear", "2015.67"))
+    self.assertNotIn("CVE-2016-7406", fired)
+    # The server-side username enumeration (svr-auth) still fires.
+    self.assertIn("CVE-2018-15599", fired)
+
+  def test_the_dbclient_cve_is_still_reachable_as_a_client_finding(self):
+    fired = self._ids(check_cves("dropbear", "2015.67", applicability="client"))
+    self.assertIn("CVE-2016-7406", fired)
+    self.assertNotIn("CVE-2018-15599", fired)
+
+  def test_a_postgresql_server_banner_does_not_raise_the_libpq_cve(self):
+    # CVE-2025-1094 is a quoting flaw in libpq / psql (the client library).
+    fired = self._ids(check_cves("postgresql", "17.2"))
+    self.assertNotIn("CVE-2025-1094", fired)
+
+  def test_every_entry_whose_title_names_a_client_component_is_client_side(self):
+    import re
+    from extensions.business.cybersec.red_mesh.cve_db import CVE_DATABASE, entry_applicability
+    client_words = re.compile(r"\b(dbclient|scp|ssh-agent|ssh-add|client|libpq|psql)\b", re.I)
+    wrong = [
+      (e.product, e.cve_id, e.title)
+      for e in CVE_DATABASE
+      if client_words.search(e.title) and entry_applicability(e) != "client"
+    ]
+    self.assertEqual(wrong, [], "titles naming a client component must resolve to client applicability")
+
+
 if __name__ == "__main__":
   unittest.main()
