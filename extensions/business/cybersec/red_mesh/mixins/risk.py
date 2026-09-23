@@ -27,6 +27,7 @@ from ..constants import (
   RISK_RAW_TOTAL_CEILING,
   RISK_CRED_PENALTY_PER,
   RISK_CRED_PENALTY_CAP,
+  RISK_CRED_SCORE_FLOOR,
 )
 
 
@@ -181,10 +182,14 @@ class _RiskScoringMixin:
           "compensating": "",
         }
 
-      # Key absence, not falsiness: `affected_assets: []` is a deliberate
-      # statement — "no location recorded" (the graybox producer documents the
-      # distinction) — and the falsy check replaced it with an invented asset.
-      if "affected_assets" not in item:
+      # Graybox `affected_assets: []` is a deliberate statement — "no location
+      # recorded" (the graybox producer documents the distinction) — and must
+      # not be replaced with an invented asset. Blackbox `[]` is not: every
+      # `Finding` serialises its empty tuple as `[]`, so a key-absence guard
+      # left every blackbox finding with no location at all. The `{host, port}`
+      # asset is not an identity dimension (`canonical_asset_string` skips it),
+      # so the synthesis does not move `finding_id`.
+      if not item.get("affected_assets") and category != "graybox":
         asset = {"host": target, "port": port if port else None}
         url = item.get("url")
         if url:
@@ -219,6 +224,9 @@ class _RiskScoringMixin:
       # and never the truncated content hash. `dedup_key`/`content_hash` are the
       # pre-collapse names still present in older archives, honoured as
       # fallbacks and dropped from the output rather than re-persisted.
+      # Before the fallback below: the port is an identity dimension, and the
+      # probe-time stamp read it from `probe_port_scope`.
+      item["port"] = port
       item["finding_id"] = (
         item.get("finding_id") or item.get("dedup_key") or _dedup_key(item)
       )
@@ -228,7 +236,6 @@ class _RiskScoringMixin:
       )
       item.pop("dedup_key", None)
       item.pop("content_hash", None)
-      item["port"] = port
       item["protocol"] = protocol
       item["category"] = category
       # The contract's one production enforcement point. B1 defined
@@ -499,16 +506,17 @@ class _RiskScoringMixin:
     credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
 
     # `finding_id = dedup_key`, unconditionally — collisions are reported, not
-    # hidden (plan decision 3; this deliberately re-opens E2, the two-port
-    # collision, as an accepted and *visible* trade).
+    # hidden (plan decision 3). The two-port collision (E2) is closed: the port
+    # is an identity dimension since RM-090.
     #
     # The collision-detection pass this replaces suffixed every member of a
     # colliding group, which made the id depend on what else the scan found:
     # pass 2 finding one SRI script where pass 1 found three re-keyed the
     # survivor and `finding_timeline` reported a brand-new finding. It also
     # produced ~29-character ids against the documented 16-hex contract.
-    # Identity stays coarse until RM-061 attaches locations; findings sharing a
-    # `dedup_key` are a probe defect, and the count below is how it is seen.
+    # Findings sharing a `dedup_key` on one port are a probe defect (a probe
+    # that emits two findings identity cannot tell apart), and the count below
+    # is how it is seen.
     id_counts = {}
     for f in flat_findings:
       id_counts[f.get("finding_id")] = id_counts.get(f.get("finding_id"), 0) + 1
@@ -524,13 +532,15 @@ class _RiskScoringMixin:
       self.P(
         f"identity collision: {identity_collisions['count']} findings share "
         f"a finding_id (probes: {', '.join(identity_collisions['probes'])}) — "
-        "the probe emits findings identity cannot distinguish until RM-061 "
-        "attaches locations",
+        "the probe emits findings identity cannot distinguish on one port",
         color="y",
       )
 
     raw_total = findings_score + open_ports_score + breadth_score + credentials_penalty
     score = normalize_risk_score(raw_total)
+    credential_floor_applied = cred_count > 0 and score < RISK_CRED_SCORE_FLOOR
+    if credential_floor_applied:
+      score = RISK_CRED_SCORE_FLOOR
 
     risk_result = {
       "score": score,
@@ -540,6 +550,17 @@ class _RiskScoringMixin:
         "breadth_score": round(breadth_score, 1),
         "credentials_penalty": credentials_penalty,
         "raw_total": round(raw_total, 1),
+        "credential_floor_applied": credential_floor_applied,
+        # The constants this score was computed with, so the report prints the
+        # method with numbers rather than prose that can drift from the code.
+        "constants": {
+          "severity_weights": dict(RISK_SEVERITY_WEIGHTS),
+          "confidence_multipliers": dict(RISK_CONFIDENCE_MULTIPLIERS),
+          "raw_total_ceiling": RISK_RAW_TOTAL_CEILING,
+          "credential_penalty_per": RISK_CRED_PENALTY_PER,
+          "credential_penalty_cap": RISK_CRED_PENALTY_CAP,
+          "credential_score_floor": RISK_CRED_SCORE_FLOOR,
+        },
         "finding_counts": finding_counts,
         # Coverage stated alongside the findings rather than folded into them:
         # "we ran 40 scenarios and 1 was vulnerable" and "we found 40 findings"
@@ -548,6 +569,9 @@ class _RiskScoringMixin:
         # Findings sharing an id — a probe emitting findings identity cannot
         # distinguish. Reported rather than hidden behind a synthetic suffix.
         "identity_collisions": identity_collisions,
+        # Whether NVD/KEV/EPSS were consulted for this pass. The report says
+        # "not evaluated" rather than implying a clean KEV check when false.
+        "reference_data_enabled": bool(aggregated_report.get("reference_data")),
         # A probe emitting a finding the contract does not accept is a defect in
         # the probe. Stated here so it is visible in the pass report rather
         # than absorbed silently by the layer that reads the finding.

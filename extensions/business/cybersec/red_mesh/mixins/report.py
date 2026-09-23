@@ -601,6 +601,14 @@ class _ReportMixin:
             # end if standard (one time) or aggregated fields
           # for each field in this local job
         # for each local job
+        # Every thread this node merged, so each finding's `_source_worker_id`
+        # can be found on its node report. The first-wins `local_worker_id`
+        # named one arbitrary thread (job 6d342bab: findings said RM-9-cfaa,
+        # the node report said RM-1-*), so it goes.
+        dct_aggregated_report["local_worker_ids"] = sorted(
+          str(status.get("local_worker_id") or key) for key, status in local_jobs.items()
+        )
+        dct_aggregated_report.pop("local_worker_id", None)
         self.P(f"Report aggregation done.")
       # endif we have local jobs
     except Exception as exc:

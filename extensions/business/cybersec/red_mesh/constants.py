@@ -221,7 +221,7 @@ LLM_ANALYSIS_EXEC_SUMMARY_PACKAGE = "exec_summary_package"
 # Prompt-template version. Stored on every emitted LlmReportSections
 # so the report's AI-disclosure appendix can show which template
 # version produced the narrative. Bump on any prompt change.
-LLM_PROMPT_VERSION_EXEC_SUMMARY = "exec-summary-v2"
+LLM_PROMPT_VERSION_EXEC_SUMMARY = "exec-summary-v3"
 
 # =====================================================================
 # Protocol fingerprinting and probe routing
@@ -339,6 +339,11 @@ COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS = [
   "web_api_exposure",
 ]
 
+# The backend release, recorded in every JobConfig at launch so a report names
+# the scanner that produced it. `pentester_api_01.__VER__` must equal it (a test
+# guards the pair; the plugin loader reads the literal there).
+REDMESH_BACKEND_VERSION = "0.10.0"
+
 # =====================================================================
 # Risk score computation
 # =====================================================================
@@ -354,6 +359,11 @@ RISK_SIGMOID_K = 0.02  # retained: legacy logistic constant, no longer used for 
 RISK_RAW_TOTAL_CEILING = 20000.0
 RISK_CRED_PENALTY_PER = 15
 RISK_CRED_PENALTY_CAP = 30
+# An accepted default credential is direct access. The additive penalty alone,
+# log-compressed, moved a real report one point (59 -> 60); any accepted
+# credential now lifts the score to at least the CRITICAL tier (owner decision,
+# RM-090).
+RISK_CRED_SCORE_FLOOR = 80
 
 # =====================================================================
 # Job archive

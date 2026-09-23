@@ -180,6 +180,55 @@ class TestBaseLocalWorkerContract(unittest.TestCase):
     for key in required:
       self.assertIn(key, status, f"Missing status key: {key}")
 
+  def _progress(self, worker):
+    return float(worker.get_status()["progress"].rstrip("%"))
+
+  def test_progress_is_100_when_a_worker_with_no_open_ports_finishes(self):
+    # Job 6d342bab: every worker read "Progress: 125.0%" — five markers
+    # (port scan + four phases) over a denominator of four.
+    worker = _make_pentest_worker()
+    worker.state["open_ports"] = []
+    worker.state["completed_tests"] = [
+      "scan_ports_step_completed", "fingerprint_completed", "service_info_completed",
+      "web_tests_completed", "correlation_completed",
+    ]
+    self.assertEqual(worker.get_status()["progress"], "100.0%")
+
+  def test_progress_is_100_when_every_enabled_probe_and_phase_completed(self):
+    worker = _make_pentest_worker(enabled_features=[
+      "_service_info_http", "_web_test_xss", "_post_scan_correlate",
+    ])
+    worker.state["open_ports"] = [80]
+    methods = [
+      m for m in worker._get_enabled_feature_methods()
+      if not m.startswith(worker.FEATURE_CATEGORY_PREFIXES["correlation"])
+    ]
+    self.assertTrue(methods)
+    worker.state["completed_tests"] = [
+      "scan_ports_step_50%", "scan_ports_step_completed", "fingerprint_completed",
+      "service_info_completed", "web_tests_completed", "correlation_completed", *methods,
+    ]
+    self.assertEqual(worker.get_status()["progress"], "100.0%")
+
+  def test_progress_never_exceeds_100(self):
+    worker = _make_pentest_worker(enabled_features=["_service_info_http", "_web_test_xss"])
+    for open_ports in ([], [80]):
+      with self.subTest(open_ports=open_ports):
+        worker.state["open_ports"] = open_ports
+        worker.state["completed_tests"] = (
+          ["scan_ports_step_completed", "fingerprint_completed", "service_info_completed",
+           "web_tests_completed", "correlation_completed", "scan_ports_step_50%", "unknown_marker"]
+          + worker._get_enabled_feature_methods() * 2
+        )
+        self.assertLessEqual(self._progress(worker), 100.0)
+
+  def test_progress_is_partial_mid_scan(self):
+    worker = _make_pentest_worker(enabled_features=["_service_info_http", "_web_test_xss"])
+    worker.state["open_ports"] = [80]
+    worker.state["completed_tests"] = ["scan_ports_step_completed", "fingerprint_completed"]
+    self.assertGreater(self._progress(worker), 0.0)
+    self.assertLess(self._progress(worker), 100.0)
+
   def test_get_status_scan_metrics_is_dict(self):
     worker = _make_pentest_worker()
     status = worker.get_status()

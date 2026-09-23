@@ -195,6 +195,11 @@ def _has_specific_location(assets: Any) -> bool:
 def dedup_key(finding: dict, *, asset_canonical: str | None = None) -> str:
   """Stable identity for a finding. Survives rewording; splits on location.
 
+  Location is the port the finding was observed on plus, where a probe records
+  one, the url/parameter of its asset. The port is read from `finding["port"]`:
+  the probe-time payload carries it from `probe_port_scope`, the flat walk sets
+  it before computing the fallback.
+
   Deliberately *not* a truncation of `content_hash`: they answer different
   questions, and deriving one from the other is how the previous model ended up
   with `finding_id = signature[:16]` and no way to change either independently.
@@ -220,6 +225,9 @@ def dedup_key(finding: dict, *, asset_canonical: str | None = None) -> str:
     _text(finding.get("probe")),
     _text(finding.get("scenario_id")),
     asset_str,
+    # Location by port (RM-090). Job 6d342bab printed one id for the same
+    # missing header on 80 and on 443; `0`/None (no port) contribute nothing.
+    _text(finding.get("port") or ""),
     _classification(finding),
   ]
   if (not finding.get("scenario_id") and asset_canonical is None

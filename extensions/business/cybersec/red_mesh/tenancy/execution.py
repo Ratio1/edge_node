@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from copy import deepcopy
 import json
 
-from .assets import canonical_digest, canonical_uuid, normalize_target
+from .assets import canonical_digest, canonical_uuid, normalize_port_scope, normalize_target
 from .identity import canonical_account_id
 from .nodes import valid_node_address
 
@@ -72,10 +72,18 @@ class ResolvedExecutionContext:
   _snapshot: str
 
   def __init__(self, value):
-    if not isinstance(value, dict) or set(value) != _FACT_FIELDS | {"selected_candidates"}:
+    # `asset_authorized_ports` is optional: the asset's port scope, read by the launch gate and
+    # never part of the binding (the scope is launch-time policy, not execution identity).
+    if (not isinstance(value, dict)
+        or set(value) - {"asset_authorized_ports"} != _FACT_FIELDS | {"selected_candidates"}):
       raise ValueError("Invalid resolved execution fields")
     _validate_facts(value)
     _node_order(value["selected_candidates"])
+    if "asset_authorized_ports" in value and (
+        value["asset_target"]["kind"] != "network"
+        or normalize_port_scope(value["asset_authorized_ports"]) != value["asset_authorized_ports"]
+        or value["asset_authorized_ports"] is None):
+      raise ValueError("Invalid execution port scope")
     object.__setattr__(self, "_snapshot", _snapshot(value))
 
   def to_dict(self):
@@ -84,6 +92,7 @@ class ResolvedExecutionContext:
   def build_binding(self, original_launcher, participant_order):
     participants = _node_order(participant_order)
     facts = self.to_dict()
+    facts.pop("asset_authorized_ports", None)
     if not set(participants).issubset(facts.pop("selected_candidates")):
       raise ValueError("Unselected execution participant")
     return ExecutionBinding({**facts, "schema_version": 1, "original_launcher": original_launcher,

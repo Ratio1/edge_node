@@ -56,6 +56,9 @@ class RiskBreakdown:
   coverage_counts: dict = None      # { "not_vulnerable": 9, "inconclusive": 1 }
   schema_violations: dict = None    # { "count": 0, "errors": [...] }
   identity_collisions: dict = None  # { "count": 0, "probes": [...] }
+  reference_data_enabled: bool = None  # NVD/KEV/EPSS consulted for this pass
+  credential_floor_applied: bool = None  # an accepted credential lifted the score
+  constants: dict = None            # weights, multipliers, ceiling, penalty, floor
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -72,6 +75,9 @@ class RiskBreakdown:
       coverage_counts=d.get("coverage_counts"),
       schema_violations=d.get("schema_violations"),
       identity_collisions=d.get("identity_collisions"),
+      reference_data_enabled=d.get("reference_data_enabled"),
+      credential_floor_applied=d.get("credential_floor_applied"),
+      constants=d.get("constants"),
     )
 
 

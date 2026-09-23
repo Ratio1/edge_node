@@ -12,6 +12,7 @@ import unittest
 from extensions.business.cybersec.red_mesh.cve_db import (
   BACKPORT_NOT_FIXED,
   BACKPORT_UNKNOWN,
+  BACKPORT_UNKNOWN_NO_PACKAGE,
   DistroPackage,
   _compare_debian_revision,
   backport_status,
@@ -79,8 +80,10 @@ class TestBackportStatus(unittest.TestCase):
     other_upstream = DistroPackage("ubuntu", "8.2p1", "4ubuntu0.11")
     self.assertEqual(backport_status("openssh", "CVE-2024-6387", other_upstream), BACKPORT_UNKNOWN)
 
-  def test_no_package_is_not_applicable(self):
-    self.assertEqual(backport_status("openssh", "CVE-2024-6387", None), "")
+  def test_no_package_is_an_explicit_state_not_an_empty_string(self):
+    # The client letter promised backport state stated explicitly; "" printed
+    # nothing on the dropbear cards of job 6d342bab.
+    self.assertEqual(backport_status("openssh", "CVE-2024-6387", None), BACKPORT_UNKNOWN_NO_PACKAGE)
 
 
 class TestCheckCvesWithPackage(unittest.TestCase):
@@ -118,13 +121,19 @@ class TestCheckCvesWithPackage(unittest.TestCase):
     self.assertEqual(f.confidence, "tentative")
     self.assertIn("Backport status unknown", f.description)
 
-  def test_callers_without_a_package_are_unchanged(self):
+  def test_callers_without_a_package_state_that_no_package_was_seen(self):
     findings = check_cves("openssh", "8.9")
     self.assertTrue(findings)
     for f in findings:
-      self.assertEqual(f.backport_status, "")
+      self.assertEqual(f.backport_status, BACKPORT_UNKNOWN_NO_PACKAGE)
       self.assertEqual(f.confidence, "tentative")
+      self.assertIn("No distribution package", f.description)
       self.assertIn("may be a false positive", f.description)
+
+  def test_every_emitted_cve_finding_carries_a_backport_state(self):
+    for product, version in (("openssh", "8.9"), ("dropbear", "2015.67")):
+      for f in check_cves(product, version):
+        self.assertTrue(f.backport_status, f"{f.cve} has no backport state")
 
 
 if __name__ == "__main__":

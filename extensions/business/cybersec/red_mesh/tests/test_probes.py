@@ -137,6 +137,50 @@ class RedMeshOWASPTests(unittest.TestCase):
       result = worker._web_test_path_traversal("example.com", 80)
     self._assert_has_finding(result, "Path traversal")
 
+  def _traversal_findings(self, body, content_type="text/plain"):
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.text = body
+    resp.status_code = 200
+    resp.headers = {"Content-Type": content_type}
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_path_traversal("example.com", 80)
+    return [f for f in result["findings"] if "Path traversal" in f["title"]]
+
+  def test_path_traversal_carries_a_bounded_response_excerpt(self):
+    """The finding asserted file markers in the body and showed none of it; the
+    excerpt is the evidence a reviewer can check."""
+    body = ("x" * 3000) + "\nroot:x:0:0:root:/root:/bin/bash\n" + ("y" * 3000)
+    findings = self._traversal_findings(body)
+    self.assertTrue(findings)
+    items = findings[0]["evidence_items"]
+    self.assertEqual(len(items), 1)
+    self.assertEqual(items[0]["kind"], "request_response")
+    self.assertIn("http://example.com", items[0]["caption"])
+    snippet = items[0]["snippet"]
+    self.assertLessEqual(len(snippet.encode("utf-8")), 512)
+    self.assertIn("root:x:0:0", snippet)
+    self.assertTrue(findings[0]["evidence"])
+
+  def test_path_traversal_excerpt_starts_at_the_marker_line(self):
+    """A fixed lead before the marker could cut a `password=` key off while its
+    value stayed in the window, and the key-anchored redaction rules then miss
+    it. The window opens at the start of the line holding the marker."""
+    body = ("x" * 200) + "\nsecret_password=" + ("hunter2!" * 12) + "\nroot:x:0:0:root:/root:/bin/bash\n"
+    snippet = self._traversal_findings(body)[0]["evidence_items"][0]["snippet"]
+    self.assertTrue(snippet.startswith("root:x:0:0"))
+    self.assertNotIn("hunter2", snippet)
+
+  def test_path_traversal_excerpt_is_redacted(self):
+    body = "root:x:0:0:root:/root:/bin/bash\nmirror=https://svc:hunter2@repo.test/\n"
+    findings = self._traversal_findings(body)
+    snippet = findings[0]["evidence_items"][0]["snippet"]
+    self.assertNotIn("hunter2", snippet)
+    self.assertIn("[REDACTED]@", snippet)
+
   def test_security_misconfiguration_missing_headers(self):
     owner, worker = self._build_worker()
     resp = MagicMock()
@@ -5312,6 +5356,20 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     self.assertTrue({"/.env", "/admin", "/actuator", "/wp-login.php"} <= paths)
     self.assertTrue(all(e["probe"] == "_web_test_common" for e in withheld))
 
+  def test_the_catch_all_indicator_is_informational(self):
+    """The canary is a property of the host, not a weakness: it says the
+    status-only checks on that host cannot be trusted. Scored 7.5 HIGH with
+    C:H it ranked above the findings it made unreliable."""
+    from extensions.business.cybersec.red_mesh.worker.web.discovery import CATCH_ALL_TITLE
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)):
+      result = worker._web_test_common("example.com", 80)
+    [canary] = [f for f in result["findings"] if f["title"] == CATCH_ALL_TITLE]
+    self.assertEqual(canary["severity"], "INFO")
+    self.assertFalse(canary.get("cvss_vector"))
+    self.assertEqual(canary["severity_source"], "probe_policy")
+    self.assertIn("status-only", canary["description"])
+
   def test_metadata_and_api_auth_are_withheld_on_a_catch_all_host(self):
     worker = self._build_worker()
     with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
@@ -5404,6 +5462,52 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     self.assertEqual(len([u for u in calls if self._UUID_PATH.search(u)]), 1)
     self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": True})
 
+  _COMMON_REQUEST = "extensions.business.cybersec.red_mesh.worker.service.common.requests.request"
+  _METHOD_TITLES = {
+    "TRACE": "HTTP TRACE method enabled (cross-site tracing / XST attack vector).",
+    "PUT": "HTTP PUT method enabled (potential unauthorized file upload).",
+    "DELETE": "HTTP DELETE method enabled (potential unauthorized file deletion).",
+  }
+
+  def test_dangerous_methods_are_status_only_and_tentative(self):
+    # Job 6d342bab: PUT/DELETE on port 80 were HIGH and "certain" on nothing
+    # but "returned status < 400"; stateful probes were off, so no write was
+    # ever verified.
+    worker = self._build_worker()
+
+    def get(url, **_kwargs):
+      return self._response(404 if self._UUID_PATH.search(url) else 200)
+
+    with patch(_DISCOVERY_GET, side_effect=get), \
+         patch(self._COMMON_REQUEST, side_effect=lambda method, url, **_kw: self._response(200)):
+      result = worker._service_info_http("example.com", 80)
+    by_title = {f["title"]: f for f in result["findings"]}
+    for method, title in self._METHOD_TITLES.items():
+      with self.subTest(method=method):
+        finding = by_title[title]
+        self.assertEqual(finding["confidence"], "tentative")
+        self.assertIn(f"{method} http://example.com returned HTTP 200", finding["evidence"])
+        self.assertIn("status-only", finding["evidence"])
+    self.assertEqual(result["dangerous_methods"], ["TRACE", "PUT", "DELETE"])
+
+  def test_dangerous_methods_are_withheld_on_a_catch_all_host(self):
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch(self._COMMON_REQUEST, side_effect=lambda method, url, **_kw: self._response(200)) as request:
+      result = worker._service_info_http("example.com", 80)
+    titles = {f["title"] for f in result["findings"]}
+    self.assertFalse(titles & set(self._METHOD_TITLES.values()))
+    request.assert_not_called()
+    self.assertEqual(result["dangerous_methods"], [])
+    self.assertEqual(result["dangerous_methods_withheld"], "catch_all")
+    withheld = worker.state["catch_all_withheld"]["http://example.com"]
+    self.assertEqual(
+      [e for e in withheld if e["probe"] == "_service_info_http"],
+      [{"probe": "_service_info_http", "path": f"{m} /"} for m in ("TRACE", "PUT", "DELETE")],
+    )
+    # The web phase reuses the memoised verdict rather than asking again.
+    self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": True})
+
   def test_a_host_that_404s_the_random_path_is_unchanged(self):
     worker = self._build_worker()
 
@@ -5418,11 +5522,34 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     self.assertNotIn("catch_all_withheld", worker.state)
     self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": False})
 
-  def test_the_canary_finding_names_the_withheld_checks_once_all_probes_ran(self):
-    from extensions.business.cybersec.red_mesh.findings import finding_from_dict
+  def test_the_withheld_count_is_distinct_paths_not_probe_checks(self):
+    """Two probes withholding `/actuator` is one path. The count said 35 over
+    a list of 32 paths, and the reader could not reconcile the two."""
     worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)):
+      common = worker._web_test_common("example.com", 80)
+    worker.state["web_tests_info"][80] = {"_web_test_common": common}
+    worker.state["catch_all_withheld"] = {"http://example.com": [
+      {"probe": "_web_test_common", "path": "/actuator"},
+      {"probe": "_web_test_java_servers", "path": "/actuator"},
+      {"probe": "_web_test_common", "path": "/.env"},
+    ]}
+
+    worker._annotate_catch_all_findings()
+
+    evidence = worker.state["web_tests_info"][80]["_web_test_common"]["findings"][0]["evidence"]
+    self.assertIn(
+      "2 distinct paths withheld pending manual validation "
+      "(3 status-only checks across 2 probes): /actuator, /.env.",
+      evidence,
+    )
+
+  def test_the_canary_finding_names_the_withheld_checks_once_all_probes_ran(self):
+    from extensions.business.cybersec.red_mesh.findings import finding_from_dict, probe_port_scope
+    worker = self._build_worker()
+    # As the web loop runs them: inside the port scope identity is keyed on.
     with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
-         patch(_API_GET, side_effect=self._all(200)):
+         patch(_API_GET, side_effect=self._all(200)), probe_port_scope(80):
       common = worker._web_test_common("example.com", 80)
       meta = worker._web_test_metadata_endpoints("example.com", 80)
     before = dict(common["findings"][0])
@@ -5434,16 +5561,15 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     worker._annotate_catch_all_findings()
 
     after = worker.state["web_tests_info"][80]["_web_test_common"]["findings"][0]
-    self.assertIn("status-only checks withheld pending manual validation", after["evidence"])
+    self.assertIn("distinct paths withheld pending manual validation", after["evidence"])
     self.assertIn("/.env", after["evidence"])
     self.assertIn("/latest/meta-data/", after["evidence"])
     # Dedup identity is untouched; the content stamp follows the new evidence.
     self.assertEqual(after["finding_id"], before["finding_id"])
     self.assertNotEqual(after["finding_signature"], before["finding_signature"])
-    self.assertEqual(
-      after["finding_signature"],
-      finding_from_dict(after).compute_signature(probe_id="_web_test_common"),
-    )
+    with probe_port_scope(80):
+      recomputed = finding_from_dict(after).compute_signature(probe_id="_web_test_common")
+    self.assertEqual(after["finding_signature"], recomputed)
     # Idempotent: a second pass does not append the sentence again.
     worker._annotate_catch_all_findings()
     self.assertEqual(

@@ -148,6 +148,41 @@ class TestTenantAssetAdministration(unittest.TestCase):
     self.assertEqual(len(self.owner.writes), before)
     self.assertTrue(update(active=True, expected_version=changed["version"])["data"]["active"])
 
+  def test_a_network_asset_records_a_canonical_authorized_port_scope(self):
+    """The scope sits beside the target, never in it: the target digest is the
+    asset's identity and the execution binding re-checks it."""
+    plain = self.create(request_id=str(uuid4()))["data"]
+    self.assertNotIn("authorizedPorts", plain)
+    result = self.create(authorized_ports=" 8080, 1-1024,1000-1030 ,22 ")
+    self.assertTrue(result["success"], result)
+    self.assertEqual(result["data"]["authorizedPorts"], "1-1030,8080")
+    self.assertEqual(result["data"]["target"], self.target)
+    self.assertEqual(result["data"]["targetDigest"], plain["targetDigest"])
+
+  def test_an_invalid_or_misplaced_port_scope_is_refused(self):
+    for scope in ("0-10", "1-65536", "20-10", "http", "1,,2", 80, ",".join(str(p) for p in range(1, 200, 2))):
+      with self.subTest(scope=scope):
+        self.assertEqual(self.create(request_id=str(uuid4()), authorized_ports=scope)["status_code"], 400)
+    webapp = {"kind": "webapp", "url": "https://example.com/api", "allowedPathPrefix": "/api"}
+    self.assertEqual(self.create(target=webapp, authorized_ports="443")["status_code"], 400)
+
+  def test_an_update_that_omits_the_scope_preserves_it_and_null_clears_it(self):
+    original = self.create(authorized_ports="1-1024")["data"]
+    def update(version, **changes):
+      fields = {"actor": self.actor, "tenant_id": self.tenant, "asset_id": original["assetId"],
+                "expected_version": version, "display_name": "Asset",
+                "target": self.target, "active": True}
+      return self.service.update_tenant_asset(**{**fields, **changes})
+    before = len(self.owner.writes)
+    self.assertEqual(update(original["version"])["data"], original)  # omitted: an exact no-op
+    self.assertEqual(len(self.owner.writes), before)
+    widened = update(original["version"], authorized_ports="1-1024,8080")["data"]
+    self.assertEqual(widened["authorizedPorts"], "1-1024,8080")
+    self.assertNotEqual(widened["version"], original["version"])
+    self.assertEqual(widened["targetDigest"], original["targetDigest"])
+    cleared = update(widened["version"], authorized_ports=None)["data"]
+    self.assertNotIn("authorizedPorts", cleared)
+
   def test_web_assets_canonicalize_authority_preserve_path_and_require_explicit_scope(self):
     for url, prefix, expected in (("HTTP://EXAMPLE.COM:80/api/item", "/api/", "http://example.com/api/item"),
                                   ("https://[2001:0DB8::1]:443/api", "/api", "https://[2001:db8::1]/api"),

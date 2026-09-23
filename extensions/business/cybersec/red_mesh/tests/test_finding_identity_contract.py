@@ -43,6 +43,9 @@ def _finding(**overrides):
     "severity": "HIGH",
     "owasp_id": "A01:2021",
     "cwe_id": "CWE-639",
+    # Observed on 443: every flat finding carries its port, an identity
+    # dimension since RM-090.
+    "port": 443,
     "affected_assets": [{
       "host": "app.test", "port": 443,
       "url": "https://app.test/api/records/99",
@@ -656,13 +659,18 @@ class TestStampedAndRawRepresentationsShareIdentity(unittest.TestCase):
     class MockHost(_RiskScoringMixin):
       pass
 
-    stamped = probe_result(
-      findings=[Finding(
-        severity=Severity.MEDIUM, title="Weak TLS", description="d",
-        confidence="certain",
-      )],
-      probe_id="_service_info_http",
-    )["findings"][0]
+    from extensions.business.cybersec.red_mesh.findings import probe_port_scope
+
+    # The worker runs every probe inside `probe_port_scope(port)`; the stamped
+    # twin is built the same way, so both representations know port 443.
+    with probe_port_scope(443):
+      stamped = probe_result(
+        findings=[Finding(
+          severity=Severity.MEDIUM, title="Weak TLS", description="d",
+          confidence="certain",
+        )],
+        probe_id="_service_info_http",
+      )["findings"][0]
     # Classification matches what `enrich_finding_for_probe` stamps from the
     # registry: classification is legitimately part of identity, so an
     # UNclassified raw dict is a different identity than its enriched twin —
@@ -705,6 +713,69 @@ class TestStampedAndRawRepresentationsShareIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestIdentityIsLocationAwareByPort(unittest.TestCase):
+  """
+  RM-090: job 6d342bab printed the same Finding ID for "Missing security
+  header: Content-Security-Policy" on port 80 and on port 443 — five such
+  pairs — while Appendix A defines the id as coming from the finding's probe
+  and location. The port is now its own identity dimension, supplied at probe
+  time by the worker loop and read from the flat item by the fallback.
+  """
+
+  _BASE = {"probe": "_web_test_security_headers", "title": "Missing security header: CSP",
+           "owasp_id": "A05:2021", "cwe_id": "CWE-693"}
+
+  def test_the_same_finding_on_two_ports_gets_two_ids(self):
+    self.assertNotEqual(
+      dedup_key({**self._BASE, "port": 80}),
+      dedup_key({**self._BASE, "port": 443}),
+    )
+
+  def test_the_same_finding_on_one_port_keeps_one_id(self):
+    self.assertEqual(
+      dedup_key({**self._BASE, "port": 443}),
+      dedup_key({**self._BASE, "port": 443, "_source_worker_id": "RM-2-bbbb"}),
+    )
+
+  def test_the_probe_time_stamp_carries_the_port_from_the_worker_loop(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      Finding, Severity, probe_port_scope, probe_result,
+    )
+
+    def stamp(port):
+      with probe_port_scope(port):
+        return probe_result(
+          findings=[Finding(severity=Severity.MEDIUM, title="Missing security header: CSP",
+                            description="d")],
+          probe_id="_web_test_security_headers",
+        )["findings"][0]["finding_id"]
+
+    self.assertNotEqual(stamp(80), stamp(443))
+    self.assertEqual(stamp(443), stamp(443))
+
+  def test_a_cve_on_two_ports_gets_two_ids(self):
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    from extensions.business.cybersec.red_mesh.findings import probe_port_scope
+
+    def ids(port):
+      with probe_port_scope(port):
+        return {f.cve[0]: f.finding_id for f in check_cves("dropbear", "2015.67")}
+
+    at_22, at_2222 = ids(22), ids(2222)
+    self.assertEqual(set(at_22), set(at_2222))
+    for cve_id in at_22:
+      self.assertNotEqual(at_22[cve_id], at_2222[cve_id], cve_id)
+
+  def test_the_scope_does_not_leak_past_the_probe(self):
+    from extensions.business.cybersec.red_mesh.findings import (
+      current_probe_port, probe_port_scope,
+    )
+    self.assertIsNone(current_probe_port())
+    with probe_port_scope(80):
+      self.assertEqual(current_probe_port(), 80)
+    self.assertIsNone(current_probe_port())
 
 
 class TestTheThreeKeysAgreeAboutWhatMoves(unittest.TestCase):

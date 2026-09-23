@@ -99,10 +99,16 @@ class _WebDiscoveryMixin:
     catch_all = self._host_is_catch_all(base_url)
     if catch_all:
       findings_list.append(Finding(
-        severity=Severity.HIGH,
+        # INFO, not a weakness: the catch-all is a property of the host that
+        # makes status-only checks on it unreliable. Scored HIGH with C:H it
+        # outranked the findings it undermines; INFO also keeps the probe's
+        # CVSS template off it (`_carries_a_weakness`).
+        severity=Severity.INFO,
         title=CATCH_ALL_TITLE,
         description="A request to a non-existent random UUID path returned HTTP 200, "
-                    "suggesting a catch-all rule or severely misconfigured server.",
+                    "suggesting a catch-all rule. It lowers confidence in any "
+                    "status-only check on this host; those checks are withheld "
+                    "and listed under coverage limitations.",
         # Not relocated to raw_data, and deliberately so: the canary is a
         # uuid4 *we* generate, not an observation of the target. It differs
         # on every run, so in `evidence` it forked the cross-worker dedup
