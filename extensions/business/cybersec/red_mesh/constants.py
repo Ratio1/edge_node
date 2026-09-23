@@ -354,6 +354,11 @@ RISK_SIGMOID_K = 0.02  # retained: legacy logistic constant, no longer used for 
 RISK_RAW_TOTAL_CEILING = 20000.0
 RISK_CRED_PENALTY_PER = 15
 RISK_CRED_PENALTY_CAP = 30
+# An accepted default credential is direct access. The additive penalty alone,
+# log-compressed, moved a real report one point (59 -> 60); any accepted
+# credential now lifts the score to at least the CRITICAL tier (owner decision,
+# RM-090).
+RISK_CRED_SCORE_FLOOR = 80
 
 # =====================================================================
 # Job archive

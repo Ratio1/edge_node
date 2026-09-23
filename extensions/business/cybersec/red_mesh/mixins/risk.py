@@ -27,6 +27,7 @@ from ..constants import (
   RISK_RAW_TOTAL_CEILING,
   RISK_CRED_PENALTY_PER,
   RISK_CRED_PENALTY_CAP,
+  RISK_CRED_SCORE_FLOOR,
 )
 
 
@@ -537,6 +538,9 @@ class _RiskScoringMixin:
 
     raw_total = findings_score + open_ports_score + breadth_score + credentials_penalty
     score = normalize_risk_score(raw_total)
+    credential_floor_applied = cred_count > 0 and score < RISK_CRED_SCORE_FLOOR
+    if credential_floor_applied:
+      score = RISK_CRED_SCORE_FLOOR
 
     risk_result = {
       "score": score,
@@ -546,6 +550,17 @@ class _RiskScoringMixin:
         "breadth_score": round(breadth_score, 1),
         "credentials_penalty": credentials_penalty,
         "raw_total": round(raw_total, 1),
+        "credential_floor_applied": credential_floor_applied,
+        # The constants this score was computed with, so the report prints the
+        # method with numbers rather than prose that can drift from the code.
+        "constants": {
+          "severity_weights": dict(RISK_SEVERITY_WEIGHTS),
+          "confidence_multipliers": dict(RISK_CONFIDENCE_MULTIPLIERS),
+          "raw_total_ceiling": RISK_RAW_TOTAL_CEILING,
+          "credential_penalty_per": RISK_CRED_PENALTY_PER,
+          "credential_penalty_cap": RISK_CRED_PENALTY_CAP,
+          "credential_score_floor": RISK_CRED_SCORE_FLOOR,
+        },
         "finding_counts": finding_counts,
         # Coverage stated alongside the findings rather than folded into them:
         # "we ran 40 scenarios and 1 was vulnerable" and "we found 40 findings"
