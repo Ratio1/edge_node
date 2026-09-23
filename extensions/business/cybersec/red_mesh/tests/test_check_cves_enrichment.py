@@ -364,26 +364,37 @@ class TestPackageVersionParsing(unittest.TestCase):
 class TestClientSideApplicabilityAcrossProducts(unittest.TestCase):
   """
   The client rerun (job 6d342bab) fingerprinted `dropbear_2015.67` and the
-  cover CRITICAL was CVE-2016-7406 — a format string in `dbclient`, the SSH
-  *client*. The applicability rule was keyed on OpenSSH CVE ids only, so the
-  same over-match the client had already rejected for OpenSSH came back for
-  the next product.
+  cover CRITICAL was CVE-2016-7406, titled "Format string vulnerability in
+  dbclient". The first fix classed it client-only; the client's own reviewer
+  then pointed at Dropbear's 2016.74 changelog: the same format string in the
+  message printout runs "arbitrary code as root when connecting to Dropbear
+  server" if usernames containing % exist. It is a server CVE with a
+  precondition, so it must fire on a server banner, with the precondition and
+  the backport state stated. The libpq case below is the genuine client-only
+  over-match this set exists to stop.
   """
 
   @staticmethod
   def _ids(findings):
     return {cve_id for f in findings for cve_id in (getattr(f, "cve", None) or ())}
 
-  def test_a_dropbear_server_banner_does_not_raise_the_dbclient_cve(self):
-    fired = self._ids(check_cves("dropbear", "2015.67"))
-    self.assertNotIn("CVE-2016-7406", fired)
-    # The server-side username enumeration (svr-auth) still fires.
-    self.assertIn("CVE-2018-15599", fired)
-
-  def test_the_dbclient_cve_is_still_reachable_as_a_client_finding(self):
-    fired = self._ids(check_cves("dropbear", "2015.67", applicability="client"))
+  def test_a_dropbear_server_banner_raises_the_format_string_cve_as_a_server_finding(self):
+    findings = check_cves("dropbear", "2015.67")
+    fired = self._ids(findings)
     self.assertIn("CVE-2016-7406", fired)
-    self.assertNotIn("CVE-2018-15599", fired)
+    self.assertIn("CVE-2018-15599", fired)
+    cve = next(f for f in findings if "CVE-2016-7406" in (f.cve or ()))
+    # "<CVE>: <component title> (<product> <version>)" — the component title
+    # must not lead with the client binary.
+    component = cve.title.split(": ", 1)[1].split("(", 1)[0]
+    self.assertNotIn("dbclient", component, "the server finding must not be titled as a client-component flaw")
+    self.assertIn("(server", cve.title)
+    self.assertIn("%", cve.title, "the precondition (usernames containing %) is part of the finding")
+    self.assertTrue(cve.backport_status, "backport state must be stated, not empty")
+
+  def test_the_format_string_cve_is_not_a_client_only_entry(self):
+    fired = self._ids(check_cves("dropbear", "2015.67", applicability="client"))
+    self.assertNotIn("CVE-2016-7406", fired)
 
   def test_a_postgresql_server_banner_does_not_raise_the_libpq_cve(self):
     # CVE-2025-1094 is a quoting flaw in libpq / psql (the client library).
@@ -398,6 +409,8 @@ class TestClientSideApplicabilityAcrossProducts(unittest.TestCase):
       (e.product, e.cve_id, e.title)
       for e in CVE_DATABASE
       if client_words.search(e.title) and entry_applicability(e) != "client"
+      # CVE-2016-7406 names dbclient as *also* affected; the server is the primary component.
+      and e.cve_id != "CVE-2016-7406"
     ]
     self.assertEqual(wrong, [], "titles naming a client component must resolve to client applicability")
 

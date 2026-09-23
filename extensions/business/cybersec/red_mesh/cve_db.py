@@ -58,10 +58,6 @@ CLIENT_SIDE_CVE_IDS = frozenset({
   # for untrusted X11 forwarding" — a client weakness, and CRITICAL, so it was
   # the highest-severity instance of the over-match this set exists to stop.
   "CVE-2016-1908",
-  # Dropbear: "Format string vulnerability in the dbclient in Dropbear SSH
-  # before 2016.74" (NVD) — the client binary. It was the cover CRITICAL of the
-  # client rerun (job 6d342bab) on a dropbear *server* banner.
-  "CVE-2016-7406",
   # PostgreSQL: PQescapeLiteral / PQescapeIdentifier quoting in libpq, reached
   # through psql — the client library, not the listening server.
   "CVE-2025-1094",
@@ -201,8 +197,15 @@ CVE_DATABASE: list = [
 
   # ── Dropbear ─────────────────────────────────────────────────────
   CveEntry("dropbear", "<2018.76", "CVE-2018-15599", Severity.MEDIUM, "Username enumeration via response size", "CWE-203"),
-  CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.CRITICAL, "Format string vulnerability in dbclient", "CWE-134",
-           applicability=CLIENT_APPLICABILITY),
+  # NVD's summary names dbclient, but the 2016.74 changelog is explicit that the
+  # same format string in the message printout lets an attacker "run arbitrary
+  # code as root when connecting to Dropbear server" when usernames containing
+  # "%" exist on the host (validated by getpwnam()). A server CVE with a
+  # precondition, so it fires on a server banner and the precondition is in
+  # the title. Classing it client-only (first RM-090 cut) dropped a real finding.
+  CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.CRITICAL,
+           "Format string in message printout (server: root code execution when usernames containing % exist; also dbclient)",
+           "CWE-134"),
 
   # ── Erlang OTP SSH ──────────────────────────────────────────────
   CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
