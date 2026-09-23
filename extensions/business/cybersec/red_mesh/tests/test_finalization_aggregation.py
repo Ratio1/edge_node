@@ -293,6 +293,42 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
     )
     self.assertEqual(f["_source_node_addr"], "0xnode_a")
 
+  def test_the_node_report_lists_every_thread_a_finding_can_name(self):
+    """
+    Job 6d342bab: findings named RM-9-cfaa and RM-10-12ae while every node
+    report said RM-1-*, because `local_worker_id` was copied first-wins from
+    whichever thread merged first. The node report now lists every thread, and
+    the single first-wins id, meaningless after the merge, is gone.
+    """
+    host = _Host()
+    host.ee_addr = "0xNODE_C"
+
+    def thread(worker_id, port, title):
+      return {
+        "job_id": "j1", "scan_type": "network", "initiator": "0xLAUNCHER",
+        "local_worker_id": worker_id,
+        "service_info": {str(port): {"_service_info_http": {
+          "findings": [{"title": title, "severity": "LOW", "port": port}],
+        }}},
+        "completed_tests": [],
+      }
+
+    reports = {
+      "RM-1-aaaa": thread("RM-1-aaaa", 80, "A"),
+      "RM-9-cfaa": thread("RM-9-cfaa", 8080, "B"),
+    }
+    aggregated = host._get_aggregated_report(reports)
+    self.assertEqual(aggregated["local_worker_ids"], ["RM-1-aaaa", "RM-9-cfaa"])
+    self.assertNotIn("local_worker_id", aggregated)
+    stamped = {
+      f["_source_worker_id"]
+      for port_info in aggregated["service_info"].values()
+      for probe in port_info.values()
+      for f in probe["findings"]
+    }
+    self.assertTrue(stamped)
+    self.assertLessEqual(stamped, set(aggregated["local_worker_ids"]))
+
   def test_the_node_stamps_its_own_mesh_address_not_its_ip(self):
     """
     Attribution must use the same kind of identifier the comparison buckets on.

@@ -89,7 +89,8 @@ class NodeReport:
   Per-node aggregate stored in R1FS (one CID per node per pass).
 
   Produced by merging multiple ThreadReports on each worker node at close time.
-  No thread identity — local_worker_id is meaningless after merge.
+  No single thread identity: `local_worker_ids` lists every merged thread, so a
+  finding's `_source_worker_id` can be traced to this report.
   """
   job_id: str
   target: str
@@ -109,6 +110,7 @@ class NodeReport:
   catch_all_withheld: dict = None
   scan_metrics: dict = None         # ScanMetrics.to_dict() — aggregated across threads
   correlation_findings: list = None
+  local_worker_ids: list = None     # [str] — every thread merged into this report
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -134,6 +136,7 @@ class NodeReport:
       catch_all_withheld=d.get("catch_all_withheld"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
+      local_worker_ids=d.get("local_worker_ids"),
     )
 
 
