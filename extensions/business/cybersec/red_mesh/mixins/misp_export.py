@@ -8,6 +8,7 @@ Exposes four endpoints:
   - get_misp_export_config_status — check if MISP is enabled/configured (no secrets)
 """
 
+from ..services import misp_export as _misp_export_service
 from ..services.misp_config import get_misp_export_config
 from ..services.misp_export import (
   _UNSET,
@@ -39,6 +40,13 @@ class _MispExportMixin:
       cfg = get_misp_export_config(self)
       if not cfg["ENABLED"]:
         return {"status": "disabled"}
+      # The tenant's MISP record decides the event's distribution and severity
+      # floor, so a bound job without one has nothing to build from. Said as a
+      # typed denial: it is a configuration state, and collapsing it into the
+      # read guard's `unavailable` told the operator it was an outage (RM-090).
+      _tenant_id, binding_error = _misp_export_service.tenant_export_binding(self, checked_job, "misp")
+      if binding_error:
+        raise AdministrationDenied(409, binding_error)
       return export_misp_json(self, job_id, pass_nr=pass_nr, checked_job=job, snapshot_mode=snapshot_mode)
     from ..tenancy.job_artifacts import validate_snapshot_mode
     validate_snapshot_mode(snapshot_mode, snapshot_supplied=False)

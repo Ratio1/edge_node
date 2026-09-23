@@ -25,12 +25,17 @@ def no_export_effects(fixture):
     effects = [stack.enter_context(patch.object(target, name, create=True,
       side_effect=AssertionError(SECRET))) for target, name in (
         (fixture.owner, "chainstore_hset"), (fixture.owner, "_get_job_from_cstore"),
-        (fixture.owner, "P"), (fixture.owner.r1fs, "add_json"), (fixture.owner.r1fs, "delete"),
+        (fixture.owner.r1fs, "add_json"), (fixture.owner.r1fs, "delete"),
         (misp_export, "PyMISP"), (misp_export, "emit_export_status_event"),
         (misp_export, "_write_job_record"))]
+    # A failed read logs its exception class (RM-090) and nothing else: never
+    # the message, which can carry target data or a credential.
+    log = stack.enter_context(patch.object(fixture.owner, "P", create=True))
     yield
     for effect in effects:
       effect.assert_not_called()
+    logged = str(log.call_args_list)
+    assert SECRET not in logged and fixture.job.get("target", "\0") not in logged
     assert (fixture.store.data, fixture.store.jobs, fixture.store.writes, fixture.artifacts) == snapshot
 
 
@@ -202,6 +207,43 @@ def test_native_artifact_corruption_never_reaches_pymisp_or_effects(read_native,
         {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 503)
       assert result == UNAVAILABLE
       build.assert_not_called()
+
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_native_download_without_a_tenant_misp_record_is_a_typed_409(read_native, response_format, monkeypatch):
+  """RM-090: the download reported "Tenant execution authorization is temporarily
+  unavailable" because the tenant had no MISP record and the typed cause was
+  collapsed to `unavailable`. It is a configuration state, not an outage."""
+  from extensions.business.cybersec.red_mesh.services import misp_export
+  from extensions.business.cybersec.red_mesh.services.config import TENANT_INTEGRATION_NOT_CONFIGURED
+  monkeypatch.setattr(misp_export, "tenant_export_binding",
+    lambda owner, job_specs, integration_id: (job_specs["execution_binding"]["tenant_id"],
+                                              TENANT_INTEGRATION_NOT_CONFIGURED))
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=True) as fixture:
+    install_json_producer(fixture)
+    with no_export_effects(fixture), \
+         patch.object(misp_export, "build_misp_event", side_effect=AssertionError(SECRET)) as build:
+      module.eng = scheduler_comms(fixture, response_format)
+      result, _ = assert_json_response(asyncio.run(request(module, ENDPOINT,
+        {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 409)
+      assert result == {"success": False, "error": TENANT_INTEGRATION_NOT_CONFIGURED, "status_code": 409}
+      build.assert_not_called()
+      assert fixture.artifact_reads == []
+
+
+def test_a_failed_read_logs_its_exception_class_only():
+  from extensions.business.cybersec.red_mesh.services import misp_export
+  with read_endpoint_fixture(bound=True) as fixture:
+    install_json_producer(fixture)
+    with patch.object(misp_export, "build_misp_event", side_effect=RuntimeError(SECRET)), \
+         patch.object(fixture.owner, "P", create=True) as log:
+      result = fixture.Plugin.export_misp_json(fixture.owner, "job-1", request_actor=fixture.actor,
+                                               tenant_id=fixture.tenant_id)
+    assert result == UNAVAILABLE
+    logged = str(log.call_args_list)
+    assert "RuntimeError" in logged and "reports:export" in logged and SECRET not in logged
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
