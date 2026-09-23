@@ -219,6 +219,9 @@ class _RiskScoringMixin:
       # and never the truncated content hash. `dedup_key`/`content_hash` are the
       # pre-collapse names still present in older archives, honoured as
       # fallbacks and dropped from the output rather than re-persisted.
+      # Before the fallback below: the port is an identity dimension, and the
+      # probe-time stamp read it from `probe_port_scope`.
+      item["port"] = port
       item["finding_id"] = (
         item.get("finding_id") or item.get("dedup_key") or _dedup_key(item)
       )
@@ -228,7 +231,6 @@ class _RiskScoringMixin:
       )
       item.pop("dedup_key", None)
       item.pop("content_hash", None)
-      item["port"] = port
       item["protocol"] = protocol
       item["category"] = category
       # The contract's one production enforcement point. B1 defined
@@ -499,16 +501,17 @@ class _RiskScoringMixin:
     credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
 
     # `finding_id = dedup_key`, unconditionally — collisions are reported, not
-    # hidden (plan decision 3; this deliberately re-opens E2, the two-port
-    # collision, as an accepted and *visible* trade).
+    # hidden (plan decision 3). The two-port collision (E2) is closed: the port
+    # is an identity dimension since RM-090.
     #
     # The collision-detection pass this replaces suffixed every member of a
     # colliding group, which made the id depend on what else the scan found:
     # pass 2 finding one SRI script where pass 1 found three re-keyed the
     # survivor and `finding_timeline` reported a brand-new finding. It also
     # produced ~29-character ids against the documented 16-hex contract.
-    # Identity stays coarse until RM-061 attaches locations; findings sharing a
-    # `dedup_key` are a probe defect, and the count below is how it is seen.
+    # Findings sharing a `dedup_key` on one port are a probe defect (a probe
+    # that emits two findings identity cannot tell apart), and the count below
+    # is how it is seen.
     id_counts = {}
     for f in flat_findings:
       id_counts[f.get("finding_id")] = id_counts.get(f.get("finding_id"), 0) + 1
@@ -524,8 +527,7 @@ class _RiskScoringMixin:
       self.P(
         f"identity collision: {identity_collisions['count']} findings share "
         f"a finding_id (probes: {', '.join(identity_collisions['probes'])}) — "
-        "the probe emits findings identity cannot distinguish until RM-061 "
-        "attaches locations",
+        "the probe emits findings identity cannot distinguish on one port",
         color="y",
       )
 

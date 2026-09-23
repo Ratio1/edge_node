@@ -5465,10 +5465,11 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": False})
 
   def test_the_canary_finding_names_the_withheld_checks_once_all_probes_ran(self):
-    from extensions.business.cybersec.red_mesh.findings import finding_from_dict
+    from extensions.business.cybersec.red_mesh.findings import finding_from_dict, probe_port_scope
     worker = self._build_worker()
+    # As the web loop runs them: inside the port scope identity is keyed on.
     with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
-         patch(_API_GET, side_effect=self._all(200)):
+         patch(_API_GET, side_effect=self._all(200)), probe_port_scope(80):
       common = worker._web_test_common("example.com", 80)
       meta = worker._web_test_metadata_endpoints("example.com", 80)
     before = dict(common["findings"][0])
@@ -5486,10 +5487,9 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     # Dedup identity is untouched; the content stamp follows the new evidence.
     self.assertEqual(after["finding_id"], before["finding_id"])
     self.assertNotEqual(after["finding_signature"], before["finding_signature"])
-    self.assertEqual(
-      after["finding_signature"],
-      finding_from_dict(after).compute_signature(probe_id="_web_test_common"),
-    )
+    with probe_port_scope(80):
+      recomputed = finding_from_dict(after).compute_signature(probe_id="_web_test_common")
+    self.assertEqual(after["finding_signature"], recomputed)
     # Idempotent: a second pass does not append the sentence again.
     worker._annotate_catch_all_findings()
     self.assertEqual(

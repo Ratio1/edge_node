@@ -20,6 +20,8 @@ from the @register_probe decorator metadata + dynamic CVE DB lookup.
 
 import inspect
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Any
@@ -248,6 +250,9 @@ class Finding:
       "owasp_id": self.owasp_id,
       "cwe_id": self.cwe_id,
       "affected_assets": [_asset_as_dict(asset) for asset in self.affected_assets],
+      # The port the worker is probing (`probe_port_scope`). Identity is
+      # location-aware by port: one weakness on 80 and on 443 is two findings.
+      "port": current_probe_port(),
     }
 
   def compute_dedup_key(
@@ -336,6 +341,30 @@ def finding_from_dict(data: dict) -> Finding:
   R1FS or test fixtures). The inverse of asdict + the severity enum
   string conversion done by probe_result()."""
   return Finding(**_revive_finding_dict(data))
+
+
+_CURRENT_PROBE_PORT: ContextVar = ContextVar("redmesh_probe_port", default=None)
+
+
+@contextmanager
+def probe_port_scope(port):
+  """Run a probe with `port` as the location its findings are identified by.
+
+  The worker loops wrap every `probe(target, port)` call in this, so the
+  probe-time identity stamp (`enrich_finding_for_probe`, the CVE matcher) knows
+  the port without threading it through ~90 `probe_result` call sites. The
+  flat-walk fallback reads the same value from `item["port"]`.
+  """
+  token = _CURRENT_PROBE_PORT.set(port)
+  try:
+    yield
+  finally:
+    _CURRENT_PROBE_PORT.reset(token)
+
+
+def current_probe_port():
+  """The port of the probe currently running on this thread, or None."""
+  return _CURRENT_PROBE_PORT.get()
 
 
 def probe_result(*, raw_data: dict = None, findings: list = None, probe_id: str | None = None) -> dict:
