@@ -5347,6 +5347,20 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     self.assertTrue({"/.env", "/admin", "/actuator", "/wp-login.php"} <= paths)
     self.assertTrue(all(e["probe"] == "_web_test_common" for e in withheld))
 
+  def test_the_catch_all_indicator_is_informational(self):
+    """The canary is a property of the host, not a weakness: it says the
+    status-only checks on that host cannot be trusted. Scored 7.5 HIGH with
+    C:H it ranked above the findings it made unreliable."""
+    from extensions.business.cybersec.red_mesh.worker.web.discovery import CATCH_ALL_TITLE
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)):
+      result = worker._web_test_common("example.com", 80)
+    [canary] = [f for f in result["findings"] if f["title"] == CATCH_ALL_TITLE]
+    self.assertEqual(canary["severity"], "INFO")
+    self.assertFalse(canary.get("cvss_vector"))
+    self.assertEqual(canary["severity_source"], "probe_policy")
+    self.assertIn("status-only", canary["description"])
+
   def test_metadata_and_api_auth_are_withheld_on_a_catch_all_host(self):
     worker = self._build_worker()
     with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
