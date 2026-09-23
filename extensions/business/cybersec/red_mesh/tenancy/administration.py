@@ -17,13 +17,24 @@ from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_o
 from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
-from .assets import canonical_digest, normalize_name, normalize_target, valid_digest
+from .assets import (canonical_digest, normalize_name, normalize_port_scope, normalize_target,
+                     valid_digest)
 from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
                            valid_integration_id)
 
 
 _ADMINISTRATION_LOCK = RLock()
+# An asset update that omits `authorized_ports` keeps the stored scope; an explicit None clears it.
+# A string rather than `object()` so it can be an HTTP endpoint default; it is never a valid scope.
+KEEP_PORT_SCOPE = "__keep__"
+
+
+def _port_scope_for(target, value):
+  scope = normalize_port_scope(value)
+  if scope is not None and target["kind"] != "network":
+    raise ValueError("Port scope applies to network assets only")
+  return scope
 _MEMBER_ROLES = TENANT_LOCAL_ROLES
 # RM-083 (owner, 2026-09-17): only a Super-Tenant Admin grants, removes or replaces these.
 _PLATFORM_RESERVED_MEMBER_ROLES = frozenset({"tenant_pentester"})
@@ -440,7 +451,8 @@ class TenantAdministrationService:
         "asset_id": asset["asset_id"], "asset_target": asset["target"],
         "asset_target_digest": asset["target_digest"], "actor_id": account.account_id,
         "actor_generation": account.account_generation,
-        "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected})
+        "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected,
+        **({"asset_authorized_ports": asset["authorized_ports"]} if "authorized_ports" in asset else {})})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid stored execution facts") from exc
 
@@ -488,7 +500,8 @@ class TenantAdministrationService:
             "displayName": row["display_name"], "target": row["target"], "active": row["active"],
             "createdBy": row["created_by"], "createdAt": row["created_at"],
             "changedBy": row["changed_by"], "changedAt": row["changed_at"],
-            "targetDigest": row["target_digest"], "version": canonical_digest(row)}
+            "targetDigest": row["target_digest"], "version": canonical_digest(row),
+            **({"authorizedPorts": row["authorized_ports"]} if "authorized_ports" in row else {})}
 
   @staticmethod
   def _asset_id(value):
@@ -525,17 +538,20 @@ class TenantAdministrationService:
               asset_tenant_ids=(row["tenant_id"],)).allowed}
 
   @_endpoint
-  def create_tenant_asset(self, actor, tenant_id, request_id, display_name, target):
+  def create_tenant_asset(self, actor, tenant_id, request_id, display_name, target, authorized_ports=None):
     _, account = self._authorized_tenant(actor, tenant_id, "assets:create")
     request_id = _request_id(request_id)
     try:
       display_name, target = normalize_name(display_name), normalize_target(target)
+      scope = _port_scope_for(target, authorized_ports)
     except (ValueError, TypeError, RecursionError):
       raise AdministrationDenied(400, "invalid_request") from None
     asset_id = "as_" + request_id
+    # The scope joins the intent only when set, so an unscoped create replays to the same digest.
     intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "asset_id": asset_id,
               "request_id": request_id, "created_by": account.account_id,
-              "display_name": display_name, "target": target}
+              "display_name": display_name, "target": target,
+              **({"authorized_ports": scope} if scope is not None else {})}
     existing = self.store.get("asset", tenant_id, asset_id)
     if existing is not None:
       if existing["create_intent_digest"] != canonical_digest(intent) or existing["created_by"] != account.account_id:
@@ -549,7 +565,8 @@ class TenantAdministrationService:
     return self._asset_row(self.store.get("asset", tenant_id, asset_id))
 
   @_endpoint
-  def update_tenant_asset(self, actor, tenant_id, asset_id, expected_version, display_name, target, active):
+  def update_tenant_asset(self, actor, tenant_id, asset_id, expected_version, display_name, target, active,
+                          authorized_ports=KEEP_PORT_SCOPE):
     _, account = self._authorized_tenant(actor, tenant_id, "assets:update")
     asset_id = self._asset_id(asset_id)
     try:
@@ -563,14 +580,24 @@ class TenantAdministrationService:
       raise AdministrationDenied(404, "not_found")
     if row["target"]["kind"] != target["kind"]:
       raise AdministrationDenied(400, "invalid_request")
-    if (row["display_name"], row["target"], row["active"]) == (display_name, target, active):
+    try:
+      scope = (row.get("authorized_ports") if authorized_ports == KEEP_PORT_SCOPE
+               else _port_scope_for(target, authorized_ports))
+    except (ValueError, TypeError, RecursionError):
+      raise AdministrationDenied(400, "invalid_request") from None
+    if ((row["display_name"], row["target"], row["active"], row.get("authorized_ports"))
+        == (display_name, target, active, scope)):
       return self._asset_row(row)
     if canonical_digest(row) != expected_version:
       raise AdministrationDenied(409, "conflict")
-    self.store.put("asset", tenant_id, asset_id, record={
+    record = {
       **row, "display_name": display_name, "target": target, "active": active,
       "target_digest": canonical_digest(target), "changed_by": account.account_id,
-      "changed_at": datetime.now(timezone.utc).isoformat()})
+      "changed_at": datetime.now(timezone.utc).isoformat()}
+    record.pop("authorized_ports", None)
+    if scope is not None:
+      record["authorized_ports"] = scope
+    self.store.put("asset", tenant_id, asset_id, record=record)
     return self._asset_row(self.store.get("asset", tenant_id, asset_id))
 
   @staticmethod

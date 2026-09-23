@@ -22,7 +22,7 @@ from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, m
 
 
 def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-0000-4000-8000-000000000001",
-                   candidates=("node-1",)):
+                   candidates=("node-1",), authorized_ports=None):
   """A resolved execution admission, as `_resolve_execution_admission_for_account` returns one.
 
   RM-084 P6 removed the unbound launch: `_admit_execution` now refuses a request with no tenant,
@@ -41,6 +41,7 @@ def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-
     "asset_target_digest": canonical_digest(target), "actor_id": "tester",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
     "selected_candidates": list(candidates),
+    **({"asset_authorized_ports": authorized_ports} if authorized_ports else {}),
   })
 
 
@@ -57,7 +58,7 @@ def _file_authorization(plugin, *references, tenant_id="tn_00000000-0000-4000-80
   plugin.r1fs.get_json.side_effect = lambda cid, *args, **kwargs: deepcopy(filed.get(cid))
 
 
-def _stub_launch_actor(plugin, kind="network", target="192.0.2.10"):
+def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", authorized_ports=None):
   """A known stored platform account, admitted into a bound tenant execution.
 
   The admitted asset is the one the test launches against (`kind`, `target`), and its candidate
@@ -82,7 +83,7 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10"):
     else:
       candidates = ["node-1"]
     try:
-      context = _bound_context(kind, target, candidates=candidates)
+      context = _bound_context(kind, target, candidates=candidates, authorized_ports=authorized_ports)
     except ValueError:
       # No asset can carry a malformed destination; the request is then launching somewhere other
       # than the saved asset, which is what the launch path has to refuse.
@@ -319,14 +320,14 @@ class TestPhase1ConfigCID(unittest.TestCase):
     _stub_launch_actor(plugin, kind, defaults.get("target_url") if kind == "webapp" else defaults.get("target"))
     return PentesterApi01Plugin.launch_test(plugin, **defaults)
 
-  def _launch_network(self, plugin, **kwargs):
+  def _launch_network(self, plugin, authorized_ports=None, **kwargs):
     """Call launch_network_scan with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     self._bind_launch_helpers(plugin)
     defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True)
     defaults.update(kwargs)
-    _stub_launch_actor(plugin, "network", defaults.get("target"))
+    _stub_launch_actor(plugin, "network", defaults.get("target"), authorized_ports=authorized_ports)
     return PentesterApi01Plugin.launch_network_scan(plugin, **defaults)
 
   def _launch_webapp(self, plugin, **kwargs):
@@ -356,6 +357,67 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(config_dict["redmesh_release"], {"backend": "0.10.0"})
     restored = JobConfig.from_dict(config_dict).to_dict()
     self.assertEqual(restored["redmesh_release"], {"backend": "0.10.0"})
+
+  _UPDATE = {"reference": "AUTH-2026-017", "authorized_signer_name": "Security Lead",
+             "authorized_signer_role": "CISO"}
+
+  def test_an_in_scope_launch_needs_no_authorization_update(self):
+    plugin = self._build_mock_plugin(job_id="scope-1")
+    result = self._launch_network(plugin, authorized_ports="1-1024")
+    self.assertNotIn("error", result)
+    config = self._latest_job_config(plugin)
+    self.assertEqual(config["authorized_ports"], "1-1024")
+    self.assertNotIn("authorization_update", config)
+
+  def test_a_widened_range_without_an_update_is_refused_with_the_ports(self):
+    plugin = self._build_mock_plugin(job_id="scope-2")
+    result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1100)
+    self.assertEqual(result["error"], "scope_exceeds_authorization")
+    self.assertEqual(result["status_code"], 400)
+    self.assertEqual(result["out_of_scope_ports"], "1025-1100")
+    self.assertIsNone(self._latest_job_config(plugin))
+
+  def test_comparison_mode_counts_as_widening(self):
+    """Comparison mode mirrors the COMMON_PORTS bundle to every node, outside
+    the operator's range; the asset's authorization has to cover it too."""
+    plugin = self._build_mock_plugin(job_id="scope-3")
+    result = self._launch_network(plugin, authorized_ports="1-100", end_port=100, comparison_mode=True)
+    self.assertEqual(result["error"], "scope_exceeds_authorization")
+    self.assertIn("443", result["out_of_scope_ports"])
+
+  def test_excepted_ports_do_not_count_as_widening(self):
+    import re
+    plugin = self._build_mock_plugin(job_id="scope-4")
+    plugin.re = re  # the plugin's `re` is the module; parse_exceptions reads it
+    result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1025, exceptions="1025")
+    self.assertNotIn("error", result)
+
+  def test_a_widened_launch_with_an_update_records_it(self):
+    plugin = self._build_mock_plugin(job_id="scope-5")
+    result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1100,
+                                  authorization_update=dict(self._UPDATE))
+    self.assertNotIn("error", result)
+    config = self._latest_job_config(plugin)
+    self.assertEqual(config["authorization_update"], {
+      **self._UPDATE, "out_of_scope_ports": "1025-1100",
+    })
+    audit = [call for call in plugin._log_audit_event.call_args_list if call[0][0] == "scan_launched"]
+    self.assertEqual(audit[-1][0][1]["authorization_update_reference"], "AUTH-2026-017")
+
+  def test_an_incomplete_update_is_refused(self):
+    for missing in ("reference", "authorized_signer_name", "authorized_signer_role"):
+      with self.subTest(missing=missing):
+        plugin = self._build_mock_plugin(job_id="scope-6")
+        update = {k: v for k, v in self._UPDATE.items() if k != missing}
+        result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1100,
+                                      authorization_update=update)
+        self.assertEqual(result["error"], "validation_error")
+
+  def test_an_asset_without_a_scope_is_not_gated(self):
+    plugin = self._build_mock_plugin(job_id="scope-7")
+    result = self._launch_network(plugin, end_port=65535, comparison_mode=True)
+    self.assertNotIn("error", result)
+    self.assertNotIn("authorized_ports", self._latest_job_config(plugin))
 
   def test_the_plugin_version_is_the_recorded_release(self):
     from extensions.business.cybersec.red_mesh import pentester_api_01

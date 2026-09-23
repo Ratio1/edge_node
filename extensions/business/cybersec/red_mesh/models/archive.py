@@ -129,6 +129,10 @@ class JobConfig:
   # {"backend": <version>} of the node that launched the job, so the report and
   # exports name the scanner release that produced them.
   redmesh_release: dict = None
+  # The asset's authorized port scope at launch, and the typed authorization update that
+  # admitted a launch beyond it (reference, signer, out_of_scope_ports). RM-090.
+  authorized_ports: str = None
+  authorization_update: dict = None
   execution_binding: ExecutionBinding | None = None
 
   def __post_init__(self):
@@ -229,6 +233,8 @@ class JobConfig:
       roe=d.get("roe"),
       authorization=d.get("authorization"),
       redmesh_release=d.get("redmesh_release"),
+      authorized_ports=d.get("authorized_ports"),
+      authorization_update=d.get("authorization_update"),
     )
 
   # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
