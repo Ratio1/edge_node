@@ -137,6 +137,41 @@ class RedMeshOWASPTests(unittest.TestCase):
       result = worker._web_test_path_traversal("example.com", 80)
     self._assert_has_finding(result, "Path traversal")
 
+  def _traversal_findings(self, body, content_type="text/plain"):
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.text = body
+    resp.status_code = 200
+    resp.headers = {"Content-Type": content_type}
+    with patch(
+      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_path_traversal("example.com", 80)
+    return [f for f in result["findings"] if "Path traversal" in f["title"]]
+
+  def test_path_traversal_carries_a_bounded_response_excerpt(self):
+    """The finding asserted file markers in the body and showed none of it; the
+    excerpt is the evidence a reviewer can check."""
+    body = ("x" * 3000) + "\nroot:x:0:0:root:/root:/bin/bash\n" + ("y" * 3000)
+    findings = self._traversal_findings(body)
+    self.assertTrue(findings)
+    items = findings[0]["evidence_items"]
+    self.assertEqual(len(items), 1)
+    self.assertEqual(items[0]["kind"], "request_response")
+    self.assertIn("http://example.com", items[0]["caption"])
+    snippet = items[0]["snippet"]
+    self.assertLessEqual(len(snippet.encode("utf-8")), 512)
+    self.assertIn("root:x:0:0", snippet)
+    self.assertTrue(findings[0]["evidence"])
+
+  def test_path_traversal_excerpt_is_redacted(self):
+    body = "root:x:0:0:root:/root:/bin/bash\nmirror=https://svc:hunter2@repo.test/\n"
+    findings = self._traversal_findings(body)
+    snippet = findings[0]["evidence_items"][0]["snippet"]
+    self.assertNotIn("hunter2", snippet)
+    self.assertIn("[REDACTED]@", snippet)
+
   def test_security_misconfiguration_missing_headers(self):
     owner, worker = self._build_worker()
     resp = MagicMock()
