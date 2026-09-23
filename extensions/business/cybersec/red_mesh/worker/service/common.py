@@ -340,14 +340,34 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       return probe_result(raw_data=result, findings=findings)
 
     # --- 2. Dangerous HTTP methods ---
+    # Status-only: a verb answered below 400 with no body sent and nothing read
+    # back (stateful probes stay off), so these are `tentative`, and on a host
+    # that 200s a random path they prove nothing and are withheld like the web
+    # phase's bare-200 checks. The canary is memoised, so the web phase reuses
+    # this verdict (job 6d342bab had PUT/DELETE HIGH and "certain" on port 80).
+    methods = ("TRACE", "PUT", "DELETE")
     dangerous = []
-    for method in ("TRACE", "PUT", "DELETE"):
-      try:
-        r = requests.request(method, url, timeout=self._target_timeout(3), verify=False)
-        if r.status_code < 400:
-          dangerous.append(method)
-      except Exception:
-        pass
+    statuses = {}
+    host_is_catch_all = getattr(self, "_host_is_catch_all", None)
+    if host_is_catch_all is not None and host_is_catch_all(url):
+      for method in methods:
+        self._withhold_on_catch_all(url, "_service_info_http", f"{method} /")
+      result["dangerous_methods_withheld"] = "catch_all"
+    else:
+      for method in methods:
+        try:
+          r = requests.request(method, url, timeout=self._target_timeout(3), verify=False)
+          if r.status_code < 400:
+            dangerous.append(method)
+            statuses[method] = r.status_code
+        except Exception:
+          pass
+
+    def _status_only(method):
+      return (
+        f"{method} {url} returned HTTP {statuses[method]} (status-only: no body sent, "
+        "no write verified; stateful probes disabled)."
+      )
 
     result["dangerous_methods"] = dangerous
     if "TRACE" in dangerous:
@@ -355,35 +375,35 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         severity=Severity.MEDIUM,
         title="HTTP TRACE method enabled (cross-site tracing / XST attack vector).",
         description="TRACE echoes request bodies back, enabling cross-site tracing attacks.",
-        evidence=f"TRACE {url} returned status < 400.",
+        evidence=_status_only("TRACE"),
         remediation="Disable the TRACE method in the web server configuration.",
         owasp_id="A05:2021",
         cwe_id="CWE-693",
-        confidence="certain",
+        confidence="tentative",
       ))
     if "PUT" in dangerous:
       findings.append(Finding(
         severity=Severity.HIGH,
         cvss_vector=V.UNAUTHENTICATED_WRITE,
         title="HTTP PUT method enabled (potential unauthorized file upload).",
-        description="The PUT method allows uploading files to the server.",
-        evidence=f"PUT {url} returned status < 400.",
+        description="The server accepted a PUT request below status 400. Corroborate with the OPTIONS Allow header (_web_test_http_methods) or a manual upload test before treating it as writable.",
+        evidence=_status_only("PUT"),
         remediation="Disable the PUT method or restrict it to authenticated users.",
         owasp_id="A01:2021",
         cwe_id="CWE-749",
-        confidence="certain",
+        confidence="tentative",
       ))
     if "DELETE" in dangerous:
       findings.append(Finding(
         severity=Severity.HIGH,
         cvss_vector=V.UNAUTHENTICATED_WRITE,
         title="HTTP DELETE method enabled (potential unauthorized file deletion).",
-        description="The DELETE method allows removing resources from the server.",
-        evidence=f"DELETE {url} returned status < 400.",
+        description="The server accepted a DELETE request below status 400. Corroborate with the OPTIONS Allow header (_web_test_http_methods) or a manual test before treating it as destructive.",
+        evidence=_status_only("DELETE"),
         remediation="Disable the DELETE method or restrict it to authenticated users.",
         owasp_id="A01:2021",
         cwe_id="CWE-749",
-        confidence="certain",
+        confidence="tentative",
       ))
 
     return probe_result(raw_data=result, findings=findings)

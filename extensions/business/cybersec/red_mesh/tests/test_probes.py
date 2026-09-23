@@ -5404,6 +5404,52 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     self.assertEqual(len([u for u in calls if self._UUID_PATH.search(u)]), 1)
     self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": True})
 
+  _COMMON_REQUEST = "extensions.business.cybersec.red_mesh.worker.service.common.requests.request"
+  _METHOD_TITLES = {
+    "TRACE": "HTTP TRACE method enabled (cross-site tracing / XST attack vector).",
+    "PUT": "HTTP PUT method enabled (potential unauthorized file upload).",
+    "DELETE": "HTTP DELETE method enabled (potential unauthorized file deletion).",
+  }
+
+  def test_dangerous_methods_are_status_only_and_tentative(self):
+    # Job 6d342bab: PUT/DELETE on port 80 were HIGH and "certain" on nothing
+    # but "returned status < 400"; stateful probes were off, so no write was
+    # ever verified.
+    worker = self._build_worker()
+
+    def get(url, **_kwargs):
+      return self._response(404 if self._UUID_PATH.search(url) else 200)
+
+    with patch(_DISCOVERY_GET, side_effect=get), \
+         patch(self._COMMON_REQUEST, side_effect=lambda method, url, **_kw: self._response(200)):
+      result = worker._service_info_http("example.com", 80)
+    by_title = {f["title"]: f for f in result["findings"]}
+    for method, title in self._METHOD_TITLES.items():
+      with self.subTest(method=method):
+        finding = by_title[title]
+        self.assertEqual(finding["confidence"], "tentative")
+        self.assertIn(f"{method} http://example.com returned HTTP 200", finding["evidence"])
+        self.assertIn("status-only", finding["evidence"])
+    self.assertEqual(result["dangerous_methods"], ["TRACE", "PUT", "DELETE"])
+
+  def test_dangerous_methods_are_withheld_on_a_catch_all_host(self):
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch(self._COMMON_REQUEST, side_effect=lambda method, url, **_kw: self._response(200)) as request:
+      result = worker._service_info_http("example.com", 80)
+    titles = {f["title"] for f in result["findings"]}
+    self.assertFalse(titles & set(self._METHOD_TITLES.values()))
+    request.assert_not_called()
+    self.assertEqual(result["dangerous_methods"], [])
+    self.assertEqual(result["dangerous_methods_withheld"], "catch_all")
+    withheld = worker.state["catch_all_withheld"]["http://example.com"]
+    self.assertEqual(
+      [e for e in withheld if e["probe"] == "_service_info_http"],
+      [{"probe": "_service_info_http", "path": f"{m} /"} for m in ("TRACE", "PUT", "DELETE")],
+    )
+    # The web phase reuses the memoised verdict rather than asking again.
+    self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": True})
+
   def test_a_host_that_404s_the_random_path_is_unchanged(self):
     worker = self._build_worker()
 
