@@ -181,10 +181,14 @@ class _RiskScoringMixin:
           "compensating": "",
         }
 
-      # Key absence, not falsiness: `affected_assets: []` is a deliberate
-      # statement — "no location recorded" (the graybox producer documents the
-      # distinction) — and the falsy check replaced it with an invented asset.
-      if "affected_assets" not in item:
+      # Graybox `affected_assets: []` is a deliberate statement — "no location
+      # recorded" (the graybox producer documents the distinction) — and must
+      # not be replaced with an invented asset. Blackbox `[]` is not: every
+      # `Finding` serialises its empty tuple as `[]`, so a key-absence guard
+      # left every blackbox finding with no location at all. The `{host, port}`
+      # asset is not an identity dimension (`canonical_asset_string` skips it),
+      # so the synthesis does not move `finding_id`.
+      if not item.get("affected_assets") and category != "graybox":
         asset = {"host": target, "port": port if port else None}
         url = item.get("url")
         if url:
