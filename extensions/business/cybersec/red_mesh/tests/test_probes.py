@@ -5513,6 +5513,28 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     self.assertNotIn("catch_all_withheld", worker.state)
     self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": False})
 
+  def test_the_withheld_count_is_distinct_paths_not_probe_checks(self):
+    """Two probes withholding `/actuator` is one path. The count said 35 over
+    a list of 32 paths, and the reader could not reconcile the two."""
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)):
+      common = worker._web_test_common("example.com", 80)
+    worker.state["web_tests_info"][80] = {"_web_test_common": common}
+    worker.state["catch_all_withheld"] = {"http://example.com": [
+      {"probe": "_web_test_common", "path": "/actuator"},
+      {"probe": "_web_test_java_servers", "path": "/actuator"},
+      {"probe": "_web_test_common", "path": "/.env"},
+    ]}
+
+    worker._annotate_catch_all_findings()
+
+    evidence = worker.state["web_tests_info"][80]["_web_test_common"]["findings"][0]["evidence"]
+    self.assertIn(
+      "2 distinct paths withheld pending manual validation "
+      "(3 status-only checks across 2 probes): /actuator, /.env.",
+      evidence,
+    )
+
   def test_the_canary_finding_names_the_withheld_checks_once_all_probes_ran(self):
     from extensions.business.cybersec.red_mesh.findings import finding_from_dict, probe_port_scope
     worker = self._build_worker()
@@ -5530,7 +5552,7 @@ class RedMeshCatchAllGatingTests(unittest.TestCase):
     worker._annotate_catch_all_findings()
 
     after = worker.state["web_tests_info"][80]["_web_test_common"]["findings"][0]
-    self.assertIn("status-only checks withheld pending manual validation", after["evidence"])
+    self.assertIn("distinct paths withheld pending manual validation", after["evidence"])
     self.assertIn("/.env", after["evidence"])
     self.assertIn("/latest/meta-data/", after["evidence"])
     # Dedup identity is untouched; the content stamp follows the new evidence.
