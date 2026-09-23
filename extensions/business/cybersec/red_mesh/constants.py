@@ -339,6 +339,11 @@ COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS = [
   "web_api_exposure",
 ]
 
+# The backend release, recorded in every JobConfig at launch so a report names
+# the scanner that produced it. `pentester_api_01.__VER__` must equal it (a test
+# guards the pair; the plugin loader reads the literal there).
+REDMESH_BACKEND_VERSION = "0.10.0"
+
 # =====================================================================
 # Risk score computation
 # =====================================================================

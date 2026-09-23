@@ -2,6 +2,7 @@ from copy import deepcopy
 from urllib.parse import urlparse
 
 from ..constants import (
+  REDMESH_BACKEND_VERSION,
   COMMON_PORTS,
   COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS,
   DISTRIBUTION_MIRROR,
@@ -1104,6 +1105,7 @@ def announce_launch(
 
   job_config = JobConfig(
     execution_binding=binding,
+    redmesh_release={"backend": REDMESH_BACKEND_VERSION},
     target=target,
     start_port=start_port,
     end_port=end_port,

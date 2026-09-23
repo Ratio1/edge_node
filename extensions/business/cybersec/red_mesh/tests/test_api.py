@@ -346,6 +346,22 @@ class TestPhase1ConfigCID(unittest.TestCase):
     _stub_launch_actor(plugin, "webapp", defaults.get("target_url"))
     return PentesterApi01Plugin.launch_webapp_scan(plugin, **defaults)
 
+  def test_launch_records_the_backend_release_that_ran_the_scan(self):
+    """A report has to say which release produced it; "1.0.0" in the export is
+    the finding schema version, not the scanner's."""
+    plugin = self._build_mock_plugin(job_id="test-job-1", r1fs_cid="QmFakeConfigCID123")
+    self._launch(plugin)
+    from extensions.business.cybersec.red_mesh.models import JobConfig
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.10.0"})
+    restored = JobConfig.from_dict(config_dict).to_dict()
+    self.assertEqual(restored["redmesh_release"], {"backend": "0.10.0"})
+
+  def test_the_plugin_version_is_the_recorded_release(self):
+    from extensions.business.cybersec.red_mesh import pentester_api_01
+    from extensions.business.cybersec.red_mesh.constants import REDMESH_BACKEND_VERSION
+    self.assertEqual(pentester_api_01.__VER__, REDMESH_BACKEND_VERSION)
+
   def test_launch_builds_job_config_and_stores_cid(self):
     """launch_test() builds JobConfig, saves to R1FS, stores job_config_cid in CStore."""
     plugin = self._build_mock_plugin(job_id="test-job-1", r1fs_cid="QmFakeConfigCID123")
