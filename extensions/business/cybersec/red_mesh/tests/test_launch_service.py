@@ -245,3 +245,27 @@ class TestComparisonTieredAssignment(unittest.TestCase):
       self.assertEqual(target, expected)  # identical full set on every node
     # All nodes scan the same set (no disjoint coverage slices).
     self.assertEqual(len({tuple(t) for t in port_sets}), 1)
+
+
+class TestWorkerAssignmentRevision(unittest.TestCase):
+  """Every freshly built worker entry carries assignment_revision=1.
+
+  Bound (tenant) jobs are refused by the worker's launch gate until the field is an int >= 1,
+  so a launch that omits it only starts after the launcher's startup_timeout reannounce.
+  """
+
+  def test_network_mirror_and_slice_seed_revision_one(self):
+    from extensions.business.cybersec.red_mesh.constants import DISTRIBUTION_MIRROR, DISTRIBUTION_SLICE
+    from extensions.business.cybersec.red_mesh.services.launch_api import build_network_workers
+
+    for strategy in (DISTRIBUTION_MIRROR, DISTRIBUTION_SLICE):
+      workers, error = build_network_workers(DummyOwner(), ["0xA", "0xB"], 1, 100, strategy)
+      self.assertIsNone(error)
+      self.assertEqual({entry["assignment_revision"] for entry in workers.values()}, {1}, strategy)
+
+  def test_comparison_workers_seed_revision_one(self):
+    from extensions.business.cybersec.red_mesh.services.launch_api import build_comparison_workers
+
+    for full_mirror in (False, True):
+      workers = build_comparison_workers(["0xA", "0xB"], 1, 100, full_mirror=full_mirror)
+      self.assertEqual({entry["assignment_revision"] for entry in workers.values()}, {1}, full_mirror)

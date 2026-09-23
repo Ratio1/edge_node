@@ -1,10 +1,39 @@
+import json as _json
 import re as _re
 import time
 import requests
 from urllib.parse import quote
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
+
+
+# Top-level keys a Spring Boot Actuator response carries, per endpoint.
+_ACTUATOR_KEYS = frozenset({
+  "_links", "propertySources", "activeProfiles", "beans", "contexts",
+  "mappings", "dispatcherServlets",
+})
+_ACTUATOR_HEALTH_STATES = frozenset({"UP", "DOWN", "OUT_OF_SERVICE", "UNKNOWN"})
+
+
+def _looks_like_actuator_body(text):
+  """True for a JSON object shaped like a Spring Actuator or Jolokia response.
+
+  Used only on a catch-all host, where a 200 with `{` in the first bytes is
+  not product validation (RM-086 item 1). Elsewhere the looser check stands.
+  """
+  try:
+    data = _json.loads(text)
+  except Exception:
+    return False
+  if not isinstance(data, dict):
+    return False
+  if _ACTUATOR_KEYS & set(data):
+    return True
+  if str(data.get("status", "")).upper() in _ACTUATOR_HEALTH_STATES:
+    return True
+  return "request" in data and "value" in data  # Jolokia envelope
 
 
 class _InjectionTestBase:
@@ -88,7 +117,8 @@ class _WebInjectionMixin(_InjectionTestBase):
         resp = requests.get(url, timeout=self._target_timeout(2), verify=False)
         if any(n in resp.text for n in unix_needles):
           findings_list.append(Finding(
-            severity=Severity.CRITICAL,
+            severity=Severity.HIGH,
+            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title=f"Path traversal: /etc/passwd via path",
             description=f"Server returned /etc/passwd content via path traversal.",
             evidence=f"URL: {url}, body contains passwd markers",
@@ -100,7 +130,8 @@ class _WebInjectionMixin(_InjectionTestBase):
           break
         if any(n in resp.text for n in win_needles):
           findings_list.append(Finding(
-            severity=Severity.CRITICAL,
+            severity=Severity.HIGH,
+            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title=f"Path traversal: win.ini via path",
             description=f"Server returned Windows system file content.",
             evidence=f"URL: {url}, body contains win.ini markers",
@@ -130,7 +161,8 @@ class _WebInjectionMixin(_InjectionTestBase):
           resp = requests.get(url, timeout=self._target_timeout(2), verify=False)
           if any(n in resp.text for n in needles):
             findings_list.append(Finding(
-              severity=Severity.CRITICAL,
+              severity=Severity.HIGH,
+              cvss_vector=V.SENSITIVE_DATA_EXPOSED,
               title=f"Path traversal via ?{param}= parameter",
               description=f"Parameter '{param}' allows reading system files.",
               evidence=f"URL: {url}",
@@ -193,6 +225,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         if needle in resp.text:
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.XSS_REFLECTED,
             title=f"Reflected XSS via URL path",
             description=f"Payload '{payload[:40]}' reflected in response body.",
             evidence=f"URL: {url}, needle '{needle}' found in body",
@@ -214,6 +247,7 @@ class _WebInjectionMixin(_InjectionTestBase):
     def _xss_finding(param, payload, resp, url):
       return Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.XSS_REFLECTED,
         title=f"Reflected XSS via ?{param}= parameter",
         description=f"Payload '{payload[:40]}' reflected unescaped via '{param}'.",
         evidence=f"URL: {url}",
@@ -286,6 +320,7 @@ class _WebInjectionMixin(_InjectionTestBase):
     def _sqli_error_finding(param, payload, resp, url):
       return Finding(
         severity=Severity.HIGH,
+        cvss_vector=V.INJECTION_DATA_ACCESS,
         title=f"SQL injection (error-based) via ?{param}=",
         description=f"SQL error keywords in response to payload '{payload}'.",
         evidence=f"URL: {url}",
@@ -324,6 +359,7 @@ class _WebInjectionMixin(_InjectionTestBase):
               abs(len(resp_true.text) - len(resp_false.text)) > 50):
             findings_list.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.INJECTION_DATA_ACCESS,
               title=f"SQL injection (boolean-blind) via ?{param}=",
               description=f"Response differs between AND 1=1 and AND 1=2.",
               evidence="Responses for AND 1=1 and AND 1=2 differ in size while the baseline matches the true case.",
@@ -349,6 +385,7 @@ class _WebInjectionMixin(_InjectionTestBase):
             raw.setdefault("time_based_delays", {})[param] = round(elapsed, 1)
             findings_list.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.INJECTION_DATA_ACCESS,
               title=f"SQL injection (time-based) via ?{param}=",
               # The measured delay is per-request wall clock; it belongs in
               # raw_data, not in two fields of the report layer's dedup key.
@@ -660,6 +697,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         if "<code>" in resp.text and "<?php" in resp.text:
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.SENSITIVE_DATA_EXPOSED,
             title="CVE-2024-4577: PHP-CGI source code disclosure",
             description="PHP-CGI -s flag can be injected via %AD soft-hyphen, "
                         "exposing PHP source code.",
@@ -774,6 +812,7 @@ class _WebInjectionMixin(_InjectionTestBase):
           if resp.status_code == 200 and "ognl" in resp.text.lower():
             findings_list.append(Finding(
               severity=Severity.HIGH,
+              cvss_vector=V.RCE_UNCONFIRMED,
               title=f"Struts2 OGNL parsing detected via {path}",
               description="Struts2 attempted to parse OGNL expression in "
                           "Content-Type header. May be exploitable for RCE.",
@@ -855,20 +894,29 @@ class _WebInjectionMixin(_InjectionTestBase):
         "product": "JBoss",
         "cve": None,
         "check": lambda resp: resp.status_code in (200, 500),
+        # The only check here a bare 200 satisfies; the others read the body
+        # or need a 500. On a catch-all host the 200 branch is withheld
+        # (RM-086 item 1); a 500 still counts.
+        "status_only_on_200": True,
         "desc": "JBoss JMXInvokerServlet exposed — Java deserialization attack surface.",
       },
     ]
 
+    catch_all = self._host_is_catch_all(base_url)
     for ep in deser_endpoints:
       try:
         url = base_url.rstrip("/") + ep["path"]
         resp = requests.get(url, timeout=self._target_timeout(4), verify=False)
+        if catch_all and ep.get("status_only_on_200") and resp.status_code == 200:
+          self._withhold_on_catch_all(base_url, "_web_test_java_deserialization", ep["path"])
+          continue
         if ep["check"](resp):
           title = f"Java deserialization endpoint: {ep['path']}"
           if ep["cve"]:
             title = f"{ep['cve']}: {ep['product']} deserialization endpoint {ep['path']}"
           findings_list.append(Finding(
             severity=Severity.CRITICAL if ep["cve"] else Severity.HIGH,
+            cvss_vector="" if ep["cve"] else V.RCE_UNCONFIRMED,
             title=title,
             description=ep["desc"],
             evidence=f"GET {url} → {resp.status_code}",
@@ -931,6 +979,10 @@ class _WebInjectionMixin(_InjectionTestBase):
       ("/jolokia", "Jolokia JMX-over-HTTP — RCE risk via MBean manipulation"),
     ]
 
+    # By label; CRITICAL (Jolokia) inherits the template.
+    _ACTUATOR_CVSS = {Severity.HIGH: V.SENSITIVE_DATA_EXPOSED, Severity.MEDIUM: V.INFO_DISCLOSURE_MEDIUM}
+
+    catch_all = self._host_is_catch_all(base_url)
     for path, desc in actuator_paths:
       try:
         url = base_url.rstrip("/") + path
@@ -939,6 +991,9 @@ class _WebInjectionMixin(_InjectionTestBase):
           # Validate it's actually an actuator/Spring endpoint
           ct = resp.headers.get("Content-Type", "").lower()
           body = resp.text[:2000]
+          if catch_all and not _looks_like_actuator_body(resp.text):
+            self._withhold_on_catch_all(base_url, "_web_test_spring_actuator", path)
+            continue
           if "json" in ct or "actuator" in body.lower() or "{" in body[:10]:
             sev = Severity.HIGH
             if path in ("/actuator/health",):
@@ -947,6 +1002,7 @@ class _WebInjectionMixin(_InjectionTestBase):
               sev = Severity.CRITICAL
             findings_list.append(Finding(
               severity=sev,
+              cvss_vector=_ACTUATOR_CVSS.get(sev, ""),
               title=f"Spring Actuator exposed: {path}",
               description=desc,
               evidence=f"GET {url} → {resp.status_code}, Content-Type: {ct}",
@@ -1068,6 +1124,7 @@ class _WebInjectionMixin(_InjectionTestBase):
           # while the control was ignored — confirms Spring binding
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
             description="Spring MVC processes class.module.classLoader parameter "
                         "binding (type error on URLs[0] vs ignored control), "
@@ -1090,6 +1147,7 @@ class _WebInjectionMixin(_InjectionTestBase):
         if resp2.status_code == 200:
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
             description="Spring MVC accepts class.module.classLoader parameter "
                         "binding, which is the attack surface for Spring4Shell RCE.",
@@ -1105,6 +1163,7 @@ class _WebInjectionMixin(_InjectionTestBase):
           # conversion — stronger evidence than silent acceptance
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.RCE_UNCONFIRMED,
             title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
             description="Spring MVC processes class.module.classLoader parameter "
                         "binding (type error on URLs[0]), confirming Spring4Shell "

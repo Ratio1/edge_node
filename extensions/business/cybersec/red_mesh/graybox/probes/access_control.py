@@ -5,6 +5,7 @@ Access control probes — A01 IDOR + privilege escalation + verb tampering + mas
 import re
 
 from .base import ProbeBase
+from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
 
 
@@ -106,7 +107,7 @@ class AccessControlProbes(ProbeBase):
         scenario_id="PT-A01-01",
         title="Object-level authorization bypass",
         status="vulnerable",
-        severity="HIGH",
+        severity="MEDIUM",
         owasp="A01:2021",
         cwe=["CWE-639", "CWE-862"],
         attack=["T1078"],
@@ -206,6 +207,7 @@ class AccessControlProbes(ProbeBase):
           title="Function-level authorization bypass",
           status=finding_status,
           severity=finding_severity,
+          cvss_vector=V.AUTHZ_BYPASS_AUTHENTICATED,
           owasp="A01:2021",
           cwe=["CWE-862"],
           attack=["T1078"],
@@ -818,7 +820,7 @@ class AccessControlProbes(ProbeBase):
         scenario_id="PT-A01-06",
         title="Ownership delete bypass — regular user deleted non-owned record",
         status="vulnerable",
-        severity="CRITICAL",
+        severity="HIGH",
         owasp="A01:2021",
         cwe=["CWE-639", "CWE-862"],
         attack=["T1078"],

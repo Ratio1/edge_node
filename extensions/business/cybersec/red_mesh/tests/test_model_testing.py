@@ -120,6 +120,21 @@ class TestModelTestingCapability(unittest.TestCase):
     self.assertNotIn("REDMESH_EVALUATOR_API_KEY", str(status))
     self.assertNotIn("raw-secret-name", str(status))
 
+  def test_capability_status_publishes_the_comparison_bundle(self):
+    # RM-086 item 2: the launch form names the mirrored bundle and shows the
+    # effective scope before launch, so the list has to be knowable up front.
+    from extensions.business.cybersec.red_mesh.constants import (
+      COMMON_PORTS, COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS,
+    )
+    status = get_capability_status(_owner(cfg_model_testing={"ENABLED": False}))
+    ports = status["network_scan"]["comparison_ports"]
+    self.assertEqual(ports, sorted(COMMON_PORTS))
+    self.assertEqual(ports, sorted(set(ports)))
+    self.assertEqual(
+      status["graybox_scan"]["comparison_bundle_feature_ids"],
+      list(COMPARISON_GRAYBOX_BUNDLE_FEATURE_IDS),
+    )
+
   def test_capability_status_omits_llm_evaluator_without_credentials_when_enabled(self):
     owner = _owner(cfg_model_testing={
       "ENABLED": True,
@@ -1973,21 +1988,34 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
     plugin.r1fs.get_json.return_value = {
       "kind": "redmesh_model_test_raw_evidence",
       "job_id": "job-1",
       "cases": [],
     }
 
-    result = PentesterApi01Plugin.get_report(plugin, "raw-cid")
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(self, plugin, PentesterApi01Plugin, jobs={"job-1": {
+      "job_id": "job-1", "workers": {"node-a": {"report_cid": "raw-cid"}}}})
+    result = PentesterApi01Plugin.get_report(plugin, "raw-cid", "job-1", request_actor=actor,
+                                             tenant_id=tenant_id)
 
-    self.assertEqual(result["error"], "forbidden")
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
+    plugin.r1fs.get_json.assert_called_once_with("raw-cid", pin=False)
     self.assertNotIn("cases", str(result))
 
   def test_raw_evidence_endpoint_reads_by_job_id(self):
     Plugin, plugin = self._raw_evidence_endpoint_plugin()
+    # RM-026 I1b B7, RM-084 P2: the endpoint admits the requester in a named tenant before
+    # reading, and `evidence:read` is the gate, so the happy path needs a platform membership.
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin, jobs={"job-raw": {
+      "job_id": "job-raw", "job_type": "model_test", "scan_type": "model_test",
+      "model_test_summary": {"overall_status": "completed"}}})
 
-    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw")
+    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw", request_actor=actor,
+                                                tenant_id=tenant_id)
 
     self.assertEqual(result["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
     self.assertEqual(result["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)

@@ -67,8 +67,10 @@ class TestApi1Bola(unittest.TestCase):
 
   # ── Vulnerable cases ────────────────────────────────────────────────
 
-  def test_owner_mismatch_emits_high(self):
-    """Different owner_value than authenticated user → vulnerable HIGH."""
+  def test_owner_mismatch_emits_medium(self):
+    """Different owner_value than authenticated user → vulnerable MEDIUM.
+
+    A regular user's read: PR:L and C:H score 6.5 (RM-087)."""
     ep = ApiObjectEndpoint(path="/api/records/{id}/", test_ids=[42],
                             owner_field="owner")
     p = _make_probe(object_endpoints=[ep])
@@ -80,13 +82,16 @@ class TestApi1Bola(unittest.TestCase):
     self.assertEqual(len(vuln), 1)
     f = vuln[0]
     self.assertEqual(f.scenario_id, "PT-OAPI1-01")
-    self.assertEqual(f.severity, "HIGH")
+    self.assertEqual(f.severity, "MEDIUM")
     self.assertIn("CWE-639", f.cwe)
     # ATT&CK default from catalog (T1190, T1078)
     self.assertEqual(set(f.attack), {"T1190", "T1078"})
 
-  def test_pii_field_escalates_to_critical(self):
-    """Leaked response with `email` / `ssn` / `password` field name → CRITICAL."""
+  def test_pii_fields_are_evidence_not_a_higher_label(self):
+    """Leaked `email` / card field names are recorded; the label stays MEDIUM.
+
+    The read already scores C:H; no vector for a regular user's read reaches
+    HIGH, let alone CRITICAL (RM-087)."""
     ep = ApiObjectEndpoint(path="/api/users/{id}/", test_ids=[7],
                             owner_field="username")
     p = _make_probe(object_endpoints=[ep])
@@ -96,7 +101,7 @@ class TestApi1Bola(unittest.TestCase):
     )
     p.run()
     vuln = [f for f in p.findings if f.status == "vulnerable"]
-    self.assertEqual(vuln[0].severity, "CRITICAL")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
     pii_evidence = next((e for e in vuln[0].evidence if e.startswith("pii_fields=")), None)
     self.assertIsNotNone(pii_evidence)
     self.assertIn("email", pii_evidence)
@@ -224,8 +229,8 @@ class TestApi5Bfla(unittest.TestCase):
 
   # ── PT-OAPI5-01 — regular user reaches admin function ──────────────
 
-  def test_regular_2xx_on_admin_function_emits_critical(self):
-    """Admin path returns 200 to regular user → CRITICAL."""
+  def test_regular_2xx_on_admin_function_emits_medium(self):
+    """Admin path returns 200 to regular user → MEDIUM, a regular user's read (RM-087)."""
     ep = ApiFunctionEndpoint(path="/api/admin/export-users/", method="GET",
                               privilege="admin")
     p = self._make_function_probe(function_endpoints=[ep])
@@ -236,7 +241,7 @@ class TestApi5Bfla(unittest.TestCase):
     vuln = [f for f in p.findings
             if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-01"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "CRITICAL")  # /admin path
+    self.assertEqual(vuln[0].severity, "MEDIUM")
     self.assertEqual(set(vuln[0].attack), {"T1190", "T1078"})
 
   def test_regular_403_emits_clean(self):
@@ -271,8 +276,8 @@ class TestApi5Bfla(unittest.TestCase):
              if f.status == "not_vulnerable" and f.scenario_id == "PT-OAPI5-01"]
     self.assertEqual(len(clean), 1)
 
-  def test_non_admin_path_baseline_high(self):
-    """Non-admin function path defaults to HIGH (not CRITICAL)."""
+  def test_non_admin_path_same_label(self):
+    """A non-admin function path is labelled as an admin one: MEDIUM."""
     ep = ApiFunctionEndpoint(path="/api/reports/", method="GET",
                               privilege="user")
     p = self._make_function_probe(function_endpoints=[ep])
@@ -282,7 +287,7 @@ class TestApi5Bfla(unittest.TestCase):
     p.run()
     vuln = [f for f in p.findings
             if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-01"]
-    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
 
   def test_mutating_method_skipped_in_phase_2(self):
     """method=POST is deferred to PT-OAPI5-04 (Subphase 3.4)."""

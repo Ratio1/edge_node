@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Any
 
+from .cvss import cvss31_base_score, severity_band
 from .models.finding_identity import (
   content_hash as _content_hash,
   dedup_key as _dedup_key,
@@ -48,6 +49,10 @@ SOURCE_AUTOMATED = "automated"
 SOURCE_AI = "ai"
 SOURCE_MANUAL = "manual"
 ALLOWED_SOURCES = frozenset({SOURCE_AUTOMATED, SOURCE_AI, SOURCE_MANUAL})
+
+# Where a finding's severity label comes from (RM-086 item 5).
+SEVERITY_SOURCE_CVSS = "cvss"
+SEVERITY_SOURCE_PROBE_POLICY = "probe_policy"
 
 TRIAGE_NEW = "new"
 TRIAGE_CONFIRMED = "confirmed"
@@ -164,6 +169,15 @@ class Finding:
   verified_by: str = ""
   triage_state: str = TRIAGE_NEW
   exploitability_status: str = ""        # forward-compat for VEX export
+  # CVE findings on a distribution package (RM-070): "" (upstream build, not
+  # applicable) | "unknown" | "not_fixed". `fixed` matches are not emitted.
+  backport_status: str = ""
+  # "cvss" when a vector is attached (probe-supplied, or the registry template
+  # whose band agrees with the label), "probe_policy" when the label is the
+  # probe author's call with no vector to ground it. Stamped by
+  # `enrich_finding_for_probe`; the report labels the latter as policy instead
+  # of printing a bare badge (RM-086 item 5).
+  severity_source: str = ""
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data
@@ -374,7 +388,10 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
       cwe_values = tuple(metadata.default_cwe)
     if not owasp_values:
       owasp_values = tuple(metadata.default_owasp)
-    if not cvss_vector and metadata.cvss_template and _carries_a_weakness(f):
+    if (
+      not cvss_vector and metadata.cvss_template and _carries_a_weakness(f)
+      and _template_band_agrees(metadata.cvss_template, f.severity)
+    ):
       cvss_vector = metadata.cvss_template
     references = _merge_unique(references, metadata.references)
 
@@ -389,6 +406,30 @@ def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
     updates["owasp_id"] = owasp_values[0]
   if cvss_vector and not f.cvss_vector:
     updates["cvss_vector"] = cvss_vector
+  # The numeric base score, derived from whichever vector the finding ends up
+  # with. Set before the identity keys are stamped below, so the content hash
+  # sees it: a score appearing is a content change and moves
+  # `finding_signature` once, on the first pass after this landed. `finding_id`
+  # does not read it. A score the probe supplied — NVD's, for CVE findings —
+  # is kept as is.
+  if cvss_vector and f.cvss_score is None:
+    derived_score = cvss31_base_score(cvss_vector)
+    if derived_score is not None:
+      updates["cvss_score"] = derived_score
+  # Not in `_CONTENT_FIELDS`: a label's provenance is metadata about the
+  # finding, so stamping it must not move `finding_signature`. "cvss" means the
+  # vector truly backs the label: an attached vector whose band is the label
+  # (the template gate above guarantees that for templates; a probe- or
+  # CVE-supplied vector is checked here the same way), or a score the probe
+  # supplied with no vector (NVD gives `cve_db` a score and a qualitative tier;
+  # `CvssRecord.vector` may be empty). Anything else is the probe author's call.
+  if not f.severity_source:
+    vector_backs_label = bool(cvss_vector) and _template_band_agrees(cvss_vector, f.severity)
+    score_without_vector = not cvss_vector and f.cvss_score is not None
+    updates["severity_source"] = (
+      SEVERITY_SOURCE_CVSS if (vector_backs_label or score_without_vector)
+      else SEVERITY_SOURCE_PROBE_POLICY
+    )
   if references != f.references:
     updates["references"] = references
   if f.remediation_structured is None:
@@ -445,6 +486,28 @@ def _carries_a_weakness(f) -> bool:
   severity = getattr(f, "severity", None)
   severity = getattr(severity, "value", severity)
   return str(severity or "").upper() != "INFO"
+
+
+def _template_band_agrees(template: str, severity) -> bool:
+  """
+  True when the template's CVSS band is the finding's severity label.
+
+  The template is the probe's worst case, applied when a finding brings no
+  vector of its own. 91 of the 168 statically resolvable `Finding(...)` sites
+  under `worker/` carry a label in a different band from their probe's
+  template (measured 2026-09-21): SMB enumeration at MEDIUM under a 9.8, SMTP
+  VRFY at LOW under a 5.3, FTP default credentials at CRITICAL under a 5.3.
+  Printing that vector beside the badge is the contradiction the client
+  reported, and a wrong vector is worse than none — so a template that does
+  not agree is withheld. A probe that wants a vector on such a finding sets
+  `cvss_vector` on the finding, which this gate never touches.
+
+  A template this module cannot score (CVSS v4.0) never agrees, and so is
+  withheld too; every registered template is v3.1 today.
+  """
+  severity = getattr(severity, "value", severity)
+  band = severity_band(cvss31_base_score(template))
+  return band is not None and band == str(severity or "").upper()
 
 
 def _get_probe_metadata_safe(probe_id: str | None):

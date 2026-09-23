@@ -20,8 +20,100 @@ from extensions.business.cybersec.red_mesh.models import CStoreJobRunning
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
 
 
+
+def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-0000-4000-8000-000000000001",
+                   candidates=("node-1",)):
+  """A resolved execution admission, as `_resolve_execution_admission_for_account` returns one.
+
+  RM-084 P6 removed the unbound launch: `_admit_execution` now refuses a request with no tenant,
+  asset and digest. These suites are about launch configuration and endpoint shape rather than about
+  who is admitted (which has its own suites), so they stub the admission -- with a real context,
+  because the launch path derives the destination, the worker set and the stored binding from it.
+  A network asset is an IPv4 literal, so the network suites launch against one.
+  """
+  from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest, normalize_target
+  from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
+  target = normalize_target({"kind": kind, "address": address} if kind == "network"
+                            else {"kind": kind, "url": address, "allowedPathPrefix": "/"})
+  return ResolvedExecutionContext({
+    "namespace": "deployment", "tenant_id": tenant_id,
+    "asset_id": "as_00000000-0000-4000-8000-000000000002", "asset_target": target,
+    "asset_target_digest": canonical_digest(target), "actor_id": "tester",
+    "actor_generation": "generation-1", "node_failure_policy": "stop",
+    "selected_candidates": list(candidates),
+  })
+
+
+_DEFAULT_ASSET = {"network": "192.0.2.10", "webapp": "https://example.com/app"}
+
+
+def _file_authorization(plugin, *references, tenant_id="tn_00000000-0000-4000-8000-000000000001"):
+  """Store permission-to-test envelopes as `upload_authorization` does: stamped with the tenant.
+
+  RM-084 P3 made launch read the named document back and refuse one filed for any other tenant,
+  so a suite that launches with a document reference has to have filed it first.
+  """
+  filed = {reference: {"tenant_id": tenant_id} for reference in references}
+  plugin.r1fs.get_json.side_effect = lambda cid, *args, **kwargs: deepcopy(filed.get(cid))
+
+
+def _stub_launch_actor(plugin, kind="network", target="192.0.2.10"):
+  """A known stored platform account, admitted into a bound tenant execution.
+
+  The admitted asset is the one the test launches against (`kind`, `target`), and its candidate
+  nodes come from the real peer resolver -- the tenant subfleet stands in for the deployment's
+  chainstore peers, which is what these suites configure.
+  """
+  from extensions.business.cybersec.red_mesh.services.launch_api import resolve_active_peers
+  from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
+  account = AccountView("tester", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
+
+  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None):
+    # Through the actor seam, as the real admission does, so a suite that swaps the account in
+    # (attribution tests) is admitted as that account.
+    resolved, denial = plugin._resolve_launch_actor(actor)
+    if denial:
+      return None, None, denial
+    peers = getattr(plugin, "cfg_chainstore_peers", None)
+    if isinstance(peers, (list, tuple)) and peers:
+      candidates, error = resolve_active_peers(plugin, selected_peers)
+      if error:
+        return None, None, error
+    else:
+      candidates = ["node-1"]
+    try:
+      context = _bound_context(kind, target, candidates=candidates)
+    except ValueError:
+      # No asset can carry a malformed destination; the request is then launching somewhere other
+      # than the saved asset, which is what the launch path has to refuse.
+      context = _bound_context(kind, _DEFAULT_ASSET[kind], candidates=candidates)
+    return resolved, context, None
+
+  plugin._resolve_launch_actor = lambda actor=None: (account, None)
+  plugin._execution_service = lambda: MagicMock()
+  plugin._admit_execution = admit
+  return plugin
+
 class TestPhase1ConfigCID(unittest.TestCase):
   """Phase 1: Job Config CID — extract static config from CStore to R1FS."""
+
+  def test_bound_compatibility_launch_rejects_opposite_target_fields(self):
+    from .test_tenant_execution_effects import context
+    from extensions.business.cybersec.red_mesh.services.launch_api import launch_test
+    for scan_type, saved, alias in (
+      ("network", {"kind": "network", "address": "192.0.2.1"}, {"target_url": "https://foreign.example"}),
+      ("webapp", {"kind": "webapp", "url": "https://target.example/app", "allowedPathPrefix": "/app"},
+       {"target": "foreign.example"}),
+    ):
+      with self.subTest(scan_type=scan_type):
+        owner = self._build_mock_plugin()
+        self._bind_launch_helpers(owner)
+        result = launch_test(owner, execution_context=context(saved), scan_type=scan_type,
+                            start_port=1, end_port=4, authorized=True, **alias)
+        self.assertEqual(result.get("error"), "validation_error")
+        self.assertEqual(result.get("message"), "Execution target mismatch")
+        owner.r1fs.add_json.assert_not_called()
+        owner.chainstore_hset.assert_not_called()
 
   def test_config_cid_roundtrip(self):
     """JobConfig.from_dict(config.to_dict()) preserves all fields."""
@@ -160,12 +252,14 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.cfg_chainstore_peers = ["node-1"]
     plugin._redact_job_config = staticmethod(lambda d: d)
     plugin._validate_feature_catalog = MagicMock()
+    _stub_launch_actor(plugin)
     return plugin
 
   @classmethod
   def _bind_launch_helpers(cls, plugin):
     """Bind real launch helper methods onto a MagicMock plugin host."""
     cls._mock_plugin_modules()
+    _stub_launch_actor(plugin)
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin._coerce_scan_type = lambda scan_type=None: PentesterApi01Plugin._coerce_scan_type(plugin, scan_type)
@@ -219,8 +313,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     self._bind_launch_helpers(plugin)
-    defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
+    defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True)
     defaults.update(kwargs)
+    kind = "webapp" if defaults.get("scan_type") == "webapp" else "network"
+    _stub_launch_actor(plugin, kind, defaults.get("target_url") if kind == "webapp" else defaults.get("target"))
     return PentesterApi01Plugin.launch_test(plugin, **defaults)
 
   def _launch_network(self, plugin, **kwargs):
@@ -228,8 +324,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     self._bind_launch_helpers(plugin)
-    defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
+    defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True)
     defaults.update(kwargs)
+    _stub_launch_actor(plugin, "network", defaults.get("target"))
     return PentesterApi01Plugin.launch_network_scan(plugin, **defaults)
 
   def _launch_webapp(self, plugin, **kwargs):
@@ -246,6 +343,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       authorized=True,
     )
     defaults.update(kwargs)
+    _stub_launch_actor(plugin, "webapp", defaults.get("target_url"))
     return PentesterApi01Plugin.launch_webapp_scan(plugin, **defaults)
 
   def test_launch_builds_job_config_and_stores_cid(self):
@@ -256,7 +354,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     # Verify r1fs.add_json was called with a JobConfig dict
     self.assertTrue(plugin.r1fs.add_json.called)
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["target"], "example.com")
+    self.assertEqual(config_dict["target"], "192.0.2.10")
     self.assertEqual(config_dict["start_port"], 1)
     self.assertEqual(config_dict["end_port"], 1024)
     self.assertIn("run_mode", config_dict)
@@ -308,7 +406,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     job_specs = self._extract_job_specs(plugin, "test-job-3")
     self.assertIsNotNone(job_specs)
 
-    self.assertEqual(job_specs["target"], "example.com")
+    self.assertEqual(job_specs["target"], "192.0.2.10")
     self.assertEqual(job_specs["task_name"], "Web Scan")
     self.assertEqual(job_specs["start_port"], 80)
     self.assertEqual(job_specs["end_port"], 443)
@@ -1220,19 +1318,28 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertTrue(config_dict["secret_store_unsafe_fallback"])
     self.assertEqual(config_dict["secret_store_key_id"], "redmesh:default_plugin_key")
 
-  def test_launch_webapp_scan_rejects_missing_target_url(self):
-    """Webapp endpoint returns structured validation error for missing URL."""
+  def test_launch_webapp_scan_takes_the_saved_url_when_none_is_supplied(self):
+    """RM-084 P6: the destination is the admitted asset's; a caller may repeat it, never supply it.
+
+    An omitted `target_url` used to be a validation error, because the unbound launch had nowhere
+    else to get one from. A bound launch always has the saved URL, so it launches against that.
+    """
     plugin = self._build_mock_plugin(job_id="test-job-weberr")
     result = self._launch_webapp(plugin, target_url="")
-    self.assertEqual(result["error"], "validation_error")
-    self.assertIn("target_url", result["message"])
+    self.assertNotIn("error", result)
+    self.assertEqual(self._latest_job_config(plugin)["target_url"], "https://example.com/app")
 
   def test_launch_webapp_scan_rejects_invalid_url_scheme(self):
-    """Webapp endpoint rejects malformed or non-http(s) targets."""
+    """A non-http(s) URL cannot be the saved asset, so it is launching somewhere else (RM-084 P6).
+
+    The scheme itself is checked where an asset is saved (`normalize_target`); at launch the only
+    question left is whether the request names that asset, and an ftp URL never does.
+    """
     plugin = self._build_mock_plugin(job_id="test-job-webbadurl")
     result = self._launch_webapp(plugin, target_url="ftp://example.com/app")
     self.assertEqual(result["error"], "validation_error")
-    self.assertIn("http/https", result["message"])
+    self.assertEqual(result["message"], "Execution target mismatch")
+    plugin.r1fs.add_json.assert_not_called()
 
   def test_launch_network_scan_requires_authorization_with_structured_error(self):
     """Network endpoint returns validation_error when authorization is missing."""
@@ -1255,9 +1362,12 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     result = self._launch_network(plugin)
 
+    # RM-084 P6: every launch is tenant-bound, and a bound job exports only to its tenant's own
+    # destination (RM-081). This tenant has none, so the required export is unavailable for that
+    # reason -- before the deployment credentials are ever consulted.
     self.assertEqual(result["error"], "soc_export_required_unavailable")
     self.assertEqual(result["integration_id"], "wazuh")
-    self.assertEqual(result["error_class"], "missing_token")
+    self.assertEqual(result["error_class"], "tenant_integration_not_configured")
     plugin.r1fs.add_json.assert_not_called()
     plugin.chainstore_hset.assert_not_called()
 
@@ -1295,15 +1405,18 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     result = self._launch_webapp(plugin)
 
+    # RM-084 P6: every launch is tenant-bound, and a bound job exports only to its tenant's own
+    # destination (RM-081). This tenant has none, so the required export is unavailable for that
+    # reason -- before the deployment credentials are ever consulted.
     self.assertEqual(result["error"], "soc_export_required_unavailable")
-    self.assertEqual(result["error_class"], "missing_credentials")
+    self.assertEqual(result["error_class"], "tenant_integration_not_configured")
     plugin.r1fs.add_json.assert_not_called()
     plugin.chainstore_hset.assert_not_called()
 
   def test_launch_network_scan_rejects_target_confirmation_mismatch(self):
     """Target confirmation must echo the resolved target host."""
     plugin = self._build_mock_plugin(job_id="test-job-confirm")
-    result = self._launch_network(plugin, target="example.com", target_confirmation="other.example.com", authorized=True)
+    result = self._launch_network(plugin, target="192.0.2.10", target_confirmation="192.0.2.11", authorized=True)
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("target_confirmation", result["message"])
 
@@ -1364,6 +1477,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     """Authorization metadata is stored in immutable job config and audit context."""
     plugin = self._build_mock_plugin(job_id="test-job-authctx")
     plugin._log_audit_event = MagicMock()
+    _file_authorization(plugin, "TICKET-42")
 
     self._launch_webapp(
       plugin,
@@ -1563,13 +1677,23 @@ class TestPhase1ConfigCID(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
     plugin = MagicMock()
+    _stub_launch_actor(plugin)
     plugin.launch_network_scan = MagicMock(return_value={"route": "network"})
     plugin.launch_webapp_scan = MagicMock(return_value={"route": "webapp"})
+    # The compat shim calls module-level launchers after resolving account attribution.
+    # Route those seams to the MagicMocks above with
+    # the historical kwargs-only shape so the assertions below stay meaningful.
+    from extensions.business.cybersec.red_mesh.services import launch_api
+    for name in ("launch_network_scan", "launch_webapp_scan"):
+      patcher = patch.object(launch_api, name, (lambda n: (lambda owner, **kw: getattr(plugin, n)(**kw)))(name))
+      patcher.start()
+      self.addCleanup(patcher.stop)
 
-    network = PentesterApi01Plugin.launch_test(plugin, target="example.com", authorized=True, scan_type="network")
-    webapp = PentesterApi01Plugin.launch_test(
-      plugin,
-      target="example.com",
+    network = PentesterApi01Plugin.launch_test(plugin, target="192.0.2.10", authorized=True, scan_type="network")
+    # Each launch is admitted against its own asset, and a webapp asset is a URL.
+    _stub_launch_actor(plugin, "webapp", "https://example.com/app")
+    # A bound webapp launch names its destination once: `target` beside `target_url` is refused.
+    webapp = PentesterApi01Plugin.launch_test(plugin,
       target_url="https://example.com/app",
       official_username="admin",
       official_password="secret",
@@ -1605,6 +1729,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
   def test_launch_test_persists_typed_ptes_context(self):
     """Compatibility launch_test preserves typed engagement/RoE/auth fields."""
     plugin = self._build_mock_plugin(job_id="test-job-ptes-context")
+    _file_authorization(plugin, "QmAuthCID")
 
     result = self._launch(
       plugin,
@@ -1758,6 +1883,9 @@ class TestPhase2PassFinalization(unittest.TestCase):
                               llm_enabled=False, r1fs_returns=None):
     """Build a mock plugin pre-configured for _maybe_finalize_pass testing."""
     plugin = MagicMock()
+    # These lifecycle tests assume explicitly verified current/new-pass authority.
+    # Tenant denial and unknown-rollout cases are exercised at the real admission seam.
+    plugin._execution_operation_allowed = MagicMock(return_value=True)
     plugin.ee_addr = "launcher-node"
     plugin.ee_id = "launcher-alias"
     plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
@@ -2891,6 +3019,133 @@ class TestPhase2PassFinalization(unittest.TestCase):
     event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
     self.assertIn("attestation_failed", event_types)
 
+  def _build_aborted_graybox_plugin(self, *, probes_attempted, job_pass=1, run_mode="SINGLEPASS",
+                                    llm_enabled=True):
+    """One graybox worker whose report carries the abort state the worker records."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(job_pass=job_pass, run_mode=run_mode,
+                                                    llm_enabled=llm_enabled)
+    job_specs["scan_type"] = "webapp"
+    job_specs["workers"] = {"worker-A": job_specs["workers"]["worker-A"]}
+    report_a = self._sample_node_report(1, 1, [])
+    report_a["scan_metrics"] = {"probes_attempted": probes_attempted, "probes_completed": probes_attempted}
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [], "service_info": {}, "web_tests_info": {}, "completed_tests": ["graybox_auth"],
+      "ports_scanned": 1, "nr_open_ports": 0, "port_protocols": {}, "scan_type": "webapp",
+      "aborted": True, "abort_phase": "authentication", "abort_reason_class": "auth_failed",
+      "abort_reason": "Official authentication failed. Cannot proceed with graybox scan.",
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target_url": "http://app.test", "scan_type": "webapp",
+                                                     "run_mode": run_mode, "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=(
+      {"score": 16, "breakdown": {}},
+      [{"title": "Scan aborted", "severity": "INFO", "status": "inconclusive", "probe": "_graybox_fatal"}],
+    ))
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+    return PentesterApi01Plugin, plugin, job_specs
+
+  def _pass_report_dicts(self, plugin):
+    return [c[0][0] for c in plugin.r1fs.add_json.call_args_list if "pass_nr" in c[0][0]]
+
+  def test_finalization_graybox_abort_before_any_probe_marks_failed(self):
+    """A graybox pass that aborted with no probe attempted is a failed job, not a
+    finished one: FAILED with the reason, no risk score, no LLM stage, archive kept."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(probes_attempted=0)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertEqual(job_specs["failure_class"], "scan_aborted")
+    self.assertEqual(
+      job_specs["failure_message"],
+      "Scan aborted during authentication: Official authentication failed. Cannot proceed with graybox scan.",
+    )
+    self.assertEqual(job_specs["risk_score"], 0)
+    plugin._get_manual_analysis_executor.return_value.submit.assert_not_called()
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("scan_aborted", event_types)
+    self.assertNotIn("scan_completed", event_types)
+    self.assertNotIn("finalized", event_types)
+    scan_aborted_meta = next(c.kwargs["meta"] for c in plugin._emit_timeline_event.call_args_list
+                             if c.args[1] == "scan_aborted")
+    self.assertEqual(scan_aborted_meta["abort_reason_class"], "auth_failed")
+    self.assertEqual(scan_aborted_meta["abort_phase"], "authentication")
+    (pass_report,) = self._pass_report_dicts(plugin)
+    self.assertEqual(pass_report["risk_score"], 0)
+    self.assertNotIn("risk_breakdown", pass_report)
+    self.assertTrue(pass_report["aborted"])
+    self.assertEqual(pass_report["abort_reason_class"], "auth_failed")
+    # The FATAL finding stays: it is the evidence of why nothing ran.
+    self.assertEqual(pass_report["findings"][0]["title"], "Scan aborted")
+
+  def test_finalization_graybox_empty_abort_submits_no_attestation(self):
+    """An on-chain "0 vulnerabilities" record for a scan that never logged in is
+    worse than no record; the terminal attestation is not submitted."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(probes_attempted=0,
+                                                                                 llm_enabled=False)
+    job_specs["blockchain_attestation_enabled"] = True
+    job_specs["end_attestation_required"] = True
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value={"tx_hash": "0xend"})
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    plugin._submit_redmesh_test_attestation.assert_not_called()
+    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertEqual(job_specs["failure_class"], "scan_aborted")
+
+  def test_finalization_abort_reason_is_bounded_and_printable(self):
+    """The reason can embed an exception or the operator's URL; the failure
+    message is capped and stripped of control bytes like the LLM boundary does."""
+    from extensions.business.cybersec.red_mesh.services.finalization import _abort_reason_text
+    self.assertEqual(_abort_reason_text("Login page 404\x00\x1b[31m at http://t\n"), "Login page 404 [31m at http://t")
+    self.assertEqual(_abort_reason_text(""), "no reason recorded")
+    self.assertEqual(_abort_reason_text(None), "no reason recorded")
+    self.assertNotIn("toor", _abort_reason_text("Accepted credential: root:toor"))
+    self.assertEqual(len(_abort_reason_text("x" * 1000)), 240)
+
+  def test_finalization_graybox_abort_after_probes_stays_finalized(self):
+    """An abort after probes ran (session lost mid-scan) keeps the completed
+    result; the pass record says a worker aborted so the report can state it."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(probes_attempted=3,
+                                                                                 llm_enabled=False)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertNotIn("failure_class", job_specs)
+    self.assertEqual(job_specs["risk_score"], 16)
+    (pass_report,) = self._pass_report_dicts(plugin)
+    self.assertTrue(pass_report["aborted"])
+    self.assertEqual(pass_report["abort_phase"], "authentication")
+    self.assertEqual(pass_report["risk_score"], 16)
+
+  def test_finalization_graybox_empty_abort_on_later_pass_keeps_monitoring(self):
+    """A monitor whose target is briefly unreachable on pass 2 is not a failed job;
+    the pass is recorded as aborted and the schedule continues."""
+    PentesterApi01Plugin, plugin, job_specs = self._build_aborted_graybox_plugin(
+      probes_attempted=0, job_pass=2, run_mode="CONTINUOUS_MONITORING", llm_enabled=False)
+    job_specs["pass_reports"] = [{"pass_nr": 1, "pass_report_cid": "QmPass1", "risk_score": 40}]
+    job_specs["risk_score"] = 40
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertNotIn("failure_class", job_specs)
+    # The headline score is the last scored pass, not the pass that tested nothing.
+    self.assertEqual(job_specs["risk_score"], 40)
+    event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("pass_aborted", event_types)
+    self.assertNotIn("scan_aborted", event_types)
+    (pass_report,) = self._pass_report_dicts(plugin)
+    self.assertTrue(pass_report["aborted"])
+    self.assertEqual(pass_report["risk_score"], 0)
+
 
 
 class TestPhase4UiAggregate(unittest.TestCase):
@@ -2909,6 +3164,7 @@ class TestPhase4UiAggregate(unittest.TestCase):
 
   def _make_plugin(self):
     plugin = MagicMock()
+    _stub_launch_actor(plugin)
     Plugin = self._get_plugin_class()
     plugin._count_services = lambda si: Plugin._count_services(plugin, si)
     plugin._dedupe_items = lambda items: Plugin._dedupe_items(items)
@@ -3676,6 +3932,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.cfg_redmesh_secret_store_key = "unit-test-redmesh-secret-key"
     plugin.r1fs = MagicMock()
 
+    plugin._test_jobs = dict(jobs_dict)
     plugin.chainstore_hgetall.return_value = dict(jobs_dict)
     plugin.chainstore_hget.side_effect = lambda hkey, key: jobs_dict.get(key)
     plugin._normalize_job_record = MagicMock(
@@ -3687,14 +3944,26 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin._get_job_from_cstore = lambda job_id: Plugin._get_job_from_cstore(plugin, job_id)
     return plugin
 
+  def _read_actor(self, plugin):
+    """The reading actor, admitted through a real tenant (RM-084 P6: there is no unscoped read).
+
+    The tenant it names is stashed on the case, because every endpoint under test now requires one.
+    """
+    from .read_endpoint_fixtures import install_tenant_read_store
+    actor, tenant_id = install_tenant_read_store(
+      self, plugin, self._get_plugin_class(), jobs=getattr(plugin, "_test_jobs", None))
+    self._tenant_id = tenant_id
+    return actor
+
   def test_get_report_does_not_pin_retrieved_cid(self):
     Plugin = self._get_plugin_class()
-    plugin = self._build_plugin({})
-    plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
+    plugin = self._build_plugin({"report-job": {"job_id": "report-job",
+      "workers": {"node-a": {"report_cid": "QmReportCID"}}}})
+    plugin.r1fs.get_json.return_value = {"job_id": "report-job", "open_ports": [443]}
 
-    result = Plugin.get_report(plugin, "QmReportCID")
+    result = Plugin.get_report(plugin, "QmReportCID", "report-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
-    self.assertEqual(result["report"]["artifact_kind"], "review_submission")
+    self.assertEqual(result["report"]["open_ports"], [443])
     plugin.r1fs.get_json.assert_called_once_with("QmReportCID", pin=False)
 
   def test_get_job_archive_finalized(self):
@@ -3706,7 +3975,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     archive_data = {
       "archive_version": JOB_ARCHIVE_VERSION,
       "job_id": "fin-job",
-      "passes": [{"findings": [{"finding_id": "f-1", "title": "Issue"}]}],
+      "passes": [{"pass_nr": 1, "findings": [{"finding_id": "f-1", "title": "Issue"}]}],
       "ui_aggregate": {},
       "job_config": {},
       "timeline": [],
@@ -3715,12 +3984,11 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
     plugin.r1fs.get_json.return_value = archive_data
-    plugin.chainstore_hgetall.side_effect = [
-      {"fin-job": stub},
-      {"fin-job:f-1": {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}},
-    ]
+    plugin.chainstore_hget.side_effect = lambda hkey, key: (
+      {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}
+      if hkey == "test-instance:triage" and key == "fin-job:f-1" else None)
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["archive"]["job_id"], "fin-job")
     self.assertEqual(result["archive"]["archive_version"], JOB_ARCHIVE_VERSION)
@@ -3778,7 +4046,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 120.0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="model-job", summary_only=True, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, job_id="model-job", summary_only=True, pass_limit=1, request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["job_id"], "model-job")
     archive = result["archive"]
@@ -3794,13 +4062,14 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertNotIn("provider.example", archive_text)
 
   def test_get_job_archive_running(self):
-    """get_job_archive for running job returns not_available error."""
+    """A job without an archive returns typed absence, not an unavailable-storage error."""
     Plugin = self._get_plugin_class()
     running = self._build_running_job("run-job", pass_count=2)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.get_job_archive(plugin, job_id="run-job")
-    self.assertEqual(result["error"], "not_available")
+    result = Plugin.get_job_archive(plugin, job_id="run-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
+    self.assertEqual(result["error"], "not_found")
+    self.assertEqual(result["status_code"], 404)
 
   def test_manual_structured_analysis_backfills_legacy_fields(self):
     """Postponed manual analysis updates the pass report for compatibility."""
@@ -3864,10 +4133,16 @@ class TestPhase5Endpoints(unittest.TestCase):
       job_specs["pass_reports"] = deepcopy(persisted["pass_reports"])
       return persisted
 
-    with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job:
-      postponed = Plugin.analyze_job(
-        plugin,
+    # RM-026 I1b B6 added admission ahead of the preparation step. This test drives the backfill on
+    # a MagicMock plugin that has no account store; stand admission up as satisfied and hand back
+    # the record the endpoint would have read. Admission is covered by test_manual_analysis_b6.py.
+    with patch.object(Plugin, "_write_job_record", side_effect=_write_job) as write_job, \
+         patch.object(Plugin, "_admitted_snapshot",
+                      staticmethod(lambda instance, *_a, **_k: (
+                        instance._get_job_from_cstore("job-llm"), "legacy_unbound"))):
+      postponed = Plugin.analyze_job(plugin,
         job_id="job-llm",
+        tenant_id="tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f",
       )
       self.assertEqual(postponed, "postponed")
       pending_id = plugin._manual_analysis_state["pending_id"]
@@ -3900,8 +4175,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "integrity_mismatch")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_get_job_archive_unsupported_version(self):
     """Unsupported archive versions are rejected explicitly."""
@@ -3921,8 +4196,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "unsupported_archive_version")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_normalize_job_record_initializes_job_revision(self):
     """Legacy records get a normalized integer job_revision."""
@@ -4254,7 +4529,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     running = self._build_running_job("run-job", pass_count=8)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.get_job_data(plugin, job_id="run-job")
+    result = Plugin.get_job_data(plugin, job_id="run-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertTrue(result["found"])
     refs = result["job"]["pass_reports"]
     self.assertEqual(len(refs), 5)
@@ -4268,7 +4543,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
 
-    result = Plugin.get_job_data(plugin, job_id="fin-job")
+    result = Plugin.get_job_data(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertTrue(result["found"])
     self.assertEqual(result["job"]["job_cid"], "QmArchiveCID")
     self.assertEqual(result["job"]["pass_count"], 1)
@@ -4315,7 +4590,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin = self._build_plugin({"model-job": stub})
 
-    result = Plugin.get_job_data(plugin, job_id="model-job")
+    result = Plugin.get_job_data(plugin, job_id="model-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     payload = result["job"]
     self.assertEqual(payload["model_test_summary"]["error_class"], "unknown_error")
@@ -4342,7 +4617,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertIn("fin-job", result)
     job = result["fin-job"]
     self.assertEqual(job["job_cid"], "QmArchiveCID")
@@ -4381,7 +4656,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     })
     plugin = self._build_plugin({"model-job": stub})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     job = result["model-job"]
     self.assertEqual(job["model_test_summary"]["error_class"], "unknown_error")
@@ -4402,7 +4677,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     running = self._build_running_job("run-job", pass_count=3)
     plugin = self._build_plugin({"run-job": running})
 
-    result = Plugin.list_network_jobs(plugin)
+    result = Plugin.list_network_jobs(plugin, request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertIn("run-job", result)
     job = result["run-job"]
     # Should have counts
@@ -4439,8 +4714,11 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
     }
     plugin.time.return_value = 100.0
+    live_payloads = plugin.chainstore_hgetall.return_value
+    plugin.chainstore_hgetall.return_value = {"run-job": running}
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live_payloads.get(key) if hkey == "test-instance:live" else None
 
-    result = Plugin.get_job_progress(plugin, job_id="run-job")
+    result = Plugin.get_job_progress(plugin, job_id="run-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["status"], "RUNNING")
     self.assertIn("worker-A", result["workers"])
     self.assertEqual(result["workers"]["worker-A"]["worker_state"], "active")
@@ -4448,17 +4726,7 @@ class TestPhase5Endpoints(unittest.TestCase):
   def test_get_job_status_does_not_report_completed_when_distributed_job_is_incomplete(self):
     """Local completion must not hide an unfinished assigned peer."""
     Plugin = self._get_plugin_class()
-    plugin = self._build_plugin({})
-    plugin.lst_completed_jobs = ["job-1"]
-    plugin.completed_jobs_reports = {
-      "job-1": {
-        "local-1": {"target": "example.com", "ports_scanned": 10},
-      },
-    }
-    plugin.scan_jobs = {}
-    plugin._get_job_status = lambda job_id: Plugin._get_job_status(plugin, job_id)
-    plugin.time.return_value = 100.0
-    plugin.chainstore_hget.return_value = {
+    stored_job = {
       "job_id": "job-1",
       "job_status": "RUNNING",
       "job_pass": 1,
@@ -4468,6 +4736,17 @@ class TestPhase5Endpoints(unittest.TestCase):
         "worker-B": {"start_port": 11, "end_port": 20, "finished": False, "assignment_revision": 1},
       },
     }
+    # The job is supplied to the tenant reader, which binds it (RM-084 P6: there is no unscoped read).
+    plugin = self._build_plugin({"job-1": stored_job})
+    plugin.lst_completed_jobs = ["job-1"]
+    plugin.completed_jobs_reports = {
+      "job-1": {
+        "local-1": {"target": "example.com", "ports_scanned": 10},
+      },
+    }
+    plugin.scan_jobs = {}
+    plugin._get_job_status = lambda job_id: Plugin._get_job_status(plugin, job_id)
+    plugin.time.return_value = 100.0
     plugin.chainstore_hgetall.side_effect = lambda hkey: (
       {
         "job-1:worker-A": {
@@ -4487,10 +4766,12 @@ class TestPhase5Endpoints(unittest.TestCase):
           "last_seen_at": 100.0,
           "finished": True,
         },
-      } if hkey == "test-instance:live" else {"job-1": plugin.chainstore_hget.return_value}
+      } if hkey == "test-instance:live" else {"job-1": stored_job}
     )
+    live_payloads = plugin.chainstore_hgetall(hkey="test-instance:live")
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live_payloads.get(key) if hkey == "test-instance:live" else None
 
-    result = Plugin.get_job_status(plugin, job_id="job-1")
+    result = Plugin.get_job_status(plugin, job_id="job-1", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["status"], "network_tracked")
     self.assertEqual(result["workers"]["worker-B"]["worker_state"], "unseen")
@@ -4575,7 +4856,9 @@ class TestPhase5Endpoints(unittest.TestCase):
       } if hkey == "test-instance:live" else {"run-job": running}
     )
 
-    result = Plugin.get_job_data(plugin, job_id="run-job")
+    live_payloads = plugin.chainstore_hgetall(hkey="test-instance:live")
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live_payloads.get(key) if hkey == "test-instance:live" else None
+    result = Plugin.get_job_data(plugin, job_id="run-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertIn("workers_reconciled", result["job"])
     self.assertEqual(result["job"]["workers_reconciled"]["worker-A"]["worker_state"], "active")
@@ -4585,18 +4868,18 @@ class TestPhase5Endpoints(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
 
-    result = Plugin.get_job_archive(plugin, job_id="missing-job")
+    result = Plugin.get_job_archive(plugin, job_id="missing-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["error"], "not_found")
 
   def test_get_job_archive_r1fs_failure(self):
-    """get_job_archive when R1FS fails returns fetch_failed."""
+    """A broken archive reference returns sanitized unavailable, not absence."""
     Plugin = self._get_plugin_class()
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
     plugin.r1fs.get_json.return_value = None
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "fetch_failed")
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_get_analysis_finalized_reads_archive(self):
     """Finalized jobs resolve stored LLM analysis from archive passes after CStore pruning."""
@@ -4624,7 +4907,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["analysis"], "Archive-backed analysis")
@@ -4662,7 +4945,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["quick_summary"], "Structured archive headline")
     self.assertIn("Structured archive posture", result["analysis"])
@@ -4694,9 +4977,10 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
-    self.assertEqual(result["error"], "No LLM analysis available for this pass")
+    self.assertEqual(result["error"], "not_found")
+    self.assertEqual(result["status_code"], 404)
     self.assertTrue(result["llm_failed"])
     self.assertEqual(result["pass_nr"], 1)
 
@@ -4717,10 +5001,10 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_analysis(plugin, job_id="fin-job")
+    result = Plugin.get_analysis(plugin, job_id="fin-job", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
-    self.assertEqual(result["error"], "integrity_mismatch")
-    self.assertEqual(result["job_id"], "fin-job")
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
+    self.assertNotIn("other-job", str(result))
 
   def test_get_job_archive_summary_only(self):
     """Summary mode returns bounded pass-history summaries instead of full pass payloads."""
@@ -4762,7 +5046,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job", summary_only=True, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", summary_only=True, pass_limit=1, request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["archive"]["archive_query"]["returned_passes"], 1)
     self.assertTrue(result["archive"]["archive_query"]["summary_only"])
@@ -4786,14 +5070,14 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
 
-    result = Plugin.get_job_archive(plugin, job_id="fin-job", pass_offset=1, pass_limit=1)
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", pass_offset=1, pass_limit=1, request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual([p["pass_nr"] for p in result["archive"]["passes"]], [2])
     self.assertTrue(result["archive"]["archive_query"]["truncated"])
 
   def test_update_finding_triage_persists_mutable_state(self):
-    """Analyst triage updates stay outside archive storage and append audit history."""
-    Plugin = self._get_plugin_class()
+    """Internal triage service updates stay outside archives and append audit history."""
+    from extensions.business.cybersec.red_mesh.services.triage import update_finding_triage
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
     plugin.r1fs.get_json.return_value = {
@@ -4836,8 +5120,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.chainstore_hgetall.side_effect = _chainstore_hgetall
     plugin.chainstore_hset.side_effect = _chainstore_hset
 
-    result = Plugin.update_finding_triage(
-      plugin,
+    result = update_finding_triage(plugin,
       job_id="fin-job",
       finding_id="f-1",
       status="accepted_risk",
@@ -4852,22 +5135,17 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin._log_audit_event.assert_called_once()
 
   def test_get_job_triage_not_found(self):
-    """Triage query returns found=False when no mutable state exists yet."""
+    """An archive-owned finding without mutable state is found=False, without audit history."""
     Plugin = self._get_plugin_class()
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
-    plugin.chainstore_hgetall.side_effect = [
-      {"fin-job": stub},
-      {},
-    ]
-    plugin.chainstore_hget.side_effect = [
-      [],
-    ]
+    plugin.r1fs.get_json.return_value = {"job_id": "fin-job", "job_config": {},
+      "passes": [{"pass_nr": 1, "findings": [{"finding_id": "missing", "title": "Owned finding"}]}]}
 
-    result = Plugin.get_job_triage(plugin, job_id="fin-job", finding_id="missing")
+    result = Plugin.get_job_triage(plugin, job_id="fin-job", finding_id="missing", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertFalse(result["found"])
-    self.assertEqual(result["audit"], [])
+    self.assertNotIn("audit", result)
 
 
 class TestModelTestingEndpointAuth(unittest.TestCase):
@@ -4930,8 +5208,14 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
     self.assertNotIn(expected, str(result))
     launch.assert_not_called()
 
-  def test_authenticated_launch_forwards_navigator_actor_assertion(self):
-    plugin = MagicMock()
+  def test_authenticated_launch_derives_attribution_from_the_resolved_actor(self):
+    # RM-075: created_by_* come from the account store via the actor seam, never from the request.
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
+
+    plugin = _stub_launch_actor(MagicMock())
+    plugin._resolve_launch_actor = lambda actor=None: (
+      AccountView("navigator-user-123", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),)), None
+    )
     token = "valid-backend-token-material-at-least-32-bytes"
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
       "extensions.business.cybersec.red_mesh.pentester_api_01.launch_model_test",
@@ -4940,14 +5224,20 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
       result = self.Plugin.launch_model_test(
         plugin,
         token,
-        created_by_id="navigator-user-123",
+        actor={"account_id": "navigator-user-123"},
+        created_by_id="spoofed-by-request",
+        created_by_name="spoofed-by-request",
       )
 
     self.assertEqual(result, {"status": "ok"})
     self.assertEqual(launch.call_args.kwargs["created_by_id"], "navigator-user-123")
+    self.assertEqual(launch.call_args.kwargs["created_by_name"], "navigator-user-123")
 
   def test_authenticated_preflight_forwards_navigator_actor_assertion(self):
-    plugin = MagicMock()
+    from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
+    plugin = _stub_launch_actor(MagicMock())
+    plugin._resolve_launch_actor = lambda actor=None: (
+      AccountView("navigator-user-123", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),)), None)
     token = "valid-backend-token-material-at-least-32-bytes"
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": token}), patch(
       "extensions.business.cybersec.red_mesh.pentester_api_01.preflight_model_test_provider",
@@ -4956,7 +5246,8 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
       result = self.Plugin.preflight_model_test_provider(
         plugin,
         token,
-        created_by_id="navigator-user-123",
+        actor={"account_id": "navigator-user-123"},
+        created_by_id="spoofed-by-request",
       )
 
     self.assertEqual(result, {"status": "ok"})

@@ -6,9 +6,12 @@ dataclasses. They share CStore/R1FS plumbing, but their schema is separate.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from ..models.shared import _strip_none
+from ..tenancy.execution import (
+  ExecutionBinding, binding_from_record, binding_value, copy_bound_config, checked_archive_config,
+)
 from ..model_test_sanitization import (
   sanitize_model_test_error_class,
   sanitize_model_test_results,
@@ -51,13 +54,21 @@ class ModelTestJobConfig:
   blockchain_attestation_enabled: bool = False
   start_attestation_required: bool = False
   end_attestation_required: bool = False
+  execution_binding: ExecutionBinding | None = None
+
+  def __post_init__(self):
+    object.__setattr__(self, "execution_binding", binding_value(self.execution_binding))
 
   def to_dict(self) -> dict:
-    return _strip_none(asdict(self))
+    payload = asdict(self)
+    if self.execution_binding is not None:
+      payload["execution_binding"] = self.execution_binding.to_dict()
+    return _strip_none(payload)
 
   @classmethod
   def from_dict(cls, d: dict) -> ModelTestJobConfig:
     return cls(
+      execution_binding=binding_from_record(d),
       schema_version=d.get("schema_version", MODEL_TEST_JOB_CONFIG_SCHEMA),
       job_type=d["job_type"],
       scan_type=d.get("scan_type", "model_test"),
@@ -146,9 +157,17 @@ class ModelTestArchive:
   archive_version: int = 1
   redmesh_test_attestation: dict = None
   model_test_raw_evidence: dict = None
+  _execution_binding: ExecutionBinding | None = field(init=False, repr=False)
+
+  def __post_init__(self):
+    object.__setattr__(self, "job_config", copy_bound_config(self.job_config))
+    object.__setattr__(self, "_execution_binding", binding_from_record(self.job_config)
+                       if isinstance(self.job_config, dict) else None)
 
   def to_dict(self) -> dict:
     payload = asdict(self)
+    payload.pop("_execution_binding")
+    payload["job_config"] = checked_archive_config(self.job_config, self._execution_binding)
     payload["model_test_results"] = sanitize_model_test_results(payload.get("model_test_results"))
     payload["model_test_summary"] = sanitize_model_test_summary(payload.get("model_test_summary"))
     payload["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(

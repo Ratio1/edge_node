@@ -290,6 +290,10 @@ class _AttestationMixin:
       "node_hashes": node_hashes,
       "ip_obfuscated": ip_obfuscated,
       "node_eth_address": node_eth_address,
+      # The network was attached only to the timeline event, so the archived
+      # record could not say which explorer resolves its tx_hash; the client's
+      # PDF linked a base-sepolia attestation to mainnet (RM-086 item 3).
+      "network": getattr(self, "REDMESH_ATTESTATION_NETWORK", None),
     }
     self.P(
       "Submitted RedMesh job-start attestation for "

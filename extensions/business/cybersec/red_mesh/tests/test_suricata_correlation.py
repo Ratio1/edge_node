@@ -3,6 +3,8 @@ import unittest
 from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.services.integration_status import get_integration_status
+from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
 from extensions.business.cybersec.red_mesh.services.suricata_correlation import (
   correlate_suricata_eve,
   get_detection_correlation,
@@ -88,6 +90,60 @@ def _eve_jsonl():
 
 
 class TestSuricataCorrelation(unittest.TestCase):
+
+  def test_checked_status_projects_detached_job_without_storage_or_effects(self):
+    source = {**_job_specs(), "detection_correlation": {"job_id": "job-1", "status": "completed"}}
+    owner = _owner({"job_id": "foreign"})
+    result = get_detection_correlation(owner, "job-1", checked_job=source, snapshot_mode="legacy_unbound")
+    self.assertEqual(result, {"job_id": "job-1", "found": True,
+                             "correlation": {"job_id": "job-1", "status": "completed"}})
+    result["correlation"]["job_id"] = "mutated-return"
+    self.assertEqual(source["detection_correlation"]["job_id"], "job-1")
+    self.assertEqual(owner.mock_calls, [])
+
+  def test_checked_status_rejects_malformed_or_foreign_summary(self):
+    for summary in ([], "private", False, {"job_id": "foreign"}, {"job_id": None}):
+      with self.subTest(summary=summary):
+        owner = _owner(_job_specs())
+        source = {**_job_specs(), "detection_correlation": summary}
+        with self.assertRaises(TenantStoreError):
+          get_detection_correlation(owner, "job-1", checked_job=source, snapshot_mode="legacy_unbound")
+        self.assertEqual(owner.mock_calls, [])
+
+  def test_checked_status_requires_valid_explicit_snapshot_mode_and_identity(self):
+    for kwargs in ({"snapshot_mode": "legacy_unbound"},
+                   {"checked_job": None, "snapshot_mode": "legacy_unbound"},
+                   {"checked_job": {"job_id": "foreign"}, "snapshot_mode": "legacy_unbound"},
+                   {"checked_job": {**_job_specs(), "execution_binding": None}, "snapshot_mode": "legacy_unbound"},
+                   {"checked_job": _job_specs(), "snapshot_mode": "unknown"},
+                   {"snapshot_mode": None}):
+      with self.subTest(kwargs=kwargs):
+        owner = _owner(_job_specs())
+        with self.assertRaises(TenantStoreError):
+          get_detection_correlation(owner, "job-1", **kwargs)
+        self.assertEqual(owner.mock_calls, [])
+
+  def test_checked_status_preserves_empty_summary_without_repair_or_lookup(self):
+    for fields in ({}, {"detection_correlation": None}, {"detection_correlation": {}}):
+      with self.subTest(fields=fields):
+        owner = _owner(None)
+        result = get_detection_correlation(owner, "job-1", checked_job={**_job_specs(), **fields},
+                                           snapshot_mode="legacy_unbound")
+        self.assertEqual(result, {"job_id": "job-1", "found": True, "correlation": fields.get("detection_correlation")})
+        self.assertEqual(owner.mock_calls, [])
+
+  def test_checked_model_rejection_is_typed_without_changing_unchecked_response(self):
+    source = {**_job_specs(), "job_type": "model_test"}
+    owner = _owner(source)
+    legacy = get_detection_correlation(owner, "job-1")
+    self.assertEqual(legacy["error"], "unsupported_job_type")
+    self.assertTrue(legacy["found"])
+    self.assertNotIn("status_code", legacy)
+    owner.reset_mock()
+    with self.assertRaises(AdministrationDenied) as caught:
+      get_detection_correlation(owner, "job-1", checked_job=source, snapshot_mode="legacy_unbound")
+    self.assertEqual((caught.exception.status_code, caught.exception.error), (400, "unsupported_job_type"))
+    self.assertEqual(owner.mock_calls, [])
 
   def test_correlates_eve_jsonl_and_persists_redacted_summary(self):
     job_specs = _job_specs()

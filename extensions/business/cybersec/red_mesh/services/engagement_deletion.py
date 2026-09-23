@@ -145,10 +145,11 @@ def delete_engagement_data(
     )
   try:
     config = artifact_repo.get_job_config(job_specs)
-  except Exception as exc:
+  except Exception:
     raise DeleteEngagementError(
       code="config_not_found",
-      message=f"failed to load JobConfig {config_cid}: {exc}",
+      # No exception prose: this message is returned to the caller (RM-026 I1b B8).
+      message=f"failed to load JobConfig {config_cid}",
     )
   if not isinstance(config, dict):
     raise DeleteEngagementError(
@@ -163,10 +164,10 @@ def delete_engagement_data(
   # deleting R1FS objects while the job still points at an unwritten config.
   try:
     new_cid = artifact_repo.put_job_config(sanitized, show_logs=False)
-  except Exception as exc:
+  except Exception:
     raise DeleteEngagementError(
       code="storage_failed",
-      message=f"failed to write sanitized JobConfig: {exc}",
+      message="failed to write sanitized JobConfig",
     )
   if not new_cid:
     raise DeleteEngagementError(

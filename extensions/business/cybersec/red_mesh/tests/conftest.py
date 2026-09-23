@@ -12,7 +12,6 @@ from xperimental.utils import color_print
 MANUAL_RUN = False
 
 
-
 def install_pymisp_stub():
   """Install a small PyMISP stand-in when the optional test dependency is absent."""
   if "pymisp" in sys.modules:
@@ -145,10 +144,17 @@ def mock_plugin_modules():
 
   # Build a real class to avoid metaclass conflicts
   def endpoint_decorator(*args, **kwargs):
-    if args and callable(args[0]):
-      return args[0]
-    def wrapper(fn):
+    # Mirror the real decorator (fast_api_web_app.py): set the discovery attributes and
+    # return the function, so the authz surface test enumerates exactly what the framework does.
+    def _mark(fn, method="get", require_token=False):
+      fn.__endpoint__ = True
+      fn.__http_method__ = str(method).lower()
+      fn.__require_token__ = require_token
       return fn
+    if args and callable(args[0]):
+      return _mark(args[0])
+    def wrapper(fn):
+      return _mark(fn, kwargs.get("method", "get"), kwargs.get("require_token", False))
     return wrapper
 
   class FakeBasePlugin:

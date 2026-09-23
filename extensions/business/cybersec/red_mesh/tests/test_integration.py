@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
+from extensions.business.cybersec.red_mesh.tenancy.effects import EffectLedger
+from .read_endpoint_fixtures import install_tenant_read_store
 
 
 def _install_pymisp_stub():
@@ -135,6 +137,16 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     return PentesterApi01Plugin
+
+  def _read_actor(self, plugin):
+    """RM-084 P6: the reader admits through a real tenant; the selector is stashed for the call."""
+    job = plugin.chainstore_hget.return_value
+    live = plugin.chainstore_hgetall.return_value
+    plugin.chainstore_hget.side_effect = lambda hkey, key: live.get(key) if hkey.endswith(":live") else None
+    jobs = {job["job_id"]: job} if isinstance(job, dict) else {}
+    actor, tenant_id = install_tenant_read_store(self, plugin, self._get_plugin_class(), jobs=jobs)
+    self._tenant_id = tenant_id
+    return actor
 
   def _make_live_hsync_plugin(self, jobs, live_payloads, cfg=None, now=100.0, last_hsync_at=0.0):
     """Build a plugin mock backed by mutable job/live dictionaries."""
@@ -282,7 +294,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
     self.assertEqual(result["job_id"], "job-A")
     self.assertEqual(result["status"], "RUNNING")
     self.assertEqual(len(result["workers"]), 2)
@@ -293,17 +305,15 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(result["workers"]["worker-2"]["worker_state"], "active")
 
   def test_get_job_progress_empty(self):
-    """get_job_progress for non-existent job returns empty workers dict."""
+    """A missing checked job is a typed not-found response, not empty progress success."""
     Plugin = self._get_plugin_class()
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
     plugin.chainstore_hgetall.return_value = {}
     plugin.chainstore_hget.return_value = None
 
-    result = Plugin.get_job_progress(plugin, job_id="nonexistent")
-    self.assertEqual(result["job_id"], "nonexistent")
-    self.assertIsNone(result["status"])
-    self.assertEqual(result["workers"], {})
+    result = Plugin.get_job_progress(plugin, job_id="nonexistent", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
+    self.assertEqual(result, {"success": False, "error": "not_found", "status_code": 404})
 
   def test_get_job_progress_marks_unseen_assigned_worker(self):
     """Assigned workers with no matching :live record are surfaced as unseen."""
@@ -321,7 +331,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["assignment_revision"], 2)
@@ -359,7 +369,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "revision_mismatch")
@@ -397,13 +407,13 @@ class TestPhase12LiveProgress(unittest.TestCase):
     }
     plugin.time.return_value = 100.0
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "pass_mismatch")
 
   def test_get_job_progress_ignores_malformed_live_payload(self):
-    """Malformed live rows are ignored instead of crashing reconciliation."""
+    """A live row with unproven worker identity fails the checked read without leaking it."""
     Plugin = self._get_plugin_class()
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
@@ -424,11 +434,9 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.time.return_value = 100.0
     plugin.P = MagicMock()
 
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    result = Plugin.get_job_progress(plugin, job_id="job-A", request_actor=self._read_actor(plugin), tenant_id=self._tenant_id)
 
-    self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
-    self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "malformed_live")
-    plugin.P.assert_called()
+    self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_publish_live_progress(self):
     """_publish_live_progress writes stage-based progress to CStore :live hset."""
@@ -802,6 +810,54 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(startup_progress["phase"], "port_scan")
     self.assertEqual(startup_progress["started_at"], 100.0)
     self.assertEqual(plugin._active_execution_identities["job-1"], ("job-1", 2, "node-A", 2))
+
+  def test_maybe_launch_jobs_starts_bound_network_job_on_first_announcement(self):
+    """A tenant-bound network launch is picked up at revision 1, before any reannounce."""
+    from extensions.business.cybersec.red_mesh.services.launch_api import build_network_workers
+    from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
+
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_check_jobs_each = 15
+    plugin.ee_addr = "node-A"
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+    plugin._active_execution_identities = {}
+    plugin._execution_live_meta = {}
+    plugin._foreign_jobs_logged = set()
+    plugin._PentesterApi01Plugin__last_checked_jobs = 0
+    plugin.time.return_value = 100.0
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin.P = MagicMock()
+    plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
+    plugin._remember_execution_identity = lambda job_id, identity, started_at: Plugin._remember_execution_identity(
+      plugin, job_id, identity, started_at
+    )
+
+    binding = binding_payload()
+    plugin._get_job_config.return_value = {"scan_type": "network", "execution_binding": binding}
+    workers, error = build_network_workers(plugin, ["node-A"], 1, 100, "MIRROR")
+    self.assertIsNone(error)
+    job_specs = {
+      "job_id": "job-1",
+      "target": "10.0.0.1",
+      "scan_type": "network",
+      "job_pass": 1,
+      "launcher": "node-launcher",
+      "launcher_alias": "rm1",
+      "execution_binding": binding,
+      "workers": workers,
+    }
+    plugin.chainstore_hgetall.return_value = {"job-1": job_specs}
+
+    with patch("extensions.business.cybersec.red_mesh.pentester_api_01.launch_local_jobs") as mocked_launch:
+      Plugin._maybe_launch_jobs(plugin)
+
+    mocked_launch.assert_called_once()
+    self.assertEqual(mocked_launch.call_args.kwargs["execution_identity"], ("job-1", 1, "node-A", 1))
+    self.assertEqual(plugin._active_execution_identities["job-1"], ("job-1", 1, "node-A", 1))
 
   def test_maybe_launch_jobs_skips_duplicate_execution_identity(self):
     """A repeated announce of the same execution identity does not relaunch."""
@@ -1565,6 +1621,25 @@ class TestPhase12LiveProgress(unittest.TestCase):
 
 
 
+# RM-026 I1b B9 put admission in front of the three destructive endpoints, which are now
+# Super-Tenant-Admin-only and tenant-scoped. These exercise the purge mechanics downstream of that
+# on a MagicMock plugin with no account store, so they call the service functions directly with the
+# snapshot admission would have supplied. Admission itself is covered by test_purge_admission_b9.py.
+def _purge_job_service(plugin, job_id, **kwargs):
+  from extensions.business.cybersec.red_mesh.services.control import purge_job
+  return purge_job(plugin, job_id, **kwargs)
+
+
+def _stop_and_delete_service(plugin, job_id, **kwargs):
+  from extensions.business.cybersec.red_mesh.services.control import stop_and_delete_job
+  return stop_and_delete_job(plugin, job_id, **kwargs)
+
+
+def _purge_all_service(plugin, **kwargs):
+  from extensions.business.cybersec.red_mesh.services.control import purge_all_jobs
+  return purge_all_jobs(plugin, **kwargs)
+
+
 class TestPhase14Purge(unittest.TestCase):
   """Phase 14: Job Deletion & Purge."""
 
@@ -1625,7 +1700,7 @@ class TestPhase14Purge(unittest.TestCase):
     # Normalize returns the specs as-is
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # Verify all 5 CIDs were deleted
@@ -1670,7 +1745,7 @@ class TestPhase14Purge(unittest.TestCase):
     }.get(hkey, {})
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # Only archive CID should be deleted (no pass_reports, no config, no workers)
@@ -1707,7 +1782,7 @@ class TestPhase14Purge(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {}
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
@@ -1732,7 +1807,7 @@ class TestPhase14Purge(unittest.TestCase):
 
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["cids_deleted"], 1)
     self.assertEqual(result["cids_failed"], 1)
@@ -1766,7 +1841,7 @@ class TestPhase14Purge(unittest.TestCase):
     }
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # Check that live progress keys for job-1 were deleted
@@ -1795,7 +1870,7 @@ class TestPhase14Purge(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {}
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
-    result = Plugin.purge_job(plugin, "job-1")
+    result = _purge_job_service(plugin, "job-1")
     self.assertEqual(result["status"], "success")
 
     # CStore tombstone: hset(hkey=instance_id, key=job_id, value=None)
@@ -1823,9 +1898,12 @@ class TestPhase14Purge(unittest.TestCase):
 
     # Mock purge_job to verify delegation
     purge_result = {"status": "success", "job_id": "job-1", "cids_deleted": 3, "cids_total": 3}
-    plugin.purge_job = MagicMock(return_value=purge_result)
+    # Internal delegation uses the module-level purge_job implementation.
+    from extensions.business.cybersec.red_mesh.services import control as control_module
+    purge_mock = MagicMock(return_value=purge_result)
 
-    result = Plugin.stop_and_delete_job(plugin, "job-1")
+    with patch.object(control_module, "purge_job", purge_mock):
+      result = _stop_and_delete_service(plugin, "job-1")
 
     # Verify job was marked stopped before purge
     hset_calls = [
@@ -1838,8 +1916,10 @@ class TestPhase14Purge(unittest.TestCase):
     self.assertTrue(saved_specs["workers"]["node-A"]["finished"])
     self.assertTrue(saved_specs["workers"]["node-A"]["canceled"])
 
-    # Verify purge was called
-    plugin.purge_job.assert_called_once_with("job-1")
+    # Verify purge was called. The ledger is forwarded so a raise inside the purge cannot report
+    # "nothing happened" after the workers were stopped and the SOC was told (RM-026 I1b B9); the
+    # snapshot is deliberately not forwarded, because the stop above just rewrote the record.
+    purge_mock.assert_called_once_with(plugin, "job-1", ledger=None)
     self.assertEqual(result, purge_result)
 
 
@@ -1860,6 +1940,14 @@ class TestPurgeAllJobs(unittest.TestCase):
   def _make_plugin(self, jobs, live=None, triage=None, triage_audit=None, integrations=None):
     """Build a plugin mock backed by mutable hash dicts keyed by hkey."""
     plugin = MagicMock()
+    # Production purge_all calls module-level purge_job / stop_and_delete_job implementations.
+    # Route those seams to the MagicMock
+    # attributes this class stubs and asserts against, with the historical one-argument shape.
+    from extensions.business.cybersec.red_mesh.services import control as control_module
+    for name in ("purge_job", "stop_and_delete_job"):
+      patcher = patch.object(control_module, name, (lambda n: (lambda owner, job_id: getattr(plugin, n)(job_id)))(name))
+      patcher.start()
+      self.addCleanup(patcher.stop)
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "node-A"
     plugin.P = MagicMock()
@@ -1921,7 +2009,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     # FINALIZED/STOPPED jobs route directly to purge_job.
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_total"], 2)
@@ -1991,7 +2079,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_total"], 2)
@@ -2041,7 +2129,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_failed"], 1)
@@ -2084,7 +2172,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.stop_and_delete_job.side_effect = RuntimeError("cannot parse legacy schema")
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_force_purged"], 1)
@@ -2108,7 +2196,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.stop_and_delete_job.return_value = {"status": "error", "message": "not found"}
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_force_purged"], 1)
@@ -2129,7 +2217,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin = self._make_plugin(jobs)
     plugin.r1fs = MagicMock()
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_failed"], 1)
@@ -2152,7 +2240,7 @@ class TestPurgeAllJobs(unittest.TestCase):
       "cids_failed": 1,
     }
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_force_purged"], 0)
@@ -2177,7 +2265,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.delete_file.return_value = True
     plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["cids_deleted"], 1)
@@ -2207,7 +2295,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     }
     plugin.r1fs = MagicMock()
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertIn(orphan_key, plugin._hashes[submission_hkey])
@@ -2230,7 +2318,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.delete_file.return_value = True
     plugin.stop_and_delete_job.side_effect = RuntimeError("legacy parse failure")
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertIn("job-bad", plugin._hashes["test-instance"])
@@ -2310,7 +2398,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.get_json.return_value = {"artifact_kind": "review_submission"}
     plugin.stop_and_delete_job.side_effect = RuntimeError("legacy parse failure")
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["cids_failed"], 0)
@@ -2319,11 +2407,20 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs.get_json.assert_not_called()
 
   def test_confirm_required(self):
-    """Endpoint refuses to purge without confirm=True."""
+    """Endpoint refuses to purge without confirm=True.
+
+    RM-026 I1b B9 runs admission before the confirmation check, so a denial cannot be used to probe
+    whether confirmation would have been accepted. This plugin has no account store, so admission is
+    stood up as satisfied and the confirmation branch is what stays under test.
+    """
     Plugin = self._get_plugin_class()
     plugin = self._make_plugin({"job-1": {"job_id": "job-1"}})
 
-    result = Plugin.purge_all_redmesh_data(plugin)
+    with patch.object(Plugin, "_effect_operation",
+                      staticmethod(lambda _self, _actor, _tenant, apply_effect, **_kwargs:
+                                   apply_effect({}, "tenant_bound", EffectLedger()))):
+      result = Plugin.purge_all_redmesh_data(plugin, request_actor={"account_id": "reader"},
+                                             tenant_id="tn_7bd2f70d-0000-4000-8000-000000000002")
     self.assertEqual(result["status"], "error")
     self.assertIn("confirm", result["message"].lower())
     plugin.stop_and_delete_job.assert_not_called()
@@ -2346,7 +2443,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.purge_job.side_effect = _fake_purge
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["jobs_total"], 1)
     self.assertEqual(result["jobs_succeeded"], 1)
@@ -2369,7 +2466,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.stop_and_delete_job.side_effect = _success
     plugin.purge_job.side_effect = _success
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_succeeded"], 3)
@@ -2382,7 +2479,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin = self._make_plugin({})
 
-    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+    result = _purge_all_service(plugin)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_total"], 0)
@@ -2435,7 +2532,9 @@ class TestPhase15Listing(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {"job-1": finalized_stub}
     plugin._normalize_job_record = MagicMock(return_value=("job-1", finalized_stub))
 
-    result = Plugin.list_network_jobs(plugin)
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin,
+                                                 jobs=plugin.chainstore_hgetall.return_value)
+    result = Plugin.list_network_jobs(plugin, request_actor=actor, tenant_id=tenant_id)
     self.assertIn("job-1", result)
     entry = result["job-1"]
 
@@ -2491,7 +2590,9 @@ class TestPhase15Listing(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {"job-2": running_spec}
     plugin._normalize_job_record = MagicMock(return_value=("job-2", running_spec))
 
-    result = Plugin.list_network_jobs(plugin)
+    actor, tenant_id = install_tenant_read_store(self, plugin, Plugin,
+                                                 jobs=plugin.chainstore_hgetall.return_value)
+    result = Plugin.list_network_jobs(plugin, request_actor=actor, tenant_id=tenant_id)
     self.assertIn("job-2", result)
     entry = result["job-2"]
 

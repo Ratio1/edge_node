@@ -13,6 +13,8 @@ from extensions.business.cybersec.red_mesh.cve_db import (
   reset_dynamic_reference_cache,
   set_dynamic_reference_cache,
 )
+from extensions.business.cybersec.red_mesh.cve_cvss_vectors import CVE_CVSS_VECTORS
+from extensions.business.cybersec.red_mesh.cvss import cvss31_base_score, severity_band
 from extensions.business.cybersec.red_mesh.findings import Severity
 from extensions.business.cybersec.red_mesh.references.dynamic import (
   CvssRecord,
@@ -52,16 +54,24 @@ def _make_cache(*, cvss_score=9.8, kev_listed=True, epss=0.94,
   )
 
 
+def _static_vector(f):
+  """The static NVD vector a finding carries without live data: the table's,
+  when its band is the finding's label, else none."""
+  vector = CVE_CVSS_VECTORS.get(f.cve[0], "")
+  return vector if vector and severity_band(cvss31_base_score(vector)) == f.severity.value else ""
+
+
 class TestLegacyBehavior(unittest.TestCase):
   """Without a cache, behavior matches pre-Phase-2."""
 
   def test_no_cache_no_cvss_data(self):
+    """No live data; the CVSS vector is the static NVD one (RM-087)."""
     findings = check_cves("openssh", "8.0")
     self.assertGreater(len(findings), 0)
     # Pick one to inspect
     f = findings[0]
-    self.assertIsNone(f.cvss_score)
-    self.assertEqual(f.cvss_vector, "")
+    self.assertEqual(f.cvss_vector, _static_vector(f))
+    self.assertEqual(f.cvss_score, cvss31_base_score(f.cvss_vector) if f.cvss_vector else None)
     self.assertFalse(f.kev)
     self.assertIsNone(f.epss_score)
     self.assertEqual(f.cvss_data_freshness, "")
@@ -220,10 +230,10 @@ class TestGracefulDegradation(unittest.TestCase):
     try:
       findings = check_cves("openssh", "8.0", dynamic_cache=cache)
       self.assertGreater(len(findings), 0)
-      # Findings still emit; CVSS fields just stay empty
+      # Findings still emit, with the static NVD vector, not live data (RM-087)
       for f in findings:
-        self.assertIsNone(f.cvss_score)
-        self.assertEqual(f.cvss_vector, "")
+        self.assertEqual(f.cvss_vector, _static_vector(f))
+        self.assertEqual(f.cvss_data_freshness, "")
         # CVE id still propagates from the static entry
         self.assertEqual(len(f.cve), 1)
     finally:

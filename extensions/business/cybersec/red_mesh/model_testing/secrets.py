@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 
 from ..services.secrets import R1fsSecretStore
+from ..tenancy.execution import binding_from_record
+from ..tenancy.effective_targets import validate_model_provider
 
 
 MODEL_TEST_PROVIDER_SECRET_REF = "model_provider_secret_ref"
@@ -63,6 +65,7 @@ def attach_model_test_provider_secret(
       evaluator_model_secret_payload,
     ) if (evaluator_runtime_model or evaluator_model) else {},
   }
+  validate_model_provider(binding_from_record(persisted), payload["tested_model"])
   store = R1fsSecretStore(owner)
   ref = store.save_model_test_provider_credentials(job_id, payload)
   if not ref:
@@ -79,6 +82,7 @@ def attach_model_test_provider_secret(
 def resolve_model_test_runtime_config(owner, config_dict: dict) -> dict:
   """Resolve provider runtime material for worker execution only."""
   resolved = deepcopy(config_dict or {})
+  binding = binding_from_record(resolved)
   job_id = str(resolved.get("job_id") or "")
   secret_ref = str(resolved.get(MODEL_TEST_PROVIDER_SECRET_REF) or "").strip()
   if not secret_ref:
@@ -96,6 +100,7 @@ def resolve_model_test_runtime_config(owner, config_dict: dict) -> dict:
         **dict(resolved.get(role) or {}),
         **runtime_provider,
       }
+  validate_model_provider(binding, resolved.get("tested_model"))
   return resolved
 
 

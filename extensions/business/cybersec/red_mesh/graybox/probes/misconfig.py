@@ -3,6 +3,7 @@ Security misconfiguration probes — A02 debug/CORS/headers/cookies/CSRF/session
 """
 
 from .base import ProbeBase
+from ... import cvss_vectors as V
 from ..findings import GrayboxFinding
 
 
@@ -121,7 +122,8 @@ class MisconfigProbes(ProbeBase):
           scenario_id="PT-A02-02",
           title="Permissive CORS: wildcard origin",
           status="vulnerable",
-          severity="HIGH" if acac == "true" else "MEDIUM",
+          severity="HIGH" if acac == "true" else "LOW",
+          cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
           owasp="A02:2021",
           cwe=["CWE-942"],
           evidence=[
@@ -134,12 +136,12 @@ class MisconfigProbes(ProbeBase):
         if not worst_finding or finding.severity == "HIGH":
           worst_finding = finding
       elif acao == "http://evil.example.com":
-        severity = "HIGH" if acac == "true" else "MEDIUM"
         finding = GrayboxFinding(
           scenario_id="PT-A02-02",
           title="CORS reflects arbitrary origin",
           status="vulnerable",
-          severity=severity,
+          severity="HIGH" if acac == "true" else "LOW",
+          cvss_vector=V.CORS_CREDENTIALED if acac == "true" else V.CORS_UNCREDENTIALED,
           owasp="A02:2021",
           cwe=["CWE-942"],
           evidence=[
@@ -365,6 +367,7 @@ class MisconfigProbes(ProbeBase):
       title="Session token weakness detected" if status != "not_vulnerable" else "Session token quality",
       status=status,
       severity=severity,
+      cvss_vector=V.AUTH_DEFEATABLE,
       owasp="A02:2021",
       cwe=["CWE-331", "CWE-345"] if evidence else [],
       evidence=evidence or ["all_tokens_appear_adequate"],
@@ -863,7 +866,7 @@ class MisconfigProbes(ProbeBase):
         scenario_id="PT-A02-17",
         title="Account enumeration via login response timing",
         status="vulnerable",
-        severity="HIGH",
+        severity="MEDIUM",
         owasp="A07:2021",
         cwe=["CWE-204", "CWE-208"],
         attack=["T1087"],
@@ -1136,7 +1139,7 @@ class MisconfigProbes(ProbeBase):
         scenario_id="PT-A07-03",
         title="Session fixation — token not rotated after login",
         status="vulnerable",
-        severity="HIGH",
+        severity="MEDIUM",
         owasp="A07:2021",
         cwe=["CWE-384"],
         attack=["T1550"],

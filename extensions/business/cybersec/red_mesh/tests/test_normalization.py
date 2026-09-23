@@ -143,20 +143,23 @@ class TestGrayboxNormalization(unittest.TestCase):
     self.assertEqual(flat_findings[0]["evidence_artifacts"][0]["raw_evidence_cid"], "QmEvidence")
 
   def test_graybox_cvss_metadata_survives_normalization(self):
-    """Graybox CVSS metadata survives flat finding normalization."""
+    """Graybox CVSS metadata survives flat finding normalization.
+
+    The score is derived from the vector, and the vector's band is the label
+    (RM-087): a disagreeing vector is withheld, `test_graybox_cvss.py`.
+    """
     finding = GrayboxFinding(
       scenario_id="PT-A01-01",
       title="Typed CVSS",
       status="vulnerable",
-      severity="HIGH",
+      severity="CRITICAL",
       owasp="A01:2021",
-      cvss_score=9.1,
       cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L",
     )
     report = _make_graybox_report([finding.to_dict()])
     host = _make_mixin()
     _, flat_findings = host._compute_risk_and_findings(report)
-    self.assertEqual(flat_findings[0]["cvss_score"], 9.1)
+    self.assertEqual(flat_findings[0]["cvss_score"], 9.4)
     self.assertEqual(flat_findings[0]["cvss_vector"], "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L")
 
   def test_cwe_joined(self):
@@ -514,6 +517,24 @@ class TestBlackboxCredentialRedaction(unittest.TestCase):
     ))
     self.assertNotIn("toor", str(redacted.get("vulnerabilities", [])))
 
+  def test_a_pair_under_a_field_redaction_never_enumerated_is_masked(self):
+    # Deny-by-default (RM-064 Phase 1). Every field-allowlist in this method
+    # carries a comment naming a field that leaked because it was not on the
+    # list. The property under test is "any string, any key", not today's list.
+    host = self._host()
+    report = self._report(
+      "SSH default credential accepted: root:toor",
+      "Accepted credential: root:toor",
+      "The SSH server accepted a well-known default credential.",
+    )
+    finding = report["service_info"]["22"]["default_creds"]["findings"][0]
+    finding["novel_field"] = "Accepted credential: root:toor"
+    finding["evidence_items"] = [{"note": "Auth OK for root:toor"}]
+    report["service_info"]["22"]["default_creds"]["novel_probe_field"] = "with root:toor"
+    report["never_seen_section"] = {"x": ["Weak credentials root:toor"]}
+    redacted = host._redact_report(report)
+    self.assertNotIn("toor", str(redacted))
+
   def test_the_http_basic_accepted_key_is_redacted(self):
     # The probe writes `accepted` (common.py:438,477); redaction read only
     # `accepted_credentials` — a key-name mismatch, so that list was archived raw.
@@ -597,6 +618,7 @@ class TestLaunchValidation(unittest.TestCase):
       with patch("extensions.business.cybersec.red_mesh.graybox.worker.AuthManager"):
         with patch("extensions.business.cybersec.red_mesh.graybox.worker.DiscoveryModule"):
           cfg = MagicMock()
+          cfg.execution_binding = None
           cfg.target_url = "http://test.local:8000"
           cfg.target_config = None
           cfg.verify_tls = True
@@ -623,6 +645,7 @@ class TestLaunchValidation(unittest.TestCase):
       with patch(f"{worker_module}.AuthManager"):
         with patch(f"{worker_module}.DiscoveryModule"):
           cfg = MagicMock()
+          cfg.execution_binding = None
           cfg.target_url = "http://test.local:8000"
           cfg.target_config = None
           cfg.verify_tls = True
@@ -906,6 +929,22 @@ class TestGrayboxRedactionCoverageFloor(unittest.TestCase):
           secret, described,
           "credential coverage dropped below the pre-branch floor",
         )
+
+  def test_a_long_secret_is_masked_to_the_end(self):
+    # `{3,64}` on the secret published the tail of anything longer:
+    # `user:***AAAA…`. `assertNotIn(secret, …)` alone cannot catch that, because
+    # the surviving tail is a substring of the secret, not the whole of it.
+    host = self._host()
+    secret = "A" * 100
+    report = {
+      "service_info": {},
+      "graybox_results": {"443": {"_p": {"findings": [
+        {"title": "t", "description": f"could not connect as dbuser:{secret}", "status": "vulnerable"},
+      ]}}},
+    }
+    out = host._redact_report(report)
+    described = out["graybox_results"]["443"]["_p"]["findings"][0]["description"]
+    self.assertEqual(described, "could not connect as dbuser:***")
 
   def test_the_narrowing_still_spares_what_it_was_written_for(self):
     host = self._host()

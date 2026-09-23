@@ -5,6 +5,7 @@ import requests
 from urllib.parse import quote, urlsplit
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
@@ -177,6 +178,7 @@ class _WebHardeningMixin:
         if header not in resp_main.headers:
           findings_list.append(Finding(
             severity=severity,
+            cvss_vector=V.MISSING_HEADER_LOW if severity == Severity.LOW else "",
             title=f"Missing security header: {header}",
             description=desc,
             evidence=f"Header {header} absent from {base_url} response.",
@@ -237,7 +239,8 @@ class _WebHardeningMixin:
       acac = resp.headers.get("Access-Control-Allow-Credentials", "")
       if acao == "*" and acac.lower() == "true":
         findings_list.append(Finding(
-          severity=Severity.CRITICAL,
+          severity=Severity.HIGH,
+          cvss_vector=V.CORS_CREDENTIALED,
           title="CORS allows credentials with wildcard origin",
           description="Any origin can make credentialed cross-site requests, enabling full account takeover.",
           evidence=f"Access-Control-Allow-Origin: *, Allow-Credentials: true on {base_url}",
@@ -644,6 +647,14 @@ class _WebHardeningMixin:
     password = "WrongPassword123!"
     attempt_count = 5
 
+    if self._host_is_catch_all(base_url):
+      # The precondition below is "the login path is not a 404"; a catch-all
+      # host passes it for paths that do not exist, so five accepted attempts
+      # against a phantom endpoint prove nothing (RM-086 item 1).
+      for path in login_paths:
+        self._withhold_on_catch_all(base_url, "_web_test_rate_limiting", path)
+      return probe_result(findings=findings_list)
+
     for path in login_paths:
       url = base_url.rstrip("/") + path
       try:
@@ -751,6 +762,7 @@ class _WebHardeningMixin:
           continue
         findings_list.append(Finding(
           severity=Severity.MEDIUM,
+          cvss_vector=V.SRI_SCRIPT_MISSING,
           title="External script loaded without SRI",
           description=f"Script from {src[:80]} has no integrity attribute. "
                       "A compromised CDN could serve malicious code.",
@@ -775,6 +787,7 @@ class _WebHardeningMixin:
             continue
           findings_list.append(Finding(
             severity=Severity.LOW,
+            cvss_vector=V.SRI_STYLESHEET_MISSING,
             title="External stylesheet loaded without SRI",
             description=f"Stylesheet from {href[:80]} has no integrity attribute.",
             evidence=f'<link href="{href[:80]}" ...> without integrity=',
@@ -834,6 +847,7 @@ class _WebHardeningMixin:
         if src.startswith("http://"):
           findings_list.append(Finding(
             severity=Severity.HIGH,
+            cvss_vector=V.MIXED_CONTENT_ACTIVE,
             title="Active mixed content: script loaded over HTTP",
             description=f"HTTPS page loads script from {src[:80]} over plain HTTP. "
                         "An attacker can modify the script in transit.",

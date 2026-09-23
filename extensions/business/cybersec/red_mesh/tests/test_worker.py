@@ -39,6 +39,7 @@ def _make_job_config(**overrides):
   cfg.scan_min_delay = 0.0
   cfg.scan_max_delay = 0.0
   cfg.authorized = True
+  cfg.execution_binding = None
   assignments, error = build_graybox_worker_assignments(["node-1"])
   if error is None:
     for key, value in assignments["node-1"].items():
@@ -1115,6 +1116,9 @@ class TestGrayboxAbortBehavior(unittest.TestCase):
     self.assertTrue(worker.state["aborted"])
     self.assertEqual(worker.state["abort_phase"], "authentication")
     self.assertIn("authentication failed", worker.state["abort_reason"].lower())
+    # The class travels on the report, not only in metrics: finalization needs
+    # it to name the failure without parsing the reason text.
+    self.assertEqual(worker.state["abort_reason_class"], "auth_failed")
 
   def test_abort_records_metric_counter(self):
     """record_abort is called exactly once on abort."""

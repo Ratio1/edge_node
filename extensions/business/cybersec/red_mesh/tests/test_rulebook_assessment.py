@@ -138,6 +138,41 @@ def _complete_review_answers():
   }
 
 
+def checked_read_producer(state="submitted"):
+  """Real rulebook writers with local fixture storage, reusable across native read replays."""
+  owner = _Owner()
+  if state == "missing":
+    return owner
+  if state in ("generated", "generation_failed", "legacy"):
+    if state == "generation_failed":
+      owner.r1fs.add_json.side_effect = None
+      owner.r1fs.add_json.return_value = None
+    result = generate_rulebook_assessment(owner, "job-1", persist=True)
+    assert (result.get("error") is not None) == (state == "generation_failed")
+    if state != "legacy":
+      return owner
+    result = update_rulebook_review(owner, "job-1", answers=_complete_review_answers(),
+                                    reviewer="fixture-reviewer", review_state="reviewed")
+    assert result["review"]["review_state"] == "reviewed"
+    return owner
+  saved = save_rulebook_review_draft(owner, "job-1", answers=_complete_review_answers(),
+                                    actor="fixture-reviewer", expected_review_revision=0)
+  assert saved["status"] == "ok"
+  if state == "draft":
+    return owner
+  if state == "submission_failed":
+    owner.r1fs.add_json.side_effect = RuntimeError("fixture artifact write failure")
+  result = submit_rulebook_review(owner, "job-1", expected_review_revision=saved["review_revision"],
+                                  expected_pass_nr=3, expected_profile_version="1.0.0",
+                                  idempotency_key="fixture-submission", actor="fixture-reviewer")
+  assert (result.get("error") is not None) == (state == "submission_failed")
+  if state == "reopened":
+    result = reopen_rulebook_review(owner, "job-1", expected_review_revision=saved["review_revision"],
+                                    idempotency_key="fixture-reopen", actor="fixture-reviewer")
+    assert result["status"] == "ok"
+  return owner
+
+
 class _FakeArtifactRepo:
   def __init__(self, owner, archive=None, aggregated=None):
     self.owner = owner
@@ -863,6 +898,31 @@ class TestRulebookAssessment(unittest.TestCase):
     serialized = json.dumps(owner.artifacts[submitted["submission"]["cid"]], sort_keys=True)
     self.assertNotIn(secret, serialized)
     self.assertIn("<redacted-hex-token>", serialized)
+
+  def test_generated_assessment_masks_default_credential_pairs_in_evidence_refs(self):
+    # RM-064 Phase 1, reopened 2026-09-03: the delivered PDF's §3.7.3 printed both
+    # default-credential pairs in cleartext because this module's own sanitiser
+    # only matched keyword-prefixed assignments, never a bare `user:secret` pair
+    # in a finding title. The evidence refs must go through the shared rule.
+    archive = _sample_archive()
+    archive["passes"][0]["findings"].append({
+      "finding_id": "finding-ssh-default-1",
+      "severity": "CRITICAL",
+      "title": "SSH default credential accepted: svc-account:Hunter2-Pl4in",
+      "description": "Password auth accepted for svc-account:Hunter2-Pl4in on app.example.test:22.",
+      "evidence": "Accepted credential: svc-account:Hunter2-Pl4in",
+      "probe": "_ssh_default_credentials",
+      "category": "auth",
+      "status": "vulnerable",
+    })
+    owner = _Owner(archive=archive)
+
+    result = generate_rulebook_assessment(owner, "job-1")
+
+    self.assertEqual(result["status"], "ok")
+    serialized = json.dumps(owner.artifacts[result["artifact_cid"]], sort_keys=True)
+    self.assertNotIn("Hunter2-Pl4in", serialized)
+    self.assertIn("svc-account:***", serialized)
 
   def test_future_registry_contract_returns_stable_upgrade_error_for_writes(self):
     owner = _Owner()

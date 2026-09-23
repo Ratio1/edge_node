@@ -1,4 +1,5 @@
 import json
+import re as _re
 import sys
 import struct
 import unittest
@@ -1046,11 +1047,19 @@ class RedMeshOWASPTests(unittest.TestCase):
 
   def test_web_api_auth_bypass(self):
     owner, worker = self._build_worker()
-    resp = MagicMock()
-    resp.status_code = 200
+
+    # A real server 404s the random canary path; only the API paths answer 200.
+    def fake_get(url, timeout=3, verify=False, headers=None):
+      resp = MagicMock()
+      resp.status_code = 200 if "/api" in url else 404
+      return resp
+
     with patch(
       "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
-      return_value=resp,
+      side_effect=fake_get,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
+      side_effect=fake_get,
     ):
       result = worker._web_test_api_auth_bypass("example.com", 80)
     self._assert_has_finding(result, "API auth bypass")
@@ -2019,7 +2028,7 @@ class TestScannerEnhancements(unittest.TestCase):
   # --- Item 1: TLS validity period ---
 
   def test_tls_validity_period_10yr(self):
-    """Certificate with 10-year validity should flag MEDIUM."""
+    """Certificate with 10-year validity is flagged LOW: hygiene, not a weakness (RM-087)."""
     _, worker = self._build_worker(ports=[443])
     try:
       from cryptography import x509
@@ -2044,7 +2053,7 @@ class TestScannerEnhancements(unittest.TestCase):
 
       findings = worker._tls_check_validity_period(cert_der)
       self.assertEqual(len(findings), 1)
-      self.assertEqual(findings[0].severity, "MEDIUM")
+      self.assertEqual(findings[0].severity, "LOW")
       self.assertIn("validity span", findings[0].title.lower())
     except ImportError:
       self.skipTest("cryptography library not available")
@@ -2581,8 +2590,9 @@ class TestPhase17aQuickWins(unittest.TestCase):
 
   # ---- 17a-5: ES IP classification + JVM ----
 
-  def test_es_nodes_public_ip_critical(self):
-    """Public IP from _nodes endpoint is flagged CRITICAL."""
+  def test_es_nodes_public_ip_medium(self):
+    """Public IP from _nodes endpoint is flagged MEDIUM: an address disclosure,
+    CVSS 5.3 (RM-087; it was CRITICAL)."""
     _, worker = self._build_worker(ports=[9200])
     worker.state["scan_metadata"] = {"internal_ips": []}
     raw = {}
@@ -2600,9 +2610,10 @@ class TestPhase17aQuickWins(unittest.TestCase):
       findings = worker._es_check_nodes("http://10.0.0.1:9200", raw)
     titles = [f.title for f in findings]
     severities = [f.severity for f in findings]
-    # Public IP should be CRITICAL
     self.assertTrue(any("public ip" in t.lower() for t in titles), f"Expected public IP finding, got: {titles}")
-    self.assertIn("CRITICAL", severities)
+    public = next(f for f in findings if "public ip" in f.title.lower())
+    self.assertEqual(public.severity, "MEDIUM")
+    self.assertNotIn("CRITICAL", severities)
     # JVM EOL
     self.assertTrue(any("eol jvm" in t.lower() for t in titles), f"Expected EOL JVM finding, got: {titles}")
     self.assertEqual(raw.get("jvm_version"), "1.7.0_55")
@@ -2943,12 +2954,20 @@ class TestOWASPFullCoverage(unittest.TestCase):
   def test_metadata_endpoints_tagged_a10(self):
     """Cloud metadata findings should use owasp_id A10:2021."""
     owner, worker = self._build_worker()
-    resp = MagicMock()
-    resp.status_code = 200
-    resp.text = "ami-id instance-id"
+
+    # A real server 404s the random canary path; the metadata paths answer 200.
+    def fake_get(url, timeout=3, verify=False, headers=None):
+      resp = MagicMock()
+      resp.status_code = 404 if _re.search(r"/[0-9a-f]{32}$", url) else 200
+      resp.text = "ami-id instance-id"
+      return resp
+
     with patch(
       "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
-      return_value=resp,
+      side_effect=fake_get,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
+      side_effect=fake_get,
     ):
       result = worker._web_test_metadata_endpoints("example.com", 80)
     findings = result.get("findings", [])
@@ -3107,7 +3126,8 @@ class TestOWASPFullCoverage(unittest.TestCase):
 
     def fake_request(url, *args, **kwargs):
       resp = MagicMock()
-      resp.status_code = 200
+      # A real server 404s the random canary path; the login paths answer 200.
+      resp.status_code = 404 if _re.search(r"/[0-9a-f]{32}$", url) else 200
       resp.text = "invalid credentials"
       resp.headers = {}
       return resp
@@ -5234,3 +5254,200 @@ class TestBatch5Improvements(unittest.TestCase):
     cve_ids = {f.title.split(":")[0] for f in findings if "CVE-" in f.title}
     expected = {"CVE-2023-26048", "CVE-2023-26049", "CVE-2023-36478", "CVE-2023-40167"}
     self.assertEqual(cve_ids, expected, f"Should match all 4 Jetty CVEs, got {cve_ids}")
+
+
+_DISCOVERY_GET = "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get"
+_API_GET = "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get"
+_INJECTION_GET = "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get"
+_INJECTION_POST = "extensions.business.cybersec.red_mesh.worker.web.injection.requests.post"
+
+
+class RedMeshCatchAllGatingTests(unittest.TestCase):
+  """RM-086 item 1: a host that 200s a random path proves nothing with a bare 200.
+
+  The client's job `6cc55610` carried 182 accessible-resource, 91 cloud-metadata,
+  39 auth-bypass and 13 JMXInvokerServlet rows (raw, per worker) from one aiohttp
+  host that answers 200 to everything, beside the canary finding that said so.
+  """
+
+  _UUID_PATH = _re.compile(r"/[0-9a-f]{32}$")
+
+  def _build_worker(self):
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-123",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80],
+      exceptions=None,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return worker
+
+  @staticmethod
+  def _response(status, text="", headers=None):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = text
+    resp.headers = headers or {}
+    resp.reason = "OK"
+    return resp
+
+  def _all(self, status, text=""):
+    def fake(url, **_kwargs):
+      return self._response(status, text)
+    return fake
+
+  def test_catch_all_host_keeps_the_canary_and_withholds_the_bare_200_checks(self):
+    from extensions.business.cybersec.red_mesh.worker.web.discovery import CATCH_ALL_TITLE
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)):
+      result = worker._web_test_common("example.com", 80)
+    self.assertEqual([f["title"] for f in result["findings"]], [CATCH_ALL_TITLE])
+    withheld = worker.state["catch_all_withheld"]["http://example.com"]
+    paths = {e["path"] for e in withheld}
+    self.assertTrue({"/.env", "/admin", "/actuator", "/wp-login.php"} <= paths)
+    self.assertTrue(all(e["probe"] == "_web_test_common" for e in withheld))
+
+  def test_metadata_and_api_auth_are_withheld_on_a_catch_all_host(self):
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch(_API_GET, side_effect=self._all(200, "ami-id instance-id")):
+      meta = worker._web_test_metadata_endpoints("example.com", 80)
+      auth = worker._web_test_api_auth_bypass("example.com", 80)
+    self.assertEqual(meta["findings"], [])
+    self.assertEqual(auth["findings"], [])
+    withheld = worker.state["catch_all_withheld"]["http://example.com"]
+    self.assertEqual(
+      {e["probe"] for e in withheld},
+      {"_web_test_metadata_endpoints", "_web_test_api_auth_bypass"},
+    )
+    self.assertIn({"probe": "_web_test_api_auth_bypass", "path": "/api/health"}, withheld)
+
+  def test_jmx_200_is_withheld_but_a_500_still_counts(self):
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch(_INJECTION_GET, side_effect=self._all(200)), \
+         patch(_INJECTION_POST, side_effect=self._all(404)):
+      result = worker._web_test_java_deserialization("example.com", 80)
+    self.assertEqual(result["findings"], [])
+    paths = {e["path"] for e in worker.state["catch_all_withheld"]["http://example.com"]}
+    self.assertEqual(paths, {"/invoker/JMXInvokerServlet"})
+
+    def jmx_500(url, **_kwargs):
+      return self._response(500 if url.endswith("/invoker/JMXInvokerServlet") else 200)
+
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch(_INJECTION_GET, side_effect=jmx_500), \
+         patch(_INJECTION_POST, side_effect=self._all(404)):
+      result = worker._web_test_java_deserialization("example.com", 80)
+    self.assertIn(
+      "Java deserialization endpoint: /invoker/JMXInvokerServlet",
+      [f["title"] for f in result["findings"]],
+    )
+
+  def test_actuator_needs_an_actuator_shaped_body_on_a_catch_all_host(self):
+    worker = self._build_worker()
+
+    def fake(url, **_kwargs):
+      if url.endswith("/actuator"):
+        return self._response(
+          200, '{"_links": {"self": {"href": "http://example.com/actuator"}}}',
+          {"Content-Type": "application/json"},
+        )
+      # What a catch-all aiohttp host actually returns: its front page.
+      return self._response(200, "<html>{ok}</html>", {"Content-Type": "text/html"})
+
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch(_INJECTION_GET, side_effect=fake), \
+         patch(_INJECTION_POST, side_effect=self._all(404)):
+      result = worker._web_test_spring_actuator("example.com", 80)
+    titles = [f["title"] for f in result["findings"]]
+    self.assertIn("Spring Actuator exposed: /actuator", titles)
+    self.assertNotIn("Spring Actuator exposed: /env", titles)
+    paths = {e["path"] for e in worker.state["catch_all_withheld"]["http://example.com"]}
+    self.assertIn("/env", paths)
+    self.assertNotIn("/actuator", paths)
+
+  def test_rate_limiting_is_withheld_on_a_catch_all_host(self):
+    # Its precondition is "login path is not a 404", which every phantom path
+    # on a catch-all host satisfies; the review round found it emitting
+    # "No rate limiting on login endpoint (/login)" for a non-existent /login.
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.hardening.requests.post",
+               side_effect=self._all(200)):
+      result = worker._web_test_rate_limiting("example.com", 80)
+    self.assertEqual(result["findings"], [])
+    paths = {e["path"] for e in worker.state["catch_all_withheld"]["http://example.com"]}
+    self.assertEqual(paths, {"/login", "/api/login", "/auth/login"})
+
+  def test_the_canary_runs_once_per_host(self):
+    worker = self._build_worker()
+    calls = []
+
+    def any_get(url, **_kwargs):
+      calls.append(url)
+      return self._response(200)
+
+    # The web modules share one `requests` module, so `_DISCOVERY_GET` and
+    # `_API_GET` patch the same attribute and the later patch wins; one patch
+    # sees every GET the three probes make.
+    with patch(_DISCOVERY_GET, side_effect=any_get):
+      worker._web_test_common("example.com", 80)
+      worker._web_test_metadata_endpoints("example.com", 80)
+      worker._web_test_api_auth_bypass("example.com", 80)
+    self.assertEqual(len([u for u in calls if self._UUID_PATH.search(u)]), 1)
+    self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": True})
+
+  def test_a_host_that_404s_the_random_path_is_unchanged(self):
+    worker = self._build_worker()
+
+    def fake(url, **_kwargs):
+      if self._UUID_PATH.search(url):
+        return self._response(404)
+      return self._response(200 if url.endswith("/admin") else 404)
+
+    with patch(_DISCOVERY_GET, side_effect=fake):
+      result = worker._web_test_common("example.com", 80)
+    self.assertEqual([f["title"] for f in result["findings"]], ["Accessible resource: /admin"])
+    self.assertNotIn("catch_all_withheld", worker.state)
+    self.assertEqual(worker.state["catch_all_hosts"], {"http://example.com": False})
+
+  def test_the_canary_finding_names_the_withheld_checks_once_all_probes_ran(self):
+    from extensions.business.cybersec.red_mesh.findings import finding_from_dict
+    worker = self._build_worker()
+    with patch(_DISCOVERY_GET, side_effect=self._all(200)), \
+         patch(_API_GET, side_effect=self._all(200)):
+      common = worker._web_test_common("example.com", 80)
+      meta = worker._web_test_metadata_endpoints("example.com", 80)
+    before = dict(common["findings"][0])
+    worker.state["web_tests_info"][80] = {
+      "_web_test_common": common,
+      "_web_test_metadata_endpoints": meta,
+    }
+
+    worker._annotate_catch_all_findings()
+
+    after = worker.state["web_tests_info"][80]["_web_test_common"]["findings"][0]
+    self.assertIn("status-only checks withheld pending manual validation", after["evidence"])
+    self.assertIn("/.env", after["evidence"])
+    self.assertIn("/latest/meta-data/", after["evidence"])
+    # Dedup identity is untouched; the content stamp follows the new evidence.
+    self.assertEqual(after["finding_id"], before["finding_id"])
+    self.assertNotEqual(after["finding_signature"], before["finding_signature"])
+    self.assertEqual(
+      after["finding_signature"],
+      finding_from_dict(after).compute_signature(probe_id="_web_test_common"),
+    )
+    # Idempotent: a second pass does not append the sentence again.
+    worker._annotate_catch_all_findings()
+    self.assertEqual(
+      worker.state["web_tests_info"][80]["_web_test_common"]["findings"][0], after,
+    )
+    status = worker.get_status()
+    self.assertIn("http://example.com", status["catch_all_withheld"])

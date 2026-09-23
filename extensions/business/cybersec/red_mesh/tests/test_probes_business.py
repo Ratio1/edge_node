@@ -123,7 +123,7 @@ class TestStatefulGating(unittest.TestCase):
     findings = probe.run()
     vuln = [f for f in findings if f.scenario_id == "PT-A06-01" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
-    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
 
 
 class TestWeakAuth(unittest.TestCase):
@@ -271,7 +271,7 @@ class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
     a06_04 = [f for f in probe.findings if f.scenario_id == "PT-A06-04"]
     self.assertEqual(len(a06_04), 1)
     self.assertEqual(a06_04[0].status, "vulnerable")
-    self.assertEqual(a06_04[0].severity, "HIGH")
+    self.assertEqual(a06_04[0].severity, "MEDIUM")
     self.assertTrue(any("submitted_amount=-9999.99" in e for e in a06_04[0].evidence))
 
   def test_pt_a06_04_emits_not_vulnerable_when_amount_rejected(self):

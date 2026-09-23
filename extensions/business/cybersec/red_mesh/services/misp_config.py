@@ -1,4 +1,4 @@
-from .config import resolve_config_block
+from .config import resolve_config_block, tenant_integration_override
 
 
 SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
@@ -16,7 +16,7 @@ DEFAULT_MISP_EXPORT_CONFIG = {
 }
 
 
-def get_misp_export_config(owner):
+def get_misp_export_config(owner, tenant_id=None):
   """Return normalized MISP export config."""
   def _normalize(merged, defaults):
     enabled = bool(merged.get("ENABLED", defaults["ENABLED"]))
@@ -64,4 +64,5 @@ def get_misp_export_config(owner):
     "MISP_EXPORT",
     DEFAULT_MISP_EXPORT_CONFIG,
     normalizer=_normalize,
+    tenant_override=tenant_integration_override(owner, tenant_id, "misp"),
   )

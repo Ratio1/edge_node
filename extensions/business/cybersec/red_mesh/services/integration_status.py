@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
+from ..tenancy.effects import EffectState
+from ..tenancy.integrations import status_tenant
 from .auth import credentials_missing
 from .config import (
   get_event_export_config,
@@ -37,21 +39,35 @@ def _utc_timestamp():
   return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _status_hkey(owner):
-  return f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
+def _status_hkey(owner, tenant_id=None):
+  """Node history keeps its original key; a tenant's history lives beside it, never merged.
+
+  Callers pass an integration id through status_tenant() first, so the three node-level ids keep
+  the node key even under a tenant-scoped call. Existing deployment history is therefore never
+  stranded or re-attributed to whichever tenant happens to read first.
+  """
+  base = f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
+  if tenant_id is None:
+    return base
+  if not isinstance(tenant_id, str) or not tenant_id.strip() or ":" in tenant_id:
+    raise ValueError("Invalid tenant for integration status")
+  return f"{base}:{tenant_id}"
 
 
-def _load_status_record(owner, integration_id):
+def _load_status_record(owner, integration_id, tenant_id=None):
   try:
-    payload = owner.chainstore_hget(hkey=_status_hkey(owner), key=integration_id)
+    payload = owner.chainstore_hget(
+      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)), key=integration_id)
   except Exception:
     return {}
   return payload if isinstance(payload, dict) else {}
 
 
-def _save_status_record(owner, integration_id, record):
+def _save_status_record(owner, integration_id, record, tenant_id=None):
   try:
-    owner.chainstore_hset(hkey=_status_hkey(owner), key=integration_id, value=record)
+    owner.chainstore_hset(
+      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)),
+      key=integration_id, value=record)
   except Exception:
     return False
   return True
@@ -132,7 +148,7 @@ def _merge_record(base, record):
   return merged
 
 
-def _event_export_status(owner):
+def _event_export_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
   cfg = get_event_export_config(owner)
   missing_secret = cfg["SIGN_PAYLOADS"] and not _has_env_secret(cfg["HMAC_SECRET_ENV"])
   configured = bool(cfg["ENABLED"]) and not missing_secret
@@ -153,9 +169,9 @@ def _event_export_status(owner):
   )
 
 
-def _wazuh_status(owner):
-  cfg = get_wazuh_export_config(owner)
-  readiness = wazuh_readiness(owner)
+def _wazuh_status(owner, tenant_id=None):
+  cfg = get_wazuh_export_config(owner, tenant_id)
+  readiness = wazuh_readiness(owner, tenant_id)
   mode = readiness["mode"]
   host = readiness["host"]
   return _base_status(
@@ -182,7 +198,7 @@ def _wazuh_status(owner):
   )
 
 
-def _suricata_status(owner):
+def _suricata_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
   cfg = get_suricata_correlation_config(owner)
   return _base_status(
     "suricata",
@@ -198,7 +214,7 @@ def _suricata_status(owner):
   )
 
 
-def _stix_status(owner):
+def _stix_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
   cfg = get_stix_export_config(owner)
   return _base_status(
     "stix",
@@ -214,8 +230,8 @@ def _stix_status(owner):
   )
 
 
-def _opencti_status(owner):
-  cfg = get_opencti_export_config(owner)
+def _opencti_status(owner, tenant_id=None):
+  cfg = get_opencti_export_config(owner, tenant_id)
   host = _redacted_url_host(cfg["URL"])
   credentials_error = credentials_missing(cfg)
   configured = bool(cfg["ENABLED"]) and bool(host) and credentials_error is None
@@ -236,8 +252,8 @@ def _opencti_status(owner):
   )
 
 
-def _taxii_status(owner):
-  cfg = get_taxii_export_config(owner)
+def _taxii_status(owner, tenant_id=None):
+  cfg = get_taxii_export_config(owner, tenant_id)
   host = _redacted_url_host(cfg["SERVER_URL"])
   credentials_error = credentials_missing(cfg)
   configured = (
@@ -274,11 +290,175 @@ _STATUS_BUILDERS = {
 }
 
 
-def get_integration_status(owner):
+# Public configuration-only projection (RM-026 I1a.3c.8).
+#
+# The owner chose to omit unowned historical event IDs and artifact CIDs from the
+# global integration view while retaining safe configuration/readiness status. This
+# path therefore rebuilds from the same six base builders and never touches
+# _load_status_record/_merge_record, so no persisted history can reach it. The
+# historical producer, record writes and cooldown policy above are unchanged and
+# still serve the internal export policy.
+
+PUBLIC_CONFIG_FIELDS = (
+  "id",
+  "label",
+  "enabled",
+  "configured",
+  "required",
+  "supports_test",
+  "status",
+  "destination_type",
+  "destination_label",
+  "redaction_mode",
+  "configuration_error",
+)
+
+_PUBLIC_CONFIG_STATUSES = frozenset({"disabled", "not_configured", "ready"})
+
+_PUBLIC_REDACTION_MODES = frozenset({"hash_only", "summary", "internal_soc", "custom"})
+
+# Configuration codes the six builders can produce. A delivery-outcome error class
+# can never appear here because records are not read; an unknown code therefore
+# means the builder contract moved, and we fail closed rather than publish it.
+_PUBLIC_CONFIGURATION_ERRORS = frozenset({
+  "missing_hmac_secret",
+  "missing_syslog_host",
+  "missing_http_url",
+  "missing_token",
+  "missing_credentials",
+  "invalid_auth_config",
+})
+
+_PUBLIC_DESTINATION_TYPES = {
+  "event_export": frozenset({"canonical"}),
+  "wazuh": frozenset({"syslog", "http", "wazuh_api"}),
+  "suricata": frozenset({
+    "uploaded_eve_json_or_external_query",
+    "uploaded_eve_json",
+    "external_query",
+  }),
+  "stix": frozenset({"manual_download"}),
+  "opencti": frozenset({"http"}),
+  "taxii": frozenset({"taxii_2.1"}),
+}
+
+_PUBLIC_DESTINATION_LABELS = {
+  "event_export": "redmesh.event.v1",
+  "wazuh": "wazuh",
+  "suricata": "suricata-security-onion",
+  "stix": "stix-2.1",
+  "opencti": "opencti",
+  "taxii": "taxii",
+}
+
+
+class IntegrationConfigUnavailable(Exception):
+  """The builder contract did not match the pinned public configuration shape."""
+
+
+def _public_config_item(integration_id, base):
+  if not isinstance(base, dict):
+    raise IntegrationConfigUnavailable(integration_id)
+
+  enabled = base.get("enabled")
+  configured = base.get("configured")
+  required = base.get("required")
+  supports_test = base.get("supports_test")
+  if any(type(value) is not bool for value in (enabled, configured, required, supports_test)):
+    raise IntegrationConfigUnavailable(integration_id)
+  if supports_test is not (integration_id in _INTEGRATIONS_WITH_TEST):
+    raise IntegrationConfigUnavailable(integration_id)
+  if required and integration_id != "wazuh":
+    raise IntegrationConfigUnavailable(integration_id)
+
+  # Derived from the booleans rather than passed through, so the public status can
+  # only ever be one of the three configuration states.
+  if not enabled:
+    status = "disabled"
+  elif configured:
+    status = "ready"
+  else:
+    status = "not_configured"
+  if status not in _PUBLIC_CONFIG_STATUSES:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  destination_type = base.get("destination_type")
+  if destination_type not in _PUBLIC_DESTINATION_TYPES[integration_id]:
+    raise IntegrationConfigUnavailable(integration_id)
+  if base.get("destination_label") != _PUBLIC_DESTINATION_LABELS[integration_id]:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  redaction_mode = base.get("redaction_mode")
+  if redaction_mode not in _PUBLIC_REDACTION_MODES:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  configuration_error = base.get("last_error_class")
+  if configuration_error is not None:
+    if (not isinstance(configuration_error, str)
+        or configuration_error not in _PUBLIC_CONFIGURATION_ERRORS):
+      raise IntegrationConfigUnavailable(integration_id)
+
+  label = INTEGRATION_LABELS[integration_id]
+  if base.get("id") != integration_id or base.get("label") != label:
+    raise IntegrationConfigUnavailable(integration_id)
+
+  return {
+    "id": integration_id,
+    "label": label,
+    "enabled": enabled,
+    "configured": configured,
+    "required": required,
+    "supports_test": supports_test,
+    "status": status,
+    "destination_type": destination_type,
+    "destination_label": _PUBLIC_DESTINATION_LABELS[integration_id],
+    "redaction_mode": redaction_mode,
+    "configuration_error": configuration_error,
+  }
+
+
+def get_public_integration_config(owner, tenant_id=None):
+  """Configuration/readiness only: no history, counts, cooldown or stored errors.
+
+  A scoped call resolves the four tenant ids from that tenant's records; the three node-level ids
+  keep coming from node config, so what they report is identical either way and the payload's key
+  set still equals _STATUS_BUILDERS.
+  """
   integrations = {}
   for integration_id, builder in _STATUS_BUILDERS.items():
-    base = builder(owner)
-    integrations[integration_id] = _merge_record(base, _load_status_record(owner, integration_id))
+    # Detached per integration; never _merge_record and never _load_status_record.
+    # status_tenant() here is a guard, not a behaviour: the three node-level builders ignore the
+    # argument today (pinned by test_node_level_builders_ignore_the_tenant), so passing the raw
+    # tenant would currently be equivalent. It stays so that a builder which starts reading it
+    # cannot silently acquire tenant scope it was never granted.
+    integrations[integration_id] = _public_config_item(
+      integration_id, builder(owner, status_tenant(integration_id, tenant_id)))
+  if set(integrations) != set(_STATUS_BUILDERS):
+    raise IntegrationConfigUnavailable("integrations")
+  generated_at = _utc_timestamp()
+  if not isinstance(generated_at, str) or not generated_at.endswith("Z"):
+    raise IntegrationConfigUnavailable("generated_at")
+  return {
+    "schema_version": INTEGRATION_STATUS_SCHEMA_VERSION,
+    "generated_at": generated_at,
+    "integrations": integrations,
+  }
+
+
+def get_integration_status(owner, tenant_id=None):
+  """Historical producer: configuration merged with persisted delivery outcomes.
+
+  Deliberately retained with no production caller as of RM-026 I1a.3c.8. The public
+  endpoint now serves get_public_integration_config instead, and the export policy
+  uses record_integration_status/_load_status_record directly rather than this
+  aggregate. It is kept as F2 groundwork for a tenant-scoped history view, and its
+  merge semantics stay under test; remove it if F2 lands on a different shape.
+  """
+  integrations = {}
+  for integration_id, builder in _STATUS_BUILDERS.items():
+    base = builder(owner, status_tenant(integration_id, tenant_id))
+    integrations[integration_id] = _merge_record(
+      base, _load_status_record(owner, integration_id, tenant_id))
   return {
     "schema_version": INTEGRATION_STATUS_SCHEMA_VERSION,
     "generated_at": _utc_timestamp(),
@@ -287,11 +467,11 @@ def get_integration_status(owner):
 
 
 def record_integration_status(owner, integration_id, *, outcome, event_id=None,
-                              artifact_cid=None, error_class=None, dry_run=False):
+                              artifact_cid=None, error_class=None, dry_run=False, tenant_id=None):
   if integration_id not in _STATUS_BUILDERS:
     return False
   now = _utc_timestamp()
-  record = _load_status_record(owner, integration_id)
+  record = _load_status_record(owner, integration_id, tenant_id)
   previous_error_class = record.get("last_error_class")
   if dry_run:
     record["last_dry_run_at"] = now
@@ -311,15 +491,17 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
     error_class=record.get("last_error_class") or error_class,
     previous_error_class=previous_error_class,
     now=now,
+    tenant_id=tenant_id,
   )
   if event_id:
     record["last_event_id"] = event_id
   if artifact_cid:
     record["last_artifact_cid"] = artifact_cid
-  return _save_status_record(owner, integration_id, record)
+  return _save_status_record(owner, integration_id, record, tenant_id)
 
 
-def test_event_export(owner, integration_id="event_export"):
+def test_event_export(owner, integration_id="event_export", *, ledger=None, tenant_id=None):
+  """Probe or deliver a synthetic event. `ledger` records what actually left the node."""
   integration_id = str(integration_id or "event_export").strip().lower()
   if integration_id not in _STATUS_BUILDERS:
     return {
@@ -337,15 +519,24 @@ def test_event_export(owner, integration_id="event_export"):
       environment=str(getattr(owner, "cfg_ee_node_network", "") or ""),
     )
     from .log_export import deliver_redmesh_event
-    return deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
+    if ledger is not None:
+      # A real send follows: dry_run only affects the status stamp, not the transmission.
+      ledger.checkpoint()
+    delivered = deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True,
+                                      tenant_id=tenant_id)
+    # deliver_redmesh_event returns "sent" | "disabled" | "error" -- never "skipped". Gating on
+    # "not skipped" recorded a delivery when the integration was disabled and nothing left the node.
+    if ledger is not None and isinstance(delivered, dict) and delivered.get("status") == "sent":
+      ledger.record(EffectState.DELIVERED)
+    return delivered
 
   if integration_id == "opencti":
     from .opencti_export import probe_opencti
-    return probe_opencti(owner)
+    return probe_opencti(owner, tenant_id)
 
   if integration_id == "taxii":
     from .taxii_export import probe_taxii
-    return probe_taxii(owner)
+    return probe_taxii(owner, tenant_id)
 
   if integration_id == "suricata":
     # Suricata correlation is pull-based — the operator uploads EVE JSONL
@@ -375,6 +566,7 @@ def test_event_export(owner, integration_id="event_export"):
     outcome="success",
     event_id=event["event_id"],
     dry_run=True,
+    tenant_id=tenant_id,
   )
   return {
     "status": "ok",

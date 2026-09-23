@@ -578,5 +578,38 @@ class TestLlmAgentRespectsTrustBoundary(unittest.TestCase):
       )
 
 
+class TestCredentialPairsScrubbed(unittest.TestCase):
+  """RM-064 Phase 1: credential redaction runs *inside* build_llm_input.
+
+  Only one of its three callers (`pentester_api_01`) redacted the report
+  first; `services/llm_structured.py` and `redmesh_llm_agent_api.py` fed
+  the model raw titles, and the narrative built from them is persisted
+  separately from the findings — so a finding-level fix never reached it.
+  """
+
+  _SECRET = "Hunter2-Pl4in"
+
+  def _default_cred_finding(self):
+    f = dict(ENRICHED_FINDING)
+    f.update({
+      "title": f"SSH default credential accepted: svc-account:{self._SECRET}",
+      "description": f"Password auth accepted for svc-account:{self._SECRET}.",
+      # Probe wording (common.py:483). The rule is phrasing-anchored, so a
+      # sentence no emitter writes is not a regression target.
+      "remediation": "Change default credentials immediately.",
+      "evidence_items": [
+        {"kind": "text", "caption": f"Accepted credential: svc-account:{self._SECRET}",
+         "cid": "QmFakeCID", "snippet": f"Auth OK for svc-account:{self._SECRET}"},
+      ],
+    })
+    return f
+
+  def test_default_credential_pair_never_in_llm_input(self):
+    out = build_llm_input(findings=[self._default_cred_finding()])
+    serialised = repr(out.to_dict())
+    self.assertNotIn(self._SECRET, serialised)
+    self.assertIn("svc-account:***", serialised)
+
+
 if __name__ == "__main__":
   unittest.main()

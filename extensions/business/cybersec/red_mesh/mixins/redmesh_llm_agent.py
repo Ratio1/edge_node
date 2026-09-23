@@ -14,6 +14,7 @@ import json
 from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
+from ..credential_redaction import redact_credential_text
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
@@ -147,6 +148,10 @@ class _RedMeshLlmAgentMixin(object):
     text = str(value)
     if not text:
       return ""
+    # This mixin hand-builds its payload without build_llm_input, so the
+    # shared credential rule runs here (RM-064 Phase 1). Before the cap: a
+    # pair cut in half by the cap is still half a secret.
+    text = redact_credential_text(text)
     # Hard cap before sanitization to bound CPU on pathological input.
     if len(text) > _LLM_UNTRUSTED_HARD_CAP:
       text = text[:_LLM_UNTRUSTED_HARD_CAP]
@@ -754,7 +759,7 @@ class _RedMeshLlmAgentMixin(object):
       severity = str(finding.get("severity") or "UNKNOWN").upper()
       status = str(finding.get("status") or "unknown").lower()
       owasp = str(finding.get("owasp_id") or finding.get("owasp") or "").strip()
-      title = str(finding.get("title") or "").strip()
+      title = redact_credential_text(str(finding.get("title") or "").strip())
       severity_counts[severity] = severity_counts.get(severity, 0) + 1
       status_counts[status] = status_counts.get(status, 0) + 1
       if owasp:
@@ -966,7 +971,8 @@ class _RedMeshLlmAgentMixin(object):
       endpoint: str,
       method: str = "POST",
       payload: dict = None,
-      timeout: int = None
+      timeout: int = None,
+      before_provider_call=None,
   ) -> dict:
     """
     Make HTTP request to the LLM Agent API.
@@ -999,6 +1005,8 @@ class _RedMeshLlmAgentMixin(object):
     retries = max(int(getattr(self, "cfg_llm_api_retries", 1) or 1), 1)
 
     def _attempt():
+      if before_provider_call is not None:
+        before_provider_call()
       self.Pd(f"Calling LLM Agent API: {method} {url}")
 
       if method.upper() == "GET":
@@ -1252,6 +1260,7 @@ class _RedMeshLlmAgentMixin(object):
       findings: list,
       aggregated_report: dict,
       engagement: dict | None = None,
+      before_provider_call=None,
   ) -> dict | None:
     """
     Run the Phase 4 structured-LLM call and return the dict form
@@ -1325,11 +1334,14 @@ class _RedMeshLlmAgentMixin(object):
       }
       if response_format is not None:
         payload["response_format"] = response_format
+      if before_provider_call is not None:
+        before_provider_call()
       response = self._call_llm_agent_api(
         endpoint="/chat",
         method="POST",
         payload=payload,
         timeout=structured_timeout,
+        **({"before_provider_call": before_provider_call} if before_provider_call is not None else {}),
       )
       if not isinstance(response, dict) or "error" in response:
         status = response.get("status") if isinstance(response, dict) else "invalid_response"

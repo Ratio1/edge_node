@@ -38,6 +38,7 @@ Deliberate limits, so the next reader does not over-trust this:
 """
 
 import unittest
+import re as _re
 from unittest.mock import MagicMock, patch
 
 from .conftest import DummyOwner, PentestLocalWorker
@@ -67,10 +68,16 @@ def _worker():
   return worker
 
 
-def _response():
-  """One deterministic HTTP response, reused for every request."""
+def _response(url=None):
+  """One deterministic HTTP response, reused for every request.
+
+  A random 32-hex path gets a 404, as a real server answers the catch-all
+  canary; answering 200 there makes the host a catch-all, and the status-only
+  probes rightly withhold their findings on one (RM-086 item 1), which would
+  shrink the net below.
+  """
   resp = MagicMock()
-  resp.status_code = 200
+  resp.status_code = 404 if url and _re.search(r"/[0-9a-f]{32}$", str(url)) else 200
   resp.ok = True
   resp.reason = "OK"
   resp.text = "<html><title>Example</title>index of /</html>"
@@ -144,7 +151,8 @@ def _stubbed_network():
     for attr in ("get", "post", "put", "head", "options", "delete", "request"):
       try:
         stack.enter_context(
-          patch(f"{base}.requests.{attr}", side_effect=lambda *a, **k: _response()))
+          patch(f"{base}.requests.{attr}",
+                side_effect=lambda *a, **k: _response(a[0] if a else k.get("url"))))
       except (AttributeError, ModuleNotFoundError):
         continue
     for attr in ("socket.socket", "socket.create_connection"):

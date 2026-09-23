@@ -34,6 +34,7 @@ from .rulebook_assessment import (
   DEFAULT_RULEBOOK_PROFILE_ID,
   build_rulebook_assessment,
   generate_rulebook_assessment,
+  get_rulebook_artifact,
   get_rulebook_assessment_status,
   get_rulebook_review,
   list_rulebook_profiles,
@@ -71,6 +72,7 @@ from .event_redaction import (
 )
 from .integration_status import (
   get_integration_status,
+  get_public_integration_config,
   record_integration_status,
   test_event_export,
 )
@@ -93,6 +95,11 @@ from .event_hooks import (
   emit_finding_event,
   emit_lifecycle_event,
   emit_redmesh_event,
+)
+from .report_review import (
+  approve_report,
+  get_report_review,
+  reject_report,
 )
 from .control import (
   purge_all_jobs,
@@ -218,6 +225,7 @@ __all__ = [
   "generate_rulebook_assessment",
   "get_misp_export_status",
   "get_opencti_export_status",
+  "get_rulebook_artifact",
   "get_rulebook_assessment_status",
   "get_rulebook_review",
   "get_stix_export_status",
@@ -239,6 +247,7 @@ __all__ = [
   "get_job_data",
   "get_job_progress",
   "get_integration_status",
+  "get_public_integration_config",
   "get_detection_correlation",
   "WAZUH_EVENT_GROUPS",
   "SOC_EVENT_STATUS_SCHEMA_VERSION",
@@ -263,6 +272,9 @@ __all__ = [
   "list_network_jobs",
   "list_rulebook_profiles",
   "reopen_rulebook_review",
+  "approve_report",
+  "get_report_review",
+  "reject_report",
   "save_rulebook_review_draft",
   "submit_rulebook_review",
   "maybe_finalize_pass",

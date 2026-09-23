@@ -61,7 +61,7 @@ class TestIdorProbe(unittest.TestCase):
     vuln = [f for f in findings if f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
     self.assertEqual(vuln[0].scenario_id, "PT-A01-01")
-    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
     self.assertIn("CWE-639", vuln[0].cwe)
 
   def test_idor_not_vulnerable(self):
@@ -319,7 +319,7 @@ class TestOwnershipDeletePTA0106(unittest.TestCase):
     f = [x for x in probe.findings if x.scenario_id == "PT-A01-06"]
     self.assertEqual(len(f), 1)
     self.assertEqual(f[0].status, "vulnerable")
-    self.assertEqual(f[0].severity, "CRITICAL")
+    self.assertEqual(f[0].severity, "HIGH")
 
   def test_pt_a01_06_not_vulnerable_when_record_still_present(self):
     probe = self._setup(before_owner="bob", followup_status=200,

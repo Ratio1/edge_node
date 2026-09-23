@@ -8,11 +8,18 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
+from ..tenancy.ports import TenantStoreError
 from .config import get_stix_export_config
+from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .event_redaction import stable_hmac_pseudonym, stable_sha256, strip_sensitive_fields
 from .integration_status import record_integration_status
 from .scan_guards import reject_model_test_for_scan_operation
+
+
+_UNSET = object()
 
 
 STIX_EXPORT_SCHEMA_VERSION = "1.0.0"
@@ -54,8 +61,9 @@ def _write_job_record(owner, job_id, job_specs, context):
   return _job_repo(owner).put_job(job_id, job_specs)
 
 
-def _resolve_pass_data(owner, job_id, pass_nr=None):
-  job_specs = owner._get_job_from_cstore(job_id)
+def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
+  # Use the caller's checked snapshot when one was admitted (RM-026 I1b).
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     return None, None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
@@ -372,17 +380,18 @@ def _observed_service_objects(aggregated, *, job_id, pass_nr, first_observed,
   return objects
 
 
-def build_stix_bundle(owner, job_id, pass_nr=None):
+def build_stix_bundle(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   """Build an isolated STIX 2.1 bundle for a RedMesh job/pass."""
   cfg = get_stix_export_config(owner)
-  job_specs = owner._get_job_from_cstore(job_id)
+  # Use the caller's checked snapshot when one was admitted (RM-026 I1b).
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
   if unsupported:
     return unsupported
 
-  job_config, pass_data, aggregated, err = _resolve_pass_data(owner, job_id, pass_nr)
+  job_config, pass_data, aggregated, err = _resolve_pass_data(owner, job_id, pass_nr, checked_job=checked_job)
   if err:
     return err
 
@@ -484,9 +493,11 @@ def build_stix_bundle(owner, job_id, pass_nr=None):
   }
 
 
-def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
+def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job=_UNSET,
+                       ledger=None):
   """Build and optionally persist a STIX 2.1 bundle for manual export."""
-  job_specs = owner._get_job_from_cstore(job_id)
+  # Checked snapshot replaces the unscoped global lookup (RM-026 I1b).
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "stix", outcome="failure", error_class="job_not_found")
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
@@ -494,14 +505,19 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
   if unsupported:
     return unsupported
 
-  result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
+  result = build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=checked_job)
   if result.get("status") != "ok":
     record_integration_status(owner, "stix", outcome="failure", error_class=result.get("error") or "build_failed")
     return result
 
   artifact_cid = None
   if persist:
+    if ledger is not None:
+      ledger.checkpoint()
     artifact_cid = _artifact_repo(owner).put_json(result["bundle"], show_logs=False)
+    if ledger is not None and artifact_cid:
+      # Bundle on disk. The SOC emission below may still fail; that is "persisted", not "nothing".
+      ledger.record(EffectState.PERSISTED)
     if not artifact_cid:
       record_integration_status(owner, "stix", outcome="failure", error_class="artifact_write_failed")
       return {"status": "error", "error": "artifact_write_failed", "job_id": job_id}
@@ -518,7 +534,12 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
     "observed_data_count": result["observed_data_count"],
   }
   job_specs["stix_export"] = export_meta
-  emit_export_status_event(
+  if ledger is not None:
+    ledger.checkpoint()
+    # The job document is mutated and a SOC event is emitted below whether or not the bundle was
+    # persisted, so `persist=False` must not leave the ledger at NONE.
+    ledger.record(EffectState.PERSISTED)
+  emission = emit_export_status_event(
     owner,
     job_specs,
     adapter_type="stix",
@@ -527,6 +548,11 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
     destination_label="stix-2.1",
     artifact_refs={"stix_bundle_id": result["bundle_id"], "stix_bundle_cid": artifact_cid},
   )
+  if ledger is not None and isinstance(emission, dict) and emission.get("status") != "skipped":
+    # Only when something actually left the node. emit_export_status_event never raises and returns
+    # {"status": "skipped"} when SOC export is disabled -- the common configuration -- so recording
+    # DELIVERED unconditionally would claim a delivery that never happened.
+    ledger.record(EffectState.DELIVERED)
   _write_job_record(owner, job_id, job_specs, context="stix_export")
   record_integration_status(
     owner,
@@ -549,15 +575,26 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
   }
 
 
-def get_stix_export_status(owner, job_id):
-  job_specs = owner._get_job_from_cstore(job_id)
+def get_stix_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "exported": False}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export_status")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {**unsupported, "found": True, "exported": False}
 
   export_meta = job_specs.get("stix_export")
+  if checked and export_meta is not None:
+    if (not isinstance(export_meta, dict)
+        or "job_id" in export_meta and export_meta["job_id"] != job_id
+        or any(field in export_meta for field in ("success", "error", "status_code", "result",
+               "detail", "exception_metadata", "execution_binding", "found", "exported"))):
+      raise TenantStoreError("Export status is unavailable")
   if not isinstance(export_meta, dict) or not export_meta:
     return {"job_id": job_id, "found": True, "exported": False}
 

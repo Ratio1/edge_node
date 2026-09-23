@@ -15,16 +15,19 @@ from .constants import (
 from .runner import ModelTestRunner
 from .catalog import selected_model_test_cases
 from .secrets import resolve_model_test_runtime_config
+from ..tenancy.execution import binding_from_record, copy_bound_config
+from ..tenancy.effective_targets import validate_effective_config
 
 
 class ModelTestWorker:
   """Lifecycle-compatible worker tracked under ``owner.model_test_jobs``."""
 
-  def __init__(self, owner, *, job_id, initiator, job_config, local_id="1"):
+  def __init__(self, owner, *, job_id, initiator, job_config, local_id="1", execution_identity=None):
     self.owner = owner
     self.job_id = job_id
     self.initiator = initiator
-    self.job_config = dict(job_config or {})
+    self.job_config = copy_bound_config(job_config or {})
+    self._execution_identity = execution_identity
     self.local_worker_id = "MT-{}-{}".format(local_id, str(uuid.uuid4())[:4])
     self.thread = None
     self.stop_event = None
@@ -71,7 +74,19 @@ class ModelTestWorker:
     self.state["phase"] = "model_test_running"
     self.state["progress"] = 10.0
     try:
+      if "execution_binding" in self.job_config:
+        if self.job_config.get("job_id") != self.job_id:
+          raise ValueError("Execution unavailable")
+        guard = getattr(self.owner, "_require_worker_execution", None)
+        if not callable(guard):
+          raise ValueError("Execution unavailable")
+        guard(self.job_id, self.job_config, execution_identity=self._execution_identity)
       runtime_config = resolve_model_test_runtime_config(self.owner, self.job_config)
+      if binding_from_record(runtime_config) != binding_from_record(self.job_config):
+        raise ValueError("Execution binding changed")
+      validate_effective_config(runtime_config)
+      if "execution_binding" in self.job_config:
+        guard(self.job_id, runtime_config, execution_identity=self._execution_identity)
       factory = getattr(self.owner, "model_test_provider_client_factory", None)
       runner = ModelTestRunner(
         self.owner,

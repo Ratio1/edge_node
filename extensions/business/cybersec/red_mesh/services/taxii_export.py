@@ -8,12 +8,19 @@ from urllib.parse import quote, urlsplit
 import requests
 
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
+from ..tenancy.ports import TenantStoreError
 from .auth import AuthError, build_auth_provider, credentials_missing
-from .config import get_taxii_export_config
+from .config import get_taxii_export_config, tenant_export_binding
+from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
 from .scan_guards import reject_model_test_for_scan_operation
 from .stix_export import build_stix_bundle
+
+
+_UNSET = object()
 
 
 TAXII_EXPORT_SCHEMA_VERSION = "1.0.0"
@@ -100,24 +107,37 @@ def _bundle_summary(result, artifact_cid=None):
   }
 
 
-def _prepare_taxii_export(owner, job_id, pass_nr=None):
-  cfg = get_taxii_export_config(owner)
+def _prepare_taxii_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
+  # The job is resolved before the config: which TAXII server this job publishes to is a property
+  # of the job's tenant, so the destination cannot be read until the job is known.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
+  if not isinstance(job_specs, dict):
+    record_integration_status(owner, "taxii", outcome="failure", error_class="job_not_found")
+    return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
+  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "taxii")
+  if binding_error:
+    record_integration_status(owner, "taxii", outcome="failure", error_class=binding_error,
+                              tenant_id=tenant_id)
+    return None, None, {"status": "not_configured", "error": binding_error, "job_id": job_id}
+  cfg = get_taxii_export_config(owner, tenant_id)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return None, None, {"status": "disabled", "error": "TAXII export is disabled", "job_id": job_id}
   if config_error:
-    record_integration_status(owner, "taxii", outcome="failure", error_class=config_error)
+    # Operator visibility when reached through _effect_operation. publish_to_taxii still calls this
+    # with no requester until B2, so do not read this as universally post-admission.
+    record_integration_status(owner, "taxii", outcome="failure", error_class=config_error,
+                              tenant_id=tenant_id)
     return None, None, {"status": "not_configured", "error": config_error, "job_id": job_id}
 
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not isinstance(job_specs, dict):
-    record_integration_status(owner, "taxii", outcome="failure", error_class="job_not_found")
-    return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "taxii_export")
   if unsupported:
     return None, None, unsupported
 
-  result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
+  # Never forward this module's own _UNSET: stix_export compares against its own sentinel object,
+  # so a foreign sentinel would be mistaken for a job record.
+  result = (build_stix_bundle(owner, job_id, pass_nr=pass_nr) if checked_job is _UNSET
+            else build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=checked_job))
   if result.get("status") != "ok":
     error = result.get("error") or "stix_build_failed"
     record_integration_status(owner, "taxii", outcome="failure", error_class=error)
@@ -126,13 +146,18 @@ def _prepare_taxii_export(owner, job_id, pass_nr=None):
   return cfg, job_specs, result
 
 
-def dry_run_taxii_export(owner, job_id, pass_nr=None):
+def dry_run_taxii_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=None):
   """Build and persist a TAXII-ready STIX bundle without publishing it."""
-  cfg, job_specs, result = _prepare_taxii_export(owner, job_id, pass_nr=pass_nr)
+  cfg, job_specs, result = _prepare_taxii_export(owner, job_id, pass_nr=pass_nr,
+                                                 checked_job=checked_job)
   if result.get("status") != "ok":
     return result
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
+  if ledger is not None and artifact_cid:
+    ledger.record(EffectState.PERSISTED)
   summary = {
     "schema_version": TAXII_EXPORT_SCHEMA_VERSION,
     "status": "dry_run",
@@ -145,6 +170,11 @@ def dry_run_taxii_export(owner, job_id, pass_nr=None):
     **_bundle_summary(result, artifact_cid=artifact_cid),
   }
   job_specs["taxii_export"] = summary
+  if ledger is not None:
+    # The job document is about to be mutated whether or not the bundle persisted, so
+    # revalidate here and record it: a later fault must not report "nothing happened".
+    ledger.checkpoint()
+    ledger.record(EffectState.PERSISTED)
   _write_job_record(owner, job_id, job_specs, context="taxii_dry_run")
   record_integration_status(
     owner,
@@ -157,17 +187,25 @@ def dry_run_taxii_export(owner, job_id, pass_nr=None):
   return {**summary, "status": "ok", "dry_run": True, "job_id": job_id}
 
 
-def publish_to_taxii(owner, job_id, pass_nr=None):
+def publish_to_taxii(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=None):
   """Manually publish a redacted STIX bundle to the configured TAXII 2.1 collection."""
-  cfg, job_specs, result = _prepare_taxii_export(owner, job_id, pass_nr=pass_nr)
+  cfg, job_specs, result = _prepare_taxii_export(owner, job_id, pass_nr=pass_nr,
+                                                 checked_job=checked_job)
   if result.get("status") != "ok":
     return result
 
+  if ledger is not None:
+    ledger.checkpoint()
   artifact_cid = _persist_bundle(owner, result["bundle"])
+  if ledger is not None and artifact_cid:
+    ledger.record(EffectState.PERSISTED)
   if not artifact_cid:
     record_integration_status(owner, "taxii", outcome="failure", error_class="artifact_write_failed")
     return {"status": "error", "error": "artifact_write_failed", "job_id": job_id}
 
+  if ledger is not None:
+    # Last revalidation before data leaves the deployment.
+    ledger.checkpoint()
   try:
     auth_headers = build_auth_provider(cfg).headers()
   except AuthError as exc:
@@ -212,6 +250,10 @@ def publish_to_taxii(owner, job_id, pass_nr=None):
   except ValueError:
     payload = {}
   status_id = payload.get("id") if isinstance(payload, dict) else None
+  if ledger is not None:
+    # 200/201/202 all mean the objects left the node. 202 is pending acceptance, not a failure to
+    # deliver, so it counts: a retry would duplicate them either way.
+    ledger.record(EffectState.DELIVERED)
   published_at = _utc_timestamp()
   export_meta = {
     "schema_version": TAXII_EXPORT_SCHEMA_VERSION,
@@ -266,7 +308,7 @@ def publish_to_taxii(owner, job_id, pass_nr=None):
   }
 
 
-def probe_taxii(owner):
+def probe_taxii(owner, tenant_id=None):
   """Read-only connectivity probe for the TAXII Test button.
 
   GETs the configured SERVER_URL (the api root) with the integration's
@@ -274,7 +316,7 @@ def probe_taxii(owner):
   read any objects; just validates reachability + auth + that the api
   root exists.
   """
-  cfg = get_taxii_export_config(owner)
+  cfg = get_taxii_export_config(owner, tenant_id)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return {"status": "disabled", "integration_id": "taxii", "error": "disabled"}
@@ -346,14 +388,25 @@ def probe_taxii(owner):
   }
 
 
-def get_taxii_export_status(owner, job_id):
-  job_specs = owner._get_job_from_cstore(job_id)
+def get_taxii_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "exported": False}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "taxii_export_status")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {**unsupported, "found": True, "exported": False}
   export_meta = job_specs.get("taxii_export")
+  if checked and export_meta is not None:
+    if (not isinstance(export_meta, dict)
+        or "job_id" in export_meta and export_meta["job_id"] != job_id
+        or any(field in export_meta for field in ("success", "error", "status_code", "result",
+               "detail", "exception_metadata", "execution_binding", "found", "exported"))):
+      raise TenantStoreError("Export status is unavailable")
   if not isinstance(export_meta, dict) or not export_meta:
     return {"job_id": job_id, "found": True, "exported": False}
   return {

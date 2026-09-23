@@ -1,7 +1,9 @@
 import ast
 from pathlib import Path
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import requests
 
 from extensions.business.cybersec.red_mesh.graybox.http_client import (
   GrayboxHttpClient,
@@ -10,6 +12,411 @@ from extensions.business.cybersec.red_mesh.graybox.http_client import (
   path_in_scope,
   validate_target_config_paths,
 )
+from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
+from extensions.business.cybersec.red_mesh.tenancy.execution import ExecutionBinding
+
+
+class RecordingAdapter(requests.adapters.BaseAdapter):
+  """Only the HTTP transport is fake; requests still prepares every request."""
+
+  def __init__(self, replies=()):
+    self.sent = []
+    self.replies = list(replies)
+
+  def send(self, request, **kwargs):
+    self.sent.append(request)
+    response = requests.Response()
+    response.status_code, response.headers = (
+      self.replies.pop(0) if self.replies else (200, {})
+    )
+    response.url = request.url
+    response.request = request
+    response._content = b"ok"
+    response.connection = self
+    return response
+
+  def close(self):
+    pass
+
+
+class TestBoundGrayboxHttpClient(unittest.TestCase):
+
+  def _binding(self, target=None):
+    target = target or {"kind": "webapp", "url": "https://target.example/api/public",
+                        "allowedPathPrefix": "/api/public"}
+    return ExecutionBinding({
+      "schema_version": 1, "namespace": "deployment",
+      "tenant_id": "tn_11111111-1111-4111-8111-111111111111",
+      "asset_id": "as_22222222-2222-4222-8222-222222222222",
+      "asset_target": target, "asset_target_digest": canonical_digest(target),
+      "actor_id": "actor", "actor_generation": "generation-1",
+      "node_failure_policy": "stop", "original_launcher": "node-a",
+      "participant_order": ["node-a"],
+    })
+
+  def _client(self, **kwargs):
+    return GrayboxHttpClient(
+      "https://target.example/api/public", execution_binding=self._binding(),
+      **kwargs,
+    )
+
+  def _session(self, replies=()):
+    session = requests.Session()
+    session.trust_env = False
+    adapter = RecordingAdapter(replies)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    self.addCleanup(session.close)
+    return session, adapter
+
+  def test_bound_target_restricts_a_broader_legacy_allowlist(self):
+    client = self._client(allowlist=["/"])
+    session, transport = self._session()
+
+    with self.assertRaises(GrayboxScopeError):
+      client.wrap_session(session).get("/admin")
+
+    self.assertEqual(transport.sent, [])
+
+  def test_preparation_cannot_retarget_an_in_scope_request(self):
+    client = self._client(allowlist=["/"])
+    session, transport = self._session()
+
+    def retarget(request):
+      request.url = "https://target.example/admin"
+      return request
+
+    with self.assertRaises(GrayboxScopeError):
+      client.wrap_session(session).get("/api/public/users", auth=retarget)
+
+    self.assertEqual(transport.sent, [])
+
+  def test_bound_host_header_cannot_route_to_another_origin(self):
+    session, transport = self._session()
+    scoped = self._client().wrap_session(session)
+
+    with self.assertRaises(GrayboxScopeError):
+      scoped.get("/api/public/users", headers={"Host": "foreign.example"})
+
+    self.assertEqual(transport.sent, [])
+
+  def test_bound_duplicate_host_headers_deny_before_preparation_collapses_them(self):
+    headers = {"Host": "target.example", "hOsT": "target.example"}
+    for source in ("request", "session", "auth"):
+      with self.subTest(source=source):
+        session, transport = self._session()
+        scoped = self._client().wrap_session(session)
+        kwargs = {}
+        if source == "request":
+          kwargs["headers"] = headers
+        elif source == "session":
+          session.headers = headers
+        else:
+          def duplicate(request):
+            request.headers = headers
+            return request
+          kwargs["auth"] = duplicate
+        with self.assertRaises(GrayboxScopeError):
+          scoped.get("/api/public/users", **kwargs)
+        self.assertEqual(transport.sent, [])
+
+  def test_auth_cannot_hide_a_host_override_in_non_string_header_names(self):
+    session, transport = self._session()
+    scoped = self._client().wrap_session(session)
+    def retarget(request):
+      request.headers = {b"Host": "foreign.example"}
+      return request
+
+    with self.assertRaises(GrayboxScopeError):
+      scoped.get("/api/public/users", auth=retarget)
+
+    self.assertEqual(transport.sent, [])
+
+  def test_bound_host_authority_accepts_only_equivalent_case_ports_and_ip_forms(self):
+    for origin, accepted, rejected in (
+      ("https://target.example", ("target.example", "TARGET.EXAMPLE", "target.example:443"),
+       ("target.example:80", "target.example:8443", "foreign.example")),
+      ("http://target.example", ("target.example", "TARGET.EXAMPLE:80"), ("target.example:443",)),
+      ("https://target.example:8443", ("TARGET.EXAMPLE:8443",), ("target.example", "target.example:443")),
+      ("https://192.0.2.1", ("192.0.2.1", "192.0.2.1:443"), ("192.0.2.2", "192.0.2.01")),
+      ("https://[2001:db8::1]", ("[2001:db8::1]", "[2001:0DB8:0:0:0:0:0:1]:443"),
+       ("[2001:db8::2]", "2001:db8::1", "[2001:db8::1]:80")),
+    ):
+      target = {"kind": "webapp", "url": origin + "/api/public", "allowedPathPrefix": "/api/public"}
+      for host in (*accepted, *rejected):
+        with self.subTest(origin=origin, host=host):
+          session, transport = self._session()
+          scoped = GrayboxHttpClient(target["url"], execution_binding=self._binding(target)).wrap_session(session)
+          if host in accepted:
+            scoped.get("/api/public/users", headers={"hOsT": host})
+            self.assertEqual(len(transport.sent), 1)
+            self.assertEqual(transport.sent[0].headers["Host"], host)
+          else:
+            with self.assertRaises(GrayboxScopeError):
+              scoped.get("/api/public/users", headers={"hOsT": host})
+            self.assertEqual(transport.sent, [])
+
+  def test_bound_host_headers_deny_ambiguous_authorities_and_names(self):
+    for headers in (
+      {"Host": ""}, {"Host": None}, {"Host": "target.example."},
+      {"Host": "target.example:0443"}, {"Host": "target.example/other"},
+      {"Host": "target.example,foreign.example"}, {"Host": "user@target.example"},
+      {"Host": "target.example\t"}, {"Host ": "target.example"}, {b"Host": "target.example"},
+    ):
+      with self.subTest(headers=headers):
+        session, transport = self._session()
+        with self.assertRaises(GrayboxScopeError):
+          self._client().wrap_session(session).get("/api/public/users", headers=headers)
+        self.assertEqual(transport.sent, [])
+
+  def test_auth_retry_redirect_and_exhausted_cleanup_cannot_override_host(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    for effect in ("auth", "retry", "redirect", "cleanup"):
+      with self.subTest(effect=effect):
+        session, transport = self._session([(302, {"Location": "/api/public/done"})])
+        scoped = self._client(request_budget=RequestBudget(remaining=0, total=1)).wrap_session(session)
+        kwargs = {"budget_exempt": True}
+        if effect == "auth":
+          def retarget(request):
+            request.headers["Host"] = "foreign.example"
+            return request
+          kwargs["auth"] = retarget
+        elif effect == "retry":
+          def retry(response, **kwargs):
+            request = response.request.copy()
+            request.headers["Host"] = "foreign.example"
+            return response.connection.send(request, **kwargs)
+          kwargs["hooks"] = {"response": retry}
+        elif effect == "redirect":
+          def retarget_next(response, **kwargs):
+            session.headers["Host"] = "foreign.example"
+            return response
+          kwargs.update(hooks={"response": retarget_next}, allow_redirects=True)
+        else:
+          kwargs["headers"] = {"Host": "foreign.example"}
+        with self.assertRaises(GrayboxScopeError):
+          scoped.post("/api/public/revert", **kwargs)
+        self.assertEqual(len(transport.sent), 1 if effect in ("retry", "redirect") else 0)
+
+  def test_real_auth_lifecycle_cannot_inject_a_foreign_gateway_host(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth import AuthManager
+    from extensions.business.cybersec.red_mesh.graybox.models import GrayboxTargetConfig
+    config = GrayboxTargetConfig.from_dict({
+      "login_path": "/api/public/login", "logout_path": "/api/public/logout",
+      "api_security": {"gateway_auth": {"auth_type": "api_key", "api_key_header_name": "Host"}},
+    })
+    client = self._client(target_config=config, gateway_api_key="foreign.example")
+    auth = AuthManager("https://target.example/api/public", config, http_client=client)
+    transport = RecordingAdapter()
+    with patch.object(requests.adapters.HTTPAdapter, "send", side_effect=transport.send):
+      self.assertIsNotNone(auth.preflight_check())
+      self.assertIsNone(auth.try_credentials("fixture-user", "fixture-password"))
+      auth.official_session = auth.make_anonymous_session()
+      auth.cleanup()
+    self.assertEqual(transport.sent, [])
+
+  def test_redirect_rechecks_duplicate_host_inputs_after_response_hooks(self):
+    session, transport = self._session([(302, {"Location": "/api/public/done"})])
+    def duplicate_next(response, **kwargs):
+      session.headers = {"Host": "target.example", "host": "target.example"}
+      return response
+    with self.assertRaises(GrayboxScopeError):
+      self._client().wrap_session(session).get("/api/public/start", allow_redirects=True,
+        hooks={"response": duplicate_next})
+    self.assertEqual(len(transport.sent), 1)
+
+  def test_unbound_host_override_keeps_legacy_behavior(self):
+    session, transport = self._session()
+    GrayboxHttpClient("https://target.example").wrap_session(session).get(
+      "/api/public/users", headers={"Host": "foreign.example"},
+    )
+    self.assertEqual(transport.sent[0].headers["Host"], "foreign.example")
+
+  def test_bound_session_cannot_send_an_unchecked_prepared_request(self):
+    session, transport = self._session()
+    scoped = self._client(allowlist=["/"]).wrap_session(session)
+    prepared = requests.Request("GET", "https://foreign.example/admin").prepare()
+
+    with self.assertRaises(GrayboxScopeError):
+      scoped.send(prepared, allow_redirects=True)
+
+    self.assertEqual(transport.sent, [])
+
+  def test_entering_a_bound_session_cannot_return_the_raw_session(self):
+    session, transport = self._session()
+    scoped = self._client(allowlist=["/"]).wrap_session(session)
+    entered = scoped.__enter__()
+    with self.assertRaises(GrayboxScopeError):
+      entered.get("https://foreign.example/admin")
+    self.assertEqual(transport.sent, [])
+
+  def test_wrapping_a_legacy_session_cannot_drop_the_binding(self):
+    session, transport = self._session()
+    legacy = GrayboxHttpClient("https://target.example", allowlist=["/"])
+    scoped = self._client(allowlist=["/"]).wrap_session(legacy.wrap_session(session))
+
+    with self.assertRaises(GrayboxScopeError):
+      scoped.get("/admin")
+    self.assertEqual(transport.sent, [])
+
+    scoped.get("/api/public/users")
+    self.assertEqual([request.url for request in transport.sent],
+                     ["https://target.example/api/public/users"])
+
+  def test_bound_session_does_not_expose_raw_transport_effects(self):
+    prepared = requests.Request("GET", "https://foreign.example/admin").prepare()
+    response = requests.Response()
+    response.status_code = 302
+    response.url = "https://target.example/api/public/start"
+    response.headers = {"Location": "https://foreign.example/admin"}
+    response._content = b""
+    for effect in (
+      lambda scoped: scoped.get_adapter(prepared.url).send(prepared),
+      lambda scoped: scoped.adapters["https://"].send(prepared),
+      lambda scoped: list(scoped.resolve_redirects(response, prepared)),
+    ):
+      with self.subTest(effect=effect):
+        session, transport = self._session()
+        scoped = self._client().wrap_session(session)
+        with self.assertRaises(GrayboxScopeError):
+          effect(scoped)
+        self.assertEqual(transport.sent, [])
+
+  def test_relative_redirect_uses_the_preceding_request_url(self):
+    session, transport = self._session([
+      (302, {"Location": "next"}),
+      (302, {"Location": "../done"}),
+      (200, {}),
+    ])
+    self._client(allowlist=["/"]).wrap_session(session).get(
+      "/api/public/flow/start", allow_redirects=True,
+    )
+    self.assertEqual([request.url for request in transport.sent], [
+      "https://target.example/api/public/flow/start",
+      "https://target.example/api/public/flow/next",
+      "https://target.example/api/public/done",
+    ])
+
+  def test_worker_passes_the_saved_binding_to_its_real_http_client(self):
+    from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
+    from extensions.business.cybersec.red_mesh.models import JobConfig
+    config = JobConfig.from_dict({
+      "target": "target.example", "target_url": "https://target.example/api/public",
+      "start_port": 443, "end_port": 443, "scan_type": "webapp",
+      "target_allowlist": ["/"], "execution_binding": self._binding().to_dict(),
+    })
+    worker = GrayboxLocalWorker(MagicMock(), "bound-job", config.target_url, config)
+    session, transport = self._session()
+
+    with self.assertRaises(GrayboxScopeError):
+      worker.http_client.wrap_session(session).get("/admin", budget_exempt=True)
+
+    self.assertEqual(transport.sent, [])
+
+  def test_mutable_options_and_binding_projections_cannot_widen_scope(self):
+    from extensions.business.cybersec.red_mesh.graybox.models import GrayboxTargetConfig
+    binding = self._binding().to_dict()
+    allowlist = ["/"]
+    target_config = GrayboxTargetConfig.from_dict({"discovery": {"scope_prefix": "/"}})
+    client = GrayboxHttpClient(
+      "https://target.example/api/public", execution_binding=binding,
+      allowlist=allowlist, target_config=target_config,
+    )
+    binding["asset_target"]["allowedPathPrefix"] = "/"
+    binding["asset_target"]["url"] = "https://foreign.example/"
+    allowlist.append("https://foreign.example/")
+    client.scopes[:] = ["/"]
+    client.target_url = "https://foreign.example"
+    session, transport = self._session()
+    with self.assertRaises(GrayboxScopeError):
+      client.wrap_session(session).get("/api/public/users")
+    self.assertEqual(transport.sent, [])
+
+  def test_bound_and_legacy_path_scopes_are_both_required(self):
+    session, transport = self._session()
+    scoped = self._client(allowlist=["/api/public/read"]).wrap_session(session)
+    with self.assertRaises(GrayboxScopeError):
+      scoped.get("/api/public/write")
+    scoped.get("/api/public/read/42?name=alice%20smith")
+    self.assertEqual([request.url for request in transport.sent],
+                     ["https://target.example/api/public/read/42?name=alice%20smith"])
+
+  def test_bound_request_and_cleanup_deny_ambiguous_or_foreign_targets(self):
+    for path in (
+      "/api/publicity", "/api/private", "../private", "/api/public/%2e%2e/private",
+      "/api/public/%25252e%25252e/private", "/api/public/%5c../private",
+      "https://foreign.example/api/public", "http://target.example/api/public",
+      "https://target.example:8443/api/public", "//foreign.example/api/public",
+    ):
+      for cleanup in (False, True):
+        with self.subTest(path=path, cleanup=cleanup):
+          session, transport = self._session()
+          scoped = self._client(allowlist=["/"]).wrap_session(session)
+          with self.assertRaises(GrayboxScopeError):
+            scoped.post(path, budget_exempt=cleanup)
+          self.assertEqual(transport.sent, [])
+
+  def test_redirects_cannot_leave_binding_even_for_exhausted_cleanup(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    for location in ("/admin/revert", "/api/publicity", "https://foreign.example/",
+                     "../private", "%2e%2e/private"):
+      with self.subTest(location=location):
+        session, transport = self._session([(302, {"Location": location})])
+        budget = RequestBudget(remaining=0, total=1)
+        scoped = self._client(allowlist=["/"], request_budget=budget).wrap_session(session)
+        with self.assertRaises(GrayboxScopeError):
+          scoped.post("/api/public/revert", allow_redirects=True, budget_exempt=True)
+        self.assertEqual([request.url for request in transport.sent],
+                         ["https://target.example/api/public/revert"])
+        self.assertEqual(budget.remaining, 0)
+
+  def test_bound_cleanup_can_finish_in_scope_after_budget_exhaustion(self):
+    from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
+    session, transport = self._session([(302, {"Location": "done"}), (200, {})])
+    scoped = self._client(request_budget=RequestBudget(remaining=0, total=1)).wrap_session(session)
+    response = scoped.post("/api/public/revert", allow_redirects=True, budget_exempt=True)
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual([request.url for request in transport.sent],
+                     ["https://target.example/api/public/revert", "https://target.example/api/public/done"])
+
+  def test_prepared_url_and_auth_retry_use_the_same_bound_target(self):
+    for url in ("https://foreign.example/api/public", "https://target.example/api/publicity",
+                "https://target.example/api/public/%252e%252e/private"):
+      with self.subTest(url=url):
+        session, transport = self._session()
+        scoped = self._client(allowlist=["/"]).wrap_session(session)
+        def retarget(request):
+          request.url = url
+          return request
+        with self.assertRaises(GrayboxScopeError):
+          scoped.get("/api/public/start", auth=retarget)
+        self.assertEqual(transport.sent, [])
+
+        def retry(response, **kwargs):
+          request = response.request.copy()
+          request.url = url
+          return response.connection.send(request, **kwargs)
+        with self.assertRaises(GrayboxScopeError):
+          scoped.get("/api/public/start", hooks={"response": retry})
+        self.assertEqual([request.url for request in transport.sent],
+                         ["https://target.example/api/public/start"])
+
+  def test_real_login_preflight_and_logout_deny_out_of_scope_effects(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth import AuthManager
+    from extensions.business.cybersec.red_mesh.graybox.models import GrayboxTargetConfig
+    for origin in ("https://target.example", "https://foreign.example"):
+      with self.subTest(origin=origin):
+        config = GrayboxTargetConfig.from_dict({
+          "login_path": "/admin/login", "logout_path": "/admin/logout",
+        })
+        auth = AuthManager(origin, config, http_client=self._client(allowlist=["/"]))
+        transport = RecordingAdapter()
+        with patch.object(requests.adapters.HTTPAdapter, "send", side_effect=transport.send):
+          self.assertIsNotNone(auth.preflight_check())
+          self.assertIsNone(auth.try_credentials("fixture-user", "fixture-password"))
+          auth.official_session = auth.make_anonymous_session()
+          auth.cleanup()
+        self.assertEqual(transport.sent, [])
 
 
 class TestGrayboxHttpClient(unittest.TestCase):
@@ -19,6 +426,13 @@ class TestGrayboxHttpClient(unittest.TestCase):
     resp = response or MagicMock(status_code=200, headers={})
     session.request.return_value = resp
     return session
+
+  def test_legacy_rewrapping_preserves_the_existing_session_scope(self):
+    session = self._session()
+    original = GrayboxHttpClient("https://original.example", allowlist=["/api/"])
+    another = GrayboxHttpClient("https://another.example")
+    another.wrap_session(original.wrap_session(session)).get("/api/users")
+    self.assertEqual(session.request.call_args.args[1], "https://original.example/api/users")
 
   def test_path_prefix_matching_is_segment_aware(self):
     self.assertTrue(path_in_scope("/api/public/users", "/api/public/"))

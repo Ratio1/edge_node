@@ -3,13 +3,20 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 import threading
 import time as _time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from ..constants import JOB_STATUS_FINALIZED
+from ..constants import (
+  JOB_STATUS_FAILED,
+  JOB_STATUS_FINALIZED,
+  JOB_STATUS_STOPPED,
+  RUN_MODE_CONTINUOUS_MONITORING,
+)
+from ..credential_redaction import redact_credential_text
 from ..models import (
   RULEBOOK_ASSESSMENT_SCHEMA,
   RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
@@ -25,6 +32,10 @@ from ..models import (
   VALID_RULEBOOK_REVIEW_STATES,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from ..tenancy.effects import EffectState
+from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode, TenantJobArtifacts
+from ..tenancy.administration import AdministrationDenied
+from ..tenancy.ports import TenantStoreError
 from .event_redaction import stable_hmac_pseudonym, strip_sensitive_fields
 from .scan_guards import reject_model_test_for_scan_operation
 
@@ -34,6 +45,7 @@ RULEBOOK_PROFILE_VERSION = "1.0.0"
 
 _SUBMISSION_LOCKS = {}
 _SUBMISSION_LOCKS_GUARD = threading.Lock()
+_UNSET = object()
 
 _IPV4_RE = re.compile(
   r"(?<![\w.])"
@@ -265,6 +277,11 @@ def _safe_text(value, *, hmac_secret, redaction_values=None, max_len=1000):
     text = str(value)
   else:
     text = str(value)
+  # Shared credential-pair rule first. The patterns below match keyword-prefixed
+  # assignments, PEM keys and bearer tokens; none of them matches a bare
+  # `user:secret` pair in a finding title, which is how the delivered §3.7.3
+  # printed two default-credential pairs in cleartext (RM-064, 2026-09-03).
+  text = redact_credential_text(text)
   for raw in sorted(set(redaction_values or []), key=len, reverse=True):
     if raw:
       text = text.replace(raw, stable_hmac_pseudonym(raw, hmac_secret, prefix="target"))
@@ -336,8 +353,10 @@ def list_rulebook_profiles():
   ]
 
 
-def _resolve_scan_context(owner, job_id, pass_nr=None):
-  job_specs = owner._get_job_from_cstore(job_id)
+def _resolve_scan_context(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
+  # Checked snapshot when the caller was admitted (RM-026 I1b B5): this resolver is the seam
+  # B4 budgeted and did not reach.
+  job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     return None, _error("job_not_found", job_id)
 
@@ -770,11 +789,12 @@ def build_rulebook_assessment(
   include_review=True,
   artifact_kind="generated_assessment",
   submission=None,
+  checked_job=_UNSET,
 ):
   profile = _profile(profile_id)
   if not profile:
     return _error("invalid_profile", job_id, profile_id=profile_id)
-  ctx, err = _resolve_scan_context(owner, job_id, pass_nr=pass_nr)
+  ctx, err = _resolve_scan_context(owner, job_id, pass_nr=pass_nr, checked_job=checked_job)
   if err:
     return err
 
@@ -847,13 +867,15 @@ def build_rulebook_assessment(
   }
 
 
-def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None, persist=True, force=True):
+def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None,
+                                 persist=True, force=True, *, checked_job=_UNSET, ledger=None):
   result = build_rulebook_assessment(
     owner,
     job_id,
     profile_id=profile_id,
     pass_nr=pass_nr,
     include_review=not persist,
+    checked_job=checked_job,
   )
   if result.get("status") != "ok":
     profile = _profile(profile_id)
@@ -880,7 +902,12 @@ def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROF
         "cached": True,
       }
 
+    if ledger is not None:
+      # Last revalidation before a content-addressed artifact lands.
+      ledger.checkpoint()
     artifact_cid = _artifact_repo(owner).put_json(result["assessment"], show_logs=False)
+    if ledger is not None and artifact_cid:
+      ledger.record(EffectState.PERSISTED)
     if not artifact_cid:
       failed = _error("artifact_write_failed", job_id, profile_id=profile_id)
       _write_assessment_meta(
@@ -918,15 +945,213 @@ def ensure_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFIL
   )
 
 
-def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
+_READ_CONTROLS = frozenset({
+  "success", "error", "status_code", "result", "detail", "exception_metadata", "execution_binding",
+  "status", "profile", "review", "audit", "found", "generated", "submission_contract_version", "submission_contract_unsupported",
+  "effective_review_state", "review_revision", "latest_submission", "submissions",
+  "submission_operation_state", "submission_error", "migration_submission_required",
+})
+
+
+def _read_unavailable():
+  raise TenantStoreError("Rulebook records are unavailable") from None
+
+
+def _checked_json(value, job_id, profile_id):
+  """Validate association before model coercion, including nested published error/answer data."""
+  if isinstance(value, dict):
+    if (any(key in value for key in ("execution_binding", "executionBinding", "tenant_id", "tenantId", "asset_id", "assetId"))
+        or "job_id" in value and value["job_id"] != job_id
+        or "profile_id" in value and value["profile_id"] != profile_id):
+      _read_unavailable()
+    for key, child in value.items():
+      if not isinstance(key, str):
+        _read_unavailable()
+      _checked_json(child, job_id, profile_id)
+  elif isinstance(value, list):
+    for child in value:
+      _checked_json(child, job_id, profile_id)
+  elif isinstance(value, (int, float)):
+    try:
+      if not math.isfinite(value):
+        _read_unavailable()
+    except OverflowError:
+      _read_unavailable()
+  elif value is not None and not isinstance(value, (str, int, bool)):
+    _read_unavailable()
+
+
+def _checked_record(value, job_id, profile_id, *, identities=False, allowed=()):
+  if not isinstance(value, dict) or (_READ_CONTROLS - set(allowed)).intersection(value):
+    _read_unavailable()
+  _checked_json(value, job_id, profile_id)
+  if identities and (value.get("job_id") != job_id or value.get("profile_id") != profile_id):
+    _read_unavailable()
+  return value
+
+
+def _checked_numbers(value, *, integers=(), timestamps=()):
+  for field in integers:
+    if field in value and (type(value[field]) is not int or value[field] < 0):
+      _read_unavailable()
+  for field in timestamps:
+    if field in value and (type(value[field]) not in (int, float) or not math.isfinite(value[field])):
+      _read_unavailable()
+
+
+def _checked_strings(value, fields):
+  if any(field in value and not isinstance(value[field], str) for field in fields):
+    _read_unavailable()
+
+
+def _checked_last_error(value, job_id, profile_id):
+  if value is not None:
+    _checked_record(value, job_id, profile_id, allowed=("error",))
+    _checked_strings(value, ("error", "error_class", "message", "at"))
+    _checked_numbers(value, timestamps=("at_epoch",))
+    if "retryable" in value and type(value["retryable"]) is not bool:
+      _read_unavailable()
+
+
+def _checked_answers(value, job_id, profile_id, *, published=False):
+  if value is None and not published:
+    return
+  if not isinstance(value, dict):
+    _read_unavailable()
+  for key, answer in value.items():
+    if not isinstance(key, str) or not key.strip():
+      _read_unavailable()
+    if isinstance(answer, str) and not published:
+      if answer not in VALID_RULEBOOK_ANSWER_VALUES:
+        _read_unavailable()
+      continue
+    _checked_record(answer, job_id, profile_id)
+    _checked_strings(answer, ("value", "note", "reviewer"))
+    if answer.get("value", None if published else "unknown") not in VALID_RULEBOOK_ANSWER_VALUES:
+      _read_unavailable()
+    _checked_numbers(answer, timestamps=("updated_at",))
+
+
+def _checked_review_records(owner, job_id, profile_id, *, include_audit=False):
+  repo = _job_repo(owner)
+  # Copy immediately: subsequent storage reads may mutate shared transport objects.
+  review_raw = copy.deepcopy(repo.get_rulebook_review(job_id, profile_id))
+  registry_raw = copy.deepcopy(repo.get_rulebook_submission_registry(job_id, profile_id))
+  audit = copy.deepcopy(repo.get_rulebook_review_audit_raw(job_id, profile_id)) if include_audit else None
+  if review_raw is not None:
+    _checked_record(review_raw, job_id, profile_id, identities=True, allowed=("review_revision",))
+    _checked_strings(review_raw, ("profile_version", "review_state", "reviewer", "note",
+                                  "last_reopen_idempotency_key", "last_reopen_actor"))
+    _checked_numbers(review_raw, integers=("review_revision", "last_reopen_from_revision"), timestamps=("updated_at",))
+    _checked_answers(review_raw.get("answers"), job_id, profile_id)
+  if audit is not None:
+    if not isinstance(audit, list):
+      _read_unavailable()
+    for entry in audit:
+      _checked_record(entry, job_id, profile_id, identities=True, allowed=("review_revision",))
+      _checked_strings(entry, ("profile_version", "review_state", "reviewer", "note"))
+      if entry.get("review_state") not in VALID_RULEBOOK_REVIEW_STATES:
+        _read_unavailable()
+      _checked_numbers(entry, integers=("review_revision",), timestamps=("timestamp", "updated_at"))
+      for field in ("previous_answers", "current_answers"):
+        if field in entry:
+          # Audit is published raw; review-only model defaults cannot repair these rows.
+          _checked_answers(entry[field], job_id, profile_id, published=True)
+      if "changed_question_ids" in entry and (not isinstance(entry["changed_question_ids"], list)
+          or any(not isinstance(item, str) for item in entry["changed_question_ids"])):
+        _read_unavailable()
+  unsupported = False
+  if registry_raw is not None:
+    _checked_record(registry_raw, job_id, profile_id, allowed=("submissions",))
+    _checked_numbers(registry_raw, integers=("latest_revision",))
+    references = registry_raw.get("submissions", [])
+    if not isinstance(references, list):
+      _read_unavailable()
+    for reference in references:
+      _checked_record(reference, job_id, profile_id, allowed=("review_revision",))
+      _checked_strings(reference, ("cid", "artifact_cid", "actor", "profile_version", "schema_version",
+                                   "idempotency_key", "fingerprint"))
+      if reference.get("profile_id") != profile_id:
+        _read_unavailable()
+      _checked_numbers(reference, integers=("revision", "pass_nr", "review_revision"), timestamps=("submitted_at",))
+      if "legacy" in reference and type(reference["legacy"]) is not bool:
+        _read_unavailable()
+    pending = registry_raw.get("pending")
+    if pending is not None:
+      _checked_record(pending, job_id, profile_id)
+      _checked_strings(pending, ("expected_profile_version", "actor", "idempotency_key", "fingerprint", "state", "cid"))
+      _checked_numbers(pending, integers=("target_revision", "expected_review_revision", "expected_pass_nr", "attempt_count"),
+                       timestamps=("created_at", "updated_at"))
+      _checked_last_error(pending.get("last_error"), job_id, profile_id)
+    version = registry_raw.get("contract_version", RULEBOOK_SUBMISSION_CONTRACT_VERSION)
+    if not isinstance(version, str) or not version:
+      _read_unavailable()
+    unsupported = version != RULEBOOK_SUBMISSION_CONTRACT_VERSION
+  try:
+    review = RulebookReviewState.from_dict(review_raw) if review_raw is not None else None
+    # Validate current known child shapes even when the explicit registry version is unsupported.
+    registry = (RulebookSubmissionRegistry.from_dict({**registry_raw, "contract_version": RULEBOOK_SUBMISSION_CONTRACT_VERSION})
+                if registry_raw is not None else _empty_submission_registry())
+    registry.to_dict()
+  except (ValueError, TypeError, KeyError, OverflowError):
+    _read_unavailable()
+  return review, registry, audit if audit is not None else [], unsupported
+
+
+def _checked_metadata_row(meta, job_id, profile_id):
+  _checked_record(meta, job_id, profile_id)
+  _checked_strings(meta, ("profile_version", "schema", "schema_version", "artifact_kind", "artifact_cid",
+                          "last_generated_at", "run_state", "review_state"))
+  _checked_numbers(meta, integers=("latest_pass_nr", "pass_nr"))
+  if any(field in meta and type(meta[field]) is not bool for field in ("auto_enabled", "stale", "cached")):
+    _read_unavailable()
+  if "run_state" in meta and meta["run_state"] not in ("pending", "running", "succeeded", "failed"):
+    _read_unavailable()
+  if "review_state" in meta and meta["review_state"] not in VALID_RULEBOOK_REVIEW_STATES:
+    _read_unavailable()
+  if "status_counts" in meta:
+    counts = meta["status_counts"]
+    if not isinstance(counts, dict):
+      _read_unavailable()
+    _checked_numbers(counts, integers=tuple(counts))
+  if "history" in meta:
+    if not isinstance(meta["history"], list):
+      _read_unavailable()
+    for entry in meta["history"]:
+      _checked_metadata_row(entry, job_id, profile_id)
+  if "last_error" in meta and meta["last_error"] is None:
+    _read_unavailable()
+  _checked_last_error(meta.get("last_error"), job_id, profile_id)
+  return meta
+
+
+def _checked_profile_metadata(job_specs, job_id, profile_id):
+  assessments = job_specs.get("rulebook_assessments")
+  if assessments is None:
+    return {}
+  if not isinstance(assessments, dict):
+    _read_unavailable()
+  meta = assessments.get(profile_id)
+  return {} if meta is None else _checked_metadata_row(meta, job_id, profile_id)
+
+
+def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, *,
+                                  checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
   profile = _profile(profile_id)
   if not profile:
+    if checked:
+      raise AdministrationDenied(400, "invalid_profile")
     return _error("invalid_profile", job_id, profile_id=profile_id)
-  job_specs = owner._get_job_from_cstore(job_id)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "generated": False, "profile_id": profile_id}
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_assessment_status")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {
       **unsupported,
       "error": "model_test_not_supported",
@@ -934,7 +1159,8 @@ def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PR
       "found": True,
       "generated": False,
     }
-  meta = (job_specs.get("rulebook_assessments") or {}).get(profile["profile_id"])
+  meta = (_checked_profile_metadata(job_specs, job_id, profile["profile_id"]) if checked
+          else (job_specs.get("rulebook_assessments") or {}).get(profile["profile_id"]))
   if not isinstance(meta, dict) or not meta:
     result = {
       "job_id": job_id,
@@ -953,6 +1179,15 @@ def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PR
       **meta,
     }
   result["submission_contract_version"] = RULEBOOK_SUBMISSION_CONTRACT_VERSION
+  if checked:
+    result["profile_id"] = profile["profile_id"]
+    review, registry, _, unsupported = _checked_review_records(owner, job_id, profile["profile_id"])
+    if unsupported:
+      result.update({"submission_contract_version": None, "submission_contract_unsupported": True})
+    else:
+      result.update(_submission_public_state(owner, job_id, job_specs, profile, review,
+                    registry=registry, checked_job=job_specs, snapshot_mode=snapshot_mode))
+    return result
   try:
     review = _job_repo(owner).get_rulebook_review_model(job_id, profile["profile_id"])
     result.update(_submission_public_state(owner, job_id, job_specs, profile, review))
@@ -962,6 +1197,68 @@ def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PR
       "submission_contract_unsupported": True,
     })
   return result
+
+
+_RULEBOOK_ARTIFACT_KINDS = ("generated_assessment", "review_submission")
+
+
+def get_rulebook_artifact(owner, job_id, cid, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, *,
+                          checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  """Read one stored rulebook artifact that the checked job itself records for this profile.
+
+  The typed read RM-026 left to I1b: `get_report` serves ordinary report edges only, so a rulebook
+  CID is authorized here, against the job's metadata row, its history and the submission registry,
+  and never through the generic report path. There is no unchecked half.
+  """
+  if checked_job is _UNSET:
+    raise TypeError("get_rulebook_artifact requires a checked job")
+  validate_snapshot_mode(snapshot_mode)
+  profile = _profile(profile_id)
+  if not profile:
+    raise AdministrationDenied(400, "invalid_profile")
+  job_specs = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+  if reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_artifact"):
+    raise AdministrationDenied(400, "unsupported_job_type")
+  if not isinstance(cid, str) or not cid.strip():
+    raise AdministrationDenied(400, "invalid_request")
+  meta = _checked_profile_metadata(job_specs, job_id, profile["profile_id"])
+  _, registry, _, _ = _checked_review_records(owner, job_id, profile["profile_id"])
+  # The legacy submission reference is the metadata artifact, so it needs no entry of its own.
+  recorded = {meta.get("artifact_cid")}
+  recorded.update(row.get("artifact_cid") for row in meta.get("history", ()))
+  recorded.update(reference["cid"] for reference in registry.to_dict()["submissions"])
+  if cid not in recorded:
+    raise AdministrationDenied(404, "not_found")
+  artifact = copy.deepcopy(_artifact_repo(owner).get_json(cid))
+  # A recorded CID that storage cannot return, or that names another job or profile, is corruption
+  # or an outage -- as for report edges -- never a success and never "absent".
+  if (not isinstance(artifact, dict) or artifact.get("artifact_kind") not in _RULEBOOK_ARTIFACT_KINDS
+      or artifact.get("job_id") != job_id or not isinstance(artifact.get("profile"), dict)
+      or artifact["profile"].get("profile_id") != profile["profile_id"]
+      or "submission" in artifact and (not isinstance(artifact["submission"], dict)
+                                       or artifact["submission"].get("profile_id") != profile["profile_id"])):
+    _read_unavailable()
+  return {"job_id": job_id, "profile_id": profile["profile_id"], "cid": cid,
+          "artifact_kind": artifact["artifact_kind"], "report": artifact}
+
+
+def reviewable_job(job_specs):
+  """Whether a job has a completed pass a human can review (NIS2 and report review alike).
+
+  A finalized job is. A continuous monitor is from its first completed pass on,
+  also while it keeps running: completed passes sit in `pass_reports` until it
+  stops, and a stopped monitor has its archive (owner decision, RM-088). A
+  single pass that is still running or was stopped mid-run is not; nor is a
+  failed job.
+  """
+  status = job_specs.get("job_status")
+  if status == JOB_STATUS_FINALIZED:
+    return True
+  if job_specs.get("run_mode") != RUN_MODE_CONTINUOUS_MONITORING or status == JOB_STATUS_FAILED:
+    return False
+  if status == JOB_STATUS_STOPPED and job_specs.get("job_cid"):
+    return True
+  return any(isinstance(entry, dict) and entry.get("pass_nr") for entry in job_specs.get("pass_reports") or [])
 
 
 def _submission_lock(owner, job_id, profile_id):
@@ -1037,15 +1334,76 @@ def _submission_reference_view(reference, *, latest_pass_nr, profile_version):
   }
 
 
-def _submission_public_state(owner, job_id, job_specs, profile, review):
+def _effective_review_state(pending, latest_reference, review):
+  """`submitted` only when a submission exists, none is in flight, and the review was not reopened."""
+  if not pending and latest_reference and review and review.review_state in {"submitted", "reviewed"}:
+    return "submitted"
+  return "draft"
+
+
+def current_rulebook_submission(owner, job_id, job_specs, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
+  """What the report review's approve gate needs to know about the NIS2 review (RM-088).
+
+  Returns `None` when NIS2 is not in play for the job: no generated assessment
+  on the record, no review row and no submission (a review can be drafted and
+  submitted without the record pointer, so all three count). Otherwise
+  `{profile_id, assessment_pass_nr, submission}`, where `submission` is
+  `{pass_nr, revision, cid}` of the latest submission while the review is
+  effectively submitted, else `None`. Reads CStore only, never an artifact.
+  An unreadable review or registry reads as not submitted: the gate stays shut.
+  """
+  profile = _profile(profile_id)
+  if not profile:
+    return None
+  meta = _profile_meta(job_specs, profile_id)
+  result = {"profile_id": profile_id, "assessment_pass_nr": _meta_pass_nr(meta), "submission": None}
   repo = _job_repo(owner)
-  registry = _submission_registry(repo, job_id, profile["profile_id"])
-  registry_payload = registry.to_dict()
-  latest_pass_nr, _ = _latest_pass_nr(owner, job_id)
+  try:
+    review = repo.get_rulebook_review_model(job_id, profile_id)
+    registry_payload = _submission_registry(repo, job_id, profile_id).to_dict()
+  except ValueError:
+    return result
   references = list(registry_payload.get("submissions") or [])
   legacy_reference = _legacy_submission_reference(job_specs, profile, review)
   if legacy_reference and not any(item.get("cid") == legacy_reference["cid"] for item in references):
     references.append(legacy_reference)
+  if not meta.get("artifact_cid") and review is None and not references:
+    return None
+  latest = max(references, key=lambda item: int(item.get("revision", 0) or 0), default=None)
+  pass_nr = int((latest or {}).get("pass_nr", 0) or 0)
+  # A submission that names no pass (a legacy `reviewed` row whose record lost
+  # its pass number) cannot vouch for any pass: it reads as not submitted.
+  if pass_nr > 0 and _effective_review_state(registry_payload.get("pending"), latest, review) == "submitted":
+    result["submission"] = {
+      "pass_nr": pass_nr,
+      "revision": int(latest.get("revision", 0) or 0),
+      "cid": str(latest.get("cid") or ""),
+    }
+  return result
+
+
+def _submission_public_state(owner, job_id, job_specs, profile, review, *, registry=_UNSET,
+                             checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  repo = _job_repo(owner)
+  if registry is _UNSET:
+    registry = _submission_registry(repo, job_id, profile["profile_id"])
+  registry_payload = registry.to_dict()
+  references = list(registry_payload.get("submissions") or [])
+  legacy_reference = _legacy_submission_reference(job_specs, profile, review)
+  if legacy_reference and not any(item.get("cid") == legacy_reference["cid"] for item in references):
+    references.append(legacy_reference)
+  if checked_job is _UNSET:
+    latest_pass_nr, _ = _latest_pass_nr(owner, job_id)
+  else:
+    latest_pass_nr = None
+    if references:
+      try:
+        latest = TenantJobArtifacts(checked_job, _artifact_repo(owner).get_json,
+                                   snapshot_mode=snapshot_mode).analysis_pass()
+        latest_pass_nr = latest["pass"]["pass_nr"]
+      except AdministrationDenied as error:
+        if error.status_code != 404:
+          raise
   views = [
     _submission_reference_view(
       reference,
@@ -1057,9 +1415,7 @@ def _submission_public_state(owner, job_id, job_specs, profile, review):
   pending = registry_payload.get("pending")
   latest = views[0] if views else None
   migration_required = bool(review and review.review_state == "reviewed" and legacy_reference is None)
-  effective_state = "draft"
-  if not pending and latest and review and review.review_state in {"submitted", "reviewed"}:
-    effective_state = "submitted"
+  effective_state = _effective_review_state(pending, latest, review)
   operation_state = None
   if pending:
     operation_state = "failed" if pending.get("last_error") else "submitting"
@@ -1096,21 +1452,31 @@ def _unsupported_submission_registry_error(job_id, profile_id):
   )
 
 
-def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
+def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, *,
+                        checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
   profile = _profile(profile_id)
   if not profile:
+    if checked:
+      raise AdministrationDenied(400, "invalid_profile")
     return _error("invalid_profile", job_id, profile_id=profile_id)
-  job_specs = owner._get_job_from_cstore(job_id)
+  job_specs = (checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+               if checked else owner._get_job_from_cstore(job_id))
   if not isinstance(job_specs, dict):
     return _error("job_not_found", job_id, profile_id=profile_id)
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
   if unsupported:
+    if checked:
+      raise AdministrationDenied(400, "unsupported_job_type")
     return {
       **unsupported,
       "error": "model_test_not_supported",
       "error_class": unsupported.get("error_class") or unsupported.get("error"),
     }
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+  if not reviewable_job(job_specs):
+    if checked:
+      raise AdministrationDenied(409, "job_not_finalized")
     return _error(
       "job_not_finalized",
       job_id,
@@ -1119,10 +1485,22 @@ def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
     )
   hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
   repo = _job_repo(owner)
-  review = repo.get_rulebook_review_model(job_id, profile["profile_id"])
+  if checked:
+    _checked_profile_metadata(job_specs, job_id, profile["profile_id"])
+    review, registry, audit, unsupported = _checked_review_records(owner, job_id, profile["profile_id"], include_audit=True)
+    if unsupported:
+      raise AdministrationDenied(503, "submission_contract_unsupported")
+  else:
+    review = repo.get_rulebook_review_model(job_id, profile["profile_id"])
+    registry = _UNSET
   try:
-    submission_state = _submission_public_state(owner, job_id, job_specs, profile, review)
+    submission_state = _submission_public_state(owner, job_id, job_specs, profile, review,
+                                               registry=registry,
+                                               checked_job=job_specs if checked else _UNSET,
+                                               snapshot_mode=snapshot_mode)
   except ValueError:
+    if checked:
+      _read_unavailable()
     return _submission_error(
       "submission_contract_unsupported",
       job_id,
@@ -1150,7 +1528,7 @@ def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
     },
     "found": review is not None,
     "review": _review_view(review, hmac_secret=hmac_secret),
-    "audit": repo.get_rulebook_review_audit(job_id, profile["profile_id"]),
+    "audit": audit if checked else repo.get_rulebook_review_audit(job_id, profile["profile_id"]),
     **submission_state,
   }
 
@@ -1233,10 +1611,17 @@ def _put_review_with_audit(
   state,
   changed_question_ids,
   event_type,
+  ledger=None,
 ):
   previous_answers = (previous.to_dict().get("answers") if previous else {}) or {}
   current_answers = (state.to_dict().get("answers") if state else {}) or {}
+  if ledger is not None:
+    # Revalidate immediately before the review state changes, then record it: this put and the
+    # audit append below are not atomic, so a failure between them must never report "no trace".
+    ledger.checkpoint()
   review_payload = repo.put_rulebook_review(state)
+  if ledger is not None:
+    ledger.record(EffectState.PERSISTED)
   audit_payload = repo.append_rulebook_review_audit(RulebookReviewAuditEntry(
     job_id=job_id,
     profile_id=profile["profile_id"],
@@ -1268,6 +1653,8 @@ def save_rulebook_review_draft(
   answers=None,
   actor="",
   note="",
+  checked_job=_UNSET,
+  ledger=None,
   expected_review_revision=None,
 ):
   profile = _profile(profile_id)
@@ -1283,13 +1670,15 @@ def save_rulebook_review_draft(
   try:
     validated_answers = _validate_review_answers(profile, answers)
   except ValueError as exc:
-    return _error("invalid_review_answer", job_id, profile_id=profile["profile_id"], message=str(exc))
+    return _error("invalid_review_answer", job_id, profile_id=profile["profile_id"])
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -1357,6 +1746,7 @@ def save_rulebook_review_draft(
         state=state,
         changed_question_ids=changed,
         event_type="rulebook_review_draft_saved",
+        ledger=ledger,
       )
     except Exception:
       return _submission_error(
@@ -1472,6 +1862,8 @@ def submit_rulebook_review(
   expected_profile_version=None,
   idempotency_key="",
   actor="",
+  checked_job=_UNSET,
+  ledger=None,
 ):
   profile = _profile(profile_id)
   if not profile:
@@ -1519,10 +1911,12 @@ def submit_rulebook_review(
     )
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -1792,6 +2186,7 @@ def submit_rulebook_review(
           state=submitted_state,
           changed_question_ids=[],
           event_type="rulebook_review_submitted",
+          ledger=ledger,
         )
       committed_registry = RulebookSubmissionRegistry(
         contract_version=RULEBOOK_SUBMISSION_CONTRACT_VERSION,
@@ -1836,6 +2231,8 @@ def reopen_rulebook_review(
   expected_review_revision=None,
   idempotency_key="",
   actor="",
+  checked_job=_UNSET,
+  ledger=None,
 ):
   profile = _profile(profile_id)
   if not profile:
@@ -1861,10 +2258,12 @@ def reopen_rulebook_review(
     return _submission_error("invalid_review_actor", job_id, profile["profile_id"], "A server-derived actor is required.")
 
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile["profile_id"])
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
     if unsupported:
@@ -1948,6 +2347,7 @@ def reopen_rulebook_review(
         state=reopened,
         changed_question_ids=[],
         event_type="rulebook_review_reopened",
+        ledger=ledger,
       )
     except Exception:
       return _submission_error(
@@ -1971,6 +2371,7 @@ def _update_rulebook_review_locked(
   reviewer,
   note,
   review_state,
+  ledger=None,
 ):
   repo = _job_repo(owner)
   previous = repo.get_rulebook_review_model(job_id, profile["profile_id"])
@@ -2025,7 +2426,14 @@ def _update_rulebook_review_locked(
     updated_at=now,
     review_revision=(previous.review_revision if previous else 0) + 1,
   )
+  if ledger is not None:
+    # Twin of _put_review_with_audit's seam. The plan named this as the single most likely place
+    # for the control to land in one helper and be missed in the other -- and the first attempt
+    # missed it at both.
+    ledger.checkpoint()
   review_payload = repo.put_rulebook_review(state)
+  if ledger is not None:
+    ledger.record(EffectState.PERSISTED)
   audit_payload = repo.append_rulebook_review_audit(RulebookReviewAuditEntry(
     job_id=job_id,
     profile_id=profile["profile_id"],
@@ -2064,6 +2472,8 @@ def update_rulebook_review(
   reviewer="",
   note="",
   review_state="draft",
+  checked_job=_UNSET,
+  ledger=None,
 ):
   profile = _profile(profile_id)
   if not profile:
@@ -2073,9 +2483,11 @@ def update_rulebook_review(
   try:
     validated_answers = _validate_review_answers(profile, answers)
   except ValueError as exc:
-    return _error("invalid_review_answer", job_id, profile_id=profile_id, message=str(exc))
+    return _error("invalid_review_answer", job_id, profile_id=profile_id)
   with _submission_lock(owner, job_id, profile["profile_id"]):
-    job_specs = owner._get_job_from_cstore(job_id)
+    # Checked snapshot replaces the unscoped lookup (RM-026 I1b): this read is the entry
+    # point to a review-state write and an append-only audit row.
+    job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
     if not isinstance(job_specs, dict):
       return _error("job_not_found", job_id, profile_id=profile_id)
     unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
@@ -2085,7 +2497,7 @@ def update_rulebook_review(
         "error": "model_test_not_supported",
         "error_class": unsupported.get("error_class") or unsupported.get("error"),
       }
-    if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    if not reviewable_job(job_specs):
       return _error(
         "job_not_finalized",
         job_id,
@@ -2101,4 +2513,5 @@ def update_rulebook_review(
       reviewer,
       note,
       review_state,
+      ledger=ledger,
     )
