@@ -11,14 +11,25 @@ from math import isfinite
 
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
+
+from extensions.business.dauth.dauth_mixin import (
+  DAUTH_SECRET_REVEAL_ACTION,
+  DAUTH_VIEW_SECRETS_PERMISSION,
+)
+from extensions.business.dauth.dauth_registry import dauth_registry_write_kwargs
 from naeural_core import constants as ct
 from ratio1.bc.base import compact_canonical_sha256
+from ratio1.const.base import dAuth
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
   DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
   CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY, DEEPLOY_RUNTIME_KEYS, \
   DEEPLOY_DYNAMIC_ENV_KEYS, DEEPLOY_DYNAMIC_ENV_TYPES
+from extensions.business.deeploy.deeploy_cmdapi_integration import (
+  build_pipeline_config,
+  dispatch_pipeline_config,
+)
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
@@ -60,6 +71,26 @@ PREFERRED_NODES_MAX_COUNT = 100
 PREFERRED_NODES_MAX_PAYLOAD_BYTES = 32 * 1024
 PREFERRED_NODE_ALIAS_MAX_LENGTH = 128
 PREFERRED_NODE_DESCRIPTION_MAX_LENGTH = 512
+DEEPLOY_DAUTH_SECRET_PLACEHOLDER = dAuth.DAUTH_SECRET_PLACEHOLDER
+DEEPLOY_DAUTH_JOB_SECRETS_HKEY = "DAUTH_JOB_SECRETS"
+DEEPLOY_DAUTH_SECRET_REVEAL_MAX_AGE_SECONDS = 120
+DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES = (
+  ("CLOUDFLARE_TOKEN",),
+  ("NGROK_AUTH_TOKEN",),
+  ("EXPOSED_PORTS", "*", "token"),
+  ("EXPOSED_PORTS", "*", "tunnel", "token"),
+  ("VCS_DATA", "TOKEN"),
+  ("CR_DATA", "PASSWORD"),
+  ("ENV", "R1EN_CSTORE_AUTH_SECRET"),
+  ("ENV", "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"),
+  ("ENV", "CF_TUNNEL_TOKEN"),
+  ("ENV", "CRDB_PASSWORD"),
+  ("ENV", "CRDB_CA_CRT"),
+  ("ENV", "CRDB_NODE_CRT"),
+  ("ENV", "CRDB_NODE_KEY"),
+  ("ENV", "CRDB_CLIENT_ROOT_CRT"),
+  ("ENV", "CRDB_CLIENT_ROOT_KEY"),
+)
 SENSITIVE_LOG_KEY_PARTS = (
   "BEGINPRIVATEKEY",
   "BEGINRSAPRIVATEKEY",
@@ -809,10 +840,11 @@ class _DeeployMixin:
       deeploy_specs=dct_deeploy_specs,
       expected_service_kind=service_kind,
     )
+    secure_config_nodes = full_target_nodes or nodes
     self._prepare_managed_service_secure_config(
       service_kind,
       inputs,
-      nodes,
+      secure_config_nodes,
       cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
     )
     plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
@@ -960,6 +992,7 @@ class _DeeployMixin:
     job_app_type=None,
     dct_deeploy_specs=None,
     prepared_deploy_plan=None,
+    prepared_pipeline_configs=None,
     skip_response_key_reset=False,
     full_target_nodes=None,
   ):
@@ -990,34 +1023,93 @@ class _DeeployMixin:
         context=f"create pipeline '{app_alias}'",
       )
 
+    if prepared_pipeline_configs is None:
+      prepared_pipeline_configs = self._build_create_pipeline_configs(
+        inputs=inputs,
+        app_id=app_id,
+        app_alias=app_alias,
+        app_type=app_type,
+        owner=owner,
+        prepared_deploy_plan=prepared_deploy_plan,
+      )
+
     saved_pipeline = None
-    for addr, node_plugins in node_plugins_by_addr.items():
-      node_plugins = self.deepcopy(node_plugins)
+    for addr, pipeline_config in prepared_pipeline_configs.items():
+      pipeline_config = self.deepcopy(pipeline_config)
       msg = ''
       if self.cfg_deeploy_verbose > 1:
-        msg = f":\n {self.json_dumps(self._redact_per_node_config_for_log(node_plugins), indent=2)}"
+        msg = f":\n {self.json_dumps(self._redact_per_node_config_for_log(pipeline_config), indent=2)}"
       self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
 
       if addr is not None:
-
-        saved_pipeline = self.cmdapi_start_pipeline_by_params(
-          name=app_id,
-          app_alias=app_alias,
-          pipeline_type=app_type,
-          node_address=addr,
-          owner=owner, 
-          url=inputs.pipeline_input_uri,
-          plugins=node_plugins,
-          is_deeployed=True,
-          deeploy_specs=self.deepcopy(dct_deeploy_specs),
-          **pipeline_kwargs,
-        )
+        saved_pipeline = pipeline_config
+        dispatch_pipeline_config(self, addr, pipeline_config)
 
       # endif addr is valid
     # endfor each target node
 
     cleaned_response_keys = prepared_response_keys if enable_chainstore_response else {}
     return cleaned_response_keys, saved_pipeline
+
+  def _build_create_pipeline_configs(
+    self,
+    inputs,
+    app_id,
+    app_alias,
+    app_type,
+    owner,
+    prepared_deploy_plan,
+  ):
+    """Use Core's pure builder to create exact per-node pipeline metadata."""
+    dct_deeploy_specs = self.deepcopy(prepared_deploy_plan.get("deeploy_specs", {}))
+    pipeline_kwargs = self.deepcopy(prepared_deploy_plan.get("pipeline_kwargs", {}))
+    node_plugins_by_addr = prepared_deploy_plan.get("node_plugins_by_addr", {})
+    configs = {}
+    for addr, node_plugins in node_plugins_by_addr.items():
+      configs[addr] = build_pipeline_config(
+        self,
+        name=app_id,
+        stream_type=app_type,
+        app_alias=app_alias,
+        owner=owner,
+        url=inputs.get(DEEPLOY_KEYS.PIPELINE_INPUT_URI),
+        plugins=self.deepcopy(node_plugins),
+        is_deeployed=True,
+        deeploy_specs=self.deepcopy(dct_deeploy_specs),
+        **pipeline_kwargs,
+      )
+    return configs
+
+  def _redact_pipeline_configs_and_build_secret_bundle(
+    self,
+    job_id,
+    pipeline_configs,
+    prior_bundle,
+    prior_pipeline=None,
+    current_identity_aliases=None,
+  ):
+    """Redact exact command metadata and reconstruct its complete bundle."""
+    redacted_configs = {}
+    merged_new_secrets = None
+    for node, pipeline in pipeline_configs.items():
+      redacted, new_secrets = self._extract_and_redact_deeploy_dauth_secrets(pipeline)
+      redacted_configs[node] = redacted
+      merged_new_secrets = self._merge_deeploy_dauth_secret_fragments(
+        merged_new_secrets,
+        new_secrets,
+      )
+    if not redacted_configs:
+      raise ValueError("Cannot stage Deeploy metadata without target pipeline configs.")
+    representative = next(iter(redacted_configs.values()))
+    bundle = self._build_complete_dauth_job_secret_bundle(
+      job_id=job_id,
+      redacted_pipeline=representative,
+      new_job_secrets=merged_new_secrets,
+      prior_bundle=prior_bundle,
+      prior_pipeline=prior_pipeline,
+      current_identity_aliases=current_identity_aliases,
+    )
+    return redacted_configs, bundle
 
   def __update_pipeline_on_nodes(
     self,
@@ -1464,6 +1556,173 @@ class _DeeployMixin:
     )
     return cockroachdb_legacy_compat_contexts
 
+  def _load_csp_reconcile_secret_bundle(self, job_id, pipeline):
+    prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+    if isinstance(prior_bundle, dict):
+      return prior_bundle
+    if list(self._iter_deeploy_dauth_placeholder_paths(pipeline)):
+      raise ValueError(
+        "Cannot reconcile a redacted pipeline without its dAuth secret bundle"
+      )
+    return {"job_id": str(job_id), "job_secrets": {}}
+
+  def _validate_job_secret_reveal_access(self, inputs, auth_result):
+    """Authorize one wallet-signed reveal against the current job generation."""
+    if inputs.get("action") != DAUTH_SECRET_REVEAL_ACTION:
+      raise ValueError("Invalid job-secret reveal action.")
+
+    nonce = inputs.get(DEEPLOY_KEYS.NONCE)
+    if not isinstance(nonce, str) or not nonce:
+      raise ValueError("Job-secret reveal nonce is required.")
+    try:
+      request_time = int(nonce, 16) / 1000
+    except (TypeError, ValueError) as exc:
+      raise ValueError("Job-secret reveal nonce is invalid.") from exc
+    request_age = self.time() - request_time
+    if request_age < 0:
+      raise ValueError("Job-secret reveal nonce is from the future.")
+    if request_age > DEEPLOY_DAUTH_SECRET_REVEAL_MAX_AGE_SECONDS:
+      raise ValueError("Job-secret reveal nonce is expired.")
+
+    sender = auth_result.get(DEEPLOY_KEYS.SENDER)
+    escrow_owner = auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER)
+    escrow_details = self.bc.get_user_escrow_details(sender)
+    if not isinstance(escrow_details, dict) or not escrow_details.get("isActive"):
+      raise ValueError("Job-secret reveal sender has no active escrow.")
+    details_owner = escrow_details.get("escrowOwner")
+    if not isinstance(details_owner, str) or details_owner.lower() != str(escrow_owner).lower():
+      raise ValueError("Job-secret reveal escrow owner is invalid.")
+    is_owner = isinstance(sender, str) and sender.lower() == details_owner.lower()
+    try:
+      can_view_secrets = bool(int(escrow_details.get("permissions", 0)) & DAUTH_VIEW_SECRETS_PERMISSION)
+    except (TypeError, ValueError):
+      can_view_secrets = False
+    if not is_owner and not can_view_secrets:
+      raise ValueError("Job-secret reveal sender lacks view-secrets permission.")
+
+    job_id = str(inputs.get(DEEPLOY_KEYS.JOB_ID, "")).strip()
+    if not job_id:
+      raise ValueError("Job ID is required for job-secret reveal.")
+    current_pipeline_cid = self._get_pipeline_from_cstore(job_id)
+    if not current_pipeline_cid:
+      raise ValueError(f"No persisted pipeline found for job {job_id}.")
+
+    pipeline = self.get_pipeline_from_r1fs(
+      current_pipeline_cid,
+      timeout=30,
+      pin=False,
+      raise_on_error=False,
+      show_logs=False,
+    )
+    if not isinstance(pipeline, dict):
+      raise ValueError(f"Pipeline payload for job {job_id} could not be loaded.")
+    pipeline_owner = pipeline.get(NetMonCt.OWNER.upper())
+    if not isinstance(pipeline_owner, str) or pipeline_owner.lower() != details_owner.lower():
+      raise ValueError("Job-secret reveal sender does not own the persisted pipeline.")
+
+    job = self.bc.get_job_details(job_id=int(job_id))
+    job_owner = job.get("escrowOwner") if isinstance(job, dict) else None
+    if not isinstance(job_owner, str) or job_owner.lower() != details_owner.lower():
+      raise ValueError("Job-secret reveal sender does not own the on-chain job.")
+    return job_id, current_pipeline_cid, pipeline
+
+  def _request_dauth_job_secret_reveal(self, wallet_request, job_id, pipeline_cid):
+    """Relay an authorized wallet request and decrypt the dAuth response."""
+    network = self.bc.get_evm_network()
+    dauth_url = self.bc.get_network_data(network)[dAuth.EvmNetData.DAUTH_URL_KEY]
+    reveal_url = dauth_url.replace("/get_auth_data", "/reveal_job_secrets")
+
+    relay_body = {
+      "wallet_request": self.deepcopy(wallet_request),
+      dAuth.DAUTH_NONCE: hex(int(self.time() * 1000)),
+    }
+    self.bc.sign(relay_body)
+    response = self.requests.post(
+      reveal_url,
+      json={"body": relay_body},
+      timeout=(10, 60),
+    )
+    if response.status_code != 200:
+      raise RuntimeError(
+        f"dAuth job-secret reveal failed with HTTP status {response.status_code}."
+      )
+    try:
+      response_data = response.json()
+    except (TypeError, ValueError) as exc:
+      raise ValueError("dAuth job-secret reveal response is not valid JSON.") from exc
+    result = response_data.get("result") if isinstance(response_data, dict) else None
+    if not isinstance(result, dict):
+      raise ValueError("dAuth job-secret reveal response result must be a dictionary.")
+
+    verification = self.bc.verify(result, return_full_info=True)
+    if not getattr(verification, "valid", False):
+      raise ValueError("dAuth job-secret reveal response signature is invalid.")
+    signer = getattr(verification, "sender", None)
+    try:
+      signer_eth = self.bc.node_address_to_eth_address(signer)
+      signer_is_dauth_oracle = self.bc.is_dauth_oracle(node_address_eth=signer_eth)
+    except Exception as exc:
+      raise ValueError("dAuth job-secret reveal response signer is not authorized.") from exc
+    if not signer_is_dauth_oracle:
+      raise ValueError("dAuth job-secret reveal response signer is not authorized.")
+
+    if result.get(dAuth.DAUTH_NONCE) != relay_body[dAuth.DAUTH_NONCE]:
+      raise ValueError("dAuth job-secret reveal response nonce does not match the request.")
+    if result.get("error") not in [None, ""]:
+      raise RuntimeError("dAuth job-secret reveal was rejected.")
+    if result.get(DEEPLOY_KEYS.STATUS) != DEEPLOY_STATUS.SUCCESS:
+      raise ValueError("dAuth job-secret reveal response status is invalid.")
+    if str(result.get(DEEPLOY_KEYS.JOB_ID, "")).strip() != job_id:
+      raise ValueError("dAuth job-secret reveal response job ID does not match the request.")
+    encrypted_bundle = result.get("encrypted_secret_bundle")
+    if not isinstance(encrypted_bundle, str) or not encrypted_bundle:
+      raise ValueError("dAuth encrypted job-secret bundle is invalid.")
+    try:
+      secret_bundle = json.loads(self.bc.decrypt_str(encrypted_bundle, signer))
+    except Exception as exc:
+      raise ValueError("dAuth job-secret bundle decryption failed.") from exc
+    if not isinstance(secret_bundle, dict):
+      raise ValueError("dAuth job-secret bundle must be a dictionary.")
+    if str(secret_bundle.get(DEEPLOY_KEYS.JOB_ID, "")).strip() != job_id:
+      raise ValueError("dAuth job-secret bundle job ID does not match the request.")
+    if secret_bundle.get(DEEPLOY_KEYS.PIPELINE_CID) != pipeline_cid:
+      raise ValueError("dAuth job-secret bundle pipeline generation is stale.")
+    job_secrets = secret_bundle.get("job_secrets")
+    if not isinstance(job_secrets, dict):
+      raise ValueError("dAuth job-secret bundle payload is invalid.")
+    if self._get_pipeline_from_cstore(job_id) != pipeline_cid:
+      raise ValueError("Persisted pipeline changed while revealing job secrets.")
+    return job_secrets
+
+  def _resolve_dauth_job_secrets_for_reveal(self, pipeline, job_secrets):
+    """Resolve exact placeholder paths in a transient pipeline copy."""
+    if not isinstance(pipeline, dict):
+      raise ValueError("Persisted pipeline payload is invalid.")
+    if not isinstance(job_secrets, dict):
+      raise ValueError("dAuth job-secret bundle payload is invalid.")
+
+    resolved_pipeline = self.deepcopy(pipeline)
+    unresolved = []
+    for path in self._iter_deeploy_dauth_placeholder_paths(resolved_pipeline):
+      found, value = self._get_dauth_secret_fragment_value(job_secrets, path)
+      if (
+        not found
+        or value is None
+        or value == DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+        or isinstance(value, (dict, list))
+      ):
+        unresolved.append("/".join(str(part) for part in path))
+        continue
+      self._set_dauth_secret_fragment_value(resolved_pipeline, path, value)
+
+    if unresolved:
+      raise ValueError(
+        "dAuth job-secret bundle is missing values for: {}".format(
+          ", ".join(unresolved)
+        )
+      )
+    return resolved_pipeline
+
   # Repairs Deeploy's off-chain pipeline metadata and live node configs after
   # PoAI Manager moves a CSP escrow to a new owner on-chain.
   def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner):
@@ -1516,6 +1775,7 @@ class _DeeployMixin:
     pipeline_to_persist = migrated_pipeline
     response_keys = {}
     node_update_delivered = False
+    staging_state = None
 
     if stale_nodes:
       discovered_instances = self._discover_plugin_instances(
@@ -1565,27 +1825,96 @@ class _DeeployMixin:
           "stale_nodes": stale_nodes,
         }
 
-      self.delete_pipeline_from_nodes(
-        job_id=job_id,
-        owner=None,
-        target_nodes=target_nodes,
-        allow_missing=True,
-        discovered_instances=discovered_instances,
+      service_kind = self._resolve_deeploy_service_kind(
+        inputs=inputs,
+        deeploy_specs=deeploy_specs,
+        discovered_plugin_instances=discovered_instances,
       )
-      _, _, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
-        owner=new_owner,
+      prepared_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+        nodes=target_nodes,
+        inputs=inputs,
+        app_id=migrated_pipeline.get("NAME"),
+        job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+        dct_deeploy_specs=deeploy_specs,
+        service_kind=service_kind,
+        cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
+        full_target_nodes=deeploy_specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES),
+      )
+      skip_response_key_reset = False
+      if prepared_deploy_plan.get("enable_chainstore_response"):
+        self._reset_chainstore_response_keys(
+          prepared_deploy_plan.get("response_keys", {}),
+          context=f"CSP reconciliation pipeline '{migrated_pipeline.get('NAME')}'",
+        )
+        skip_response_key_reset = True
+      prepared_pipeline_configs = self._build_create_pipeline_configs(
         inputs=inputs,
         app_id=migrated_pipeline.get("NAME"),
         app_alias=migrated_pipeline.get("APP_ALIAS") or migrated_pipeline.get("NAME"),
         app_type=migrated_pipeline.get("TYPE", "void"),
-        update_nodes=target_nodes,
-        new_nodes=[],
-        discovered_plugin_instances=discovered_instances,
-        dct_deeploy_specs=deeploy_specs,
-        job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
-        wait_for_responses=False,
-        cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
+        owner=new_owner,
+        prepared_deploy_plan=prepared_deploy_plan,
       )
+      try:
+        prior_bundle = self._load_csp_reconcile_secret_bundle(job_id, pipeline)
+        prepared_pipeline_configs, complete_secret_bundle = (
+          self._redact_pipeline_configs_and_build_secret_bundle(
+            job_id=job_id,
+            pipeline_configs=prepared_pipeline_configs,
+            prior_bundle=prior_bundle,
+            prior_pipeline=pipeline,
+          )
+        )
+        node_plugins_by_addr = prepared_deploy_plan.get("node_plugins_by_addr", {})
+        for node, pipeline_config in prepared_pipeline_configs.items():
+          if node in node_plugins_by_addr:
+            node_plugins_by_addr[node] = self.deepcopy(
+              pipeline_config.get(self.ct.CONFIG_STREAM.K_PLUGINS, [])
+            )
+        pipeline_to_persist = next(iter(prepared_pipeline_configs.values()))
+        staging_state = self.stage_job_pipeline_and_secrets(
+          pipeline=pipeline_to_persist,
+          job_id=job_id,
+          secret_bundle=complete_secret_bundle,
+        )
+      except Exception as exc:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: f"Failed to stage reconciled pipeline metadata: {exc}",
+        }
+
+      try:
+        self.delete_pipeline_from_nodes(
+          job_id=job_id,
+          owner=None,
+          target_nodes=target_nodes,
+          allow_missing=True,
+          discovered_instances=discovered_instances,
+        )
+        _, _, response_keys, _ = self.check_and_deploy_pipelines(
+          owner=new_owner,
+          inputs=inputs,
+          app_id=migrated_pipeline.get("NAME"),
+          app_alias=migrated_pipeline.get("APP_ALIAS") or migrated_pipeline.get("NAME"),
+          app_type=migrated_pipeline.get("TYPE", "void"),
+          update_nodes=[],
+          new_nodes=target_nodes,
+          discovered_plugin_instances=[],
+          dct_deeploy_specs_create=prepared_deploy_plan.get("deeploy_specs"),
+          prepared_create_deploy_plan=prepared_deploy_plan,
+          prepared_pipeline_configs=prepared_pipeline_configs,
+          skip_create_response_key_reset=skip_response_key_reset,
+          job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+          wait_for_responses=False,
+        )
+      except Exception as exc:
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: f"Failed to replace reconciled pipeline: {exc}",
+        }
       node_update_delivered = True
 
     if isinstance(pipeline_to_persist, dict):
@@ -1597,17 +1926,26 @@ class _DeeployMixin:
       pipeline_to_persist = migrated_pipeline
 
     if pipeline_changed or node_update_delivered:
-      saved = self.persist_job_pipeline_metadata(
-        pipeline=pipeline_to_persist,
-        job_id=job_id,
-        previous_cid=pipeline_cid,
-        delete_previous=True,
-      )
-      if not saved:
+      try:
+        if staging_state is None:
+          prior_bundle = self._load_csp_reconcile_secret_bundle(job_id, pipeline)
+          staging_state = self.stage_job_pipeline_and_secrets(
+            pipeline=pipeline_to_persist,
+            job_id=job_id,
+            secret_bundle=prior_bundle,
+          )
+      except Exception as exc:
         return {
           DEEPLOY_KEYS.STATUS: "failed",
           DEEPLOY_KEYS.JOB_ID: job_id,
-          DEEPLOY_KEYS.ERROR: "Failed to persist reconciled pipeline metadata",
+          DEEPLOY_KEYS.ERROR: f"Failed to stage reconciled pipeline metadata: {exc}",
+        }
+      if not self.commit_staged_job_pipeline_and_secrets(staging_state):
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: "Failed to commit reconciled pipeline metadata",
         }
 
     if node_update_delivered:
@@ -4435,6 +4773,274 @@ class _DeeployMixin:
     redact(redacted)
     return redacted
 
+  def _matches_deeploy_dauth_secret_path(self, path):
+    path = [str(part) for part in path]
+    for suffix in DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES:
+      if len(path) < len(suffix):
+        continue
+      tail = path[-len(suffix):]
+      if all(expected == "*" or expected == actual for expected, actual in zip(suffix, tail)):
+        return True
+    return False
+
+  def _has_deeploy_dauth_secret_value(self, value):
+    if isinstance(value, (dict, list)):
+      return False
+    if value is None or value == "":
+      return False
+    return value != DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+
+  def _merge_deeploy_dauth_secret_fragments(self, target, source):
+    if source is None:
+      return target
+    if target is None:
+      return self.deepcopy(source)
+    if isinstance(target, dict) and isinstance(source, dict):
+      for key, value in source.items():
+        target[key] = self._merge_deeploy_dauth_secret_fragments(target.get(key), value)
+      return target
+    if isinstance(target, list) and isinstance(source, list):
+      while len(target) < len(source):
+        target.append(None)
+      for idx, value in enumerate(source):
+        target[idx] = self._merge_deeploy_dauth_secret_fragments(target[idx], value)
+      return target
+    return self.deepcopy(source)
+
+  def _extract_and_redact_deeploy_dauth_secrets(self, payload):
+    redacted = self.deepcopy(payload)
+
+    def walk(value, path):
+      if isinstance(value, dict):
+        secrets = {}
+        for key, item in list(value.items()):
+          item_path = path + [key]
+          if (
+            self._matches_deeploy_dauth_secret_path(item_path)
+            and self._has_deeploy_dauth_secret_value(item)
+          ):
+            secrets[key] = self.deepcopy(item)
+            value[key] = DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+            continue
+          child_secrets = walk(item, item_path)
+          if child_secrets is not None:
+            secrets[key] = child_secrets
+        return secrets or None
+      if isinstance(value, list):
+        secrets = [None] * len(value)
+        found = False
+        for idx, item in enumerate(value):
+          child_secrets = walk(item, path + [idx])
+          if child_secrets is not None:
+            secrets[idx] = child_secrets
+            found = True
+        return secrets if found else None
+      return None
+
+    return redacted, walk(redacted, [])
+
+  def _redact_deeploy_dauth_secrets_for_response(self, payload):
+    redacted, _ = self._extract_and_redact_deeploy_dauth_secrets(payload)
+    return redacted
+
+  def _extract_dauth_job_secrets_from_prepared_deploy_plan(self, prepared_deploy_plan):
+    if not isinstance(prepared_deploy_plan, dict):
+      return None
+    node_plugins_by_addr = prepared_deploy_plan.get("node_plugins_by_addr")
+    if not isinstance(node_plugins_by_addr, dict):
+      return None
+
+    merged_plugins_secrets = None
+    for node, plugins in list(node_plugins_by_addr.items()):
+      redacted_plugins, plugins_secrets = self._extract_and_redact_deeploy_dauth_secrets(plugins)
+      node_plugins_by_addr[node] = redacted_plugins
+      merged_plugins_secrets = self._merge_deeploy_dauth_secret_fragments(
+        merged_plugins_secrets,
+        plugins_secrets,
+      )
+    if merged_plugins_secrets is None:
+      return None
+    return {"PLUGINS": merged_plugins_secrets}
+
+  def _get_dauth_secret_fragment_value(self, fragment, path):
+    current = fragment
+    for part in path:
+      if isinstance(current, dict) and part in current:
+        current = current[part]
+      elif isinstance(current, list) and isinstance(part, int) and part < len(current):
+        current = current[part]
+      else:
+        return False, None
+    return True, current
+
+  def _set_dauth_secret_fragment_value(self, fragment, path, value):
+    current = fragment
+    for idx, part in enumerate(path):
+      is_last = idx == len(path) - 1
+      next_part = None if is_last else path[idx + 1]
+      if isinstance(part, int):
+        while len(current) <= part:
+          current.append(None)
+        if is_last:
+          current[part] = self.deepcopy(value)
+          continue
+        if current[part] is None:
+          current[part] = [] if isinstance(next_part, int) else {}
+        current = current[part]
+      else:
+        if is_last:
+          current[part] = self.deepcopy(value)
+          continue
+        if part not in current or current[part] is None:
+          current[part] = [] if isinstance(next_part, int) else {}
+        current = current[part]
+    return fragment
+
+  def _iter_deeploy_dauth_placeholder_paths(self, payload):
+    def walk(value, path):
+      if isinstance(value, dict):
+        for key, item in value.items():
+          item_path = path + [key]
+          if item == DEEPLOY_DAUTH_SECRET_PLACEHOLDER:
+            yield item_path
+          else:
+            yield from walk(item, item_path)
+      elif isinstance(value, list):
+        for idx, item in enumerate(value):
+          yield from walk(item, path + [idx])
+    yield from walk(payload, [])
+
+  def _build_complete_dauth_job_secret_bundle(
+    self,
+    job_id,
+    redacted_pipeline,
+    new_job_secrets,
+    prior_bundle=None,
+    prior_pipeline=None,
+    current_identity_aliases=None,
+  ):
+    """Reconstruct the complete current bundle from exact placeholder paths."""
+    prior_job_secrets = {}
+    if isinstance(prior_bundle, dict):
+      candidate = prior_bundle.get("job_secrets")
+      if isinstance(candidate, (dict, list)):
+        prior_job_secrets = candidate
+    if not isinstance(new_job_secrets, (dict, list)):
+      new_job_secrets = {}
+
+    complete = {}
+    unresolved = []
+    for path in self._iter_deeploy_dauth_placeholder_paths(redacted_pipeline):
+      found, value = self._get_dauth_secret_fragment_value(new_job_secrets, path)
+      if not found:
+        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, path)
+        if found and not self._same_dauth_secret_path_identity(
+          path,
+          redacted_pipeline,
+          prior_pipeline,
+          current_identity_aliases=current_identity_aliases,
+        ):
+          found = False
+      if (
+        not found
+        or value is None
+        or value == DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+        or isinstance(value, (dict, list))
+      ):
+        unresolved.append("/".join(str(part) for part in path))
+        continue
+      self._set_dauth_secret_fragment_value(complete, path, value)
+
+    if unresolved:
+      raise ValueError(
+        "Unresolved dAuth secret placeholder path(s): {}.".format(
+          ", ".join(unresolved)
+        )
+      )
+    return {
+      "job_id": str(job_id),
+      "job_secrets": complete,
+    }
+
+  def _dauth_secret_path_identity(self, pipeline, path):
+    """Return the plugin identity owning a secret path."""
+    if not isinstance(pipeline, dict):
+      return None
+    normalized_path = [str(part).upper() if not isinstance(part, int) else part for part in path]
+    try:
+      plugins_pos = normalized_path.index("PLUGINS")
+      plugin_idx = normalized_path[plugins_pos + 1]
+    except (ValueError, IndexError):
+      return None
+    if not isinstance(plugin_idx, int):
+      return None
+    plugins = pipeline.get("PLUGINS", pipeline.get("plugins"))
+    if not isinstance(plugins, list) or plugin_idx >= len(plugins):
+      return None
+    plugin = plugins[plugin_idx]
+    if not isinstance(plugin, dict):
+      return None
+    signature = plugin.get("SIGNATURE", plugin.get("signature"))
+    if not isinstance(signature, str) or not signature:
+      return None
+
+    instance_id = None
+    if "INSTANCES" in normalized_path[plugins_pos + 2:]:
+      instances_pos = normalized_path.index("INSTANCES", plugins_pos + 2)
+      try:
+        instance_idx = normalized_path[instances_pos + 1]
+      except IndexError:
+        return None
+      instances = plugin.get("INSTANCES", plugin.get("instances"))
+      if (
+        not isinstance(instance_idx, int)
+        or not isinstance(instances, list)
+        or instance_idx >= len(instances)
+        or not isinstance(instances[instance_idx], dict)
+      ):
+        return None
+      instance = instances[instance_idx]
+      instance_id = instance.get("INSTANCE_ID", instance.get("instance_id"))
+      if instance_id in [None, ""]:
+        return None
+    return signature.upper(), None if instance_id is None else str(instance_id)
+
+  def _same_dauth_secret_path_identity(
+    self,
+    path,
+    pipeline,
+    prior_pipeline,
+    current_identity_aliases=None,
+  ):
+    current_identity = self._dauth_secret_path_identity(pipeline, path)
+    prior_identity = self._dauth_secret_path_identity(prior_pipeline, path)
+    if isinstance(current_identity_aliases, dict):
+      current_identity = current_identity_aliases.get(
+        current_identity,
+        current_identity,
+      )
+    return current_identity is not None and current_identity == prior_identity
+
+  def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):
+    if not job_secrets:
+      return False
+    if job_id in [None, ""]:
+      raise ValueError("Cannot store dAuth secrets without job_id.")
+    job_id = str(job_id)
+    bundle = {
+      "job_id": job_id,
+      "job_secrets": self.deepcopy(job_secrets),
+    }
+    ok = self.chainstore_hset(
+      hkey=DEEPLOY_DAUTH_JOB_SECRETS_HKEY,
+      key=job_id,
+      value=bundle,
+      **dauth_registry_write_kwargs(self),
+    )
+    if not ok:
+      raise ValueError(f"Failed to store dAuth secrets for job {job_id}.")
+    return True
+
   def _iter_per_node_configs(self, plugins):
     for plugin in plugins or []:
       instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
@@ -5247,6 +5853,7 @@ class _DeeployMixin:
       dct_deeploy_specs=None, job_app_type=None,
       dct_deeploy_specs_create=None,
       prepared_create_deploy_plan=None,
+      prepared_pipeline_configs=None,
       skip_create_response_key_reset=False,
       wait_for_responses=True,
       cockroachdb_legacy_compat_contexts=None,
@@ -5316,6 +5923,7 @@ class _DeeployMixin:
         job_app_type=job_app_type,
         dct_deeploy_specs=dct_deeploy_specs_create,
         prepared_deploy_plan=prepared_create_deploy_plan,
+        prepared_pipeline_configs=prepared_pipeline_configs,
         skip_response_key_reset=skip_create_response_key_reset,
       )
       response_keys.update(new_response_keys)
@@ -5340,37 +5948,75 @@ class _DeeployMixin:
     Scale up the job workers.
     """
 
-    # todo: get pipeline from R1FS.
-    # Prepare updated app pipeline
-    base_pipeline = self.get_job_base_pipeline_from_apps(running_apps_for_job)
+    base_pipeline = self.get_job_base_pipeline_from_r1fs(
+      job_id,
+      owner=owner,
+      expected_nodes=update_nodes,
+      running_apps_for_job=running_apps_for_job,
+    )
+    generated_instance_identity_aliases = {}
     create_pipelines, update_pipelines, chainstore_response_keys = (
       self.prepare_create_update_pipelines(base_pipeline,
                                             new_nodes,
                                             update_nodes,
-                                            running_apps_for_job))
+                                            running_apps_for_job,
+                                            generated_instance_identity_aliases=(
+                                              generated_instance_identity_aliases
+                                            )))
+
+    prepared_create_configs = self._build_scale_up_create_pipeline_configs(
+      create_pipelines=create_pipelines,
+      owner=owner,
+    )
+    prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+    prepared_create_configs, complete_secret_bundle = (
+      self._redact_pipeline_configs_and_build_secret_bundle(
+        job_id=job_id,
+        pipeline_configs=prepared_create_configs,
+        prior_bundle=prior_bundle,
+        prior_pipeline=base_pipeline,
+        current_identity_aliases=generated_instance_identity_aliases,
+      )
+    )
+    for node, pipeline in update_pipelines.items():
+      redacted_plugins, _ = self._extract_and_redact_deeploy_dauth_secrets(
+        pipeline.get("plugins", [])
+      )
+      pipeline["plugins"] = redacted_plugins
+    pipeline_to_stage = next(iter(prepared_create_configs.values()))
+    staging_state = self.stage_job_pipeline_and_secrets(
+      pipeline=pipeline_to_stage,
+      job_id=job_id,
+      secret_bundle=complete_secret_bundle,
+    )
 
     self.P(f"Prepared create pipelines: {self.json_dumps(self._redact_per_node_config_for_log(create_pipelines))}")
     self.P(f"Prepared update pipelines: {self.json_dumps(self._redact_per_node_config_for_log(update_pipelines))}")
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
 
-    # RESET chainstore_response_keys here
-    self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
-    self._reset_chainstore_response_keys(
-      chainstore_response_keys,
-      context=f"scale up job {job_id}",
-    )
+    try:
+      self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
+      self._reset_chainstore_response_keys(
+        chainstore_response_keys,
+        context=f"scale up job {job_id}",
+      )
 
-    # Start pipelines on nodes.
-    self._start_create_update_pipelines(create_pipelines=create_pipelines,
-                                        update_pipelines=update_pipelines,
-                                        owner=owner)
+      self._start_create_update_pipelines(
+        create_pipelines=create_pipelines,
+        update_pipelines=update_pipelines,
+        owner=owner,
+        prepared_create_configs=prepared_create_configs,
+      )
+    except Exception:
+      self.rollback_staged_job_pipeline_and_secrets(staging_state)
+      raise
 
     if wait_for_responses:
       dct_status, str_status = self._get_pipeline_responses(chainstore_response_keys, 300)
     else:
       dct_status, str_status = {}, DEEPLOY_STATUS.PENDING
 
-    return dct_status, str_status, chainstore_response_keys
+    return dct_status, str_status, chainstore_response_keys, staging_state
 
   def _discover_plugin_instances(
     self,
@@ -5713,7 +6359,65 @@ class _DeeployMixin:
       "pipeline_params": pipeline_params,
     }
 
-  def prepare_create_update_pipelines(self, base_pipeline, new_nodes, update_nodes, running_apps_for_job):
+  def get_job_base_pipeline_from_r1fs(
+    self,
+    job_id,
+    owner=None,
+    expected_nodes=None,
+    running_apps_for_job=None,
+  ):
+    """Load scale-up source metadata from the persisted R1FS pipeline."""
+    pipeline = self.get_job_pipeline_from_cstore(job_id)
+    if not isinstance(pipeline, dict):
+      raise ValueError(f"No persisted R1FS pipeline found for job {job_id}.")
+
+    name_key = self.ct.CONFIG_STREAM.K_NAME
+    type_key = self.ct.CONFIG_STREAM.K_TYPE
+    plugins_key = self.ct.CONFIG_STREAM.K_PLUGINS
+    specs_key = self.ct.CONFIG_STREAM.DEEPLOY_SPECS
+    plugins = pipeline.get(plugins_key)
+    specs = pipeline.get(specs_key)
+    if not isinstance(plugins, list) or not isinstance(specs, dict):
+      raise ValueError(f"Persisted R1FS pipeline for job {job_id} is incomplete.")
+    persisted_job_id = specs.get(DEEPLOY_KEYS.JOB_ID)
+    if persisted_job_id in [None, ""] or str(persisted_job_id) != str(job_id):
+      raise ValueError(f"Persisted R1FS pipeline job ID does not match job {job_id}.")
+
+    persisted_owner = pipeline.get(NetMonCt.OWNER.upper())
+    if owner is not None and persisted_owner != owner:
+      raise ValueError(f"Persisted R1FS pipeline owner does not match job {job_id}.")
+
+    app_id = pipeline.get(name_key)
+    current_target_nodes = specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES, [])
+    for node in expected_nodes or []:
+      if node not in current_target_nodes:
+        raise ValueError(
+          f"Persisted R1FS pipeline does not authorize existing node {node}."
+        )
+      node_apps = (running_apps_for_job or {}).get(node)
+      if not isinstance(node_apps, dict) or app_id not in node_apps:
+        raise ValueError(
+          f"Persisted R1FS pipeline app ID does not match running node {node}."
+        )
+    pipeline_params = self._get_pipeline_params_from_deeploy_specs(specs) or {}
+    return {
+      "base_pipeline": self.deepcopy(pipeline),
+      "app_id": pipeline.get(name_key),
+      "deeploy_specs": self.deepcopy(specs),
+      "plugins": self.deepcopy(plugins),
+      "pipeline_type": pipeline.get(type_key, "void"),
+      "url": pipeline.get(self.ct.CONFIG_STREAM.K_URL),
+      "pipeline_params": self.deepcopy(pipeline_params),
+    }
+
+  def prepare_create_update_pipelines(
+    self,
+    base_pipeline,
+    new_nodes,
+    update_nodes,
+    running_apps_for_job,
+    generated_instance_identity_aliases=None,
+  ):
     """
     Prepare the create and update pipelines.
     Running Apps for job example:
@@ -5738,8 +6442,11 @@ class _DeeployMixin:
 
     raw_deeploy_specs = base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
     deeploy_specs = self.deepcopy(raw_deeploy_specs) if isinstance(raw_deeploy_specs, dict) else {}
+    persisted_nodes = deeploy_specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES, [])
+    if not isinstance(persisted_nodes, list):
+      persisted_nodes = []
     requested_nodes = []
-    for node in list(update_nodes or []) + list(new_nodes or []):
+    for node in persisted_nodes + list(update_nodes or []) + list(new_nodes or []):
       if node not in requested_nodes:
         requested_nodes.append(node)
     # Scale-up extends the configured deployment, including temporarily offline
@@ -5782,7 +6489,18 @@ class _DeeployMixin:
         for instance in plugin_instances:
           instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
           instance["PER_NODE_TARGET_NODES"] = self.deepcopy(chainstore_peers)
+          source_instance_id = instance.get(self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID)
           instance_id = self._generate_plugin_instance_id(signature=plugin_signature)
+          if (
+            isinstance(generated_instance_identity_aliases, dict)
+            and source_instance_id not in [None, ""]
+          ):
+            generated_instance_identity_aliases[
+              (str(plugin_signature).upper(), str(instance_id))
+            ] = (
+              str(plugin_signature).upper(),
+              str(source_instance_id),
+            )
           chainstore_response_key = self._generate_chainstore_response_key(
             instance_id=instance_id)
           instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
@@ -5877,10 +6595,8 @@ class _DeeployMixin:
 
     return create_pipelines, update_pipelines, prepared_response_keys
 
-  def _start_create_update_pipelines(self, create_pipelines, update_pipelines, owner):
-    """
-    Start the create and update pipelines.
-    """
+  def _build_scale_up_create_pipeline_configs(self, create_pipelines, owner):
+    configs = {}
     for node, pipeline in create_pipelines.items():
       pipeline_params = pipeline.get('pipeline_params', {})
       if not isinstance(pipeline_params, dict):
@@ -5889,17 +6605,38 @@ class _DeeployMixin:
         pipeline_params,
         reserved_keys={"app_alias", "owner", "is_deeployed", "deeploy_specs"},
       )
-      self.cmdapi_start_pipeline_by_params(
+      configs[node] = build_pipeline_config(
+        self,
         name=pipeline['app_id'],
-        pipeline_type=pipeline['pipeline_type'],
-        node_address=node,
-        owner=owner, 
+        stream_type=pipeline['pipeline_type'],
+        owner=owner,
         url=pipeline.get('url'),
         plugins=pipeline['plugins'],
         is_deeployed=True,
         deeploy_specs=pipeline['deeploy_specs'],
         **pipeline_kwargs,
-      )    
+      )
+    if not configs:
+      raise ValueError("Scale-up did not produce a new-node pipeline config.")
+    return configs
+
+  def _start_create_update_pipelines(
+    self,
+    create_pipelines,
+    update_pipelines,
+    owner,
+    prepared_create_configs=None,
+  ):
+    """
+    Start the create and update pipelines.
+    """
+    if prepared_create_configs is None:
+      prepared_create_configs = self._build_scale_up_create_pipeline_configs(
+        create_pipelines,
+        owner,
+      )
+    for node, pipeline_config in prepared_create_configs.items():
+      dispatch_pipeline_config(self, node, self.deepcopy(pipeline_config))
     for node, pipeline in update_pipelines.items():
       # For update pipelines, we need to iterate through the plugins and instances
       for plugin in pipeline['plugins']:

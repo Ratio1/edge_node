@@ -17,8 +17,12 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
     self.plugin.defaultdict = defaultdict
     self.plugin.time = lambda: 1_000.0
     self.persisted = []
+    self.staged = []
+    self.committed = []
+    self.rolled_back = []
     self.deleted = []
     self.deploy_calls = []
+    self.events = []
 
     def persist_job_pipeline_metadata(pipeline, job_id, previous_cid=None, delete_previous=False):
       self.persisted.append({
@@ -30,16 +34,46 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
       return True
 
     def delete_pipeline_from_nodes(**kwargs):
+      self.events.append("delete")
       self.deleted.append(kwargs)
       return kwargs.get("discovered_instances", [])
 
     def check_and_deploy_pipelines(**kwargs):
+      self.events.append("deploy")
       self.deploy_calls.append(kwargs)
       pipeline = copy.deepcopy(kwargs["inputs"]["_source_pipeline"])
       pipeline["OWNER"] = kwargs["owner"]
       return {}, "pending", {}, pipeline
 
     self.plugin.persist_job_pipeline_metadata = persist_job_pipeline_metadata
+    self.plugin._load_dauth_job_secret_bundle = lambda job_id: {
+      "job_id": str(job_id),
+      "job_secrets": {},
+      "pipeline_cid": "cid-10",
+    }
+
+    def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
+      self.events.append("stage")
+      state = {
+        "pipeline": copy.deepcopy(pipeline),
+        "job_id": str(job_id),
+        "secret_bundle": copy.deepcopy(secret_bundle),
+      }
+      self.staged.append(state)
+      return state
+
+    def commit_staged_job_pipeline_and_secrets(state):
+      self.committed.append(state)
+      return True
+
+    def rollback_staged_job_pipeline_and_secrets(state):
+      self.rolled_back.append(state)
+      return True
+
+    self.plugin.stage_job_pipeline_and_secrets = stage_job_pipeline_and_secrets
+    self.plugin.commit_staged_job_pipeline_and_secrets = commit_staged_job_pipeline_and_secrets
+    self.plugin.rollback_staged_job_pipeline_and_secrets = rollback_staged_job_pipeline_and_secrets
+    self.plugin._reset_chainstore_response_keys = lambda *args, **kwargs: True
     self.plugin.delete_pipeline_from_nodes = delete_pipeline_from_nodes
     self.plugin.check_and_deploy_pipelines = check_and_deploy_pipelines
 
@@ -125,8 +159,13 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
 
     self.assertEqual(result[DEEPLOY_KEYS.STATUS], "node_update_delivered")
     self.assertEqual(self.deploy_calls[0]["owner"], "0xNew")
-    self.assertEqual(self.persisted[0]["pipeline"]["OWNER"], "0xNew")
+    self.assertEqual(self.staged[0]["pipeline"]["OWNER"], "0xNew")
+    self.assertEqual(self.staged[0]["secret_bundle"]["job_id"], "10")
+    self.assertEqual(self.committed, self.staged)
+    self.assertEqual(self.persisted, [])
     self.assertEqual(self.deleted[0]["owner"], None)
+    self.assertLess(self.events.index("stage"), self.events.index("delete"))
+    self.assertLess(self.events.index("stage"), self.events.index("deploy"))
     self.assertTrue(any(call["owner"] is None for call in online_calls))
 
   def test_reconcile_is_idempotent_when_pipeline_and_live_owner_are_current(self):
@@ -146,7 +185,46 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
 
     self.assertEqual(result[DEEPLOY_KEYS.STATUS], "already_current")
     self.assertEqual(self.persisted, [])
+    self.assertEqual(self.staged, [])
     self.assertEqual(self.deploy_calls, [])
+
+  def test_reconcile_rolls_back_when_staged_metadata_cannot_commit(self):
+    self._install_pipeline(self._pipeline(owner="0xOld"))
+    self.plugin._get_online_apps = lambda **kwargs: {
+      "node1": {"app1": {"owner": "0xNew", "deeploy_specs": {"job_id": 10}}}
+    }
+    self.plugin.commit_staged_job_pipeline_and_secrets = lambda state: False
+
+    result = self.plugin._reconcile_csp_escrow_job_owner(
+      job_id=10,
+      old_owner="0xOld",
+      new_owner="0xNew",
+    )
+
+    self.assertEqual(result[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("commit", result[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(self.rolled_back, self.staged)
+
+  def test_reconcile_rejects_redacted_pipeline_without_secret_bundle(self):
+    pipeline = self._pipeline(owner="0xOld")
+    pipeline["PLUGINS"][0]["INSTANCES"][0]["ENV"] = {
+      "CF_TUNNEL_TOKEN": "__R1_DAUTH_SECRET__",
+    }
+    self._install_pipeline(pipeline)
+    self.plugin._load_dauth_job_secret_bundle = lambda job_id: None
+    self.plugin._get_online_apps = lambda **kwargs: {
+      "node1": {"app1": {"owner": "0xNew", "deeploy_specs": {"job_id": 10}}}
+    }
+
+    result = self.plugin._reconcile_csp_escrow_job_owner(
+      job_id=10,
+      old_owner="0xOld",
+      new_owner="0xNew",
+    )
+
+    self.assertEqual(result[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("without its dAuth secret bundle", result[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(self.staged, [])
 
   def test_reconcile_returns_pipeline_missing_for_active_job_without_r1fs_payload(self):
     """
@@ -180,6 +258,7 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
 
     self.assertEqual(result[DEEPLOY_KEYS.STATUS], "failed")
     self.assertEqual(self.persisted, [])
+    self.assertEqual(self.staged, [])
     self.assertEqual(self.deploy_calls, [])
 
   def test_reconcile_validates_restart_payload_before_stopping_pipeline(self):
@@ -295,6 +374,14 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
       return inputs
 
     self.plugin._build_csp_reconcile_inputs = build_inputs
+    prepare_calls = []
+    original_prepare_plan = self.plugin._prepare_create_pipeline_deploy_plan
+
+    def prepare_plan(**kwargs):
+      prepare_calls.append(kwargs)
+      return original_prepare_plan(**kwargs)
+
+    self.plugin._prepare_create_pipeline_deploy_plan = prepare_plan
 
     result = self.plugin._reconcile_csp_escrow_job_owner(
       job_id=10,
@@ -303,7 +390,7 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
     )
 
     self.assertEqual(result[DEEPLOY_KEYS.STATUS], "node_update_delivered")
-    self.assertTrue(self.deploy_calls[0]["cockroachdb_legacy_compat_contexts"])
+    self.assertTrue(prepare_calls[0]["cockroachdb_legacy_compat_contexts"])
 
 
 if __name__ == "__main__":
