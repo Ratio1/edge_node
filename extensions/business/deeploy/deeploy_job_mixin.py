@@ -467,7 +467,7 @@ class _DeeployJobMixin:
 
     return True
 
-  def _recursively_sort_pipeline_data(self, data):
+  def _recursively_sort_pipeline_data(self, data, preserve_list_order=False):
     """
     Recursively sort pipeline data including items within arrays.
     
@@ -481,13 +481,18 @@ class _DeeployJobMixin:
       # Sort dictionary by keys and recursively sort values
       sorted_dict = {}
       for key in sorted(data.keys()):
-        sorted_dict[key] = self._recursively_sort_pipeline_data(data[key])
+        sorted_dict[key] = self._recursively_sort_pipeline_data(
+          data[key],
+          preserve_list_order=preserve_list_order or key in ("SECRET_PATHS", "DYNAMIC_ENV"),
+        )
       return sorted_dict
     elif isinstance(data, list):
       # Sort list items recursively
       sorted_list = []
       for item in data:
-        sorted_list.append(self._recursively_sort_pipeline_data(item))
+        sorted_list.append(self._recursively_sort_pipeline_data(item, preserve_list_order=preserve_list_order))
+      if preserve_list_order:
+        return sorted_list
       # Sort the list items themselves if they are comparable
       try:
         sorted_list.sort()

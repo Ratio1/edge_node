@@ -11,6 +11,7 @@ from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
 
 from .deeploy_mixin import _DeeployMixin
+from .selected_secrets import compile_request_selections
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
@@ -829,6 +830,7 @@ class DeeployManagerApiPlugin(
         self.deepcopy(request),
         preserve_legacy_instance_id=not is_create,
       )
+      compile_request_selections(request, normalized_request)
       self._sync_normalized_plugins_input(inputs, normalized_request)
       submitted_job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
       if not is_create:
@@ -1199,7 +1201,7 @@ class DeeployManagerApiPlugin(
       )
       prior_bundle = self._load_dauth_job_secret_bundle(job_id)
       prior_pipeline = None
-      if isinstance(prior_bundle, dict):
+      if not is_create or isinstance(prior_bundle, dict):
         prior_pipeline = self.get_job_pipeline_from_cstore(
           job_id,
           timeout=30,
@@ -1256,7 +1258,10 @@ class DeeployManagerApiPlugin(
       )
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
-        dct_request = self._redact_deeploy_dauth_secrets_for_response(request)
+        dct_request = self._redact_deeploy_dauth_secrets_for_response(
+          request, pipeline=pipeline_to_stage,
+          normalized_plugins=inputs.get(DEEPLOY_KEYS.PLUGINS),
+        )
         dct_request.pop(DEEPLOY_KEYS.APP_PARAMS, None)
       else:
         # Build simplified request summary (no app_params - data is in plugins array now)

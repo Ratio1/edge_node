@@ -30,6 +30,17 @@ from extensions.business.deeploy.deeploy_cmdapi_integration import (
   build_pipeline_config,
   dispatch_pipeline_config,
 )
+from extensions.business.deeploy.selected_secrets import (
+  canonicalize_selected_per_node_config,
+  compile_request_selections,
+  inherit_selections,
+  iter_instances,
+  materialized_selections,
+  restore_per_node_response_shape,
+  same_dynamic_structure,
+  selected_leaf_paths,
+  selected_value_paths,
+)
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 from extensions.business.container_apps.container_utils import validate_exposed_ports_origin_tls_options
@@ -1092,6 +1103,11 @@ class _DeeployMixin:
     redacted_configs = {}
     merged_new_secrets = None
     for node, pipeline in pipeline_configs.items():
+      pipeline = self.deepcopy(pipeline)
+      inherit_selections(
+        pipeline, prior_pipeline, DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+        identity_aliases=current_identity_aliases,
+      )
       redacted, new_secrets = self._extract_and_redact_deeploy_dauth_secrets(pipeline)
       redacted_configs[node] = redacted
       merged_new_secrets = self._merge_deeploy_dauth_secret_fragments(
@@ -4757,7 +4773,11 @@ class _DeeployMixin:
     def redact(value):
       if isinstance(value, dict):
         for key, item in list(value.items()):
-          if key in PER_NODE_CONFIG_KEYS and item:
+          if isinstance(key, str) and key.upper() in ("ENV", "DYNAMIC_ENV"):
+            # Logs also receive malformed, unvalidated requests. Key heuristics
+            # cannot safely identify user-selected values such as CUSTOM_VALUE.
+            value[key] = {name: "***" for name in item} if isinstance(item, dict) else "***"
+          elif key in PER_NODE_CONFIG_KEYS and item:
             value[key] = "***"
           elif any(
             part in re.sub(r"[^A-Z0-9]", "", str(key).upper())
@@ -4809,6 +4829,7 @@ class _DeeployMixin:
 
   def _extract_and_redact_deeploy_dauth_secrets(self, payload):
     redacted = self.deepcopy(payload)
+    selected_paths = set(selected_leaf_paths(redacted))
 
     def walk(value, path):
       if isinstance(value, dict):
@@ -4816,8 +4837,11 @@ class _DeeployMixin:
         for key, item in list(value.items()):
           item_path = path + [key]
           if (
-            self._matches_deeploy_dauth_secret_path(item_path)
-            and self._has_deeploy_dauth_secret_value(item)
+            (tuple(item_path) in selected_paths and item != DEEPLOY_DAUTH_SECRET_PLACEHOLDER)
+            or (
+              self._matches_deeploy_dauth_secret_path(item_path)
+              and self._has_deeploy_dauth_secret_value(item)
+            )
           ):
             secrets[key] = self.deepcopy(item)
             value[key] = DEEPLOY_DAUTH_SECRET_PLACEHOLDER
@@ -4839,7 +4863,53 @@ class _DeeployMixin:
 
     return redacted, walk(redacted, [])
 
-  def _redact_deeploy_dauth_secrets_for_response(self, payload):
+  def _redact_deeploy_dauth_secrets_for_response(self, payload, pipeline=None, normalized_plugins=None):
+    request = self.deepcopy(payload)
+    payload = self.deepcopy(request)
+    if isinstance(payload, dict) and (
+      isinstance(payload.get("plugins"), list) or payload.get("plugin_signature")
+    ):
+      payload = self._normalize_plugins_input(payload, preserve_legacy_instance_id=True)
+      compile_request_selections(request, payload)
+      payload.pop(DEEPLOY_KEYS.APP_PARAMS, None)
+      instances = dict(iter_instances(pipeline))
+      for idx, plugin in enumerate(payload["plugins"]):
+        self._canonicalize_per_node_config_key(plugin)
+        normalized = normalized_plugins[idx] if normalized_plugins is not None else plugin
+        identity = (
+          str(normalized.get("plugin_signature", "")).upper(),
+          str(normalized.get("instance_id", normalized.get("INSTANCE_ID", ""))),
+        )
+        instance = instances.get(identity)
+        if instance is not None and "SECRET_PATHS" in instance:
+          canonicalize_selected_per_node_config(plugin, instance["SECRET_PATHS"])
+          paths = []
+          for path in instance["SECRET_PATHS"]:
+            try:
+              selected_value_paths(plugin, path)
+            except ValueError:
+              continue  # Backend-inherited variables need not exist in the request.
+            paths.append(self.deepcopy(path))
+          plugin["SECRET_PATHS"] = paths
+      redacted, _ = self._extract_and_redact_deeploy_dauth_secrets(payload)
+      # Use canonical selectors for redaction without changing the caller's
+      # response namespace (including legacy top-level per-node aliases).
+      for idx, plugin in enumerate(request.get("plugins") or []):
+        canonical = redacted["plugins"][idx]
+        for key in list(plugin):
+          canonical_key = CANONICAL_PER_NODE_CONFIG_KEY if key in PER_NODE_CONFIG_KEYS else key
+          if canonical_key in canonical:
+            plugin[key] = (
+              restore_per_node_response_shape(plugin[key], canonical[canonical_key])
+              if key in PER_NODE_CONFIG_KEYS else self.deepcopy(canonical[canonical_key])
+            )
+      for key in PER_NODE_CONFIG_KEYS:
+        if key in request and request[key] is not None:
+          request[key] = restore_per_node_response_shape(
+            request[key], redacted["plugins"][0][CANONICAL_PER_NODE_CONFIG_KEY],
+          )
+      request.pop(DEEPLOY_KEYS.APP_PARAMS, None)
+      payload = request
     redacted, _ = self._extract_and_redact_deeploy_dauth_secrets(payload)
     return redacted
 
@@ -4867,7 +4937,7 @@ class _DeeployMixin:
     for part in path:
       if isinstance(current, dict) and part in current:
         current = current[part]
-      elif isinstance(current, list) and isinstance(part, int) and part < len(current):
+      elif isinstance(current, list) and type(part) is int and 0 <= part < len(current):
         current = current[part]
       else:
         return False, None
@@ -5019,7 +5089,10 @@ class _DeeployMixin:
         current_identity,
         current_identity,
       )
-    return current_identity is not None and current_identity == prior_identity
+    return (
+      current_identity is not None and current_identity == prior_identity
+      and same_dynamic_structure(path, pipeline, prior_pipeline)
+    )
 
   def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):
     if not job_secrets:
@@ -5064,12 +5137,18 @@ class _DeeployMixin:
       for instance in instances:
         if not isinstance(instance, dict):
           continue
+        secret_paths = (
+          materialized_selections(instance, node_addr, node_index)
+          if "SECRET_PATHS" in instance else None
+        )
         raw_config = self._pop_per_node_config(instance)
         overlay = self._overlay_for_node(raw_config, node_addr, node_index)
         if overlay:
           merged = deep_merge_config(instance, overlay, copy_fn=self.deepcopy)
           instance.clear()
           instance.update(merged)
+        if secret_paths is not None:
+          instance["SECRET_PATHS"] = secret_paths
     return materialized
 
   def _validate_materialized_plugins_for_node(self, plugins, node_addr=None):
