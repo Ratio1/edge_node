@@ -460,10 +460,19 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
     actual = result["result"] if response_format == "WRAPPED" else result
     assert isinstance(actual, dict)
     if name in TENANT_JSON_EXPORT_ROUTES:
-      # A download renders even on a node with MISP export off (RM-093); the fixture's one
-      # finding has no severity, so the LOW floor exports none of it.
       assert actual["status"] == "ok" and actual["job_id"] == "job-1"
-      assert (actual["findings_exported"], actual["findings_total"]) == (0, 1)
+      if name == "export_misp_json":
+        # A download renders even on a node with MISP export off (RM-093); the fixture's one
+        # finding has no severity, so the LOW floor exports none of it.
+        assert (actual["findings_exported"], actual["findings_total"]) == (0, 1)
+      elif name == "export_stix_json":
+        # No OpenCTI/TAXII destination needed either (RM-093 phase 6): the bundle still renders.
+        assert actual["finding_count"] == 1 and actual["object_count"] >= 1
+      else:
+        # export_siem_events_json: one lifecycle event plus the fixture's one (non-coverage) finding.
+        assert actual["schema"] == "redmesh.event.v1" and actual["event_count"] == 2
+        assert [event["event_type"] for event in actual["events"]] == [
+          "redmesh.job.pass_completed", "redmesh.finding.created"]
       return
     if name == "get_report":
       assert actual["job_id"] == "job-1" and actual["cid"] == "worker"

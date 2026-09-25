@@ -108,6 +108,8 @@ _READ_FIELDS = {
   "llm_health": (("request_actor", dict, None),),
   "update_finding_triage": (("request_actor", dict, None),),
   "export_misp_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "export_stix_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "export_siem_events_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
   "get_integration_status": (("request_actor", dict, None), ("tenant_id", str, None)),
 }
 # Effect-bearing endpoints (RM-026 I1b).
@@ -479,7 +481,8 @@ def install_generated_read_api(app, model_namespace) -> None:
             if error.status_code == status and (typed or raw):
               return _read_error_response(status, code=code)
         if (request.scope.get("path") in ("/get_detection_correlation", "/get_misp_export_status",
-            "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status", "/export_misp_json")
+            "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status", "/export_misp_json",
+            "/export_stix_json", "/export_siem_events_json")
             and error.status_code == 400
             and isinstance(detail, dict)):
           typed = (detail.get("success") is False and type(detail.get("status_code")) is int

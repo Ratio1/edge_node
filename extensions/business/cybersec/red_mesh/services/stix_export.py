@@ -575,6 +575,38 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job
   }
 
 
+def export_stix_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  """
+  Return the STIX 2.1 bundle a job/pass would produce, as a pure read.
+
+  Byte-for-byte what OpenCTI push and TAXII publish send: no R1FS write, no job-record mutation,
+  no SOC event, no integration-status record, and no destination is ever contacted (RM-093 phase 6).
+  """
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  if checked:
+    job_specs = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+    if pass_nr is not None and (type(pass_nr) is not int or pass_nr < 1):
+      raise AdministrationDenied(400, "invalid_request")
+    unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
+    if unsupported:
+      raise AdministrationDenied(400, "unsupported_job_type")
+    result = build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=job_specs)
+  else:
+    result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
+  if result.get("status") != "ok":
+    return result
+  return {
+    "status": "ok",
+    "job_id": job_id,
+    "pass_nr": result["pass_nr"],
+    "bundle_id": result["bundle_id"],
+    "object_count": result["object_count"],
+    "finding_count": result["finding_count"],
+    "stix_bundle": result["bundle"],
+  }
+
+
 def get_stix_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
   checked = checked_job is not _UNSET
   validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)

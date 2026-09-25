@@ -1,6 +1,6 @@
 """RM-084 P1: every export endpoint (E1) is tenant-scoped with no unscoped half.
 
-One matrix over all fourteen endpoints, through real admission against the stored account, tenant
+One matrix over all sixteen endpoints, through real admission against the stored account, tenant
 and job: the caller's tenant is required (400), a job owned by another tenant is indistinguishable
 from a missing one (404), and a role without the operation is refused (403) before any artifact or
 destination is touched.
@@ -11,11 +11,12 @@ import pytest
 
 from .read_endpoint_fixtures import read_endpoint_fixture
 
-# (endpoint, extra kwargs). Effects and the MISP download need reports:export; the
+# (endpoint, extra kwargs). Effects and the MISP/STIX/SIEM downloads need reports:export; the
 # per-job status reads need reports:view; the job-less reads and the synthetic delivery need
 # reports:export.
 JOB_EXPORTS = (
   ("export_misp", {}), ("export_misp_json", {}), ("export_stix_bundle", {}),
+  ("export_stix_json", {}), ("export_siem_events_json", {}),
   ("dry_run_opencti_export", {}), ("push_to_opencti", {}),
   ("dry_run_taxii_export", {}), ("publish_to_taxii", {}),
 )

@@ -332,7 +332,7 @@ def emit_redmesh_event(owner, job_specs, event):
   return result
 
 
-def emit_lifecycle_event(
+def build_lifecycle_event_for_emission(
   owner,
   job_specs,
   *,
@@ -346,10 +346,14 @@ def emit_lifecycle_event(
   expected_egress_ips=None,
   report_refs=None,
 ):
+  """Build the lifecycle event `emit_lifecycle_event` would send, without delivering it.
+
+  Returns `(event, error)`; `event` is None when `error` is set. Separated out so a pure read (a
+  JSON download) can reuse the exact same builder and redaction as live emission (RM-093 phase 6).
+  """
   secret, error = _event_export_secret(owner)
   if error:
-    record_integration_status(owner, "wazuh", outcome="failure", error_class=error)
-    return _skip_result(error)
+    return None, error
   if actual_end_at is None and event_type in {"redmesh.job.pass_completed", "redmesh.job.stopped"}:
     time_fn = getattr(owner, "time", None)
     if callable(time_fn):
@@ -380,10 +384,48 @@ def emit_lifecycle_event(
     assessment_window=window,
     artifact_refs=report_refs,
   )
+  return event, None
+
+
+def emit_lifecycle_event(
+  owner,
+  job_specs,
+  *,
+  event_type,
+  event_action,
+  event_outcome="success",
+  pass_nr=None,
+  started_at=None,
+  expected_end_at=None,
+  actual_end_at=None,
+  expected_egress_ips=None,
+  report_refs=None,
+):
+  event, error = build_lifecycle_event_for_emission(
+    owner,
+    job_specs,
+    event_type=event_type,
+    event_action=event_action,
+    event_outcome=event_outcome,
+    pass_nr=pass_nr,
+    started_at=started_at,
+    expected_end_at=expected_end_at,
+    actual_end_at=actual_end_at,
+    expected_egress_ips=expected_egress_ips,
+    report_refs=report_refs,
+  )
+  if error:
+    record_integration_status(owner, "wazuh", outcome="failure", error_class=error)
+    return _skip_result(error)
   return emit_redmesh_event(owner, job_specs, event)
 
 
-def emit_finding_event(owner, job_specs, *, finding, event_action="created", pass_nr=None):
+def build_finding_event_for_emission(owner, job_specs, *, finding, event_action="created", pass_nr=None):
+  """Build the finding event `emit_finding_event` would send, without delivering it.
+
+  Returns `(event, error)`; `event` is None when `error` is set, `error` being `"coverage_result"`
+  for a coverage result (RM-093 phase 6: the same skip, so a JSON download never carries one).
+  """
   # A coverage result is not a finding, and it does not leave the platform as
   # one. It used to ship flagged (`status` + `is_coverage_result`), but a HIGH
   # `inconclusive` still arrived in a SIEM as a *created finding*, and a flag a
@@ -392,11 +434,10 @@ def emit_finding_event(owner, job_specs, *, finding, event_action="created", pas
   # so no emission path can reintroduce it. The archive keeps coverage
   # regardless: that is the PTES record, and that decision stands.
   if is_coverage_result(finding):
-    return _skip_result("coverage_result")
+    return None, "coverage_result"
   secret, error = _event_export_secret(owner)
   if error:
-    record_integration_status(owner, "wazuh", outcome="failure", error_class=error)
-    return _skip_result(error)
+    return None, error
   event = build_finding_event(
     job_specs,
     finding=finding,
@@ -406,6 +447,16 @@ def emit_finding_event(owner, job_specs, *, finding, event_action="created", pas
     environment=_environment(owner),
     pass_nr=pass_nr,
   )
+  return event, None
+
+
+def emit_finding_event(owner, job_specs, *, finding, event_action="created", pass_nr=None):
+  event, error = build_finding_event_for_emission(
+    owner, job_specs, finding=finding, event_action=event_action, pass_nr=pass_nr)
+  if error:
+    if error != "coverage_result":
+      record_integration_status(owner, "wazuh", outcome="failure", error_class=error)
+    return _skip_result(error)
   return emit_redmesh_event(owner, job_specs, event)
 
 
