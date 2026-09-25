@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 76  # +1 typed rulebook artifact read (RM-086)
+EXPECTED_ENDPOINTS = 78  # +2 pure JSON downloads: STIX bundle, SIEM events (RM-093 phase 6)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -54,6 +54,8 @@ ENDPOINT_FIRST_ARGS = {
   'list_local_jobs': 'request_actor',
   'export_misp': 'job_id',
   'export_misp_json': 'job_id',
+  'export_stix_json': 'job_id',
+  'export_siem_events_json': 'job_id',
   'get_misp_export_status': 'job_id',
   'get_misp_export_config_status': 'request_actor',
   'get_integration_status': 'request_actor',

@@ -546,6 +546,17 @@ class TestExportMispJson(unittest.TestCase):
     self.assertEqual(result["status"], "ok")
     self.assertIn("misp_event", result)
 
+  def test_plugin_download_ignores_disabled_and_missing_credentials(self):
+    """RM-093: the endpoint's builder used to answer `disabled` before building; a download
+    has no destination, so neither the node flag nor missing credentials stop it."""
+    from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExportMixin
+    for misp_config in ({"ENABLED": False}, {"ENABLED": True, "MISP_URL": "", "MISP_API_KEY": ""}):
+      with self.subTest(misp_config=misp_config):
+        owner = _make_integration_owner(misp_config)
+        result = _MispExportMixin._build_misp_json(owner, "test_job_1")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("misp_event", result)
+
   def test_model_test_job_rejected_for_json_export(self):
     owner = _make_integration_owner(job_specs={
       "job_id": "test_job_1",

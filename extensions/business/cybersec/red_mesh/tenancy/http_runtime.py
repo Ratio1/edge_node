@@ -108,6 +108,8 @@ _READ_FIELDS = {
   "llm_health": (("request_actor", dict, None),),
   "update_finding_triage": (("request_actor", dict, None),),
   "export_misp_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "export_stix_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
+  "export_siem_events_json": _JOB_FIELD + (("pass_nr", int, None),) + _REQUESTER_FIELDS,
   "get_integration_status": (("request_actor", dict, None), ("tenant_id", str, None)),
 }
 # Effect-bearing endpoints (RM-026 I1b).
@@ -195,9 +197,12 @@ _TYPED_READ_ERRORS = {
   # it reads as an outage, and the caller retries against a node that can never serve it.
   # `job_not_running`: the job already ended, so the stop has nothing to do and a retry never will.
   "/stop_monitoring": {(409, "job_launcher_mismatch"), (409, "job_not_running")},
-  # RM-090: the tenant has no MISP record. Collapsed to `unavailable` it read as an outage
-  # ("Tenant execution authorization is temporarily unavailable") for a configuration state.
-  "/export_misp_json": {(409, "tenant_integration_not_configured")},
+  # RM-093: a job with nothing to export yet, or a pass that does not exist, is a state the caller
+  # can act on; collapsed to `unavailable` it read as an outage. MISP push resolves the pass through
+  # the same checked resolver, so it answers the same codes.
+  **{path: {(409, "no_completed_passes"), (404, "pass_not_found")}
+     for path in ("/export_misp", "/export_misp_json", "/export_stix_json",
+                  "/export_siem_events_json")},
 }
 _TYPED_READ_PAIRS = frozenset(pair for pairs in _TYPED_READ_ERRORS.values() for pair in pairs)
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"
@@ -482,7 +487,8 @@ def install_generated_read_api(app, model_namespace) -> None:
             if error.status_code == status and (typed or raw):
               return _read_error_response(status, code=code)
         if (request.scope.get("path") in ("/get_detection_correlation", "/get_misp_export_status",
-            "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status", "/export_misp_json")
+            "/get_stix_export_status", "/get_opencti_export_status", "/get_taxii_export_status", "/export_misp_json",
+            "/export_stix_json", "/export_siem_events_json")
             and error.status_code == 400
             and isinstance(detail, dict)):
           typed = (detail.get("success") is False and type(detail.get("status_code")) is int

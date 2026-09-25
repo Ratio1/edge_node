@@ -127,6 +127,20 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   return job_config, pass_data, aggregated or {}, None
 
 
+def raise_for_pass_error(err):
+  """Turn a `_resolve_pass_data` error into the typed answer a checked read publishes (RM-093).
+
+  Nothing to export is a state, not an outage: `no_completed_passes` (409) and `pass_not_found`
+  (404) reach the caller by name. Anything else is a storage failure and stays `unavailable`.
+  """
+  error = err.get("error") if isinstance(err, dict) else None
+  if error in ("no_completed_passes", "no_passes"):
+    raise AdministrationDenied(409, "no_completed_passes")
+  if error == "pass_not_found":
+    raise AdministrationDenied(404, "pass_not_found")
+  raise TenantStoreError("pass data unavailable")
+
+
 def _utc_timestamp(epoch=None):
   if epoch is None:
     dt = datetime.now(timezone.utc)
@@ -571,6 +585,40 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True, *, checked_job
     "object_count": result["object_count"],
     "finding_count": result["finding_count"],
     "observed_data_count": result["observed_data_count"],
+    "stix_bundle": result["bundle"],
+  }
+
+
+def export_stix_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
+  """
+  Return the STIX 2.1 bundle a job/pass would produce, as a pure read.
+
+  Byte-for-byte what OpenCTI push and TAXII publish send: no R1FS write, no job-record mutation,
+  no SOC event, no integration-status record, and no destination is ever contacted (RM-093 phase 6).
+  """
+  checked = checked_job is not _UNSET
+  validate_snapshot_mode(snapshot_mode, snapshot_supplied=checked)
+  if checked:
+    job_specs = checked_job_snapshot(checked_job, job_id, snapshot_mode=snapshot_mode)
+    if pass_nr is not None and (type(pass_nr) is not int or pass_nr < 1):
+      raise AdministrationDenied(400, "invalid_request")
+    unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
+    if unsupported:
+      raise AdministrationDenied(400, "unsupported_job_type")
+    result = build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=job_specs)
+    if result.get("status") != "ok":
+      raise_for_pass_error(result)
+  else:
+    result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
+  if result.get("status") != "ok":
+    return result
+  return {
+    "status": "ok",
+    "job_id": job_id,
+    "pass_nr": result["pass_nr"],
+    "bundle_id": result["bundle_id"],
+    "object_count": result["object_count"],
+    "finding_count": result["finding_count"],
     "stix_bundle": result["bundle"],
   }
 
