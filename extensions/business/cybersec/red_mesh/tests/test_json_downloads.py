@@ -40,6 +40,16 @@ def _install_findings(fixture, findings):
   fixture.artifacts["archive"]["passes"][0]["findings"] = deepcopy(findings)
 
 
+def _forbid_writes(fixture):
+  """Any store or R1FS write fails the test; returns the job store as it was, to compare after."""
+  def refuse(*_args, **_kwargs):
+    raise AssertionError("a JSON download must not write")
+  fixture.owner.chainstore_hset = refuse
+  fixture.owner.r1fs.add_json = refuse
+  fixture.owner.r1fs.add_file = refuse
+  return deepcopy(fixture.store.jobs)
+
+
 class TestStixJsonDownload:
 
   def test_pure_read_matches_build_stix_bundle_with_no_side_effects(self):
@@ -47,6 +57,7 @@ class TestStixJsonDownload:
 
     with read_endpoint_fixture(bound=True, archived=False) as fixture:
       _install_findings(fixture, _findings())
+      jobs_before = _forbid_writes(fixture)
       captured = {}
       real_build = stix_export.build_stix_bundle
 
@@ -76,6 +87,7 @@ class TestStixJsonDownload:
       object_types = {obj["type"] for obj in result["stix_bundle"]["objects"]}
       assert {"marking-definition", "report", "vulnerability"} <= object_types
       assert fixture.artifact_reads  # the pass/aggregate were read; nothing else happened
+      assert fixture.store.jobs == jobs_before
 
   def test_model_test_job_is_refused_before_any_build(self):
     with read_endpoint_fixture(bound=True) as fixture:
@@ -105,6 +117,7 @@ class TestSiemEventsJsonDownload:
 
     with read_endpoint_fixture(bound=True, archived=False) as fixture:
       _install_findings(fixture, _findings())
+      jobs_before = _forbid_writes(fixture)
       with patch.object(event_hooks, "emit_redmesh_event",
                          side_effect=AssertionError("must not deliver")), \
            patch.object(event_hooks, "record_integration_status",
@@ -123,6 +136,7 @@ class TestSiemEventsJsonDownload:
       dumped = json.dumps(result)
       assert "secret123" not in dumped
       assert "admin:***" in dumped
+      assert fixture.store.jobs == jobs_before
 
   def test_model_test_job_is_refused_before_any_build(self):
     with read_endpoint_fixture(bound=True) as fixture:
@@ -196,6 +210,61 @@ class TestNothingToExport:
       assert json.loads(raw)["error"] == "pass_not_found", raw
       fixture.job["pass_reports"] = []
       status, headers, raw, _calls = asyncio.run(request(module, endpoint, body))
+      assert status == 409, raw
+      assert headers[b"cache-control"] == b"no-store"
+      assert json.loads(raw)["error"] == "no_completed_passes", raw
+
+
+# Push resolves the pass through the same checked resolver, so it answers the same codes. The config
+# is forced ENABLED so the refusal is the resolver's, and PyMISP is poisoned: nothing may leave.
+def _push_patches():
+  from extensions.business.cybersec.red_mesh.services import misp_export
+
+  cfg = {**misp_export.DEFAULT_MISP_EXPORT_CONFIG,
+         "ENABLED": True, "MISP_URL": "https://misp.invalid", "MISP_API_KEY": "k"}
+  return (
+    patch.object(misp_export, "tenant_export_binding", return_value=("tenant", None)),
+    patch.object(misp_export, "get_misp_export_config", return_value=cfg),
+    patch.object(misp_export, "PyMISP", side_effect=AssertionError("must not contact MISP")),
+    patch.object(misp_export, "emit_export_status_event",
+                 side_effect=AssertionError("must not emit a SOC event")),
+    patch.object(misp_export, "_write_job_record",
+                 side_effect=AssertionError("must not write the job record")),
+  )
+
+
+class TestPushWithNothingToExport:
+
+  def _push(self, fixture, pass_nr):
+    binding, config, pymisp, emit, write = _push_patches()
+    with binding, config, pymisp, emit, write:
+      return fixture.Plugin.export_misp(fixture.owner, "job-1", pass_nr, fixture.actor,
+                                        fixture.tenant_id)
+
+  def test_a_job_with_no_completed_pass_is_typed_409_and_nothing_happens(self):
+    with read_endpoint_fixture(bound=True, archived=False) as fixture:
+      fixture.job["pass_reports"] = []
+      assert self._push(fixture, None) == NO_COMPLETED_PASSES
+
+  def test_a_pass_that_does_not_exist_is_typed_404_and_nothing_happens(self):
+    with read_endpoint_fixture(bound=True, archived=False) as fixture:
+      assert self._push(fixture, 5) == PASS_NOT_FOUND
+
+  @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+  def test_the_codes_survive_the_guard(self, read_native, response_format):
+    module, _ = read_native
+    install(module)
+    binding, config, pymisp, emit, write = _push_patches()
+    with read_endpoint_fixture(bound=True, archived=False) as fixture, \
+         binding, config, pymisp, emit, write:
+      module.eng = scheduler_comms(fixture, response_format)
+      body = {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
+      status, headers, raw, _calls = asyncio.run(request(module, "export_misp", {**body, "pass_nr": 5}))
+      assert status == 404, raw
+      assert headers[b"cache-control"] == b"no-store"
+      assert json.loads(raw)["error"] == "pass_not_found", raw
+      fixture.job["pass_reports"] = []
+      status, headers, raw, _calls = asyncio.run(request(module, "export_misp", body))
       assert status == 409, raw
       assert headers[b"cache-control"] == b"no-store"
       assert json.loads(raw)["error"] == "no_completed_passes", raw
