@@ -39,6 +39,7 @@ from extensions.business.deeploy.deeploy_const import (
   JOB_APP_TYPES,
 )
 from extensions.business.deeploy.deeploy_manager_api import DeeployManagerApiPlugin
+from extensions.business.deeploy.deeploy_mixin import DEEPLOY_DAUTH_SECRET_PLACEHOLDER
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
 
 
@@ -84,6 +85,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "DEEPLOY_SPECS": copy.deepcopy(deeploy_specs or {"job_id": 11}),
     }
     plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
+    plugin.chainstore_writes = []
+
+    def chainstore_hset(hkey, key, value):
+      plugin.chainstore_writes.append({
+        "hkey": hkey,
+        "key": key,
+        "value": copy.deepcopy(value),
+      })
+      return True
+
+    plugin.chainstore_hset = chainstore_hset
 
     called = {
       "delete": 0,
@@ -92,11 +104,48 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "queued": 0,
       "persisted": 0,
       "bc_update": 0,
+      "stage": 0,
+      "committed": 0,
+      "staged_pipeline": None,
+      "staged_secret_bundle": None,
     }
     plugin.bc = types.SimpleNamespace(
       node_addr_to_eth_addr=lambda node: node,
       submit_node_update=lambda **kwargs: called.__setitem__("bc_update", called["bc_update"] + 1),
     )
+
+    def build_pipeline_config(**kwargs):
+      config = {
+        "NAME": kwargs["name"],
+        "TYPE": kwargs["stream_type"],
+      }
+      if kwargs.get("url") is not None:
+        config["URL"] = kwargs["url"]
+      if kwargs.get("plugins") is not None:
+        config["PLUGINS"] = copy.deepcopy(kwargs["plugins"])
+      ignored = {"name", "stream_type", "url", "plugins"}
+      config.update({
+        key.upper(): copy.deepcopy(value)
+        for key, value in kwargs.items()
+        if key not in ignored
+      })
+      return config
+
+    plugin.cmdapi_build_pipeline_config = build_pipeline_config
+    plugin._load_dauth_job_secret_bundle = lambda job_id: None
+    def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
+      called["stage"] += 1
+      called["staged_pipeline"] = copy.deepcopy(pipeline)
+      called["staged_secret_bundle"] = copy.deepcopy(secret_bundle)
+      return {
+        "job_id": str(job_id),
+        "pipeline": copy.deepcopy(pipeline),
+        "secret_bundle": copy.deepcopy(secret_bundle),
+      }
+
+    plugin.stage_job_pipeline_and_secrets = stage_job_pipeline_and_secrets
+    plugin.commit_staged_job_pipeline_and_secrets = lambda state: True
+    plugin.rollback_staged_job_pipeline_and_secrets = lambda state: True
     plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
 
     def check_and_deploy_pipelines(**kwargs):
@@ -642,7 +691,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     for index, node in enumerate(nodes):
       emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
       overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
-      self.assertEqual(overlay["ENV"]["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
+      self.assertEqual(
+        overlay["ENV"]["CRDB_NODE_KEY"],
+        DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+      )
+      stored_env = (
+        called["staged_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
+        ["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
+      )
+      self.assertEqual(stored_env["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
     self.assertEqual(called["delete"], 1)
     self.assertEqual(called["deploy"], 1)
 
@@ -711,7 +768,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     for index, node in enumerate(nodes):
       emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
       overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
-      self.assertEqual(overlay["ENV"]["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
+      self.assertEqual(
+        overlay["ENV"]["CRDB_NODE_KEY"],
+        DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+      )
+      stored_env = (
+        called["staged_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
+        ["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
+      )
+      self.assertEqual(stored_env["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 1)
 
@@ -741,10 +806,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       claim,
     )
 
-  def test_cockroachdb_regeneration_reports_persistence_failure_after_three_attempts(self):
+  def test_cockroachdb_regeneration_reports_staging_commit_failure(self):
     plugin, called = self._make_process_update_plugin(discovered_instances=[])
-    plugin.persist_job_pipeline_metadata = (
-      lambda **kwargs: called.__setitem__("persisted", called["persisted"] + 1) or False
+    plugin.commit_staged_job_pipeline_and_secrets = (
+      lambda state: called.__setitem__("committed", called["committed"] + 1) or False
     )
     operation = {
       "owner": "0xOwner",
@@ -763,12 +828,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     result = plugin.finalize_pending_request_pipeline(
       pending={
         "confirm": {"nodes_changed": False},
-        "persistence": {
-          "pipeline": {"NAME": "cockroachdb_422ce92"},
-          "job_id": 11,
-          "previous_cid": "old-cid",
-          "delete_previous": True,
-        },
+        "staging": {"job_id": "11", "staged_cid": "new-cid"},
         "managed_update_action_claim_key": claim_key,
         "managed_update_action": operation,
         "base_result": {},
@@ -779,16 +839,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     self.assertEqual(result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
     self.assertIn("metadata persistence failed", result[DEEPLOY_KEYS.ERROR])
-    self.assertEqual(called["persisted"], 3)
-    self.assertEqual(called["queued"], 1)
-    self.assertEqual(
-      plugin._pending_managed_update_actions,
-      {
-        ("0xOwner", "cockroachdb_422ce92"): (
-          operation["kind"], operation["operation_id"], operation["intent_hash"]
-        ),
-      },
-    )
+    self.assertEqual(called["committed"], 1)
+    self.assertEqual(called["persisted"], 0)
+    self.assertEqual(called["queued"], 0)
+    self.assertEqual(plugin._pending_managed_update_actions, {})
 
   def test_process_cockroachdb_regeneration_replay_uses_recent_confirmed_success(self):
     fixture_plugin = make_deeploy_plugin()
@@ -836,14 +890,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "certificateGenerationId": regeneration_id,
       "certificateRegenerationIntentSha256": intent_hash,
     })
-    durable_pipeline = {}
+    durable_pipeline = {
+      "OWNER": "0xOwner",
+      "NAME": "cockroachdb_422ce92",
+      "DEEPLOY_SPECS": applied_specs,
+    }
 
-    def persist_regeneration(**kwargs):
-      called["persisted"] += 1
-      durable_pipeline.update(copy.deepcopy(kwargs["pipeline"]))
+    def commit_regeneration(state):
+      called["committed"] += 1
       return True
 
-    plugin.persist_job_pipeline_metadata = persist_regeneration
+    plugin.commit_staged_job_pipeline_and_secrets = commit_regeneration
     operation = {
       "owner": "0xOwner",
       "app_id": "cockroachdb_422ce92",
@@ -860,16 +917,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.finalize_pending_request_pipeline(
       pending={
         "confirm": {"nodes_changed": False},
-        "persistence": {
-          "pipeline": {
-            "OWNER": "0xOwner",
-            "NAME": "cockroachdb_422ce92",
-            "DEEPLOY_SPECS": applied_specs,
-          },
-          "job_id": 11,
-          "previous_cid": "old-cid",
-          "delete_previous": True,
-        },
+        "staging": {"job_id": "11", "staged_cid": "new-cid"},
         "managed_update_action_claim_key": claim_key,
         "managed_update_action": operation,
         "base_result": {},
@@ -877,7 +925,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       dct_status={f"response-{index}": {"node": node} for index, node in enumerate(nodes)},
       str_status=DEEPLOY_STATUS.SUCCESS,
     )
-    self.assertEqual(called["persisted"], 1)
+    self.assertEqual(called["committed"], 1)
+    self.assertEqual(called["persisted"], 0)
     called["queued"] = 0
     plugin._applied_managed_update_actions = {}
     plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: copy.deepcopy(durable_pipeline)
@@ -2639,7 +2688,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 1)
-    self.assertEqual(called["queued"], 1)
+    self.assertEqual(called["stage"], 1)
+    self.assertEqual(called["queued"], 0)
     self.assertEqual(called["bc_update"], 1)
     self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["new-node-1"])
     plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
@@ -4190,11 +4240,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     }
 
+    generated_instance_identity_aliases = {}
     create_pipelines, update_pipelines, _response_keys = plugin.prepare_create_update_pipelines(
       base_pipeline=base_pipeline,
       new_nodes=["0xai_node_c"],
       update_nodes=["0xai_node_a", "0xai_node_b"],
       running_apps_for_job=running_apps_for_job,
+      generated_instance_identity_aliases=generated_instance_identity_aliases,
     )
 
     expected_nodes = ["0xai_node_a", "0xai_node_b", "0xai_node_c"]
@@ -4205,6 +4257,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(updated["CHAINSTORE_PEERS"], expected_nodes)
     self.assertEqual(updated["PER_NODE_TARGET_NODES"], expected_nodes)
     self.assertEqual(base_pipeline["deeploy_specs"][DEEPLOY_KEYS.NR_TARGET_NODES], 3)
+    self.assertEqual(
+      generated_instance_identity_aliases[
+        ("CONTAINER_APP_RUNNER", created["INSTANCE_ID"])
+      ],
+      ("CONTAINER_APP_RUNNER", "stale-instance"),
+    )
 
     # Only b reports now: a remains a configured target, and c keeps index 2.
     create_pipelines, update_pipelines, _ = plugin.prepare_create_update_pipelines(
@@ -4285,6 +4343,54 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         update_nodes=[],
         running_apps_for_job={},
       )
+
+  def test_scale_up_prepare_preserves_offline_persisted_targets(self):
+    plugin = make_deeploy_plugin()
+    plugin.defaultdict = defaultdict
+    plugin.time = lambda: 1000
+    base_pipeline = {
+      "app_id": "app-1",
+      "pipeline_type": "Void",
+      "url": "",
+      "pipeline_params": {},
+      "deeploy_specs": {
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["online-node", "offline-node"],
+        DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
+      },
+      "plugins": [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{"INSTANCE_ID": "stale", "ENV": {}}],
+      }],
+    }
+    running_apps = {
+      "online-node": {
+        "app-1": {
+          "plugins": {
+            "CONTAINER_APP_RUNNER": [{
+              "instance": "existing",
+              "instance_conf": {"CHAINSTORE_RESPONSE_KEY": "response"},
+            }],
+          },
+        },
+      },
+    }
+
+    create_pipelines, update_pipelines, _ = plugin.prepare_create_update_pipelines(
+      base_pipeline=base_pipeline,
+      new_nodes=["new-node"],
+      update_nodes=["online-node"],
+      running_apps_for_job=running_apps,
+    )
+
+    expected = ["online-node", "offline-node", "new-node"]
+    self.assertEqual(
+      create_pipelines["new-node"]["deeploy_specs"][DEEPLOY_KEYS.CURRENT_TARGET_NODES],
+      expected,
+    )
+    self.assertEqual(
+      update_pipelines["online-node"]["deeploy_specs"][DEEPLOY_KEYS.CURRENT_TARGET_NODES],
+      expected,
+    )
 
 
 if __name__ == "__main__":
