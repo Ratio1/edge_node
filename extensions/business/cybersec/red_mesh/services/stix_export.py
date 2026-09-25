@@ -127,6 +127,20 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
   return job_config, pass_data, aggregated or {}, None
 
 
+def raise_for_pass_error(err):
+  """Turn a `_resolve_pass_data` error into the typed answer a checked read publishes (RM-093).
+
+  Nothing to export is a state, not an outage: `no_completed_passes` (409) and `pass_not_found`
+  (404) reach the caller by name. Anything else is a storage failure and stays `unavailable`.
+  """
+  error = err.get("error") if isinstance(err, dict) else None
+  if error in ("no_completed_passes", "no_passes"):
+    raise AdministrationDenied(409, "no_completed_passes")
+  if error == "pass_not_found":
+    raise AdministrationDenied(404, "pass_not_found")
+  raise TenantStoreError("pass data unavailable")
+
+
 def _utc_timestamp(epoch=None):
   if epoch is None:
     dt = datetime.now(timezone.utc)
@@ -592,6 +606,8 @@ def export_stix_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     if unsupported:
       raise AdministrationDenied(400, "unsupported_job_type")
     result = build_stix_bundle(owner, job_id, pass_nr=pass_nr, checked_job=job_specs)
+    if result.get("status") != "ok":
+      raise_for_pass_error(result)
   else:
     result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
   if result.get("status") != "ok":

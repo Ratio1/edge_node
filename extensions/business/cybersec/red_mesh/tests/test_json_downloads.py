@@ -5,12 +5,18 @@ produce, without ever writing to R1FS, mutating the job record, emitting a SOC e
 integration status, or contacting a destination -- whatever the tenant's OpenCTI/TAXII/Wazuh
 records or the node's `ENABLED` flags say.
 """
+import asyncio
 import json
 from copy import deepcopy
 from unittest.mock import patch
 
+import pytest
+
 from .read_endpoint_fixtures import read_endpoint_fixture
 from .test_tenant_exports_scope import second_tenant
+from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
+  install, read_native, request, scheduler_comms,
+)
 
 
 def _findings():
@@ -138,3 +144,58 @@ class TestSiemEventsJsonDownload:
       result = fixture.Plugin.export_siem_events_json(
         fixture.owner, "job-1", None, fixture.actor, other)
       assert result == {"success": False, "error": "not_found", "status_code": 404}
+
+
+# RM-093 phase 8: a job with nothing to export is a state, not an outage. Before, STIX/SIEM answered
+# 200 with an error body (which the console collapsed to "temporarily unavailable") and MISP a bare
+# 404 `not_found`.
+JSON_DOWNLOADS = ("export_misp_json", "export_stix_json", "export_siem_events_json")
+NO_COMPLETED_PASSES = {"success": False, "error": "no_completed_passes", "status_code": 409}
+PASS_NOT_FOUND = {"success": False, "error": "pass_not_found", "status_code": 404}
+
+
+class TestNothingToExport:
+
+  @pytest.mark.parametrize("endpoint", JSON_DOWNLOADS)
+  def test_a_running_job_with_no_completed_pass_is_typed_409(self, endpoint):
+    with read_endpoint_fixture(bound=True, archived=False) as fixture:
+      fixture.job["pass_reports"] = []
+      result = getattr(fixture.Plugin, endpoint)(
+        fixture.owner, "job-1", None, fixture.actor, fixture.tenant_id)
+      assert result == NO_COMPLETED_PASSES
+
+  @pytest.mark.parametrize("endpoint", JSON_DOWNLOADS)
+  def test_an_archive_with_no_passes_is_typed_409(self, endpoint):
+    with read_endpoint_fixture(bound=True, archived=True) as fixture:
+      fixture.artifacts["archive"]["passes"] = []
+      result = getattr(fixture.Plugin, endpoint)(
+        fixture.owner, "job-1", None, fixture.actor, fixture.tenant_id)
+      assert result == NO_COMPLETED_PASSES
+
+  @pytest.mark.parametrize("archived", (False, True))
+  @pytest.mark.parametrize("endpoint", JSON_DOWNLOADS)
+  def test_a_pass_that_does_not_exist_is_typed_404(self, endpoint, archived):
+    with read_endpoint_fixture(bound=True, archived=archived) as fixture:
+      result = getattr(fixture.Plugin, endpoint)(
+        fixture.owner, "job-1", 5, fixture.actor, fixture.tenant_id)
+      assert result == PASS_NOT_FOUND
+
+  @pytest.mark.parametrize("endpoint", JSON_DOWNLOADS)
+  @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+  def test_the_codes_survive_the_read_guard(self, read_native, endpoint, response_format):
+    """The strict transport rebuilds error bodies and keeps only codes registered in
+    `_TYPED_READ_ERRORS`; unregistered, both would reach the console as `unavailable`."""
+    module, _ = read_native
+    install(module)
+    with read_endpoint_fixture(bound=True, archived=False) as fixture:
+      module.eng = scheduler_comms(fixture, response_format)
+      body = {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
+      status, headers, raw, _calls = asyncio.run(request(module, endpoint, {**body, "pass_nr": 5}))
+      assert status == 404, raw
+      assert headers[b"cache-control"] == b"no-store"
+      assert json.loads(raw)["error"] == "pass_not_found", raw
+      fixture.job["pass_reports"] = []
+      status, headers, raw, _calls = asyncio.run(request(module, endpoint, body))
+      assert status == 409, raw
+      assert headers[b"cache-control"] == b"no-store"
+      assert json.loads(raw)["error"] == "no_completed_passes", raw

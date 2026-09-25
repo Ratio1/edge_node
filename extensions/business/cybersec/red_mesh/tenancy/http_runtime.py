@@ -197,6 +197,10 @@ _TYPED_READ_ERRORS = {
   # it reads as an outage, and the caller retries against a node that can never serve it.
   # `job_not_running`: the job already ended, so the stop has nothing to do and a retry never will.
   "/stop_monitoring": {(409, "job_launcher_mismatch"), (409, "job_not_running")},
+  # RM-093: a job with nothing to export yet, or a pass that does not exist, is a state the caller
+  # can act on; collapsed to `unavailable` it read as an outage.
+  **{path: {(409, "no_completed_passes"), (404, "pass_not_found")}
+     for path in ("/export_misp_json", "/export_stix_json", "/export_siem_events_json")},
 }
 _TYPED_READ_PAIRS = frozenset(pair for pairs in _TYPED_READ_ERRORS.values() for pair in pairs)
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"

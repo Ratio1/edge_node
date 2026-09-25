@@ -10,7 +10,7 @@ from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from .event_hooks import build_finding_event_for_emission, build_lifecycle_event_for_emission
 from .scan_guards import reject_model_test_for_scan_operation
-from .stix_export import _resolve_pass_data
+from .stix_export import _resolve_pass_data, raise_for_pass_error
 
 
 _UNSET = object()
@@ -65,6 +65,8 @@ def export_siem_events_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, 
   _job_config, pass_data, _aggregated, err = _resolve_pass_data(
     owner, job_id, pass_nr, checked_job=job_specs)
   if err:
+    if checked:
+      raise_for_pass_error(err)
     return err
 
   actual_pass_nr = pass_data.get("pass_nr", pass_nr or 1)

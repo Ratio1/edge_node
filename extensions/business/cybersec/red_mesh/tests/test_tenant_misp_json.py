@@ -296,7 +296,8 @@ def test_native_missing_pass_is404_but_missing_referenced_archive_is503(read_nat
       module.eng = scheduler_comms(fixture, response_format)
       result, _ = assert_json_response(asyncio.run(request(module, ENDPOINT,
         {"job_id": "job-1", "pass_nr": 2, "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 404)
-      assert result == {"success": False, "error": "not_found", "status_code": 404}
+      # RM-093: named, so the console says which pass is missing rather than "resource not found".
+      assert result == {"success": False, "error": "pass_not_found", "status_code": 404}
     if archived:
       fixture.artifacts["archive"] = None
       with no_export_effects(fixture):

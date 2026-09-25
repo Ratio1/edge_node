@@ -288,8 +288,11 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snaps
     passes = archive["passes"] if archive is not None else job_specs.get("pass_reports", [])
     selected = (next((entry for entry in passes if entry["pass_nr"] == pass_nr), None)
                 if pass_nr is not None else passes[-1] if passes else None)
+    # Nothing to export is a state, not a missing resource (RM-093): named so the console can say so.
+    if not passes:
+      raise AdministrationDenied(409, "no_completed_passes")
     if selected is None:
-      raise AdministrationDenied(404, "not_found")
+      raise AdministrationDenied(404, "pass_not_found")
     if archive is None and (not isinstance(selected.get("report_cid"), str) or not selected["report_cid"].strip()):
       raise TenantStoreError("MISP export unavailable")
     pass_data = selected if archive is not None else artifacts.report(selected["report_cid"])
