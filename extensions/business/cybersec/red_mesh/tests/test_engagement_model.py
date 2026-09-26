@@ -144,6 +144,15 @@ class TestRulesOfEngagement(unittest.TestCase):
     ])
     self.assertEqual(restored.retest_window_end, "2026-06-30")
 
+  def test_authenticated_action_defaults_off_and_round_trips(self):
+    # RM-103 item 5: the post-login action is opt-in; the flag alone makes
+    # the RoE non-empty, so a launch that sets only it keeps it.
+    self.assertFalse(RulesOfEngagement().authenticated_action)
+    roe = RulesOfEngagement(authenticated_action=True)
+    self.assertFalse(roe.is_empty())
+    self.assertTrue(RulesOfEngagement.from_dict(roe.to_dict()).authenticated_action)
+    self.assertFalse(RulesOfEngagement.from_dict({"dos_allowed": True}).authenticated_action)
+
   def test_validate_rejects_unknown_strength(self):
     roe = RulesOfEngagement(strength_of_test="brutal")
     errors = roe.validate()

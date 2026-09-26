@@ -176,6 +176,29 @@ class TestLaunchService(unittest.TestCase):
       {"THOROUGH"},
     )
 
+  def _launch_with_roe(self, roe):
+    owner = DummyOwner()
+    strategy = ScanStrategy(
+      scan_type=ScanType.NETWORK,
+      worker_cls=DummyNetworkWorker,
+      catalog_categories=("service",),
+    )
+    job_config = {"scan_type": "network", "nr_local_workers": 1}
+    if roe is not None:
+      job_config["roe"] = roe
+    with patch("extensions.business.cybersec.red_mesh.services.launch.get_scan_strategy", return_value=strategy):
+      local_jobs = launch_local_jobs(
+        owner, job_id="job-roe", target="10.0.0.10", launcher="0xlauncher",
+        start_port=22, end_port=23, job_config=job_config,
+      )
+    return {worker.kwargs["authenticated_action"] for worker in local_jobs.values()}
+
+  def test_authenticated_action_follows_the_roe(self):
+    # RM-103 item 5: off unless the job's RoE permit it.
+    self.assertEqual(self._launch_with_roe(None), {False})
+    self.assertEqual(self._launch_with_roe({"dos_allowed": True}), {False})
+    self.assertEqual(self._launch_with_roe({"authenticated_action": True}), {True})
+
 
 class TestComparisonTieredAssignment(unittest.TestCase):
   """Tiered mirror+slice port assignment for geographic comparison mode."""

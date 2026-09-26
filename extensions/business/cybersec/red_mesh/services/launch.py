@@ -36,6 +36,9 @@ def _launch_network_jobs(
   scanner_identity = job_config.get("scanner_identity", owner.cfg_scanner_identity)
   scanner_user_agent = job_config.get("scanner_user_agent", owner.cfg_scanner_user_agent)
   timeout_profile = job_config.get("timeout_profile")
+  # The post-login action is opt-in per job through the RoE (RM-103).
+  roe = job_config.get("roe")
+  authenticated_action = bool(roe.get("authenticated_action")) if isinstance(roe, dict) else False
   # The comparison tier is node-wide evidence, not per-thread work: it goes to
   # a single worker so the tier is probed exactly once from this vantage.
   comparison_ports = job_config.get("comparison_ports") or []
@@ -110,6 +113,7 @@ def _launch_network_jobs(
         scanner_identity=scanner_identity,
         scanner_user_agent=scanner_user_agent,
         timeout_profile=timeout_profile,
+        authenticated_action=authenticated_action,
         comparison_ports=comparison_ports if index == 0 else None,
         **({"execution_config": job_config, "execution_identity": execution_identity}
            if "execution_binding" in job_config else {}),

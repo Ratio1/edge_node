@@ -21,7 +21,7 @@ CONTROL_ACCEPTED = "accepted"
 CONTROL_NOT_RUN = "not_run"
 
 
-def _default_credential_findings(protocol, accepted, *, control, proofs=None):
+def _default_credential_findings(protocol, accepted, *, control, proofs=None, action_permitted=True):
   """
   Build the default-credential findings for one service, gated on the
   negative control (RM-069).
@@ -44,6 +44,10 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None):
   action (`id` over SSH, `PWD` over FTP, `id`/`uname` over Telnet). A pair
   with a proof is `certain`; a handshake alone is `firm` — the server said
   yes, but nothing was done with the session.
+
+  `action_permitted` is the job's RoE consent to that action (RM-103). When
+  it is false the probe never ran one, and the finding says the RoE, not a
+  failed attempt, is why the handshake is the whole evidence.
 
   The evidence keeps the `Accepted credential: <pair>` lead the redaction rule
   is anchored on; the proof follows a `;` so the pair still terminates there.
@@ -90,7 +94,11 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None):
       title=f"{protocol} default credential accepted: {cred}",
       description=(
         f"The {protocol} server accepted a well-known default credential.{control_note}"
-        + ("" if proof else " No authenticated action was completed; the handshake alone was observed.")
+        + ("" if proof else (
+          " No authenticated action was completed; the handshake alone was observed."
+          if action_permitted else
+          " No authenticated action was attempted; not permitted by the Rules of Engagement for this job."
+        ))
       ),
       evidence=evidence,
       remediation="Change default passwords immediately and enforce strong credential policies.",
@@ -883,13 +891,15 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 6. Default credential check ---
     accepted_creds = []
     proofs = {}
+    action_permitted = getattr(self, "authenticated_action", False)
     for user, passwd in _FTP_DEFAULT_CREDS:
       try:
         ftp_cred = _ftp_connect(user, passwd)
         cred = f"{user}:{passwd}"
         accepted_creds.append(cred)
         result["accepted_credentials"].append(cred)
-        proofs[cred] = _ftp_authenticated_action(ftp_cred)
+        if action_permitted:
+          proofs[cred] = _ftp_authenticated_action(ftp_cred)
         try:
           ftp_cred.quit()
         except Exception:
@@ -934,6 +944,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     result["auth_control"] = {"random_credentials": control}
     findings += _default_credential_findings(
       "FTP", accepted_creds, control=control, proofs=proofs,
+      action_permitted=action_permitted,
     )
 
     return probe_result(raw_data=result, findings=findings)
@@ -1025,6 +1036,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 3. Default credential check ---
     accepted_creds = []
     proofs = {}
+    action_permitted = getattr(self, "authenticated_action", False)
 
     for username, password in _SSH_DEFAULT_CREDS:
       try:
@@ -1038,7 +1050,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         )
         cred = f"{username}:{password}"
         accepted_creds.append(cred)
-        proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+        if action_permitted:
+          proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
         client.close()
       except paramiko.AuthenticationException:
         continue
@@ -1090,6 +1103,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       result["accepted_credentials"] = accepted_creds
       findings += _default_credential_findings(
         "SSH", accepted_creds, control=control, proofs=proofs,
+        action_permitted=action_permitted,
       )
 
     # --- 5. Cipher/KEX audit ---
@@ -1602,6 +1616,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     2. Default credential check — try common user:pass combos.
     3. Privilege escalation check — report if root shell is obtained.
     4. System fingerprint — run ``id`` and ``uname -a`` on successful login.
+       Steps 3 and 4 run only when the job's RoE permit an authenticated
+       action (RM-103); otherwise the login outcome is all that is recorded.
     5. Arbitrary credential acceptance test.
 
     Parameters
@@ -1679,8 +1695,12 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     result["negotiation_options"] = iac_options
 
     # --- 2–4. Default credential check with system fingerprint ---
-    def _try_telnet_login(user, passwd):
-      """Attempt Telnet login, return (success, uid_line, uname_line)."""
+    def _try_telnet_login(user, passwd, act=False):
+      """Attempt Telnet login, return (success, uid_line, uname_line).
+
+      `id` and `uname -a` are sent only when `act` is true; otherwise the
+      session is closed as soon as the login outcome is known.
+      """
       try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(self._target_timeout(5))
@@ -1749,6 +1769,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         # Login succeeded — try to get system info
         uid_line = None
         uname_line = None
+        if not act:
+          s.close()
+          return True, None, None
         try:
           s.sendall(b"id\n")
           _time.sleep(0.5)
@@ -1787,14 +1810,16 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     system_info_captured = False
     accepted_creds = []
     proofs = {}
+    action_permitted = getattr(self, "authenticated_action", False)
     for user, passwd in _TELNET_DEFAULT_CREDS:
-      success, uid_line, uname_line = _try_telnet_login(user, passwd)
+      success, uid_line, uname_line = _try_telnet_login(user, passwd, act=action_permitted)
       if success:
         cred = f"{user}:{passwd}"
         accepted_creds.append(cred)
         result["accepted_credentials"].append(cred)
         # The `id`/`uname` capture above is the authenticated action.
-        proofs[cred] = " | ".join(p for p in (uid_line, uname_line) if p) or None
+        if action_permitted:
+          proofs[cred] = " | ".join(p for p in (uid_line, uname_line) if p) or None
         # Check for root access
         if uid_line and "uid=0" in uid_line:
           findings.append(Finding(
@@ -1847,6 +1872,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     result["auth_control"] = {"random_credentials": control}
     findings += _default_credential_findings(
       "Telnet", accepted_creds, control=control, proofs=proofs,
+      action_permitted=action_permitted,
     )
 
     return probe_result(raw_data=result, findings=findings)
