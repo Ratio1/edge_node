@@ -118,11 +118,13 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "cockroachdb",
     )
 
-  def test_managed_service_kind_recognizes_exact_r1_meshdb_and_legacy_repositories(self):
+  def test_managed_service_kind_recognizes_r1db_and_legacy_repositories(self):
     plugin = make_deeploy_plugin()
     digest = "sha256:" + ("a" * 64)
     accepted = (
       "ghcr.io/ratio1/r1-meshdb:v1.0.0",
+      "ghcr.io/ratio1/r1db:v1.0.7",
+      f"ghcr.io/ratio1/r1db@{digest}",
       f"ghcr.io/ratio1/r1-meshdb@{digest}",
       f"ghcr.io/ratio1/r1-meshdb:v1.0.0@{digest}",
       "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
@@ -132,6 +134,8 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     rejected = (
       "ghcr.io/example/r1-meshdb:latest",
       "ghcr.io/ratio1/r1-meshdb-helper:latest",
+      "ghcr.io/example/r1db:latest",
+      "ghcr.io/ratio1/r1db-helper:latest",
       "ghcr.io/ratio1/deeploy-cockroachdb-service2:main",
     )
 
