@@ -18,11 +18,14 @@ from dataclasses import dataclass
 from .cve_catalog_expansion import EXPANDED_CVE_ROWS
 from .cve_cvss_vectors import CVE_CVSS_VECTORS
 from .cvss import cvss31_base_score
-from .findings import Finding, Remediation, Severity, _template_band_agrees
+from .findings import Finding, Remediation, Severity, _template_band_agrees, current_probe_port
 from .references import cwe_to_owasp
 
 CVE_DB_LAST_UPDATED = "2026-05-08"
 _CURRENT_DYNAMIC_CACHE: ContextVar = ContextVar("redmesh_dynamic_reference_cache", default=None)
+# Scan-local `{"<port>/<cve_id>": entry}` of CVEs the matcher evaluated and
+# skipped as not applicable (RM-103 item 6). None outside a worker run.
+_CURRENT_NOT_APPLICABLE: ContextVar = ContextVar("redmesh_cves_not_applicable", default=None)
 
 
 @dataclass(frozen=True)
@@ -404,18 +407,60 @@ BACKPORT_UNKNOWN = "unknown"
 BACKPORT_UNKNOWN_NO_PACKAGE = "unknown_no_package"
 
 
+def _backport_row(product: str, cve_id: str, package):
+  """The `(upstream, fixed_revision, advisory)` row for this package's upstream, or None."""
+  if package is None:
+    return None
+  rows = BACKPORT_FIXES.get((product, package.distro), {}).get(cve_id, ())
+  for row in rows:
+    if row[0] == package.upstream:
+      return row
+  return None
+
+
 def backport_status(product: str, cve_id: str, package) -> str:
   """`fixed`, `not_fixed`, `unknown` or `unknown_no_package` for a CVE on a distribution package."""
   if package is None:
     return BACKPORT_UNKNOWN_NO_PACKAGE
-  rows = BACKPORT_FIXES.get((product, package.distro), {}).get(cve_id, ())
-  for upstream, fixed_revision, _advisory in rows:
-    if upstream != package.upstream:
-      continue
-    if _compare_debian_revision(package.revision, fixed_revision) >= 0:
-      return BACKPORT_FIXED
-    return BACKPORT_NOT_FIXED
-  return BACKPORT_UNKNOWN
+  row = _backport_row(product, cve_id, package)
+  if row is None:
+    return BACKPORT_UNKNOWN
+  if _compare_debian_revision(package.revision, row[1]) >= 0:
+    return BACKPORT_FIXED
+  return BACKPORT_NOT_FIXED
+
+
+# Why a CVE whose version range matched was still not reported.
+NOT_APPLICABLE_CLIENT_SIDE = "client_side"
+NOT_APPLICABLE_BACKPORT_FIXED = "backport_fixed"
+
+
+def _record_not_applicable(entry, product: str, version: str, package, reason: str) -> None:
+  """Note a matched-but-skipped CVE in the scan-local collector, if one is set.
+
+  Only the two reasons a reader could dispute are recorded. A version outside
+  the CVE's range was never a candidate, so listing it would bury these rows
+  under the whole catalog for the product.
+  """
+  collector = _CURRENT_NOT_APPLICABLE.get()
+  if collector is None:
+    return
+  port = current_probe_port()
+  key = f"{port if port is not None else ''}/{entry.cve_id}"
+  if key in collector:
+    return
+  row = _backport_row(product, entry.cve_id, package) if reason == NOT_APPLICABLE_BACKPORT_FIXED else None
+  collector[key] = {
+    "cve_id": entry.cve_id,
+    "title": entry.title,
+    "product": product,
+    "version": version,
+    "package": f"{package.distro} {package.upstream}-{package.revision}" if package else "",
+    "port": port,
+    "reason": reason,
+    "advisory": row[2] if row else "",
+    "fixed_revision": row[1] if row else "",
+  }
 
 
 def check_cves(
@@ -447,9 +492,13 @@ def check_cves(
   for entry in CVE_DATABASE:
     if entry.product != product:
       continue
-    if applicability and entry_applicability(entry) != applicability:
-      continue
+    # Range first, so an entry skipped below is one the version did match and
+    # the skip can be recorded as a judgement rather than a non-match.
     if not _matches_constraint(version, entry.constraint):
+      continue
+    if applicability and entry_applicability(entry) != applicability:
+      if entry_applicability(entry) == CLIENT_APPLICABILITY:
+        _record_not_applicable(entry, product, version, package, NOT_APPLICABLE_CLIENT_SIDE)
       continue
     # A CVE whose published scope is a disjunction is carried as one row per
     # range, so it must still be reported once.
@@ -458,6 +507,7 @@ def check_cves(
     seen_cves.add(entry.cve_id)
     status = backport_status(product, entry.cve_id, package)
     if status == BACKPORT_FIXED:
+      _record_not_applicable(entry, product, version, package, NOT_APPLICABLE_BACKPORT_FIXED)
       continue
     findings.append(_build_finding(entry, product, version, dynamic_cache, backport_status=status))
   return findings
@@ -476,6 +526,16 @@ def reset_dynamic_reference_cache(token) -> None:
 def get_dynamic_reference_cache():
   """Return the scan-local dynamic reference cache, if one is active."""
   return _CURRENT_DYNAMIC_CACHE.get()
+
+
+def set_not_applicable_collector(collector: dict):
+  """Set the scan-local not-applicable CVE collector; returns the reset token."""
+  return _CURRENT_NOT_APPLICABLE.set(collector)
+
+
+def reset_not_applicable_collector(token) -> None:
+  """Reset the scan-local not-applicable CVE collector token."""
+  _CURRENT_NOT_APPLICABLE.reset(token)
 
 
 def _build_finding(entry, product: str, version: str, dynamic_cache, backport_status: str = ""):
