@@ -1,3 +1,4 @@
+import re
 from copy import deepcopy
 from urllib.parse import urlparse
 
@@ -990,6 +991,27 @@ def build_webapp_workers(
   return workers, None
 
 
+_RELEASE_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$")
+
+
+def _redmesh_release(console_version, report_pipeline_version):
+  """The job's release record: this backend, plus what the launching console reports.
+
+  The console and its report pipeline are separate deployables, so only the
+  console can say which of each launched the job (RM-103 item 12). A part
+  the caller did not send is omitted, never guessed; a malformed one refuses
+  the launch rather than persisting an unreadable release string.
+  """
+  release = {"backend": REDMESH_BACKEND_VERSION}
+  for key, value in (("console", console_version), ("report_pipeline", report_pipeline_version)):
+    if value in (None, ""):
+      continue
+    if not isinstance(value, str) or not _RELEASE_VERSION_RE.match(value):
+      return None, validation_error(f"{key}_version must be a short version string")
+    release[key] = value
+  return release, None
+
+
 def announce_launch(
   owner,
   *,
@@ -1053,8 +1075,13 @@ def announce_launch(
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
   authorized_ports=None,
   authorization_update=None,
+  console_version="",
+  report_pipeline_version="",
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
+  redmesh_release, release_error = _redmesh_release(console_version, report_pipeline_version)
+  if release_error:
+    return release_error
   comparison_mode = bool(comparison_mode)
   excluded_features, enabled_features = resolve_enabled_features(
     owner,
@@ -1108,7 +1135,7 @@ def announce_launch(
 
   job_config = JobConfig(
     execution_binding=binding,
-    redmesh_release={"backend": REDMESH_BACKEND_VERSION},
+    redmesh_release=redmesh_release,
     target=target,
     start_port=start_port,
     end_port=end_port,
@@ -1433,6 +1460,8 @@ def launch_network_scan(
   comparison_mode=False,
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
   authorization_update=None,
+  console_version="",
+  report_pipeline_version="",
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
   try:
@@ -1596,6 +1625,8 @@ def launch_network_scan(
     timeout_profile=timeout_profile,
     authorized_ports=authorized_ports,
     authorization_update=recorded_update,
+    console_version=console_version,
+    report_pipeline_version=report_pipeline_version,
   )
 
 
@@ -1660,6 +1691,8 @@ def launch_webapp_scan(
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
   comparison_mode=False,
+  console_version="",
+  report_pipeline_version="",
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
@@ -1923,6 +1956,8 @@ def launch_webapp_scan(
     target_config_secrets=target_config_secrets,
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,
+    console_version=console_version,
+    report_pipeline_version=report_pipeline_version,
   )
 
 
@@ -1991,6 +2026,8 @@ def launch_test(
   comparison_mode=False,
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
   authorization_update=None,
+  console_version="",
+  report_pipeline_version="",
 ):
   """Compatibility shim that routes to scan-type-specific launch endpoints."""
   try:
@@ -2060,6 +2097,8 @@ def launch_test(
       unsafe_launch_confirmations=unsafe_launch_confirmations,
       blockchain_attestation_enabled=blockchain_attestation_enabled,
       comparison_mode=comparison_mode,
+      console_version=console_version,
+      report_pipeline_version=report_pipeline_version,
     )
 
   return launch_network_scan(
@@ -2100,4 +2139,6 @@ def launch_test(
     comparison_mode=comparison_mode,
     timeout_profile=timeout_profile,
     authorization_update=authorization_update,
+    console_version=console_version,
+    report_pipeline_version=report_pipeline_version,
   )

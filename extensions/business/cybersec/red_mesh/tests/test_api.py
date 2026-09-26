@@ -359,6 +359,36 @@ class TestPhase1ConfigCID(unittest.TestCase):
     restored = JobConfig.from_dict(config_dict).to_dict()
     self.assertEqual(restored["redmesh_release"], {"backend": "0.10.0"})
 
+  def test_launch_records_the_console_and_report_pipeline_it_was_sent(self):
+    """RM-103 item 12: the release names all three deployables. Only the
+    console knows its own and its report pipeline's version, so it sends them;
+    every launch path must carry them into the JobConfig."""
+    from extensions.business.cybersec.red_mesh.constants import REDMESH_BACKEND_VERSION
+    versions = dict(console_version="1.33.0", report_pipeline_version="1.2.0")
+    expected = {"backend": REDMESH_BACKEND_VERSION, "console": "1.33.0", "report_pipeline": "1.2.0"}
+    for path, launch in (
+      ("launch_test network", lambda p: self._launch(p, **versions)),
+      ("launch_test webapp", lambda p: self._launch(
+        p, scan_type="webapp", target="", target_url="https://example.com/app",
+        official_username="admin", official_password="secret",
+        regular_username="user", regular_password="pass", **versions)),
+      ("launch_network_scan", lambda p: self._launch_network(p, **versions)),
+      ("launch_webapp_scan", lambda p: self._launch_webapp(p, **versions)),
+    ):
+      with self.subTest(path=path):
+        plugin = self._build_mock_plugin(job_id="release-job", r1fs_cid="QmFakeConfigCID123")
+        result = launch(plugin)
+        self.assertNotIn("error", result)
+        self.assertEqual(self._latest_job_config(plugin)["redmesh_release"], expected)
+
+  def test_a_malformed_console_version_refuses_the_launch(self):
+    for bad in ("1.33.0; rm -rf", "x" * 40, 133, " 1.0"):
+      with self.subTest(value=bad):
+        plugin = self._build_mock_plugin(job_id="release-bad", r1fs_cid="QmFakeConfigCID123")
+        result = self._launch(plugin, console_version=bad)
+        self.assertIn("error", result)
+        plugin.r1fs.add_json.assert_not_called()
+
   _UPDATE = {"reference": "AUTH-2026-017", "authorized_signer_name": "Security Lead",
              "authorized_signer_role": "CISO"}
 
