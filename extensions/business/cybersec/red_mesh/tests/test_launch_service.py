@@ -198,6 +198,7 @@ class TestLaunchService(unittest.TestCase):
     self.assertEqual(self._launch_with_roe(None), {False})
     self.assertEqual(self._launch_with_roe({"dos_allowed": True}), {False})
     self.assertEqual(self._launch_with_roe({"authenticated_action": True}), {True})
+    self.assertEqual(self._launch_with_roe({"authenticated_action": "false"}), {False})
 
 
 class TestComparisonTieredAssignment(unittest.TestCase):

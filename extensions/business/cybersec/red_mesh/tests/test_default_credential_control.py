@@ -42,7 +42,9 @@ class TestDefaultCredentialVerdict(unittest.TestCase):
     self.assertIn("Accepted credential: root:toor; authenticated action: exec id ->", f.evidence)
 
   def test_control_rejected_without_proof_is_firm_not_certain(self):
-    f = _default_credential_findings("FTP", ["ftp:ftp"], control=CONTROL_REJECTED)[0]
+    f = _default_credential_findings(
+      "FTP", ["ftp:ftp"], control=CONTROL_REJECTED, action_permitted=True,
+    )[0]
     self.assertEqual(f.severity, Severity.CRITICAL)
     self.assertEqual(f.confidence, "firm")
     self.assertIn("handshake alone", f.description)
@@ -192,9 +194,8 @@ class TestAuthenticatedActionNeedsRoeConsent(unittest.TestCase):
   """
 
   def test_not_permitted_wording_replaces_the_handshake_sentence(self):
-    f = _default_credential_findings(
-      "SSH", ["root:toor"], control=CONTROL_REJECTED, action_permitted=False,
-    )[0]
+    # The default: a caller that does not pass the flag gets the RoE wording.
+    f = _default_credential_findings("SSH", ["root:toor"], control=CONTROL_REJECTED)[0]
     self.assertEqual(f.severity, Severity.CRITICAL)
     self.assertEqual(f.confidence, "firm")
     self.assertIn(NOT_PERMITTED, f.description)

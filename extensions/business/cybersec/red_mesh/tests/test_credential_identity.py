@@ -211,6 +211,35 @@ class TestNonCredentialIdentityIsUnchanged(unittest.TestCase):
         self.assertEqual(dedup_key(finding), fid)
         self.assertEqual(content_hash(finding), sig)
 
+  def test_the_one_non_credential_signature_that_moves_keeps_its_id(self):
+    # `worker/service/common.py` HTTP Host-drop evidence reads `with Host:<target>`,
+    # which the rule masks. Measured on fb060643: id da836ede9c8b1092, signature
+    # 4f2bce20…0615. The id must not move; the signature moves once (disclosed).
+    finding = {
+      "probe": "_service_info_http", "port": 8080,
+      "title": "HTTP service drops requests with Host header",
+      "description": "TCP port 8080 returns empty replies for standard HTTP/1.1 requests "
+                     "but responds to HTTP/1.0 without a Host header. This indicates a "
+                     "server_name mismatch or intentional filtering.",
+      "evidence": "HTTP/1.1 with Host:10.0.0.5 → empty reply; HTTP/1.0 without Host → nginx",
+      "remediation": "Configure a proper default server block or virtual host.",
+      "severity": "INFO", "confidence": "certain", "cwe_id": "CWE-200", "affected_assets": [],
+    }
+    self.assertEqual(dedup_key(finding), "da836ede9c8b1092")
+    self.assertEqual(
+      content_hash(finding),
+      "b28bfc4e92e12258381bbe633cd9b3228783a8ed78f4b0959a392f92c6ccbc39",
+    )
+
+  def test_two_passwords_for_one_user_are_one_finding(self):
+    # Owner decision 2026-09-26: identity is protocol + port + username. Two
+    # accepted passwords for `root` on one port collapse into one finding with
+    # one id and one signature; the pairs stay in `accepted_credentials`.
+    a = _finding("ssh", "root", "toor")
+    b = _finding("ssh", "root", "password")
+    self.assertEqual(dedup_key(a), dedup_key(b))
+    self.assertEqual(content_hash(a), content_hash(b))
+
 
 if __name__ == "__main__":
   unittest.main()

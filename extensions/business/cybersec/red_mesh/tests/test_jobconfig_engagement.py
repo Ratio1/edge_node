@@ -97,6 +97,16 @@ class TestEngagementFieldsTyped(unittest.TestCase):
     cfg = JobConfig.from_dict(JobConfig(**_base_jobconfig_kwargs(), roe=normalized).to_dict())
     self.assertTrue(cfg.get_roe().authenticated_action)
 
+  def test_launch_roe_with_a_string_flag_is_refused(self):
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      _normalize_typed_payload,
+    )
+    normalized, error = _normalize_typed_payload(
+      "roe", {"authenticated_action": "false"}, RulesOfEngagement,
+    )
+    self.assertIsNone(normalized)
+    self.assertIsNotNone(error)
+
   def test_with_typed_authorization_dict(self):
     auth = AuthorizationRef(
       document_cid="QmAuthCID",

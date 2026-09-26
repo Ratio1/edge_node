@@ -21,7 +21,7 @@ CONTROL_ACCEPTED = "accepted"
 CONTROL_NOT_RUN = "not_run"
 
 
-def _default_credential_findings(protocol, accepted, *, control, proofs=None, action_permitted=True):
+def _default_credential_findings(protocol, accepted, *, control, proofs=None, action_permitted=False):
   """
   Build the default-credential findings for one service, gated on the
   negative control (RM-069).

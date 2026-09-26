@@ -38,7 +38,7 @@ def _launch_network_jobs(
   timeout_profile = job_config.get("timeout_profile")
   # The post-login action is opt-in per job through the RoE (RM-103).
   roe = job_config.get("roe")
-  authenticated_action = bool(roe.get("authenticated_action")) if isinstance(roe, dict) else False
+  authenticated_action = isinstance(roe, dict) and roe.get("authenticated_action") is True
   # The comparison tier is node-wide evidence, not per-thread work: it goes to
   # a single worker so the tier is probed exactly once from this vantage.
   comparison_ports = job_config.get("comparison_ports") or []
