@@ -670,7 +670,8 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     1. Banner grab and SYST/FEAT fingerprint.
     2. Anonymous login attempt.
-    3. Write access test (STOR) after anonymous login.
+    3. Write access test (STOR) after anonymous login, only when the job's RoE
+       permit an authenticated action (RM-103).
     4. Directory listing and traversal.
     5. TLS support check (AUTH TLS).
     6. Default credential check.
@@ -795,7 +796,11 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         pass
 
     # --- 3. Write access test (only if anonymous login succeeded) ---
-    if ftp and result["anonymous_access"]:
+    # Uploading a file changes the target, so it needs the same RoE consent as
+    # the post-login action (RM-103); without it the test is recorded as not run.
+    if ftp and result["anonymous_access"] and not getattr(self, "authenticated_action", False):
+      result["write_access_test"] = "not_permitted_by_roe"
+    elif ftp and result["anonymous_access"]:
       import io
       try:
         ftp.set_pasv(True)

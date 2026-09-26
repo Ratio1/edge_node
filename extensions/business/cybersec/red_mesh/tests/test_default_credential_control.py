@@ -294,6 +294,49 @@ class TestFtpActionGate(unittest.TestCase):
     self.assertIn("authenticated action: PWD -> /home/ftp", self._default_finding(result)["evidence"])
 
 
+class _FakeAnonymousFtp(_FakeFtp):
+  """Accepts anonymous login and uploads; records every STOR."""
+  stored = []
+
+  def login(self, user="", passwd=""):
+    if user in ("", "anonymous"):
+      return "230 anonymous ok"
+    return super().login(user, passwd)
+
+  def storbinary(self, cmd, fp, *a, **k):
+    _FakeAnonymousFtp.stored.append(cmd)
+    return "226 Transfer complete"
+
+  def delete(self, name):
+    return "250 ok"
+
+
+class TestFtpAnonymousWriteGate(unittest.TestCase):
+  """RM-103 item 5: the anonymous upload test changes the target, so it
+  needs the same RoE consent as the post-login action."""
+
+  def _run(self, authenticated_action):
+    _FakeAnonymousFtp.stored = []
+    worker = TestSshProbeWiring._worker(self, authenticated_action)
+    base = "extensions.business.cybersec.red_mesh.worker.service.common."
+    with patch(base + "ftplib.FTP", _FakeAnonymousFtp), patch(base + "check_cves", return_value=[]):
+      return worker._service_info_ftp("example.com", 21)
+
+  def test_flag_off_uploads_nothing_and_records_why(self):
+    result = self._run(False)
+    self.assertEqual(_FakeAnonymousFtp.stored, [])
+    self.assertEqual(result["write_access_test"], "not_permitted_by_roe")
+    titles = [f["title"] for f in result["findings"]]
+    self.assertIn("FTP allows anonymous login.", titles)
+    self.assertNotIn("FTP anonymous write access enabled (file upload possible).", titles)
+
+  def test_flag_on_runs_the_upload_test(self):
+    result = self._run(True)
+    self.assertEqual(_FakeAnonymousFtp.stored, ["STOR __redmesh_probe.txt"])
+    self.assertIn("FTP anonymous write access enabled (file upload possible).",
+                  [f["title"] for f in result["findings"]])
+
+
 class _FakeTelnet:
   """Scripted Telnet server: `root:root` logs in to a root shell; records commands."""
   sent = []
