@@ -870,7 +870,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("edgeguard_api_ms", result["metrics"])
     self.assertEqual(session.post.call_args.args[0], "http://127.0.0.1:53001/create_chat_completion")
     self.assertEqual(session.post.call_args.kwargs["json"]["temperature"], 0.0)
-    self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 64)
+    self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 256)
     self.assertEqual(session.post.call_args.kwargs["json"]["model"], PRIVATE_MODEL_KEY)
     self.assertEqual(result["attempts"][0]["finish_reason"], "stop")
     self.assertEqual(result["attempts"][0]["completion_tokens"], 10)
