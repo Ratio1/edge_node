@@ -221,12 +221,17 @@ class RulesOfEngagement:
     during which scans must not run.
   - retest_window_end: ISO date by which the customer expects a
     retest to verify fixes.
+  - authenticated_action: explicit opt-in for one harmless command
+    (`id`, `PWD`, `uname`) over a session opened with an accepted
+    default credential. Default false: without it the probe reports
+    the accepted credential and does nothing with the session (RM-103).
   """
   strength_of_test: str = "standard"
   dos_allowed: bool = False
   post_exploit_rules: str = "va_only"
   blackout_windows: list[tuple[str, str]] = field(default_factory=list)
   retest_window_end: str = ""
+  authenticated_action: bool = False
 
   def to_dict(self) -> dict:
     return {
@@ -235,6 +240,7 @@ class RulesOfEngagement:
       "post_exploit_rules": self.post_exploit_rules,
       "blackout_windows": [list(w) for w in self.blackout_windows],
       "retest_window_end": self.retest_window_end,
+      "authenticated_action": self.authenticated_action is True,
     }
 
   @classmethod
@@ -252,6 +258,9 @@ class RulesOfEngagement:
       post_exploit_rules=str(d.get("post_exploit_rules", "va_only")),
       blackout_windows=windows,
       retest_window_end=str(d.get("retest_window_end", "")),
+      # Kept as sent, so `validate()` can refuse a non-boolean: this is consent
+      # to run commands, and `bool("false")` is True.
+      authenticated_action=d.get("authenticated_action", False),
     )
 
   def is_empty(self) -> bool:
@@ -261,6 +270,7 @@ class RulesOfEngagement:
       self.post_exploit_rules == "va_only",
       not self.blackout_windows,
       not self.retest_window_end,
+      self.authenticated_action is not True,
     ])
 
   def validate(self) -> list[str]:
@@ -272,6 +282,10 @@ class RulesOfEngagement:
     if self.post_exploit_rules not in POST_EXPLOIT_RULES:
       errors.append(
         f"post_exploit_rules {self.post_exploit_rules!r} not in {POST_EXPLOIT_RULES}"
+      )
+    if not isinstance(self.authenticated_action, bool):
+      errors.append(
+        f"authenticated_action must be true or false, got {self.authenticated_action!r}"
       )
     return errors
 

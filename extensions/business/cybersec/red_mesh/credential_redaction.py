@@ -34,8 +34,14 @@ import re
 # accepting it anywhere turned every `with <word>: <text>` label into
 # `<word>:*** <text>` (found by the closeout e2e). `with https://…` stays
 # untouched through `(?![/])`, and `Auth OK for root:` becomes `root:***`.
+#
+# `(empty)` is how HTTP Basic, MySQL and PostgreSQL print a blank secret. It is
+# matched whole and first: the lazy `\S+?` otherwise stopped at the `)`
+# terminator and left `admin:***)`, which told the reader the password was blank
+# and, once identity is computed over redacted text, forked the finding id
+# between a blank and a non-blank acceptance of the same user (RM-103).
 _PAIR_TEMPLATE = (
-  r"(?P<user>[^\s:]{1,64}):(?![/])%s(?P<secret>\S+?|(?=\s*(?:$|\()))"
+  r"(?P<user>[^\s:]{1,64}):(?![/])%s(?P<secret>\(empty\)|\S+?|(?=\s*(?:$|\()))"
   r"(?=[\s;)\]}]|[.,](?:\s|$)|$)"
 )
 _PAIR = _PAIR_TEMPLATE % ""

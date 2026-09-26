@@ -123,8 +123,15 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
   # Risk score as comment attribute
   event.add_attribute("comment", f"RedMesh risk score: {risk_score}/100",
                       comment="Risk assessment")
-  backend = (redmesh_release or {}).get("backend") or "not recorded"
-  event.add_attribute("comment", f"RedMesh release: backend {backend}",
+  # All three deployables that produced the job, as the launch recorded them
+  # (RM-103 item 12). The console parts exist only when the console sent them.
+  release = redmesh_release or {}
+  release_line = " · ".join(
+    f"{label} {release.get(key) or 'not recorded'}"
+    for label, key in (("backend", "backend"), ("console", "console"),
+                       ("report pipeline", "report_pipeline"))
+  )
+  event.add_attribute("comment", f"RedMesh release: {release_line}",
                       comment="Scanner release")
 
   # ── ip-port objects ──

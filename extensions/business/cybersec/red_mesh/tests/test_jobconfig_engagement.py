@@ -84,6 +84,29 @@ class TestEngagementFieldsTyped(unittest.TestCase):
     self.assertEqual(resolved.post_exploit_rules, "pivot")
     self.assertEqual(len(resolved.blackout_windows), 1)
 
+  def test_launch_roe_with_only_authenticated_action_survives(self):
+    # RM-103 item 5: the launch normaliser drops an RoE that `is_empty()`;
+    # a payload setting only the new flag must reach the JobConfig.
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      _normalize_typed_payload,
+    )
+    normalized, error = _normalize_typed_payload(
+      "roe", {"authenticated_action": True}, RulesOfEngagement,
+    )
+    self.assertIsNone(error)
+    cfg = JobConfig.from_dict(JobConfig(**_base_jobconfig_kwargs(), roe=normalized).to_dict())
+    self.assertTrue(cfg.get_roe().authenticated_action)
+
+  def test_launch_roe_with_a_string_flag_is_refused(self):
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      _normalize_typed_payload,
+    )
+    normalized, error = _normalize_typed_payload(
+      "roe", {"authenticated_action": "false"}, RulesOfEngagement,
+    )
+    self.assertIsNone(normalized)
+    self.assertIsNotNone(error)
+
   def test_with_typed_authorization_dict(self):
     auth = AuthorizationRef(
       document_cid="QmAuthCID",
