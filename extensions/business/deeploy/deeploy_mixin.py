@@ -138,6 +138,7 @@ SENSITIVE_LOG_KEY_PARTS = (
 COCKROACHDB_IMAGE_REPOSITORIES = frozenset((
   "ghcr.io/ratio1/deeploy-cockroachdb-service",
   "ghcr.io/ratio1/r1-meshdb",
+  "ghcr.io/ratio1/r1db",
 ))
 COCKROACHDB_LEGACY_IMAGE_REPOSITORY = "ghcr.io/ratio1/deeploy-cockroachdb-service"
 COCKROACHDB_CERT_ENV_KEYS = (
