@@ -153,10 +153,21 @@ class TestContractReplay(unittest.TestCase):
     again = self.prepare(**contract_terms())
     self.assertEqual(again["data"]["tenantId"], first["data"]["tenantId"])
 
+  def test_the_same_file_uploaded_again_replays_the_same_creation(self):
+    # A second upload of the same bytes gets a new reference (the envelope carries its upload time);
+    # a retry after a page reload, or a seeded rerun, must still be the same creation.
+    first = self.prepare(**contract_terms())
+    again = contract_terms()
+    again["contract"] = {**contract_ref(ref="doc-reuploaded"), "uploaded_at": "2026-09-28T08:00:00Z"}
+    replay = self.prepare(**again)
+    self.assertEqual(replay["data"]["tenantId"], first["data"]["tenantId"])
+    receipt = next(v for v in self.store.data.values() if isinstance(v, dict) and v.get("kind") == "receipt")
+    self.assertEqual(receipt["contract"]["ref"], "doc-fixture")
+
   def test_a_replay_with_a_different_contract_or_legal_details_conflicts(self):
     self.prepare(**contract_terms())
     other = contract_terms()
-    other["contract"] = contract_ref(ref="doc-other")
+    other["contract"] = {**contract_ref(ref="doc-other"), "sha256": "b" * 64}
     self.assertEqual(self.prepare(**other)["error"], "request_conflict")
     renamed = contract_terms()
     renamed["legal"]["name"] = "Someone Else SRL"

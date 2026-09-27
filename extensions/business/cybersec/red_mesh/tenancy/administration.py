@@ -114,8 +114,11 @@ def _valid_contract(value):
 
 
 def _same_contract(stored, requested):
+  # Same bytes, same contract: a re-upload of the file gets a new reference (the envelope carries its
+  # upload time), and a retry after a page reload must still be the same creation. The receipt keeps
+  # the reference it was first created with.
   return (isinstance(stored, dict) and isinstance(requested, dict)
-          and stored.get("store") == requested.get("store") and stored.get("ref") == requested.get("ref"))
+          and stored.get("sha256") == requested.get("sha256"))
 
 
 class TenantAdministrationService:
