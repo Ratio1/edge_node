@@ -10,6 +10,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
   build_direct_cypher_system_prompt,
   build_schema_prompt_context,
   build_schema_correction_prompt,
+  classify_empty_reason,
   classify_result_shape,
   extract_schema_tokens,
   load_schema_artifact_v0_11,
@@ -720,3 +721,70 @@ class ClassifyResultShapeTests(unittest.TestCase):
     for query in cases:
       with self.subTest(query=query):
         self.assertEqual(classify_result_shape(query), "other")
+
+
+class ClassifyEmptyReasonTests(unittest.TestCase):
+  """Contract §6: `classify_empty_reason` — `topology_surface_no_data` |
+  `literal_not_found` | `no_match`, from the accepted Cypher text and the
+  schema artifact alone, no extra Neo4j round trip. Synthetic literals only
+  (RFC 5737 test-net addresses, made-up identifiers) — no prod values."""
+
+  def test_topology_surface_label_or_relationship_type_is_topology_surface_no_data(self):
+    # Mission-[:SUPPORTS]->Component is `surface: "topology"` in the v0.11
+    # artifact (no data loaded yet for this pattern).
+    query = "MATCH p=(m:Mission)-[:SUPPORTS]->(c:Component) RETURN p LIMIT 5"
+    self.assertEqual(
+      classify_empty_reason(query, EDGEGUARD_SCHEMA_V0_11),
+      "topology_surface_no_data",
+    )
+
+  def test_populated_surface_without_a_literal_index_is_no_match(self):
+    # CVE-[:AFFECTS]->Sector is `surface: "populated"` with real snapshot
+    # rows; no `literal_index` means the literal check is skipped entirely.
+    query = (
+      "MATCH p=(c:CVE)-[:AFFECTS]->(s:Sector) "
+      "WHERE c.cve_id = 'CVE-2021-00000' RETURN p LIMIT 5"
+    )
+    self.assertEqual(
+      classify_empty_reason(query, EDGEGUARD_SCHEMA_V0_11, literal_index=None),
+      "no_match",
+    )
+
+  def test_populated_surface_literal_absent_from_the_index_is_literal_not_found(self):
+    query = (
+      "MATCH (i:Indicator) WHERE i.value = '198.51.100.7' "
+      "RETURN i.value AS value LIMIT 5"
+    )
+    self.assertEqual(
+      classify_empty_reason(
+        query, EDGEGUARD_SCHEMA_V0_11, literal_index={"203.0.113.9"},
+      ),
+      "literal_not_found",
+    )
+
+  def test_populated_surface_literal_present_in_the_index_is_no_match(self):
+    query = (
+      "MATCH (i:Indicator) WHERE i.value = '198.51.100.7' "
+      "RETURN i.value AS value LIMIT 5"
+    )
+    self.assertEqual(
+      classify_empty_reason(
+        query, EDGEGUARD_SCHEMA_V0_11, literal_index={"198.51.100.7"},
+      ),
+      "no_match",
+    )
+
+  def test_topology_surface_check_runs_before_the_literal_index_check(self):
+    # A topology-surface pattern is classified as such even when every
+    # literal in the query is present in the index — the snapshot has no
+    # rows for the pattern at all, so the literal was never the problem.
+    query = (
+      "MATCH p=(m:Mission)-[:SUPPORTS]->(c:Component) "
+      "WHERE m.name = 'mission-synthetic-1' RETURN p LIMIT 5"
+    )
+    self.assertEqual(
+      classify_empty_reason(
+        query, EDGEGUARD_SCHEMA_V0_11, literal_index={"mission-synthetic-1"},
+      ),
+      "topology_surface_no_data",
+    )

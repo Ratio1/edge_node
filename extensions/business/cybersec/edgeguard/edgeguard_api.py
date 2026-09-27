@@ -35,6 +35,8 @@ from .edgeguard_cypher_guard import (
   build_direct_cypher_system_prompt,
   build_schema_correction_prompt,
   canonical_schema_surface,
+  classify_empty_reason,
+  classify_result_shape,
   normalize_user_literal_text,
 )
 from . import literal_classes
@@ -1534,6 +1536,69 @@ def _legacy_query_result_evidence(
   }, raw_nodes, raw_relationships
 
 
+_JSON_SAFE_TEMPORAL_CLASS_NAMES = {
+  "date", "datetime", "duration", "localdatetime", "localtime", "time",
+}
+
+
+def _neo4j_row_json_safe(value: Any, depth: int = 0) -> Any:
+  """Convert one `/neo4j_query` row value into a JSON-serializable form.
+
+  Contract §4.3: rows stay complete (PR #477 review, F1 decision — no ref
+  indirection, no property redaction, unlike `_legacy_query_result_value`);
+  this only replaces the structural types stdlib ``json`` cannot encode
+  (`neo4j.graph.Path`, temporal values, points) with plain dict/str forms.
+  A bare node or relationship value is flattened to its property dict so a
+  row's shape for those columns is unchanged from before this fix.
+  """
+  if depth > 8:
+    raise _ResultEvidenceError("result_nesting_limit", "query result nesting exceeds eight levels")
+  if value is None or isinstance(value, (bool, int, str)):
+    return value
+  if isinstance(value, float):
+    if not math.isfinite(value):
+      raise _ResultEvidenceError("invalid_result_number", "query result number must be finite")
+    return value
+  if _is_relationship_like(value):
+    return {
+      key: _neo4j_row_json_safe(item, depth=depth + 1)
+      for key, item in _object_items(value).items()
+    }
+  if _is_node_like(value):
+    return {
+      key: _neo4j_row_json_safe(item, depth=depth + 1)
+      for key, item in _object_items(value).items()
+    }
+  if _is_path_like(value):
+    return {
+      "nodes": [
+        _neo4j_row_json_safe(node, depth=depth + 1)
+        for node in list(getattr(value, "nodes", []) or [])
+      ],
+      "relationships": [
+        _neo4j_row_json_safe(relationship, depth=depth + 1)
+        for relationship in list(getattr(value, "relationships", []) or [])
+      ],
+    }
+  class_name = value.__class__.__name__.lower()
+  if class_name in _JSON_SAFE_TEMPORAL_CLASS_NAMES:
+    return str(value)
+  if hasattr(value, "srid") and hasattr(value, "x") and hasattr(value, "y"):
+    point = {"srid": str(getattr(value, "srid")), "x": getattr(value, "x"), "y": getattr(value, "y")}
+    if getattr(value, "z", None) is not None:
+      point["z"] = getattr(value, "z")
+    return point
+  if hasattr(value, "to_native"):
+    native = value.to_native()
+    if isinstance(native, int):
+      return native
+  if isinstance(value, (list, tuple)):
+    return [_neo4j_row_json_safe(item, depth=depth + 1) for item in value]
+  if isinstance(value, dict):
+    return {str(key): _neo4j_row_json_safe(item, depth=depth + 1) for key, item in value.items()}
+  raise _ResultEvidenceError("unsupported_query_result_value", "query result contains an unsupported value")
+
+
 def _serialized_graph_error(code: str, detail: str) -> tuple[None, None, list[Dict[str, str]]]:
   return None, None, [_contract_error(code, detail)]
 
@@ -3020,7 +3085,11 @@ _CONFIG = {
   },
   "NEO4J_MAX_ROWS": 100,
   "NEO4J_QUERY_TIMEOUT_SECONDS": 30,
-  "LIVE_EMPTY_RESULT_BROADENING": True,
+  # Contract §6: broadening is off by default so an empty result is reported
+  # truthfully, with an `empty_reason`, instead of being replaced by an
+  # unrelated deterministic-broadening row. Callers opt in per request with
+  # `enable_empty_result_broadening=True`.
+  "LIVE_EMPTY_RESULT_BROADENING": False,
   "REQUEST_TIMEOUT": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "REQUEST_TIMEOUT_SECONDS": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "EDGEGUARD_VERBOSE": 10,
@@ -4969,6 +5038,12 @@ class EdgeguardApiPlugin(BasePlugin):
       _collect_graph(row, graph_state)
     return {
       "columns": columns,
+      # Raw driver objects (Node/Relationship/Path/temporal): the graph
+      # evidence pipeline (`explain_graph`, `prepare_graph_explanation` ->
+      # `_build_graph_evidence_packet` / `_legacy_query_result_evidence`)
+      # needs these original types to build its own ref-based, redacted
+      # evidence. `/neo4j_query` converts a copy to a JSON-safe form itself
+      # (contract §4.3) rather than this shared helper doing it here.
       "rows": rows,
       "row_count": len(rows),
       "truncated": truncated,
@@ -5089,12 +5164,19 @@ class EdgeguardApiPlugin(BasePlugin):
   ) -> Dict[str, Any]:
     started = time.monotonic()
     analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
+    # Contract §4.3: `classify_result_shape` on every `/neo4j_query` response,
+    # accepted or rejected — it is a static text classification, not an
+    # execution-safety verdict, so it does not gate acceptance here.
+    validation = {
+      **analysis,
+      "result_shape": classify_result_shape(analysis.get("candidate") or cypher),
+    }
     if not analysis["accepted"]:
       return {
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
-        "validation": analysis,
+        "validation": validation,
         "error": "Cypher rejected by EdgeGuard guard; query was not executed.",
       }
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
@@ -5156,13 +5238,29 @@ class EdgeguardApiPlugin(BasePlugin):
               broadening_cypher=broadened["cypher"],
               error=self._sanitize_error(exc, connection["password"]),
             )
+      # Contract §6: every empty result carries a reason, classified from the
+      # accepted (originally requested) Cypher text — not from a broadened
+      # fallback query, which is deliberately unrelated to the request.
+      empty_reason = (
+        None if query_result["rows"]
+        else classify_empty_reason(analysis["accepted_cypher"], EDGEGUARD_SCHEMA_V0_11)
+      )
+      # Contract §4.3: `/neo4j_query` rows are JSON-safe for every shape.
+      # `_run_neo4j_query` keeps `rows` as raw driver objects for its other
+      # callers (the graph evidence pipeline); this response converts a copy.
+      json_safe_rows = [
+        {key: _neo4j_row_json_safe(value) for key, value in row.items()}
+        for row in query_result["rows"]
+      ]
       return {
         "status": STATUS_OK,
         "ok": True,
         "executed": True,
         "method": "native_driver" if method == "native_driver" else "bolt_over_wss",
         **query_result,
-        "validation": analysis,
+        "rows": json_safe_rows,
+        "empty_reason": empty_reason,
+        "validation": validation,
         "live_retry": live_retry,
         "metrics": {
           "connect_ms": connect_ms,
@@ -5176,7 +5274,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "ok": False,
         "executed": False,
         "error": self._sanitize_error(exc, connection["password"]),
-        "validation": analysis,
+        "validation": validation,
         "metrics": {
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
           "query_ms": 0.0,

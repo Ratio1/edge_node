@@ -679,6 +679,78 @@ def classify_result_shape(cypher: str) -> str:
   return RESULT_SHAPE_OTHER
 
 
+EMPTY_REASON_TOPOLOGY_SURFACE_NO_DATA = "topology_surface_no_data"
+EMPTY_REASON_LITERAL_NOT_FOUND = "literal_not_found"
+EMPTY_REASON_NO_MATCH = "no_match"
+# Cypher single- or double-quoted string literal (backslash-escaped or
+# doubled-quote-escaped), the same shape as the API's own
+# `_cypher_string_literals` helper — duplicated here so the guard module
+# stays a standalone, stdlib-only dependency the hub validator can vendor.
+_STRING_LITERAL = re.compile(r"'((?:\\.|''|[^'])*)'|\"((?:\\.|\"\"|[^\"])*)\"")
+
+
+def _string_literal_values(cypher: str) -> list[str]:
+  values: list[str] = []
+  for match in _STRING_LITERAL.finditer(str(cypher or "")):
+    raw = match.group(1) if match.group(1) is not None else match.group(2) or ""
+    values.append(re.sub(r"\\(['\"\\])", r"\1", raw).replace("''", "'").replace('""', '"'))
+  return values
+
+
+def _topology_surface_relationship_types(artifact: dict[str, Any]) -> set[str]:
+  """Contract §6: relationship types that only ever appear on
+  topology-surface patterns (`surface: "topology"`, or a `populated: false`
+  pending row) — a query touching one of these can only return an empty
+  result because the snapshot carries no data for it, not because the
+  request's literal was wrong.
+
+  Keyed on relationship type, not label: the same label (e.g. `CVE`,
+  `Indicator`) sits on both populated and topology-surface patterns, so a
+  label-only test flags almost every real query; a relationship type is
+  reused across surfaces only once in the v0.11 artifact (`PART_OF`, a known
+  imprecise case — a query using it may under- or over-classify)."""
+  topology_types: set[str] = set()
+  populated_types: set[str] = set()
+  for pattern in artifact.get("patterns", []) or []:
+    rel_type = pattern.get("type")
+    if not rel_type:
+      continue
+    is_topology = pattern.get("surface") == "topology" or pattern.get("populated") is False
+    (topology_types if is_topology else populated_types).add(str(rel_type))
+  return topology_types - populated_types
+
+
+def classify_empty_reason(
+  cypher: str,
+  artifact: dict[str, Any] | None = None,
+  literal_index: set[str] | frozenset[str] | None = None,
+) -> str:
+  """Contract §6: why an executed, guard-accepted query returned zero rows,
+  from the Cypher text and the schema artifact alone (no extra Neo4j round
+  trip).
+
+  - `topology_surface_no_data`: the query uses a relationship type that the
+    snapshot has no data for.
+  - `literal_not_found`: a string literal in the query is absent from
+    `literal_index` (the snapshot's identifier index — not built yet, see
+    the run ledger; `literal_index=None` skips this check).
+  - `no_match`: neither of the above — the query is schema-populated and
+    every literal is known, so the filter combination legitimately matches
+    nothing.
+  """
+  artifact = artifact if artifact is not None else EDGEGUARD_SCHEMA_V0_11
+  tokens = extract_schema_tokens(cypher)
+  topology_relationship_types = _topology_surface_relationship_types(artifact)
+  if tokens["relationship_types"] & topology_relationship_types:
+    return EMPTY_REASON_TOPOLOGY_SURFACE_NO_DATA
+  if literal_index is not None:
+    for literal in _string_literal_values(cypher):
+      normalized = literal.strip()
+      if normalized and normalized not in literal_index:
+        return EMPTY_REASON_LITERAL_NOT_FOUND
+  return EMPTY_REASON_NO_MATCH
+
+
 def _execution_safety_error(
   candidate: str,
   schema_tokens: dict[str, set[str]],

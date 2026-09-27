@@ -665,7 +665,9 @@ def _make_api(**overrides):
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
   plugin.cfg_neo4j_query_timeout_seconds = overrides.get("neo4j_query_timeout_seconds", 30)
   plugin.cfg_neo4j_default_connection = overrides.get("neo4j_default_connection", {})
-  plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", True)
+  # Contract §6: broadening is off by default from EGM-059 phase 2; tests
+  # that exercise the old True default now pass it explicitly.
+  plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", False)
   plugin.cfg_request_timeout_seconds = overrides.get("request_timeout_seconds", 120)
   plugin.cfg_edgeguard_verbose = 0
   plugin.os_environ = overrides.get("os_environ", {})
@@ -1166,7 +1168,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     bridge.close.assert_called_once_with()
 
   def test_api_model_metadata_describes_the_configured_default_model(self):
-    plugin = _make_api()
+    plugin = _make_api(live_empty_result_broadening=True)
 
     model = plugin.model()
 
@@ -1665,6 +1667,9 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertFalse(result["executed"])
     self.assertEqual(result["status"], "rejected")
+    # Contract §4.3: `validation.result_shape` is set even on a rejected
+    # query — it is a static text classification, not an acceptance gate.
+    self.assertEqual(result["validation"]["result_shape"], "other")
     mocked_driver.assert_not_called()
 
   def test_neo4j_query_uses_driver_for_accepted_cypher(self):
@@ -1787,6 +1792,60 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(graph_properties, {"value": "example.org"})
     self.assertNotIn("sentinel", json.dumps(result["graph"]))
 
+  def test_neo4j_query_returns_json_safe_rows_for_a_path_with_temporal_properties(self):
+    """Regression for the HTTP 500 in
+    `.no-commit/edgeguard-t2c-resilmesh-2026-09-26/ip_crashed_run.log` (query
+    [13]/[14]): a `RETURN p` path whose node carries a Neo4j temporal
+    property crashed JSON serialization because `_run_neo4j_query` put the
+    raw `neo4j.graph.Path` / `neo4j.time.DateTime` driver objects straight
+    into `rows`. Synthetic values only, per contract §4.3 (no prod CVE ids,
+    no prod dates); the two fixture node/relationship types below already
+    stand in for the real driver's `Node`/`Relationship`/`Path` classes
+    elsewhere in this file (`_graph_path_record`, `test_graph_packet_...`)."""
+    plugin = _make_api()
+    cve = _GraphNode(
+      "cve-1",
+      ["CVE"],
+      {"cve_id": "CVE-2021-00000", "cisa_action_due": DateTime()},
+    )
+    cvss = _GraphNode("cvss-1", ["CVSSv31"], {"base_score": 9.8})
+    relationship = _GraphRelationship("rel-1", "HAS_CVSS_v31", cve, cvss)
+    path = _GraphPath([cve, cvss], [relationship])
+    record = _DriverRecord({"p": path}, {"p": "unused"})
+    fake_driver, _session = _driver_with_results(_Result([record], keys=["p"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher=(
+            "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) "
+            "WHERE c.cve_id = 'CVE-2021-00000' RETURN p LIMIT 5"
+          ),
+        )
+
+    self.assertTrue(result["executed"])
+    # Before the fix this line raised TypeError ("Object of type _GraphPath /
+    # DateTime is not JSON serializable") — the exact shape of the crash.
+    encoded = json.dumps(result)
+    row_path = result["rows"][0]["p"]
+    self.assertEqual(
+      {node["cve_id"] for node in row_path["nodes"] if "cve_id" in node},
+      {"CVE-2021-00000"},
+    )
+    self.assertEqual(
+      next(node for node in row_path["nodes"] if "cve_id" in node)["cisa_action_due"],
+      "2026-08-03T17:00:00Z",
+    )
+    self.assertEqual(row_path["relationships"], [{}])
+    # The graph packet (redacted, ref-based) still builds from the same raw
+    # Path unaffected by the row conversion.
+    self.assertEqual(result["graph"]["nodes"][0]["properties"]["cisa_action_due"], "2026-08-03T17:00:00Z")
+    self.assertIn("CVE-2021-00000", encoded)
+
   def test_neo4j_query_broadens_empty_result_once(self):
     plugin = _make_api()
     fake_record = MagicMock()
@@ -1807,6 +1866,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           username="neo4j",
           password="secret",
           cypher="MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+          enable_empty_result_broadening=True,
         )
 
     self.assertTrue(result["executed"])
@@ -1848,11 +1908,43 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["rows"], [])
     self.assertFalse(result["live_retry"]["enabled"])
     self.assertFalse(result["live_retry"]["attempted"])
+    # Contract §6: every empty result carries a reason; INDICATES is a
+    # populated-surface relationship type, so this is a legitimate no-match,
+    # not a topology gap.
+    self.assertEqual(result["empty_reason"], "no_match")
     self.assertEqual(fake_session.run.call_count, 1)
     self.assertEqual(
       _run_text(fake_session.run.call_args),
       "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
     )
+
+  def test_neo4j_query_empty_topology_surface_result_carries_the_contract_reason(self):
+    """Contract §6 acceptance: a topology-surface pattern with no rows
+    returns `empty_reason: topology_surface_no_data`, `live_retry.enabled:
+    false`, `status: ok`; contract §4.3: `validation.result_shape` is set."""
+    plugin = _make_api()
+    empty_result = _Result([], keys=["p"])
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = empty_result
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(m:Mission)-[:SUPPORTS]->(c:Component) RETURN p LIMIT 5",
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["rows"], [])
+    self.assertEqual(result["empty_reason"], "topology_surface_no_data")
+    self.assertFalse(result["live_retry"]["enabled"])
+    self.assertEqual(result["validation"]["result_shape"], "graph")
 
   def test_neo4j_query_returns_structured_error_when_driver_fails(self):
     plugin = _make_api()
