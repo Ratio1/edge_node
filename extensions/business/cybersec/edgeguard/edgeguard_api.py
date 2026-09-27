@@ -61,6 +61,7 @@ from .graph_first_explanation import (
   COVERAGE_VERSION,
   GraphFirstContractError,
   ModePlan,
+  node_alias_map,
   resolve_mode,
 )
 from .graph_first_runtime import (
@@ -80,6 +81,8 @@ from .graph_first_runtime import (
 from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_projection_digest, build_result_digest
 from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
 from . import egx2
+from . import misp_enrichment
+from .misp_enrichment import FORBIDDEN_PACKET_PROPERTY_RE
 
 try:
   from neo4j import GraphDatabase, Query, READ_ACCESS
@@ -377,11 +380,11 @@ WRITE_OR_ADMIN_RE = re.compile(
   r"START\s+DATABASE|STOP\s+DATABASE)\b",
   re.IGNORECASE,
 )
-FORBIDDEN_PACKET_PROPERTY_RE = re.compile(
-  r"(raw|payload|body|content|header|authorization|cookie|password|secret|token|api_key|"
-  r"credential|log|screenshot|stack|request|response)",
-  re.IGNORECASE,
-)
+# `FORBIDDEN_PACKET_PROPERTY_RE` lives in `misp_enrichment.py` and is
+# imported back above under the same name -- this policy regex is used far
+# beyond MISP enrichment (packet-property sanitisation, projection safety),
+# but the misp_enrichment block validator needs it too, and one definition
+# is easier to keep in sync than two.
 SEVERITY_EVIDENCE_KEYS = {
   "severity",
   "risk",
@@ -891,6 +894,11 @@ class _GraphPacketState:
   relationships: Dict[str, Dict[str, Any]] = field(default_factory=dict)
   node_keys: Dict[str, str] = field(default_factory=dict)
   relationship_keys: Dict[str, str] = field(default_factory=dict)
+  # The driver-native element id for every packet node, captured at the one
+  # place packet node ids are assigned, so a caller
+  # (`_collect_misp_candidate_nodes`) never has to re-derive it with a
+  # second, private walk.
+  element_ids: Dict[str, str] = field(default_factory=dict)
   dropped_forbidden_properties: int = 0
   truncated_properties: int = 0
   graph_truncated: bool = False
@@ -1360,11 +1368,18 @@ def _object_items(value: Any) -> Dict[str, Any]:
   return {}
 
 
-def _object_key(value: Any, prefix: str) -> str:
+def _entity_identity(value: Any) -> Optional[str]:
   for attr in ("element_id", "elementId", "id"):
     item = getattr(value, attr, None)
     if item not in (None, ""):
-      return f"{prefix}:{item}"
+      return str(item)
+  return None
+
+
+def _object_key(value: Any, prefix: str) -> str:
+  identity = _entity_identity(value)
+  if identity is not None:
+    return f"{prefix}:{identity}"
   return f"{prefix}:{repr(value)}"
 
 
@@ -1455,6 +1470,9 @@ def _add_graph_node(value: Any, state: _GraphPacketState) -> Optional[str]:
     "caption": _node_caption(labels, properties),
     "properties": properties,
   }
+  identity = _entity_identity(value)
+  if identity is not None:
+    state.element_ids[node_id] = identity
   return node_id
 
 
@@ -1509,6 +1527,42 @@ def _collect_graph(value: Any, state: _GraphPacketState) -> None:
       _collect_graph(item, state)
 
 
+def _has_misp_id_property(properties: Mapping[str, Any]) -> bool:
+  for key in ("misp_event_ids", "misp_attribute_ids"):
+    value = properties.get(key)
+    if isinstance(value, (list, tuple)) and any(item not in (None, "") for item in value):
+      return True
+    if isinstance(value, str) and value.strip():
+      return True
+  return False
+
+
+def _collect_misp_candidate_nodes(records: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+  """Contract §7.1. Returns `{element_id: {"packet_id": ..., "labels": [...]}}`
+  for every distinct node that carries a non-empty `misp_event_ids` or
+  `misp_attribute_ids` property.
+
+  Reuses `_collect_graph` (the same walk that builds the graph evidence
+  packet, via `_add_graph_node`'s dedup and its `element_ids` tracking)
+  instead of a second, private recursive walker -- packet ids and element
+  ids come from the one place that assigns them. This
+  pre-filter (the probe report: every enrichable label carries both lists at
+  100 % coverage) is also what keeps the one internal read query from firing
+  on graphs with no MISP-taggable nodes at all."""
+  state = _GraphPacketState()
+  for record in records:
+    _collect_graph(record, state)
+  candidates: Dict[str, Dict[str, Any]] = {}
+  for node_id, node in state.nodes.items():
+    element_id = state.element_ids.get(node_id)
+    if element_id is None:
+      continue
+    if not _has_misp_id_property(node["properties"]):
+      continue
+    candidates[element_id] = {"packet_id": node_id, "labels": list(node["labels"])}
+  return candidates
+
+
 def _build_graph_evidence_packet(
   *,
   request: str,
@@ -1552,6 +1606,8 @@ def _build_graph_evidence_packet(
     "redaction": {
       "policy": GRAPH_PACKET_REDACTION_POLICY,
       "contains_customer_evidence": False,
+      # `misp_enrichment` never accompanies this packet (contract §7.4), so
+      # the flag it would take is always `False` in slice 3a.
       "contains_raw_misp_payload": False,
     },
   }
@@ -2545,6 +2601,8 @@ def _build_graph_evidence_packet_from_execution(
     "redaction": {
       "policy": GRAPH_PACKET_REDACTION_POLICY,
       "contains_customer_evidence": False,
+      # Same as `_build_graph_evidence_packet`: `misp_enrichment` never
+      # accompanies this packet, so the flag stays `False`.
       "contains_raw_misp_payload": False,
     },
   }
@@ -2716,6 +2774,10 @@ def _validate_graph_evidence_packet(packet: Any) -> tuple[list[Dict[str, str]], 
       errors.append(_contract_error("redaction_policy", "unexpected redaction policy"))
     if redaction.get("contains_customer_evidence") is not False:
       errors.append(_contract_error("customer_evidence_not_allowed", "customer evidence is not allowed in v0.1 model input"))
+    # v0.1 packet behaviour: `misp_enrichment` never accompanies this packet
+    # in slice 3a, so the declared flag is trusted, not recomputed (v0.2
+    # wiring in a later slice reopens this as a computed check once a block
+    # can reach a packet).
     if redaction.get("contains_raw_misp_payload") is not False:
       errors.append(_contract_error("raw_misp_payload_not_allowed", "raw MISP payloads are not allowed in v0.1 model input"))
 
@@ -3204,6 +3266,16 @@ _CONFIG = {
   "RESPONSE_FORMAT": "RAW",
   "PORT": None,
 
+  # Contract §7.3: fail-open MISP enrichment block, off switch for an
+  # operator who wants to disable the extra internal Neo4j read query
+  # without a code change (EGM-059 phase 3, slice 3a). Default False -- the
+  # unpatched playground (f545720) rejects unknown top-level keys, so this
+  # stays off until the playground patch (slice 3b) ships alongside it.
+  "MISP_ENRICHMENT_ENABLED": False,
+  # The internal enrichment read's own bounded timeout, independent of
+  # `cfg_neo4j_query_timeout_seconds`.
+  "MISP_ENRICHMENT_TIMEOUT_SECONDS": misp_enrichment.DEFAULT_TIMEOUT_SECONDS,
+
   "API_TITLE": "EdgeGuard API",
   "API_SUMMARY": "Guarded EdgeGuard text-to-Cypher and playground Neo4j API.",
 
@@ -3297,6 +3369,11 @@ class EdgeguardApiPlugin(BasePlugin):
     self._request_count = 0
     self._error_count = 0
     self._last_request_time = None
+    # Bounded, value-free observability for a swallowed `misp_enrichment`
+    # error -- a count and the exception class name (or `"validation"`) only,
+    # never the message or any raw data.
+    self._misp_enrichment_error_count = 0
+    self._misp_enrichment_last_error = None
     self._explanation_token = self._resolve_secret(
       explicit=self.cfg_edgeguard_explanation_model_token,
       env_name=self.cfg_edgeguard_explanation_model_token_env,
@@ -3726,13 +3803,28 @@ class EdgeguardApiPlugin(BasePlugin):
       raise GraphFirstRuntimeError("execution_trace_mismatch", "validation", "selected execution trace does not match evidence")
     return {"selected": selected, "executions": clean}
 
+  @staticmethod
+  def _graph_first_response_byte_size(value: Dict[str, Any]) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+
   def _bounded_graph_first_success(self, value: Dict[str, Any]) -> Dict[str, Any]:
     try:
-      size = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+      size = self._graph_first_response_byte_size(value)
     except (TypeError, ValueError) as exc:
       raise GraphFirstRuntimeError("explanation_response_shape", "internal", "graph-first response is not serializable") from exc
     if size <= RESPONSE_MAX_BYTES:
       return value
+    # Contract §7.3: `misp_enrichment` is dropped first, before
+    # `explanation_trace` is ever touched.
+    if value.get("misp_enrichment") is not None:
+      trimmed = {key: item for key, item in value.items() if key != "misp_enrichment"}
+      try:
+        trimmed_size = self._graph_first_response_byte_size(trimmed)
+      except (TypeError, ValueError) as exc:
+        raise GraphFirstRuntimeError("explanation_response_shape", "internal", "graph-first response is not serializable") from exc
+      if trimmed_size <= RESPONSE_MAX_BYTES:
+        return trimmed
+      value = trimmed
     trace = value.get("explanation_trace")
     safe_trace = None
     if isinstance(trace, dict):
@@ -4416,6 +4508,72 @@ class EdgeguardApiPlugin(BasePlugin):
       query_scope="expand" if plan.get("broadening", {}).get("enabled") else "exact",
     )
 
+  def _misp_enrichment_for_response(
+    self,
+    *,
+    driver: Any,
+    records: Optional[list[Dict[str, Any]]],
+    node_source_aliases: Optional[Mapping[str, str]] = None,
+  ) -> Optional[Dict[str, Any]]:
+    """Contract §7.1-§7.3, slice 3a: the block returned to the API caller
+    only -- never fed to a model (§7.4; that wiring is a later slice).
+    Fail-open on any error (Neo4j, parse, validation) and fail fast (no
+    extra latency) when the driver is unavailable; never a partially
+    invalid block.
+
+    `node_source_aliases` maps a packet node id
+    (`_collect_misp_candidate_nodes`' `"packet_id"`) to the digest node ref
+    (`N0`, `N1`, ... -- `node_alias_map`'s output). A candidate node with no
+    entry there never reached the digest and is dropped, not enriched."""
+    if not getattr(self, "cfg_misp_enrichment_enabled", False):
+      return None
+    if driver is None or not records:
+      return None
+    try:
+      candidates = _collect_misp_candidate_nodes(records)
+      if not candidates:
+        return None
+      aliases = node_source_aliases or {}
+      joined = [
+        (element_id, aliases[info["packet_id"]])
+        for element_id, info in candidates.items()
+        if info["packet_id"] in aliases
+      ]
+      if not joined:
+        return None
+      total_candidates = len(joined)
+      capped_items = joined[: misp_enrichment.MAX_NODES]
+      element_ids = [element_id for element_id, _ref in capped_items]
+      node_ref_by_element_id = dict(capped_items)
+      timeout_seconds = max(1, int(getattr(self, "cfg_misp_enrichment_timeout_seconds", 5)))
+      with driver.session(default_access_mode=READ_ACCESS) as session:
+        rows = misp_enrichment.fetch_misp_enrichment_rows(
+          session, element_ids, timeout_seconds=timeout_seconds,
+        )
+      block = misp_enrichment.build_misp_enrichment_block(
+        rows,
+        node_ref_by_element_id,
+        truncated=total_candidates > misp_enrichment.MAX_NODES,
+        omitted_nodes=max(total_candidates - misp_enrichment.MAX_NODES, 0),
+      )
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract §7.3.
+      # A bounded, value-free observability note -- never the exception
+      # message or any raw data.
+      with self._metrics_lock:
+        self._misp_enrichment_error_count += 1
+        self._misp_enrichment_last_error = type(exc).__name__
+      return None
+    if block is None:
+      return None
+    if not misp_enrichment.validate_misp_enrichment_block(block):
+      # Same counter as the exception path above, with a fixed reason name
+      # instead of an exception class -- never the block content.
+      with self._metrics_lock:
+        self._misp_enrichment_error_count += 1
+        self._misp_enrichment_last_error = "validation"
+      return None
+    return block
+
   def _active_explanation_strategy(self) -> str:
     value = getattr(self, "cfg_edgeguard_explanation_strategy", "one_call")
     return value if value in {"one_call", "eel_compatibility", "insight_brief"} else "one_call"
@@ -4470,10 +4628,14 @@ class EdgeguardApiPlugin(BasePlugin):
     request: str,
     deadline: float,
     projection_digest: Optional[Mapping[str, Any]] = None,
+    misp_enrichment_block: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
-    # Contract §4.3: a sibling of `result_digest`, present for
-    # `ranked_projection` results only.
+    # Contract §4.3/§7.3: siblings of `result_digest`; `projection_digest`
+    # only for `ranked_projection` results, `misp_enrichment` fail-open and
+    # never passed into `run_analyst_brief` below (never fed to a model).
     digest_siblings = {"projection_digest": dict(projection_digest)} if projection_digest is not None else {}
+    if misp_enrichment_block is not None:
+      digest_siblings["misp_enrichment"] = dict(misp_enrichment_block)
     if digest.get("counts", {}).get("returned_rows") == 0:
       safe_code = "no_graph_evidence"
       diagnostics = {
@@ -4618,7 +4780,11 @@ class EdgeguardApiPlugin(BasePlugin):
     request: str,
     deadline: float,
     mode: Optional[str] = None,
+    misp_enrichment_block: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
+    # Contract §7.4: `misp_enrichment` is a sibling of `result_digest` only
+    # -- it is never passed into `egx2.run_insight_brief` below (never fed
+    # to a model).
     graph = packet.get("graph") or {}
     returned_rows = digest.get("counts", {}).get("returned_rows")
     deterministic_reason = None
@@ -4654,6 +4820,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "packet": dict(packet),
       "packet_meta": dict(packet_meta),
       "result_digest": dict(digest),
+      **({"misp_enrichment": dict(misp_enrichment_block)} if misp_enrichment_block is not None else {}),
       "case_explanation": result["case_explanation"],
       "explanation_trace": result["explanation_trace"],
       "validation": validation,
@@ -4671,6 +4838,7 @@ class EdgeguardApiPlugin(BasePlugin):
     packet_meta: Mapping[str, Any],
     validation: Optional[Mapping[str, Any]],
     live_retry: Mapping[str, Any],
+    misp_enrichment_block: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
     failed_result = failure.get("result", {}) if isinstance(failure, Mapping) else {}
     return self._bounded_graph_first_success({
@@ -4681,6 +4849,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "packet": dict(packet),
       "packet_meta": dict(packet_meta),
       "result_digest": dict(digest),
+      **({"misp_enrichment": dict(misp_enrichment_block)} if misp_enrichment_block is not None else {}),
       "analyst_brief": {
         "schema_version": "edgeguard.analyst_brief_state.v1",
         "status": "unavailable",
@@ -5124,6 +5293,8 @@ class EdgeguardApiPlugin(BasePlugin):
         "total_requests": self._request_count,
         "failed_requests": self._error_count,
         "last_request_time": self._last_request_time,
+        "misp_enrichment_error_count": self._misp_enrichment_error_count,
+        "misp_enrichment_last_error": self._misp_enrichment_last_error,
       }
     explanation_url, explanation_error = self._explanation_url()
     worker_readiness = self._worker_readiness()
@@ -6517,6 +6688,19 @@ class EdgeguardApiPlugin(BasePlugin):
         query_result_evidence=query_result_evidence,
         evidence_catalog=evidence_catalog,
       )
+      # Contract §7.3: produced after the digest, before the EAB/1 admission
+      # check below; fails open (never raises) and stays `None` when the
+      # driver is unavailable. `node_alias_map` re-derives the same node-ref
+      # assignment the digest just used, from the identical evidence inputs
+      # -- any failure here still fails open (block absent), never the
+      # request.
+      try:
+        misp_node_aliases = node_alias_map(query_result_evidence, evidence_catalog)
+      except Exception:  # noqa: BLE001 - fail-open by contract §7.3.
+        misp_node_aliases = {}
+      misp_block = self._misp_enrichment_for_response(
+        driver=driver, records=query_result["rows"], node_source_aliases=misp_node_aliases,
+      )
       if packet["execution"]["truncated"]:
         if self._active_explanation_strategy() == "insight_brief":
           result = egx2.run_insight_brief(
@@ -6536,6 +6720,7 @@ class EdgeguardApiPlugin(BasePlugin):
             "packet": dict(packet),
             "packet_meta": dict(packet_meta),
             "result_digest": dict(digest),
+            **({"misp_enrichment": dict(misp_block)} if misp_block is not None else {}),
             "case_explanation": result["case_explanation"],
             "explanation_trace": result["explanation_trace"],
             "validation": analysis,
@@ -6562,6 +6747,7 @@ class EdgeguardApiPlugin(BasePlugin):
           packet_meta=packet_meta,
           validation=analysis,
           live_retry=live_retry,
+          misp_enrichment_block=misp_block,
         )
       result_shape = analysis.get("result_shape")
       effective_strategy = self._explanation_dispatch_strategy(result_shape)
@@ -6575,6 +6761,7 @@ class EdgeguardApiPlugin(BasePlugin):
           request=request,
           deadline=deadline,
           mode=mode_plan.mode if mode_plan is not None else None,
+          misp_enrichment_block=misp_block,
         )
       if effective_strategy == "one_call":
         projection_digest = self._projection_digest_for_ranked_result(
@@ -6590,6 +6777,7 @@ class EdgeguardApiPlugin(BasePlugin):
           request=request,
           deadline=deadline,
           projection_digest=projection_digest,
+          misp_enrichment_block=misp_block,
         )
       try:
         graph_first = self._run_graph_first(
@@ -6610,6 +6798,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet": packet,
           "packet_meta": packet_meta,
           "result_digest": digest,
+          **({"misp_enrichment": dict(misp_block)} if misp_block is not None else {}),
           "analyst_brief": {
             "schema_version": "edgeguard.analyst_brief_state.v1",
             "status": "available",
@@ -6638,6 +6827,7 @@ class EdgeguardApiPlugin(BasePlugin):
           packet_meta=packet_meta,
           validation=analysis,
           live_retry=live_retry,
+          misp_enrichment_block=misp_block,
         )
       return success
     except NEO4J_AUTH_ERROR_TYPES as exc:

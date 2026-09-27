@@ -707,6 +707,11 @@ def _make_api(**overrides):
   )
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
   plugin.cfg_neo4j_query_timeout_seconds = overrides.get("neo4j_query_timeout_seconds", 30)
+  # Ruling R4: the production default is `False` (unsafe with an unpatched
+  # playground); tests that need the `misp_enrichment` machinery keep the
+  # old effective default explicitly.
+  plugin.cfg_misp_enrichment_enabled = overrides.get("misp_enrichment_enabled", True)
+  plugin.cfg_misp_enrichment_timeout_seconds = overrides.get("misp_enrichment_timeout_seconds", 5)
   plugin.cfg_neo4j_default_connection = overrides.get("neo4j_default_connection", {})
   # Contract §6: broadening is off by default from EGM-059 phase 2; tests
   # that exercise the old True default now pass it explicitly.
@@ -719,6 +724,8 @@ def _make_api(**overrides):
   plugin._request_count = 0
   plugin._error_count = 0
   plugin._last_request_time = None
+  plugin._misp_enrichment_error_count = 0
+  plugin._misp_enrichment_last_error = None
   plugin.time = lambda: 1000
   plugin.P = lambda *_args, **_kwargs: None
   plugin.Pd = lambda *_args, **_kwargs: None
