@@ -58,6 +58,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_SERVER_MAX_ROWS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _neo4j_row_json_safe  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
 from extensions.business.cybersec.edgeguard.graph_first_runtime import GraphFirstRuntimeError, render_chat  # noqa: E402
@@ -1887,6 +1888,38 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["graph"]["nodes"][0]["properties"]["cisa_action_due"], "2026-08-03T17:00:00Z")
     self.assertIn("CVE-2021-00000", encoded)
 
+  def test_neo4j_row_json_safe_converts_bytes_to_hex(self):
+    # Review finding Q5: a single `bytes` value used to fall through to the
+    # generic "unsupported" rejection and turn an executed query into
+    # `status: error, executed: false`.
+    self.assertEqual(_neo4j_row_json_safe(b"\x00\x01\xff"), "0001ff")
+    self.assertEqual(_neo4j_row_json_safe(bytearray(b"\xab\xcd")), "abcd")
+    self.assertEqual(_neo4j_row_json_safe({"payload": b"\x01"}), {"payload": "01"})
+
+  def test_neo4j_row_json_safe_raises_a_distinct_code_for_a_truly_unsupported_value(self):
+    with self.assertRaises(_ResultEvidenceError) as raised:
+      _neo4j_row_json_safe({1, 2, 3})
+    self.assertEqual(raised.exception.code, "unsupported_query_result_value")
+
+  def test_neo4j_query_surfaces_a_distinct_error_code_for_an_unsupported_result_value(self):
+    plugin = _make_api()
+    record = _DriverRecord({"blob": {1, 2, 3}}, {"blob": "unused"})
+    fake_driver, _session = _driver_with_results(_Result([record], keys=["blob"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator) RETURN i.value AS blob LIMIT 5",
+        )
+
+    self.assertEqual(result["status"], "error")
+    self.assertFalse(result["executed"])
+    self.assertEqual(result["error_code"], "unsupported_query_result_value")
+
   def test_neo4j_query_broadens_empty_result_once(self):
     plugin = _make_api()
     fake_record = MagicMock()
@@ -2665,6 +2698,57 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("projection_digest", result)
     self.assertEqual(result["projection_digest"]["ranking_rule"], "cvss_v31_desc")
     self.assertEqual(result["projection_digest"]["row_count"], 2)
+
+  def test_explain_prepared_execution_carries_empty_reason_for_zero_rows(self):
+    # Carry-over from review finding 6 (S5=Q9): the `execution_result=`
+    # supplied-evidence path (`_explain_prepared_execution`) never set
+    # `empty_reason` at all, unlike the live-connection path
+    # (`test_explain_graph_topology_surface_empty_result_carries_the_contract_reason`).
+    # `Mission` is the same topology-only label used there.
+    from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode
+
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    cypher = "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p LIMIT 10"
+    plan = {
+      "accepted_cypher": cypher,
+      "executed_cypher": cypher,
+      "result_columns": ["p"],
+      "projection_descriptors": [],
+      "limit_policy": {
+        "generated_limit": 10,
+        "executed_limit": 10,
+        "transport_row_cap": 25,
+        "server_max_rows": EXPLANATION_SERVER_MAX_ROWS,
+        "limit_adjusted": False,
+        "query_rewritten": False,
+      },
+      "broadening": {"enabled": False, "cypher": None, "strategy": None, "result_columns": None},
+      "validation": {"result_shape": "graph"},
+    }
+    execution_result = {
+      "executed_cypher": cypher,
+      "primary_row_count": 0,
+      "row_count": 0,
+      "truncated": False,
+      "broadened": False,
+      "graph": {"nodes": [], "relationships": [], "truncated": False},
+      "query_result_evidence": {
+        "schema_version": "edgeguard.query_result_evidence.v1",
+        "columns": ["p"],
+        "rows": [],
+      },
+      "execution_trace": {"selected": "primary", "executions": []},
+    }
+
+    result = plugin._explain_prepared_execution(
+      plan=plan,
+      execution_result=execution_result,
+      request="Explain the returned investigation graph.",
+      mode_plan=resolve_mode("balanced"),
+      deadline=1e20,
+    )
+
+    self.assertEqual(result["validation"]["empty_reason"], "topology_surface_no_data")
 
   def test_explain_graph_scalar_only_non_ranked_result_still_falls_back_under_insight_brief(self):
     # `other` (scalar, non-ranked) keeps today's deterministic fallback: only

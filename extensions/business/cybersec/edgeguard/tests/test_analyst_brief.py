@@ -236,6 +236,36 @@ class AnalystBriefTests(unittest.TestCase):
       )
     self.assertEqual(raised.exception.code, "brief_grounding_failed")
 
+  def test_a_fabricated_identifier_hiding_in_a_projection_column_alias_does_not_ground(self):
+    # Review finding X2: `projection_digest.columns` are Cypher aliases the
+    # model itself wrote (a backtick alias may contain arbitrary text); a
+    # hallucinated identifier planted there must not ground a brief that
+    # cites it — only row values and the ranking rule are evidence.
+    source = digest()
+    source["groups"] = [{"id": "R0", "relationship_types": []}]
+    projection = {
+      "schema_version": "edgeguard.projection_digest.v1",
+      "columns": ["CVE-2099-9999", "cvss_v31"],
+      "rows": [{"ordinal": 0, "values": [{"type": "string", "value": "CVE-2024-0001"}, {"type": "float", "value": 9.8}]}],
+      "row_count": 1,
+      "truncated": False,
+      "ranking_rule": "cvss_v31_desc",
+      "sha256": "a" * 64,
+    }
+    with self.assertRaises(GraphFirstRuntimeError) as raised:
+      run_analyst_brief(
+        question="Which CVE ranks highest?",
+        digest=source,
+        model="base_qwen3_4b",
+        provider_call=lambda _payload: {
+          "content": json.dumps({"text": "CVE-2099-9999 ranks highest under cvss_v31_desc."}),
+          "finish_reason": "stop",
+          "completion_tokens": 10,
+        },
+        projection_digest=projection,
+      )
+    self.assertEqual(raised.exception.code, "brief_grounding_failed")
+
   def test_large_view_uses_topology_summary_without_losing_group_ownership(self):
     source = digest()
     source["groups"] = []
@@ -287,6 +317,151 @@ class AnalystBriefTests(unittest.TestCase):
     self.assertEqual([group[0] for group in view["groups"]], [f"R{index}" for index in range(40)])
     self.assertIn(["Sector", 1], view["inventory"]["node_label_counts"])
     self.assertEqual(result["analyst_brief"]["group_ids"], [f"R{index}" for index in range(40)])
+
+  def test_system_prompt_is_neutral_for_non_ranked_results(self):
+    # Review finding Q10: the ranked_projection sentence must not appear in
+    # every brief's system prompt, only when a projection is actually used.
+    calls = []
+    run_analyst_brief(
+      question="Explain.",
+      digest=digest(),
+      model="base_qwen3_4b",
+      provider_call=lambda payload: calls.append(payload) or {
+        "content": json.dumps({"text": "The INDICATES branch connects indicators to malware; the ATTRIBUTED TO branch connects that malware to actors."}),
+        "finish_reason": "stop",
+        "completion_tokens": 17,
+      },
+    )
+    system_prompt = calls[0]["messages"][0]["content"]
+    self.assertNotIn("ranked_projection", system_prompt)
+    self.assertNotIn("ranking", system_prompt)
+
+  def test_system_prompt_mentions_the_projection_view_only_when_supplied(self):
+    source = digest()
+    source["groups"] = [{"id": "R0", "relationship_types": []}]
+    projection = {
+      "schema_version": "edgeguard.projection_digest.v1",
+      "columns": ["cve_id"],
+      "rows": [{"ordinal": 0, "values": [{"type": "string", "value": "CVE-2024-0001"}]}],
+      "row_count": 1,
+      "truncated": False,
+      "ranking_rule": "cvss_v31_desc",
+      "sha256": "a" * 64,
+    }
+    calls = []
+    run_analyst_brief(
+      question="Which CVE ranks highest?",
+      digest=source,
+      model="base_qwen3_4b",
+      provider_call=lambda payload: calls.append(payload) or {
+        "content": json.dumps({"text": "CVE-2024-0001 ranks highest under cvss_v31_desc."}),
+        "finish_reason": "stop",
+        "completion_tokens": 10,
+      },
+      projection_digest=projection,
+    )
+    system_prompt = calls[0]["messages"][0]["content"]
+    self.assertIn("result_view.projection", system_prompt)
+    self.assertIn("ranking", system_prompt)
+
+  def test_ranked_result_groups_do_not_duplicate_the_projections_row_values(self):
+    # Review finding Q10: the group and projection views are built from the
+    # same underlying rows for a ranked_projection result; the group view
+    # must not carry the same values a second time.
+    source = digest()
+    source["groups"] = [{"id": "R0", "relationship_types": [], "values": [{"type": "string", "value": "CVE-2024-0001"}]}]
+    projection = {
+      "schema_version": "edgeguard.projection_digest.v1",
+      "columns": ["cve_id"],
+      "rows": [{"ordinal": 0, "values": [{"type": "string", "value": "CVE-2024-0001"}]}],
+      "row_count": 1,
+      "truncated": False,
+      "ranking_rule": "cvss_v31_desc",
+      "sha256": "a" * 64,
+    }
+    calls = []
+    run_analyst_brief(
+      question="Which CVE ranks highest?",
+      digest=source,
+      model="base_qwen3_4b",
+      provider_call=lambda payload: calls.append(payload) or {
+        "content": json.dumps({"text": "CVE-2024-0001 ranks highest under cvss_v31_desc."}),
+        "finish_reason": "stop",
+        "completion_tokens": 10,
+      },
+      projection_digest=projection,
+    )
+    view = json.loads(calls[0]["messages"][1]["content"])["result_view"]
+    group_columns = view["encoding"]["group_columns"]
+    values_index = group_columns.index("values")
+    self.assertIsNone(view["groups"][0][values_index])
+    self.assertEqual(view["projection"]["rows"][0]["values"][0]["value"], "CVE-2024-0001")
+
+  def test_summary_fallback_trims_an_oversized_projection(self):
+    # Review finding Q10: the summary fallback exists to fit `MAX_PROMPT_BYTES`;
+    # an untrimmed projection would defeat that when it is itself large.
+    source = digest()
+    source["groups"] = []
+    nodes = []
+    relationships = []
+    paths = []
+    for index in range(40):
+      source["groups"].append({
+        "id": f"R{index}", "row_ordinals": [index], "occurrences": 1,
+        "node_refs": [f"N{index}", "N40"], "relationship_refs": [f"E{index}"],
+        "path_refs": [f"P{index}"], "relationship_types": ["AFFECTS"],
+        "path_shapes": [{
+          "path_ref": f"P{index}", "start_ref": f"N{index}", "end_ref": "N40",
+          "relationship_types": ["AFFECTS"],
+        }],
+        "values": [],
+      })
+      nodes.append({
+        "ref": f"N{index}", "labels": ["CVE"],
+        "properties": [["cve_id", {"type": "string", "value": f"CVE-2026-{index:04d}"}]],
+      })
+      relationships.append({
+        "ref": f"E{index}", "type": "AFFECTS", "start_ref": f"N{index}", "end_ref": "N40",
+        "properties": [],
+      })
+      paths.append({
+        "ref": f"P{index}", "start_ref": f"N{index}", "end_ref": "N40",
+        "steps": [[f"N{index}", f"E{index}", "N40"]],
+      })
+    nodes.append({"ref": "N40", "labels": ["Sector"], "properties": [["name", {"type": "string", "value": "healthcare"}]]})
+    source["exact_inventory"] = {
+      "columns": ["p"], "nodes": nodes, "relationships": relationships, "paths": paths,
+    }
+    projection = {
+      "schema_version": "edgeguard.projection_digest.v1",
+      "columns": ["cve_id", "cvss_v31"],
+      "rows": [
+        {"ordinal": i, "values": [
+          {"type": "string", "value": f"CVE-2026-{i:04d}"}, {"type": "float", "value": 9.0},
+        ]}
+        for i in range(40)
+      ],
+      "row_count": 40,
+      "truncated": False,
+      "ranking_rule": "cvss_v31_desc",
+      "sha256": "a" * 64,
+    }
+    calls = []
+    run_analyst_brief(
+      question="Which CVEs rank highest by CVSS for the healthcare sector?",
+      digest=source,
+      model="base_qwen3_4b",
+      provider_call=lambda payload: calls.append(payload) or {
+        "content": json.dumps({"text": "CVE-2026-0000 ranks highest under cvss_v31_desc for the healthcare sector, AFFECTS applies throughout."}),
+        "finish_reason": "stop",
+        "completion_tokens": 20,
+      },
+      projection_digest=projection,
+    )
+    view = json.loads(calls[0]["messages"][1]["content"])["result_view"]
+    self.assertEqual(view["view_mode"], "topology_summary")
+    self.assertLessEqual(len(view["projection"]["rows"]), 8)
+    self.assertTrue(view["projection"]["truncated"])
 
 
 if __name__ == "__main__":

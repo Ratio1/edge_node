@@ -334,6 +334,36 @@ TEMPORAL_REQUEST = re.compile(
 DEFANGED_DOT = re.compile(r"\[\s*\.\s*\]|\(\s*\.\s*\)|\{\s*\.\s*\}", re.I)
 CVE_TOKEN = re.compile(r"\bcve-\d{4}-\d{4,}\b", re.I)
 
+# --- Guard hardening (review finding X1, pre-existing gap, every profile) --
+# A label bound to a parameter (`(n:$("Secret"))`) is never a static,
+# allowlist-checkable label. `$name` alone is already rejected by `PARAM_REF`
+# in `assert_read_only_cypher`; this catches the `$(...)` function-call shape
+# that regex does not (the `(` after `$` keeps it out of `PARAM_REF`'s
+# `[A-Za-z_]` class).
+DYNAMIC_LABEL = re.compile(r":\s*\$")
+# `n IS Label` (Neo4j 5's shorthand for `n:Label`) bypasses `LABEL_CHAIN`
+# extraction entirely, so an arbitrary label predicate would otherwise ride
+# through unchecked on a query anchored by some other, allowed label.
+# `IS NOT NULL` / `IS NULL` stay valid Cypher and must not match.
+IS_LABEL_PREDICATE = re.compile(r"\bIS\s+(?!NOT\b|NULL\b)" + IDENT, re.I)
+# A variable-length relationship spec inside a pattern bracket: bare `*`,
+# `*1`, `*1..`, `*..3`, `*1..3`. Matched only inside `[...]`, so `count(*)`
+# and similar are never touched.
+VAR_LENGTH_SPEC = re.compile(r"\*\s*(\d+)?(\s*\.\.\s*)?(\d+)?")
+RELATIONSHIP_BRACKET = re.compile(r"\[([^\]]*)\]")
+# One edge of a pattern chain once its bracket content (relationship type,
+# variable, var-length spec) is stripped: `-[...]->` -> `-->`, `<-[...]-` ->
+# `<--`, `-[...]-` -> `--`.
+PATTERN_EDGE = re.compile(r"<--|-->|--")
+# Contract §4.1: at most this many relationship hops per pattern, enforced
+# for the v0.11 profile only (`enforce_hop_bounds`, `analyze_generated_cypher`).
+MAX_PATTERN_HOPS = 3
+_MATCH_CLAUSE_START = re.compile(r"\b(?:OPTIONAL\s+MATCH|MATCH)\b", re.I)
+_MATCH_CLAUSE_BOUNDARY = re.compile(
+  r"\b(?:OPTIONAL\s+MATCH|MATCH|WHERE|WITH|RETURN|UNWIND|ORDER\s+BY|SKIP|LIMIT|UNION|CALL)\b",
+  re.I,
+)
+
 
 class EdgeGuardCypherGuardError(Exception):
   """Raised for invalid EdgeGuard Cypher guard inputs."""
@@ -646,7 +676,7 @@ def classify_result_shape(cypher: str) -> str:
   - `graph` (§4.1): every top-level RETURN item is a bare pattern variable
     (a path, node or relationship bound in the query) — `RETURN p`,
     `RETURN p, q`, `RETURN i, c`. No property or function projection.
-  - `ranked_projection` (§4.2): starts with `MATCH`, has an `ORDER BY`, no
+  - `ranked_projection` (§4.2): starts with `MATCH` or `OPTIONAL MATCH`, has an `ORDER BY`, no
     `collect()`, and is not a bare pattern-variable return. (`LIMIT` and
     `UNWIND`-as-start are enforced generically by `analyze_generated_cypher`
     for every shape; a ranking candidate that violates one of those still
@@ -673,7 +703,9 @@ def classify_result_shape(cypher: str) -> str:
     if bare_names and all(name in pattern_variables for name in bare_names):
       return RESULT_SHAPE_GRAPH
 
-  starts_with_match = bool(re.match(r"\s*MATCH\b", stripped, re.I))
+  # Review finding Q11: contract §4.2's own ranking example may legitimately
+  # start with `OPTIONAL MATCH`, not only a bare `MATCH`.
+  starts_with_match = bool(re.match(r"\s*(?:OPTIONAL\s+MATCH|MATCH)\b", stripped, re.I))
   if starts_with_match and ORDER_BY_CLAUSE.search(stripped) and not COLLECT_AGGREGATE.search(stripped):
     return RESULT_SHAPE_RANKED_PROJECTION
   return RESULT_SHAPE_OTHER
@@ -685,14 +717,23 @@ def classify_result_shape(cypher: str) -> str:
 ORDER_BY_ITEM_TERMINATOR = re.compile(r"\b(RETURN|SKIP|LIMIT)\b", re.I)
 _ORDER_BY_ITEM_DIRECTION = re.compile(r"\s+(ASC|ASCENDING|DESC|DESCENDING)\s*\Z", re.I)
 _RETURN_ITEM_ALIAS = re.compile(r"\A(.*?)\s+AS\s+(" + IDENT + r")\s*\Z", re.I)
-_TRAILING_IDENTIFIER = re.compile(r"(" + IDENT + r")\s*\Z")
+# Review finding Q6: not just a trailing identifier (`s.base_score` ->
+# `base_score`) but the last identifier anywhere in the expression, so a
+# function call with no `AS` alias (`coalesce(s.base_score, 0)`) still
+# renders as a readable property name (`base_score`) instead of the whole
+# normalised expression.
+_LAST_IDENTIFIER_IN_EXPRESSION = re.compile(IDENT)
 
 
 def _order_by_items(stripped: str) -> list[str]:
-  match = ORDER_BY_CLAUSE.search(stripped)
-  if not match:
+  # Review finding Q6: a `WITH ... ORDER BY` (aggregation ordering) is
+  # followed by the final clause's own `ORDER BY`, which is the one that
+  # actually determines row order — use the last `ORDER BY` in the query,
+  # not the first.
+  matches = list(ORDER_BY_CLAUSE.finditer(stripped))
+  if not matches:
     return []
-  tail = stripped[match.end():]
+  tail = stripped[matches[-1].end():]
   terminator = ORDER_BY_ITEM_TERMINATOR.search(tail)
   if terminator:
     tail = tail[:terminator.start()]
@@ -702,11 +743,14 @@ def _order_by_items(stripped: str) -> list[str]:
 def derive_ranking_rule(cypher: str) -> str:
   """Contract §4.2: a deterministic, human-readable label for the `ORDER BY`
   a `ranked_projection` query applies, e.g. `"exploiting_indicators_desc,
-  cvss_v31_desc"`. Resolved against the final `RETURN` clause's `AS` aliases
-  so the label uses output column names rather than raw property access
-  where the query already names one; falls back to the trailing identifier
-  of the sort expression (`s.base_score` -> `base_score`) otherwise. Cypher's
-  own default sort direction (ascending) applies when a key has none.
+  cvss_v31_desc"`. Uses the query's last `ORDER BY` (a `WITH`-clause's own
+  `ORDER BY`, used for aggregation, is not what determines final row order).
+  Resolved against the final `RETURN` clause's `AS` aliases so the label uses
+  output column names rather than raw property access where the query
+  already names one; falls back to the last identifier in the sort
+  expression otherwise (`s.base_score` -> `base_score`;
+  `coalesce(s.base_score, 0)` -> `base_score` too). Cypher's own default sort
+  direction (ascending) applies when a key has none.
 
   `"unranked"` when there is no `ORDER BY` at all — `classify_result_shape`
   never routes such a query here, but the function stays total.
@@ -732,8 +776,8 @@ def derive_ranking_rule(cypher: str) -> str:
     expression_key = re.sub(r"\s+", "", text)
     alias = alias_by_expression.get(expression_key)
     if alias is None:
-      tail_match = _TRAILING_IDENTIFIER.search(text)
-      alias = tail_match.group(1) if tail_match else expression_key
+      identifiers = _LAST_IDENTIFIER_IN_EXPRESSION.findall(text)
+      alias = identifiers[-1] if identifiers else expression_key
     labels.append(f"{alias}_{direction}")
   return ", ".join(labels)
 
@@ -756,6 +800,15 @@ def _string_literal_values(cypher: str) -> list[str]:
   return values
 
 
+# Review finding Q8: `classify_empty_reason` is on the per-query hot path
+# and every real caller passes the same module-loaded `EDGEGUARD_SCHEMA_V0_11`
+# object; scanning its full pattern list on every call is wasted work.
+# Single-slot cache keyed by the artifact object's identity — a different
+# artifact object (a test fixture) always recomputes.
+_topology_relationship_types_cache: tuple[Any, set[str]] | None = None
+_topology_labels_cache: tuple[Any, set[str]] | None = None
+
+
 def _topology_surface_relationship_types(artifact: dict[str, Any]) -> set[str]:
   """Contract §6: relationship types that only ever appear on
   topology-surface patterns (`surface: "topology"`, or a `populated: false`
@@ -768,6 +821,9 @@ def _topology_surface_relationship_types(artifact: dict[str, Any]) -> set[str]:
   label-only test flags almost every real query; a relationship type is
   reused across surfaces only once in the v0.11 artifact (`PART_OF`, a known
   imprecise case — a query using it may under- or over-classify)."""
+  global _topology_relationship_types_cache
+  if _topology_relationship_types_cache is not None and _topology_relationship_types_cache[0] is artifact:
+    return _topology_relationship_types_cache[1]
   topology_types: set[str] = set()
   populated_types: set[str] = set()
   for pattern in artifact.get("patterns", []) or []:
@@ -776,7 +832,9 @@ def _topology_surface_relationship_types(artifact: dict[str, Any]) -> set[str]:
       continue
     is_topology = pattern.get("surface") == "topology" or pattern.get("populated") is False
     (topology_types if is_topology else populated_types).add(str(rel_type))
-  return topology_types - populated_types
+  result = topology_types - populated_types
+  _topology_relationship_types_cache = (artifact, result)
+  return result
 
 
 def _topology_surface_labels(artifact: dict[str, Any]) -> set[str]:
@@ -788,6 +846,9 @@ def _topology_surface_labels(artifact: dict[str, Any]) -> set[str]:
   pairs. Keyed on label, mirroring `_topology_surface_relationship_types`;
   a label reused across surfaces (e.g. `CVE`, `Indicator`) is never
   topology-only, so it never triggers this branch."""
+  global _topology_labels_cache
+  if _topology_labels_cache is not None and _topology_labels_cache[0] is artifact:
+    return _topology_labels_cache[1]
   topology_labels: set[str] = set()
   populated_labels: set[str] = set()
   for pattern in artifact.get("patterns", []) or []:
@@ -797,7 +858,9 @@ def _topology_surface_labels(artifact: dict[str, Any]) -> set[str]:
       label = pattern.get(endpoint)
       if label:
         bucket.add(str(label))
-  return topology_labels - populated_labels
+  result = topology_labels - populated_labels
+  _topology_labels_cache = (artifact, result)
+  return result
 
 
 def classify_empty_reason(
@@ -833,12 +896,77 @@ def classify_empty_reason(
   return EMPTY_REASON_NO_MATCH
 
 
+def _match_pattern_chains(stripped: str) -> list[str]:
+  """Every comma-separated pattern chain across every `MATCH`/`OPTIONAL
+  MATCH` clause (analysis-view text): the text between the clause keyword
+  and the next top-level clause keyword, split on top-level commas. Used to
+  bound multi-hop patterns (contract §4.1, v0.11 profile only) and,
+  unconditionally, to require every comma-separated chain to carry its own
+  label or relationship type (review finding X1 — a comma pattern lets an
+  unlabeled full-scan chain ride through anchored by an unrelated sibling
+  chain)."""
+  chains: list[str] = []
+  for start in _MATCH_CLAUSE_START.finditer(stripped):
+    tail = stripped[start.end():]
+    boundary = _MATCH_CLAUSE_BOUNDARY.search(tail)
+    pattern_text = tail[:boundary.start()] if boundary else tail
+    chains.extend(_split_top_level(pattern_text))
+  return chains
+
+
+def _unlabeled_comma_pattern_error(chains: list[str]) -> str | None:
+  if len(chains) < 2:
+    return None
+  for chain in chains:
+    if not LABEL_CHAIN.search(chain) and not REL_TYPE_REF.search(chain):
+      return (
+        "each comma-separated pattern must carry at least one allowed label "
+        "or relationship type"
+      )
+  return None
+
+
+def _variable_length_bound_error(stripped: str, max_hops: int | None) -> str | None:
+  """Every variable-length relationship spec must carry an explicit upper
+  bound (`*3`, `*..3`, `*1..3`); bare `*` and an open-ended `*1..` are
+  rejected for every profile (X1, pre-existing gap). `max_hops` additionally
+  caps that upper bound — v0.11 profile only (contract §4.1); `None` skips
+  the cap, v0.10's existing behaviour."""
+  for bracket in RELATIONSHIP_BRACKET.finditer(stripped):
+    star = VAR_LENGTH_SPEC.search(bracket.group(1))
+    if star is None:
+      continue
+    lower, dotdot, upper = star.group(1), star.group(2), star.group(3)
+    if dotdot is None:
+      bound = int(lower) if lower is not None else None
+    else:
+      bound = int(upper) if upper is not None else None
+    if bound is None:
+      return "variable-length relationship patterns must have an explicit upper bound"
+    if isinstance(max_hops, int) and bound > max_hops:
+      return f"variable-length relationship patterns are bounded to at most {max_hops} hops"
+  return None
+
+
+def _pattern_hop_count_error(chains: list[str], max_hops: int) -> str | None:
+  """Contract §4.1: at most `max_hops` relationship edges in one pattern
+  chain (v0.11 profile only). Bracket content is stripped first so
+  `-[:REL]->` collapses to `-->` and each edge counts once regardless of its
+  relationship type or var-length spec."""
+  for chain in chains:
+    stripped_edges = RELATIONSHIP_BRACKET.sub("", chain)
+    if len(PATTERN_EDGE.findall(stripped_edges)) > max_hops:
+      return f"a pattern may have at most {max_hops} relationship hops"
+  return None
+
+
 def _execution_safety_error(
   candidate: str,
   schema_tokens: dict[str, set[str]],
   max_limit: int | None,
   *,
   require_limit: bool = True,
+  enforce_hop_bounds: bool = False,
 ) -> str | None:
   """First execution-safety violation for an otherwise read-only query, or
   None. Runs on string-literal-stripped text; messages are the stable
@@ -847,7 +975,13 @@ def _execution_safety_error(
   `require_limit=False` (contract §4.1, `graph` shape only): a missing
   `LIMIT` is not itself an error — the runtime bounds rows at
   `NEO4J_MAX_ROWS`/`EXPLANATION_SERVER_MAX_ROWS` instead — but a `LIMIT`
-  that is present must still be a single bounded integer literal."""
+  that is present must still be a single bounded integer literal.
+
+  `enforce_hop_bounds=True` (contract §4.1, v0.11 profile only): caps
+  variable-length upper bounds and per-pattern hop counts at
+  `MAX_PATTERN_HOPS`. The unbounded-variable-length rejection itself and the
+  comma-pattern-with-unlabeled-node rejection run for every profile
+  regardless (X1, pre-existing gap; v0.10 behaviour is otherwise unchanged)."""
   stripped = _analysis_text(candidate)
   if CYPHER_COMMENT.search(stripped):
     return "comments are not allowed"
@@ -855,6 +989,23 @@ def _execution_safety_error(
     return "a label expression is not allowed directly on a property access"
   if LABEL_EXPRESSION_UNSAFE.search(stripped):
     return "label expressions with negation, wildcard or grouping are not allowed"
+  if DYNAMIC_LABEL.search(stripped):
+    return "a label expression may not reference a parameter"
+  if IS_LABEL_PREDICATE.search(stripped):
+    return "an `IS <label>` predicate is not allowed; use a label expression on the node pattern instead"
+  var_length_error = _variable_length_bound_error(
+    stripped, MAX_PATTERN_HOPS if enforce_hop_bounds else None,
+  )
+  if var_length_error:
+    return var_length_error
+  chains = _match_pattern_chains(stripped)
+  unlabeled_comma_error = _unlabeled_comma_pattern_error(chains)
+  if unlabeled_comma_error:
+    return unlabeled_comma_error
+  if enforce_hop_bounds:
+    hop_count_error = _pattern_hop_count_error(chains, MAX_PATTERN_HOPS)
+    if hop_count_error:
+      return hop_count_error
   if PROCEDURE_CALL.search(stripped):
     return "namespaced function calls are not allowed"
   if PROPERTIES_PROJECTION.search(stripped):
@@ -905,12 +1056,20 @@ def analyze_generated_cypher(
   *,
   max_limit: int | None = None,
   allow_limit_optional_graph: bool = False,
+  enforce_hop_bounds: bool = False,
 ) -> dict[str, Any]:
   """`allow_limit_optional_graph` (contract §4.1, v0.11 profile only; v0.10
   callers never pass it, so v0.10 behaviour — `LIMIT` always required — is
   unchanged): a `graph`-shape candidate (`classify_result_shape`) may omit
   `LIMIT`; a `ranked_projection` or `other`-shape candidate still requires
-  one, exactly as before."""
+  one, exactly as before.
+
+  `enforce_hop_bounds` (contract §4.1, v0.11 profile only): caps
+  variable-length upper bounds and per-pattern hop counts at
+  `MAX_PATTERN_HOPS` (3). v0.10 callers never pass it, so a var-length or hop
+  count above 3 stays accepted for v0.10, unchanged; the unbounded-var-length
+  rejection (bare `*`, `*1..`) and the comma-pattern-with-unlabeled-node
+  rejection apply to every profile regardless (X1, pre-existing gap)."""
   allowed = allowed or schema_sets()
   candidate = str(output or "").strip()
   forbidden = {name: bool(pattern.search(candidate)) for name, pattern in FORBIDDEN_OUTPUT.items()}
@@ -943,7 +1102,8 @@ def analyze_generated_cypher(
     if allow_limit_optional_graph:
       require_limit = classify_result_shape(candidate) != RESULT_SHAPE_GRAPH
     execution_safety_error = _execution_safety_error(
-      candidate, schema_tokens, max_limit, require_limit=require_limit,
+      candidate, schema_tokens, max_limit,
+      require_limit=require_limit, enforce_hop_bounds=enforce_hop_bounds,
     )
 
   invented_temporal = sorted(

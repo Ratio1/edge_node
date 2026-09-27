@@ -70,13 +70,26 @@ def _vocabulary_values(entries: Any) -> list[str]:
   return []
 
 
+# Review finding Q8: the schema artifact is loaded once per process and the
+# same object is passed on every call (`EDGEGUARD_SCHEMA_V0_11`), so
+# rescanning its full vocabulary/synonym table on every literal check is
+# wasted work. Single-slot cache keyed by the artifact object's identity —
+# a different artifact object (a test fixture, say) always recomputes.
+_closed_vocabulary_index_cache: tuple[Any, dict[str, list[dict[str, str]]]] | None = None
+_synonym_index_cache: tuple[Any, dict[tuple[str, str], list[str]]] | None = None
+
+
 def build_closed_vocabulary_index(artifact: Mapping[str, Any] | None) -> dict[str, list[dict[str, str]]]:
   """casefolded literal value -> list of `{"property": "Label.field", "value": value}`."""
-  artifact = artifact or {}
+  global _closed_vocabulary_index_cache
+  if _closed_vocabulary_index_cache is not None and _closed_vocabulary_index_cache[0] is artifact:
+    return _closed_vocabulary_index_cache[1]
+  source = artifact or {}
   index: dict[str, list[dict[str, str]]] = {}
-  for prop, entries in (artifact.get("vocabularies") or {}).items():
+  for prop, entries in (source.get("vocabularies") or {}).items():
     for value in _vocabulary_values(entries):
       index.setdefault(value.casefold(), []).append({"property": str(prop), "value": value})
+  _closed_vocabulary_index_cache = (artifact, index)
   return index
 
 
@@ -85,14 +98,18 @@ def build_synonym_index(artifact: Mapping[str, Any] | None) -> dict[tuple[str, s
 
   `property` may be a `*.field` wildcard row (contract §3.1: severity applies
   the same way across every CVSS label)."""
-  artifact = artifact or {}
+  global _synonym_index_cache
+  if _synonym_index_cache is not None and _synonym_index_cache[0] is artifact:
+    return _synonym_index_cache[1]
+  source = artifact or {}
   index: dict[tuple[str, str], list[str]] = {}
-  for row in artifact.get("synonyms") or []:
+  for row in source.get("synonyms") or []:
     prop = str(row.get("property", ""))
     wording = [str(word) for word in row.get("wording", [])]
     for value in row.get("values", []):
       key = (prop, str(value).casefold())
       index.setdefault(key, []).extend(wording)
+  _synonym_index_cache = (artifact, index)
   return index
 
 

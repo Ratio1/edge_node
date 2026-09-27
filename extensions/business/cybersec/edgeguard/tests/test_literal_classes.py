@@ -161,6 +161,21 @@ class LiteralClassesUnitTests(unittest.TestCase):
     )
     self.assertEqual(result["grounded_properties"], [])
 
+  def test_index_builders_are_cached_by_artifact_identity(self):
+    # Review finding Q8: repeat calls with the same (process-lifetime)
+    # artifact object must not rescan it every time.
+    first = literal_classes.build_closed_vocabulary_index(EDGEGUARD_SCHEMA_V0_11)
+    second = literal_classes.build_closed_vocabulary_index(EDGEGUARD_SCHEMA_V0_11)
+    self.assertIs(first, second)
+    first_synonyms = literal_classes.build_synonym_index(EDGEGUARD_SCHEMA_V0_11)
+    second_synonyms = literal_classes.build_synonym_index(EDGEGUARD_SCHEMA_V0_11)
+    self.assertIs(first_synonyms, second_synonyms)
+    # A different artifact object is never served the other's cached result.
+    other_artifact = {"vocabularies": {"kind": ["fixture"]}}
+    other = literal_classes.build_closed_vocabulary_index(other_artifact)
+    self.assertIsNot(other, first)
+    self.assertEqual(other, {"fixture": [{"property": "kind", "value": "fixture"}]})
+
   def test_module_has_no_edge_node_imports(self):
     """Contract: `literal_classes.py` is stdlib-only, no edge_node imports,
     so the hub validator can vendor it by sha (EGM-059 phase 5)."""

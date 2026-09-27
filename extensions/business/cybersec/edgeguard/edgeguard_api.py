@@ -642,12 +642,16 @@ PROMPT_PROFILES = {
 # v0.10 builders (`build_direct_cypher_system_prompt`,
 # `build_schema_correction_prompt`) — that is what keeps the v0.10 profile
 # byte-identical.
-_V0_11_SYSTEM_PROMPT_BUILDER = build_v0_11_pattern_schema_system_prompt
+#
+# Review finding Q8: the v0.11 prompt renders from the fixed, module-loaded
+# `EDGEGUARD_SCHEMA_V0_11` artifact — it never changes within a process — so
+# it is built once here rather than on every `generate` call.
+_V0_11_SYSTEM_PROMPT = build_v0_11_pattern_schema_system_prompt()
 
 
 def _system_prompt_for_profile(profile_name: str) -> str:
   if profile_name == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
-    return _V0_11_SYSTEM_PROMPT_BUILDER()
+    return _V0_11_SYSTEM_PROMPT
   return build_direct_cypher_system_prompt()
 
 
@@ -1674,10 +1678,19 @@ def _neo4j_row_json_safe(value: Any, depth: int = 0) -> Any:
     native = value.to_native()
     if isinstance(native, int):
       return native
+  if isinstance(value, (bytes, bytearray)):
+    # Review finding Q5: a byte string is a legitimate Neo4j value (e.g. a
+    # raw property); hex is JSON-safe and lossless, unlike falling through to
+    # the catch-all rejection below.
+    return bytes(value).hex()
   if isinstance(value, (list, tuple)):
     return [_neo4j_row_json_safe(item, depth=depth + 1) for item in value]
   if isinstance(value, dict):
     return {str(key): _neo4j_row_json_safe(item, depth=depth + 1) for key, item in value.items()}
+  # Review finding Q5: `unsupported_query_result_value` is a distinct code
+  # from every other `_ResultEvidenceError` this function raises (nesting,
+  # non-finite numbers) so a caller catching it specifically (`/neo4j_query`)
+  # can surface it as `error_code` instead of a generic driver failure.
   raise _ResultEvidenceError("unsupported_query_result_value", "query result contains an unsupported value")
 
 
@@ -4045,6 +4058,7 @@ class EdgeguardApiPlugin(BasePlugin):
           allowed=guard_schema_allowed,
           max_limit=int(self.cfg_neo4j_max_rows),
           allow_limit_optional_graph=use_v0_11_schema,
+          enforce_hop_bounds=use_v0_11_schema,
         )
         validation["result_shape"] = classify_result_shape(validation.get("candidate") or raw_output)
         if completion.get("finish_reason") != "stop":
@@ -4247,16 +4261,41 @@ class EdgeguardApiPlugin(BasePlugin):
   def _explanation_dispatch_strategy(self, result_shape: Optional[str]) -> str:
     """Contract §4.3: a `ranked_projection` result is explained by the digest
     analyst brief (EAB/1) even when `insight_brief` (EGX/2) is the configured
-    strategy. EGX/2's insight sheet and the `eel_compatibility` graph
-    explainer both derive everything from `packet.graph`, which is empty for
-    a scalar projection, so routing them there would only ever reach their
-    deterministic no-graph-evidence fallback (`tabular_result` /
-    `empty_graph`), never the model. `other` (scalar, non-ranked) keeps its
-    existing strategy and fallback behaviour unchanged."""
+    strategy. EGX/2's insight sheet derives everything from `packet.graph`,
+    which is empty for a scalar projection, so routing it there would only
+    ever reach its deterministic no-graph-evidence fallback (`empty_graph`),
+    never the model. `other` (scalar, non-ranked) keeps its existing strategy
+    and fallback behaviour unchanged.
+
+    Review finding Q7: this reroutes `insight_brief` only. The legacy
+    `eel_compatibility` strategy is not rerouted here — its own call sites
+    (`_active_explanation_strategy() == "eel_compatibility"` checks
+    elsewhere) already special-case it independently of this function, and a
+    ranked-projection result reaching it is out of this contract's scope."""
     strategy = self._active_explanation_strategy()
     if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION:
       return "one_call"
     return strategy
+
+  @staticmethod
+  def _projection_digest_for_ranked_result(
+    result_shape: Optional[str],
+    query_result_evidence: Mapping[str, Any],
+    accepted_cypher: str,
+    truncated: Any,
+  ) -> Optional[Dict[str, Any]]:
+    """Contract §4.2/§4.3: `projection_digest` is built only for a
+    `ranked_projection` result. Both `one_call` explanation-dispatch call
+    sites duplicated this exact shape check plus `derive_ranking_rule` +
+    `build_projection_digest` pair (review finding Q7); this is the one
+    shared copy."""
+    if result_shape != RESULT_SHAPE_RANKED_PROJECTION:
+      return None
+    return build_projection_digest(
+      query_result_evidence,
+      ranking_rule=derive_ranking_rule(str(accepted_cypher)),
+      truncated=bool(truncated),
+    )
 
   def _run_digest_analyst_brief(
     self,
@@ -5407,6 +5446,7 @@ class EdgeguardApiPlugin(BasePlugin):
       allowed=guard_schema_allowed,
       max_limit=int(self.cfg_neo4j_max_rows),
       allow_limit_optional_graph=use_v0_11_schema,
+      enforce_hop_bounds=use_v0_11_schema,
     )
     # Contract §4.3: `classify_result_shape` on every `/neo4j_query` response,
     # accepted or rejected — it is a static text classification, not an
@@ -5510,6 +5550,24 @@ class EdgeguardApiPlugin(BasePlugin):
         "metrics": {
           "connect_ms": connect_ms,
           "query_ms": round((time.monotonic() - query_started) * 1000, 1),
+          "total_ms": round((time.monotonic() - started) * 1000, 1),
+        },
+      }
+    except _ResultEvidenceError as exc:
+      # Review finding Q5: distinguish "the query executed but one result
+      # value could not be made JSON-safe" from an opaque driver/connection
+      # failure — `exc.code` is a stable, closed set (see
+      # `_neo4j_row_json_safe`), not free text.
+      return {
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": exc.code,
+        "validation": validation,
+        "metrics": {
+          "connect_ms": round((time.monotonic() - started) * 1000, 1),
+          "query_ms": 0.0,
           "total_ms": round((time.monotonic() - started) * 1000, 1),
         },
       }
@@ -5635,6 +5693,18 @@ class EdgeguardApiPlugin(BasePlugin):
       query_result_evidence=query_result_evidence,
       evidence_catalog=evidence_catalog,
     )
+    # Contract §6, review finding 6 (S5=Q9), carry-over B: every empty
+    # result carries a reason on this `execution_result=`-supplied path too,
+    # not only the live-connection path (`explain_graph`'s own primary
+    # query) and `/neo4j_query`. `plan["validation"]` is the one object every
+    # response branch below returns as `validation`, so setting it here
+    # threads the reason through all of them.
+    validation = plan.get("validation")
+    if isinstance(validation, dict):
+      validation["empty_reason"] = (
+        None if query_result_evidence.get("rows")
+        else classify_empty_reason(plan["accepted_cypher"], EDGEGUARD_SCHEMA_V0_11)
+      )
     packet_errors, _context = _validate_graph_evidence_packet(packet)
     if packet_errors:
       first_error = packet_errors[0]
@@ -5670,14 +5740,9 @@ class EdgeguardApiPlugin(BasePlugin):
         mode=mode_plan.mode if mode_plan is not None else None,
       )
     if effective_strategy == "one_call":
-      projection_digest = (
-        build_projection_digest(
-          query_result_evidence,
-          ranking_rule=derive_ranking_rule(str(plan["accepted_cypher"])),
-          truncated=bool(execution_result.get("truncated")),
-        )
-        if result_shape == RESULT_SHAPE_RANKED_PROJECTION
-        else None
+      projection_digest = self._projection_digest_for_ranked_result(
+        result_shape, query_result_evidence, plan["accepted_cypher"],
+        execution_result.get("truncated"),
       )
       return self._run_digest_analyst_brief(
         digest=digest,
@@ -6175,14 +6240,9 @@ class EdgeguardApiPlugin(BasePlugin):
           mode=mode_plan.mode if mode_plan is not None else None,
         )
       if effective_strategy == "one_call":
-        projection_digest = (
-          build_projection_digest(
-            query_result_evidence,
-            ranking_rule=derive_ranking_rule(str(plan["accepted_cypher"])),
-            truncated=bool(execution_envelope.get("truncated")),
-          )
-          if result_shape == RESULT_SHAPE_RANKED_PROJECTION
-          else None
+        projection_digest = self._projection_digest_for_ranked_result(
+          result_shape, query_result_evidence, plan["accepted_cypher"],
+          execution_envelope.get("truncated"),
         )
         return self._run_digest_analyst_brief(
           digest=digest,

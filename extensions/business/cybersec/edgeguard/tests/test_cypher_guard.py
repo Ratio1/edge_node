@@ -571,6 +571,143 @@ class LimitOptionalForGraphShapeTests(unittest.TestCase):
     self.assertIn("server row cap of 100", analysis["validation_feedback"])
 
 
+class GuardHardeningTests(unittest.TestCase):
+  """Review finding X1 (pre-existing gap): every profile, `analyze_generated_
+  cypher` called with its v0.10 defaults (no `enforce_hop_bounds`)."""
+
+  def _analysis(self, cypher, **kwargs):
+    kwargs.setdefault("max_limit", 100)
+    return analyze_generated_cypher(cypher, **kwargs)
+
+  def test_rejects_dynamic_label(self):
+    analysis = self._analysis('MATCH (n:$("Secret")) RETURN n LIMIT 5')
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("may not reference a parameter", analysis["validation_feedback"])
+
+  def test_rejects_is_label_predicate(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-->(n) WHERE n IS SecretLabel RETURN n LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("IS <label>", analysis["validation_feedback"])
+
+  def test_is_not_null_and_is_null_stay_accepted(self):
+    for cypher in (
+      "MATCH (i:Indicator) WHERE i.value IS NOT NULL RETURN i.value AS value LIMIT 5",
+      "MATCH (i:Indicator) WHERE i.value IS NULL RETURN i.value AS value LIMIT 5",
+    ):
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_rejects_comma_pattern_with_an_unlabeled_node(self):
+    cases = [
+      "MATCH (n), (i:Indicator) RETURN n LIMIT 5",
+      "MATCH (i:Indicator) RETURN i LIMIT 5 UNION MATCH (n), (m:Malware) RETURN n AS i LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertIn(
+          "comma-separated pattern must carry", analysis["validation_feedback"], cypher,
+        )
+
+  def test_comma_pattern_with_every_chain_anchored_is_unaffected(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:INDICATES]->(m), (o:OrganizationUnit) RETURN i, o LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_rejects_unbounded_variable_length(self):
+    cases = [
+      "MATCH (a:Indicator)-[:INDICATES*]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*1..]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH p=(a:Indicator)-[*]-(b:Malware) RETURN p LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertIn("explicit upper bound", analysis["validation_feedback"], cypher)
+
+  def test_bounded_variable_length_forms_are_accepted_for_v0_10(self):
+    # v0.10 keeps today's behaviour: any explicit upper bound is accepted,
+    # even above 3 — the tighter `<= 3` cap is v0.11-only (`enforce_hop_bounds`).
+    cases = [
+      "MATCH (a:Indicator)-[:INDICATES*1..3]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*..2]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*2]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*1..10]->(b:Malware) RETURN a, b LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertTrue(analysis["accepted"], f"{cypher!r}: {analysis['validation_feedback']}")
+
+
+class HopBoundsV0_11Tests(unittest.TestCase):
+  """Contract §4.1 carry-over: at most three relationship hops per pattern;
+  variable length only with an upper bound <= 3. v0.11 profile only
+  (`enforce_hop_bounds=True`); v0.10 is covered by `GuardHardeningTests`
+  above and is unaffected by this flag."""
+
+  def _analysis(self, cypher, **kwargs):
+    kwargs.setdefault("allowed", schema_sets(EDGEGUARD_SCHEMA_V0_11))
+    kwargs.setdefault("max_limit", 100)
+    kwargs.setdefault("enforce_hop_bounds", True)
+    return analyze_generated_cypher(cypher, **kwargs)
+
+  def test_accepts_variable_length_up_to_three(self):
+    cases = [
+      "MATCH (a:Indicator)-[:INDICATES*1..3]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*..2]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*2]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*..3]->(b:Malware) RETURN a, b LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertTrue(analysis["accepted"], f"{cypher!r}: {analysis['validation_feedback']}")
+
+  def test_rejects_variable_length_above_three(self):
+    cases = [
+      "MATCH (a:Indicator)-[:INDICATES*4]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*..4]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*1..4]->(b:Malware) RETURN a, b LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertIn("at most 3 hops", analysis["validation_feedback"], cypher)
+
+  def test_rejects_a_pattern_with_more_than_three_static_hops(self):
+    analysis = self._analysis(
+      "MATCH p=(a:Indicator)-[:INDICATES]->(b:Malware)-[:ATTRIBUTED_TO]->(c:ThreatActor)"
+      "-[:EMPLOYS_TECHNIQUE]->(d:Technique)-[:IN_TACTIC]->(e:Tactic) RETURN p LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("at most 3 relationship hops", analysis["validation_feedback"])
+
+  def test_accepts_a_pattern_with_exactly_three_static_hops(self):
+    analysis = self._analysis(
+      "MATCH p=(a:Indicator)-[:INDICATES]->(b:Malware)-[:ATTRIBUTED_TO]->(c:ThreatActor)"
+      "-[:EMPLOYS_TECHNIQUE]->(d:Technique) RETURN p LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_v0_10_default_call_is_unaffected_by_hop_bounds(self):
+    # Same over-long pattern, but through the v0.10 default (no
+    # `enforce_hop_bounds`, no v0.11 schema sets): still accepted.
+    analysis = analyze_generated_cypher(
+      "MATCH p=(a:Indicator)-[:INDICATES]->(b:Malware)-[:ATTRIBUTED_TO]->(c:ThreatActor)"
+      "-[:EMPLOYS_TECHNIQUE]->(d:Technique)-[:IN_TACTIC]->(e:Tactic) RETURN p LIMIT 5",
+      max_limit=100,
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+
 class SchemaArtifactV0_11Tests(unittest.TestCase):
   """Contract §2: the guard loads the vendored schema artifact v0.11; the
   v0.10 `EDGEGUARD_SCHEMA`/`SCHEMA_VERSION` constants keep serving the v0.10
@@ -784,6 +921,19 @@ class ClassifyResultShapeTests(unittest.TestCase):
       with self.subTest(query=query):
         self.assertEqual(classify_result_shape(query), "other")
 
+  def test_a_ranking_query_starting_with_optional_match_classifies_as_ranked_projection(self):
+    # Review finding Q11: `classify_result_shape` only recognised a leading
+    # bare `MATCH`; a ranking query legitimately starting with `OPTIONAL
+    # MATCH` (contract §4.2's own example does) fell through to `other`.
+    query = (
+      "OPTIONAL MATCH (i:Indicator)-[:EXPLOITS]->(c:CVE) "
+      "WITH c, count(i) AS exploiting_indicators ORDER BY exploiting_indicators DESC "
+      "RETURN c.cve_id AS cve_id, exploiting_indicators LIMIT 3"
+    )
+    self.assertEqual(classify_result_shape(query), "ranked_projection")
+    analysis = analyze_generated_cypher(query, allowed=schema_sets(EDGEGUARD_SCHEMA_V0_11), max_limit=100)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
 
 class DeriveRankingRuleTests(unittest.TestCase):
   """Contract §4.2, §4.3: `derive_ranking_rule` renders the `ORDER BY` of a
@@ -816,6 +966,29 @@ class DeriveRankingRuleTests(unittest.TestCase):
 
   def test_a_query_with_no_order_by_is_unranked(self):
     self.assertEqual(derive_ranking_rule("MATCH (i:Indicator) RETURN i.value AS value LIMIT 5"), "unranked")
+
+  def test_uses_the_last_order_by_not_the_with_clauses_first_one(self):
+    # Review finding Q6: a `WITH ... ORDER BY` (used for aggregation) is
+    # followed by the `RETURN` clause's own final `ORDER BY`, which is the
+    # one that actually determines row order; the WITH one must not win.
+    query = (
+      "MATCH (b:Malware)<-[:INDICATES]-(a:Indicator) "
+      "WITH b, count(a) AS total ORDER BY total DESC "
+      "RETURN b.name AS name, total ORDER BY total ASC LIMIT 5"
+    )
+    self.assertEqual(derive_ranking_rule(query), "total_asc")
+
+  def test_an_unaliased_function_expression_gets_a_readable_label(self):
+    # Review finding Q6: an expression key with no `AS` alias and no bare
+    # trailing identifier (a function call) used to render as the entire
+    # normalised expression (`coalesce(c.score,0)_desc`); the innermost
+    # property/identifier is a readable label instead.
+    query = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) "
+      "RETURN c.cve_id AS cve_id, s.base_score AS score "
+      "ORDER BY coalesce(s.base_score, 0) DESC LIMIT 5"
+    )
+    self.assertEqual(derive_ranking_rule(query), "base_score_desc")
 
   def test_every_ranked_reference_query_yields_a_non_empty_rule(self):
     for pattern in [p for p in EDGEGUARD_SCHEMA_V0_11["patterns"] if p.get("to_properties")]:
@@ -908,6 +1081,24 @@ class ClassifyEmptyReasonTests(unittest.TestCase):
       ),
       "topology_surface_no_data",
     )
+
+  def test_topology_surface_sets_are_cached_by_artifact_identity(self):
+    # Review finding Q8: `classify_empty_reason` is on the per-query hot
+    # path; repeat calls with the same artifact object must not rescan its
+    # full pattern list every time.
+    from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
+      _topology_surface_labels,
+      _topology_surface_relationship_types,
+    )
+    first_types = _topology_surface_relationship_types(EDGEGUARD_SCHEMA_V0_11)
+    self.assertIs(_topology_surface_relationship_types(EDGEGUARD_SCHEMA_V0_11), first_types)
+    first_labels = _topology_surface_labels(EDGEGUARD_SCHEMA_V0_11)
+    self.assertIs(_topology_surface_labels(EDGEGUARD_SCHEMA_V0_11), first_labels)
+    # A different artifact object is never served the other's cached result.
+    other_artifact = {"patterns": [{"type": "OTHER", "surface": "topology", "from": "A", "to": "B"}]}
+    other_types = _topology_surface_relationship_types(other_artifact)
+    self.assertIsNot(other_types, first_types)
+    self.assertEqual(other_types, {"OTHER"})
 
 
 class V0_10_PromptByteIdentityTests(unittest.TestCase):
