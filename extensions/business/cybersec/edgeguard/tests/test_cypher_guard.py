@@ -1,14 +1,20 @@
 import unittest
 
 from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
+  EDGEGUARD_SCHEMA_V0_11,
+  SCHEMA_ARTIFACT_V0_11_SHA256,
   SCHEMA_VERSION,
+  SCHEMA_VERSION_V0_11,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,
   build_direct_cypher_system_prompt,
   build_schema_prompt_context,
   build_schema_correction_prompt,
+  classify_result_shape,
   extract_schema_tokens,
+  load_schema_artifact_v0_11,
   normalize_user_literal_text,
+  schema_sets,
   unsupported_temporal_behavior,
 )
 
@@ -500,3 +506,217 @@ class EdgeGuardExecutionSafetyTests(unittest.TestCase):
   def test_execution_safety_feedback_reaches_validation_feedback(self):
     analysis = self._analysis("MATCH (i:Indicator) RETURN i.value AS value")
     self.assertIn("Execution safety error", analysis["validation_feedback"])
+
+
+class SchemaArtifactV0_11Tests(unittest.TestCase):
+  """Contract §2: the guard loads the vendored schema artifact v0.11; the
+  v0.10 `EDGEGUARD_SCHEMA`/`SCHEMA_VERSION` constants keep serving the v0.10
+  profile unchanged (checked by the v0.10 pins elsewhere in this file)."""
+
+  def test_v0_10_schema_version_is_unchanged(self):
+    self.assertEqual(SCHEMA_VERSION, "edgeguard-cypher-schema-v0.10")
+
+  def test_v0_11_artifact_schema_version(self):
+    self.assertEqual(EDGEGUARD_SCHEMA_V0_11["schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertEqual(SCHEMA_VERSION_V0_11, "edgeguard-cypher-schema-v0.11")
+
+  def test_v0_11_artifact_sha256_is_pinned_and_reverified(self):
+    recorded = EDGEGUARD_SCHEMA_V0_11["checksums"]["artifact_sha256"]
+
+    self.assertEqual(recorded, SCHEMA_ARTIFACT_V0_11_SHA256)
+    # Loading again re-verifies the sha against a fresh recomputation; a
+    # tampered vendor copy would raise instead of silently loading.
+    reloaded = load_schema_artifact_v0_11()
+    self.assertEqual(reloaded["checksums"]["artifact_sha256"], SCHEMA_ARTIFACT_V0_11_SHA256)
+
+  def test_v0_11_artifact_carries_counts_vocabularies_and_snapshot_id_only(self):
+    snapshot = EDGEGUARD_SCHEMA_V0_11["graph_snapshot_id"]
+    self.assertIn("name", snapshot)
+    self.assertIn("neo4j_store_id", snapshot)
+    # No host filesystem paths leak into the vendored artifact.
+    dumped = str(EDGEGUARD_SCHEMA_V0_11)
+    self.assertNotIn("/data/", dumped)
+    self.assertNotIn("/home/", dumped)
+
+
+class LabelChainLookbehindTests(unittest.TestCase):
+  """Contract §2.4: the `LABEL_CHAIN` lookbehind fix rejects a label
+  expression directly on a property access (`i.value:IP`)."""
+
+  def test_rejects_label_expression_on_property_access(self):
+    cases = [
+      "MATCH (i:Indicator) WHERE i.value:IP RETURN i.value AS v LIMIT 5",
+      "MATCH (i:Indicator) RETURN i.value:IP AS v LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = analyze_generated_cypher(cypher, max_limit=100)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertIn(
+          "a label expression is not allowed directly on a property access",
+          analysis["validation_feedback"],
+        )
+
+  def test_still_extracts_every_label_in_a_real_chain(self):
+    # The fix only excludes a preceding `.`; ordinary label chains (and the
+    # `(n):Label` predicate form) are unaffected.
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator:Nope) RETURN i.value AS v LIMIT 5", max_limit=100,
+    )
+    self.assertEqual(analysis["schema_unknown"]["labels"], ["Nope"])
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator)-->(n) WHERE (n):ReviewPrivate RETURN n LIMIT 5", max_limit=100,
+    )
+    self.assertEqual(analysis["schema_unknown"]["labels"], ["ReviewPrivate"])
+
+
+class SchemaArtifactV0_11PatternTests(unittest.TestCase):
+  """Contract §2.4: one reference query per `populated` and per `topology`
+  pattern is accepted; a label or relationship type outside both surfaces is
+  rejected."""
+
+  @classmethod
+  def setUpClass(cls):
+    cls.allowed = schema_sets(EDGEGUARD_SCHEMA_V0_11)
+    cls.patterns = EDGEGUARD_SCHEMA_V0_11["patterns"]
+
+  def test_every_pattern_has_an_accepted_reference_query(self):
+    self.assertGreaterEqual(len(self.patterns), 40)
+    populated = [p for p in self.patterns if p["surface"] == "populated"]
+    topology = [p for p in self.patterns if p["surface"] == "topology"]
+    self.assertGreaterEqual(len(populated), 20)
+    self.assertGreaterEqual(len(topology), 20)
+    for pattern in self.patterns:
+      query = (
+        f"MATCH (a:{pattern['from']})-[:{pattern['type']}]->(b:{pattern['to']}) "
+        "RETURN a, b LIMIT 5"
+      )
+      with self.subTest(pattern=f"{pattern['from']}-[:{pattern['type']}]->{pattern['to']}", surface=pattern["surface"]):
+        analysis = analyze_generated_cypher(query, allowed=self.allowed, max_limit=100)
+        self.assertTrue(analysis["accepted"], f"{query!r}: {analysis['validation_feedback']}")
+
+  def test_topology_surface_patterns_carry_count_zero_and_a_spec_ref(self):
+    topology = [p for p in self.patterns if p["surface"] == "topology"]
+    for pattern in topology:
+      with self.subTest(pattern=f"{pattern['from']}-[:{pattern['type']}]->{pattern['to']}"):
+        self.assertEqual(pattern["count"], 0)
+        self.assertTrue(pattern.get("spec_ref"))
+
+  def test_rejects_a_label_and_relationship_type_outside_both_surfaces(self):
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator)-[:REVIEW_PRIVATE]->(n:ReviewPrivate) RETURN i, n LIMIT 5",
+      allowed=self.allowed,
+      max_limit=100,
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["schema_unknown"]["labels"], ["ReviewPrivate"])
+    self.assertEqual(analysis["schema_unknown"]["relationship_types"], ["REVIEW_PRIVATE"])
+
+
+class ClassifyResultShapeTests(unittest.TestCase):
+  """Contract §4.3-§4.4: `classify_result_shape` returns `graph` or
+  `ranked_projection`; at least 20 reference queries per shape classify
+  correctly. Rejection of a malformed ranked_projection candidate (no
+  `LIMIT`, with `collect()`, starting with `UNWIND`) is enforced generically
+  by `analyze_generated_cypher` and carries an explicit message regardless of
+  shape."""
+
+  @classmethod
+  def setUpClass(cls):
+    cls.patterns = [p for p in EDGEGUARD_SCHEMA_V0_11["patterns"] if p.get("to_properties")]
+
+  def _graph_reference_queries(self):
+    queries = []
+    for pattern in self.patterns:
+      queries.append(
+        f"MATCH p=(a:{pattern['from']})-[:{pattern['type']}]->(b:{pattern['to']}) RETURN p LIMIT 5"
+      )
+      queries.append(
+        f"MATCH (a:{pattern['from']})-[:{pattern['type']}]->(b:{pattern['to']}) RETURN a, b LIMIT 5"
+      )
+    return queries
+
+  def _ranked_reference_queries(self):
+    queries = []
+    for pattern in self.patterns:
+      if pattern["surface"] != "populated":
+        continue
+      to_prop = pattern["to_properties"][0]
+      queries.append(
+        f"MATCH (a:{pattern['from']})-[:{pattern['type']}]->(b:{pattern['to']}) "
+        f"WITH b, count(a) AS total ORDER BY total DESC "
+        f"RETURN b.{to_prop} AS name, total LIMIT 5"
+      )
+    return queries
+
+  def test_at_least_twenty_graph_reference_queries_classify_as_graph(self):
+    queries = self._graph_reference_queries()
+    self.assertGreaterEqual(len(queries), 20)
+    for query in queries:
+      with self.subTest(query=query):
+        self.assertEqual(classify_result_shape(query), "graph")
+
+  def test_at_least_twenty_ranked_projection_reference_queries_classify_correctly(self):
+    queries = self._ranked_reference_queries()
+    self.assertGreaterEqual(len(queries), 20)
+    for query in queries:
+      with self.subTest(query=query):
+        self.assertEqual(classify_result_shape(query), "ranked_projection")
+        analysis = analyze_generated_cypher(
+          query, allowed=schema_sets(EDGEGUARD_SCHEMA_V0_11), max_limit=100,
+        )
+        self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_the_contract_example_ranked_projection_query_classifies_correctly(self):
+    query = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) "
+      "WHERE c.cve_id IN ['CVE-2024-0001', 'CVE-2024-0002'] "
+      "OPTIONAL MATCH (i:Indicator)-[:EXPLOITS]->(c) "
+      "WITH c, s, count(DISTINCT i) AS exploiting_indicators "
+      "ORDER BY exploiting_indicators DESC, s.base_score DESC "
+      "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31, exploiting_indicators "
+      "LIMIT 3"
+    )
+    self.assertEqual(classify_result_shape(query), "ranked_projection")
+
+  def test_ranked_projection_without_limit_is_rejected_with_an_explicit_message(self):
+    query = (
+      "MATCH (a:Indicator)-[:INDICATES]->(b:Malware) "
+      "WITH b, count(a) AS total ORDER BY total DESC "
+      "RETURN b.name AS name, total"
+    )
+    analysis = analyze_generated_cypher(query, max_limit=100)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("explicit positive LIMIT", analysis["execution_safety_error"])
+
+  def test_ranked_projection_with_collect_is_rejected_with_an_explicit_message(self):
+    query = (
+      "MATCH (a:Indicator)-[:INDICATES]->(b:Malware) "
+      "WITH b, collect(a.value) AS vals ORDER BY size(vals) DESC "
+      "RETURN b.name AS name, vals LIMIT 5"
+    )
+    analysis = analyze_generated_cypher(query, max_limit=100)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("collect()", analysis["execution_safety_error"])
+
+  def test_ranked_projection_starting_with_unwind_is_rejected_with_an_explicit_message(self):
+    query = (
+      "UNWIND ['MalwareA', 'MalwareB'] AS name "
+      "MATCH (b:Malware {name: name}) "
+      "WITH b, count(*) AS total ORDER BY total DESC "
+      "RETURN b.name AS name, total LIMIT 5"
+    )
+    analysis = analyze_generated_cypher(query, max_limit=100)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("read-only Cypher clause", analysis["read_only_error"])
+    self.assertEqual(classify_result_shape(query), "other")
+
+  def test_scalar_only_and_mixed_queries_classify_as_other(self):
+    cases = [
+      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
+      "MATCH (i:Indicator) RETURN count(i) AS total",
+      "MATCH (i:Indicator)-[:INDICATES]->(m:Malware) RETURN i, m.name AS name LIMIT 5",
+    ]
+    for query in cases:
+      with self.subTest(query=query):
+        self.assertEqual(classify_result_shape(query), "other")

@@ -28,6 +28,7 @@ from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebApp
 from .edgeguard_cypher_guard import (
   DEFAULT_SCHEMA_RETRY_LIMIT,
   EDGEGUARD_SCHEMA,
+  EDGEGUARD_SCHEMA_V0_11,
   SCHEMA_VERSION,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,
@@ -36,6 +37,7 @@ from .edgeguard_cypher_guard import (
   canonical_schema_surface,
   normalize_user_literal_text,
 )
+from . import literal_classes
 from .graph_first_explanation import (
   COVERAGE_VERSION,
   GraphFirstContractError,
@@ -3620,7 +3622,6 @@ class EdgeguardApiPlugin(BasePlugin):
     if not validation.get("accepted"):
       return validation
     candidate = validation.get("accepted_cypher") or validation.get("candidate") or raw_output
-    request_text = normalized_request.casefold()
     temporal_request = bool(re.search(
       r"\b(last|past|recent|latest|hours?|days?|weeks?|months?|years?)\b",
       normalized_request,
@@ -3628,21 +3629,32 @@ class EdgeguardApiPlugin(BasePlugin):
     ))
     unrequested = []
     for literal in self._cypher_string_literals(str(candidate)):
-      normalized = literal.strip().casefold()
+      normalized = literal.strip()
+      if not normalized:
+        continue
       derived_temporal = temporal_request and bool(
         re.fullmatch(r"P(?:\d+[YMWD])*(?:T(?:\d+[HMS])*)?", literal, re.IGNORECASE)
       )
-      if normalized and normalized not in request_text and not derived_temporal:
-        unrequested.append(literal)
+      if derived_temporal:
+        continue
+      # contract §3.1-§3.2: a closed-vocabulary literal (e.g. `indicator_type
+      # = 'ipv4'`) is grounded by the artifact's synonym table even when it
+      # is not a substring of the request ("IP addresses" -> 'ipv4'); a free
+      # literal still needs to appear in the request text.
+      grounding = literal_classes.literal_is_grounded(
+        normalized, normalized_request, EDGEGUARD_SCHEMA_V0_11,
+      )
+      if not grounding["grounded"]:
+        unrequested.append({"literal": normalized, "class": grounding["class"]})
     if not unrequested:
       return validation
     return {
       **validation,
       "accepted": False,
       "accepted_cypher": None,
-      "validation_feedback": (
-        "The query introduced a literal value or filter that was not present in the user request. "
-        "Remove unrequested WHERE filters and return the requested unfiltered graph pattern."
+      "validation_feedback": "\n".join(
+        literal_classes.format_literal_rejection(item["literal"], item["class"])
+        for item in unrequested
       ),
     }
 

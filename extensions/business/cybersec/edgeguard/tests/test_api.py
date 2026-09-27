@@ -7,6 +7,7 @@ import threading
 import unittest
 import sys
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 def mock_plugin_modules():
@@ -4194,3 +4195,68 @@ class EdgeGuardModeBudgetThreadingTests(unittest.TestCase):
           )
 
     self.assertEqual(run_brief.call_args.kwargs["mode"], "thorough")
+
+
+def _literal_class_vectors():
+  path = Path(__file__).parent / "fixtures" / "literal_class_vectors.json"
+  with open(path, "r", encoding="utf-8") as handle:
+    return json.load(handle)
+
+
+class LiteralGroundingGuardTests(unittest.TestCase):
+  """Contract §3: `_apply_literal_grounding_guard` accepts closed-vocabulary
+  filters implied by request wording (not just a request substring) and
+  rejects a free literal absent from the request, naming it."""
+
+  def _accepted_validation(self, cypher):
+    return {"accepted": True, "accepted_cypher": cypher, "candidate": cypher}
+
+  def test_ip_synonym_filter_is_accepted_on_the_first_attempt(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' RETURN i.value AS value LIMIT 10"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Which IP addresses are indicators of compromise?",
+    )
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(result["accepted_cypher"], cypher)
+
+  def test_free_literal_absent_from_request_is_rejected_with_the_literal_named(self):
+    plugin = _make_api()
+    cypher = "MATCH (c:CVE) WHERE c.cisa_vulnerability_name = 'CISA Vuls' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me CVE details for this vulnerability.",
+    )
+
+    self.assertFalse(result["accepted"])
+    self.assertIsNone(result["accepted_cypher"])
+    self.assertEqual(
+      result["validation_feedback"],
+      "Literal 'CISA Vuls' (free) is not in the request.",
+    )
+
+  def test_shared_vector_file_accept_and_reject_cases(self):
+    plugin = _make_api()
+    vectors = _literal_class_vectors()
+    self.assertGreaterEqual(len(vectors["accept"]), 20)
+    self.assertGreaterEqual(len(vectors["reject"]), 20)
+
+    for vector in vectors["accept"]:
+      with self.subTest(literal=vector["literal"], request=vector["request"]):
+        cypher = f"MATCH (i:Indicator) WHERE i.value = '{vector['literal']}' RETURN i.value AS value LIMIT 5"
+        result = plugin._apply_literal_grounding_guard(
+          self._accepted_validation(cypher), cypher, vector["request"],
+        )
+        self.assertTrue(result["accepted"], f"{vector}: {result.get('validation_feedback')}")
+
+    for vector in vectors["reject"]:
+      with self.subTest(literal=vector["literal"], request=vector["request"]):
+        cypher = f"MATCH (i:Indicator) WHERE i.value = '{vector['literal']}' RETURN i.value AS value LIMIT 5"
+        result = plugin._apply_literal_grounding_guard(
+          self._accepted_validation(cypher), cypher, vector["request"],
+        )
+        self.assertFalse(result["accepted"], vector)
+        self.assertIn(vector["literal"], result["validation_feedback"])
+        self.assertIn(vector["class"], result["validation_feedback"])

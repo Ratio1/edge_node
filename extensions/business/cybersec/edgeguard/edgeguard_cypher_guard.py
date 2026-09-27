@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
+import hashlib
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 __VER__ = '0.2.0.0'
@@ -195,6 +199,55 @@ EDGEGUARD_SCHEMA = {
   },
 }
 
+# --- Schema artifact v0.11 (contract §2) -----------------------------------
+# The v0.10 constants above are untouched and keep serving the v0.10 profile;
+# the artifact below is additive. Profile dispatch (which profile loads which
+# schema) is EGM-059 phase 2 slice C, not here.
+SCHEMA_VERSION_V0_11 = "edgeguard-cypher-schema-v0.11"
+SCHEMA_ARTIFACT_V0_11_PATH = Path(__file__).resolve().parent / "schema" / "edgeguard_cypher_schema_v0_11.json"
+# Pinned by the phase-1 freeze (`docs/tasks_manager/_runs/EGM-059/state.md`);
+# re-verified against the vendored file's own `checksums.artifact_sha256` and
+# a fresh recomputation on every load, so a stale or corrupted vendor copy
+# fails loudly at import time instead of serving silently.
+SCHEMA_ARTIFACT_V0_11_SHA256 = "sha256:15910445975040e50dd8cec81c08454bda7b2365717554f54a5a47d79374e8ae"
+
+
+def _canonical_artifact_sha256(artifact: dict[str, Any]) -> str:
+  """sha256 over the canonical artifact JSON with `checksums.artifact_sha256`
+  removed (contract §2.3; matches the hub build script's `artifact_sha256`
+  in `edgeguard_cypher_schema_v0_11.py`)."""
+  body = copy.deepcopy(artifact)
+  body.get("checksums", {}).pop("artifact_sha256", None)
+  text = json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+  return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def load_schema_artifact_v0_11(path: Path | None = None) -> dict[str, Any]:
+  """Load the vendored v0.11 schema artifact and re-verify its pinned sha
+  (contract §2.3, §2.4). Raises `EdgeGuardCypherGuardError` on a mismatch.
+
+  Defined here (before the exception class, further down in the file) so it
+  sits beside the other schema-artifact constants; called once at the bottom
+  of this module, after `EdgeGuardCypherGuardError` exists.
+  """
+  artifact_path = path or SCHEMA_ARTIFACT_V0_11_PATH
+  with open(artifact_path, "r", encoding="utf-8") as handle:
+    artifact = json.load(handle)
+  recorded = (artifact.get("checksums") or {}).get("artifact_sha256")
+  recomputed = _canonical_artifact_sha256(artifact)
+  if recorded != recomputed:
+    raise EdgeGuardCypherGuardError(
+      f"schema artifact v0.11 at {artifact_path}: recorded artifact_sha256 {recorded!r} does not "
+      f"match a fresh recomputation {recomputed!r}"
+    )
+  if path is None and recorded != SCHEMA_ARTIFACT_V0_11_SHA256:
+    raise EdgeGuardCypherGuardError(
+      f"schema artifact v0.11 at {artifact_path}: artifact_sha256 {recorded!r} does not match the "
+      f"pinned {SCHEMA_ARTIFACT_V0_11_SHA256!r}; rebuild the artifact or update the pin deliberately"
+    )
+  return artifact
+
+
 TOKEN = r"`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*"
 PARAM_REF = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 # Every label in a node pattern's chain: after `(` (anonymous node) or after a
@@ -204,10 +257,21 @@ PARAM_REF = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 # Every identifier in it is checked. Negation, wildcard and grouping are
 # rejected separately (LABEL_EXPRESSION_UNSAFE) because they widen the match.
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+# v0.11 fix (contract §2.4): the lookbehind now also excludes a preceding
+# `.`, so a property access such as `i.value:IP` is never read as a fresh
+# label-chain variable `value` labelled `:IP` (`edgeguard_cypher_guard.py:208`
+# in the v0.10 baseline). `PROPERTY_LABEL_SUFFIX` below rejects that
+# construct explicitly instead.
 LABEL_CHAIN = re.compile(
-  r"(?:(?<=\()|(?<![\[\w])" + IDENT + r"|\))\s*(:\s*" + IDENT + r"(?:\s*[|&:]\s*" + IDENT + r")*)"
+  r"(?:(?<=\()|(?<![\[\w.])" + IDENT + r"|\))\s*(:\s*" + IDENT + r"(?:\s*[|&:]\s*" + IDENT + r")*)"
 )
 REL_TYPE_REF = re.compile(r"\[[^\]]*:\s*(" + IDENT + r"(?:\s*[|&]\s*" + IDENT + r")*)[^\]]*\]")
+# A label expression directly on a property access (`i.value:IP`, `n.name:Foo`)
+# is never valid Cypher; the v0.10 LABEL_CHAIN lookbehind let it through
+# silently when the trailing identifier happened to be a known label.
+PROPERTY_LABEL_SUFFIX = re.compile(
+  r"(?:\b" + IDENT + r"|\))\s*\.\s*(?:" + TOKEN + r")\s*:\s*" + IDENT
+)
 LABEL_EXPRESSION_UNSAFE = re.compile(r":\s*[!%(]|[|&]\s*[!%(]")
 # Property access with a variable or a parenthesised expression on the left,
 # so `(i).private` is seen; bracket indexing is rejected separately.
@@ -273,6 +337,9 @@ CVE_TOKEN = re.compile(r"\bcve-\d{4}-\d{4,}\b", re.I)
 
 class EdgeGuardCypherGuardError(Exception):
   """Raised for invalid EdgeGuard Cypher guard inputs."""
+
+
+EDGEGUARD_SCHEMA_V0_11 = load_schema_artifact_v0_11()
 
 
 def normalize_user_literal_text(text: str) -> str:
@@ -535,22 +602,81 @@ def _split_top_level(text: str) -> list[str]:
   return items
 
 
-def _scalar_aggregate_only_return(stripped: str) -> bool:
-  """True when every top-level RETURN item is a scalar aggregate
-  (count/min/max/sum/avg). Such queries return a bounded row set by
-  construction and may omit LIMIT."""
+def _final_return_items(stripped: str) -> list[str] | None:
+  """Top-level items of the final RETURN clause (analysis-view text), or
+  `None` when there is no RETURN. Shared by the scalar-aggregate check and
+  `classify_result_shape`."""
   matches = list(RETURN_CLAUSE.finditer(stripped))
   if not matches:
-    return False
+    return None
   tail = stripped[matches[-1].end():]
   terminator = RETURN_TERMINATOR.search(tail)
   if terminator:
     tail = tail[:terminator.start()]
   tail = re.sub(r"^\s*DISTINCT\b", "", tail, flags=re.I).strip()
-  items = _split_top_level(tail)
+  return _split_top_level(tail)
+
+
+def _scalar_aggregate_only_return(stripped: str) -> bool:
+  """True when every top-level RETURN item is a scalar aggregate
+  (count/min/max/sum/avg). Such queries return a bounded row set by
+  construction and may omit LIMIT."""
+  items = _final_return_items(stripped)
   if not items:
     return False
   return all(SCALAR_AGGREGATE_ITEM.match(item) for item in items)
+
+
+RESULT_SHAPE_GRAPH = "graph"
+RESULT_SHAPE_RANKED_PROJECTION = "ranked_projection"
+RESULT_SHAPE_OTHER = "other"
+# A pattern variable bound by a node `(var...)` or relationship `[var...]`
+# position anywhere in the query text.
+PATTERN_VARIABLE_BINDING = re.compile(r"[(\[]\s*(" + IDENT + r")\b")
+# A path variable bound by `MATCH p=(...)` / `OPTIONAL MATCH p=(...)`.
+PATH_VARIABLE_BINDING = re.compile(r"\b(" + IDENT + r")\s*=\s*(?=\()")
+BARE_RETURN_ITEM = re.compile(r"\A(" + IDENT + r")(?:\s+AS\s+" + IDENT + r")?\Z", re.I)
+ORDER_BY_CLAUSE = re.compile(r"\bORDER\s+BY\b", re.I)
+
+
+def classify_result_shape(cypher: str) -> str:
+  """Contract §4.3: `graph | ranked_projection | other`, from the Cypher text
+  alone.
+
+  - `graph` (§4.1): every top-level RETURN item is a bare pattern variable
+    (a path, node or relationship bound in the query) — `RETURN p`,
+    `RETURN p, q`, `RETURN i, c`. No property or function projection.
+  - `ranked_projection` (§4.2): starts with `MATCH`, has an `ORDER BY`, no
+    `collect()`, and is not a bare pattern-variable return. (`LIMIT` and
+    `UNWIND`-as-start are enforced generically by `analyze_generated_cypher`
+    for every shape; a ranking candidate that violates one of those still
+    reaches an explicit rejection message through that path.)
+  - `other`: everything else — scalar-only, mixed graph and scalar, and
+    unbounded projections.
+  """
+  candidate = str(cypher or "").strip()
+  stripped = _analysis_text(candidate)
+  items = _final_return_items(stripped)
+  if not items:
+    return RESULT_SHAPE_OTHER
+
+  pattern_variables = set(PATTERN_VARIABLE_BINDING.findall(stripped))
+  pattern_variables.update(PATH_VARIABLE_BINDING.findall(stripped))
+  if pattern_variables:
+    bare_names: list[str] = []
+    for item in items:
+      match = BARE_RETURN_ITEM.match(item.strip())
+      if match is None:
+        bare_names = []
+        break
+      bare_names.append(match.group(1))
+    if bare_names and all(name in pattern_variables for name in bare_names):
+      return RESULT_SHAPE_GRAPH
+
+  starts_with_match = bool(re.match(r"\s*MATCH\b", stripped, re.I))
+  if starts_with_match and ORDER_BY_CLAUSE.search(stripped) and not COLLECT_AGGREGATE.search(stripped):
+    return RESULT_SHAPE_RANKED_PROJECTION
+  return RESULT_SHAPE_OTHER
 
 
 def _execution_safety_error(
@@ -564,6 +690,8 @@ def _execution_safety_error(
   stripped = _analysis_text(candidate)
   if CYPHER_COMMENT.search(stripped):
     return "comments are not allowed"
+  if PROPERTY_LABEL_SUFFIX.search(stripped):
+    return "a label expression is not allowed directly on a property access"
   if LABEL_EXPRESSION_UNSAFE.search(stripped):
     return "label expressions with negation, wildcard or grouping are not allowed"
   if PROCEDURE_CALL.search(stripped):
