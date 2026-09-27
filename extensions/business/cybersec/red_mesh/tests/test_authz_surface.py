@@ -123,7 +123,8 @@ def _known_rollout(plugin):
   plugin.cfg_instance_id = "fixture-instance"
   plugin._execution_service = lambda: MagicMock()
 
-  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None):
+  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None,
+            engagement_id=None, require_engagement=False):
     account, denial = plugin._resolve_launch_actor(actor)
     if denial:
       return None, None, denial

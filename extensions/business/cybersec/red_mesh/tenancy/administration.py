@@ -130,6 +130,8 @@ class TenantAdministrationService:
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
+    # The engagement window is checked against this clock at launch (a test seam).
+    self.clock = lambda: datetime.now(timezone.utc)
 
   def _actor(self, actor, *, creator=False):
     account, denial = resolve_actor(actor, self.accounts)
@@ -451,10 +453,10 @@ class TenantAdministrationService:
     return self._members(tenant_id)
 
   def resolve_execution_admission(self, actor, tenant_id, asset_id, selected_peers=None, *,
-                                  expected_target_digest=None):
+                                  expected_target_digest=None, engagement_id=None):
     """Resolve current stored facts only; no endpoint, publication, DNS or execution."""
     return self._resolve_execution_admission_for_account(self._actor(actor), tenant_id, asset_id,
-      selected_peers, expected_target_digest=expected_target_digest)
+      selected_peers, expected_target_digest=expected_target_digest, engagement_id=engagement_id)
 
   def _execution_asset_for_account(self, account, tenant_id, asset_id, expected_target_digest):
     tenant, account = self.authorize_tenant_for_account(account, tenant_id)
@@ -489,9 +491,57 @@ class TenantAdministrationService:
     eligible = {row["node_address"] for row in assignments if row["active"]} & set(configured)
     return sorted(eligible)
 
+  def _execution_engagement(self, tenant_id, asset, engagement_id):
+    """The launch gate's engagement facts, from the stored row (never the DTO, which has no refs).
+
+    Refusals follow the engagements contract. The asset row's own port scope is never read here:
+    it only seeded the engagement's (owner, 2026-09-27).
+    """
+    engagement_id = self._engagement_id(engagement_id)
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      raise AdministrationDenied(404, "engagement_not_found")
+    if row["active"] is not True:
+      raise AdministrationDenied(400, "engagement_revoked")
+    now = self.clock()
+    if not (datetime.fromisoformat(row["valid_from"]) <= now < datetime.fromisoformat(row["valid_until"])):
+      raise AdministrationDenied(400, "engagement_expired")
+    entry = next((item for item in row["assets"] if item["asset_id"] == asset["asset_id"]), None)
+    if entry is None:
+      raise AdministrationDenied(400, "engagement_asset_not_locked")
+    if entry["kind"] != asset["target"]["kind"] or entry["target_digest"] != asset["target_digest"]:
+      # Owner Q3: the fix is a new engagement that `supersedes` this one.
+      raise AdministrationDenied(409, "engagement_asset_changed")
+    document = row["authorization_document"]
+    facts = {
+      "engagement_id": engagement_id, "engagement_hash": row["engagement_hash"],
+      "authorized_tests": list(entry["authorized_tests"]), "roe": dict(row["roe"]),
+      "context": row["context"],
+      # `AuthorizationRef` shape, so reports and exports read the job snapshot as before. No
+      # document reference: the job is readable under `reports:view` and reaches reports and SIEM
+      # events, while the document itself is `engagements:documents` only (download by engagement).
+      "authorization": {
+        "document_cid": "",
+        "document_thumbnail_cid": "",
+        "authorized_signer_name": document["authorized_signer_name"],
+        "authorized_signer_role": document["authorized_signer_role"],
+        "third_party_auth_cids": list(document["third_party_auth_refs"]),
+        "document_filename": document["filename"], "document_mime": document["mime"],
+        "document_size_bytes": document["size_bytes"], "document_sha256": document["sha256"],
+        "document_uploaded_at": document["uploaded_at"],
+      },
+    }
+    if entry["kind"] != "network":
+      return facts, None
+    return {**facts, "authorized_scan_modes": list(entry["authorized_scan_modes"])}, entry["authorized_ports"]
+
   def _resolve_execution_admission_for_account(self, account, tenant_id, asset_id, selected_peers=None, *,
-                                               expected_target_digest=None):
+                                               expected_target_digest=None, engagement_id=None):
     tenant, asset = self._execution_asset_for_account(account, tenant_id, asset_id, expected_target_digest)
+    policy = {}
+    if engagement_id is not None:
+      engagement, ports = self._execution_engagement(tenant_id, asset, engagement_id)
+      policy = {"engagement": engagement, **({"asset_authorized_ports": ports} if ports is not None else {})}
     eligible = self._execution_eligible_nodes(tenant_id)
     if selected_peers is not None and (not isinstance(selected_peers, list)
         or any(not valid_node_address(peer) for peer in selected_peers)
@@ -506,7 +556,7 @@ class TenantAdministrationService:
         "asset_target_digest": asset["target_digest"], "actor_id": account.account_id,
         "actor_generation": account.account_generation,
         "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected,
-        **({"asset_authorized_ports": asset["authorized_ports"]} if "authorized_ports" in asset else {})})
+        **policy})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid stored execution facts") from exc
 

@@ -21,11 +21,8 @@ from ..constants import (
   ScanType,
 )
 from ..models import (
-  AuthorizationRef,
   CStoreJobRunning,
-  EngagementContext,
   JobConfig,
-  RulesOfEngagement,
 )
 from ..graybox.models.target_config import (
   GrayboxTargetConfig,
@@ -527,16 +524,15 @@ def _validate_authorization_context(
   scan_type: str,
   authorized: bool,
   target_confirmation: str,
-  scope_id: str,
-  authorization_ref: str,
-  engagement_metadata,
-  target_allowlist,
   target_config,
 ):
+  """The launch confirmation and the node's configured target allowlist.
+
+  RM-095 removed the request-fed context (`scope_id`, `authorization_ref`,
+  `engagement_metadata`, `target_allowlist`): the engagement carries it now.
+  """
   if not authorized:
     return None, validation_error("Scan authorization required. Confirm you are authorized to scan this target.")
-  if engagement_metadata is not None and not isinstance(engagement_metadata, dict):
-    return None, validation_error("engagement_metadata must be a JSON object when provided")
 
   normalized_host = (target_host or "").strip().lower()
   normalized_confirmation = (target_confirmation or "").strip().lower()
@@ -545,9 +541,7 @@ def _validate_authorization_context(
       f"target_confirmation must echo the resolved target host ({normalized_host})"
     )
 
-  normalized_allowlist = _normalize_allowlist(
-    target_allowlist or getattr(owner, "cfg_scan_target_allowlist", [])
-  )
+  normalized_allowlist = _normalize_allowlist(getattr(owner, "cfg_scan_target_allowlist", []))
   if normalized_allowlist and not _host_in_allowlist(normalized_host, normalized_allowlist):
     return None, validation_error(
       f"Target {normalized_host} is outside the configured allowlist."
@@ -562,50 +556,59 @@ def _validate_authorization_context(
 
   return {
     "target_confirmation": normalized_confirmation or normalized_host,
-    "scope_id": str(scope_id or "").strip(),
-    "authorization_ref": str(authorization_ref or "").strip(),
-    "engagement_metadata": deepcopy(engagement_metadata) if isinstance(engagement_metadata, dict) else None,
     "target_allowlist": normalized_allowlist or None,
   }, None
 
 
-def _normalize_typed_payload(name: str, payload, model_cls):
-  """Validate and normalize optional PTES typed launch payloads."""
-  if payload is None:
+def require_engagement(execution_context):
+  """Hard gate (RM-095): a tenant launch runs inside an engagement. Returns (facts, error)."""
+  if execution_context is None:
     return None, None
-  if not isinstance(payload, dict):
-    return None, validation_error(f"{name} must be a JSON object when provided")
-  if not payload:
-    return None, None
-  try:
-    model = model_cls.from_dict(payload)
-  except Exception as exc:
-    return None, validation_error(f"{name} is malformed: {exc}")
-  if model is None:
-    return None, None
-  validate = getattr(model, "validate", None)
-  if callable(validate):
-    errors = validate()
-    if errors:
-      return None, validation_error(f"{name} is invalid: {'; '.join(errors)}")
-  is_empty = getattr(model, "is_empty", None)
-  if callable(is_empty) and is_empty():
-    return None, None
-  return model.to_dict(), None
+  engagement = execution_context.to_dict().get("engagement")
+  if engagement is None:
+    return None, {
+      "error": "engagement_required", "status_code": 400,
+      "message": "A tenant launch requires an engagement_id.",
+    }
+  return engagement, None
 
 
-def _validate_typed_engagement_context(engagement, roe, authorization):
-  normalized = {}
-  for name, payload, model_cls in (
-    ("engagement", engagement, EngagementContext),
-    ("roe", roe, RulesOfEngagement),
-    ("authorization", authorization, AuthorizationRef),
-  ):
-    value, err = _normalize_typed_payload(name, payload, model_cls)
-    if err:
-      return None, err
-    normalized[name] = value
-  return normalized, None
+def check_engagement_roe(engagement, *, ics_safe_mode=True, allow_stateful_probes=False):
+  """The engagement RoE is a ceiling: a job may be stricter, never wider."""
+  if engagement is None:
+    return None
+  roe = engagement["roe"]
+  field = None
+  if roe["ics_safe_mode_required"] and not ics_safe_mode:
+    field = "ics_safe_mode"
+  elif not roe["stateful_probes_allowed"] and allow_stateful_probes:
+    field = "allow_stateful_probes"
+  if field is None:
+    return None
+  return {
+    "error": "roe_forbids", "status_code": 400, "field": field,
+    "message": f"The engagement's rules of engagement do not allow {field} for this job.",
+  }
+
+
+def check_authorized_tests(enabled_features, authorized_tests):
+  """Refuse enabled probe methods outside the asset's authorized tests (RM-095).
+
+  Each method maps to its live `FEATURE_CATALOG` id; an authorized id that the live
+  catalog no longer has authorizes nothing. Returns an error or None.
+  """
+  owner_of = {method: item["id"] for item in FEATURE_CATALOG for method in item.get("methods", [])}
+  authorized = set(authorized_tests)
+  # A method without a catalog id cannot be authorized by any engagement.
+  unauthorized = sorted({owner_of.get(method, method) for method in enabled_features
+                         if owner_of.get(method) not in authorized})
+  if not unauthorized:
+    return None
+  return {
+    "error": "tests_exceed_authorization", "status_code": 400,
+    "message": "The enabled tests exceed the engagement's authorized tests for this asset.",
+    "unauthorized_features": unauthorized,
+  }
 
 
 def _apply_launch_safety_policy(
@@ -1051,15 +1054,10 @@ def announce_launch(
   target_config,
   allow_stateful_probes,
   target_confirmation,
-  scope_id,
-  authorization_ref,
-  engagement_metadata,
   target_allowlist,
   safety_policy,
   graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
   engagement=None,
-  roe=None,
-  authorization=None,
   bearer_token="",
   api_key="",
   bearer_refresh_token="",
@@ -1108,6 +1106,12 @@ def announce_launch(
         start_port, end_port,
         full_mirror=(distribution_strategy == DISTRIBUTION_MIRROR),
       )
+
+  # After the comparison bundle, which enables tests too (RM-095).
+  if engagement is not None:
+    tests_error = check_authorized_tests(enabled_features, engagement["authorized_tests"])
+    if tests_error:
+      return tests_error
 
   if not scanner_identity:
     scanner_identity = owner.cfg_scanner_identity
@@ -1165,10 +1169,6 @@ def announce_launch(
     created_by_id=created_by_id or "",
     authorized=True,
     target_confirmation=target_confirmation,
-    scope_id=scope_id,
-    authorization_ref=authorization_ref,
-    engagement_metadata=engagement_metadata,
-    target_allowlist=target_allowlist,
     safety_policy=safety_policy,
     scan_type=scan_type,
     target_url=target_url,
@@ -1183,9 +1183,11 @@ def announce_launch(
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
     graybox_assignment_strategy=graybox_assignment_strategy,
-    engagement=engagement,
-    roe=roe,
-    authorization=authorization,
+    # The engagement snapshot (RM-095): reports and exports keep reading these three fields.
+    **({"engagement": engagement["context"], "roe": engagement["roe"],
+        "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
+        "engagement_hash": engagement["engagement_hash"],
+        "authorized_tests": engagement["authorized_tests"]} if engagement is not None else {}),
     # OWASP API Top 10 (Subphase 1.5 commit #8): runtime-only secret
     # fields. Blanked by `_blank_graybox_secret_fields` before persistence;
     # `has_bearer_token` / `has_api_key` capability flags are set on the
@@ -1326,9 +1328,9 @@ def announce_launch(
     "enabled_features_count": len(enabled_features),
     "redact_credentials": redact_credentials,
     "ics_safe_mode": ics_safe_mode,
-    "scope_id": scope_id,
-    "authorization_ref": authorization_ref,
     "has_target_allowlist": bool(target_allowlist),
+    **({"engagement_id": engagement["engagement_id"], "engagement_hash": engagement["engagement_hash"]}
+       if engagement is not None else {}),
     **({"authorized_ports": authorized_ports} if authorized_ports else {}),
     **({"authorization_update_reference": authorization_update["reference"],
         "out_of_scope_ports": authorization_update["out_of_scope_ports"]}
@@ -1448,13 +1450,6 @@ def launch_network_scan(
   created_by_id="",
   nr_local_workers=0,
   target_confirmation="",
-  scope_id="",
-  authorization_ref="",
-  engagement_metadata=None,
-  target_allowlist=None,
-  engagement=None,
-  roe=None,
-  authorization=None,
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
   comparison_mode=False,
@@ -1470,6 +1465,9 @@ def launch_network_scan(
     return validation_error("Execution target mismatch")
   if not target:
     return validation_error("target required for network scan")
+  engagement, engagement_error = require_engagement(execution_context)
+  if engagement_error:
+    return engagement_error
 
   comparison_mode = bool(comparison_mode)
   timeout_profile, timeout_profile_error = normalize_network_timeout_profile(timeout_profile)
@@ -1515,6 +1513,9 @@ def launch_network_scan(
   )
   if confirmation_error:
     return confirmation_error
+  roe_error = check_engagement_roe(engagement, ics_safe_mode=bool(ics_safe_mode))
+  if roe_error:
+    return roe_error
 
   if execution_context is not None:
     active_peers, peer_error = execution_context.to_dict()["selected_candidates"], None
@@ -1529,19 +1530,10 @@ def launch_network_scan(
     scan_type=ScanType.NETWORK.value,
     authorized=authorized,
     target_confirmation=target_confirmation,
-    scope_id=scope_id,
-    authorization_ref=authorization_ref,
-    engagement_metadata=engagement_metadata,
-    target_allowlist=target_allowlist,
     target_config=None,
   )
   if auth_error:
     return auth_error
-  typed_context, typed_error = _validate_typed_engagement_context(
-    engagement, roe, authorization
-  )
-  if typed_error:
-    return typed_error
   soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
   if soc_error:
     return soc_error
@@ -1573,6 +1565,9 @@ def launch_network_scan(
     execution_context, workers, exception_ports, authorization_update)
   if scope_error:
     return scope_error
+  if recorded_update is not None and engagement is not None:
+    # The one-off widening is recorded against the engagement it goes beyond (never re-anchored).
+    recorded_update = {**recorded_update, "engagement_id": engagement["engagement_id"]}
 
   return announce_launch(
     owner,
@@ -1612,14 +1607,9 @@ def launch_network_scan(
     target_config=None,
     allow_stateful_probes=False,
     target_confirmation=authorization_context["target_confirmation"],
-    scope_id=authorization_context["scope_id"],
-    authorization_ref=authorization_context["authorization_ref"],
-    engagement_metadata=authorization_context["engagement_metadata"],
     target_allowlist=authorization_context["target_allowlist"],
     safety_policy=safety_policy,
-    engagement=typed_context["engagement"],
-    roe=typed_context["roe"],
-    authorization=typed_context["authorization"],
+    engagement=engagement,
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,
     timeout_profile=timeout_profile,
@@ -1661,13 +1651,6 @@ def launch_webapp_scan(
   target_config=None,
   allow_stateful_probes=False,
   target_confirmation="",
-  scope_id="",
-  authorization_ref="",
-  engagement_metadata=None,
-  target_allowlist=None,
-  engagement=None,
-  roe=None,
-  authorization=None,
   # OWASP API Top 10 (Subphase 1.5 commit #8) — top-level secret params.
   # These NEVER appear inside the persisted JobConfig: they flow straight
   # into the R1FS secret payload via persist_job_config_with_secrets and
@@ -1713,6 +1696,14 @@ def launch_webapp_scan(
     return validation_error("Execution target mismatch")
   if not target_url:
     return validation_error("target_url required for webapp scan")
+  engagement, engagement_error = require_engagement(execution_context)
+  if engagement_error:
+    return engagement_error
+  # The requested stateful options, before any policy budget narrows them: ICS applies to network.
+  roe_error = check_engagement_roe(
+    engagement, allow_stateful_probes=bool(allow_stateful_probes) or bool(allow_mirror_stateful))
+  if roe_error:
+    return roe_error
   max_weak_attempts, numeric_error = _parse_positive_int(
     max_weak_attempts, "max_weak_attempts", default=5,
   )
@@ -1787,10 +1778,6 @@ def launch_webapp_scan(
     scan_type=ScanType.WEBAPP.value,
     authorized=authorized,
     target_confirmation=target_confirmation,
-    scope_id=scope_id,
-    authorization_ref=authorization_ref,
-    engagement_metadata=engagement_metadata,
-    target_allowlist=target_allowlist,
     target_config=target_config,
   )
   if auth_error:
@@ -1802,11 +1789,6 @@ def launch_webapp_scan(
   )
   if path_scope_errors:
     return validation_error("; ".join(path_scope_errors))
-  typed_context, typed_error = _validate_typed_engagement_context(
-    engagement, roe, authorization
-  )
-  if typed_error:
-    return typed_error
   soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
   if soc_error:
     return soc_error
@@ -1936,14 +1918,9 @@ def launch_webapp_scan(
     allow_stateful_probes=allow_stateful_probes,
     graybox_assignment_strategy=graybox_assignment_strategy,
     target_confirmation=authorization_context["target_confirmation"],
-    scope_id=authorization_context["scope_id"],
-    authorization_ref=authorization_context["authorization_ref"],
-    engagement_metadata=authorization_context["engagement_metadata"],
     target_allowlist=authorization_context["target_allowlist"],
     safety_policy=safety_policy,
-    engagement=typed_context["engagement"],
-    roe=typed_context["roe"],
-    authorization=typed_context["authorization"],
+    engagement=engagement,
     bearer_token=bearer_token,
     api_key=api_key,
     bearer_refresh_token=bearer_refresh_token,
@@ -2014,13 +1991,6 @@ def launch_test(
   allow_mirror_stateful=False,
   allow_mirror_per_worker_budget=False,
   target_confirmation="",
-  scope_id="",
-  authorization_ref="",
-  engagement_metadata=None,
-  target_allowlist=None,
-  engagement=None,
-  roe=None,
-  authorization=None,
   unsafe_launch_confirmations=None,
   blockchain_attestation_enabled=False,
   comparison_mode=False,
@@ -2087,13 +2057,6 @@ def launch_test(
       allow_mirror_stateful=allow_mirror_stateful,
       allow_mirror_per_worker_budget=allow_mirror_per_worker_budget,
       target_confirmation=target_confirmation,
-      scope_id=scope_id,
-      authorization_ref=authorization_ref,
-      engagement_metadata=engagement_metadata,
-      target_allowlist=target_allowlist,
-      engagement=engagement,
-      roe=roe,
-      authorization=authorization,
       unsafe_launch_confirmations=unsafe_launch_confirmations,
       blockchain_attestation_enabled=blockchain_attestation_enabled,
       comparison_mode=comparison_mode,
@@ -2127,13 +2090,6 @@ def launch_test(
     created_by_id=created_by_id,
     nr_local_workers=nr_local_workers,
     target_confirmation=target_confirmation,
-    scope_id=scope_id,
-    authorization_ref=authorization_ref,
-    engagement_metadata=engagement_metadata,
-    target_allowlist=target_allowlist,
-    engagement=engagement,
-    roe=roe,
-    authorization=authorization,
     unsafe_launch_confirmations=unsafe_launch_confirmations,
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,

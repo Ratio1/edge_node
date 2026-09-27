@@ -48,13 +48,17 @@ def _job_specs_for_event(owner, job_specs):
     config = {}
   if not specs.get("authorized"):
     specs["authorized"] = bool(config.get("authorized", False))
+  # A job launched under an engagement (RM-095) is identified by it: its snapshot carries no
+  # document reference and no scope_id.
   if not specs.get("authorization_id"):
-    specs["authorization_id"] = config.get("scope_id") or config.get("authorization_id")
+    specs["authorization_id"] = (config.get("scope_id") or config.get("authorization_id")
+                                 or config.get("engagement_id"))
   if not specs.get("authorization_ref"):
     typed_auth = config.get("authorization") if isinstance(config.get("authorization"), dict) else {}
     specs["authorization_ref"] = (
       config.get("authorization_ref")
       or typed_auth.get("document_cid")
+      or config.get("engagement_hash")
     )
   return specs
 
