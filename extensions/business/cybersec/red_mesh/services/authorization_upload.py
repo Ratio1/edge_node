@@ -234,6 +234,8 @@ def validate_document(
   ``AuthorizationUploadError`` with ``invalid_base64 | empty | too_large | bad_mime``.
   """
   # 1. Decode
+  if content_b64 is not None and not isinstance(content_b64, str):
+    raise AuthorizationUploadError(code="invalid_base64", message="content_b64 must be a base64 string")
   try:
     raw = base64.b64decode(content_b64 or "", validate=True)
   except (binascii.Error, ValueError) as exc:

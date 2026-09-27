@@ -74,6 +74,27 @@ class TestUploadTenantContract(_PluginCase):
     result = self.upload()
     self.assertEqual((result["status_code"], result["error"]), (503, "unavailable"))
 
+  def test_non_text_content_is_a_typed_refusal(self):
+    for content in (7, ["JVBERi0="], {"b64": "x"}):
+      with self.subTest(content=content):
+        result = self.plugin.upload_tenant_contract(self.actor, "c.pdf", content)
+        self.assertEqual((result["status_code"], result["error"]), (400, "invalid_base64"))
+
+  def test_an_uploaded_contract_binds_and_downloads_unchanged(self):
+    # The whole path on one store: upload, bind the returned reference, read it back.
+    ref = self.upload()["data"]
+    request = str(uuid4())
+    prepared = self.plugin.prepare_tenant(self.actor, request, "Tenant", "tenant", "initial",
+                                          legal_name="A SRL", registration_id="RO1", signer_name="Ana",
+                                          signer_role="Director", contract_ref=ref["ref"])
+    self.assertEqual(prepared["status_code"], 200, prepared)
+    tenant_id = prepared["data"]["tenantId"]
+    self.store.grant("initial", tenant_id)
+    self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
+    self.assertEqual(self.plugin.get_tenant_contract(self.actor, tenant_id)["data"]["contract"], ref)
+    downloaded = self.plugin.download_tenant_contract(self.actor, tenant_id)["data"]
+    self.assertEqual((downloaded["sha256"], downloaded["content_b64"]), (CONTRACT_SHA256, contract_b64()))
+
   def test_no_namespace_means_no_upload(self):
     self.plugin.cfg_tenancy_namespace = None
     self.assertEqual(self.upload()["status_code"], 503)
@@ -109,6 +130,7 @@ class TestPrepareBindsTheContract(_PluginCase):
 
   def test_an_unreadable_foreign_or_tampered_contract_looks_the_same(self):
     cases = {"missing": None, "wrong kind": envelope(kind="redmesh_authorization_document"),
+             "mime claim": envelope(mime="text/html"),
              "tampered": envelope(sha256="0" * 64), "not a pdf": envelope(raw=b"\x89PNG\r\n\x1a\nimg")}
     for label, stored in cases.items():
       with self.subTest(label):
@@ -249,6 +271,20 @@ class TestReadTenantContract(_PluginCase):
                      {"legal": None, "contract": None})
     result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
     self.assertEqual((result["status_code"], result["error"]), (404, "not_found"))
+
+  def test_a_contract_the_receipt_never_bound_fails_closed(self):
+    # A tenant record that gained a contract its creation receipt does not carry (only a CStore
+    # writer can do that) is not served as the tenant's contract.
+    for (hkey, key), value in self.store.data.items():
+      if isinstance(value, dict) and value.get("tenant_id") == self.tenant_id:
+        if value.get("kind") == "receipt":
+          value.pop("contract"); value.pop("legal")
+        elif value.get("kind") == "tenant":
+          value["contract"] = {"store": "fake"}
+          value.pop("legal")
+    for call in (self.plugin.get_tenant_contract, self.plugin.download_tenant_contract):
+      with self.subTest(call.__name__):
+        self.assertEqual(call(self.actor, self.tenant_id)["status_code"], 503)
 
   def test_an_unknown_tenant_is_not_found(self):
     result = self.plugin.get_tenant_contract(self.actor, "tn_" + str(uuid4()))

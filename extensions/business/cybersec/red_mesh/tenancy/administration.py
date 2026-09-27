@@ -751,7 +751,19 @@ class TenantAdministrationService:
     tenant, account = self._authorized_tenant(actor, tenant_id)
     if not holds_platform_role(account):
       raise AdministrationDenied(403, "forbidden")
-    return {"legal": tenant.get("legal"), "contract": tenant.get("contract")}
+    legal, contract = tenant.get("legal"), tenant.get("contract")
+    # The receipt binding covers tenants whose receipt carries the terms; this covers the reverse
+    # (a record that gained terms its receipt never bound). Both or neither, and well formed.
+    if (legal is None) != (contract is None) or (contract is not None and not _valid_contract(contract)):
+      raise TenantStoreError("Invalid tenant contract record")
+    if legal is not None:
+      try:
+        valid_legal = _legal(legal) == legal
+      except AdministrationDenied:
+        valid_legal = False
+      if not valid_legal:
+        raise TenantStoreError("Invalid tenant contract record")
+    return {"legal": legal, "contract": contract}
 
   @_endpoint
   def authorize_platform(self, actor):

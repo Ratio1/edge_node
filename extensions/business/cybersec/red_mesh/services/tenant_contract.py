@@ -63,7 +63,7 @@ def resolve_contract(documents, ref):
   except AuthorizationUploadError:
     raise ContractRefused(400, "contract_invalid") from None
   if (document.sha256_hex != envelope.get("sha256") or document.size_bytes != envelope.get("size_bytes")
-      or document.filename != envelope.get("filename")
+      or document.filename != envelope.get("filename") or document.mime != envelope.get("mime")
       or any(not isinstance(envelope.get(key), str) or not envelope[key] for key in ("uploaded_at", "uploaded_by"))):
     raise ContractRefused(400, "contract_invalid")
   return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}
