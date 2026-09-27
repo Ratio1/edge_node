@@ -655,7 +655,8 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
   def test_missing_namespace_denies_every_administration_method_before_store_access(self):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
-               "check_tenant_domain", "upload_tenant_contract", "authorize_tenant_membership",
+               "check_tenant_domain", "upload_tenant_contract", "get_tenant_contract",
+               "download_tenant_contract", "authorize_tenant_membership",
                "authorize_tenant_account_creation",
                "authorize_account_state_change",
                "update_tenant_allow_pentester",

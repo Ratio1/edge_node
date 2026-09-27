@@ -190,5 +190,64 @@ class TestContractReplay(unittest.TestCase):
     self.assertEqual(self.service.activate_tenant(self.actor, self.request)["status_code"], 503)
 
 
+class TestReadTenantContract(_PluginCase):
+  def setUp(self):
+    super().setUp()
+    fields = install_contract(self.plugin)
+    self.documents = self.plugin._document_store()
+    self.request = str(uuid4())
+    prepared = self.plugin.prepare_tenant(self.actor, self.request, "Tenant", "tenant", "initial", **fields)
+    self.tenant_id = prepared["data"]["tenantId"]
+    self.store.grant("initial", self.tenant_id)
+    self.assertTrue(self.plugin.activate_tenant(self.actor, self.request)["success"])
+
+  def test_a_super_tenant_admin_reads_the_legal_details_and_contract_record(self):
+    result = self.plugin.get_tenant_contract(self.actor, self.tenant_id)
+    self.assertEqual(result["status_code"], 200, result)
+    self.assertEqual(result["data"], {"legal": LEGAL, "contract": contract_ref(store="fake")})
+
+  def test_the_tenant_admin_cannot_read_or_download_the_contract(self):
+    initial = {"account_id": "initial"}
+    for call in (self.plugin.get_tenant_contract, self.plugin.download_tenant_contract):
+      with self.subTest(call.__name__):
+        result = call(initial, self.tenant_id)
+        self.assertEqual((result["status_code"], result["error"]), (403, "forbidden"))
+
+  def test_download_returns_the_verified_file(self):
+    result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
+    self.assertEqual(result["status_code"], 200, result)
+    self.assertEqual(result["data"], {"filename": "contract.pdf", "mime": "application/pdf",
+                                      "size_bytes": len(CONTRACT_PDF), "sha256": CONTRACT_SHA256,
+                                      "content_b64": contract_b64()})
+
+  def test_a_file_that_no_longer_matches_the_tenant_record_is_not_served(self):
+    # The stored envelope is rewritten consistently with itself; only the tenant record knows better.
+    self.documents.envelopes["doc-fixture"] = envelope(raw=b"%PDF-1.7\n%a different contract\n%%EOF\n")
+    result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
+    self.assertEqual((result["status_code"], result["error"]), (409, "contract_integrity"))
+    self.documents.envelopes.pop("doc-fixture")
+    result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
+    self.assertEqual((result["status_code"], result["error"]), (409, "contract_integrity"))
+
+  def test_a_tenant_created_before_contracts_reads_as_not_recorded(self):
+    for (hkey, key), value in self.store.data.items():
+      if isinstance(value, dict) and value.get("tenant_id") == self.tenant_id:
+        value.pop("legal", None)
+        value.pop("contract", None)
+    self.assertEqual(self.plugin.get_tenant_contract(self.actor, self.tenant_id)["data"],
+                     {"legal": None, "contract": None})
+    result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
+    self.assertEqual((result["status_code"], result["error"]), (404, "not_found"))
+
+  def test_an_unknown_tenant_is_not_found(self):
+    result = self.plugin.get_tenant_contract(self.actor, "tn_" + str(uuid4()))
+    self.assertEqual(result["status_code"], 404)
+
+  def test_a_store_failure_is_unavailable(self):
+    self.documents.fail = True
+    result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
+    self.assertEqual((result["status_code"], result["error"]), (503, "unavailable"))
+
+
 if __name__ == "__main__":
   unittest.main()

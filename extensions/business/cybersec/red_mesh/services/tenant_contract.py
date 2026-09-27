@@ -67,3 +67,24 @@ def resolve_contract(documents, ref):
       or any(not isinstance(envelope.get(key), str) or not envelope[key] for key in ("uploaded_at", "uploaded_by"))):
     raise ContractRefused(400, "contract_invalid")
   return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}
+
+
+def read_contract(documents, contract):
+  """The stored contract file, served only if it still matches the tenant record.
+
+  The tenant record is the authority: the file's bytes are hashed and sized here and compared with
+  the record, never with the envelope's own claims. Anything else is 409 `contract_integrity`.
+  """
+  if contract.get("store") != documents.name:
+    raise ContractRefused(503, "unavailable")
+  envelope = documents.get(contract["ref"])
+  if not isinstance(envelope, dict) or envelope.get("kind") != CONTRACT_KIND:
+    raise ContractRefused(409, "contract_integrity")
+  try:
+    document = validate_document(contract["filename"], envelope.get("content_b64"), accepted=CONTRACT_FORMATS)
+  except AuthorizationUploadError:
+    raise ContractRefused(409, "contract_integrity") from None
+  if document.sha256_hex != contract["sha256"] or document.size_bytes != contract["size_bytes"]:
+    raise ContractRefused(409, "contract_integrity")
+  return {"filename": contract["filename"], "mime": document.mime, "size_bytes": document.size_bytes,
+          "sha256": document.sha256_hex, "content_b64": envelope["content_b64"]}

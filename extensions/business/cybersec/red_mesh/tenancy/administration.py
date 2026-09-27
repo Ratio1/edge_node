@@ -742,6 +742,15 @@ class TenantAdministrationService:
     return {"tenantId": tenant_id, "nodeAddress": node_address, "active": active}
 
   @_endpoint
+  def get_tenant_contract(self, actor, tenant_id):
+    """RM-095. The tenant's legal details and contract record (never the file), for a full-portfolio
+    Super-Tenant Admin only. Tenants created before contracts were required read as not recorded."""
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    if not holds_platform_role(account):
+      raise AdministrationDenied(403, "forbidden")
+    return {"legal": tenant.get("legal"), "contract": tenant.get("contract")}
+
+  @_endpoint
   def authorize_platform(self, actor):
     """RM-095. The caller is a full-portfolio Super-Tenant Admin; the contract calls do their
     storage I/O outside this lock after it."""
