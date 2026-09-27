@@ -29,6 +29,7 @@ from .edgeguard_cypher_guard import (
   DEFAULT_SCHEMA_RETRY_LIMIT,
   EDGEGUARD_SCHEMA,
   EDGEGUARD_SCHEMA_V0_11,
+  RESULT_SHAPE_RANKED_PROJECTION,
   SCHEMA_VERSION,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,
@@ -39,6 +40,7 @@ from .edgeguard_cypher_guard import (
   canonical_schema_surface,
   classify_empty_reason,
   classify_result_shape,
+  derive_ranking_rule,
   normalize_user_literal_text,
 )
 from . import literal_classes
@@ -62,7 +64,7 @@ from .graph_first_runtime import (
   production_token_counter,
   run_graph_first_explanation,
 )
-from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_result_digest
+from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_projection_digest, build_result_digest
 from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
 from . import egx2
 
@@ -1094,6 +1096,10 @@ def _prepare_graph_explanation_plan(
   # rejects them identically; only the packet-property projection policy below
   # remains explanation-specific.
   analysis = analyze_generated_cypher(cypher, max_limit=guard_max_limit)
+  # Contract §4.3: carried in `plan["validation"]` so the explanation
+  # dispatcher can route `ranked_projection` to the digest analyst brief
+  # regardless of the configured graph-topology explanation strategy.
+  analysis["result_shape"] = classify_result_shape(analysis.get("candidate") or cypher)
   if not analysis["accepted"]:
     return {
       "status": STATUS_REJECTED,
@@ -4158,6 +4164,20 @@ class EdgeguardApiPlugin(BasePlugin):
     value = getattr(self, "cfg_edgeguard_explanation_strategy", "one_call")
     return value if value in {"one_call", "eel_compatibility", "insight_brief"} else "one_call"
 
+  def _explanation_dispatch_strategy(self, result_shape: Optional[str]) -> str:
+    """Contract §4.3: a `ranked_projection` result is explained by the digest
+    analyst brief (EAB/1) even when `insight_brief` (EGX/2) is the configured
+    strategy. EGX/2's insight sheet and the `eel_compatibility` graph
+    explainer both derive everything from `packet.graph`, which is empty for
+    a scalar projection, so routing them there would only ever reach their
+    deterministic no-graph-evidence fallback (`tabular_result` /
+    `empty_graph`), never the model. `other` (scalar, non-ranked) keeps its
+    existing strategy and fallback behaviour unchanged."""
+    strategy = self._active_explanation_strategy()
+    if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION:
+      return "one_call"
+    return strategy
+
   def _run_digest_analyst_brief(
     self,
     *,
@@ -4168,7 +4188,11 @@ class EdgeguardApiPlugin(BasePlugin):
     live_retry: Mapping[str, Any],
     request: str,
     deadline: float,
+    projection_digest: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
+    # Contract §4.3: a sibling of `result_digest`, present for
+    # `ranked_projection` results only.
+    digest_siblings = {"projection_digest": dict(projection_digest)} if projection_digest is not None else {}
     if digest.get("counts", {}).get("returned_rows") == 0:
       safe_code = "no_graph_evidence"
       diagnostics = {
@@ -4192,6 +4216,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet": dict(packet),
         "packet_meta": dict(packet_meta),
         "result_digest": dict(digest),
+        **digest_siblings,
         "analyst_brief": {
           "schema_version": "edgeguard.analyst_brief_state.v1",
           "status": "unavailable",
@@ -4239,6 +4264,7 @@ class EdgeguardApiPlugin(BasePlugin):
         digest=digest,
         model=getattr(self, "cfg_edgeguard_explanation_model", None),
         provider_call=self._call_graph_first_provider,
+        projection_digest=projection_digest,
       )
       return self._bounded_graph_first_success({
         "status": STATUS_OK,
@@ -4248,6 +4274,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet": dict(packet),
         "packet_meta": dict(packet_meta),
         "result_digest": dict(digest),
+        **digest_siblings,
         **brief,
         "validation": validation,
         "live_retry": dict(live_retry),
@@ -4284,6 +4311,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet": dict(packet),
         "packet_meta": dict(packet_meta),
         "result_digest": dict(digest),
+        **digest_siblings,
         "analyst_brief": {
           "schema_version": "edgeguard.analyst_brief_state.v1",
           "status": "unavailable",
@@ -5517,7 +5545,9 @@ class EdgeguardApiPlugin(BasePlugin):
       strategy=plan["broadening"].get("strategy") if broadened else None,
       broadening_cypher=plan["broadening"].get("cypher") if broadened else None,
     )
-    if self._active_explanation_strategy() == "insight_brief":
+    result_shape = (plan.get("validation") or {}).get("result_shape")
+    effective_strategy = self._explanation_dispatch_strategy(result_shape)
+    if effective_strategy == "insight_brief":
       return self._run_insight_brief(
         digest=digest,
         packet=packet,
@@ -5528,7 +5558,16 @@ class EdgeguardApiPlugin(BasePlugin):
         deadline=deadline,
         mode=mode_plan.mode if mode_plan is not None else None,
       )
-    if self._active_explanation_strategy() == "one_call":
+    if effective_strategy == "one_call":
+      projection_digest = (
+        build_projection_digest(
+          query_result_evidence,
+          ranking_rule=derive_ranking_rule(str(plan["accepted_cypher"])),
+          truncated=bool(execution_result.get("truncated")),
+        )
+        if result_shape == RESULT_SHAPE_RANKED_PROJECTION
+        else None
+      )
       return self._run_digest_analyst_brief(
         digest=digest,
         packet=packet,
@@ -5537,6 +5576,7 @@ class EdgeguardApiPlugin(BasePlugin):
         live_retry=live_retry,
         request=request,
         deadline=deadline,
+        projection_digest=projection_digest,
       )
     if not packet["graph"]["nodes"]:
       return {
@@ -5694,6 +5734,9 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation_errors": [_contract_error(code, detail)],
       }
     analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
+    # Contract §4.3: routes the explanation dispatch below, independent of
+    # the configured graph-topology explanation strategy.
+    analysis["result_shape"] = classify_result_shape(analysis.get("candidate") or cypher)
     if not analysis["accepted"]:
       return {
         "status": STATUS_REJECTED,
@@ -5997,7 +6040,9 @@ class EdgeguardApiPlugin(BasePlugin):
           validation=analysis,
           live_retry=live_retry,
         )
-      if self._active_explanation_strategy() == "insight_brief":
+      result_shape = analysis.get("result_shape")
+      effective_strategy = self._explanation_dispatch_strategy(result_shape)
+      if effective_strategy == "insight_brief":
         return self._run_insight_brief(
           digest=digest,
           packet=packet,
@@ -6008,7 +6053,16 @@ class EdgeguardApiPlugin(BasePlugin):
           deadline=deadline,
           mode=mode_plan.mode if mode_plan is not None else None,
         )
-      if self._active_explanation_strategy() == "one_call":
+      if effective_strategy == "one_call":
+        projection_digest = (
+          build_projection_digest(
+            query_result_evidence,
+            ranking_rule=derive_ranking_rule(str(plan["accepted_cypher"])),
+            truncated=bool(execution_envelope.get("truncated")),
+          )
+          if result_shape == RESULT_SHAPE_RANKED_PROJECTION
+          else None
+        )
         return self._run_digest_analyst_brief(
           digest=digest,
           packet=packet,
@@ -6017,6 +6071,7 @@ class EdgeguardApiPlugin(BasePlugin):
           live_retry=live_retry,
           request=request,
           deadline=deadline,
+          projection_digest=projection_digest,
         )
       try:
         graph_first = self._run_graph_first(

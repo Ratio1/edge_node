@@ -23,6 +23,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
   _v0_11_grouped_pattern_lines,
   classify_empty_reason,
   classify_result_shape,
+  derive_ranking_rule,
   extract_schema_tokens,
   load_schema_artifact_v0_11,
   normalize_user_literal_text,
@@ -741,6 +742,52 @@ class ClassifyResultShapeTests(unittest.TestCase):
     for query in cases:
       with self.subTest(query=query):
         self.assertEqual(classify_result_shape(query), "other")
+
+
+class DeriveRankingRuleTests(unittest.TestCase):
+  """Contract §4.2, §4.3: `derive_ranking_rule` renders the `ORDER BY` of a
+  `ranked_projection` query as a deterministic, non-empty label so the
+  runtime never invents a ranking rule for `projection_digest`."""
+
+  def test_the_contract_example_query_resolves_return_aliases_in_order(self):
+    query = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) "
+      "WHERE c.cve_id IN ['CVE-2024-0001', 'CVE-2024-0002'] "
+      "OPTIONAL MATCH (i:Indicator)-[:EXPLOITS]->(c) "
+      "WITH c, s, count(DISTINCT i) AS exploiting_indicators "
+      "ORDER BY exploiting_indicators DESC, s.base_score DESC "
+      "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31, exploiting_indicators "
+      "LIMIT 3"
+    )
+    self.assertEqual(derive_ranking_rule(query), "exploiting_indicators_desc, cvss_v31_desc")
+
+  def test_a_bare_property_without_a_return_alias_falls_back_to_its_own_name(self):
+    query = (
+      "MATCH (b:Malware)<-[:INDICATES]-(a:Indicator) "
+      "WITH b, count(a) AS total ORDER BY total DESC "
+      "RETURN b.name AS name, total LIMIT 5"
+    )
+    self.assertEqual(derive_ranking_rule(query), "total_desc")
+
+  def test_an_order_by_key_without_a_direction_defaults_to_cyphers_own_ascending(self):
+    query = "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) RETURN c.cve_id AS cve_id, s.base_score AS score ORDER BY s.base_score LIMIT 5"
+    self.assertEqual(derive_ranking_rule(query), "score_asc")
+
+  def test_a_query_with_no_order_by_is_unranked(self):
+    self.assertEqual(derive_ranking_rule("MATCH (i:Indicator) RETURN i.value AS value LIMIT 5"), "unranked")
+
+  def test_every_ranked_reference_query_yields_a_non_empty_rule(self):
+    for pattern in [p for p in EDGEGUARD_SCHEMA_V0_11["patterns"] if p.get("to_properties")]:
+      if pattern["surface"] != "populated":
+        continue
+      to_prop = pattern["to_properties"][0]
+      query = (
+        f"MATCH (a:{pattern['from']})-[:{pattern['type']}]->(b:{pattern['to']}) "
+        f"WITH b, count(a) AS total ORDER BY total DESC "
+        f"RETURN b.{to_prop} AS name, total LIMIT 5"
+      )
+      with self.subTest(query=query):
+        self.assertEqual(derive_ranking_rule(query), "total_desc")
 
 
 class ClassifyEmptyReasonTests(unittest.TestCase):

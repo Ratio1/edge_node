@@ -56,6 +56,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _valid_temporal
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_SERVER_MAX_ROWS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
@@ -2484,6 +2485,155 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
     self.assertIn("tabular/scalar", result["case_explanation"]["assessment"]["text"])
     self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_explain_graph_ranked_projection_calls_the_model_under_insight_brief(self):
+    # Contract §4.2-§4.4: a `ranked_projection` result has no graph nodes
+    # either, but must call the model (no `tabular_result` fallback) and
+    # ground the brief against `projection_digest`.
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {
+        "content": json.dumps({"text": "CVE-2024-0001 ranks highest under cvss_v31_desc."}),
+        "finish_reason": "stop",
+        "completion_tokens": 14,
+      }
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    fake_driver, fake_session = _driver_with_results(_Result(
+      [
+        _DriverRecord({"cve_id": "CVE-2024-0001", "cvss_v31": 9.8}, {"cve_id": "CVE-2024-0001", "cvss_v31": 9.8}),
+        _DriverRecord({"cve_id": "CVE-2024-0002", "cvss_v31": 7.5}, {"cve_id": "CVE-2024-0002", "cvss_v31": 7.5}),
+      ],
+      keys=["cve_id", "cvss_v31"],
+    ))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Which CVE ranks highest by CVSS?",
+          cypher=(
+            "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s "
+            "ORDER BY s.base_score DESC "
+            "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+          ),
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["executed"])
+    self.assertTrue(result["explained"])
+    self.assertEqual(result["validation"]["result_shape"], "ranked_projection")
+    self.assertEqual(len(payloads), 1)
+    self.assertNotIn("case_explanation", result)
+    self.assertEqual(result["analyst_brief"]["strategy"], "one_call")
+    self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
+    self.assertNotEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
+    self.assertEqual(result["result_digest"]["counts"]["nodes"], 0)
+    projection_digest = result["projection_digest"]
+    self.assertEqual(projection_digest["schema_version"], "edgeguard.projection_digest.v1")
+    self.assertEqual(projection_digest["columns"], ["cve_id", "cvss_v31"])
+    self.assertEqual(projection_digest["ranking_rule"], "cvss_v31_desc")
+    self.assertEqual(projection_digest["rows"][0]["values"][0], {"type": "string", "value": "CVE-2024-0001"})
+    self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_explain_prepared_execution_ranked_projection_calls_the_model_under_insight_brief(self):
+    # Same fix on the `execution_result=`-supplied dispatch path
+    # (`_explain_prepared_execution`), used by the JSON-execution-evidence
+    # contract and its own harnesses.
+    from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode
+
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {
+        "content": json.dumps({"text": "CVE-2024-0001 ranks highest under cvss_v31_desc."}),
+        "finish_reason": "stop",
+        "completion_tokens": 12,
+      }
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    cypher = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s "
+      "ORDER BY s.base_score DESC "
+      "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+    )
+    plan = {
+      "accepted_cypher": cypher,
+      "executed_cypher": cypher,
+      "result_columns": ["cve_id", "cvss_v31"],
+      "projection_descriptors": [],
+      "limit_policy": {
+        "generated_limit": 5,
+        "executed_limit": 5,
+        "transport_row_cap": 25,
+        "server_max_rows": EXPLANATION_SERVER_MAX_ROWS,
+        "limit_adjusted": False,
+        "query_rewritten": False,
+      },
+      "broadening": {"enabled": False, "cypher": None, "strategy": None, "result_columns": None},
+      "validation": {"result_shape": "ranked_projection"},
+    }
+    execution_result = {
+      "executed_cypher": cypher,
+      "primary_row_count": 2,
+      "row_count": 2,
+      "truncated": False,
+      "broadened": False,
+      "graph": {"nodes": [], "relationships": [], "truncated": False},
+      "query_result_evidence": {
+        "schema_version": "edgeguard.query_result_evidence.v1",
+        "columns": ["cve_id", "cvss_v31"],
+        "rows": [
+          {"ordinal": 0, "values": [{"type": "string", "value": "CVE-2024-0001"}, {"type": "float", "value": 9.8}]},
+          {"ordinal": 1, "values": [{"type": "string", "value": "CVE-2024-0002"}, {"type": "float", "value": 7.5}]},
+        ],
+      },
+      "execution_trace": {"selected": "primary", "executions": []},
+    }
+
+    result = plugin._explain_prepared_execution(
+      plan=plan,
+      execution_result=execution_result,
+      request="Which CVE ranks highest by CVSS?",
+      mode_plan=resolve_mode("balanced"),
+      deadline=1e20,
+    )
+
+    self.assertTrue(result["explained"])
+    self.assertEqual(len(payloads), 1)
+    self.assertEqual(result["analyst_brief"]["strategy"], "one_call")
+    self.assertIn("projection_digest", result)
+    self.assertEqual(result["projection_digest"]["ranking_rule"], "cvss_v31_desc")
+    self.assertEqual(result["projection_digest"]["row_count"], 2)
+
+  def test_explain_graph_scalar_only_non_ranked_result_still_falls_back_under_insight_brief(self):
+    # `other` (scalar, non-ranked) keeps today's deterministic fallback: only
+    # `ranked_projection` is rerouted to the digest analyst brief.
+    fake_driver, _fake_session = _driver_with_results(_Result(
+      [_DriverRecord({"name": "quietsieve"}, {"name": "quietsieve"})], keys=["name"],
+    ))
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="List malware names.",
+          cypher="MATCH (m:Malware) RETURN m.name AS name LIMIT 10",
+        )
+
+    self.assertEqual(result["validation"]["result_shape"], "other")
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
+    self.assertNotIn("projection_digest", result)
 
   def test_explain_graph_scalar_only_result_succeeds_under_one_call(self):
     payloads = []

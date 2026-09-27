@@ -679,6 +679,65 @@ def classify_result_shape(cypher: str) -> str:
   return RESULT_SHAPE_OTHER
 
 
+# `ORDER BY ...` up to the next top-level clause: a `WITH`-then-`ORDER BY`
+# pattern (as ranked queries use, per contract §4.2) is followed by `RETURN`;
+# a final `ORDER BY` after `RETURN` is followed by `SKIP`/`LIMIT` only.
+ORDER_BY_ITEM_TERMINATOR = re.compile(r"\b(RETURN|SKIP|LIMIT)\b", re.I)
+_ORDER_BY_ITEM_DIRECTION = re.compile(r"\s+(ASC|ASCENDING|DESC|DESCENDING)\s*\Z", re.I)
+_RETURN_ITEM_ALIAS = re.compile(r"\A(.*?)\s+AS\s+(" + IDENT + r")\s*\Z", re.I)
+_TRAILING_IDENTIFIER = re.compile(r"(" + IDENT + r")\s*\Z")
+
+
+def _order_by_items(stripped: str) -> list[str]:
+  match = ORDER_BY_CLAUSE.search(stripped)
+  if not match:
+    return []
+  tail = stripped[match.end():]
+  terminator = ORDER_BY_ITEM_TERMINATOR.search(tail)
+  if terminator:
+    tail = tail[:terminator.start()]
+  return [item for item in _split_top_level(tail.strip()) if item.strip()]
+
+
+def derive_ranking_rule(cypher: str) -> str:
+  """Contract §4.2: a deterministic, human-readable label for the `ORDER BY`
+  a `ranked_projection` query applies, e.g. `"exploiting_indicators_desc,
+  cvss_v31_desc"`. Resolved against the final `RETURN` clause's `AS` aliases
+  so the label uses output column names rather than raw property access
+  where the query already names one; falls back to the trailing identifier
+  of the sort expression (`s.base_score` -> `base_score`) otherwise. Cypher's
+  own default sort direction (ascending) applies when a key has none.
+
+  `"unranked"` when there is no `ORDER BY` at all — `classify_result_shape`
+  never routes such a query here, but the function stays total.
+  """
+  stripped = _analysis_text(cypher)
+  order_items = _order_by_items(stripped)
+  if not order_items:
+    return "unranked"
+  alias_by_expression = {}
+  for item in (_final_return_items(stripped) or []):
+    match = _RETURN_ITEM_ALIAS.match(item.strip())
+    if match:
+      alias_by_expression[re.sub(r"\s+", "", match.group(1))] = match.group(2)
+  labels = []
+  for item in order_items:
+    text = item.strip()
+    direction_match = _ORDER_BY_ITEM_DIRECTION.search(text)
+    if direction_match:
+      direction = "asc" if direction_match.group(1).lower().startswith("asc") else "desc"
+      text = text[:direction_match.start()].strip()
+    else:
+      direction = "asc"
+    expression_key = re.sub(r"\s+", "", text)
+    alias = alias_by_expression.get(expression_key)
+    if alias is None:
+      tail_match = _TRAILING_IDENTIFIER.search(text)
+      alias = tail_match.group(1) if tail_match else expression_key
+    labels.append(f"{alias}_{direction}")
+  return ", ".join(labels)
+
+
 EMPTY_REASON_TOPOLOGY_SURFACE_NO_DATA = "topology_surface_no_data"
 EMPTY_REASON_LITERAL_NOT_FOUND = "literal_not_found"
 EMPTY_REASON_NO_MATCH = "no_match"
