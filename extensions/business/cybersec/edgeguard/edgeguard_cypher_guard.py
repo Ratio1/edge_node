@@ -723,6 +723,16 @@ _RETURN_ITEM_ALIAS = re.compile(r"\A(.*?)\s+AS\s+(" + IDENT + r")\s*\Z", re.I)
 # renders as a readable property name (`base_score`) instead of the whole
 # normalised expression.
 _LAST_IDENTIFIER_IN_EXPRESSION = re.compile(IDENT)
+# Review finding 5, round 2: a Cypher aggregate function used directly as an
+# `ORDER BY` key, with no `AS` alias in the final `RETURN` — the whole call
+# is captured so its readable label can name the function too
+# (`count(i)` -> `count_i`, `count(DISTINCT i)` -> `count_i`), not just the
+# last bare identifier inside it. Scalar functions (`coalesce(...)`) are
+# deliberately excluded: their existing bare-identifier fallback stays as
+# `derive_ranking_rule`'s own docstring documents.
+_AGGREGATE_FUNCTION_CALL = re.compile(
+  r"\A(count|sum|avg|min|max|collect)\s*\((?:\s*DISTINCT\s+)?(.*)\)\Z", re.I,
+)
 
 
 def _order_by_items(stripped: str) -> list[str]:
@@ -776,8 +786,21 @@ def derive_ranking_rule(cypher: str) -> str:
     expression_key = re.sub(r"\s+", "", text)
     alias = alias_by_expression.get(expression_key)
     if alias is None:
-      identifiers = _LAST_IDENTIFIER_IN_EXPRESSION.findall(text)
-      alias = identifiers[-1] if identifiers else expression_key
+      aggregate_match = _AGGREGATE_FUNCTION_CALL.match(text)
+      if aggregate_match:
+        # Review finding 5, round 2: an aggregate with no `AS` alias in the
+        # final `RETURN` (`ORDER BY count(i) DESC`) used to fall back to
+        # the last bare identifier inside the call (`i`), losing the
+        # aggregate itself (`i_desc`); name the function too (`count_i`).
+        function_name = aggregate_match.group(1).lower()
+        argument_identifiers = _LAST_IDENTIFIER_IN_EXPRESSION.findall(aggregate_match.group(2))
+        alias = (
+          f"{function_name}_{argument_identifiers[-1]}" if argument_identifiers
+          else function_name
+        )
+      else:
+        identifiers = _LAST_IDENTIFIER_IN_EXPRESSION.findall(text)
+        alias = identifiers[-1] if identifiers else expression_key
     labels.append(f"{alias}_{direction}")
   return ", ".join(labels)
 
@@ -931,7 +954,17 @@ def _variable_length_bound_error(stripped: str, max_hops: int | None) -> str | N
   bound (`*3`, `*..3`, `*1..3`); bare `*` and an open-ended `*1..` are
   rejected for every profile (X1, pre-existing gap). `max_hops` additionally
   caps that upper bound — v0.11 profile only (contract §4.1); `None` skips
-  the cap, v0.10's existing behaviour."""
+  the cap, v0.10's existing behaviour.
+
+  v0.11 also requires the *lower* bound to be exactly 1 (review finding 2,
+  round 2): `*1`, `*1..2`, `*1..3` are the accepted forms. A range with no
+  explicit lower (`*..3`, which Cypher would default to 1) is rejected
+  regardless — v0.11 accepts only a written `1`, not an implied one — and so
+  are `*2`/`*3` (an exact hop count other than 1, the bare-number form's own
+  "implied" lower/upper), `*3..1` (lower above upper) and `*0..` (lower
+  below 1, and also caught by the missing-upper-bound rule below since it
+  has none). v0.10 (`max_hops is None`) is unaffected — any explicit upper
+  bound is accepted, as before."""
   for bracket in RELATIONSHIP_BRACKET.finditer(stripped):
     star = VAR_LENGTH_SPEC.search(bracket.group(1))
     if star is None:
@@ -945,17 +978,43 @@ def _variable_length_bound_error(stripped: str, max_hops: int | None) -> str | N
       return "variable-length relationship patterns must have an explicit upper bound"
     if isinstance(max_hops, int) and bound > max_hops:
       return f"variable-length relationship patterns are bounded to at most {max_hops} hops"
+    if isinstance(max_hops, int):
+      if dotdot is None:
+        lower_bound_ok = bound == 1
+      else:
+        lower_bound_ok = lower is not None and int(lower) == 1 and bound >= 1
+      if not lower_bound_ok:
+        return (
+          "variable-length relationship patterns must start at 1 hop, e.g. "
+          f"`*1`, `*1..2`, `*1..{max_hops}`"
+        )
   return None
 
 
 def _pattern_hop_count_error(chains: list[str], max_hops: int) -> str | None:
-  """Contract §4.1: at most `max_hops` relationship edges in one pattern
-  chain (v0.11 profile only). Bracket content is stripped first so
-  `-[:REL]->` collapses to `-->` and each edge counts once regardless of its
-  relationship type or var-length spec."""
+  """Contract §4.1: at most `max_hops` in the *maximum path length* of one
+  pattern chain (v0.11 profile only; review finding 2, round 2) — a fixed
+  edge counts 1 hop, and a variable-length edge counts its upper bound, so
+  two `*1..3` edges in the same chain (up to 6 hops) are rejected even
+  though each edge alone is within bounds. Counted as: the number of edges
+  (bracket content stripped, `-[:REL]->` collapses to `-->`) plus, for each
+  var-length edge, its upper bound minus the 1 hop already counted for that
+  edge."""
   for chain in chains:
     stripped_edges = RELATIONSHIP_BRACKET.sub("", chain)
-    if len(PATTERN_EDGE.findall(stripped_edges)) > max_hops:
+    total_hops = len(PATTERN_EDGE.findall(stripped_edges))
+    for bracket in RELATIONSHIP_BRACKET.finditer(chain):
+      star = VAR_LENGTH_SPEC.search(bracket.group(1))
+      if star is None:
+        continue
+      lower, dotdot, upper = star.group(1), star.group(2), star.group(3)
+      if dotdot is None:
+        var_bound = int(lower) if lower is not None else None
+      else:
+        var_bound = int(upper) if upper is not None else None
+      if var_bound is not None and var_bound > 1:
+        total_hops += var_bound - 1
+    if total_hops > max_hops:
       return f"a pattern may have at most {max_hops} relationship hops"
   return None
 

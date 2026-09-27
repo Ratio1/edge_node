@@ -659,11 +659,13 @@ class HopBoundsV0_11Tests(unittest.TestCase):
     return analyze_generated_cypher(cypher, **kwargs)
 
   def test_accepts_variable_length_up_to_three(self):
+    # Review finding 2, round 2: the v0.11 accepted forms are `*1`,
+    # `*1..2`, `*1..3` — lower bound 1 (explicit or implied by the bare
+    # exact-count form), upper bound <= 3.
     cases = [
       "MATCH (a:Indicator)-[:INDICATES*1..3]->(b:Malware) RETURN a, b LIMIT 5",
-      "MATCH (a:Indicator)-[:INDICATES*..2]->(b:Malware) RETURN a, b LIMIT 5",
-      "MATCH (a:Indicator)-[:INDICATES*2]->(b:Malware) RETURN a, b LIMIT 5",
-      "MATCH (a:Indicator)-[:INDICATES*..3]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*1..2]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*1]->(b:Malware) RETURN a, b LIMIT 5",
     ]
     for cypher in cases:
       with self.subTest(cypher=cypher):
@@ -673,7 +675,6 @@ class HopBoundsV0_11Tests(unittest.TestCase):
   def test_rejects_variable_length_above_three(self):
     cases = [
       "MATCH (a:Indicator)-[:INDICATES*4]->(b:Malware) RETURN a, b LIMIT 5",
-      "MATCH (a:Indicator)-[:INDICATES*..4]->(b:Malware) RETURN a, b LIMIT 5",
       "MATCH (a:Indicator)-[:INDICATES*1..4]->(b:Malware) RETURN a, b LIMIT 5",
     ]
     for cypher in cases:
@@ -681,6 +682,57 @@ class HopBoundsV0_11Tests(unittest.TestCase):
         analysis = self._analysis(cypher)
         self.assertFalse(analysis["accepted"], cypher)
         self.assertIn("at most 3 hops", analysis["validation_feedback"], cypher)
+
+  def test_rejects_variable_length_with_a_lower_bound_other_than_one(self):
+    # Review finding 2, round 2: `*..3` (implied lower via a range with no
+    # explicit lower) and a bare exact count other than 1 (`*2`, `*3`) fit
+    # under the <= 3 upper-bound cap but are still rejected — only lower
+    # bound 1 is accepted for v0.11. `*3..1` (lower above upper) and `*0..`
+    # (lower below 1, no upper at all) are rejected for the same reason.
+    cases = [
+      "MATCH (a:Indicator)-[:INDICATES*..3]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*2]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*3]->(b:Malware) RETURN a, b LIMIT 5",
+      "MATCH (a:Indicator)-[:INDICATES*3..1]->(b:Malware) RETURN a, b LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertIn("must start at 1 hop", analysis["validation_feedback"], cypher)
+
+  def test_rejects_open_ended_lower_bound_zero_for_v0_11_too(self):
+    # `*0..` has no upper bound at all, so it is already rejected by the
+    # unbounded-variable-length check every profile shares (X1); confirm the
+    # v0.11 profile does not accidentally let it through.
+    analysis = self._analysis(
+      "MATCH (a:Indicator)-[:INDICATES*0..]->(b:Malware) RETURN a, b LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("explicit upper bound", analysis["validation_feedback"])
+
+  def test_rejects_a_pattern_whose_var_length_upper_bounds_sum_above_three(self):
+    # Review finding 2, round 2: hop bound is the *maximum path length*, so
+    # two `*1..3` edges in one chain (up to 6 hops) or an `EXPLOITS` edge
+    # plus a `*1..3` edge (up to 4 hops) are rejected even though each var-
+    # length edge alone is within the <= 3 cap.
+    cases = [
+      "MATCH p=(a:CVE)-[:AFFECTS*1..3]->(b:Sector)-[:AFFECTS*1..3]->(c:Sector) RETURN p LIMIT 5",
+      "MATCH p=(i:Indicator)-[:EXPLOITS]->(c:CVE)-[:AFFECTS*1..3]->(x:Sector) RETURN p LIMIT 5",
+    ]
+    for cypher in cases:
+      with self.subTest(cypher=cypher):
+        analysis = self._analysis(cypher)
+        self.assertFalse(analysis["accepted"], cypher)
+        self.assertIn("at most 3 relationship hops", analysis["validation_feedback"], cypher)
+
+  def test_accepts_a_single_var_length_edge_at_the_upper_bound(self):
+    # The chain-total accounting must not double-penalize a single `*1..3`
+    # edge: one var-length edge at the cap is still exactly 3 hops.
+    analysis = self._analysis(
+      "MATCH p=(a:CVE)-[:AFFECTS*1..3]->(b:Sector) RETURN p LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
 
   def test_rejects_a_pattern_with_more_than_three_static_hops(self):
     analysis = self._analysis(
@@ -983,6 +1035,37 @@ class DeriveRankingRuleTests(unittest.TestCase):
     # trailing identifier (a function call) used to render as the entire
     # normalised expression (`coalesce(c.score,0)_desc`); the innermost
     # property/identifier is a readable label instead.
+    query = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) "
+      "RETURN c.cve_id AS cve_id, s.base_score AS score "
+      "ORDER BY coalesce(s.base_score, 0) DESC LIMIT 5"
+    )
+    self.assertEqual(derive_ranking_rule(query), "base_score_desc")
+
+  def test_an_aggregate_order_by_key_without_a_return_alias_names_the_function(self):
+    # Review finding 5, round 2: `ORDER BY count(i) DESC` with no `AS` alias
+    # in the final `RETURN` used to render as `i_desc` (the last bare
+    # identifier inside the call), losing the aggregate itself; the label
+    # names the function too.
+    query = (
+      "MATCH (i:Indicator)-[:EXPLOITS]->(c:CVE) "
+      "RETURN c.cve_id AS cve_id, count(i) "
+      "ORDER BY count(i) DESC LIMIT 5"
+    )
+    self.assertEqual(derive_ranking_rule(query), "count_i_desc")
+
+  def test_an_aggregate_order_by_key_with_distinct_names_the_function_too(self):
+    query = (
+      "MATCH (i:Indicator)-[:EXPLOITS]->(c:CVE) "
+      "RETURN c.cve_id AS cve_id, count(DISTINCT i) "
+      "ORDER BY count(DISTINCT i) DESC LIMIT 5"
+    )
+    self.assertEqual(derive_ranking_rule(query), "count_i_desc")
+
+  def test_a_scalar_function_order_by_key_keeps_its_bare_identifier_fallback(self):
+    # `coalesce(...)` is not an aggregate: it must not gain a function-name
+    # prefix (`test_an_unaliased_function_expression_gets_a_readable_label`
+    # above already pins the exact label its own docstring documents).
     query = (
       "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) "
       "RETURN c.cve_id AS cve_id, s.base_score AS score "

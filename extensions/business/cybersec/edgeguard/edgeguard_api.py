@@ -1098,6 +1098,7 @@ def _prepare_graph_explanation_plan(
   broadening_enabled: bool = False,
   mode_plan: Optional[ModePlan] = None,
   guard_max_limit: Optional[int] = None,
+  validation_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
   try:
     selected_mode = mode_plan or resolve_mode(explanation_rows=requested_limit)
@@ -1112,7 +1113,20 @@ def _prepare_graph_explanation_plan(
   # shared guard's execution-safety stage (EG-013), so every execution route
   # rejects them identically; only the packet-property projection policy below
   # remains explanation-specific.
-  analysis = analyze_generated_cypher(cypher, max_limit=guard_max_limit)
+  # Contract §1/§4.1 (review finding 1, round 2): explain routes accept what
+  # `generate` accepts for the v0.11 profile — the caller resolves the
+  # selection once via `EdgeguardApi._cypher_validation_profile` and passes
+  # it down here; `validation_profile=None` (module-level test callers with
+  # no model key) keeps the v0.10 defaults exactly as before.
+  use_v0_11 = bool((validation_profile or {}).get("use_v0_11"))
+  analysis = analyze_generated_cypher(
+    cypher,
+    allowed=(validation_profile or {}).get("schema_allowed"),
+    max_limit=guard_max_limit,
+    allow_limit_optional_graph=use_v0_11,
+    enforce_hop_bounds=use_v0_11,
+  )
+  analysis["schema_version"] = (validation_profile or {}).get("schema_version", SCHEMA_VERSION)
   # Contract §4.3: carried in `plan["validation"]` so the explanation
   # dispatcher can route `ranked_projection` to the digest analyst brief
   # regardless of the configured graph-topology explanation strategy.
@@ -3758,6 +3772,37 @@ class EdgeguardApiPlugin(BasePlugin):
       name = DEFAULT_PROMPT_PROFILE
     return {"name": name, **PROMPT_PROFILES[name]}
 
+  def _cypher_validation_profile(self, model_key: Optional[str]) -> Dict[str, Any]:
+    """Contract §1/§4.1 (review finding 1, both rounds): the one place that
+    resolves, from a model key, which schema a Cypher candidate validates
+    against — `generate`, `/neo4j_query`, `check_cypher` and the explain
+    routes (`_prepare_graph_explanation_plan`, `explain_graph`) all call this
+    instead of repeating the `model_key -> profile -> v0.11?` selection.
+
+    A `model_key` that resolves to the `v0_11_pattern_schema` prompt profile
+    gets the v0.11 artifact's derived flat sets, `LIMIT` optional for the
+    `graph` shape, and the tightened hop bounds; every other key (including
+    `None`, unresolved keys, and v0.10 profiles) keeps today's v0.10
+    defaults — `analyze_generated_cypher`'s own `allowed=None`,
+    `allow_limit_optional_graph=False`, `enforce_hop_bounds=False`.
+    """
+    use_v0_11 = (
+      isinstance(model_key, str)
+      and bool(model_key.strip())
+      and self._prompt_profile(model_key)["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
+    )
+    return {
+      "use_v0_11": use_v0_11,
+      "schema_allowed": schema_sets(EDGEGUARD_SCHEMA_V0_11) if use_v0_11 else None,
+      "allow_limit_optional_graph": use_v0_11,
+      "enforce_hop_bounds": use_v0_11,
+      "schema_version": SCHEMA_VERSION_V0_11 if use_v0_11 else SCHEMA_VERSION,
+      "schema_surface": (
+        canonical_schema_surface(EDGEGUARD_SCHEMA_V0_11) if use_v0_11
+        else canonical_schema_surface()
+      ),
+    }
+
   def _generation_model_entry(self, model_key: str) -> Optional[Dict[str, Any]]:
     """Public catalog view of one configured model: metadata only, no worker addresses."""
     worker, err = self._generation_worker(model_key)
@@ -4022,21 +4067,16 @@ class EdgeguardApiPlugin(BasePlugin):
     # for an unrelated reason.
     retained_closed_vocabulary_literals: set = set()
     llm_model = model.get("model_file")
-    # Contract §1/§4.1 (review finding 1): the v0.11 profile validates
-    # against the v0.11 artifact's derived flat sets (labels, relationship
-    # types, properties, including the topology surface) instead of the
-    # v0.10 `EDGEGUARD_SCHEMA`, and its `graph`-shape candidates may omit
-    # `LIMIT` (the runtime bounds rows instead). Every other profile is
-    # unaffected: `allowed=None`/`allow_limit_optional_graph=False` keep
-    # `analyze_generated_cypher`'s v0.10 defaults exactly.
-    profile = self._prompt_profile(selected_key)
-    use_v0_11_schema = profile["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
-    guard_schema_allowed = schema_sets(EDGEGUARD_SCHEMA_V0_11) if use_v0_11_schema else None
-    response_schema_version = SCHEMA_VERSION_V0_11 if use_v0_11_schema else SCHEMA_VERSION
-    response_schema_surface = (
-      canonical_schema_surface(EDGEGUARD_SCHEMA_V0_11) if use_v0_11_schema
-      else canonical_schema_surface()
-    )
+    # Contract §1/§4.1 (review finding 1, both rounds): one shared resolver
+    # (`_cypher_validation_profile`) selects the v0.11 artifact's derived
+    # flat sets and the `graph`-shape optional `LIMIT` for the v0.11 profile;
+    # every other profile keeps `analyze_generated_cypher`'s v0.10 defaults
+    # exactly.
+    validation_profile = self._cypher_validation_profile(selected_key)
+    use_v0_11_schema = validation_profile["use_v0_11"]
+    guard_schema_allowed = validation_profile["schema_allowed"]
+    response_schema_version = validation_profile["schema_version"]
+    response_schema_surface = validation_profile["schema_surface"]
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
         remaining = deadline - time.monotonic()
@@ -5135,10 +5175,23 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="POST")
   @_tracked_endpoint
-  def check_cypher(self, cypher: str, **kwargs) -> Dict[str, Any]:
-    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
+  def check_cypher(self, cypher: str, model_key: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    # Contract §1/§4.1 (review finding 1, round 2): same v0.11-vs-v0.10
+    # selection as `generate` and `/neo4j_query`, via the shared resolver —
+    # a v0.11 `model_key` validates against the v0.11 sets with `LIMIT`
+    # optional for `graph` and the tightened hop bounds; `model_key=None`
+    # keeps this endpoint's v0.10 behaviour exactly as before.
+    validation_profile = self._cypher_validation_profile(model_key)
+    analysis = analyze_generated_cypher(
+      cypher,
+      allowed=validation_profile["schema_allowed"],
+      max_limit=int(self.cfg_neo4j_max_rows),
+      allow_limit_optional_graph=validation_profile["use_v0_11"],
+      enforce_hop_bounds=validation_profile["use_v0_11"],
+    )
     return {
       "status": STATUS_ACCEPTED if analysis["accepted"] else STATUS_REJECTED,
+      "schema_version": validation_profile["schema_version"],
       **analysis,
     }
 
@@ -5430,20 +5483,18 @@ class EdgeguardApiPlugin(BasePlugin):
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
-    # Contract §1 (review finding 1): `/neo4j_query` is the operator route —
-    # no profile of its own — so it picks the v0.11 artifact's derived flat
-    # sets only when the caller names a configured v0.11 model/profile;
-    # otherwise it keeps validating against the v0.10 `EDGEGUARD_SCHEMA`
-    # exactly as before. The choice is stated back in `validation.schema_version`.
-    use_v0_11_schema = (
-      isinstance(model_key, str)
-      and bool(model_key.strip())
-      and self._prompt_profile(model_key)["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
-    )
-    guard_schema_allowed = schema_sets(EDGEGUARD_SCHEMA_V0_11) if use_v0_11_schema else None
+    # Contract §1 (review finding 1, both rounds): `/neo4j_query` is the
+    # operator route — no profile of its own — so it picks the v0.11
+    # artifact's derived flat sets only when the caller names a configured
+    # v0.11 model/profile (the shared `_cypher_validation_profile`
+    # resolver); otherwise it keeps validating against the v0.10
+    # `EDGEGUARD_SCHEMA` exactly as before. The choice is stated back in
+    # `validation.schema_version`.
+    validation_profile = self._cypher_validation_profile(model_key)
+    use_v0_11_schema = validation_profile["use_v0_11"]
     analysis = analyze_generated_cypher(
       cypher,
-      allowed=guard_schema_allowed,
+      allowed=validation_profile["schema_allowed"],
       max_limit=int(self.cfg_neo4j_max_rows),
       allow_limit_optional_graph=use_v0_11_schema,
       enforce_hop_bounds=use_v0_11_schema,
@@ -5454,7 +5505,7 @@ class EdgeguardApiPlugin(BasePlugin):
     validation = {
       **analysis,
       "result_shape": classify_result_shape(analysis.get("candidate") or cypher),
-      "schema_version": SCHEMA_VERSION_V0_11 if use_v0_11_schema else SCHEMA_VERSION,
+      "schema_version": validation_profile["schema_version"],
     }
     if not analysis["accepted"]:
       return {
@@ -5551,6 +5602,12 @@ class EdgeguardApiPlugin(BasePlugin):
           "connect_ms": connect_ms,
           "query_ms": round((time.monotonic() - query_started) * 1000, 1),
           "total_ms": round((time.monotonic() - started) * 1000, 1),
+          # Contract §4.1 (review finding 4, round 2): "when [LIMIT is]
+          # absent the runtime bounds rows at NEO4J_MAX_ROWS ... reported in
+          # `metrics`" — `row_limit` is that applied cap (the caller's
+          # `max_rows`, itself capped by the server's `NEO4J_MAX_ROWS`),
+          # reported unconditionally, not only for no-`LIMIT` queries.
+          "row_bound": row_limit,
         },
       }
     except _ResultEvidenceError as exc:
@@ -5561,7 +5618,11 @@ class EdgeguardApiPlugin(BasePlugin):
       return {
         "status": STATUS_ERROR,
         "ok": False,
-        "executed": False,
+        # Review finding 3 (round 2): the query executed against Neo4j —
+        # only turning the result rows into a JSON-safe response failed
+        # afterward — so this is not "not executed"; `error_code` already
+        # distinguishes it from a connection/driver failure.
+        "executed": True,
         "error": self._sanitize_error(exc, connection["password"]),
         "error_code": exc.code,
         "validation": validation,
@@ -5569,6 +5630,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
           "query_ms": 0.0,
           "total_ms": round((time.monotonic() - started) * 1000, 1),
+          "row_bound": row_limit,
         },
       }
     except Exception as exc:
@@ -5596,6 +5658,7 @@ class EdgeguardApiPlugin(BasePlugin):
     explanation_rows: Optional[int] = None,
     max_rows: Optional[int] = None,
     enable_empty_result_broadening: Optional[bool] = None,
+    model_key: Optional[str] = None,
     **kwargs,
   ) -> Dict[str, Any]:
     if not isinstance(cypher, str) or not cypher.strip():
@@ -5636,7 +5699,15 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation_errors": [_contract_error(exc.code, exc.detail)],
       })
     broadening_enabled = bool(enable_empty_result_broadening) if enable_empty_result_broadening is not None else False
-    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
+    # Contract §1/§4.1 (review finding 1, round 2): explain routes accept
+    # what `generate` accepts for the v0.11 profile — same resolver, same
+    # selection.
+    validation_profile = self._cypher_validation_profile(model_key)
+    plan = _prepare_graph_explanation_plan(
+      cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
+      guard_max_limit=int(self.cfg_neo4j_max_rows),
+      validation_profile=validation_profile,
+    )
     if not plan.get("ok"):
       return self._with_active_prepare_contract(plan, mode_plan)
     if self._active_explanation_strategy() == "eel_compatibility":
@@ -5835,6 +5906,7 @@ class EdgeguardApiPlugin(BasePlugin):
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
+    model_key: Optional[str] = None,
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
@@ -5909,7 +5981,17 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": "Graph-first explanation configuration is unavailable.",
         "validation_errors": [_contract_error(code, detail)],
       }
-    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
+    # Contract §1/§4.1 (review finding 1, round 2): `explain_graph` accepts
+    # what `generate` accepts for the v0.11 profile — same shared resolver.
+    validation_profile = self._cypher_validation_profile(model_key)
+    analysis = analyze_generated_cypher(
+      cypher,
+      allowed=validation_profile["schema_allowed"],
+      max_limit=int(self.cfg_neo4j_max_rows),
+      allow_limit_optional_graph=validation_profile["use_v0_11"],
+      enforce_hop_bounds=validation_profile["use_v0_11"],
+    )
+    analysis["schema_version"] = validation_profile["schema_version"]
     # Contract §4.3: routes the explanation dispatch below, independent of
     # the configured graph-topology explanation strategy.
     analysis["result_shape"] = classify_result_shape(analysis.get("candidate") or cypher)
@@ -5963,7 +6045,11 @@ class EdgeguardApiPlugin(BasePlugin):
           ],
           "validation": analysis,
         }
-      plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
+      plan = _prepare_graph_explanation_plan(
+        cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
+        guard_max_limit=int(self.cfg_neo4j_max_rows),
+        validation_profile=validation_profile,
+      )
       if not plan.get("ok"):
         return {**plan, "executed": False, "explained": False}
       return self._explain_prepared_execution(
@@ -5985,7 +6071,11 @@ class EdgeguardApiPlugin(BasePlugin):
       unavailable.update({"executed": False, "explained": False})
       return unavailable
 
-    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
+    plan = _prepare_graph_explanation_plan(
+      cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
+      guard_max_limit=int(self.cfg_neo4j_max_rows),
+      validation_profile=validation_profile,
+    )
     if not plan.get("ok"):
       return {**plan, "executed": False, "explained": False}
     executed_cypher = plan["executed_cypher"]

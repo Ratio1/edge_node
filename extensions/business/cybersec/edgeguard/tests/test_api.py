@@ -68,6 +68,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (  # n
   build_v0_11_correction_prompt,
   build_v0_11_pattern_schema_system_prompt,
   canonical_schema_surface,
+  SCHEMA_VERSION,
 )
 from extensions.business.cybersec.edgeguard import literal_classes  # noqa: E402
 
@@ -1695,6 +1696,23 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "accepted")
     self.assertTrue(result["accepted"])
 
+  def test_check_cypher_accepts_v0_11_sets_and_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: `check_cypher` must accept what `generate`
+    # accepts for the v0.11 profile — v0.11-only sets, `LIMIT` optional for
+    # the `graph` shape — via the same shared resolver `/neo4j_query` uses.
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+    cypher = "MATCH p=(c:CVE)-[:HAS_CVSS_v2]->(s:CVSSv2) RETURN p"
+
+    with_v0_11 = plugin.check_cypher(cypher=cypher, model_key=V0_11_MODEL_KEY)
+    without_model_key = plugin.check_cypher(cypher=cypher)
+
+    self.assertEqual(with_v0_11["status"], "accepted")
+    self.assertTrue(with_v0_11["accepted"], with_v0_11["validation_feedback"])
+    self.assertEqual(with_v0_11["schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertEqual(without_model_key["status"], "rejected")
+    self.assertFalse(without_model_key["accepted"])
+    self.assertEqual(without_model_key["schema_version"], SCHEMA_VERSION)
+
   def test_neo4j_query_rejects_invalid_cypher_without_driver(self):
     plugin = _make_api()
 
@@ -1917,7 +1935,10 @@ class EdgeGuardApiTests(unittest.TestCase):
         )
 
     self.assertEqual(result["status"], "error")
-    self.assertFalse(result["executed"])
+    # Review finding 3, round 2: the query ran against Neo4j — only turning
+    # its rows into a JSON-safe response failed afterward — so `executed`
+    # is `True`; `error_code` is what tells the caller the row was unusable.
+    self.assertTrue(result["executed"])
     self.assertEqual(result["error_code"], "unsupported_query_result_value")
 
   def test_neo4j_query_broadens_empty_result_once(self):
@@ -2026,6 +2047,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertFalse(result["live_retry"]["enabled"])
     self.assertEqual(result["validation"]["result_shape"], "graph")
     self.assertEqual(result["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
+    # Review finding 4, round 2: with no `LIMIT`, the runtime bounds rows at
+    # `NEO4J_MAX_ROWS` (contract §4.1) — the applied bound is reported back
+    # in `metrics`, not left implicit.
+    self.assertEqual(result["metrics"]["row_bound"], plugin.cfg_neo4j_max_rows)
 
   def test_neo4j_query_without_a_v0_11_model_key_still_requires_limit_on_v0_10_sets(self):
     """The same no-`LIMIT`, `Mission`-labelled query is rejected by default
@@ -2413,6 +2438,25 @@ class EdgeGuardApiTests(unittest.TestCase):
       },
     })
 
+  def test_prepare_graph_explanation_accepts_v0_11_sets_and_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: `prepare_graph_explanation` (through
+    # `_prepare_graph_explanation_plan`) must accept what `generate` accepts
+    # for the v0.11 profile — v0.11-only sets, `LIMIT` optional for `graph`.
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+    )
+    cypher = "MATCH p=(c:CVE)-[:HAS_CVSS_v2]->(s:CVSSv2) RETURN p"
+
+    with_v0_11 = plugin.prepare_graph_explanation(cypher=cypher, model_key=V0_11_MODEL_KEY)
+    without_model_key = plugin.prepare_graph_explanation(cypher=cypher)
+
+    self.assertEqual(with_v0_11["status"], "accepted")
+    self.assertTrue(with_v0_11["ok"], with_v0_11.get("error"))
+    self.assertEqual(with_v0_11["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertEqual(without_model_key["status"], "rejected")
+    self.assertFalse(without_model_key["ok"])
+
   def test_one_call_prepare_contract_has_distinct_identity_and_cap(self):
     plugin = _make_api(edgeguard_explanation_strategy="one_call")
     result = plugin.prepare_graph_explanation(
@@ -2537,6 +2581,42 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "ok")
     self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 0)
     self.assertEqual(result["validation"]["empty_reason"], "topology_surface_no_data")
+
+  def test_explain_graph_accepts_v0_11_sets_and_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: `explain_graph`'s live-connection path
+    # must accept what `generate` accepts for the v0.11 profile — the same
+    # no-`LIMIT` `CVSSv2`/`HAS_CVSS_v2` query `/neo4j_query` already covers.
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+    )
+    cypher = "MATCH p=(c:CVE)-[:HAS_CVSS_v2]->(s:CVSSv2) RETURN p"
+    fake_driver, fake_session = _driver_with_results(_Result([], keys=["p"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        with_v0_11 = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher=cypher,
+          model_key=V0_11_MODEL_KEY,
+        )
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        without_model_key = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher=cypher,
+        )
+
+    self.assertEqual(with_v0_11["status"], "ok")
+    self.assertTrue(with_v0_11["executed"])
+    self.assertEqual(with_v0_11["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertEqual(without_model_key["status"], "rejected")
+    self.assertFalse(without_model_key["executed"])
 
   def test_explain_graph_scalar_only_result_succeeds_under_insight_brief(self):
     plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
@@ -3127,6 +3207,43 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["packet_meta"]["dropped_forbidden_properties"], 1)
     self.assertTrue(all(node["id"].startswith("n:") for node in packet["graph"]["nodes"]))
     self.assertTrue(all(rel["id"].startswith("r:") for rel in packet["graph"]["relationships"]))
+
+  def test_explain_graph_supplied_execution_result_accepts_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: the `execution_result=`-supplied path
+    # (`_explain_prepared_execution`) must accept what `generate` accepts
+    # for the v0.11 profile too, not only the live-connection path above.
+    plugin = _make_api(
+      edgeguard_explanation_model_port=5091,
+      edgeguard_explanation_model="base_qwen3_4b",
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+    )
+    cypher = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p"
+    execution_result = _serialized_execution(cypher)
+
+    def provider_side_effect(*_args, **kwargs):
+      packet = _packet_from_provider_kwargs(kwargs)
+      return _provider_response_for_packet(packet, caveat_types=[])
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+        side_effect=provider_side_effect,
+      ):
+        with_v0_11 = plugin.explain_graph(
+          cypher=cypher,
+          execution_result=execution_result,
+          model_key=V0_11_MODEL_KEY,
+        )
+        without_model_key = plugin.explain_graph(
+          cypher=cypher,
+          execution_result=execution_result,
+        )
+
+    self.assertEqual(with_v0_11["status"], "ok")
+    self.assertTrue(with_v0_11["explained"])
+    mocked_driver.assert_not_called()
+    self.assertEqual(without_model_key["status"], "rejected")
+    self.assertFalse(without_model_key["explained"])
 
   def test_explain_graph_rejects_result_columns_that_do_not_match_return_projection(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
