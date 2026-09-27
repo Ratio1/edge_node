@@ -145,6 +145,15 @@ class TestEngagementValidator(unittest.TestCase):
   def test_unknown_fields_are_kept(self):
     validate_engagement({**record(), "signature": {"future": True}}, (TENANT, ENGAGEMENT))
 
+  def test_a_later_catalog_context_or_document_change_does_not_make_a_record_unreadable(self):
+    # Immutable and hashed: live-code vocabularies are checked at creation, not on every read.
+    retired = record()
+    retired["assets"][0]["authorized_tests"] = ["retired_feature"]
+    retired["context"] = {**retired["context"], "added_later": ""}
+    retired["authorization_document"] = {**retired["authorization_document"], "signature": "0x1"}
+    retired["engagement_hash"] = engagement_hash(retired)
+    validate_engagement(retired, (TENANT, ENGAGEMENT))
+
   def test_tampered_records_are_refused(self):
     unsorted = record()
     unsorted["assets"] = list(reversed(unsorted["assets"]))
@@ -153,8 +162,8 @@ class TestEngagementValidator(unittest.TestCase):
     webapp_ports["assets"][1]["authorized_ports"] = "80"
     network_without_ports = record()
     network_without_ports["assets"][0]["authorized_ports"] = None
-    wrong_tests = record()
-    wrong_tests["assets"][1]["authorized_tests"] = ["service_info_common"]
+    unsorted_tests = record()
+    unsorted_tests["assets"][0]["authorized_tests"] = ["z_test", "a_test"]
     cases = {
       "hash": {**record(), "engagement_hash": "0" * 64},
       "ids": record(engagement_id="en_" + "3" * 8 + "-3333-4333-8333-" + "3" * 12),
@@ -166,8 +175,8 @@ class TestEngagementValidator(unittest.TestCase):
       "contract ref instead of hash": record(contract_sha256={"ref": "doc-1"}),
       "signer missing": {**record(), "authorization_document": doc_ref(SHA_B)},
       "webapp ports": webapp_ports, "network without ports": network_without_ports,
-      "tests of another kind": wrong_tests,
-      "context coerced": record(context={**normalize_context({}), "client_name": "None", "extra": 1}),
+      "tests unsorted": unsorted_tests,
+      "context not an object": record(context="Example"),
     }
     for name, row in cases.items():
       with self.subTest(name), self.assertRaises((ValueError, TypeError, KeyError)):

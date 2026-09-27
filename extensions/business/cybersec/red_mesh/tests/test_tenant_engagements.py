@@ -72,6 +72,11 @@ class TestTenantEngagements(unittest.TestCase):
   def create(self, **changes):
     return self.service.create_engagement(**self.fields(**changes))
 
+  @staticmethod
+  def view(result):
+    """The engagement DTO without the per-call `replayed` flag."""
+    return {key: value for key, value in result["data"].items() if key != "replayed"}
+
   def refused(self, result, status, error):
     self.assertFalse(result["success"], result)
     self.assertEqual((result["status_code"], result["error"]), (status, error))
@@ -112,6 +117,13 @@ class TestTenantEngagements(unittest.TestCase):
     engagement = self.create(assets=assets)["data"]
     self.assertEqual(engagement["assets"][0]["authorizedPorts"], "80,443")
     self.assertEqual(engagement["assets"][0]["authorizedScanModes"], ["connect", "syn"])
+
+  def test_scan_mode_order_does_not_change_the_request(self):
+    assets = lambda modes: [{"asset_id": self.network, "authorized_scan_modes": modes,
+                             "authorized_tests": ["active_auth"]}]
+    first = self.view(self.create(assets=assets(["syn", "connect"])))
+    self.assertEqual(self.view(self.create(assets=assets(["connect", "syn"]))), first)
+    self.refused(self.create(request_id=str(uuid4()), assets=assets([["connect"]])), 400, "engagement_asset_invalid")
 
   def test_a_network_asset_needs_a_port_scope(self):
     bare = self.asset({"kind": "network", "address": "192.0.2.11"})
@@ -171,14 +183,18 @@ class TestTenantEngagements(unittest.TestCase):
         self.refused(self.create(**{"request_id": str(uuid4()), **changes}), 400, error)
 
   def test_replay_returns_the_record_without_a_write_even_after_an_asset_edit(self):
-    first = self.create()["data"]
+    first = self.create()
+    self.assertIs(first["data"]["replayed"], False)
+    first = self.view(first)
     version = self.service.get_tenant_asset(self.actor, self.tenant, self.network)["data"]["asset"]["version"]
     self.assertTrue(self.service.update_tenant_asset(self.actor, self.tenant, self.network, version, "Asset",
                                                      {"kind": "network", "address": "192.0.2.99"}, True)["success"])
     writes = len(self.owner.writes)
-    self.assertEqual(self.create()["data"], first)
+    replayed = self.create()
+    self.assertIs(replayed["data"]["replayed"], True)
+    self.assertEqual(self.view(replayed), first)
     # A re-upload of the same bytes has a new reference but is the same creation.
-    self.assertEqual(self.create(roe_document=doc(SHA_ROE, "roe-again"))["data"], first)
+    self.assertEqual(self.view(self.create(roe_document=doc(SHA_ROE, "roe-again"))), first)
     self.assertEqual(len(self.owner.writes), writes)
     self.refused(self.create(display_name="Other"), 409, "conflict")
     self.refused(self.create(roe_document=doc("3" * 64, "roe")), 409, "conflict")
@@ -246,9 +262,11 @@ class TestTenantEngagements(unittest.TestCase):
     self.assertFalse(revoked["data"]["active"])
     self.assertEqual((revoked["data"]["revokedBy"], revoked["data"]["revokeReason"]), ("creator", "Scope withdrawn"))
     self.assertEqual(revoked["data"]["engagementHash"], engagement["engagementHash"])
+    self.assertIs(revoked["data"]["replayed"], False)
     writes = len(self.owner.writes)
-    self.assertEqual(self.service.revoke_engagement(self.actor, self.tenant, engagement["engagementId"],
-                                                    "again")["data"], revoked["data"])
+    again = self.service.revoke_engagement(self.actor, self.tenant, engagement["engagementId"], "again")
+    self.assertIs(again["data"]["replayed"], True)
+    self.assertEqual(self.view(again), self.view(revoked))
     self.assertEqual(len(self.owner.writes), writes)
     self.refused(self.service.revoke_engagement(self.actor, self.tenant, "en_" + str(uuid4()), "x"), 404, "not_found")
 

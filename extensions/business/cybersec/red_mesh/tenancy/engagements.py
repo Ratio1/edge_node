@@ -146,8 +146,8 @@ def normalize_signer(name, role, third_party_auth_refs=None):
 def normalize_scan_modes(value):
   if value is None:
     return list(DEFAULT_SCAN_MODES)
-  if (not isinstance(value, list) or not value or len(set(value)) != len(value)
-      or any(mode not in SCAN_MODES for mode in value)):
+  if (not isinstance(value, list) or not value or not all(isinstance(mode, str) for mode in value)
+      or len(set(value)) != len(value) or any(mode not in SCAN_MODES for mode in value)):
     raise EngagementInvalid("engagement_asset_invalid")
   return sorted(value)
 
@@ -161,9 +161,10 @@ def normalize_tests(kind, value):
   return sorted(value)
 
 
-def valid_doc_ref(value, *, signer=False):
+def valid_doc_ref(value, *, signer=False, stored=False):
+  """`stored` accepts extra keys: a later release (RM-068) may add some to a document it wrote."""
   keys = {*_DOC_TEXT, "sha256", "size_bytes", *(_SIGNER_FIELDS if signer else ())}
-  if not (isinstance(value, dict) and set(value) == keys
+  if not (isinstance(value, dict) and (set(value) >= keys if stored else set(value) == keys)
           and all(isinstance(value[key], str) and value[key] for key in _DOC_TEXT)
           and valid_digest(value["sha256"])
           and type(value["size_bytes"]) is int and value["size_bytes"] > 0):
@@ -175,6 +176,13 @@ def valid_doc_ref(value, *, signer=False):
       key: value[key] for key in _SIGNER_FIELDS}
   except EngagementInvalid:
     return False
+
+
+def _stored_tests_valid(tests):
+  # Shape only: catalog membership was checked at creation, and a later catalog change must not
+  # make an immutable, hashed record unreadable. Launch re-checks membership (phase 3).
+  return (isinstance(tests, list) and bool(tests) and all(isinstance(item, str) and item for item in tests)
+          and tests == sorted(set(tests)))
 
 
 def _asset_entry_valid(entry):
@@ -190,7 +198,7 @@ def _asset_entry_valid(entry):
     if (not isinstance(entry["asset_id"], str) or not entry["asset_id"].startswith("as_")
         or "as_" + canonical_uuid(entry["asset_id"][3:]) != entry["asset_id"]
         or not valid_digest(entry["target_digest"])
-        or normalize_tests(kind, entry["authorized_tests"]) != entry["authorized_tests"]):
+        or not _stored_tests_valid(entry["authorized_tests"])):
       return False
     if kind == "network":
       return (entry["authorized_ports"] is not None
@@ -228,10 +236,12 @@ def _utc(value):
 
 
 def validate_engagement(row, ids):
-  """Refuse any stored engagement that is not exactly what creation and revoke write.
+  """Refuse any stored engagement that creation and revoke could not have written.
 
-  Unknown fields are kept (as assets keep them) so a later field does not make older nodes refuse
-  the whole tenant's engagements during a mixed deploy.
+  Values that live code may later change (the test catalog, `EngagementContext`, the document-ref
+  keys) are checked for shape only: the record is immutable and its hash covers the content, so a
+  catalog change must not make a tenant's engagements unreadable. Unknown fields are kept (as
+  assets keep them) for the same reason during a mixed deploy.
   """
   assets = row.get("assets")
   if (len(ids) != 2 or row.get("tenant_id") != ids[0] or row.get("engagement_id") != ids[1]
@@ -242,12 +252,13 @@ def validate_engagement(row, ids):
       or normalize_window(row.get("valid_from"), row.get("valid_until"))
          != (row["valid_from"], row["valid_until"])
       or not (row.get("contract_sha256") is None or valid_digest(row["contract_sha256"]))
-      or not valid_doc_ref(row.get("roe_document"))
-      or not valid_doc_ref(row.get("authorization_document"), signer=True)
+      or not valid_doc_ref(row.get("roe_document"), stored=True)
+      or not valid_doc_ref(row.get("authorization_document"), signer=True, stored=True)
       or not ("supersedes" not in row
               or (valid_engagement_id(row["supersedes"]) and row["supersedes"] != ids[1]))
       or normalize_roe(row.get("roe")) != row["roe"]
-      or normalize_context(row.get("context")) != row["context"]
+      # Shape only for the context: `EngagementContext` may gain fields; the hash covers the content.
+      or not isinstance(row.get("context"), dict)
       or not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS
       or not all(_asset_entry_valid(entry) for entry in assets)
       or [entry["asset_id"] for entry in assets] != sorted({entry["asset_id"] for entry in assets})

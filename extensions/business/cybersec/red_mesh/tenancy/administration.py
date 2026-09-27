@@ -747,10 +747,14 @@ class TenantAdministrationService:
       tests = entry.get("authorized_tests")
       if not isinstance(tests, list) or not tests or not all(isinstance(item, str) for item in tests):
         raise AdministrationDenied(400, "tests_invalid")
+      try:
+        modes = (normalize_scan_modes(entry["authorized_scan_modes"])
+                 if "authorized_scan_modes" in entry else None)
+      except EngagementInvalid as exc:
+        raise AdministrationDenied(400, exc.code) from None
       requested[asset_id] = {"asset_id": asset_id, "authorized_tests": sorted(tests),
                              **({"authorized_ports": ports} if ports is not None else {}),
-                             **({"authorized_scan_modes": entry["authorized_scan_modes"]}
-                                if "authorized_scan_modes" in entry else {})}
+                             **({"authorized_scan_modes": modes} if modes is not None else {})}
     return {"display_name": display_name, "engagement_kind": kind, "valid_from": valid_from,
             "valid_until": valid_until, "roe": roe, "context": context,
             "roe_document_sha256": roe_document["sha256"],
@@ -802,7 +806,7 @@ class TenantAdministrationService:
     if existing is not None:
       if existing["create_intent_digest"] != canonical_digest(intent) or existing["created_by"] != account.account_id:
         raise AdministrationDenied(409, "conflict")
-      return self._engagement_row(existing)
+      return {**self._engagement_row(existing), "replayed": True}
     if supersedes is not None and (supersedes == engagement_id
                                    or self.store.get("engagement", tenant_id, supersedes) is None):
       raise AdministrationDenied(400, "supersedes_invalid")
@@ -828,7 +832,8 @@ class TenantAdministrationService:
     }
     record["engagement_hash"] = engagement_hash(record)
     self.store.put("engagement", tenant_id, engagement_id, record=record)
-    return self._engagement_row(self.store.get("engagement", tenant_id, engagement_id))
+    # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
 
   @_endpoint
   def list_engagements(self, actor, tenant_id, active=None):
@@ -864,11 +869,11 @@ class TenantAdministrationService:
     if row is None:
       raise AdministrationDenied(404, "not_found")
     if not row["active"]:
-      return self._engagement_row(row)
+      return {**self._engagement_row(row), "replayed": True}
     self.store.put("engagement", tenant_id, engagement_id, record={
       **row, "active": False, "revoked_by": account.account_id,
       "revoked_at": datetime.now(timezone.utc).isoformat(), "revoke_reason": reason})
-    return self._engagement_row(self.store.get("engagement", tenant_id, engagement_id))
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
 
   @_endpoint
   def engagement_document_ref(self, actor, tenant_id, engagement_id, document):
