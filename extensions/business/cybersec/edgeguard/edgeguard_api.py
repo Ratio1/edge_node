@@ -4104,7 +4104,12 @@ class EdgeguardApiPlugin(BasePlugin):
     deadline = started + min(GENERATION_TIMEOUT_SECONDS, int(self.cfg_request_timeout_seconds))
     selected_key = model_key or modelKey or self._default_model_key()
     if benchmark_mode:
-      return {
+      # Fix round 6: same `_wrapper_safe_error` convention as `/neo4j_query`
+      # and `explain_graph` (round 4/5) — a top-level `error` key with no
+      # `status_code` is the exact shape the platform's FastAPI wrapper
+      # turns into a bare HTTP 500. 403: the caller asked for a workflow the
+      # API-owned deployment forbids, not a missing/unknown route (404).
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
@@ -4114,35 +4119,40 @@ class EdgeguardApiPlugin(BasePlugin):
           "code": "benchmark_mode_disabled",
           "retryable": False,
         },
-      }
+      }, 403)
     if not isinstance(request, str) or not request.strip():
-      return {
+      # Fix round 6: malformed/absent request body — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
         "error": "Request is required.",
         "diagnostics": {"stage": "request", "code": "invalid_request", "retryable": False},
-      }
+      }, 400)
     if len(request) > GENERATION_MAX_REQUEST_CHARS:
-      return {
+      # Fix round 6: request exceeds the accepted size — 413.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
         "error": f"Request is too long; max {GENERATION_MAX_REQUEST_CHARS} characters.",
         "diagnostics": {"stage": "request", "code": "request_too_large", "retryable": False},
-      }
+      }, 413)
     model = self._generation_model_entry(selected_key)
     if model is None:
-      return {
+      # Fix round 6: unknown/unconfigured model key — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
         "error": "Unsupported model key.",
         "diagnostics": {"stage": "request", "code": "unsupported_model", "retryable": False},
-      }
+      }, 400)
     url, worker_error = self._generation_worker_url(selected_key)
     if worker_error or not url:
-      return {
+      # Fix round 6: the worker is not configured/reachable — server-side
+      # dependency, retryable, 503.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "accepted": False,
         "accepted_cypher": None,
@@ -4150,10 +4160,12 @@ class EdgeguardApiPlugin(BasePlugin):
         "model_key": selected_key,
         "error": "The selected model worker is not ready.",
         "diagnostics": {"stage": "worker", "code": "worker_not_ready", "retryable": True},
-      }
+      }, 503)
     worker, _worker_config_error = self._generation_worker(selected_key)
     if not isinstance(worker, Mapping) or not self._worker_runtime_ready(worker):
-      return {
+      # Fix round 6: same as above — the model process itself is still
+      # starting, retryable, 503.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "accepted": False,
         "accepted_cypher": None,
@@ -4161,7 +4173,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "model_key": selected_key,
         "error": "The selected model is still starting. Retry shortly.",
         "diagnostics": {"stage": "worker", "code": "model_not_ready", "retryable": True},
-      }
+      }, 503)
 
     normalized_request = normalize_user_literal_text(request)
     attempts = []
@@ -4331,7 +4343,11 @@ class EdgeguardApiPlugin(BasePlugin):
           "server_total_ms": total_ms,
         },
       }
-    return {
+    # Fix round 6: the deadline/timeout/unreachable/exception branches above
+    # all land here with a top-level `error` key and no `status_code` — the
+    # generation service (not the caller) failed, 502 via the wrapper-safe
+    # transport.
+    return _wrapper_safe_error({
       "status": STATUS_ERROR,
       "accepted": False,
       "accepted_cypher": None,
@@ -4347,7 +4363,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "llm_inference_ms": round(sum(item["timing_ms"] for item in attempts), 1),
         "server_total_ms": round((time.monotonic() - started) * 1000, 1),
       },
-    }
+    }, 502)
 
   def _run_graph_first(
     self,
@@ -5514,18 +5530,24 @@ class EdgeguardApiPlugin(BasePlugin):
     started = time.monotonic()
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
     if err:
-      return {
+      # Fix round 6: malformed/absent connection parameters — caller input,
+      # 400, same convention as `/neo4j_query` (round 5) via the
+      # wrapper-safe transport.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "error": err,
         "metrics": {"connect_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     normalized_uri, err = self._normalize_neo4j_uri(connection["uri"], connection["scheme"])
     if err:
-      return {
+      # Fix round 6: malformed URI/scheme — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "error": err,
         "metrics": {"connect_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     if GraphDatabase is None:
-      return self._neo4j_unavailable()
+      # Fix round 6: the Neo4j driver is missing from this runtime — a
+      # server-side dependency, 503.
+      return _wrapper_safe_error(self._neo4j_unavailable(), 503)
     driver = None
     try:
       driver = self._neo4j_driver(
@@ -5544,7 +5566,9 @@ class EdgeguardApiPlugin(BasePlugin):
         },
       }
     except Exception as exc:
-      return {
+      # Fix round 6: the driver connected (or attempted to) and failed —
+      # a connection/auth failure at the Neo4j service, 503.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "error": self._sanitize_error(exc, connection["password"]),
@@ -5552,7 +5576,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
           "total_ms": round((time.monotonic() - started) * 1000, 1),
         },
-      }
+      }, 503)
     finally:
       self._close_neo4j_driver(driver)
 

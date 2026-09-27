@@ -62,6 +62,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jAuthError 
 from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jClientError  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _neo4j_row_json_safe  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_REQUEST_CHARS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _prepare_graph_explanation_plan  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _WRAPPER_STATUS_CODE_KEY  # noqa: E402
@@ -860,7 +861,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post") as post:
       result = plugin.generate(request="Show indicators", model_key="not-configured")
 
-    self.assertEqual(result["diagnostics"]["code"], "unsupported_model")
+    # Fix round 6: unsupported model key is now a deliberate 400 via the
+    # wrapper-safe transport, not a bare top-level `error` key.
+    self.assertEqual(result["status_code"], 400)
+    self.assertEqual(_graph_first_payload(result)["diagnostics"]["code"], "unsupported_model")
     post.assert_not_called()
 
   def test_edgeguard_api_owns_generation_endpoint(self):
@@ -879,8 +883,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post") as post:
       result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
 
-    self.assertEqual(result["status"], "error")
-    self.assertEqual(result["diagnostics"]["code"], "worker_not_ready")
+    # Fix round 6: the worker not being ready is now a deliberate 503 via
+    # the wrapper-safe transport, not a bare top-level `error` key.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertEqual(payload["diagnostics"]["code"], "worker_not_ready")
     post.assert_not_called()
 
   def test_generate_uses_semaphore_worker_and_validates_model_output(self):
@@ -1032,13 +1040,17 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     result, session, timeouts = self._generate_with_fake_clock(plugin, [truncated, truncated], 119.5)
 
+    # Fix round 6: exhausting the budget is a generation-service failure,
+    # 502 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 502)
+    payload = _graph_first_payload(result)
     self.assertEqual(session.post.call_count, 1)
-    self.assertEqual(result["status"], "error")
+    self.assertEqual(payload["status"], "error")
     self.assertEqual(
-      result["diagnostics"],
+      payload["diagnostics"],
       {"stage": "worker", "code": "generation_deadline_exceeded", "retryable": True},
     )
-    self.assertEqual(len(result["attempts"]), 1)
+    self.assertEqual(len(payload["attempts"]), 1)
     self.assertEqual(timeouts, [120.0])
 
   def test_generate_passes_remaining_budget_as_http_timeout(self):
@@ -1064,8 +1076,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     result, session, timeouts = self._generate_with_fake_clock(plugin, [], 0.0)
 
     session.post.assert_not_called()
-    self.assertEqual(result["diagnostics"]["code"], "generation_deadline_exceeded")
-    self.assertEqual(result["attempts"], [])
+    # Fix round 6: same generation-service-failure transport, 502.
+    self.assertEqual(result["status_code"], 502)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "generation_deadline_exceeded")
+    self.assertEqual(payload["attempts"], [])
     self.assertEqual(timeouts, [])
 
   def test_generate_fails_fast_while_model_process_is_starting(self):
@@ -1081,8 +1096,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     ):
       result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
 
-    self.assertEqual(result["diagnostics"]["code"], "model_not_ready")
-    self.assertTrue(result["diagnostics"]["retryable"])
+    # Fix round 6: the model still starting is a deliberate 503 via the
+    # wrapper-safe transport.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "model_not_ready")
+    self.assertTrue(payload["diagnostics"]["retryable"])
     session.post.assert_not_called()
 
   def test_neo4j_connection_uses_complete_default_or_complete_override(self):
@@ -5181,6 +5200,117 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
       {"credential_field_not_allowed"},
     )
     self.assertEqual(self._simulated_wrapper_status(result), 422)
+
+  # Fix round 6: extends the round-4/5 wrapper-rule replica
+  # (`_simulated_wrapper_status`) to `/generate` and `/neo4j_test` —
+  # every remaining error path that carried a top-level `error` key without
+  # `status_code`, the exact shape the platform's FastAPI wrapper turns
+  # into a bare HTTP 500.
+
+  def test_generate_every_early_error_path_resolves_to_a_deliberate_status_code(self):
+    def benchmark_mode_disabled():
+      plugin = _make_api()
+      return plugin.generate(request="Show indicators", benchmark_mode=True)
+
+    def invalid_request():
+      plugin = _make_api()
+      return plugin.generate(request="")
+
+    def request_too_large():
+      plugin = _make_api()
+      return plugin.generate(request="x" * (GENERATION_MAX_REQUEST_CHARS + 1))
+
+    def unsupported_model():
+      plugin = _make_api()
+      return plugin.generate(request="Show indicators", model_key="not-configured")
+
+    def worker_not_ready():
+      # No `worker_semaphore_env` configured for `PRIVATE_MODEL_KEY` — the
+      # worker URL itself cannot be resolved, distinct from `model_not_ready`
+      # below (a configured worker that has not finished starting).
+      plugin = _make_api()
+      with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post"):
+        return plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
+
+    def model_not_ready():
+      plugin = _make_api(worker_semaphore_env={
+        PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+      })
+      session = MagicMock()
+      session.get.return_value = _Response(payload={"result": {"serving_ready": False}})
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+        return_value=session,
+      ):
+        return plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
+
+    cases = (
+      ("benchmark_mode_disabled", benchmark_mode_disabled, 403),
+      ("invalid_request", invalid_request, 400),
+      ("request_too_large", request_too_large, 413),
+      ("unsupported_model", unsupported_model, 400),
+      ("worker_not_ready", worker_not_ready, 503),
+      ("model_not_ready", model_not_ready, 503),
+    )
+    for name, run, expected_status in cases:
+      with self.subTest(case=name):
+        result = run()
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+    # `worker_not_ready` and `model_not_ready` both resolve to 503 but are
+    # distinct diagnostics codes — pin that they are not silently collapsed
+    # into the same branch.
+    self.assertEqual(
+      _graph_first_payload(worker_not_ready())["diagnostics"]["code"], "worker_not_ready",
+    )
+    self.assertEqual(
+      _graph_first_payload(model_not_ready())["diagnostics"]["code"], "model_not_ready",
+    )
+
+  def test_neo4j_test_every_error_path_resolves_to_a_deliberate_status_code(self):
+    def bad_connection_override(plugin):
+      # `_resolve_neo4j_connection`: an incomplete override (missing
+      # username/password) is caller input, not a driver failure.
+      return plugin.neo4j_test(uri="override.example:7687", scheme="neo4j+s")
+
+    def bad_uri_scheme(plugin):
+      # `_normalize_neo4j_uri`: a scheme outside `NEO4J_SCHEMES`.
+      return plugin.neo4j_test(
+        uri="override.example:7687", username="neo4j", password="secret", scheme="ftp",
+      )
+
+    def driver_missing(plugin):
+      # `GraphDatabase is None` (the neo4j driver package is not installed
+      # in this runtime) — unpatched, matching the module's own default.
+      return plugin.neo4j_test(
+        uri="override.example:7687", username="neo4j", password="secret", scheme="bolt+s",
+      )
+
+    def connection_failure(plugin):
+      # The driver is present but the connection attempt itself fails —
+      # a Neo4j-service-side failure, not caller input.
+      with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+        with patch.object(plugin, "_neo4j_driver", side_effect=RuntimeError("connection failed")):
+          return plugin.neo4j_test(
+            uri="override.example:7687", username="neo4j", password="secret", scheme="bolt+s",
+          )
+
+    cases = (
+      ("bad_connection_override", bad_connection_override, 400),
+      ("bad_uri_scheme", bad_uri_scheme, 400),
+      ("driver_missing", driver_missing, 503),
+      ("connection_failure", connection_failure, 503),
+    )
+    for name, make_result, expected_status in cases:
+      with self.subTest(case=name):
+        plugin = _make_api()
+        result = make_result(plugin)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
 
 
 class EdgeGuardHealthMetricsTests(unittest.TestCase):
