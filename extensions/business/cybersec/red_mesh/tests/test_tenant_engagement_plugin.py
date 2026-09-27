@@ -15,25 +15,15 @@ PDF = b"%PDF-1.7\n%fixture signed authorization\n%%EOF\n"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
 
-class _SharedRepository:
-  """What `upload_authorization` writes through, backed by the plugin's document store."""
-
-  def __init__(self, documents):
-    self.documents = documents
-
-  def put_json(self, envelope, **kwargs):
-    return self.documents.put(envelope)
-
-
 class TestTenantEngagementPlugin(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
     from .conftest import mock_plugin_modules
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    from extensions.business.cybersec.red_mesh.services.authorization_upload import store_authorization_document
+    from extensions.business.cybersec.red_mesh.services.engagement_documents import store_engagement_document
     cls.Plugin = PentesterApi01Plugin
-    cls.store_authorization_document = staticmethod(store_authorization_document)
+    cls.store_engagement_document = staticmethod(store_engagement_document)
 
   def setUp(self):
     environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
@@ -69,12 +59,17 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     model = create_model("EngagementRequest", **fields)
     return endpoint(**model.model_validate_json(json.dumps(body)).model_dump())
 
-  def upload(self, raw=PDF, filename="authorization.pdf", uploaded_by="creator", tenant_id=None):
-    """Store an envelope exactly as the `upload_authorization` endpoint does."""
-    return self.store_authorization_document(
-      filename=filename, content_b64=base64.b64encode(raw).decode("ascii"),
-      artifact_repo=_SharedRepository(self.documents), uploaded_by=uploaded_by,
-      tenant_id=tenant_id or self.tenant).cid
+  def upload(self, raw=PDF, filename="authorization.pdf", actor=None):
+    uploaded = self.call_json("upload_engagement_document", actor=actor or self.actor, tenant_id=self.tenant,
+                              filename=filename, content_b64=base64.b64encode(raw).decode("ascii"))
+    self.assertTrue(uploaded["success"], uploaded)
+    return uploaded["data"]["ref"]
+
+  def stored(self, uploaded_by="creator", tenant_id=None):
+    """An envelope written directly, for owners the endpoint would never stamp."""
+    return self.store_engagement_document(
+      self.documents, filename="authorization.pdf", content_b64=base64.b64encode(PDF).decode("ascii"),
+      tenant_id=tenant_id or self.tenant, uploaded_by=uploaded_by)["ref"]
 
   def create(self, actor=None, **changes):
     body = {"actor": actor or self.actor, "tenant_id": self.tenant, "request_id": str(uuid4()),
@@ -111,14 +106,36 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     listed = self.call_json("list_engagements", actor={"account_id": "viewer"}, tenant_id=self.tenant, active=True)
     self.assertEqual([row["engagementId"] for row in listed["data"]["engagements"]], [engagement["engagementId"]])
 
+  def test_only_a_super_tenant_admin_uploads_creates_and_revokes(self):
+    engagement = self.create()["data"]
+    pentester = {"account_id": "platform-pentester"}
+    content = base64.b64encode(PDF).decode("ascii")
+    for actor in (pentester, {"account_id": "viewer"}):
+      self.refused(self.call_json("upload_engagement_document", actor=actor, tenant_id=self.tenant,
+                                  filename="a.pdf", content_b64=content), 403, "forbidden")
+      self.refused(self.create(actor=actor, roe_document_ref="x", authorization_document_ref="y"), 403, "forbidden")
+      self.refused(self.call_json("revoke_engagement", actor=actor, tenant_id=self.tenant,
+                                  engagement_id=engagement["engagementId"], reason="x"), 403, "forbidden")
+    self.assertEqual(len([ref for ref in self.documents.envelopes if ref != "doc-fixture"]), 2)
+
+  def test_upload_works_with_pentesting_off_and_refuses_bad_files(self):
+    self.assertTrue(self.plugin.update_tenant_allow_pentester(self.actor, self.tenant, False)["success"])
+    self.assertTrue(self.create()["success"])
+    self.refused(self.call_json("upload_engagement_document", actor=self.actor, tenant_id=self.tenant,
+                                filename="a.txt", content_b64=base64.b64encode(b"plain").decode("ascii")),
+                 400, "bad_mime")
+
   def test_documents_must_be_this_tenants_this_creators_and_intact(self):
     tampered = self.upload()
     self.documents.envelopes[tampered]["sha256"] = "0" * 64
     wrong_kind = self.upload()
     self.documents.envelopes[wrong_kind]["kind"] = "redmesh_tenant_contract"
+    job_level = self.upload()
+    self.documents.envelopes[job_level]["kind"] = "redmesh_authorization_document"
     cases = {
-      "other tenant": {"authorization_document_ref": self.upload(tenant_id="tn_other")},
-      "other uploader": {"authorization_document_ref": self.upload(uploaded_by="platform-pentester")},
+      "other tenant": {"authorization_document_ref": self.stored(tenant_id="tn_other")},
+      "other uploader": {"authorization_document_ref": self.stored(uploaded_by="second-admin")},
+      "job-level authorization upload": {"authorization_document_ref": job_level},
       "authorization not a PDF": {"authorization_document_ref": self.upload(PNG, "auth.png")},
       "tampered": {"authorization_document_ref": tampered},
       "wrong kind": {"roe_document_ref": wrong_kind},
@@ -159,14 +176,14 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     engagement = self.create(request_id=request, **refs)["data"]
     self.assertTrue(self.create(request_id=request, **refs)["success"])
     for _ in range(2):
-      revoked = self.call_json("revoke_engagement", actor={"account_id": "platform-pentester"},
+      revoked = self.call_json("revoke_engagement", actor=self.actor,
                                tenant_id=self.tenant, engagement_id=engagement["engagementId"], reason="Done")
       self.assertTrue(revoked["success"], revoked)
     self.assertEqual(self.events, [
       ("engagement_created", {"tenant_id": self.tenant, "engagement_id": engagement["engagementId"],
                               "engagement_hash": engagement["engagementHash"], "actor": "creator"}),
       ("engagement_revoked", {"tenant_id": self.tenant, "engagement_id": engagement["engagementId"],
-                              "engagement_hash": engagement["engagementHash"], "actor": "platform-pentester"}),
+                              "engagement_hash": engagement["engagementHash"], "actor": "creator"}),
     ])
 
   def test_capability_status_advertises_engagements(self):

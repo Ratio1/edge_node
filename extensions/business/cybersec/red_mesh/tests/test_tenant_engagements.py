@@ -206,17 +206,17 @@ class TestTenantEngagements(unittest.TestCase):
     self.owner.account("viewer", memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
     other = self.new_tenant("other", contract=True)
     self.owner.account("elsewhere", memberships=[{"role": "super_pentester", "tenant_id": other}])
-    for account in ("platform-pentester", "scoped-pentester"):
+    # Owner, 2026-09-28: only a Super-Tenant Admin manages engagements; a Super-Pentester reads
+    # their documents (Q5) but neither creates nor revokes.
+    for account in ("platform-pentester", "scoped-pentester", "pentester", "viewer", "initial"):
       docs = {"roe_document": doc(SHA_ROE, "roe", account), "authorization_document": doc(SHA_AUTH, "auth", account)}
-      result = self.create(actor={"account_id": account}, request_id=str(uuid4()), **docs)
-      self.assertTrue(result["success"], (account, result))
-    for account in ("pentester", "viewer", "initial"):
-      self.refused(self.create(actor={"account_id": account}, request_id=str(uuid4())), 403, "forbidden")
+      self.refused(self.create(actor={"account_id": account}, request_id=str(uuid4()), **docs), 403, "forbidden")
     self.refused(self.create(actor={"account_id": "elsewhere"}, request_id=str(uuid4())), 404, "not_found")
     engagement = self.create()["data"]["engagementId"]
-    for account in ("pentester", "viewer"):
+    for account in ("platform-pentester", "scoped-pentester", "pentester", "viewer"):
       self.refused(self.service.revoke_engagement({"account_id": account}, self.tenant, engagement, "x"),
                    403, "forbidden")
+    for account in ("pentester", "viewer"):
       self.refused(self.service.engagement_document_ref({"account_id": account}, self.tenant, engagement, "roe"),
                    403, "forbidden")
       self.assertTrue(self.service.get_engagement({"account_id": account}, self.tenant, engagement)["success"])
@@ -225,6 +225,8 @@ class TestTenantEngagements(unittest.TestCase):
     viewer = self.service.get_engagement({"account_id": "viewer"}, self.tenant, engagement)["data"]
     self.assertEqual((viewer["canRevokeEngagements"], viewer["canDownloadDocuments"]), (False, False))
     listed = self.service.list_engagements({"account_id": "platform-pentester"}, self.tenant)["data"]
+    self.assertEqual((listed["canCreateEngagements"], listed["canRevokeEngagements"]), (False, False))
+    listed = self.service.list_engagements(self.actor, self.tenant)["data"]
     self.assertEqual((listed["canCreateEngagements"], listed["canRevokeEngagements"]), (True, True))
 
   def test_document_ref_is_authorized_before_the_lookup(self):
