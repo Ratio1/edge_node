@@ -57,7 +57,15 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUE
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
 from extensions.business.cybersec.edgeguard.graph_first_runtime import GraphFirstRuntimeError, render_chat  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (  # noqa: E402
+  build_direct_cypher_system_prompt,
+  build_schema_correction_prompt,
+  build_v0_11_correction_prompt,
+  build_v0_11_pattern_schema_system_prompt,
+)
 
 
 class _Response:
@@ -618,6 +626,31 @@ TEST_GENERATION_WORKERS = {
   **EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"],
 }
 
+# A second deployment-supplied fixture, fine-tuned on the v0.11 artifact
+# (EGM-059 phase 2 slice C). Kept out of `TEST_GENERATION_WORKERS` so the
+# existing "exactly three models" catalog pin is untouched; tests that need
+# it pass `edgeguard_generation_workers=` explicitly.
+V0_11_MODEL_KEY = "v0-11-fixture-model"
+V0_11_WORKER_SEMAPHORE = "edgeguard_llm_v0_11"
+TEST_GENERATION_WORKERS_WITH_V0_11 = {
+  V0_11_MODEL_KEY: {
+    "SEMAPHORE": V0_11_WORKER_SEMAPHORE,
+    "PATH": "/create_chat_completion",
+    "PROMPT_PROFILE": PROMPT_PROFILE_V0_11_PATTERN_SCHEMA,
+    "DISPLAY_NAME": "Private v0.11 fixture model",
+    "DESCRIPTION": "Deployment-supplied fine-tuned-on-v0.11 GGUF fixture.",
+    "MODEL_REPO": "example-org/private-v0-11-fixture-gguf",
+    "MODEL_FILE": "private-v0-11-fixture.Q4_K_M.gguf",
+    "FORMAT": "GGUF",
+    "QUANTIZATION": "Q4_K_M",
+    "BASE_MODEL": "Qwen/Qwen3-4B-Instruct-2507",
+    "ARTIFACT_SHA256": "1" * 64,
+    "SOURCE": "private_deployment",
+    "MODEL_CARD": {"method": "QLoRA SFT"},
+  },
+  **TEST_GENERATION_WORKERS,
+}
+
 
 def _make_api(**overrides):
   plugin = EdgeguardApiPlugin.__new__(EdgeguardApiPlugin)
@@ -873,7 +906,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("edgeguard_api_ms", result["metrics"])
     self.assertEqual(session.post.call_args.args[0], "http://127.0.0.1:53001/create_chat_completion")
     self.assertEqual(session.post.call_args.kwargs["json"]["temperature"], 0.0)
-    self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 256)
+    self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 384)
     self.assertEqual(session.post.call_args.kwargs["json"]["model"], PRIVATE_MODEL_KEY)
     self.assertEqual(result["attempts"][0]["finish_reason"], "stop")
     self.assertEqual(result["attempts"][0]["completion_tokens"], 10)
@@ -1243,6 +1276,11 @@ class EdgeGuardApiTests(unittest.TestCase):
       "edgeguard-cybersec-schema-grounded-v0.10",
     )
     self.assertRegex(profiles[PRIVATE_MODEL_KEY]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
+    # Contract §5.4: every profile gets a real `system_prompt_sha256`, not
+    # just the profile without a suffix — `base_qwen3_4b` and
+    # `cybersec_qwen_4b` used to report `None` here.
+    self.assertRegex(profiles["base_qwen3_4b"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(profiles["cybersec_qwen_4b"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
     self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v1")
     self.assertEqual(explanation["profile_id"], "EEL/1")
@@ -4352,3 +4390,226 @@ class LiteralGroundingGuardTests(unittest.TestCase):
         self.assertFalse(result["accepted"], vector)
         self.assertIn(vector["literal"], result["validation_feedback"])
         self.assertIn(vector["class"], result["validation_feedback"])
+
+  def test_accepted_attempt_reports_its_grounded_closed_vocabulary_literals(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' RETURN i.value AS value LIMIT 10"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Which IP addresses are indicators of compromise?",
+    )
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(result["grounded_closed_vocabulary_literals"], ["ipv4"])
+
+  def test_retained_closed_vocabulary_literal_missing_from_a_later_attempt_is_rejected(self):
+    # Contract §3.2: a correction attempt may not remove a closed-vocabulary
+    # literal that was accepted (grounded) on an earlier attempt, even if
+    # that earlier attempt was rejected overall for an unrelated reason.
+    plugin = _make_api()
+    first_cypher = (
+      "MATCH (c:CVE) WHERE c.indicator_type = 'ipv4' AND c.cisa_vulnerability_name = 'CISA Vuls' "
+      "RETURN c LIMIT 5"
+    )
+    first = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(first_cypher), first_cypher,
+      "Which IP addresses relate to this CVE?",
+    )
+    self.assertFalse(first["accepted"])
+    self.assertIn("CISA Vuls", first["validation_feedback"])
+    retained = set(first["grounded_closed_vocabulary_literals"])
+    self.assertEqual(retained, {"ipv4"})
+
+    corrected_cypher = "MATCH (c:CVE) RETURN c LIMIT 5"
+    second = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(corrected_cypher), corrected_cypher,
+      "Which IP addresses relate to this CVE?",
+      frozenset(retained),
+    )
+
+    self.assertFalse(second["accepted"])
+    self.assertIn("ipv4", second["validation_feedback"])
+    self.assertIn("must not be removed", second["validation_feedback"])
+
+  def test_retained_closed_vocabulary_literal_kept_is_accepted(self):
+    plugin = _make_api()
+    retained = frozenset({"ipv4"})
+    corrected_cypher = "MATCH (c:CVE) WHERE c.indicator_type = 'ipv4' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(corrected_cypher), corrected_cypher,
+      "Which IP addresses relate to this CVE?",
+      retained,
+    )
+
+    self.assertTrue(result["accepted"])
+
+  def test_generate_retry_loop_rejects_a_correction_that_drops_the_grounded_literal(self):
+    # End-to-end through `generate()`'s retry loop (not just the guard
+    # method directly): attempt 1 is rejected for the free literal, attempt
+    # 2 drops the grounded closed-vocabulary filter too and is rejected
+    # again (naming the dropped filter), attempt 3 restores it and accepts.
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+
+    def _response(cypher):
+      return _Response(payload={
+        "result": {
+          "TEXT_RESPONSE": cypher,
+          "FULL_OUTPUT": {
+            "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 12},
+          },
+        },
+      })
+
+    attempt_1 = (
+      "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' AND i.source = 'CISA Vuls' "
+      "RETURN i.value AS value LIMIT 10"
+    )
+    attempt_2 = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10"
+    attempt_3 = "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' RETURN i.value AS value LIMIT 10"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [_response(attempt_1), _response(attempt_2), _response(attempt_3)]
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(
+        request="Which IP addresses are indicators of compromise?", model_key=PRIVATE_MODEL_KEY,
+      )
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 3)
+    self.assertFalse(result["attempts"][0]["accepted"])
+    self.assertIn("CISA Vuls", result["attempts"][0]["validation_feedback"])
+    self.assertFalse(result["attempts"][1]["accepted"])
+    self.assertIn("ipv4", result["attempts"][1]["validation_feedback"])
+    self.assertIn("must not be removed", result["attempts"][1]["validation_feedback"])
+    self.assertTrue(result["attempts"][2]["accepted"])
+
+
+class PromptProfileDispatchTests(unittest.TestCase):
+  """Contract §5.1/§5.2: `_generation_messages` dispatches the system prompt
+  and the correction turn per profile."""
+
+  def test_v0_10_profile_served_system_prompt_is_unchanged(self):
+    plugin = _make_api()
+
+    messages = plugin._generation_messages(PRIVATE_MODEL_KEY, "Show indicators")
+
+    self.assertEqual(messages[0]["role"], "system")
+    self.assertEqual(messages[0]["content"], build_direct_cypher_system_prompt())
+
+  def test_v0_10_profile_correction_turn_still_re_embeds_the_schema(self):
+    plugin = _make_api()
+
+    messages = plugin._generation_messages(
+      PRIVATE_MODEL_KEY, "Show indicators",
+      rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+      validation_feedback="unknown property 'bogus'",
+      retry_index=1,
+      retry_limit=2,
+    )
+
+    self.assertEqual(
+      messages[1]["content"],
+      build_schema_correction_prompt(
+        original_user_prompt="Show indicators",
+        rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+        validation_feedback="unknown property 'bogus'",
+        retry_index=1,
+        retry_limit=2,
+      ),
+    )
+    self.assertIn("Allowed EdgeGuard Cypher schema:", messages[1]["content"])
+
+  def test_v0_11_profile_served_system_prompt_is_the_pattern_schema_builder(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    messages = plugin._generation_messages(V0_11_MODEL_KEY, "Show indicators")
+
+    self.assertEqual(messages[0]["content"], build_v0_11_pattern_schema_system_prompt())
+
+  def test_v0_11_profile_correction_turn_does_not_re_embed_the_schema(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    messages = plugin._generation_messages(
+      V0_11_MODEL_KEY, "Show indicators",
+      rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+      validation_feedback="unknown property 'bogus'",
+      retry_index=1,
+      retry_limit=2,
+    )
+
+    self.assertEqual(
+      messages[1]["content"],
+      build_v0_11_correction_prompt(
+        rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+        validation_feedback="unknown property 'bogus'",
+        retry_index=1,
+        retry_limit=2,
+      ),
+    )
+    self.assertNotIn("Allowed EdgeGuard Cypher schema:", messages[1]["content"])
+    self.assertNotIn("Populated graph patterns:", messages[1]["content"])
+    self.assertNotIn("Original user request:", messages[1]["content"])
+
+
+class PromptContractProfileShaTests(unittest.TestCase):
+  """Contract §5.4: `/prompt_contract` exposes `system_prompt_sha256` per
+  profile, including profiles that append a suffix (previously `None`)."""
+
+  def test_every_profile_gets_a_real_system_prompt_sha256(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    for model_key in (V0_11_MODEL_KEY, PRIVATE_MODEL_KEY, "base_qwen3_4b", "cybersec_qwen_4b"):
+      self.assertRegex(
+        profiles[model_key]["system_prompt_sha256"], r"^[0-9a-f]{64}$", model_key,
+      )
+
+  def test_v0_10_profile_sha_matches_the_pinned_builder_output(self):
+    plugin = _make_api()
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertEqual(
+      profiles[PRIVATE_MODEL_KEY]["system_prompt_sha256"],
+      _sha256_text(build_direct_cypher_system_prompt()),
+    )
+
+  def test_v0_11_profile_sha_matches_the_pattern_schema_builder_output(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertEqual(
+      profiles[V0_11_MODEL_KEY]["system_prompt_sha256"],
+      _sha256_text(build_v0_11_pattern_schema_system_prompt()),
+    )
+
+  def test_v0_11_profile_correction_sha_does_not_match_the_v0_10_correction_sha(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertNotEqual(
+      profiles[V0_11_MODEL_KEY]["correction_prompt_sha256"],
+      profiles[PRIVATE_MODEL_KEY]["correction_prompt_sha256"],
+    )
+
+
+class GenerationMaxTokensPinTests(unittest.TestCase):
+  """Contract §5.4/§6 (code half): `GENERATION_MAX_TOKENS = 384`."""
+
+  def test_generation_max_tokens_is_384(self):
+    self.assertEqual(GENERATION_MAX_TOKENS, 384)

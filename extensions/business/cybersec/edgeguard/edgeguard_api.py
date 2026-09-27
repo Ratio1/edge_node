@@ -34,6 +34,8 @@ from .edgeguard_cypher_guard import (
   build_empty_result_broadening_cypher,
   build_direct_cypher_system_prompt,
   build_schema_correction_prompt,
+  build_v0_11_correction_prompt,
+  build_v0_11_pattern_schema_system_prompt,
   canonical_schema_surface,
   classify_empty_reason,
   classify_result_shape,
@@ -251,7 +253,10 @@ EXPLANATION_OPTIONAL_NARRATIVE_MAX_WORDS = {
 }
 EXPLANATION_TRUNCATED_MESSAGE = "Graph explanation output was truncated at the safe token limit."
 GENERATION_MAX_REQUEST_CHARS = 4_000
-GENERATION_MAX_TOKENS = 256
+# Contract §5.4: 75 of 76 observed v0.10 attempts stopped under 105 tokens;
+# ranked pipelines estimate 120-200; the one rambling attempt hit 256. 384
+# keeps headroom without letting a runaway completion burn the request budget.
+GENERATION_MAX_TOKENS = 384
 GENERATION_TEMPERATURE = 0.0
 GENERATION_TOP_P = 1.0
 GENERATION_TIMEOUT_SECONDS = 600
@@ -567,6 +572,16 @@ def _tracked_endpoint(func):
 PROMPT_PROFILE_DIRECT_CYPHER = "direct_cypher"
 PROMPT_PROFILE_SCHEMA_GROUNDED = "schema_grounded"
 PROMPT_PROFILE_CYBERSEC_SCHEMA_GROUNDED = "cybersec_schema_grounded"
+# Contract §5.1: the v0.11 served prompt, built from the pinned schema
+# artifact (typed patterns, vocabularies, synonym rule, both output shapes).
+# No default public worker declares this profile: it is meant for a
+# deployment's own fine-tuned-on-v0.11 model key, wired in by
+# `EDGEGUARD_GENERATION_WORKERS` (deployment config), same as
+# `finetuned_v0_10` today wires in `direct_cypher`.
+PROMPT_PROFILE_V0_11_PATTERN_SCHEMA = "v0_11_pattern_schema"
+# Fallback profile for a misconfigured/unknown worker declaration (contract
+# does not ask the served default to switch this phase, see `_prompt_profile`
+# below): stays the v0.10 schema-grounded profile.
 DEFAULT_PROMPT_PROFILE = PROMPT_PROFILE_SCHEMA_GROUNDED
 PROMPT_PROFILES = {
   PROMPT_PROFILE_DIRECT_CYPHER: {
@@ -596,7 +611,55 @@ PROMPT_PROFILES = {
     ),
     "single_user_message": True,
   },
+  PROMPT_PROFILE_V0_11_PATTERN_SCHEMA: {
+    "prompt_profile_id": "edgeguard_v0_11_pattern_schema",
+    "template_version": "edgeguard-v0-11-pattern-schema",
+    "prompt_contract": (
+      "schema-grounded read-only Cypher query string, graph or ranked_projection shape"
+    ),
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+  },
 }
+
+# Contract §5.1/§5.2: which builder renders the system prompt / correction
+# turn for a profile. Every profile not listed here keeps the unchanged
+# v0.10 builders (`build_direct_cypher_system_prompt`,
+# `build_schema_correction_prompt`) — that is what keeps the v0.10 profile
+# byte-identical.
+_V0_11_SYSTEM_PROMPT_BUILDER = build_v0_11_pattern_schema_system_prompt
+
+
+def _system_prompt_for_profile(profile_name: str) -> str:
+  if profile_name == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
+    return _V0_11_SYSTEM_PROMPT_BUILDER()
+  return build_direct_cypher_system_prompt()
+
+
+def _correction_prompt_for_profile(
+  profile_name: str,
+  *,
+  normalized_request: str,
+  rejected_cypher: str,
+  validation_feedback: str,
+  retry_index: int,
+  retry_limit: int,
+) -> str:
+  if profile_name == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
+    return build_v0_11_correction_prompt(
+      rejected_cypher=rejected_cypher,
+      validation_feedback=validation_feedback,
+      retry_index=retry_index,
+      retry_limit=retry_limit,
+    )
+  return build_schema_correction_prompt(
+    original_user_prompt=normalized_request,
+    rejected_cypher=rejected_cypher,
+    validation_feedback=validation_feedback,
+    retry_index=retry_index,
+    retry_limit=retry_limit,
+  )
+
 
 GRAPH_EXPLANATION_PROMPT_CONTRACT = {
   "prompt_version": GRAPH_EXPLANATION_PROMPT_VERSION,
@@ -3576,14 +3639,15 @@ class EdgeguardApiPlugin(BasePlugin):
     retry_limit: int = DEFAULT_SCHEMA_RETRY_LIMIT,
   ) -> list[Dict[str, str]]:
     profile = self._prompt_profile(model_key)
-    system_prompt = build_direct_cypher_system_prompt()
+    system_prompt = _system_prompt_for_profile(profile["name"])
     suffix = profile.get("system_prompt_suffix")
     if isinstance(suffix, str) and suffix:
       system_prompt += suffix
     user_prompt = normalized_request
     if retry_index:
-      user_prompt = build_schema_correction_prompt(
-        original_user_prompt=normalized_request,
+      user_prompt = _correction_prompt_for_profile(
+        profile["name"],
+        normalized_request=normalized_request,
         rejected_cypher=rejected_cypher or "",
         validation_feedback=validation_feedback or "The previous output failed validation.",
         retry_index=retry_index,
@@ -3687,7 +3751,15 @@ class EdgeguardApiPlugin(BasePlugin):
     validation: Dict[str, Any],
     raw_output: str,
     normalized_request: str,
+    retained_closed_vocabulary_literals: Optional[frozenset] = None,
   ) -> Dict[str, Any]:
+    """Contract §3.2, plus the correction-turn retention rule: a
+    closed-vocabulary literal grounded on an earlier attempt (even one the
+    overall query was later rejected for, on account of an unrelated free
+    literal) may not silently disappear from a later correction attempt.
+    `retained_closed_vocabulary_literals` is the running set the caller
+    (`generate`'s retry loop) accumulates from this method's
+    `grounded_closed_vocabulary_literals` output key across attempts."""
     if not validation.get("accepted"):
       return validation
     candidate = validation.get("accepted_cypher") or validation.get("candidate") or raw_output
@@ -3697,10 +3769,13 @@ class EdgeguardApiPlugin(BasePlugin):
       re.IGNORECASE,
     ))
     unrequested = []
+    grounded_closed_vocabulary: set = set()
+    candidate_literals_cf: set = set()
     for literal in self._cypher_string_literals(str(candidate)):
       normalized = literal.strip()
       if not normalized:
         continue
+      candidate_literals_cf.add(normalized.casefold())
       derived_temporal = temporal_request and bool(
         re.fullmatch(r"P(?:\d+[YMWD])*(?:T(?:\d+[HMS])*)?", literal, re.IGNORECASE)
       )
@@ -3715,16 +3790,34 @@ class EdgeguardApiPlugin(BasePlugin):
       )
       if not grounding["grounded"]:
         unrequested.append({"literal": normalized, "class": grounding["class"]})
-    if not unrequested:
-      return validation
+      elif grounding["class"] == literal_classes.CLOSED_VOCABULARY:
+        grounded_closed_vocabulary.add(normalized.casefold())
+    missing_retained = set()
+    if retained_closed_vocabulary_literals:
+      missing_retained = {
+        literal for literal in retained_closed_vocabulary_literals
+        if literal not in candidate_literals_cf
+      }
+    if not unrequested and not missing_retained:
+      return {
+        **validation,
+        "grounded_closed_vocabulary_literals": sorted(grounded_closed_vocabulary),
+      }
+    feedback_lines = [
+      literal_classes.format_literal_rejection(item["literal"], item["class"])
+      for item in unrequested
+    ]
+    feedback_lines.extend(
+      f"Literal '{literal}' (closed_vocabulary) was accepted in a previous attempt and must "
+      "not be removed."
+      for literal in sorted(missing_retained)
+    )
     return {
       **validation,
       "accepted": False,
       "accepted_cypher": None,
-      "validation_feedback": "\n".join(
-        literal_classes.format_literal_rejection(item["literal"], item["class"])
-        for item in unrequested
-      ),
+      "validation_feedback": "\n".join(feedback_lines),
+      "grounded_closed_vocabulary_literals": sorted(grounded_closed_vocabulary),
     }
 
   def _extract_generation_model(self, payload: Any, fallback: Optional[str]) -> Optional[str]:
@@ -3872,6 +3965,10 @@ class EdgeguardApiPlugin(BasePlugin):
     attempts = []
     last_candidate = ""
     last_feedback = ""
+    # Contract §3.2: a closed-vocabulary literal grounded on one attempt is
+    # retained across correction attempts, even if that attempt was rejected
+    # for an unrelated reason.
+    retained_closed_vocabulary_literals: set = set()
     llm_model = model.get("model_file")
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
@@ -3905,6 +4002,10 @@ class EdgeguardApiPlugin(BasePlugin):
             validation,
             raw_output,
             normalized_request,
+            retained_closed_vocabulary_literals,
+          )
+          retained_closed_vocabulary_literals |= set(
+            validation.get("grounded_closed_vocabulary_literals") or []
           )
         attempt = {
           "attempt": attempt_index,
@@ -4768,25 +4869,30 @@ class EdgeguardApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="GET")
   @_tracked_endpoint
   def prompt_contract(self) -> Dict[str, Any]:
-    direct_system_prompt = build_direct_cypher_system_prompt()
-    correction_prompt = build_schema_correction_prompt(
-      original_user_prompt="{normalized_request}",
-      rejected_cypher="{candidate_cypher}",
-      validation_feedback="{validation_feedback}",
-      retry_index=1,
-      retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
-    )
     profiles = []
     for key in self._configured_model_keys():
       profile = self._prompt_profile(key)
+      # Contract §5.4: `system_prompt_sha256` per profile, over the prompt
+      # this profile actually serves (builder dispatch + its suffix), not
+      # just the bare v0.10 template — every profile gets a real sha now.
+      system_prompt = _system_prompt_for_profile(profile["name"])
+      suffix = profile.get("system_prompt_suffix")
+      if isinstance(suffix, str) and suffix:
+        system_prompt += suffix
+      correction_prompt = _correction_prompt_for_profile(
+        profile["name"],
+        normalized_request="{normalized_request}",
+        rejected_cypher="{candidate_cypher}",
+        validation_feedback="{validation_feedback}",
+        retry_index=1,
+        retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
+      )
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],
         "model_key": key,
         "template_version": profile["template_version"],
-        # The bare direct-Cypher template is hashed; profiles that append
-        # grounding guidance are described by template_version instead.
-        "system_prompt_sha256": _sha256_text(direct_system_prompt) if not profile.get("system_prompt_suffix") else None,
+        "system_prompt_sha256": _sha256_text(system_prompt),
         "correction_prompt_sha256": _sha256_text(correction_prompt),
         "expected_output": profile["prompt_contract"],
       })
