@@ -149,6 +149,19 @@ class TestHappyPath(unittest.TestCase):
                 "QmMsspAuth1", "QmLegacyAuthRef"}
     self.assertEqual(set(repo.deleted), expected)
 
+  def test_engagement_bound_job_keeps_the_engagement_documents(self):
+    # RM-095: the snapshot points at the engagement's documents, which other jobs share and the
+    # engagement hash covers; `third_party_auth_cids` are free text. Only the snapshot goes.
+    _, repo = _build_specs()
+    config = {**repo.configs["QmInitial1"], "engagement_id": "en_00000000-0000-4000-8000-000000000003",
+              "engagement_hash": "a" * 64}
+    specs, repo = _build_specs(config=config)
+    result = delete_engagement_data(job_id="abc123", job_specs=specs, artifact_repo=repo)
+    self.assertEqual((result.documents_deleted, result.documents_failed, repo.deleted), (0, 0, []))
+    sanitized = repo.configs[result.new_job_config_cid]
+    self.assertEqual([sanitized[key] for key in ("engagement", "roe", "authorization")], [None] * 3)
+    self.assertEqual(sanitized["engagement_id"], config["engagement_id"])
+
   def test_job_specs_updated_to_new_cid(self):
     specs, repo = _build_specs()
     old_cid = specs["job_config_cid"]

@@ -20,9 +20,7 @@ from extensions.business.cybersec.red_mesh.models.engagement import (
   DATA_CLASSIFICATIONS,
   EngagementContext,
   KickoffQuestionnaire,
-  POST_EXPLOIT_RULES,
   RulesOfEngagement,
-  STRENGTH_OF_TEST,
 )
 
 
@@ -117,85 +115,37 @@ class TestEngagementContext(unittest.TestCase):
 
 
 class TestRulesOfEngagement(unittest.TestCase):
+  """RM-095: the RoE is the three flags workers enforce."""
 
   def test_default_is_empty_and_safe(self):
     roe = RulesOfEngagement()
     self.assertTrue(roe.is_empty())
-    # Safe defaults
-    self.assertEqual(roe.strength_of_test, "standard")
-    self.assertFalse(roe.dos_allowed)
-    self.assertEqual(roe.post_exploit_rules, "va_only")
+    self.assertEqual(roe.to_dict(), {"authenticated_action": False, "stateful_probes_allowed": False,
+                                     "ics_safe_mode_required": True})
 
   def test_round_trip(self):
-    roe = RulesOfEngagement(
-      strength_of_test="aggressive",
-      dos_allowed=True,
-      post_exploit_rules="pivot",
-      blackout_windows=[("2026-05-04T22:00:00Z", "2026-05-05T06:00:00Z")],
-      retest_window_end="2026-06-30",
-    )
-    d = roe.to_dict()
-    restored = RulesOfEngagement.from_dict(d)
-    self.assertEqual(restored.strength_of_test, "aggressive")
-    self.assertTrue(restored.dos_allowed)
-    self.assertEqual(restored.post_exploit_rules, "pivot")
-    self.assertEqual(restored.blackout_windows, [
-      ("2026-05-04T22:00:00Z", "2026-05-05T06:00:00Z"),
-    ])
-    self.assertEqual(restored.retest_window_end, "2026-06-30")
-
-  def test_authenticated_action_defaults_off_and_round_trips(self):
-    # RM-103 item 5: the post-login action is opt-in; the flag alone makes
-    # the RoE non-empty, so a launch that sets only it keeps it.
-    self.assertFalse(RulesOfEngagement().authenticated_action)
-    roe = RulesOfEngagement(authenticated_action=True)
+    roe = RulesOfEngagement(authenticated_action=True, stateful_probes_allowed=True,
+                            ics_safe_mode_required=False)
     self.assertFalse(roe.is_empty())
-    self.assertTrue(RulesOfEngagement.from_dict(roe.to_dict()).authenticated_action)
-    self.assertFalse(RulesOfEngagement.from_dict({"dos_allowed": True}).authenticated_action)
+    self.assertEqual(RulesOfEngagement.from_dict(roe.to_dict()), roe)
 
-  def test_authenticated_action_accepts_only_a_boolean(self):
-    # Consent to run commands must not fail open: `bool("false")` is True.
-    for raw in ("false", "true", 1, "yes"):
-      with self.subTest(raw=raw):
-        roe = RulesOfEngagement.from_dict({"authenticated_action": raw})
-        self.assertTrue(any("authenticated_action" in e for e in roe.validate()))
-        self.assertFalse(roe.to_dict()["authenticated_action"])
+  def test_an_archive_written_before_rm095_still_loads(self):
+    old = {"strength_of_test": "aggressive", "dos_allowed": True, "post_exploit_rules": "pivot",
+           "blackout_windows": [["a", "b"]], "retest_window_end": "2026-06-30", "authenticated_action": True}
+    roe = RulesOfEngagement.from_dict(old)
+    self.assertEqual(roe.validate(), [])
+    self.assertEqual(roe.to_dict(), {"authenticated_action": True, "stateful_probes_allowed": False,
+                                     "ics_safe_mode_required": True})
+
+  def test_flags_accept_only_booleans_and_fail_safe(self):
+    # Consents must not fail open: `bool("false")` is True.
+    for name in ("authenticated_action", "stateful_probes_allowed", "ics_safe_mode_required"):
+      for raw in ("false", "true", 1, 0, "yes"):
+        with self.subTest(name=name, raw=raw):
+          roe = RulesOfEngagement.from_dict({name: raw})
+          self.assertTrue(any(name in e for e in roe.validate()))
+          self.assertEqual(roe.to_dict()[name], name == "ics_safe_mode_required")
     self.assertEqual(RulesOfEngagement.from_dict({"authenticated_action": True}).validate(), [])
-
-  def test_validate_rejects_unknown_strength(self):
-    roe = RulesOfEngagement(strength_of_test="brutal")
-    errors = roe.validate()
-    self.assertEqual(len(errors), 1)
-    self.assertIn("strength_of_test", errors[0])
-
-  def test_validate_rejects_unknown_post_exploit(self):
-    roe = RulesOfEngagement(post_exploit_rules="lateral_movement")
-    errors = roe.validate()
-    self.assertEqual(len(errors), 1)
-    self.assertIn("post_exploit_rules", errors[0])
-
-  def test_blackout_windows_coercion(self):
-    """Lists vs. tuples both accepted on input."""
-    roe = RulesOfEngagement.from_dict({
-      "blackout_windows": [
-        ["2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z"],
-        ("2026-05-10T00:00:00Z", "2026-05-11T00:00:00Z"),
-      ]
-    })
-    self.assertEqual(len(roe.blackout_windows), 2)
-    self.assertEqual(roe.blackout_windows[0],
-                     ("2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z"))
-
-  def test_blackout_windows_drops_malformed(self):
-    """1-element or 3-element lists are dropped, not crashed."""
-    roe = RulesOfEngagement.from_dict({
-      "blackout_windows": [
-        ["only-one"],
-        ["a", "b", "c"],
-        ["good-start", "good-end"],
-      ]
-    })
-    self.assertEqual(len(roe.blackout_windows), 1)
 
 
 class TestAuthorizationRef(unittest.TestCase):
@@ -282,7 +232,7 @@ class TestKickoffQuestionnaire(unittest.TestCase):
         client_name="ACME", data_classification="PCI",
         asset_exposure="external",
       ),
-      roe=RulesOfEngagement(strength_of_test="aggressive", dos_allowed=True),
+      roe=RulesOfEngagement(stateful_probes_allowed=True),
       authorization=AuthorizationRef(
         document_cid="QmAuthCID", authorized_signer_name="Jane",
       ),
@@ -292,7 +242,7 @@ class TestKickoffQuestionnaire(unittest.TestCase):
     d = q.to_dict()
     restored = KickoffQuestionnaire.from_dict(d)
     self.assertEqual(restored.engagement.client_name, "ACME")
-    self.assertTrue(restored.roe.dos_allowed)
+    self.assertTrue(restored.roe.stateful_probes_allowed)
     self.assertEqual(restored.authorization.document_cid, "QmAuthCID")
     self.assertEqual(restored.created_at, "2026-05-05T10:00:00Z")
 
@@ -323,13 +273,6 @@ class TestEnumExports(unittest.TestCase):
     self.assertIn("external", ASSET_EXPOSURES)
     self.assertIn("internal", ASSET_EXPOSURES)
     self.assertIn("airgapped", ASSET_EXPOSURES)
-
-  def test_strength_levels_exported(self):
-    self.assertEqual(set(STRENGTH_OF_TEST), {"light", "standard", "aggressive"})
-
-  def test_post_exploit_rules_exported(self):
-    self.assertIn("va_only", POST_EXPLOIT_RULES)
-    self.assertIn("pivot", POST_EXPLOIT_RULES)
 
 
 if __name__ == "__main__":

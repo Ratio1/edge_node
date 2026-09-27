@@ -1892,7 +1892,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     config_dict = self._latest_job_config(plugin)
     self.assertEqual(config_dict["engagement"]["client_name"], "ACME")
     self.assertEqual(config_dict["engagement"]["data_classification"], "PII")
-    self.assertEqual(config_dict["roe"]["strength_of_test"], "light")
+    # RM-095: the RoE is the three enforced flags; the dropped fields are ignored.
+    self.assertEqual(config_dict["roe"], {"authenticated_action": False, "stateful_probes_allowed": False,
+                                          "ics_safe_mode_required": True})
     self.assertEqual(config_dict["authorization"]["document_cid"], "QmAuthCID")
     self.assertEqual(config_dict["authorization"]["authorized_signer_name"], "Alice")
 
