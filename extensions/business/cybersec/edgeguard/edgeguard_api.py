@@ -913,6 +913,17 @@ def _wrapper_safe_error(result: Dict[str, Any], status_code: int) -> Dict[str, A
   return {"status_code": status_code, "result": result, "logged": True}
 
 
+# Fix round 5: `_prepare_graph_explanation_plan` is a shared, unwrapped
+# helper — its callers (`prepare_graph_explanation`, `explain_graph`'s two
+# `plan`-consuming branches) each finish the response differently
+# (`_with_active_prepare_contract`, a bare envelope), so it cannot call
+# `_wrapper_safe_error` itself. It instead tags the intended HTTP status on
+# a private key a caller pops before building the final response, so every
+# guard/content/config rejection it can return still resolves to a
+# deliberate status code instead of the wrapper's bare 500.
+_WRAPPER_STATUS_CODE_KEY = "_wrapper_status_code"
+
+
 def _graph_first_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, Any]:
   resolved_mode = None
   if mode_plan is not None:
@@ -1170,6 +1181,7 @@ def _prepare_graph_explanation_plan(
       "ok": False,
       "error": "Graph explanation request configuration is invalid.",
       "validation_errors": [_contract_error(exc.code, exc.detail)],
+      _WRAPPER_STATUS_CODE_KEY: 400,
     }
   # CALL/properties()/wildcard/bracket projection safety now lives in the
   # shared guard's execution-safety stage (EG-013), so every execution route
@@ -1199,6 +1211,7 @@ def _prepare_graph_explanation_plan(
       "ok": False,
       "validation": analysis,
       "error": "Cypher rejected by EdgeGuard guard; graph explanation was not prepared.",
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   accepted_cypher = analysis["accepted_cypher"]
   projected_properties = re.findall(
@@ -1221,6 +1234,7 @@ def _prepare_graph_explanation_plan(
           f"property {forbidden_projection} is excluded by the explanation security policy",
         )
       ],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   return_clause = _top_level_return_clause(accepted_cypher) or ""
   result_functions = re.findall(
@@ -1247,6 +1261,7 @@ def _prepare_graph_explanation_plan(
           f"result-producing function {unsafe_function} is not allowlisted",
         )
       ],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   result_columns = _result_columns_from_cypher(accepted_cypher)
   if result_columns is None:
@@ -1261,6 +1276,7 @@ def _prepare_graph_explanation_plan(
           "every returned expression must have a deterministic unique column name",
         )
       ],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   try:
     projection_descriptors = direct_projection_descriptors(return_clause, result_columns)
@@ -1271,6 +1287,7 @@ def _prepare_graph_explanation_plan(
       "validation": analysis,
       "error": "Cypher result projection is not safe for complete-result explanation.",
       "validation_errors": [_contract_error(exc.code, exc.detail)],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   try:
     primary_cypher, generated_limit, executed_limit, limit_adjusted = _normalize_explanation_cypher_limit(
@@ -1283,6 +1300,7 @@ def _prepare_graph_explanation_plan(
       "ok": False,
       "validation": analysis,
       "error": f"Invalid explanation row limit: {exc}",
+      _WRAPPER_STATUS_CODE_KEY: 400,
     }
 
   broadening = build_empty_result_broadening_cypher(accepted_cypher) if broadening_enabled else None
@@ -5596,29 +5614,38 @@ class EdgeguardApiPlugin(BasePlugin):
       "schema_version": validation_profile["schema_version"],
     }
     if not analysis["accepted"]:
-      return {
+      # Fix round 5 (re-review-3 finding 3, remaining gap): the live 38-
+      # question re-run hit this exact branch (guard-rejected Cypher) as an
+      # opaque HTTP 500 — 422 states the query content is at fault, via the
+      # wrapper-safe transport.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "validation": validation,
         "error": "Cypher rejected by EdgeGuard guard; query was not executed.",
-      }
+      }, 422)
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
     if err:
-      return {
+      # Fix round 5: malformed/absent connection parameters — caller input,
+      # 400, via the wrapper-safe transport.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "executed": False, "error": err,
         "metrics": {"connect_ms": 0.0, "query_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     normalized_uri, err = self._normalize_neo4j_uri(connection["uri"], connection["scheme"])
     if err:
-      return {
+      # Fix round 5: malformed URI/scheme — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "executed": False, "error": err,
         "metrics": {"connect_ms": 0.0, "query_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     if GraphDatabase is None:
+      # Fix round 5: the Neo4j driver is missing from this runtime — a
+      # server-side dependency, 503.
       unavailable = self._neo4j_unavailable()
       unavailable["executed"] = False
-      return unavailable
+      return _wrapper_safe_error(unavailable, 503)
     row_limit = max(1, min(int(max_rows or self.cfg_neo4j_max_rows), int(self.cfg_neo4j_max_rows)))
     broadening_enabled = (
       bool(self.cfg_live_empty_result_broadening)
@@ -5808,29 +5835,34 @@ class EdgeguardApiPlugin(BasePlugin):
     **kwargs,
   ) -> Dict[str, Any]:
     if not isinstance(cypher, str) or not cypher.strip():
-      return self._with_active_prepare_contract({
+      # Fix round 5: malformed request shape (missing/blank `cypher`), not a
+      # rejected query — 400, via the wrapper-safe transport (see
+      # `_wrapper_safe_error`).
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation Cypher must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
-      })
+      }), 400)
     forwarded = sorted(str(name) for name in kwargs)
     if forwarded:
-      return self._with_active_prepare_contract({
+      # Fix round 5: unexpected request fields — malformed request body, 400.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation preparation does not accept Neo4j connection fields.",
         "validation_errors": [
           _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
         ],
-      })
+      }), 400)
     if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
-      return self._with_active_prepare_contract({
+      # Fix round 5: wrong field type — malformed request body, 400.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
-      })
+      }), 400)
     try:
       mode_plan = resolve_mode(
         explanation_mode=explanation_mode,
@@ -5838,12 +5870,14 @@ class EdgeguardApiPlugin(BasePlugin):
         max_rows=max_rows,
       )
     except GraphFirstContractError as exc:
-      return self._with_active_prepare_contract({
+      # Fix round 5: invalid `explanation_mode`/`explanation_rows`/`max_rows`
+      # configuration — caller input, not the guard, 400.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error(exc.code, exc.detail)],
-      })
+      }), 400)
     broadening_enabled = bool(enable_empty_result_broadening) if enable_empty_result_broadening is not None else False
     # Contract §1/§4.1 (review finding 1, round 2): explain routes accept
     # what `generate` accepts for the v0.11 profile — same resolver, same
@@ -5855,26 +5889,35 @@ class EdgeguardApiPlugin(BasePlugin):
       validation_profile=validation_profile,
     )
     if not plan.get("ok"):
-      return self._with_active_prepare_contract(plan, mode_plan)
+      # Fix round 5: `_prepare_graph_explanation_plan` tags the intended
+      # status on `_WRAPPER_STATUS_CODE_KEY` (422 default: guard rejection or
+      # unsafe-result-projection content issue; 400 for a bad mode/row-limit
+      # input) — pop it so it never reaches the response body.
+      status_code = plan.pop(_WRAPPER_STATUS_CODE_KEY, 422)
+      return _wrapper_safe_error(self._with_active_prepare_contract(plan, mode_plan), status_code)
     if self._active_explanation_strategy() == "eel_compatibility":
       try:
         self._graph_first_token_counter()
       except GraphFirstRuntimeError as exc:
-        return self._with_active_prepare_contract({
+        # Fix round 5: the graph-first tokenizer is a server-side dependency,
+        # not caller input — 503 (service unavailable).
+        return _wrapper_safe_error(self._with_active_prepare_contract({
           "status": "config_error",
           "ok": False,
           "validation": plan.get("validation"),
           "error": "Graph-first explanation tokenizer is unavailable.",
           "validation_errors": [_contract_error(exc.code, exc.detail)],
-        }, mode_plan)
+        }, mode_plan), 503)
       _explanation_url, explanation_err = self._explanation_url()
       if explanation_err:
-        return self._with_active_prepare_contract({
+        # Fix round 5: the explanation model endpoint is not configured — a
+        # server-side dependency, 503.
+        return _wrapper_safe_error(self._with_active_prepare_contract({
           "status": "config_error",
           "ok": False,
           "validation": plan.get("validation"),
           "error": explanation_err,
-        }, mode_plan)
+        }, mode_plan), 503)
     return self._with_active_prepare_contract(plan, mode_plan)
 
   def _explain_prepared_execution(
@@ -5972,7 +6015,9 @@ class EdgeguardApiPlugin(BasePlugin):
         projection_digest=projection_digest,
       )
     if not packet["graph"]["nodes"]:
-      return {
+      # Fix round 5: packet/evidence validation rejection (no explainable
+      # graph nodes in the supplied execution evidence), 422.
+      return _wrapper_safe_error({
         "status": "empty_graph",
         "ok": False,
         "executed": True,
@@ -5982,7 +6027,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet_meta": packet_meta,
         "validation": plan.get("validation"),
         "live_retry": live_retry,
-      }
+      }, 422)
     try:
       graph_first = self._run_graph_first(
         plan=plan,
@@ -6058,23 +6103,25 @@ class EdgeguardApiPlugin(BasePlugin):
     started = time.monotonic()
     deadline = started + EDGEGUARD_REQUEST_TIMEOUT_SECONDS
     if not isinstance(cypher, str) or not cypher.strip():
-      return {
+      # Fix round 5: malformed request body (missing/blank `cypher`), 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation Cypher must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
-      }
+      }, 400)
     if not isinstance(request, str) or not request.strip():
-      return {
+      # Fix round 5: malformed request body (missing/blank `request`), 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation request must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_explanation_request", "request must be a non-empty string")],
-      }
+      }, 400)
     invalid_fields = [str(name) for name in kwargs] if execution_result is None else []
     if method is not None and method not in {"native_driver", "bolt_over_wss"}:
       invalid_fields.append("method")
@@ -6088,23 +6135,25 @@ class EdgeguardApiPlugin(BasePlugin):
     if execution_result is not None and not isinstance(execution_result, dict):
       invalid_fields.append("execution_result")
     if invalid_fields:
-      return {
+      # Fix round 5: unexpected/mistyped request fields, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation request contains invalid or unexpected fields.",
         "validation_errors": [_contract_error("invalid_request_fields", "request fields must match the exact contract")],
-      }
+      }, 400)
     if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
-      return {
+      # Fix round 5: wrong field type, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
-      }
+      }, 400)
     try:
       mode_plan = resolve_mode(
         explanation_mode=explanation_mode,
@@ -6119,14 +6168,20 @@ class EdgeguardApiPlugin(BasePlugin):
     except (GraphFirstContractError, GraphFirstRuntimeError) as exc:
       code = exc.code
       detail = exc.detail
-      return {
+      # Fix round 5: `GraphFirstContractError` is `resolve_mode` rejecting bad
+      # mode/row-limit/temperature caller input, 400; `GraphFirstRuntimeError`
+      # here is only `_graph_first_token_counter`'s server-side tokenizer
+      # unavailability (matching the identical branch in
+      # `prepare_graph_explanation`), 503.
+      status_code = 400 if isinstance(exc, GraphFirstContractError) else 503
+      return _wrapper_safe_error({
         "status": "config_error",
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph-first explanation configuration is unavailable.",
         "validation_errors": [_contract_error(code, detail)],
-      }
+      }, status_code)
     # Contract §1/§4.1 (review finding 1, round 2): `explain_graph` accepts
     # what `generate` accepts for the v0.11 profile — same shared resolver.
     validation_profile = self._cypher_validation_profile(model_key)
@@ -6142,14 +6197,15 @@ class EdgeguardApiPlugin(BasePlugin):
     # the configured graph-topology explanation strategy.
     analysis["result_shape"] = classify_result_shape(analysis.get("candidate") or cypher)
     if not analysis["accepted"]:
-      return {
+      # Fix round 5: same guard-rejection HTTP-500 gap as `/neo4j_query`, 422.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "validation": analysis,
         "error": "Cypher rejected by EdgeGuard guard; graph explanation was not executed.",
-      }
+      }, 422)
 
     if self._active_explanation_strategy() == "eel_compatibility":
       try:
@@ -6180,7 +6236,9 @@ class EdgeguardApiPlugin(BasePlugin):
       forwarded = [name for name, value in connection_fields.items() if value not in (None, "")]
       forwarded.extend(str(name) for name in kwargs)
       if forwarded:
-        return {
+        # Fix round 5: unexpected connection fields in execution-evidence
+        # mode — malformed request body, 400.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": False,
@@ -6190,14 +6248,17 @@ class EdgeguardApiPlugin(BasePlugin):
             _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
           ],
           "validation": analysis,
-        }
+        }, 400)
       plan = _prepare_graph_explanation_plan(
         cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
         guard_max_limit=int(self.cfg_neo4j_max_rows),
         validation_profile=validation_profile,
       )
       if not plan.get("ok"):
-        return {**plan, "executed": False, "explained": False}
+        # Fix round 5: see the identical `plan.pop(...)` in
+        # `prepare_graph_explanation` for the status-code source.
+        status_code = plan.pop(_WRAPPER_STATUS_CODE_KEY, 422)
+        return _wrapper_safe_error({**plan, "executed": False, "explained": False}, status_code)
       return self._explain_prepared_execution(
         plan=plan,
         execution_result=execution_result,
@@ -6208,14 +6269,21 @@ class EdgeguardApiPlugin(BasePlugin):
 
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
     if err:
-      return {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}
+      # Fix round 5: malformed/absent connection parameters, 400.
+      return _wrapper_safe_error(
+        {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}, 400,
+      )
     normalized_uri, err = self._normalize_neo4j_uri(connection["uri"], connection["scheme"])
     if err:
-      return {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}
+      # Fix round 5: malformed URI/scheme, 400.
+      return _wrapper_safe_error(
+        {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}, 400,
+      )
     if GraphDatabase is None:
+      # Fix round 5: the Neo4j driver is missing from this runtime, 503.
       unavailable = self._neo4j_unavailable()
       unavailable.update({"executed": False, "explained": False})
-      return unavailable
+      return _wrapper_safe_error(unavailable, 503)
 
     plan = _prepare_graph_explanation_plan(
       cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
@@ -6223,7 +6291,9 @@ class EdgeguardApiPlugin(BasePlugin):
       validation_profile=validation_profile,
     )
     if not plan.get("ok"):
-      return {**plan, "executed": False, "explained": False}
+      # Fix round 5: see the identical `plan.pop(...)` above.
+      status_code = plan.pop(_WRAPPER_STATUS_CODE_KEY, 422)
+      return _wrapper_safe_error({**plan, "executed": False, "explained": False}, status_code)
     executed_cypher = plan["executed_cypher"]
     generated_limit = plan["limit_policy"]["generated_limit"]
     executed_limit = plan["limit_policy"]["executed_limit"]
@@ -6307,7 +6377,8 @@ class EdgeguardApiPlugin(BasePlugin):
       # input construction, so no response artifact carries the values.
       forbidden_field = _forbidden_execution_field(query_result)
       if forbidden_field:
-        return {
+        # Fix round 5: executed-result / packet validation rejection, 422.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -6319,7 +6390,7 @@ class EdgeguardApiPlugin(BasePlugin):
           )],
           "validation": analysis,
           "live_retry": live_retry,
-        }
+        }, 422)
 
       packet, packet_meta = _build_graph_evidence_packet(
         request=request,
@@ -6335,7 +6406,8 @@ class EdgeguardApiPlugin(BasePlugin):
       )
       packet_errors, _context = _validate_graph_evidence_packet(packet)
       if packet_errors:
-        return {
+        # Fix round 5: packet validation rejection, 422.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -6345,9 +6417,10 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet": packet,
           "packet_meta": packet_meta,
           "live_retry": live_retry,
-        }
+        }, 422)
       if packet_meta.get("truncated_properties"):
-        return {
+        # Fix round 5: packet validation rejection, 422.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -6360,7 +6433,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet_meta": packet_meta,
           "validation": analysis,
           "live_retry": live_retry,
-        }
+        }, 422)
       try:
         raw_query_result, raw_nodes, raw_relationships = _legacy_query_result_evidence(
           query_result["rows"],

@@ -63,6 +63,8 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jClientErro
 from extensions.business.cybersec.edgeguard.edgeguard_api import _neo4j_row_json_safe  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _prepare_graph_explanation_plan  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _WRAPPER_STATUS_CODE_KEY  # noqa: E402
 from extensions.business.cybersec.edgeguard.graph_first_runtime import GraphFirstRuntimeError, render_chat  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (  # noqa: E402
   build_direct_cypher_system_prompt,
@@ -1727,11 +1729,15 @@ class EdgeGuardApiTests(unittest.TestCase):
         cypher="MATCH (i:InternetFacing) RETURN i.hostname AS hostname",
       )
 
-    self.assertFalse(result["executed"])
-    self.assertEqual(result["status"], "rejected")
+    # Fix round 5: a guard rejection is a deliberate 422 via the
+    # wrapper-safe transport, not a bare 500.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertFalse(payload["executed"])
+    self.assertEqual(payload["status"], "rejected")
     # Contract §4.3: `validation.result_shape` is set even on a rejected
     # query — it is a static text classification, not an acceptance gate.
-    self.assertEqual(result["validation"]["result_shape"], "other")
+    self.assertEqual(payload["validation"]["result_shape"], "other")
     mocked_driver.assert_not_called()
 
   def test_neo4j_query_uses_driver_for_accepted_cypher(self):
@@ -2072,9 +2078,11 @@ class EdgeGuardApiTests(unittest.TestCase):
       cypher="MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p",
     )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertFalse(result["executed"])
-    self.assertEqual(result["validation"]["schema_version"], "edgeguard-cypher-schema-v0.10")
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertFalse(payload["executed"])
+    self.assertEqual(payload["validation"]["schema_version"], "edgeguard-cypher-schema-v0.10")
 
   def test_neo4j_query_returns_structured_error_when_driver_fails(self):
     plugin = _make_api()
@@ -2466,8 +2474,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(with_v0_11["status"], "accepted")
     self.assertTrue(with_v0_11["ok"], with_v0_11.get("error"))
     self.assertEqual(with_v0_11["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
-    self.assertEqual(without_model_key["status"], "rejected")
-    self.assertFalse(without_model_key["ok"])
+    # Fix round 5: the guard rejection on the v0.10 fallback profile is now a
+    # deliberate 422 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(without_model_key["status_code"], 422)
+    without_model_key_payload = _graph_first_payload(without_model_key)
+    self.assertEqual(without_model_key_payload["status"], "rejected")
+    self.assertFalse(without_model_key_payload["ok"])
 
   def test_one_call_prepare_contract_has_distinct_identity_and_cap(self):
     plugin = _make_api(edgeguard_explanation_strategy="one_call")
@@ -2627,8 +2639,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(with_v0_11["status"], "ok")
     self.assertTrue(with_v0_11["executed"])
     self.assertEqual(with_v0_11["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
-    self.assertEqual(without_model_key["status"], "rejected")
-    self.assertFalse(without_model_key["executed"])
+    # Fix round 5: the guard rejection on the v0.10 fallback profile is now a
+    # deliberate 422 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(without_model_key["status_code"], 422)
+    without_model_key_payload = _graph_first_payload(without_model_key)
+    self.assertEqual(without_model_key_payload["status"], "rejected")
+    self.assertFalse(without_model_key_payload["executed"])
 
   def test_explain_graph_scalar_only_result_succeeds_under_insight_brief(self):
     plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
@@ -2970,13 +2986,17 @@ class EdgeGuardApiTests(unittest.TestCase):
         cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
       )
 
-    self.assertEqual(result["status"], "config_error")
+    # Fix round 5: the explanation model endpoint is a server-side
+    # dependency, 503 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "config_error")
     self.assertEqual(
-      result["explanation_contract"]["schema_version"],
+      payload["explanation_contract"]["schema_version"],
       "edgeguard.graph_first_prepare.v1",
     )
     self.assertEqual(
-      result["explanation_contract"]["resolved_mode"]["effective"],
+      payload["explanation_contract"]["resolved_mode"]["effective"],
       "balanced",
     )
     mocked_driver.assert_not_called()
@@ -3075,7 +3095,10 @@ class EdgeGuardApiTests(unittest.TestCase):
       for kwargs in invalid_requests:
         with self.subTest(kwargs=kwargs):
           result = plugin.explain_graph(**kwargs)
-          self.assertFalse(result["ok"])
+          # Fix round 5: malformed request shape/type is now a deliberate
+          # 400 via the wrapper-safe transport, not a bare 500.
+          self.assertEqual(result["status_code"], 400)
+          self.assertFalse(_graph_first_payload(result)["ok"])
     mocked_driver.assert_not_called()
     provider.assert_not_called()
 
@@ -3106,21 +3129,31 @@ class EdgeGuardApiTests(unittest.TestCase):
       password="test-password",
     )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+    # Fix round 5: unexpected/forwarded connection fields are malformed
+    # request bodies, 400 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertIn("credential_field_not_allowed", {item["code"] for item in payload["validation_errors"]})
 
     authorization = plugin.prepare_graph_explanation(
       cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
       authorization="Bearer should-not-cross",
     )
-    self.assertEqual(authorization["status"], "rejected")
-    self.assertIn("credential_field_not_allowed", {item["code"] for item in authorization["validation_errors"]})
+    self.assertEqual(authorization["status_code"], 400)
+    authorization_payload = _graph_first_payload(authorization)
+    self.assertEqual(authorization_payload["status"], "rejected")
+    self.assertIn(
+      "credential_field_not_allowed",
+      {item["code"] for item in authorization_payload["validation_errors"]},
+    )
 
     mixed_case = plugin.prepare_graph_explanation(
       cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
       Authorization="Bearer should-not-cross",
     )
-    self.assertEqual(mixed_case["status"], "rejected")
+    self.assertEqual(mixed_case["status_code"], 400)
+    self.assertEqual(_graph_first_payload(mixed_case)["status"], "rejected")
     self.assertNotIn("should-not-cross", json.dumps(mixed_case))
 
   def test_prepare_graph_explanation_rejects_dynamic_properties_procedures_and_ambiguous_columns(self):
@@ -3147,18 +3180,23 @@ class EdgeGuardApiTests(unittest.TestCase):
             "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post"
           ) as mocked_post:
             result = plugin.prepare_graph_explanation(cypher=cypher)
-        self.assertEqual(result["status"], "rejected")
+        # Fix round 5: every rejection this plan builder returns (guard
+        # content rejection or the unsafe-result-projection checks) is a
+        # deliberate 422 via the wrapper-safe transport, not a bare 500.
+        self.assertEqual(result["status_code"], 422)
+        payload = _graph_first_payload(result)
+        self.assertEqual(payload["status"], "rejected")
         # Projection safety moved into the shared guard (EG-013): guard-level
         # rejections carry execution_safety_error/read_only_error in the
         # validation verdict; the remaining plan-only checks keep the
         # unsafe_result_projection validation_errors code.
-        codes = {item["code"] for item in result.get("validation_errors", [])}
-        validation = result.get("validation") or {}
+        codes = {item["code"] for item in payload.get("validation_errors", [])}
+        validation = payload.get("validation") or {}
         self.assertTrue(
           "unsafe_result_projection" in codes
           or validation.get("execution_safety_error")
           or validation.get("read_only_error"),
-          f"no rejection mechanism recorded for {cypher!r}: {result}",
+          f"no rejection mechanism recorded for {cypher!r}: {payload}",
         )
         mocked_driver.assert_not_called()
         mocked_post.assert_not_called()
@@ -3176,10 +3214,14 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher='MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
         )
 
-    self.assertEqual(result["status"], "rejected")
+    # Fix round 5: guard rejection is a deliberate 422 via the wrapper-safe
+    # transport, not a bare 500.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
     self.assertIn(
       "dynamic or bracket property access",
-      str((result.get("validation") or {}).get("execution_safety_error")),
+      str((payload.get("validation") or {}).get("execution_safety_error")),
     )
     mocked_driver.assert_not_called()
 
@@ -3254,8 +3296,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(with_v0_11["status"], "ok")
     self.assertTrue(with_v0_11["explained"])
     mocked_driver.assert_not_called()
-    self.assertEqual(without_model_key["status"], "rejected")
-    self.assertFalse(without_model_key["explained"])
+    # Fix round 5: the guard rejection on the v0.10 fallback profile is now a
+    # deliberate 422 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(without_model_key["status_code"], 422)
+    without_model_key_payload = _graph_first_payload(without_model_key)
+    self.assertEqual(without_model_key_payload["status"], "rejected")
+    self.assertFalse(without_model_key_payload["explained"])
 
   def test_explain_graph_rejects_result_columns_that_do_not_match_return_projection(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
@@ -3427,8 +3473,12 @@ class EdgeGuardApiTests(unittest.TestCase):
         execution_result=_serialized_execution(cypher),
       )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+    # Fix round 5: unexpected connection fields in execution-evidence mode
+    # are a malformed request body, 400 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertIn("credential_field_not_allowed", {item["code"] for item in payload["validation_errors"]})
     mocked_driver.assert_not_called()
 
   def test_explain_graph_evidence_mode_rejects_inconsistent_query_and_broadening_flags(self):
@@ -3682,8 +3732,12 @@ class EdgeGuardApiTests(unittest.TestCase):
           execution_result=_serialized_execution(cypher),
           **{field: "should-not-cross"},
         )
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+        # Fix round 5: unexpected connection/credential fields in
+        # execution-evidence mode are a malformed request body, 400.
+        self.assertEqual(result["status_code"], 400)
+        payload = _graph_first_payload(result)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertIn("credential_field_not_allowed", {item["code"] for item in payload["validation_errors"]})
       mocked_driver.assert_not_called()
 
   def test_explain_graph_rejects_invalid_cypher_before_provider_or_driver(self):
@@ -3699,8 +3753,12 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:InternetFacing) RETURN i.hostname AS hostname",
         )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertFalse(result["executed"])
+    # Fix round 5: guard rejection is a deliberate 422 via the wrapper-safe
+    # transport, not a bare 500.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertFalse(payload["executed"])
     mocked_driver.assert_not_called()
     mocked_post.assert_not_called()
 
@@ -4834,6 +4892,295 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
             )
         self.assertIn("error", _graph_first_payload(result))
         self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  # Fix round 5: extends the round-4 wrapper-rule replica
+  # (`_simulated_wrapper_status`) to every remaining `/neo4j_query`,
+  # `prepare_graph_explanation` and `explain_graph` error/rejection path
+  # that carries a top-level `error` key without `status_code` — the exact
+  # shape the platform's FastAPI wrapper turns into a bare HTTP 500.
+
+  ACCEPTED_ROWS_CYPHER = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5"
+  GUARD_REJECTED_CYPHER = "MATCH (i:InternetFacing) RETURN i.hostname AS hostname"
+
+  def test_neo4j_query_every_error_path_resolves_to_a_deliberate_status_code(self):
+    def guard_rejection(plugin):
+      return plugin.neo4j_query(cypher=self.GUARD_REJECTED_CYPHER)
+
+    def bad_connection_override(plugin):
+      # `_resolve_neo4j_connection`: an incomplete override (missing
+      # username/password) is caller input, not a driver failure.
+      return plugin.neo4j_query(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687",
+        scheme="neo4j+s",
+      )
+
+    def bad_uri_scheme(plugin):
+      # `_normalize_neo4j_uri`: a scheme outside `NEO4J_SCHEMES`.
+      return plugin.neo4j_query(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687",
+        username="neo4j",
+        password="secret",
+        scheme="ftp",
+      )
+
+    def driver_missing(plugin):
+      # `GraphDatabase is None` (the neo4j driver package is not installed
+      # in this runtime) — unpatched, matching the module's own default.
+      return plugin.neo4j_query(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687",
+        username="neo4j",
+        password="secret",
+        scheme="bolt+s",
+      )
+
+    cases = (
+      ("guard_rejection", guard_rejection, 422),
+      ("bad_connection_override", bad_connection_override, 400),
+      ("bad_uri_scheme", bad_uri_scheme, 400),
+      ("driver_missing", driver_missing, 503),
+    )
+    for name, make_result, expected_status in cases:
+      with self.subTest(case=name):
+        plugin = _make_api()
+        result = make_result(plugin)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_prepare_graph_explanation_every_error_path_resolves_to_a_deliberate_status_code(self):
+    def empty_cypher(plugin):
+      return plugin.prepare_graph_explanation(cypher="")
+
+    def forwarded_connection_field(plugin):
+      return plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER, username="neo4j")
+
+    def invalid_broadening_type(plugin):
+      return plugin.prepare_graph_explanation(
+        cypher=self.ACCEPTED_ROWS_CYPHER, enable_empty_result_broadening="nope",
+      )
+
+    def invalid_mode_config(plugin):
+      return plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER, explanation_mode="bogus")
+
+    def guard_rejection(plugin):
+      return plugin.prepare_graph_explanation(cypher=self.GUARD_REJECTED_CYPHER)
+
+    def unsafe_projection(plugin):
+      # Reaches the plan's own projection-safety checks (contract §4.3) via
+      # a bracket-property-access candidate the shared guard's own
+      # execution-safety stage may also independently reject; either
+      # mechanism resolves to the same deliberate 422.
+      return plugin.prepare_graph_explanation(
+        cypher='MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
+      )
+
+    def tokenizer_unavailable(plugin_factory):
+      plugin = plugin_factory(
+        graph_first_token_counter=None,
+        edgeguard_explanation_tokenizer_path=None,
+      )
+      return plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER)
+
+    cases = (
+      ("empty_cypher", lambda factory: empty_cypher(factory()), 400),
+      ("forwarded_connection_field", lambda factory: forwarded_connection_field(factory()), 400),
+      ("invalid_broadening_type", lambda factory: invalid_broadening_type(factory()), 400),
+      ("invalid_mode_config", lambda factory: invalid_mode_config(factory()), 400),
+      ("guard_rejection", lambda factory: guard_rejection(factory()), 422),
+      ("unsafe_projection", lambda factory: unsafe_projection(factory()), 422),
+      ("tokenizer_unavailable", tokenizer_unavailable, 503),
+    )
+    for name, run, expected_status in cases:
+      with self.subTest(case=name):
+        result = run(_make_api)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_every_early_error_path_resolves_to_a_deliberate_status_code(self):
+    def empty_cypher(plugin):
+      return plugin.explain_graph(cypher="")
+
+    def empty_request(plugin):
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER, request="")
+
+    def invalid_fields(plugin):
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER, method="carrier-pigeon")
+
+    def invalid_broadening_type(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER, enable_empty_result_broadening="nope",
+      )
+
+    def invalid_mode_config(plugin):
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER, explanation_mode="bogus")
+
+    def guard_rejection(plugin):
+      return plugin.explain_graph(cypher=self.GUARD_REJECTED_CYPHER)
+
+    def tokenizer_unavailable(factory):
+      plugin = factory(graph_first_token_counter=None, edgeguard_explanation_tokenizer_path=None)
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER)
+
+    cases = (
+      ("empty_cypher", lambda: empty_cypher(_make_api()), 400),
+      ("empty_request", lambda: empty_request(_make_api()), 400),
+      ("invalid_fields", lambda: invalid_fields(_make_api()), 400),
+      ("invalid_broadening_type", lambda: invalid_broadening_type(_make_api()), 400),
+      ("invalid_mode_config", lambda: invalid_mode_config(_make_api()), 400),
+      ("guard_rejection", lambda: guard_rejection(_make_api()), 422),
+      ("tokenizer_unavailable", lambda: tokenizer_unavailable(_make_api), 503),
+    )
+    for name, run, expected_status in cases:
+      with self.subTest(case=name):
+        result = run()
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_live_connection_error_paths_resolve_to_a_deliberate_status_code(self):
+    # Fix round 5: the `insight_brief` strategy skips the `eel_compatibility`
+    # explanation-model gate (already wrapper-safe, untouched by this round)
+    # so these cases isolate the live-connection branches this round fixed.
+    def bad_connection_override(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER, uri="override.example:7687", scheme="neo4j+s",
+      )
+
+    def bad_uri_scheme(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687", username="neo4j", password="secret", scheme="ftp",
+      )
+
+    def driver_missing(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687", username="neo4j", password="secret", scheme="bolt+s",
+      )
+
+    cases = (
+      ("bad_connection_override", bad_connection_override, 400),
+      ("bad_uri_scheme", bad_uri_scheme, 400),
+      ("driver_missing", driver_missing, 503),
+    )
+    for name, make_result, expected_status in cases:
+      with self.subTest(case=name):
+        plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+        result = make_result(plugin)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_execution_result_forwarded_connection_field_is_400(self):
+    plugin = _make_api(
+      edgeguard_explanation_model_port=5091,
+      edgeguard_explanation_model="base_qwen3_4b",
+    )
+    result = plugin.explain_graph(
+      cypher=self.ACCEPTED_ROWS_CYPHER,
+      execution_result=_serialized_execution(self.ACCEPTED_ROWS_CYPHER),
+      username="neo4j",
+    )
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertIn("error", payload)
+    self.assertEqual(self._simulated_wrapper_status(result), 400)
+
+  def test_plan_not_ok_status_code_is_popped_from_the_plan_and_never_leaks(self):
+    # Fix round 5: `_prepare_graph_explanation_plan` tags the intended HTTP
+    # status on `_WRAPPER_STATUS_CODE_KEY`; every one of its three callers
+    # (`prepare_graph_explanation`, `explain_graph`'s execution-result and
+    # live branches) must pop it — both when the plan supplies one and when
+    # it falls back to the 422 default — and never let the key reach the
+    # response body.
+    tagged_plan = {
+      "ok": False,
+      "status": "rejected",
+      "error": "forced test rejection",
+      _WRAPPER_STATUS_CODE_KEY: 400,
+    }
+    untagged_plan = {"ok": False, "status": "rejected", "error": "forced test rejection"}
+
+    for plan, expected_status in ((tagged_plan, 400), (untagged_plan, 422)):
+      with self.subTest(tagged=(_WRAPPER_STATUS_CODE_KEY in plan)):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api._prepare_graph_explanation_plan",
+          # Fix round 5 test note: a fresh dict per call — each of the three
+          # call sites below pops `_WRAPPER_STATUS_CODE_KEY` from its own
+          # plan, and a shared `return_value` dict would let the first pop
+          # silently strip it before the next call site ever sees it.
+          side_effect=lambda *args, **kwargs: dict(plan),
+        ):
+          plugin = _make_api(
+            edgeguard_explanation_model_port=5091,
+            edgeguard_explanation_model="base_qwen3_4b",
+          )
+          prepare_result = plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER)
+          execution_result_call = plugin.explain_graph(
+            cypher=self.ACCEPTED_ROWS_CYPHER,
+            execution_result=_serialized_execution(self.ACCEPTED_ROWS_CYPHER),
+          )
+          live_plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+          with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+            with patch.object(live_plugin, "_neo4j_driver"):
+              live_call = live_plugin.explain_graph(
+                cypher=self.ACCEPTED_ROWS_CYPHER,
+                uri="override.example:7687",
+                username="neo4j",
+                password="secret",
+                scheme="bolt+s",
+              )
+
+        for result in (prepare_result, execution_result_call, live_call):
+          self.assertEqual(result["status_code"], expected_status)
+          payload = _graph_first_payload(result)
+          self.assertIn("error", payload)
+          self.assertNotIn(_WRAPPER_STATUS_CODE_KEY, payload)
+          self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_live_forbidden_execution_field_is_422_not_a_bare_500(self):
+    # Fix round 5: EG-013's recursive no-connection-data invariant on the
+    # live-query path — forcing `_forbidden_execution_field` to fire proves
+    # the branch resolves to the deliberate 422 (packet/evidence validation
+    # rejection), not the wrapper's bare 500, without depending on a
+    # specific Cypher shape to organically trigger it.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = _Result([], keys=["value"])
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api._forbidden_execution_field",
+          return_value="password",
+        ):
+          result = plugin.explain_graph(
+            cypher=self.ACCEPTED_ROWS_CYPHER,
+            uri="override.example:7687",
+            username="neo4j",
+            password="secret",
+            scheme="bolt+s",
+          )
+
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertIn("error", payload)
+    self.assertEqual(
+      {item["code"] for item in payload["validation_errors"]},
+      {"credential_field_not_allowed"},
+    )
+    self.assertEqual(self._simulated_wrapper_status(result), 422)
 
 
 class EdgeGuardHealthMetricsTests(unittest.TestCase):
