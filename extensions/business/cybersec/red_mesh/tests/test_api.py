@@ -102,6 +102,9 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", authorized_p
     resolved, denial = plugin._resolve_launch_actor(actor)
     if denial:
       return None, None, denial
+    # As the real admission: a scan endpoint must forward the engagement it launches under.
+    if require_engagement and engagement_id != _engagement()["engagement_id"]:
+      return None, None, {"error": "engagement_required", "status_code": 400, "success": False}
     peers = getattr(plugin, "cfg_chainstore_peers", None)
     if isinstance(peers, (list, tuple)) and peers:
       candidates, error = resolve_active_peers(plugin, selected_peers)
@@ -342,7 +345,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     self._bind_launch_helpers(plugin)
-    defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True)
+    defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True,
+                    engagement_id=_engagement()["engagement_id"])
     defaults.update(kwargs)
     kind = "webapp" if defaults.get("scan_type") == "webapp" else "network"
     _stub_launch_actor(plugin, kind, defaults.get("target_url") if kind == "webapp" else defaults.get("target"),
@@ -354,7 +358,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     self._bind_launch_helpers(plugin)
-    defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True)
+    defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True,
+                    engagement_id=_engagement()["engagement_id"])
     defaults.update(kwargs)
     _stub_launch_actor(plugin, "network", defaults.get("target"), authorized_ports=authorized_ports,
                        engagement=engagement)
@@ -372,6 +377,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       regular_username="user",
       regular_password="pass",
       authorized=True,
+      engagement_id=_engagement("webapp")["engagement_id"],
     )
     defaults.update(kwargs)
     _stub_launch_actor(plugin, "webapp", defaults.get("target_url"), engagement=engagement)
@@ -515,6 +521,22 @@ class TestPhase1ConfigCID(unittest.TestCase):
         plugin = self._build_mock_plugin(job_id="engagement-required")
         self._refused(plugin, launch(plugin, engagement=None, **extra), "engagement_required")
 
+  def test_engagement_id_is_forwarded_by_every_scan_endpoint(self):
+    # Each endpoint passes its engagement_id to admission, and a missing one is refused there.
+    launches = (("network", self._launch_network, {}), ("webapp", self._launch_webapp, {}),
+                ("launch_test network", self._launch, {}),
+                ("launch_test webapp", self._launch, {"scan_type": "webapp", "target": "",
+                                                      "target_url": "https://example.com/app",
+                                                      "regular_username": "user", "regular_password": "pass"}))
+    for name, launch, extra in launches:
+      for engagement_id in (None, "", "en_00000000-0000-4000-8000-000000000009"):
+        with self.subTest(name, engagement_id=engagement_id):
+          plugin = self._build_mock_plugin(job_id="engagement-forwarded")
+          self._refused(plugin, launch(plugin, engagement_id=engagement_id, **extra), "engagement_required")
+      with self.subTest(name, engagement_id="forwarded"):
+        plugin = self._build_mock_plugin(job_id="engagement-forwarded-ok")
+        self.assertNotIn("error", launch(plugin, **extra))
+
   def test_engagement_tests_exceeding_authorization_are_refused(self):
     engagement = {**_engagement("network"), "authorized_tests": ["service_info_common"]}
     plugin = self._build_mock_plugin(job_id="engagement-tests")
@@ -544,7 +566,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
       "_service_info_uncatalogued"]
     _stub_launch_actor(plugin, "network", "192.0.2.10")
     result = PentesterApi01Plugin.launch_network_scan(plugin, target="192.0.2.10", start_port=1, end_port=1024,
-                                                      exceptions="", authorized=True)
+                                                      exceptions="", authorized=True,
+                                                      engagement_id=_engagement()["engagement_id"])
     self._refused(plugin, result, "tests_exceed_authorization",
                   unauthorized_features=["_service_info_uncatalogued"])
 
@@ -1762,8 +1785,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(config_dict["target_confirmation"], "example.com")
     self.assertEqual(config_dict["engagement_id"], "en_00000000-0000-4000-8000-000000000003")
     self.assertEqual(config_dict["authorized_tests"], ["graybox"])
-    for legacy in ("engagement_metadata", "target_allowlist"):
-      self.assertNotIn(legacy, config_dict)
+    self.assertNotIn("engagement_metadata", config_dict)
+    # The node's configured allowlist still reaches the worker, which enforces its path scopes.
+    self.assertEqual(config_dict["target_allowlist"], ["example.com", "/api/"])
     self.assertEqual((config_dict["scope_id"], config_dict["authorization_ref"]), ("", ""))
     audit_payload = plugin._log_audit_event.call_args[0][1]
     self.assertEqual(audit_payload["engagement_id"], "en_00000000-0000-4000-8000-000000000003")
@@ -1957,11 +1981,13 @@ class TestPhase1ConfigCID(unittest.TestCase):
       patcher.start()
       self.addCleanup(patcher.stop)
 
-    network = PentesterApi01Plugin.launch_test(plugin, target="192.0.2.10", authorized=True, scan_type="network")
+    network = PentesterApi01Plugin.launch_test(plugin, target="192.0.2.10", authorized=True, scan_type="network",
+                                               engagement_id=_engagement()["engagement_id"])
     # Each launch is admitted against its own asset, and a webapp asset is a URL.
     _stub_launch_actor(plugin, "webapp", "https://example.com/app")
     # A bound webapp launch names its destination once: `target` beside `target_url` is refused.
     webapp = PentesterApi01Plugin.launch_test(plugin,
+      engagement_id=_engagement()["engagement_id"],
       target_url="https://example.com/app",
       official_username="admin",
       official_password="secret",

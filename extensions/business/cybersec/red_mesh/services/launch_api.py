@@ -1169,6 +1169,9 @@ def announce_launch(
     created_by_id=created_by_id or "",
     authorized=True,
     target_confirmation=target_confirmation,
+    # The node's configured allowlist (never request input since RM-095): the graybox worker
+    # enforces its path scopes at runtime (`GrayboxHttpClient(allowlist=...)`).
+    target_allowlist=target_allowlist,
     safety_policy=safety_policy,
     scan_type=scan_type,
     target_url=target_url,
