@@ -695,6 +695,12 @@ class TenantAdministrationService:
     return {"tenantId": tenant_id, "nodeAddress": node_address, "active": active}
 
   @_endpoint
+  def authorize_platform(self, actor):
+    """RM-095. The caller is a full-portfolio Super-Tenant Admin; the contract calls do their
+    storage I/O outside this lock after it."""
+    return {"accountId": self._actor(actor, creator=True).account_id}
+
+  @_endpoint
   def check_tenant_domain(self, actor, domain_id):
     self._actor(actor, creator=True)
     return {"available": self.store.get("domain", _domain(domain_id)) is None}
