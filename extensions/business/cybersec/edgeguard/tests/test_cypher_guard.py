@@ -645,6 +645,68 @@ class GuardHardeningTests(unittest.TestCase):
         analysis = self._analysis(cypher)
         self.assertTrue(analysis["accepted"], f"{cypher!r}: {analysis['validation_feedback']}")
 
+  def test_rejects_where_pattern_predicate_introducing_a_new_variable(self):
+    # Fix round 3, L2b: Neo4j rejects a bare pattern in `WHERE` that
+    # introduces a variable no earlier `MATCH` bound
+    # (`Neo.ClientError.Statement.SyntaxError: PatternExpressions are not
+    # allowed to introduce new variables`); the guard must reject it first,
+    # naming the new variable and pointing at the fix.
+    cypher = (
+      "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(cvss:CVSSv31) WHERE c.cve_id IN ['CVE-2024-99999'] "
+      "AND (c)-[:EXPLOITS]->(i:Indicator) AND i.value STARTS WITH '203.0.113.' "
+      "RETURN p ORDER BY cvss.base_score DESC LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("'i'", analysis["validation_feedback"])
+    self.assertIn("MATCH", analysis["validation_feedback"])
+    self.assertIn("EXISTS", analysis["validation_feedback"])
+
+  def test_rejects_where_pattern_predicate_introducing_a_new_relationship_variable(self):
+    # Same rule for a relationship variable, not just a node variable.
+    cypher = (
+      "MATCH (c:CVE) WHERE (c)-[rel:EXPLOITS]->(:Indicator) RETURN c LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("'rel'", analysis["validation_feedback"])
+
+  def test_where_pattern_predicate_reusing_only_bound_variables_is_accepted(self):
+    # `(c)-[:EXPLOITS]->(cvss)` reuses two variables both already bound by
+    # the `MATCH` clause — no new variable, so this is legitimate Cypher.
+    cypher = (
+      "MATCH (c:CVE), (cvss:CVSSv31) WHERE (c)-[:HAS_CVSS_v31]->(cvss) RETURN c, cvss LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_exists_subquery_is_exempt_and_may_bind_its_own_new_variable(self):
+    cypher = (
+      "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(cvss:CVSSv31) WHERE c.cve_id IN ['CVE-2024-99999'] "
+      "AND EXISTS { MATCH (c)-[:EXPLOITS]->(i:Indicator) WHERE i.value STARTS WITH '203.0.113.' } "
+      "RETURN p ORDER BY cvss.base_score DESC LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_count_subquery_is_also_exempt(self):
+    cypher = (
+      "MATCH (c:CVE) WHERE COUNT { MATCH (c)-[:EXPLOITS]->(i:Indicator) } > 0 "
+      "RETURN c LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_where_pattern_predicate_check_runs_for_the_v0_11_profile_too(self):
+    cypher = (
+      "MATCH (c:CVE) WHERE (c)-[:EXPLOITS]->(i:Indicator) RETURN c LIMIT 5"
+    )
+    analysis = analyze_generated_cypher(
+      cypher, allowed=None, max_limit=100, allow_limit_optional_graph=True, enforce_hop_bounds=True,
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("'i'", analysis["validation_feedback"])
+
 
 class HopBoundsV0_11Tests(unittest.TestCase):
   """Contract §4.1 carry-over: at most three relationship hops per pattern;

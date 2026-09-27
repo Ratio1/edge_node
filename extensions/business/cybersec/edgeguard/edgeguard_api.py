@@ -89,6 +89,20 @@ except Exception:  # pragma: no cover - exercised through dependency-missing tes
   READ_ACCESS = "READ"
 
 try:
+  # Fix round 3, L2a: `neo4j.exceptions.ClientError` (and its subclasses,
+  # e.g. `CypherSyntaxError`) is the Neo4j driver's signal that the server
+  # rejected the Cypher itself (syntax, type, constraint) — the caller's
+  # fault, not a connection/timeout failure. `/neo4j_query` and
+  # `explain_graph` give this family a distinct `error_code` instead of
+  # falling through to the generic exception branch.
+  from neo4j.exceptions import ClientError as Neo4jClientError
+except Exception:  # pragma: no cover - exercised through dependency-missing tests.
+  class Neo4jClientError(Exception):
+    """Placeholder when `neo4j` (or its `exceptions` submodule) is not
+    installed: the real driver never raises this placeholder, so the
+    dedicated except clause below simply never matches on such a host."""
+
+try:
   import websocket
 except Exception:  # pragma: no cover - exercised through dependency-missing tests.
   websocket = None
@@ -3849,6 +3863,7 @@ class EdgeguardApiPlugin(BasePlugin):
     raw_output: str,
     normalized_request: str,
     retained_closed_vocabulary_literals: Optional[frozenset] = None,
+    use_v0_11: bool = True,
   ) -> Dict[str, Any]:
     """Contract §3.2, plus the correction-turn retention rule: a
     closed-vocabulary literal grounded on an earlier attempt (even one the
@@ -3856,7 +3871,18 @@ class EdgeguardApiPlugin(BasePlugin):
     literal) may not silently disappear from a later correction attempt.
     `retained_closed_vocabulary_literals` is the running set the caller
     (`generate`'s retry loop) accumulates from this method's
-    `grounded_closed_vocabulary_literals` output key across attempts."""
+    `grounded_closed_vocabulary_literals` output key across attempts.
+
+    `use_v0_11` (fix round 3, L1): the v0.10 fine-tuned profile was trained
+    on the pre-v0.11 rejection sentence ("The query introduced a literal
+    value or filter that was not present in the user request. Remove
+    unrequested WHERE filters and return the requested unfiltered graph
+    pattern."); dropping it for a bare `Literal 'X' (class) is not in the
+    request.` left the model without an instruction it recognised, and it
+    repeated the same rejected Cypher on every retry. `use_v0_11=False`
+    prepends that sentence verbatim, followed by the named literal(s);
+    `use_v0_11=True` (the v0.11 profile default) appends a concise
+    equivalent instruction after the named literal(s)."""
     if not validation.get("accepted"):
       return validation
     candidate = validation.get("accepted_cypher") or validation.get("candidate") or raw_output
@@ -3909,6 +3935,19 @@ class EdgeguardApiPlugin(BasePlugin):
       "not be removed."
       for literal in sorted(missing_retained)
     )
+    if unrequested:
+      if use_v0_11:
+        feedback_lines.append(
+          "Remove the WHERE condition or property filter using each literal named above and "
+          "return the requested pattern without it."
+        )
+      else:
+        feedback_lines.insert(
+          0,
+          "The query introduced a literal value or filter that was not present in the user "
+          "request. Remove unrequested WHERE filters and return the requested unfiltered "
+          "graph pattern.",
+        )
     return {
       **validation,
       "accepted": False,
@@ -4117,6 +4156,7 @@ class EdgeguardApiPlugin(BasePlugin):
             raw_output,
             normalized_request,
             retained_closed_vocabulary_literals,
+            use_v0_11=use_v0_11_schema,
           )
           retained_closed_vocabulary_literals |= set(
             validation.get("grounded_closed_vocabulary_literals") or []
@@ -5633,6 +5673,26 @@ class EdgeguardApiPlugin(BasePlugin):
           "row_bound": row_limit,
         },
       }
+    except Neo4jClientError as exc:
+      # Fix round 3, L2a: a query the guard accepted can still be rejected
+      # by Neo4j itself (syntax, type or constraint error) — the caller's
+      # fault, not a connection/timeout failure. `error_code` names this
+      # family distinctly so the response is never mistaken for one of the
+      # generic driver failures below.
+      return {
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_client_error",
+        "validation": validation,
+        "metrics": {
+          "connect_ms": round((time.monotonic() - started) * 1000, 1),
+          "query_ms": 0.0,
+          "total_ms": round((time.monotonic() - started) * 1000, 1),
+          "row_bound": row_limit,
+        },
+      }
     except Exception as exc:
       return {
         "status": STATUS_ERROR,
@@ -6393,6 +6453,24 @@ class EdgeguardApiPlugin(BasePlugin):
           live_retry=live_retry,
         )
       return success
+    except Neo4jClientError as exc:
+      # Fix round 3, L2a: same distinct error code as `/neo4j_query` — a
+      # query the guard accepted can still be rejected by Neo4j itself
+      # (syntax, type or constraint error), the caller's fault, not a
+      # connection/timeout failure.
+      return {
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_client_error",
+        "validation": analysis,
+        "metrics": {
+          "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
+          "server_total_ms": round((time.monotonic() - started) * 1000, 1),
+        },
+      }
     except Exception as exc:
       return {
         "status": STATUS_ERROR,

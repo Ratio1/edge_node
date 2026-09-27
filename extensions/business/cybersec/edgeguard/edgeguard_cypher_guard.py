@@ -363,6 +363,29 @@ _MATCH_CLAUSE_BOUNDARY = re.compile(
   r"\b(?:OPTIONAL\s+MATCH|MATCH|WHERE|WITH|RETURN|UNWIND|ORDER\s+BY|SKIP|LIMIT|UNION|CALL)\b",
   re.I,
 )
+# Fix round 3, L2b: a pattern predicate inside `WHERE` (a bare pattern used
+# as a boolean expression, not a `MATCH`) may only reference variables an
+# earlier `MATCH`/`OPTIONAL MATCH` already bound — Neo4j itself rejects one
+# that introduces a new node or relationship variable
+# (`Neo.ClientError.Statement.SyntaxError: PatternExpressions are not
+# allowed to introduce new variables`). `EXISTS { MATCH ... }` /
+# `COUNT { MATCH ... }` subqueries are exempt: they bind their own new
+# variables legitimately, so their `{ ... }` body is blanked out before the
+# bare-pattern search below runs.
+_WHERE_CLAUSE_START = re.compile(r"\bWHERE\b", re.I)
+_SUBQUERY_PREDICATE_OPEN = re.compile(r"\b(?:EXISTS|COUNT)\s*\{", re.I)
+_NODE_VAR_HEAD = re.compile(r"\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+_REL_VAR_HEAD = re.compile(r"\[\s*([A-Za-z_][A-Za-z0-9_]*)")
+# One or more chained hops, each a node pattern followed by a relationship
+# bracket and another node pattern (`(a)-[...]->(b)`, optionally continuing
+# `-[...]->(c)` ...). A lone parenthesised group with no relationship after
+# it (a boolean sub-expression such as `(a.x = 1 OR a.y = 2)`) never
+# matches: the mandatory `\[...\]` hop is what makes this a pattern.
+_WHERE_PATTERN_CHAIN = re.compile(
+  r"\(\s*[A-Za-z_]?[A-Za-z0-9_]*\s*(?::[^()]*)?\)"
+  r"(?:\s*<?-\s*\[[^\]]*\]\s*-?>?\s*"
+  r"\(\s*[A-Za-z_]?[A-Za-z0-9_]*\s*(?::[^()]*)?\))+"
+)
 
 
 class EdgeGuardCypherGuardError(Exception):
@@ -949,6 +972,76 @@ def _unlabeled_comma_pattern_error(chains: list[str]) -> str | None:
   return None
 
 
+def _match_bound_variables(chains: list[str]) -> set[str]:
+  """Every node and relationship variable name bound by a `MATCH`/`OPTIONAL
+  MATCH` pattern chain (fix round 3, L2b)."""
+  bound: set[str] = set()
+  for chain in chains:
+    bound.update(match.group(1) for match in _NODE_VAR_HEAD.finditer(chain))
+    bound.update(match.group(1) for match in _REL_VAR_HEAD.finditer(chain))
+  return bound
+
+
+def _where_clause_texts(stripped: str) -> list[str]:
+  """The text of every top-level `WHERE` clause (analysis-view text): from
+  the keyword to the next top-level clause keyword (fix round 3, L2b)."""
+  texts: list[str] = []
+  for start in _WHERE_CLAUSE_START.finditer(stripped):
+    tail = stripped[start.end():]
+    boundary = _MATCH_CLAUSE_BOUNDARY.search(tail)
+    texts.append(tail[:boundary.start()] if boundary else tail)
+  return texts
+
+
+def _mask_subquery_predicate_blocks(text: str) -> str:
+  """Blank out every `EXISTS { ... }` / `COUNT { ... }` span (balanced
+  braces), so the bare-pattern-predicate search below never looks inside a
+  Cypher subquery expression — it legitimately binds its own new variables
+  via its own `MATCH` (fix round 3, L2b)."""
+  chars = list(text)
+  for open_match in _SUBQUERY_PREDICATE_OPEN.finditer(text):
+    depth = 0
+    brace_start = open_match.end() - 1
+    for pos in range(brace_start, len(text)):
+      if text[pos] == "{":
+        depth += 1
+      elif text[pos] == "}":
+        depth -= 1
+        if depth == 0:
+          for blank_pos in range(open_match.start(), pos + 1):
+            chars[blank_pos] = " "
+          break
+  return "".join(chars)
+
+
+def _where_pattern_predicate_new_variable_error(stripped: str, chains: list[str]) -> str | None:
+  """Fix round 3, L2b: Neo4j rejects a `WHERE` pattern predicate (a bare
+  pattern used as a boolean expression, not a `MATCH`) that introduces a
+  node or relationship variable no earlier `MATCH` bound
+  (`Neo.ClientError.Statement.SyntaxError: PatternExpressions are not
+  allowed to introduce new variables`); the guard previously accepted such
+  a query and Neo4j rejected it at execution. Checked for every profile,
+  since Neo4j enforces this regardless. `EXISTS { MATCH ... }` /
+  `COUNT { MATCH ... }` subqueries are exempt (masked out first): they bind
+  their own new variables legitimately."""
+  bound = _match_bound_variables(chains)
+  for where_text in _where_clause_texts(stripped):
+    masked = _mask_subquery_predicate_blocks(where_text)
+    for chain_match in _WHERE_PATTERN_CHAIN.finditer(masked):
+      chain_text = chain_match.group(0)
+      new_variables = sorted({
+        *(match.group(1) for match in _NODE_VAR_HEAD.finditer(chain_text)),
+        *(match.group(1) for match in _REL_VAR_HEAD.finditer(chain_text)),
+      } - bound)
+      if new_variables:
+        names = ", ".join(f"'{name}'" for name in new_variables)
+        return (
+          f"pattern predicate in WHERE introduces variable(s) {names} that no earlier MATCH "
+          "bound; move the pattern into MATCH or use EXISTS { MATCH ... }"
+        )
+  return None
+
+
 def _variable_length_bound_error(stripped: str, max_hops: int | None) -> str | None:
   """Every variable-length relationship spec must carry an explicit upper
   bound (`*3`, `*..3`, `*1..3`); bare `*` and an open-ended `*1..` are
@@ -1040,7 +1133,10 @@ def _execution_safety_error(
   variable-length upper bounds and per-pattern hop counts at
   `MAX_PATTERN_HOPS`. The unbounded-variable-length rejection itself and the
   comma-pattern-with-unlabeled-node rejection run for every profile
-  regardless (X1, pre-existing gap; v0.10 behaviour is otherwise unchanged)."""
+  regardless (X1, pre-existing gap; v0.10 behaviour is otherwise unchanged).
+  So does the `WHERE` pattern-predicate-introduces-a-new-variable rejection
+  (fix round 3, L2b) — Neo4j rejects that shape outright, regardless of
+  profile."""
   stripped = _analysis_text(candidate)
   if CYPHER_COMMENT.search(stripped):
     return "comments are not allowed"
@@ -1061,6 +1157,9 @@ def _execution_safety_error(
   unlabeled_comma_error = _unlabeled_comma_pattern_error(chains)
   if unlabeled_comma_error:
     return unlabeled_comma_error
+  where_pattern_error = _where_pattern_predicate_new_variable_error(stripped, chains)
+  if where_pattern_error:
+    return where_pattern_error
   if enforce_hop_bounds:
     hop_count_error = _pattern_hop_count_error(chains, MAX_PATTERN_HOPS)
     if hop_count_error:

@@ -58,6 +58,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_SERVER_MAX_ROWS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jClientError  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _neo4j_row_json_safe  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
@@ -4574,6 +4575,40 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
     self.assertFalse(result["ok"])
     self.assertNotIn("secret", json.dumps(result))
 
+  def test_neo4j_client_error_returns_structured_status_error_not_a_500(self):
+    # Fix round 3, L2a: a Neo4j client/syntax error (accepted by the guard,
+    # rejected by Neo4j itself) must come back as a structured `status:
+    # error` with a distinct `error_code`, never let the driver's exception
+    # escape `/neo4j_query` uncaught.
+    plugin = _make_api()
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = Neo4jClientError(
+      "{code: Neo.ClientError.Statement.SyntaxError} {message: PatternExpressions are not "
+      "allowed to introduce new variables: 'i'.}"
+    )
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          cypher=(
+            "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(cvss:CVSSv31) WHERE c.cve_id IN ['CVE-2024-99999'] "
+            "AND EXISTS { MATCH (c)-[:EXPLOITS]->(i:Indicator) WHERE i.value STARTS WITH '203.0.113.' } "
+            "RETURN p ORDER BY cvss.base_score DESC LIMIT 5"
+          ),
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+        )
+
+    self.assertEqual(result["status"], "error")
+    self.assertFalse(result["ok"])
+    self.assertEqual(result["error_code"], "neo4j_client_error")
+    self.assertIn("PatternExpressions", result["error"])
+
   def test_prepared_execution_rejects_nested_connection_fields(self):
     plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
     cypher = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10"
@@ -4630,6 +4665,40 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
     self.assertEqual(provider_calls, [])
     self.assertFalse(result.get("explained"))
     self.assertIn("credential_field_not_allowed", serialized)
+
+  def test_explain_graph_neo4j_client_error_returns_structured_status_error(self):
+    # Fix round 3, L2a: the explain route shares `_run_neo4j_query` with
+    # `/neo4j_query` and must give the same distinct `error_code` for a
+    # Neo4j client/syntax error, never let it escape as an unhandled 500.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _fake_session = _driver_with_results(
+      Neo4jClientError(
+        "{code: Neo.ClientError.Statement.SyntaxError} {message: PatternExpressions are not "
+        "allowed to introduce new variables: 'i'.}"
+      ),
+    )
+
+    provider_calls = []
+    plugin._graph_first_provider_for_tests = lambda payload: provider_calls.append(payload)
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Explain the returned graph.",
+          cypher=(
+            "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(cvss:CVSSv31) WHERE c.cve_id IN ['CVE-2024-99999'] "
+            "AND EXISTS { MATCH (c)-[:EXPLOITS]->(i:Indicator) WHERE i.value STARTS WITH '203.0.113.' } "
+            "RETURN p ORDER BY cvss.base_score DESC LIMIT 5"
+          ),
+        )
+
+    self.assertEqual(result["status"], "error")
+    self.assertFalse(result["ok"])
+    self.assertEqual(result["error_code"], "neo4j_client_error")
+    self.assertEqual(provider_calls, [])
 
 
 class EdgeGuardHealthMetricsTests(unittest.TestCase):
@@ -4773,8 +4842,73 @@ class LiteralGroundingGuardTests(unittest.TestCase):
     self.assertIsNone(result["accepted_cypher"])
     self.assertEqual(
       result["validation_feedback"],
+      "Literal 'CISA Vuls' (free) is not in the request.\n"
+      "Remove the WHERE condition or property filter using each literal named above and "
+      "return the requested pattern without it.",
+    )
+
+  def test_v0_11_profile_names_the_literal_and_gives_an_actionable_instruction(self):
+    # Fix round 3, L1: naming the literal alone is not actionable enough —
+    # the v0.11 profile gets a concise instruction appended after the named
+    # literal(s), same default as the call above with `use_v0_11` explicit.
+    plugin = _make_api()
+    cypher = "MATCH (c:CVE) WHERE c.cisa_vulnerability_name = 'CISA Vuls' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me CVE details for this vulnerability.",
+      use_v0_11=True,
+    )
+
+    self.assertFalse(result["accepted"])
+    self.assertIn("Literal 'CISA Vuls' (free) is not in the request.", result["validation_feedback"])
+    self.assertIn("Remove the WHERE condition or property filter", result["validation_feedback"])
+
+  def test_v0_10_profile_keeps_the_pre_v0_11_instruction_sentence_verbatim(self):
+    # Fix round 3, L1 (2 of 20 questions regressed live on edg3): the v0.10
+    # fine-tuned model was trained on this exact sentence; the bare
+    # `Literal 'X' (class) is not in the request.` left it without an
+    # instruction it recognised and it repeated the same rejected Cypher on
+    # every retry attempt. `use_v0_11=False` restores the sentence verbatim,
+    # followed by the named literal(s).
+    plugin = _make_api()
+    cypher = "MATCH (c:CVE) WHERE c.cisa_vulnerability_name = 'CISA Vuls' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me CVE details for this vulnerability.",
+      use_v0_11=False,
+    )
+
+    self.assertFalse(result["accepted"])
+    self.assertEqual(
+      result["validation_feedback"],
+      "The query introduced a literal value or filter that was not present in the user "
+      "request. Remove unrequested WHERE filters and return the requested unfiltered "
+      "graph pattern.\n"
       "Literal 'CISA Vuls' (free) is not in the request.",
     )
+
+  def test_v0_10_profile_names_every_literal_after_the_verbatim_sentence(self):
+    plugin = _make_api()
+    cypher = (
+      "MATCH (i:Indicator) WHERE i.value = '203.0.113.5' AND i.source = 'CISA Vuls' "
+      "RETURN i LIMIT 5"
+    )
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me indicators.",
+      use_v0_11=False,
+    )
+
+    self.assertFalse(result["accepted"])
+    lines = result["validation_feedback"].splitlines()
+    self.assertEqual(
+      lines[0],
+      "The query introduced a literal value or filter that was not present in the user "
+      "request. Remove unrequested WHERE filters and return the requested unfiltered "
+      "graph pattern.",
+    )
+    self.assertIn("Literal '203.0.113.5' (free) is not in the request.", lines[1:])
+    self.assertIn("Literal 'CISA Vuls' (free) is not in the request.", lines[1:])
 
   def test_shared_vector_file_accept_and_reject_cases(self):
     plugin = _make_api()
@@ -4899,6 +5033,53 @@ class LiteralGroundingGuardTests(unittest.TestCase):
     self.assertIn("ipv4", result["attempts"][1]["validation_feedback"])
     self.assertIn("must not be removed", result["attempts"][1]["validation_feedback"])
     self.assertTrue(result["attempts"][2]["accepted"])
+
+  def test_generate_rejection_feedback_keeps_the_pre_v0_11_sentence_on_the_v0_10_profile(self):
+    # Fix round 3, L1: through `generate()`'s retry loop, not just the guard
+    # method directly, the v0.10 (`direct_cypher`) profile's rejection
+    # feedback must include the verbatim pre-v0.11 instruction sentence the
+    # fine-tuned model was trained on, not just the bare literal name.
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+
+    def _response(cypher):
+      return _Response(payload={
+        "result": {
+          "TEXT_RESPONSE": cypher,
+          "FULL_OUTPUT": {
+            "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 12},
+          },
+        },
+      })
+
+    rejected_cypher = (
+      "MATCH (i:Indicator) WHERE i.value = '203.0.113.5' AND m.name = 'Fixture Malware' "
+      "RETURN i.value AS value LIMIT 10"
+    )
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [_response(rejected_cypher)] * 4
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(
+        request="Show me indicators.", model_key=PRIVATE_MODEL_KEY,
+      )
+
+    self.assertFalse(result["accepted"])
+    feedback = result["attempts"][0]["validation_feedback"]
+    self.assertIn(
+      "The query introduced a literal value or filter that was not present in the user "
+      "request. Remove unrequested WHERE filters and return the requested unfiltered "
+      "graph pattern.",
+      feedback,
+    )
+    self.assertIn("Literal '203.0.113.5' (free) is not in the request.", feedback)
+    self.assertIn("Literal 'Fixture Malware' (free) is not in the request.", feedback)
 
 
 class V0_11GenerateRuntimeTests(unittest.TestCase):
