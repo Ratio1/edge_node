@@ -29,8 +29,11 @@ from .edgeguard_cypher_guard import (
   DEFAULT_SCHEMA_RETRY_LIMIT,
   EDGEGUARD_SCHEMA,
   EDGEGUARD_SCHEMA_V0_11,
+  RESULT_SHAPE_GRAPH,
+  RESULT_SHAPE_OTHER,
   RESULT_SHAPE_RANKED_PROJECTION,
   SCHEMA_VERSION,
+  SCHEMA_VERSION_V0_11,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,
   build_direct_cypher_system_prompt,
@@ -42,8 +45,18 @@ from .edgeguard_cypher_guard import (
   classify_result_shape,
   derive_ranking_rule,
   normalize_user_literal_text,
+  schema_sets,
 )
 from . import literal_classes
+
+# Contract §3.2 (review finding 7, S8): "the dataset validator and the guard
+# import it, and both pin its sha in their reports" — the API side of that
+# pin, read fresh at import time (never hand-copied) so it always matches
+# the module actually running; a test re-verifies the file has not silently
+# drifted from what `/prompt_contract` reports.
+with open(literal_classes.__file__, "rb") as _literal_classes_fh:
+  LITERAL_CLASSES_SHA256 = hashlib.sha256(_literal_classes_fh.read()).hexdigest()
+
 from .graph_first_explanation import (
   COVERAGE_VERSION,
   GraphFirstContractError,
@@ -3649,21 +3662,41 @@ class EdgeguardApiPlugin(BasePlugin):
     suffix = profile.get("system_prompt_suffix")
     if isinstance(suffix, str) and suffix:
       system_prompt += suffix
-    user_prompt = normalized_request
-    if retry_index:
-      user_prompt = _correction_prompt_for_profile(
-        profile["name"],
-        normalized_request=normalized_request,
-        rejected_cypher=rejected_cypher or "",
-        validation_feedback=validation_feedback or "The previous output failed validation.",
-        retry_index=retry_index,
-        retry_limit=retry_limit,
-      )
+    if not retry_index:
+      if profile.get("single_user_message"):
+        return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{normalized_request}"}]
+      return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": normalized_request},
+      ]
+    correction_prompt = _correction_prompt_for_profile(
+      profile["name"],
+      normalized_request=normalized_request,
+      rejected_cypher=rejected_cypher or "",
+      validation_feedback=validation_feedback or "The previous output failed validation.",
+      retry_index=retry_index,
+      retry_limit=retry_limit,
+    )
     if profile.get("single_user_message"):
-      return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{user_prompt}"}]
+      # v0.10 profile, unchanged: the correction turn re-embeds the original
+      # request and the whole schema itself (`build_schema_correction_prompt`),
+      # so a single combined user message stays a faithful conversation.
+      return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{correction_prompt}"}]
+    if profile["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
+      # Contract §5.2 (review finding 2, S3=Q1): the v0.11 correction turn
+      # itself carries only the attempt index, the rejected Cypher, the
+      # feedback and the output rule — no schema, no original request — on
+      # the premise that both are already in the conversation. Restore that
+      # premise: [system, user:request, assistant:rejected, user:correction].
+      return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": normalized_request},
+        {"role": "assistant", "content": rejected_cypher or ""},
+        {"role": "user", "content": correction_prompt},
+      ]
     return [
       {"role": "system", "content": system_prompt},
-      {"role": "user", "content": user_prompt},
+      {"role": "user", "content": correction_prompt},
     ]
 
   def _configured_model_keys(self) -> list[str]:
@@ -3976,6 +4009,21 @@ class EdgeguardApiPlugin(BasePlugin):
     # for an unrelated reason.
     retained_closed_vocabulary_literals: set = set()
     llm_model = model.get("model_file")
+    # Contract §1/§4.1 (review finding 1): the v0.11 profile validates
+    # against the v0.11 artifact's derived flat sets (labels, relationship
+    # types, properties, including the topology surface) instead of the
+    # v0.10 `EDGEGUARD_SCHEMA`, and its `graph`-shape candidates may omit
+    # `LIMIT` (the runtime bounds rows instead). Every other profile is
+    # unaffected: `allowed=None`/`allow_limit_optional_graph=False` keep
+    # `analyze_generated_cypher`'s v0.10 defaults exactly.
+    profile = self._prompt_profile(selected_key)
+    use_v0_11_schema = profile["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
+    guard_schema_allowed = schema_sets(EDGEGUARD_SCHEMA_V0_11) if use_v0_11_schema else None
+    response_schema_version = SCHEMA_VERSION_V0_11 if use_v0_11_schema else SCHEMA_VERSION
+    response_schema_surface = (
+      canonical_schema_surface(EDGEGUARD_SCHEMA_V0_11) if use_v0_11_schema
+      else canonical_schema_surface()
+    )
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
         remaining = deadline - time.monotonic()
@@ -3992,7 +4040,13 @@ class EdgeguardApiPlugin(BasePlugin):
         raw_output, llm_model, timing_ms, completion = self._call_generation_model(
           url, messages, model, timeout=remaining,
         )
-        validation = analyze_generated_cypher(raw_output, max_limit=int(self.cfg_neo4j_max_rows))
+        validation = analyze_generated_cypher(
+          raw_output,
+          allowed=guard_schema_allowed,
+          max_limit=int(self.cfg_neo4j_max_rows),
+          allow_limit_optional_graph=use_v0_11_schema,
+        )
+        validation["result_shape"] = classify_result_shape(validation.get("candidate") or raw_output)
         if completion.get("finish_reason") != "stop":
           validation = {
             **validation,
@@ -4013,6 +4067,25 @@ class EdgeguardApiPlugin(BasePlugin):
           retained_closed_vocabulary_literals |= set(
             validation.get("grounded_closed_vocabulary_literals") or []
           )
+          # Contract §4.3: `other` (scalar-only, mixed graph and scalar,
+          # unbounded projections) is rejected for model output on the v0.11
+          # profile — the operator `/neo4j_query` route allows it.
+          if (
+            use_v0_11_schema
+            and validation.get("accepted")
+            and validation.get("result_shape") == RESULT_SHAPE_OTHER
+          ):
+            validation = {
+              **validation,
+              "accepted": False,
+              "accepted_cypher": None,
+              "validation_feedback": (
+                "Query shape 'other' (scalar-only, mixed graph and scalar, or an unbounded "
+                "projection) is not accepted for model output; return a graph query "
+                "(MATCH p=... RETURN p [LIMIT k]) or a ranked_projection query "
+                "(MATCH ... ORDER BY ... RETURN ... LIMIT k)."
+              ),
+            }
         attempt = {
           "attempt": attempt_index,
           "kind": "initial" if attempt_index == 0 else "schema_correction",
@@ -4023,6 +4096,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "read_only_static": bool(validation.get("read_only_static")),
           "schema_compatible": bool(validation.get("schema_compatible")),
           "schema_unknown": validation.get("schema_unknown") or {},
+          "result_shape": validation.get("result_shape"),
           "invented_temporal_properties": validation.get("invented_temporal_properties") or [],
           "validation_feedback": validation.get("validation_feedback") or "",
           "prompt_messages": messages,
@@ -4049,7 +4123,10 @@ class EdgeguardApiPlugin(BasePlugin):
             "prompt_profile_id": model.get("prompt_profile_id"),
             "prompt_messages": messages,
             "provider": "llm_inference_api",
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": response_schema_version,
+            "cypher_schema_version": response_schema_version,
+            "schema_surface": response_schema_surface,
+            "validation": {"result_shape": validation.get("result_shape")},
             "metrics": {
               "edgeguard_api_ms": round(max(0.0, total_ms - llm_ms), 1),
               "llm_inference_ms": llm_ms,
@@ -4083,7 +4160,10 @@ class EdgeguardApiPlugin(BasePlugin):
         "model_metadata": model,
         "prompt_profile_id": model.get("prompt_profile_id"),
         "provider": "llm_inference_api",
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": response_schema_version,
+        "cypher_schema_version": response_schema_version,
+        "schema_surface": response_schema_surface,
+        "validation": {"result_shape": validation.get("result_shape")},
         "validation_feedback": last_feedback,
         "metrics": {
           "edgeguard_api_ms": round(max(0.0, total_ms - llm_ms), 1),
@@ -4915,6 +4995,7 @@ class EdgeguardApiPlugin(BasePlugin):
         retry_index=1,
         retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
       )
+      is_v0_11 = profile["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],
@@ -4923,6 +5004,18 @@ class EdgeguardApiPlugin(BasePlugin):
         "system_prompt_sha256": _sha256_text(system_prompt),
         "correction_prompt_sha256": _sha256_text(correction_prompt),
         "expected_output": profile["prompt_contract"],
+        # Contract §1/§3.2 (review finding 7, S8): the v0.11 profile reports
+        # the v0.11 artifact's own schema_version/schema_surface here (the
+        # top-level `cypher_schema_version`/`schema_surface` fields below
+        # stay the v0.10 default view); every profile pins the guard's
+        # `literal_classes.py` module sha, since the literal-grounding guard
+        # reads it regardless of profile (contract §3.2: "both pin its sha
+        # in their reports").
+        "cypher_schema_version": SCHEMA_VERSION_V0_11 if is_v0_11 else SCHEMA_VERSION,
+        "schema_surface": (
+          canonical_schema_surface(EDGEGUARD_SCHEMA_V0_11) if is_v0_11 else canonical_schema_surface()
+        ),
+        "literal_classes_sha256": LITERAL_CLASSES_SHA256,
       })
     return {
       "schema_version": "edgeguard.prompt_contract.v1",
@@ -5294,16 +5387,34 @@ class EdgeguardApiPlugin(BasePlugin):
     method: Optional[str] = None,
     max_rows: Optional[int] = None,
     enable_empty_result_broadening: Optional[bool] = None,
+    model_key: Optional[str] = None,
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
-    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
+    # Contract §1 (review finding 1): `/neo4j_query` is the operator route —
+    # no profile of its own — so it picks the v0.11 artifact's derived flat
+    # sets only when the caller names a configured v0.11 model/profile;
+    # otherwise it keeps validating against the v0.10 `EDGEGUARD_SCHEMA`
+    # exactly as before. The choice is stated back in `validation.schema_version`.
+    use_v0_11_schema = (
+      isinstance(model_key, str)
+      and bool(model_key.strip())
+      and self._prompt_profile(model_key)["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
+    )
+    guard_schema_allowed = schema_sets(EDGEGUARD_SCHEMA_V0_11) if use_v0_11_schema else None
+    analysis = analyze_generated_cypher(
+      cypher,
+      allowed=guard_schema_allowed,
+      max_limit=int(self.cfg_neo4j_max_rows),
+      allow_limit_optional_graph=use_v0_11_schema,
+    )
     # Contract §4.3: `classify_result_shape` on every `/neo4j_query` response,
     # accepted or rejected — it is a static text classification, not an
     # execution-safety verdict, so it does not gate acceptance here.
     validation = {
       **analysis,
       "result_shape": classify_result_shape(analysis.get("candidate") or cypher),
+      "schema_version": SCHEMA_VERSION_V0_11 if use_v0_11_schema else SCHEMA_VERSION,
     }
     if not analysis["accepted"]:
       return {
@@ -5835,6 +5946,16 @@ class EdgeguardApiPlugin(BasePlugin):
         "duration_ms": primary_duration_ms,
         "method": "native_driver",
       }]
+      # Contract §6, review finding 6 (S5=Q9): every empty result carries a
+      # reason, on explain routes too, not just `/neo4j_query`; classified
+      # from the requested (accepted) Cypher — so it still names *why the
+      # primary attempt was empty* even when opt-in broadening goes on to
+      # find rows. `analysis` is the one `validation` object every response
+      # branch below returns, so setting it here threads the reason through
+      # all of them.
+      analysis["empty_reason"] = (
+        None if primary_row_count else classify_empty_reason(plan["accepted_cypher"], EDGEGUARD_SCHEMA_V0_11)
+      )
       live_retry = self._empty_result_broadening_state(enabled=broadening_enabled)
       final_executed_cypher = executed_cypher
       broadened_applied = False

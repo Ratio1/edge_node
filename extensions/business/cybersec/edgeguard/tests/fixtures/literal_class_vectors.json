@@ -337,6 +337,48 @@
       "literal": "T1071",
       "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
       "request": "Show techniques used by this campaign."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "ipv4",
+      "note": "substring trap: 'relationship' contains 'ip' but does not ask for IP addresses (token-boundary, not substring)",
+      "request": "Show me every relationship between these campaigns."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "ipv4",
+      "note": "substring trap: 'shipped' contains 'ip' but does not ask for IP addresses",
+      "request": "Which malware families have shipped payloads recently?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "url",
+      "note": "substring trap: 'linked' contains the 'link' synonym wording but is a different word",
+      "request": "Which malware is linked to this campaign?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "LOW",
+      "note": "substring trap: 'allow' contains 'low' but is not a severity request",
+      "request": "Would you allow this indicator through the firewall?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "HIGH",
+      "note": "substring trap: 'highest' contains 'high' but is a different word (superlative, no severity wording)",
+      "request": "Which CVE has the highest CVSS score?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0002",
+      "note": "compound-term trap: 'remote code execution' names a CWE/CVE concept, not the ATT&CK Execution tactic ('execution' immediately preceded by 'code')",
+      "request": "Which CVEs enable remote code execution?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0040",
+      "note": "substring trap: 'impacted' contains the 'impact' synonym wording but is a different word",
+      "request": "Which sectors were impacted by this campaign?"
     }
   ]
 }

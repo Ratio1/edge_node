@@ -66,7 +66,9 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (  # n
   build_schema_correction_prompt,
   build_v0_11_correction_prompt,
   build_v0_11_pattern_schema_system_prompt,
+  canonical_schema_surface,
 )
+from extensions.business.cybersec.edgeguard import literal_classes  # noqa: E402
 
 
 class _Response:
@@ -1939,7 +1941,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           scheme="bolt+s",
           username="neo4j",
           password="secret",
-          cypher="MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+          cypher="MATCH (i:Indicator)-[:INDICATES]->(m:Malware) RETURN i.value AS value LIMIT 10",
           enable_empty_result_broadening=False,
         )
 
@@ -1947,21 +1949,25 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["rows"], [])
     self.assertFalse(result["live_retry"]["enabled"])
     self.assertFalse(result["live_retry"]["attempted"])
-    # Contract §6: every empty result carries a reason; INDICATES is a
-    # populated-surface relationship type, so this is a legitimate no-match,
-    # not a topology gap.
+    # Contract §6: every empty result carries a reason; INDICATES, Indicator
+    # and Malware are all populated-surface (review finding 4 gives `Alert` a
+    # topology-only label classification of its own, so this test uses
+    # `Malware` to keep exercising the plain `no_match` branch), so this is a
+    # legitimate no-match, not a topology gap.
     self.assertEqual(result["empty_reason"], "no_match")
     self.assertEqual(fake_session.run.call_count, 1)
     self.assertEqual(
       _run_text(fake_session.run.call_args),
-      "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+      "MATCH (i:Indicator)-[:INDICATES]->(m:Malware) RETURN i.value AS value LIMIT 10",
     )
 
   def test_neo4j_query_empty_topology_surface_result_carries_the_contract_reason(self):
-    """Contract §6 acceptance: a topology-surface pattern with no rows
-    returns `empty_reason: topology_surface_no_data`, `live_retry.enabled:
-    false`, `status: ok`; contract §4.3: `validation.result_shape` is set."""
-    plugin = _make_api()
+    """Contract §6's own acceptance query: `MATCH p=(c:CVE)-[:AFFECTS]->
+    (m:Mission) ... RETURN p`, with no `LIMIT` (contract §4.1: optional for
+    the `graph` shape once the caller names the v0.11 profile) — `Mission`
+    is a topology-only label the v0.10 schema does not even know, so this
+    also exercises review finding 1 (the v0.11 flat sets)."""
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
     empty_result = _Result([], keys=["p"])
     fake_session = MagicMock()
     fake_session.__enter__.return_value = fake_session
@@ -1976,14 +1982,35 @@ class EdgeGuardApiTests(unittest.TestCase):
           scheme="bolt+s",
           username="neo4j",
           password="secret",
-          cypher="MATCH p=(m:Mission)-[:SUPPORTS]->(c:Component) RETURN p LIMIT 5",
+          cypher="MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p",
+          model_key=V0_11_MODEL_KEY,
         )
 
     self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["executed"])
     self.assertEqual(result["rows"], [])
     self.assertEqual(result["empty_reason"], "topology_surface_no_data")
     self.assertFalse(result["live_retry"]["enabled"])
     self.assertEqual(result["validation"]["result_shape"], "graph")
+    self.assertEqual(result["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
+
+  def test_neo4j_query_without_a_v0_11_model_key_still_requires_limit_on_v0_10_sets(self):
+    """The same no-`LIMIT`, `Mission`-labelled query is rejected by default
+    (no `model_key`): `/neo4j_query` states the choice by falling back to
+    the v0.10 schema, which does not even know the `Mission` label."""
+    plugin = _make_api()
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687",
+      scheme="bolt+s",
+      username="neo4j",
+      password="secret",
+      cypher="MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p",
+    )
+
+    self.assertEqual(result["status"], "rejected")
+    self.assertFalse(result["executed"])
+    self.assertEqual(result["validation"]["schema_version"], "edgeguard-cypher-schema-v0.10")
 
   def test_neo4j_query_returns_structured_error_when_driver_fails(self):
     plugin = _make_api()
@@ -2450,6 +2477,33 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "no_graph_evidence")
     self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
     self.assertEqual(fake_session.run.call_count, 1)
+    # Contract §6, review finding 6 (S5=Q9): explain routes carry an
+    # `empty_reason` too, not just `/neo4j_query`. SOURCED_FROM is a
+    # populated-surface relationship type, so this is a legitimate no-match.
+    self.assertEqual(result["validation"]["empty_reason"], "no_match")
+
+  def test_explain_graph_topology_surface_empty_result_carries_the_contract_reason(self):
+    """Contract §6's own acceptance query, through `/explain_graph`: `Mission`
+    is a topology-only label (review finding 4), so the zero-row result is
+    `topology_surface_no_data`, not `no_match` (review finding 6, S5=Q9)."""
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    fake_driver, fake_session = _driver_with_results(
+      _Result([], keys=["p"]),
+    )
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 0)
+    self.assertEqual(result["validation"]["empty_reason"], "topology_surface_no_data")
 
   def test_explain_graph_scalar_only_result_succeeds_under_insight_brief(self):
     plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
@@ -3695,6 +3749,10 @@ class EdgeGuardApiTests(unittest.TestCase):
       _run_text(fake_session.run.call_args_list[1]),
       "MATCH p=(n:Indicator)-[:SOURCED_FROM]-() RETURN p LIMIT 25",
     )
+    # Contract §6, review finding 6 (S5=Q9): with opt-in broadening, the
+    # requested (primary) query's `empty_reason` is still reported even
+    # though the broadened query went on to return rows.
+    self.assertEqual(result["validation"]["empty_reason"], "no_match")
 
   def test_explain_graph_returns_truthful_truncated_digest_without_model_call(self):
     plugin = _make_api()
@@ -4642,6 +4700,98 @@ class LiteralGroundingGuardTests(unittest.TestCase):
     self.assertTrue(result["attempts"][2]["accepted"])
 
 
+class V0_11GenerateRuntimeTests(unittest.TestCase):
+  """Review findings 1, 5, 7: `generate()` on the v0.11 profile validates
+  against the v0.11 flat sets, allows a `graph`-shape candidate to omit
+  `LIMIT`, rejects an `other`-shape candidate with feedback, and reports
+  v0.11 `schema_version`/`cypher_schema_version`/`schema_surface`."""
+
+  def _make_v0_11_api(self):
+    return _make_api(
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+      worker_semaphore_env={V0_11_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53002"}},
+    )
+
+  def _response(self, cypher):
+    return _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": cypher,
+        "FULL_OUTPUT": {
+          "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+          "usage": {"completion_tokens": 12},
+        },
+      },
+    })
+
+  def test_graph_shape_without_limit_is_accepted_against_the_v0_11_flat_sets(self):
+    plugin = self._make_v0_11_api()
+    # `Mission` is a topology-only label the v0.10 schema does not know, and
+    # there is no `LIMIT` (contract §4.1, optional for `graph` on this
+    # profile).
+    cypher = "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.return_value = self._response(cypher)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show CVEs affecting missions.", model_key=V0_11_MODEL_KEY)
+
+    self.assertTrue(result["accepted"], result)
+    self.assertEqual(result["accepted_cypher"], cypher)
+    self.assertEqual(result["validation"]["result_shape"], "graph")
+    self.assertEqual(result["schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertEqual(result["cypher_schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertIn("Mission", result["schema_surface"]["labels"])
+
+  def test_other_shape_is_rejected_with_feedback_naming_the_two_accepted_shapes(self):
+    plugin = self._make_v0_11_api()
+    # Schema-compatible, has `LIMIT`, read-only — the guard would accept it —
+    # but it mixes a pattern-variable and a scalar projection: `other`
+    # (contract §4.3), rejected for model output on this profile.
+    cypher = "MATCH (i:Indicator) RETURN i, i.value AS value LIMIT 10"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [self._response(cypher)] * 3
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show indicators.", model_key=V0_11_MODEL_KEY)
+
+    self.assertFalse(result["accepted"])
+    self.assertIsNone(result["accepted_cypher"])
+    self.assertEqual(result["validation"]["result_shape"], "other")
+    for attempt in result["attempts"]:
+      self.assertFalse(attempt["accepted"])
+      self.assertEqual(attempt["result_shape"], "other")
+    self.assertIn("graph", result["validation_feedback"])
+    self.assertIn("ranked_projection", result["validation_feedback"])
+
+  def test_v0_10_profile_generate_response_is_unaffected(self):
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53003"},
+    })
+    cypher = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.return_value = self._response(cypher)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show indicators.", model_key=PRIVATE_MODEL_KEY)
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(result["schema_version"], "edgeguard-cypher-schema-v0.10")
+    self.assertEqual(result["cypher_schema_version"], "edgeguard-cypher-schema-v0.10")
+    self.assertEqual(result["schema_surface"], canonical_schema_surface())
+
+
 class PromptProfileDispatchTests(unittest.TestCase):
   """Contract §5.1/§5.2: `_generation_messages` dispatches the system prompt
   and the correction turn per profile."""
@@ -4684,7 +4834,11 @@ class PromptProfileDispatchTests(unittest.TestCase):
 
     self.assertEqual(messages[0]["content"], build_v0_11_pattern_schema_system_prompt())
 
-  def test_v0_11_profile_correction_turn_does_not_re_embed_the_schema(self):
+  def test_v0_11_profile_correction_turn_preserves_the_original_request_and_rejected_attempt(self):
+    """Contract §5.2 (review finding 2, S3=Q1): the v0.11 retry conversation
+    is [system, user:request, assistant:rejected, user:correction] — the
+    correction *turn itself* still carries no schema and no re-embedded
+    request (both are already earlier turns in the same conversation)."""
     plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
 
     messages = plugin._generation_messages(
@@ -4696,7 +4850,13 @@ class PromptProfileDispatchTests(unittest.TestCase):
     )
 
     self.assertEqual(
-      messages[1]["content"],
+      [message["role"] for message in messages],
+      ["system", "user", "assistant", "user"],
+    )
+    self.assertEqual(messages[1]["content"], "Show indicators")
+    self.assertEqual(messages[2]["content"], "MATCH (i:Indicator) RETURN i.bogus")
+    self.assertEqual(
+      messages[3]["content"],
       build_v0_11_correction_prompt(
         rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
         validation_feedback="unknown property 'bogus'",
@@ -4704,9 +4864,9 @@ class PromptProfileDispatchTests(unittest.TestCase):
         retry_limit=2,
       ),
     )
-    self.assertNotIn("Allowed EdgeGuard Cypher schema:", messages[1]["content"])
-    self.assertNotIn("Populated graph patterns:", messages[1]["content"])
-    self.assertNotIn("Original user request:", messages[1]["content"])
+    self.assertNotIn("Allowed EdgeGuard Cypher schema:", messages[3]["content"])
+    self.assertNotIn("Populated graph patterns:", messages[3]["content"])
+    self.assertNotIn("Original user request:", messages[3]["content"])
 
 
 class PromptContractProfileShaTests(unittest.TestCase):
@@ -4756,6 +4916,41 @@ class PromptContractProfileShaTests(unittest.TestCase):
       profiles[V0_11_MODEL_KEY]["correction_prompt_sha256"],
       profiles[PRIVATE_MODEL_KEY]["correction_prompt_sha256"],
     )
+
+  def test_v0_11_profile_reports_v0_11_schema_version_and_surface(self):
+    """Review finding 7 (S8): the v0.11 profile's `/prompt_contract` entry
+    names the v0.11 artifact's schema_version and schema_surface, not the
+    v0.10 defaults every other profile still reports."""
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertEqual(
+      profiles[V0_11_MODEL_KEY]["cypher_schema_version"], "edgeguard-cypher-schema-v0.11",
+    )
+    self.assertIn("Mission", profiles[V0_11_MODEL_KEY]["schema_surface"]["labels"])
+    self.assertEqual(
+      profiles[PRIVATE_MODEL_KEY]["cypher_schema_version"], "edgeguard-cypher-schema-v0.10",
+    )
+    self.assertEqual(
+      profiles[PRIVATE_MODEL_KEY]["schema_surface"], canonical_schema_surface(),
+    )
+
+  def test_every_profile_pins_the_literal_classes_module_sha(self):
+    """Contract §3.2 (review finding 7, S8): "both [the guard and the
+    validator] pin its sha in their reports" — every profile reports the
+    same, freshly-recomputed `literal_classes.py` sha (the guard applies
+    the literal-grounding fix regardless of profile)."""
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    with open(literal_classes.__file__, "rb") as handle:
+      expected = hashlib.sha256(handle.read()).hexdigest()
+    for profile in contract["profiles"]:
+      self.assertEqual(profile["literal_classes_sha256"], expected, profile["model_key"])
+    self.assertRegex(expected, r"^[0-9a-f]{64}$")
 
 
 class GenerationMaxTokensPinTests(unittest.TestCase):

@@ -106,6 +106,61 @@ class LiteralClassesUnitTests(unittest.TestCase):
     self.assertFalse(result["grounded"])
     self.assertEqual(result["class"], literal_classes.CLOSED_VOCABULARY)
 
+  def test_synonym_wording_does_not_match_a_substring_of_a_longer_word(self):
+    """Review finding 3 (S7/Q2): 'relationship'/'shipped' contain the 'ip'
+    wording, 'linked' contains 'link', but neither asks about IP addresses
+    or URLs; token-boundary matching, not substring, is required."""
+    for request in ("Show me every relationship between these campaigns.", "shipped"):
+      with self.subTest(request=request):
+        result = literal_classes.literal_is_grounded("ipv4", request, EDGEGUARD_SCHEMA_V0_11)
+        self.assertFalse(result["grounded"])
+    result = literal_classes.literal_is_grounded(
+      "url", "Which malware is linked to this campaign?", EDGEGUARD_SCHEMA_V0_11,
+    )
+    self.assertFalse(result["grounded"])
+
+  def test_closed_vocabulary_literal_itself_does_not_match_inside_a_longer_word(self):
+    """'allow' contains 'low', 'highest' contains 'high', 'impacted'
+    contains 'impact': the literal-value direct match must also be
+    token-boundary, not substring."""
+    self.assertFalse(
+      literal_classes.literal_is_grounded("LOW", "Would you allow this?", EDGEGUARD_SCHEMA_V0_11)["grounded"],
+    )
+    self.assertFalse(
+      literal_classes.literal_is_grounded(
+        "HIGH", "Which CVE has the highest score?", EDGEGUARD_SCHEMA_V0_11,
+      )["grounded"],
+    )
+    self.assertFalse(
+      literal_classes.literal_is_grounded(
+        "TA0040", "Which sectors were impacted?", EDGEGUARD_SCHEMA_V0_11,
+      )["grounded"],
+    )
+
+  def test_execution_tactic_wording_is_not_grounded_when_it_names_code_execution(self):
+    """'remote code execution' is a CWE/CVE concept, not an ATT&CK Execution
+    tactic request; a bare 'Execution tactic' request is unaffected."""
+    result = literal_classes.literal_is_grounded(
+      "TA0002", "Which CVEs enable remote code execution?", EDGEGUARD_SCHEMA_V0_11,
+    )
+    self.assertFalse(result["grounded"])
+
+    result = literal_classes.literal_is_grounded(
+      "TA0002", "Which techniques belong to the Execution tactic?", EDGEGUARD_SCHEMA_V0_11,
+    )
+    self.assertTrue(result["grounded"])
+
+  def test_grounded_properties_names_the_specific_property_for_a_synonym_match(self):
+    result = literal_classes.literal_is_grounded(
+      "ipv4", "Which IP addresses are indicators of compromise?", EDGEGUARD_SCHEMA_V0_11,
+    )
+    self.assertEqual(result["grounded_properties"], ["Indicator.indicator_type"])
+
+    result = literal_classes.literal_is_grounded(
+      "CISA Vuls", "Show me CVE details for this vulnerability.", EDGEGUARD_SCHEMA_V0_11,
+    )
+    self.assertEqual(result["grounded_properties"], [])
+
   def test_module_has_no_edge_node_imports(self):
     """Contract: `literal_classes.py` is stdlib-only, no edge_node imports,
     so the hub validator can vendor it by sha (EGM-059 phase 5)."""

@@ -530,6 +530,47 @@ class EdgeGuardExecutionSafetyTests(unittest.TestCase):
     self.assertIn("Execution safety error", analysis["validation_feedback"])
 
 
+class LimitOptionalForGraphShapeTests(unittest.TestCase):
+  """Contract §4.1 (review finding 1): with `allow_limit_optional_graph=True`
+  a `graph`-shape candidate may omit `LIMIT`; `ranked_projection` still
+  requires one; v0.10 callers (the default) are unaffected."""
+
+  def test_graph_shape_without_limit_is_accepted_when_optional(self):
+    analysis = analyze_generated_cypher(
+      "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p",
+      allowed=schema_sets(EDGEGUARD_SCHEMA_V0_11),
+      allow_limit_optional_graph=True,
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_graph_shape_without_limit_is_still_rejected_by_default(self):
+    analysis = analyze_generated_cypher(
+      "MATCH p=(i:Indicator)-[:INDICATES]->(m:Malware) RETURN p",
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("LIMIT", analysis["validation_feedback"])
+
+  def test_ranked_projection_without_limit_still_requires_one_even_when_optional_graph_is_set(self):
+    analysis = analyze_generated_cypher(
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s ORDER BY s.base_score DESC "
+      "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31",
+      allowed=schema_sets(EDGEGUARD_SCHEMA_V0_11),
+      allow_limit_optional_graph=True,
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("LIMIT", analysis["validation_feedback"])
+
+  def test_graph_shape_limit_present_is_still_bounded_by_the_row_cap(self):
+    analysis = analyze_generated_cypher(
+      "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p LIMIT 500",
+      allowed=schema_sets(EDGEGUARD_SCHEMA_V0_11),
+      allow_limit_optional_graph=True,
+      max_limit=100,
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("server row cap of 100", analysis["validation_feedback"])
+
+
 class SchemaArtifactV0_11Tests(unittest.TestCase):
   """Contract §2: the guard loads the vendored schema artifact v0.11; the
   v0.10 `EDGEGUARD_SCHEMA`/`SCHEMA_VERSION` constants keep serving the v0.10
@@ -805,6 +846,18 @@ class ClassifyEmptyReasonTests(unittest.TestCase):
       "topology_surface_no_data",
     )
 
+  def test_topology_only_label_via_a_populated_relationship_type_is_topology_surface_no_data(self):
+    # Contract §6's own acceptance query: AFFECTS is a populated-surface
+    # relationship type (CVE->Sector), but Mission is a topology-only label
+    # (only ever a topology-pattern endpoint) — the label check must catch
+    # this even though the relationship-type check alone would not (review
+    # finding 4, S2=Q4).
+    query = "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p"
+    self.assertEqual(
+      classify_empty_reason(query, EDGEGUARD_SCHEMA_V0_11),
+      "topology_surface_no_data",
+    )
+
   def test_populated_surface_without_a_literal_index_is_no_match(self):
     # CVE-[:AFFECTS]->Sector is `surface: "populated"` with real snapshot
     # rows; no `literal_index` means the literal check is skipped entirely.
@@ -962,11 +1015,25 @@ class V0_11_PatternSchemaPromptTests(unittest.TestCase):
     self.assertNotIn("HAS_CVSS_v2", self.prompt)
 
   def test_every_topology_pattern_appears(self):
-    for pattern in EDGEGUARD_SCHEMA_V0_11["patterns"]:
-      if pattern.get("surface") != "topology":
-        continue
-      line = f"{pattern['from']} {pattern['type']} {pattern['to']}"
+    # Review finding 8 (S6): one notation for populated and topology
+    # patterns, both `TYPE To: From1 From2 ...` (`_v0_11_grouped_pattern_lines`).
+    topology = [
+      pattern for pattern in EDGEGUARD_SCHEMA_V0_11["patterns"]
+      if pattern.get("surface") == "topology"
+    ]
+    for line in _v0_11_grouped_pattern_lines(topology):
       self.assertIn(line, self.prompt)
+
+  def test_populated_and_topology_patterns_share_one_notation(self):
+    self.assertIn("Populated patterns, `TYPE To: From1 From2 ...` (has data):", self.prompt)
+    self.assertIn("Topology patterns, `TYPE To: From1 From2 ...` (no data yet):", self.prompt)
+
+  def test_defense_evasion_wording_is_inferable_to_both_tactic_ids(self):
+    # Review finding 8 (S6), contract §10: ATT&CK v18 renamed TA0005 to
+    # Stealth and added TA0112 Defense Impairment; "defense evasion" maps to
+    # both ids, which the model cannot infer from the id list alone.
+    self.assertIn("defense evasion", self.prompt)
+    self.assertIn("TA0005+TA0112", self.prompt)
 
   def test_closed_vocabularies_present_and_deduplicated(self):
     self.assertIn("ipv4", self.prompt)
@@ -1083,8 +1150,13 @@ class V0_11_TokenBudgetTests(unittest.TestCase):
     self.assertLessEqual(count, 900)
 
   def test_full_correction_turn_is_at_most_1300_tokens(self):
+    """Review finding 2 (S3=Q1): the full v0.11 retry conversation is
+    [system, user:request, assistant:rejected, user:correction] (contract
+    §5.2) — measure all four messages together, not just the correction
+    turn's own content."""
     counter = self._counter_or_skip()
     system_prompt = build_v0_11_pattern_schema_system_prompt()
+    original_request = "Which IP addresses are attributed to FIN13 through Emotet?"
     # Realistic sizes, not short filler: a three-hop rejected query (~220
     # chars) and a two-literal feedback message (~140 chars), the shape a
     # live retry actually produces.
@@ -1103,20 +1175,29 @@ class V0_11_TokenBudgetTests(unittest.TestCase):
       retry_index=1,
       retry_limit=2,
     )
+    # `render_chat` (`graph_first_runtime.py`, sha-pinned, out of this
+    # dispatch's scope) only accepts `system`/`user` roles — it is a
+    # single-shot prompt counter, not a full chat renderer. The real
+    # conversation's third turn has role `assistant`; framed as `user` here
+    # the rendered markup differs by only the (1-token) role-name span, so
+    # this is a tight over/under-approximation of the true 4-message count,
+    # not a different measurement.
     count = counter([
       {"role": "system", "content": system_prompt},
+      {"role": "user", "content": original_request},
+      {"role": "user", "content": rejected_cypher},
       {"role": "user", "content": correction_prompt},
     ])
     self.assertLessEqual(count, 1300)
 
   def test_char_length_sanity_ceiling_runs_without_a_tokenizer(self):
     # Approximate companion that runs on any host (no tokenizer needed).
-    # Measured on the real Qwen3 tokenizer after fix round 1: 3,361 chars
-    # -> 881 tokens (~3.8 chars/token on this identifier-heavy text, far
-    # below the ~4-4.5 chars/token English-prose rule of thumb this codebase
-    # otherwise assumes) — this ceiling gives ~250 chars (~65 tokens) of
-    # headroom before the real check on edg3 would need to confirm again.
-    # It is not the contract's check and is not a substitute for the token
-    # test above.
+    # Measured on the real Qwen3 tokenizer after fix round 1 + review
+    # finding 8 (one pattern notation, "defense evasion" inferable): 3,289
+    # chars -> 896 tokens (~3.7 chars/token on this identifier-heavy text,
+    # far below the ~4-4.5 chars/token English-prose rule of thumb this
+    # codebase otherwise assumes) — this ceiling gives headroom before the
+    # real check on edg3 would need to confirm again. It is not the
+    # contract's check and is not a substitute for the token test above.
     system_prompt = build_v0_11_pattern_schema_system_prompt()
-    self.assertLessEqual(len(system_prompt), 3600)
+    self.assertLessEqual(len(system_prompt), 3350)

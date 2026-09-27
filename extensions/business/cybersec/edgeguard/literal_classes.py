@@ -18,6 +18,7 @@ Contract §3.1 defines two literal classes:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 __VER__ = "0.1.0.0"
@@ -26,6 +27,36 @@ CLOSED_VOCABULARY = "closed_vocabulary"
 FREE = "free"
 
 _CAMPAIGN_SUFFIX = " campaign"
+
+# A single-word tactic/value name that is also a common noun inside an
+# unrelated compound security term: a request naming that noun as part of the
+# compound (e.g. "remote code execution", a CWE/CVE concept) must not ground
+# the ATT&CK tactic id (`edgeguard_cypher_guard.py` v0.11 review finding 3).
+# Keyed by the casefolded wording; value is the set of casefolded words that,
+# immediately preceding the match, invalidate it.
+_DENIED_PRECEDING_WORD = {
+  "execution": {"code"},
+}
+
+
+def _token_boundary_match(phrase_cf: str, request_cf: str) -> bool:
+  """True when `phrase_cf` (already casefolded) occurs in `request_cf` as a
+  whole run of words, not embedded inside a longer word ("ip" inside
+  "relationship", "link" inside "linked", "high" inside "highest", "impact"
+  inside "impacted") and not immediately preceded by a word on its own
+  deny-list (see `_DENIED_PRECEDING_WORD`)."""
+  if not phrase_cf:
+    return False
+  pattern = re.compile(r"(?<!\w)" + re.escape(phrase_cf) + r"(?!\w)")
+  denylist = _DENIED_PRECEDING_WORD.get(phrase_cf)
+  for match in pattern.finditer(request_cf):
+    if denylist:
+      preceding = request_cf[:match.start()].rstrip()
+      preceding_word = preceding.rsplit(None, 1)[-1] if preceding else ""
+      if preceding_word.strip(".,;:!?\"'()[]{}") in denylist:
+        continue
+    return True
+  return False
 
 
 def _vocabulary_values(entries: Any) -> list[str]:
@@ -88,18 +119,32 @@ def literal_is_grounded(
 ) -> dict[str, Any]:
   """Contract §3.2: is `literal` grounded in `request_text`?
 
-  Returns the classification (`class`, `candidates`) plus `grounded` and the
+  Returns the classification (`class`, `candidates`) plus `grounded`, the
   `matched_wording` (`None` when the literal itself was the match rather than
-  a synonym wording).
+  a synonym wording) and `grounded_properties` (the closed-vocabulary
+  property or properties the match grounds this literal for; empty for
+  `free` or an ungrounded result) — used by the retry-retention rule (§3.2)
+  to key a grounded value by property, not by value text alone.
+
+  Closed-vocabulary matching (the literal itself or a synonym wording) is
+  token-boundary: the phrase must occur as a whole run of words, not
+  embedded inside a longer word ("ip" inside "relationship" or "ship",
+  "link" inside "linked", "low" inside "allow", "high" inside "highest",
+  "impact" inside "impacted"). `free` literals keep substring matching
+  (indicator values, ids, names and dates are copied verbatim, so a
+  defanged/quoted variant may not sit on a word boundary).
   """
   classification = classify_literal(literal, artifact)
   literal_cf = str(literal).strip().casefold()
   request_cf = str(request_text or "").casefold()
 
-  if literal_cf and literal_cf in request_cf:
-    return {**classification, "grounded": True, "matched_wording": None}
-
   if classification["class"] == CLOSED_VOCABULARY:
+    if literal_cf and _token_boundary_match(literal_cf, request_cf):
+      properties = sorted({candidate["property"] for candidate in classification["candidates"]})
+      return {
+        **classification, "grounded": True, "matched_wording": None,
+        "grounded_properties": properties,
+      }
     synonyms = build_synonym_index(artifact)
     for candidate in classification["candidates"]:
       prop = candidate["property"]
@@ -110,19 +155,24 @@ def literal_is_grounded(
         keys.append((wildcard, value_cf))
       for key in keys:
         for wording in synonyms.get(key, []):
-          if str(wording).casefold() in request_cf:
-            return {**classification, "grounded": True, "matched_wording": wording}
-    return {**classification, "grounded": False, "matched_wording": None}
+          if _token_boundary_match(str(wording).casefold(), request_cf):
+            return {
+              **classification, "grounded": True, "matched_wording": wording,
+              "grounded_properties": [prop],
+            }
+    return {**classification, "grounded": False, "matched_wording": None, "grounded_properties": []}
 
   # free: a campaign literal is matched with and without the trailing
   # " Campaign" (contract §3.1).
+  if literal_cf and literal_cf in request_cf:
+    return {**classification, "grounded": True, "matched_wording": None, "grounded_properties": []}
   if literal_cf.endswith(_CAMPAIGN_SUFFIX):
     trimmed = literal_cf[: -len(_CAMPAIGN_SUFFIX)]
     if trimmed and trimmed in request_cf:
-      return {**classification, "grounded": True, "matched_wording": None}
+      return {**classification, "grounded": True, "matched_wording": None, "grounded_properties": []}
   elif literal_cf and f"{literal_cf}{_CAMPAIGN_SUFFIX}" in request_cf:
-    return {**classification, "grounded": True, "matched_wording": None}
-  return {**classification, "grounded": False, "matched_wording": None}
+    return {**classification, "grounded": True, "matched_wording": None, "grounded_properties": []}
+  return {**classification, "grounded": False, "matched_wording": None, "grounded_properties": []}
 
 
 def format_literal_rejection(literal: str, literal_class: str) -> str:
