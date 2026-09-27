@@ -89,18 +89,53 @@ except Exception:  # pragma: no cover - exercised through dependency-missing tes
   READ_ACCESS = "READ"
 
 try:
-  # Fix round 3, L2a: `neo4j.exceptions.ClientError` (and its subclasses,
-  # e.g. `CypherSyntaxError`) is the Neo4j driver's signal that the server
-  # rejected the Cypher itself (syntax, type, constraint) — the caller's
-  # fault, not a connection/timeout failure. `/neo4j_query` and
-  # `explain_graph` give this family a distinct `error_code` instead of
-  # falling through to the generic exception branch.
+  # Fix round 3, L2a; comment corrected in fix round 4 (re-review-3 finding
+  # 6): `neo4j.exceptions.ClientError` is the Neo4j driver's base class for
+  # every error the *server* raised against the statement as sent — it
+  # covers two distinct families, not one. Most subclasses (`CypherSyntaxError`,
+  # `CypherTypeError`, `ConstraintError`, ...) mean the server rejected the
+  # Cypher itself (syntax, type, constraint) — the caller's fault, not a
+  # connection/timeout failure; `/neo4j_query` and `explain_graph` give that
+  # family the `neo4j_client_error` `error_code` and HTTP 422. A second
+  # family — `AuthError`, `Forbidden`, `TokenExpired` (imported below as
+  # `Neo4jAuthError`/`Neo4jForbidden`/`Neo4jTokenExpired`) — is also a
+  # `ClientError` subclass but means the *driver's own credentials* were
+  # rejected: a server-side misconfiguration, not a bad query, so a
+  # dedicated `except` clause ahead of the generic `ClientError` one gives
+  # it the distinct `neo4j_auth_error` code and HTTP 503 instead.
   from neo4j.exceptions import ClientError as Neo4jClientError
 except Exception:  # pragma: no cover - exercised through dependency-missing tests.
   class Neo4jClientError(Exception):
     """Placeholder when `neo4j` (or its `exceptions` submodule) is not
     installed: the real driver never raises this placeholder, so the
     dedicated except clause below simply never matches on such a host."""
+
+try:
+  # Fix round 4 (re-review-3 finding 6): `AuthError`, `Forbidden` and
+  # `TokenExpired` are `ClientError` subclasses that report a rejected
+  # credential or a missing privilege, not a malformed statement — see the
+  # `Neo4jClientError` comment above. Imported with the same
+  # dependency-missing fallback pattern as `Neo4jClientError`.
+  from neo4j.exceptions import (
+    AuthError as Neo4jAuthError,
+    Forbidden as Neo4jForbidden,
+    TokenExpired as Neo4jTokenExpired,
+  )
+except Exception:  # pragma: no cover - exercised through dependency-missing tests.
+  class Neo4jAuthError(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jForbidden(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jTokenExpired(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+# Fix round 4: a single tuple so both `/neo4j_query` and `explain_graph`
+# catch the auth-family subclasses with one `except` clause, ahead of the
+# generic `Neo4jClientError` one (subclass except clauses must be listed
+# before their base class, or they never match).
+NEO4J_AUTH_ERROR_TYPES = (Neo4jAuthError, Neo4jForbidden, Neo4jTokenExpired)
 
 try:
   import websocket
@@ -863,6 +898,19 @@ class _GraphPacketState:
 
 def _contract_error(code: str, detail: str) -> Dict[str, str]:
   return {"code": code, "detail": detail}
+
+
+def _wrapper_safe_error(result: Dict[str, Any], status_code: int) -> Dict[str, Any]:
+  """Fix round 4 (re-review-3 finding 3): the platform's generated FastAPI
+  wrapper treats any plugin result dict that carries a top-level `error`
+  key, but no `status_code`, as an unhandled failure and raises it as an
+  opaque HTTP 500 (`docs/tasks_manager/_runs/EGM-059/phase-2/re-review-3.md`
+  — edg3 log `20260927_184345_EE_005_log.txt:762-768`). Nesting the
+  structured body under `result` and naming `status_code` explicitly (the
+  same transport already used by `_explanation_failure_transport` and
+  `_graph_first_failure_transport`) lets `/neo4j_query` and `explain_graph`
+  state the intended HTTP status instead of falling into that default."""
+  return {"status_code": status_code, "result": result, "logged": True}
 
 
 def _graph_first_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, Any]:
@@ -5655,7 +5703,12 @@ class EdgeguardApiPlugin(BasePlugin):
       # value could not be made JSON-safe" from an opaque driver/connection
       # failure — `exc.code` is a stable, closed set (see
       # `_neo4j_row_json_safe`), not free text.
-      return {
+      # Fix round 4 (re-review-3 finding 3): serialization failure stays a
+      # 500 — turning an executed result into JSON-safe rows is entirely
+      # under this runtime's control, so a failure here is a server bug,
+      # not a caller or Neo4j problem — but it now goes through the same
+      # wrapper-safe transport as every other branch below.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         # Review finding 3 (round 2): the query executed against Neo4j —
@@ -5672,14 +5725,40 @@ class EdgeguardApiPlugin(BasePlugin):
           "total_ms": round((time.monotonic() - started) * 1000, 1),
           "row_bound": row_limit,
         },
-      }
+      }, 500)
+    except NEO4J_AUTH_ERROR_TYPES as exc:
+      # Fix round 4 (re-review-3 findings 3 and 6): `AuthError`/`Forbidden`/
+      # `TokenExpired` are `ClientError` subclasses (see the
+      # `Neo4jClientError` import comment) but report a rejected driver
+      # credential or privilege, not a malformed query — a server-side
+      # misconfiguration, not the caller's fault, so this listens ahead of
+      # the generic `Neo4jClientError` clause and answers 503, not 422.
+      return _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_auth_error",
+        "validation": validation,
+        "metrics": {
+          "connect_ms": round((time.monotonic() - started) * 1000, 1),
+          "query_ms": 0.0,
+          "total_ms": round((time.monotonic() - started) * 1000, 1),
+          "row_bound": row_limit,
+        },
+      }, 503)
     except Neo4jClientError as exc:
       # Fix round 3, L2a: a query the guard accepted can still be rejected
       # by Neo4j itself (syntax, type or constraint error) — the caller's
       # fault, not a connection/timeout failure. `error_code` names this
       # family distinctly so the response is never mistaken for one of the
       # generic driver failures below.
-      return {
+      # Fix round 4 (re-review-3 finding 3): the platform's FastAPI wrapper
+      # maps any plugin result carrying a top-level `error` key to HTTP 500
+      # unless `status_code` says otherwise — this is the exact defect the
+      # live 38-question re-run hit. 422 (Unprocessable Entity) states that
+      # the *query content* is at fault, not the transport.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "executed": False,
@@ -5692,20 +5771,27 @@ class EdgeguardApiPlugin(BasePlugin):
           "total_ms": round((time.monotonic() - started) * 1000, 1),
           "row_bound": row_limit,
         },
-      }
+      }, 422)
     except Exception as exc:
-      return {
+      # Fix round 4: everything left here is a connection/timeout/driver
+      # failure below Neo4j's own statement validation (unreachable host,
+      # DNS failure, transaction timeout, ...) — a connectivity or
+      # service-unavailable condition, not the caller's query content, so
+      # 503 rather than the generic-exception 500 the wrapper would
+      # otherwise assign.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "executed": False,
         "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_connection_error",
         "validation": validation,
         "metrics": {
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
           "query_ms": 0.0,
           "total_ms": round((time.monotonic() - started) * 1000, 1),
         },
-      }
+      }, 503)
     finally:
       self._close_neo4j_driver(driver)
 
@@ -6301,7 +6387,11 @@ class EdgeguardApiPlugin(BasePlugin):
           raw_relationships=raw_relationships,
         )
       except _ResultEvidenceError as exc:
-        return {
+        # Fix round 4 (re-review-3 finding 3): same serialization-failure
+        # class as `/neo4j_query`'s `_ResultEvidenceError` branch — a
+        # server bug in this runtime, not a caller or Neo4j problem — kept
+        # at 500 but through the wrapper-safe transport.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -6312,7 +6402,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet_meta": packet_meta,
           "validation": analysis,
           "live_retry": live_retry,
-        }
+        }, 500)
       execution_envelope = {
         "executed_cypher": final_executed_cypher,
         "primary_row_count": primary_row_count,
@@ -6453,12 +6543,32 @@ class EdgeguardApiPlugin(BasePlugin):
           live_retry=live_retry,
         )
       return success
+    except NEO4J_AUTH_ERROR_TYPES as exc:
+      # Fix round 4 (re-review-3 findings 3 and 6): same auth/credential
+      # family as `/neo4j_query` — a server-side misconfiguration, not the
+      # caller's fault, so this listens ahead of the generic
+      # `Neo4jClientError` clause and answers 503, not 422.
+      return _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_auth_error",
+        "validation": analysis,
+        "metrics": {
+          "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
+          "server_total_ms": round((time.monotonic() - started) * 1000, 1),
+        },
+      }, 503)
     except Neo4jClientError as exc:
       # Fix round 3, L2a: same distinct error code as `/neo4j_query` — a
       # query the guard accepted can still be rejected by Neo4j itself
       # (syntax, type or constraint error), the caller's fault, not a
       # connection/timeout failure.
-      return {
+      # Fix round 4 (re-review-3 finding 3): wrapper-safe transport at 422 —
+      # see the identical branch in `/neo4j_query` for the wrapper rule.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "executed": False,
@@ -6470,19 +6580,23 @@ class EdgeguardApiPlugin(BasePlugin):
           "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
           "server_total_ms": round((time.monotonic() - started) * 1000, 1),
         },
-      }
+      }, 422)
     except Exception as exc:
-      return {
+      # Fix round 4: connection/timeout/driver failure below Neo4j's own
+      # statement validation — connectivity/service-unavailable, not the
+      # caller's query content, so 503 via the wrapper-safe transport.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_connection_error",
         "validation": analysis,
         "metrics": {
           "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
           "server_total_ms": round((time.monotonic() - started) * 1000, 1),
         },
-      }
+      }, 503)
     finally:
       self._close_neo4j_driver(driver)

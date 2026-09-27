@@ -376,6 +376,11 @@ _WHERE_CLAUSE_START = re.compile(r"\bWHERE\b", re.I)
 _SUBQUERY_PREDICATE_OPEN = re.compile(r"\b(?:EXISTS|COUNT)\s*\{", re.I)
 _NODE_VAR_HEAD = re.compile(r"\(\s*([A-Za-z_][A-Za-z0-9_]*)")
 _REL_VAR_HEAD = re.compile(r"\[\s*([A-Za-z_][A-Za-z0-9_]*)")
+# Fix round 4 (re-review-3 findings 1 and 5): a `WITH ... AS name` or bare
+# `WITH a, b` pass-through, and `UNWIND ... AS name`, all carry a variable
+# name into the rest of the query — the `WHERE` pattern-predicate rule must
+# treat those as bound too, not only `MATCH`/`OPTIONAL MATCH` variables.
+_WITH_OR_UNWIND_CLAUSE_START = re.compile(r"\b(?:WITH|UNWIND)\b", re.I)
 # One or more chained hops, each a node pattern followed by a relationship
 # bracket and another node pattern (`(a)-[...]->(b)`, optionally continuing
 # `-[...]->(c)` ...). A lone parenthesised group with no relationship after
@@ -386,6 +391,11 @@ _WHERE_PATTERN_CHAIN = re.compile(
   r"(?:\s*<?-\s*\[[^\]]*\]\s*-?>?\s*"
   r"\(\s*[A-Za-z_]?[A-Za-z0-9_]*\s*(?::[^()]*)?\))+"
 )
+# Fix round 4 (re-review-3 finding 2): the opening bracket of a Cypher
+# *pattern comprehension* (`[ (a)-[:R]->(b) ... | expr ]`) always opens
+# directly on a node pattern; a plain list literal (`['a', 'b']`) or an
+# `IN [...]` list never does, so this alone cannot false-match either.
+_PATTERN_COMPREHENSION_OPEN = re.compile(r"\[\s*\(")
 
 
 class EdgeGuardCypherGuardError(Exception):
@@ -1014,7 +1024,78 @@ def _mask_subquery_predicate_blocks(text: str) -> str:
   return "".join(chars)
 
 
-def _where_pattern_predicate_new_variable_error(stripped: str, chains: list[str]) -> str | None:
+def _mask_pattern_comprehension_blocks(text: str) -> str:
+  """Blank out every Cypher pattern comprehension (`[ (a)-[:R]->(b) ... |
+  expr ]`, fix round 4, re-review-3 finding 2): like an `EXISTS { ... }`
+  subquery, it legitimately binds its own new pattern variables inside the
+  brackets. A bracket only counts once it both opens on a node pattern
+  (`_PATTERN_COMPREHENSION_OPEN`) and carries a top-level `|` before its
+  matching `]` — a plain list literal or an `IN [...]` list has neither, or
+  has the first but never the second, and is left untouched."""
+  chars = list(text)
+  for open_match in _PATTERN_COMPREHENSION_OPEN.finditer(text):
+    start = open_match.start()
+    depth = 0
+    has_pipe = False
+    end = None
+    for pos in range(start, len(text)):
+      char = text[pos]
+      if char == "[":
+        depth += 1
+      elif char == "]":
+        depth -= 1
+        if depth == 0:
+          end = pos
+          break
+      elif char == "|" and depth == 1:
+        has_pipe = True
+    if end is not None and has_pipe:
+      for blank_pos in range(start, end + 1):
+        chars[blank_pos] = " "
+  return "".join(chars)
+
+
+def _with_unwind_clause_texts(stripped: str) -> list[str]:
+  """The text of every top-level `WITH`/`UNWIND` clause (analysis-view
+  text): from the keyword to the next top-level clause keyword (fix round
+  4, re-review-3 finding 1)."""
+  texts: list[str] = []
+  for start in _WITH_OR_UNWIND_CLAUSE_START.finditer(stripped):
+    tail = stripped[start.end():]
+    boundary = _MATCH_CLAUSE_BOUNDARY.search(tail)
+    texts.append(tail[:boundary.start()] if boundary else tail)
+  return texts
+
+
+def _with_unwind_bound_variables(stripped: str) -> set[str]:
+  """Every variable name a `WITH`/`UNWIND` clause carries into the rest of
+  the query, whether renamed (`WITH x AS y`, `UNWIND list AS y`) or passed
+  through bare (`WITH a, b`) — fix round 4, re-review-3 finding 1: the
+  `WHERE` pattern-predicate rule previously only recognised `MATCH`-bound
+  variables, rejecting Cypher that legitimately references a `WITH`/
+  `UNWIND` alias.
+
+  `EXISTS { ... }` / `COUNT { ... }` subquery bodies are masked out first
+  (finding 5): a `WITH`/`UNWIND` written only inside one of those does not
+  bind a name for the outer query, so it must not count as outer-bound
+  either."""
+  masked = _mask_subquery_predicate_blocks(stripped)
+  bound: set[str] = set()
+  for clause_text in _with_unwind_clause_texts(masked):
+    for item in _split_top_level(clause_text):
+      item = item.strip()
+      if not item or item == "*":
+        continue
+      alias_match = _RETURN_ITEM_ALIAS.match(item)
+      if alias_match:
+        bound.add(alias_match.group(2))
+        continue
+      if re.fullmatch(IDENT, item):
+        bound.add(item)
+  return bound
+
+
+def _where_pattern_predicate_new_variable_error(stripped: str) -> str | None:
   """Fix round 3, L2b: Neo4j rejects a `WHERE` pattern predicate (a bare
   pattern used as a boolean expression, not a `MATCH`) that introduces a
   node or relationship variable no earlier `MATCH` bound
@@ -1023,10 +1104,28 @@ def _where_pattern_predicate_new_variable_error(stripped: str, chains: list[str]
   a query and Neo4j rejected it at execution. Checked for every profile,
   since Neo4j enforces this regardless. `EXISTS { MATCH ... }` /
   `COUNT { MATCH ... }` subqueries are exempt (masked out first): they bind
-  their own new variables legitimately."""
-  bound = _match_bound_variables(chains)
-  for where_text in _where_clause_texts(stripped):
-    masked = _mask_subquery_predicate_blocks(where_text)
+  their own new variables legitimately. Fix round 4 (re-review-3 finding
+  5): `EXISTS`/`COUNT` bodies are masked out of the *whole* query text
+  before anything else runs — not just re-masked per `WHERE`-clause text as
+  fix round 3 did — for two reasons. First, the `MATCH`-bound half of
+  `bound` is computed from this masked text, so a `MATCH` written only
+  inside one of those subqueries does not leak into the outer-bound set
+  (the module-level `chains` passed to the other `_execution_safety_error`
+  checks deliberately keeps seeing subquery `MATCH`es unmasked — hop bounds
+  and the unlabeled-comma-pattern rule still apply inside them; only this
+  check's own bound-variable set needs the narrower view). Second,
+  `_where_clause_texts`' own boundary search (`_MATCH_CLAUSE_BOUNDARY`)
+  stops at the first `MATCH`/`WHERE` keyword it sees, including one nested
+  inside an unmasked `EXISTS`/`COUNT` body — masking first blanks those
+  nested keywords too, so a bare pattern predicate written *after* the
+  subquery in the same `WHERE` clause is no longer silently dropped from
+  the scanned text. `WITH`/`UNWIND` aliases (finding 1) are added the same
+  way."""
+  masked_stripped = _mask_subquery_predicate_blocks(stripped)
+  bound = _match_bound_variables(_match_pattern_chains(masked_stripped))
+  bound |= _with_unwind_bound_variables(stripped)
+  for where_text in _where_clause_texts(masked_stripped):
+    masked = _mask_pattern_comprehension_blocks(where_text)
     for chain_match in _WHERE_PATTERN_CHAIN.finditer(masked):
       chain_text = chain_match.group(0)
       new_variables = sorted({
@@ -1157,7 +1256,7 @@ def _execution_safety_error(
   unlabeled_comma_error = _unlabeled_comma_pattern_error(chains)
   if unlabeled_comma_error:
     return unlabeled_comma_error
-  where_pattern_error = _where_pattern_predicate_new_variable_error(stripped, chains)
+  where_pattern_error = _where_pattern_predicate_new_variable_error(stripped)
   if where_pattern_error:
     return where_pattern_error
   if enforce_hop_bounds:

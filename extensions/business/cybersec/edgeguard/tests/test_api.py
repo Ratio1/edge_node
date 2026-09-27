@@ -58,6 +58,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_SERVER_MAX_ROWS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jAuthError  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jClientError  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _neo4j_row_json_safe  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
@@ -1935,12 +1936,16 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:Indicator) RETURN i.value AS blob LIMIT 5",
         )
 
-    self.assertEqual(result["status"], "error")
+    # Fix round 4 (re-review-3 finding 3): serialization failure stays a
+    # 500, but through the wrapper-safe transport, not a raw `error` key.
+    self.assertEqual(result["status_code"], 500)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
     # Review finding 3, round 2: the query ran against Neo4j — only turning
     # its rows into a JSON-safe response failed afterward — so `executed`
     # is `True`; `error_code` is what tells the caller the row was unusable.
-    self.assertTrue(result["executed"])
-    self.assertEqual(result["error_code"], "unsupported_query_result_value")
+    self.assertTrue(payload["executed"])
+    self.assertEqual(payload["error_code"], "unsupported_query_result_value")
 
   def test_neo4j_query_broadens_empty_result_once(self):
     plugin = _make_api()
@@ -2087,10 +2092,16 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
         )
 
-    self.assertEqual(result["status"], "error")
-    self.assertFalse(result["ok"])
-    self.assertFalse(result["executed"])
-    self.assertNotIn("secret", result["error"])
+    # Fix round 4 (re-review-3 finding 3): a driver/connection failure below
+    # Neo4j's own statement validation is connectivity/service-unavailable,
+    # not the caller's query content — 503 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertFalse(payload["executed"])
+    self.assertEqual(payload["error_code"], "neo4j_connection_error")
+    self.assertNotIn("secret", payload["error"])
 
   def test_legacy_query_marks_truncation_only_after_observing_an_extra_row(self):
     plugin = _make_api()
@@ -4572,7 +4583,12 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
           password="secret",
         )
 
-    self.assertFalse(result["ok"])
+    # Fix round 4 (re-review-3 finding 3): a driver/connection failure is
+    # connectivity/service-unavailable — 503 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_connection_error")
     self.assertNotIn("secret", json.dumps(result))
 
   def test_neo4j_client_error_returns_structured_status_error_not_a_500(self):
@@ -4604,10 +4620,49 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
           password="secret",
         )
 
-    self.assertEqual(result["status"], "error")
-    self.assertFalse(result["ok"])
-    self.assertEqual(result["error_code"], "neo4j_client_error")
-    self.assertIn("PatternExpressions", result["error"])
+    # Fix round 4 (re-review-3 finding 3): the platform's FastAPI wrapper
+    # maps any plugin result carrying a top-level `error` key to HTTP 500
+    # unless `status_code` says otherwise — 422 states the query content is
+    # at fault, via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_client_error")
+    self.assertIn("PatternExpressions", payload["error"])
+
+  def test_neo4j_auth_error_returns_service_unavailable_not_a_500(self):
+    # Fix round 4 (re-review-3 finding 6): `AuthError`/`Forbidden`/
+    # `TokenExpired` are `ClientError` subclasses but report a rejected
+    # driver credential, not a malformed query — a server-side
+    # misconfiguration, so this must be 503 with a distinct `error_code`,
+    # never the 422 given to a Cypher syntax/type/constraint error.
+    plugin = _make_api()
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = Neo4jAuthError(
+      "{code: Neo.ClientError.Security.Unauthorized} {message: The client is unauthorized due to "
+      "authentication failure.}"
+    )
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 5",
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+        )
+
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_auth_error")
+    self.assertIn("Unauthorized", payload["error"])
 
   def test_prepared_execution_rejects_nested_connection_fields(self):
     plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
@@ -4695,10 +4750,90 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
           ),
         )
 
-    self.assertEqual(result["status"], "error")
-    self.assertFalse(result["ok"])
-    self.assertEqual(result["error_code"], "neo4j_client_error")
+    # Fix round 4 (re-review-3 finding 3): same wrapper-safe transport and
+    # 422 as `/neo4j_query`'s identical branch.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_client_error")
     self.assertEqual(provider_calls, [])
+
+  def test_explain_graph_neo4j_auth_error_returns_service_unavailable(self):
+    # Fix round 4 (re-review-3 finding 6): same auth/credential family as
+    # `/neo4j_query` — 503 with a distinct `error_code`, not 422.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _fake_session = _driver_with_results(
+      Neo4jAuthError(
+        "{code: Neo.ClientError.Security.Unauthorized} {message: The client is unauthorized due to "
+        "authentication failure.}"
+      ),
+    )
+
+    provider_calls = []
+    plugin._graph_first_provider_for_tests = lambda payload: provider_calls.append(payload)
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Explain the returned graph.",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_auth_error")
+    self.assertEqual(provider_calls, [])
+
+  @staticmethod
+  def _simulated_wrapper_status(result):
+    # Fix round 4 (re-review-3 finding 3): the platform's generated FastAPI
+    # wrapper (`/tmp/tmp*/main.py:229-245` inside the edg3 container; see
+    # `docs/tasks_manager/_runs/EGM-059/phase-2/re-review-3.md`) does, for
+    # each plugin endpoint result dict: if `status_code` is present and not
+    # 2xx, raise an HTTP error with that code; elif `"error" in result`,
+    # raise HTTP 500; else respond 200. This four-line replica proves the
+    # actual `neo4j_query`/`explain_graph` return values never fall into the
+    # bare-500 branch for a client- or auth-class Neo4j failure.
+    status_code = result.get("status_code")
+    if status_code is not None and not (200 <= status_code < 300):
+      return status_code
+    if "error" in result:
+      return 500
+    return 200
+
+  def test_neo4j_client_and_auth_errors_never_reach_the_wrappers_bare_500(self):
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+    cypher = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5"
+
+    cases = (
+      (Neo4jClientError("{code: Neo.ClientError.Statement.SyntaxError} {message: bad}"), 422),
+      (Neo4jAuthError("{code: Neo.ClientError.Security.Unauthorized} {message: bad}"), 503),
+      (RuntimeError("connection failed"), 503),
+    )
+    for exc, expected_status in cases:
+      with self.subTest(exc=type(exc).__name__):
+        plugin = _make_api()
+        fake_session.run.side_effect = exc
+        with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+          with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+            result = plugin.neo4j_query(
+              cypher=cypher,
+              uri="example.com:7687",
+              scheme="bolt+s",
+              username="neo4j",
+              password="secret",
+            )
+        self.assertIn("error", _graph_first_payload(result))
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
 
 
 class EdgeGuardHealthMetricsTests(unittest.TestCase):

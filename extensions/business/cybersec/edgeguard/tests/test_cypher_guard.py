@@ -707,6 +707,88 @@ class GuardHardeningTests(unittest.TestCase):
     self.assertFalse(analysis["accepted"])
     self.assertIn("'i'", analysis["validation_feedback"])
 
+  def test_where_pattern_predicate_reusing_a_with_renamed_alias_is_accepted(self):
+    # Fix round 4 (re-review-3 finding 1): `WITH x AS cvss` carries `cvss`
+    # into scope just as a `MATCH`-bound variable would; the `WHERE`
+    # pattern predicate below reuses it, introducing no new variable.
+    cypher = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(x:CVSSv31) WITH c, x AS cvss "
+      "WHERE (c)-[:HAS_CVSS_v31]->(cvss) RETURN c, cvss LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_where_pattern_predicate_reusing_an_unwind_alias_is_accepted(self):
+    # Fix round 4 (re-review-3 finding 1): same rule for `UNWIND ... AS`.
+    # A bare identifier operand (not a `[...]` list literal, a pre-existing,
+    # unrelated gap: any identifier directly followed by `[` trips
+    # `BRACKET_ACCESS`) is enough to exercise the alias-binding syntax this
+    # rule cares about.
+    cypher = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(x:CVSSv31) UNWIND x AS cvss "
+      "WHERE (c)-[:HAS_CVSS_v31]->(cvss) RETURN c, cvss LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_where_pattern_predicate_reusing_a_bare_with_pass_through_is_accepted(self):
+    # Fix round 4 (re-review-3 finding 1): a bare `WITH a, b` pass-through
+    # (mixed here with a rename in the same clause) keeps both names bound.
+    cypher = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(x:CVSSv31) WITH c, x AS cvss "
+      "WITH c, cvss WHERE (c)-[:HAS_CVSS_v31]->(cvss) RETURN c, cvss LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_where_pattern_predicate_still_rejects_a_variable_no_with_or_match_bound(self):
+    # Regression: a `WITH`/`UNWIND` clause elsewhere in the query must not
+    # make the rule accept everything — an actually new variable is still
+    # rejected.
+    cypher = (
+      "MATCH (c:CVE) WITH c WHERE (c)-[:EXPLOITS]->(i:Indicator) RETURN c LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("'i'", analysis["validation_feedback"])
+
+  def test_pattern_comprehension_in_where_is_accepted(self):
+    # Fix round 4 (re-review-3 finding 2): `size([...])`'s pattern
+    # comprehension binds its own new pattern variables (`i`), same as an
+    # `EXISTS { ... }` subquery — it must not be mistaken for a bare
+    # pattern predicate that introduces `i` illegally.
+    cypher = (
+      "MATCH (c:CVE) WHERE size([(c)-[:EXPLOITS]->(i:Indicator) | i.value]) > 0 "
+      "RETURN c LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_pattern_comprehension_masking_does_not_hide_a_real_new_variable_elsewhere(self):
+    # Regression: masking the pattern comprehension must not blank out an
+    # unrelated bare pattern predicate later in the same `WHERE` clause.
+    cypher = (
+      "MATCH (c:CVE) WHERE size([(c)-[:EXPLOITS]->(i:Indicator) | i.value]) > 0 "
+      "AND (c)-[:EXPLOITS]->(j:Indicator) RETURN c LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("'j'", analysis["validation_feedback"])
+
+  def test_variable_bound_only_inside_exists_is_not_treated_as_outer_bound(self):
+    # Fix round 4 (re-review-3 finding 5): `i` is bound only inside the
+    # `EXISTS { ... }` subquery's own `MATCH` — Neo4j would reject a second,
+    # outer reference to it as an undefined variable; the guard must not
+    # treat it as outer-bound just because it appears in a `MATCH` anywhere
+    # in the query text.
+    cypher = (
+      "MATCH (c:CVE) WHERE EXISTS { MATCH (c)-[:EXPLOITS]->(i:Indicator) } "
+      "AND (c)-[:EXPLOITS]->(i) RETURN c LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("'i'", analysis["validation_feedback"])
+
 
 class HopBoundsV0_11Tests(unittest.TestCase):
   """Contract §4.1 carry-over: at most three relationship hops per pattern;
