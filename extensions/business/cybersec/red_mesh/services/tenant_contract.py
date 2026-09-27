@@ -45,3 +45,25 @@ def store_contract(documents, *, filename, content_b64, uploaded_by, now_fn=None
   }
   ref = documents.put(envelope)
   return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}
+
+
+def resolve_contract(documents, ref):
+  """The document reference for a stored contract, re-verified from its bytes.
+
+  Unreadable, foreign-kind, non-PDF and tampered envelopes are all `contract_invalid`: the caller
+  learns nothing about which one it was.
+  """
+  if not isinstance(ref, str) or not ref.strip():
+    raise ContractRefused(400, "contract_required")
+  envelope = documents.get(ref)
+  if not isinstance(envelope, dict) or envelope.get("kind") != CONTRACT_KIND:
+    raise ContractRefused(400, "contract_invalid")
+  try:
+    document = validate_document(envelope.get("filename"), envelope.get("content_b64"), accepted=CONTRACT_FORMATS)
+  except AuthorizationUploadError:
+    raise ContractRefused(400, "contract_invalid") from None
+  if (document.sha256_hex != envelope.get("sha256") or document.size_bytes != envelope.get("size_bytes")
+      or document.filename != envelope.get("filename")
+      or any(not isinstance(envelope.get(key), str) or not envelope[key] for key in ("uploaded_at", "uploaded_by"))):
+    raise ContractRefused(400, "contract_invalid")
+  return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}

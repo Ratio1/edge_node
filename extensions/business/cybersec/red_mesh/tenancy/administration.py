@@ -88,6 +88,36 @@ def _domain(value):
   return value
 
 
+# RM-095 phase 1: a tenant is created around a signed contract and its legal details.
+_LEGAL_FIELDS = ("name", "registration_id", "signer_name", "signer_role")
+_CONTRACT_TEXT_FIELDS = ("store", "ref", "filename", "mime", "uploaded_at", "uploaded_by")
+
+
+def _legal(value):
+  if not isinstance(value, dict) or set(value) != set(_LEGAL_FIELDS):
+    raise AdministrationDenied(400, "legal_details_required")
+  legal = {}
+  for key in _LEGAL_FIELDS:
+    text = value[key].strip() if isinstance(value[key], str) else ""
+    if not 1 <= len(text) <= 200:
+      raise AdministrationDenied(400, "legal_details_required")
+    legal[key] = text
+  return legal
+
+
+def _valid_contract(value):
+  return (isinstance(value, dict)
+          and set(value) == {*_CONTRACT_TEXT_FIELDS, "sha256", "size_bytes"}
+          and all(isinstance(value[key], str) and value[key] for key in _CONTRACT_TEXT_FIELDS)
+          and isinstance(value["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None
+          and type(value["size_bytes"]) is int and value["size_bytes"] > 0)
+
+
+def _same_contract(stored, requested):
+  return (isinstance(stored, dict) and isinstance(requested, dict)
+          and stored.get("store") == requested.get("store") and stored.get("ref") == requested.get("ref"))
+
+
 class TenantAdministrationService:
   def __init__(self, accounts, store, configured_peers_reader=None):
     self.accounts = accounts
@@ -125,8 +155,12 @@ class TenantAdministrationService:
     try:
       _domain(receipt.get("domain_id"))
       _request_id(receipt["tenant_id"][3:])
+      if "legal" in receipt and _legal(receipt["legal"]) != receipt["legal"]:
+        raise AdministrationDenied(400, "legal_details_required")
     except AdministrationDenied:
       raise TenantStoreError("Invalid creation receipt") from None
+    if "contract" in receipt and not _valid_contract(receipt["contract"]):
+      raise TenantStoreError("Invalid creation receipt")
     return receipt
 
   @staticmethod
@@ -135,7 +169,10 @@ class TenantAdministrationService:
 
   @staticmethod
   def _tenant_payload(receipt):
-    return {
+    # RM-095: `legal` and `contract` exist only on tenants created since contracts were required;
+    # the tenant copies them from its receipt, so both sides match exactly or not at all.
+    contract_terms = {key: receipt[key] for key in ("legal", "contract") if key in receipt}
+    return {**contract_terms,
       "tenant_id": receipt["tenant_id"], "actor_id": receipt["actor_id"],
       "request_id": receipt["request_id"], "display_name": receipt["display_name"],
       "domain_id": receipt["domain_id"], "created_by": receipt["actor_id"],
@@ -202,17 +239,26 @@ class TenantAdministrationService:
     return policy
 
   @_endpoint
-  def prepare_tenant(self, actor, request_id, display_name, domain_id, initial_admin_id):
+  def prepare_tenant(self, actor, request_id, display_name, domain_id, initial_admin_id, legal=None,
+                     contract=None):
+    """`contract` is the document reference `services.tenant_contract.resolve_contract` verified
+    outside this lock; this method never reads the document store."""
     creator = self._actor(actor, creator=True)
     request_id = _request_id(request_id)
     domain_id = _domain(domain_id)
     initial_admin_id = canonical_account_id(initial_admin_id)
     if not isinstance(display_name, str) or not 1 <= len(display_name.strip()) <= 120 or not initial_admin_id:
       raise AdministrationDenied(400, "invalid_request")
+    legal = _legal(legal)
+    if contract is None:
+      raise AdministrationDenied(400, "contract_required")
+    if not _valid_contract(contract) or contract["uploaded_by"] != creator.account_id:
+      raise AdministrationDenied(400, "contract_invalid")
     intent = {"display_name": display_name.strip(), "domain_id": domain_id, "initial_admin_id": initial_admin_id}
     receipt = self._receipt(creator.account_id, request_id)
     if receipt is not None:
-      if any(receipt[key] != value for key, value in intent.items()):
+      if (any(receipt.get(key) != value for key, value in intent.items())
+          or receipt.get("legal") != legal or not _same_contract(receipt.get("contract"), contract)):
         raise AdministrationDenied(409, "request_conflict")
       domain, tenant = self._reserved_tenant(receipt)
     else:
@@ -224,7 +270,8 @@ class TenantAdministrationService:
       # finds its own tenant_admin membership already written.
       if admin.tenant_memberships:
         raise AdministrationDenied(409, "scope_conflict")
-      receipt = {**intent, "actor_id": creator.account_id, "request_id": request_id,
+      receipt = {**intent, "legal": legal, "contract": dict(contract),
+                 "actor_id": creator.account_id, "request_id": request_id,
                  "initial_admin_generation": admin.account_generation, "tenant_id": "tn_" + str(uuid4()),
                  "created_at": datetime.now(timezone.utc).isoformat()}
       self.store.put("receipt", creator.account_id, request_id, record=receipt)

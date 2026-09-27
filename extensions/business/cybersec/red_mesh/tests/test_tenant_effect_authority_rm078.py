@@ -21,6 +21,7 @@ from extensions.business.cybersec.red_mesh.tenancy.policy import (
   TenantPolicyContext,
   authorize_tenant_operation,
 )
+from .contract_fixture import contract_terms
 
 EFFECT_OPERATIONS = ("analysis:run", "engagement:delete", "jobs:purge")
 ROLES = ("super_tenant_admin", "super_pentester", "tenant_admin", "tenant_pentester", "tenant_user")
@@ -152,7 +153,7 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
       CstoreAuthAccountReader(self.store), CstoreTenantAdministrationStore(self.store, "deployment"))
     request_id = str(uuid4())
     prepared = administration.prepare_tenant(
-      {"account_id": "creator"}, request_id, "Example", "example", "initial")
+      {"account_id": "creator"}, request_id, "Example", "example", "initial", **contract_terms())
     self.tenant_id = prepared["data"]["tenantId"]
     self.store.grant("initial", self.tenant_id)
     administration.activate_tenant({"account_id": "creator"}, request_id)

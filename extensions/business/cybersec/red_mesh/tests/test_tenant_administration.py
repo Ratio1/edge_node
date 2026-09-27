@@ -9,6 +9,7 @@ from extensions.business.cybersec.red_mesh.tenancy.administration import TenantA
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_tenant import CstoreTenantReader
+from .contract_fixture import contract_terms, install_contract
 
 
 class FakeAdministrationStore:
@@ -88,7 +89,8 @@ class TestTenantAdministration(unittest.TestCase):
     self.request = str(uuid4())
 
   def prepare(self, **changes):
-    values = dict(request_id=self.request, display_name=" Example ", domain_id="example", initial_admin_id=" INITIAL ")
+    values = dict(request_id=self.request, display_name=" Example ", domain_id="example", initial_admin_id=" INITIAL ",
+                  **contract_terms())
     values.update(changes)
     return self.service.prepare_tenant(self.actor, **values)
 
@@ -336,7 +338,8 @@ class TestTenantAdministration(unittest.TestCase):
     other = {"account_id": "other"}
     before = len(self.store.writes)
     self.assertEqual(self.service.activate_tenant(other, self.request)["status_code"], 404)
-    self.assertEqual(self.service.prepare_tenant(other, self.request, "Example", "example", "initial")["status_code"], 409)
+    self.assertEqual(self.service.prepare_tenant(other, self.request, "Example", "example", "initial",
+                                                 **contract_terms(uploaded_by="other"))["status_code"], 409)
     self.assertEqual(len(self.store.writes), before)
 
   def test_each_observable_failed_write_is_unavailable_and_retryable(self):
@@ -409,7 +412,7 @@ class TestTenantAdministration(unittest.TestCase):
 
     def prepare(_):
       service = TenantAdministrationService(CstoreAuthAccountReader(self.store), self.repo)
-      return service.prepare_tenant(self.actor, self.request, "Example", "example", "initial")
+      return service.prepare_tenant(self.actor, self.request, "Example", "example", "initial", **contract_terms())
 
     with ThreadPoolExecutor(max_workers=8) as executor:
       results = list(executor.map(prepare, range(16)))
@@ -634,7 +637,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     actor = {"account_id": "creator"}
     request_id = str(uuid4())
     with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
-      tenant_id = plugin.prepare_tenant(actor, request_id, "Tenant", "tenant", "initial")["data"]["tenantId"]
+      tenant_id = plugin.prepare_tenant(actor, request_id, "Tenant", "tenant", "initial", **install_contract(plugin))["data"]["tenantId"]
       store.grant("initial", tenant_id)
       plugin.activate_tenant(actor, request_id)
       for value in (True, False, 0, 1, "true", "false", None, [], {}):
@@ -681,7 +684,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     actor = {"account_id": "creator", "namespace": "browser-ignored"}
     request = str(uuid4())
     with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
-      prepared = plugin.prepare_tenant(actor, request, "Tenant", "tenant", "initial")
+      prepared = plugin.prepare_tenant(actor, request, "Tenant", "tenant", "initial", **install_contract(plugin))
       self.assertTrue(prepared["success"], prepared)
       tenant_id = prepared["data"]["tenantId"]
       store.grant("initial", tenant_id)

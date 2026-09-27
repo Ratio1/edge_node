@@ -16,6 +16,7 @@ from .test_tenant_read_access import ReadStore
 from .test_tenant_administration import FakeAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
 from extensions.business.cybersec.red_mesh.tenancy.policy import PLATFORM_ROLES
+from .contract_fixture import contract_terms
 
 _SAME_TENANT = object()
 
@@ -39,7 +40,7 @@ def install_tenant_read_store(case, owner, Plugin, *, jobs=None, role="super_ten
   administration = TenantAdministrationService(CstoreAuthAccountReader(store), tenant_store)
   request_id = str(uuid4())
   prepared = administration.prepare_tenant({"account_id": "creator"}, request_id,
-    "Read fixture", "read-fixture", "initial")
+    "Read fixture", "read-fixture", "initial", **contract_terms())
   assert prepared["success"], prepared
   tenant_id = prepared["data"]["tenantId"]
   store.grant("initial", tenant_id)
@@ -109,7 +110,7 @@ def read_endpoint_fixture(*, bound=True, archived=True, role="tenant_admin"):
     administration = TenantAdministrationService(CstoreAuthAccountReader(store), tenant_store)
     request_id = str(uuid4())
     prepared = administration.prepare_tenant({"account_id": "creator"}, request_id,
-      "Read fixture", "read-fixture", "initial")
+      "Read fixture", "read-fixture", "initial", **contract_terms())
     assert prepared["success"], prepared
     tenant_id = prepared["data"]["tenantId"]
     store.grant("initial", tenant_id)

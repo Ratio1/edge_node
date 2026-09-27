@@ -13,6 +13,7 @@ from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from extensions.business.cybersec.red_mesh.services.config import (
   DEFAULT_OPENCTI_EXPORT_CONFIG, DEFAULT_TAXII_EXPORT_CONFIG, DEFAULT_WAZUH_EXPORT_CONFIG)
 from extensions.business.cybersec.red_mesh.services.misp_config import DEFAULT_MISP_EXPORT_CONFIG
+from .contract_fixture import contract_terms
 
 
 def integration_location(tenant_id, integration_id):
@@ -31,7 +32,7 @@ class IntegrationRecordCase(unittest.TestCase):
     self.actor = {"account_id": "creator"}
     request = str(uuid4())
     self.tenant = self.service.prepare_tenant(
-      self.actor, request, "Tenant", "tenant", "initial")["data"]["tenantId"]
+      self.actor, request, "Tenant", "tenant", "initial", **contract_terms())["data"]["tenantId"]
     self.owner.grant("initial", self.tenant)
     self.assertTrue(self.service.activate_tenant(self.actor, request)["success"])
 
@@ -172,7 +173,7 @@ class TestTenantIntegrationRecords(IntegrationRecordCase):
   def test_a_foreign_tenant_admin_reads_nothing(self):
     other = str(uuid4())
     self.owner.account("initial-other")
-    foreign = self.service.prepare_tenant(self.actor, other, "Other", "other", "initial-other")["data"]["tenantId"]
+    foreign = self.service.prepare_tenant(self.actor, other, "Other", "other", "initial-other", **contract_terms())["data"]["tenantId"]
     self.owner.account("outsider", memberships=[{"role": "tenant_admin", "tenant_id": foreign}])
     self.assertIn(self.service.list_tenant_integrations(
       {"account_id": "outsider"}, self.tenant)["status_code"], (403, 404))
