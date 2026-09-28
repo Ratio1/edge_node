@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from copy import deepcopy
 import json
 
-from .assets import canonical_digest, canonical_uuid, normalize_port_scope, normalize_target
+from .assets import canonical_digest, canonical_uuid, normalize_port_scope, normalize_target, valid_digest
 from .identity import canonical_account_id
 from .nodes import valid_node_address
 
@@ -11,6 +11,10 @@ from .nodes import valid_node_address
 _FACT_FIELDS = frozenset({"namespace", "tenant_id", "asset_id", "asset_target",
   "asset_target_digest", "actor_id", "actor_generation", "node_failure_policy"})
 _BINDING_FIELDS = _FACT_FIELDS | {"schema_version", "original_launcher", "participant_order"}
+# Launch-time policy, read by the launch gate and never part of the binding.
+_POLICY_FIELDS = frozenset({"asset_authorized_ports", "engagement"})
+_ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "authorized_tests", "roe", "context",
+                                "authorization"})
 
 
 def _validate_facts(value, *, failure_policy=True):
@@ -40,6 +44,21 @@ def _node_order(value):
       or len(set(value)) != len(value)):
     raise ValueError("Invalid execution participant order")
   return value
+
+
+def _validate_engagement(value, kind):
+  """The engagement facts a launch is gated on and snapshots (RM-095); shape only."""
+  # Imported here: `engagements` loads the models package, which imports this module.
+  from .engagements import normalize_roe, valid_engagement_id
+  fields = _ENGAGEMENT_FIELDS | ({"authorized_scan_modes"} if kind == "network" else set())
+  if (not isinstance(value, dict) or set(value) != fields
+      or not valid_engagement_id(value["engagement_id"]) or not valid_digest(value["engagement_hash"])
+      or not isinstance(value["authorized_tests"], list) or not value["authorized_tests"]
+      or any(not isinstance(item, str) or not item for item in value["authorized_tests"])
+      or not isinstance(value["context"], dict) or not isinstance(value["authorization"], dict)):
+    raise ValueError("Invalid execution engagement")
+  if normalize_roe(value["roe"]) != value["roe"]:
+    raise ValueError("Invalid execution engagement")
 
 
 def _snapshot(value):
@@ -72,13 +91,20 @@ class ResolvedExecutionContext:
   _snapshot: str
 
   def __init__(self, value):
-    # `asset_authorized_ports` is optional: the asset's port scope, read by the launch gate and
-    # never part of the binding (the scope is launch-time policy, not execution identity).
+    # `asset_authorized_ports` and `engagement` are optional launch-time policy, read by the launch
+    # gate and never part of the binding: the engagement's port scope for the asset, and the
+    # engagement facts (RM-095). A network scope only comes with an engagement.
     if (not isinstance(value, dict)
-        or set(value) - {"asset_authorized_ports"} != _FACT_FIELDS | {"selected_candidates"}):
+        or set(value) - _POLICY_FIELDS != _FACT_FIELDS | {"selected_candidates"}):
       raise ValueError("Invalid resolved execution fields")
     _validate_facts(value)
     _node_order(value["selected_candidates"])
+    if "engagement" in value:
+      _validate_engagement(value["engagement"], value["asset_target"]["kind"])
+      # A network entry in an engagement always has a port scope (a signed engagement never
+      # means "any port").
+      if value["asset_target"]["kind"] == "network" and "asset_authorized_ports" not in value:
+        raise ValueError("Invalid execution port scope")
     if "asset_authorized_ports" in value and (
         value["asset_target"]["kind"] != "network"
         or normalize_port_scope(value["asset_authorized_ports"]) != value["asset_authorized_ports"]
@@ -92,7 +118,8 @@ class ResolvedExecutionContext:
   def build_binding(self, original_launcher, participant_order):
     participants = _node_order(participant_order)
     facts = self.to_dict()
-    facts.pop("asset_authorized_ports", None)
+    for name in _POLICY_FIELDS:
+      facts.pop(name, None)
     if not set(participants).issubset(facts.pop("selected_candidates")):
       raise ValueError("Unselected execution participant")
     return ExecutionBinding({**facts, "schema_version": 1, "original_launcher": original_launcher,

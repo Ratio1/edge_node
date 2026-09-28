@@ -199,6 +199,9 @@ class TestLaunchService(unittest.TestCase):
     self.assertEqual(self._launch_with_roe({"dos_allowed": True}), {False})
     self.assertEqual(self._launch_with_roe({"authenticated_action": True}), {True})
     self.assertEqual(self._launch_with_roe({"authenticated_action": "false"}), {False})
+    # RM-095: the engagement snapshot's three-field RoE.
+    self.assertEqual(self._launch_with_roe({"authenticated_action": True, "stateful_probes_allowed": False,
+                                            "ics_safe_mode_required": True}), {True})
 
 
 class TestComparisonTieredAssignment(unittest.TestCase):

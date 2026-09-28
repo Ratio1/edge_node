@@ -172,3 +172,21 @@ class TestResolvedContextCarriesThePortScope(unittest.TestCase):
     for scope in ("1024-1", "22, 80", None, 80):
       with self.subTest(scope=scope), self.assertRaises(ValueError):
         self._context(asset_authorized_ports=scope)
+
+  def test_the_engagement_facts_are_carried_and_kept_out_of_the_binding(self):
+    # RM-095: the facts the launch gate checks and the job snapshots; not execution identity.
+    engagement = {"engagement_id": "en_" + str(uuid4()), "engagement_hash": "a" * 64,
+                  "authorized_tests": ["service_info_common"], "authorized_scan_modes": ["connect"],
+                  "roe": {"authenticated_action": False, "stateful_probes_allowed": False,
+                          "ics_safe_mode_required": True},
+                  "context": {}, "authorization": {}}
+    context = self._context(engagement=engagement, asset_authorized_ports="443")
+    self.assertEqual(context.to_dict()["engagement"], engagement)
+    binding = context.build_binding("coordinator", ["node-a"]).to_dict()
+    self.assertEqual(binding, self._context().build_binding("coordinator", ["node-a"]).to_dict())
+    broken = ({**engagement, "engagement_id": "en_x"}, {**engagement, "authorized_tests": []},
+              {**engagement, "roe": {"authenticated_action": "yes"}}, {**engagement, "extra": 1},
+              {key: value for key, value in engagement.items() if key != "authorized_scan_modes"})
+    for value in broken:
+      with self.subTest(value=value), self.assertRaises(ValueError):
+        self._context(engagement=value)

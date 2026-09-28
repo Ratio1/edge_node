@@ -27,6 +27,7 @@ from ..models import (
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.execution import binding_from_record
 from .config import get_attestation_config
+from .control import stop_monitoring
 from .config import get_llm_agent_config
 from .event_hooks import (
   emit_attestation_status_event as _emit_attestation_status_event,
@@ -111,6 +112,63 @@ def emit_finding_event(owner, job_specs, **kwargs):
 def emit_lifecycle_event(owner, job_specs, **kwargs):
   if _execution_operation_allowed(owner, job_specs):
     return _emit_lifecycle_event(owner, job_specs, **kwargs)
+
+
+# RM-095: how often a running continuous pass re-reads its engagement. Before a new pass the
+# engagement is always read.
+ENGAGEMENT_RECHECK_SECONDS = 60
+
+
+def _stop_if_engagement_ended(owner, job_specs, *, due):
+  """Hard-stop a continuous job whose engagement has ended; True when it was stopped.
+
+  RM-095 (owner, 2026-09-28): the engagement ends at `valid_until` or on a revoke, and the job
+  stops then, mid-pass included, the way an operator's HARD stop does. Passes finalized before
+  the stop keep their reports. A job launched without an engagement is not checked.
+  """
+  check = getattr(owner, "_engagement_end_reason", None)
+  if not callable(check):
+    return False
+  job_id = job_specs.get("job_id")
+  # Per job: when it was last checked, and its config once read (immutable, so R1FS is read once;
+  # an unavailable read answers {} and is not kept).
+  checks = getattr(owner, "_engagement_checks", None)
+  if not isinstance(checks, dict):
+    checks = {}
+    owner._engagement_checks = checks
+  entry = checks.setdefault(job_id, {"at": float("-inf")})
+  now = owner.time()
+  if not due and now - entry["at"] < ENGAGEMENT_RECHECK_SECONDS:
+    return False
+  entry["at"] = now
+  # Fail-safe: one job whose config or engagement cannot be read must not break the loop for the
+  # others, and never reads as an ended engagement.
+  try:
+    config = entry.get("config") or owner._get_job_config(job_specs, resolve_secrets=False) or {}
+    if config:
+      entry["config"] = config
+    engagement_id = config.get("engagement_id")
+    if not engagement_id:
+      return False
+    reason = check(job_specs, config)
+  except Exception as exc:
+    owner.P(f"[CONTINUOUS] Engagement check for job {job_id} unavailable: {exc}", color='y')
+    return False
+  if reason is None:
+    return False
+  owner._emit_timeline_event(
+    job_specs, "engagement_ended", f"Engagement ended ({reason}): job stopped",
+    actor_type="system", meta={"engagement_id": engagement_id, "reason": reason},
+  )
+  result = stop_monitoring(owner, job_id, "HARD", checked_job=job_specs)
+  if not isinstance(result, dict) or result.get("error"):
+    return False
+  checks.pop(job_id, None)
+  owner._log_audit_event("continuous_stopped_engagement_ended", {
+    "job_id": job_id, "engagement_id": engagement_id, "reason": reason, "pass_nr": job_specs.get("job_pass", 1),
+  })
+  owner.P(f"[CONTINUOUS] Job {job_id} stopped: its engagement ended ({reason})", color='y')
+  return True
 
 
 def _all_workers_finished_with_reports(workers):
@@ -431,6 +489,11 @@ def maybe_finalize_pass(owner):
       _record_stale_intermediate_recovery(owner, job_specs, job_status, len(workers))
       set_job_status(job_specs, JOB_STATUS_COLLECTING)
       job_status = job_specs.get("job_status", JOB_STATUS_COLLECTING)
+
+    new_pass_due = bool(all_finished and next_pass_at and owner.time() >= next_pass_at)
+    if (run_mode == RUN_MODE_CONTINUOUS_MONITORING and not (all_finished and next_pass_at is None)
+        and _stop_if_engagement_ended(owner, job_specs, due=new_pass_due)):
+      continue
 
     if all_finished and next_pass_at is None:
       pass_date_started = owner._get_timeline_date(job_specs, "pass_started") or owner._get_timeline_date(job_specs, "created")

@@ -93,6 +93,15 @@ class AuthorizationUploadResult:
 
 
 @dataclass(frozen=True)
+class ValidatedDocument:
+  raw: bytes
+  filename: str           # sanitized
+  mime: str               # detected from the bytes
+  size_bytes: int
+  sha256_hex: str
+
+
+@dataclass(frozen=True)
 class AuthorizationUploadError(Exception):
   code: str               # invalid_base64 | empty | too_large | bad_mime | storage_failed
   message: str
@@ -145,39 +154,8 @@ def store_authorization_document(
   if now_fn is None:
     now_fn = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-  # 1. Decode
-  try:
-    raw = base64.b64decode(content_b64 or "", validate=True)
-  except (binascii.Error, ValueError) as exc:
-    raise AuthorizationUploadError(
-      code="invalid_base64",
-      message=f"content_b64 is not valid base64: {exc}",
-    )
-
-  if not raw:
-    raise AuthorizationUploadError(
-      code="empty", message="uploaded file is empty",
-    )
-
-  if len(raw) > MAX_AUTH_DOCUMENT_BYTES:
-    raise AuthorizationUploadError(
-      code="too_large",
-      message=(
-        f"file size {len(raw)} bytes exceeds the {MAX_AUTH_DOCUMENT_BYTES} "
-        f"byte ({MAX_AUTH_DOCUMENT_BYTES // (1024*1024)} MB) cap"
-      ),
-    )
-
-  # 2. MIME sniff
-  detected_mime = _sniff_mime(raw)
-  if detected_mime is None:
-    raise AuthorizationUploadError(
-      code="bad_mime",
-      message=(
-        "file is not a recognized PDF, PNG, or JPEG. Content-Type "
-        "headers are ignored — we sniff the file bytes directly."
-      ),
-    )
+  document = validate_document(filename, content_b64)
+  raw, detected_mime = document.raw, document.mime
 
   # 3. Optional virus scan
   if virus_scan_hook is not None:
@@ -195,8 +173,8 @@ def store_authorization_document(
       )
 
   # 4. Build envelope
-  sanitized = _sanitize_filename(filename)
-  sha256_hex = hashlib.sha256(raw).hexdigest()
+  sanitized = document.filename
+  sha256_hex = document.sha256_hex
   envelope: dict[str, Any] = {
     "kind": "redmesh_authorization_document",
     "schema_version": "1.0",
@@ -241,6 +219,67 @@ def store_authorization_document(
     size_bytes=len(raw),
     sha256_hex=sha256_hex,
     uploaded_at=envelope["uploaded_at"],
+  )
+
+
+def validate_document(
+  filename: str,
+  content_b64: str,
+  *,
+  accepted: tuple[str, ...] | None = None,
+) -> ValidatedDocument:
+  """Decode, size-check and sniff one uploaded document; shared by every document upload.
+
+  ``accepted`` narrows the sniffed MIME types (RM-095: tenant contracts are PDF only). Raises
+  ``AuthorizationUploadError`` with ``invalid_base64 | empty | too_large | bad_mime``.
+  """
+  # 1. Decode
+  if content_b64 is not None and not isinstance(content_b64, str):
+    raise AuthorizationUploadError(code="invalid_base64", message="content_b64 must be a base64 string")
+  try:
+    raw = base64.b64decode(content_b64 or "", validate=True)
+  except (binascii.Error, ValueError) as exc:
+    raise AuthorizationUploadError(
+      code="invalid_base64",
+      message=f"content_b64 is not valid base64: {exc}",
+    )
+
+  if not raw:
+    raise AuthorizationUploadError(
+      code="empty", message="uploaded file is empty",
+    )
+
+  if len(raw) > MAX_AUTH_DOCUMENT_BYTES:
+    raise AuthorizationUploadError(
+      code="too_large",
+      message=(
+        f"file size {len(raw)} bytes exceeds the {MAX_AUTH_DOCUMENT_BYTES} "
+        f"byte ({MAX_AUTH_DOCUMENT_BYTES // (1024*1024)} MB) cap"
+      ),
+    )
+
+  # 2. MIME sniff
+  detected_mime = _sniff_mime(raw)
+  if detected_mime is None:
+    raise AuthorizationUploadError(
+      code="bad_mime",
+      message=(
+        "file is not a recognized PDF, PNG, or JPEG. Content-Type "
+        "headers are ignored — we sniff the file bytes directly."
+      ),
+    )
+  if accepted is not None and detected_mime not in accepted:
+    raise AuthorizationUploadError(
+      code="bad_mime",
+      message=f"file is {detected_mime}; accepted here: {', '.join(accepted)}",
+    )
+
+  return ValidatedDocument(
+    raw=raw,
+    filename=_sanitize_filename(filename),
+    mime=detected_mime,
+    size_bytes=len(raw),
+    sha256_hex=hashlib.sha256(raw).hexdigest(),
   )
 
 

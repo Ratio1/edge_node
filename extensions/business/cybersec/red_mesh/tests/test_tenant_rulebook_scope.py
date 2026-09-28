@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 
 from .read_endpoint_fixtures import as_role, read_endpoint_fixture
+from .contract_fixture import contract_terms
 
 PROFILE = "nis2.eu_baseline.v1"
 
@@ -60,7 +61,7 @@ def second_tenant(fixture):
   request_id = str(uuid4())
   fixture.store.account("other-admin")
   prepared = fixture.administration.prepare_tenant({"account_id": "creator"}, request_id,
-    "Other tenant", "other-tenant", "other-admin")
+    "Other tenant", "other-tenant", "other-admin", **contract_terms())
   assert prepared["success"], prepared
   tenant_id = prepared["data"]["tenantId"]
   fixture.store.grant("other-admin", tenant_id)

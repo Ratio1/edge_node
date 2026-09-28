@@ -14,6 +14,7 @@ from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.read_access import TenantReadAccess
 from .test_execution_binding_models import binding_payload
 from .test_tenant_administration import FakeAdministrationStore
+from .contract_fixture import contract_terms
 
 
 class ReadStore(FakeAdministrationStore):
@@ -56,7 +57,7 @@ class TestTenantReadAccess(unittest.TestCase):
     self.administration = TenantAdministrationService(self.accounts, self.tenants)
     self.request_id = str(uuid4())
     prepared = self.administration.prepare_tenant(
-      {"account_id": "creator"}, self.request_id, "Example", "example", "initial")
+      {"account_id": "creator"}, self.request_id, "Example", "example", "initial", **contract_terms())
     self.assertTrue(prepared["success"], prepared)
     self.tenant_id = prepared["data"]["tenantId"]
     self.store.grant("initial", self.tenant_id)
@@ -188,7 +189,7 @@ class TestTenantReadAccess(unittest.TestCase):
   def test_unknown_foreign_and_unpublished_tenants_deny_before_jobs(self):
     self.store.account("initial-pending")
     pending = self.administration.prepare_tenant({"account_id": "creator"}, str(uuid4()), "Pending", "pending",
-                                                 "initial-pending")
+                                                 "initial-pending", **contract_terms())
     pending_id = pending["data"]["tenantId"]
     self.writes_before = list(self.store.writes)
     for operation in ("get", "list"):

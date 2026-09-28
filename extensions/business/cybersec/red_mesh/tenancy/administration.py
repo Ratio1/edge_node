@@ -17,11 +17,15 @@ from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_o
 from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
-from .assets import (canonical_digest, normalize_name, normalize_port_scope, normalize_target,
-                     valid_digest)
+from .assets import (canonical_digest, canonical_uuid, normalize_name, normalize_port_scope,
+                     normalize_target, valid_digest)
 from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
                            valid_integration_id)
+from .engagements import (ENGAGEMENT_ASSET_KINDS, ENGAGEMENT_KINDS, MAX_ENGAGEMENT_ASSETS, EngagementInvalid,
+                          engagement_hash, engagement_id_for, normalize_context, normalize_roe,
+                          normalize_scan_modes, normalize_signer, normalize_tests, normalize_window,
+                          valid_doc_ref, valid_engagement_id)
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -88,11 +92,46 @@ def _domain(value):
   return value
 
 
+# RM-095 phase 1: a tenant is created around a signed contract and its legal details.
+_LEGAL_FIELDS = ("name", "registration_id", "signer_name", "signer_role")
+_CONTRACT_TEXT_FIELDS = ("store", "ref", "filename", "mime", "uploaded_at", "uploaded_by")
+
+
+def _legal(value):
+  if not isinstance(value, dict) or set(value) != set(_LEGAL_FIELDS):
+    raise AdministrationDenied(400, "legal_details_required")
+  legal = {}
+  for key in _LEGAL_FIELDS:
+    text = value[key].strip() if isinstance(value[key], str) else ""
+    if not 1 <= len(text) <= 200:
+      raise AdministrationDenied(400, "legal_details_required")
+    legal[key] = text
+  return legal
+
+
+def _valid_contract(value):
+  return (isinstance(value, dict)
+          and set(value) == {*_CONTRACT_TEXT_FIELDS, "sha256", "size_bytes"}
+          and all(isinstance(value[key], str) and value[key] for key in _CONTRACT_TEXT_FIELDS)
+          and isinstance(value["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None
+          and type(value["size_bytes"]) is int and value["size_bytes"] > 0)
+
+
+def _same_contract(stored, requested):
+  # Same bytes, same contract: a re-upload of the file gets a new reference (the envelope carries its
+  # upload time), and a retry after a page reload must still be the same creation. The receipt keeps
+  # the reference it was first created with.
+  return (isinstance(stored, dict) and isinstance(requested, dict)
+          and stored.get("sha256") == requested.get("sha256"))
+
+
 class TenantAdministrationService:
   def __init__(self, accounts, store, configured_peers_reader=None):
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
+    # The engagement window is checked against this clock at launch (a test seam).
+    self.clock = lambda: datetime.now(timezone.utc)
 
   def _actor(self, actor, *, creator=False):
     account, denial = resolve_actor(actor, self.accounts)
@@ -125,8 +164,12 @@ class TenantAdministrationService:
     try:
       _domain(receipt.get("domain_id"))
       _request_id(receipt["tenant_id"][3:])
+      if "legal" in receipt and _legal(receipt["legal"]) != receipt["legal"]:
+        raise AdministrationDenied(400, "legal_details_required")
     except AdministrationDenied:
       raise TenantStoreError("Invalid creation receipt") from None
+    if "contract" in receipt and not _valid_contract(receipt["contract"]):
+      raise TenantStoreError("Invalid creation receipt")
     return receipt
 
   @staticmethod
@@ -135,7 +178,10 @@ class TenantAdministrationService:
 
   @staticmethod
   def _tenant_payload(receipt):
-    return {
+    # RM-095: `legal` and `contract` exist only on tenants created since contracts were required;
+    # the tenant copies them from its receipt, so both sides match exactly or not at all.
+    contract_terms = {key: receipt[key] for key in ("legal", "contract") if key in receipt}
+    return {**contract_terms,
       "tenant_id": receipt["tenant_id"], "actor_id": receipt["actor_id"],
       "request_id": receipt["request_id"], "display_name": receipt["display_name"],
       "domain_id": receipt["domain_id"], "created_by": receipt["actor_id"],
@@ -202,17 +248,26 @@ class TenantAdministrationService:
     return policy
 
   @_endpoint
-  def prepare_tenant(self, actor, request_id, display_name, domain_id, initial_admin_id):
+  def prepare_tenant(self, actor, request_id, display_name, domain_id, initial_admin_id, legal=None,
+                     contract=None):
+    """`contract` is the document reference `services.tenant_contract.resolve_contract` verified
+    outside this lock; this method never reads the document store."""
     creator = self._actor(actor, creator=True)
     request_id = _request_id(request_id)
     domain_id = _domain(domain_id)
     initial_admin_id = canonical_account_id(initial_admin_id)
     if not isinstance(display_name, str) or not 1 <= len(display_name.strip()) <= 120 or not initial_admin_id:
       raise AdministrationDenied(400, "invalid_request")
+    legal = _legal(legal)
+    if contract is None:
+      raise AdministrationDenied(400, "contract_required")
+    if not _valid_contract(contract) or contract["uploaded_by"] != creator.account_id:
+      raise AdministrationDenied(400, "contract_invalid")
     intent = {"display_name": display_name.strip(), "domain_id": domain_id, "initial_admin_id": initial_admin_id}
     receipt = self._receipt(creator.account_id, request_id)
     if receipt is not None:
-      if any(receipt[key] != value for key, value in intent.items()):
+      if (any(receipt.get(key) != value for key, value in intent.items())
+          or receipt.get("legal") != legal or not _same_contract(receipt.get("contract"), contract)):
         raise AdministrationDenied(409, "request_conflict")
       domain, tenant = self._reserved_tenant(receipt)
     else:
@@ -224,7 +279,8 @@ class TenantAdministrationService:
       # finds its own tenant_admin membership already written.
       if admin.tenant_memberships:
         raise AdministrationDenied(409, "scope_conflict")
-      receipt = {**intent, "actor_id": creator.account_id, "request_id": request_id,
+      receipt = {**intent, "legal": legal, "contract": dict(contract),
+                 "actor_id": creator.account_id, "request_id": request_id,
                  "initial_admin_generation": admin.account_generation, "tenant_id": "tn_" + str(uuid4()),
                  "created_at": datetime.now(timezone.utc).isoformat()}
       self.store.put("receipt", creator.account_id, request_id, record=receipt)
@@ -397,10 +453,10 @@ class TenantAdministrationService:
     return self._members(tenant_id)
 
   def resolve_execution_admission(self, actor, tenant_id, asset_id, selected_peers=None, *,
-                                  expected_target_digest=None):
+                                  expected_target_digest=None, engagement_id=None):
     """Resolve current stored facts only; no endpoint, publication, DNS or execution."""
     return self._resolve_execution_admission_for_account(self._actor(actor), tenant_id, asset_id,
-      selected_peers, expected_target_digest=expected_target_digest)
+      selected_peers, expected_target_digest=expected_target_digest, engagement_id=engagement_id)
 
   def _execution_asset_for_account(self, account, tenant_id, asset_id, expected_target_digest):
     tenant, account = self.authorize_tenant_for_account(account, tenant_id)
@@ -435,9 +491,57 @@ class TenantAdministrationService:
     eligible = {row["node_address"] for row in assignments if row["active"]} & set(configured)
     return sorted(eligible)
 
+  def _execution_engagement(self, tenant_id, asset, engagement_id):
+    """The launch gate's engagement facts, from the stored row (never the DTO, which has no refs).
+
+    Refusals follow the engagements contract. The asset row's own port scope is never read here:
+    it only seeded the engagement's (owner, 2026-09-27).
+    """
+    engagement_id = self._engagement_id(engagement_id)
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      raise AdministrationDenied(404, "engagement_not_found")
+    if row["active"] is not True:
+      raise AdministrationDenied(400, "engagement_revoked")
+    now = self.clock()
+    if not (datetime.fromisoformat(row["valid_from"]) <= now < datetime.fromisoformat(row["valid_until"])):
+      raise AdministrationDenied(400, "engagement_expired")
+    entry = next((item for item in row["assets"] if item["asset_id"] == asset["asset_id"]), None)
+    if entry is None:
+      raise AdministrationDenied(400, "engagement_asset_not_locked")
+    if entry["kind"] != asset["target"]["kind"] or entry["target_digest"] != asset["target_digest"]:
+      # Owner Q3: the fix is a new engagement that `supersedes` this one.
+      raise AdministrationDenied(409, "engagement_asset_changed")
+    document = row["authorization_document"]
+    facts = {
+      "engagement_id": engagement_id, "engagement_hash": row["engagement_hash"],
+      "authorized_tests": list(entry["authorized_tests"]), "roe": dict(row["roe"]),
+      "context": row["context"],
+      # `AuthorizationRef` shape, so reports and exports read the job snapshot as before. No
+      # document reference: the job is readable under `reports:view` and reaches reports and SIEM
+      # events, while the document itself is `engagements:documents` only (download by engagement).
+      "authorization": {
+        "document_cid": "",
+        "document_thumbnail_cid": "",
+        "authorized_signer_name": document["authorized_signer_name"],
+        "authorized_signer_role": document["authorized_signer_role"],
+        "third_party_auth_cids": list(document["third_party_auth_refs"]),
+        "document_filename": document["filename"], "document_mime": document["mime"],
+        "document_size_bytes": document["size_bytes"], "document_sha256": document["sha256"],
+        "document_uploaded_at": document["uploaded_at"],
+      },
+    }
+    if entry["kind"] != "network":
+      return facts, None
+    return {**facts, "authorized_scan_modes": list(entry["authorized_scan_modes"])}, entry["authorized_ports"]
+
   def _resolve_execution_admission_for_account(self, account, tenant_id, asset_id, selected_peers=None, *,
-                                               expected_target_digest=None):
+                                               expected_target_digest=None, engagement_id=None):
     tenant, asset = self._execution_asset_for_account(account, tenant_id, asset_id, expected_target_digest)
+    policy = {}
+    if engagement_id is not None:
+      engagement, ports = self._execution_engagement(tenant_id, asset, engagement_id)
+      policy = {"engagement": engagement, **({"asset_authorized_ports": ports} if ports is not None else {})}
     eligible = self._execution_eligible_nodes(tenant_id)
     if selected_peers is not None and (not isinstance(selected_peers, list)
         or any(not valid_node_address(peer) for peer in selected_peers)
@@ -452,7 +556,7 @@ class TenantAdministrationService:
         "asset_target_digest": asset["target_digest"], "actor_id": account.account_id,
         "actor_generation": account.account_generation,
         "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected,
-        **({"asset_authorized_ports": asset["authorized_ports"]} if "authorized_ports" in asset else {})})
+        **policy})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid stored execution facts") from exc
 
@@ -480,6 +584,25 @@ class TenantAdministrationService:
         "actor_generation": account.account_generation, "eligible_nodes": eligible})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid current execution facts") from exc
+
+  def engagement_end_reason(self, tenant_id, engagement_id):
+    """Why an admitted job's engagement no longer covers it, or None while it does.
+
+    RM-095 (owner, 2026-09-28): a continuous job hard-stops when its engagement ends, at
+    `valid_until` or on a revoke. System-internal like `reauthorize_execution`: the launcher asks
+    it for jobs it already admitted. A store it cannot read raises `TenantStoreError`, so a
+    transient outage never reads as an ended engagement.
+    """
+    if not valid_engagement_id(engagement_id):
+      return "engagement_not_found"
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      return "engagement_not_found"
+    if row["active"] is not True:
+      return "engagement_revoked"
+    if self.clock() >= datetime.fromisoformat(row["valid_until"]):
+      return "engagement_expired"
+    return None
 
   @_endpoint
   def get_tenant_nodes(self, actor, tenant_id):
@@ -600,6 +723,241 @@ class TenantAdministrationService:
     self.store.put("asset", tenant_id, asset_id, record=record)
     return self._asset_row(self.store.get("asset", tenant_id, asset_id))
 
+  # RM-095 phase 2: engagements. Created by the platform roles, read by every tenant role, changed
+  # only by a revoke. The DTO never carries a document or contract reference: tenant roles read it,
+  # and a reference would bypass the download rules (engagement documents: STA and SP only; the
+  # tenant contract: STA only).
+
+  @staticmethod
+  def _engagement_document(ref):
+    return {"sha256": ref["sha256"], "filename": ref["filename"], "mime": ref["mime"],
+            "sizeBytes": ref["size_bytes"], "uploadedAt": ref["uploaded_at"]}
+
+  def _engagement_row(self, row):
+    if row is None:
+      raise TenantStoreError("Engagement readback is unavailable")
+    authorization = row["authorization_document"]
+    assets = []
+    for entry in row["assets"]:
+      asset = {"assetId": entry["asset_id"], "kind": entry["kind"], "targetDigest": entry["target_digest"],
+               "authorizedTests": entry["authorized_tests"]}
+      if entry["kind"] == "network":
+        asset.update(authorizedPorts=entry["authorized_ports"],
+                     authorizedScanModes=entry["authorized_scan_modes"])
+      assets.append(asset)
+    return {
+      "tenantId": row["tenant_id"], "engagementId": row["engagement_id"],
+      "displayName": row["display_name"], "kind": row["engagement_kind"],
+      "validFrom": row["valid_from"], "validUntil": row["valid_until"],
+      "contractSha256": row["contract_sha256"],
+      "roeDocument": self._engagement_document(row["roe_document"]),
+      "authorizationDocument": {**self._engagement_document(authorization),
+                                "signerName": authorization["authorized_signer_name"],
+                                "signerRole": authorization["authorized_signer_role"],
+                                "thirdPartyAuthRefs": authorization["third_party_auth_refs"]},
+      "supersedes": row.get("supersedes"), "roe": row["roe"], "context": row["context"],
+      "assets": assets, "engagementHash": row["engagement_hash"],
+      # No registry function anchors an arbitrary hash yet (owner, 2026-09-28): always pending.
+      "anchor": {"status": "pending"},
+      "active": row["active"], "createdBy": row["created_by"], "createdAt": row["created_at"],
+      **({"revokedBy": row["revoked_by"], "revokedAt": row["revoked_at"],
+          "revokeReason": row["revoke_reason"]} if not row["active"] else {}),
+    }
+
+  @staticmethod
+  def _engagement_id(value):
+    if not valid_engagement_id(value):
+      raise AdministrationDenied(400, "invalid_request")
+    return value
+
+  @_endpoint
+  def authorize_engagement_create(self, actor, tenant_id):
+    """The plugin reads the two documents outside this lock, and only after this check."""
+    _, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    return {"accountId": account.account_id}
+
+  @staticmethod
+  def _engagement_request(display_name, kind, valid_from, valid_until, roe, context, assets,
+                          roe_document, authorization_document, signer_name, signer_role,
+                          third_party_auth_refs, supersedes, creator):
+    """The request as sent, normalized without any store read: the replay intent."""
+    try:
+      display_name = normalize_name(display_name)
+      if kind not in ENGAGEMENT_KINDS:
+        raise ValueError("Invalid engagement kind")
+    except (ValueError, TypeError):
+      raise AdministrationDenied(400, "invalid_request") from None
+    try:
+      valid_from, valid_until = normalize_window(valid_from, valid_until)
+      roe, context = normalize_roe(roe), normalize_context(context)
+      signer = normalize_signer(signer_name, signer_role, third_party_auth_refs)
+    except EngagementInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    # The plugin verified both documents; the uploader rule is re-checked here (phase-1 precedent).
+    for document in (roe_document, authorization_document):
+      if not valid_doc_ref(document) or document["uploaded_by"] != creator:
+        raise AdministrationDenied(400, "document_invalid")
+    if supersedes is not None and not valid_engagement_id(supersedes):
+      raise AdministrationDenied(400, "supersedes_invalid")
+    if not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS:
+      raise AdministrationDenied(400, "engagement_asset_invalid")
+    requested = {}
+    for entry in assets:
+      if (not isinstance(entry, dict) or not isinstance(entry.get("asset_id"), str)
+          or not set(entry) <= {"asset_id", "authorized_ports", "authorized_scan_modes", "authorized_tests"}):
+        raise AdministrationDenied(400, "engagement_asset_invalid")
+      try:
+        asset_id = "as_" + canonical_uuid(entry["asset_id"][3:]) if entry["asset_id"].startswith("as_") else None
+        ports = normalize_port_scope(entry.get("authorized_ports"))
+      except (ValueError, TypeError):
+        raise AdministrationDenied(400, "engagement_asset_invalid") from None
+      if asset_id != entry["asset_id"] or asset_id in requested:
+        raise AdministrationDenied(400, "engagement_asset_invalid")
+      tests = entry.get("authorized_tests")
+      if not isinstance(tests, list) or not tests or not all(isinstance(item, str) for item in tests):
+        raise AdministrationDenied(400, "tests_invalid")
+      try:
+        modes = (normalize_scan_modes(entry["authorized_scan_modes"])
+                 if "authorized_scan_modes" in entry else None)
+      except EngagementInvalid as exc:
+        raise AdministrationDenied(400, exc.code) from None
+      requested[asset_id] = {"asset_id": asset_id, "authorized_tests": sorted(tests),
+                             **({"authorized_ports": ports} if ports is not None else {}),
+                             **({"authorized_scan_modes": modes} if modes is not None else {})}
+    return {"display_name": display_name, "engagement_kind": kind, "valid_from": valid_from,
+            "valid_until": valid_until, "roe": roe, "context": context,
+            "roe_document_sha256": roe_document["sha256"],
+            "authorization_sha256": authorization_document["sha256"], **signer,
+            "supersedes": supersedes, "assets": [requested[key] for key in sorted(requested)]}
+
+  def _engagement_asset(self, tenant_id, entry):
+    row = self.store.get("asset", tenant_id, entry["asset_id"])
+    if row is None or row["active"] is not True or row["target"]["kind"] not in ENGAGEMENT_ASSET_KINDS:
+      raise AdministrationDenied(400, "engagement_asset_invalid")
+    kind = row["target"]["kind"]
+    try:
+      tests = normalize_tests(kind, entry["authorized_tests"])
+    except EngagementInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    locked = {"asset_id": entry["asset_id"], "kind": kind, "target_digest": row["target_digest"],
+              "authorized_tests": tests}
+    if kind != "network":
+      if "authorized_ports" in entry or "authorized_scan_modes" in entry:
+        raise AdministrationDenied(400, "engagement_asset_invalid")
+      return locked
+    # The asset row's port scope only seeds the engagement's (owner, 2026-09-27); a network entry
+    # always ends with an explicit scope, so a signed engagement never means "any port".
+    ports = entry.get("authorized_ports", row.get("authorized_ports"))
+    if ports is None:
+      raise AdministrationDenied(400, "ports_required")
+    try:
+      modes = normalize_scan_modes(entry.get("authorized_scan_modes"))
+    except EngagementInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    return {**locked, "authorized_ports": ports, "authorized_scan_modes": modes}
+
+  @_endpoint
+  def create_engagement(self, actor, tenant_id, request_id, display_name, kind, valid_from, valid_until,
+                        roe, context, assets, roe_document, authorization_document, signer_name,
+                        signer_role, third_party_auth_refs=None, supersedes=None):
+    tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    request_id = _request_id(request_id)
+    engagement_id = engagement_id_for(request_id)
+    request = self._engagement_request(
+      display_name, kind, valid_from, valid_until, roe, context, assets, roe_document,
+      authorization_document, signer_name, signer_role, third_party_auth_refs, supersedes,
+      account.account_id)
+    intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "engagement_id": engagement_id,
+              "request_id": request_id, "created_by": account.account_id, "request": request}
+    # Replay is decided on the request alone, before any asset read: a retry after an asset edit is
+    # still the same creation.
+    existing = self.store.get("engagement", tenant_id, engagement_id)
+    if existing is not None:
+      if existing["create_intent_digest"] != canonical_digest(intent) or existing["created_by"] != account.account_id:
+        raise AdministrationDenied(409, "conflict")
+      return {**self._engagement_row(existing), "replayed": True}
+    if supersedes is not None and (supersedes == engagement_id
+                                   or self.store.get("engagement", tenant_id, supersedes) is None):
+      raise AdministrationDenied(400, "supersedes_invalid")
+    contract = tenant.get("contract")
+    if contract is not None and not _valid_contract(contract):
+      raise TenantStoreError("Invalid tenant contract record")
+    record = {
+      "tenant_id": tenant_id, "engagement_id": engagement_id, "request_id": request_id,
+      "display_name": request["display_name"], "engagement_kind": request["engagement_kind"],
+      "valid_from": request["valid_from"], "valid_until": request["valid_until"],
+      # Tenants created before contracts were required still create engagements (with no contract).
+      "contract_sha256": contract["sha256"] if contract is not None else None,
+      "roe_document": dict(roe_document),
+      "authorization_document": {**authorization_document,
+                                 **{key: request[key] for key in ("authorized_signer_name",
+                                    "authorized_signer_role", "third_party_auth_refs")}},
+      **({"supersedes": supersedes} if supersedes is not None else {}),
+      "roe": request["roe"], "context": request["context"],
+      "assets": [self._engagement_asset(tenant_id, entry) for entry in request["assets"]],
+      "active": True, "created_by": account.account_id,
+      "created_at": datetime.now(timezone.utc).isoformat(),
+      "create_intent_digest": canonical_digest(intent),
+    }
+    record["engagement_hash"] = engagement_hash(record)
+    self.store.put("engagement", tenant_id, engagement_id, record=record)
+    # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
+
+  @_endpoint
+  def list_engagements(self, actor, tenant_id, active=None):
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    if active is not None and type(active) is not bool:
+      raise AdministrationDenied(400, "invalid_request")
+    rows = [row for row in self.store.list_engagements(tenant_id) if active is None or row["active"] is active]
+    rows.sort(key=lambda row: row["engagement_id"])
+    rows.sort(key=lambda row: row["created_at"], reverse=True)
+    return {"tenantId": tenant_id, "engagements": [self._engagement_row(row) for row in rows],
+            "canCreateEngagements": self._asset_permission(account, tenant, "engagements:create"),
+            "canRevokeEngagements": self._asset_permission(account, tenant, "engagements:revoke")}
+
+  @_endpoint
+  def get_engagement(self, actor, tenant_id, engagement_id):
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    row = self.store.get("engagement", tenant_id, self._engagement_id(engagement_id))
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    return {"engagement": self._engagement_row(row),
+            "canRevokeEngagements": self._asset_permission(account, tenant, "engagements:revoke"),
+            "canDownloadDocuments": self._asset_permission(account, tenant, "engagements:documents")}
+
+  @_endpoint
+  def revoke_engagement(self, actor, tenant_id, engagement_id, reason):
+    _, account = self._authorized_tenant(actor, tenant_id, "engagements:revoke")
+    engagement_id = self._engagement_id(engagement_id)
+    try:
+      reason = normalize_name(reason, 500)
+    except (ValueError, TypeError):
+      raise AdministrationDenied(400, "invalid_request") from None
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    if not row["active"]:
+      return {**self._engagement_row(row), "replayed": True}
+    self.store.put("engagement", tenant_id, engagement_id, record={
+      **row, "active": False, "revoked_by": account.account_id,
+      "revoked_at": datetime.now(timezone.utc).isoformat(), "revoke_reason": reason})
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
+
+  @_endpoint
+  def engagement_document_ref(self, actor, tenant_id, engagement_id, document):
+    """The stored reference for a download; authorized before the engagement is looked up."""
+    self._authorized_tenant(actor, tenant_id, "engagements:documents")
+    engagement_id = self._engagement_id(engagement_id)
+    if document not in ("roe", "authorization"):
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    ref = row["roe_document" if document == "roe" else "authorization_document"]
+    return {"store": ref["store"], "ref": ref["ref"], "sha256": ref["sha256"], "filename": ref["filename"],
+            "size_bytes": ref["size_bytes"], "engagement_hash": row["engagement_hash"]}
+
   @staticmethod
   def _integration_row(row):
     if row is None:
@@ -693,6 +1051,33 @@ class TenantAdministrationService:
              "changed_at": datetime.now(timezone.utc).isoformat()}
       self.store.put("tenant_node", tenant_id, node_address, record=row)
     return {"tenantId": tenant_id, "nodeAddress": node_address, "active": active}
+
+  @_endpoint
+  def get_tenant_contract(self, actor, tenant_id):
+    """RM-095. The tenant's legal details and contract record (never the file), for a full-portfolio
+    Super-Tenant Admin only. Tenants created before contracts were required read as not recorded."""
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    if not holds_platform_role(account):
+      raise AdministrationDenied(403, "forbidden")
+    legal, contract = tenant.get("legal"), tenant.get("contract")
+    # The receipt binding covers tenants whose receipt carries the terms; this covers the reverse
+    # (a record that gained terms its receipt never bound). Both or neither, and well formed.
+    if (legal is None) != (contract is None) or (contract is not None and not _valid_contract(contract)):
+      raise TenantStoreError("Invalid tenant contract record")
+    if legal is not None:
+      try:
+        valid_legal = _legal(legal) == legal
+      except AdministrationDenied:
+        valid_legal = False
+      if not valid_legal:
+        raise TenantStoreError("Invalid tenant contract record")
+    return {"legal": legal, "contract": contract}
+
+  @_endpoint
+  def authorize_platform(self, actor):
+    """RM-095. The caller is a full-portfolio Super-Tenant Admin; the contract calls do their
+    storage I/O outside this lock after it."""
+    return {"accountId": self._actor(actor, creator=True).account_id}
 
   @_endpoint
   def check_tenant_domain(self, actor, domain_id):

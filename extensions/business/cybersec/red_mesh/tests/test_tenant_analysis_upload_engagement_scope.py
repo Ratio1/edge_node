@@ -22,6 +22,7 @@ from uuid import uuid4
 import pytest
 
 from .read_endpoint_fixtures import allow_pentester, as_role, read_endpoint_fixture
+from .contract_fixture import contract_terms
 
 OTHER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64).decode("ascii")
@@ -80,7 +81,7 @@ def second_tenant(fixture):
   request_id = str(uuid4())
   fixture.store.account("other-admin")
   prepared = fixture.administration.prepare_tenant({"account_id": "creator"}, request_id,
-    "Other tenant", "other-tenant", "other-admin")
+    "Other tenant", "other-tenant", "other-admin", **contract_terms())
   assert prepared["success"], prepared
   tenant_id = prepared["data"]["tenantId"]
   fixture.store.grant("other-admin", tenant_id)

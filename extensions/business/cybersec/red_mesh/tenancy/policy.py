@@ -23,10 +23,15 @@ _ROLE_OPERATIONS = {
     # RM-084 P3. Uploading a permission-to-test document is a pre-engagement step of launching, so
     # it carries the launch role set and the same Allow Pentester binding analysis:run has.
     "authorization:upload",
+    # RM-095 phase 2. Plural, unlike RM-078's engagement:delete (which redacts a job's snapshot).
+    # Owner, 2026-09-28: only a Super-Tenant Admin manages engagements and uploads their documents.
+    "engagements:create", "engagements:revoke", "engagements:documents",
   }),
   "super_pentester": frozenset({
     "assets:create", "assets:update", "allow_pentester:update", "tasks:launch", "tasks:update",
     "reports:view", "reports:export", "evidence:read", "analysis:run", "authorization:upload",
+    # Reads an engagement's documents (owner Q5); creating, revoking and uploading are STA only.
+    "engagements:documents",
   }),
   "tenant_admin": frozenset({
     "node_failure_policy:update",
