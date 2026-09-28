@@ -503,7 +503,7 @@ class TenantAdministrationService:
       "engagement_id": row["engagement_id"], "engagement_hash": row["engagement_hash"],
       "contract_sha256": row["contract_sha256"],
       "authorized_tests": list(entry["authorized_tests"]), "roe": dict(row["roe"]),
-      "context": row["context"],
+      "context": row["context"], "allowed_run_modes": list(row["allowed_run_modes"]),
       # `AuthorizationRef` shape, so reports, exports and SIEM hooks read the job snapshot as
       # before. The signed basis is the tenant contract, signed by the tenant's legal signer. No
       # document reference: the job is readable under `reports:view`, while the contract itself is

@@ -237,7 +237,7 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     ])
 
   def test_capability_status_advertises_engagements(self):
-    self.assertEqual(self.plugin.get_capability_status()["engagements"], {"enabled": True})
+    self.assertEqual(self.plugin.get_capability_status()["engagements"], {"enabled": True, "schema": 2})
 
 if __name__ == "__main__":
   unittest.main()

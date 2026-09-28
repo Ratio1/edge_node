@@ -47,7 +47,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertEqual(context["asset_target_digest"], self.engagement["assets"][0]["targetDigest"])
     self.assertEqual(context["engagement"], {
       "engagement_id": self.engagement["engagementId"], "engagement_hash": self.engagement["engagementHash"],
-      "contract_sha256": CONTRACT_SHA256,
+      "contract_sha256": CONTRACT_SHA256, "allowed_run_modes": ["continuous", "single_pass"],
       "authorized_tests": ["active_auth", "service_info_common"], "authorized_scan_modes": ["connect"],
       "roe": {"authenticated_action": True, "stateful_probes_allowed": False, "ics_safe_mode_required": True},
       "context": self.engagement["context"],

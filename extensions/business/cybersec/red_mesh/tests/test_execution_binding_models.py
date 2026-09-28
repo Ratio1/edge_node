@@ -34,7 +34,7 @@ ENGAGEMENT_FACTS = {"engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
                     "authorized_tests": ["service_info_common"], "authorized_scan_modes": ["connect"],
                     "roe": {"authenticated_action": False, "stateful_probes_allowed": False,
                             "ics_safe_mode_required": True},
-                    "context": {}, "authorization": {}}
+                    "context": {}, "authorization": {}, "allowed_run_modes": ["single_pass"]}
 
 
 class TestExecutionBindingModels(unittest.TestCase):
@@ -226,7 +226,12 @@ class TestResolvedContextCarriesThePolicy(unittest.TestCase):
               {**engagement, "engagement_hash": "f" * 64}, {**engagement, "authorized_tests": []},
               {**engagement, "roe": {"authenticated_action": "yes"}}, {**engagement, "extra": 1},
               {**engagement, "contract_sha256": None},
-              {key: value for key, value in engagement.items() if key != "authorized_scan_modes"})
+              {key: value for key, value in engagement.items() if key != "authorized_scan_modes"},
+              # RM-107: the allowed run modes, as the record stores them (non-empty, known, sorted).
+              {key: value for key, value in engagement.items() if key != "allowed_run_modes"},
+              {**engagement, "allowed_run_modes": []}, {**engagement, "allowed_run_modes": "single_pass"},
+              {**engagement, "allowed_run_modes": ["single_pass", "continuous"]},
+              {**engagement, "allowed_run_modes": ["SINGLEPASS"]})
     for value in broken:
       with self.subTest(value=value), self.assertRaises(ValueError):
         self._context(engagement=value)

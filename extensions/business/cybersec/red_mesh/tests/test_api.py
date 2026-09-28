@@ -30,7 +30,7 @@ def _engagement(kind="network", **roe):
   from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
   return {
     "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
-    "contract_sha256": "c" * 64,
+    "contract_sha256": "c" * 64, "allowed_run_modes": ["continuous", "single_pass"],
     "authorized_tests": sorted(feature_ids_for_kind(kind)),
     "roe": {"authenticated_action": False, "stateful_probes_allowed": True, "ics_safe_mode_required": False,
             **roe},
@@ -390,9 +390,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._launch(plugin)
     from extensions.business.cybersec.red_mesh.models import JobConfig
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.11.0"})
+    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.12.0"})
     restored = JobConfig.from_dict(config_dict).to_dict()
-    self.assertEqual(restored["redmesh_release"], {"backend": "0.11.0"})
+    self.assertEqual(restored["redmesh_release"], {"backend": "0.12.0"})
 
   def test_launch_records_the_console_and_report_pipeline_it_was_sent(self):
     """RM-103 item 12: the release names all three deployables. Only the
@@ -596,6 +596,38 @@ class TestPhase1ConfigCID(unittest.TestCase):
         self._refused(plugin, result, "roe_forbids", field="allow_stateful_probes")
     plugin = self._build_mock_plugin(job_id="engagement-stateful-ok")
     self.assertNotIn("error", self._launch_webapp(plugin, engagement=no_stateful))
+
+  def test_engagement_run_mode_outside_the_allowed_modes_is_refused(self):
+    # RM-107: the gate reads the normalized run mode, so an empty one (continuous) is gated too.
+    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
+    for run_mode in ("", "CONTINUOUS_MONITORING", "bogus"):
+      with self.subTest(run_mode=run_mode):
+        plugin = self._build_mock_plugin(job_id="engagement-run-mode")
+        result = self._launch_network(plugin, engagement=single, run_mode=run_mode)
+        self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["single_pass"])
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-ok")
+    result = self._launch_network(plugin, engagement=single, run_mode="SINGLEPASS")
+    self.assertNotIn("error", result)
+    self.assertEqual(self._latest_job_config(plugin)["run_mode"], "SINGLEPASS")
+    continuous = {**_engagement("webapp"), "allowed_run_modes": ["continuous"]}
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp")
+    result = self._launch_webapp(plugin, engagement=continuous, run_mode="SINGLEPASS")
+    self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["continuous"])
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp-ok")
+    self.assertNotIn("error", self._launch_webapp(plugin, engagement=continuous))
+
+  def test_launch_test_reaches_the_run_mode_gate(self):
+    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-test")
+    self._refused(plugin, self._launch(plugin, engagement=single), "run_mode_not_authorized",
+                  allowed_run_modes=["single_pass"])
+
+  def test_the_run_mode_gate_comes_before_the_unsafe_confirmations(self):
+    # A disallowed mode is the answer, not a confirmation the operator could never usefully give.
+    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first")
+    result = self._launch_network(plugin, engagement=single, monitor_interval=1)
+    self._refused(plugin, result, "run_mode_not_authorized")
 
   def test_engagement_port_scope_admits_a_narrower_run(self):
     # Owner, 2026-09-28: a run may use any part of the engagement's scope.

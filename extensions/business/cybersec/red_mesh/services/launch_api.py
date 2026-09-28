@@ -43,6 +43,7 @@ from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 from ..tenancy.assets import collapse_ports, format_port_ranges, ports_outside_scope
+from ..tenancy.engagements import RUN_MODE_LAUNCH_VALUES
 from ..tenancy.execution import context_tenant_id
 from .soc_export_policy import required_soc_launch_error
 
@@ -588,6 +589,23 @@ def check_engagement_roe(engagement, *, ics_safe_mode=True, allow_stateful_probe
   return {
     "error": "roe_forbids", "status_code": 400, "field": field,
     "message": f"The engagement's rules of engagement do not allow {field} for this job.",
+  }
+
+
+def check_allowed_run_mode(engagement, run_mode):
+  """Refuse a normalized run mode the engagement does not allow (RM-107). Returns an error or None.
+
+  Called on the normalized mode, so an empty one (continuous) is gated like an explicit one.
+  """
+  if engagement is None:
+    return None
+  allowed = engagement["allowed_run_modes"]
+  if run_mode in {RUN_MODE_LAUNCH_VALUES[mode] for mode in allowed}:
+    return None
+  return {
+    "error": "run_mode_not_authorized", "status_code": 400,
+    "message": "The engagement does not allow this run mode.",
+    "allowed_run_modes": list(allowed),
   }
 
 
@@ -1500,6 +1518,10 @@ def launch_network_scan(
   )
   if "error" in options:
     return options
+  # RM-107: first after normalization, before any confirmation or comparison work.
+  run_mode_error = check_allowed_run_mode(engagement, options["run_mode"])
+  if run_mode_error:
+    return run_mode_error
   # Comparison mode keeps the operator's MIRROR/SLICE choice: MIRROR mirrors the
   # whole range to every node (full comparison); SLICE uses the tiered scheme
   # (mirror the comparison tier, slice the bulk). See build_comparison_workers.
@@ -1811,6 +1833,10 @@ def launch_webapp_scan(
   )
   if "error" in options:
     return options
+  # RM-107: first after normalization, before any confirmation or comparison work.
+  run_mode_error = check_allowed_run_mode(engagement, options["run_mode"])
+  if run_mode_error:
+    return run_mode_error
   required_confirmation_ids = required_unsafe_confirmation_ids(
     scan_type=ScanType.WEBAPP.value,
     options=options,

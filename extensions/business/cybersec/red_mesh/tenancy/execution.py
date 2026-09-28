@@ -25,7 +25,7 @@ _ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
 # Launch-time policy, read by the launch gate and never part of the binding.
 _POLICY_FIELDS = frozenset({"asset_authorized_ports", "engagement"})
 _ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "authorized_tests", "roe", "context",
-                                "authorization", "contract_sha256"})
+                                "authorization", "contract_sha256", "allowed_run_modes"})
 
 
 def _validate_facts(value, *, failure_policy=True, version=BINDING_SCHEMA_VERSION):
@@ -67,7 +67,7 @@ def _node_order(value):
 def _validate_engagement(value, kind):
   """The engagement facts a launch is gated on and snapshots (RM-095); shape only."""
   # Imported here: `engagements` loads the models package, which imports this module.
-  from .engagements import normalize_roe, valid_engagement_id
+  from .engagements import normalize_roe, normalize_run_modes, valid_engagement_id
   fields = _ENGAGEMENT_FIELDS | ({"authorized_scan_modes"} if kind == "network" else set())
   if (not isinstance(value, dict) or set(value) != fields
       or not valid_engagement_id(value["engagement_id"]) or not valid_digest(value["engagement_hash"])
@@ -76,7 +76,8 @@ def _validate_engagement(value, kind):
       or any(not isinstance(item, str) or not item for item in value["authorized_tests"])
       or not isinstance(value["context"], dict) or not isinstance(value["authorization"], dict)):
     raise ValueError("Invalid execution engagement")
-  if normalize_roe(value["roe"]) != value["roe"]:
+  if (normalize_roe(value["roe"]) != value["roe"] or not isinstance(value["allowed_run_modes"], list)
+      or normalize_run_modes(value["allowed_run_modes"]) != value["allowed_run_modes"]):
     raise ValueError("Invalid execution engagement")
 
 
