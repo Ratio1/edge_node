@@ -13,6 +13,7 @@ from extensions.business.cybersec.red_mesh.tenancy.administration import TenantS
 
 from . import test_tenant_engagements as engagements
 from .conftest import mock_plugin_modules
+from .test_execution_binding_models import binding_payload
 from .test_tenant_execution_finalization import FinalizationOwner, execution_binding
 
 INSIDE = datetime(2026, 10, 15, tzinfo=timezone.utc)
@@ -73,6 +74,12 @@ class TestPluginEngagementEndReason(unittest.TestCase):
   def test_it_asks_about_the_bound_tenant_and_the_snapshot_engagement(self):
     self.assertEqual(self.reason("engagement_revoked"), "engagement_revoked")
     self.assertEqual(self.asked, (execution_binding()["tenant_id"], "en_1"))
+
+  def test_a_schema_2_binding_names_the_engagement_without_the_config(self):
+    binding = binding_payload()
+    self.assertEqual(self.reason("engagement_revoked", config={}, job={"execution_binding": binding}),
+                     "engagement_revoked")
+    self.assertEqual(self.asked, (binding["tenant_id"], binding["engagement_id"]))
 
   def test_an_unreadable_store_or_a_job_without_engagement_is_not_an_end(self):
     self.assertIsNone(self.reason(TenantStoreError("down")))
@@ -180,6 +187,23 @@ class TestContinuousJobStopsWhenTheEngagementEnds(unittest.TestCase):
     maybe_finalize_pass(owner)
     self.assertEqual(owner.job["job_status"], "RUNNING")
     self.assertEqual(owner.reason_checks, [])
+
+  def test_a_schema_2_job_is_stopped_even_when_its_config_cannot_be_read(self):
+    # RM-107: the binding names the engagement, so an R1FS outage cannot let a pass start after the
+    # engagement ended.
+    class Unreadable(EngagementOwner):
+      def _get_job_config(self, job_specs, **kwargs):
+        raise ValueError("R1FS unavailable")
+    owner = Unreadable(reason="engagement_revoked")
+    binding = binding_payload()
+    owner.job["execution_binding"] = binding
+    owner.job["next_pass_at"] = 50
+    maybe_finalize_pass(owner)
+    self.assertEqual(owner.job["job_status"], "STOPPED")
+    self.assertEqual(owner.job["job_pass"], 1)
+    self.assertIn(("continuous_stopped_engagement_ended",
+                   {"job_id": "job-1", "engagement_id": binding["engagement_id"], "reason": "engagement_revoked",
+                    "pass_nr": 1}), owner.audit)
 
   def test_the_config_is_read_once_per_job(self):
     owner = EngagementOwner().running_pass()

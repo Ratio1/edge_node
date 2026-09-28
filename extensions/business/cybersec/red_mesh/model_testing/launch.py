@@ -425,7 +425,11 @@ def launch_model_test(
   soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
   if soc_error:
     return soc_error
-  engagement = execution_context.to_dict().get("engagement") if execution_context is not None else None
+  admitted = execution_context.to_dict() if execution_context is not None else {}
+  if admitted and admitted["asset_target"]["kind"] != "model":
+    # Before the question-set gate, so a model launch on a scan asset is named for what it is.
+    return _validation_error("Execution target mismatch", error_class="execution_target_mismatch")
+  engagement = admitted.get("engagement")
   if engagement is not None and test_sets is None and not test_set_id:
     # RM-107: no selection means every question set the engagement authorizes for this model.
     test_sets = [{"id": test_set} for test_set in engagement["authorized_tests"]]

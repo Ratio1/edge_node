@@ -17,7 +17,18 @@ launch, no legacy read path and no rollout: `ExecutionRollout`, the `execution_r
 `TENANT_EXECUTION_ENABLED`/`TENANT_EXECUTION_STAGE`, `LegacyReadAccess` and `_admit_actor_only` are
 deleted. Every launch names `tenant_id`, `asset_id` and `expected_target_digest` (an incomplete
 selector is `400 invalid_request`); every job read names `tenant_id`; an unbound record can no longer
-be operated on. Paragraphs below that describe compatibility admission, `legacy_unbound` snapshots or
+be operated on.
+
+**RM-107 phase 2 (2026-09-28): the engagement owns its assets.** The launch selectors are now
+`tenant_id`, `engagement_id` and `engagement_asset_id` on all five routes (a blank `engagement_id`
+is `400 engagement_required`, any other incomplete selector `400 invalid_request`); `asset_id`,
+`expected_target_digest` and the 409 on a changed digest are gone, and model launches and preflight
+are engagement-gated. The binding is schema 2 (`engagement_id`, `engagement_asset_id`,
+`engagement_hash` instead of `asset_id`); schema 1 still parses for reads but is never reauthorized.
+Reauthorization re-reads the engagement entry (same target and hash), `tasks:launch` and Allow
+Pentester. The tenant asset record and its operations are removed. The selector paragraphs below are
+the RM-084 history. Current contract: the hub's `docs/resources/redmesh/contracts/engagements.md`
+§Target v2. Paragraphs below that describe compatibility admission, `legacy_unbound` snapshots or
 rollout stages are the history of how the boundary was built, not current behaviour. The current
 account and authority contract is the hub's `docs/resources/redmesh/contracts/redmesh-auth.md`.
 

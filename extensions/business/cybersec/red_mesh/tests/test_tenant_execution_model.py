@@ -76,6 +76,14 @@ class TestTenantExecutionModel(unittest.TestCase):
     self.assertNotIn("error", result, result)
     self.assertEqual([item["id"] for item in captured[0]["test_sets"]], ["prompt_injection_v1"])
 
+  def test_a_model_launch_on_a_scan_asset_is_a_target_mismatch(self):
+    from .test_tenant_execution_effects import context
+    for selection in ({"test_set_id": None}, {}):
+      with self.subTest(selection=selection):
+        result, captured = self.launch(context({"kind": "network", "address": "192.0.2.10"}), **selection)
+        self.assertEqual(result.get("error_class"), "execution_target_mismatch")
+        self.assertEqual(captured, [])
+
   def test_the_job_config_carries_the_engagement_snapshot(self):
     result, captured = self.launch(self.context)
     self.assertNotIn("error", result, result)

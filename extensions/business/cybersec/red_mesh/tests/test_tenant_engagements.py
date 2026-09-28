@@ -308,5 +308,121 @@ class TestTenantEngagements(unittest.TestCase):
     self.refused(self.service.list_engagements(self.actor, self.tenant, active="yes"), 400, "invalid_request")
 
 
+class TestEngagementTargetGrammar(unittest.TestCase):
+  """RM-107: an engagement asset's target is the only scan-target write gate (`normalize_target`).
+
+  Ported from the retired tenant asset suites: the strict grammar, canonical forms, the refusal of
+  secret-bearing or ambiguous targets, and no DNS, HTTP or write on any refusal.
+  """
+  setUp = TestTenantEngagements.setUp
+  new_tenant = TestTenantEngagements.new_tenant
+  fields = TestTenantEngagements.fields
+  _TESTS = {"network": ["service_info_common"], "webapp": ["graybox"], "model": ["prompt_injection_v1"]}
+
+  def create(self, target, display_name="Asset"):
+    kind = target.get("kind") if isinstance(target, dict) else None
+    asset = {"display_name": display_name, "target": target, "authorized_tests": self._TESTS.get(kind, ["graybox"]),
+             **({"authorized_ports": "443"} if kind == "network" else {})}
+    return self.service.create_engagement(**self.fields(request_id=str(uuid4()), assets=[asset], documents=[]))
+
+  def created_target(self, target):
+    result = self.create(target)
+    self.assertTrue(result["success"], result)
+    return result["data"]["assets"][0]["target"]
+
+  def refused(self, target, error="asset_target_invalid", display_name="Asset"):
+    before = len(self.owner.writes)
+    result = self.create(target, display_name)
+    self.assertEqual((result.get("status_code"), result.get("error")), (400, error), result)
+    self.assertEqual(len(self.owner.writes), before)
+
+  def test_web_targets_canonicalize_authority_preserve_path_and_require_explicit_scope(self):
+    for url, prefix, expected in (("HTTP://EXAMPLE.COM:80/api/item", "/api/", "http://example.com/api/item"),
+                                  ("https://[2001:0DB8::1]:443/api", "/api", "https://[2001:db8::1]/api"),
+                                  ("https://xn--bcher-kva.example/api/%7Eme", "/api", "https://xn--bcher-kva.example/api/%7Eme"),
+                                  ("https://example.com", "/", "https://example.com/")):
+      with self.subTest(url=url):
+        self.assertEqual(self.created_target({"kind": "webapp", "url": url, "allowedPathPrefix": prefix}),
+                         {"kind": "webapp", "url": expected, "allowedPathPrefix": prefix.rstrip("/") or "/"})
+    self.refused({"kind": "webapp", "url": "https://example.com/api-other", "allowedPathPrefix": "/api"})
+
+  def test_model_target_retains_full_endpoint_and_case_without_dns_or_provider_requests(self):
+    with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS during create")), \
+         patch("requests.sessions.Session.request", side_effect=AssertionError("No target calls during create")):
+      target = {"kind": "model", "adapter": "openai_compatible",
+                "endpointUrl": "https://EXAMPLE.COM:443/custom/chat/completions", "model": " Case-Sensitive "}
+      self.assertEqual(self.created_target(target),
+                       {**target, "endpointUrl": "https://example.com/custom/chat/completions", "model": "Case-Sensitive"})
+      for endpoint in ("http://example.com/chat/completions", "https://example.com/v1",
+                       "https://example.com/chat/completions/", "https://example.com/chat%2Fcompletions"):
+        with self.subTest(endpoint=endpoint):
+          self.refused({**target, "endpointUrl": endpoint})
+
+  def test_raw_non_ascii_authority_and_scheme_are_not_repaired_into_valid_urls(self):
+    for url in ("https://\u212a.example/api", "http\u017f://example.com/api", "https://0x/api"):
+      with self.subTest(url=url):
+        self.refused({"kind": "webapp", "url": url, "allowedPathPrefix": "/"})
+
+  def test_url_grammar_rejects_ambiguous_authorities_and_every_decoding_stage(self):
+    bad_authorities = ("@host", "user@host", "user:password@host", "host:", "host:0", "host:080", "host:65536",
+                       "127.1", "0x7f000001", "0x", "0X", "example.0x", "127.00.0.1", "256.0.0.1",
+                       "example.123", "example.0xabc", "host.", "under_score", "h\u00f6st", "-host", "host-",
+                       "a" * 64 + ".example", "[::1%zone]", "[::1", "::1", "[::1]:", "[::1]:00")
+    bad_paths = ("/a?", "/a#", "/a//b", "/a/./b", "/a/../b", "/a/%", "/a/%GG", "/a/%FF", "/a/%C0%AF",
+                 "/a/%ED%A0%80", "/a/%25252541", "/a/%2E%2e/b", "/a/%252e%252e/b", "/a/%2F/b",
+                 "/a/%20", "/a/%00", "/a/%C2%85", "/a/%EF%BB%BF", "/a/%3F", "/a/%23", "/a/%5C",
+                 "/a\u2003", "/a\\b", "/a\ud800")
+    with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
+         patch("requests.sessions.Session.request", side_effect=AssertionError("No HTTP")):
+      for url in ["https://" + host + "/api" for host in bad_authorities] + ["https://host" + path for path in bad_paths]:
+        with self.subTest(url=url):
+          self.refused({"kind": "webapp", "url": url, "allowedPathPrefix": "/"})
+      for prefix in (None, [], "", "api", "//api", "/api//", "/api/.", "/api/..", "/%61pi", "/api?", "/api#",
+                     "/api\\", "/api\u00a0"):
+        with self.subTest(prefix=prefix):
+          self.refused({"kind": "webapp", "url": "https://host/api", "allowedPathPrefix": prefix})
+
+  def test_valid_encodings_boundaries_and_names_preserve_canonical_values(self):
+    for path in ("/api/%7Eme", "/api/%257Eme", "/api/%25257Eme", "/api/%E2%82%AC"):
+      with self.subTest(path=path):
+        self.assertEqual(self.created_target({"kind": "webapp", "url": "https://host" + path,
+                                              "allowedPathPrefix": "/api"})["url"], "https://host" + path)
+    name = "\U0001f600" * 200
+    result = self.create({"kind": "network", "address": "192.0.2.10"}, display_name="\u2003" + name + "\u2003")
+    self.assertEqual(result["data"]["assets"][0]["displayName"], name)
+    for value in ("", " ", name + "x", "\tAsset", "Asset\n", "\ufeffAsset", "Asset\x7f", "Asset\x85", "Asset\ud800",
+                  [], 1):
+      with self.subTest(name=value):
+        self.refused({"kind": "network", "address": "192.0.2.10"}, "engagement_asset_invalid", display_name=value)
+    target = {"kind": "model", "adapter": "openai_compatible", "endpointUrl": "https://host/chat/completions",
+              "model": "\U0001f600" * 200}
+    self.created_target(target)
+    for value in ("x" * 201, "\tModel", "Model\n", "\ufeffModel", "Model\ud800", None):
+      with self.subTest(model=value):
+        self.refused({**target, "model": value})
+    url = "https://host/" + "a" * (2048 - len("https://host/"))
+    self.created_target({"kind": "webapp", "url": url, "allowedPathPrefix": "/"})
+    self.refused({"kind": "webapp", "url": url + "a", "allowedPathPrefix": "/"})
+
+  def test_network_target_accepts_a_canonical_hostname(self):
+    target = {"kind": "network", "address": "scanme.nmap.org"}
+    self.assertEqual(self.created_target(target), target)
+
+  def test_noncanonical_and_secret_bearing_targets_are_rejected_before_writes(self):
+    network = {"kind": "network", "address": "192.0.2.10"}
+    for target in (None, [], "192.0.2.10", {}, {"kind": "network", "address": 1},
+                   {"kind": "network", "address": "192.0.2.0/24"}, {"kind": "network", "address": "::1"},
+                   {"kind": "network", "address": "Example.com"}, {"kind": "network", "address": "http://example.com"},
+                   {"kind": "network", "address": "example.com:80"}, {"kind": "network", "address": "example.com/"},
+                   {"kind": "network", "address": "example.com."}, {"kind": "network", "address": "a..b"},
+                   {"kind": "network", "address": "127.1"}, {"kind": "network", "address": "010.0.0.1"},
+                   {"kind": "network", "address": "user@example.com"}, {"kind": "network", "address": "b\u00fccher.de"},
+                   {"kind": "network", "address": ""}, {**network, "port": 443},
+                   {**network, "credential_ref": "secret"}, {**network, "headers": {}},
+                   {"kind": "api", "url": "https://host"}):
+      with self.subTest(target=target):
+        self.refused(target)
+
+
 if __name__ == "__main__":
   unittest.main()

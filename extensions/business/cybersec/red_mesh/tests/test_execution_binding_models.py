@@ -76,7 +76,6 @@ class TestExecutionBindingModels(unittest.TestCase):
     # Jobs launched before RM-107 stay readable, purgeable and renderable (contract §Compatibility).
     legacy = binding_v1_payload()
     self.assertEqual(ExecutionBinding(legacy).to_dict(), legacy)
-    self.assertEqual(ExecutionBinding(legacy).version, 1)
     for model, raw in self.payloads(legacy):
       with self.subTest(model=model.__name__):
         self.assertEqual(model.from_dict(raw).to_dict()["execution_binding"], legacy)

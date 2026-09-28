@@ -106,10 +106,6 @@ class ExecutionBinding:
   def to_dict(self):
     return json.loads(self._snapshot)
 
-  @property
-  def version(self):
-    return self.to_dict()["schema_version"]
-
 
 @dataclass(frozen=True, init=False)
 class ResolvedExecutionContext:

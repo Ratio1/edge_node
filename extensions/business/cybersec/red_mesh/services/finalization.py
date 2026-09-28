@@ -144,10 +144,16 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
   # Fail-safe: one job whose config or engagement cannot be read must not break the loop for the
   # others, and never reads as an ended engagement.
   try:
-    config = entry.get("config") or owner._get_job_config(job_specs, resolve_secrets=False) or {}
-    if config:
-      entry["config"] = config
-    engagement_id = config.get("engagement_id")
+    # RM-107: a schema-2 binding names its engagement, so the check needs no config read (an R1FS
+    # outage then never lets a pass start after the engagement ended). Schema 1 reads the snapshot.
+    binding = job_specs.get("execution_binding")
+    engagement_id = binding.get("engagement_id") if isinstance(binding, dict) else None
+    config = {}
+    if not engagement_id:
+      config = entry.get("config") or owner._get_job_config(job_specs, resolve_secrets=False) or {}
+      if config:
+        entry["config"] = config
+      engagement_id = config.get("engagement_id")
     if not engagement_id:
       return False
     reason = check(job_specs, config)

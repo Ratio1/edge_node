@@ -86,6 +86,19 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     self.assertFalse(result["success"], result)
     self.assertEqual((result["status_code"], result["error"]), (status, error))
 
+  def test_capability_reports_tenant_execution_without_stored_reads(self):
+    # RM-084 P6: tenant execution is no longer a rollout a deployment opts into, so the capability
+    # reports the only state there is -- whatever a stale `TENANT_EXECUTION_ENABLED` still says.
+    # (Moved here from the retired tenant asset suite, RM-107.)
+    self.plugin.cfg_tenancy_namespace = ""
+    with patch.object(self.plugin, "chainstore_hget", side_effect=AssertionError("No stored capability reads")), \
+         patch.object(self.plugin, "chainstore_hgetall", side_effect=AssertionError("No capability enumeration")), \
+         patch.object(self.plugin, "chainstore_hset", side_effect=AssertionError("No capability writes")):
+      for value in (None, False, "false", True):
+        with self.subTest(value=value):
+          self.plugin.cfg_tenant_execution_enabled = value
+          self.assertIs(self.plugin.get_capability_status()["tenant_execution_enabled"], True)
+
   def test_upload_create_download_chain(self):
     created = self.create()
     self.assertTrue(created["success"], created)
