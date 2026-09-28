@@ -1,4 +1,4 @@
-"""RM-095 phase 2: engagements through the real administration service, identity and CStore store."""
+"""RM-095 phase 2, RM-107: engagements through the real administration service, identity and CStore store."""
 from datetime import datetime, timezone
 import json
 import unittest
@@ -14,8 +14,10 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity impo
 SHA_ROE, SHA_AUTH = "1" * 64, "2" * 64
 
 
-def doc(sha256, ref, uploaded_by="creator", mime="application/pdf"):
-  return {"store": "r1fs", "ref": ref, "sha256": sha256, "filename": ref + ".pdf", "mime": mime,
+def doc(sha256, ref, uploaded_by="creator", mime="application/pdf", kind="agreement", title=None, comment=""):
+  """A verified document reference, as `resolve_engagement_document` returns one."""
+  return {"store": "r1fs", "ref": ref, "kind": kind, "title": title or ref.upper(), "comment": comment,
+          "sha256": sha256, "filename": ref + ".pdf", "mime": mime,
           "size_bytes": 2048, "uploaded_at": "2026-09-28T09:00:00Z", "uploaded_by": uploaded_by}
 
 
@@ -58,13 +60,14 @@ class TestTenantEngagements(unittest.TestCase):
   def fields(self, **changes):
     fields = {
       "actor": self.actor, "tenant_id": self.tenant, "request_id": self.request,
-      "display_name": " Q4 external ", "kind": "point-in-time",
+      "display_name": " Q4 external ", "allowed_run_modes": ["single_pass", "continuous"],
       "valid_from": "2026-10-01T00:00:00Z", "valid_until": "2026-10-31T00:00:00+00:00",
       "roe": {"authenticated_action": True}, "context": {"client_name": "Example", "asset_exposure": "external"},
       "assets": [{"asset_id": self.network, "authorized_tests": ["service_info_common", "active_auth"]},
                  {"asset_id": self.webapp, "authorized_tests": ["graybox"]}],
-      "roe_document": doc(SHA_ROE, "roe"), "authorization_document": doc(SHA_AUTH, "auth"),
-      "signer_name": "Ana Pop", "signer_role": "CISO",
+      "documents": [doc(SHA_ROE, "roe", title="Rules of engagement"),
+                    doc(SHA_AUTH, "auth", kind="third_party_consent", title="Hosting consent",
+                        comment="provider ticket 42")],
     }
     fields.update(changes)
     return fields
@@ -98,7 +101,13 @@ class TestTenantEngagements(unittest.TestCase):
     self.assertEqual(network["authorizedScanModes"], ["connect"])
     self.assertEqual(network["authorizedTests"], ["active_auth", "service_info_common"])
     self.assertNotIn("authorizedPorts", webapp)
-    self.assertEqual(engagement["authorizationDocument"]["signerName"], "Ana Pop")
+    self.assertEqual(engagement["allowedRunModes"], ["continuous", "single_pass"])
+    self.assertEqual([(item["documentId"], item["kind"], item["title"], item["comment"], item["sha256"])
+                      for item in engagement["documents"]],
+                     [("ed_1", "agreement", "Rules of engagement", "", SHA_ROE),
+                      ("ed_2", "third_party_consent", "Hosting consent", "provider ticket 42", SHA_AUTH)])
+    for gone in ("kind", "roeDocument", "authorizationDocument"):
+      self.assertNotIn(gone, engagement)
     self.assertEqual([item["assetId"] for item in engagement["assets"]],
                      sorted(item["assetId"] for item in engagement["assets"]))
 
@@ -110,6 +119,20 @@ class TestTenantEngagements(unittest.TestCase):
       self.assertNotIn('"ref"', text)
       self.assertNotIn('"store"', text)
       self.assertNotIn("r1fs", text)
+
+  def test_documents_are_optional(self):
+    result = self.create(documents=[])
+    self.assertTrue(result["success"], result)
+    self.assertEqual(result["data"]["documents"], [])
+
+  def test_a_tenant_without_a_contract_creates_no_engagement(self):
+    legacy = self.new_tenant("legacy", contract=False)
+    asset = self.asset({"kind": "network", "address": "192.0.2.20"}, tenant=legacy, authorized_ports="22")
+    writes = len(self.owner.writes)
+    self.refused(self.create(tenant_id=legacy, assets=[{"asset_id": asset, "authorized_tests": ["active_auth"]}]),
+                 400, "contract_required")
+    self.refused(self.service.authorize_engagement_create(self.actor, legacy), 400, "contract_required")
+    self.assertEqual(len(self.owner.writes), writes)
 
   def test_explicit_ports_and_scan_modes_override_the_seed(self):
     assets = [{"asset_id": self.network, "authorized_ports": "80, 443", "authorized_scan_modes": ["syn", "connect"],
@@ -168,12 +191,18 @@ class TestTenantEngagements(unittest.TestCase):
 
   def test_request_value_refusals(self):
     cases = [
-      ({"kind": "forever"}, "invalid_request"), ({"display_name": ""}, "invalid_request"),
+      ({"allowed_run_modes": ["forever"]}, "run_modes_invalid"), ({"allowed_run_modes": []}, "run_modes_invalid"),
+      ({"allowed_run_modes": None}, "run_modes_invalid"), ({"display_name": ""}, "invalid_request"),
       ({"valid_until": "2026-09-01T00:00:00Z"}, "window_invalid"), ({"valid_from": "tomorrow"}, "window_invalid"),
       ({"roe": {"dos_allowed": True}}, "roe_invalid"), ({"roe": {"authenticated_action": "yes"}}, "roe_invalid"),
-      ({"context": {"client_name": None}}, "context_invalid"), ({"signer_name": ""}, "signer_required"),
-      ({"roe_document": doc(SHA_ROE, "roe", uploaded_by="someone")}, "document_invalid"),
-      ({"authorization_document": {"ref": "auth"}}, "document_invalid"),
+      ({"context": {"client_name": None}}, "context_invalid"),
+      ({"documents": [doc(SHA_ROE, "roe", uploaded_by="someone")]}, "document_invalid"),
+      ({"documents": [{"ref": "auth"}]}, "document_invalid"),
+      ({"documents": [doc(SHA_ROE, "roe", kind="roe")]}, "document_invalid"),
+      ({"documents": [doc(SHA_ROE, "roe", title=" ")]}, "document_invalid"),
+      ({"documents": [doc(SHA_ROE, "roe"), doc(SHA_ROE, "roe-again")]}, "document_invalid"),
+      ({"documents": [doc("%064x" % index, "d%d" % index) for index in range(21)]}, "document_invalid"),
+      ({"documents": "roe"}, "document_invalid"),
       ({"supersedes": "en_nope"}, "supersedes_invalid"),
       ({"supersedes": "en_" + str(uuid4())}, "supersedes_invalid"),
       ({"request_id": "not-a-uuid"}, "invalid_request"),
@@ -194,10 +223,15 @@ class TestTenantEngagements(unittest.TestCase):
     self.assertIs(replayed["data"]["replayed"], True)
     self.assertEqual(self.view(replayed), first)
     # A re-upload of the same bytes has a new reference but is the same creation.
-    self.assertEqual(self.view(self.create(roe_document=doc(SHA_ROE, "roe-again"))), first)
+    documents = self.fields()["documents"]
+    self.assertEqual(self.view(self.create(documents=[doc(SHA_ROE, "roe-again", title="Rules of engagement"),
+                                                      documents[1]])), first)
     self.assertEqual(len(self.owner.writes), writes)
     self.refused(self.create(display_name="Other"), 409, "conflict")
-    self.refused(self.create(roe_document=doc("3" * 64, "roe")), 409, "conflict")
+    self.refused(self.create(documents=[doc("3" * 64, "roe", title="Rules of engagement"), documents[1]]),
+                 409, "conflict")
+    self.refused(self.create(documents=[doc(SHA_ROE, "roe", title="SOW"), documents[1]]), 409, "conflict")
+    self.refused(self.create(allowed_run_modes=["continuous"]), 409, "conflict")
 
   def test_roles(self):
     self.owner.account("platform-pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
@@ -209,19 +243,20 @@ class TestTenantEngagements(unittest.TestCase):
     # Owner, 2026-09-28: only a Super-Tenant Admin manages engagements; a Super-Pentester reads
     # their documents (Q5) but neither creates nor revokes.
     for account in ("platform-pentester", "scoped-pentester", "pentester", "viewer", "initial"):
-      docs = {"roe_document": doc(SHA_ROE, "roe", account), "authorization_document": doc(SHA_AUTH, "auth", account)}
-      self.refused(self.create(actor={"account_id": account}, request_id=str(uuid4()), **docs), 403, "forbidden")
+      docs = [doc(SHA_ROE, "roe", account), doc(SHA_AUTH, "auth", account)]
+      self.refused(self.create(actor={"account_id": account}, request_id=str(uuid4()), documents=docs),
+                   403, "forbidden")
     self.refused(self.create(actor={"account_id": "elsewhere"}, request_id=str(uuid4())), 404, "not_found")
     engagement = self.create()["data"]["engagementId"]
     for account in ("platform-pentester", "scoped-pentester", "pentester", "viewer"):
       self.refused(self.service.revoke_engagement({"account_id": account}, self.tenant, engagement, "x"),
                    403, "forbidden")
     for account in ("pentester", "viewer"):
-      self.refused(self.service.engagement_document_ref({"account_id": account}, self.tenant, engagement, "roe"),
+      self.refused(self.service.engagement_document_ref({"account_id": account}, self.tenant, engagement, "ed_1"),
                    403, "forbidden")
       self.assertTrue(self.service.get_engagement({"account_id": account}, self.tenant, engagement)["success"])
     self.refused(self.service.get_engagement({"account_id": "elsewhere"}, self.tenant, engagement), 404, "not_found")
-    self.assertTrue(self.service.engagement_document_ref({"account_id": "platform-pentester"}, self.tenant, engagement, "roe")["success"])
+    self.assertTrue(self.service.engagement_document_ref({"account_id": "platform-pentester"}, self.tenant, engagement, "ed_1")["success"])
     viewer = self.service.get_engagement({"account_id": "viewer"}, self.tenant, engagement)["data"]
     self.assertEqual((viewer["canRevokeEngagements"], viewer["canDownloadDocuments"]), (False, False))
     listed = self.service.list_engagements({"account_id": "platform-pentester"}, self.tenant)["data"]
@@ -232,21 +267,16 @@ class TestTenantEngagements(unittest.TestCase):
   def test_document_ref_is_authorized_before_the_lookup(self):
     self.owner.account("viewer", memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
     missing = "en_" + str(uuid4())
-    self.refused(self.service.engagement_document_ref({"account_id": "viewer"}, self.tenant, missing, "roe"),
+    self.refused(self.service.engagement_document_ref({"account_id": "viewer"}, self.tenant, missing, "ed_1"),
                  403, "forbidden")
-    self.refused(self.service.engagement_document_ref(self.actor, self.tenant, missing, "roe"), 404, "not_found")
+    self.refused(self.service.engagement_document_ref(self.actor, self.tenant, missing, "ed_1"), 404, "not_found")
     engagement = self.create()["data"]["engagementId"]
-    self.refused(self.service.engagement_document_ref(self.actor, self.tenant, engagement, "contract"),
-                 400, "invalid_request")
-    ref = self.service.engagement_document_ref(self.actor, self.tenant, engagement, "authorization")["data"]
+    for bad in ("contract", "roe", "ed_0", "ed_01", 2):
+      self.refused(self.service.engagement_document_ref(self.actor, self.tenant, engagement, bad),
+                   400, "invalid_request")
+    self.refused(self.service.engagement_document_ref(self.actor, self.tenant, engagement, "ed_3"), 404, "not_found")
+    ref = self.service.engagement_document_ref(self.actor, self.tenant, engagement, "ed_2")["data"]
     self.assertEqual((ref["store"], ref["ref"], ref["sha256"]), ("r1fs", "auth", SHA_AUTH))
-
-  def test_a_tenant_created_before_contracts_still_creates_engagements(self):
-    legacy = self.new_tenant("legacy", contract=False)
-    asset = self.asset({"kind": "network", "address": "192.0.2.20"}, tenant=legacy, authorized_ports="22")
-    result = self.create(tenant_id=legacy, assets=[{"asset_id": asset, "authorized_tests": ["active_auth"]}])
-    self.assertTrue(result["success"], result)
-    self.assertIsNone(result["data"]["contractSha256"])
 
   def test_supersedes_links_without_revoking(self):
     first = self.create()["data"]["engagementId"]

@@ -46,6 +46,7 @@
       "tasks:launch",
       "tasks:update",
       "tenant_users:manage",
+      "tenants:delete",
       "tenants:manage"
     ],
     "tenant_admin": [

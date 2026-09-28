@@ -30,6 +30,7 @@ def _engagement(kind="network", **roe):
   from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
   return {
     "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
+    "contract_sha256": "c" * 64,
     "authorized_tests": sorted(feature_ids_for_kind(kind)),
     "roe": {"authenticated_action": False, "stateful_probes_allowed": True, "ics_safe_mode_required": False,
             **roe},

@@ -1190,6 +1190,7 @@ def announce_launch(
     **({"engagement": engagement["context"], "roe": engagement["roe"],
         "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
         "engagement_hash": engagement["engagement_hash"],
+        "contract_sha256": engagement["contract_sha256"],
         "authorized_tests": engagement["authorized_tests"]} if engagement is not None else {}),
     # OWASP API Top 10 (Subphase 1.5 commit #8): runtime-only secret
     # fields. Blanked by `_blank_graybox_secret_fields` before persistence;

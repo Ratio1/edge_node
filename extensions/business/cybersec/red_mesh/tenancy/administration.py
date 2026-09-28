@@ -22,10 +22,10 @@ from .assets import (canonical_digest, canonical_uuid, normalize_name, normalize
 from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
                            valid_integration_id)
-from .engagements import (ENGAGEMENT_ASSET_KINDS, ENGAGEMENT_KINDS, MAX_ENGAGEMENT_ASSETS, EngagementInvalid,
-                          engagement_hash, engagement_id_for, normalize_context, normalize_roe,
-                          normalize_scan_modes, normalize_signer, normalize_tests, normalize_window,
-                          valid_doc_ref, valid_engagement_id)
+from .engagements import (ENGAGEMENT_ASSET_KINDS, MAX_ENGAGEMENT_ASSETS, MAX_ENGAGEMENT_DOCUMENTS,
+                          EngagementInvalid, document_id_for, engagement_hash, engagement_id_for,
+                          normalize_context, normalize_roe, normalize_run_modes, normalize_scan_modes,
+                          normalize_tests, normalize_window, valid_doc_ref, valid_engagement_id)
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -201,6 +201,9 @@ class TenantAdministrationService:
     tenant = self.store.get("tenant", receipt["tenant_id"])
     if tenant is not None:
       self._assert_tenant_binding(tenant, receipt)
+      # RM-107: a retried creation or activation must not bring back a tenant being deleted.
+      if "deleting" in tenant:
+        raise AdministrationDenied(409, "tenant_deleting")
       if tenant["active"] and domain is None:
         raise TenantStoreError("Active tenant has no domain reservation")
     return domain, tenant
@@ -491,12 +494,14 @@ class TenantAdministrationService:
     eligible = {row["node_address"] for row in assignments if row["active"]} & set(configured)
     return sorted(eligible)
 
-  def _execution_engagement(self, tenant_id, asset, engagement_id):
+  def _execution_engagement(self, tenant, asset, engagement_id):
     """The launch gate's engagement facts, from the stored row (never the DTO, which has no refs).
 
     Refusals follow the engagements contract. The asset row's own port scope is never read here:
-    it only seeded the engagement's (owner, 2026-09-27).
+    it only seeded the engagement's (owner, 2026-09-27). RM-107: the authorization is the tenant
+    contract the engagement was created under, so it is read from the tenant and must still be it.
     """
+    tenant_id = tenant["tenant_id"]
     engagement_id = self._engagement_id(engagement_id)
     row = self.store.get("engagement", tenant_id, engagement_id)
     if row is None:
@@ -512,23 +517,31 @@ class TenantAdministrationService:
     if entry["kind"] != asset["target"]["kind"] or entry["target_digest"] != asset["target_digest"]:
       # Owner Q3: the fix is a new engagement that `supersedes` this one.
       raise AdministrationDenied(409, "engagement_asset_changed")
-    document = row["authorization_document"]
+    contract, legal = tenant.get("contract"), tenant.get("legal")
+    if (not _valid_contract(contract) or not isinstance(legal, dict)
+        or contract["sha256"] != row["contract_sha256"]):
+      # The contract cannot change after creation (there is no attach operation): a mismatch is a
+      # damaged record, never a reason to launch under a different signed basis.
+      raise TenantStoreError("Engagement contract does not match its tenant")
     facts = {
       "engagement_id": engagement_id, "engagement_hash": row["engagement_hash"],
+      "contract_sha256": row["contract_sha256"],
       "authorized_tests": list(entry["authorized_tests"]), "roe": dict(row["roe"]),
       "context": row["context"],
-      # `AuthorizationRef` shape, so reports and exports read the job snapshot as before. No
-      # document reference: the job is readable under `reports:view` and reaches reports and SIEM
-      # events, while the document itself is `engagements:documents` only (download by engagement).
+      # `AuthorizationRef` shape, so reports, exports and SIEM hooks read the job snapshot as
+      # before. The signed basis is the tenant contract, signed by the tenant's legal signer. No
+      # document reference: the job is readable under `reports:view`, while the contract itself is
+      # Super-Tenant Admin only (`download_tenant_contract`).
       "authorization": {
         "document_cid": "",
         "document_thumbnail_cid": "",
-        "authorized_signer_name": document["authorized_signer_name"],
-        "authorized_signer_role": document["authorized_signer_role"],
-        "third_party_auth_cids": list(document["third_party_auth_refs"]),
-        "document_filename": document["filename"], "document_mime": document["mime"],
-        "document_size_bytes": document["size_bytes"], "document_sha256": document["sha256"],
-        "document_uploaded_at": document["uploaded_at"],
+        "authorized_signer_name": legal["signer_name"],
+        "authorized_signer_role": legal["signer_role"],
+        "third_party_auth_cids": [document["title"] for document in row["documents"]
+                                  if document["kind"] == "third_party_consent"],
+        "document_filename": contract["filename"], "document_mime": contract["mime"],
+        "document_size_bytes": contract["size_bytes"], "document_sha256": contract["sha256"],
+        "document_uploaded_at": contract["uploaded_at"],
       },
     }
     if entry["kind"] != "network":
@@ -540,7 +553,7 @@ class TenantAdministrationService:
     tenant, asset = self._execution_asset_for_account(account, tenant_id, asset_id, expected_target_digest)
     policy = {}
     if engagement_id is not None:
-      engagement, ports = self._execution_engagement(tenant_id, asset, engagement_id)
+      engagement, ports = self._execution_engagement(tenant, asset, engagement_id)
       policy = {"engagement": engagement, **({"asset_authorized_ports": ports} if ports is not None else {})}
     eligible = self._execution_eligible_nodes(tenant_id)
     if selected_peers is not None and (not isinstance(selected_peers, list)
@@ -736,7 +749,6 @@ class TenantAdministrationService:
   def _engagement_row(self, row):
     if row is None:
       raise TenantStoreError("Engagement readback is unavailable")
-    authorization = row["authorization_document"]
     assets = []
     for entry in row["assets"]:
       asset = {"assetId": entry["asset_id"], "kind": entry["kind"], "targetDigest": entry["target_digest"],
@@ -747,14 +759,12 @@ class TenantAdministrationService:
       assets.append(asset)
     return {
       "tenantId": row["tenant_id"], "engagementId": row["engagement_id"],
-      "displayName": row["display_name"], "kind": row["engagement_kind"],
+      "displayName": row["display_name"], "allowedRunModes": row["allowed_run_modes"],
       "validFrom": row["valid_from"], "validUntil": row["valid_until"],
       "contractSha256": row["contract_sha256"],
-      "roeDocument": self._engagement_document(row["roe_document"]),
-      "authorizationDocument": {**self._engagement_document(authorization),
-                                "signerName": authorization["authorized_signer_name"],
-                                "signerRole": authorization["authorized_signer_role"],
-                                "thirdPartyAuthRefs": authorization["third_party_auth_refs"]},
+      "documents": [{"documentId": document["document_id"], "kind": document["kind"],
+                     "title": document["title"], "comment": document["comment"],
+                     **self._engagement_document(document)} for document in row["documents"]],
       "supersedes": row.get("supersedes"), "roe": row["roe"], "context": row["context"],
       "assets": assets, "engagementHash": row["engagement_hash"],
       # No registry function anchors an arbitrary hash yet (owner, 2026-09-28): always pending.
@@ -770,33 +780,46 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "invalid_request")
     return value
 
+  @staticmethod
+  def _tenant_contract_sha256(tenant):
+    """RM-107: the tenant contract is the permission an engagement extends, so it must exist.
+    Tenants created before contracts were required keep `contract: null` and create no engagement."""
+    contract = tenant.get("contract")
+    if contract is None:
+      raise AdministrationDenied(400, "contract_required")
+    if not _valid_contract(contract):
+      raise TenantStoreError("Invalid tenant contract record")
+    return contract["sha256"]
+
   @_endpoint
   def authorize_engagement_create(self, actor, tenant_id):
-    """The plugin reads the two documents outside this lock, and only after this check."""
-    _, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    """The plugin reads the documents outside this lock, and only after this check. Refusing a
+    tenant without a contract here spares the uploads and the document reads."""
+    tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    self._tenant_contract_sha256(tenant)
     return {"accountId": account.account_id}
 
   @staticmethod
-  def _engagement_request(display_name, kind, valid_from, valid_until, roe, context, assets,
-                          roe_document, authorization_document, signer_name, signer_role,
-                          third_party_auth_refs, supersedes, creator):
+  def _engagement_request(display_name, allowed_run_modes, valid_from, valid_until, roe, context, assets,
+                          documents, supersedes, creator):
     """The request as sent, normalized without any store read: the replay intent."""
     try:
       display_name = normalize_name(display_name)
-      if kind not in ENGAGEMENT_KINDS:
-        raise ValueError("Invalid engagement kind")
     except (ValueError, TypeError):
       raise AdministrationDenied(400, "invalid_request") from None
     try:
+      allowed_run_modes = normalize_run_modes(allowed_run_modes)
       valid_from, valid_until = normalize_window(valid_from, valid_until)
       roe, context = normalize_roe(roe), normalize_context(context)
-      signer = normalize_signer(signer_name, signer_role, third_party_auth_refs)
     except EngagementInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
-    # The plugin verified both documents; the uploader rule is re-checked here (phase-1 precedent).
-    for document in (roe_document, authorization_document):
-      if not valid_doc_ref(document) or document["uploaded_by"] != creator:
-        raise AdministrationDenied(400, "document_invalid")
+    # The plugin verified every document; the uploader rule is re-checked here (phase-1 precedent).
+    # The same file twice is refused: its hash says nothing the first entry did not.
+    if (not isinstance(documents, list) or len(documents) > MAX_ENGAGEMENT_DOCUMENTS
+        or any(not valid_doc_ref(document, labels=True) or document["uploaded_by"] != creator
+               for document in documents)
+        or len({document["sha256"] for document in documents}) != len(documents)):
+      raise AdministrationDenied(400, "document_invalid")
     if supersedes is not None and not valid_engagement_id(supersedes):
       raise AdministrationDenied(400, "supersedes_invalid")
     if not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS:
@@ -824,10 +847,10 @@ class TenantAdministrationService:
       requested[asset_id] = {"asset_id": asset_id, "authorized_tests": sorted(tests),
                              **({"authorized_ports": ports} if ports is not None else {}),
                              **({"authorized_scan_modes": modes} if modes is not None else {})}
-    return {"display_name": display_name, "engagement_kind": kind, "valid_from": valid_from,
+    return {"display_name": display_name, "allowed_run_modes": allowed_run_modes, "valid_from": valid_from,
             "valid_until": valid_until, "roe": roe, "context": context,
-            "roe_document_sha256": roe_document["sha256"],
-            "authorization_sha256": authorization_document["sha256"], **signer,
+            "documents": [[document[key] for key in ("kind", "sha256", "title", "comment")]
+                          for document in documents],
             "supersedes": supersedes, "assets": [requested[key] for key in sorted(requested)]}
 
   def _engagement_asset(self, tenant_id, entry):
@@ -857,16 +880,18 @@ class TenantAdministrationService:
     return {**locked, "authorized_ports": ports, "authorized_scan_modes": modes}
 
   @_endpoint
-  def create_engagement(self, actor, tenant_id, request_id, display_name, kind, valid_from, valid_until,
-                        roe, context, assets, roe_document, authorization_document, signer_name,
-                        signer_role, third_party_auth_refs=None, supersedes=None):
+  def create_engagement(self, actor, tenant_id, request_id, display_name, allowed_run_modes, valid_from,
+                        valid_until, roe, context, assets, documents=None, supersedes=None):
+    """`documents` are the references `services.engagement_documents.resolve_engagement_document`
+    verified outside this lock, in the order they are numbered (`ed_1`, `ed_2`, ...)."""
     tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    contract_sha256 = self._tenant_contract_sha256(tenant)
     request_id = _request_id(request_id)
     engagement_id = engagement_id_for(request_id)
+    documents = [] if documents is None else documents
     request = self._engagement_request(
-      display_name, kind, valid_from, valid_until, roe, context, assets, roe_document,
-      authorization_document, signer_name, signer_role, third_party_auth_refs, supersedes,
-      account.account_id)
+      display_name, allowed_run_modes, valid_from, valid_until, roe, context, assets, documents,
+      supersedes, account.account_id)
     intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "engagement_id": engagement_id,
               "request_id": request_id, "created_by": account.account_id, "request": request}
     # Replay is decided on the request alone, before any asset read: a retry after an asset edit is
@@ -879,19 +904,13 @@ class TenantAdministrationService:
     if supersedes is not None and (supersedes == engagement_id
                                    or self.store.get("engagement", tenant_id, supersedes) is None):
       raise AdministrationDenied(400, "supersedes_invalid")
-    contract = tenant.get("contract")
-    if contract is not None and not _valid_contract(contract):
-      raise TenantStoreError("Invalid tenant contract record")
     record = {
       "tenant_id": tenant_id, "engagement_id": engagement_id, "request_id": request_id,
-      "display_name": request["display_name"], "engagement_kind": request["engagement_kind"],
+      "display_name": request["display_name"], "allowed_run_modes": request["allowed_run_modes"],
       "valid_from": request["valid_from"], "valid_until": request["valid_until"],
-      # Tenants created before contracts were required still create engagements (with no contract).
-      "contract_sha256": contract["sha256"] if contract is not None else None,
-      "roe_document": dict(roe_document),
-      "authorization_document": {**authorization_document,
-                                 **{key: request[key] for key in ("authorized_signer_name",
-                                    "authorized_signer_role", "third_party_auth_refs")}},
+      "contract_sha256": contract_sha256,
+      "documents": [{"document_id": document_id_for(index), **document}
+                    for index, document in enumerate(documents)],
       **({"supersedes": supersedes} if supersedes is not None else {}),
       "roe": request["roe"], "context": request["context"],
       "assets": [self._engagement_asset(tenant_id, entry) for entry in request["assets"]],
@@ -945,16 +964,18 @@ class TenantAdministrationService:
     return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
 
   @_endpoint
-  def engagement_document_ref(self, actor, tenant_id, engagement_id, document):
+  def engagement_document_ref(self, actor, tenant_id, engagement_id, document_id):
     """The stored reference for a download; authorized before the engagement is looked up."""
     self._authorized_tenant(actor, tenant_id, "engagements:documents")
     engagement_id = self._engagement_id(engagement_id)
-    if document not in ("roe", "authorization"):
+    if not isinstance(document_id, str) or not re.fullmatch(r"ed_[1-9][0-9]*", document_id):
       raise AdministrationDenied(400, "invalid_request")
     row = self.store.get("engagement", tenant_id, engagement_id)
     if row is None:
       raise AdministrationDenied(404, "not_found")
-    ref = row["roe_document" if document == "roe" else "authorization_document"]
+    ref = next((document for document in row["documents"] if document["document_id"] == document_id), None)
+    if ref is None:
+      raise AdministrationDenied(404, "not_found")
     return {"store": ref["store"], "ref": ref["ref"], "sha256": ref["sha256"], "filename": ref["filename"],
             "size_bytes": ref["size_bytes"], "engagement_hash": row["engagement_hash"]}
 
@@ -1072,6 +1093,101 @@ class TenantAdministrationService:
       if not valid_legal:
         raise TenantStoreError("Invalid tenant contract record")
     return {"legal": legal, "contract": contract}
+
+  # RM-107: delete a tenant. Owner, 2026-09-28: it exists so tenants created before contracts can be
+  # removed; it deletes the tenant's records and its stored documents, refuses while the tenant has
+  # jobs or members (accounts are the Navigator's records, never deleted here), and keeps the domain
+  # reserved. The plugin runs it in steps so every document read and delete is outside this lock and
+  # a failed attempt can be retried: `begin_tenant_delete` (check, then mark), the job checks,
+  # the document deletes (`record_tenant_documents_deleted`), `finish_tenant_delete`.
+  _DELETABLE_KINDS = ("engagement", "asset", "integration", "tenant_node")
+
+  def _tenant_for_delete(self, actor, tenant_id):
+    account = self._actor(actor)
+    _, denial = resolve_tenant_roles(account, tenant_id)
+    if denial:
+      raise AdministrationDenied(denial.status_code, denial.error)
+    tenant = self.store.get("tenant", tenant_id)
+    deleting = isinstance(tenant, dict) and isinstance(tenant.get("deleting"), dict)
+    if tenant is None or (tenant.get("active") is not True and not deleting):
+      raise AdministrationDenied(404, "not_found")
+    self._validate_tenant(tenant)
+    # A tenant being deleted is inactive to every other operation; the delete itself is authorized
+    # as on the live tenant, so a retry after a failed attempt can finish it.
+    decision = authorize_tenant_operation(account, "tenants:delete", TenantPolicyContext(
+      tenant_id, True, tenant["allow_pentester"]))
+    if not decision.allowed:
+      raise AdministrationDenied(decision.status_code, decision.error)
+    if self._members(tenant_id):
+      raise AdministrationDenied(409, "tenant_has_members")
+    return tenant, account
+
+  def _tenant_document_refs(self, tenant):
+    """Every stored document the tenant's records point at, read from the raw rows."""
+    refs = [tenant["contract"]] if isinstance(tenant.get("contract"), dict) else []
+    for ids in self.store.tenant_record_ids("engagement", tenant["tenant_id"]):
+      row = self.store.raw_record("engagement", *ids) or {}
+      documents = row.get("documents") if isinstance(row.get("documents"), list) else []
+      # v1 rows (RM-095) held two fixed documents; they are cleared by the same delete.
+      refs.extend([*documents, row.get("roe_document"), row.get("authorization_document")])
+    done = set(tenant.get("deleting", {}).get("deleted_refs", []))
+    unique = {}
+    for ref in refs:
+      if isinstance(ref, dict) and isinstance(ref.get("ref"), str) and ref["ref"] and ref["ref"] not in done:
+        unique.setdefault(ref["ref"], {"store": ref.get("store"), "ref": ref["ref"]})
+    return [unique[key] for key in sorted(unique)]
+
+  @_endpoint
+  def begin_tenant_delete(self, actor, tenant_id, mark=False):
+    """Check the delete; with `mark`, make the tenant inactive to everything but this delete."""
+    tenant, account = self._tenant_for_delete(actor, tenant_id)
+    if mark and not isinstance(tenant.get("deleting"), dict):
+      tenant = {**tenant, "active": False, "deleting": {
+        "by": account.account_id, "at": datetime.now(timezone.utc).isoformat(), "deleted_refs": []}}
+      self.store.put("tenant", tenant_id, record=tenant)
+    return {"tenantId": tenant_id, "accountId": account.account_id,
+            "marked": isinstance(tenant.get("deleting"), dict),
+            "documentRefs": self._tenant_document_refs(tenant)}
+
+  @_endpoint
+  def abort_tenant_delete(self, actor, tenant_id):
+    """Undo the mark when jobs appeared after it, so they can be purged; never once a document went."""
+    tenant, _ = self._tenant_for_delete(actor, tenant_id)
+    marker = tenant.get("deleting")
+    if isinstance(marker, dict) and not marker.get("deleted_refs"):
+      restored = {key: value for key, value in tenant.items() if key != "deleting"}
+      self.store.put("tenant", tenant_id, record={**restored, "active": True})
+    return {"tenantId": tenant_id}
+
+  @_endpoint
+  def record_tenant_documents_deleted(self, actor, tenant_id, refs):
+    tenant, _ = self._tenant_for_delete(actor, tenant_id)
+    marker = tenant.get("deleting")
+    if not isinstance(marker, dict):
+      raise AdministrationDenied(409, "conflict")
+    deleted = sorted(set(marker.get("deleted_refs", [])) | set(refs))
+    self.store.put("tenant", tenant_id, record={**tenant, "deleting": {**marker, "deleted_refs": deleted}})
+    return {"tenantId": tenant_id, "deletedRefs": deleted}
+
+  @_endpoint
+  def finish_tenant_delete(self, actor, tenant_id):
+    """Delete the records. The receipt goes before the tenant row, so a retried `prepare_tenant`
+    can never re-create the tenant; the domain reservation stays (owner, 2026-09-28)."""
+    tenant, _ = self._tenant_for_delete(actor, tenant_id)
+    if not isinstance(tenant.get("deleting"), dict) or self._tenant_document_refs(tenant):
+      raise AdministrationDenied(409, "conflict")
+    counts = {}
+    for kind in self._DELETABLE_KINDS:
+      ids = self.store.tenant_record_ids(kind, tenant_id)
+      for record_ids in ids:
+        self.store.delete(kind, *record_ids)
+      counts[kind] = len(ids)
+    self.store.delete("receipt", tenant["actor_id"], tenant["request_id"])
+    self.store.delete("tenant", tenant_id)
+    return {"tenantId": tenant_id, "deleted": True, "engagements": counts["engagement"],
+            "assets": counts["asset"], "integrations": counts["integration"],
+            "nodeAssignments": counts["tenant_node"],
+            "documents": len(tenant["deleting"]["deleted_refs"])}
 
   @_endpoint
   def authorize_platform(self, actor):

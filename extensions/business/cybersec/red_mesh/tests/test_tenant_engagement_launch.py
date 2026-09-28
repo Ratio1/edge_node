@@ -1,9 +1,11 @@
-"""RM-095 phase 3: launch admission reads the engagement through the real service and CStore store."""
+"""RM-095 phase 3, RM-107: launch admission reads the engagement through the real service and CStore store."""
 from datetime import datetime, timezone
 import unittest
 from uuid import uuid4
 
-from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
+from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied, TenantStoreError
+
+from .contract_fixture import CONTRACT_PDF, CONTRACT_SHA256, LEGAL
 
 from . import test_tenant_engagements as engagements
 
@@ -23,7 +25,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.service.clock = lambda: INSIDE
     self.service.configured_peers_reader = lambda: ["node-a"]
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-a", True)["success"])
-    created = self.create(third_party_auth_refs=["Cloud provider letter"])
+    created = self.create()
     self.assertTrue(created["success"], created)
     self.engagement = created["data"]
 
@@ -43,15 +45,33 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertEqual(context["asset_authorized_ports"], "22,443")
     self.assertEqual(context["engagement"], {
       "engagement_id": self.engagement["engagementId"], "engagement_hash": self.engagement["engagementHash"],
+      "contract_sha256": CONTRACT_SHA256,
       "authorized_tests": ["active_auth", "service_info_common"], "authorized_scan_modes": ["connect"],
       "roe": {"authenticated_action": True, "stateful_probes_allowed": False, "ics_safe_mode_required": True},
       "context": self.engagement["context"],
+      # RM-107: the signed basis is the tenant contract and its legal signer; the consents are
+      # named by the titles of the engagement's third-party consent documents.
       "authorization": {
-        "document_cid": "", "document_thumbnail_cid": "", "authorized_signer_name": "Ana Pop",
-        "authorized_signer_role": "CISO", "third_party_auth_cids": ["Cloud provider letter"],
-        "document_filename": "auth.pdf", "document_mime": "application/pdf", "document_size_bytes": 2048,
-        "document_sha256": engagements.SHA_AUTH, "document_uploaded_at": "2026-09-28T09:00:00Z"},
+        "document_cid": "", "document_thumbnail_cid": "", "authorized_signer_name": LEGAL["signer_name"],
+        "authorized_signer_role": LEGAL["signer_role"], "third_party_auth_cids": ["Hosting consent"],
+        "document_filename": "contract.pdf", "document_mime": "application/pdf",
+        "document_size_bytes": len(CONTRACT_PDF), "document_sha256": CONTRACT_SHA256,
+        "document_uploaded_at": "2026-09-27T12:00:00Z"},
     })
+
+  def test_an_engagement_without_consents_names_none(self):
+    self.request = str(uuid4())
+    bare = self.create(documents=[])["data"]
+    authorization = self.admit(engagement_id=bare["engagementId"]).to_dict()["engagement"]["authorization"]
+    self.assertEqual(authorization["third_party_auth_cids"], [])
+    self.assertEqual(authorization["document_sha256"], CONTRACT_SHA256)
+
+  def test_a_tenant_contract_that_no_longer_matches_fails_closed(self):
+    for key, row in self.owner.data.items():
+      if isinstance(row, dict) and row.get("kind") == "tenant" and row.get("tenant_id") == self.tenant:
+        self.owner.data[key] = {**row, "contract": {**row["contract"], "sha256": "9" * 64}}
+    with self.assertRaises(TenantStoreError):
+      self.admit()
 
   def test_the_engagement_scope_replaces_the_asset_rows(self):
     self.network = self.asset({"kind": "network", "address": "192.0.2.20"}, authorized_ports="1-65535")

@@ -95,6 +95,33 @@ class CstoreTenantAdministrationStore:
     if observed != expected:
       raise TenantStoreError("Tenant storage write could not be verified")
 
+  def delete(self, kind, *ids):
+    """RM-107. Remove one record (a CStore tombstone) and verify it reads back as absent."""
+    hkey, key = self._location(kind, ids)
+    try:
+      self._owner.chainstore_hset(hkey=hkey, key=key, value=None)
+      remaining = self._owner.chainstore_hget(hkey=hkey, key=key)
+    except Exception as exc:
+      raise TenantStoreError("Tenant storage delete could not be verified") from exc
+    if remaining is not None:
+      raise TenantStoreError("Tenant storage delete could not be verified")
+
+  def tenant_record_ids(self, kind, tenant_id):
+    """RM-107. The ids of a tenant's rows of one kind, without validating them: a delete must clear
+    rows the current validator refuses (an engagement written by an older release)."""
+    self._location(kind, (tenant_id,))
+    return [ids for ids, _ in self._fields(kind, tenant_id)]
+
+  def raw_record(self, kind, *ids):
+    """RM-107. One row decoded but not validated, for the same reason; None when absent or unreadable."""
+    hkey, key = self._location(kind, ids)
+    try:
+      raw = self._owner.chainstore_hget(hkey=hkey, key=key)
+      raw = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+    except Exception as exc:
+      raise TenantStoreError("Tenant storage cannot be read") from exc
+    return raw if isinstance(raw, dict) else None
+
   def _records(self):
     hkey, _ = self._location("tenant", ("enumeration",))
     try:
@@ -107,6 +134,9 @@ class CstoreTenantAdministrationStore:
 
   def _fields(self, kind, tenant_id=None):
     for key, raw in self._records().items():
+      # A deleted record (RM-107 `delete`) is a tombstone, not a row.
+      if raw is None:
+        continue
       try:
         field = json.loads(key) if isinstance(key, str) else None
       except (ValueError, RecursionError):

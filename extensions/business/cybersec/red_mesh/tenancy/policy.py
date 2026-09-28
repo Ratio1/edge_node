@@ -26,6 +26,8 @@ _ROLE_OPERATIONS = {
     # RM-095 phase 2. Plural, unlike RM-078's engagement:delete (which redacts a job's snapshot).
     # Owner, 2026-09-28: only a Super-Tenant Admin manages engagements and uploads their documents.
     "engagements:create", "engagements:revoke", "engagements:documents",
+    # RM-107. Removes a tenant with no members and no jobs (owner, 2026-09-28).
+    "tenants:delete",
   }),
   "super_pentester": frozenset({
     "assets:create", "assets:update", "allow_pentester:update", "tasks:launch", "tasks:update",

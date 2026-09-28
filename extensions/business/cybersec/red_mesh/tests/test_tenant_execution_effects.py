@@ -57,6 +57,7 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
   from uuid import uuid4
   from .test_tenant_execution import TestTenantExecution
   from .test_tenant_engagements import doc
+  from .contract_fixture import CONTRACT_SHA256
   from .test_api import TestPhase1ConfigCID
   from extensions.business.cybersec.red_mesh.constants import FEATURE_CATALOG
   from extensions.business.cybersec.red_mesh.tenancy.identity import resolve_actor, TenantMembership
@@ -66,12 +67,12 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
     asset = fixture.ready()
     fixture.service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
     engagement = fixture.service.create_engagement(
-      fixture.actor, fixture.tenant, str(uuid4()), "Q4", "point-in-time", "2026-10-01T00:00:00Z",
+      fixture.actor, fixture.tenant, str(uuid4()), "Q4", ["continuous", "single_pass"], "2026-10-01T00:00:00Z",
       "2026-10-31T00:00:00Z", {}, {"client_name": "Example"},
       [{"asset_id": asset["assetId"], "authorized_ports": "1-1024",
         "authorized_tests": sorted(item["id"] for item in FEATURE_CATALOG
                                    if item["category"] in ("service", "web", "correlation"))}],
-      doc("1" * 64, "QmEngagementRoeRef"), doc("2" * 64, "QmEngagementAuthRef"), "Ana Pop", "CISO")
+      [doc("1" * 64, "QmEngagementRoeRef"), doc("2" * 64, "QmEngagementAuthRef")])
     assert engagement["success"], engagement
     owner = TestPhase1ConfigCID._build_mock_plugin()
     TestPhase1ConfigCID._bind_launch_helpers(owner)
@@ -114,7 +115,9 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
     audit = [call[0][1] for call in owner._log_audit_event.call_args_list if call[0][0] == "scan_launched"]
     leaked = {"QmEngagementRoeRef", "QmEngagementAuthRef"} & set(values([allowed, audit]))
     assert not leaked, leaked
-    assert allowed["job_config"]["authorization"]["document_sha256"] == "2" * 64
+    # RM-107: the snapshot's signed basis is the tenant contract, not an engagement document.
+    assert allowed["job_config"]["authorization"]["document_sha256"] == CONTRACT_SHA256
+    assert allowed["job_config"]["contract_sha256"] == CONTRACT_SHA256
     assert allowed["job_specs"]["execution_binding"]["participant_order"] == ["node-a"]
   finally:
     fixture.doCleanups()

@@ -1,4 +1,4 @@
-"""RM-095 phase 2: engagement values, the hashed shape and the stored-record validator."""
+"""RM-095 phase 2, RM-107: engagement values, the hashed shape and the stored-record validator."""
 import copy
 import json
 import unittest
@@ -7,8 +7,8 @@ from extensions.business.cybersec.red_mesh.constants import FEATURE_CATALOG
 from extensions.business.cybersec.red_mesh.services.scan_strategy import SCAN_STRATEGIES
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.engagements import (
-  EngagementInvalid, engagement_hash, feature_ids_for_kind, normalize_context, normalize_instant,
-  normalize_roe, normalize_signer, normalize_window, validate_engagement)
+  EngagementInvalid, engagement_hash, feature_ids_for_kind, normalize_context, normalize_document_labels,
+  normalize_instant, normalize_roe, normalize_run_modes, normalize_window, validate_engagement)
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from .test_tenant_administration import FakeAdministrationStore
 
@@ -26,15 +26,19 @@ def doc_ref(sha256=SHA_A, ref="doc-1", **extra):
           "uploaded_by": "creator", **extra}
 
 
+def document(index, sha256, kind="agreement", title="Rules of engagement", comment="", **extra):
+  return {"document_id": "ed_%d" % index, "kind": kind, "title": title, "comment": comment,
+          **doc_ref(sha256, "doc-%d" % index), **extra}
+
+
 def record(**changes):
   row = {
     "tenant_id": TENANT, "engagement_id": ENGAGEMENT, "request_id": REQUEST,
-    "display_name": "Q4 external test", "engagement_kind": "point-in-time",
+    "display_name": "Q4 external test", "allowed_run_modes": ["single_pass"],
     "valid_from": "2026-10-01T00:00:00Z", "valid_until": "2026-10-31T00:00:00Z",
     "contract_sha256": SHA_C,
-    "roe_document": doc_ref(),
-    "authorization_document": doc_ref(SHA_B, "doc-2", authorized_signer_name="Ana Pop",
-                                      authorized_signer_role="CISO", third_party_auth_refs=[]),
+    "documents": [document(1, SHA_A),
+                  document(2, SHA_B, "third_party_consent", "Hosting consent", "AWS case 123")],
     "roe": normalize_roe({}), "context": normalize_context({"client_name": "Example"}),
     "assets": [
       {"asset_id": NETWORK_ASSET, "kind": "network", "target_digest": "d" * 64,
@@ -95,14 +99,24 @@ class TestEngagementValues(unittest.TestCase):
     with self.assertRaises(EngagementInvalid):
       normalize_window("2026-10-01T00:00:00Z", "2026-10-01T00:00:00+00:00")
 
-  def test_signer_is_required(self):
-    self.assertEqual(normalize_signer(" Ana ", "CISO"), {"authorized_signer_name": "Ana",
-                     "authorized_signer_role": "CISO", "third_party_auth_refs": []})
-    for args in (("", "CISO"), ("Ana", None), ("Ana", "CISO", "ref"), ("Ana", "CISO", [""]),
-                 ("Ana", "CISO", ["r"] * 21)):
+  def test_run_modes_are_a_sorted_non_empty_subset(self):
+    self.assertEqual(normalize_run_modes(["single_pass", "continuous"]), ["continuous", "single_pass"])
+    self.assertEqual(normalize_run_modes(["single_pass"]), ["single_pass"])
+    for bad in ([], None, "continuous", ["continuous", "continuous"], ["SINGLEPASS"], ["point-in-time"]):
       with self.assertRaises(EngagementInvalid) as caught:
-        normalize_signer(*args)
-      self.assertEqual(caught.exception.code, "signer_required")
+        normalize_run_modes(bad)
+      self.assertEqual(caught.exception.code, "run_modes_invalid")
+
+  def test_document_labels_are_a_kind_a_title_and_a_bounded_comment(self):
+    self.assertEqual(normalize_document_labels("agreement", " RoE v2 ", " signed \n"),
+                     {"kind": "agreement", "title": "RoE v2", "comment": "signed"})
+    self.assertEqual(normalize_document_labels("other", "Scope email", "")["comment"], "")
+    for args in (("roe", "RoE", ""), ("agreement", "", ""), ("agreement", "x" * 201, ""),
+                 ("agreement", "RoE", "x" * 2001), ("agreement", "RoE", None), ("agreement", None, ""),
+                 ("agreement", "RoE", "bell\x07")):
+      with self.assertRaises(EngagementInvalid) as caught:
+        normalize_document_labels(*args)
+      self.assertEqual(caught.exception.code, "document_invalid")
 
 
 class TestEngagementHash(unittest.TestCase):
@@ -114,10 +128,9 @@ class TestEngagementHash(unittest.TestCase):
     base = record()["engagement_hash"]
     changes = {
       "tenant_id": "tenant-2", "engagement_id": "en_" + "1" * 8 + "-1111-4111-8111-" + "1" * 12,
-      "display_name": "Other", "engagement_kind": "continuous", "valid_until": "2026-11-30T00:00:00Z",
-      "contract_sha256": None, "roe_document": doc_ref(SHA_C),
-      "authorization_document": doc_ref(SHA_B, "doc-2", authorized_signer_name="Ana Pop",
-                                        authorized_signer_role="CEO", third_party_auth_refs=[]),
+      "display_name": "Other", "allowed_run_modes": ["continuous", "single_pass"],
+      "valid_until": "2026-11-30T00:00:00Z", "contract_sha256": "9" * 64,
+      "documents": record()["documents"][:1],
       "supersedes": "en_" + "2" * 8 + "-2222-4222-8222-" + "2" * 12,
       "roe": normalize_roe({"authenticated_action": True}),
       "context": normalize_context({"client_name": "Other"}),
@@ -129,10 +142,21 @@ class TestEngagementHash(unittest.TestCase):
     scoped = copy.deepcopy(record()["assets"])
     scoped[0]["authorized_scan_modes"] = ["connect", "syn"]
     self.assertNotEqual(record(assets=scoped)["engagement_hash"], base)
+    for label, value in (("kind", "other"), ("sha256", SHA_C), ("title", "SOW"), ("comment", "annex 2")):
+      with self.subTest(document=label):
+        documents = copy.deepcopy(record()["documents"])
+        documents[0][label] = value
+        self.assertNotEqual(record(documents=documents)["engagement_hash"], base)
 
   def test_document_references_and_bookkeeping_do_not_enter_the_hash(self):
     base = record()["engagement_hash"]
-    self.assertEqual(record(roe_document=doc_ref(ref="doc-99", uploaded_at="2026-09-29T00:00:00Z"))["engagement_hash"], base)
+    moved = copy.deepcopy(record()["documents"])
+    moved[0].update(ref="doc-99", uploaded_at="2026-09-29T00:00:00Z", filename="other.pdf")
+    self.assertEqual(record(documents=moved)["engagement_hash"], base)
+    # The same documents in another order are the same engagement (ids follow the new order).
+    swapped = [dict(item, document_id="ed_%d" % (index + 1))
+               for index, item in enumerate(reversed(record()["documents"]))]
+    self.assertEqual(record(documents=swapped)["engagement_hash"], base)
     self.assertEqual(record(created_at="2026-09-29T00:00:00+00:00", created_by="other")["engagement_hash"], base)
 
 
@@ -142,6 +166,9 @@ class TestEngagementValidator(unittest.TestCase):
     validate_engagement(record(active=False, revoked_by="creator", revoked_at="2026-10-02T00:00:00+00:00",
                                revoke_reason="Scope withdrawn"), (TENANT, ENGAGEMENT))
 
+  def test_an_engagement_without_documents_is_valid(self):
+    validate_engagement(record(documents=[]), (TENANT, ENGAGEMENT))
+
   def test_unknown_fields_are_kept(self):
     validate_engagement({**record(), "signature": {"future": True}}, (TENANT, ENGAGEMENT))
 
@@ -150,7 +177,7 @@ class TestEngagementValidator(unittest.TestCase):
     retired = record()
     retired["assets"][0]["authorized_tests"] = ["retired_feature"]
     retired["context"] = {**retired["context"], "added_later": ""}
-    retired["authorization_document"] = {**retired["authorization_document"], "signature": "0x1"}
+    retired["documents"][0] = {**retired["documents"][0], "signature": "0x1"}
     retired["engagement_hash"] = engagement_hash(retired)
     validate_engagement(retired, (TENANT, ENGAGEMENT))
 
@@ -173,7 +200,16 @@ class TestEngagementValidator(unittest.TestCase):
       "window not canonical": record(valid_from="2026-10-01T00:00:00+00:00"),
       "self supersedes": record(supersedes=ENGAGEMENT),
       "contract ref instead of hash": record(contract_sha256={"ref": "doc-1"}),
-      "signer missing": {**record(), "authorization_document": doc_ref(SHA_B)},
+      "no contract": record(contract_sha256=None),
+      "run modes unsorted": record(allowed_run_modes=["single_pass", "continuous"]),
+      "no run mode": record(allowed_run_modes=[]),
+      "document ids out of order": record(documents=[document(2, SHA_A)]),
+      "document kind": record(documents=[document(1, SHA_A, kind="roe")]),
+      "document without title": record(documents=[document(1, SHA_A, title="")]),
+      "same file twice": record(documents=[document(1, SHA_A), document(2, SHA_A, title="Again")]),
+      "21 documents": record(documents=[document(index + 1, "%064x" % index) for index in range(21)]),
+      "v1 kind": {**record(), "engagement_kind": "continuous"},
+      "v1 documents": {**record(), "roe_document": doc_ref(), "authorization_document": doc_ref(SHA_B)},
       "webapp ports": webapp_ports, "network without ports": network_without_ports,
       "tests unsorted": unsorted_tests,
       "context not an object": record(context="Example"),

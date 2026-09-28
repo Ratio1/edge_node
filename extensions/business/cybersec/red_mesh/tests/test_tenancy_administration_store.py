@@ -31,6 +31,30 @@ class Store:
 
 
 class TestAdministrationStore(unittest.TestCase):
+  def test_delete_is_verified_and_tombstones_are_not_rows(self):
+    # RM-107. A deleted record is a CStore tombstone (None); enumeration skips it.
+    owner = Store()
+    store = CstoreTenantAdministrationStore(owner, "deployment-a")
+    store.put("tenant", "tn_a", record={"tenant_id": "tn_a", "active": True, "allow_pentester": False})
+    store.put("receipt", "alice", "request", record={"tenant_id": "tn_a"})
+    store.delete("tenant", "tn_a")
+    self.assertIsNone(store.get("tenant", "tn_a"))
+    self.assertEqual(store.list_tenants(), [])
+    owner.write_noop = True
+    with self.assertRaises(TenantStoreError):
+      store.delete("receipt", "alice", "request")
+
+  def test_tenant_record_ids_and_raw_rows_skip_validation(self):
+    owner = Store()
+    store = CstoreTenantAdministrationStore(owner, "deployment-a")
+    hkey = '["redmesh","tenancy",1,"deployment-a"]'
+    owner.records[hkey, '["engagement","deployment-a","tn_a","en_1"]'] = {"not": "valid"}
+    owner.records[hkey, '["engagement","deployment-a","tn_b","en_2"]'] = {"other": "tenant"}
+    owner.records[hkey, '["engagement","deployment-a","tn_a","en_3"]'] = None
+    self.assertEqual(store.tenant_record_ids("engagement", "tn_a"), [["tn_a", "en_1"]])
+    self.assertEqual(store.raw_record("engagement", "tn_a", "en_1"), {"not": "valid"})
+    self.assertIsNone(store.raw_record("engagement", "tn_a", "en_3"))
+
   def test_published_tenant_round_trips_through_existing_policy_reader(self):
     owner = Store()
     store = CstoreTenantAdministrationStore(owner, "deployment-a")

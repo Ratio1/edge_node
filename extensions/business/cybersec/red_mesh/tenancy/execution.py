@@ -14,7 +14,7 @@ _BINDING_FIELDS = _FACT_FIELDS | {"schema_version", "original_launcher", "partic
 # Launch-time policy, read by the launch gate and never part of the binding.
 _POLICY_FIELDS = frozenset({"asset_authorized_ports", "engagement"})
 _ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "authorized_tests", "roe", "context",
-                                "authorization"})
+                                "authorization", "contract_sha256"})
 
 
 def _validate_facts(value, *, failure_policy=True):
@@ -53,6 +53,7 @@ def _validate_engagement(value, kind):
   fields = _ENGAGEMENT_FIELDS | ({"authorized_scan_modes"} if kind == "network" else set())
   if (not isinstance(value, dict) or set(value) != fields
       or not valid_engagement_id(value["engagement_id"]) or not valid_digest(value["engagement_hash"])
+      or not valid_digest(value["contract_sha256"])
       or not isinstance(value["authorized_tests"], list) or not value["authorized_tests"]
       or any(not isinstance(item, str) or not item for item in value["authorized_tests"])
       or not isinstance(value["context"], dict) or not isinstance(value["authorization"], dict)):
