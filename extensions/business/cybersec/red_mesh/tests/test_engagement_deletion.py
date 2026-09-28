@@ -124,7 +124,16 @@ class TestHappyPath(unittest.TestCase):
     self.assertIsNone(sanitized["engagement_metadata"])
     self.assertEqual(sanitized["authorization_ref"], "")
     self.assertEqual(sanitized["scope_id"], "")
-    self.assertIsNone(sanitized["target_allowlist"])
+
+  def test_target_allowlist_survives_for_runtime_enforcement(self):
+    """The allowlist is technical scope the graybox worker enforces on every later pass: redacting
+    a continuous job must not let its later passes run without it (RM-095, owner 2026-09-28)."""
+    specs, repo = _build_specs()
+    result = delete_engagement_data(
+      job_id="abc123", job_specs=specs, artifact_repo=repo,
+    )
+    sanitized = repo.configs[result.new_job_config_cid]
+    self.assertEqual(sanitized["target_allowlist"], ["10.0.0.1"])
 
   def test_technical_scan_record_preserved(self):
     """Target / ports / mode must survive the deletion."""

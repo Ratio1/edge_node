@@ -19,7 +19,6 @@ What gets deleted
     JobConfig.engagement_metadata
     JobConfig.authorization_ref
     JobConfig.scope_id
-    JobConfig.target_allowlist
 
   R1FS objects (when delete_documents=True, default):
     The R1FS object pointed to by authorization.document_cid
@@ -30,7 +29,9 @@ What is preserved
 -----------------
 
   Everything else on the JobConfig (target, ports, mode, features,
-  worker count, etc.). Findings, pass reports, scan metrics,
+  worker count, etc.), including `target_allowlist`: it is technical
+  scope the graybox worker enforces on every later pass, so a redacted
+  continuous job keeps its path limits (RM-095). Findings, pass reports, scan metrics,
   timeline events. The job remains discoverable and viewable; it
   just no longer carries client identity / objectives / contacts /
   authorization paperwork.
@@ -235,7 +236,6 @@ _LEGACY_FIELDS = (
   "engagement_metadata",
   "authorization_ref",
   "scope_id",
-  "target_allowlist",
 )
 
 
