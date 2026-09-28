@@ -44,7 +44,6 @@ TEXT_LIMIT = 1_000
 # Explanation spec v0.2 §5: byte budget of the `misp_enrichment` model view
 # in the user message (the field legend is bounded by the catalog).
 ENRICHMENT_VIEW_MAX_BYTES = 2_048
-MAX_CITATIONS = 4
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 RETRY_NOTE_TEMPLATE = (
@@ -89,6 +88,30 @@ def _entity_id_map(graph: Mapping[str, Any]) -> dict[str, str]:
       if isinstance(value, str) and value:
         mapping.setdefault(value.lower(), str(node.get("id")))
   return mapping
+
+
+def _scalar(value: Any) -> bool:
+  return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
+def _parse_citations(raw: Any) -> list[dict[str, Any]]:
+  """Well-formed `misp_citations`, one scalar value each.
+
+  A list value of scalars becomes one citation per item (models often cite a
+  list field whole); anything else malformed is dropped. No cap: every kept
+  citation is graded, so a wrong one can never be cut before the gate (the
+  output itself is bounded by the brief's max_tokens).
+  """
+  if not isinstance(raw, list):
+    return []
+  parsed = []
+  for c in raw:
+    if not (isinstance(c, Mapping) and isinstance(c.get("entity"), str) and isinstance(c.get("field"), str)):
+      continue
+    value = c.get("value")
+    values = value if isinstance(value, list) else [value]
+    parsed += [{"entity": c["entity"], "field": c["field"], "value": v} for v in values if _scalar(v)]
+  return parsed
 
 
 def _enrichment_view(
@@ -230,19 +253,11 @@ def _parse_brief(content: str, trace: Optional[Mapping[str, Any]]) -> dict[str, 
     }
     # Explanation spec v0.2 §5: optional typed enrichment citations, graded
     # by the `enrichment_grounding` gate; never copied to the public case.
-    citations = item.get("misp_citations")
-    if citations is not None:
-      if not isinstance(citations, list) or len(citations) > MAX_CITATIONS or not all(
-        isinstance(c, Mapping)
-        and set(c) == {"entity", "field", "value"}
-        and isinstance(c.get("entity"), str)
-        and isinstance(c.get("field"), str)
-        and isinstance(c.get("value"), (str, int, float))
-        and not isinstance(c.get("value"), bool)
-        for c in citations
-      ):
-        raise GraphFirstRuntimeError("invalid_brief_shape", "response_parse", "observation misp_citations are invalid", trace)
-      parsed_observation["misp_citations"] = [dict(c) for c in citations]
+    # They are optional internal evidence, so a malformed one is dropped
+    # rather than failing the brief; the text itself is still graded.
+    citations = _parse_citations(item.get("misp_citations"))
+    if citations:
+      parsed_observation["misp_citations"] = citations
     brief["observations"].append(parsed_observation)
   brief["next_checks"] = []
   for item in next_checks:

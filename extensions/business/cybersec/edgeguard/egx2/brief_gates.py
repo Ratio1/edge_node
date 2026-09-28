@@ -265,10 +265,10 @@ def enrichment_grounding(brief, sheet, enrichment=None):
                 problems.append(f"citation entity '{c.get('entity')}' is not an exemplar of its observation")
             elif node is None:
                 problems.append(f"citation entity '{c.get('entity')}' has no enrichment")
-            elif field not in (node.get("fields") or {}):
+            elif field != "misp_event_ids" and field not in (node.get("fields") or {}):
                 problems.append(f"field '{field}' is not in the enrichment of '{c.get('entity')}'")
             else:
-                items = node["fields"][field]
+                items = (node.get("misp_event_ids") or []) if field == "misp_event_ids" else node["fields"][field]
                 if not any(str(item) == str(value).strip() for item in (items if isinstance(items, list) else [items])):
                     problems.append(f"cited value is not the enrichment {field} of '{c.get('entity')}'")
     other_texts = [brief.get("assessment", ""), brief.get("why_it_matters", "")]

@@ -548,6 +548,54 @@ class Egx2EnrichmentRuntimeTests(unittest.TestCase):
     passed, _detail, _tier = brief_gates.grade(enrichment_brief(sheet), sheet, None)["enrichment_grounding"]
     self.assertFalse(passed)
 
+  def test_live_shaped_citations_are_normalised_not_fatal(self):
+    # edg3 2026-09-28: the model cites list fields whole, cites event ids and
+    # over-cites; a malformed optional citation must not discard the brief.
+    raw = [
+      {"entity": "CVE-2000-0001", "field": "cwe", "value": ["CWE-79"]},
+      {"entity": "CVE-2000-0001", "field": "misp_event_ids", "value": ["901"]},
+      {"entity": "CVE-2000-0001", "field": "cwe", "value": {"nested": "x"}},
+      {"entity": "CVE-2000-0001", "field": "cwe", "value": True},
+      {"entity": "CVE-2000-0001", "field": "cwe", "value": None},
+      "not a citation",
+    ]
+    self.assertEqual(egx2_runtime._parse_citations(raw), [
+      {"entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-79"},
+      {"entity": "CVE-2000-0001", "field": "misp_event_ids", "value": "901"},
+    ])
+    self.assertEqual(egx2_runtime._parse_citations({"entity": "e"}), [])
+
+    def brief(sheet):
+      b = enrichment_brief(sheet)
+      b["observations"][0]["misp_citations"] = raw
+      return b
+    result, payloads = self._run(brief)
+    self.assertEqual(len(payloads), 1)
+    self.assertEqual(result["case_explanation"]["provenance"]["mode"], "model")
+
+  def test_every_citation_is_graded_however_many(self):
+    sheet = insights.build_insight_sheet(enrichment_graph())
+    ok = {"entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-79"}
+    for label, citations in (
+      ("fifth citation wrong", [ok, ok, ok, ok, {"entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-89"}]),
+      ("list with a wrong item", [{"entity": "CVE-2000-0001", "field": "cwe", "value": ["CWE-79", "CWE-89"]}]),
+    ):
+      with self.subTest(label=label):
+        b = enrichment_brief(sheet)
+        b["observations"][0]["misp_citations"] = egx2_runtime._parse_citations(citations)
+        passed, detail, _tier = brief_gates.grade(b, sheet, _view())["enrichment_grounding"]
+        self.assertFalse(passed)
+        self.assertIn("cited value", detail)
+
+  def test_event_id_citations_are_graded_against_the_node(self):
+    sheet = insights.build_insight_sheet(enrichment_graph())
+    good = enrichment_brief(sheet, cve_citation={"entity": "CVE-2000-0001", "field": "misp_event_ids", "value": "901"})
+    self.assertTrue(brief_gates.grade(good, sheet, _view())["enrichment_grounding"][0])
+    bad = enrichment_brief(sheet, cve_citation={"entity": "CVE-2000-0001", "field": "misp_event_ids", "value": "999"})
+    passed, detail, _tier = brief_gates.grade(bad, sheet, _view())["enrichment_grounding"]
+    self.assertFalse(passed)
+    self.assertIn("cited value", detail)
+
   def test_injected_nested_object_keeps_the_block_out_of_the_prompt(self):
     block = enrichment_block()
     block["nodes"][0]["fields"]["cwe"] = {"nested": "object"}
