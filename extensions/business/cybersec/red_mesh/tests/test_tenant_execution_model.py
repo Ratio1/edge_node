@@ -76,6 +76,13 @@ class TestTenantExecutionModel(unittest.TestCase):
     self.assertNotIn("error", result, result)
     self.assertEqual([item["id"] for item in captured[0]["test_sets"]], ["prompt_injection_v1"])
 
+  def test_a_model_launch_needs_an_engagement_that_allows_single_pass(self):
+    continuous = self.model_context({**self.engagement, "allowed_run_modes": ["continuous"]})
+    result, captured = self.launch(continuous)
+    self.assertEqual((result.get("error"), result.get("status_code"), result.get("allowed_run_modes")),
+                     ("run_mode_not_authorized", 400, ["continuous"]))
+    self.assertEqual(captured, [])
+
   def test_a_model_launch_on_a_scan_asset_is_a_target_mismatch(self):
     from .test_tenant_execution_effects import context
     for selection in ({"test_set_id": None}, {}):

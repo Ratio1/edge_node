@@ -696,6 +696,9 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "invalid_request") from None
     try:
       allowed_run_modes = normalize_run_modes(allowed_run_modes)
+      if "single_pass" not in allowed_run_modes:
+        # RM-107 (owner, 2026-09-28): single pass is always allowed; continuous is the opt-in.
+        raise EngagementInvalid("run_modes_invalid")
       valid_from, valid_until = normalize_window(valid_from, valid_until)
       roe, context = normalize_roe(roe), normalize_context(context)
     except EngagementInvalid as exc:

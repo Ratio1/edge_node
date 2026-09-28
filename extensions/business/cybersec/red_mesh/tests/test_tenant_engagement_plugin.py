@@ -71,7 +71,7 @@ class TestTenantEngagementPlugin(unittest.TestCase):
 
   def create(self, actor=None, **changes):
     body = {"actor": actor or self.actor, "tenant_id": self.tenant, "request_id": str(uuid4()),
-            "display_name": "Q4", "allowed_run_modes": ["continuous"], "valid_from": "2026-10-01T00:00:00Z",
+            "display_name": "Q4", "allowed_run_modes": ["continuous", "single_pass"], "valid_from": "2026-10-01T00:00:00Z",
             "valid_until": "2027-10-01T00:00:00Z", "roe": {}, "context": {"client_name": "Example"},
             "assets": [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
                         "authorized_ports": "443", "authorized_tests": ["service_info_common"]}]}

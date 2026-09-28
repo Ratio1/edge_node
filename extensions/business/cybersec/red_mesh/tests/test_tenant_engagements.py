@@ -189,7 +189,8 @@ class TestTenantEngagements(unittest.TestCase):
 
   def test_request_value_refusals(self):
     cases = [
-      ({"allowed_run_modes": ["forever"]}, "run_modes_invalid"), ({"allowed_run_modes": []}, "run_modes_invalid"),
+      ({"allowed_run_modes": ["forever"]}, "run_modes_invalid"),
+      ({"allowed_run_modes": ["continuous"]}, "run_modes_invalid"), ({"allowed_run_modes": []}, "run_modes_invalid"),
       ({"allowed_run_modes": None}, "run_modes_invalid"), ({"display_name": ""}, "invalid_request"),
       ({"valid_until": "2026-09-01T00:00:00Z"}, "window_invalid"), ({"valid_from": "tomorrow"}, "window_invalid"),
       ({"roe": {"dos_allowed": True}}, "roe_invalid"), ({"roe": {"authenticated_action": "yes"}}, "roe_invalid"),
@@ -226,7 +227,7 @@ class TestTenantEngagements(unittest.TestCase):
     self.refused(self.create(documents=[doc("3" * 64, "roe", title="Rules of engagement"), documents[1]]),
                  409, "conflict")
     self.refused(self.create(documents=[doc(SHA_ROE, "roe", title="SOW"), documents[1]]), 409, "conflict")
-    self.refused(self.create(allowed_run_modes=["continuous"]), 409, "conflict")
+    self.refused(self.create(allowed_run_modes=["single_pass"]), 409, "conflict")
     self.refused(self.create(assets=list(reversed(self.fields()["assets"]))), 409, "conflict")
 
   def test_roles(self):

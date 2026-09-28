@@ -430,6 +430,13 @@ def launch_model_test(
     # Before the question-set gate, so a model launch on a scan asset is named for what it is.
     return _validation_error("Execution target mismatch", error_class="execution_target_mismatch")
   engagement = admitted.get("engagement")
+  if engagement is not None and "single_pass" not in engagement["allowed_run_modes"]:
+    # RM-107: a model test is a single pass, so it needs an engagement that allows single pass.
+    return {
+      "error": "run_mode_not_authorized", "status_code": 400,
+      "message": "The engagement does not allow this run mode.",
+      "allowed_run_modes": list(engagement["allowed_run_modes"]),
+    }
   if engagement is not None and test_sets is None and not test_set_id:
     # RM-107: no selection means every question set the engagement authorizes for this model.
     test_sets = [{"id": test_set} for test_set in engagement["authorized_tests"]]
