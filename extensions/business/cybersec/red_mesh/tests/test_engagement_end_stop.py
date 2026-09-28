@@ -80,6 +80,9 @@ class TestPluginEngagementEndReason(unittest.TestCase):
     self.assertEqual(self.reason("engagement_revoked", config={}, job={"execution_binding": binding}),
                      "engagement_revoked")
     self.assertEqual(self.asked, (binding["tenant_id"], binding["engagement_id"]))
+    # The binding is the reauthorized fact; the config is a mutable copy and never wins.
+    self.reason("engagement_revoked", config={"engagement_id": "en_other"}, job={"execution_binding": binding})
+    self.assertEqual(self.asked, (binding["tenant_id"], binding["engagement_id"]))
 
   def test_an_unreadable_store_or_a_job_without_engagement_is_not_an_end(self):
     self.assertIsNone(self.reason(TenantStoreError("down")))

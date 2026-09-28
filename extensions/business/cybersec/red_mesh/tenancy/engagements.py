@@ -239,12 +239,12 @@ def normalize_engagement_asset(index, entry):
     if "authorized_ports" in entry or "authorized_scan_modes" in entry:
       raise EngagementInvalid("engagement_asset_invalid")
     return stored
-  if entry.get("authorized_ports") is None:
-    raise EngagementInvalid("ports_required")
   try:
-    ports = normalize_port_scope(entry["authorized_ports"])
+    ports = normalize_port_scope(entry.get("authorized_ports"))
   except (ValueError, TypeError):
     raise EngagementInvalid("engagement_asset_invalid") from None
+  if ports is None:  # absent, None or blank
+    raise EngagementInvalid("ports_required")
   return {**stored, "authorized_ports": ports,
           "authorized_scan_modes": normalize_scan_modes(entry.get("authorized_scan_modes"))}
 

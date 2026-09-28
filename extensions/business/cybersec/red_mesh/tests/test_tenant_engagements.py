@@ -155,6 +155,10 @@ class TestTenantEngagements(unittest.TestCase):
   def test_a_network_asset_needs_a_port_scope(self):
     bare = {"display_name": "Bare", "target": NETWORK, "authorized_tests": ["service_info_common"]}
     self.refused(self.create(assets=[bare]), 400, "ports_required")
+    for blank in (None, "", "   "):
+      with self.subTest(ports=blank):
+        self.refused(self.create(request_id=str(uuid4()), assets=[dict(bare, authorized_ports=blank)]),
+                     400, "ports_required")
     self.assertTrue(self.create(assets=[dict(bare, authorized_ports="443")])["success"])
 
   def test_asset_refusals(self):
@@ -404,6 +408,23 @@ class TestEngagementTargetGrammar(unittest.TestCase):
     self.created_target({"kind": "webapp", "url": url, "allowedPathPrefix": "/"})
     self.refused({"kind": "webapp", "url": url + "a", "allowedPathPrefix": "/"})
 
+  def test_port_scope_is_merged_canonical_and_bounded(self):
+    # Ported from the retired tenant asset suite with the target grammar.
+    network = {"kind": "network", "address": "192.0.2.10"}
+
+    def create(ports):
+      asset = {"display_name": "Edge", "target": network, "authorized_ports": ports,
+               "authorized_tests": ["service_info_common"]}
+      return self.service.create_engagement(**self.fields(request_id=str(uuid4()), assets=[asset], documents=[]))
+    created = create(" 8080, 1-1024,1000-1030 ,22 ")
+    self.assertEqual(created["data"]["assets"][0]["authorizedPorts"], "1-1030,8080")
+    for ports in ("0-10", "1-65536", "20-10", "http", "1,,2", 80, ",".join(str(port * 2) for port in range(1, 66))):
+      with self.subTest(ports=ports):
+        before = len(self.owner.writes)
+        result = create(ports)
+        self.assertEqual((result.get("status_code"), result.get("error")), (400, "engagement_asset_invalid"), result)
+        self.assertEqual(len(self.owner.writes), before)
+
   def test_network_target_accepts_a_canonical_hostname(self):
     target = {"kind": "network", "address": "scanme.nmap.org"}
     self.assertEqual(self.created_target(target), target)
@@ -419,6 +440,11 @@ class TestEngagementTargetGrammar(unittest.TestCase):
                    {"kind": "network", "address": "user@example.com"}, {"kind": "network", "address": "b\u00fccher.de"},
                    {"kind": "network", "address": ""}, {**network, "port": 443},
                    {**network, "credential_ref": "secret"}, {**network, "headers": {}},
+                   {"kind": "webapp", "url": "https://0177.0.0.1/api", "allowedPathPrefix": "/"},
+                   {"kind": "webapp", "url": "https://example.test:0443/api", "allowedPathPrefix": "/"},
+                   {"kind": "webapp", "url": "https://host/api/%253foutside", "allowedPathPrefix": "/api"},
+                   {"kind": "webapp", "url": "https://host/api/%255coutside", "allowedPathPrefix": "/api"},
+                   {"kind": "webapp", "url": "https://host/api/%2e%2e/x", "allowedPathPrefix": "/api"},
                    {"kind": "api", "url": "https://host"}):
       with self.subTest(target=target):
         self.refused(target)
