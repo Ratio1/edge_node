@@ -126,6 +126,26 @@ class TestTenantDelete(unittest.TestCase):
     self.assertNotIn("deleting", self.tenancy_rows()["tenant"][0])
     self.assertEqual(self.documents.deleted, [])
 
+  def test_a_failed_give_back_is_finished_by_a_retry(self):
+    self.remove_members()
+    answers = iter([[], ["late-job"]])
+    real = self.Plugin._call_tenant_administration
+
+    def abort_fails(plugin, operation, *args, **kwargs):
+      if operation == "abort_tenant_delete":
+        return {"success": False, "status": "error", "status_code": 503, "error": "unavailable"}
+      return real(plugin, operation, *args, **kwargs)
+    with patch.object(self.Plugin, "_tenant_job_ids", lambda plugin, tenant_id: next(answers)), \
+         patch.object(self.Plugin, "_call_tenant_administration", abort_fails):
+      self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 503, "unavailable")
+    self.assertIn("deleting", self.tenancy_rows()["tenant"][0])
+    # The job is still there: the retry refuses at the first check and gives the tenant back.
+    self.put_job("late-job", self.tenant)
+    self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 409, "tenant_has_jobs")
+    self.assertNotIn("deleting", self.tenancy_rows()["tenant"][0])
+    self.assertTrue(self.plugin.get_tenant(self.actor, self.tenant)["success"])
+    self.assertEqual(self.documents.deleted, [])
+
   def test_unreadable_jobs_are_unavailable_not_none(self):
     self.remove_members()
     self.storage.data[("jobs", "broken")] = "not a record"
