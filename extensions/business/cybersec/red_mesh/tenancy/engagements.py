@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import re
 
 from .assets import (canonical_digest, canonical_uuid, normalize_name, normalize_port_scope,
-                     valid_digest)
+                     normalize_target, valid_digest)
 from .identity import canonical_account_id
 from ..constants import FEATURE_CATALOG, RUN_MODE_CONTINUOUS_MONITORING, RUN_MODE_SINGLEPASS
 from ..models.engagement import Contact, EngagementContext
@@ -30,11 +30,13 @@ SCAN_MODES = ("connect", "syn")
 DEFAULT_SCAN_MODES = ("connect",)
 ROE_DEFAULTS = {"authenticated_action": False, "stateful_probes_allowed": False,
                 "ics_safe_mode_required": True}
-# The asset kinds an engagement may lock. `model` waits until model launches are engagement-gated.
-# Categories mirror `services.scan_strategy.SCAN_STRATEGIES` (not imported: it loads the workers).
+# The asset kinds an engagement owns (RM-107). Scan categories mirror
+# `services.scan_strategy.SCAN_STRATEGIES` (not imported: it loads the workers); a model asset's
+# tests are the Model Testing question sets.
 _KIND_CATEGORIES = {"network": ("service", "web", "correlation"), "webapp": ("graybox",)}
-ENGAGEMENT_ASSET_KINDS = tuple(_KIND_CATEGORIES)
+ENGAGEMENT_ASSET_KINDS = ("model", "network", "webapp")
 MAX_ENGAGEMENT_ASSETS = 64
+_ASSET_NAME_MAX = 200
 HASH_SCHEMA = "redmesh.engagement/2"
 # v1 fields a v2 row can never carry: their presence means a v1 record (refused, never migrated).
 _V1_FIELDS = ("engagement_kind", "roe_document", "authorization_document")
@@ -57,6 +59,10 @@ class EngagementInvalid(ValueError):
 
 
 def feature_ids_for_kind(kind):
+  if kind == "model":
+    # Imported here: the catalog loads the probe cases, which the record validator never needs.
+    from ..model_testing.catalog import MODEL_TEST_CATALOG
+    return tuple(test_set["id"] for test_set in MODEL_TEST_CATALOG)
   categories = _KIND_CATEGORIES.get(kind, ())
   return tuple(item["id"] for item in FEATURE_CATALOG if item["category"] in categories)
 
@@ -202,6 +208,57 @@ def valid_doc_ref(value, *, labels=False, stored=False):
     return False
 
 
+def engagement_asset_id_for(index):
+  """`ea_<n>`, numbered from 1 in the order the assets were given at creation (as documents are)."""
+  return "ea_%d" % (index + 1)
+
+
+def normalize_engagement_asset(index, entry):
+  """One requested asset as stored and hashed: the target is defined here, never read from a row.
+
+  The kind is the target's. A network asset always ends with an explicit port scope, so a signed
+  engagement never means "any port"; scan modes and ports apply to network assets only.
+  """
+  if (not isinstance(entry, dict)
+      or not set(entry) <= {"display_name", "target", "authorized_ports", "authorized_scan_modes",
+                            "authorized_tests"}):
+    raise EngagementInvalid("engagement_asset_invalid")
+  try:
+    display_name = normalize_name(entry.get("display_name"), _ASSET_NAME_MAX)
+  except (ValueError, TypeError):
+    raise EngagementInvalid("engagement_asset_invalid") from None
+  try:
+    target = normalize_target(entry.get("target"))
+  except (ValueError, TypeError):
+    raise EngagementInvalid("asset_target_invalid") from None
+  kind = target["kind"]
+  stored = {"engagement_asset_id": engagement_asset_id_for(index), "display_name": display_name,
+            "kind": kind, "target": target, "target_digest": canonical_digest(target),
+            "authorized_tests": normalize_tests(kind, entry.get("authorized_tests"))}
+  if kind != "network":
+    if "authorized_ports" in entry or "authorized_scan_modes" in entry:
+      raise EngagementInvalid("engagement_asset_invalid")
+    return stored
+  if entry.get("authorized_ports") is None:
+    raise EngagementInvalid("ports_required")
+  try:
+    ports = normalize_port_scope(entry["authorized_ports"])
+  except (ValueError, TypeError):
+    raise EngagementInvalid("engagement_asset_invalid") from None
+  return {**stored, "authorized_ports": ports,
+          "authorized_scan_modes": normalize_scan_modes(entry.get("authorized_scan_modes"))}
+
+
+def normalize_engagement_assets(value):
+  """The requested assets in the order given; the same target twice is refused."""
+  if not isinstance(value, list) or not 1 <= len(value) <= MAX_ENGAGEMENT_ASSETS:
+    raise EngagementInvalid("engagement_asset_invalid")
+  assets = [normalize_engagement_asset(index, entry) for index, entry in enumerate(value)]
+  if len({entry["target_digest"] for entry in assets}) != len(assets):
+    raise EngagementInvalid("engagement_asset_invalid")
+  return assets
+
+
 def document_id_for(index):
   """`ed_<n>`, numbered from 1 in the order the documents were given at creation."""
   return "ed_%d" % (index + 1)
@@ -225,26 +282,26 @@ def _stored_tests_valid(tests):
           and tests == sorted(set(tests)))
 
 
-def _asset_entry_valid(entry):
+def _asset_entry_valid(index, entry):
   if not isinstance(entry, dict) or not isinstance(entry.get("kind"), str):
     return False
   kind = entry["kind"]
-  network = {"asset_id", "kind", "target_digest", "authorized_ports", "authorized_scan_modes",
-             "authorized_tests"}
-  expected = network if kind == "network" else {"asset_id", "kind", "target_digest", "authorized_tests"}
+  common = {"engagement_asset_id", "display_name", "kind", "target", "target_digest", "authorized_tests"}
+  expected = common | ({"authorized_ports", "authorized_scan_modes"} if kind == "network" else set())
   if kind not in ENGAGEMENT_ASSET_KINDS or set(entry) != expected:
     return False
   try:
-    if (not isinstance(entry["asset_id"], str) or not entry["asset_id"].startswith("as_")
-        or "as_" + canonical_uuid(entry["asset_id"][3:]) != entry["asset_id"]
-        or not valid_digest(entry["target_digest"])
+    if (entry["engagement_asset_id"] != engagement_asset_id_for(index)
+        or normalize_name(entry["display_name"], _ASSET_NAME_MAX) != entry["display_name"]
+        or normalize_target(entry["target"]) != entry["target"] or entry["target"]["kind"] != kind
+        or canonical_digest(entry["target"]) != entry["target_digest"]
         or not _stored_tests_valid(entry["authorized_tests"])):
       return False
     if kind == "network":
       return (entry["authorized_ports"] is not None
               and normalize_port_scope(entry["authorized_ports"]) == entry["authorized_ports"]
               and normalize_scan_modes(entry["authorized_scan_modes"]) == entry["authorized_scan_modes"])
-  except (ValueError, TypeError):
+  except (ValueError, TypeError, EngagementInvalid):
     return False
   return True
 
@@ -260,6 +317,7 @@ def hashed_fields(record):
     "documents": sorted([document["kind"], document["sha256"], document["title"], document["comment"]]
                         for document in record["documents"]),
     "supersedes": record.get("supersedes"),
+    # In stored order: `ea_<n>` is positional, and launches and reports name assets by it.
     "roe": record["roe"], "context": record["context"], "assets": record["assets"],
   }
 
@@ -299,8 +357,8 @@ def validate_engagement(row, ids):
       # Shape only for the context: `EngagementContext` may gain fields; the hash covers the content.
       or not isinstance(row.get("context"), dict)
       or not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS
-      or not all(_asset_entry_valid(entry) for entry in assets)
-      or [entry["asset_id"] for entry in assets] != sorted({entry["asset_id"] for entry in assets})
+      or not all(_asset_entry_valid(index, entry) for index, entry in enumerate(assets))
+      or len({entry["target_digest"] for entry in assets}) != len(assets)
       or not valid_digest(row.get("create_intent_digest"))
       or row.get("engagement_hash") != engagement_hash(row)):
     raise ValueError("Invalid engagement")

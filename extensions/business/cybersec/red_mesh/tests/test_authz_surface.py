@@ -125,8 +125,7 @@ def _known_rollout(plugin):
   plugin.cfg_instance_id = "fixture-instance"
   plugin._execution_service = lambda: MagicMock()
 
-  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None,
-            engagement_id=None, require_engagement=False):
+  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None):
     account, denial = plugin._resolve_launch_actor(actor)
     if denial:
       return None, None, denial
@@ -363,12 +362,13 @@ class TestAuthzSurface(unittest.TestCase):
           launch.assert_not_called()
 
   def test_preflight_accepts_trimmed_configured_token(self):
-    from .test_api import _stub_launch_actor
+    from .test_api import _engagement, _stub_launch_actor
     plugin = _stub_launch_actor(MagicMock())
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN + "\n"}, clear=True), \
          patch("extensions.business.cybersec.red_mesh.pentester_api_01.preflight_model_test_provider", return_value={"ok": True}) as preflight:
       self.assertEqual(self.Plugin.preflight_model_test_provider(
-        plugin, TEST_CHANNEL_TOKEN, actor={"account_id": "tester"}), {"ok": True})
+        plugin, TEST_CHANNEL_TOKEN, actor={"account_id": "tester"},
+        engagement_id=_engagement()["engagement_id"], engagement_asset_id="ea_1"), {"ok": True})
     preflight.assert_called_once()
 
 

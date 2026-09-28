@@ -16,7 +16,6 @@ class TestTenantEngagementLaunch(unittest.TestCase):
   # Borrowed, not inherited, so the phase 2 tests are not collected twice.
   setUp_engagements = engagements.TestTenantEngagements.setUp
   new_tenant = engagements.TestTenantEngagements.new_tenant
-  asset = engagements.TestTenantEngagements.asset
   fields = engagements.TestTenantEngagements.fields
   create = engagements.TestTenantEngagements.create
 
@@ -29,10 +28,9 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertTrue(created["success"], created)
     self.engagement = created["data"]
 
-  def admit(self, asset=None, engagement_id=None, **kwargs):
+  def admit(self, asset="ea_1", engagement_id=None, **kwargs):
     return self.service.resolve_execution_admission(
-      self.actor, self.tenant, asset or self.network,
-      engagement_id=engagement_id or self.engagement["engagementId"], **kwargs)
+      self.actor, self.tenant, engagement_id or self.engagement["engagementId"], asset, **kwargs)
 
   def denied(self, status, error, **kwargs):
     with self.assertRaises(AdministrationDenied) as caught:
@@ -41,8 +39,12 @@ class TestTenantEngagementLaunch(unittest.TestCase):
 
   def test_network_admission_carries_the_engagement_facts_and_its_port_scope(self):
     context = self.admit().to_dict()
-    # The asset row seeded "22,443"; the engagement's scope is what the gate reads.
     self.assertEqual(context["asset_authorized_ports"], "22,443")
+    # RM-107: the target is the engagement entry's.
+    self.assertEqual((context["engagement_id"], context["engagement_asset_id"], context["engagement_hash"]),
+                     (self.engagement["engagementId"], "ea_1", self.engagement["engagementHash"]))
+    self.assertEqual(context["asset_target"], engagements.NETWORK)
+    self.assertEqual(context["asset_target_digest"], self.engagement["assets"][0]["targetDigest"])
     self.assertEqual(context["engagement"], {
       "engagement_id": self.engagement["engagementId"], "engagement_hash": self.engagement["engagementHash"],
       "contract_sha256": CONTRACT_SHA256,
@@ -75,32 +77,33 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     with self.assertRaises(TenantStoreError):
       self.admit()
 
-  def test_the_engagement_scope_replaces_the_asset_rows(self):
-    self.network = self.asset({"kind": "network", "address": "192.0.2.20"}, authorized_ports="1-65535")
-    self.request = str(uuid4())
-    narrow = self.create(assets=[{"asset_id": self.network, "authorized_ports": "443",
-                                  "authorized_tests": ["service_info_common"]}])["data"]
-    self.assertEqual(self.admit(engagement_id=narrow["engagementId"]).to_dict()["asset_authorized_ports"], "443")
-
   def test_webapp_admission_has_no_port_scope_or_scan_modes(self):
-    context = self.admit(asset=self.webapp).to_dict()
+    context = self.admit(asset="ea_2").to_dict()
     self.assertNotIn("asset_authorized_ports", context)
     self.assertNotIn("authorized_scan_modes", context["engagement"])
     self.assertEqual(context["engagement"]["authorized_tests"], ["graybox"])
 
-  def test_the_binding_does_not_change(self):
-    with_engagement = self.admit().build_binding("launcher", ["node-a"]).to_dict()
-    without = self.service.resolve_execution_admission(self.actor, self.tenant, self.network)
-    self.assertEqual(with_engagement, without.build_binding("launcher", ["node-a"]).to_dict())
-    # Without an engagement no port scope is read at all: the asset row is a creation seed only.
-    self.assertNotIn("asset_authorized_ports", without.to_dict())
-    self.assertNotIn("engagement", without.to_dict())
+  def test_the_binding_names_the_engagement_asset_and_keeps_policy_out(self):
+    binding = self.admit().build_binding("launcher", ["node-a"]).to_dict()
+    self.assertEqual(binding["schema_version"], 2)
+    self.assertEqual((binding["engagement_id"], binding["engagement_asset_id"], binding["engagement_hash"]),
+                     (self.engagement["engagementId"], "ea_1", self.engagement["engagementHash"]))
+    self.assertNotIn("asset_id", binding)
+    self.assertFalse(set(binding) & {"engagement", "asset_authorized_ports"})
+
+  def test_a_model_asset_is_admitted_with_its_question_sets(self):
+    context = self.admit(asset="ea_3").to_dict()
+    self.assertEqual(context["asset_target"]["kind"], "model")
+    self.assertEqual(context["engagement"]["authorized_tests"], ["prompt_injection_v1"])
+    self.assertNotIn("asset_authorized_ports", context)
 
   def test_refusals(self):
     self.denied(400, "invalid_request", engagement_id="en_not-a-uuid")
     self.denied(404, "engagement_not_found", engagement_id="en_" + str(uuid4()))
-    unlocked = self.asset({"kind": "network", "address": "192.0.2.30"}, authorized_ports="80")
-    self.denied(400, "engagement_asset_not_locked", asset=unlocked)
+    for bad in ("ea_0", "ea_01", "as_" + str(uuid4()), "", 1):
+      with self.subTest(asset=bad):
+        self.denied(400, "invalid_request", asset=bad)
+    self.denied(400, "engagement_asset_not_locked", asset="ea_4")
 
   def test_window_bounds(self):
     for instant, allowed in ((datetime(2026, 10, 1, tzinfo=timezone.utc), True),
@@ -119,20 +122,10 @@ class TestTenantEngagementLaunch(unittest.TestCase):
                                                    "Contract ended")["success"])
     self.denied(400, "engagement_revoked")
 
-  def test_an_asset_edited_after_locking_is_refused(self):
-    current = self.service.get_tenant_asset(self.actor, self.tenant, self.network)["data"]["asset"]
-    edited = self.service.update_tenant_asset(self.actor, self.tenant, self.network, current["version"],
-                                              "Asset", {"kind": "network", "address": "192.0.2.11"}, True,
-                                              authorized_ports="22,443")
-    self.assertTrue(edited["success"], edited)
-    self.denied(409, "engagement_asset_changed")
-
   def test_an_engagement_of_another_tenant_is_not_found(self):
     other = self.new_tenant("other", contract=True)
-    other_asset = self.asset({"kind": "network", "address": "192.0.2.40"}, tenant=other, authorized_ports="80")
     self.request = str(uuid4())
-    foreign = self.service.create_engagement(**self.fields(
-      tenant_id=other, assets=[{"asset_id": other_asset, "authorized_tests": ["service_info_common"]}]))
+    foreign = self.service.create_engagement(**self.fields(tenant_id=other))
     self.assertTrue(foreign["success"], foreign)
     self.denied(404, "engagement_not_found", engagement_id=foreign["data"]["engagementId"])
 

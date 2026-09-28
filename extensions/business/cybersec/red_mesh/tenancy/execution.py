@@ -2,32 +2,50 @@
 from dataclasses import dataclass
 from copy import deepcopy
 import json
+import re
 
 from .assets import canonical_digest, canonical_uuid, normalize_port_scope, normalize_target, valid_digest
 from .identity import canonical_account_id
 from .nodes import valid_node_address
 
 
-_FACT_FIELDS = frozenset({"namespace", "tenant_id", "asset_id", "asset_target",
+# RM-107: a job runs on one asset of one engagement; the target is the engagement entry's.
+_FACT_FIELDS = frozenset({"namespace", "tenant_id", "engagement_id", "engagement_asset_id",
+  "engagement_hash", "asset_target", "asset_target_digest", "actor_id", "actor_generation",
+  "node_failure_policy"})
+_BINDING_EXTRA = frozenset({"schema_version", "original_launcher", "participant_order"})
+_BINDING_FIELDS = _FACT_FIELDS | _BINDING_EXTRA
+BINDING_SCHEMA_VERSION = 2
+# Schema 1 (RM-084, a tenant asset row) is still read, so jobs launched before RM-107 stay readable,
+# purgeable and renderable; it is never built again and never reauthorized.
+_V1_FACT_FIELDS = frozenset({"namespace", "tenant_id", "asset_id", "asset_target",
   "asset_target_digest", "actor_id", "actor_generation", "node_failure_policy"})
-_BINDING_FIELDS = _FACT_FIELDS | {"schema_version", "original_launcher", "participant_order"}
+_BINDING_FIELDS_BY_VERSION = {1: _V1_FACT_FIELDS | _BINDING_EXTRA, 2: _BINDING_FIELDS}
+_ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
 # Launch-time policy, read by the launch gate and never part of the binding.
 _POLICY_FIELDS = frozenset({"asset_authorized_ports", "engagement"})
 _ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "authorized_tests", "roe", "context",
                                 "authorization", "contract_sha256"})
 
 
-def _validate_facts(value, *, failure_policy=True):
+def _validate_facts(value, *, failure_policy=True, version=BINDING_SCHEMA_VERSION):
   for name in ("namespace", "actor_generation"):
     text = value.get(name)
     if not isinstance(text, str) or not text.strip():
       raise ValueError("Invalid execution identity")
     text.encode("utf-8", errors="strict")
-  for name, prefix in (("tenant_id", "tn_"), ("asset_id", "as_")):
+  for name, prefix in (("tenant_id", "tn_"),) + ((("asset_id", "as_"),) if version == 1 else ()):
     text = value.get(name)
     if not isinstance(text, str) or not text.startswith(prefix):
       raise ValueError("Invalid execution object identity")
     canonical_uuid(text[len(prefix):])
+  if version != 1:
+    # Imported here: `engagements` loads the models package, which imports this module.
+    from .engagements import valid_engagement_id
+    asset_id = value.get("engagement_asset_id")
+    if (not valid_engagement_id(value.get("engagement_id")) or not valid_digest(value.get("engagement_hash"))
+        or not isinstance(asset_id, str) or not _ENGAGEMENT_ASSET_ID.fullmatch(asset_id)):
+      raise ValueError("Invalid execution object identity")
   actor = value.get("actor_id")
   if not actor or canonical_account_id(actor) != actor:
     raise ValueError("Invalid execution actor")
@@ -72,11 +90,14 @@ class ExecutionBinding:
   _snapshot: str
 
   def __init__(self, value):
-    if not isinstance(value, dict) or set(value) != _BINDING_FIELDS:
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
       raise ValueError("Invalid execution binding fields")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+    version = value["schema_version"]
+    if version not in _BINDING_FIELDS_BY_VERSION:
       raise ValueError("Unsupported execution binding version")
-    _validate_facts(value)
+    if set(value) != _BINDING_FIELDS_BY_VERSION[version]:
+      raise ValueError("Invalid execution binding fields")
+    _validate_facts(value, version=version)
     if not valid_node_address(value["original_launcher"]):
       raise ValueError("Invalid original launcher")
     _node_order(value["participant_order"])
@@ -85,6 +106,10 @@ class ExecutionBinding:
   def to_dict(self):
     return json.loads(self._snapshot)
 
+  @property
+  def version(self):
+    return self.to_dict()["schema_version"]
+
 
 @dataclass(frozen=True, init=False)
 class ResolvedExecutionContext:
@@ -92,20 +117,21 @@ class ResolvedExecutionContext:
   _snapshot: str
 
   def __init__(self, value):
-    # `asset_authorized_ports` and `engagement` are optional launch-time policy, read by the launch
-    # gate and never part of the binding: the engagement's port scope for the asset, and the
-    # engagement facts (RM-095). A network scope only comes with an engagement.
-    if (not isinstance(value, dict)
+    # `engagement` (the facts the launch gate reads and snapshots, RM-095) and, for a network
+    # asset, `asset_authorized_ports` are launch-time policy, never part of the binding. RM-107:
+    # every launch runs inside an engagement, and a network entry always has a port scope (a
+    # signed engagement never means "any port").
+    if (not isinstance(value, dict) or "engagement" not in value
         or set(value) - _POLICY_FIELDS != _FACT_FIELDS | {"selected_candidates"}):
       raise ValueError("Invalid resolved execution fields")
     _validate_facts(value)
     _node_order(value["selected_candidates"])
-    if "engagement" in value:
-      _validate_engagement(value["engagement"], value["asset_target"]["kind"])
-      # A network entry in an engagement always has a port scope (a signed engagement never
-      # means "any port").
-      if value["asset_target"]["kind"] == "network" and "asset_authorized_ports" not in value:
-        raise ValueError("Invalid execution port scope")
+    _validate_engagement(value["engagement"], value["asset_target"]["kind"])
+    if (value["engagement"]["engagement_id"] != value["engagement_id"]
+        or value["engagement"]["engagement_hash"] != value["engagement_hash"]):
+      raise ValueError("Invalid execution engagement")
+    if value["asset_target"]["kind"] == "network" and "asset_authorized_ports" not in value:
+      raise ValueError("Invalid execution port scope")
     if "asset_authorized_ports" in value and (
         value["asset_target"]["kind"] != "network"
         or normalize_port_scope(value["asset_authorized_ports"]) != value["asset_authorized_ports"]
@@ -123,7 +149,8 @@ class ResolvedExecutionContext:
       facts.pop(name, None)
     if not set(participants).issubset(facts.pop("selected_candidates")):
       raise ValueError("Unselected execution participant")
-    return ExecutionBinding({**facts, "schema_version": 1, "original_launcher": original_launcher,
+    return ExecutionBinding({**facts, "schema_version": BINDING_SCHEMA_VERSION,
+                             "original_launcher": original_launcher,
                              "participant_order": participants})
 
 

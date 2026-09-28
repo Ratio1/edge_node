@@ -22,10 +22,9 @@ from .assets import (canonical_digest, canonical_uuid, normalize_name, normalize
 from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
                            valid_integration_id)
-from .engagements import (ENGAGEMENT_ASSET_KINDS, MAX_ENGAGEMENT_ASSETS, MAX_ENGAGEMENT_DOCUMENTS,
-                          EngagementInvalid, document_id_for, engagement_hash, engagement_id_for,
-                          normalize_context, normalize_roe, normalize_run_modes, normalize_scan_modes,
-                          normalize_tests, normalize_window, valid_doc_ref, valid_engagement_id)
+from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
+                          engagement_id_for, normalize_context, normalize_engagement_assets, normalize_roe,
+                          normalize_run_modes, normalize_window, valid_doc_ref, valid_engagement_id)
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -455,13 +454,14 @@ class TenantAdministrationService:
     self._authorized_tenant(actor, tenant_id, "tenant_users:manage")
     return self._members(tenant_id)
 
-  def resolve_execution_admission(self, actor, tenant_id, asset_id, selected_peers=None, *,
-                                  expected_target_digest=None, engagement_id=None):
+  def resolve_execution_admission(self, actor, tenant_id, engagement_id, engagement_asset_id,
+                                  selected_peers=None):
     """Resolve current stored facts only; no endpoint, publication, DNS or execution."""
-    return self._resolve_execution_admission_for_account(self._actor(actor), tenant_id, asset_id,
-      selected_peers, expected_target_digest=expected_target_digest, engagement_id=engagement_id)
+    return self._resolve_execution_admission_for_account(self._actor(actor), tenant_id, engagement_id,
+      engagement_asset_id, selected_peers)
 
-  def _execution_asset_for_account(self, account, tenant_id, asset_id, expected_target_digest):
+  def _execution_entry_for_account(self, account, tenant_id, engagement_id, engagement_asset_id):
+    """RM-107: the engagement row and the asset entry a job runs on; the entry is the target."""
     tenant, account = self.authorize_tenant_for_account(account, tenant_id)
     policy = TenantPolicyContext(tenant_id, tenant["active"], tenant["allow_pentester"])
     _, denial = resolve_operation_roles(account, "tasks:launch", policy)
@@ -469,19 +469,19 @@ class TenantAdministrationService:
       raise AdministrationDenied(denial.status_code, denial.error)
     if not account.account_generation:
       raise AdministrationDenied(409, "account_changed")
-    asset = self.store.get("asset", tenant_id, self._asset_id(asset_id))
-    if asset is None or asset["active"] is not True:
-      raise AdministrationDenied(404, "not_found")
-    decision = authorize_tenant_operation(account, "tasks:launch", policy,
-      asset_tenant_ids=(asset["tenant_id"],))
+    engagement_id = self._engagement_id(engagement_id)
+    if not isinstance(engagement_asset_id, str) or not re.fullmatch(r"ea_[1-9][0-9]*", engagement_asset_id):
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      raise AdministrationDenied(404, "engagement_not_found")
+    decision = authorize_tenant_operation(account, "tasks:launch", policy, asset_tenant_ids=(row["tenant_id"],))
     if not decision.allowed:
       raise AdministrationDenied(decision.status_code, decision.error)
-    if expected_target_digest is not None:
-      if not valid_digest(expected_target_digest):
-        raise AdministrationDenied(400, "invalid_request")
-      if expected_target_digest != asset["target_digest"]:
-        raise AdministrationDenied(409, "target_changed")
-    return tenant, asset
+    entry = next((item for item in row["assets"] if item["engagement_asset_id"] == engagement_asset_id), None)
+    if entry is None:
+      raise AdministrationDenied(400, "engagement_asset_not_locked")
+    return tenant, account, row, entry
 
   def _execution_eligible_nodes(self, tenant_id):
     assignments = self.store.list_node_assignments(tenant_id)
@@ -494,29 +494,17 @@ class TenantAdministrationService:
     eligible = {row["node_address"] for row in assignments if row["active"]} & set(configured)
     return sorted(eligible)
 
-  def _execution_engagement(self, tenant, asset, engagement_id):
+  def _execution_engagement(self, tenant, row, entry):
     """The launch gate's engagement facts, from the stored row (never the DTO, which has no refs).
 
-    Refusals follow the engagements contract. The asset row's own port scope is never read here:
-    it only seeded the engagement's (owner, 2026-09-27). RM-107: the authorization is the tenant
-    contract the engagement was created under, so it is read from the tenant and must still be it.
+    Refusals follow the engagements contract. RM-107: the authorization is the tenant contract the
+    engagement was created under, so it is read from the tenant and must still be it.
     """
-    tenant_id = tenant["tenant_id"]
-    engagement_id = self._engagement_id(engagement_id)
-    row = self.store.get("engagement", tenant_id, engagement_id)
-    if row is None:
-      raise AdministrationDenied(404, "engagement_not_found")
     if row["active"] is not True:
       raise AdministrationDenied(400, "engagement_revoked")
     now = self.clock()
     if not (datetime.fromisoformat(row["valid_from"]) <= now < datetime.fromisoformat(row["valid_until"])):
       raise AdministrationDenied(400, "engagement_expired")
-    entry = next((item for item in row["assets"] if item["asset_id"] == asset["asset_id"]), None)
-    if entry is None:
-      raise AdministrationDenied(400, "engagement_asset_not_locked")
-    if entry["kind"] != asset["target"]["kind"] or entry["target_digest"] != asset["target_digest"]:
-      # Owner Q3: the fix is a new engagement that `supersedes` this one.
-      raise AdministrationDenied(409, "engagement_asset_changed")
     contract, legal = tenant.get("contract"), tenant.get("legal")
     if (not _valid_contract(contract) or not isinstance(legal, dict)
         or contract["sha256"] != row["contract_sha256"]):
@@ -524,7 +512,7 @@ class TenantAdministrationService:
       # damaged record, never a reason to launch under a different signed basis.
       raise TenantStoreError("Engagement contract does not match its tenant")
     facts = {
-      "engagement_id": engagement_id, "engagement_hash": row["engagement_hash"],
+      "engagement_id": row["engagement_id"], "engagement_hash": row["engagement_hash"],
       "contract_sha256": row["contract_sha256"],
       "authorized_tests": list(entry["authorized_tests"]), "roe": dict(row["roe"]),
       "context": row["context"],
@@ -548,13 +536,17 @@ class TenantAdministrationService:
       return facts, None
     return {**facts, "authorized_scan_modes": list(entry["authorized_scan_modes"])}, entry["authorized_ports"]
 
-  def _resolve_execution_admission_for_account(self, account, tenant_id, asset_id, selected_peers=None, *,
-                                               expected_target_digest=None, engagement_id=None):
-    tenant, asset = self._execution_asset_for_account(account, tenant_id, asset_id, expected_target_digest)
-    policy = {}
-    if engagement_id is not None:
-      engagement, ports = self._execution_engagement(tenant, asset, engagement_id)
-      policy = {"engagement": engagement, **({"asset_authorized_ports": ports} if ports is not None else {})}
+  @staticmethod
+  def _entry_facts(row, entry):
+    return {"engagement_id": row["engagement_id"], "engagement_asset_id": entry["engagement_asset_id"],
+            "engagement_hash": row["engagement_hash"], "asset_target": entry["target"],
+            "asset_target_digest": entry["target_digest"]}
+
+  def _resolve_execution_admission_for_account(self, account, tenant_id, engagement_id, engagement_asset_id,
+                                               selected_peers=None):
+    tenant, account, row, entry = self._execution_entry_for_account(
+      account, tenant_id, engagement_id, engagement_asset_id)
+    engagement, ports = self._execution_engagement(tenant, row, entry)
     eligible = self._execution_eligible_nodes(tenant_id)
     if selected_peers is not None and (not isinstance(selected_peers, list)
         or any(not valid_node_address(peer) for peer in selected_peers)
@@ -565,36 +557,45 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "ineligible_node")
     try:
       return ResolvedExecutionContext({"namespace": self.store.namespace, "tenant_id": tenant_id,
-        "asset_id": asset["asset_id"], "asset_target": asset["target"],
-        "asset_target_digest": asset["target_digest"], "actor_id": account.account_id,
+        **self._entry_facts(row, entry), "actor_id": account.account_id,
         "actor_generation": account.account_generation,
         "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected,
-        **policy})
+        "engagement": engagement, **({"asset_authorized_ports": ports} if ports is not None else {})})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid stored execution facts") from exc
 
   def reauthorize_execution(self, binding, *, worker_node=None):
-    """Re-read original execution authority; preserve every field in the saved binding."""
+    """Re-read original execution authority; preserve every field in the saved binding.
+
+    RM-107: authority is the engagement entry the job was bound to, unchanged (same hash, same
+    target), plus `tasks:launch` and Allow Pentester. The engagement's window and revoke are not
+    checked here: the engagement-end hard stop (`engagement_end_reason`) owns them, so a stop's own
+    finalization is never refused. A schema-1 binding (a tenant asset row) is never reauthorized.
+    """
     try:
       saved = (binding if isinstance(binding, ExecutionBinding) else ExecutionBinding(binding)).to_dict()
     except (ValueError, TypeError, RecursionError):
       raise AdministrationDenied(409, "invalid_execution_binding") from None
+    if saved["schema_version"] != 2:
+      raise AdministrationDenied(409, "invalid_execution_binding")
     if saved["namespace"] != self.store.namespace:
       raise AdministrationDenied(404, "not_found")
     account = self._actor({"account_id": saved["actor_id"]})
     if account.account_generation != saved["actor_generation"]:
       raise AdministrationDenied(409, "account_changed")
-    _, asset = self._execution_asset_for_account(account, saved["tenant_id"], saved["asset_id"],
-      saved["asset_target_digest"])
+    _, account, row, entry = self._execution_entry_for_account(
+      account, saved["tenant_id"], saved["engagement_id"], saved["engagement_asset_id"])
+    current = self._entry_facts(row, entry)
+    if any(current[key] != saved[key] for key in current):
+      raise AdministrationDenied(409, "invalid_execution_binding")
     eligible = self._execution_eligible_nodes(saved["tenant_id"])
     if worker_node is not None and (not valid_node_address(worker_node)
         or worker_node not in saved["participant_order"] or worker_node not in eligible):
       raise AdministrationDenied(403, "ineligible_node")
     try:
       return CurrentExecutionFacts({"namespace": self.store.namespace, "tenant_id": saved["tenant_id"],
-        "asset_id": asset["asset_id"], "asset_target": asset["target"],
-        "asset_target_digest": asset["target_digest"], "actor_id": account.account_id,
-        "actor_generation": account.account_generation, "eligible_nodes": eligible})
+        **current, "actor_id": account.account_id, "actor_generation": account.account_generation,
+        "eligible_nodes": eligible})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid current execution facts") from exc
 
@@ -751,7 +752,8 @@ class TenantAdministrationService:
       raise TenantStoreError("Engagement readback is unavailable")
     assets = []
     for entry in row["assets"]:
-      asset = {"assetId": entry["asset_id"], "kind": entry["kind"], "targetDigest": entry["target_digest"],
+      asset = {"engagementAssetId": entry["engagement_asset_id"], "displayName": entry["display_name"],
+               "kind": entry["kind"], "target": entry["target"], "targetDigest": entry["target_digest"],
                "authorizedTests": entry["authorized_tests"]}
       if entry["kind"] == "network":
         asset.update(authorizedPorts=entry["authorized_ports"],
@@ -822,62 +824,16 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "document_invalid")
     if supersedes is not None and not valid_engagement_id(supersedes):
       raise AdministrationDenied(400, "supersedes_invalid")
-    if not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS:
-      raise AdministrationDenied(400, "engagement_asset_invalid")
-    requested = {}
-    for entry in assets:
-      if (not isinstance(entry, dict) or not isinstance(entry.get("asset_id"), str)
-          or not set(entry) <= {"asset_id", "authorized_ports", "authorized_scan_modes", "authorized_tests"}):
-        raise AdministrationDenied(400, "engagement_asset_invalid")
-      try:
-        asset_id = "as_" + canonical_uuid(entry["asset_id"][3:]) if entry["asset_id"].startswith("as_") else None
-        ports = normalize_port_scope(entry.get("authorized_ports"))
-      except (ValueError, TypeError):
-        raise AdministrationDenied(400, "engagement_asset_invalid") from None
-      if asset_id != entry["asset_id"] or asset_id in requested:
-        raise AdministrationDenied(400, "engagement_asset_invalid")
-      tests = entry.get("authorized_tests")
-      if not isinstance(tests, list) or not tests or not all(isinstance(item, str) for item in tests):
-        raise AdministrationDenied(400, "tests_invalid")
-      try:
-        modes = (normalize_scan_modes(entry["authorized_scan_modes"])
-                 if "authorized_scan_modes" in entry else None)
-      except EngagementInvalid as exc:
-        raise AdministrationDenied(400, exc.code) from None
-      requested[asset_id] = {"asset_id": asset_id, "authorized_tests": sorted(tests),
-                             **({"authorized_ports": ports} if ports is not None else {}),
-                             **({"authorized_scan_modes": modes} if modes is not None else {})}
+    # RM-107: the engagement defines its targets; nothing is read from a tenant asset row.
+    try:
+      assets = normalize_engagement_assets(assets)
+    except EngagementInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
     return {"display_name": display_name, "allowed_run_modes": allowed_run_modes, "valid_from": valid_from,
             "valid_until": valid_until, "roe": roe, "context": context,
             "documents": [[document[key] for key in ("kind", "sha256", "title", "comment")]
                           for document in documents],
-            "supersedes": supersedes, "assets": [requested[key] for key in sorted(requested)]}
-
-  def _engagement_asset(self, tenant_id, entry):
-    row = self.store.get("asset", tenant_id, entry["asset_id"])
-    if row is None or row["active"] is not True or row["target"]["kind"] not in ENGAGEMENT_ASSET_KINDS:
-      raise AdministrationDenied(400, "engagement_asset_invalid")
-    kind = row["target"]["kind"]
-    try:
-      tests = normalize_tests(kind, entry["authorized_tests"])
-    except EngagementInvalid as exc:
-      raise AdministrationDenied(400, exc.code) from None
-    locked = {"asset_id": entry["asset_id"], "kind": kind, "target_digest": row["target_digest"],
-              "authorized_tests": tests}
-    if kind != "network":
-      if "authorized_ports" in entry or "authorized_scan_modes" in entry:
-        raise AdministrationDenied(400, "engagement_asset_invalid")
-      return locked
-    # The asset row's port scope only seeds the engagement's (owner, 2026-09-27); a network entry
-    # always ends with an explicit scope, so a signed engagement never means "any port".
-    ports = entry.get("authorized_ports", row.get("authorized_ports"))
-    if ports is None:
-      raise AdministrationDenied(400, "ports_required")
-    try:
-      modes = normalize_scan_modes(entry.get("authorized_scan_modes"))
-    except EngagementInvalid as exc:
-      raise AdministrationDenied(400, exc.code) from None
-    return {**locked, "authorized_ports": ports, "authorized_scan_modes": modes}
+            "supersedes": supersedes, "assets": assets}
 
   @_endpoint
   def create_engagement(self, actor, tenant_id, request_id, display_name, allowed_run_modes, valid_from,
@@ -894,8 +850,7 @@ class TenantAdministrationService:
       supersedes, account.account_id)
     intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "engagement_id": engagement_id,
               "request_id": request_id, "created_by": account.account_id, "request": request}
-    # Replay is decided on the request alone, before any asset read: a retry after an asset edit is
-    # still the same creation.
+    # Replay is decided on the request alone.
     existing = self.store.get("engagement", tenant_id, engagement_id)
     if existing is not None:
       if existing["create_intent_digest"] != canonical_digest(intent) or existing["created_by"] != account.account_id:
@@ -913,7 +868,7 @@ class TenantAdministrationService:
                     for index, document in enumerate(documents)],
       **({"supersedes": supersedes} if supersedes is not None else {}),
       "roe": request["roe"], "context": request["context"],
-      "assets": [self._engagement_asset(tenant_id, entry) for entry in request["assets"]],
+      "assets": request["assets"],
       "active": True, "created_by": account.account_id,
       "created_at": datetime.now(timezone.utc).isoformat(),
       "create_intent_digest": canonical_digest(intent),

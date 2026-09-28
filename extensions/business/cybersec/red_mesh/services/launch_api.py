@@ -1340,8 +1340,8 @@ def announce_launch(
         "out_of_scope_ports": authorization_update["out_of_scope_ports"]}
        if authorization_update else {}),
     "safety_warning_count": len((safety_policy or {}).get("warnings", [])),
-    **({"tenant_id": binding.to_dict()["tenant_id"], "asset_id": binding.to_dict()["asset_id"]}
-       if binding is not None else {}),
+    **({"tenant_id": binding.to_dict()["tenant_id"],
+        "engagement_asset_id": binding.to_dict()["engagement_asset_id"]} if binding is not None else {}),
   })
 
   if binding is not None:
@@ -1390,12 +1390,12 @@ def _normalize_authorization_update(value):
 
 
 def check_authorized_port_scope(execution_context, workers, exceptions, authorization_update):
-  """Refuse a launch whose derived ports exceed the asset's authorized port scope.
+  """Refuse a launch whose derived ports exceed the engagement's port scope for the asset.
 
   The derived set is what the workers will actually scan: each worker's explicit `target_ports`
   (comparison mode mirrors COMMON_PORTS outside the operator's range) or its start-end slice,
-  minus the excepted ports. An asset with no recorded scope, and a launch with no tenant
-  context, are not gated.
+  minus the excepted ports. Every network entry of an engagement has a scope (RM-095, RM-107);
+  only a launch with no tenant context (the legacy path tests still drive) is not gated.
 
   Returns (authorized_ports, recorded_update, error).
   """
@@ -1416,7 +1416,7 @@ def check_authorized_port_scope(execution_context, workers, exceptions, authoriz
     return None, None, {
       "error": "scope_exceeds_authorization",
       "status_code": 400,
-      "message": (f"The requested ports exceed the asset's authorized port scope ({scope}). "
+      "message": (f"The requested ports exceed the engagement's authorized port scope for this asset ({scope}). "
                   "Record an authorization update to widen it."),
       "authorized_ports": scope,
       "out_of_scope_ports": outside_text,

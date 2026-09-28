@@ -43,14 +43,12 @@ class TestTenantDelete(unittest.TestCase):
     self.assertTrue(self.plugin.activate_tenant(self.actor, self.request)["success"])
     self.documents = self.plugin._document_store()
     self.plugin.configured_peers_reader = None
-    asset = self.plugin.create_tenant_asset(self.actor, self.tenant, str(uuid4()), "Edge",
-                                            {"kind": "network", "address": "192.0.2.10"}, "443")
-    self.assertTrue(asset["success"], asset)
     refs = [self.upload("Rules of engagement"), self.upload("Scope email", kind="other", raw=PDF + b"2")]
     created = self.plugin.create_engagement(
       self.actor, self.tenant, str(uuid4()), "Q4", ["single_pass"], "2026-10-01T00:00:00Z",
       "2027-10-01T00:00:00Z", {}, {"client_name": "Example"},
-      [{"asset_id": asset["data"]["assetId"], "authorized_tests": ["service_info_common"]}], refs)
+      [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
+        "authorized_ports": "443", "authorized_tests": ["service_info_common"]}], refs)
     self.assertTrue(created["success"], created)
     self.engagement_refs = refs
     self.events.clear()
@@ -90,7 +88,7 @@ class TestTenantDelete(unittest.TestCase):
     self.put_job("other-job", "tn_" + str(uuid4()))
     result = self.plugin.delete_tenant(self.actor, self.tenant)
     self.assertTrue(result["success"], result)
-    self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1, "assets": 1,
+    self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1, "assets": 0,
                                       "integrations": 0, "nodeAssignments": 0, "documents": 3})
     self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", *self.engagement_refs]))
     rows = self.tenancy_rows()
@@ -104,7 +102,7 @@ class TestTenantDelete(unittest.TestCase):
     self.refused(self.plugin.prepare_tenant(self.actor, self.request, "Example", "example", "initial",
                                             **install_contract(self.plugin)), 409, "domain_conflict")
     self.assertEqual(self.events, [("tenant_deleted", {
-      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "assets": 1, "integrations": 0,
+      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "assets": 0, "integrations": 0,
       "nodeAssignments": 0, "documents": 3})])
     self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 404, "not_found")
 

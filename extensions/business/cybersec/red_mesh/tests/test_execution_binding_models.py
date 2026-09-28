@@ -13,12 +13,28 @@ from .test_tenant_administration import FakeAdministrationStore
 
 
 def binding_payload():
+  """Schema 2 (RM-107): the job runs on one asset of one engagement."""
   target = {"kind": "network", "address": "192.0.2.10"}
-  return {"schema_version": 1, "namespace": "deployment", "tenant_id": "tn_" + str(uuid4()),
-          "asset_id": "as_" + str(uuid4()), "asset_target": target,
+  return {"schema_version": 2, "namespace": "deployment", "tenant_id": "tn_" + str(uuid4()),
+          "engagement_id": "en_" + str(uuid4()), "engagement_asset_id": "ea_1",
+          "engagement_hash": "e" * 64, "asset_target": target,
           "asset_target_digest": canonical_digest(target), "actor_id": "actor",
           "actor_generation": "generation-1", "node_failure_policy": "stop",
           "original_launcher": "coordinator", "participant_order": ["node-b", "node-a"]}
+
+
+def binding_v1_payload():
+  """Schema 1 (RM-084): a tenant asset row; still read, never built again."""
+  value = {key: item for key, item in binding_payload().items()
+           if key not in ("engagement_id", "engagement_asset_id", "engagement_hash")}
+  return {**value, "schema_version": 1, "asset_id": "as_" + str(uuid4())}
+
+
+ENGAGEMENT_FACTS = {"engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
+                    "authorized_tests": ["service_info_common"], "authorized_scan_modes": ["connect"],
+                    "roe": {"authenticated_action": False, "stateful_probes_allowed": False,
+                            "ics_safe_mode_required": True},
+                    "context": {}, "authorization": {}}
 
 
 class TestExecutionBindingModels(unittest.TestCase):
@@ -56,16 +72,42 @@ class TestExecutionBindingModels(unittest.TestCase):
           raw.pop("execution_binding")
           self.assertNotIn("execution_binding", model.from_dict(raw).to_dict())
 
+  def test_a_schema_1_binding_is_still_read_by_every_model(self):
+    # Jobs launched before RM-107 stay readable, purgeable and renderable (contract §Compatibility).
+    legacy = binding_v1_payload()
+    self.assertEqual(ExecutionBinding(legacy).to_dict(), legacy)
+    self.assertEqual(ExecutionBinding(legacy).version, 1)
+    for model, raw in self.payloads(legacy):
+      with self.subTest(model=model.__name__):
+        self.assertEqual(model.from_dict(raw).to_dict()["execution_binding"], legacy)
+    for mixed in ({**legacy, "engagement_id": "en_" + str(uuid4())}, {**binding_payload(), "asset_id": legacy["asset_id"]},
+                  {**legacy, "schema_version": 2}, {**binding_payload(), "schema_version": 1},
+                  {**binding_payload(), "schema_version": 3}):
+      with self.subTest(mixed=mixed), self.assertRaises(ValueError):
+        ExecutionBinding(mixed)
+
+  def test_model_test_config_keeps_the_engagement_snapshot(self):
+    snapshot = {"engagement_id": "en_" + str(uuid4()), "engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
+                "authorized_tests": ["prompt_injection_v1"], "roe": {"ics_safe_mode_required": True},
+                "engagement": {"client_name": "Example"}, "authorization": {"document_cid": ""}}
+    raw = {"job_type": "model_test", "execution_binding": binding_payload(), **snapshot}
+    stored = ModelTestJobConfig.from_dict(raw).to_dict()
+    self.assertEqual({key: stored[key] for key in snapshot}, snapshot)
+    self.assertEqual(ModelTestJobConfig.from_dict(stored).to_dict(), stored)
+    before = ModelTestJobConfig.from_dict({"job_type": "model_test"}).to_dict()
+    self.assertFalse(set(snapshot) & set(before))
+
   def test_exact_wire_fields_and_malformed_present_values_reject(self):
     good = binding_payload()
     invalid = [None, {}, [], "binding"]
     invalid += [{key: value for key, value in good.items() if key != missing} for missing in good]
     invalid += [{**good, "extra": True}]
     for name, values in {
-      "schema_version": (True, False, 1.0, "1", 2),
+      "schema_version": (True, False, 2.0, "2", 1, 3),
       "namespace": (None, "", " "), "actor_id": (None, [], " ACTOR "),
       "actor_generation": (None, "", 1), "tenant_id": ("tenant", "tn_bad"),
-      "asset_id": ("asset", "as_bad"), "asset_target_digest": (None, "0" * 64),
+      "engagement_id": (None, "en_bad", "tn_" + str(uuid4())), "engagement_asset_id": (None, "ea_0", "ea_01", "as_1"),
+      "engagement_hash": (None, "E" * 64, "e" * 63), "asset_target_digest": (None, "0" * 64),
       "node_failure_policy": (None, "STOP", True), "original_launcher": (None, "node with space"),
       "participant_order": ([], ["node-a", "node-a"], [None], "node-a"),
     }.items():
@@ -149,43 +191,40 @@ class TestExecutionBindingModels(unittest.TestCase):
           archive.to_dict()
 
 
-class TestResolvedContextCarriesThePortScope(unittest.TestCase):
-  """The asset's authorized port scope reaches the launch gate through the resolved context and
-  stays out of the stored binding: the scope is launch-time policy, not execution identity."""
+class TestResolvedContextCarriesThePolicy(unittest.TestCase):
+  """The engagement facts and the port scope reach the launch gate through the resolved context and
+  stay out of the stored binding: they are launch-time policy, not execution identity."""
 
   def setUp(self):
     self.facts = {key: value for key, value in binding_payload().items()
                   if key not in ("schema_version", "original_launcher", "participant_order")}
+    self.engagement = {**ENGAGEMENT_FACTS, "engagement_id": self.facts["engagement_id"]}
 
   def _context(self, **extra):
     from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
-    return ResolvedExecutionContext({**self.facts, "selected_candidates": ["node-a"], **extra})
+    value = {**self.facts, "selected_candidates": ["node-a"], "engagement": self.engagement,
+             "asset_authorized_ports": "1-1024", **extra}
+    return ResolvedExecutionContext({key: item for key, item in value.items() if item is not ...})
 
-  def test_the_scope_is_carried_and_kept_out_of_the_binding(self):
-    context = self._context(asset_authorized_ports="1-1024")
+  def test_the_policy_is_carried_and_kept_out_of_the_binding(self):
+    context = self._context()
     self.assertEqual(context.to_dict()["asset_authorized_ports"], "1-1024")
+    self.assertEqual(context.to_dict()["engagement"], self.engagement)
     binding = context.build_binding("coordinator", ["node-a"]).to_dict()
-    self.assertNotIn("asset_authorized_ports", binding)
-    self.assertEqual(binding, self._context().build_binding("coordinator", ["node-a"]).to_dict())
+    self.assertEqual(set(binding) & {"asset_authorized_ports", "engagement"}, set())
+    self.assertEqual(binding["schema_version"], 2)
+    self.assertEqual(binding, self._context(asset_authorized_ports="443").build_binding(
+      "coordinator", ["node-a"]).to_dict())
 
-  def test_a_non_canonical_or_null_scope_is_refused(self):
-    for scope in ("1024-1", "22, 80", None, 80):
+  def test_a_non_canonical_or_missing_scope_is_refused(self):
+    for scope in ("1024-1", "22, 80", None, 80, ...):
       with self.subTest(scope=scope), self.assertRaises(ValueError):
         self._context(asset_authorized_ports=scope)
 
-  def test_the_engagement_facts_are_carried_and_kept_out_of_the_binding(self):
-    # RM-095: the facts the launch gate checks and the job snapshots; not execution identity.
-    engagement = {"engagement_id": "en_" + str(uuid4()), "engagement_hash": "a" * 64,
-                  "contract_sha256": "c" * 64,
-                  "authorized_tests": ["service_info_common"], "authorized_scan_modes": ["connect"],
-                  "roe": {"authenticated_action": False, "stateful_probes_allowed": False,
-                          "ics_safe_mode_required": True},
-                  "context": {}, "authorization": {}}
-    context = self._context(engagement=engagement, asset_authorized_ports="443")
-    self.assertEqual(context.to_dict()["engagement"], engagement)
-    binding = context.build_binding("coordinator", ["node-a"]).to_dict()
-    self.assertEqual(binding, self._context().build_binding("coordinator", ["node-a"]).to_dict())
-    broken = ({**engagement, "engagement_id": "en_x"}, {**engagement, "authorized_tests": []},
+  def test_every_launch_carries_its_engagement(self):
+    engagement = self.engagement
+    broken = (..., {**engagement, "engagement_id": "en_x"}, {**engagement, "engagement_id": "en_" + str(uuid4())},
+              {**engagement, "engagement_hash": "f" * 64}, {**engagement, "authorized_tests": []},
               {**engagement, "roe": {"authenticated_action": "yes"}}, {**engagement, "extra": 1},
               {**engagement, "contract_sha256": None},
               {key: value for key, value in engagement.items() if key != "authorized_scan_modes"})

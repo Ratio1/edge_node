@@ -47,10 +47,6 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     self.documents = self.plugin._document_store()
     self.storage.account("platform-pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.storage.account("viewer", memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
-    asset = self.call_json("create_tenant_asset", actor=self.actor, tenant_id=self.tenant, request_id=str(uuid4()),
-                           display_name="Edge", target={"kind": "network", "address": "192.0.2.10"},
-                           authorized_ports="443")
-    self.asset = asset["data"]["assetId"]
 
   def call_json(self, method, **body):
     endpoint = getattr(self.plugin, method)
@@ -77,7 +73,8 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     body = {"actor": actor or self.actor, "tenant_id": self.tenant, "request_id": str(uuid4()),
             "display_name": "Q4", "allowed_run_modes": ["continuous"], "valid_from": "2026-10-01T00:00:00Z",
             "valid_until": "2027-10-01T00:00:00Z", "roe": {}, "context": {"client_name": "Example"},
-            "assets": [{"asset_id": self.asset, "authorized_tests": ["service_info_common"]}]}
+            "assets": [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
+                        "authorized_ports": "443", "authorized_tests": ["service_info_common"]}]}
     body.update(changes)
     if "document_refs" not in body:
       body["document_refs"] = [self.upload(PNG, "roe.png", title="Rules of engagement (scan)"),

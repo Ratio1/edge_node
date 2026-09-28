@@ -23,7 +23,6 @@ class TestEngagementEndReason(unittest.TestCase):
   # Borrowed, not inherited, so the phase 2 tests are not collected twice.
   setUp_engagements = engagements.TestTenantEngagements.setUp
   new_tenant = engagements.TestTenantEngagements.new_tenant
-  asset = engagements.TestTenantEngagements.asset
   fields = engagements.TestTenantEngagements.fields
   create = engagements.TestTenantEngagements.create
 
