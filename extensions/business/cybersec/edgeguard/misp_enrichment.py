@@ -3,8 +3,9 @@
 Builds the `misp_enrichment` block from `raw_data` already in Neo4j (the
 flattened `SOURCED_FROM` source payload, a JSON string) plus the node's own
 MISP id lists. Read by one internal, parameterised, read-only Cypher query
-keyed on node element ids -- never a model-generated query, never fed to any
-model (contract §7.4; that wiring is a later slice). Every function here is
+keyed on node element ids -- never a model-generated query. Explanation
+spec v0.2 (approved 2026-09-28) admits the validated block, as the compact
+`build_model_view`, into EAB/1 and EGX/2 model input only. Every function here is
 pure or takes an already-open Neo4j session; `edgeguard_api.py` owns the
 fail-open wrapper, the config switch and the response wiring.
 
@@ -425,12 +426,9 @@ def _field_key_is_clean(key: Any) -> bool:
 
 def misp_block_contains_raw_payload(block: Any) -> bool:
   """True if a nested object, a list-inside-list, a forbidden key, or a raw
-  JSON string ever reached the block's `fields` -- the signal
-  `redaction.contains_raw_misp_payload` would take for the block that
-  accompanies a model input, if one ever did (never in slice 3a: the
-  graph-evidence packet never carries `misp_enrichment`, so that flag stays
-  the v0.1 hard-coded `False`). Used by `validate_misp_enrichment_block` to
-  fail closed."""
+  JSON string ever reached the block's `fields`. Used by
+  `validate_misp_enrichment_block` to fail closed; the model-admission flag
+  itself is `contains_raw_misp_payload` below (the full validator)."""
   if not isinstance(block, dict):
     return True
   nodes = block.get("nodes")
@@ -545,3 +543,225 @@ def validate_misp_enrichment_block(block: Any) -> bool:
   canonical = json.dumps(nodes, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
   recomputed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
   return recomputed == sha256_value
+
+
+def contains_raw_misp_payload(block: Any) -> bool:
+  """Explanation spec v0.2 §4: `redaction.contains_raw_misp_payload`,
+  computed against the block that would accompany a model input -- `False`
+  when no block accompanies it, `True` when the block breaks any
+  validation rule. Never declared by the producer."""
+  if block is None:
+    return False
+  return not validate_misp_enrichment_block(block)
+
+
+# Explanation spec v0.2 §5: the compact, model-facing view of a validated
+# block. Event URLs and attribute ids are omitted (derivable / bookkeeping),
+# `last_imported_from` is ingest bookkeeping, and array fields are cut to a
+# few items. The view is then fitted to the caller's byte budget greedily, in
+# block order: a node that does not fit whole loses its largest fields first,
+# and a node whose envelope alone does not fit is omitted.
+MODEL_VIEW_SCHEMA_VERSION = "edgeguard.misp_enrichment_model_view.v1"
+MODEL_VIEW_ARRAY_ITEMS = 5
+_MODEL_VIEW_EXCLUDED_FIELDS = frozenset({"last_imported_from"})
+
+
+def _model_view_bytes(view: Mapping[str, Any]) -> int:
+  return len(json.dumps(view, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def build_model_view(
+  block: Any,
+  *,
+  max_bytes: int,
+  entity_by_ref: Optional[Mapping[str, str]] = None,
+  fields_by_label: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+  """The model view of `block`, or `None` when there is no valid block or
+  not even one node fits `max_bytes` (canonical JSON, sorted keys). Values
+  are copied verbatim from the block, never shortened, so any value the
+  model quotes from the view is a verbatim block value. With
+  `entity_by_ref`, only nodes it names are kept and each carries its
+  `entity` display name (EGX/2 links enrichment to sheet entities); with
+  `fields_by_label`, only the fields it lists for a node's label are kept
+  (the EGX/2 field catalog). Deterministic for a given block and budget."""
+  if block is None or not validate_misp_enrichment_block(block):
+    return None
+  truncated = bool(block["truncated"])
+  candidates: List[Dict[str, Any]] = []
+  for node in block["nodes"]:
+    if entity_by_ref is not None and node["node_ref"] not in entity_by_ref:
+      continue
+    fields: Dict[str, Any] = {}
+    for key in sorted(node["fields"]):
+      if key in _MODEL_VIEW_EXCLUDED_FIELDS:
+        continue
+      if fields_by_label is not None and key not in (fields_by_label.get(node["label"]) or ()):
+        continue
+      value = node["fields"][key]
+      if isinstance(value, list) and len(value) > MODEL_VIEW_ARRAY_ITEMS:
+        value = value[:MODEL_VIEW_ARRAY_ITEMS]
+        truncated = True
+      fields[key] = value
+    entry: Dict[str, Any] = {
+      "node_ref": node["node_ref"],
+      "label": node["label"],
+      "misp_event_ids": list(node["misp_event_ids"]),
+      "fields": fields,
+    }
+    if entity_by_ref is not None:
+      entry["entity"] = entity_by_ref[node["node_ref"]]
+    candidates.append(entry)
+  omitted = int(block["omitted_nodes"]) + (len(block["nodes"]) - len(candidates))
+
+  def view_of(nodes: List[Dict[str, Any]], omitted_count: int, is_truncated: bool) -> Dict[str, Any]:
+    return {
+      "schema_version": MODEL_VIEW_SCHEMA_VERSION,
+      "nodes": nodes,
+      "omitted_nodes": omitted_count,
+      "truncated": bool(is_truncated or omitted_count > 0),
+    }
+
+  # Measured against the final `omitted_nodes` upper bound, and one byte
+  # short of the budget (`false` is one byte longer than `true`), so the
+  # final counters can only shrink the view, never push it over the budget.
+  worst_omitted = omitted + len(candidates)
+  kept: List[Dict[str, Any]] = []
+  for entry in candidates:
+    fields = dict(entry["fields"])
+    while True:
+      trial = {**entry, "fields": fields}
+      if _model_view_bytes(view_of(kept + [trial], worst_omitted, True)) <= max_bytes - 1:
+        kept.append(trial)
+        if len(fields) < len(entry["fields"]):
+          truncated = True
+        break
+      if not fields:
+        break
+      largest = max(sorted(fields), key=lambda key: len(json.dumps(fields[key], ensure_ascii=False)))
+      fields = {key: value for key, value in fields.items() if key != largest}
+  if not kept:
+    return None
+  view = view_of(kept, omitted + len(candidates) - len(kept), truncated)
+  return view if _model_view_bytes(view) <= max_bytes else None
+
+
+# Explanation spec v0.2 §5: the one lexical grounding rule set shared by
+# EAB/1 (`analyst_brief`) and EGX/2 (`egx2.brief_gates`). Fail-closed; it
+# also runs without a block, so a model can never invent a URL or CWE id.
+URL_TOKEN_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.IGNORECASE)
+# `javascript:` / `vbscript:` followed, after optional whitespace, by any
+# non-space (browsers tolerate `javascript: alert(1)`); `data:` only when a
+# MIME type or `,` / `;` follows (optional whitespace), so prose such as
+# "source data: one CVE" still passes.
+UNSAFE_SCHEME_RE = re.compile(
+  r"(?<![a-z0-9+.-])(?:(?:javascript|vbscript):(?=\s*\S)"
+  r"|data:\s*(?:[a-z0-9.+-]+/[a-z0-9.+-]+|[,;]))",
+  re.IGNORECASE,
+)
+CWE_TOKEN_RE = re.compile(r"(?<![a-z0-9-])cwe-\d+(?!\d)", re.IGNORECASE)
+# Values shorter than this, and closed-vocabulary category fields (feed
+# name, roles, types, TLP, industries, tags), are shared vocabulary, not a
+# fact about one node, so they are never attributed to a node.
+ATTRIBUTION_MIN_CHARS = 6
+ATTRIBUTION_EXCLUDED_FIELDS = frozenset({
+  "source", "indicator_role", "threat_type", "pulse_tlp", "otx_industries",
+})
+
+
+def url_tokens(text: str) -> List[str]:
+  """Complete `http(s)://` URL tokens in `text`, trailing punctuation cut."""
+  return [match.group(0).rstrip(".,;:!?") for match in URL_TOKEN_RE.finditer(text or "")]
+
+
+def cwe_tokens(text: str) -> List[str]:
+  return [match.group(0).lower() for match in CWE_TOKEN_RE.finditer(text or "")]
+
+
+def mentions(text: str, name: str) -> bool:
+  """`name` occurs in `text` as a whole token (case-insensitive), so
+  `203.0.113.7` is not found inside `203.0.113.70`."""
+  if not name:
+    return False
+  return re.search(rf"(?<![a-z0-9]){re.escape(name.lower())}(?![a-z0-9])", (text or "").lower()) is not None
+
+
+def view_node_values(node: Mapping[str, Any], *, attributable_only: bool = False) -> List[str]:
+  """The string values under one model-view node's `fields`, verbatim.
+  `attributable_only` keeps the distinctive ones (the mismatch rule)."""
+  values: List[str] = []
+  for key, value in (node.get("fields") or {}).items():
+    if attributable_only and key in ATTRIBUTION_EXCLUDED_FIELDS:
+      continue
+    for item in value if isinstance(value, list) else [value]:
+      if isinstance(item, str) and (not attributable_only or len(item) >= ATTRIBUTION_MIN_CHARS):
+        values.append(item)
+  return values
+
+
+def enrichment_grounding_error(
+  claims: Sequence[Tuple[str, Any]],
+  *,
+  evidence_texts: Sequence[str],
+  view: Optional[Mapping[str, Any]],
+  names_by_ref: Mapping[str, Any],
+  known_names: Sequence[str] = (),
+) -> Optional[str]:
+  """Spec v0.2 §5 for one model output. `claims` is every output text with
+  the names of the result nodes it is typed to be about (EGX/2 exemplars;
+  may be empty); each text is also about every `known_names` entry (every
+  digest identity, or every sheet and view entity) it mentions, enriched or
+  not. `evidence_texts` is every non-enrichment evidence string (digest,
+  projection, question or sheet); `names_by_ref` names each view node the
+  way `claims` do. Returns a fixed error code, or `None`:
+
+  - `unsafe_url_scheme`: a `javascript:` / `data:` / `vbscript:` token;
+  - `ungrounded_url`: a URL token that is not exactly a URL token of the
+    evidence or the view (no prefix or substring matches);
+  - `ungrounded_cwe`: a CWE id absent from the evidence and the view;
+  - `enrichment_node_mismatch`: a claim about some nodes carries a CWE id or
+    distinctive enrichment value that belongs only to another node's view
+    entry (the node the claim is about must own the value). Values match
+    as whole tokens (`mentions`), and a value that also occurs in the
+    evidence or in the view entry of a node the claim is about is exempt.
+  """
+  nodes = [
+    node for node in ((view or {}).get("nodes") or [])
+    if isinstance(node, Mapping) and isinstance(node.get("node_ref"), str)
+  ]
+  view_texts = [value for node in nodes for value in view_node_values(node)]
+  allowed_urls = {url for text in list(evidence_texts) + view_texts for url in url_tokens(text)}
+  base_cwes = {token for text in evidence_texts for token in cwe_tokens(text)}
+  allowed_cwes = base_cwes | {token for text in view_texts for token in cwe_tokens(text)}
+  for text, _about in claims:
+    if UNSAFE_SCHEME_RE.search(text or ""):
+      return "unsafe_url_scheme"
+    if any(url not in allowed_urls for url in url_tokens(text)):
+      return "ungrounded_url"
+    if any(token not in allowed_cwes for token in cwe_tokens(text)):
+      return "ungrounded_cwe"
+  evidence_joined = "\n".join(evidence_texts)
+  known = {str(name).lower() for name in known_names if name}
+  for text, about in claims:
+    about = {str(name).lower() for name in about or () if name}
+    about |= {name for name in known if mentions(text, name)}
+    if not about:
+      continue
+    owned = [node for node in nodes if about & {str(n).lower() for n in names_by_ref.get(node["node_ref"], ())}]
+    others = [node for node in nodes if node not in owned]
+    own_values = {value.lower() for node in owned for value in view_node_values(node)}
+    own_cwes = {token for value in own_values for token in cwe_tokens(value)}
+    for token in cwe_tokens(text):
+      if token in own_cwes or token in base_cwes:
+        continue
+      if any(token in cwe_tokens(value) for node in others for value in view_node_values(node)):
+        return "enrichment_node_mismatch"
+    for node in others:
+      for value in view_node_values(node, attributable_only=True):
+        if (
+          mentions(text, value)
+          and value.lower() not in own_values
+          and not mentions(evidence_joined, value)
+        ):
+          return "enrichment_node_mismatch"
+  return None

@@ -1606,9 +1606,12 @@ def _build_graph_evidence_packet(
     "redaction": {
       "policy": GRAPH_PACKET_REDACTION_POLICY,
       "contains_customer_evidence": False,
-      # `misp_enrichment` never accompanies this packet (contract §7.4), so
-      # the flag it would take is always `False` in slice 3a.
-      "contains_raw_misp_payload": False,
+      # Explanation spec v0.2 §4: computed, never declared. The packet
+      # itself never embeds the block, so the value here is the one for
+      # "no block"; `_admit_misp_enrichment_for_model` recomputes it against
+      # the block that would accompany a model call and runs the redaction
+      # check below on the result.
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(None),
     },
   }
   meta = {
@@ -2601,9 +2604,9 @@ def _build_graph_evidence_packet_from_execution(
     "redaction": {
       "policy": GRAPH_PACKET_REDACTION_POLICY,
       "contains_customer_evidence": False,
-      # Same as `_build_graph_evidence_packet`: `misp_enrichment` never
-      # accompanies this packet, so the flag stays `False`.
-      "contains_raw_misp_payload": False,
+      # Same as `_build_graph_evidence_packet`: computed for "no block";
+      # the prepared-execution path never carries `misp_enrichment`.
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(None),
     },
   }
   meta = {
@@ -2766,22 +2769,25 @@ def _validate_graph_evidence_packet(packet: Any) -> tuple[list[Dict[str, str]], 
       if any(str(key).lower() in SEVERITY_EVIDENCE_KEYS for key in properties):
         context["severity_evidence_ids"].add(rel_id)
 
-  redaction = packet.get("redaction")
-  if not isinstance(redaction, dict):
-    errors.append(_contract_error("redaction_missing", "redaction must be an object"))
-  else:
-    if redaction.get("policy") != GRAPH_PACKET_REDACTION_POLICY:
-      errors.append(_contract_error("redaction_policy", "unexpected redaction policy"))
-    if redaction.get("contains_customer_evidence") is not False:
-      errors.append(_contract_error("customer_evidence_not_allowed", "customer evidence is not allowed in v0.1 model input"))
-    # v0.1 packet behaviour: `misp_enrichment` never accompanies this packet
-    # in slice 3a, so the declared flag is trusted, not recomputed (v0.2
-    # wiring in a later slice reopens this as a computed check once a block
-    # can reach a packet).
-    if redaction.get("contains_raw_misp_payload") is not False:
-      errors.append(_contract_error("raw_misp_payload_not_allowed", "raw MISP payloads are not allowed in v0.1 model input"))
+  _validate_packet_redaction(packet.get("redaction"), errors)
 
   return errors, context
+
+
+def _validate_packet_redaction(redaction: Any, errors: list[Dict[str, str]]) -> None:
+  """The packet redaction check, shared by `_validate_graph_evidence_packet`
+  and the `misp_enrichment` model-admission step. Fails closed on a `True`
+  `contains_raw_misp_payload`, which explanation spec v0.2 §4 computes
+  against the block that would accompany the model input."""
+  if not isinstance(redaction, dict):
+    errors.append(_contract_error("redaction_missing", "redaction must be an object"))
+    return
+  if redaction.get("policy") != GRAPH_PACKET_REDACTION_POLICY:
+    errors.append(_contract_error("redaction_policy", "unexpected redaction policy"))
+  if redaction.get("contains_customer_evidence") is not False:
+    errors.append(_contract_error("customer_evidence_not_allowed", "customer evidence is not allowed in v0.1 model input"))
+  if redaction.get("contains_raw_misp_payload") is not False:
+    errors.append(_contract_error("raw_misp_payload_not_allowed", "raw MISP payloads are not allowed in v0.1 model input"))
 
 
 def _unexpected_keys(value: Dict[str, Any], allowed: set[str], where: str, errors: list[Dict[str, str]]) -> None:
@@ -4515,8 +4521,9 @@ class EdgeguardApiPlugin(BasePlugin):
     records: Optional[list[Dict[str, Any]]],
     node_source_aliases: Optional[Mapping[str, str]] = None,
   ) -> Optional[Dict[str, Any]]:
-    """Contract §7.1-§7.3, slice 3a: the block returned to the API caller
-    only -- never fed to a model (§7.4; that wiring is a later slice).
+    """Contract §7.1-§7.3: the block returned beside `result_digest`.
+    Explanation models see it only through `_admit_misp_enrichment_for_model`
+    (explanation spec v0.2).
     Fail-open on any error (Neo4j, parse, validation) and fail fast (no
     extra latency) when the driver is unavailable; never a partially
     invalid block.
@@ -4571,6 +4578,34 @@ class EdgeguardApiPlugin(BasePlugin):
       with self._metrics_lock:
         self._misp_enrichment_error_count += 1
         self._misp_enrichment_last_error = "validation"
+      return None
+    return block
+
+  def _admit_misp_enrichment_for_model(
+    self,
+    packet: Mapping[str, Any],
+    block: Optional[Mapping[str, Any]],
+  ) -> Optional[Mapping[str, Any]]:
+    """Explanation spec v0.2 §4: runs before any EAB/1 or EGX/2 model call.
+    Re-validates the block that would be admitted, computes
+    `redaction.contains_raw_misp_payload` from it, and runs the packet
+    redaction check on that computed flag. A rejected block is dropped from
+    model input and from the response (fail-closed for the block,
+    fail-open for the response) and counted like any other swallowed
+    enrichment failure; the flag is never taken from the producer."""
+    if block is None:
+      return None
+    redaction = packet.get("redaction") if isinstance(packet.get("redaction"), Mapping) else {}
+    model_redaction = {
+      **dict(redaction),
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(block),
+    }
+    errors: list[Dict[str, str]] = []
+    _validate_packet_redaction(model_redaction, errors)
+    if any(error.get("code") == "raw_misp_payload_not_allowed" for error in errors):
+      with self._metrics_lock:
+        self._misp_enrichment_error_count += 1
+        self._misp_enrichment_last_error = "model_admission"
       return None
     return block
 
@@ -4631,8 +4666,10 @@ class EdgeguardApiPlugin(BasePlugin):
     misp_enrichment_block: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
     # Contract §4.3/§7.3: siblings of `result_digest`; `projection_digest`
-    # only for `ranked_projection` results, `misp_enrichment` fail-open and
-    # never passed into `run_analyst_brief` below (never fed to a model).
+    # only for `ranked_projection` results, `misp_enrichment` fail-open.
+    # Explanation spec v0.2: the block reaches `run_analyst_brief` only
+    # after the model-admission check.
+    misp_enrichment_block = self._admit_misp_enrichment_for_model(packet, misp_enrichment_block)
     digest_siblings = {"projection_digest": dict(projection_digest)} if projection_digest is not None else {}
     if misp_enrichment_block is not None:
       digest_siblings["misp_enrichment"] = dict(misp_enrichment_block)
@@ -4708,6 +4745,7 @@ class EdgeguardApiPlugin(BasePlugin):
         model=getattr(self, "cfg_edgeguard_explanation_model", None),
         provider_call=self._call_graph_first_provider,
         projection_digest=projection_digest,
+        misp_enrichment=misp_enrichment_block,
       )
       return self._bounded_graph_first_success({
         "status": STATUS_OK,
@@ -4781,10 +4819,13 @@ class EdgeguardApiPlugin(BasePlugin):
     deadline: float,
     mode: Optional[str] = None,
     misp_enrichment_block: Optional[Mapping[str, Any]] = None,
+    misp_node_aliases: Optional[Mapping[str, str]] = None,
   ) -> Dict[str, Any]:
-    # Contract §7.4: `misp_enrichment` is a sibling of `result_digest` only
-    # -- it is never passed into `egx2.run_insight_brief` below (never fed
-    # to a model).
+    # Contract §7.3: `misp_enrichment` is a sibling of `result_digest`.
+    # Explanation spec v0.2: it reaches `egx2.run_insight_brief` only after
+    # the model-admission check; `misp_node_aliases` (packet node id ->
+    # digest node ref) joins block nodes to packet-graph nodes.
+    misp_enrichment_block = self._admit_misp_enrichment_for_model(packet, misp_enrichment_block)
     graph = packet.get("graph") or {}
     returned_rows = digest.get("counts", {}).get("returned_rows")
     deterministic_reason = None
@@ -4810,6 +4851,10 @@ class EdgeguardApiPlugin(BasePlugin):
       allow_model=allow_model,
       deterministic_reason=deterministic_reason,
       mode=mode,
+      misp_enrichment=misp_enrichment_block,
+      misp_node_ids={
+        node_ref: packet_id for packet_id, node_ref in (misp_node_aliases or {}).items()
+      },
     )
     outcome_status = result["explanation_trace"].get("outcome", {}).get("status")
     return self._bounded_graph_first_success({
@@ -6762,6 +6807,7 @@ class EdgeguardApiPlugin(BasePlugin):
           deadline=deadline,
           mode=mode_plan.mode if mode_plan is not None else None,
           misp_enrichment_block=misp_block,
+          misp_node_aliases=misp_node_aliases,
         )
       if effective_strategy == "one_call":
         projection_digest = self._projection_digest_for_ranked_result(

@@ -1,17 +1,20 @@
-"""EGM-059 phase 3, slice 3a: the `misp_enrichment` block (contract §7).
+"""EGM-059 phase 3: the `misp_enrichment` block (contract §7).
 
 Fixtures only -- no network, no prod literals. Synthetic identifiers
 (`CVE-2000-0001`, `203.0.113.x`, MISP event ids in the 900s) throughout, per
-the phase-3 probe report's reproduce-safe convention. Never asserts the
-block is fed to a model -- contract §7.4 forbids that until explanation
-spec v0.2 is approved (a later slice).
+the phase-3 probe report's reproduce-safe convention.
+
+Slice 3a built, validated and returned the block to the API caller only.
+Slice 3b (explanation spec v0.2, approved 2026-09-28) lifts that isolation
+for EAB/1 and EGX/2 only: the block reaches `run_analyst_brief` /
+`egx2.run_insight_brief` after `_admit_misp_enrichment_for_model` recomputes
+`redaction.contains_raw_misp_payload` from it. Everything else -- the
+explanation trace, the packet, the digest, logs, and any other model call
+-- stays free of the block (`ModelInputIsolationTests`).
 
 The block validator and its policy regex live in `misp_enrichment.py`, not
 `edgeguard_api`. `node_ref` is the digest node ref, not the packet id --
-`_misp_enrichment_for_response` takes a `node_source_aliases` map. The
-packet-level `contains_raw_misp_payload` flag is the v0.1 hard-coded
-`False`; `edgeguard_api` trusts it rather than recomputing it from
-`packet["graph"]`.
+`_misp_enrichment_for_response` takes a `node_source_aliases` map.
 """
 
 import hashlib
@@ -82,12 +85,17 @@ _BLOCK_LEAK_MARKERS = ("misp_enrichment", "misp.edgeguard.org/events/view", "Syn
 
 
 def _assert_no_block_leak(test, mock_call):
-  """Every argument of every recorded model call, at any depth, is free of
-  the block: its key name, its event URLs and its field values."""
+  """Every argument of every recorded call, at any depth, is free of the
+  block: its key name, its event URLs and its field values. Since slice 3b
+  this pins only calls that must never carry the block (deterministic,
+  model-free paths and non-explanation calls)."""
   for call in mock_call.call_args_list:
-    rendered = repr(call)
-    for marker in _BLOCK_LEAK_MARKERS:
-      test.assertNotIn(marker, rendered)
+    _assert_text_has_no_block(test, repr(call))
+
+
+def _assert_text_has_no_block(test, rendered):
+  for marker in _BLOCK_LEAK_MARKERS:
+    test.assertNotIn(marker, rendered)
 
 
 def _valid_block(node_count=1, *, padded=False):
@@ -576,11 +584,11 @@ class MispBlockContainsRawPayloadTests(unittest.TestCase):
     self.assertTrue(misp_enrichment.misp_block_contains_raw_payload(block))
 
 
-class GraphPacketRedactionRevertTests(unittest.TestCase):
-  """v0.1 packet behaviour: `misp_enrichment` never accompanies the graph
-  evidence packet in slice 3a, so `redaction.contains_raw_misp_payload` is
-  the hard-coded `False`, and `_validate_graph_evidence_packet` trusts the
-  declared field instead of recomputing it from `packet["graph"]`."""
+class GraphPacketRedactionTests(unittest.TestCase):
+  """Explanation spec v0.2 §4: the packet never embeds the block, so its
+  computed `contains_raw_misp_payload` is the "no block" value `False`; the
+  packet validator keeps failing closed on a `True` flag (the check the
+  model-admission step reuses)."""
 
   def _clean_packet(self):
     indicator = _GraphNode("indicator-1", ["Indicator"], {"value": "203.0.113.7", "type": "ip"})
@@ -596,17 +604,15 @@ class GraphPacketRedactionRevertTests(unittest.TestCase):
     )
     return packet
 
-  def test_redaction_flag_is_hardcoded_false(self):
+  def test_packet_flag_is_computed_false_without_a_block(self):
     packet = self._clean_packet()
     self.assertIs(packet["redaction"]["contains_raw_misp_payload"], False)
     errors, _context = _validate_graph_evidence_packet(packet)
     codes = {error["code"] for error in errors}
     self.assertNotIn("raw_misp_payload_not_allowed", codes)
 
-  def test_validator_trusts_the_declared_field_not_a_recompute(self):
-    # v0.1 behaviour: the validator only checks the declared flag -- a
-    # clean packet with the flag declared `False` passes, and the same
-    # packet with the flag declared `True` fails, regardless of what
+  def test_validator_fails_closed_on_a_true_flag(self):
+    # The check stays: a packet whose flag is `True` fails, whatever
     # `packet["graph"]` itself contains.
     clean_packet = self._clean_packet()
     errors, _context = _validate_graph_evidence_packet(clean_packet)
@@ -975,11 +981,11 @@ class ExplainGraphEndToEndTests(unittest.TestCase):
     self.assertNotIn("misp_enrichment", result)
     self.assertEqual(fake_session.run.call_count, 1)  # the internal query never fires
 
-  def test_neither_run_analyst_brief_nor_insight_brief_ever_receive_the_block(self):
-    # Contract §7.4: every dispatch path that can call a model is exercised
-    # here -- `one_call` calls `run_analyst_brief`, `insight_brief` calls
-    # `egx2.run_insight_brief` -- and neither ever receives
-    # `misp_enrichment` as an argument.
+  def test_run_analyst_brief_and_insight_brief_receive_the_admitted_block(self):
+    # Explanation spec v0.2: every dispatch path that can call an
+    # explanation model -- `one_call` -> `run_analyst_brief`,
+    # `insight_brief` -> `egx2.run_insight_brief` -- now receives the
+    # validated block (this replaces the slice-3a isolation test).
     misp_rows = [{
       "element_id": "indicator-1", "labels": ["Indicator"],
       "misp_event_ids": ["901"], "misp_attribute_ids": ["attr-1"],
@@ -1003,7 +1009,7 @@ class ExplainGraphEndToEndTests(unittest.TestCase):
         with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
           with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
             with patch(target) as fake_call:
-              fake_call.side_effect = Exception("model call should not carry misp_enrichment as an argument")
+              fake_call.side_effect = Exception("stop after capturing the model-call arguments")
               try:
                 plugin.explain_graph(
                   uri="example.com:7687",
@@ -1016,7 +1022,250 @@ class ExplainGraphEndToEndTests(unittest.TestCase):
               except Exception:
                 pass
               self.assertEqual(fake_call.call_count, 1)
-              _assert_no_block_leak(self, fake_call)
+              block = fake_call.call_args.kwargs["misp_enrichment"]
+              self.assertTrue(misp_enrichment.validate_misp_enrichment_block(block))
+              self.assertEqual(block["nodes"][0]["fields"]["pulse_name"], "Synthetic Pulse")
+              if strategy == "insight_brief":
+                # Digest ref -> packet-graph node id, for every digest node;
+                # the block's `N0` joins to the Indicator's graph node.
+                node_ids = fake_call.call_args.kwargs["misp_node_ids"]
+                graph_nodes = {node["id"]: node for node in fake_call.call_args.kwargs["graph"]["nodes"]}
+                self.assertEqual(graph_nodes[node_ids["N0"]]["labels"], ["Indicator"])
+              # Only the block argument carries it; the question and the
+              # digest / graph arguments stay free of it.
+              other_args = {
+                key: value for key, value in fake_call.call_args.kwargs.items()
+                if key not in {"misp_enrichment", "provider_call"}
+              }
+              _assert_text_has_no_block(self, repr(other_args))
+
+
+class ModelAdmissionTests(unittest.TestCase):
+  """Explanation spec v0.2 §4: before any EAB/1 or EGX/2 model call the
+  block is re-validated and `contains_raw_misp_payload` is computed from it;
+  a `True` flag fails the packet redaction check, the block is dropped from
+  model input and from the response, and the response keeps working."""
+
+  def _injected_block(self):
+    block = _valid_block()
+    block["nodes"][0]["fields"]["cwe"] = {"nested": "object"}
+    return block
+
+  def test_valid_block_is_admitted_and_flag_is_false(self):
+    plugin = _make_api()
+    block = _valid_block()
+    self.assertIs(misp_enrichment.contains_raw_misp_payload(block), False)
+    self.assertIs(misp_enrichment.contains_raw_misp_payload(None), False)
+    self.assertIs(plugin._admit_misp_enrichment_for_model({"redaction": {}}, block), block)
+
+  def test_injected_nested_object_sets_the_flag_and_is_rejected(self):
+    plugin = _make_api()
+    block = self._injected_block()
+    self.assertIs(misp_enrichment.contains_raw_misp_payload(block), True)
+    # The same flag fails the packet redaction check closed.
+    errors = []
+    api_module._validate_packet_redaction({
+      "policy": api_module.GRAPH_PACKET_REDACTION_POLICY,
+      "contains_customer_evidence": False,
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(block),
+    }, errors)
+    self.assertEqual([error["code"] for error in errors], ["raw_misp_payload_not_allowed"])
+    self.assertIsNone(plugin._admit_misp_enrichment_for_model({"redaction": {}}, block))
+    self.assertEqual(plugin._misp_enrichment_error_count, 1)
+    self.assertEqual(plugin._misp_enrichment_last_error, "model_admission")
+
+  def test_producer_declared_false_is_ignored(self):
+    # The flag is never declared by the producer: a packet claiming `False`
+    # does not admit an invalid block.
+    plugin = _make_api()
+    packet = {"redaction": {"contains_raw_misp_payload": False}}
+    self.assertIsNone(plugin._admit_misp_enrichment_for_model(packet, self._injected_block()))
+
+  def _analyst_packet(self):
+    return {
+      "graph": {"nodes": [], "relationships": []},
+      "redaction": {
+        "policy": api_module.GRAPH_PACKET_REDACTION_POLICY,
+        "contains_customer_evidence": False,
+        "contains_raw_misp_payload": False,
+      },
+    }
+
+  def _digest(self):
+    return {
+      "schema_version": "edgeguard.result_digest.v1",
+      "summary": {"text": "One CVE."},
+      "counts": {"returned_rows": 1},
+      "coverage": {"complete": True},
+      "groups": [{"id": "R0", "relationship_types": []}],
+      "exact_inventory": {
+        "columns": ["c"],
+        "nodes": [{"ref": "N0", "labels": ["CVE"], "properties": [["cve_id", "CVE-2000-0001"]]}],
+        "relationships": [],
+        "paths": [],
+      },
+    }
+
+  def _run_analyst(self, block):
+    payloads = []
+    plugin = _make_api(graph_first_provider=lambda payload: payloads.append(payload) or {
+      "content": json.dumps({"text": "The result holds CVE-2000-0001, classed as CWE-79."}),
+      "finish_reason": "stop", "completion_tokens": 12,
+    })
+    result = plugin._run_digest_analyst_brief(
+      digest=self._digest(), packet=self._analyst_packet(), packet_meta={}, validation=None,
+      live_retry={}, request="Explain", deadline=time.monotonic() + 1000,
+      misp_enrichment_block=block,
+    )
+    return plugin, result, payloads
+
+  def test_eab1_model_call_carries_a_valid_block_as_evidence(self):
+    _plugin, result, payloads = self._run_analyst(_valid_block())
+    self.assertEqual(len(payloads), 1)
+    document = json.loads(payloads[0]["messages"][1]["content"])
+    self.assertEqual(document["misp_enrichment"]["nodes"][0]["fields"]["cwe"], ["CWE-79"])
+    self.assertEqual(result["analyst_brief"]["status"], "available")
+    self.assertIn("misp_enrichment", result)
+    _assert_text_has_no_block(self, json.dumps(result["explanation_trace"]))
+
+  def test_eab1_rejected_block_never_reaches_the_model_and_response_keeps_working(self):
+    plugin, result, payloads = self._run_analyst(self._injected_block())
+    self.assertEqual(len(payloads), 1)
+    self.assertNotIn("misp_enrichment", payloads[0]["messages"][1]["content"])
+    self.assertNotIn("nested", json.dumps(payloads))
+    self.assertEqual(result["status"], "ok")
+    self.assertNotIn("misp_enrichment", result)
+    self.assertEqual(plugin._misp_enrichment_last_error, "model_admission")
+
+  def _egx2_packet(self):
+    return {
+      "graph": {
+        "nodes": [
+          {"id": "i1", "labels": ["Indicator"], "properties": {"value": "203.0.113.7", "indicator_type": "ipv4", "confidence_score": 0.5}},
+          {"id": "i2", "labels": ["Indicator"], "properties": {"value": "203.0.113.8", "indicator_type": "ipv4", "confidence_score": 0.5}},
+          {"id": "m1", "labels": ["Malware"], "properties": {"name": "quietsieve", "confidence_score": 0.6}},
+        ],
+        "relationships": [
+          {"id": "r1", "type": "INDICATES", "startNodeId": "i1", "endNodeId": "m1", "properties": {}},
+          {"id": "r2", "type": "INDICATES", "startNodeId": "i2", "endNodeId": "m1", "properties": {}},
+        ],
+        "truncated": False,
+      },
+    }
+
+  def _indicator_block(self, *, inject=False):
+    rows = [{
+      "element_id": "e-i1", "labels": ["Indicator"], "misp_event_ids": ["901"], "misp_attribute_ids": ["attr-1"],
+      "source": "alienvault_otx", "last_imported_from": None,
+      "sourced": [{"source_id": "alienvault_otx", "raw_data": json.dumps({"pulse_name": "Synthetic Pulse"})}],
+    }]
+    block = misp_enrichment.build_misp_enrichment_block(rows, {"e-i1": "N0"})
+    if inject:
+      block["nodes"][0]["fields"]["pulse_name"] = {"nested": "object"}
+    return block
+
+  def _run_egx2(self, block):
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"finish_reason": "stop", "completion_tokens": 50, "content": json.dumps({
+        "assessment": "The indicators likely map to one malware family.",
+        "observations": [{
+          "text": "Pulse Synthetic Pulse lists 203.0.113.7, which indicates \"quietsieve\".",
+          "insight_ids": ["I1"], "exemplar_entities": ["203.0.113.7", "quietsieve"],
+          "misp_citations": [{"entity": "203.0.113.7", "field": "pulse_name", "value": "Synthetic Pulse"}],
+        }],
+        "why_it_matters": "Shared infrastructure suggests common tooling.",
+        "next_checks": [],
+        "confidence": {"tier": "low", "basis": "per the sheet confidence insight"},
+      })}
+
+    plugin = _make_api(graph_first_provider=provider)
+    result = plugin._run_insight_brief(
+      digest={"counts": {"returned_rows": 2}}, packet=self._egx2_packet(), packet_meta={},
+      validation=None, live_retry={}, request="Explain", deadline=time.monotonic() + 1000,
+      misp_enrichment_block=block, misp_node_aliases={"i1": "N0"},
+    )
+    return plugin, result, payloads
+
+  def test_egx2_model_call_carries_a_valid_block_and_grounds_the_citation(self):
+    _plugin, result, payloads = self._run_egx2(self._indicator_block())
+    self.assertEqual(len(payloads), 1)
+    self.assertIn("MISP ENRICHMENT", payloads[0]["messages"][1]["content"])
+    self.assertIn("Synthetic Pulse", payloads[0]["messages"][1]["content"])
+    self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
+    self.assertIn("misp_enrichment", result)
+    _assert_text_has_no_block(self, json.dumps(result["explanation_trace"]))
+    _assert_text_has_no_block(self, json.dumps(result["packet"]))
+
+  def test_egx2_rejected_block_never_reaches_the_model(self):
+    plugin, result, payloads = self._run_egx2(self._indicator_block(inject=True))
+    self.assertTrue(payloads)
+    for payload in payloads:
+      self.assertNotIn("MISP ENRICHMENT", payload["messages"][1]["content"])
+      self.assertNotIn("nested", payload["messages"][1]["content"])
+    self.assertEqual(result["status"], "ok")
+    self.assertNotIn("misp_enrichment", result)
+    self.assertEqual(plugin._misp_enrichment_last_error, "model_admission")
+
+
+class ModelInputIsolationTests(unittest.TestCase):
+  """What the slice-3a isolation tests pinned, minus EAB/1 and EGX/2: end
+  to end through `explain_graph`, the block reaches the explanation model's
+  structured evidence only -- never the explanation trace, the packet, the
+  digest, a log line, or any provider call other than the EAB/1 brief."""
+
+  def test_block_reaches_only_the_eab1_evidence(self):
+    payloads = []
+    logs = []
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      graph_first_provider=lambda payload: payloads.append(payload) or {
+        "content": json.dumps({"text": "Indicator 203.0.113.7 is in the pulse Synthetic Pulse."}),
+        "finish_reason": "stop", "completion_tokens": 12,
+      },
+    )
+    plugin.P = lambda *args, **kwargs: logs.append(repr((args, kwargs)))
+    plugin.Pd = lambda *args, **kwargs: logs.append(repr((args, kwargs)))
+    indicator = _GraphNode("indicator-1", ["Indicator"], {
+      "value": "203.0.113.7", "misp_event_ids": ["901"], "misp_attribute_ids": ["attr-1"],
+    })
+    source = _GraphNode("source-1", ["Source"], {"name": "AlienVault OTX"})
+    record = _DriverRecord({"i": indicator, "s": source}, {"i": {"value": "203.0.113.7"}, "s": {"name": "AlienVault OTX"}})
+    misp_rows = [{
+      "element_id": "indicator-1", "labels": ["Indicator"],
+      "misp_event_ids": ["901"], "misp_attribute_ids": ["attr-1"],
+      "source": "alienvault_otx", "last_imported_from": None,
+      "sourced": [{"source_id": "alienvault_otx", "raw_data": json.dumps({"pulse_name": "Synthetic Pulse"})}],
+    }]
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = [_Result([record], keys=["i", "s"]), misp_rows]
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          request="Explain the indicator",
+          cypher="MATCH (i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN i, s LIMIT 10",
+        )
+    self.assertEqual(result["status"], "ok")
+    self.assertIn("misp_enrichment", result)
+    self.assertEqual(len(payloads), 1)
+    self.assertEqual(payloads[0]["metadata"]["task"], "edgeguard_result_digest_analyst_brief")
+    system_prompt, user_content = (message["content"] for message in payloads[0]["messages"])
+    self.assertNotIn("Synthetic Pulse", system_prompt)
+    document = json.loads(user_content)
+    self.assertEqual(document["misp_enrichment"]["nodes"][0]["fields"]["pulse_name"], "Synthetic Pulse")
+    _assert_text_has_no_block(self, json.dumps(document["result_view"]))
+    # The brief quoting the pulse name passed grounding end to end.
+    self.assertEqual(result["analyst_brief"]["status"], "available")
+    for key in ("explanation_trace", "packet", "packet_meta", "result_digest"):
+      with self.subTest(key=key):
+        _assert_text_has_no_block(self, json.dumps(result.get(key)))
+    _assert_text_has_no_block(self, "\n".join(logs))
 
 
 class ResponsePathsCarryTheBlockTests(unittest.TestCase):
@@ -1130,6 +1379,8 @@ class ResponsePathsCarryTheBlockTests(unittest.TestCase):
       target="extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
     )
     self.assertEqual(spy.call_count, 1)
+    # The transport-truncated EGX/2 path is deterministic (no model call),
+    # so it still never receives the block.
     _assert_no_block_leak(self, spy)
     self.assertEqual(result["status"], "ok")
     self.assertIn("misp_enrichment", result)
@@ -1140,6 +1391,150 @@ class ResponsePathsCarryTheBlockTests(unittest.TestCase):
     self.assertEqual(result["status"], "ok")
     self.assertIn("misp_enrichment", result)
     self.assertEqual(result["misp_enrichment"]["nodes"][0]["misp_event_ids"], ["901"])
+
+
+class BuildModelViewTests(unittest.TestCase):
+  """Direct tests of `misp_enrichment.build_model_view` (spec v0.2 §5)."""
+
+  def _block(self, raw_data_list):
+    rows = [
+      _cve_row(element_id=f"cve-{i}", event_ids=(str(960 + i),), raw_data=raw_data)
+      for i, raw_data in enumerate(raw_data_list)
+    ]
+    block = misp_enrichment.build_misp_enrichment_block(rows, {f"cve-{i}": f"N{i}" for i in range(len(rows))})
+    self.assertTrue(misp_enrichment.validate_misp_enrichment_block(block))
+    return block
+
+  @staticmethod
+  def _size(view):
+    return len(json.dumps(view, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+  def test_arrays_are_capped_at_five_items_and_flagged(self):
+    block = self._block([{"cwe": [f"CWE-{i}" for i in range(7)]}])
+    view = misp_enrichment.build_model_view(block, max_bytes=10_000)
+    self.assertEqual(view["nodes"][0]["fields"]["cwe"], [f"CWE-{i}" for i in range(5)])
+    self.assertTrue(view["truncated"])
+    self.assertEqual(view["omitted_nodes"], 0)
+
+  def test_small_block_is_untruncated_and_drops_bookkeeping(self):
+    block = self._block([{"cwe": ["CWE-79"]}])
+    view = misp_enrichment.build_model_view(block, max_bytes=10_000)
+    self.assertFalse(view["truncated"])
+    node = view["nodes"][0]
+    self.assertEqual(set(node), {"node_ref", "label", "misp_event_ids", "fields"})
+    self.assertNotIn("last_imported_from", node["fields"])
+
+  def test_largest_field_is_dropped_first_ties_by_field_name(self):
+    block = self._block([{"cwe": ["c" * 100], "affected_products": ["a" * 100], "cisa_action_due": "2000-01-01"}])
+    full = misp_enrichment.build_model_view(block, max_bytes=10_000)
+    view = misp_enrichment.build_model_view(block, max_bytes=self._size(full) - 1)
+    # `affected_products` and `cwe` tie on size: the name-first one goes.
+    self.assertEqual(set(view["nodes"][0]["fields"]), set(full["nodes"][0]["fields"]) - {"affected_products"})
+    self.assertTrue(view["truncated"])
+    block = self._block([{"cwe": ["c" * 50], "affected_products": ["a" * 100]}])
+    full = misp_enrichment.build_model_view(block, max_bytes=10_000)
+    view = misp_enrichment.build_model_view(block, max_bytes=self._size(full) - 1)
+    self.assertIn("cwe", view["nodes"][0]["fields"])
+    self.assertNotIn("affected_products", view["nodes"][0]["fields"])
+
+  def test_entity_and_field_filters(self):
+    block = self._block([{"cwe": ["CWE-79"], "affected_products": ["p1"]}, {"cwe": ["CWE-80"]}])
+    view = misp_enrichment.build_model_view(
+      block, max_bytes=10_000,
+      entity_by_ref={"N1": "CVE-2000-0002"},
+      fields_by_label={"CVE": ("cwe",)},
+    )
+    self.assertEqual([node["node_ref"] for node in view["nodes"]], ["N1"])
+    self.assertEqual(view["nodes"][0]["entity"], "CVE-2000-0002")
+    self.assertEqual(view["nodes"][0]["fields"], {"cwe": ["CWE-80"]})
+    self.assertEqual(view["omitted_nodes"], 1)
+    self.assertTrue(view["truncated"])
+
+  def test_never_over_budget_and_deterministic(self):
+    block = self._block([
+      {"cwe": ["CWE-79"], "affected_products": ["x" * 120, "y" * 80]},
+      {"cwe": ["CWE-80"], "cisa_vulnerability_name": "Synthetic Name"},
+      {"cwe": ["CWE-81"]},
+    ])
+    full = self._size(misp_enrichment.build_model_view(block, max_bytes=10_000))
+    for budget in range(1, full + 20):
+      view = misp_enrichment.build_model_view(block, max_bytes=budget)
+      self.assertEqual(view, misp_enrichment.build_model_view(block, max_bytes=budget))
+      if view is not None:
+        self.assertLessEqual(self._size(view), budget)
+        self.assertEqual(len(view["nodes"]) + view["omitted_nodes"], 3)
+
+  def test_invalid_block_yields_no_view(self):
+    block = self._block([{"cwe": ["CWE-79"]}])
+    block["nodes"][0]["fields"]["cwe"] = {"nested": "object"}
+    self.assertIsNone(misp_enrichment.build_model_view(block, max_bytes=10_000))
+    self.assertIsNone(misp_enrichment.build_model_view(None, max_bytes=10_000))
+
+
+class InsightBriefModelInputIsolationTests(unittest.TestCase):
+  """The `insight_brief` twin of `ModelInputIsolationTests`: end to end
+  through `explain_graph`, the block reaches only the EGX/2 prompt's
+  enrichment section."""
+
+  def test_block_reaches_only_the_egx2_enrichment_section(self):
+    payloads = []
+    logs = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {"finish_reason": "stop", "completion_tokens": 40, "content": json.dumps({
+        "assessment": "The result is likely a small set of IPv4 indicators.",
+        "observations": [{"text": "Two ipv4 indicators were returned.", "insight_ids": ["I1"], "exemplar_entities": []}],
+        "why_it_matters": "The indicators share one type.",
+        "next_checks": [],
+        "confidence": {"tier": "low", "basis": "per the sheet confidence insight"},
+      })}
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    plugin.P = lambda *args, **kwargs: logs.append(repr((args, kwargs)))
+    plugin.Pd = lambda *args, **kwargs: logs.append(repr((args, kwargs)))
+    first = _GraphNode("indicator-1", ["Indicator"], {
+      "value": "203.0.113.7", "indicator_type": "ipv4",
+      "misp_event_ids": ["901"], "misp_attribute_ids": ["attr-1"],
+    })
+    second = _GraphNode("indicator-2", ["Indicator"], {"value": "203.0.113.8", "indicator_type": "ipv4"})
+    records = [
+      _DriverRecord({"i": first}, {"i": {"value": "203.0.113.7"}}),
+      _DriverRecord({"i": second}, {"i": {"value": "203.0.113.8"}}),
+    ]
+    misp_rows = [{
+      "element_id": "indicator-1", "labels": ["Indicator"],
+      "misp_event_ids": ["901"], "misp_attribute_ids": ["attr-1"],
+      "source": "alienvault_otx", "last_imported_from": None,
+      "sourced": [{"source_id": "alienvault_otx", "raw_data": json.dumps({"pulse_name": "Synthetic Pulse"})}],
+    }]
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = [_Result(records, keys=["i"]), misp_rows]
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          request="Explain the indicators",
+          cypher="MATCH (i:Indicator) RETURN i LIMIT 10",
+        )
+    self.assertEqual(result["status"], "ok")
+    self.assertIn("misp_enrichment", result)
+    self.assertTrue(payloads)
+    for payload in payloads:
+      self.assertEqual(payload["metadata"]["task"], "edgeguard_insight_brief")
+      system_prompt, user_content = (message["content"] for message in payload["messages"])
+      _assert_text_has_no_block(self, system_prompt)
+      head, marker, tail = user_content.partition("\n\nMISP ENRICHMENT")
+      self.assertTrue(marker)
+      _assert_text_has_no_block(self, head)
+      self.assertIn("Synthetic Pulse", tail)
+    for key in ("explanation_trace", "packet", "packet_meta", "result_digest", "case_explanation"):
+      with self.subTest(key=key):
+        _assert_text_has_no_block(self, json.dumps(result.get(key)))
+    _assert_text_has_no_block(self, "\n".join(logs))
 
 
 if __name__ == "__main__":

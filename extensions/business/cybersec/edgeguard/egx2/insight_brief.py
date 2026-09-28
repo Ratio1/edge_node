@@ -23,6 +23,7 @@ from . import brief_gates
 from . import brief_profile
 from . import field_catalog as fc
 from . import insights
+from .. import misp_enrichment as misp
 from ..graph_first_runtime import GraphFirstRuntimeError
 
 PROFILE_ID = "EGX/2"
@@ -40,6 +41,10 @@ MAX_NEXT_CHECKS = 3
 DEFAULT_BRIEF_BUDGET = (2, 2)
 MODE_BRIEF_BUDGETS = {"thorough": (3, 3)}
 TEXT_LIMIT = 1_000
+# Explanation spec v0.2 §5: byte budget of the `misp_enrichment` model view
+# in the user message (the field legend is bounded by the catalog).
+ENRICHMENT_VIEW_MAX_BYTES = 2_048
+MAX_CITATIONS = 4
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 RETRY_NOTE_TEMPLATE = (
@@ -62,6 +67,9 @@ PROFILE_MANIFEST = {
   "system_prompt": brief_profile.SYSTEM,
   "user_template": brief_profile.USER_TEMPLATE,
   "retry_note_template": RETRY_NOTE_TEMPLATE,
+  "enrichment_template": brief_profile.ENRICHMENT_TEMPLATE,
+  "enrichment_system_sentence": brief_profile.ENRICHMENT_SYSTEM_SENTENCE,
+  "enrichment_view_max_bytes": ENRICHMENT_VIEW_MAX_BYTES,
   "sampling": {"temperature": TEMPERATURE, "top_p": TOP_P, "top_k": 20},
   "max_tokens": MAX_TOKENS,
   "hard_gates": sorted(brief_gates.HARD_GATES),
@@ -81,6 +89,52 @@ def _entity_id_map(graph: Mapping[str, Any]) -> dict[str, str]:
       if isinstance(value, str) and value:
         mapping.setdefault(value.lower(), str(node.get("id")))
   return mapping
+
+
+def _enrichment_view(
+  block: Optional[Mapping[str, Any]],
+  graph: Mapping[str, Any],
+  node_ids: Optional[Mapping[str, str]],
+) -> Optional[dict[str, Any]]:
+  """Explanation spec v0.2 §5: the compact `misp_enrichment` view for the
+  prompt. Each block node is joined to its packet-graph node through
+  `node_ids` (digest node ref -> packet node id) and named by the same
+  display value the sheet uses; only catalogued fields are kept, and the
+  view is trimmed to `ENRICHMENT_VIEW_MAX_BYTES`. The block is re-validated
+  (`build_model_view`); anything invalid or unjoinable yields `None`."""
+  if block is None or not node_ids:
+    return None
+  nodes_by_id = {str(node.get("id")): node for node in graph.get("nodes", []) or []}
+  entity_by_ref: dict[str, str] = {}
+  for node_ref, node_id in node_ids.items():
+    node = nodes_by_id.get(str(node_id))
+    if node is None:
+      continue
+    view = fc.project(node)
+    for key in ("name", "value", "cve_id", "mitre_id"):
+      value = view.get(key)
+      if isinstance(value, str) and value:
+        entity_by_ref[str(node_ref)] = value
+        break
+  if not entity_by_ref:
+    return None
+  return misp.build_model_view(
+    block,
+    max_bytes=ENRICHMENT_VIEW_MAX_BYTES,
+    entity_by_ref=entity_by_ref,
+    fields_by_label=fc.MISP_ENRICHMENT_CATALOG,
+  )
+
+
+def _render_enrichment(view: Optional[Mapping[str, Any]]) -> Optional[str]:
+  """The view plus the catalog meaning of every field it carries."""
+  if view is None:
+    return None
+  meanings = fc.misp_enrichment_meanings(sorted({node["label"] for node in view["nodes"]}))
+  present = {field for node in view["nodes"] for field in node["fields"]}
+  return brief_profile.render_enrichment(
+    view, {field: meaning for field, meaning in meanings.items() if field in present},
+  )
 
 
 def _entity_ids_for(names: list[str], id_map: Mapping[str, str]) -> list[str]:
@@ -169,11 +223,27 @@ def _parse_brief(content: str, trace: Optional[Mapping[str, Any]]) -> dict[str, 
       raise GraphFirstRuntimeError("invalid_brief_shape", "response_parse", "observation insight_ids are invalid", trace)
     if entities is not None and (not isinstance(entities, list) or not all(isinstance(x, str) for x in entities)):
       raise GraphFirstRuntimeError("invalid_brief_shape", "response_parse", "observation exemplar_entities are invalid", trace)
-    brief["observations"].append({
+    parsed_observation = {
       "text": _validated_text(item.get("text"), "invalid_brief_text", trace),
       "insight_ids": list(ids),
       "exemplar_entities": list(entities or []),
-    })
+    }
+    # Explanation spec v0.2 §5: optional typed enrichment citations, graded
+    # by the `enrichment_grounding` gate; never copied to the public case.
+    citations = item.get("misp_citations")
+    if citations is not None:
+      if not isinstance(citations, list) or len(citations) > MAX_CITATIONS or not all(
+        isinstance(c, Mapping)
+        and set(c) == {"entity", "field", "value"}
+        and isinstance(c.get("entity"), str)
+        and isinstance(c.get("field"), str)
+        and isinstance(c.get("value"), (str, int, float))
+        and not isinstance(c.get("value"), bool)
+        for c in citations
+      ):
+        raise GraphFirstRuntimeError("invalid_brief_shape", "response_parse", "observation misp_citations are invalid", trace)
+      parsed_observation["misp_citations"] = [dict(c) for c in citations]
+    brief["observations"].append(parsed_observation)
   brief["next_checks"] = []
   for item in next_checks:
     if not isinstance(item, Mapping):
@@ -255,6 +325,8 @@ def run_insight_brief(
   allow_model: bool = True,
   deterministic_reason: Optional[str] = None,
   mode: Optional[str] = None,
+  misp_enrichment: Optional[Mapping[str, Any]] = None,
+  misp_node_ids: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
   sheet = insights.build_insight_sheet(graph)
   substantive = [ins for ins in sheet if ins.get("kind") != "confidence"]
@@ -280,10 +352,12 @@ def run_insight_brief(
     return {"case_explanation": case, "explanation_trace": _trace([], "fallback", "model_not_admitted")}
 
   max_observations, max_next_checks = MODE_BRIEF_BUDGETS.get(mode or "", DEFAULT_BRIEF_BUDGET)
+  enrichment_view = _enrichment_view(misp_enrichment, graph, misp_node_ids)
   prompt = brief_profile.build_brief_prompt(
     sheet, question,
     max_observations=max_observations,
     max_next_checks=max_next_checks,
+    enrichment=_render_enrichment(enrichment_view),
   )
   calls: list[dict[str, Any]] = []
   failure_code: Optional[str] = None
@@ -333,7 +407,7 @@ def run_insight_brief(
       if not isinstance(content, str) or not content:
         raise GraphFirstRuntimeError("missing_content", "completion", "brief content is missing")
       brief = _parse_brief(content, None)
-      results = brief_gates.grade(brief, sheet)
+      results = brief_gates.grade(brief, sheet, enrichment_view)
       hard_failures = {
         name: detail for name, (passed, detail, tier) in results.items()
         if tier == "hard" and not passed
