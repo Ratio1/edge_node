@@ -299,7 +299,7 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
     pipeline["DEEPLOY_SPECS"]["job_app_type"] = "service"
     pipeline["DEEPLOY_SPECS"]["current_target_nodes"] = ["node1", "node2", "node3"]
     pipeline["PLUGINS"][0]["INSTANCES"][0].update({
-      "IMAGE": "ghcr.io/ratio1/r1-meshdb@sha256:" + ("a" * 64),
+      "IMAGE": "ghcr.io/ratio1/r1db@sha256:" + ("a" * 64),
       "ENV": {
         "CRDB_DATABASE": "appdb",
         "CRDB_USER": "app_user",

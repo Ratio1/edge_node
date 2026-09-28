@@ -1,8 +1,8 @@
-# R1 MeshDB Verify-Full Testbed
+# R1DB Verify-Full Testbed
 
 This local-only bed starts three real edge runtimes on a private broker. The
 validator then uses the edge certificate-preparation helper and the exact
-published R1 MeshDB digest to run a three-node SQL cluster on the same isolated
+published R1DB v1.0.7 digest to run a three-node SQL cluster on the same isolated
 network. No dAuth, Cloudflare, remote node, or live Deeploy resource is used.
 
 Run from the `edge_node` worktree root:

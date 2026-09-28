@@ -123,18 +123,14 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     plugin = make_deeploy_plugin()
     digest = "sha256:" + ("a" * 64)
     accepted = (
-      "ghcr.io/ratio1/r1-meshdb:v1.0.0",
       "ghcr.io/ratio1/r1db:v1.0.7",
       f"ghcr.io/ratio1/r1db@{digest}",
-      f"ghcr.io/ratio1/r1-meshdb@{digest}",
-      f"ghcr.io/ratio1/r1-meshdb:v1.0.0@{digest}",
       "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
       f"ghcr.io/ratio1/deeploy-cockroachdb-service@{digest}",
       f"ghcr.io/ratio1/deeploy-cockroachdb-service:main@{digest}",
     )
     rejected = (
-      "ghcr.io/example/r1-meshdb:latest",
-      "ghcr.io/ratio1/r1-meshdb-helper:latest",
+      "ghcr.io/ratio1/r1-meshdb:v1.0.6",
       "ghcr.io/example/r1db:latest",
       "ghcr.io/ratio1/r1db-helper:latest",
       "ghcr.io/ratio1/deeploy-cockroachdb-service2:main",
