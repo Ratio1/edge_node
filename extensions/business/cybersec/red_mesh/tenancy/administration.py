@@ -585,6 +585,25 @@ class TenantAdministrationService:
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid current execution facts") from exc
 
+  def engagement_end_reason(self, tenant_id, engagement_id):
+    """Why an admitted job's engagement no longer covers it, or None while it does.
+
+    RM-095 (owner, 2026-09-28): a continuous job hard-stops when its engagement ends, at
+    `valid_until` or on a revoke. System-internal like `reauthorize_execution`: the launcher asks
+    it for jobs it already admitted. A store it cannot read raises `TenantStoreError`, so a
+    transient outage never reads as an ended engagement.
+    """
+    if not valid_engagement_id(engagement_id):
+      return "engagement_not_found"
+    row = self.store.get("engagement", tenant_id, engagement_id)
+    if row is None:
+      return "engagement_not_found"
+    if row["active"] is not True:
+      return "engagement_revoked"
+    if self.clock() >= datetime.fromisoformat(row["valid_until"]):
+      return "engagement_expired"
+    return None
+
   @_endpoint
   def get_tenant_nodes(self, actor, tenant_id):
     tenant, account = self._authorized_tenant(actor, tenant_id)
