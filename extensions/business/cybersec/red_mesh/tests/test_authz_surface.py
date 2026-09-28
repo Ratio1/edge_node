@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 76  # +1 typed rulebook artifact read (RM-086)
+EXPECTED_ENDPOINTS = 87  # +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -29,6 +29,16 @@ ENDPOINT_FIRST_ARGS = {
   'update_tenant_node_failure_policy': 'actor',
   'get_tenant_members': 'actor',
   'check_tenant_domain': 'actor',
+  # RM-095 phase 1: the contract a tenant is created around.
+  'upload_tenant_contract': 'actor',
+  'get_tenant_contract': 'actor',
+  'download_tenant_contract': 'actor',
+  'upload_engagement_document': 'actor',
+  'create_engagement': 'actor',
+  'list_engagements': 'actor',
+  'get_engagement': 'actor',
+  'revoke_engagement': 'actor',
+  'download_engagement_document': 'actor',
   'authorize_tenant_membership': 'actor',
   # RM-083: an account is approved together with its one tenant membership.
   'authorize_tenant_account_creation': 'actor',
@@ -54,6 +64,8 @@ ENDPOINT_FIRST_ARGS = {
   'list_local_jobs': 'request_actor',
   'export_misp': 'job_id',
   'export_misp_json': 'job_id',
+  'export_stix_json': 'job_id',
+  'export_siem_events_json': 'job_id',
   'get_misp_export_status': 'job_id',
   'get_misp_export_config_status': 'request_actor',
   'get_integration_status': 'request_actor',
@@ -111,7 +123,8 @@ def _known_rollout(plugin):
   plugin.cfg_instance_id = "fixture-instance"
   plugin._execution_service = lambda: MagicMock()
 
-  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None):
+  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None,
+            engagement_id=None, require_engagement=False):
     account, denial = plugin._resolve_launch_actor(actor)
     if denial:
       return None, None, denial

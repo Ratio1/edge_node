@@ -117,10 +117,38 @@ def test_real_configuration_producer_preserves_independent_flags_and_never_expos
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
+    # Node URL and key alone never make a tenant "configured": the fixture tenant has no record,
+    # and a push would be refused (RM-093, I-039).
     assert actual == {"enabled": enabled, "auto_export": auto_export,
-                      "misp_configured": configured, "min_severity": expected}
+                      "misp_configured": False, "min_severity": expected}
     assert calls == 1 and SECRET not in str(result) and URL not in str(result)
     fixture.owner.P.assert_not_called()
+
+
+@pytest.mark.parametrize("record,node_credentials,expected", (
+  ({"MISP_URL": URL, "MISP_API_KEY": SECRET}, False, True),
+  ({"MISP_URL": URL}, False, False),
+  ({"MIN_SEVERITY": "HIGH"}, True, True),
+  (None, True, False),
+))
+def test_misp_configured_reflects_the_tenant_record(record, node_credentials, expected):
+  """RM-093 (I-039): the Push button is enabled from this flag, so it says whether THIS tenant's
+  destination is ready: a record whose merged config has URL and key. Node credentials count only
+  once the tenant has a record of its own."""
+  from types import SimpleNamespace
+
+  class RecordOwner(SimpleNamespace):
+    def _get_tenant_integration_config(self, tenant_id, integration_id):
+      if record is None or (tenant_id, integration_id) != ("tn-1", "misp"):
+        return None
+      return {"tenant_id": tenant_id, "integration_id": integration_id, "enabled": True,
+              "config": deepcopy(record)}
+
+  node = {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET} if node_credentials else {"ENABLED": True}
+  owner = RecordOwner(CONFIG={"MISP_EXPORT": node}, config_data={})
+  actual = _MispExportMixin._get_misp_export_config(owner, "tn-1")
+  assert actual["misp_configured"] is expected
+  assert set(actual) == set(DEFAULT) and SECRET not in str(actual) and URL not in str(actual)
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))

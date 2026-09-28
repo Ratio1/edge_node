@@ -1,6 +1,9 @@
 """dAuth registry lookup and ChainStore routing helpers."""
 
 
+DAUTH_SECRET_PIPELINE_CID_KEY = "pipeline_cid"
+
+
 def resolve_dauth_registry_internal_peers(plugin, eth_oracles):
   """Resolve cached registry ETH addresses through current NetMon state."""
   current_eth = plugin.bc.eth_address.lower()
@@ -45,13 +48,19 @@ def get_cached_dauth_registry_internal_peers(plugin):
 
 
 def get_dauth_registry_internal_peers(plugin):
-  """Return cached peers when available, otherwise load a registry snapshot."""
+  """Return cached manager peers or resolve peers for another plugin."""
   if (
     getattr(plugin, "_dauth_registry_eth_oracles", None)
     or hasattr(plugin, "_dauth_registry_internal_peers")
   ):
     return get_cached_dauth_registry_internal_peers(plugin)
-  peers, _ = load_dauth_registry_snapshot(plugin)
+  peers, _ = plugin.bc.get_dauth_oracles()
+  peers = list(dict.fromkeys(
+    peer for peer in peers or []
+    if isinstance(peer, str) and peer
+  ))
+  if not peers:
+    raise ValueError("No dAuth registry internal peers are available.")
   return peers
 
 

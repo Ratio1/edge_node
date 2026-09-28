@@ -28,8 +28,10 @@ from .misp_export import (
 from .stix_export import (
   build_stix_bundle,
   export_stix_bundle,
+  export_stix_json,
   get_stix_export_status,
 )
+from .siem_export import export_siem_events_json
 from .rulebook_assessment import (
   DEFAULT_RULEBOOK_PROFILE_ID,
   build_rulebook_assessment,
@@ -221,7 +223,9 @@ __all__ = [
   "dry_run_opencti_export",
   "dry_run_taxii_export",
   "export_misp_json",
+  "export_siem_events_json",
   "export_stix_bundle",
+  "export_stix_json",
   "generate_rulebook_assessment",
   "get_misp_export_status",
   "get_opencti_export_status",

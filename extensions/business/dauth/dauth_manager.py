@@ -40,6 +40,7 @@ _CONFIG = {
   'PORT': None,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
+  'REQUEST_TIMEOUT': 600,
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
@@ -488,3 +489,24 @@ class DauthManagerPlugin(
       **data
     })
     return response
+
+  @BasePlugin.endpoint(method="post")
+  # /reveal_job_secrets
+  def reveal_job_secrets(self, body: dict):
+    """Relay a wallet-authorized job-secret reveal to a Deeploy oracle."""
+    request_nonce = body.get("nonce") if isinstance(body, dict) else None
+    if not self._is_dauth_server_enabled():
+      return self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle',
+        'nonce': request_nonce,
+      })
+
+    try:
+      data = self.process_dauth_reveal_secret_request(body)
+    except Exception as e:
+      self.P("Error processing reveal_job_secrets request: {}".format(e), color='r')
+      data = {'error': str(e)}
+    return self.__get_response({
+      'nonce': request_nonce,
+      **data,
+    })

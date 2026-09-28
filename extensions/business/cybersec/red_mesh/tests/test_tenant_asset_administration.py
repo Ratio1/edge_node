@@ -9,6 +9,7 @@ from extensions.business.cybersec.red_mesh.tenancy.administration import TenantA
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+from .contract_fixture import contract_terms
 
 
 def asset_location(tenant_id, asset_id):
@@ -26,7 +27,7 @@ class TestTenantAssetAdministration(unittest.TestCase):
     self.service = TenantAdministrationService(CstoreAuthAccountReader(self.owner), self.store)
     self.actor = {"account_id": "creator"}
     request = str(uuid4())
-    self.tenant = self.service.prepare_tenant(self.actor, request, "Tenant", "tenant", "initial")["data"]["tenantId"]
+    self.tenant = self.service.prepare_tenant(self.actor, request, "Tenant", "tenant", "initial", **contract_terms())["data"]["tenantId"]
     self.owner.grant("initial", self.tenant)
     self.assertTrue(self.service.activate_tenant(self.actor, request)["success"])
     self.request = str(uuid4())
@@ -96,7 +97,7 @@ class TestTenantAssetAdministration(unittest.TestCase):
     foreign_request = str(uuid4())
     self.owner.account("initial-foreign")
     foreign = self.service.prepare_tenant(self.actor, foreign_request, "Foreign", "foreign",
-                                          "initial-foreign")["data"]["tenantId"]
+                                          "initial-foreign", **contract_terms())["data"]["tenantId"]
     result = self.service.get_tenant_asset(self.actor, foreign, asset["assetId"])
     self.assertEqual(result["status_code"], 404, result)
     self.assertNotIn("data", result)

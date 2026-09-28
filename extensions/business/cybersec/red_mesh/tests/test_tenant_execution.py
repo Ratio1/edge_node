@@ -9,6 +9,7 @@ from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
 
 from . import test_tenant_asset_administration as fixtures
+from .contract_fixture import contract_terms
 
 
 class TestTenantExecution(unittest.TestCase):
@@ -304,7 +305,7 @@ class TestTenantExecution(unittest.TestCase):
     own_asset = self.ready()
     request = str(uuid4())
     self.owner.account("initial-other")
-    foreign = self.service.prepare_tenant(self.actor, request, "Other", "other", "initial-other")["data"]["tenantId"]
+    foreign = self.service.prepare_tenant(self.actor, request, "Other", "other", "initial-other", **contract_terms())["data"]["tenantId"]
     self.owner.grant("initial-other", foreign)
     self.assertTrue(self.service.activate_tenant(self.actor, request)["success"])
     foreign_asset = self.service.create_tenant_asset(self.actor, foreign, str(uuid4()), "Other asset", self.target)["data"]

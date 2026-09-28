@@ -10,6 +10,7 @@ from uuid import uuid4
 from pydantic import ValidationError, create_model
 
 from .test_tenant_administration import FakeAdministrationStore
+from .contract_fixture import install_contract
 
 
 class TestTenantAssetPlugin(unittest.TestCase):
@@ -31,7 +32,7 @@ class TestTenantAssetPlugin(unittest.TestCase):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.actor = {"account_id": "creator"}
     request = str(uuid4())
-    prepared = self.plugin.prepare_tenant(self.actor, request, "Example", "example", "initial")
+    prepared = self.plugin.prepare_tenant(self.actor, request, "Example", "example", "initial", **install_contract(self.plugin))
     self.assertTrue(prepared["success"], prepared)
     self.tenant = prepared["data"]["tenantId"]
     self.storage.grant("initial", self.tenant)

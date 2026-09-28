@@ -49,6 +49,7 @@ class ThreadReport:
   port_protocols: dict = None       # { "80": "http", "22": "ssh" }
   port_banners: dict = None         # { "22": "SSH-2.0-OpenSSH_8.9" }
   catch_all_withheld: dict = None   # { base_url: [ {probe, path} ] } (RM-086 item 1)
+  cves_not_applicable: dict = None  # { "<port>/<cve_id>": entry } (RM-103 item 6)
   scan_metrics: dict = None         # ScanMetrics.to_dict() — raw thread-level metrics
   correlation_findings: list = None
 
@@ -78,6 +79,7 @@ class ThreadReport:
       port_protocols=d.get("port_protocols"),
       port_banners=d.get("port_banners"),
       catch_all_withheld=d.get("catch_all_withheld"),
+      cves_not_applicable=d.get("cves_not_applicable"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
     )
@@ -108,6 +110,7 @@ class NodeReport:
   port_protocols: dict = None
   port_banners: dict = None
   catch_all_withheld: dict = None
+  cves_not_applicable: dict = None
   scan_metrics: dict = None         # ScanMetrics.to_dict() — aggregated across threads
   correlation_findings: list = None
   local_worker_ids: list = None     # [str] — every thread merged into this report
@@ -134,6 +137,7 @@ class NodeReport:
       port_protocols=d.get("port_protocols"),
       port_banners=d.get("port_banners"),
       catch_all_withheld=d.get("catch_all_withheld"),
+      cves_not_applicable=d.get("cves_not_applicable"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
       local_worker_ids=d.get("local_worker_ids"),
@@ -158,6 +162,7 @@ class AggregatedScanData:
   port_protocols: dict = None
   port_banners: dict = None
   catch_all_withheld: dict = None
+  cves_not_applicable: dict = None
   scan_metrics: dict = None         # ScanMetrics.to_dict() — aggregated across all nodes
   correlation_findings: list = None
   # `services/finalization.py` round-trips the aggregated report through this
@@ -196,6 +201,7 @@ class AggregatedScanData:
       port_protocols=d.get("port_protocols"),
       port_banners=d.get("port_banners"),
       catch_all_withheld=d.get("catch_all_withheld"),
+      cves_not_applicable=d.get("cves_not_applicable"),
       scan_metrics=d.get("scan_metrics"),
       correlation_findings=d.get("correlation_findings"),
       graybox_results=d.get("graybox_results"),

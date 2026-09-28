@@ -38,6 +38,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from ..credential_redaction import redact_credential_text
+
 
 # 16 hex, because `finding_id` *is* this key rather than a truncation of it:
 # the archived contract and the triage store both key on a 16-char id, and
@@ -100,6 +102,25 @@ _RECORD = "\x1e"
 
 def _text(value: Any) -> str:
   return "" if value is None else str(value)
+
+
+# Probe prose that can carry an interpolated credential pair. Both keys are
+# computed over a copy with the secret half masked, so identity reads the
+# username and never the password: a published `finding_id` over
+# "SSH default credential accepted: admin:<password>" let a short dictionary
+# recover the password (RM-103), and a honeypot that
+# accepted a different password each run gave one finding a new id each run.
+# Masking is idempotent, so a redacted archive hashes the same as the probe did.
+_SECRET_BEARING_FIELDS = ("title", "description", "evidence", "remediation")
+
+
+def _without_secrets(finding: dict) -> dict:
+  view = dict(finding)
+  for name in _SECRET_BEARING_FIELDS:
+    value = view.get(name)
+    if isinstance(value, str):
+      view[name] = redact_credential_text(value)
+  return view
 
 
 def canonical_asset_string(assets: Any) -> str:
@@ -216,6 +237,7 @@ def dedup_key(finding: dict, *, asset_canonical: str | None = None) -> str:
   """
   if not isinstance(finding, dict):
     raise TypeError("finding must be a dict")
+  finding = _without_secrets(finding)
   assets = finding.get("affected_assets")
   # An explicit override for callers whose asset is not an `AffectedAsset` at
   # all — the CVE matcher identifies by `product:version:cve_id`, which is what
@@ -241,6 +263,7 @@ def content_hash(finding: dict, *, asset_canonical: str | None = None) -> str:
   """Change detection over the whole finding, minus per-worker attribution."""
   if not isinstance(finding, dict):
     raise TypeError("finding must be a dict")
+  finding = _without_secrets(finding)
   parts = [dedup_key(finding, asset_canonical=asset_canonical)]
   for name in _CONTENT_FIELDS:
     value = finding.get(name)

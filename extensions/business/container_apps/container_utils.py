@@ -869,7 +869,7 @@ class _ContainerUtilsMixin:
           variable_value += candidate_value
         # endfor each part
         self.dynamic_env[variable_name] = variable_value
-        self.P(f"Dynamic env var {variable_name} = {variable_value}")
+        self.P(f"Resolved dynamic env var {variable_name}")
       #endfor each variable
 
   ## END CONTAINER MIXIN ###
@@ -1258,8 +1258,8 @@ class _ContainerUtilsMixin:
           "=" * 60,
           f"  Adding {len(sanitized_semaphore_env)} env vars from semaphored plugins:",
         ]
-        for key, value in sanitized_semaphore_env.items():
-          log_lines.append(f"    {key} = {value}")
+        for key in sanitized_semaphore_env:
+          log_lines.append(f"    {key}")
         log_lines.append("=" * 60)
         self.Pd("\n".join(log_lines))
         self.env.update(sanitized_semaphore_env)

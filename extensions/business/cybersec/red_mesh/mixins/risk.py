@@ -212,9 +212,11 @@ class _RiskScoringMixin:
       # which is precisely what redaction rewrites: the same finding came out
       # with two different ids depending on which caller asked.
       #
-      # `enrich_finding_for_probe` stamps both keys at probe time, on unredacted
-      # values, and nothing downstream recomputes them. Carrying them is what
-      # makes identity redaction-invariant.
+      # `enrich_finding_for_probe` stamps both keys at probe time and nothing
+      # downstream recomputes them. Since RM-103 both keys are also computed
+      # over credential-masked text (`finding_identity._without_secrets`), so
+      # the fallback below gives the same value on either side of redaction,
+      # and no published id encodes a password.
       #
       # Two fields, not four. `finding_id` used to be *derived* here as
       # `finding_signature[:16]` — content-addressed identity, the defect B2

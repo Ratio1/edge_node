@@ -280,12 +280,21 @@ class TestBuildMispEvent(unittest.TestCase):
   def test_the_event_names_the_backend_release(self):
     self.assertEqual(
       self._release_comments(redmesh_release={"backend": "0.10.0"}),
-      ["RedMesh release: backend 0.10.0"],
+      ["RedMesh release: backend 0.10.0 · console not recorded · report pipeline not recorded"],
     )
 
   def test_a_job_without_a_recorded_release_says_so(self):
     self.assertEqual(
-      self._release_comments(), ["RedMesh release: backend not recorded"],
+      self._release_comments(),
+      ["RedMesh release: backend not recorded · console not recorded · report pipeline not recorded"],
+    )
+
+  def test_the_event_names_all_three_parts_when_recorded(self):
+    # RM-103 item 12: the same parts, in the same order, as the PDF release line.
+    self.assertEqual(
+      self._release_comments(redmesh_release={
+        "backend": "0.11.0", "console": "1.33.0", "report_pipeline": "1.2.0"}),
+      ["RedMesh release: backend 0.11.0 · console 1.33.0 · report pipeline 1.2.0"],
     )
 
   def test_tags_present(self):
@@ -545,6 +554,17 @@ class TestExportMispJson(unittest.TestCase):
     result = export_misp_json(owner, "test_job_1")
     self.assertEqual(result["status"], "ok")
     self.assertIn("misp_event", result)
+
+  def test_plugin_download_ignores_disabled_and_missing_credentials(self):
+    """RM-093: the endpoint's builder used to answer `disabled` before building; a download
+    has no destination, so neither the node flag nor missing credentials stop it."""
+    from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExportMixin
+    for misp_config in ({"ENABLED": False}, {"ENABLED": True, "MISP_URL": "", "MISP_API_KEY": ""}):
+      with self.subTest(misp_config=misp_config):
+        owner = _make_integration_owner(misp_config)
+        result = _MispExportMixin._build_misp_json(owner, "test_job_1")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("misp_event", result)
 
   def test_model_test_job_rejected_for_json_export(self):
     owner = _make_integration_owner(job_specs={

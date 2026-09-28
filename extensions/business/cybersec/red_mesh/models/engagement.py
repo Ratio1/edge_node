@@ -13,7 +13,7 @@ Three distinct concerns are kept in separate dataclasses so that
 the form, persistence, and API can address each independently:
 
   EngagementContext     — who, why, what data, what classification
-  RulesOfEngagement     — strength, allowed actions, blackout windows
+  RulesOfEngagement     — the three RoE flags workers enforce
   AuthorizationRef      — written permission-to-test (R1FS document
                           CID + signer + third-party auth refs)
 
@@ -59,19 +59,6 @@ ASSET_EXPOSURES = (
   "dmz",          # in a DMZ
   "internal",     # private network only
   "airgapped",    # isolated network
-)
-
-STRENGTH_OF_TEST = (
-  "light",
-  "standard",
-  "aggressive",
-)
-
-POST_EXPLOIT_RULES = (
-  "va_only",         # vulnerability assessment only — no exploitation
-  "priv_esc",        # exploit + privilege escalation OK
-  "persistence",     # also OK to test persistence mechanisms
-  "pivot",           # also OK to pivot to adjacent systems
 )
 
 
@@ -133,7 +120,7 @@ class EngagementContext:
   secondary_objective: str = ""
   scope_rationale: str = ""
   data_classification: str = ""        # one of DATA_CLASSIFICATIONS
-  asset_exposure: str = ""             # one of ASSET_EXPOSURES — drives CVSS Environmental
+  asset_exposure: str = ""             # one of ASSET_EXPOSURES
   methodology: str = "PTES + OWASP WSTG + CVSS v3.1"
   point_of_contact: Contact | None = None
   emergency_contact: Contact | None = None
@@ -207,73 +194,55 @@ class EngagementContext:
 
 @dataclass
 class RulesOfEngagement:
-  """Operational constraints for the test.
+  """The rules of engagement workers enforce (RM-095: the engagement owns them).
 
-  - strength_of_test: drives probe selection (light skips destructive
-    probes; aggressive runs everything that's not gated by
-    explicit DoS opt-in).
-  - dos_allowed: explicit opt-in for probes that may degrade service
-    (slowloris-style timing, large payloads). Default false.
-  - post_exploit_rules: how far the tester is allowed to go after
-    initial compromise — VA only, privilege escalation, persistence,
-    or pivoting. Default va_only.
-  - blackout_windows: list of (start, end) ISO 8601 datetime ranges
-    during which scans must not run.
-  - retest_window_end: ISO date by which the customer expects a
-    retest to verify fixes.
+  - authenticated_action: explicit opt-in for one harmless command
+    (`id`, `PWD`, `uname`) over a session opened with an accepted
+    default credential. Default false: without it the probe reports
+    the accepted credential and does nothing with the session (RM-103).
+  - stateful_probes_allowed: whether a webapp job may enable stateful
+    probes (`allow_stateful_probes`). Default false.
+  - ics_safe_mode_required: whether a network job must keep ICS safe
+    mode on. Default true.
+
+  The never-enforced `strength_of_test`, `dos_allowed`,
+  `post_exploit_rules`, `blackout_windows` and `retest_window_end` were
+  dropped in RM-095; `from_dict` ignores them, so archives written
+  before still load. DoS is never permitted.
   """
-  strength_of_test: str = "standard"
-  dos_allowed: bool = False
-  post_exploit_rules: str = "va_only"
-  blackout_windows: list[tuple[str, str]] = field(default_factory=list)
-  retest_window_end: str = ""
+  authenticated_action: bool = False
+  stateful_probes_allowed: bool = False
+  ics_safe_mode_required: bool = True
 
   def to_dict(self) -> dict:
     return {
-      "strength_of_test": self.strength_of_test,
-      "dos_allowed": bool(self.dos_allowed),
-      "post_exploit_rules": self.post_exploit_rules,
-      "blackout_windows": [list(w) for w in self.blackout_windows],
-      "retest_window_end": self.retest_window_end,
+      "authenticated_action": self.authenticated_action is True,
+      "stateful_probes_allowed": self.stateful_probes_allowed is True,
+      # Fails safe: anything but an explicit false keeps ICS safe mode required.
+      "ics_safe_mode_required": self.ics_safe_mode_required is not False,
     }
 
   @classmethod
   def from_dict(cls, d: dict | None) -> "RulesOfEngagement | None":
     if not d:
       return None
-    raw_windows = d.get("blackout_windows") or []
-    windows: list[tuple[str, str]] = []
-    for w in raw_windows:
-      if isinstance(w, (list, tuple)) and len(w) == 2:
-        windows.append((str(w[0]), str(w[1])))
+    # Kept as sent, so `validate()` can refuse a non-boolean: these are
+    # consents, and `bool("false")` is True.
     return cls(
-      strength_of_test=str(d.get("strength_of_test", "standard")),
-      dos_allowed=bool(d.get("dos_allowed", False)),
-      post_exploit_rules=str(d.get("post_exploit_rules", "va_only")),
-      blackout_windows=windows,
-      retest_window_end=str(d.get("retest_window_end", "")),
+      authenticated_action=d.get("authenticated_action", False),
+      stateful_probes_allowed=d.get("stateful_probes_allowed", False),
+      ics_safe_mode_required=d.get("ics_safe_mode_required", True),
     )
 
   def is_empty(self) -> bool:
-    return all([
-      self.strength_of_test == "standard",
-      not self.dos_allowed,
-      self.post_exploit_rules == "va_only",
-      not self.blackout_windows,
-      not self.retest_window_end,
-    ])
+    return self.to_dict() == RulesOfEngagement().to_dict()
 
   def validate(self) -> list[str]:
-    errors: list[str] = []
-    if self.strength_of_test not in STRENGTH_OF_TEST:
-      errors.append(
-        f"strength_of_test {self.strength_of_test!r} not in {STRENGTH_OF_TEST}"
-      )
-    if self.post_exploit_rules not in POST_EXPLOIT_RULES:
-      errors.append(
-        f"post_exploit_rules {self.post_exploit_rules!r} not in {POST_EXPLOIT_RULES}"
-      )
-    return errors
+    return [
+      f"{name} must be true or false, got {getattr(self, name)!r}"
+      for name in ("authenticated_action", "stateful_probes_allowed", "ics_safe_mode_required")
+      if not isinstance(getattr(self, name), bool)
+    ]
 
 
 # ---------------------------------------------------------------------

@@ -72,17 +72,16 @@ class TestEngagementFieldsTyped(unittest.TestCase):
     self.assertEqual(resolved.point_of_contact.email, "jane@acme.example")
 
   def test_with_typed_roe_dict(self):
-    roe = RulesOfEngagement(
-      strength_of_test="aggressive", dos_allowed=True,
-      post_exploit_rules="pivot",
-      blackout_windows=[("2026-05-04T22:00:00Z", "2026-05-05T06:00:00Z")],
-    )
+    roe = RulesOfEngagement(authenticated_action=True, stateful_probes_allowed=True)
     cfg = JobConfig(**_base_jobconfig_kwargs(), roe=roe.to_dict())
-    resolved = cfg.get_roe()
-    self.assertEqual(resolved.strength_of_test, "aggressive")
-    self.assertTrue(resolved.dos_allowed)
-    self.assertEqual(resolved.post_exploit_rules, "pivot")
-    self.assertEqual(len(resolved.blackout_windows), 1)
+    self.assertEqual(cfg.get_roe(), roe)
+
+  def test_engagement_fields_round_trip_and_stay_absent_on_old_jobs(self):
+    fields = {"engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "a" * 64,
+              "authorized_tests": ["service_info_common"]}
+    restored = JobConfig.from_dict(JobConfig(**_base_jobconfig_kwargs(), **fields).to_dict())
+    self.assertEqual({key: getattr(restored, key) for key in fields}, fields)
+    self.assertFalse(set(fields) & set(JobConfig(**_base_jobconfig_kwargs()).to_dict()))
 
   def test_with_typed_authorization_dict(self):
     auth = AuthorizationRef(
@@ -100,7 +99,7 @@ class TestEngagementFieldsTyped(unittest.TestCase):
 
   def test_round_trip_through_to_dict_from_dict(self):
     eng = EngagementContext(client_name="ACME", asset_exposure="dmz")
-    roe = RulesOfEngagement(dos_allowed=True)
+    roe = RulesOfEngagement(stateful_probes_allowed=True)
     auth = AuthorizationRef(document_cid="QmAuthCID")
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
@@ -112,7 +111,7 @@ class TestEngagementFieldsTyped(unittest.TestCase):
     restored = JobConfig.from_dict(payload)
     self.assertEqual(restored.get_engagement().client_name, "ACME")
     self.assertEqual(restored.get_engagement().asset_exposure, "dmz")
-    self.assertTrue(restored.get_roe().dos_allowed)
+    self.assertTrue(restored.get_roe().stateful_probes_allowed)
     self.assertEqual(restored.get_authorization().document_cid, "QmAuthCID")
 
 
@@ -164,13 +163,13 @@ class TestKickoffQuestionnaireBundle(unittest.TestCase):
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       engagement=EngagementContext(client_name="ACME").to_dict(),
-      roe=RulesOfEngagement(dos_allowed=True).to_dict(),
+      roe=RulesOfEngagement(stateful_probes_allowed=True).to_dict(),
       authorization=AuthorizationRef(document_cid="QmAuthCID").to_dict(),
     )
     q = cfg.get_kickoff_questionnaire()
     self.assertIsNotNone(q)
     self.assertEqual(q.engagement.client_name, "ACME")
-    self.assertTrue(q.roe.dos_allowed)
+    self.assertTrue(q.roe.stateful_probes_allowed)
     self.assertEqual(q.authorization.document_cid, "QmAuthCID")
 
   def test_returns_none_when_all_empty(self):

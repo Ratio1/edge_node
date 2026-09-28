@@ -8,6 +8,7 @@ from ..ports import TenantStoreError
 from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
 from ..assets import validate_asset
+from ..engagements import validate_engagement
 
 MAX_ENUMERATED_RECORDS = 10000
 
@@ -61,6 +62,11 @@ class CstoreTenantAdministrationStore:
         validate_asset(raw, ids)
       except (ValueError, TypeError, RecursionError) as exc:
         raise TenantStoreError("Invalid asset storage record") from exc
+    if kind == "engagement":
+      try:
+        validate_engagement(raw, ids)
+      except (ValueError, TypeError, KeyError, RecursionError) as exc:
+        raise TenantStoreError("Invalid engagement storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):
@@ -122,6 +128,10 @@ class CstoreTenantAdministrationStore:
   def list_assets(self, tenant_id):
     self._location("asset", (tenant_id,))
     return [self._validate(raw, "asset", ids) for ids, raw in self._fields("asset", tenant_id)]
+
+  def list_engagements(self, tenant_id):
+    self._location("engagement", (tenant_id,))
+    return [self._validate(raw, "engagement", ids) for ids, raw in self._fields("engagement", tenant_id)]
 
   def list_integrations(self, tenant_id):
     self._location("integration", (tenant_id,))

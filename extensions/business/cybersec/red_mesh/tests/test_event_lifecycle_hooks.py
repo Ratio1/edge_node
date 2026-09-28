@@ -249,3 +249,20 @@ class TestEventLifecycleHooks(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestEngagementIdentifiesTheEventAuthorization(unittest.TestCase):
+  """RM-095: an engagement-bound job carries no document reference or scope_id; its events name the
+  engagement instead."""
+
+  def test_engagement_fields_fill_the_authorization_identifiers(self):
+    from extensions.business.cybersec.red_mesh.services.event_hooks import _job_specs_for_event
+    owner = MagicMock()
+    owner._get_job_config.return_value = {
+      "authorized": True, "scope_id": "", "authorization_ref": "",
+      "authorization": {"document_cid": "", "document_sha256": "a" * 64},
+      "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
+    }
+    specs = _job_specs_for_event(owner, _job_specs())
+    self.assertEqual((specs["authorization_id"], specs["authorization_ref"]),
+                     ("en_00000000-0000-4000-8000-000000000003", "e" * 64))
