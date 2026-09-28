@@ -1111,7 +1111,12 @@ class TenantAdministrationService:
     deleting = isinstance(tenant, dict) and isinstance(tenant.get("deleting"), dict)
     if tenant is None or (tenant.get("active") is not True and not deleting):
       raise AdministrationDenied(404, "not_found")
-    self._validate_tenant(tenant)
+    # A failed `finish_tenant_delete` can leave the marked row after its receipt is gone (the receipt
+    # goes first); the marker is then the only binding left, and the retry must still finish.
+    if not deleting or self.store.get("receipt", tenant.get("actor_id"), tenant.get("request_id")) is not None:
+      self._validate_tenant(tenant)
+    elif type(tenant.get("allow_pentester")) is not bool:
+      raise TenantStoreError("Invalid administration tenant")
     # A tenant being deleted is inactive to every other operation; the delete itself is authorized
     # as on the live tenant, so a retry after a failed attempt can finish it.
     decision = authorize_tenant_operation(account, "tenants:delete", TenantPolicyContext(

@@ -155,8 +155,12 @@ def normalize_document_labels(kind, title, comment):
     raise EngagementInvalid("document_invalid") from None
   if not isinstance(comment, str):
     raise EngagementInvalid("document_invalid")
+  # Line breaks and tabs are allowed in a comment; every other control is refused, as in a title
+  # (checked before the strip, which would silently drop a leading or trailing one).
+  if any((ord(ch) < 32 and ch not in "\n\t\r") or 127 <= ord(ch) <= 159 or ch == "\ufeff" for ch in comment):
+    raise EngagementInvalid("document_invalid")
   comment = comment.strip()
-  if len(comment) > _DOCUMENT_COMMENT_MAX or any(ord(ch) < 32 and ch not in "\n\t" for ch in comment):
+  if len(comment) > _DOCUMENT_COMMENT_MAX:
     raise EngagementInvalid("document_invalid")
   return {"kind": kind, "title": title, "comment": comment}
 

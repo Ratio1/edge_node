@@ -113,7 +113,7 @@ class TestEngagementValues(unittest.TestCase):
     self.assertEqual(normalize_document_labels("other", "Scope email", "")["comment"], "")
     for args in (("roe", "RoE", ""), ("agreement", "", ""), ("agreement", "x" * 201, ""),
                  ("agreement", "RoE", "x" * 2001), ("agreement", "RoE", None), ("agreement", None, ""),
-                 ("agreement", "RoE", "bell\x07")):
+                 ("agreement", "RoE", "bell\x07"), ("agreement", "RoE", "c1\x85"), ("agreement", "RoE", "\ufeffbom")):
       with self.assertRaises(EngagementInvalid) as caught:
         normalize_document_labels(*args)
       self.assertEqual(caught.exception.code, "document_invalid")

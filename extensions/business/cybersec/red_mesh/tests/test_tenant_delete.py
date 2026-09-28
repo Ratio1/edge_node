@@ -150,6 +150,43 @@ class TestTenantDelete(unittest.TestCase):
     self.assertEqual(self.documents.deleted[:len(first)], first)
     self.assertEqual(self.events[-1][1]["documents"], 3)
 
+  def test_a_record_delete_that_stopped_after_the_receipt_is_finished_by_a_retry(self):
+    from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import (
+      CstoreTenantAdministrationStore)
+    from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+    self.remove_members()
+    original = CstoreTenantAdministrationStore.delete
+
+    def failing(store, kind, *ids):
+      if kind == "tenant":
+        raise TenantStoreError("write not verified")
+      return original(store, kind, *ids)
+    with patch.object(CstoreTenantAdministrationStore, "delete", failing):
+      self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 503, "unavailable")
+    rows = self.tenancy_rows()
+    self.assertNotIn("receipt", rows)
+    self.assertIn("deleting", rows["tenant"][0])
+    result = self.plugin.delete_tenant(self.actor, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertNotIn("tenant", self.tenancy_rows())
+
+  def test_a_document_deleted_but_not_recorded_does_not_block_the_retry(self):
+    self.remove_members()
+    # An earlier attempt deleted this file and stopped before recording it: the backend no longer
+    # confirms a delete for it, and it reads as absent.
+    gone = self.engagement_refs[0]
+    self.documents.envelopes.pop(gone)
+    self.documents.fail_delete = {gone}
+    result = self.plugin.delete_tenant(self.actor, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertEqual(result["data"]["documents"], 3)
+  def test_a_document_the_backend_still_holds_stops_the_delete(self):
+    self.remove_members()
+    self.documents.fail_delete = {"doc-fixture"}
+    self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 503, "unavailable")
+    self.assertIn("doc-fixture", self.documents.envelopes)
+    self.assertIn("tenant", self.tenancy_rows())
+
   def test_only_a_super_tenant_admin_deletes(self):
     self.storage.account("platform-pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.refused(self.plugin.delete_tenant({"account_id": "platform-pentester"}, self.tenant), 403, "forbidden")

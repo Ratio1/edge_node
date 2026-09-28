@@ -67,8 +67,10 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertEqual(authorization["document_sha256"], CONTRACT_SHA256)
 
   def test_a_tenant_contract_that_no_longer_matches_fails_closed(self):
+    # Tenant and receipt edited together, so the receipt binding holds and the engagement check is
+    # the one that refuses.
     for key, row in self.owner.data.items():
-      if isinstance(row, dict) and row.get("kind") == "tenant" and row.get("tenant_id") == self.tenant:
+      if isinstance(row, dict) and row.get("kind") in ("tenant", "receipt") and row.get("tenant_id") == self.tenant:
         self.owner.data[key] = {**row, "contract": {**row["contract"], "sha256": "9" * 64}}
     with self.assertRaises(TenantStoreError):
       self.admit()
