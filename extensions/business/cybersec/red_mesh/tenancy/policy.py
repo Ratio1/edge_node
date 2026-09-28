@@ -14,7 +14,7 @@ from .identity import AccountView, TenantMembership, canonical_account_id
 _ROLE_OPERATIONS = {
   "super_tenant_admin": frozenset({
     "node_assignments:manage", "node_failure_policy:update",
-    "tenants:manage", "tenant_users:manage", "assets:create", "assets:update",
+    "tenants:manage", "tenant_users:manage",
     "integrations:manage", "attestation_keys:manage", "allow_pentester:update",
     "tasks:launch", "tasks:update", "reports:view", "reports:export", "evidence:read", "audit:view",
     # RM-078. analysis:run is an operator action and binds to allow_pentester below;
@@ -30,7 +30,7 @@ _ROLE_OPERATIONS = {
     "tenants:delete",
   }),
   "super_pentester": frozenset({
-    "assets:create", "assets:update", "allow_pentester:update", "tasks:launch", "tasks:update",
+    "allow_pentester:update", "tasks:launch", "tasks:update",
     "reports:view", "reports:export", "evidence:read", "analysis:run", "authorization:upload",
     # Reads an engagement's documents (owner Q5); creating, revoking and uploading are STA only.
     "engagements:documents",

@@ -88,7 +88,7 @@ class TestTenantDelete(unittest.TestCase):
     self.put_job("other-job", "tn_" + str(uuid4()))
     result = self.plugin.delete_tenant(self.actor, self.tenant)
     self.assertTrue(result["success"], result)
-    self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1, "assets": 0,
+    self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1,
                                       "integrations": 0, "nodeAssignments": 0, "documents": 3})
     self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", *self.engagement_refs]))
     rows = self.tenancy_rows()
@@ -102,7 +102,7 @@ class TestTenantDelete(unittest.TestCase):
     self.refused(self.plugin.prepare_tenant(self.actor, self.request, "Example", "example", "initial",
                                             **install_contract(self.plugin)), 409, "domain_conflict")
     self.assertEqual(self.events, [("tenant_deleted", {
-      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "assets": 0, "integrations": 0,
+      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "integrations": 0,
       "nodeAssignments": 0, "documents": 3})])
     self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 404, "not_found")
 

@@ -17,8 +17,7 @@ from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_o
 from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import valid_node_address
-from .assets import (canonical_digest, canonical_uuid, normalize_name, normalize_port_scope,
-                     normalize_target, valid_digest)
+from .assets import canonical_digest, normalize_name, valid_digest
 from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
                            valid_integration_id)
@@ -28,16 +27,6 @@ from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_
 
 
 _ADMINISTRATION_LOCK = RLock()
-# An asset update that omits `authorized_ports` keeps the stored scope; an explicit None clears it.
-# A string rather than `object()` so it can be an HTTP endpoint default; it is never a valid scope.
-KEEP_PORT_SCOPE = "__keep__"
-
-
-def _port_scope_for(target, value):
-  scope = normalize_port_scope(value)
-  if scope is not None and target["kind"] != "network":
-    raise ValueError("Port scope applies to network assets only")
-  return scope
 _MEMBER_ROLES = TENANT_LOCAL_ROLES
 # RM-083 (owner, 2026-09-17): only a Super-Tenant Admin grants, removes or replaces these.
 _PLATFORM_RESERVED_MEMBER_ROLES = frozenset({"tenant_pentester"})
@@ -384,8 +373,7 @@ class TenantAdministrationService:
             "createdAt": tenant["created_at"], "lastActivityAt": None}
 
   def _detail(self, tenant, account):
-    detail = {**self._row(tenant), "assetCount": self.store.count_assets(tenant["tenant_id"]),
-              "nodeFailurePolicy": self._node_failure_policy(tenant),
+    detail = {**self._row(tenant), "nodeFailurePolicy": self._node_failure_policy(tenant),
               "canUpdateNodeFailurePolicy": authorize_tenant_operation(
                 account, "node_failure_policy:update", TenantPolicyContext(
                   tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed,
@@ -630,112 +618,9 @@ class TenantAdministrationService:
                 tenant_id, tenant["active"], tenant["allow_pentester"])).allowed}
 
   @staticmethod
-  def _asset_row(row):
-    if row is None:
-      raise TenantStoreError("Asset readback is unavailable")
-    return {"tenantId": row["tenant_id"], "assetId": row["asset_id"],
-            "displayName": row["display_name"], "target": row["target"], "active": row["active"],
-            "createdBy": row["created_by"], "createdAt": row["created_at"],
-            "changedBy": row["changed_by"], "changedAt": row["changed_at"],
-            "targetDigest": row["target_digest"], "version": canonical_digest(row),
-            **({"authorizedPorts": row["authorized_ports"]} if "authorized_ports" in row else {})}
-
-  @staticmethod
-  def _asset_id(value):
-    if not isinstance(value, str) or not value.startswith("as_"):
-      raise AdministrationDenied(400, "invalid_request")
-    return "as_" + _request_id(value[3:])
-
-  @staticmethod
-  def _asset_permission(account, tenant, operation):
+  def _permission(account, tenant, operation):
     return authorize_tenant_operation(account, operation, TenantPolicyContext(
       tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed
-
-  @_endpoint
-  def list_tenant_assets(self, actor, tenant_id):
-    tenant, account = self._authorized_tenant(actor, tenant_id)
-    return {"tenantId": tenant_id,
-            "assets": [self._asset_row(row) for row in sorted(self.store.list_assets(tenant_id),
-                                                              key=lambda row: row["asset_id"])],
-            "canCreateAssets": self._asset_permission(account, tenant, "assets:create"),
-            "canUpdateAssets": self._asset_permission(account, tenant, "assets:update")}
-
-  @_endpoint
-  def get_tenant_asset(self, actor, tenant_id, asset_id):
-    tenant, account = self._authorized_tenant(actor, tenant_id)
-    asset_id = self._asset_id(asset_id)
-    row = self.store.get("asset", tenant_id, asset_id)
-    if row is None:
-      raise AdministrationDenied(404, "not_found")
-    return {"asset": self._asset_row(row),
-            "canUpdateAssets": self._asset_permission(account, tenant, "assets:update"),
-            "canLaunchJobs": row["active"] is True and authorize_tenant_operation(
-              account, "tasks:launch", TenantPolicyContext(
-                tenant["tenant_id"], tenant["active"], tenant["allow_pentester"]),
-              asset_tenant_ids=(row["tenant_id"],)).allowed}
-
-  @_endpoint
-  def create_tenant_asset(self, actor, tenant_id, request_id, display_name, target, authorized_ports=None):
-    _, account = self._authorized_tenant(actor, tenant_id, "assets:create")
-    request_id = _request_id(request_id)
-    try:
-      display_name, target = normalize_name(display_name), normalize_target(target)
-      scope = _port_scope_for(target, authorized_ports)
-    except (ValueError, TypeError, RecursionError):
-      raise AdministrationDenied(400, "invalid_request") from None
-    asset_id = "as_" + request_id
-    # The scope joins the intent only when set, so an unscoped create replays to the same digest.
-    intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "asset_id": asset_id,
-              "request_id": request_id, "created_by": account.account_id,
-              "display_name": display_name, "target": target,
-              **({"authorized_ports": scope} if scope is not None else {})}
-    existing = self.store.get("asset", tenant_id, asset_id)
-    if existing is not None:
-      if existing["create_intent_digest"] != canonical_digest(intent) or existing["created_by"] != account.account_id:
-        raise AdministrationDenied(409, "conflict")
-      return self._asset_row(existing)
-    now = datetime.now(timezone.utc).isoformat()
-    self.store.put("asset", tenant_id, asset_id, record={
-      **intent, "active": True, "create_intent_digest": canonical_digest(intent),
-      "created_at": now, "changed_by": account.account_id, "changed_at": now,
-      "target_digest": canonical_digest(target)})
-    return self._asset_row(self.store.get("asset", tenant_id, asset_id))
-
-  @_endpoint
-  def update_tenant_asset(self, actor, tenant_id, asset_id, expected_version, display_name, target, active,
-                          authorized_ports=KEEP_PORT_SCOPE):
-    _, account = self._authorized_tenant(actor, tenant_id, "assets:update")
-    asset_id = self._asset_id(asset_id)
-    try:
-      display_name, target = normalize_name(display_name), normalize_target(target)
-      if type(active) is not bool or not valid_digest(expected_version):
-        raise ValueError("Invalid desired state")
-    except (ValueError, TypeError, RecursionError):
-      raise AdministrationDenied(400, "invalid_request") from None
-    row = self.store.get("asset", tenant_id, asset_id)
-    if row is None:
-      raise AdministrationDenied(404, "not_found")
-    if row["target"]["kind"] != target["kind"]:
-      raise AdministrationDenied(400, "invalid_request")
-    try:
-      scope = (row.get("authorized_ports") if authorized_ports == KEEP_PORT_SCOPE
-               else _port_scope_for(target, authorized_ports))
-    except (ValueError, TypeError, RecursionError):
-      raise AdministrationDenied(400, "invalid_request") from None
-    if ((row["display_name"], row["target"], row["active"], row.get("authorized_ports"))
-        == (display_name, target, active, scope)):
-      return self._asset_row(row)
-    if canonical_digest(row) != expected_version:
-      raise AdministrationDenied(409, "conflict")
-    record = {
-      **row, "display_name": display_name, "target": target, "active": active,
-      "target_digest": canonical_digest(target), "changed_by": account.account_id,
-      "changed_at": datetime.now(timezone.utc).isoformat()}
-    record.pop("authorized_ports", None)
-    if scope is not None:
-      record["authorized_ports"] = scope
-    self.store.put("asset", tenant_id, asset_id, record=record)
-    return self._asset_row(self.store.get("asset", tenant_id, asset_id))
 
   # RM-095 phase 2: engagements. Created by the platform roles, read by every tenant role, changed
   # only by a revoke. The DTO never carries a document or contract reference: tenant roles read it,
@@ -887,8 +772,8 @@ class TenantAdministrationService:
     rows.sort(key=lambda row: row["engagement_id"])
     rows.sort(key=lambda row: row["created_at"], reverse=True)
     return {"tenantId": tenant_id, "engagements": [self._engagement_row(row) for row in rows],
-            "canCreateEngagements": self._asset_permission(account, tenant, "engagements:create"),
-            "canRevokeEngagements": self._asset_permission(account, tenant, "engagements:revoke")}
+            "canCreateEngagements": self._permission(account, tenant, "engagements:create"),
+            "canRevokeEngagements": self._permission(account, tenant, "engagements:revoke")}
 
   @_endpoint
   def get_engagement(self, actor, tenant_id, engagement_id):
@@ -897,8 +782,8 @@ class TenantAdministrationService:
     if row is None:
       raise AdministrationDenied(404, "not_found")
     return {"engagement": self._engagement_row(row),
-            "canRevokeEngagements": self._asset_permission(account, tenant, "engagements:revoke"),
-            "canDownloadDocuments": self._asset_permission(account, tenant, "engagements:documents")}
+            "canRevokeEngagements": self._permission(account, tenant, "engagements:revoke"),
+            "canDownloadDocuments": self._permission(account, tenant, "engagements:documents")}
 
   @_endpoint
   def revoke_engagement(self, actor, tenant_id, engagement_id, reason):
@@ -1055,7 +940,7 @@ class TenantAdministrationService:
   # reserved. The plugin runs it in steps so every document read and delete is outside this lock and
   # a failed attempt can be retried: `begin_tenant_delete` (check, then mark), the job checks,
   # the document deletes (`record_tenant_documents_deleted`), `finish_tenant_delete`.
-  _DELETABLE_KINDS = ("engagement", "asset", "integration", "tenant_node")
+  _DELETABLE_KINDS = ("engagement", "integration", "tenant_node")
 
   def _tenant_for_delete(self, actor, tenant_id):
     account = self._actor(actor)
@@ -1145,7 +1030,7 @@ class TenantAdministrationService:
     self.store.delete("receipt", tenant["actor_id"], tenant["request_id"])
     self.store.delete("tenant", tenant_id)
     return {"tenantId": tenant_id, "deleted": True, "engagements": counts["engagement"],
-            "assets": counts["asset"], "integrations": counts["integration"],
+            "integrations": counts["integration"],
             "nodeAssignments": counts["tenant_node"],
             "documents": len(tenant["deleting"]["deleted_refs"])}
 

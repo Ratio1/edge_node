@@ -115,7 +115,8 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(activated["tenantId"], tenant_id)
     self.assertEqual(activated["displayName"], "Example")
     self.assertFalse(activated["allowPentester"])
-    self.assertEqual((activated["memberCount"], activated["adminCount"], activated["assetCount"]), (1, 1, 0))
+    self.assertEqual((activated["memberCount"], activated["adminCount"]), (1, 1))
+    self.assertNotIn("assetCount", activated)
     self.assertTrue(activated["canUpdateAllowPentester"])
     self.assertEqual(self.service.get_tenant({"account_id": "initial"}, tenant_id)["data"],
                      {**activated, "canUpdateAllowPentester": False,
@@ -660,8 +661,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
                "authorize_tenant_account_creation",
                "authorize_account_state_change",
                "update_tenant_allow_pentester",
-               "get_tenant_nodes", "set_tenant_node_assignment", "list_tenant_assets",
-               "get_tenant_asset", "create_tenant_asset", "update_tenant_asset")
+               "get_tenant_nodes", "set_tenant_node_assignment")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
     for namespace in (None, " ", 7):
       for name in methods:

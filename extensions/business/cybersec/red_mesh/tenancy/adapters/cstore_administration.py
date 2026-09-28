@@ -7,10 +7,12 @@ import json
 from ..ports import TenantStoreError
 from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
-from ..assets import validate_asset
 from ..engagements import validate_engagement
 
 MAX_ENUMERATED_RECORDS = 10000
+# RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
+# is never read or written, so a leftover row cannot come back through a new code path.
+_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement"})
 
 
 class CstoreTenantAdministrationStore:
@@ -24,7 +26,7 @@ class CstoreTenantAdministrationStore:
 
   def _location(self, kind, ids):
     if (not isinstance(self._namespace, str) or not self._namespace.strip()
-        or not isinstance(kind, str) or not kind.strip() or not ids
+        or kind not in _KINDS or not ids
         or any(not isinstance(value, str) or not value.strip() for value in ids)):
       raise TenantStoreError("Invalid tenant storage binding")
     hkey = json.dumps(["redmesh", "tenancy", 1, self._namespace], separators=(",", ":"))
@@ -57,11 +59,6 @@ class CstoreTenantAdministrationStore:
       validate_node_assignment(raw, ids)
     if kind == "integration":
       validate_integration(raw, ids)
-    if kind == "asset":
-      try:
-        validate_asset(raw, ids)
-      except (ValueError, TypeError, RecursionError) as exc:
-        raise TenantStoreError("Invalid asset storage record") from exc
     if kind == "engagement":
       try:
         validate_engagement(raw, ids)
@@ -155,10 +152,6 @@ class CstoreTenantAdministrationStore:
     return [self._validate(raw, "tenant_node", ids)
             for ids, raw in self._fields("tenant_node", tenant_id)]
 
-  def list_assets(self, tenant_id):
-    self._location("asset", (tenant_id,))
-    return [self._validate(raw, "asset", ids) for ids, raw in self._fields("asset", tenant_id)]
-
   def list_engagements(self, tenant_id):
     self._location("engagement", (tenant_id,))
     return [self._validate(raw, "engagement", ids) for ids, raw in self._fields("engagement", tenant_id)]
@@ -190,5 +183,3 @@ class CstoreTenantAdministrationStore:
         rows.append(row)
     return rows
 
-  def count_assets(self, tenant_id):
-    return sum(row["active"] for row in self.list_assets(tenant_id))

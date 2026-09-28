@@ -119,7 +119,8 @@ class TestTenantNodeFailurePolicy(unittest.TestCase):
         result = self.service.update_tenant_node_failure_policy(self.actor, tenant_id, "continue")
         self.assertTrue(result["success"], result)
     from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
-    with patch.object(self.repo, "count_assets", side_effect=TenantStoreError("private response failure")):
+    # The detail readback (its member counts) fails after the write.
+    with patch.object(self.service.accounts, "list_accounts", side_effect=TenantStoreError("private response failure")):
       result = self.service.update_tenant_node_failure_policy(self.actor, tenant_id, "stop")
     self.assertEqual(result["status_code"], 503)
     self.assertEqual(self.repo.get("tenant", tenant_id)["node_failure_policy"], "stop")
