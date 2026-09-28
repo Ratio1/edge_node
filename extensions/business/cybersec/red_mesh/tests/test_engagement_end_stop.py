@@ -157,6 +157,39 @@ class TestContinuousJobStopsWhenTheEngagementEnds(unittest.TestCase):
     maybe_finalize_pass(due)
     self.assert_stopped_for(due, "engagement_expired")
 
+  def test_a_finishing_pass_is_finalized_first_and_the_job_stops_after(self):
+    owner = EngagementOwner(reason="engagement_expired")
+    owner.current_allowed = False  # no queued analysis: the pass is recorded on this tick
+    maybe_finalize_pass(owner)
+    self.assertEqual(len(owner.job["pass_reports"]), 1)
+    self.assertEqual(owner.reason_checks, [])
+    owner.now = 200
+    maybe_finalize_pass(owner)
+    self.assert_stopped_for(owner, "engagement_expired")
+
+  def test_a_scheduled_stop_is_hard_stopped_when_the_engagement_ends(self):
+    owner = EngagementOwner(reason="engagement_revoked").running_pass()
+    owner.job["job_status"] = "SCHEDULED_FOR_STOP"
+    maybe_finalize_pass(owner)
+    self.assert_stopped_for(owner, "engagement_revoked")
+
+  def test_a_config_that_cannot_be_read_leaves_the_job_and_the_loop_alone(self):
+    class Unreadable(EngagementOwner):
+      def _get_job_config(self, job_specs, **kwargs):
+        raise ValueError("Execution binding mismatch")
+    owner = Unreadable(reason="engagement_expired").running_pass()
+    maybe_finalize_pass(owner)
+    self.assertEqual(owner.job["job_status"], "RUNNING")
+    self.assertEqual(owner.reason_checks, [])
+
+  def test_the_config_is_read_once_per_job(self):
+    owner = EngagementOwner().running_pass()
+    maybe_finalize_pass(owner)
+    owner.now = 200
+    maybe_finalize_pass(owner)
+    self.assertEqual(owner.reason_checks, ["en_1", "en_1"])
+    self.assertEqual(owner.r1fs.reads.count("config"), 1)
+
   def test_single_pass_jobs_and_jobs_without_an_engagement_are_left_alone(self):
     single = EngagementOwner(continuous=False, reason="engagement_expired").running_pass()
     maybe_finalize_pass(single)

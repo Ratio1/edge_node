@@ -130,19 +130,30 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
   if not callable(check):
     return False
   job_id = job_specs.get("job_id")
-  checked_at = getattr(owner, "_engagement_checked_at", None)
-  if not isinstance(checked_at, dict):
-    checked_at = {}
-    owner._engagement_checked_at = checked_at
+  # Per job: when it was last checked, and its config once read (immutable, so R1FS is read once;
+  # an unavailable read answers {} and is not kept).
+  checks = getattr(owner, "_engagement_checks", None)
+  if not isinstance(checks, dict):
+    checks = {}
+    owner._engagement_checks = checks
+  entry = checks.setdefault(job_id, {"at": float("-inf")})
   now = owner.time()
-  if not due and now - checked_at.get(job_id, float("-inf")) < ENGAGEMENT_RECHECK_SECONDS:
+  if not due and now - entry["at"] < ENGAGEMENT_RECHECK_SECONDS:
     return False
-  checked_at[job_id] = now
-  config = owner._get_job_config(job_specs, resolve_secrets=False) or {}
-  engagement_id = config.get("engagement_id")
-  if not engagement_id:
+  entry["at"] = now
+  # Fail-safe: one job whose config or engagement cannot be read must not break the loop for the
+  # others, and never reads as an ended engagement.
+  try:
+    config = entry.get("config") or owner._get_job_config(job_specs, resolve_secrets=False) or {}
+    if config:
+      entry["config"] = config
+    engagement_id = config.get("engagement_id")
+    if not engagement_id:
+      return False
+    reason = check(job_specs, config)
+  except Exception as exc:
+    owner.P(f"[CONTINUOUS] Engagement check for job {job_id} unavailable: {exc}", color='y')
     return False
-  reason = check(job_specs, config)
   if reason is None:
     return False
   owner._emit_timeline_event(
@@ -152,7 +163,7 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
   result = stop_monitoring(owner, job_id, "HARD", checked_job=job_specs)
   if not isinstance(result, dict) or result.get("error"):
     return False
-  checked_at.pop(job_id, None)
+  checks.pop(job_id, None)
   owner._log_audit_event("continuous_stopped_engagement_ended", {
     "job_id": job_id, "engagement_id": engagement_id, "reason": reason, "pass_nr": job_specs.get("job_pass", 1),
   })
