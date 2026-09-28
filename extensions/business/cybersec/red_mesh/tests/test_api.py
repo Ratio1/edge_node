@@ -628,6 +628,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin = self._build_mock_plugin(job_id="engagement-run-mode-first")
     result = self._launch_network(plugin, engagement=single, monitor_interval=1)
     self._refused(plugin, result, "run_mode_not_authorized")
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first-webapp")
+    result = self._launch_webapp(plugin, engagement={**_engagement("webapp"), "allowed_run_modes": ["single_pass"]},
+                                 monitor_interval=1)
+    self._refused(plugin, result, "run_mode_not_authorized")
 
   def test_engagement_port_scope_admits_a_narrower_run(self):
     # Owner, 2026-09-28: a run may use any part of the engagement's scope.
