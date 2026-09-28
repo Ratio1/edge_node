@@ -8,7 +8,9 @@ from extensions.business.cybersec.edgeguard.graph_first_runtime import (
 )
 from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
   EDGEGUARD_SCHEMA_V0_11,
+  EXECUTION_SAFETY_ERROR_CODE,
   EdgeGuardCypherGuardError,
+  PATTERN_ENDPOINT_MISMATCH_CODE,
   SCHEMA_ARTIFACT_V0_11_SHA256,
   SCHEMA_VERSION,
   SCHEMA_VERSION_V0_11,
@@ -21,6 +23,11 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
   build_v0_11_pattern_schema_system_prompt,
   _compress_id_values,
   _v0_11_grouped_pattern_lines,
+  _global_var_labels,
+  _iter_top_level_parens,
+  _pattern_endpoint_hop_error,
+  _pattern_endpoint_pairs_by_type,
+  _topology_surface_labels,
   classify_empty_reason,
   classify_result_shape,
   derive_ranking_rule,
@@ -902,6 +909,337 @@ class HopBoundsV0_11Tests(unittest.TestCase):
       max_limit=100,
     )
     self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+
+class PatternEndpointV0_11Tests(unittest.TestCase):
+  """Contract §2.2/§3.2/§5.2, EGM-059 phase 4 slice 4b: the served guard
+  previously checked flat label/relationship-type/property membership only,
+  so `(i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique)` was accepted even
+  though the schema artifact only carries
+  `(ThreatActor)-[:EMPLOYS_TECHNIQUE]->(Technique)`. v0.11 profile only
+  (`enforce_pattern_endpoints=True`); v0.10 is unaffected by the flag."""
+
+  def _analysis(self, cypher, **kwargs):
+    kwargs.setdefault("allowed", schema_sets(EDGEGUARD_SCHEMA_V0_11))
+    kwargs.setdefault("max_limit", 100)
+    kwargs.setdefault("enforce_hop_bounds", True)
+    kwargs.setdefault("enforce_pattern_endpoints", True)
+    return analyze_generated_cypher(cypher, **kwargs)
+
+  def test_seeded_case_indicator_employs_technique_is_rejected(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+    self.assertIn(
+      "`EMPLOYS_TECHNIQUE` connects ThreatActor→Technique", analysis["validation_feedback"],
+    )
+    self.assertIn("for Indicator use `USES_TECHNIQUE`", analysis["validation_feedback"])
+
+  def test_threat_actor_employs_technique_is_accepted(self):
+    analysis = self._analysis(
+      "MATCH (ta:ThreatActor)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN ta, t LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+    self.assertIsNone(analysis["execution_safety_error_code"])
+
+  def test_direction_reversal_is_rejected(self):
+    # The arrow points at `ta`, so the actual relationship direction is
+    # Technique -> ThreatActor, which is not a schema pattern (only
+    # ThreatActor -> Technique is).
+    analysis = self._analysis(
+      "MATCH (ta:ThreatActor)<-[:EMPLOYS_TECHNIQUE]-(t:Technique) RETURN ta, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  def test_direction_reversal_written_the_other_way_is_accepted(self):
+    # Same reversed-arrow syntax, but now the arrow correctly points at the
+    # Technique node, so the real direction is ThreatActor -> Technique.
+    analysis = self._analysis(
+      "MATCH (t:Technique)<-[:EMPLOYS_TECHNIQUE]-(ta:ThreatActor) RETURN t, ta LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_undirected_rejects_a_pair_valid_in_neither_order(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE]-(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  def test_undirected_accepts_a_pair_valid_in_either_order(self):
+    analysis = self._analysis(
+      "MATCH (ta:ThreatActor)-[:EMPLOYS_TECHNIQUE]-(t:Technique) RETURN ta, t LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_alternatives_reject_when_any_alternative_is_invalid(self):
+    # `[:A|B]`: each alternative is checked; EMPLOYS_TECHNIQUE alone is
+    # invalid for (Indicator, Technique) even though USES_TECHNIQUE is
+    # valid, so the whole pattern is rejected (fail-closed).
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE|USES_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  def test_variable_length_relationship_is_checked(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE*1..2]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  def test_unlabeled_endpoint_is_not_checked(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t) RETURN i, t LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_unlabeled_middle_node_leaves_both_adjacent_hops_unchecked(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:INDICATES]->(x)-[:ATTRIBUTED_TO]->(ta:ThreatActor) "
+      "RETURN i, ta LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_label_bound_in_a_separate_match_is_still_checked(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator) MATCH (i)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+    self.assertIn("for Indicator use `USES_TECHNIQUE`", analysis["validation_feedback"])
+
+  def test_topology_surface_label_endpoint_is_not_checked(self):
+    # Contract §6's own acceptance query: `AFFECTS` is a populated type
+    # pinned to `CVE -> Sector`; `Mission` is a topology-surface-only label
+    # not itself listed as an `AFFECTS` endpoint anywhere in `patterns[]`.
+    # The pattern-endpoint check must not reject it — `classify_empty_reason`
+    # already classifies it `topology_surface_no_data` at the empty-result
+    # stage, not as a guard rejection.
+    analysis = self._analysis(
+      "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p",
+      allow_limit_optional_graph=True,
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_v0_10_profile_is_unaffected(self):
+    # No `enforce_pattern_endpoints` (v0.10 default): the same mismatched
+    # pair is accepted, exactly as before this change.
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5",
+      max_limit=100,
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+    self.assertIsNone(analysis["execution_safety_error_code"])
+
+  def test_a_generic_execution_safety_violation_keeps_its_own_code(self):
+    # A valid pair (ThreatActor -> Technique) but no LIMIT: rejected for a
+    # reason unrelated to endpoint pairing, so the code must stay the
+    # generic one, not the pattern-endpoint one.
+    analysis = self._analysis(
+      "MATCH (ta:ThreatActor)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN ta, t"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], EXECUTION_SAFETY_ERROR_CODE)
+
+
+class PatternEndpointV0_11FixRound1Tests(unittest.TestCase):
+  """EGM-059 phase 4 slice 4b, fix round 1 (findings-4b-1.md items 1, 3-8)."""
+
+  def _analysis(self, cypher, **kwargs):
+    kwargs.setdefault("allowed", schema_sets(EDGEGUARD_SCHEMA_V0_11))
+    kwargs.setdefault("max_limit", 100)
+    kwargs.setdefault("enforce_hop_bounds", True)
+    kwargs.setdefault("enforce_pattern_endpoints", True)
+    return analyze_generated_cypher(cypher, **kwargs)
+
+  # Item 1: orchestrator ruling on the topology carve-out.
+  def test_topology_topology_hop_reversed_is_rejected(self):
+    # Both `Component` and `Mission` are topology-surface-only: the ruling
+    # checks a hop where *both* sides are topology-only against the
+    # topology patterns, and the real pattern is Mission -> Component.
+    analysis = self._analysis(
+      "MATCH (c:Component)-[:SUPPORTS]->(m:Mission) RETURN c, m LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  def test_topology_topology_hop_correct_direction_is_accepted(self):
+    analysis = self._analysis(
+      "MATCH (m:Mission)-[:SUPPORTS]->(c:Component) RETURN m, c LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_mixed_surface_hop_is_skipped_per_ruling(self):
+    # `Mission` is topology-only, `Technique` is not: mixed-surface, skipped.
+    analysis = self._analysis(
+      "MATCH (m:Mission)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN m, t LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_label_set_merely_containing_a_topology_label_gets_no_skip(self):
+    # `(t:Technique|Mission)`: not "every candidate label topology-only", so
+    # this is checked normally like any other populated-type hop, and
+    # rejected (Indicator -> EMPLOYS_TECHNIQUE -> Technique is invalid).
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique|Mission) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  def test_contract_section_6_query_is_still_accepted(self):
+    analysis = self._analysis(
+      "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p", allow_limit_optional_graph=True,
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  # Item 3: direction-reversal feedback names the correct direction.
+  def test_direction_reversal_feedback_says_reverse_the_arrow(self):
+    analysis = self._analysis(
+      "MATCH (t:Technique)-[:USES_TECHNIQUE]->(i:Indicator) RETURN t, i LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn(
+      "`USES_TECHNIQUE` goes Indicator→Technique; reverse the arrow",
+      analysis["validation_feedback"],
+    )
+
+  # Item 4: an unknown relationship type is the flat check's rejection only.
+  def test_unknown_relationship_type_does_not_get_the_endpoint_code(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)-[:FOO_BAR]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertFalse(analysis["schema_compatible"])
+    self.assertNotEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  # Item 5: `<-[..]->` is undirected, not `reverse`.
+  def test_double_arrow_bracket_is_treated_as_undirected_and_accepted(self):
+    analysis = self._analysis(
+      "MATCH (ta:ThreatActor)<-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN ta, t LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_double_arrow_bracket_still_rejects_when_neither_order_fits(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator)<-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+
+  # Item 6: label alternation (`|`) fails closed; multi-label (`:`) passes
+  # if any label fits; feedback names the specific label that failed.
+  def test_label_alternation_fails_closed(self):
+    # `Indicator` fits `USES_TECHNIQUE`, `Malware` does not: rejected, and
+    # the feedback names the label that actually failed (`Malware`), not
+    # an arbitrary one.
+    analysis = self._analysis(
+      "MATCH (i:Indicator|Malware)-[:USES_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertIn("for Malware use", analysis["validation_feedback"])
+
+  def test_multi_label_passes_if_any_label_fits(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator:Malware)-[:USES_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  # Item 7: `_global_var_labels` is scoped per `UNION` branch.
+  def test_union_branch_does_not_leak_a_label_into_a_later_branch(self):
+    # `x` is `Indicator` in branch 1 only; branch 2's `x` is a fresh,
+    # unlabeled variable, so its hop is skipped (unknown endpoint), not
+    # false-rejected using branch 1's label.
+    analysis = self._analysis(
+      "MATCH (x:Indicator) RETURN x.value AS v LIMIT 5 "
+      "UNION MATCH (x)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN x.value AS v LIMIT 5"
+    )
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  # Item 8: `WHERE`-clause pattern predicates are checked.
+  def test_where_clause_pattern_predicate_is_checked(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator) WHERE (i)-[:EMPLOYS_TECHNIQUE]->(:Technique) RETURN i LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
+
+  def test_iter_top_level_parens_keeps_a_function_call_inside_the_outer_node(self):
+    # Item 8, `_NODE_TEXT`-equivalent fix: a property-map function call must
+    # not read as a separate, spurious "node". Tested directly against the
+    # hop-checking unit (`_pattern_endpoint_hop_error`), since a property
+    # map with a function call also trips an unrelated, pre-existing
+    # flat-schema quirk (`extract_schema_tokens`'s own `LABEL_CHAIN` scan
+    # reads a `key: function(...)` map entry as a label-like token) that
+    # would stop the pipeline before this check ever runs — out of this fix
+    # round's scope.
+    chain = "(m:Malware {value: toLower('a')})-[:INDICATES]->(i:Indicator)"
+    spans = list(_iter_top_level_parens(chain))
+    self.assertEqual(len(spans), 2)
+    self.assertEqual(spans[0][2], "(m:Malware {value: toLower('a')})")
+    self.assertEqual(spans[1][2], "(i:Indicator)")
+    patterns_by_type = _pattern_endpoint_pairs_by_type(EDGEGUARD_SCHEMA_V0_11)
+    topology_labels = _topology_surface_labels(EDGEGUARD_SCHEMA_V0_11)
+    var_labels = _global_var_labels(chain)
+    error = _pattern_endpoint_hop_error(chain, var_labels, patterns_by_type, topology_labels)
+    # `INDICATES` is `Indicator -> Malware`; the chain writes
+    # `Malware -> Indicator`, so this must be caught, not silently skipped.
+    self.assertIsNotNone(error)
+    self.assertIn("reverse the arrow", error)
+
+
+class PatternEndpointV0_11FixRound2Tests(unittest.TestCase):
+  """EGM-059 phase 4 slice 4b, fix round 2 (findings-4b-2.md item 1)."""
+
+  def _analysis(self, cypher, **kwargs):
+    kwargs.setdefault("allowed", schema_sets(EDGEGUARD_SCHEMA_V0_11))
+    kwargs.setdefault("max_limit", 100)
+    kwargs.setdefault("enforce_hop_bounds", True)
+    kwargs.setdefault("enforce_pattern_endpoints", True)
+    return analyze_generated_cypher(cypher, **kwargs)
+
+  def test_label_check_inside_a_where_boolean_expression_does_not_bind_a_different_variable(self):
+    # A label chain only binds the variable it directly follows at a node
+    # head; `(t.name = 'x' AND i:Indicator)` is a parenthesised WHERE
+    # boolean expression, not a node pattern for `t` — `t` must stay
+    # unlabeled (unknown endpoint, not checked), not silently become
+    # `Indicator` because `i:Indicator` appears later in the same text.
+    cypher = (
+      "MATCH (i:Indicator)-[:USES_TECHNIQUE]->(t) "
+      "WHERE (t.name = 'x' AND i:Indicator) RETURN i LIMIT 5"
+    )
+    analysis = self._analysis(cypher)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_v0_10_profile_accepts_the_same_probe(self):
+    cypher = (
+      "MATCH (i:Indicator)-[:USES_TECHNIQUE]->(t) "
+      "WHERE (t.name = 'x' AND i:Indicator) RETURN i LIMIT 5"
+    )
+    analysis = analyze_generated_cypher(cypher, max_limit=100)
+    self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_where_label_predicates_never_bind_a_variable(self):
+    # `NOT (t:Tactic)` and `(t:Malware OR t:Technique)` are predicates on an
+    # unlabeled `t`; binding them would falsely reject a query Neo4j runs.
+    for predicate in ("NOT (t:Tactic)", "(t:Malware OR t:Technique)"):
+      with self.subTest(predicate=predicate):
+        analysis = self._analysis(
+          "MATCH (i:Indicator)-[:USES_TECHNIQUE]->(t) "
+          f"WHERE {predicate} RETURN i LIMIT 5"
+        )
+        self.assertTrue(analysis["accepted"], analysis["validation_feedback"])
+
+  def test_where_label_predicate_cannot_hide_a_mismatch(self):
+    analysis = self._analysis(
+      "MATCH (i:Indicator) MATCH (i)-[:EMPLOYS_TECHNIQUE]->(t:Technique) "
+      "WHERE (i:ThreatActor OR i.value = 'x') RETURN t LIMIT 5"
+    )
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["execution_safety_error_code"], PATTERN_ENDPOINT_MISMATCH_CODE)
 
 
 class SchemaArtifactV0_11Tests(unittest.TestCase):

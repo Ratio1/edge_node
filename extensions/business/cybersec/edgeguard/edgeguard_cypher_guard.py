@@ -1211,6 +1211,386 @@ def _pattern_hop_count_error(chains: list[str], max_hops: int) -> str | None:
   return None
 
 
+# --- Endpoint-pair validation for relationship patterns (contract §2.2, ---
+# --- §3.2, §5.2; v0.11 profile only) ----------------------------------------
+# The served guard previously checked flat label/relationship-type/property
+# membership only, so `(i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique)` was
+# accepted even though the schema artifact only carries
+# `(ThreatActor)-[:EMPLOYS_TECHNIQUE]->(Technique)` — both endpoint labels
+# and the relationship type were individually allowlisted, but the *pair*
+# never was. This adds a check on top of the flat-schema one, gated by the
+# same v0.11-only `enforce_pattern_endpoints` flag `analyze_generated_cypher`
+# already threads through for every other v0.11-only behaviour, and runs
+# from there directly rather than inside `_execution_safety_error` — the two
+# checks are independent, and folding this one into the other would have
+# meant every one of that function's ~25 `return` points carrying an extra
+# rejection code it otherwise never needed.
+PATTERN_ENDPOINT_MISMATCH_CODE = "pattern_endpoint_mismatch"
+# Every `_execution_safety_error` violation (missing/oversized LIMIT, hop
+# bounds, disallowed constructs, ...) shares this one code; only the
+# endpoint-pair violation above gets its own, so a caller can tell the two
+# apart without parsing the message text.
+EXECUTION_SAFETY_ERROR_CODE = "execution_safety_violation"
+# User-submitted Cypher has no length cap at the operator routes
+# (`/check_cypher`, `/neo4j_query`, `/explain_graph`, `/prepare_graph_explanation`,
+# edgeguard_api.py); this check's own cost grows with the number of
+# relationship brackets in the input, so an unbounded string is unbounded
+# work. The cap itself lives in edgeguard_api.py; the constant is shared so
+# the two files cannot drift.
+CYPHER_MAX_CHARS = 16_384
+# The relationship type(s) inside a bracket's content (`RELATIONSHIP_BRACKET`
+# already isolates the bracket content elsewhere in this module): `r:REL`,
+# `:REL`, `:A|B`, with an optional trailing var-length spec ignored (the
+# identifier class stops before `*`).
+_BRACKET_TYPE_RE = re.compile(r":\s*(" + IDENT + r"(?:\s*\|\s*" + IDENT + r")*)")
+# A node pattern's head: `(`, an optional variable, an optional label chain
+# (`:A`, `:A:B`, `:A|B`) — anchored (`^`), so a label chain is only read
+# right after the variable/paren, never found elsewhere inside the node
+# text (a parenthesised `WHERE` boolean expression, `(t.name = 'x' AND
+# i:Indicator)`, is also a `_iter_top_level_parens` span and would
+# otherwise falsely bind `t` to `Indicator`).
+_NODE_HEAD = re.compile(
+  r"^\(\s*(" + IDENT + r")?\s*(:\s*" + IDENT + r"(?:\s*[:|&]\s*" + IDENT + r")*)?"
+)
+
+
+def _iter_top_level_parens(text: str) -> Any:
+  """Every top-level `(...)` span in `text` as `(start, end, text)`,
+  respecting nested parens: a node's property map may hold a function call
+  (`{value: toLower('a')}`), and the simple `\\([^()]*\\)` regex this module
+  uses for flatter cases (e.g. `RELATIONSHIP_BRACKET`'s sibling for `[...]`)
+  stops at the first inner `(`/`)` and would mis-read the call's own parens
+  as a false, separate node."""
+  depth = 0
+  start = None
+  for index, char in enumerate(text):
+    if char == "(":
+      if depth == 0:
+        start = index
+      depth += 1
+    elif char == ")" and depth > 0:
+      depth -= 1
+      if depth == 0 and start is not None:
+        yield start, index + 1, text[start:index + 1]
+        start = None
+
+
+def _node_var_and_chain(node_text: str) -> tuple[str | None, str | None]:
+  """The bound variable name and raw label-chain capture at the head of one
+  node-pattern text, or `None`/`None` (`_NODE_HEAD`). Shared by
+  `_parse_node_labels` and `_global_var_labels` (also dedupes the
+  label-chain split)."""
+  match = _NODE_HEAD.match(node_text)
+  if not match:
+    return None, None
+  return match.group(1), match.group(2)
+
+
+def _split_label_chain(chain: str) -> tuple[frozenset[str], bool]:
+  """A label-chain capture (`_NODE_HEAD` group 2, e.g. `:A`, `:A:B`, `:A|B`)
+  split into its labels, and whether every one of them must independently
+  satisfy the endpoint check: `True` for `:A|B` — Neo4j's "node has label A
+  OR label B"; since the guard cannot know which, every alternative must
+  fit, fail-closed, the same rule `[:A|B]` relationship-type alternatives
+  already follow. `False` for a single label or `:A:B` — Neo4j's "node has
+  label A AND label B" — a node carrying every colon-joined label at once
+  needs only one of them to be a valid endpoint. A chain mixing `:` and `|`
+  is treated as alternation (the fail-closed, safer default)."""
+  labels = frozenset(part.strip() for part in re.split(r"[:|&]", chain[1:]) if part.strip())
+  return labels, "|" in chain
+
+
+def _parse_node_labels(
+  node_text: str, var_labels: dict[str, tuple[frozenset[str], bool]],
+) -> tuple[frozenset[str], bool]:
+  """The label(s) a single node-pattern occurrence carries, and their
+  quantifier (`_split_label_chain`): its own inline label chain if present,
+  otherwise the labels bound to its variable elsewhere in the query
+  (`var_labels`, built by `_global_var_labels`), or an empty set (quantifier
+  moot) when neither is known — contract §5.2: "Unknown endpoints (no
+  label) are not checked."."""
+  var, chain = _node_var_and_chain(node_text)
+  if chain:
+    return _split_label_chain(chain)
+  if var:
+    return var_labels.get(var, (frozenset(), False))
+  return frozenset(), False
+
+
+def _global_var_labels(text: str) -> dict[str, tuple[frozenset[str], bool]]:
+  """Every variable name bound to an inline label in any `MATCH`/`OPTIONAL
+  MATCH` node pattern of `text` (contract §5.2: "variables bound to a label
+  anywhere in the query, including `MATCH (i:Indicator)` then
+  `(i)-[:T]->(t)`"), so a label bound in a separate `MATCH` clause is still
+  known. Only pattern node heads bind: a `WHERE` label test such as
+  `NOT (t:Tactic)` or `(t:A OR t:B)` is a predicate, not a binding. The caller passes one
+  `UNION` branch's text at a time: a variable name reused in a later branch
+  is fresh there, so scoping this per branch avoids a false reject. A
+  `WITH`-clause rename is not tracked as a separate scope (documented
+  simplification): `WITH i AS j` does not carry `i`'s label to `j`, but `i`
+  keeps its own label too, so neither name silently loses a real binding —
+  only a rename gains one."""
+  var_labels: dict[str, tuple[frozenset[str], bool]] = {}
+  node_texts = (
+    node_text
+    for pattern_chain in _match_pattern_chains(text)
+    for _start, _end, node_text in _iter_top_level_parens(pattern_chain)
+  )
+  for node_text in node_texts:
+    var, chain = _node_var_and_chain(node_text)
+    if var and chain:
+      labels, requires_all = _split_label_chain(chain)
+      if labels:
+        existing_labels, existing_all = var_labels.get(var, (frozenset(), False))
+        var_labels[var] = (existing_labels | labels, existing_all or requires_all)
+  return var_labels
+
+
+# A few characters is always enough to see a `<-`/`->` arrow plus stray
+# whitespace; slicing a fixed-size window instead of the whole preceding/
+# following chain text keeps this function's cost independent of chain
+# length (it runs once per relationship bracket, so an O(chain length)
+# slice per call would make the endpoint check quadratic in chain length on
+# a long, bracket-heavy input). Leniency, not a false reject: an arrow
+# written with more whitespace than the window covers (`(a)<-        [:T]-
+# (b)`, ≥ 7 spaces) reads as `undirected` instead of `reverse` — undirected
+# only widens which pairs are accepted, it never rejects a query Neo4j
+# itself would run, so this fails open, not closed.
+_EDGE_DIRECTION_WINDOW = 8
+
+
+def _edge_direction(chain: str, bracket_match: re.Match[str]) -> str:
+  """`forward` (`-[...]->`), `reverse` (`<-[...]-`) or `undirected`
+  (`-[...]-`, or the syntactically unusual but undirected-in-practice
+  `<-[...]->`), read from a small window of characters immediately around
+  the bracket (see `_EDGE_DIRECTION_WINDOW` for its leniency)."""
+  before = chain[max(0, bracket_match.start() - _EDGE_DIRECTION_WINDOW):bracket_match.start()]
+  after = chain[bracket_match.end():bracket_match.end() + _EDGE_DIRECTION_WINDOW]
+  left_reverse = bool(re.search(r"<-\s*$", before))
+  right_forward = bool(re.match(r"^\s*->", after))
+  if left_reverse and right_forward:
+    return "undirected"
+  if left_reverse:
+    return "reverse"
+  if right_forward:
+    return "forward"
+  return "undirected"
+
+
+# Cache keyed on the artifact object's identity, mirroring
+# `_topology_relationship_types_cache` above.
+_pattern_endpoint_pairs_cache: tuple[Any, dict[str, frozenset[tuple[str, str]]]] | None = None
+
+
+def _pattern_endpoint_pairs_by_type(artifact: dict[str, Any]) -> dict[str, frozenset[tuple[str, str]]]:
+  """`(from, to)` label pairs per relationship type, over every pattern in
+  the artifact regardless of surface (contract §5.2: "check ... against the
+  schema artifact v0.11 `patterns[]` (both surfaces)"). A relationship type
+  absent from this dict is unknown to the schema entirely — the caller skips
+  it: that is the flat-schema check's rejection, not this one's."""
+  global _pattern_endpoint_pairs_cache
+  if _pattern_endpoint_pairs_cache is not None and _pattern_endpoint_pairs_cache[0] is artifact:
+    return _pattern_endpoint_pairs_cache[1]
+  grouped: dict[str, set[tuple[str, str]]] = {}
+  for pattern in artifact.get("patterns", []) or []:
+    rel_type, p_from, p_to = pattern.get("type"), pattern.get("from"), pattern.get("to")
+    if not rel_type or not p_from or not p_to:
+      continue
+    grouped.setdefault(str(rel_type), set()).add((str(p_from), str(p_to)))
+  result = {rel_type: frozenset(pairs) for rel_type, pairs in grouped.items()}
+  _pattern_endpoint_pairs_cache = (artifact, result)
+  return result
+
+
+def _quantified_pairs_valid(
+  from_labels: frozenset[str], from_requires_all: bool,
+  to_labels: frozenset[str], to_requires_all: bool,
+  pairs: frozenset[tuple[str, str]],
+) -> bool:
+  """Whether the `(from, type, to)` requirement is satisfied given each
+  side's label-chain quantifier (`_split_label_chain`)."""
+  def to_ok(from_label: str) -> bool:
+    checks = ((from_label, to_label) in pairs for to_label in to_labels)
+    return all(checks) if to_requires_all else any(checks)
+  return all(to_ok(f) for f in from_labels) if from_requires_all else any(to_ok(f) for f in from_labels)
+
+
+def _pattern_endpoint_witness(
+  from_labels: frozenset[str], from_requires_all: bool,
+  to_labels: frozenset[str], to_requires_all: bool,
+  pairs: frozenset[tuple[str, str]],
+) -> tuple[str, str]:
+  """A representative `(from_label, to_label)` pair for feedback, computed
+  only once `_quantified_pairs_valid` is already known False: on the common
+  single-label (or `:A:B`) case this is simply the label(s) involved; when a
+  side uses `|` alternation, it is the first (sorted) alternative that
+  itself fails `_quantified_pairs_valid` as a singleton, so the feedback
+  names the specific label that failed rather than an arbitrary one."""
+  from_candidates = sorted(from_labels)
+  to_candidates = sorted(to_labels)
+  if from_requires_all:
+    for from_label in from_candidates:
+      if not _quantified_pairs_valid(frozenset((from_label,)), False, to_labels, to_requires_all, pairs):
+        from_candidates = [from_label]
+        break
+  if to_requires_all:
+    for to_label in to_candidates:
+      if not _quantified_pairs_valid(
+        frozenset(from_candidates), from_requires_all, frozenset((to_label,)), False, pairs,
+      ):
+        to_candidates = [to_label]
+        break
+  return from_candidates[0], to_candidates[0]
+
+
+def _pattern_endpoint_feedback(
+  rel_type: str, from_label: str, to_label: str, patterns_by_type: dict[str, frozenset[tuple[str, str]]],
+) -> str:
+  """Contract §5.2 style: "`EMPLOYS_TECHNIQUE` connects ThreatActor→Technique;
+  for Indicator use `USES_TECHNIQUE`" — the valid endpoint pair(s) of the
+  used type, then the valid type(s) between the labels actually used (or a
+  statement that none exists). Deterministic ordering (sorted). Reuses the
+  cached `patterns_by_type` instead of rescanning the artifact's raw
+  `patterns[]` list.
+
+  When `rel_type` IS valid between `from_label` and `to_label`, only in the
+  opposite direction, the feedback says so instead of repeating the same
+  type as its own "fix" — the generic message reads like a no-op suggestion
+  otherwise (e.g. "for Technique use `EMPLOYS_TECHNIQUE`" when
+  `EMPLOYS_TECHNIQUE` is exactly what was used)."""
+  own_pairs = patterns_by_type.get(rel_type, frozenset())
+  if (to_label, from_label) in own_pairs and (from_label, to_label) not in own_pairs:
+    return f"`{rel_type}` goes {to_label}→{from_label}; reverse the arrow"
+  valid_pairs = sorted(f"{p_from}→{p_to}" for p_from, p_to in own_pairs)
+  pairs_text = ", ".join(valid_pairs) if valid_pairs else "no endpoints in the schema"
+  alt_types = sorted(
+    rel for rel, pairs in patterns_by_type.items()
+    if (from_label, to_label) in pairs or (to_label, from_label) in pairs
+  )
+  if alt_types:
+    suggestion = f"for {from_label} use " + " or ".join(f"`{t}`" for t in alt_types)
+  else:
+    suggestion = f"no relationship type connects {from_label} and {to_label} in the schema"
+  return f"`{rel_type}` connects {pairs_text}; {suggestion}"
+
+
+def _pattern_endpoint_hop_error(
+  chain: str,
+  var_labels: dict[str, tuple[frozenset[str], bool]],
+  patterns_by_type: dict[str, frozenset[tuple[str, str]]],
+  topology_labels: frozenset[str],
+) -> str | None:
+  """The first endpoint-pair violation in one chain-like pattern text (a
+  `MATCH`/`OPTIONAL MATCH` chain, or a `WHERE`-clause pattern predicate —
+  both share the `(node)-[rel]->(node)...` shape), or None. A relationship
+  type without endpoint labels known on both sides is skipped, including
+  every hop touching an unlabeled middle node (both its own label lookup
+  fails).
+
+  Orchestrator ruling (state.md): a mixed-surface hop — exactly one side's
+  *every* candidate label is topology-surface-only (`_topology_surface_labels`)
+  and the other side is not — is not checked: contract §5.1 item 3 tells the
+  model to "write the correct query" for the not-yet-populated ISIM topology
+  even where `patterns[]` does not enumerate every populated-type x
+  topology-label combination (e.g. `(CVE)-[:AFFECTS]->(Mission)`, contract
+  §6's own acceptance query), and `classify_empty_reason` already classifies
+  those as `topology_surface_no_data`, not a guard rejection. A hop where
+  *both* sides are topology-only is still checked, against the topology
+  patterns in `patterns_by_type`; a label set that only partly overlaps the
+  topology surface (`:Technique|Mission`) is never "every candidate label
+  topology-only", so it is checked too."""
+  node_spans = list(_iter_top_level_parens(chain))
+  for bracket_match in RELATIONSHIP_BRACKET.finditer(chain):
+    type_match = _BRACKET_TYPE_RE.search(bracket_match.group(1))
+    if not type_match:
+      continue
+    preceding_text, following_text = None, None
+    for start, end, text in node_spans:
+      if end <= bracket_match.start():
+        preceding_text = text
+      elif following_text is None and start >= bracket_match.end():
+        following_text = text
+    if preceding_text is None or following_text is None:
+      continue
+    preceding_labels, preceding_all = _parse_node_labels(preceding_text, var_labels)
+    following_labels, following_all = _parse_node_labels(following_text, var_labels)
+    if not preceding_labels or not following_labels:
+      continue
+    preceding_topology_only = preceding_labels <= topology_labels
+    following_topology_only = following_labels <= topology_labels
+    if preceding_topology_only != following_topology_only:
+      continue
+    direction = _edge_direction(chain, bracket_match)
+    if direction == "forward":
+      candidates = [(preceding_labels, preceding_all, following_labels, following_all)]
+    elif direction == "reverse":
+      candidates = [(following_labels, following_all, preceding_labels, preceding_all)]
+    else:
+      candidates = [
+        (preceding_labels, preceding_all, following_labels, following_all),
+        (following_labels, following_all, preceding_labels, preceding_all),
+      ]
+    alternatives = [part.strip() for part in type_match.group(1).split("|") if part.strip()]
+    for rel_type in alternatives:
+      pairs = patterns_by_type.get(rel_type)
+      if pairs is None:
+        continue
+      valid = any(
+        _quantified_pairs_valid(from_labels, from_all, to_labels, to_all, pairs)
+        for from_labels, from_all, to_labels, to_all in candidates
+      )
+      if not valid:
+        from_labels, from_all, to_labels, to_all = candidates[0]
+        from_label, to_label = _pattern_endpoint_witness(from_labels, from_all, to_labels, to_all, pairs)
+        return _pattern_endpoint_feedback(rel_type, from_label, to_label, patterns_by_type)
+  return None
+
+
+def _pattern_endpoint_error(stripped: str, artifact: dict[str, Any]) -> str | None:
+  """The first endpoint-pair violation across the whole query, or None
+  (contract §5.2). Deterministic: `UNION` branches in order (each branch
+  gets its own `_global_var_labels`, so a variable in a later branch does
+  not inherit an earlier branch's label), `MATCH`/`OPTIONAL MATCH` chains
+  before `WHERE`-clause pattern predicates within a branch, chains/predicates
+  in the order found, relationship brackets left to right within one, type
+  alternatives (`[:A|B]`) in written order.
+
+  `WHERE`-clause pattern predicates are masked for `EXISTS`/`COUNT`
+  subquery bodies first (`_mask_subquery_predicate_blocks`), the same
+  masking `_where_pattern_predicate_new_variable_error` already applies —
+  a subquery's own `MATCH` is checked as a `MATCH` chain instead, not
+  double-counted as a bare predicate. `MATCH` chains themselves are read
+  unmasked, matching `_execution_safety_error`'s existing hop-bound and
+  unlabeled-comma checks: a subquery's `MATCH` is checked too.
+
+  Known gap, documented rather than fixed (tracked as a follow-up in
+  state.md): an inline node predicate, `(i:Indicator WHERE i.value =
+  'x')-[:T]->(...)`, truncates the `MATCH`-chain text at the shared
+  `_MATCH_CLAUSE_BOUNDARY` regex (`WHERE` is one of its boundary keywords)
+  before this check ever sees the relationship — a pre-existing gap in
+  `_match_pattern_chains` itself, shared by the hop-bound and
+  unlabeled-comma checks, not safe to change here across every caller. Such
+  a hop is silently not checked by any of the three."""
+  patterns_by_type = _pattern_endpoint_pairs_by_type(artifact)
+  topology_labels = _topology_surface_labels(artifact)
+  for branch in UNION_SPLIT.split(stripped):
+    var_labels = _global_var_labels(branch)
+    for chain in _match_pattern_chains(branch):
+      error = _pattern_endpoint_hop_error(chain, var_labels, patterns_by_type, topology_labels)
+      if error:
+        return error
+    masked = _mask_subquery_predicate_blocks(branch)
+    for where_text in _where_clause_texts(masked):
+      comprehension_masked = _mask_pattern_comprehension_blocks(where_text)
+      for predicate_match in _WHERE_PATTERN_CHAIN.finditer(comprehension_masked):
+        error = _pattern_endpoint_hop_error(
+          predicate_match.group(0), var_labels, patterns_by_type, topology_labels,
+        )
+        if error:
+          return error
+  return None
+
+
 def _execution_safety_error(
   candidate: str,
   schema_tokens: dict[str, set[str]],
@@ -1221,7 +1601,11 @@ def _execution_safety_error(
 ) -> str | None:
   """First execution-safety violation for an otherwise read-only query, or
   None. Runs on string-literal-stripped text; messages are the stable
-  rejection diagnostics.
+  rejection diagnostics. The endpoint-pair check (contract §2.2/§3.2/§5.2)
+  is a separate function, `_pattern_endpoint_error`, called directly from
+  `analyze_generated_cypher` rather than from here: the two checks are
+  independent, and every `return` point below would otherwise have had to
+  carry an extra rejection code it never needed.
 
   `require_limit=False` (contract §4.1, `graph` shape only): a missing
   `LIMIT` is not itself an error — the runtime bounds rows at
@@ -1314,6 +1698,8 @@ def analyze_generated_cypher(
   max_limit: int | None = None,
   allow_limit_optional_graph: bool = False,
   enforce_hop_bounds: bool = False,
+  enforce_pattern_endpoints: bool = False,
+  schema_artifact: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   """`allow_limit_optional_graph` (contract §4.1, v0.11 profile only; v0.10
   callers never pass it, so v0.10 behaviour — `LIMIT` always required — is
@@ -1326,7 +1712,15 @@ def analyze_generated_cypher(
   `MAX_PATTERN_HOPS` (3). v0.10 callers never pass it, so a var-length or hop
   count above 3 stays accepted for v0.10, unchanged; the unbounded-var-length
   rejection (bare `*`, `*1..`) and the comma-pattern-with-unlabeled-node
-  rejection apply to every profile regardless (X1, pre-existing gap)."""
+  rejection apply to every profile regardless (X1, pre-existing gap).
+
+  `enforce_pattern_endpoints` (contract §2.2/§3.2/§5.2, v0.11 profile only):
+  rejects a relationship pattern whose two known endpoint labels are not a
+  valid `(from, type, to)` triple in `schema_artifact` (`EDGEGUARD_SCHEMA_V0_11`
+  by default). v0.10 callers never pass it, so a mismatched pair such as
+  `(i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique)` — individually
+  allowlisted labels and relationship type, wrong pair — stays accepted for
+  v0.10, unchanged."""
   allowed = allowed or schema_sets()
   candidate = str(output or "").strip()
   forbidden = {name: bool(pattern.search(candidate)) for name, pattern in FORBIDDEN_OUTPUT.items()}
@@ -1347,6 +1741,7 @@ def analyze_generated_cypher(
   schema_unknown = {}
   schema_compatible = False
   execution_safety_error = None
+  execution_safety_error_code = None
   if read_only_static:
     schema_tokens = extract_schema_tokens(candidate)
     schema_unknown = {
@@ -1362,6 +1757,19 @@ def analyze_generated_cypher(
       candidate, schema_tokens, max_limit,
       require_limit=require_limit, enforce_hop_bounds=enforce_hop_bounds,
     )
+    if execution_safety_error is not None:
+      execution_safety_error_code = EXECUTION_SAFETY_ERROR_CODE
+    elif enforce_pattern_endpoints and schema_compatible:
+      # Contract §2.2/§3.2/§5.2, v0.11 profile only: only once the flat
+      # schema and every other execution-safety rule already pass — a
+      # completely unknown label or relationship type is the flat-schema
+      # check's rejection (`schema_unknown`), not this one's.
+      pattern_endpoint_error = _pattern_endpoint_error(
+        _analysis_text(candidate), schema_artifact or EDGEGUARD_SCHEMA_V0_11,
+      )
+      if pattern_endpoint_error is not None:
+        execution_safety_error = pattern_endpoint_error
+        execution_safety_error_code = PATTERN_ENDPOINT_MISMATCH_CODE
 
   invented_temporal = sorted(
     set(schema_unknown.get("properties", [])) & set(TEMPORAL_HALLUCINATION_PROPERTIES)
@@ -1379,6 +1787,7 @@ def analyze_generated_cypher(
     "schema_compatible": schema_compatible,
     "schema_unknown": schema_unknown,
     "execution_safety_error": execution_safety_error,
+    "execution_safety_error_code": execution_safety_error_code,
     "invented_temporal_properties": invented_temporal,
     "accepted": accepted,
     "accepted_cypher": candidate if accepted else None,

@@ -26,6 +26,7 @@ import requests
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 from .edgeguard_cypher_guard import (
+  CYPHER_MAX_CHARS,
   DEFAULT_SCHEMA_RETRY_LIMIT,
   EDGEGUARD_SCHEMA,
   EDGEGUARD_SCHEMA_V0_11,
@@ -1207,6 +1208,7 @@ def _prepare_graph_explanation_plan(
     max_limit=guard_max_limit,
     allow_limit_optional_graph=use_v0_11,
     enforce_hop_bounds=use_v0_11,
+    enforce_pattern_endpoints=use_v0_11,
   )
   analysis["schema_version"] = (validation_profile or {}).get("schema_version", SCHEMA_VERSION)
   # Contract §4.3: carried in `plan["validation"]` so the explanation
@@ -4314,6 +4316,7 @@ class EdgeguardApiPlugin(BasePlugin):
           max_limit=int(self.cfg_neo4j_max_rows),
           allow_limit_optional_graph=use_v0_11_schema,
           enforce_hop_bounds=use_v0_11_schema,
+          enforce_pattern_endpoints=use_v0_11_schema,
         )
         validation["result_shape"] = classify_result_shape(validation.get("candidate") or raw_output)
         if completion.get("finish_reason") != "stop":
@@ -4366,6 +4369,12 @@ class EdgeguardApiPlugin(BasePlugin):
           "read_only_static": bool(validation.get("read_only_static")),
           "schema_compatible": bool(validation.get("schema_compatible")),
           "schema_unknown": validation.get("schema_unknown") or {},
+          # The baseline runner reads only `/generate` attempts, so it needs
+          # the rejection code (and message) here too, not only on
+          # `/check_cypher`/`/neo4j_query` (which spread `**analysis`
+          # directly).
+          "execution_safety_error": validation.get("execution_safety_error"),
+          "execution_safety_error_code": validation.get("execution_safety_error_code"),
           "result_shape": validation.get("result_shape"),
           "invented_temporal_properties": validation.get("invented_temporal_properties") or [],
           "validation_feedback": validation.get("validation_feedback") or "",
@@ -5514,6 +5523,26 @@ class EdgeguardApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="POST")
   @_tracked_endpoint
   def check_cypher(self, cypher: str, model_key: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    if not isinstance(cypher, str):
+      # Malformed request body (wrong type) — caller input, 400.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "accepted": False,
+        "accepted_cypher": None,
+        "error": "cypher must be a string.",
+        "diagnostics": {"stage": "request", "code": "invalid_cypher", "retryable": False},
+      }, 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # User-submitted Cypher had no length cap at this route — same
+      # 413-via-`_wrapper_safe_error` convention as `GENERATION_MAX_REQUEST_CHARS`
+      # on `/generate`.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "accepted": False,
+        "accepted_cypher": None,
+        "error": f"cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "diagnostics": {"stage": "request", "code": "cypher_too_large", "retryable": False},
+      }, 413)
     # Contract §1/§4.1 (review finding 1, round 2): same v0.11-vs-v0.10
     # selection as `generate` and `/neo4j_query`, via the shared resolver —
     # a v0.11 `model_key` validates against the v0.11 sets with `LIMIT`
@@ -5526,6 +5555,7 @@ class EdgeguardApiPlugin(BasePlugin):
       max_limit=int(self.cfg_neo4j_max_rows),
       allow_limit_optional_graph=validation_profile["use_v0_11"],
       enforce_hop_bounds=validation_profile["use_v0_11"],
+      enforce_pattern_endpoints=validation_profile["use_v0_11"],
     )
     return {
       "status": STATUS_ACCEPTED if analysis["accepted"] else STATUS_REJECTED,
@@ -5829,6 +5859,24 @@ class EdgeguardApiPlugin(BasePlugin):
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
+    if not isinstance(cypher, str):
+      # Malformed request body (wrong type) — caller input, 400.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "error": "cypher must be a string.",
+        "diagnostics": {"stage": "request", "code": "invalid_cypher", "retryable": False},
+      }, 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # Same length cap as `/check_cypher`.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "error": f"cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "diagnostics": {"stage": "request", "code": "cypher_too_large", "retryable": False},
+      }, 413)
     # Contract §1 (review finding 1, both rounds): `/neo4j_query` is the
     # operator route — no profile of its own — so it picks the v0.11
     # artifact's derived flat sets only when the caller names a configured
@@ -5844,6 +5892,7 @@ class EdgeguardApiPlugin(BasePlugin):
       max_limit=int(self.cfg_neo4j_max_rows),
       allow_limit_optional_graph=use_v0_11_schema,
       enforce_hop_bounds=use_v0_11_schema,
+      enforce_pattern_endpoints=use_v0_11_schema,
     )
     # Contract §4.3: `classify_result_shape` on every `/neo4j_query` response,
     # accepted or rejected — it is a static text classification, not an
@@ -6084,6 +6133,14 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": "Graph explanation Cypher must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
       }), 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # Same length cap as `/check_cypher`, `/neo4j_query`, `/explain_graph`.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "error": f"Graph explanation Cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "validation_errors": [_contract_error("cypher_too_large", f"cypher must be at most {CYPHER_MAX_CHARS} characters")],
+      }), 413)
     forwarded = sorted(str(name) for name in kwargs)
     if forwarded:
       # Fix round 5: unexpected request fields — malformed request body, 400.
@@ -6352,6 +6409,16 @@ class EdgeguardApiPlugin(BasePlugin):
         "error": "Graph explanation Cypher must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
       }, 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # Same length cap as `/check_cypher` and `/neo4j_query`.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": f"Graph explanation Cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "validation_errors": [_contract_error("cypher_too_large", f"cypher must be at most {CYPHER_MAX_CHARS} characters")],
+      }, 413)
     if not isinstance(request, str) or not request.strip():
       # Fix round 5: malformed request body (missing/blank `request`), 400.
       return _wrapper_safe_error({
@@ -6431,6 +6498,7 @@ class EdgeguardApiPlugin(BasePlugin):
       max_limit=int(self.cfg_neo4j_max_rows),
       allow_limit_optional_graph=validation_profile["use_v0_11"],
       enforce_hop_bounds=validation_profile["use_v0_11"],
+      enforce_pattern_endpoints=validation_profile["use_v0_11"],
     )
     analysis["schema_version"] = validation_profile["schema_version"]
     # Contract §4.3: routes the explanation dispatch below, independent of

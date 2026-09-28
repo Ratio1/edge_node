@@ -63,6 +63,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jClientErro
 from extensions.business.cybersec.edgeguard.edgeguard_api import _neo4j_row_json_safe  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_REQUEST_CHARS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import CYPHER_MAX_CHARS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _prepare_graph_explanation_plan  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _WRAPPER_STATUS_CODE_KEY  # noqa: E402
@@ -5791,6 +5792,175 @@ class V0_11GenerateRuntimeTests(unittest.TestCase):
     self.assertEqual(result["schema_version"], "edgeguard-cypher-schema-v0.10")
     self.assertEqual(result["cypher_schema_version"], "edgeguard-cypher-schema-v0.10")
     self.assertEqual(result["schema_surface"], canonical_schema_surface())
+
+
+class PatternEndpointFixRound1ApiTests(unittest.TestCase):
+  """EGM-059 phase 4 slice 4b, fix round 1 (findings-4b-1.md items 2, 10,
+  11): `execution_safety_error`/`execution_safety_error_code` on `/generate`
+  attempts, the `enforce_pattern_endpoints` flag actually wired at the
+  `/generate` and `/neo4j_query` call sites, and the Cypher length cap at
+  `/check_cypher`, `/neo4j_query`, `/explain_graph`."""
+
+  SEEDED_CYPHER = "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+
+  def _make_v0_11_api(self):
+    return _make_api(
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+      worker_semaphore_env={V0_11_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53002"}},
+    )
+
+  def _response(self, cypher):
+    return _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": cypher,
+        "FULL_OUTPUT": {
+          "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+          "usage": {"completion_tokens": 12},
+        },
+      },
+    })
+
+  def test_generate_v0_11_rejects_the_seeded_case_with_the_code_on_every_attempt(self):
+    plugin = self._make_v0_11_api()
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [self._response(self.SEEDED_CYPHER)] * 3
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Which techniques does this indicator use?", model_key=V0_11_MODEL_KEY)
+
+    self.assertFalse(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 3)
+    for attempt in result["attempts"]:
+      self.assertFalse(attempt["accepted"])
+      self.assertEqual(attempt["execution_safety_error_code"], "pattern_endpoint_mismatch")
+      self.assertIn("USES_TECHNIQUE", attempt["execution_safety_error"])
+
+  def test_generate_v0_10_accepts_the_same_candidate(self):
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53004"},
+    })
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.return_value = self._response(self.SEEDED_CYPHER)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Which techniques does this indicator use?", model_key=PRIVATE_MODEL_KEY)
+
+    self.assertTrue(result["accepted"], result)
+    self.assertEqual(result["accepted_cypher"], self.SEEDED_CYPHER)
+
+  def test_neo4j_query_v0_11_rejects_the_seeded_case(self):
+    plugin = self._make_v0_11_api()
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+      cypher=self.SEEDED_CYPHER, model_key=V0_11_MODEL_KEY,
+    )
+
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertFalse(payload["executed"])
+    self.assertEqual(
+      payload["validation"]["execution_safety_error_code"], "pattern_endpoint_mismatch",
+    )
+
+  def test_neo4j_query_v0_10_accepts_the_same_candidate(self):
+    plugin = _make_api()
+    empty_result = _Result([], keys=["i", "t"])
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = empty_result
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          cypher=self.SEEDED_CYPHER,
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["executed"])
+
+  def test_check_cypher_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.check_cypher(cypher=oversized)
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "cypher_too_large")
+
+  def test_neo4j_query_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+      cypher=oversized,
+    )
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "cypher_too_large")
+
+  def test_explain_graph_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.explain_graph(cypher=oversized, request="Explain this.")
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(
+      {item["code"] for item in payload["validation_errors"]}, {"cypher_too_large"},
+    )
+
+
+class PatternEndpointFixRound2ApiTests(unittest.TestCase):
+  """EGM-059 phase 4 slice 4b, fix round 2 (findings-4b-2.md items 2, 3)."""
+
+  def test_prepare_graph_explanation_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.prepare_graph_explanation(cypher=oversized)
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(
+      {item["code"] for item in payload["validation_errors"]}, {"cypher_too_large"},
+    )
+
+  def test_check_cypher_rejects_a_non_string_cypher_with_400(self):
+    plugin = _make_api()
+
+    result = plugin.check_cypher(cypher=["not", "a", "string"])
+
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "invalid_cypher")
+
+  def test_neo4j_query_rejects_a_non_string_cypher_with_400(self):
+    plugin = _make_api()
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+      cypher={"not": "a string"},
+    )
+
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "invalid_cypher")
 
 
 class PromptProfileDispatchTests(unittest.TestCase):
