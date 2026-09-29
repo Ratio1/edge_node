@@ -82,6 +82,18 @@ class TestScopedReadinessPayload(unittest.TestCase):
     self.assertTrue(
       get_public_integration_config(owner, self.tenant)["integrations"]["taxii"]["configured"])
 
+  def test_a_tenant_without_a_record_is_not_configured_even_when_the_node_is(self):
+    # RM-093 / I-039, the generic twin of the MISP status: a push for a tenant with no record goes
+    # nowhere, so readiness must not offer it on the strength of the node's own destination.
+    owner = Owner(self.node)
+    scoped = get_public_integration_config(owner, self.tenant)["integrations"]
+    unscoped = get_public_integration_config(owner)["integrations"]
+    for integration_id in ("opencti", "taxii", "wazuh"):
+      self.assertTrue(unscoped[integration_id]["configured"], integration_id)
+      self.assertFalse(scoped[integration_id]["configured"], integration_id)
+      self.assertEqual(scoped[integration_id]["status"], "not_configured", integration_id)
+      self.assertIsNone(scoped[integration_id]["configuration_error"], integration_id)
+
   def test_the_node_level_three_read_identically_scoped_or_not(self):
     owner = Owner(self.node, {
       (self.tenant, "wazuh"): {"config": {"ENABLED": True, "MODE": "http",

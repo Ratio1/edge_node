@@ -342,3 +342,18 @@ def test_a_misconfigured_misp_does_not_emit_or_write(misp_ready, monkeypatch):
     emit.assert_not_called()
     write.assert_not_called()
   assert result.get("configuration_error") == "missing_credentials"
+
+
+@pytest.mark.parametrize("endpoint", ["export_misp", "push_to_opencti", "publish_to_taxii"])
+def test_a_push_for_a_tenant_without_a_record_answers_not_configured(endpoint):
+  """RM-093: a bound tenant with no integration record pushes nowhere, and says so. The projection
+  used to drop the untyped code and publish {"status": "error", "configuration_error": null}."""
+  from extensions.business.cybersec.red_mesh.services import misp_export
+  with read_endpoint_fixture(bound=True) as fixture, \
+       patch.object(misp_export, "PyMISP", side_effect=AssertionError("reached MISP")), \
+       patch.object(opencti_export, "build_stix_bundle", side_effect=AssertionError("built a bundle")), \
+       patch.object(taxii_export, "build_stix_bundle", side_effect=AssertionError("built a bundle")):
+    result = getattr(fixture.Plugin, endpoint)(fixture.owner, "job-1", request_actor=fixture.actor,
+                                               tenant_id=fixture.tenant_id)
+  assert result.get("status") == "not_configured", result
+  assert result.get("configuration_error") == "tenant_integration_not_configured", result

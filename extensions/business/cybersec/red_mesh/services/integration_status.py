@@ -13,6 +13,7 @@ from .config import (
   get_suricata_correlation_config,
   get_taxii_export_config,
   get_wazuh_export_config,
+  tenant_integration_override,
 )
 from .event_builder import build_test_event
 from .soc_export_policy import (
@@ -431,8 +432,13 @@ def get_public_integration_config(owner, tenant_id=None):
     # argument today (pinned by test_node_level_builders_ignore_the_tenant), so passing the raw
     # tenant would currently be equivalent. It stays so that a builder which starts reading it
     # cannot silently acquire tenant scope it was never granted.
-    integrations[integration_id] = _public_config_item(
-      integration_id, builder(owner, status_tenant(integration_id, tenant_id)))
+    scoped_tenant = status_tenant(integration_id, tenant_id)
+    base = builder(owner, scoped_tenant)
+    if scoped_tenant is not None and not tenant_integration_override(owner, scoped_tenant, integration_id):
+      # A tenant with no record of its own pushes nowhere (tenant_export_binding), so the node's
+      # destination merged in by the builder must not read as this tenant's readiness (RM-093).
+      base = {**base, "configured": False, "last_error_class": None}
+    integrations[integration_id] = _public_config_item(integration_id, base)
   if set(integrations) != set(_STATUS_BUILDERS):
     raise IntegrationConfigUnavailable("integrations")
   generated_at = _utc_timestamp()
