@@ -135,8 +135,10 @@ class JobConfig:
   authorization_update: dict = None
   # The signed engagement the job ran under (RM-095): its id and hash, and the asset's
   # authorized FEATURE_CATALOG ids. `engagement`, `roe` and `authorization` above are its snapshot.
+  # RM-107: the SHA-256 of the tenant contract the engagement extends (the signed basis).
   engagement_id: str = None
   engagement_hash: str = None
+  contract_sha256: str = None
   authorized_tests: list = None
   execution_binding: ExecutionBinding | None = None
 
@@ -242,6 +244,7 @@ class JobConfig:
       authorization_update=d.get("authorization_update"),
       engagement_id=d.get("engagement_id"),
       engagement_hash=d.get("engagement_hash"),
+      contract_sha256=d.get("contract_sha256"),
       authorized_tests=d.get("authorized_tests"),
     )
 

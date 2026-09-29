@@ -30,6 +30,7 @@ def _engagement(kind="network", **roe):
   from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
   return {
     "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
+    "contract_sha256": "c" * 64, "allowed_run_modes": ["continuous", "single_pass"],
     "authorized_tests": sorted(feature_ids_for_kind(kind)),
     "roe": {"authenticated_action": False, "stateful_probes_allowed": True, "ics_safe_mode_required": False,
             **roe},
@@ -48,7 +49,7 @@ def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-
   """A resolved execution admission, as `_resolve_execution_admission_for_account` returns one.
 
   RM-084 P6 removed the unbound launch: `_admit_execution` now refuses a request with no tenant,
-  asset and digest. These suites are about launch configuration and endpoint shape rather than about
+  engagement and engagement asset (RM-107). These suites are about launch configuration and endpoint shape rather than about
   who is admitted (which has its own suites), so they stub the admission -- with a real context,
   because the launch path derives the destination, the worker set and the stored binding from it.
   A network asset is an IPv4 literal, so the network suites launch against one.
@@ -57,17 +58,17 @@ def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-
   from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
   target = normalize_target({"kind": kind, "address": address} if kind == "network"
                             else {"kind": kind, "url": address, "allowedPathPrefix": "/"})
+  engagement = _engagement(kind) if engagement is _UNSET else engagement
   return ResolvedExecutionContext({
     "namespace": "deployment", "tenant_id": tenant_id,
-    "asset_id": "as_00000000-0000-4000-8000-000000000002", "asset_target": target,
+    "engagement_id": engagement["engagement_id"], "engagement_asset_id": "ea_1",
+    "engagement_hash": engagement["engagement_hash"], "asset_target": target,
     "asset_target_digest": canonical_digest(target), "actor_id": "tester",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
     "selected_candidates": list(candidates),
     # An engagement's network entry always has a port scope; the full range when a suite sets none.
-    **({"asset_authorized_ports": authorized_ports or "1-65535"}
-       if authorized_ports or (kind == "network" and engagement is not None) else {}),
-    **({"engagement": _engagement(kind) if engagement is _UNSET else engagement}
-       if engagement is not None else {}),
+    **({"asset_authorized_ports": authorized_ports or "1-65535"} if kind == "network" else {}),
+    "engagement": engagement,
   })
 
 
@@ -95,15 +96,14 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", authorized_p
   from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
   account = AccountView("tester", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
 
-  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None,
-            engagement_id=None, require_engagement=False):
+  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None):
     # Through the actor seam, as the real admission does, so a suite that swaps the account in
     # (attribution tests) is admitted as that account.
     resolved, denial = plugin._resolve_launch_actor(actor)
     if denial:
       return None, None, denial
-    # As the real admission: a scan endpoint must forward the engagement it launches under.
-    if require_engagement and engagement_id != _engagement()["engagement_id"]:
+    # As the real admission: every launch must forward the engagement it launches under.
+    if engagement_id != _engagement()["engagement_id"]:
       return None, None, {"error": "engagement_required", "status_code": 400, "success": False}
     peers = getattr(plugin, "cfg_chainstore_peers", None)
     if isinstance(peers, (list, tuple)) and peers:
@@ -390,9 +390,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._launch(plugin)
     from extensions.business.cybersec.red_mesh.models import JobConfig
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.11.0"})
+    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.12.0"})
     restored = JobConfig.from_dict(config_dict).to_dict()
-    self.assertEqual(restored["redmesh_release"], {"backend": "0.11.0"})
+    self.assertEqual(restored["redmesh_release"], {"backend": "0.12.0"})
 
   def test_launch_records_the_console_and_report_pipeline_it_was_sent(self):
     """RM-103 item 12: the release names all three deployables. Only the
@@ -510,16 +510,13 @@ class TestPhase1ConfigCID(unittest.TestCase):
       self.assertEqual(result[key], value)
     plugin.r1fs.add_json.assert_not_called()
 
-  def test_engagement_required_for_every_tenant_launch(self):
-    launches = (("network", self._launch_network, {}), ("webapp", self._launch_webapp, {}),
-                ("launch_test network", self._launch, {}),
-                ("launch_test webapp", self._launch, {"scan_type": "webapp", "target": "",
-                                                      "target_url": "https://example.com/app",
-                                                      "regular_username": "user", "regular_password": "pass"}))
-    for name, launch, extra in launches:
-      with self.subTest(name):
-        plugin = self._build_mock_plugin(job_id="engagement-required")
-        self._refused(plugin, launch(plugin, engagement=None, **extra), "engagement_required")
+  def test_the_launch_gate_refuses_a_context_without_an_engagement(self):
+    # RM-107: a resolved context always carries its engagement; the gate stays as defense in depth.
+    from types import SimpleNamespace
+    from extensions.business.cybersec.red_mesh.services.launch_api import require_engagement
+    facts, error = require_engagement(SimpleNamespace(to_dict=lambda: {"tenant_id": "tn_x"}))
+    self.assertIsNone(facts)
+    self.assertEqual((error["error"], error["status_code"]), ("engagement_required", 400))
 
   def test_engagement_id_is_forwarded_by_every_scan_endpoint(self):
     # Each endpoint passes its engagement_id to admission, and a missing one is refused there.
@@ -599,6 +596,42 @@ class TestPhase1ConfigCID(unittest.TestCase):
         self._refused(plugin, result, "roe_forbids", field="allow_stateful_probes")
     plugin = self._build_mock_plugin(job_id="engagement-stateful-ok")
     self.assertNotIn("error", self._launch_webapp(plugin, engagement=no_stateful))
+
+  def test_engagement_run_mode_outside_the_allowed_modes_is_refused(self):
+    # RM-107: the gate reads the normalized run mode, so an empty one (continuous) is gated too.
+    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
+    for run_mode in ("", "CONTINUOUS_MONITORING", "bogus"):
+      with self.subTest(run_mode=run_mode):
+        plugin = self._build_mock_plugin(job_id="engagement-run-mode")
+        result = self._launch_network(plugin, engagement=single, run_mode=run_mode)
+        self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["single_pass"])
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-ok")
+    result = self._launch_network(plugin, engagement=single, run_mode="SINGLEPASS")
+    self.assertNotIn("error", result)
+    self.assertEqual(self._latest_job_config(plugin)["run_mode"], "SINGLEPASS")
+    continuous = {**_engagement("webapp"), "allowed_run_modes": ["continuous"]}
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp")
+    result = self._launch_webapp(plugin, engagement=continuous, run_mode="SINGLEPASS")
+    self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["continuous"])
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp-ok")
+    self.assertNotIn("error", self._launch_webapp(plugin, engagement=continuous))
+
+  def test_launch_test_reaches_the_run_mode_gate(self):
+    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-test")
+    self._refused(plugin, self._launch(plugin, engagement=single), "run_mode_not_authorized",
+                  allowed_run_modes=["single_pass"])
+
+  def test_the_run_mode_gate_comes_before_the_unsafe_confirmations(self):
+    # A disallowed mode is the answer, not a confirmation the operator could never usefully give.
+    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first")
+    result = self._launch_network(plugin, engagement=single, monitor_interval=1)
+    self._refused(plugin, result, "run_mode_not_authorized")
+    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first-webapp")
+    result = self._launch_webapp(plugin, engagement={**_engagement("webapp"), "allowed_run_modes": ["single_pass"]},
+                                 monitor_interval=1)
+    self._refused(plugin, result, "run_mode_not_authorized")
 
   def test_engagement_port_scope_admits_a_narrower_run(self):
     # Owner, 2026-09-28: a run may use any part of the engagement's scope.
@@ -5502,6 +5535,7 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
         plugin,
         token,
         actor={"account_id": "navigator-user-123"},
+        engagement_id=_engagement()["engagement_id"], engagement_asset_id="ea_1",
         created_by_id="spoofed-by-request",
         created_by_name="spoofed-by-request",
       )
@@ -5524,6 +5558,7 @@ class TestModelTestingEndpointAuth(unittest.TestCase):
         plugin,
         token,
         actor={"account_id": "navigator-user-123"},
+        engagement_id=_engagement()["engagement_id"], engagement_asset_id="ea_1",
         created_by_id="spoofed-by-request",
       )
 

@@ -29,3 +29,12 @@ class R1fsDocumentStore:
     except Exception as exc:
       raise DocumentStoreError("Document storage cannot be read") from exc
     return envelope if isinstance(envelope, dict) else None
+
+  def delete(self, ref):
+    # Unpinned locally and remotely, then garbage-collected: the same call `purge_job` makes.
+    try:
+      deleted = self._artifacts.delete(ref, show_logs=False, raise_on_error=False, purge=True)
+    except Exception as exc:
+      raise DocumentStoreError("Document storage delete failed") from exc
+    if deleted is not True:
+      raise DocumentStoreError("Document storage did not confirm the delete")

@@ -78,7 +78,7 @@ class TestEngagementFieldsTyped(unittest.TestCase):
 
   def test_engagement_fields_round_trip_and_stay_absent_on_old_jobs(self):
     fields = {"engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "a" * 64,
-              "authorized_tests": ["service_info_common"]}
+              "authorized_tests": ["service_info_common"], "contract_sha256": "c" * 64}
     restored = JobConfig.from_dict(JobConfig(**_base_jobconfig_kwargs(), **fields).to_dict())
     self.assertEqual({key: getattr(restored, key) for key in fields}, fields)
     self.assertFalse(set(fields) & set(JobConfig(**_base_jobconfig_kwargs()).to_dict()))

@@ -14,7 +14,7 @@ from .identity import AccountView, TenantMembership, canonical_account_id
 _ROLE_OPERATIONS = {
   "super_tenant_admin": frozenset({
     "node_assignments:manage", "node_failure_policy:update",
-    "tenants:manage", "tenant_users:manage", "assets:create", "assets:update",
+    "tenants:manage", "tenant_users:manage",
     "integrations:manage", "attestation_keys:manage", "allow_pentester:update",
     "tasks:launch", "tasks:update", "reports:view", "reports:export", "evidence:read", "audit:view",
     # RM-078. analysis:run is an operator action and binds to allow_pentester below;
@@ -26,9 +26,11 @@ _ROLE_OPERATIONS = {
     # RM-095 phase 2. Plural, unlike RM-078's engagement:delete (which redacts a job's snapshot).
     # Owner, 2026-09-28: only a Super-Tenant Admin manages engagements and uploads their documents.
     "engagements:create", "engagements:revoke", "engagements:documents",
+    # RM-107. Removes a tenant with no members and no jobs (owner, 2026-09-28).
+    "tenants:delete",
   }),
   "super_pentester": frozenset({
-    "assets:create", "assets:update", "allow_pentester:update", "tasks:launch", "tasks:update",
+    "allow_pentester:update", "tasks:launch", "tasks:update",
     "reports:view", "reports:export", "evidence:read", "analysis:run", "authorization:upload",
     # Reads an engagement's documents (owner Q5); creating, revoking and uploading are STA only.
     "engagements:documents",

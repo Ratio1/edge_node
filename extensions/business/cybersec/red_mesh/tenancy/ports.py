@@ -38,3 +38,7 @@ class DocumentStore(Protocol):
   def get(self, ref: str) -> dict | None:
     """Read an envelope; None when absent or not an envelope; DocumentStoreError on failure."""
     ...
+
+  def delete(self, ref: str) -> None:
+    """RM-107. Remove one envelope for good; DocumentStoreError when the backend did not confirm it."""
+    ...

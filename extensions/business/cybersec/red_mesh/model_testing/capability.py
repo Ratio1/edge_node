@@ -27,7 +27,9 @@ def get_capability_status(owner):
     # reports the only state there is. The key stays because the capability payload is a contract.
     "tenant_execution_enabled": True,
     # RM-095 phase 2. A console fails closed (no engagements card or engagement launch) without it.
-    "engagements": {"enabled": True},
+    # RM-107: schema 2 is engagements v2 (owned assets, document set, allowed run modes). The
+    # console reads `enabled` today; a v2 console also requires `schema: 2`.
+    "engagements": {"enabled": True, "schema": 2},
     "network_scan": {
       "enabled": True,
       "disabled_reason": None,

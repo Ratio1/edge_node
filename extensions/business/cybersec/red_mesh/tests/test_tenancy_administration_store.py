@@ -31,6 +31,30 @@ class Store:
 
 
 class TestAdministrationStore(unittest.TestCase):
+  def test_delete_is_verified_and_tombstones_are_not_rows(self):
+    # RM-107. A deleted record is a CStore tombstone (None); enumeration skips it.
+    owner = Store()
+    store = CstoreTenantAdministrationStore(owner, "deployment-a")
+    store.put("tenant", "tn_a", record={"tenant_id": "tn_a", "active": True, "allow_pentester": False})
+    store.put("receipt", "alice", "request", record={"tenant_id": "tn_a"})
+    store.delete("tenant", "tn_a")
+    self.assertIsNone(store.get("tenant", "tn_a"))
+    self.assertEqual(store.list_tenants(), [])
+    owner.write_noop = True
+    with self.assertRaises(TenantStoreError):
+      store.delete("receipt", "alice", "request")
+
+  def test_tenant_record_ids_and_raw_rows_skip_validation(self):
+    owner = Store()
+    store = CstoreTenantAdministrationStore(owner, "deployment-a")
+    hkey = '["redmesh","tenancy",1,"deployment-a"]'
+    owner.records[hkey, '["engagement","deployment-a","tn_a","en_1"]'] = {"not": "valid"}
+    owner.records[hkey, '["engagement","deployment-a","tn_b","en_2"]'] = {"other": "tenant"}
+    owner.records[hkey, '["engagement","deployment-a","tn_a","en_3"]'] = None
+    self.assertEqual(store.tenant_record_ids("engagement", "tn_a"), [["tn_a", "en_1"]])
+    self.assertEqual(store.raw_record("engagement", "tn_a", "en_1"), {"not": "valid"})
+    self.assertIsNone(store.raw_record("engagement", "tn_a", "en_3"))
+
   def test_published_tenant_round_trips_through_existing_policy_reader(self):
     owner = Store()
     store = CstoreTenantAdministrationStore(owner, "deployment-a")
@@ -59,27 +83,18 @@ class TestAdministrationStore(unittest.TestCase):
     owner.records[hkey, '["tenant","deployment-b","other"]'] = {"secret": "other"}
     self.assertEqual([row["tenant_id"] for row in store.list_tenants()], ["tn_a"])
 
-  def test_asset_count_rejects_legacy_local_projections_without_adopting_them(self):
+  def test_the_retired_asset_kind_is_never_read_or_written(self):
+    # RM-107: the engagement owns its targets; a leftover tenant asset row stays unreachable.
     owner = Store()
     hkey = '["redmesh","tenancy",1,"deployment-a"]'
-    for tenant, asset, active in (("tn_a", "one", True), ("tn_a", "two", False),
-                                  ("tn_b", "other", True)):
-      owner.records[hkey, json.dumps(["asset", "deployment-a", tenant, asset],
-                                    separators=(",", ":"))] = {
-        "schemaVersion": 1, "namespace": "deployment-a", "tenant_id": tenant,
-        "asset_id": asset, "active": active,
-      }
+    owner.records[hkey, '["asset","deployment-a","tn_a","one"]'] = {
+      "schemaVersion": 1, "namespace": "deployment-a", "kind": "asset", "ids": ["tn_a", "one"]}
     store = CstoreTenantAdministrationStore(owner, "deployment-a")
-    # Asset administration now requires full target/attribution/digest records, including inactive rows.
-    self.assertEqual(store.count_assets("tn_empty"), 0)
-    with self.assertRaises(TenantStoreError):
-      store.count_assets("tn_a")
-    owner.records[hkey, '["asset","deployment-a","tn_a","bad"]'] = {
-      "schemaVersion": 1, "namespace": "deployment-a", "tenant_id": "tn_b",
-      "asset_id": "bad", "active": True,
-    }
-    with self.assertRaises(TenantStoreError):
-      store.count_assets("tn_a")
+    for call in (lambda: store.get("asset", "tn_a", "one"), lambda: store.put("asset", "tn_a", "one", record={}),
+                 lambda: store.tenant_record_ids("asset", "tn_a"), lambda: store.get("unknown", "x")):
+      with self.assertRaises(TenantStoreError):
+        call()
+    self.assertFalse(hasattr(store, "list_assets") or hasattr(store, "count_assets"))
 
   def test_every_observable_write_failure_denies_even_when_data_was_mutated(self):
     for result, noop in ((False, False), (None, False), (1, False), (True, True)):
@@ -150,7 +165,7 @@ class TestAdministrationStore(unittest.TestCase):
       with self.assertRaises(TenantStoreError):
         store.list_tenants()
       with self.assertRaises(TenantStoreError):
-        store.count_assets("tn_a")
+        store.list_engagements("tn_a")
     with patch.object(owner, "chainstore_hgetall", return_value=None):
       with self.assertRaises(TenantStoreError):
         store.list_tenants()

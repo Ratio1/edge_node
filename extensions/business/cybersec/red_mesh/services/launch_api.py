@@ -43,6 +43,7 @@ from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 from ..tenancy.assets import collapse_ports, format_port_ranges, ports_outside_scope
+from ..tenancy.engagements import RUN_MODE_LAUNCH_VALUES
 from ..tenancy.execution import context_tenant_id
 from .soc_export_policy import required_soc_launch_error
 
@@ -588,6 +589,23 @@ def check_engagement_roe(engagement, *, ics_safe_mode=True, allow_stateful_probe
   return {
     "error": "roe_forbids", "status_code": 400, "field": field,
     "message": f"The engagement's rules of engagement do not allow {field} for this job.",
+  }
+
+
+def check_allowed_run_mode(engagement, run_mode):
+  """Refuse a normalized run mode the engagement does not allow (RM-107). Returns an error or None.
+
+  Called on the normalized mode, so an empty one (continuous) is gated like an explicit one.
+  """
+  if engagement is None:
+    return None
+  allowed = engagement["allowed_run_modes"]
+  if run_mode in {RUN_MODE_LAUNCH_VALUES[mode] for mode in allowed}:
+    return None
+  return {
+    "error": "run_mode_not_authorized", "status_code": 400,
+    "message": "The engagement does not allow this run mode.",
+    "allowed_run_modes": list(allowed),
   }
 
 
@@ -1190,6 +1208,7 @@ def announce_launch(
     **({"engagement": engagement["context"], "roe": engagement["roe"],
         "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
         "engagement_hash": engagement["engagement_hash"],
+        "contract_sha256": engagement["contract_sha256"],
         "authorized_tests": engagement["authorized_tests"]} if engagement is not None else {}),
     # OWASP API Top 10 (Subphase 1.5 commit #8): runtime-only secret
     # fields. Blanked by `_blank_graybox_secret_fields` before persistence;
@@ -1339,8 +1358,8 @@ def announce_launch(
         "out_of_scope_ports": authorization_update["out_of_scope_ports"]}
        if authorization_update else {}),
     "safety_warning_count": len((safety_policy or {}).get("warnings", [])),
-    **({"tenant_id": binding.to_dict()["tenant_id"], "asset_id": binding.to_dict()["asset_id"]}
-       if binding is not None else {}),
+    **({"tenant_id": binding.to_dict()["tenant_id"],
+        "engagement_asset_id": binding.to_dict()["engagement_asset_id"]} if binding is not None else {}),
   })
 
   if binding is not None:
@@ -1389,12 +1408,12 @@ def _normalize_authorization_update(value):
 
 
 def check_authorized_port_scope(execution_context, workers, exceptions, authorization_update):
-  """Refuse a launch whose derived ports exceed the asset's authorized port scope.
+  """Refuse a launch whose derived ports exceed the engagement's port scope for the asset.
 
   The derived set is what the workers will actually scan: each worker's explicit `target_ports`
   (comparison mode mirrors COMMON_PORTS outside the operator's range) or its start-end slice,
-  minus the excepted ports. An asset with no recorded scope, and a launch with no tenant
-  context, are not gated.
+  minus the excepted ports. Every network entry of an engagement has a scope (RM-095, RM-107);
+  only a launch with no tenant context (the legacy path tests still drive) is not gated.
 
   Returns (authorized_ports, recorded_update, error).
   """
@@ -1415,7 +1434,7 @@ def check_authorized_port_scope(execution_context, workers, exceptions, authoriz
     return None, None, {
       "error": "scope_exceeds_authorization",
       "status_code": 400,
-      "message": (f"The requested ports exceed the asset's authorized port scope ({scope}). "
+      "message": (f"The requested ports exceed the engagement's authorized port scope for this asset ({scope}). "
                   "Record an authorization update to widen it."),
       "authorized_ports": scope,
       "out_of_scope_ports": outside_text,
@@ -1499,6 +1518,10 @@ def launch_network_scan(
   )
   if "error" in options:
     return options
+  # RM-107: first after normalization, before any confirmation or comparison work.
+  run_mode_error = check_allowed_run_mode(engagement, options["run_mode"])
+  if run_mode_error:
+    return run_mode_error
   # Comparison mode keeps the operator's MIRROR/SLICE choice: MIRROR mirrors the
   # whole range to every node (full comparison); SLICE uses the tiered scheme
   # (mirror the comparison tier, slice the bulk). See build_comparison_workers.
@@ -1810,6 +1833,10 @@ def launch_webapp_scan(
   )
   if "error" in options:
     return options
+  # RM-107: first after normalization, before any confirmation or comparison work.
+  run_mode_error = check_allowed_run_mode(engagement, options["run_mode"])
+  if run_mode_error:
+    return run_mode_error
   required_confirmation_ids = required_unsafe_confirmation_ids(
     scan_type=ScanType.WEBAPP.value,
     options=options,

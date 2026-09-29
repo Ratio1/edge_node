@@ -213,7 +213,7 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
     """Deny-by-default survives the widening: the gate admits a fixed set, not anything the matrix
     happens to contain, so a future matrix entry cannot reach reads without its own decision."""
     self._as("super_tenant_admin")
-    for operation in ("tasks:launch", "tenants:manage", "assets:create", "", None):
+    for operation in ("tasks:launch", "tenants:manage", "engagements:create", "", None):
       with self.subTest(operation=operation):
         with self.assertRaises(self.AdministrationDenied) as caught:
           self.access.get_job(self.actor, self.tenant_id, "job-1", operation=operation)
