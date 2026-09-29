@@ -84,6 +84,11 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
     self.files = Files()
     self.plugin._get_artifact_repository = lambda: self.files
+    # What `ipfs pin ls` would say: unknown unless a test says so.
+    self.pins = {}
+    pins = patch.object(data_maintenance, "pinned_locally", side_effect=lambda item, home: self.pins.get(item))
+    pins.start()
+    self.addCleanup(pins.stop)
     self.current = binding_payload()
     self.current["tenant_id"] = self.tenant
     self.put(JOBS, "new1", job("new1", self.current, job_config_cid=cid(20), job_cid=cid(21),
@@ -255,7 +260,7 @@ class TestDataMaintenance(unittest.TestCase):
                rows[(f"{JOBS}:model_test_raw_evidence", "old1")]]
     outcomes = self.clean(*targets)
     self.assertEqual(outcomes[0], {"hkey": JOBS, "field": "old1", "outcome": "deleted",
-                                   "files_deleted": 5, "files_kept": 1})
+                                   "files_deleted": 5, "files_kept": 1, "files_unverified": 0})
     self.assertEqual([item["outcome"] for item in outcomes], ["deleted"] * 3)
     self.assertEqual(sorted(self.files.deleted), sorted([CONFIG, ARCHIVE, REPORT, SECRET, BUNDLE, EVIDENCE]))
     for key in ((JOBS, "old1"), (f"{JOBS}:live", "old1:node-a"), (f"{JOBS}:model_test_raw_evidence", "old1")):
@@ -356,15 +361,43 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertNotIn(ARCHIVE, self.files.deleted)
     self.assertTrue(self.scan()[(JOBS, "old1")]["files_complete"])
 
-  def test_a_file_an_earlier_request_deleted_counts_as_gone(self):
+  def test_a_file_gone_from_this_node_is_counted_unverified_and_a_failed_one_stops_the_row(self):
     self.files.refuse = {BUNDLE}
-    pinned = {BUNDLE: False}
-    self.plugin.r1fs = type("R1fs", (), {"is_pinned": staticmethod(lambda item: pinned.get(item, True))})()
-    self.assertEqual(self.clean(self.scan()[(JOBS, "old1")])[0]["outcome"], "deleted")
-    pinned[BUNDLE] = True
+    self.pins[BUNDLE] = False
+    outcome = self.clean(self.scan()[(JOBS, "old1")])[0]
+    self.assertEqual((outcome["outcome"], outcome["files_unverified"]), ("deleted", 1))
+    self.assertEqual(self.events[-1][1]["outcomes"], {"deleted": 1})
+    # Still pinned here after a failed delete: a real failure.
+    self.pins[BUNDLE] = True
     self.put(JOBS, "old1", job("old1", binding_v1_payload(), opencti_export={"artifact_cid": BUNDLE},
                                job_config_cid=None, job_cid=None))
     self.assertEqual(self.clean(self.scan()[(JOBS, "old1")])[0]["outcome"], "partial")
+    # `ipfs` could not tell: a failure too.
+    self.pins[BUNDLE] = None
+    self.assertEqual(self.clean(self.scan()[(JOBS, "old1")])[0]["outcome"], "partial")
+
+  def test_a_container_gone_from_this_node_does_not_lock_the_row(self):
+    # A restored old job whose archive was withheld: the archive is gone, the row can be cleaned.
+    del self.files.json[ARCHIVE]
+    self.pins[ARCHIVE] = False
+    row = self.scan()[(JOBS, "old1")]
+    self.assertTrue(row["files_complete"])
+    self.assertNotIn(ARCHIVE, {item["cid"] for item in row["cids"]})
+    self.assertEqual(self.clean(row)[0]["outcome"], "deleted")
+    self.assertNotIn(ARCHIVE, self.files.deleted)
+
+  def test_a_gone_file_is_answered_410(self):
+    self.pins[CONFIG] = False
+    with patch.object(data_maintenance, "read_stored_file",
+                      side_effect=data_maintenance.MaintenanceError(503, "file_unavailable")):
+      answer = self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)
+    self.assertEqual((answer["status_code"], answer["error"]), (410, "file_gone"))
+
+  def test_audit_details_from_the_caller_are_bounded(self):
+    self.plugin.export_redmesh_file({"account_id": "x" * 500}, JOBS, "old1", {"not": "a cid"})
+    self.plugin.export_redmesh_records(self.actor, 0, "y" * 500, 10)
+    self.assertEqual(self.events[0][1], {"actor": "x" * 128, "cid": None, "status_code": 404})
+    self.assertEqual(self.events[1][1]["offset"], "y" * 128)
 
   def test_the_files_of_a_running_old_job_are_kept(self):
     self.put(JOBS, "busy", job("busy", binding_v1_payload(), job_status="RUNNING", job_config_cid=cid(52),
@@ -508,6 +541,26 @@ class TestStoredFiles(unittest.TestCase):
         self.write(**changes)
       self.assertEqual(raised.exception.code, code, changes)
     self.assertEqual(self.calls, [])
+
+
+class TestPinnedLocally(unittest.TestCase):
+  """`ipfs pin ls` answers: pinned, definitely not pinned, or anything else (unknown)."""
+
+  def answer(self, returncode, stdout=b"", stderr=b""):
+    done = type("Done", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+    with patch.object(data_maintenance.subprocess, "run", return_value=done) as run:
+      found = data_maintenance.pinned_locally(CONFIG, "/repo")
+    return found, run
+
+  def test_the_three_answers(self):
+    found, run = self.answer(0, stdout=f"{CONFIG} recursive\n".encode())
+    self.assertIs(found, True)
+    self.assertEqual(run.call_args.args[0], ["ipfs", "pin", "ls", "--type=recursive", "--", CONFIG])
+    self.assertEqual(run.call_args.kwargs["env"]["IPFS_PATH"], "/repo")
+    self.assertIs(self.answer(1, stderr=f"Error: path '/ipfs/{CONFIG}' is not pinned".encode())[0], False)
+    self.assertIsNone(self.answer(1, stderr=b"Error: no IPFS repo found")[0])
+    self.assertIsNone(self.answer(0, stdout=b"")[0])
+    self.assertIsNone(data_maintenance.pinned_locally("--help", "/repo"))
 
 
 if __name__ == "__main__":

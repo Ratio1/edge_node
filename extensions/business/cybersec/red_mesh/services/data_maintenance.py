@@ -107,8 +107,13 @@ def references(value, path=""):
 class Inventory:
   """One read of the stores. Built per request; nothing is cached between requests."""
 
-  def __init__(self, owner, namespace, read_json):
+  def __init__(self, owner, namespace, read_json, pinned=None):
     self._owner = owner
+    # cid -> True (pinned here), False (definitely not pinned: gone), None (cannot tell).
+    self._pinned = pinned or (lambda cid: None)
+    # Referenced files that are no longer on the node: left out of every file list, so they are
+    # neither backed up nor deleted. What only they referenced is not found.
+    self.gone = set()
     self._instance = owner.cfg_instance_id
     self._store = CstoreTenantAdministrationStore(owner, namespace)
     self._namespace = namespace
@@ -353,7 +358,7 @@ class Inventory:
       if hkey == self._instance and isinstance(value, dict):
         complete = self._nested(value, found)
     result = ([{"cid": cid, "role": role, "withheld": cid in self._withheld}
-               for cid, role in sorted(found.items())], complete)
+               for cid, role in sorted(found.items()) if cid not in self.gone], complete)
     self._files[key] = result
     return result
 
@@ -374,7 +379,10 @@ class Inventory:
         return False
       payload = self.read_json(cid)
       if not isinstance(payload, dict):
-        complete = False
+        if self._pinned(cid) is False:
+          self.gone.add(cid)
+        else:
+          complete = False
         continue
       self._containers.add(cid)
       # A job config held graybox credentials inline before they moved to a secret file; an
@@ -484,6 +492,25 @@ def _ipfs(arguments, ipfs_home, *, cwd=None, timeout=IPFS_TIMEOUT):
   return done.stdout.decode("utf-8", errors="replace")
 
 
+def pinned_locally(cid, ipfs_home):
+  """True when the node pins the file, False when `ipfs` says it does not, None otherwise."""
+  if not valid_cid(cid):
+    return None
+  environment = dict(os.environ)
+  if ipfs_home:
+    environment["IPFS_PATH"] = ipfs_home
+  try:
+    done = subprocess.run(["ipfs", "pin", "ls", "--type=recursive", "--", cid], env=environment,
+                          timeout=IPFS_TIMEOUT, capture_output=True, check=False)
+  except (OSError, subprocess.SubprocessError):
+    return None
+  if done.returncode == 0 and cid.encode() in done.stdout:
+    return True
+  if done.returncode != 0 and b"is not pinned" in done.stderr:
+    return False
+  return None
+
+
 def read_stored_file(cid, ipfs_home):
   """The stored bytes and file name of one R1FS file (a directory wrapping one file)."""
   if not valid_cid(cid):
@@ -565,7 +592,12 @@ def export_file(inventory, hkey, field, cid, ipfs_home):
     raise MaintenanceError(404, "file_not_in_inventory")
   if found[cid]["withheld"]:
     raise MaintenanceError(409, "file_withheld")
-  return read_stored_file(cid, ipfs_home)
+  try:
+    return read_stored_file(cid, ipfs_home)
+  except MaintenanceError as exc:
+    if exc.code == "file_unavailable" and pinned_locally(cid, ipfs_home) is False:
+      raise MaintenanceError(410, "file_gone") from None
+    raise
 
 
 def _checked_targets(targets):
@@ -594,7 +626,7 @@ def cleanup(owner, inventory, targets, delete_file, job_lock):
     hkey, field = target["hkey"], target["field"]
     if hkey not in inventory.hkeys() or inventory.is_account_hkey(hkey):
       outcomes.append({"hkey": hkey, "field": field, "outcome": "refused",
-                       "files_deleted": 0, "files_kept": 0})
+                       "files_deleted": 0, "files_kept": 0, "files_unverified": 0})
       continue
     job_id = inventory.job_of(hkey, field)
     if job_id is None:
@@ -607,7 +639,8 @@ def cleanup(owner, inventory, targets, delete_file, job_lock):
 
 def _clean_row(owner, inventory, target, delete_file, job_id=None):
   hkey, field = target["hkey"], target["field"]
-  result = {"hkey": hkey, "field": field, "outcome": "deleted", "files_deleted": 0, "files_kept": 0}
+  result = {"hkey": hkey, "field": field, "outcome": "deleted", "files_deleted": 0, "files_kept": 0,
+            "files_unverified": 0}
   value = owner.chainstore_hget(hkey=hkey, key=field)
   inventory.refresh(hkey, field, value)
   if value is None:
@@ -633,13 +666,13 @@ def _clean_row(owner, inventory, target, delete_file, job_id=None):
     if cid in inventory.deleted:
       continue
     try:
-      gone = delete_file(cid) is True
+      state = delete_file(cid)
     except Exception:
-      gone = False
-    if not gone:
+      state = "failed"
+    if state not in ("deleted", "unverified"):
       return {**result, "outcome": "partial"}
     inventory.deleted.add(cid)
-    result["files_deleted"] += 1
+    result["files_deleted" if state == "deleted" else "files_unverified"] += 1
   owner.chainstore_hset(hkey=hkey, key=field, value=None)
   remaining = owner.chainstore_hget(hkey=hkey, key=field)
   inventory.refresh(hkey, field, remaining)
@@ -686,18 +719,21 @@ def _purge_lock(owner, job_id):
 
 def run(owner, namespace, operation, **arguments):
   """One authorized maintenance call, in the tenant-administration envelope."""
-  def inventory():
-    return Inventory(owner, namespace, owner._get_artifact_repository().get_json)
-
   def ipfs_home():
     return getattr(getattr(owner, "r1fs", None), "ipfs_home", None) or os.environ.get("IPFS_PATH")
 
+  def pinned(cid):
+    return pinned_locally(cid, ipfs_home())
+
+  def inventory():
+    return Inventory(owner, namespace, owner._get_artifact_repository().get_json, pinned)
+
   def delete_file(cid):
+    """`deleted`, `unverified` (gone from this node, the relay's unpin was not confirmed: a file an
+    earlier cleanup deleted, one only this node held, or a relay error), or `failed`."""
     if owner._get_artifact_repository().delete(cid, show_logs=False, raise_on_error=False, purge=True) is True:
-      return True
-    # Deleted by an earlier request (another old row shared it): the relay refuses to unpin what
-    # it no longer holds. Gone here is what the delete wants.
-    return getattr(owner, "r1fs", None) is not None and owner.r1fs.is_pinned(cid) is False
+      return "deleted"
+    return "unverified" if pinned(cid) is False else "failed"
 
   try:
     if operation == "export_records":
