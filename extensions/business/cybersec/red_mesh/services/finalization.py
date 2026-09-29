@@ -68,16 +68,17 @@ def _execution_operation_allowed(owner, job_specs, *, operation="current", confi
   else:
     checker = owner.__dict__.get("_execution_operation_allowed")
   if not callable(checker):
-    return "execution_binding" not in job_specs and operation == "current"
+    return False
   try:
-    if "execution_binding" in job_specs:
-      current = _job_repo(owner).get_job(job_specs["job_id"])
-      if (not isinstance(current, dict)
-          or _execution_identity(current) != _execution_identity(job_specs)
-          or current.get("launcher") != owner.ee_addr
-          or is_terminal_job_status(current.get("job_status"))):
-        return False
-      job_specs = current
+    # RM-108 phase 5: admission never yields a job with no execution_binding, so this reauthorizes
+    # against the current stored record unconditionally rather than only for a bound snapshot.
+    current = _job_repo(owner).get_job(job_specs["job_id"])
+    if (not isinstance(current, dict)
+        or _execution_identity(current) != _execution_identity(job_specs)
+        or current.get("launcher") != owner.ee_addr
+        or is_terminal_job_status(current.get("job_status"))):
+      return False
+    job_specs = current
     return checker(job_specs, operation=operation, config=config) is True
   except Exception:
     return False
@@ -124,7 +125,9 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
 
   RM-095 (owner, 2026-09-28): the engagement ends at `valid_until` or on a revoke, and the job
   stops then, mid-pass included, the way an operator's HARD stop does. Passes finalized before
-  the stop keep their reports. A job launched without an engagement is not checked.
+  the stop keep their reports. RM-108 phase 5: admission never yields a job with no engagement, so
+  this check always applies to an admitted job; `_engagement_end_reason` still returns None rather
+  than raising if a record is somehow missing one.
   """
   check = getattr(owner, "_engagement_end_reason", None)
   if not callable(check):
@@ -149,7 +152,7 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
     engagement_id = binding.get("engagement_id") if isinstance(binding, dict) else None
     if not engagement_id:
       return False
-    reason = check(job_specs, {})
+    reason = check(job_specs)
   except Exception as exc:
     owner.P(f"[CONTINUOUS] Engagement check for job {job_id} unavailable: {exc}", color='y')
     return False
@@ -582,11 +585,12 @@ def maybe_finalize_pass(owner):
             if not _execution_operation_allowed(owner, job_specs, config=job_config):
               raise RuntimeError("Automatic analysis execution unavailable")
             executor = owner._get_manual_analysis_executor()
-            provider_options = {}
-            if "execution_binding" in job_specs:
-              provider_options["before_provider_call"] = partial(
+            # RM-108 phase 5: _execution_operation_allowed above already required a binding.
+            provider_options = {
+              "before_provider_call": partial(
                 _check_automatic_analysis_authority, owner, deepcopy(job_specs),
-              )
+              ),
+            }
             # HTTP work yields with PostponedRequest. Automatic work has no
             # request to postpone, so process() yields by checking this future
             # on later turns.
@@ -609,9 +613,7 @@ def maybe_finalize_pass(owner):
               "pass_date_completed": pass_date_completed,
               "future": future,
               "discard_result": False,
-              "execution_identity": (
-                _execution_identity(job_specs) if "execution_binding" in job_specs else None
-              ),
+              "execution_identity": _execution_identity(job_specs),
             }
             return
           except Exception as exc:

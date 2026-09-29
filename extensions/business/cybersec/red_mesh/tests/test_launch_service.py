@@ -7,6 +7,21 @@ from extensions.business.cybersec.red_mesh.constants import (
 )
 from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
 from extensions.business.cybersec.red_mesh.services.scan_strategy import ScanStrategy
+from .test_tenant_execution_effects import context as _execution_context
+
+
+def _bound_network_config(job_config, address="10.0.0.10"):
+  """RM-108 phase 5: admission never yields an unbound config."""
+  binding = _execution_context({"kind": "network", "address": address}).build_binding(
+    "0xlauncher", ["node-1"]).to_dict()
+  return {**job_config, "target": address, "execution_binding": binding}
+
+
+def _bound_webapp_config(job_config, url="https://example.com/app"):
+  binding = _execution_context(
+    {"kind": "webapp", "url": url, "allowedPathPrefix": "/"}).build_binding(
+    "0xlauncher", ["node-1"]).to_dict()
+  return {**job_config, "execution_binding": binding}
 
 
 class DummyOwner:
@@ -20,9 +35,16 @@ class DummyOwner:
     self.cfg_scanner_user_agent = ""
     self.cfg_nr_local_workers = 2
     self.messages = []
+    # RM-108 phase 5: a bound job_config now requires the owner to reauthorize the announced
+    # assignment before local workers start; these dispatch/port-slicing tests are not about that
+    # check, so it is a stub that always confirms the announced assignment.
+    self._worker_assignment = {}
 
   def P(self, message, **_kwargs):
     self.messages.append(message)
+
+  def _require_worker_execution(self, job_id, job_config, execution_identity=None):
+    return self._worker_assignment
 
 
 class DummyNetworkWorker:
@@ -52,6 +74,7 @@ class TestLaunchService(unittest.TestCase):
 
   def test_launch_local_jobs_uses_network_strategy_dispatch(self):
     owner = DummyOwner()
+    owner._worker_assignment = {"start_port": 1, "end_port": 4, "target_ports": None}
     strategy = ScanStrategy(
       scan_type=ScanType.NETWORK,
       worker_cls=DummyNetworkWorker,
@@ -66,11 +89,11 @@ class TestLaunchService(unittest.TestCase):
         launcher="0xlauncher",
         start_port=1,
         end_port=4,
-        job_config={
+        job_config=_bound_network_config({
           "scan_type": "network",
           "nr_local_workers": 2,
           "port_order": PORT_ORDER_SEQUENTIAL,
-        },
+        }),
       )
 
     self.assertEqual(len(local_jobs), 2)
@@ -96,7 +119,7 @@ class TestLaunchService(unittest.TestCase):
         launcher="0xlauncher",
         start_port=443,
         end_port=443,
-        job_config={
+        job_config=_bound_webapp_config({
           "scan_type": "webapp",
           "target": "app.internal",
           "start_port": 443,
@@ -111,7 +134,7 @@ class TestLaunchService(unittest.TestCase):
           "target_url": "https://example.com/app",
           "official_username": "admin",
           "official_password": "secret",
-        },
+        }),
       )
 
     self.assertEqual(list(local_jobs.keys()), ["1"])
@@ -123,6 +146,7 @@ class TestLaunchService(unittest.TestCase):
   def test_explicit_target_ports_override_contiguous_range(self):
     """Comparison mode supplies an explicit, non-contiguous port list."""
     owner = DummyOwner()
+    owner._worker_assignment = {"start_port": 1, "end_port": 2, "target_ports": [22, 443, 8080]}
     strategy = ScanStrategy(
       scan_type=ScanType.NETWORK,
       worker_cls=DummyNetworkWorker,
@@ -136,11 +160,11 @@ class TestLaunchService(unittest.TestCase):
         launcher="0xlauncher",
         start_port=1,
         end_port=2,  # ignored when target_ports is provided
-        job_config={
+        job_config=_bound_network_config({
           "scan_type": "network",
           "nr_local_workers": 1,
           "port_order": PORT_ORDER_SEQUENTIAL,
-        },
+        }),
         target_ports=[22, 443, 8080],
       )
     scanned = sorted(
@@ -150,6 +174,7 @@ class TestLaunchService(unittest.TestCase):
 
   def test_network_timeout_profile_reaches_each_local_worker(self):
     owner = DummyOwner()
+    owner._worker_assignment = {"start_port": 80, "end_port": 81, "target_ports": None}
     strategy = ScanStrategy(
       scan_type=ScanType.NETWORK,
       worker_cls=DummyNetworkWorker,
@@ -163,12 +188,12 @@ class TestLaunchService(unittest.TestCase):
         launcher="0xlauncher",
         start_port=80,
         end_port=81,
-        job_config={
+        job_config=_bound_network_config({
           "scan_type": "network",
           "nr_local_workers": 2,
           "port_order": PORT_ORDER_SEQUENTIAL,
           "timeout_profile": "THOROUGH",
-        },
+        }),
       )
 
     self.assertEqual(
@@ -178,6 +203,7 @@ class TestLaunchService(unittest.TestCase):
 
   def _launch_with_roe(self, roe):
     owner = DummyOwner()
+    owner._worker_assignment = {"start_port": 22, "end_port": 23, "target_ports": None}
     strategy = ScanStrategy(
       scan_type=ScanType.NETWORK,
       worker_cls=DummyNetworkWorker,
@@ -186,6 +212,7 @@ class TestLaunchService(unittest.TestCase):
     job_config = {"scan_type": "network", "nr_local_workers": 1}
     if roe is not None:
       job_config["roe"] = roe
+    job_config = _bound_network_config(job_config)
     with patch("extensions.business.cybersec.red_mesh.services.launch.get_scan_strategy", return_value=strategy):
       local_jobs = launch_local_jobs(
         owner, job_id="job-roe", target="10.0.0.10", launcher="0xlauncher",

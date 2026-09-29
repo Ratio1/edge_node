@@ -74,19 +74,19 @@ class ModelTestWorker:
     self.state["phase"] = "model_test_running"
     self.state["progress"] = 10.0
     try:
-      if "execution_binding" in self.job_config:
-        if self.job_config.get("job_id") != self.job_id:
-          raise ValueError("Execution unavailable")
-        guard = getattr(self.owner, "_require_worker_execution", None)
-        if not callable(guard):
-          raise ValueError("Execution unavailable")
-        guard(self.job_id, self.job_config, execution_identity=self._execution_identity)
+      # RM-108 phase 5: every model-test job config is bound (admission never yields an unbound
+      # one), so the worker-execution guard is required, not conditional on the binding's presence.
+      if self.job_config.get("job_id") != self.job_id:
+        raise ValueError("Execution unavailable")
+      guard = getattr(self.owner, "_require_worker_execution", None)
+      if not callable(guard):
+        raise ValueError("Execution unavailable")
+      guard(self.job_id, self.job_config, execution_identity=self._execution_identity)
       runtime_config = resolve_model_test_runtime_config(self.owner, self.job_config)
       if binding_from_record(runtime_config) != binding_from_record(self.job_config):
         raise ValueError("Execution binding changed")
       validate_effective_config(runtime_config)
-      if "execution_binding" in self.job_config:
-        guard(self.job_id, runtime_config, execution_identity=self._execution_identity)
+      guard(self.job_id, runtime_config, execution_identity=self._execution_identity)
       factory = getattr(self.owner, "model_test_provider_client_factory", None)
       runner = ModelTestRunner(
         self.owner,

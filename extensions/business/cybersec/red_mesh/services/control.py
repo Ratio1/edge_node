@@ -169,6 +169,8 @@ def _purge_job_locked(owner, job_id: str, *, checked_job=None, ledger=None):
     if not isinstance(raw, dict):
       return {"status": "error", "message": f"Job {job_id} not found."}
     _, job_specs = owner._normalize_job_record(job_id, raw)
+    if job_specs is None:
+      return {"status": "error", "message": f"Job {job_id} not found."}
   owner_error = _foreign_launcher_error(owner, job_id, job_specs, "purge")
   if owner_error:
     return owner_error

@@ -18,6 +18,7 @@ from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
 from extensions.business.cybersec.red_mesh.models import CStoreJobRunning
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
+from .test_execution_binding_models import binding_payload
 
 
 
@@ -2264,9 +2265,13 @@ class TestPhase2PassFinalization(unittest.TestCase):
       },
       "timeline": [{"type": "created", "label": "Created", "date": 1000000.0, "actor": "launcher-alias", "actor_type": "system", "meta": {}}],
       "pass_reports": [],
+      # RM-108 phase 5: admission never yields a job with no execution_binding; the reauthorization
+      # check reads this same record back via chainstore_hget, matching CStore's current state.
+      "execution_binding": binding_payload(),
     }
 
     plugin.chainstore_hgetall.return_value = {job_id: job_specs}
+    plugin.chainstore_hget.side_effect = lambda hkey, key: job_specs if key == job_id else None
     plugin.chainstore_hset = MagicMock()
 
     Plugin = self._get_plugin_class()
@@ -3714,6 +3719,10 @@ class TestPhase3Archive(unittest.TestCase):
     # R1FS mock
     plugin.r1fs = MagicMock()
 
+    # RM-108 phase 5: admission never yields a job with no execution_binding.
+    execution_binding = _bound_context("webapp", "https://example.com/app",
+      candidates=("worker-A",)).build_binding("launcher-node", ["worker-A"]).to_dict()
+
     # Build pass report dicts and refs
     pass_reports_data = []
     pass_report_refs = []
@@ -3747,6 +3756,7 @@ class TestPhase3Archive(unittest.TestCase):
       "target": "example.com", "start_port": 1, "end_port": 1024,
       "run_mode": run_mode, "enabled_features": [], "scan_type": "webapp",
       "target_url": "https://example.com/app",
+      "execution_binding": execution_binding,
       "redact_credentials": True,
       "official_username": "admin",
       "official_password": "super-secret",
@@ -3794,6 +3804,8 @@ class TestPhase3Archive(unittest.TestCase):
 
     if r1fs_write_fail:
       plugin.r1fs.add_json.return_value = None
+      # The job_config read (unrelated to the archive write under test) must still succeed.
+      plugin.r1fs.get_json.side_effect = lambda cid: cid_map.get(cid)
     else:
       archive_cid = "QmArchiveCID"
       plugin.r1fs.add_json.return_value = archive_cid
@@ -3830,6 +3842,7 @@ class TestPhase3Archive(unittest.TestCase):
       "date_created": 1000000.0,
       "risk_score": 25 + pass_count,
       "job_config_cid": "QmConfigCID",
+      "execution_binding": execution_binding,
       "workers": {
         "worker-A": {"start_port": 1, "end_port": 512, "finished": True, "report_cid": "QmReportA"},
       },
@@ -3839,7 +3852,16 @@ class TestPhase3Archive(unittest.TestCase):
       "pass_reports": pass_report_refs,
     }
 
-    plugin.chainstore_hset = MagicMock()
+    # The archive-build identity recheck re-reads the job through the real repository, including
+    # right after the CStore prune write, so the fake store must reflect that write like the real
+    # one does. A test that needs its own chainstore_hset observation should wrap
+    # `plugin.chainstore_hset.side_effect` rather than replace it, so the store stays live.
+    records = {(plugin.cfg_instance_id, job_id): job_specs}
+    plugin.chainstore_hget = MagicMock(side_effect=lambda hkey, key: records.get((hkey, key)))
+    def _default_hset(*, hkey, key, value, **kwargs):
+      records[(hkey, key)] = value
+      return True
+    plugin.chainstore_hset = MagicMock(side_effect=_default_hset)
 
     # Bind real methods for archive building
     Plugin = self._get_plugin_class()
@@ -3878,11 +3900,13 @@ class TestPhase3Archive(unittest.TestCase):
     """Retrying finalization after prune is harmless and writes no artifact."""
     Plugin = self._get_plugin_class()
     plugin, job_specs, _, _ = self._build_archive_plugin()
+    plugin.chainstore_hget.side_effect = None
     plugin.chainstore_hget.return_value = {
       "job_id": "test-job",
       "job_status": "FINALIZED",
       "launcher": "launcher-node",
       "job_cid": "QmExistingArchive",
+      "execution_binding": job_specs["execution_binding"],
     }
 
     result = Plugin._build_job_archive(plugin, "test-job", job_specs)
@@ -3934,6 +3958,7 @@ class TestPhase3Archive(unittest.TestCase):
         "redact_credentials": True,
         "secret_ref": "QmSecretCID",
         "official_username": "",
+        "execution_binding": job_specs["execution_binding"],
       },
       {
         "pass_nr": 1,
@@ -3980,8 +4005,8 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(stub["scan_type"], "webapp")
     self.assertEqual(stub["target_url"], "https://example.com/app")
 
-  def test_archive_clears_live_progress_before_prune(self):
-    """Archive commit clears :live rows before the CStore stub is written."""
+  def test_archive_clears_live_progress_after_the_confirmed_prune(self):
+    """RM-108 phase 5: cleanup belongs to the confirmed commit, so the stub is written first."""
     Plugin = self._get_plugin_class()
     plugin, job_specs, _, _ = self._build_archive_plugin()
     events = []
@@ -3989,9 +4014,11 @@ class TestPhase3Archive(unittest.TestCase):
     def clear_live(job_id, worker_addresses):
       events.append(("clear_live", job_id, tuple(worker_addresses)))
 
+    default_hset = plugin.chainstore_hset.side_effect
     def record_hset(*args, **kwargs):
       if kwargs.get("hkey") == "test-instance" and kwargs.get("key") == "test-job":
         events.append(("archive_prune", kwargs["value"].get("job_cid")))
+      return default_hset(*args, **kwargs)
 
     plugin._clear_live_progress = MagicMock(side_effect=clear_live)
     plugin.chainstore_hset.side_effect = record_hset
@@ -3999,8 +4026,8 @@ class TestPhase3Archive(unittest.TestCase):
     Plugin._build_job_archive(plugin, "test-job", job_specs)
 
     self.assertGreaterEqual(len(events), 2)
-    self.assertEqual(events[0], ("clear_live", "test-job", ("worker-A",)))
-    self.assertEqual(events[1], ("archive_prune", "QmArchiveCID"))
+    self.assertEqual(events[0], ("archive_prune", "QmArchiveCID"))
+    self.assertEqual(events[1], ("clear_live", "test-job", ("worker-A",)))
 
   def test_stub_fields_match_model(self):
     """Stub has exactly CStoreJobFinalized fields."""
@@ -4116,33 +4143,24 @@ class TestPhase3Archive(unittest.TestCase):
     plugin._build_job_archive.assert_called_once_with("test-job", job_specs)
 
   def test_idempotent_rebuild(self):
-    """Calling _build_job_archive twice doesn't corrupt state."""
+    """Calling _build_job_archive twice doesn't corrupt state: the retry reuses the first CID."""
     Plugin = self._get_plugin_class()
     plugin, job_specs, _, _ = self._build_archive_plugin()
 
     Plugin._build_job_archive(plugin, "test-job", job_specs)
     first_stub = plugin.chainstore_hset.call_args[1]["value"]
+    self.assertEqual(first_stub["job_id"], "test-job")
 
-    # Reset and call again (simulating a retry where data is still available)
+    # Reset and call again (simulating a retry): the pruned stub now has this CID, so the retry
+    # is a read-only idempotent return, not a second write.
     plugin.chainstore_hset.reset_mock()
     plugin.r1fs.add_json.reset_mock()
-    new_archive_cid = "QmArchiveCID2"
-    plugin.r1fs.add_json.return_value = new_archive_cid
 
-    # Update get_json to also return data for the new archive CID
-    orig_side_effect = plugin.r1fs.get_json.side_effect
-    def extended_get(cid):
-      if cid == new_archive_cid:
-        return {"job_id": "test-job"}
-      return orig_side_effect(cid)
-    plugin.r1fs.get_json.side_effect = extended_get
+    second_cid = Plugin._build_job_archive(plugin, "test-job", job_specs)
 
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    second_stub = plugin.chainstore_hset.call_args[1]["value"]
-    # Both produce valid stubs
-    self.assertEqual(first_stub["job_id"], second_stub["job_id"])
-    self.assertEqual(first_stub["pass_count"], second_stub["pass_count"])
+    self.assertEqual(second_cid, first_stub["job_cid"])
+    plugin.r1fs.add_json.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
 
   def test_multipass_archive(self):
     """Archive with 3 passes contains all pass data."""
@@ -4521,6 +4539,29 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     self.assertEqual(normalized_key, "job-1")
     self.assertEqual(normalized["job_revision"], 0)
+
+  def test_normalize_job_record_refuses_a_record_stored_under_a_foreign_key(self):
+    """RM-108 phase 5: a record whose own job_id disagrees with its storage key is refused, not
+    repaired -- there is no more aliased-legacy-key migration to perform."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+
+    normalized_key, normalized = Plugin._normalize_job_record(
+      plugin, "job-1", {"job_id": "job-2", "launcher": "node-a", "workers": {}})
+
+    self.assertIsNone(normalized_key)
+    self.assertIsNone(normalized)
+
+  def test_normalize_job_record_refuses_a_record_with_no_launcher(self):
+    """RM-108 phase 5: a record missing its launcher is refused, not treated as unbound-but-usable."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+
+    normalized_key, normalized = Plugin._normalize_job_record(
+      plugin, "job-1", {"job_id": "job-1", "workers": {}})
+
+    self.assertIsNone(normalized_key)
+    self.assertIsNone(normalized)
 
   def test_write_job_record_bumps_revision(self):
     """Centralized job writes bump the revision counter."""

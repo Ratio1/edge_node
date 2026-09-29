@@ -1362,23 +1362,9 @@ def announce_launch(
         "engagement_asset_id": binding.to_dict()["engagement_asset_id"]} if binding is not None else {}),
   })
 
-  if binding is not None:
-    return {"job_specs": job_specs, "worker": owner.ee_addr, "job_config": persisted_config}
-
-  all_network_jobs = _job_repo(owner).list_jobs()
-  report = {}
-  for other_key, other_spec in all_network_jobs.items():
-    normalized_key, normalized_spec = owner._normalize_job_record(other_key, other_spec)
-    if normalized_key and normalized_key != job_id:
-      report[normalized_key] = normalized_spec
-
-  owner.P(f"Current jobs:\n{owner.json_dumps(all_network_jobs, indent=2)}")
-  return {
-    "job_specs": job_specs,
-    "worker": owner.ee_addr,
-    "other_jobs": report,
-    "job_config": persisted_config,
-  }
+  # RM-108 phase 5: admission never yields an unbound launch, so the response never lists the
+  # other current jobs a pre-tenancy console once needed to find its own job in.
+  return {"job_specs": job_specs, "worker": owner.ee_addr, "job_config": persisted_config}
 
 
 _AUTHORIZATION_UPDATE_REQUIRED = ("reference", "authorized_signer_name", "authorized_signer_role")

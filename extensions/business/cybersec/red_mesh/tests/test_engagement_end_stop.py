@@ -66,24 +66,20 @@ class TestPluginEngagementEndReason(unittest.TestCase):
       return answer
     return SimpleNamespace(_execution_service=lambda: SimpleNamespace(engagement_end_reason=engagement_end_reason))
 
-  def reason(self, answer, config=None, job=None):
+  def reason(self, answer, job=None):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     job = job if job is not None else {"execution_binding": execution_binding()}
-    config = config if config is not None else {"engagement_id": "en_1"}
-    return PentesterApi01Plugin._engagement_end_reason(self.plugin(answer), job, config)
+    return PentesterApi01Plugin._engagement_end_reason(self.plugin(answer), job)
 
   def test_it_asks_about_the_bound_tenant_and_the_snapshot_engagement(self):
     self.assertEqual(self.reason("engagement_revoked"), "engagement_revoked")
     self.assertEqual(self.asked, (execution_binding()["tenant_id"], ENGAGEMENT_ID))
 
-  def test_a_schema_2_binding_names_the_engagement_without_the_config(self):
+  def test_a_schema_2_binding_names_the_engagement(self):
     binding = binding_payload()
-    self.assertEqual(self.reason("engagement_revoked", config={}, job={"execution_binding": binding}),
+    self.assertEqual(self.reason("engagement_revoked", job={"execution_binding": binding}),
                      "engagement_revoked")
-    self.assertEqual(self.asked, (binding["tenant_id"], binding["engagement_id"]))
-    # The binding is the reauthorized fact; the config is a mutable copy and never wins.
-    self.reason("engagement_revoked", config={"engagement_id": "en_other"}, job={"execution_binding": binding})
     self.assertEqual(self.asked, (binding["tenant_id"], binding["engagement_id"]))
 
   def test_an_unreadable_store_or_a_job_without_a_binding_is_not_an_end(self):
@@ -106,7 +102,7 @@ class EngagementOwner(FinalizationOwner):
   def _log_audit_event(self, event, data):
     self.audit.append((event, data))
 
-  def _engagement_end_reason(self, job_specs, config):
+  def _engagement_end_reason(self, job_specs):
     binding = job_specs.get("execution_binding")
     self.reason_checks.append(binding.get("engagement_id") if isinstance(binding, dict) else None)
     return self.reason

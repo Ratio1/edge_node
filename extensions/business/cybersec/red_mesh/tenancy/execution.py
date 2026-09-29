@@ -162,7 +162,7 @@ class CurrentExecutionFacts:
 
 
 def context_tenant_id(context):
-  """The launching tenant, or None for a legacy unbound launch. Never raises at a launch gate."""
+  """The launching tenant, or None when there is no execution context. Never raises at a launch gate."""
   if context is None:
     return None
   try:
@@ -173,7 +173,8 @@ def context_tenant_id(context):
 
 
 def binding_from_record(record):
-  """Absence is legacy; an explicit null or malformed field is never absence."""
+  """The record's binding, or None when the field is absent. An explicit null or malformed field
+  is never absence -- it is a broken record, and `ExecutionBinding(...)` raises for it."""
   return ExecutionBinding(record["execution_binding"]) if "execution_binding" in record else None
 
 
@@ -185,7 +186,9 @@ def binding_value(value):
 
 
 def copy_bound_config(config):
-  """Validate only the additive field; partial legacy archive configs remain compatible."""
+  """Deep-copy a job/archive config; validate only the additive field. A config with no
+  `execution_binding` stays that way -- an archive predating a binding must stay loadable -- but a
+  present field is never malformed nor mutable through the copy."""
   result = deepcopy(config)
   if isinstance(result, dict) and "execution_binding" in result:
     result["execution_binding"] = binding_from_record(result).to_dict()
@@ -193,7 +196,7 @@ def copy_bound_config(config):
 
 
 def checked_archive_config(config, original_binding):
-  """Public archive config is mutable; its original binding (including absence) is not."""
+  """Public archive config is mutable; its original binding, including absence, is not."""
   result = copy_bound_config(config)
   observed = binding_from_record(result) if isinstance(result, dict) else None
   if observed != original_binding:

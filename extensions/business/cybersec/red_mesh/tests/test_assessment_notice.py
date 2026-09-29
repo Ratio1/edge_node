@@ -12,6 +12,8 @@ from extensions.business.cybersec.red_mesh.services.event_redaction import (
 )
 from extensions.business.cybersec.red_mesh.services.event_hooks import emit_lifecycle_event
 
+from .test_execution_binding_models import binding_payload
+
 
 def _job_specs():
   return {
@@ -27,6 +29,8 @@ def _job_specs():
     "authorized": True,
     "authorization_id": "scope-1",
     "authorization_ref": "QmAuth",
+    # RM-108 phase 5: admission never yields a job with no execution_binding.
+    "execution_binding": binding_payload(),
     "workers": {
       "0xai_worker_a": {"start_port": 1, "end_port": 512},
       "0xai_worker_b": {"start_port": 513, "end_port": 1024},
@@ -37,8 +41,20 @@ def _job_specs():
   }
 
 
+class _TenantEventOwner(MagicMock):
+  """A `_get_tenant_integration_config` lookup goes through the class, not the instance.
+
+  RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this fixture's
+  tenant needs one on file to still exercise delivery.
+  """
+  def _get_tenant_integration_config(self, tenant_id, integration_id):
+    if integration_id == "wazuh":
+      return {"config": dict(self.cfg_wazuh_export)}
+    return None
+
+
 def _owner():
-  owner = MagicMock()
+  owner = _TenantEventOwner()
   owner.cfg_instance_id = "tenant-a"
   owner.cfg_ee_node_network = "devnet"
   owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}

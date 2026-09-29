@@ -191,7 +191,9 @@ def producer_job(key, *, dry_run=False):
   """Use unchanged real export producers; only external dependencies are fixture transports."""
   if key == "misp_export":
     owner = misp_fixtures.TestPushToMisp()._setup_owner()
-    job = {"job_id": "job-1", "job_cid": "archive_cid_123"}
+    # RM-108 phase 5: admission never yields an unbound job.
+    job = {"job_id": "job-1", "job_cid": "archive_cid_123",
+           "execution_binding": misp_fixtures.binding_payload()}
     owner._get_job_from_cstore = lambda job_id: job
     from pymisp import MISPEvent
     event = MISPEvent()
