@@ -292,6 +292,17 @@ def _target_label(model_config):
   return label or model or "Model Test"
 
 
+def _single_pass_error(engagement):
+  """RM-107: a model test is a single pass, so its engagement must allow single pass."""
+  if engagement is None or "single_pass" in engagement["allowed_run_modes"]:
+    return None
+  return {
+    "error": "run_mode_not_authorized", "status_code": 400,
+    "message": "The engagement does not allow this run mode.",
+    "allowed_run_modes": list(engagement["allowed_run_modes"]),
+  }
+
+
 def preflight_model_test_provider(
   owner,
   *,
@@ -319,6 +330,10 @@ def preflight_model_test_provider(
   created_by_id, err = _bounded_text(created_by_id, "created_by_id")
   if err:
     return {"ok": False, **err}
+  # Before any outbound call: an engagement that cannot run a model test gets no provider probe.
+  run_mode_err = _single_pass_error((execution_context.to_dict() if execution_context is not None else {}).get("engagement"))
+  if run_mode_err:
+    return {"ok": False, **run_mode_err}
   normalized_limits, err = _normalize_limits(limits, cfg)
   if err:
     return {"ok": False, **err}
@@ -430,13 +445,9 @@ def launch_model_test(
     # Before the question-set gate, so a model launch on a scan asset is named for what it is.
     return _validation_error("Execution target mismatch", error_class="execution_target_mismatch")
   engagement = admitted.get("engagement")
-  if engagement is not None and "single_pass" not in engagement["allowed_run_modes"]:
-    # RM-107: a model test is a single pass, so it needs an engagement that allows single pass.
-    return {
-      "error": "run_mode_not_authorized", "status_code": 400,
-      "message": "The engagement does not allow this run mode.",
-      "allowed_run_modes": list(engagement["allowed_run_modes"]),
-    }
+  run_mode_err = _single_pass_error(engagement)
+  if run_mode_err:
+    return run_mode_err
   if engagement is not None and test_sets is None and not test_set_id:
     # RM-107: no selection means every question set the engagement authorizes for this model.
     test_sets = [{"id": test_set} for test_set in engagement["authorized_tests"]]

@@ -78,10 +78,21 @@ class TestTenantExecutionModel(unittest.TestCase):
 
   def test_a_model_launch_needs_an_engagement_that_allows_single_pass(self):
     continuous = self.model_context({**self.engagement, "allowed_run_modes": ["continuous"]})
-    result, captured = self.launch(continuous)
+    with patch(LAUNCH + "attach_model_test_provider_secret") as attach:
+      result, captured = self.launch(continuous)
+    attach.assert_not_called()
     self.assertEqual((result.get("error"), result.get("status_code"), result.get("allowed_run_modes")),
                      ("run_mode_not_authorized", 400, ["continuous"]))
     self.assertEqual(captured, [])
+
+  def test_a_provider_preflight_needs_an_engagement_that_allows_single_pass(self):
+    continuous = self.model_context({**self.engagement, "allowed_run_modes": ["continuous"]})
+    with patch(LAUNCH + "OpenAICompatibleProviderClient") as client:
+      result = preflight_model_test_provider(self.owner, created_by_id="actor", tested_model=_provider(),
+        tested_model_secret_payload={"api_key": "test-only"}, execution_context=continuous)
+    self.assertEqual((result["ok"], result.get("error"), result.get("allowed_run_modes")),
+                     (False, "run_mode_not_authorized", ["continuous"]))
+    client.assert_not_called()
 
   def test_a_model_launch_on_a_scan_asset_is_a_target_mismatch(self):
     from .test_tenant_execution_effects import context

@@ -36,10 +36,12 @@ account and authority contract is the hub's `docs/resources/redmesh/contracts/re
 
 ## Admission and compatibility
 
-The four launch endpoints and model-provider preflight append `tenant_id`, `asset_id` and
-`expected_target_digest`, preserving existing positional arguments. All three selectors are required
-together for tenant execution. A saved target is derived server-side; repeated matching target
-values are accepted, different protected values are denied. A changed target digest returns 409.
+The four launch endpoints and model-provider preflight append `tenant_id`, `engagement_id` and
+`engagement_asset_id` (RM-107), preserving existing positional arguments. All three selectors are
+required together for tenant execution. The target is taken from the engagement's asset entry
+server-side; repeated matching target values are accepted, different protected values are denied. An
+unknown `engagement_asset_id` is `400 engagement_asset_not_locked`; the entry is the definition, so
+there is no target drift and no digest selector.
 Model preflight now also accepts the trusted forwarded actor. Only the two original model endpoints
 retain their existing token requirement; no new shared token or wallet proof is introduced.
 
