@@ -12,6 +12,7 @@ from .config import (
   get_stix_export_config,
   get_suricata_correlation_config,
   get_taxii_export_config,
+  TENANT_INTEGRATION_NOT_CONFIGURED,
   get_wazuh_export_config,
   tenant_integration_override,
 )
@@ -515,6 +516,13 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None, tena
       "error": "unknown_integration",
       "integration_id": integration_id,
     }
+
+  scoped_tenant = status_tenant(integration_id, tenant_id)
+  if scoped_tenant is not None and not tenant_integration_override(owner, scoped_tenant, integration_id):
+    # A tenant with no record of its own has no destination to test. Probing would reach the
+    # node's destination, with the node's credentials, on the tenant's behalf (RM-093).
+    return {"status": "not_configured", "integration_id": integration_id,
+            "error": TENANT_INTEGRATION_NOT_CONFIGURED}
 
   if integration_id == "wazuh":
     cfg = get_event_export_config(owner)
