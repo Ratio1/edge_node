@@ -2696,7 +2696,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         },
       },
     }
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
 
     PentesterApi01Plugin._maybe_launch_jobs(plugin)
 
@@ -2730,7 +2730,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     selected.model_test_jobs = {}
     selected.scan_jobs = {}
     selected.chainstore_hgetall.return_value = {"job-1": job_specs}
-    selected._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    selected._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     selected._get_worker_entry.side_effect = lambda _job_id, specs: specs["workers"].get(selected.ee_addr)
     selected._get_artifact_repository.return_value.get_job_config.return_value = {
       "job_id": "job-1",
@@ -2785,7 +2785,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     other.ee_addr = "node-a"
     other.model_test_jobs = {}
     other.chainstore_hgetall.return_value = {"job-1": job_specs}
-    other._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    other._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     other._get_worker_entry.side_effect = lambda _job_id, specs: specs["workers"].get(other.ee_addr)
 
     PentesterApi01Plugin._maybe_launch_model_test_jobs(other)
@@ -3074,7 +3074,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       lambda hkey, key: job_specs if hkey == "instance" and key == "job-1" else None
     )
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     plugin._write_job_record.side_effect = lambda job_id, specs, context="": specs
     plugin._publish_model_test_progress.side_effect = (
       lambda job_id, worker_arg, specs, **kwargs: PentesterApi01Plugin._publish_model_test_progress(
@@ -3194,7 +3194,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.time.return_value = 130.0
     plugin.chainstore_hget.return_value = job_specs
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     written_records = []
 
     def write_record(job_id, specs, context=""):
@@ -3374,7 +3374,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.chainstore_hgetall.side_effect = lambda hkey: (
       terminal_live if hkey == "instance:live" else {"job-stale": job_specs}
     )
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     written_records = []
     stored_artifacts = []
 
@@ -3483,7 +3483,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.ee_addr = "node-a"
     plugin.cfg_instance_id = "instance"
     plugin.chainstore_hgetall.return_value = {"job-failed-attestation": job_specs}
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
 
     finalized = PentesterApi01Plugin._maybe_finalize_finished_model_test_jobs(plugin)
 
@@ -3619,7 +3619,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       lambda hkey, key: None if hkey.endswith(":live") else job_specs
     )
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     plugin._emit_timeline_event.side_effect = (
       lambda specs, event_type, message, actor_type="system", meta=None: specs.setdefault("timeline", []).append({
         "event_type": event_type,
@@ -3755,7 +3755,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       lambda hkey, key: None if hkey.endswith(":live") else job_specs
     )
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     written_records = []
     stored_artifacts = []
 

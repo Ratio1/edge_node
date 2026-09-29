@@ -9,11 +9,18 @@ from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.services import data_maintenance
 from .contract_fixture import install_contract
-from .test_execution_binding_models import binding_payload, binding_v1_payload
+from .test_execution_binding_models import binding_payload
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY = '["redmesh","tenancy",1,"deployment"]'
 JOBS = "jobs"
+
+
+def binding_v1_payload():
+  """Schema 1 (RM-084): a tenant asset row. No longer built or read outside this tool."""
+  value = {key: item for key, item in binding_payload().items()
+           if key not in ("engagement_id", "engagement_asset_id", "engagement_hash")}
+  return {**value, "schema_version": 1, "asset_id": "as_" + str(uuid4())}
 
 
 def cid(number):

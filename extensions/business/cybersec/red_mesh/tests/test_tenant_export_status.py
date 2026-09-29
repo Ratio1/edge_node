@@ -1,7 +1,7 @@
 """Checked export metadata: pure reads, real admission and native transport.
 
-RM-084 P1: the endpoints require the caller's tenant. The pure service readers still accept the
-legacy snapshot mode until RM-084 P6 removes it."""
+RM-084 P1: the endpoints require the caller's tenant. RM-108 phase 5 removed the legacy snapshot
+mode the pure service readers used to also accept."""
 import asyncio
 from copy import deepcopy
 from unittest.mock import MagicMock, patch
@@ -14,10 +14,13 @@ from . import test_opencti_export as opencti_fixtures
 from . import test_taxii_export as taxii_fixtures
 from .read_endpoint_fixtures import read_endpoint_fixture
 from .test_tenant_read_native import assert_json_response, install, read_native, request, scheduler_comms
+from .test_execution_binding_models import binding_payload
 from extensions.business.cybersec.red_mesh.services import misp_export, stix_export, opencti_export, taxii_export
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 
+
+BINDING = binding_payload()
 
 CASES = (
   (misp_export.get_misp_export_status, "misp_export", None),
@@ -31,8 +34,8 @@ CASES = (
 def test_checked_status_uses_detached_snapshot_without_fallback_or_effects(reader, key, published):
   owner = MagicMock()
   meta = {"job_id": "job-1", "passes_exported": [1], "status": published or "stored"}
-  source = {"job_id": "job-1", key: meta}
-  result = reader(owner, "job-1", checked_job=source, snapshot_mode="legacy_unbound")
+  source = {"job_id": "job-1", "execution_binding": deepcopy(BINDING), key: meta}
+  result = reader(owner, "job-1", checked_job=source, snapshot_mode="tenant_bound")
   assert result["job_id"] == "job-1" and result["found"] is True and result["exported"] is True
   result["passes_exported"].append(2)
   assert meta["passes_exported"] == [1]
@@ -59,8 +62,8 @@ def test_invalid_checked_snapshot_denies_before_fallback(reader, key, published,
 @pytest.mark.parametrize("metadata", (None, {}))
 def test_checked_empty_status_is_not_a_missing_job(reader, key, published, metadata):
   owner = MagicMock()
-  result = reader(owner, "job-1", checked_job={"job_id": "job-1", key: metadata},
-                  snapshot_mode="legacy_unbound")
+  result = reader(owner, "job-1", checked_job={"job_id": "job-1", "execution_binding": deepcopy(BINDING), key: metadata},
+                  snapshot_mode="tenant_bound")
   assert result == {"job_id": "job-1", "found": True, "exported": False}
   assert owner.mock_calls == []
 
@@ -81,9 +84,9 @@ def test_checked_metadata_corruption_denies_without_repair(reader, key, publishe
 @pytest.mark.parametrize("reader,key,published", CASES)
 def test_checked_model_error_is_typed_and_unchecked_compatibility_remains(reader, key, published):
   owner = MagicMock()
-  job = {"job_id": "job-1", "job_type": "model_test"}
+  job = {"job_id": "job-1", "job_type": "model_test", "execution_binding": deepcopy(BINDING)}
   with pytest.raises(AdministrationDenied) as caught:
-    reader(owner, "job-1", checked_job=job, snapshot_mode="legacy_unbound")
+    reader(owner, "job-1", checked_job=job, snapshot_mode="tenant_bound")
   assert caught.value.status_code == 400 and caught.value.error == "unsupported_job_type"
   assert owner.mock_calls == []
   owner._get_job_from_cstore.return_value = job
@@ -217,6 +220,7 @@ def producer_job(key, *, dry_run=False):
       assert post.call_count == (0 if dry_run else 1)
   assert result["status"] == "ok", result
   assert isinstance(job[key], dict) and job[key]
+  job.setdefault("execution_binding", deepcopy(BINDING))
   return deepcopy(job)
 
 
@@ -230,7 +234,7 @@ def test_real_producer_metadata_survives_checked_native_transport(read_native, k
   job = producer_job(key, dry_run=dry_run)
   reader, _, published = next(case for case in CASES if case[1] == key)
   pure_owner = MagicMock()
-  expected = reader(pure_owner, "job-1", checked_job=job, snapshot_mode="legacy_unbound")
+  expected = reader(pure_owner, "job-1", checked_job=job, snapshot_mode="tenant_bound")
   assert pure_owner.mock_calls == []
   assert expected["exported"] is (not dry_run)
   if dry_run:

@@ -130,8 +130,7 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
   if not callable(check):
     return False
   job_id = job_specs.get("job_id")
-  # Per job: when it was last checked, and its config once read (immutable, so R1FS is read once;
-  # an unavailable read answers {} and is not kept).
+  # Per job: when it was last checked, so a running pass is polled at most once a minute.
   checks = getattr(owner, "_engagement_checks", None)
   if not isinstance(checks, dict):
     checks = {}
@@ -145,18 +144,12 @@ def _stop_if_engagement_ended(owner, job_specs, *, due):
   # others, and never reads as an ended engagement.
   try:
     # RM-107: a schema-2 binding names its engagement, so the check needs no config read (an R1FS
-    # outage then never lets a pass start after the engagement ended). Schema 1 reads the snapshot.
+    # outage then never lets a pass start after the engagement ended).
     binding = job_specs.get("execution_binding")
     engagement_id = binding.get("engagement_id") if isinstance(binding, dict) else None
-    config = {}
-    if not engagement_id:
-      config = entry.get("config") or owner._get_job_config(job_specs, resolve_secrets=False) or {}
-      if config:
-        entry["config"] = config
-      engagement_id = config.get("engagement_id")
     if not engagement_id:
       return False
-    reason = check(job_specs, config)
+    reason = check(job_specs, {})
   except Exception as exc:
     owner.P(f"[CONTINUOUS] Engagement check for job {job_id} unavailable: {exc}", color='y')
     return False

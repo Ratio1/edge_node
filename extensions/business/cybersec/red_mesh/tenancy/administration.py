@@ -976,8 +976,7 @@ class TenantAdministrationService:
     for ids in self.store.tenant_record_ids("engagement", tenant["tenant_id"]):
       row = self.store.raw_record("engagement", *ids) or {}
       documents = row.get("documents") if isinstance(row.get("documents"), list) else []
-      # v1 rows (RM-095) held two fixed documents; they are cleared by the same delete.
-      refs.extend([*documents, row.get("roe_document"), row.get("authorization_document")])
+      refs.extend(documents)
     done = set(tenant.get("deleting", {}).get("deleted_refs", []))
     unique = {}
     for ref in refs:

@@ -7,7 +7,6 @@ from unittest.mock import patch
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import (
   CstoreTenantAdministrationStore,
 )
-from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_tenant import CstoreTenantReader
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 
 
@@ -55,7 +54,7 @@ class TestAdministrationStore(unittest.TestCase):
     self.assertEqual(store.raw_record("engagement", "tn_a", "en_1"), {"not": "valid"})
     self.assertIsNone(store.raw_record("engagement", "tn_a", "en_3"))
 
-  def test_published_tenant_round_trips_through_existing_policy_reader(self):
+  def test_published_tenant_round_trips_through_the_store(self):
     owner = Store()
     store = CstoreTenantAdministrationStore(owner, "deployment-a")
     store.put("tenant", "tn_a", record={"tenant_id": "tn_a", "active": True,
@@ -64,8 +63,6 @@ class TestAdministrationStore(unittest.TestCase):
     self.assertEqual(row, {"schemaVersion": 1, "namespace": "deployment-a",
                           "kind": "tenant", "ids": ["tn_a"], "tenant_id": "tn_a",
                           "active": True, "allow_pentester": False})
-    self.assertFalse(CstoreTenantReader(owner, "deployment-a")
-                     .get_tenant_policy("tn_a").allow_pentester)
 
   def test_list_omits_pending_foundation_and_other_namespace_rows(self):
     owner = Store()

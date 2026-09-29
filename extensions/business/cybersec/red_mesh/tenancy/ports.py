@@ -13,10 +13,6 @@ class TenantReader(Protocol):
     """Read a bound active policy, None for absent/invalid data, or raise TenantStoreError."""
     ...
 
-  def get_asset_owner(self, tenant_id: str, asset_id: str) -> str | None:
-    """Read the owner of a bound existing active asset; never infer it from the selector."""
-    ...
-
 
 class DocumentStoreError(TenantStoreError):
   """A document backend failure. A TenantStoreError, so administration endpoints answer 503."""

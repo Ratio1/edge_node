@@ -4510,13 +4510,14 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result, {"success": False, "error": "unavailable", "status_code": 503})
 
   def test_normalize_job_record_initializes_job_revision(self):
-    """Legacy records get a normalized integer job_revision."""
+    """A job record with no revision counter gets a normalized integer job_revision."""
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
     plugin._write_job_record = MagicMock(side_effect=lambda job_id, specs, context="": specs)
     plugin._delete_job_record = MagicMock()
 
-    normalized_key, normalized = Plugin._normalize_job_record(plugin, "job-1", {"job_id": "job-1", "workers": {}})
+    normalized_key, normalized = Plugin._normalize_job_record(
+      plugin, "job-1", {"job_id": "job-1", "launcher": "node-a", "workers": {}})
 
     self.assertEqual(normalized_key, "job-1")
     self.assertEqual(normalized["job_revision"], 0)
@@ -4792,7 +4793,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.completed_jobs_reports = {}
     plugin.lst_completed_jobs = []
     plugin._foreign_jobs_logged = set()
-    plugin._normalize_job_record = lambda key, spec, migrate=False: (key, spec)
+    plugin._normalize_job_record = lambda key, spec: (key, spec)
     plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
     plugin._get_active_execution_identity = lambda job_id: None
     plugin._build_execution_identity = lambda job_id, pass_nr, worker_addr, revision: (

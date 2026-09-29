@@ -157,7 +157,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.ee_id = "launcher-alias"
     plugin.cfg_distributed_job_reconciliation = cfg or {"LIVE_HSYNC_ENABLED": True}
     plugin._last_live_hsync_at = last_hsync_at
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
     plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
       Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)
@@ -760,7 +760,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin._foreign_jobs_logged = set()
     plugin._PentesterApi01Plugin__last_checked_jobs = 0
     plugin.time.side_effect = [100.0, 100.0, 100.0]
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_config.return_value = {"scan_type": "network"}
     plugin.P = MagicMock()
     plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
@@ -829,7 +829,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin._foreign_jobs_logged = set()
     plugin._PentesterApi01Plugin__last_checked_jobs = 0
     plugin.time.return_value = 100.0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
     plugin._remember_execution_identity = lambda job_id, identity, started_at: Plugin._remember_execution_identity(
@@ -881,7 +881,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin._foreign_jobs_logged = set()
     plugin._PentesterApi01Plugin__last_checked_jobs = 0
     plugin.time.return_value = 100.0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
 
@@ -919,7 +919,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._log_audit_event = MagicMock()
     plugin.time.return_value = 100.0
@@ -1006,7 +1006,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._log_audit_event = MagicMock()
     plugin.time.return_value = 100.0
@@ -1084,7 +1084,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._log_audit_event = MagicMock()
     plugin.time.side_effect = [100.0, 100.0, 100.0]
@@ -1148,7 +1148,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
     plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
       Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)
@@ -1243,7 +1243,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "launcher-A"
     plugin.cfg_distributed_job_reconciliation = {"LIVE_HSYNC_ENABLED": True}
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
     plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
       Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)

@@ -23,13 +23,6 @@ def binding_payload():
           "original_launcher": "coordinator", "participant_order": ["node-b", "node-a"]}
 
 
-def binding_v1_payload():
-  """Schema 1 (RM-084): a tenant asset row; still read, never built again."""
-  value = {key: item for key, item in binding_payload().items()
-           if key not in ("engagement_id", "engagement_asset_id", "engagement_hash")}
-  return {**value, "schema_version": 1, "asset_id": "as_" + str(uuid4())}
-
-
 ENGAGEMENT_FACTS = {"engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
                     "authorized_tests": ["service_info_common"], "authorized_scan_modes": ["connect"],
                     "roe": {"authenticated_action": False, "stateful_probes_allowed": False,
@@ -72,16 +65,21 @@ class TestExecutionBindingModels(unittest.TestCase):
           raw.pop("execution_binding")
           self.assertNotIn("execution_binding", model.from_dict(raw).to_dict())
 
-  def test_a_schema_1_binding_is_still_read_by_every_model(self):
-    # Jobs launched before RM-107 stay readable, purgeable and renderable (contract §Compatibility).
-    legacy = binding_v1_payload()
-    self.assertEqual(ExecutionBinding(legacy).to_dict(), legacy)
+  def test_a_schema_1_binding_is_refused_by_every_model(self):
+    # RM-108 phase 5: storage holds no schema-1 rows any more; the tool alone still classifies them.
+    good = binding_payload()
+    legacy = {**{key: item for key, item in good.items()
+                 if key not in ("engagement_id", "engagement_asset_id", "engagement_hash")},
+              "schema_version": 1, "asset_id": "as_" + str(uuid4())}
+    with self.assertRaises(ValueError):
+      ExecutionBinding(legacy)
     for model, raw in self.payloads(legacy):
       with self.subTest(model=model.__name__):
-        self.assertEqual(model.from_dict(raw).to_dict()["execution_binding"], legacy)
-    for mixed in ({**legacy, "engagement_id": "en_" + str(uuid4())}, {**binding_payload(), "asset_id": legacy["asset_id"]},
-                  {**legacy, "schema_version": 2}, {**binding_payload(), "schema_version": 1},
-                  {**binding_payload(), "schema_version": 3}):
+        with self.assertRaises(ValueError):
+          model.from_dict(raw)
+    for mixed in ({**legacy, "engagement_id": "en_" + str(uuid4())}, {**good, "asset_id": legacy["asset_id"]},
+                  {**legacy, "schema_version": 2}, {**good, "schema_version": 1},
+                  {**good, "schema_version": 3}):
       with self.subTest(mixed=mixed), self.assertRaises(ValueError):
         ExecutionBinding(mixed)
 

@@ -8,7 +8,6 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService, TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
-from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_tenant import CstoreTenantReader
 from .contract_fixture import contract_terms, install_contract
 
 
@@ -107,7 +106,7 @@ class TestTenantAdministration(unittest.TestCase):
     tenant_id = prepared["tenantId"]
     self.assertEqual(prepared["state"], "pending")
     self.assertEqual(len(tenant_id), 39)
-    self.assertIsNone(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id))
+    self.assertFalse(self.repo.get("tenant", tenant_id)["active"])
     self.assertEqual(self.service.list_tenants(self.actor)["data"], [])
     self.assertEqual(self.service.activate_tenant(self.actor, self.request)["status_code"], 409)
     self.store.grant("initial", tenant_id)
@@ -121,7 +120,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(self.service.get_tenant({"account_id": "initial"}, tenant_id)["data"],
                      {**activated, "canUpdateAllowPentester": False,
                       "assignableMemberRoles": ["tenant_admin", "tenant_user"]})
-    self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).active)
+    self.assertTrue(self.repo.get("tenant", tenant_id)["active"])
 
   def test_matching_pending_retry_resumes_but_changed_intent_never_writes(self):
     first = self.prepare()["data"]
@@ -143,7 +142,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(result["data"]["allowPentesterChangedBy"], "creator")
     self.assertTrue(result["data"]["allowPentesterChangedAt"])
     self.assertEqual(self.service.get_tenant(self.actor, tenant_id)["data"], result["data"])
-    self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).allow_pentester)
+    self.assertTrue(self.repo.get("tenant", tenant_id)["allow_pentester"])
     stored = self.repo.get("tenant", tenant_id)
     for field, value in before.items():
       if field != "allow_pentester":

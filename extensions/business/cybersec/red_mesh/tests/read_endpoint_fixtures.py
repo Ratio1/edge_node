@@ -136,7 +136,8 @@ def read_endpoint_fixture(*, bound=True, archived=True, role="tenant_admin"):
                  "archive": {"job_id": "job-1", "job_config": config, "passes": [deepcopy(pass_report)]}}
     if archived:
       job["job_cid"] = "archive"
-    store.jobs["job-1" if bound else "legacy-alias"] = job
+    # RM-108 phase 5: storage holds no record under a key other than its own job_id any more.
+    store.jobs["job-1"] = job
     artifact_reads = []
     def get_json(cid, **kwargs):
       artifact_reads.append((cid, kwargs))
