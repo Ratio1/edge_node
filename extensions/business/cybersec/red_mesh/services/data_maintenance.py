@@ -123,6 +123,12 @@ class Inventory:
     self._json = {}
     self._withheld = set()
     self._kept = None
+    # Files the job-reading walk opened: a cleanup deletes them last, so a failure part-way leaves
+    # them readable and the row's file list complete for the retry.
+    self._containers = set()
+    self._tenants = None
+    # Files this request deleted: another old row that shares one does not delete it again.
+    self.deleted = set()
 
   # -- registry ---------------------------------------------------------------------------------
 
@@ -133,6 +139,14 @@ class Inventory:
     if hkey == self._tenancy_hkey:
       self._tenancy = None
       self._live = None
+
+  def _job_running(self, hkey, field):
+    job_id = self.job_of(hkey, field)
+    job = self.rows(self._instance).get(job_id) if job_id is not None else None
+    return job is not None and not job_is_terminal(job)
+
+  def is_container(self, cid):
+    return cid in self._containers
 
   def instance(self):
     return self._instance
@@ -174,7 +188,13 @@ class Inventory:
     return self._tenancy
 
   def tenant_ids(self):
-    """Every tenant id a stored row names, present or not: its status hkey may still hold rows."""
+    """Every tenant id a stored row names, present or not: its status hkey may still hold rows.
+
+    Fixed for the request: a row deleted by this request must not take a status hkey out of the
+    registry while the request still works on it.
+    """
+    if self._tenants is not None:
+      return self._tenants
     found = set()
     for _, kind, ids, value in self._tenancy_fields():
       if kind in ("tenant", "tenant_node", "integration", "engagement", "asset") and ids:
@@ -185,7 +205,8 @@ class Inventory:
       binding = value.get("execution_binding") if isinstance(value, dict) else None
       if isinstance(binding, dict) and isinstance(binding.get("tenant_id"), str):
         found.add(binding["tenant_id"])
-    return sorted(item for item in found if _TENANT_STATUS_HKEY.match(f":integrations:{item}"))
+    self._tenants = sorted(item for item in found if _TENANT_STATUS_HKEY.match(f":integrations:{item}"))
+    return self._tenants
 
   def hkeys(self):
     """The registry, in a stable order. The index into it is the export's paging cursor."""
@@ -328,6 +349,7 @@ class Inventory:
     if value is not None and hkey != self._account_hkey:
       for cid, role in references(value):
         found.setdefault(cid, role)
+      self._withheld |= fallback_key_files(value)
       if hkey == self._instance and isinstance(value, dict):
         complete = self._nested(value, found)
     result = ([{"cid": cid, "role": role, "withheld": cid in self._withheld}
@@ -354,8 +376,13 @@ class Inventory:
       if not isinstance(payload, dict):
         complete = False
         continue
-      if has_inline_credentials(payload):
+      self._containers.add(cid)
+      # A job config held graybox credentials inline before they moved to a secret file; an
+      # archive embeds the config as it was. Reports are not checked: a finding may name a key.
+      config = payload if kind == "config" else payload.get("job_config") if kind == "archive" else None
+      if has_inline_credentials(config):
         self._withheld.add(cid)
+      self._withheld |= fallback_key_files(payload)
       for nested, role in references(payload, kind):
         found.setdefault(nested, role)
     return complete
@@ -375,7 +402,8 @@ class Inventory:
             "class": group, "reason": reason, "cids": files, "files_complete": complete}
 
   def kept_files(self):
-    """(files, complete): the files a current row references; a cleanup never deletes them.
+    """(files, complete): the files a current row, or any row of a running job, references; a
+    cleanup never deletes them.
 
     Computed once per request. `complete` is False when a current row's file list could not be
     read in full: a file only it names might then be missing here, so nothing with files is
@@ -388,7 +416,8 @@ class Inventory:
         if hkey == self._account_hkey or self.is_status_hkey(hkey):
           continue
         for field, value in self.rows(hkey).items():
-          if value is None or self.classify(hkey, field, value)[0] != CURRENT:
+          if value is None or (self.classify(hkey, field, value)[0] != CURRENT
+                               and not self._job_running(hkey, field)):
             continue
           found, whole = self.files(hkey, field, value)
           kept.update(item["cid"] for item in found)
@@ -408,6 +437,31 @@ def has_inline_credentials(value):
   elif isinstance(value, list):
     return any(has_inline_credentials(item) for item in value)
   return False
+
+
+# A credential file (or raw model-test evidence) encrypted with the plugin's built-in fallback key,
+# which is the same on every node and public in the source: its ciphertext is as good as
+# plaintext. The value that points at the file records the fallback beside the pointer.
+_FALLBACK_POINTERS = (
+  ("secret_store_unsafe_fallback", "secret_ref"),
+  ("model_provider_secret_store_unsafe_fallback", "model_provider_secret_ref"),
+  ("unsafe_key_fallback", "artifact_cid"),
+)
+
+
+def fallback_key_files(value):
+  """CIDs a stored value points at that are encrypted with the built-in fallback key."""
+  found = set()
+  if isinstance(value, dict):
+    for flag, pointer in _FALLBACK_POINTERS:
+      if value.get(flag) is True and valid_cid(value.get(pointer)):
+        found.add(value[pointer])
+    for item in value.values():
+      found |= fallback_key_files(item)
+  elif isinstance(value, list):
+    for item in value:
+      found |= fallback_key_files(item)
+  return found
 
 
 def job_is_terminal(value):
@@ -574,18 +628,18 @@ def _clean_row(owner, inventory, target, delete_file, job_id=None):
   if files and not kept_complete:
     return {**result, "outcome": "files_unknown"}
   result["files_kept"] = len(files & kept)
-  failed = 0
-  for cid in sorted(files - kept):
+  # Leaf files first, the config, archive and pass reports last; stop at the first failure.
+  for cid in sorted(files - kept, key=lambda item: (inventory.is_container(item), item)):
+    if cid in inventory.deleted:
+      continue
     try:
       gone = delete_file(cid) is True
     except Exception:
       gone = False
-    if gone:
-      result["files_deleted"] += 1
-    else:
-      failed += 1
-  if failed:
-    return {**result, "outcome": "partial"}
+    if not gone:
+      return {**result, "outcome": "partial"}
+    inventory.deleted.add(cid)
+    result["files_deleted"] += 1
   owner.chainstore_hset(hkey=hkey, key=field, value=None)
   remaining = owner.chainstore_hget(hkey=hkey, key=field)
   inventory.refresh(hkey, field, remaining)
@@ -639,7 +693,11 @@ def run(owner, namespace, operation, **arguments):
     return getattr(getattr(owner, "r1fs", None), "ipfs_home", None) or os.environ.get("IPFS_PATH")
 
   def delete_file(cid):
-    return owner._get_artifact_repository().delete(cid, show_logs=False, raise_on_error=False, purge=True)
+    if owner._get_artifact_repository().delete(cid, show_logs=False, raise_on_error=False, purge=True) is True:
+      return True
+    # Deleted by an earlier request (another old row shared it): the relay refuses to unpin what
+    # it no longer holds. Gone here is what the delete wants.
+    return getattr(owner, "r1fs", None) is not None and owner.r1fs.is_pinned(cid) is False
 
   try:
     if operation == "export_records":

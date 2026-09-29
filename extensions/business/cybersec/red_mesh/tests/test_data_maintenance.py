@@ -314,6 +314,71 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual(self.clean(row)[0]["outcome"], "deleted")
     self.assertIn(CONFIG, self.files.deleted)
 
+  def test_credential_files_under_the_built_in_key_are_withheld(self):
+    fallback, safe, evidence = cid(41), cid(42), cid(43)
+    self.files.json[CONFIG].update(secret_store_unsafe_fallback=True, secret_ref=fallback)
+    self.files.json[ARCHIVE]["job_config"] = {"model_provider_secret_ref": safe,
+                                              "model_provider_secret_store_unsafe_fallback": False}
+    self.put(f"{JOBS}:model_test_raw_evidence", "old1", {"artifact_cid": evidence, "unsafe_key_fallback": True})
+    rows = self.scan()
+    listed = {item["cid"]: item["withheld"] for item in rows[(JOBS, "old1")]["cids"]}
+    self.assertEqual((listed[fallback], listed[safe], listed[CONFIG]), (True, False, False))
+    self.assertEqual(rows[(f"{JOBS}:model_test_raw_evidence", "old1")]["cids"],
+                     [{"cid": evidence, "role": "artifact_cid", "withheld": True}])
+
+  def test_an_archive_embedding_a_config_with_inline_credentials_is_withheld(self):
+    self.files.json[ARCHIVE]["job_config"] = {"regular_password": "not-for-export", "official_password": ""}
+    listed = {item["cid"]: item["withheld"] for item in self.scan()[(JOBS, "old1")]["cids"]}
+    self.assertEqual((listed[ARCHIVE], listed[CONFIG]), (True, False))
+
+  def test_a_current_config_with_blank_credential_fields_is_exported(self):
+    self.files.json[cid(20)].update(official_password="", bearer_token="", weak_candidates=[],
+                                    secret_store_unsafe_fallback=False, secret_ref=cid(44))
+    listed = {item["cid"]: item["withheld"] for item in self.scan()[(JOBS, "new1")]["cids"]}
+    self.assertEqual((listed[cid(20)], listed[cid(44)]), (False, False))
+
+  def test_a_file_two_old_rows_share_is_deleted_once(self):
+    self.put(JOBS, "old2", job("old2", binding_v1_payload(), job_config_cid=cid(50), job_cid=cid(51),
+                                opencti_export={"artifact_cid": BUNDLE}))
+    self.files.json[cid(50)] = {"target": "192.0.2.10"}
+    self.files.json[cid(51)] = {"job_id": "old2", "passes": []}
+    rows = self.scan()
+    outcomes = self.clean(rows[(JOBS, "old1")], rows[(JOBS, "old2")])
+    self.assertEqual([item["outcome"] for item in outcomes], ["deleted", "deleted"])
+    self.assertEqual(self.files.deleted.count(BUNDLE), 1)
+
+  def test_a_failed_delete_stops_before_the_files_that_list_the_others(self):
+    self.files.refuse = {BUNDLE}
+    row = self.scan()[(JOBS, "old1")]
+    self.assertEqual(self.clean(row)[0]["outcome"], "partial")
+    # The config and the archive were not touched: the row still lists all its files.
+    self.assertNotIn(CONFIG, self.files.deleted)
+    self.assertNotIn(ARCHIVE, self.files.deleted)
+    self.assertTrue(self.scan()[(JOBS, "old1")]["files_complete"])
+
+  def test_a_file_an_earlier_request_deleted_counts_as_gone(self):
+    self.files.refuse = {BUNDLE}
+    pinned = {BUNDLE: False}
+    self.plugin.r1fs = type("R1fs", (), {"is_pinned": staticmethod(lambda item: pinned.get(item, True))})()
+    self.assertEqual(self.clean(self.scan()[(JOBS, "old1")])[0]["outcome"], "deleted")
+    pinned[BUNDLE] = True
+    self.put(JOBS, "old1", job("old1", binding_v1_payload(), opencti_export={"artifact_cid": BUNDLE},
+                               job_config_cid=None, job_cid=None))
+    self.assertEqual(self.clean(self.scan()[(JOBS, "old1")])[0]["outcome"], "partial")
+
+  def test_the_files_of_a_running_old_job_are_kept(self):
+    self.put(JOBS, "busy", job("busy", binding_v1_payload(), job_status="RUNNING", job_config_cid=cid(52),
+                               job_cid=None, opencti_export={"artifact_cid": BUNDLE}))
+    self.files.json[cid(52)] = {"target": "192.0.2.10"}
+    outcome = self.clean(self.scan()[(JOBS, "old1")])[0]
+    self.assertEqual(outcome["outcome"], "deleted")
+    self.assertNotIn(BUNDLE, self.files.deleted)
+
+  def test_a_refused_call_is_audited_with_the_account_it_claimed(self):
+    self.plugin.export_redmesh_records({"account_id": "pentester"}, 0, 0, 10)
+    self.assertEqual(self.events, [("data_exported", {"actor": "pentester", "hkey_index": 0, "offset": 0,
+                                                      "status_code": 403})])
+
   def test_file_exports_and_restores_are_audited_by_cid(self):
     with patch.object(data_maintenance, "read_stored_file", return_value={"cid": CONFIG}):
       self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)
