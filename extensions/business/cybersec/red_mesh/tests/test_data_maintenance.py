@@ -1,0 +1,384 @@
+"""RM-108 (temporary): backup export, old-format cleanup and restore through the plugin endpoints."""
+import base64
+import copy
+import hashlib
+import json
+import unittest
+from unittest.mock import patch
+from uuid import uuid4
+
+from extensions.business.cybersec.red_mesh.services import data_maintenance
+from .contract_fixture import install_contract
+from .test_execution_binding_models import binding_payload, binding_v1_payload
+from .test_tenant_administration import FakeAdministrationStore
+
+TENANCY = '["redmesh","tenancy",1,"deployment"]'
+JOBS = "jobs"
+
+
+def cid(number):
+  return "Qm" + str(number).rjust(44, "1").replace("0", "A")
+
+
+CONFIG, ARCHIVE, REPORT, SECRET, BUNDLE, SHARED, EVIDENCE = (cid(n) for n in range(1, 8))
+
+
+def job(job_id, binding, **extra):
+  return {"job_id": job_id, "job_status": "FINALIZED", "run_mode": "SINGLEPASS", "launcher": "node-a",
+          "target": "192.0.2.10", "start_port": 20, "end_port": 25, "date_created": 1,
+          "job_config_cid": CONFIG, "job_cid": ARCHIVE, **({"execution_binding": binding}
+                                                           if binding is not None else {}), **extra}
+
+
+class Files:
+  """R1FS as the artifact repository sees it, plus what the raw `ipfs` calls would return."""
+
+  def __init__(self):
+    self.json = {
+      CONFIG: {"target": "192.0.2.10", "secret_ref": SECRET},
+      ARCHIVE: {"job_id": "old1", "passes": [{"pass_nr": 1, "aggregated_report_cid": SHARED,
+                                                "worker_reports": {"node-a": {"report_cid": REPORT}}}]},
+    }
+    self.deleted = []
+    self.refuse = set()
+
+  def get_json(self, reference, **kwargs):
+    return copy.deepcopy(self.json.get(reference))
+
+  def delete(self, reference, **kwargs):
+    if reference in self.refuse:
+      return False
+    self.deleted.append(reference)
+    return True
+
+
+class TestDataMaintenance(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    from .conftest import mock_plugin_modules
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    cls.Plugin = PentesterApi01Plugin
+
+  def setUp(self):
+    environment = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
+    environment.start()
+    self.addCleanup(environment.stop)
+    self.storage = FakeAdministrationStore()
+    self.storage.account("pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
+    self.plugin = object.__new__(self.Plugin)
+    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.plugin.cfg_instance_id = JOBS
+    self.plugin.P = lambda *args, **kwargs: None
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+      setattr(self.plugin, name, getattr(self.storage, name))
+    self.events = []
+    self.plugin._log_audit_event = lambda event, details: self.events.append((event, details))
+    self.actor = {"account_id": "creator"}
+    request = str(uuid4())
+    prepared = self.plugin.prepare_tenant(self.actor, request, "Example", "example", "initial",
+                                          **install_contract(self.plugin))
+    self.assertTrue(prepared["success"], prepared)
+    self.tenant = prepared["data"]["tenantId"]
+    self.storage.grant("initial", self.tenant)
+    self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
+    self.files = Files()
+    self.plugin._get_artifact_repository = lambda: self.files
+    self.current = binding_payload()
+    self.current["tenant_id"] = self.tenant
+    self.put(JOBS, "new1", job("new1", self.current, job_config_cid=cid(20), job_cid=cid(21),
+                                stix_export={"artifact_cid": SHARED}))
+    self.files.json[cid(20)] = {"target": "192.0.2.10"}
+    self.files.json[cid(21)] = {"job_id": "new1", "passes": []}
+    self.put(JOBS, "old1", job("old1", binding_v1_payload(), opencti_export={"artifact_cid": BUNDLE}))
+    self.put(f"{JOBS}:live", "old1:node-a", {"job_id": "old1"})
+    self.put(f"{JOBS}:model_test_raw_evidence", "old1", {"artifact_cid": EVIDENCE})
+    self.events.clear()
+
+  def put(self, hkey, field, value):
+    self.storage.data[(hkey, field)] = copy.deepcopy(value)
+
+  def scan(self):
+    rows, cursor = [], {"hkey_index": 0, "offset": 0}
+    while cursor:
+      page = self.plugin.export_redmesh_records(self.actor, cursor["hkey_index"], cursor["offset"], 2)
+      self.assertTrue(page["success"], page)
+      rows += page["data"]["rows"]
+      cursor = page["data"]["next"]
+    return {(row["hkey"], row["field"]): row for row in rows}
+
+  def target(self, row):
+    return {"hkey": row["hkey"], "field": row["field"], "expected_sha256": row["sha256"]}
+
+  def clean(self, *rows):
+    done = self.plugin.cleanup_redmesh_old_data(self.actor, True, [self.target(row) for row in rows])
+    self.assertTrue(done["success"], done)
+    return done["data"]["outcomes"]
+
+  # -- authorization ----------------------------------------------------------------------------
+
+  def test_only_a_full_portfolio_super_tenant_admin_calls_any_of_the_five(self):
+    calls = (
+      lambda actor: self.plugin.export_redmesh_records(actor, 0, 0, 10),
+      lambda actor: self.plugin.export_redmesh_file(actor, JOBS, "old1", CONFIG),
+      lambda actor: self.plugin.cleanup_redmesh_old_data(actor, True, []),
+      lambda actor: self.plugin.restore_redmesh_file(actor, CONFIG, "a.bin", "", ""),
+      lambda actor: self.plugin.restore_redmesh_records(actor, []),
+    )
+    before = copy.deepcopy(self.storage.data)
+    for actor in ({"account_id": "pentester"}, {"account_id": "initial"}, {"account_id": "nobody"}, None):
+      for call in calls:
+        result = call(actor)
+        self.assertFalse(result["success"])
+        self.assertIn(result["status_code"], (401, 403, 404))
+    self.assertEqual(self.storage.data, before)
+    self.assertEqual(self.files.deleted, [])
+
+  # -- export -----------------------------------------------------------------------------------
+
+  def test_export_pages_through_every_registered_hkey_and_classifies_rows(self):
+    rows = self.scan()
+    self.assertEqual(rows[(JOBS, "new1")]["class"], "current")
+    self.assertEqual((rows[(JOBS, "old1")]["class"], rows[(JOBS, "old1")]["reason"]),
+                     ("old", "binding_schema_1"))
+    self.assertEqual(rows[(f"{JOBS}:live", "old1:node-a")]["reason"], "old_job")
+    self.assertEqual(rows[("auth", "creator")]["class"], "current")
+    tenancy = [row for (hkey, _), row in rows.items() if hkey == TENANCY]
+    self.assertEqual({row["class"] for row in tenancy}, {"current"})
+    self.assertEqual({json.loads(row["field"])[0] for row in tenancy}, {"tenant", "receipt", "domain"})
+    self.assertEqual(self.events, [("data_exported", {"actor": "creator"})])
+
+  def test_the_registry_names_every_hkey_the_plugin_builds(self):
+    import pathlib
+    import re
+    root = pathlib.Path(data_maintenance.__file__).resolve().parents[1]
+    built = set()
+    for path in root.rglob("*.py"):
+      if "tests" in path.parts or path.name == "data_maintenance.py":
+        continue
+      text = path.read_text(encoding="utf-8")
+      built.update(re.findall(r"""cfg_instance_id[^"'\n]*\}((?::[a-z_]+)+)[:"']""", text))
+    self.assertTrue(built)
+    hkeys = self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]
+    names = {item["hkey"] for item in hkeys}
+    self.assertEqual({JOBS + suffix for suffix in built} - names, set())
+    self.assertLessEqual({JOBS, TENANCY, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
+    self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["auth"])
+
+  def test_a_job_lists_the_files_its_record_config_and_archive_name(self):
+    row = self.scan()[(JOBS, "old1")]
+    self.assertEqual({item["cid"] for item in row["cids"]}, {CONFIG, ARCHIVE, REPORT, SECRET, BUNDLE, SHARED})
+    self.assertTrue(row["files_complete"])
+    self.assertEqual(self.scan()[(f"{JOBS}:model_test_raw_evidence", "old1")]["cids"],
+                     [{"cid": EVIDENCE, "role": "artifact_cid"}])
+
+  def test_an_unreadable_archive_marks_the_row_and_blocks_its_cleanup(self):
+    del self.files.json[ARCHIVE]
+    row = self.scan()[(JOBS, "old1")]
+    self.assertFalse(row["files_complete"])
+    self.assertEqual(self.clean(row)[0]["outcome"], "files_unknown")
+    self.assertIsNotNone(self.storage.data[(JOBS, "old1")])
+    self.assertEqual(self.files.deleted, [])
+
+  def test_old_formats_of_every_kind_are_named(self):
+    asset = json.dumps(["asset", "deployment", self.tenant, "as_1"], separators=(",", ":"))
+    engagement = json.dumps(["engagement", "deployment", self.tenant, "en_1"], separators=(",", ":"))
+    gone = json.dumps(["tenant_node", "deployment", "tn_" + str(uuid4()), "node"], separators=(",", ":"))
+    self.put(TENANCY, asset, {"kind": "asset"})
+    self.put(TENANCY, engagement, {"kind": "engagement", "engagement_kind": "point-in-time",
+                                   "roe_document": {"ref": cid(30)}})
+    self.put(TENANCY, gone, {"kind": "tenant_node"})
+    self.put(TENANCY, "not json", {"x": 1})
+    self.put(JOBS, "unbound", job("unbound", None))
+    self.put(JOBS, "moved", job("other", self.current))
+    self.put(JOBS, "text", "a string")
+    self.put(JOBS, "dead", None)
+    self.put(f"{JOBS}:triage", "missing:f1", {"state": "open"})
+    self.put(f"{JOBS}:triage:audit", "new1:f1", {"not": "a list"})
+    self.put(f"{JOBS}:integrations", "wazuh", {"last_success_at": "2026-09-01T00:00:00Z",
+                                                "last_artifact_cid": SECRET})
+    self.put(f"{JOBS}:integrations", "retired", {"last_success_at": "2026-09-01T00:00:00Z"})
+    self.put(f"{JOBS}:integrations", "stix", "text")
+    rows = self.scan()
+    found = {key: (row["class"], row["reason"]) for key, row in rows.items()}
+    self.assertEqual(found[(TENANCY, asset)], ("old", "asset_row"))
+    self.assertEqual(found[(TENANCY, engagement)], ("old", "engagement_v1"))
+    self.assertEqual(rows[(TENANCY, engagement)]["cids"], [{"cid": cid(30), "role": "roe_document.ref"}])
+    self.assertEqual(found[(TENANCY, gone)], ("old", "unrecognized"))
+    self.assertEqual(found[(TENANCY, "not json")], ("old", "unrecognized"))
+    self.assertEqual(found[(JOBS, "unbound")], ("old", "unbound_job"))
+    self.assertEqual(found[(JOBS, "moved")], ("old", "legacy_job_key"))
+    self.assertEqual(found[(JOBS, "text")], ("old", "unrecognized"))
+    self.assertEqual(found[(JOBS, "dead")], ("tombstone", ""))
+    self.assertEqual(found[(f"{JOBS}:triage", "missing:f1")], ("orphan", "job_gone"))
+    self.assertEqual(found[(f"{JOBS}:triage:audit", "new1:f1")], ("old", "unrecognized"))
+    self.assertEqual(found[(f"{JOBS}:integrations", "wazuh")], ("current", ""))
+    self.assertEqual(found[(f"{JOBS}:integrations", "retired")], ("old", "unrecognized"))
+    self.assertEqual(found[(f"{JOBS}:integrations", "stix")], ("old", "unrecognized"))
+    # A status row remembers a file without owning it: the old job's file still goes.
+    self.assertEqual(self.clean(rows[(JOBS, "old1")])[0]["files_kept"], 1)
+    self.assertIn(SECRET, self.files.deleted)
+
+  def test_a_tenant_without_a_contract_is_old_and_so_are_its_rows(self):
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    row = self.storage.data[(TENANCY, tenant)]
+    del row["contract"], row["legal"]
+    self.put(f"{JOBS}:integrations:{self.tenant}", "wazuh", {"last_success_at": "2026-09-01T00:00:00Z"})
+    rows = self.scan()
+    self.assertEqual((rows[(TENANCY, tenant)]["class"], rows[(TENANCY, tenant)]["reason"]),
+                     ("old", "tenant_without_contract"))
+    self.assertEqual(rows[(f"{JOBS}:integrations:{self.tenant}", "wazuh")]["class"], "orphan")
+    self.assertEqual(rows[(JOBS, "new1")]["class"], "current")
+
+  def test_a_file_is_served_only_for_a_row_that_references_it(self):
+    with patch.object(data_maintenance, "read_stored_file", return_value={"cid": CONFIG}) as read:
+      self.assertTrue(self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)["success"])
+      refused = self.plugin.export_redmesh_file(self.actor, JOBS, "new1", CONFIG)
+      self.assertEqual((refused["status_code"], refused["error"]), (404, "file_not_in_inventory"))
+      self.assertEqual(self.plugin.export_redmesh_file(self.actor, "other", "x", CONFIG)["status_code"], 400)
+      self.assertEqual(read.call_count, 1)
+
+  def test_bad_paging_is_refused(self):
+    for arguments in ((-1, 0, 10), (0, -1, 10), (0, 0, 0), (0, 0, 201), (99, 0, 10), ("0", 0, 10), (True, 0, 10)):
+      result = self.plugin.export_redmesh_records(self.actor, *arguments)
+      self.assertEqual((result["status_code"], result["error"]), (400, "invalid_request"), arguments)
+
+  # -- cleanup ----------------------------------------------------------------------------------
+
+  def test_cleanup_deletes_an_old_job_its_rows_and_its_files_but_keeps_a_shared_file(self):
+    rows = self.scan()
+    outcome = self.clean(rows[(JOBS, "old1")])[0]
+    self.assertEqual(outcome, {"hkey": JOBS, "field": "old1", "outcome": "deleted",
+                               "files_deleted": 6, "files_kept": 1})
+    self.assertEqual(sorted(self.files.deleted), sorted([CONFIG, ARCHIVE, REPORT, SECRET, BUNDLE, EVIDENCE]))
+    for key in ((JOBS, "old1"), (f"{JOBS}:live", "old1:node-a"), (f"{JOBS}:model_test_raw_evidence", "old1")):
+      self.assertIsNone(self.storage.data[key])
+    self.assertIsNotNone(self.storage.data[(JOBS, "new1")])
+    self.assertEqual(self.events[-1], ("old_data_deleted", {"actor": "creator", "outcomes": {"deleted": 1}}))
+    after = self.scan()
+    self.assertEqual({row["class"] for row in after.values()}, {"current", "tombstone"})
+
+  def test_cleanup_refuses_what_changed_runs_or_is_current(self):
+    rows = self.scan()
+    self.put(JOBS, "busy", job("busy", binding_v1_payload(), job_status="RUNNING"))
+    busy = self.scan()[(JOBS, "busy")]
+    stale = dict(rows[(JOBS, "old1")])
+    self.storage.data[(JOBS, "old1")]["job_status"] = "STOPPED"
+    outcomes = self.clean(stale, busy, rows[(JOBS, "new1")], rows[("auth", "creator")],
+                          {"hkey": JOBS, "field": "never", "sha256": "0" * 64})
+    self.assertEqual([item["outcome"] for item in outcomes],
+                     ["changed", "running", "not_old", "refused", "absent"])
+    self.assertEqual(self.files.deleted, [])
+    self.assertIsNotNone(self.storage.data[("auth", "creator")])
+
+  def test_a_failed_file_delete_keeps_the_row(self):
+    self.files.refuse = {REPORT}
+    outcome = self.clean(self.scan()[(JOBS, "old1")])[0]
+    self.assertEqual(outcome["outcome"], "partial")
+    self.assertIsNotNone(self.storage.data[(JOBS, "old1")])
+    self.files.refuse = set()
+    self.assertEqual(self.clean(self.scan()[(JOBS, "old1")])[0]["outcome"], "deleted")
+
+  def test_cleanup_needs_confirm_and_a_bounded_list(self):
+    row = self.target(self.scan()[(JOBS, "old1")])
+    for confirm, targets in ((False, [row]), ("true", [row]), (True, []), (True, [row, row]),
+                             (True, [{**row, "extra": 1}]), (True, [row] * 101), (True, None)):
+      result = self.plugin.cleanup_redmesh_old_data(self.actor, confirm, targets)
+      self.assertEqual((result["status_code"], result["error"]), (400, "invalid_request"))
+    self.assertIsNotNone(self.storage.data[(JOBS, "old1")])
+
+  # -- restore ----------------------------------------------------------------------------------
+
+  def test_restore_writes_back_what_is_gone_and_never_overwrites(self):
+    rows = self.scan()
+    saved = [{"hkey": key[0], "field": key[1], "value": rows[key]["value"]}
+             for key in ((JOBS, "old1"), (JOBS, "new1"), ("auth", "creator"))]
+    self.clean(rows[(JOBS, "old1")])
+    self.storage.data[(JOBS, "new1")]["job_status"] = "STOPPED"
+    self.events.clear()
+    done = self.plugin.restore_redmesh_records(self.actor, saved + [
+      {"hkey": "elsewhere", "field": "x", "value": {"a": 1}},
+      {"hkey": f"{JOBS}:integrations:tn_{uuid4()}", "field": "wazuh", "value": {"schema_version": "1.0.0"}}])
+    self.assertTrue(done["success"], done)
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]],
+                     ["written", "conflict", "refused", "refused", "written"])
+    self.assertEqual(self.storage.data[(JOBS, "old1")], rows[(JOBS, "old1")]["value"])
+    self.assertEqual(self.storage.data[(JOBS, "new1")]["job_status"], "STOPPED")
+    self.assertEqual(self.events[0][0], "data_restored")
+    again = self.plugin.restore_redmesh_records(self.actor, saved[:1])
+    self.assertEqual(again["data"]["outcomes"][0]["outcome"], "same")
+
+
+class TestStoredFiles(unittest.TestCase):
+  """The raw `ipfs` calls, with the binary replaced by a recorder."""
+
+  def setUp(self):
+    self.calls = []
+    self.answers = {}
+    patcher = patch.object(data_maintenance, "_ipfs", side_effect=self.ipfs)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def ipfs(self, arguments, ipfs_home, *, cwd=None, timeout=None):
+    self.calls.append(list(arguments))
+    if arguments[0] == "get":
+      with open(f"{cwd}/file", "wb") as handle:
+        handle.write(b"stored bytes")
+      return ""
+    return self.answers[arguments[0] if "--only-hash" not in arguments else "hash"]
+
+  def test_read_returns_the_stored_bytes_and_name(self):
+    self.answers["ls"] = f"{cid(9)} 12 abc123.bin\n"
+    found = data_maintenance.read_stored_file(CONFIG, "/repo")
+    self.assertEqual(found, {"cid": CONFIG, "filename": "abc123.bin",
+                             "content_b64": base64.b64encode(b"stored bytes").decode(),
+                             "sha256": hashlib.sha256(b"stored bytes").hexdigest(), "size_bytes": 12})
+    self.assertEqual(self.calls[1], ["get", "-o", "file", "--", f"{CONFIG}/abc123.bin"])
+
+  def test_read_refuses_bad_input_strange_listings_and_large_files(self):
+    for bad in ("-o/etc/passwd", "../x", "", None, "Qmshort", CONFIG + "/x", CONFIG + "\n"):
+      with self.assertRaises(data_maintenance.MaintenanceError) as raised:
+        data_maintenance.read_stored_file(bad, "/repo")
+      self.assertEqual(raised.exception.code, "invalid_request")
+    self.assertEqual(self.calls, [])
+    for listing, code in ((f"{cid(9)} 12 ../evil\n", "file_unavailable"),
+                          (f"{cid(9)} 12 a.bin\n{cid(9)} 12 b.bin\n", "file_unavailable"),
+                          ("", "file_unavailable"),
+                          (f"{cid(9)} {51 * 1024 * 1024} a.bin\n", "file_too_large")):
+      self.answers["ls"] = listing
+      with self.assertRaises(data_maintenance.MaintenanceError) as raised:
+        data_maintenance.read_stored_file(CONFIG, "/repo")
+      self.assertEqual(raised.exception.code, code)
+    self.assertNotIn("get", [call[0] for call in self.calls])
+
+  def write(self, **changes):
+    data = b"stored bytes"
+    arguments = {"cid": CONFIG, "filename": "abc123.bin",
+                 "content_b64": base64.b64encode(data).decode(),
+                 "sha256": hashlib.sha256(data).hexdigest(), **changes}
+    return data_maintenance.write_stored_file(ipfs_home="/repo", **arguments)
+
+  def test_write_adds_the_file_only_when_the_cid_is_the_same(self):
+    self.answers.update(hash=f"{cid(9)}\n{CONFIG}\n", add=f"{cid(9)}\n{CONFIG}\n")
+    self.assertEqual(self.write(), {"cid": CONFIG, "outcome": "written"})
+    self.assertEqual(self.calls[-1], ["add", "-q", "-w", "--", "abc123.bin"])
+    self.calls.clear()
+    self.answers["hash"] = f"{cid(9)}\n{cid(8)}\n"
+    with self.assertRaises(data_maintenance.MaintenanceError) as raised:
+      self.write()
+    self.assertEqual(raised.exception.code, "cid_mismatch")
+    self.assertEqual(len(self.calls), 1)
+
+  def test_write_refuses_bad_names_bad_bytes_and_a_wrong_hash(self):
+    for changes, code in (({"filename": "../a.bin"}, "invalid_request"), ({"filename": ".hidden"}, "invalid_request"),
+                          ({"filename": "-rf"}, "invalid_request"), ({"filename": "a/b"}, "invalid_request"),
+                          ({"cid": "--help"}, "invalid_request"), ({"content_b64": "not base64!"}, "invalid_request"),
+                          ({"sha256": "0" * 64}, "hash_mismatch"), ({"sha256": None}, "invalid_request")):
+      with self.assertRaises(data_maintenance.MaintenanceError) as raised:
+        self.write(**changes)
+      self.assertEqual(raised.exception.code, code, changes)
+    self.assertEqual(self.calls, [])
+
+
+if __name__ == "__main__":
+  unittest.main()
