@@ -31,7 +31,7 @@ from .integration_status import _STATUS_BUILDERS
 
 CURRENT, OLD, ORPHAN, TOMBSTONE = "current", "old", "orphan", "tombstone"
 BACKUP_SCHEMA = "redmesh.backup/1"
-MAX_PAGE = 200
+MAX_PAGE = 50
 MAX_TARGETS = 100
 MAX_FILE_BYTES = 50 * 1024 * 1024
 IPFS_TIMEOUT = 60
@@ -57,6 +57,13 @@ _PER_JOB = (
   (":report_review:audit", list, False),
 )
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement")
+# Graybox credentials that job configs held inline before they moved to an encrypted secret file.
+# Such a config is stored under the engine's fixed default secret, so its bytes are as good as
+# plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
+_INLINE_CREDENTIALS = frozenset({
+  "official_password", "regular_password", "bearer_token", "api_key", "bearer_refresh_token",
+  "regular_bearer_token", "regular_api_key", "regular_bearer_refresh_token", "gateway_api_key",
+  "gateway_bearer_token", "gateway_bearer_refresh_token", "target_config_secrets", "weak_candidates"})
 _ENGAGEMENT_V1_FIELDS = ("engagement_kind", "roe_document", "authorization_document")
 
 
@@ -86,6 +93,10 @@ def references(value, path=""):
           and isinstance(item, str)):
         if valid_cid(item):
           yield item, role
+      elif isinstance(key, str) and key.endswith("_cids") and isinstance(item, list):
+        for index, entry in enumerate(item):
+          if valid_cid(entry):
+            yield entry, f"{role}[{index}]"
       else:
         yield from references(item, role)
   elif isinstance(value, (list, tuple)):
@@ -108,8 +119,34 @@ class Inventory:
     self._files = {}
     self._tenancy = None
     self._live = None
+    # Files are content-addressed: one read per CID per request, whatever asks for it.
+    self._json = {}
+    self._withheld = set()
+    self._kept = None
 
   # -- registry ---------------------------------------------------------------------------------
+
+  def refresh(self, hkey, field, value):
+    """Record what a fresh read or a delete found, so the rest of the request sees it."""
+    self.rows(hkey)[field] = value
+    self._files.pop((hkey, field), None)
+    if hkey == self._tenancy_hkey:
+      self._tenancy = None
+      self._live = None
+
+  def instance(self):
+    return self._instance
+
+  def job_of(self, hkey, field):
+    """The job a row belongs to: the job record itself or a per-job row; None otherwise."""
+    if not isinstance(field, str):
+      return None
+    if hkey == self._instance:
+      return field
+    for suffix, _, prefixed in _PER_JOB:
+      if hkey == self._instance + suffix:
+        return field.split(":", 1)[0] if prefixed else field
+    return None
 
   def rows(self, hkey):
     if hkey not in self._rows:
@@ -245,7 +282,9 @@ class Inventory:
     # an integration this release has.
     match = _TENANT_STATUS_HKEY.search(hkey)
     if match and match.group(1) not in self._live_tenants():
-      return ORPHAN, "tenant_gone"
+      stored = any(kind == "tenant" and ids == [match.group(1)] and row is not None
+                   for _, kind, ids, row in self._tenancy_fields())
+      return (OLD, "old_tenant") if stored else (ORPHAN, "tenant_gone")
     if not isinstance(value, dict) or field not in _STATUS_BUILDERS:
       return OLD, "unrecognized"
     return CURRENT, ""
@@ -291,7 +330,8 @@ class Inventory:
         found.setdefault(cid, role)
       if hkey == self._instance and isinstance(value, dict):
         complete = self._nested(value, found)
-    result = ([{"cid": cid, "role": role} for cid, role in sorted(found.items())], complete)
+    result = ([{"cid": cid, "role": role, "withheld": cid in self._withheld}
+               for cid, role in sorted(found.items())], complete)
     self._files[key] = result
     return result
 
@@ -310,16 +350,23 @@ class Inventory:
       reads += 1
       if reads > MAX_NESTED_READS:
         return False
-      try:
-        payload = self._read_json(cid)
-      except Exception:
-        payload = None
+      payload = self.read_json(cid)
       if not isinstance(payload, dict):
         complete = False
         continue
+      if has_inline_credentials(payload):
+        self._withheld.add(cid)
       for nested, role in references(payload, kind):
         found.setdefault(nested, role)
     return complete
+
+  def read_json(self, cid):
+    if cid not in self._json:
+      try:
+        self._json[cid] = self._read_json(cid)
+      except Exception:
+        self._json[cid] = None
+    return self._json[cid]
 
   def describe(self, hkey, field, value):
     group, reason = self.classify(hkey, field, value)
@@ -327,32 +374,40 @@ class Inventory:
     return {"hkey": hkey, "field": field, "value": value, "sha256": row_sha256(value),
             "class": group, "reason": reason, "cids": files, "files_complete": complete}
 
-  def kept_files(self, excluding):
-    """Files a current row references: a cleanup never deletes them.
+  def kept_files(self):
+    """(files, complete): the files a current row references; a cleanup never deletes them.
 
-    An integration status row only remembers the last file it delivered and does not own it
-    (`purge_job` deletes such files too), so it keeps nothing.
+    Computed once per request. `complete` is False when a current row's file list could not be
+    read in full: a file only it names might then be missing here, so nothing with files is
+    deleted. An integration status row only remembers the last file it delivered and does not own
+    it (`purge_job` deletes such files too), so it keeps nothing.
     """
-    kept = set()
-    for hkey in self.hkeys():
-      if hkey == self._account_hkey or self.is_status_hkey(hkey):
-        continue
-      for field, value in self.rows(hkey).items():
-        if (hkey, field) in excluding or value is None:
+    if self._kept is None:
+      kept, complete = set(), True
+      for hkey in self.hkeys():
+        if hkey == self._account_hkey or self.is_status_hkey(hkey):
           continue
-        if self.classify(hkey, field, value)[0] == CURRENT:
-          kept.update(item["cid"] for item in self.files(hkey, field, value)[0])
-    return kept
+        for field, value in self.rows(hkey).items():
+          if value is None or self.classify(hkey, field, value)[0] != CURRENT:
+            continue
+          found, whole = self.files(hkey, field, value)
+          kept.update(item["cid"] for item in found)
+          complete = complete and whole
+      self._kept = (kept, complete)
+    return self._kept
 
-  def job_rows(self, job_id):
-    """The per-job rows that go with a job record."""
-    for suffix, _, prefixed in _PER_JOB:
-      hkey = self._instance + suffix
-      for field, value in self.rows(hkey).items():
-        if value is None or not isinstance(field, str):
-          continue
-        if field == job_id or prefixed and field.startswith(f"{job_id}:"):
-          yield hkey, field, value
+
+def has_inline_credentials(value):
+  """True when a stored JSON value carries a graybox credential inline (a pre-split job config)."""
+  if isinstance(value, dict):
+    for key, item in value.items():
+      if key in _INLINE_CREDENTIALS and item not in (None, "", [], {}):
+        return True
+      if has_inline_credentials(item):
+        return True
+  elif isinstance(value, list):
+    return any(has_inline_credentials(item) for item in value)
+  return False
 
 
 def job_is_terminal(value):
@@ -438,6 +493,7 @@ def export_records(inventory, hkey_index, offset, limit):
     following = {"hkey_index": hkey_index + 1, "offset": 0}
   return {
     "schema": BACKUP_SCHEMA,
+    "instance_id": inventory.instance(),
     "hkeys": [{"index": index, "hkey": name, "total": len(inventory.rows(name)),
                "account": inventory.is_account_hkey(name)} for index, name in enumerate(hkeys)],
     "rows": [inventory.describe(hkey, field, inventory.rows(hkey)[field]) for field in page],
@@ -450,8 +506,11 @@ def export_file(inventory, hkey, field, cid, ipfs_home):
   if not isinstance(hkey, str) or hkey not in inventory.hkeys() or not valid_cid(cid):
     raise MaintenanceError(400, "invalid_request")
   value = inventory.rows(hkey).get(field)
-  if cid not in {item["cid"] for item in inventory.files(hkey, field, value)[0]}:
+  found = {item["cid"]: item for item in inventory.files(hkey, field, value)[0]}
+  if cid not in found:
     raise MaintenanceError(404, "file_not_in_inventory")
+  if found[cid]["withheld"]:
+    raise MaintenanceError(409, "file_withheld")
   return read_stored_file(cid, ipfs_home)
 
 
@@ -468,52 +527,53 @@ def _checked_targets(targets):
   return targets
 
 
-def cleanup(owner, build_inventory, targets, delete_file, job_lock):
+def cleanup(owner, inventory, targets, delete_file, job_lock):
   """Delete rows that are still old or orphan and unchanged since the operator's scan.
 
-  `build_inventory` gives a fresh read; `delete_file(cid)` returns True when the file is gone;
-  `job_lock(job_id)` is the context manager `purge_job` serializes on.
+  Each target is exactly one row: a job's other rows are targets of their own, each with the hash
+  the operator saw. `delete_file(cid)` returns True when the file is gone; `job_lock(job_id)` is
+  the context manager `purge_job` serializes on, held for every row of a job.
   """
   targets = _checked_targets(targets)
   outcomes = []
   for target in targets:
     hkey, field = target["hkey"], target["field"]
-    inventory = build_inventory()
     if hkey not in inventory.hkeys() or inventory.is_account_hkey(hkey):
       outcomes.append({"hkey": hkey, "field": field, "outcome": "refused",
                        "files_deleted": 0, "files_kept": 0})
       continue
-    if inventory.is_job_hkey(hkey):
-      with job_lock(field):
-        outcomes.append(_clean_row(owner, build_inventory(), target, delete_file))
-    else:
+    job_id = inventory.job_of(hkey, field)
+    if job_id is None:
       outcomes.append(_clean_row(owner, inventory, target, delete_file))
+    else:
+      with job_lock(job_id):
+        outcomes.append(_clean_row(owner, inventory, target, delete_file, job_id=job_id))
   return {"outcomes": outcomes}
 
 
-def _clean_row(owner, inventory, target, delete_file):
+def _clean_row(owner, inventory, target, delete_file, job_id=None):
   hkey, field = target["hkey"], target["field"]
   result = {"hkey": hkey, "field": field, "outcome": "deleted", "files_deleted": 0, "files_kept": 0}
-  value = inventory.rows(hkey).get(field)
+  value = owner.chainstore_hget(hkey=hkey, key=field)
+  inventory.refresh(hkey, field, value)
   if value is None:
     return {**result, "outcome": "absent"}
   if row_sha256(value) != target["expected_sha256"]:
     return {**result, "outcome": "changed"}
   if inventory.classify(hkey, field, value)[0] not in (OLD, ORPHAN):
     return {**result, "outcome": "not_old"}
-  rows = [(hkey, field, value)]
-  if inventory.is_job_hkey(hkey):
-    if not job_is_terminal(value):
+  if job_id is not None:
+    job = owner.chainstore_hget(hkey=inventory.instance(), key=job_id)
+    if job is not None and not job_is_terminal(job):
       return {**result, "outcome": "running"}
-    rows += list(inventory.job_rows(field))
-  files = set()
-  for row in rows:
-    found, complete = inventory.files(*row)
-    if not complete:
-      return {**result, "outcome": "files_unknown"}
-    files.update(item["cid"] for item in found)
-  kept = files & inventory.kept_files({(name, key) for name, key, _ in rows})
-  result["files_kept"] = len(kept)
+  found, complete = inventory.files(hkey, field, value)
+  if not complete:
+    return {**result, "outcome": "files_unknown"}
+  files = {item["cid"] for item in found}
+  kept, kept_complete = inventory.kept_files()
+  if files and not kept_complete:
+    return {**result, "outcome": "files_unknown"}
+  result["files_kept"] = len(files & kept)
   failed = 0
   for cid in sorted(files - kept):
     try:
@@ -526,9 +586,10 @@ def _clean_row(owner, inventory, target, delete_file):
       failed += 1
   if failed:
     return {**result, "outcome": "partial"}
-  for name, key, _ in reversed(rows):
-    owner.chainstore_hset(hkey=name, key=key, value=None)
-  if owner.chainstore_hget(hkey=hkey, key=field) is not None:
+  owner.chainstore_hset(hkey=hkey, key=field, value=None)
+  remaining = owner.chainstore_hget(hkey=hkey, key=field)
+  inventory.refresh(hkey, field, remaining)
+  if remaining is not None:
     return {**result, "outcome": "resurrected"}
   return result
 
@@ -588,7 +649,7 @@ def run(owner, namespace, operation, **arguments):
     elif operation == "cleanup":
       if arguments.pop("confirm", None) is not True:
         raise MaintenanceError(400, "invalid_request")
-      data = cleanup(owner, inventory, arguments["targets"], delete_file,
+      data = cleanup(owner, inventory(), arguments["targets"], delete_file,
                      lambda job_id: _purge_lock(owner, job_id))
     elif operation == "restore_file":
       data = write_stored_file(ipfs_home=ipfs_home(), **arguments)

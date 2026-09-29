@@ -146,7 +146,10 @@ class TestDataMaintenance(unittest.TestCase):
     tenancy = [row for (hkey, _), row in rows.items() if hkey == TENANCY]
     self.assertEqual({row["class"] for row in tenancy}, {"current"})
     self.assertEqual({json.loads(row["field"])[0] for row in tenancy}, {"tenant", "receipt", "domain"})
-    self.assertEqual(self.events, [("data_exported", {"actor": "creator"})])
+    # Every page is audited, with where it read and nothing of what it read.
+    exported = [details for event, details in self.events if event == "data_exported"]
+    self.assertGreater(len(exported), 5)
+    self.assertEqual(exported[0], {"actor": "creator", "hkey_index": 0, "offset": 0, "status_code": 200})
 
   def test_the_registry_names_every_hkey_the_plugin_builds(self):
     import pathlib
@@ -170,7 +173,7 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual({item["cid"] for item in row["cids"]}, {CONFIG, ARCHIVE, REPORT, SECRET, BUNDLE, SHARED})
     self.assertTrue(row["files_complete"])
     self.assertEqual(self.scan()[(f"{JOBS}:model_test_raw_evidence", "old1")]["cids"],
-                     [{"cid": EVIDENCE, "role": "artifact_cid"}])
+                     [{"cid": EVIDENCE, "role": "artifact_cid", "withheld": False}])
 
   def test_an_unreadable_archive_marks_the_row_and_blocks_its_cleanup(self):
     del self.files.json[ARCHIVE]
@@ -203,7 +206,7 @@ class TestDataMaintenance(unittest.TestCase):
     found = {key: (row["class"], row["reason"]) for key, row in rows.items()}
     self.assertEqual(found[(TENANCY, asset)], ("old", "asset_row"))
     self.assertEqual(found[(TENANCY, engagement)], ("old", "engagement_v1"))
-    self.assertEqual(rows[(TENANCY, engagement)]["cids"], [{"cid": cid(30), "role": "roe_document.ref"}])
+    self.assertEqual(rows[(TENANCY, engagement)]["cids"], [{"cid": cid(30), "role": "roe_document.ref", "withheld": False}])
     self.assertEqual(found[(TENANCY, gone)], ("old", "unrecognized"))
     self.assertEqual(found[(TENANCY, "not json")], ("old", "unrecognized"))
     self.assertEqual(found[(JOBS, "unbound")], ("old", "unbound_job"))
@@ -227,7 +230,8 @@ class TestDataMaintenance(unittest.TestCase):
     rows = self.scan()
     self.assertEqual((rows[(TENANCY, tenant)]["class"], rows[(TENANCY, tenant)]["reason"]),
                      ("old", "tenant_without_contract"))
-    self.assertEqual(rows[(f"{JOBS}:integrations:{self.tenant}", "wazuh")]["class"], "orphan")
+    self.assertEqual((rows[(f"{JOBS}:integrations:{self.tenant}", "wazuh")]["class"],
+                      rows[(f"{JOBS}:integrations:{self.tenant}", "wazuh")]["reason"]), ("old", "old_tenant"))
     self.assertEqual(rows[(JOBS, "new1")]["class"], "current")
 
   def test_a_file_is_served_only_for_a_row_that_references_it(self):
@@ -239,24 +243,84 @@ class TestDataMaintenance(unittest.TestCase):
       self.assertEqual(read.call_count, 1)
 
   def test_bad_paging_is_refused(self):
-    for arguments in ((-1, 0, 10), (0, -1, 10), (0, 0, 0), (0, 0, 201), (99, 0, 10), ("0", 0, 10), (True, 0, 10)):
+    for arguments in ((-1, 0, 10), (0, -1, 10), (0, 0, 0), (0, 0, 51), (99, 0, 10), ("0", 0, 10), (True, 0, 10)):
       result = self.plugin.export_redmesh_records(self.actor, *arguments)
       self.assertEqual((result["status_code"], result["error"]), (400, "invalid_request"), arguments)
 
   # -- cleanup ----------------------------------------------------------------------------------
 
-  def test_cleanup_deletes_an_old_job_its_rows_and_its_files_but_keeps_a_shared_file(self):
+  def test_cleanup_deletes_each_old_row_with_its_files_and_keeps_a_shared_file(self):
     rows = self.scan()
-    outcome = self.clean(rows[(JOBS, "old1")])[0]
-    self.assertEqual(outcome, {"hkey": JOBS, "field": "old1", "outcome": "deleted",
-                               "files_deleted": 6, "files_kept": 1})
+    targets = [rows[(JOBS, "old1")], rows[(f"{JOBS}:live", "old1:node-a")],
+               rows[(f"{JOBS}:model_test_raw_evidence", "old1")]]
+    outcomes = self.clean(*targets)
+    self.assertEqual(outcomes[0], {"hkey": JOBS, "field": "old1", "outcome": "deleted",
+                                   "files_deleted": 5, "files_kept": 1})
+    self.assertEqual([item["outcome"] for item in outcomes], ["deleted"] * 3)
     self.assertEqual(sorted(self.files.deleted), sorted([CONFIG, ARCHIVE, REPORT, SECRET, BUNDLE, EVIDENCE]))
     for key in ((JOBS, "old1"), (f"{JOBS}:live", "old1:node-a"), (f"{JOBS}:model_test_raw_evidence", "old1")):
       self.assertIsNone(self.storage.data[key])
     self.assertIsNotNone(self.storage.data[(JOBS, "new1")])
-    self.assertEqual(self.events[-1], ("old_data_deleted", {"actor": "creator", "outcomes": {"deleted": 1}}))
+    self.assertEqual(self.events[-1], ("old_data_deleted", {"actor": "creator", "targets": 3, "status_code": 200,
+                                                             "outcomes": {"deleted": 3}}))
     after = self.scan()
     self.assertEqual({row["class"] for row in after.values()}, {"current", "tombstone"})
+
+  def test_a_job_row_is_deleted_alone_and_its_other_rows_keep_their_own_hash_check(self):
+    rows = self.scan()
+    self.clean(rows[(JOBS, "old1")])
+    self.assertIsNotNone(self.storage.data[(f"{JOBS}:live", "old1:node-a")])
+    # Changed after the scan: refused, so the backup never misses the newer value.
+    self.storage.data[(f"{JOBS}:live", "old1:node-a")]["progress"] = 50
+    self.assertEqual(self.clean(rows[(f"{JOBS}:live", "old1:node-a")])[0]["outcome"], "changed")
+    fresh = self.scan()[(f"{JOBS}:live", "old1:node-a")]
+    self.assertEqual((fresh["class"], fresh["reason"]), ("orphan", "job_gone"))
+    self.assertEqual(self.clean(fresh)[0]["outcome"], "deleted")
+
+  def test_the_rows_of_a_running_old_job_are_never_deleted(self):
+    self.put(JOBS, "busy", job("busy", binding_v1_payload(), job_status="RUNNING"))
+    self.put(f"{JOBS}:triage", "busy:f1", {"state": "open"})
+    rows = self.scan()
+    self.assertEqual(rows[(f"{JOBS}:triage", "busy:f1")]["reason"], "old_job")
+    outcomes = self.clean(rows[(JOBS, "busy")], rows[(f"{JOBS}:triage", "busy:f1")])
+    self.assertEqual([item["outcome"] for item in outcomes], ["running", "running"])
+    self.assertIsNotNone(self.storage.data[(f"{JOBS}:triage", "busy:f1")])
+
+  def test_nothing_with_files_is_deleted_while_a_current_row_cannot_be_read_in_full(self):
+    del self.files.json[cid(21)]
+    rows = self.scan()
+    self.assertFalse(rows[(JOBS, "new1")]["files_complete"])
+    self.assertEqual(self.clean(rows[(JOBS, "old1")])[0]["outcome"], "files_unknown")
+    self.assertEqual(self.files.deleted, [])
+    asset = json.dumps(["asset", "deployment", self.tenant, "as_1"], separators=(",", ":"))
+    self.put(TENANCY, asset, {"kind": "asset"})
+    self.assertEqual(self.clean(self.scan()[(TENANCY, asset)])[0]["outcome"], "deleted")
+
+  def test_a_config_with_inline_credentials_is_withheld_from_the_backup(self):
+    self.files.json[CONFIG]["official_password"] = "not-for-export"
+    self.files.json[cid(40)] = {"third": 1}
+    self.put(JOBS, "old1", {**self.storage.data[(JOBS, "old1")],
+                             "authorization": {"third_party_auth_cids": [cid(40), "not a cid"]}})
+    row = self.scan()[(JOBS, "old1")]
+    listed = {item["cid"]: item for item in row["cids"]}
+    self.assertTrue(listed[CONFIG]["withheld"])
+    self.assertFalse(listed[ARCHIVE]["withheld"])
+    self.assertEqual(listed[cid(40)]["role"], "authorization.third_party_auth_cids[0]")
+    with patch.object(data_maintenance, "read_stored_file") as read:
+      refused = self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)
+      self.assertEqual((refused["status_code"], refused["error"]), (409, "file_withheld"))
+      read.assert_not_called()
+    # Withheld from the backup, still deleted with its job.
+    self.assertEqual(self.clean(row)[0]["outcome"], "deleted")
+    self.assertIn(CONFIG, self.files.deleted)
+
+  def test_file_exports_and_restores_are_audited_by_cid(self):
+    with patch.object(data_maintenance, "read_stored_file", return_value={"cid": CONFIG}):
+      self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)
+    self.plugin.restore_redmesh_file(self.actor, "--bad", "a.bin", "", "")
+    self.assertEqual(self.events, [
+      ("data_file_exported", {"actor": "creator", "cid": CONFIG, "status_code": 200}),
+      ("data_file_restored", {"actor": "creator", "cid": "--bad", "status_code": 400})])
 
   def test_cleanup_refuses_what_changed_runs_or_is_current(self):
     rows = self.scan()
@@ -304,7 +368,8 @@ class TestDataMaintenance(unittest.TestCase):
                      ["written", "conflict", "refused", "refused", "written"])
     self.assertEqual(self.storage.data[(JOBS, "old1")], rows[(JOBS, "old1")]["value"])
     self.assertEqual(self.storage.data[(JOBS, "new1")]["job_status"], "STOPPED")
-    self.assertEqual(self.events[0][0], "data_restored")
+    self.assertEqual(self.events[0], ("data_restored", {"actor": "creator", "rows": 5, "status_code": 200,
+                                                        "outcomes": {"written": 2, "conflict": 1, "refused": 2}}))
     again = self.plugin.restore_redmesh_records(self.actor, saved[:1])
     self.assertEqual(again["data"]["outcomes"][0]["outcome"], "same")
 
