@@ -1922,6 +1922,38 @@ class TestPhase14Purge(unittest.TestCase):
     purge_mock.assert_called_once_with(plugin, "job-1", ledger=None)
     self.assertEqual(result, purge_result)
 
+  def test_stop_and_delete_refuses_a_stored_record_the_normalizer_refuses(self):
+    """RM-108 phase 5: a record the normalizer refuses (foreign key, no launcher) must be refused
+    before any side effect -- not treated the same as no record at all, which reports success with
+    nothing to stop. Previously this stopped local worker threads and reported bare success without
+    ever marking the job STOPPED or purging."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+    plugin.scan_jobs = {"job-1": {"local-A": MagicMock()}}
+
+    job_specs = {
+      "job_id": "job-2",  # stored under a foreign key
+      "job_status": "RUNNING",
+      "launcher": "node-A",
+      "workers": {"node-A": {"finished": False}},
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin._normalize_job_record = MagicMock(return_value=(None, None))
+
+    from extensions.business.cybersec.red_mesh.services import control as control_module
+    purge_mock = MagicMock()
+
+    with patch.object(control_module, "purge_job", purge_mock):
+      result = _stop_and_delete_service(plugin, "job-1")
+
+    self.assertEqual(result.get("error"), "Job not found")
+    # No worker was stopped, no record written, no purge attempted, no false-success audit.
+    for worker in plugin.scan_jobs["job-1"].values():
+      worker.stop.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
+    plugin._emit_timeline_event.assert_not_called()
+    purge_mock.assert_not_called()
+
 
 class TestPurgeAllJobs(unittest.TestCase):
   """purge_all_jobs: bulk wipe across every RedMesh job."""

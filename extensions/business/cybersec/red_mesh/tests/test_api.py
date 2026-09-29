@@ -318,7 +318,6 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin._build_webapp_workers = lambda active_peers, target_port: (
       PentesterApi01Plugin._build_webapp_workers(plugin, active_peers, target_port)
     )
-    plugin._announce_launch = lambda **kwargs: PentesterApi01Plugin._announce_launch(plugin, **kwargs)
     plugin.launch_network_scan = lambda **kwargs: PentesterApi01Plugin.launch_network_scan(plugin, **kwargs)
     plugin.launch_webapp_scan = lambda **kwargs: PentesterApi01Plugin.launch_webapp_scan(plugin, **kwargs)
     return plugin
@@ -2892,6 +2891,23 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(len(job_specs["pass_reports"]), 1)
     self.assertIsNone(plugin._automatic_analysis_state)
     executor.submit.assert_called_once()
+
+  def test_stop_monitoring_refuses_a_stored_record_the_normalizer_refuses(self):
+    """RM-108 phase 5: with no checked_job, stop_monitoring reads and normalizes the stored record
+    itself. A record the normalizer refuses (foreign key, no launcher) must be refused here too,
+    not dereferenced as if it were a normal job_specs dict."""
+    from extensions.business.cybersec.red_mesh.services.control import stop_monitoring
+
+    plugin, job_specs = self._build_finalize_plugin()
+    plugin.chainstore_hget.return_value = job_specs
+    plugin._normalize_job_record = MagicMock(return_value=(None, None))
+    plugin._log_audit_event = MagicMock()
+
+    result = stop_monitoring(plugin, job_specs["job_id"], stop_type="HARD")
+
+    self.assertEqual(result.get("error"), "Job not found")
+    plugin._emit_timeline_event.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
 
   def test_automatic_analysis_future_failure_keeps_existing_llm_failure_path(self):
     PentesterApi01Plugin = self._get_plugin_class()

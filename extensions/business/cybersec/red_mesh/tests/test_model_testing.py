@@ -42,6 +42,10 @@ from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models i
 
 
 PUBLIC_TEST_IP = "93.184.216.34"
+# A second real, public, non-forbidden IP (validate_provider_url resolves and checks the
+# destination), distinct from PUBLIC_TEST_IP, for tests that must tell a tested-model endpoint
+# apart from an evaluator endpoint in an assertion.
+EVALUATOR_TEST_IP = "1.1.1.1"
 
 
 class _Owner(SimpleNamespace):
@@ -1269,7 +1273,10 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
           "label": "Primary evaluator",
           "provider_label": "Evaluator Provider",
           "adapter": "openai_compatible",
-          "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+          # A distinct host from the tested model's: the admitted execution_binding legitimately
+          # echoes the tested model's own endpoint in the launch result (RM-107's asset_target), so
+          # only a host the evaluator alone knows about can pin "this must never leak" below.
+          "base_url": f"https://{EVALUATOR_TEST_IP}/v1",
           "model": "evaluator-model",
           "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
           "enabled": True,
@@ -1290,17 +1297,14 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     result_text = str(result)
     self.assertNotIn("preset-secret", result_text)
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", result_text)
-    # RM-108 phase 5: the admitted execution_binding now always echoes the tested model's own
-    # endpoint (its asset_target) in the launch result -- that is the immutable execution identity
-    # the caller itself supplied, not an evaluator secret. It is checked below via
-    # tested_model/evaluator_model instead of a blanket URL absence.
-    self.assertEqual(result["job_config"]["evaluator_model"].get("base_url"), None)
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", result_text)
     stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
     stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["api_key"], "preset-secret")
-    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1")
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{EVALUATOR_TEST_IP}/v1")
     self.assertNotIn("preset-secret", str(stored_config))
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", str(stored_config))
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", str(stored_config))
 
   def test_launch_resolves_llm_evaluator_preset_secret_from_inline_key(self):
     inline_secret = "inline-evaluator-secret"
@@ -1313,7 +1317,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
           "label": "Koala text moderation",
           "provider_label": "Koala",
           "adapter": "openai_compatible",
-          "base_url": f"https://{PUBLIC_TEST_IP}/v1/moderations",
+          # A distinct host from the tested model's: see the comment in
+          # test_launch_resolves_llm_evaluator_preset_secret_from_env.
+          "base_url": f"https://{EVALUATOR_TEST_IP}/v1/moderations",
           "model": "koala-text-moderation",
           "API_KEY": inline_secret,
           "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
@@ -1340,16 +1346,12 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("api_key", result_text)
     self.assertNotIn("api_key_env", result_text)
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", result_text)
-    # RM-108 phase 5: the admitted execution_binding now always echoes the tested model's own
-    # endpoint (its asset_target) in the launch result and the persisted job_config -- that is the
-    # immutable execution identity the caller itself supplied, not an evaluator secret. The
-    # evaluator's own base_url (a different path, "/v1/moderations") is what must stay absent.
-    self.assertNotIn("/v1/moderations", result_text)
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", result_text)
     stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
     stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["api_key"], inline_secret)
     self.assertNotEqual(stored_secret["payload"]["evaluator_model"]["api_key"], env_secret)
-    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1/moderations")
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{EVALUATOR_TEST_IP}/v1/moderations")
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["method"], MODERATION_EVALUATOR_METHOD)
     stored_config_text = str(stored_config)
     self.assertNotIn(inline_secret, stored_config_text)
@@ -1358,7 +1360,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("api_key", stored_config_text)
     self.assertNotIn("api_key_env", stored_config_text)
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", stored_config_text)
-    self.assertNotIn("/v1/moderations", stored_config_text)
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", stored_config_text)
 
   def test_launch_persists_koala_moderation_evaluator_method(self):
     owner = _owner(

@@ -251,3 +251,18 @@ def test_a_tenant_bound_record_is_normalized_before_the_service_touches_it():
     received = stop.call_args.kwargs["checked_job"]
     assert isinstance(received.get("workers"), dict), received.get("workers")
     assert received.get("launcher"), received
+
+
+def test_a_stored_record_with_no_launcher_is_refused_without_stopping_anything():
+  """RM-108 phase 5: the normalizer refuses a record with no launcher (`(None, None)`); the plugin
+  seam must not pass that None through to stop_monitoring as if it were "no checked job supplied"
+  -- that would fall back to an unscoped re-read by job_id, bypassing the tenant scope this record
+  was just read under. It is refused here, before the real service is ever called."""
+  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+    _membership(fixture, "tenant_admin")
+    fixture.store.jobs["job-1"].pop("launcher")
+    with _no_stop(fixture) as stop:
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                              tenant_id=fixture.tenant_id)
+    assert result.get("success") is not True, result
+    stop.assert_not_called()

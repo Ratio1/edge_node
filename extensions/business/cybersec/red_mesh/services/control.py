@@ -78,6 +78,11 @@ def stop_and_delete_job(owner, job_id: str, *, checked_job=None, snapshot_mode=N
   job_specs = None
   if isinstance(raw_job_specs, dict):
     _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+    # RM-108 phase 5: a stored-but-refused record (foreign key, no launcher) is refused before any
+    # side effect -- it is not the same as no record at all, which the branch below treats as
+    # already-stopped success.
+    if job_specs is None:
+      return {"error": "Job not found", "job_id": job_id}
     owner_error = _foreign_launcher_error(owner, job_id, job_specs, "stop_and_delete")
     if owner_error:
       return owner_error
@@ -870,6 +875,8 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT", *, checked_job=
     if not raw_job_specs:
       return {"error": "Job not found", "job_id": job_id}
     _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
+    if job_specs is None:
+      return {"error": "Job not found", "job_id": job_id}
   else:
     job_specs = checked_job
   owner_error = _foreign_launcher_error(owner, job_id, job_specs, "stop_monitoring")

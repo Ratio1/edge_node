@@ -186,9 +186,9 @@ def binding_value(value):
 
 
 def copy_bound_config(config):
-  """Deep-copy a job/archive config; validate only the additive field. A config with no
-  `execution_binding` stays that way -- an archive predating a binding must stay loadable -- but a
-  present field is never malformed nor mutable through the copy."""
+  """Deep-copy a job/archive config; validate only the additive field. The binding cannot change
+  through this copy, absence included: a present field is re-validated and never left malformed,
+  and an absent one stays absent rather than being synthesized."""
   result = deepcopy(config)
   if isinstance(result, dict) and "execution_binding" in result:
     result["execution_binding"] = binding_from_record(result).to_dict()
