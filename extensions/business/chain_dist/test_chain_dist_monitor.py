@@ -163,6 +163,15 @@ class ChainDistMonitorTests(unittest.TestCase):
     self.monitor.check_all_jobs()
     self.assertEqual(len(self.bc.submissions), 1)
 
+  def test_none_pending_response_still_checks_late_pipeline_recovery(self):
+    self.bc.pending = None
+    self.bc.jobs[1] = self.job()
+    self.visible()
+    self.monitor.check_all_jobs()
+    self.now += 300
+    self.monitor.check_all_jobs()
+    self.assertEqual(self.bc.submissions, [(1, ['0xnode1'])])
+
   def test_late_pipeline_does_not_reopen_closed_or_removed_job(self):
     self.visible()
     self.bc.jobs[1] = self.job(start=2000)
