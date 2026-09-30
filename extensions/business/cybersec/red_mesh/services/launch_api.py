@@ -118,19 +118,50 @@ def _raw_socket_available():
   return raw_socket_available()
 
 
-def resolve_network_scan_mode(value):
-  """Validate a network scan_mode and enforce the raw-socket capability rule.
-
-  Returns ``(mode, None)`` on success or ``(None, error_payload)``. A ``syn``
-  request on a node without a raw socket is refused at launch with a typed
-  ``scan_mode_unavailable`` error rather than downgraded to a full handshake.
-  RM-094 phase 1.
-  """
+def _normalize_scan_mode(value):
+  """Normalize and format-validate a network scan_mode. Returns ``(mode, error)``."""
   mode = (value or "connect").strip().lower()
   if mode not in SCAN_MODES:
     return None, validation_error(
       "scan_mode must be one of: {}".format(", ".join(sorted(SCAN_MODES)))
     )
+  return mode, None
+
+
+def check_authorized_scan_mode(scan_mode, authorized_scan_modes):
+  """Refuse a scan mode outside the asset's authorized modes (RM-094 phase 2).
+
+  ``authorized_scan_modes`` is the engagement network asset's allow-list; a
+  non-tenant launch passes ``None`` and is not gated (mirrors
+  ``check_allowed_run_mode`` on an absent engagement). Returns an error or None.
+  """
+  if authorized_scan_modes is None:
+    return None
+  if scan_mode in set(authorized_scan_modes):
+    return None
+  return {
+    "error": "scan_mode_not_authorized", "status_code": 400,
+    "message": "The engagement does not authorize this scan mode for this asset.",
+    "authorized_scan_modes": list(authorized_scan_modes),
+  }
+
+
+def resolve_network_scan_mode(value, authorized_scan_modes=None):
+  """Validate, authorize, and capability-check a network scan_mode.
+
+  Returns ``(mode, None)`` on success or ``(None, error_payload)``. Precedence is
+  format validation > engagement authorization > node capability: a mode outside
+  the asset's ``authorized_scan_modes`` is refused with ``scan_mode_not_authorized``
+  before the raw-socket probe, and a ``syn`` request on a node without a raw socket
+  is refused at launch with a typed ``scan_mode_unavailable`` error rather than
+  downgraded to a full handshake. RM-094.
+  """
+  mode, error = _normalize_scan_mode(value)
+  if error:
+    return None, error
+  authz_error = check_authorized_scan_mode(mode, authorized_scan_modes)
+  if authz_error:
+    return None, authz_error
   if mode == "syn" and not _raw_socket_available():
     return None, {"error": "scan_mode_unavailable",
                   "message": "SYN scan mode requires a raw socket (CAP_NET_RAW) on the node"}
@@ -1512,8 +1543,13 @@ def launch_network_scan(
   timeout_profile, timeout_profile_error = normalize_network_timeout_profile(timeout_profile)
   if timeout_profile_error:
     return timeout_profile_error
-  # SYN needs a raw socket (CAP_NET_RAW); refuse at launch, never downgrade.
-  scan_mode, scan_mode_error = resolve_network_scan_mode(scan_mode)
+  # scan_mode: format-validate, gate against the engagement's authorized modes
+  # (RM-094 phase 2), then the raw-socket capability rule. SYN needs CAP_NET_RAW;
+  # refuse at launch, never downgrade.
+  scan_mode, scan_mode_error = resolve_network_scan_mode(
+    scan_mode,
+    authorized_scan_modes=engagement.get("authorized_scan_modes") if engagement is not None else None,
+  )
   if scan_mode_error:
     return scan_mode_error
   start_port = int(start_port)
