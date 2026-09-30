@@ -94,7 +94,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
   
   
   def check_all_jobs(self):
-    unvalidated_job_ids = self.bc.get_unvalidated_job_ids(oracle_address=self.bc.eth_address)
+    unvalidated_job_ids = self.bc.get_unvalidated_job_ids(oracle_address=self.bc.eth_address) or []
     known_apps = self.netmon.network_known_apps()
     running_nodes_by_job = {}
     for node, apps in known_apps.items():
