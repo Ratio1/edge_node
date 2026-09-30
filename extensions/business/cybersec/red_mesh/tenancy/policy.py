@@ -17,7 +17,7 @@ _ROLE_OPERATIONS = {
     "tenants:manage", "tenant_users:manage",
     "integrations:manage", "attestation_keys:manage", "allow_pentester:update",
     "tasks:launch", "tasks:update", "reports:view", "reports:export", "evidence:read", "audit:view",
-    # RM-078. analysis:run is an operator action and binds to allow_pentester below;
+    # RM-078. analysis:run is an operator action; allow_pentester binds it below as it binds launch;
     # engagement:delete and jobs:purge are administrative and do not.
     "analysis:run", "engagement:delete", "jobs:purge",
     # RM-084 P3. Uploading a permission-to-test document is a pre-engagement step of launching, so
@@ -159,12 +159,13 @@ def authorize_tenant_operation(
       return PolicyDecision(False, 404, "not_found")
     if not roles & _PLATFORM_ROLES and tenant.allow_pentester is not True:
       return PolicyDecision(False, 403, "pentesting_disabled")
-  # RM-078. Unlike tasks:launch, this binds the platform roles too: the owner's decision reads
-  # "scoped STA/SP and Tenant Pentesters subject to Allow Pentester", and a tenant that switched
-  # pentesting off has said something about analysis of its pentest findings as well. Stricter than
-  # the launch gate on purpose; flagged for the owner rather than silently harmonised with it.
-  # RM-084 P3 puts authorization:upload on the same binding: the document exists to authorize a
-  # pentest, so a tenant with pentesting off has nothing to file one against.
-  if operation in ("analysis:run", "authorization:upload") and tenant.allow_pentester is not True:
+  # RM-078. analysis:run follows the launch gate: Allow Pentester binds the Tenant Pentester, and the
+  # platform roles are exempt (owner, 2026-09-30, replacing the stricter 2026-09-15 reading).
+  if (operation == "analysis:run" and not roles & _PLATFORM_ROLES
+      and tenant.allow_pentester is not True):
+    return PolicyDecision(False, 403, "pentesting_disabled")
+  # RM-084 P3 binds authorization:upload for every role: the document exists to authorize a pentest,
+  # so a tenant with pentesting off has nothing to file one against.
+  if operation == "authorization:upload" and tenant.allow_pentester is not True:
     return PolicyDecision(False, 403, "pentesting_disabled")
   return PolicyDecision(True, 200, None)
