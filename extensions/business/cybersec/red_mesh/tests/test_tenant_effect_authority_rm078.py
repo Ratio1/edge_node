@@ -91,6 +91,30 @@ class TestTenantEffectAuthority(unittest.TestCase):
           PolicyDecision(False, 403, "pentesting_disabled") if bound
           else PolicyDecision(True, 200, None))
 
+  def test_stop_and_review_follow_the_launch_rule(self):
+    """`tasks:stop` and `reports:review` belong to whoever may launch, under launch's Allow Pentester
+    rule: the Tenant Pentester is bound, the platform roles are exempt, and a Tenant Admin or Tenant
+    User holds neither (owner, 2026-09-30). Both used to ride on `reports:export`, which a Tenant
+    Admin holds for downloads."""
+    for operation in ("tasks:stop", "reports:review"):
+      for role, holds, bound in (("super_tenant_admin", True, False), ("super_pentester", True, False),
+                                 ("tenant_pentester", True, True), ("tenant_admin", False, False),
+                                 ("tenant_user", False, False)):
+        with self.subTest(operation=operation, role=role):
+          actor = account(in_tenant(role, "a"))
+          on = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, True))
+          off = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, False))
+          if not holds:
+            self.assertEqual(on, PolicyDecision(False, 403, "forbidden"))
+            self.assertEqual(off, PolicyDecision(False, 403, "forbidden"))
+            continue
+          self.assertTrue(on.allowed)
+          self.assertEqual(off, PolicyDecision(False, 403, "pentesting_disabled") if bound
+                           else PolicyDecision(True, 200, None))
+          self.assertEqual(
+            authorize_tenant_operation(actor, operation, TenantPolicyContext("b", True, True)).status_code,
+            200 if role == "super_tenant_admin" else 404)
+
   def test_deletion_and_purge_do_not_depend_on_the_pentesting_switch(self):
     """They are administrative, not operator, actions. A tenant that disabled pentesting has not
     thereby forfeited its ability to delete its own data -- and must not gain it either."""

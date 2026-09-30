@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from .read_endpoint_fixtures import as_role, read_endpoint_fixture
+from .read_endpoint_fixtures import allow_pentester, as_role, read_endpoint_fixture
 from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
   install, read_native, request, scheduler_comms,
 )
@@ -51,7 +51,7 @@ def _no_stop(fixture):
   ("identity_store", 503),
 ))
 def test_denials_never_stop_a_worker_or_emit_a_lifecycle_event(fault, status):
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
     account = fixture.store.data[("auth", "reader")]
     actor, tenant_id = fixture.actor, fixture.tenant_id
     if fault == "actor": actor = None
@@ -78,7 +78,7 @@ def test_the_stop_reads_no_job_of_its_own():
   Asserted by object identity, not `is not None`: the weaker form passes for any snapshot at all,
   including one the endpoint fetched itself, which is the defect this is meant to exclude.
   """
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
     module = sys.modules[fixture.Plugin.__module__]
     admitted = []
     real_snapshot = fixture.Plugin._admitted_snapshot
@@ -108,7 +108,7 @@ def test_the_stop_reads_no_job_of_its_own():
 def test_the_denial_keeps_its_status_over_the_wire(read_native, response_format, fault, status):
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     payload = {**BODY, "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
     if fault == "tenant_user":
@@ -138,7 +138,7 @@ def test_the_launcher_mismatch_keeps_its_code_over_the_wire(read_native, respons
   """
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     fixture.owner.ee_addr = "some-other-node"   # the fixture job was launched by node-a
     fixture.owner.P = lambda *_args, **_kwargs: None
@@ -158,7 +158,7 @@ def test_a_stop_on_a_job_that_already_ended_keeps_its_code_over_the_wire(read_na
   ledger checkpoint, so nothing is stopped, persisted or emitted, and the code survives the guard."""
   module, _ = read_native
   install(module)
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
     module.eng = scheduler_comms(fixture, response_format)
     fixture.store.jobs["job-1"].update(job_status="STOPPED", run_mode="CONTINUOUS_MONITORING")
     fixture.owner.ee_addr = "node-a"   # the fixture job's launcher: the stop is ours to refuse
@@ -177,20 +177,45 @@ def test_a_stop_on_a_job_that_already_ended_keeps_its_code_over_the_wire(read_na
 # The MVP walkthrough stops a tenant-bound job as a tenant-scoped actor. Until now stop_monitoring
 # passed tenant_id=None to the effect seam (legacy only), and its operation "reports:export" was in
 # neither _TENANT_EFFECT_OPERATIONS nor _TENANT_OPERATIONS, so a tenant member could not stop a job
-# at all. Same admission shape as purge_job; the service receives the admitted snapshot unchanged.
+# at all. Since 2026-09-30 the operation is `tasks:stop` (the launch roles, launch's pentesting rule). Same admission shape as purge_job; the service receives the admitted snapshot unchanged.
 
 def _stop_ok(fixture):
   module = sys.modules[fixture.Plugin.__module__]
   return patch.object(module, "stop_monitoring", Mock(return_value={"success": True, "status_code": 200}))
 
 
-def _membership(fixture, role):
+def _membership(fixture, role, *, pentesting=True):
+  """One tenant-local membership. The stop runs as `tasks:stop`, which Allow Pentester binds for the
+  Tenant Pentester (owner, 2026-09-30), so the switch is set explicitly rather than inherited."""
   fixture.store.account("reader", memberships=[{"role": role, "tenant_id": fixture.tenant_id}])
+  allow_pentester(fixture, pentesting)
 
 
-def test_a_tenant_admin_can_stop_a_bound_job_through_the_tenant_seam():
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+def test_a_tenant_admin_cannot_stop_a_job():
+  """Owner, 2026-09-30: stopping belongs to whoever may launch. A Tenant Admin downloads reports
+  but does not operate scans, so the stop that used to ride on its `reports:export` is refused."""
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
     _membership(fixture, "tenant_admin")
+    with _no_stop(fixture):
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                              tenant_id=fixture.tenant_id)
+    assert (result.get("success"), result.get("status_code"), result.get("error")) == (
+      False, 403, "forbidden"), result
+
+
+def test_a_tenant_pentester_cannot_stop_while_pentesting_is_off():
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
+    _membership(fixture, "tenant_pentester", pentesting=False)
+    with _no_stop(fixture):
+      result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
+                                              tenant_id=fixture.tenant_id)
+    assert (result.get("success"), result.get("status_code"), result.get("error")) == (
+      False, 403, "pentesting_disabled"), result
+
+
+def test_a_tenant_pentester_can_stop_a_bound_job_through_the_tenant_seam():
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
+    _membership(fixture, "tenant_pentester")
     with _stop_ok(fixture) as stop:
       result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
                                               tenant_id=fixture.tenant_id)
@@ -200,7 +225,7 @@ def test_a_tenant_admin_can_stop_a_bound_job_through_the_tenant_seam():
 
 
 def test_a_tenant_user_cannot_stop_a_bound_job():
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
     _membership(fixture, "tenant_user")
     with _stop_ok(fixture) as stop:
       result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
@@ -212,8 +237,8 @@ def test_a_tenant_user_cannot_stop_a_bound_job():
 @pytest.mark.parametrize("tenant_id", (None, "", "   "))
 def test_omitting_the_tenant_is_refused_rather_than_falling_back(tenant_id):
   """RM-084 P3: there is no unscoped half left to fall back to, so this is a 400 and not a stop."""
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
-    _membership(fixture, "tenant_admin")
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
+    _membership(fixture, "tenant_pentester")
     with _stop_ok(fixture) as stop:
       result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
                                               tenant_id=tenant_id)
@@ -224,8 +249,8 @@ def test_omitting_the_tenant_is_refused_rather_than_falling_back(tenant_id):
 
 def test_an_unbound_job_is_not_found_through_a_tenant_selector():
   """A record with no binding belongs to no tenant, so a tenant caller cannot reach it at all."""
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
-    _membership(fixture, "tenant_admin")
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
+    _membership(fixture, "tenant_pentester")
     fixture.store.jobs["legacy-alias"] = {**deepcopy(fixture.job), "job_id": "legacy-alias"}
     fixture.store.jobs["legacy-alias"].pop("execution_binding")
     with _stop_ok(fixture) as stop:
@@ -241,8 +266,8 @@ def test_a_tenant_bound_record_is_normalized_before_the_service_touches_it():
   the worker and then raised after the irreversible step -- a 503 that invites a duplicating retry.
   Pinned at the seam: what the service receives must already be normalized. (The read fixture cannot
   run the real service to completion -- no persistence -- so the effect itself is not asserted here.)"""
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
-    _membership(fixture, "tenant_admin")
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
+    _membership(fixture, "tenant_pentester")
     fixture.store.jobs["job-1"]["workers"] = None
     with _stop_ok(fixture) as stop:
       result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,
@@ -258,8 +283,8 @@ def test_a_stored_record_with_no_launcher_is_refused_without_stopping_anything()
   seam must not pass that None through to stop_monitoring as if it were "no checked job supplied"
   -- that would fall back to an unscoped re-read by job_id, bypassing the tenant scope this record
   was just read under. It is refused here, before the real service is ever called."""
-  with read_endpoint_fixture(bound=True, archived=False) as fixture:
-    _membership(fixture, "tenant_admin")
+  with read_endpoint_fixture(bound=True, archived=False, role="super_pentester") as fixture:
+    _membership(fixture, "tenant_pentester")
     fixture.store.jobs["job-1"].pop("launcher")
     with _no_stop(fixture) as stop:
       result = fixture.Plugin.stop_monitoring(fixture.owner, **BODY, request_actor=fixture.actor,

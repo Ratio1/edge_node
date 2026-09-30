@@ -17,6 +17,9 @@ _ROLE_OPERATIONS = {
     "tenants:manage", "tenant_users:manage",
     "integrations:manage", "attestation_keys:manage", "allow_pentester:update",
     "tasks:launch", "tasks:update", "reports:view", "reports:export", "evidence:read", "audit:view",
+    # Owner, 2026-09-30: stopping a job and approving/rejecting its report belong to whoever may
+    # launch, under the same Allow Pentester rule (below). Both used to ride on reports:export.
+    "tasks:stop", "reports:review",
     # RM-078. analysis:run is an operator action; allow_pentester binds it below as it binds launch;
     # engagement:delete and jobs:purge are administrative and do not.
     "analysis:run", "engagement:delete", "jobs:purge",
@@ -32,6 +35,7 @@ _ROLE_OPERATIONS = {
   "super_pentester": frozenset({
     "allow_pentester:update", "tasks:launch", "tasks:update",
     "reports:view", "reports:export", "evidence:read", "analysis:run", "authorization:upload",
+    "tasks:stop", "reports:review",
     # Reads an engagement's documents (owner Q5); creating, revoking and uploading are STA only.
     "engagements:documents",
   }),
@@ -41,10 +45,15 @@ _ROLE_OPERATIONS = {
     "reports:view", "reports:export", "audit:view",
   }),
   "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export",
-                                 "analysis:run", "authorization:upload"}),
+                                 "analysis:run", "authorization:upload", "tasks:stop",
+                                 "reports:review"}),
   "tenant_user": frozenset({"reports:view"}),
 }
 _PLATFORM_ROLES = frozenset({"super_tenant_admin", "super_pentester"})
+# Operations Allow Pentester binds the way it binds launch: the tenant roles need the switch on, the
+# platform roles are exempt. RM-078 analysis and the 2026-09-30 stop/review split (owner).
+_LAUNCH_BOUND_OPERATIONS = frozenset({
+  "tasks:launch", "tasks:update", "analysis:run", "tasks:stop", "reports:review"})
 # The role vocabularies other modules validate against, derived from the matrix so they cannot drift.
 PLATFORM_ROLES = _PLATFORM_ROLES
 TENANT_LOCAL_ROLES = frozenset(_ROLE_OPERATIONS) - _PLATFORM_ROLES
@@ -157,11 +166,9 @@ def authorize_tenant_operation(
     if (not isinstance(asset_tenant_ids, tuple) or not asset_tenant_ids
         or any(not _valid_id(owner) or owner != tenant.tenant_id for owner in asset_tenant_ids)):
       return PolicyDecision(False, 404, "not_found")
-    if not roles & _PLATFORM_ROLES and tenant.allow_pentester is not True:
-      return PolicyDecision(False, 403, "pentesting_disabled")
-  # RM-078. analysis:run follows the launch gate: Allow Pentester binds the Tenant Pentester, and the
-  # platform roles are exempt (owner, 2026-09-30, replacing the stricter 2026-09-15 reading).
-  if (operation == "analysis:run" and not roles & _PLATFORM_ROLES
+  # RM-078 put analysis:run on the launch rule (owner, 2026-09-30, replacing the stricter 2026-09-15
+  # reading); stop and review joined it the same day.
+  if (operation in _LAUNCH_BOUND_OPERATIONS and not roles & _PLATFORM_ROLES
       and tenant.allow_pentester is not True):
     return PolicyDecision(False, 403, "pentesting_disabled")
   # RM-084 P3 binds authorization:upload for every role: the document exists to authorize a pentest,
