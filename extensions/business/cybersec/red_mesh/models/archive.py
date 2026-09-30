@@ -42,6 +42,7 @@ class JobConfig:
   timeout_profile: str = TIMEOUT_PROFILE_STANDARD  # STANDARD | THOROUGH (network scans)
   scan_min_delay: float = 0
   scan_max_delay: float = 0
+  scan_mode: str = "connect"        # connect (full handshake) | syn (half-open)
   ics_safe_mode: bool = False
   redact_credentials: bool = True
   scanner_identity: str = ""
@@ -168,6 +169,7 @@ class JobConfig:
       timeout_profile=normalize_timeout_profile(d.get("timeout_profile")),
       scan_min_delay=d.get("scan_min_delay", 0),
       scan_max_delay=d.get("scan_max_delay", 0),
+      scan_mode=d.get("scan_mode", "connect"),
       ics_safe_mode=d.get("ics_safe_mode", False),
       redact_credentials=d.get("redact_credentials", True),
       scanner_identity=d.get("scanner_identity", ""),

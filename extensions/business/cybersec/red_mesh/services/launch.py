@@ -32,6 +32,7 @@ def _launch_network_jobs(
   enabled_features = job_config.get("enabled_features", [])
   scan_min_delay = job_config.get("scan_min_delay", owner.cfg_scan_min_rnd_delay)
   scan_max_delay = job_config.get("scan_max_delay", owner.cfg_scan_max_rnd_delay)
+  scan_mode = job_config.get("scan_mode", "connect")
   ics_safe_mode = job_config.get("ics_safe_mode", owner.cfg_ics_safe_mode)
   scanner_identity = job_config.get("scanner_identity", owner.cfg_scanner_identity)
   scanner_user_agent = job_config.get("scanner_user_agent", owner.cfg_scanner_user_agent)
@@ -108,6 +109,7 @@ def _launch_network_jobs(
         enabled_features=enabled_features,
         scan_min_delay=scan_min_delay,
         scan_max_delay=scan_max_delay,
+        scan_mode=scan_mode,
         ics_safe_mode=ics_safe_mode,
         scanner_identity=scanner_identity,
         scanner_user_agent=scanner_user_agent,

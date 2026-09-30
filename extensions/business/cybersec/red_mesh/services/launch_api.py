@@ -43,7 +43,7 @@ from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 from ..tenancy.assets import collapse_ports, format_port_ranges, ports_outside_scope
-from ..tenancy.engagements import RUN_MODE_LAUNCH_VALUES
+from ..tenancy.engagements import RUN_MODE_LAUNCH_VALUES, SCAN_MODES
 from ..tenancy.execution import context_tenant_id
 from .soc_export_policy import required_soc_launch_error
 
@@ -107,6 +107,34 @@ def _job_repo(owner):
 def validation_error(message: str):
   """Return a consistent validation error payload."""
   return {"error": "validation_error", "message": message}
+
+
+def _raw_socket_available():
+  """Whether this node can open a raw socket (CAP_NET_RAW) for SYN scans.
+
+  Imported lazily so launch_api stays importable without the worker package.
+  """
+  from ..worker.syn_scan import raw_socket_available
+  return raw_socket_available()
+
+
+def resolve_network_scan_mode(value):
+  """Validate a network scan_mode and enforce the raw-socket capability rule.
+
+  Returns ``(mode, None)`` on success or ``(None, error_payload)``. A ``syn``
+  request on a node without a raw socket is refused at launch with a typed
+  ``scan_mode_unavailable`` error rather than downgraded to a full handshake.
+  RM-094 phase 1.
+  """
+  mode = (value or "connect").strip().lower()
+  if mode not in SCAN_MODES:
+    return None, validation_error(
+      "scan_mode must be one of: {}".format(", ".join(sorted(SCAN_MODES)))
+    )
+  if mode == "syn" and not _raw_socket_available():
+    return None, {"error": "scan_mode_unavailable",
+                  "message": "SYN scan mode requires a raw socket (CAP_NET_RAW) on the node"}
+  return mode, None
 
 
 def normalize_network_timeout_profile(value):
@@ -1048,6 +1076,7 @@ def announce_launch(
   monitor_interval,
   scan_min_delay,
   scan_max_delay,
+  scan_mode="connect",
   task_name,
   task_description,
   active_peers,
@@ -1171,6 +1200,7 @@ def announce_launch(
     timeout_profile=timeout_profile,
     scan_min_delay=scan_min_delay,
     scan_max_delay=scan_max_delay,
+    scan_mode=scan_mode,
     ics_safe_mode=ics_safe_mode,
     redact_credentials=redact_credentials,
     scanner_identity=scanner_identity,
@@ -1462,6 +1492,7 @@ def launch_network_scan(
   blockchain_attestation_enabled=False,
   comparison_mode=False,
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
+  scan_mode="connect",
   authorization_update=None,
   console_version="",
   report_pipeline_version="",
@@ -1481,6 +1512,10 @@ def launch_network_scan(
   timeout_profile, timeout_profile_error = normalize_network_timeout_profile(timeout_profile)
   if timeout_profile_error:
     return timeout_profile_error
+  # SYN needs a raw socket (CAP_NET_RAW); refuse at launch, never downgrade.
+  scan_mode, scan_mode_error = resolve_network_scan_mode(scan_mode)
+  if scan_mode_error:
+    return scan_mode_error
   start_port = int(start_port)
   end_port = int(end_port)
   if start_port > end_port:
@@ -1595,6 +1630,7 @@ def launch_network_scan(
     monitor_interval=options["monitor_interval"],
     scan_min_delay=options["scan_min_delay"],
     scan_max_delay=options["scan_max_delay"],
+    scan_mode=scan_mode,
     task_name=task_name,
     task_description=task_description,
     active_peers=active_peers,
