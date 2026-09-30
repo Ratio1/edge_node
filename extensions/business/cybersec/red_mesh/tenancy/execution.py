@@ -16,11 +16,6 @@ _FACT_FIELDS = frozenset({"namespace", "tenant_id", "engagement_id", "engagement
 _BINDING_EXTRA = frozenset({"schema_version", "original_launcher", "participant_order"})
 _BINDING_FIELDS = _FACT_FIELDS | _BINDING_EXTRA
 BINDING_SCHEMA_VERSION = 2
-# Schema 1 (RM-084, a tenant asset row) is still read, so jobs launched before RM-107 stay readable,
-# purgeable and renderable; it is never built again and never reauthorized.
-_V1_FACT_FIELDS = frozenset({"namespace", "tenant_id", "asset_id", "asset_target",
-  "asset_target_digest", "actor_id", "actor_generation", "node_failure_policy"})
-_BINDING_FIELDS_BY_VERSION = {1: _V1_FACT_FIELDS | _BINDING_EXTRA, 2: _BINDING_FIELDS}
 _ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
 # Launch-time policy, read by the launch gate and never part of the binding.
 _POLICY_FIELDS = frozenset({"asset_authorized_ports", "engagement"})
@@ -28,24 +23,22 @@ _ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "authorized_
                                 "authorization", "contract_sha256", "allowed_run_modes"})
 
 
-def _validate_facts(value, *, failure_policy=True, version=BINDING_SCHEMA_VERSION):
+def _validate_facts(value, *, failure_policy=True):
   for name in ("namespace", "actor_generation"):
     text = value.get(name)
     if not isinstance(text, str) or not text.strip():
       raise ValueError("Invalid execution identity")
     text.encode("utf-8", errors="strict")
-  for name, prefix in (("tenant_id", "tn_"),) + ((("asset_id", "as_"),) if version == 1 else ()):
-    text = value.get(name)
-    if not isinstance(text, str) or not text.startswith(prefix):
-      raise ValueError("Invalid execution object identity")
-    canonical_uuid(text[len(prefix):])
-  if version != 1:
-    # Imported here: `engagements` loads the models package, which imports this module.
-    from .engagements import valid_engagement_id
-    asset_id = value.get("engagement_asset_id")
-    if (not valid_engagement_id(value.get("engagement_id")) or not valid_digest(value.get("engagement_hash"))
-        or not isinstance(asset_id, str) or not _ENGAGEMENT_ASSET_ID.fullmatch(asset_id)):
-      raise ValueError("Invalid execution object identity")
+  text = value.get("tenant_id")
+  if not isinstance(text, str) or not text.startswith("tn_"):
+    raise ValueError("Invalid execution object identity")
+  canonical_uuid(text[len("tn_"):])
+  # Imported here: `engagements` loads the models package, which imports this module.
+  from .engagements import valid_engagement_id
+  asset_id = value.get("engagement_asset_id")
+  if (not valid_engagement_id(value.get("engagement_id")) or not valid_digest(value.get("engagement_hash"))
+      or not isinstance(asset_id, str) or not _ENGAGEMENT_ASSET_ID.fullmatch(asset_id)):
+    raise ValueError("Invalid execution object identity")
   actor = value.get("actor_id")
   if not actor or canonical_account_id(actor) != actor:
     raise ValueError("Invalid execution actor")
@@ -91,14 +84,12 @@ class ExecutionBinding:
   _snapshot: str
 
   def __init__(self, value):
-    if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
-      raise ValueError("Invalid execution binding fields")
-    version = value["schema_version"]
-    if version not in _BINDING_FIELDS_BY_VERSION:
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+        or value["schema_version"] != BINDING_SCHEMA_VERSION):
       raise ValueError("Unsupported execution binding version")
-    if set(value) != _BINDING_FIELDS_BY_VERSION[version]:
+    if set(value) != _BINDING_FIELDS:
       raise ValueError("Invalid execution binding fields")
-    _validate_facts(value, version=version)
+    _validate_facts(value)
     if not valid_node_address(value["original_launcher"]):
       raise ValueError("Invalid original launcher")
     _node_order(value["participant_order"])
@@ -171,7 +162,7 @@ class CurrentExecutionFacts:
 
 
 def context_tenant_id(context):
-  """The launching tenant, or None for a legacy unbound launch. Never raises at a launch gate."""
+  """The launching tenant, or None when there is no execution context. Never raises at a launch gate."""
   if context is None:
     return None
   try:
@@ -182,7 +173,8 @@ def context_tenant_id(context):
 
 
 def binding_from_record(record):
-  """Absence is legacy; an explicit null or malformed field is never absence."""
+  """The record's binding, or None when the field is absent. An explicit null or malformed field
+  is never absence -- it is a broken record, and `ExecutionBinding(...)` raises for it."""
   return ExecutionBinding(record["execution_binding"]) if "execution_binding" in record else None
 
 
@@ -194,7 +186,9 @@ def binding_value(value):
 
 
 def copy_bound_config(config):
-  """Validate only the additive field; partial legacy archive configs remain compatible."""
+  """Deep-copy a job/archive config; validate only the additive field. The binding cannot change
+  through this copy, absence included: a present field is re-validated and never left malformed,
+  and an absent one stays absent rather than being synthesized."""
   result = deepcopy(config)
   if isinstance(result, dict) and "execution_binding" in result:
     result["execution_binding"] = binding_from_record(result).to_dict()
@@ -202,7 +196,7 @@ def copy_bound_config(config):
 
 
 def checked_archive_config(config, original_binding):
-  """Public archive config is mutable; its original binding (including absence) is not."""
+  """Public archive config is mutable; its original binding, including absence, is not."""
   result = copy_bound_config(config)
   observed = binding_from_record(result) if isinstance(result, dict) else None
   if observed != original_binding:

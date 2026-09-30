@@ -24,10 +24,13 @@ def resolve_launch_target(context, kind, supplied):
 
 
 def validate_effective_config(config, *, target=_UNSET):
-  """Check final worker inputs, including a separately passed network destination."""
+  """Check final worker inputs, including a separately passed network destination.
+
+  RM-108 phase 5: admission never yields an unbound config, so an absent binding is refused.
+  """
   binding = binding_from_record(config)
   if binding is None:
-    return
+    raise ValueError("Execution target mismatch")
   kind = binding.to_dict()["asset_target"]["kind"]
   if config.get("scan_type", "network") != ("model_test" if kind == "model" else kind):
     raise ValueError("Execution target mismatch")
@@ -46,8 +49,9 @@ def validate_effective_config(config, *, target=_UNSET):
 
 
 def validate_model_provider(context, provider):
+  """RM-108 phase 5: admission never yields an unbound context, so an absent one is refused."""
   if context is None:
-    return
+    raise ValueError("Execution target mismatch")
   from ..model_testing.runner import _chat_completions_url
 
   if not isinstance(provider, dict):

@@ -251,15 +251,13 @@ class JobConfig:
   # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
 
   def get_engagement(self):
-    """Return EngagementContext or None. Resolves the typed `engagement`
-    field first; falls back to the legacy free-form `engagement_metadata`
-    dict for backward compat with archives created before PR-3.3."""
+    """Return EngagementContext from the typed `engagement` field, or None.
+
+    RM-108 phase 5: the pre-PR-3.3 free-form `engagement_metadata` fallback is gone; storage
+    holds no archive that needs it.
+    """
     from .engagement import EngagementContext
-    if self.engagement:
-      return EngagementContext.from_dict(self.engagement)
-    if self.engagement_metadata:
-      return EngagementContext.from_dict(self.engagement_metadata)
-    return None
+    return EngagementContext.from_dict(self.engagement) if self.engagement else None
 
   def get_roe(self):
     """Return RulesOfEngagement or None."""
@@ -267,15 +265,13 @@ class JobConfig:
     return RulesOfEngagement.from_dict(self.roe) if self.roe else None
 
   def get_authorization(self):
-    """Return AuthorizationRef or None. Falls back to the legacy
-    string `authorization_ref` (just a CID, no signer) when the typed
-    field is absent."""
+    """Return AuthorizationRef from the typed `authorization` field, or None.
+
+    RM-108 phase 5: the pre-PR-3.3 bare `authorization_ref` CID-string fallback is gone; storage
+    holds no archive that needs it.
+    """
     from .engagement import AuthorizationRef
-    if self.authorization:
-      return AuthorizationRef.from_dict(self.authorization)
-    if self.authorization_ref:
-      return AuthorizationRef(document_cid=self.authorization_ref)
-    return None
+    return AuthorizationRef.from_dict(self.authorization) if self.authorization else None
 
   def get_kickoff_questionnaire(self):
     """Return a KickoffQuestionnaire bundling engagement/roe/authorization

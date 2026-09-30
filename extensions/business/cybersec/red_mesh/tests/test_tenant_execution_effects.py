@@ -468,15 +468,10 @@ def test_model_identity_change_during_secret_read_denies_provider_start():
   assert worker.state["model_test_summary"]["overall_status"] == "failed"
 
 
-def test_bound_legacy_wrapper_and_revised_network_batch_cannot_start_workers():
+def test_revised_network_batch_cannot_start_workers():
   from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
   from extensions.business.cybersec.red_mesh.constants import ScanType
-  plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
-  with patch("extensions.business.cybersec.red_mesh.services.launch.get_scan_strategy") as strategy:
-    with pytest.raises(ValueError, match="Execution unavailable"):
-      plugin._launch_job(owner, job_id="job", target="192.0.2.1", network_worker_address="launcher",
-        start_port=10, end_port=20)
-  strategy.assert_not_called()
+  _plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
   guard = owner._require_worker_execution
   checks = []
   def revise_before_batch(*args, **kwargs):
@@ -495,7 +490,7 @@ def test_bound_legacy_wrapper_and_revised_network_batch_cannot_start_workers():
 
 
 def test_unbound_network_job_never_starts_a_worker():
-  """RM-084 P6: an unbound job has no tenant to reauthorize against, so no worker starts for it."""
+  """RM-108 phase 5: admission never yields an unbound job, so one is refused, not tolerated."""
   from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
   _plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
   config.pop("execution_binding")
@@ -507,7 +502,7 @@ def test_unbound_network_job_never_starts_a_worker():
     def start(self):
       pass
   with patch("extensions.business.cybersec.red_mesh.worker.base.threading.Thread", DeferredThread), \
-       pytest.raises(ValueError, match="Execution unavailable"):
+       pytest.raises(ValueError, match="Execution target mismatch"):
     launch_local_jobs(owner, job_id="job", target="192.0.2.1", launcher="launcher",
       start_port=10, end_port=20, nr_local_workers_override=1, job_config=config, execution_identity=None)
   assert deferred == []

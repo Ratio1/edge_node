@@ -213,19 +213,22 @@ class TestTenantDelete(unittest.TestCase):
     self.refused(self.plugin.delete_tenant(self.actor, "tn_" + str(uuid4())), 404, "not_found")
     self.assertTrue(self.plugin.get_tenant(self.actor, self.tenant)["success"])
 
-  def test_a_tenant_created_before_contracts_and_a_v1_engagement_row_are_deleted(self):
+  def test_a_tenant_created_before_contracts_deletes_and_a_v1_engagement_rows_document_is_left_alone(self):
+    # RM-108 phase 5: storage holds no v1 engagement row any more, so the delete no longer reads
+    # its legacy `roe_document` / `authorization_document` fields; such a document is neither
+    # found nor deleted, and does not block the tenant delete.
     self.remove_members()
     for (hkey, key), row in list(self.storage.data.items()):
       if hkey == TENANCY_HKEY and isinstance(row, dict) and row.get("tenant_id") == self.tenant:
         if row.get("kind") in ("tenant", "receipt"):
           row.pop("legal", None), row.pop("contract", None)
         if row.get("kind") == "engagement":
-          # An RM-095 record: the v2 validator refuses it, the delete still clears it and its files.
           row.pop("documents"), row.update(roe_document={"store": "fake", "ref": "doc-roe-v1"})
     self.documents.envelopes["doc-roe-v1"] = {"kind": "redmesh_engagement_document"}
     result = self.plugin.delete_tenant(self.actor, self.tenant)
     self.assertTrue(result["success"], result)
-    self.assertEqual(sorted(self.documents.deleted), ["doc-roe-v1"])
+    self.assertEqual(self.documents.deleted, [])
+    self.assertIn("doc-roe-v1", self.documents.envelopes)
     self.assertNotIn("tenant", self.tenancy_rows())
 
 

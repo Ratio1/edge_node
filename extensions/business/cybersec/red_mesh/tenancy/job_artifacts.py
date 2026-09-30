@@ -27,8 +27,7 @@ def _copy(value):
 
 def validate_snapshot_mode(snapshot_mode, *, snapshot_supplied=True):
   """Explicit compatibility mode never selects an unchecked storage fallback."""
-  if (not isinstance(snapshot_mode, str) or snapshot_mode not in ("tenant_bound", "legacy_unbound")
-      or snapshot_mode == "legacy_unbound" and not snapshot_supplied):
+  if snapshot_mode != "tenant_bound":
     _unavailable()
 
 
@@ -40,8 +39,7 @@ def checked_job_snapshot(checked_job, job_id=None, *, snapshot_mode="tenant_boun
     if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("job_id"), str)
         or not snapshot["job_id"].strip() or job_id is not None and snapshot["job_id"] != job_id):
       _unavailable()
-    if (snapshot_mode == "legacy_unbound" and "execution_binding" in snapshot
-        or snapshot_mode == "tenant_bound" and binding_from_record(snapshot) is None):
+    if binding_from_record(snapshot) is None:
       _unavailable()
   except Exception:
     _unavailable()
@@ -67,16 +65,11 @@ class TenantJobArtifacts:
     self._job = checked_job_snapshot(checked_job, snapshot_mode=snapshot_mode)
     self._job_id = self._job["job_id"]
     self._binding = binding_from_record(self._job)
-    self._worker = None
-    if self._binding is not None:
-      facts = self._binding.to_dict()
-      self._model = facts["asset_target"]["kind"] == "model"
-      if self._model and len(facts["participant_order"]) != 1:
-        _unavailable()
-      self._worker = facts["participant_order"][0] if self._model else None
-    else:
-      from ..model_testing.constants import is_model_test_job
-      self._model = is_model_test_job(self._job)
+    facts = self._binding.to_dict()
+    self._model = facts["asset_target"]["kind"] == "model"
+    if self._model and len(facts["participant_order"]) != 1:
+      _unavailable()
+    self._worker = facts["participant_order"][0] if self._model else None
     self._read_json = read_json
     self._archive_cid = _cid(self._job.get("job_cid"))
     self._config_cid = _cid(self._job.get("job_config_cid"))
@@ -123,22 +116,7 @@ class TenantJobArtifacts:
     return cid
 
   def _model_worker(self):
-    if self._binding is not None:
-      return self._worker
-    workers = self._collection(self._job, "workers", dict)
-    selection = self._collection(self._job, "model_test_node_selection", dict)
-    selected = selection.get("selected_execution_node")
-    if (selected is not None and (not isinstance(selected, str) or not selected.strip())
-        or len(workers) > 1
-        or any(not isinstance(key, str) or not key.strip() or not isinstance(value, dict)
-               for key, value in workers.items())):
-      _unavailable()
-    worker = next(iter(workers), None)
-    if worker and selected and worker != selected:
-      _unavailable()
-    if not (worker or selected):
-      _unavailable()
-    return worker or selected
+    return self._worker
 
   def _workers(self, parent, field):
     workers = self._collection(parent, field, dict)
@@ -191,7 +169,7 @@ class TenantJobArtifacts:
         _unavailable()
     except Exception:
       _unavailable()
-    if self._model and self._binding is not None and config.get("job_id") != self._job_id:
+    if self._model and config.get("job_id") != self._job_id:
       _unavailable()
     self._present_identity(config)
     if self._model:

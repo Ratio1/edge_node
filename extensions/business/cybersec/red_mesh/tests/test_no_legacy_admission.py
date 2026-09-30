@@ -19,10 +19,13 @@ PACKAGE = Path(__file__).resolve().parents[1]
 REMOVED_IDENTIFIERS = frozenset({
   "LegacyReadAccess", "ExecutionRollout", "read_execution_rollout", "_admit_actor_only",
   "tenant_memberships_present", "app_role",
+  "get_asset_owner", "_V1_FACT_FIELDS", "TenantAuthorizationService",
+  "synthesize_legacy_mirror_assignment", "CstoreTenantReader", "TenantReader",
 })
 REMOVED_STRINGS = frozenset({
   "TENANT_EXECUTION_ENABLED", "TENANT_EXECUTION_STAGE", "execution_rollout",
   "navigatorAccountGeneration", "navigatorAccountState", "appRole",
+  "legacy_unbound",
 })
 
 
