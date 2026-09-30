@@ -4,6 +4,7 @@ import socket
 import struct
 import threading
 import unittest
+from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.worker import syn_scan
 
@@ -75,6 +76,17 @@ class SynReplyParsingTests(unittest.TestCase):
 
   def test_short_packet_ignored(self):
     self.assertIsNone(syn_scan.parse_reply(b"\x45" + b"\x00" * 10, "10.0.0.9", 80, 40000))
+
+
+class SynProbeTimeoutTests(unittest.TestCase):
+  def test_no_reply_is_filtered(self):
+    # A port that never answers (dropped SYN) classifies as filtered. Simulate
+    # by giving the probe a socket that sends fine but whose select() never
+    # signals a readable reply within the deadline.
+    with patch.object(syn_scan.socket, "socket", return_value=MagicMock()), \
+         patch.object(syn_scan.select, "select", return_value=([], [], [])):
+      result = syn_scan.syn_probe("10.0.0.9", 80, timeout=0.02, src_ip="10.0.0.1")
+    self.assertEqual(result, syn_scan.FILTERED)
 
 
 @unittest.skipUnless(syn_scan.raw_socket_available(),
