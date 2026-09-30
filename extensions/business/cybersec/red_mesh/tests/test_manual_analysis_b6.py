@@ -39,8 +39,11 @@ def test_denials_never_prepare_or_submit_analysis(fault, status):
     elif fault == "inactive": fixture.store.account("reader", active=False)
     elif fault == "none_scope": account["memberships"] = []
     elif fault == "tenant_user": as_role(fixture, "tenant_user")
-    # analysis:run binds Allow Pentester for the platform roles too (RM-078).
-    elif fault == "pentesting_off": allow_pentester(fixture, False)
+    # analysis:run binds Allow Pentester for the Tenant Pentester; the platform roles are exempt,
+    # as they are for launch (RM-078, owner 2026-09-30).
+    elif fault == "pentesting_off":
+      as_role(fixture, "tenant_pentester")
+      allow_pentester(fixture, False)
     elif fault == "missing_tenant": tenant_id = None
     elif fault == "unknown_tenant": tenant_id = OTHER_TENANT
     elif fault == "identity_store": fixture.store.fail_hkey = "auth"

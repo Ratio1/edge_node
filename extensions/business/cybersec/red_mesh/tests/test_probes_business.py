@@ -56,8 +56,8 @@ class TestTheWorkflowProbeReportsAVerbItNeverIssues(unittest.TestCase):
   """
   `_test_workflow_bypass` issues POST only for a POST endpoint and a plain GET
   for every other verb, so a configured `DELETE` entry is probed with GET. The
-  finding nonetheless writes `method=DELETE` into its evidence and
-  `"Send DELETE to /orders/1."` into its replay steps.
+  finding's evidence and replay step therefore name the verb actually sent (GET),
+  with the configured one kept as `configured_method=` so the gap stays visible.
 
   This is why the finding does **not** carry a typed `method`: splitting identity
   on the configured verb would key a finding on a request that was never sent,
@@ -95,6 +95,29 @@ class TestTheWorkflowProbeReportsAVerbItNeverIssues(unittest.TestCase):
       [f.method for f in vuln], [None, None],
       "a typed method here would key identity on a request never sent",
     )
+
+  def test_the_evidence_and_replay_name_the_verb_actually_sent(self):
+    probe = _make_probe(
+      workflow_endpoints=[
+        WorkflowEndpoint(path="/orders/1", method="DELETE", expected_guard="403"),
+        WorkflowEndpoint(path="/orders/2", method="POST", expected_guard="403"),
+      ],
+    )
+    session = probe.auth.regular_session
+    session.get.return_value = _mock_response(status=200)
+    session.post.return_value = _mock_response(status=200)
+    probe.auth.detected_csrf_field = None
+    probe._test_workflow_bypass()
+
+    vuln = {f.url.rsplit("/", 1)[-1]: f for f in probe.findings
+            if f.scenario_id == "PT-A06-01" and f.status == "vulnerable"}
+    self.assertIn("method=GET", vuln["1"].evidence)
+    self.assertIn("configured_method=DELETE", vuln["1"].evidence)
+    self.assertNotIn("method=DELETE", vuln["1"].evidence)
+    self.assertIn("Send GET to /orders/1.", vuln["1"].replay_steps)
+    self.assertIn("method=POST", vuln["2"].evidence)
+    self.assertFalse(any(e.startswith("configured_method=") for e in vuln["2"].evidence))
+    self.assertIn("Send POST to /orders/2.", vuln["2"].replay_steps)
 
 
 class TestStatefulGating(unittest.TestCase):

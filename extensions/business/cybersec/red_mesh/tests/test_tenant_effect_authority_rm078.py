@@ -75,23 +75,45 @@ class TestTenantEffectAuthority(unittest.TestCase):
                                      TenantPolicyContext("a", True, False)),
           PolicyDecision(False, 403, "pentesting_disabled" if holds else "forbidden"))
 
-  def test_manual_analysis_honours_allow_pentester_for_every_scoped_role(self):
-    """The owner's words were "scoped STA/SP and Tenant Pentesters subject to Allow Pentester", so
-    the switch binds all three, including Super-Tenant Admin.
-
-    This is stricter than `tasks:launch`, which exempts the platform roles. The divergence is
-    deliberate: deny-by-default on a literal reading, and a tenant that has switched pentesting off
-    has said something about analysis of pentest findings too. Flagged for the owner rather than
-    silently harmonised with `tasks:launch`.
+  def test_manual_analysis_follows_the_launch_pentesting_rule(self):
+    """Allow Pentester binds `analysis:run` exactly as it binds `tasks:launch`: the Tenant Pentester
+    is refused while the switch is off, and the platform roles are exempt (owner, 2026-09-30). This
+    replaces the 2026-09-15 literal reading that bound Super-Tenant Admin and Super-Pentester too.
     """
-    for role in ("super_tenant_admin", "super_pentester", "tenant_pentester"):
+    for role, bound in (("super_tenant_admin", False), ("super_pentester", False),
+                        ("tenant_pentester", True)):
       with self.subTest(role=role):
         actor = account(in_tenant(role, "a"))
         self.assertTrue(authorize_tenant_operation(
           actor, "analysis:run", TenantPolicyContext("a", True, True)).allowed)
         self.assertEqual(
           authorize_tenant_operation(actor, "analysis:run", TenantPolicyContext("a", True, False)),
-          PolicyDecision(False, 403, "pentesting_disabled"))
+          PolicyDecision(False, 403, "pentesting_disabled") if bound
+          else PolicyDecision(True, 200, None))
+
+  def test_stop_and_review_follow_the_launch_rule(self):
+    """`tasks:stop` and `reports:review` belong to whoever may launch, under launch's Allow Pentester
+    rule: the Tenant Pentester is bound, the platform roles are exempt, and a Tenant Admin or Tenant
+    User holds neither (owner, 2026-09-30). Both used to ride on `reports:export`, which a Tenant
+    Admin holds for downloads."""
+    for operation in ("tasks:stop", "reports:review"):
+      for role, holds, bound in (("super_tenant_admin", True, False), ("super_pentester", True, False),
+                                 ("tenant_pentester", True, True), ("tenant_admin", False, False),
+                                 ("tenant_user", False, False)):
+        with self.subTest(operation=operation, role=role):
+          actor = account(in_tenant(role, "a"))
+          on = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, True))
+          off = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, False))
+          if not holds:
+            self.assertEqual(on, PolicyDecision(False, 403, "forbidden"))
+            self.assertEqual(off, PolicyDecision(False, 403, "forbidden"))
+            continue
+          self.assertTrue(on.allowed)
+          self.assertEqual(off, PolicyDecision(False, 403, "pentesting_disabled") if bound
+                           else PolicyDecision(True, 200, None))
+          self.assertEqual(
+            authorize_tenant_operation(actor, operation, TenantPolicyContext("b", True, True)).status_code,
+            200 if role == "super_tenant_admin" else 404)
 
   def test_deletion_and_purge_do_not_depend_on_the_pentesting_switch(self):
     """They are administrative, not operator, actions. A tenant that disabled pentesting has not
@@ -189,13 +211,16 @@ class TestTenantReadAccessAdmitsTheEffectOperations(unittest.TestCase):
   def test_the_pentesting_switch_reaches_the_read_seam(self):
     """Not just the pure policy function: the switch has to survive the whole admission path, or it
     is enforced in a unit test and nowhere a caller can reach."""
-    self._as("super_tenant_admin")
+    self._as("tenant_pentester")
     self._allow_pentester(False)
     with self.assertRaises(self.AdministrationDenied) as caught:
       self.access.get_job(self.actor, self.tenant_id, "job-1", operation="analysis:run")
     self.assertEqual((caught.exception.status_code, caught.exception.error),
                      (403, "pentesting_disabled"))
-    for operation in ("engagement:delete", "jobs:purge"):
+    # The platform roles are exempt for analysis, as for launch, and the administrative operations
+    # ignore the switch.
+    self._as("super_tenant_admin")
+    for operation in ("analysis:run", "engagement:delete", "jobs:purge"):
       with self.subTest(operation=operation):
         self.assertEqual(
           self.access.get_job(self.actor, self.tenant_id, "job-1", operation=operation)["job_id"],

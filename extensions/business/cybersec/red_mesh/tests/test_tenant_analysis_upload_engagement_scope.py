@@ -1,15 +1,18 @@
 """RM-084 P3: every E3 endpoint is tenant-scoped with no unscoped half.
 
-One matrix over manual analysis, the authorization upload, engagement deletion and stop-monitoring,
+One matrix over manual analysis, the authorization upload, engagement deletion, stop-monitoring and
+the report approve/reject review mutations,
 through real admission against the stored account, tenant and job: the caller's tenant is required
 (400), a job owned by another tenant is indistinguishable from a missing one (404), and a role
 without the operation is refused (403) before any record, artifact or effect is touched.
 
 The four gates differ, which is the point of the matrix:
-  * `analysis:run` -- the launch roles, bound to Allow Pentester (the platform roles too, RM-078);
-  * `authorization:upload` -- new in P3, the same role set and the same Allow Pentester binding;
+  * `analysis:run` -- the launch roles, bound to Allow Pentester the way launch is: the Tenant
+    Pentester only, the platform roles exempt (owner, 2026-09-30);
+  * `authorization:upload` -- new in P3, the same role set, bound to Allow Pentester for every role;
   * `engagement:delete` -- the Super-Tenant Admin alone, because it irreversibly deletes documents;
-  * `reports:export` -- stop-monitoring, which every role but `tenant_user` holds.
+  * `tasks:stop` -- stop-monitoring, and `reports:review` -- approve/reject: the launch roles with
+    launch's Allow Pentester rule (owner, 2026-09-30). A Tenant Admin holds neither.
 
 The confused-deputy this phase closes is at the end: a permission-to-test document uploaded in one
 tenant cannot authorize a launch in another.
@@ -28,15 +31,20 @@ OTHER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64).decode("ascii")
 UPLOAD = {"filename": "permission.png", "content_b64": PNG}
 
-# (endpoint, extra arguments, roles admitted, whether the tenant's Allow Pentester must be on)
+# (endpoint, extra arguments, roles admitted, roles refused while the tenant's Allow Pentester is off)
 ENDPOINTS = (
   ("analyze_job", {"analysis_type": "summary"},
-   ("tenant_pentester", "super_pentester", "super_tenant_admin"), True),
+   ("tenant_pentester", "super_pentester", "super_tenant_admin"), ("tenant_pentester",)),
   ("upload_authorization", dict(UPLOAD),
-   ("tenant_pentester", "super_pentester", "super_tenant_admin"), True),
-  ("delete_job_engagement", {"delete_documents": False}, ("super_tenant_admin",), False),
+   ("tenant_pentester", "super_pentester", "super_tenant_admin"),
+   ("tenant_pentester", "super_pentester", "super_tenant_admin")),
+  ("delete_job_engagement", {"delete_documents": False}, ("super_tenant_admin",), ()),
   ("stop_monitoring", {"stop_type": "SOFT"},
-   ("tenant_pentester", "tenant_admin", "super_pentester", "super_tenant_admin"), False),
+   ("tenant_pentester", "super_pentester", "super_tenant_admin"), ("tenant_pentester",)),
+  ("approve_report", {"expected_review_revision": 1, "note": "ok"},
+   ("tenant_pentester", "super_pentester", "super_tenant_admin"), ("tenant_pentester",)),
+  ("reject_report", {"expected_review_revision": 1, "note": "not yet"},
+   ("tenant_pentester", "super_pentester", "super_tenant_admin"), ("tenant_pentester",)),
 )
 ALL_ROLES = ("tenant_user", "tenant_pentester", "tenant_admin", "super_pentester",
              "super_tenant_admin")
@@ -66,10 +74,10 @@ def invoke(fixture, name, extra, *, tenant_id):
 
 
 def no_effects(fixture):
-  """Canary on every irreversible symbol the four endpoints call, bound where the plugin reads it."""
+  """Canary on every irreversible symbol these endpoints call, bound where the plugin reads it."""
   module = sys.modules[fixture.Plugin.__module__]
   names = ("stop_monitoring", "delete_engagement_data", "collect_engagement_document_cids",
-           "store_authorization_document")
+           "store_authorization_document", "approve_report", "reject_report")
   for name in names:
     assert hasattr(module, name), "the plugin no longer imports %s; the canary is vacuous" % name
   return patch.multiple(module, **{name: Mock(side_effect=RuntimeError("effect ran"))
@@ -163,12 +171,18 @@ def test_only_the_roles_holding_the_operation_are_admitted(name, extra, roles, p
                          [row for row in ENDPOINTS if row[3]])
 @pytest.mark.parametrize("role", ("tenant_pentester", "super_pentester", "super_tenant_admin"))
 def test_pentesting_switched_off_refuses_analysis_and_upload(name, extra, roles, pentesting, role):
-  """The P3 acceptance criterion. RM-078 binds these for the platform roles too, so a tenant that
-  switched pentesting off cannot have one run in it by a Super-Tenant Admin either."""
+  """The P3 acceptance criterion, per role. Upload binds every role. Analysis binds only the Tenant
+  Pentester, as launch does: a Super-Tenant Admin or Super-Pentester may still analyse a job in a
+  tenant that switched pentesting off (owner, 2026-09-30)."""
   with read_endpoint_fixture(bound=True, role=role) as fixture:
     tenant_id = allow_pentester(fixture, False)
     with no_effects(fixture):
-      assert_denied(invoke(fixture, name, extra, tenant_id=tenant_id), 403, "pentesting_disabled")
+      result = invoke(fixture, name, extra, tenant_id=tenant_id)
+    if role in pentesting:
+      assert_denied(result, 403, "pentesting_disabled")
+    else:
+      assert result.get("error") != "pentesting_disabled", result
+      assert result.get("status_code") != 403, result
 
 
 @pytest.mark.parametrize("name,extra,roles,pentesting",

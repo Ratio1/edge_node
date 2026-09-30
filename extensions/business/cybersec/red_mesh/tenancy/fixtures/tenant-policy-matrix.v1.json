@@ -18,8 +18,10 @@
       "engagements:documents",
       "evidence:read",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tasks:launch",
+      "tasks:stop",
       "tasks:update"
     ],
     "super_tenant_admin": [
@@ -38,8 +40,10 @@
       "node_assignments:manage",
       "node_failure_policy:update",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tasks:launch",
+      "tasks:stop",
       "tasks:update",
       "tenant_users:manage",
       "tenants:delete",
@@ -58,8 +62,10 @@
       "analysis:run",
       "authorization:upload",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tasks:launch",
+      "tasks:stop",
       "tasks:update"
     ],
     "tenant_user": [
