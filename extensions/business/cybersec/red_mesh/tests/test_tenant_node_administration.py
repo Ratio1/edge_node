@@ -333,6 +333,10 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True)["success"])
     self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True,
                                                              "private")["error"], "node_shared_assigned")
+    # A release writes the mode the row read as, so a legacy row leaves the release with `mode` set.
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["data"]["state"],
+                     "released")
+    self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A")["mode"], "shared")
 
   def test_conflict_table_precedence_for_private_and_shared_requests(self):
     other = self.create_tenant("other")

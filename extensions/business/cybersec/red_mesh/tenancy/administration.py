@@ -985,10 +985,12 @@ class TenantAdministrationService:
       if row.get("draining"):
         return {"tenantId": tenant_id, "nodeAddress": node_address, "active": False,
                 "mode": node_assignment_mode(row), "state": "draining"}
-      new_row = {**row, "active": True, "draining": True, "changed_by": account.account_id,
+      new_row = {**row, "active": True, "draining": True, "mode": node_assignment_mode(row),
+                 "changed_by": account.account_id,
                  "changed_at": datetime.now(timezone.utc).isoformat()}
     else:
-      new_row = {**row, "active": False, "draining": False, "changed_by": account.account_id,
+      new_row = {**row, "active": False, "draining": False, "mode": node_assignment_mode(row),
+                 "changed_by": account.account_id,
                  "changed_at": datetime.now(timezone.utc).isoformat()}
     self.store.put("tenant_node", tenant_id, node_address, record=new_row)
     return {"tenantId": tenant_id, "nodeAddress": node_address, "active": False,

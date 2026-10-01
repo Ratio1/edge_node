@@ -156,6 +156,12 @@ class TestTenantNodePlugin(unittest.TestCase):
                            "job_status": "FINALIZED"}, False),
       "stopped_status": ({"execution_binding": binding, "workers": {"Node-A": {}},
                           "job_status": "STOPPED"}, False),
+      "unreadable_status_of_own_job_counts_as_running": (
+        {"execution_binding": binding, "workers": {"Node-A": {}}, "job_status": ["RUNNING"]}, True),
+      "malformed_record_of_another_tenant_is_skipped": (
+        {"execution_binding": {**binding, "tenant_id": "tn_other", "participant_order": 7},
+         "workers": 5, "job_status": {"bad": 1}}, False),
+      "malformed_worker_containers": ({"execution_binding": {**binding, "participant_order": 7}, "workers": 5}, False),
       "has_job_cid": ({"execution_binding": binding, "workers": {"Node-A": {}}, "job_cid": "cid-1"}, False),
       "other_tenant": ({"execution_binding": {**binding, "tenant_id": "tn_other"},
                         "workers": {"Node-A": {}}}, False),
