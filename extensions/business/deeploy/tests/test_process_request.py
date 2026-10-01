@@ -290,7 +290,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
         DEEPLOY_KEYS.RETURN_REQUEST: False,
         DEEPLOY_KEYS.PLUGINS: [{
           DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
-          "IMAGE": "ghcr.io/ratio1/r1-meshdb@sha256:" + ("a" * 64),
+          "IMAGE": "ghcr.io/ratio1/r1db@sha256:" + ("a" * 64),
           "CONTAINER_RESOURCES": {"cpu": 1, "memory": "2g", "storage": "8g"},
           "ENV": {
             "CRDB_DATABASE": "appdb",
@@ -343,7 +343,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
         DEEPLOY_KEYS.RETURN_REQUEST: False,
         DEEPLOY_KEYS.PLUGINS: [{
           DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
-          "IMAGE": "ghcr.io/ratio1/r1-meshdb@sha256:" + ("a" * 64),
+          "IMAGE": "ghcr.io/ratio1/r1db@sha256:" + ("a" * 64),
           "CONTAINER_RESOURCES": {"cpu": 1, "memory": "2g", "storage": "8g"},
           "ENV": {
             "CRDB_DATABASE": "appdb",

@@ -38,9 +38,25 @@ from extensions.business.cybersec.red_mesh.models import (
 )
 from extensions.business.cybersec.red_mesh.repositories import ArtifactRepository
 from extensions.business.cybersec.red_mesh.tests.conftest import mock_plugin_modules
+from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
 
 
 PUBLIC_TEST_IP = "93.184.216.34"
+# A second real, public, non-forbidden IP (validate_provider_url resolves and checks the
+# destination), distinct from PUBLIC_TEST_IP, for tests that must tell a tested-model endpoint
+# apart from an evaluator endpoint in an assertion.
+EVALUATOR_TEST_IP = "1.1.1.1"
+
+
+class _Owner(SimpleNamespace):
+  """RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so a tenant
+  integration lookup here mirrors whatever node-level `cfg_<integration>_export` block the test
+  already set -- same effective config, since these tests are about launch/export behavior, not
+  tenant destination resolution."""
+
+  def _get_tenant_integration_config(self, tenant_id, integration_id):
+    config = getattr(self, f"cfg_{integration_id}_export", None)
+    return {"config": dict(config)} if isinstance(config, dict) else None
 
 
 def _owner(**kwargs):
@@ -58,7 +74,7 @@ def _owner(**kwargs):
     "chainstore_hgetall": MagicMock(return_value={}),
   }
   defaults.update(kwargs)
-  return SimpleNamespace(**defaults)
+  return _Owner(**defaults)
 
 
 def _provider(base_url=f"https://{PUBLIC_TEST_IP}/v1", credential_ref=""):
@@ -85,6 +101,64 @@ def _valid_launch_kwargs(secret="sentinel-model-api-key"):
     "tested_model_secret_payload": {"api_key": secret},
     "evaluator_id": "heuristic_v1",
   }
+
+
+def _context(*, candidates=("node-a",), tested_model=None):
+  """RM-108 phase 5: admission always supplies a real, bound execution context.
+
+  Matches `_provider()`'s default target so a test's `tested_model` (unless it deliberately
+  supplies a different one) needs no extra target-mismatch handling.
+  """
+  from extensions.business.cybersec.red_mesh.model_testing.catalog import (
+    CBRN_SAFETY_V1_ID,
+    PROMPT_INJECTION_V1_ID,
+  )
+  from extensions.business.cybersec.red_mesh.model_testing.runner import _chat_completions_url
+  from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
+  from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
+  provider = tested_model or _provider()
+  target = {
+    "kind": "model",
+    "adapter": provider.get("adapter") or "openai_compatible",
+    "model": provider.get("model") or "unit-model",
+    "endpointUrl": _chat_completions_url(provider.get("base_url") or f"https://{PUBLIC_TEST_IP}/v1"),
+  }
+  engagement = {
+    "engagement_id": "en_00000000-0000-4000-8000-000000000099", "engagement_hash": "e" * 64,
+    "contract_sha256": "c" * 64, "allowed_run_modes": ["continuous", "single_pass"],
+    "authorized_tests": [CBRN_SAFETY_V1_ID, PROMPT_INJECTION_V1_ID],
+    "roe": {"authenticated_action": False, "stateful_probes_allowed": False, "ics_safe_mode_required": False},
+    "context": {}, "authorization": {},
+  }
+  return ResolvedExecutionContext({
+    "namespace": "deployment", "tenant_id": "tn_00000000-0000-4000-8000-000000000001",
+    "engagement_id": engagement["engagement_id"], "engagement_asset_id": "ea_1",
+    "engagement_hash": engagement["engagement_hash"], "asset_target": target,
+    "asset_target_digest": canonical_digest(target), "actor_id": "tester",
+    "actor_generation": "generation-1", "node_failure_policy": "stop",
+    "selected_candidates": list(candidates), "engagement": engagement,
+  })
+
+
+def _bind_job_store(plugin, job_specs):
+  """A minimal stateful CStore double keyed by job_id.
+
+  RM-108 phase 5: finalization rechecks the *stored* record before and after the prune write
+  (read-your-own-write), so a static `chainstore_hget.return_value` is not enough once
+  `_write_job_record` is expected to change what a later `chainstore_hget` sees.
+  """
+  records = {job_specs["job_id"]: job_specs}
+
+  def hget(hkey, key):
+    return records.get(key)
+
+  def write_record(job_id, specs, **kwargs):
+    records[job_id] = specs
+    return specs
+
+  plugin.chainstore_hget.side_effect = hget
+  plugin._write_job_record.side_effect = write_record
+  return records
 
 
 class TestModelTestingCapability(unittest.TestCase):
@@ -248,7 +322,7 @@ class TestModelTestingCapability(unittest.TestCase):
   def test_launch_model_test_disabled_fails_before_persistence(self):
     owner = _owner()
 
-    result = launch_model_test(owner, **_valid_launch_kwargs())
+    result = launch_model_test(owner, **_valid_launch_kwargs(), execution_context=_context())
 
     self.assertEqual(result["error"], "model_testing_disabled")
     owner.r1fs.add_json.assert_not_called()
@@ -268,7 +342,7 @@ class TestModelTestingCapability(unittest.TestCase):
       },
     )
 
-    result = launch_model_test(owner, **_valid_launch_kwargs())
+    result = launch_model_test(owner, **_valid_launch_kwargs(), execution_context=_context())
 
     self.assertEqual(result["error"], "soc_export_required_unavailable")
     self.assertEqual(result["error_class"], "missing_token")
@@ -971,7 +1045,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       **kwargs["tested_model"],
       "api_key": "inline-secret",
     }
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
     self.assertEqual(result["error"], "validation_error")
     self.assertEqual(result["error_class"], "invalid_provider_config")
     self.assertNotIn("inline-secret", str(result))
@@ -987,7 +1061,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     }
     kwargs["evaluator_model_secret_payload"] = {"api_key": "inline-evaluator-secret"}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertEqual(result["error_class"], "unsupported_evaluator_config")
@@ -1003,7 +1077,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "headers": {"Authorization": "Bearer inline-secret"},
     }
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertEqual(result["error_class"], "invalid_provider_config")
@@ -1038,7 +1112,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs["tested_model"] = _provider(credential_ref=credential_ref)
     kwargs["tested_model_secret_payload"] = None
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error_class"], "credential_unavailable")
     self.assertNotIn(credential_ref, str(result))
@@ -1060,6 +1134,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
         tested_model=_provider(),
         tested_model_secret_payload={"api_key": secret},
         limits={"tested_max_tokens": 64},
+        execution_context=_context(),
       )
 
     self.assertTrue(result["ok"])
@@ -1082,6 +1157,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
         created_by_id="user-123",
         tested_model=_provider(),
         tested_model_secret_payload={"api_key": secret},
+        execution_context=_context(),
       )
 
     self.assertFalse(result["ok"])
@@ -1102,6 +1178,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       created_by_id="user-123",
       tested_model=_provider(credential_ref=credential_ref),
       tested_model_secret_payload=None,
+      execution_context=_context(),
     )
 
     self.assertFalse(result["ok"])
@@ -1125,7 +1202,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "unknown_secret_field": secret,
     }
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context(candidates=("node-b",)))
 
     self.assertNotIn("error", result)
     self.assertEqual(result["job_type"], "model_test")
@@ -1196,7 +1273,10 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
           "label": "Primary evaluator",
           "provider_label": "Evaluator Provider",
           "adapter": "openai_compatible",
-          "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+          # A distinct host from the tested model's: the admitted execution_binding legitimately
+          # echoes the tested model's own endpoint in the launch result (RM-107's asset_target), so
+          # only a host the evaluator alone knows about can pin "this must never leak" below.
+          "base_url": f"https://{EVALUATOR_TEST_IP}/v1",
           "model": "evaluator-model",
           "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
           "enabled": True,
@@ -1208,7 +1288,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs.pop("evaluator_id")
 
     with patch.dict("os.environ", {"RM_TEST_EVALUATOR_PRESET_KEY": "preset-secret"}, clear=False):
-      result = launch_model_test(owner, **kwargs)
+      result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertNotIn("error", result)
     self.assertEqual(result["job_config"]["evaluator_id"], "eval-primary")
@@ -1217,13 +1297,14 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     result_text = str(result)
     self.assertNotIn("preset-secret", result_text)
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", result_text)
-    self.assertNotIn(f"https://{PUBLIC_TEST_IP}", result_text)
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", result_text)
     stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
     stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["api_key"], "preset-secret")
-    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1")
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{EVALUATOR_TEST_IP}/v1")
     self.assertNotIn("preset-secret", str(stored_config))
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", str(stored_config))
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", str(stored_config))
 
   def test_launch_resolves_llm_evaluator_preset_secret_from_inline_key(self):
     inline_secret = "inline-evaluator-secret"
@@ -1236,7 +1317,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
           "label": "Koala text moderation",
           "provider_label": "Koala",
           "adapter": "openai_compatible",
-          "base_url": f"https://{PUBLIC_TEST_IP}/v1/moderations",
+          # A distinct host from the tested model's: see the comment in
+          # test_launch_resolves_llm_evaluator_preset_secret_from_env.
+          "base_url": f"https://{EVALUATOR_TEST_IP}/v1/moderations",
           "model": "koala-text-moderation",
           "API_KEY": inline_secret,
           "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
@@ -1249,7 +1332,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs.pop("evaluator_id")
 
     with patch.dict("os.environ", {"RM_TEST_EVALUATOR_PRESET_KEY": env_secret}, clear=False):
-      result = launch_model_test(owner, **kwargs)
+      result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertNotIn("error", result)
     self.assertEqual(result["job_config"]["evaluator_id"], "koala_text_moderation")
@@ -1263,12 +1346,12 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("api_key", result_text)
     self.assertNotIn("api_key_env", result_text)
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", result_text)
-    self.assertNotIn(f"https://{PUBLIC_TEST_IP}", result_text)
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", result_text)
     stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
     stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["api_key"], inline_secret)
     self.assertNotEqual(stored_secret["payload"]["evaluator_model"]["api_key"], env_secret)
-    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1/moderations")
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{EVALUATOR_TEST_IP}/v1/moderations")
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["method"], MODERATION_EVALUATOR_METHOD)
     stored_config_text = str(stored_config)
     self.assertNotIn(inline_secret, stored_config_text)
@@ -1277,7 +1360,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("api_key", stored_config_text)
     self.assertNotIn("api_key_env", stored_config_text)
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", stored_config_text)
-    self.assertNotIn(f"https://{PUBLIC_TEST_IP}", stored_config_text)
+    self.assertNotIn(f"https://{EVALUATOR_TEST_IP}", stored_config_text)
 
   def test_launch_persists_koala_moderation_evaluator_method(self):
     owner = _owner(
@@ -1300,7 +1383,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs["evaluator_id"] = "koala_text_moderation"
 
     with patch.dict("os.environ", {"RM_TEST_KOALA_KEY": "preset-secret"}, clear=False):
-      result = launch_model_test(owner, **kwargs)
+      result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertNotIn("error", result)
     self.assertEqual(result["job_config"]["evaluator_id"], "koala_text_moderation")
@@ -1330,7 +1413,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs["evaluator_id"] = "eval-primary"
 
     with patch.dict("os.environ", {"RM_TEST_MISSING_EVALUATOR_KEY": ""}, clear=False):
-      result = launch_model_test(owner, **kwargs)
+      result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertEqual(result["error_class"], "credential_unavailable")
@@ -1344,7 +1427,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       _submit_redmesh_job_start_attestation=MagicMock(),
     )
 
-    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=False)
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=False, execution_context=_context())
 
     self.assertNotIn("error", result)
     owner._submit_redmesh_job_start_attestation.assert_not_called()
@@ -1357,7 +1440,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       _submit_redmesh_job_start_attestation=MagicMock(return_value=None),
     )
 
-    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True)
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True, execution_context=_context())
 
     self.assertEqual(result["error"], "attestation_failed")
     owner._submit_redmesh_job_start_attestation.assert_called_once()
@@ -1369,7 +1452,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       _submit_redmesh_job_start_attestation=MagicMock(side_effect=RuntimeError("chain offline")),
     )
 
-    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True)
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True, execution_context=_context())
 
     self.assertEqual(result["error"], "attestation_failed")
     self.assertIn("chain offline", result["message"])
@@ -1383,7 +1466,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       ),
     )
 
-    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True)
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True, execution_context=_context())
 
     self.assertNotIn("error", result)
     stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
@@ -1408,16 +1491,20 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
     plugin.time.return_value = 200.0
     plugin.r1fs = MagicMock()
+    binding = binding_payload()
     plugin.r1fs.get_json.return_value = {
       "job_type": "model_test",
       "blockchain_attestation_enabled": True,
+      "execution_binding": binding,
     }
     plugin.r1fs.add_json.return_value = "QmArchiveCID"
     plugin.r1fs.get_json.side_effect = [
-      {"job_type": "model_test", "blockchain_attestation_enabled": True},
+      {"job_type": "model_test", "blockchain_attestation_enabled": True, "execution_binding": binding},
       {"job_id": "job-123"},
     ]
     plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    # RM-108 phase 5: finalization requires a currently-bound, currently-running job record.
+    plugin._execution_operation_allowed = MagicMock(return_value=True)
     job_specs = {
       "job_id": "job-123",
       "job_status": "RUNNING",
@@ -1433,7 +1520,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "workers": {"launcher-node": {"finished": True}},
       "timeline": [],
       "blockchain_attestation_enabled": True,
+      "execution_binding": binding,
     }
+    _bind_job_store(plugin, job_specs)
 
     result = PentesterApi01Plugin._finalize_model_test_job(
       plugin,
@@ -1470,16 +1559,19 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
     plugin.time.return_value = 200.0
     plugin.r1fs = MagicMock()
+    binding = binding_payload()
     plugin.r1fs.get_json.return_value = {
       "job_type": "model_test",
       "blockchain_attestation_enabled": True,
+      "execution_binding": binding,
     }
     plugin.r1fs.add_json.return_value = "QmArchiveCID"
     plugin.r1fs.get_json.side_effect = [
-      {"job_type": "model_test", "blockchain_attestation_enabled": True},
+      {"job_type": "model_test", "blockchain_attestation_enabled": True, "execution_binding": binding},
       {"job_id": "job-123"},
     ]
     plugin._submit_redmesh_test_attestation = MagicMock(side_effect=RuntimeError("chain offline"))
+    plugin._execution_operation_allowed = MagicMock(return_value=True)
     job_specs = {
       "job_id": "job-123",
       "job_status": "RUNNING",
@@ -1495,7 +1587,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "workers": {"launcher-node": {"finished": True}},
       "timeline": [],
       "blockchain_attestation_enabled": True,
+      "execution_binding": binding,
     }
+    _bind_job_store(plugin, job_specs)
 
     result = PentesterApi01Plugin._finalize_model_test_job(
       plugin,
@@ -1527,16 +1621,19 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     plugin.time.return_value = 200.0
     plugin.r1fs = MagicMock()
     plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    binding = binding_payload()
     plugin.r1fs.get_json.side_effect = [
       {
         "job_type": "model_test",
         "blockchain_attestation_enabled": True,
+        "execution_binding": binding,
       },
       {"job_id": "job-123"},
     ]
     plugin._submit_redmesh_test_attestation = MagicMock(
       return_value={"tx_hash": "0xend", "job_id": "job-123"}
     )
+    plugin._execution_operation_allowed = MagicMock(return_value=True)
     job_specs = {
       "job_id": "job-123",
       "job_status": "RUNNING",
@@ -1552,7 +1649,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "workers": {"launcher-node": {"finished": True}},
       "timeline": [],
       "blockchain_attestation_enabled": True,
+      "execution_binding": binding,
     }
+    _bind_job_store(plugin, job_specs)
 
     result = PentesterApi01Plugin._finalize_model_test_job(
       plugin,
@@ -1623,11 +1722,13 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     plugin.cfg_archive_verify_retries = 1
     plugin.r1fs = MagicMock()
     plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    binding = binding_payload()
     plugin.r1fs.get_json.side_effect = [
       {
         "schema_version": "model_test_job_config_v1",
         "job_type": "model_test",
         "raw_evidence": {"requested": True},
+        "execution_binding": binding,
       },
       {"job_id": "job-raw"},
     ]
@@ -1645,7 +1746,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job_config_cid": "QmConfigCID",
       "workers": {"launcher-node": {"finished": True}},
       "timeline": [],
+      "execution_binding": binding,
     }
+    _bind_job_store(plugin, job_specs)
 
     result = PentesterApi01Plugin._finalize_model_test_job(
       plugin,
@@ -1695,11 +1798,13 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     }
     plugin.cfg_archive_verify_retries = 1
     plugin.r1fs = MagicMock()
+    binding = binding_payload()
     plugin.r1fs.get_json.side_effect = [
       {
         "schema_version": "model_test_job_config_v1",
         "job_type": "model_test",
         "raw_evidence": {"requested": True},
+        "execution_binding": binding,
       },
       {"job_id": "job-raw"},
     ]
@@ -1724,7 +1829,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
       "job_config_cid": "QmConfigCID",
       "workers": {"launcher-node": {"finished": True}},
       "timeline": [],
+      "execution_binding": binding,
     }
+    _bind_job_store(plugin, job_specs)
 
     result = PentesterApi01Plugin._finalize_model_test_job(
       plugin,
@@ -1814,7 +1921,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs.pop("test_set_id")
     kwargs["limits"] = {"max_cases": 1, "tested_max_tokens": 128}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertNotIn("error", result)
     self.assertEqual(
@@ -1828,7 +1935,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["test_set_id"] = "cbrn_safety_v1"
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertNotIn("error", result)
     self.assertEqual(result["job_config"]["test_set_id"], "cbrn_safety_v1")
@@ -1839,7 +1946,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["test_sets"] = [{"id": "unknown"}]
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("unknown test set", result["message"])
@@ -1853,10 +1960,15 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["selected_peers"] = ["node-x"]
 
-    result = launch_model_test(owner, **kwargs)
+    # RM-108 phase 5: peer selection is admitted (execution_context.selected_candidates), not
+    # taken from the caller-supplied `selected_peers` kwarg. Launch folds the specific
+    # node-selection failure into one generic message (the peer-address detail is still asserted
+    # directly against select_model_test_execution_node in
+    # test_invalid_selected_peer_rejected_before_selection).
+    result = launch_model_test(owner, **kwargs, execution_context=_context(candidates=("node-x",)))
 
     self.assertEqual(result["error"], "validation_error")
-    self.assertIn("Invalid peer addresses", result["message"])
+    self.assertIn("Execution node unavailable", result["message"])
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
 
@@ -1865,7 +1977,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     r1fs.add_json.return_value = ""
     owner = _owner(cfg_model_testing={"ENABLED": True}, r1fs=r1fs)
 
-    result = launch_model_test(owner, **_valid_launch_kwargs())
+    result = launch_model_test(owner, **_valid_launch_kwargs(), execution_context=_context())
 
     self.assertEqual(result["error"], "storage_error")
     owner.chainstore_hset.assert_not_called()
@@ -1875,7 +1987,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["limits"] = {"tested_max_tokens": 257}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("limits.tested_max_tokens", result["message"])
@@ -1887,7 +1999,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["limits"] = {"evaluator_max_tokens": 384}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["job_type"], "model_test")
     self.assertEqual(result["job_config"]["limits"]["evaluator_max_tokens"], 384)
@@ -1900,7 +2012,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["limits"] = {"temperature": 0.1}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("limits.temperature", result["message"])
@@ -1912,7 +2024,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["limits"] = {"temperature": "nan"}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("limits.temperature", result["message"])
@@ -1924,7 +2036,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["raw_evidence"] = {"enabled": True, "reason": "debug"}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertEqual(result["error"], "validation_error")
     self.assertEqual(result["error_class"], "raw_evidence_disabled")
@@ -1937,7 +2049,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     kwargs = _valid_launch_kwargs()
     kwargs["raw_evidence"] = {"enabled": True, "reason": "debug"}
 
-    result = launch_model_test(owner, **kwargs)
+    result = launch_model_test(owner, **kwargs, execution_context=_context())
 
     self.assertNotIn("error", result)
     job_specs = result["job_specs"]
@@ -2696,7 +2808,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         },
       },
     }
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
 
     PentesterApi01Plugin._maybe_launch_jobs(plugin)
 
@@ -2707,6 +2819,11 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
+    # RM-108 phase 5: the binding's asset_target must match the resolved (secret-merged) provider
+    # endpoint the worker actually calls, not just any bound network/webapp target.
+    binding = _context(candidates=("node-b",), tested_model={
+      "adapter": "openai_compatible", "model": "tested-model", "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+    }).build_binding("launcher-node", ["node-b"]).to_dict()
     job_specs = {
       "job_id": "job-1",
       "job_status": "RUNNING",
@@ -2714,14 +2831,17 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "scan_type": "model_test",
       "launcher": "launcher-node",
       "job_config_cid": "cid-config",
+      "job_pass": 1,
       "workers": {
         "node-b": {
           "worker_type": "model_test",
           "start_port": 0,
           "end_port": 0,
           "finished": False,
+          "assignment_revision": 1,
         },
       },
+      "execution_binding": binding,
     }
 
     selected = MagicMock()
@@ -2730,16 +2850,18 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     selected.model_test_jobs = {}
     selected.scan_jobs = {}
     selected.chainstore_hgetall.return_value = {"job-1": job_specs}
-    selected._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    selected._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     selected._get_worker_entry.side_effect = lambda _job_id, specs: specs["workers"].get(selected.ee_addr)
     selected._get_artifact_repository.return_value.get_job_config.return_value = {
       "job_id": "job-1",
       "job_type": "model_test",
+      "scan_type": "model_test",
       "test_set_id": "cbrn_safety_v1",
       "limits": {"max_cases": 12},
       "tested_model": {"provider_label": "Unit Provider"},
       "evaluator_model": {"provider_label": "Evaluator Provider"},
       "model_provider_secret_ref": "cid-model-provider-secret",
+      "execution_binding": binding,
     }
     selected.r1fs.get_json.return_value = {
       "kind": "redmesh_model_test_provider_credentials",
@@ -2785,7 +2907,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     other.ee_addr = "node-a"
     other.model_test_jobs = {}
     other.chainstore_hgetall.return_value = {"job-1": job_specs}
-    other._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    other._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     other._get_worker_entry.side_effect = lambda _job_id, specs: specs["workers"].get(other.ee_addr)
 
     PentesterApi01Plugin._maybe_launch_model_test_jobs(other)
@@ -3074,7 +3196,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       lambda hkey, key: job_specs if hkey == "instance" and key == "job-1" else None
     )
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     plugin._write_job_record.side_effect = lambda job_id, specs, context="": specs
     plugin._publish_model_test_progress.side_effect = (
       lambda job_id, worker_arg, specs, **kwargs: PentesterApi01Plugin._publish_model_test_progress(
@@ -3194,7 +3316,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.time.return_value = 130.0
     plugin.chainstore_hget.return_value = job_specs
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     written_records = []
 
     def write_record(job_id, specs, context=""):
@@ -3301,6 +3423,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
           "assigned_at": 123.0,
         },
       },
+      "execution_binding": binding_payload(),
     }
     worker_result = {
       "schema_version": "model_test_worker_result_v1",
@@ -3347,6 +3470,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         "selection_mode": "manual",
         "selected_execution_node": "node-a",
       },
+      "execution_binding": job_specs["execution_binding"],
     }
     plugin = MagicMock()
     plugin.ee_addr = "launcher-node"
@@ -3371,15 +3495,19 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         "job_type": "model_test",
       },
     }
+    job_store = {"job-stale": job_specs}
     plugin.chainstore_hgetall.side_effect = lambda hkey: (
-      terminal_live if hkey == "instance:live" else {"job-stale": job_specs}
+      terminal_live if hkey == "instance:live" else dict(job_store)
     )
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin.chainstore_hget.side_effect = lambda hkey, key: job_store.get(key)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     written_records = []
     stored_artifacts = []
 
-    def write_record(job_id, specs, context=""):
+    def write_record(job_id, specs, context="", **kwargs):
       written_records.append((job_id, deepcopy(specs), context))
+      # RM-108 phase 5: finalization rechecks the stored record after this write (read-your-own-write).
+      job_store[job_id] = specs
       return specs
 
     def add_json(payload, show_logs=False):
@@ -3483,7 +3611,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.ee_addr = "node-a"
     plugin.cfg_instance_id = "instance"
     plugin.chainstore_hgetall.return_value = {"job-failed-attestation": job_specs}
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
 
     finalized = PentesterApi01Plugin._maybe_finalize_finished_model_test_jobs(plugin)
 
@@ -3527,6 +3655,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
           "finished": False,
         },
       },
+      "execution_binding": binding_payload(),
     }
     model_test_config = {
       "schema_version": "model_test_job_config_v1",
@@ -3551,6 +3680,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         "selection_mode": "manual",
         "selected_execution_node": "node-a",
       },
+      "execution_binding": job_specs["execution_binding"],
     }
     live_progress = WorkerProgress(
       job_id="job-stale",
@@ -3612,14 +3742,15 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.cfg_model_testing = {"ENABLED": True}
     plugin.time.return_value = 200.0
     plugin._get_artifact_repository.return_value.get_job_config.return_value = model_test_config
+    job_store = {"job-stale": job_specs}
     plugin.chainstore_hgetall.side_effect = (
-      lambda hkey: {"job-stale:node-a": live_progress} if hkey.endswith(":live") else {"job-stale": job_specs}
+      lambda hkey: {"job-stale:node-a": live_progress} if hkey.endswith(":live") else dict(job_store)
     )
     plugin.chainstore_hget.side_effect = (
-      lambda hkey, key: None if hkey.endswith(":live") else job_specs
+      lambda hkey, key: None if hkey.endswith(":live") else job_store.get(key)
     )
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     plugin._emit_timeline_event.side_effect = (
       lambda specs, event_type, message, actor_type="system", meta=None: specs.setdefault("timeline", []).append({
         "event_type": event_type,
@@ -3630,8 +3761,10 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     written_records = []
     stored_artifacts = []
 
-    def write_record(job_id, specs, context=""):
+    def write_record(job_id, specs, context="", **kwargs):
       written_records.append((job_id, deepcopy(specs), context))
+      # RM-108 phase 5: finalization rechecks the stored record after this write (read-your-own-write).
+      job_store[job_id] = specs
       return specs
 
     def add_json(payload, show_logs=False):
@@ -3723,6 +3856,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
           "cancel_requested": True,
         },
       },
+      "execution_binding": binding_payload(),
     }
     model_test_config = {
       "schema_version": "model_test_job_config_v1",
@@ -3740,6 +3874,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "raw_evidence": {"requested": False},
       "selected_peers": ["node-a"],
       "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "execution_binding": job_specs["execution_binding"],
     }
     plugin = MagicMock()
     plugin.ee_addr = "launcher-node"
@@ -3748,19 +3883,22 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.cfg_model_testing = {"ENABLED": True}
     plugin.time.return_value = 110.0
     plugin._get_artifact_repository.return_value.get_job_config.return_value = model_test_config
+    job_store = {"job-cancel": job_specs}
     plugin.chainstore_hgetall.side_effect = (
-      lambda hkey: {} if hkey.endswith(":live") else {"job-cancel": job_specs}
+      lambda hkey: {} if hkey.endswith(":live") else dict(job_store)
     )
     plugin.chainstore_hget.side_effect = (
-      lambda hkey, key: None if hkey.endswith(":live") else job_specs
+      lambda hkey, key: None if hkey.endswith(":live") else job_store.get(key)
     )
     plugin.chainstore_hset = MagicMock()
-    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._normalize_job_record.side_effect = lambda key, specs: (key, specs)
     written_records = []
     stored_artifacts = []
 
-    def write_record(job_id, specs, context=""):
+    def write_record(job_id, specs, context="", **kwargs):
       written_records.append((job_id, deepcopy(specs), context))
+      # RM-108 phase 5: finalization rechecks the stored record after this write (read-your-own-write).
+      job_store[job_id] = specs
       return specs
 
     def add_json(payload, show_logs=False):

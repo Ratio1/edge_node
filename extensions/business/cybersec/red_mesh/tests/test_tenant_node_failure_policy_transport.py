@@ -9,6 +9,7 @@ from pydantic import create_model
 
 from .conftest import mock_plugin_modules
 from .test_tenant_administration import FakeAdministrationStore
+from .contract_fixture import install_contract
 
 
 class TestNodeFailurePolicyTransport(unittest.TestCase):
@@ -29,7 +30,7 @@ class TestNodeFailurePolicyTransport(unittest.TestCase):
       setattr(self.plugin, name, getattr(self.store, name))
     self.creator = {"account_id": "creator"}
     request = str(uuid4())
-    prepared = self.plugin.prepare_tenant(self.creator, request, "Tenant", "tenant", "initial")
+    prepared = self.plugin.prepare_tenant(self.creator, request, "Tenant", "tenant", "initial", **install_contract(self.plugin))
     self.assertTrue(prepared["success"], prepared)
     self.tenant_id = prepared["data"]["tenantId"]
     self.store.grant("initial", self.tenant_id)

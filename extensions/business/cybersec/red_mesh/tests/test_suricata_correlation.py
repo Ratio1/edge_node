@@ -9,6 +9,9 @@ from extensions.business.cybersec.red_mesh.services.suricata_correlation import 
   correlate_suricata_eve,
   get_detection_correlation,
 )
+from .test_execution_binding_models import binding_payload
+
+BINDING = binding_payload()
 
 
 def _owner(job_specs):
@@ -92,9 +95,9 @@ def _eve_jsonl():
 class TestSuricataCorrelation(unittest.TestCase):
 
   def test_checked_status_projects_detached_job_without_storage_or_effects(self):
-    source = {**_job_specs(), "detection_correlation": {"job_id": "job-1", "status": "completed"}}
+    source = {**_job_specs(), "execution_binding": BINDING, "detection_correlation": {"job_id": "job-1", "status": "completed"}}
     owner = _owner({"job_id": "foreign"})
-    result = get_detection_correlation(owner, "job-1", checked_job=source, snapshot_mode="legacy_unbound")
+    result = get_detection_correlation(owner, "job-1", checked_job=source, snapshot_mode="tenant_bound")
     self.assertEqual(result, {"job_id": "job-1", "found": True,
                              "correlation": {"job_id": "job-1", "status": "completed"}})
     result["correlation"]["job_id"] = "mutated-return"
@@ -127,8 +130,8 @@ class TestSuricataCorrelation(unittest.TestCase):
     for fields in ({}, {"detection_correlation": None}, {"detection_correlation": {}}):
       with self.subTest(fields=fields):
         owner = _owner(None)
-        result = get_detection_correlation(owner, "job-1", checked_job={**_job_specs(), **fields},
-                                           snapshot_mode="legacy_unbound")
+        result = get_detection_correlation(owner, "job-1", checked_job={**_job_specs(), "execution_binding": BINDING, **fields},
+                                           snapshot_mode="tenant_bound")
         self.assertEqual(result, {"job_id": "job-1", "found": True, "correlation": fields.get("detection_correlation")})
         self.assertEqual(owner.mock_calls, [])
 
@@ -140,8 +143,9 @@ class TestSuricataCorrelation(unittest.TestCase):
     self.assertTrue(legacy["found"])
     self.assertNotIn("status_code", legacy)
     owner.reset_mock()
+    source = {**source, "execution_binding": BINDING}
     with self.assertRaises(AdministrationDenied) as caught:
-      get_detection_correlation(owner, "job-1", checked_job=source, snapshot_mode="legacy_unbound")
+      get_detection_correlation(owner, "job-1", checked_job=source, snapshot_mode="tenant_bound")
     self.assertEqual((caught.exception.status_code, caught.exception.error), (400, "unsupported_job_type"))
     self.assertEqual(owner.mock_calls, [])
 

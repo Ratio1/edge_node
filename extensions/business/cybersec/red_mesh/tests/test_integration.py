@@ -157,7 +157,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.ee_id = "launcher-alias"
     plugin.cfg_distributed_job_reconciliation = cfg or {"LIVE_HSYNC_ENABLED": True}
     plugin._last_live_hsync_at = last_hsync_at
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
     plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
       Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)
@@ -760,7 +760,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin._foreign_jobs_logged = set()
     plugin._PentesterApi01Plugin__last_checked_jobs = 0
     plugin.time.side_effect = [100.0, 100.0, 100.0]
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_config.return_value = {"scan_type": "network"}
     plugin.P = MagicMock()
     plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
@@ -829,7 +829,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin._foreign_jobs_logged = set()
     plugin._PentesterApi01Plugin__last_checked_jobs = 0
     plugin.time.return_value = 100.0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
     plugin._remember_execution_identity = lambda job_id, identity, started_at: Plugin._remember_execution_identity(
@@ -881,7 +881,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin._foreign_jobs_logged = set()
     plugin._PentesterApi01Plugin__last_checked_jobs = 0
     plugin.time.return_value = 100.0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
 
@@ -919,7 +919,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._log_audit_event = MagicMock()
     plugin.time.return_value = 100.0
@@ -1006,7 +1006,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._log_audit_event = MagicMock()
     plugin.time.return_value = 100.0
@@ -1084,7 +1084,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin.P = MagicMock()
     plugin._log_audit_event = MagicMock()
     plugin.time.side_effect = [100.0, 100.0, 100.0]
@@ -1148,7 +1148,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "MAX_REANNOUNCE_ATTEMPTS": 3,
     }
     plugin._last_worker_reconcile_check = 0
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
     plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
       Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)
@@ -1243,7 +1243,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "launcher-A"
     plugin.cfg_distributed_job_reconciliation = {"LIVE_HSYNC_ENABLED": True}
-    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._normalize_job_record.side_effect = lambda job_id, payload: (job_id, payload)
     plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
     plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
       Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)
@@ -1921,6 +1921,38 @@ class TestPhase14Purge(unittest.TestCase):
     # snapshot is deliberately not forwarded, because the stop above just rewrote the record.
     purge_mock.assert_called_once_with(plugin, "job-1", ledger=None)
     self.assertEqual(result, purge_result)
+
+  def test_stop_and_delete_refuses_a_stored_record_the_normalizer_refuses(self):
+    """RM-108 phase 5: a record the normalizer refuses (foreign key, no launcher) must be refused
+    before any side effect -- not treated the same as no record at all, which reports success with
+    nothing to stop. Previously this stopped local worker threads and reported bare success without
+    ever marking the job STOPPED or purging."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+    plugin.scan_jobs = {"job-1": {"local-A": MagicMock()}}
+
+    job_specs = {
+      "job_id": "job-2",  # stored under a foreign key
+      "job_status": "RUNNING",
+      "launcher": "node-A",
+      "workers": {"node-A": {"finished": False}},
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin._normalize_job_record = MagicMock(return_value=(None, None))
+
+    from extensions.business.cybersec.red_mesh.services import control as control_module
+    purge_mock = MagicMock()
+
+    with patch.object(control_module, "purge_job", purge_mock):
+      result = _stop_and_delete_service(plugin, "job-1")
+
+    self.assertEqual(result.get("error"), "Job not found")
+    # No worker was stopped, no record written, no purge attempted, no false-success audit.
+    for worker in plugin.scan_jobs["job-1"].values():
+      worker.stop.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
+    plugin._emit_timeline_event.assert_not_called()
+    purge_mock.assert_not_called()
 
 
 class TestPurgeAllJobs(unittest.TestCase):

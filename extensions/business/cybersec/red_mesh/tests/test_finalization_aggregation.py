@@ -253,6 +253,18 @@ class TestGrayboxMultiWorkerAggregation(unittest.TestCase):
                                           "completed_tests": []}).to_dict()
     self.assertNotIn("aborted", clean)
 
+  def test_scan_mode_survives_the_archive_round_trip(self):
+    """RM-094: the pass's scan mode must survive the AggregatedScanData round
+    trip so the report can name the effective mode; None is stripped when unset."""
+    from extensions.business.cybersec.red_mesh.models.reports import AggregatedScanData
+    agg = {"open_ports": [], "service_info": {}, "web_tests_info": {},
+           "completed_tests": [], "scan_mode": "syn"}
+    out = AggregatedScanData.from_dict(agg).to_dict()
+    self.assertEqual(out["scan_mode"], "syn")
+    clean = AggregatedScanData.from_dict({"open_ports": [], "service_info": {}, "web_tests_info": {},
+                                          "completed_tests": []}).to_dict()
+    self.assertNotIn("scan_mode", clean)
+
   def test_findings_carry_worker_and_node_attribution(self):
     """Every finding in the aggregated report has the four stamp
     fields (_source_probe/_source_port stamped in Phase 2 at

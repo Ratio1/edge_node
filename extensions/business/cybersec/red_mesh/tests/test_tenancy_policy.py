@@ -46,8 +46,6 @@ class TestTenantPolicy(unittest.TestCase):
     rows = (
       ("tenants:manage",          (True, False, False, False, False)),
       ("tenant_users:manage",     (True, False, True, False, False)),
-      ("assets:create",           (True, True, False, False, False)),
-      ("assets:update",           (True, True, False, False, False)),
       ("integrations:manage",     (True, False, True, False, False)),
       ("attestation_keys:manage", (True, False, True, False, False)),
       ("allow_pentester:update",  (True, True, False, False, False)),
@@ -72,17 +70,17 @@ class TestTenantPolicy(unittest.TestCase):
     self.assertEqual(authorize_tenant_operation(account(("super_pentester", "a")), "reports:view", tenant),
                      PolicyDecision(False, 404, "not_found"))
     allowlisted = account(("super_pentester", "a"), ("super_pentester", "b"))
-    self.assertTrue(authorize_tenant_operation(allowlisted, "assets:create", tenant).allowed)
+    self.assertTrue(authorize_tenant_operation(allowlisted, "allow_pentester:update", tenant).allowed)
     self.assertTrue(authorize_tenant_operation(account(("super_tenant_admin", None), ("super_pentester", None)),
                                              "tenants:manage", tenant).allowed)
     for role in ("super_tenant_admin", "super_pentester"):
       with self.subTest(role=role):
-        self.assertTrue(authorize_tenant_operation(account((role, None)), "assets:create", tenant).allowed)
+        self.assertTrue(authorize_tenant_operation(account((role, None)), "allow_pentester:update", tenant).allowed)
     combined = account(("tenant_admin", "b"), ("tenant_pentester", "b"))
     self.assertTrue(authorize_tenant_operation(combined, "integrations:manage", tenant).allowed)
     self.assertTrue(authorize_tenant_operation(combined, "tasks:launch", tenant,
                                              asset_tenant_ids=("b",)).allowed)
-    self.assertFalse(authorize_tenant_operation(combined, "assets:update", tenant).allowed)
+    self.assertFalse(authorize_tenant_operation(combined, "allow_pentester:update", tenant).allowed)
 
   def test_an_account_with_more_than_one_scope_is_denied_as_a_whole(self):
     # RM-083 (owner): an account is platform-scoped or scoped to one tenant, never both or two.
@@ -189,7 +187,7 @@ class TestTenantPolicy(unittest.TestCase):
 
   def test_bootstrap_actor_has_no_ordinary_tenant_authority(self):
     deployer = account(("ratio1_deployer", None))
-    for operation in ("tenants:manage", "assets:create", "tasks:launch", "reports:view", "bootstrap"):
+    for operation in ("tenants:manage", "allow_pentester:update", "tasks:launch", "reports:view", "bootstrap"):
       with self.subTest(operation=operation):
         self.assertEqual(authorize_tenant_operation(deployer, operation, TenantPolicyContext("a", True, True),
                                                    asset_tenant_ids=("a",)),
@@ -223,7 +221,7 @@ class TestIdentityPolicyBoundary(unittest.TestCase):
     with patch.dict("os.environ", {AUTH_HKEY_ENV: "test-policy-auth"}):
       actor, error = resolve_actor({"account_id": "operator"}, reader)
       self.assertIsNone(error)
-      self.assertTrue(authorize_tenant_operation(actor, "assets:create", tenant).allowed)
+      self.assertTrue(authorize_tenant_operation(actor, "allow_pentester:update", tenant).allowed)
       for revoked in (record("operator", memberships=[]),
                       {**record("operator"), "memberships": None},
                       record("operator", memberships=platform, state="deleting", **stamp),
@@ -232,7 +230,7 @@ class TestIdentityPolicyBoundary(unittest.TestCase):
         with self.subTest(revoked=revoked):
           store["operator"] = json.dumps(revoked)
           actor, _ = resolve_actor({"account_id": "operator"}, reader)
-          self.assertEqual(authorize_tenant_operation(actor, "assets:create", tenant),
+          self.assertEqual(authorize_tenant_operation(actor, "allow_pentester:update", tenant),
                            PolicyDecision(False, 404, "not_found"))
 
 

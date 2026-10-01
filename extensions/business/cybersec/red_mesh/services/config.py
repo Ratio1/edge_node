@@ -41,14 +41,15 @@ TENANT_INTEGRATION_NOT_CONFIGURED = "tenant_integration_not_configured"
 def tenant_export_binding(owner, job_specs, integration_id):
   """Which tenant's destination this job exports to. Returns (tenant_id, error_code).
 
-  Three outcomes, and the third is the one that matters:
+  Every production launch is admitted through `_admit_execution`, which never yields a job with no
+  `execution_binding` (RM-108 phase 5); an absent or malformed binding is refused exactly like a
+  bound tenant with no stored record:
 
-  - An unbound job (no `execution_binding`) is legacy: (None, None), node config applies, which is
-    how a compatibility-stage node keeps working.
   - A bound job whose tenant has a stored record: (tenant_id, None).
-  - A bound job whose tenant has NO record: (tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED). It
-    exports nowhere rather than falling back to the node's destination, because falling back would
-    publish one tenant's findings into whatever SOC the deployment happens to point at.
+  - Anything else -- no binding, a malformed one, or a bound tenant with no record --:
+    (None or tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED). It exports nowhere rather than falling
+    back to the node's destination, because falling back would publish one tenant's findings into
+    whatever SOC the deployment happens to point at.
     A JSON download is the exception: it has no destination and renders with the backend defaults
     (misp_export._json_export_config, RM-093).
 
@@ -62,10 +63,9 @@ def tenant_export_binding(owner, job_specs, integration_id):
   try:
     binding = binding_from_record(job_specs) if isinstance(job_specs, dict) else None
   except Exception:
-    # A malformed binding is not absence: refuse rather than treat the job as legacy.
-    return None, TENANT_INTEGRATION_NOT_CONFIGURED
+    binding = None
   if binding is None:
-    return None, None
+    return None, TENANT_INTEGRATION_NOT_CONFIGURED
   # ExecutionBinding is a frozen snapshot: its fields are reachable through to_dict(), not as
   # attributes. getattr(binding, "tenant_id") silently yields None and reads as a malformed binding.
   tenant_id = binding.to_dict().get("tenant_id")

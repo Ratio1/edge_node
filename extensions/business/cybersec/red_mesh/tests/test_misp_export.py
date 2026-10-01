@@ -28,6 +28,7 @@ from extensions.business.cybersec.red_mesh.services.misp_export import (
   get_misp_export_status,
   push_to_misp,
 )
+from .test_execution_binding_models import binding_payload
 
 
 # ── Test fixtures ──
@@ -466,6 +467,11 @@ def _make_integration_owner(misp_config=None, archive=None, aggregated=None, job
       return FakeArtifactRepo()
     def _write_job_record(self, job_key, job_specs, context=""):
       return job_specs
+    def _get_tenant_integration_config(self, tenant_id, integration_id):
+      # RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so a bound
+      # fixture's tenant needs its own record on file -- the same effective config as node-level,
+      # since these tests are about MISP behavior, not tenant destination resolution.
+      return {"config": dict(config)} if integration_id == "misp" else None
 
   return IntegrationOwner()
 
@@ -478,7 +484,9 @@ class TestBuildMispEventIntegration(unittest.TestCase):
 
   def test_builds_event_from_archive(self):
     owner = self._setup_owner()
-    result = build_misp_event(owner, "test_job_1")
+    # RM-108 phase 5: the unchecked call has no job to derive a tenant from any more, so the
+    # caller resolves the (here, node-level) config itself, as export_misp_json/push_to_misp do.
+    result = build_misp_event(owner, "test_job_1", export_config=get_misp_export_config(owner))
     self.assertEqual(result["status"], "ok")
     self.assertEqual(result["pass_nr"], 1)
     self.assertEqual(result["target"], "10.0.0.1")
@@ -489,18 +497,18 @@ class TestBuildMispEventIntegration(unittest.TestCase):
 
   def test_severity_filter_medium(self):
     owner = self._setup_owner({"ENABLED": True, "MIN_SEVERITY": "MEDIUM"})
-    result = build_misp_event(owner, "test_job_1")
+    result = build_misp_event(owner, "test_job_1", export_config=get_misp_export_config(owner))
     self.assertEqual(result["findings_exported"], 3)  # CRITICAL + HIGH + MEDIUM
 
   def test_severity_filter_high(self):
     owner = self._setup_owner({"ENABLED": True, "MIN_SEVERITY": "HIGH"})
-    result = build_misp_event(owner, "test_job_1")
+    result = build_misp_event(owner, "test_job_1", export_config=get_misp_export_config(owner))
     # CRITICAL + HIGH
     self.assertEqual(result["findings_exported"], 2)
 
   def test_severity_filter_critical(self):
     owner = self._setup_owner({"ENABLED": True, "MIN_SEVERITY": "CRITICAL"})
-    result = build_misp_event(owner, "test_job_1")
+    result = build_misp_event(owner, "test_job_1", export_config=get_misp_export_config(owner))
     self.assertEqual(result["findings_exported"], 1)
 
   def test_job_not_found(self):
@@ -520,7 +528,7 @@ class TestBuildMispEventIntegration(unittest.TestCase):
       },
     )
 
-    result = build_misp_event(owner, "test_job_1")
+    result = build_misp_event(owner, "test_job_1", export_config=get_misp_export_config(owner))
 
     self.assertEqual(result["status"], "error")
     self.assertEqual(result["error"], "unsupported_job_type")
@@ -532,7 +540,7 @@ class TestExportMispJson(unittest.TestCase):
   def test_invalid_explicit_snapshot_and_mode_never_fall_back_to_unchecked_lookup(self):
     from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExportMixin
     from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
-    for builder in (build_misp_event, export_misp_json, _MispExportMixin._build_misp_json):
+    for builder in (export_misp_json, _MispExportMixin._build_misp_json):
       for kwargs in ({"checked_job": None}, {"checked_job": {}},
                      {"snapshot_mode": "legacy_unbound"}, {"snapshot_mode": "invalid"}):
         with self.subTest(builder=builder.__name__, kwargs=kwargs):
@@ -541,6 +549,19 @@ class TestExportMispJson(unittest.TestCase):
             with self.assertRaises(TenantStoreError):
               builder(owner, "test_job_1", **kwargs)
             lookup.assert_not_called()
+    # build_misp_event's own bare call (no export_config) resolves the tenant from checked_job
+    # before ever reaching the checked-snapshot validation. RM-108 phase 5 made that resolution
+    # refuse an absent or malformed binding outright (services.config.tenant_export_binding), so
+    # it still never performs the unchecked lookup -- it reports the refusal as a result instead
+    # of raising, since a bare call has no snapshot-shape contract of its own to violate.
+    for kwargs in ({"checked_job": None}, {"checked_job": {}},
+                   {"snapshot_mode": "legacy_unbound"}, {"snapshot_mode": "invalid"}):
+      with self.subTest(builder=build_misp_event.__name__, kwargs=kwargs):
+        owner = _make_integration_owner({"ENABLED": False})
+        with patch.object(owner, "_get_job_from_cstore", side_effect=AssertionError("unchecked lookup")) as lookup:
+          result = build_misp_event(owner, "test_job_1", **kwargs)
+          self.assertEqual(result["status"], "error")
+          lookup.assert_not_called()
 
   def test_returns_misp_dict(self):
     owner = _make_integration_owner({"ENABLED": True})
@@ -662,6 +683,13 @@ class TestPushToMisp(unittest.TestCase):
       "MISP_API_KEY": "testkey123",
       **(misp_config or {}),
     }
+    if job_specs is None:
+      # RM-108 phase 5: admission never yields an unbound job.
+      job_specs = {
+        "job_id": "test_job_1",
+        "job_cid": "archive_cid_123",
+        "execution_binding": binding_payload(),
+      }
     return _make_integration_owner(config, job_specs=job_specs)
 
   def test_disabled(self):
@@ -745,6 +773,7 @@ class TestPushToMisp(unittest.TestCase):
     owner = self._setup_owner(job_specs={
       "job_id": "test_job_1",
       "job_cid": "archive_cid_123",
+      "execution_binding": binding_payload(),
       "misp_export": {
         "event_uuid": "existing-uuid",
         "event_id": 50,

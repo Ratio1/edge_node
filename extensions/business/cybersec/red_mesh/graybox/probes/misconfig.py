@@ -1037,6 +1037,9 @@ class MisconfigProbes(ProbeBase):
           owasp="A02:2021",
           cwe=["CWE-327", "CWE-345"],
           attack=["T1550"],
+          # The forged token is accepted here. The evidence names both paths, which
+          # location_from_evidence treats as ambiguous, so state the location.
+          url=protected_url,
           evidence=[
             f"token_path={jwt_cfg.token_path}",
             f"protected_path={jwt_cfg.protected_path}",

@@ -74,11 +74,14 @@ class TestAutomaticEmissionTenant(unittest.TestCase):
     self.assertEqual(status["integration_status"], "not_configured")
     self.assertIsNone(status.get("last_failure_signature"))
 
-  def test_a_legacy_unbound_job_still_delivers_on_the_node(self):
+  def test_an_unbound_job_is_refused_not_treated_as_legacy(self):
+    # RM-108 phase 5: admission never yields an unbound job; an absent binding no longer falls
+    # back to the node's own destination.
     owner = Owner(NODE)
     result, deliver = self.emit(owner, {"job_id": "job-1"})
-    self.assertEqual(result["status"], "sent")
-    self.assertIsNone(deliver.call_args.kwargs["tenant_id"])
+    self.assertEqual(result["status"], "skipped")
+    self.assertEqual(result["error"], TENANT_INTEGRATION_NOT_CONFIGURED)
+    deliver.assert_not_called()
 
   def test_two_tenants_reach_two_destinations(self):
     other = binding_payload()

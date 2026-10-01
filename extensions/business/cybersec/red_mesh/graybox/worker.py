@@ -287,15 +287,16 @@ class GrayboxLocalWorker(BaseLocalWorker):
     "scan finished cleanly" from "scan was terminated at a safety gate."
     """
     discovery_result = DiscoveryResult()
-    execution_authorized = self.job_config.execution_binding is None
+    # RM-108 phase 5: admission never yields a job with no execution_binding, so an absent one is
+    # not authorized -- it is refused by the guard below like any other unavailable execution.
+    execution_authorized = False
     self.metrics.start_scan(1)
     try:
-      if not execution_authorized:
-        guard = getattr(self.owner, "_require_worker_execution", None)
-        if not callable(guard):
-          raise ValueError("Execution unavailable")
-        guard(self.job_id, self.job_config.to_dict(), execution_identity=self._execution_identity)
-        execution_authorized = True
+      guard = getattr(self.owner, "_require_worker_execution", None)
+      if not callable(guard):
+        raise ValueError("Execution unavailable")
+      guard(self.job_id, self.job_config.to_dict(), execution_identity=self._execution_identity)
+      execution_authorized = True
       self._run_preflight_phase()
       if self._check_stopped():
         return

@@ -9,6 +9,7 @@ from extensions.business.cybersec.red_mesh.model_testing.worker import ModelTest
 from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
 from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
 
+from .test_api import _engagement
 from .test_execution_binding_models import binding_payload
 from .test_model_testing import _owner, _provider, _valid_launch_kwargs, PUBLIC_TEST_IP
 
@@ -24,8 +25,10 @@ class TestTenantExecutionModel(unittest.TestCase):
               "endpointUrl": f"https://{PUBLIC_TEST_IP}/v1/chat/completions"}
     facts = {key: value for key, value in binding_payload().items()
              if key not in ("schema_version", "original_launcher", "participant_order")}
-    self.context = ResolvedExecutionContext({**facts, "asset_target": target,
-      "asset_target_digest": canonical_digest(target), "selected_candidates": ["node-a", "node-b"]})
+    # RM-107: a model test runs inside an engagement that lists the model asset.
+    self.engagement = {**_engagement("model"), "engagement_id": facts["engagement_id"],
+                       "engagement_hash": facts["engagement_hash"]}
+    self.context = self.model_context(self.engagement)
     self.binding = self.context.build_binding("launcher-node", ["node-b"]).to_dict()
     self.owner = _owner(cfg_model_testing={"ENABLED": True},
       cfg_chainstore_peers=["node-a", "node-b", "foreign-node"],
@@ -35,6 +38,80 @@ class TestTenantExecutionModel(unittest.TestCase):
       "execution_binding": self.binding, "tested_model": _provider(),
       "model_provider_secret_ref": "secret-cid"}
     self.execution_identity = ("job-123", 1, "node-b", 1)
+
+  def model_context(self, engagement):
+    target = {"kind": "model", "adapter": "openai_compatible", "model": "unit-model",
+              "endpointUrl": f"https://{PUBLIC_TEST_IP}/v1/chat/completions"}
+    facts = {key: value for key, value in binding_payload().items()
+             if key not in ("schema_version", "original_launcher", "participant_order")}
+    return ResolvedExecutionContext({**facts, "engagement_id": engagement["engagement_id"],
+      "engagement_hash": engagement["engagement_hash"], "asset_target": target,
+      "asset_target_digest": canonical_digest(target), "selected_candidates": ["node-a", "node-b"],
+      "engagement": engagement})
+
+  def launch(self, context, **changes):
+    captured = []
+    with patch(SECRETS + "R1fsSecretStore") as secret_store, \
+         patch(LAUNCH + "_artifact_repo") as artifacts, \
+         patch(LAUNCH + "_write_job_record", side_effect=lambda owner, job_id, row: deepcopy(row)), \
+         patch(LAUNCH + "_write_initial_progress"), \
+         patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")):
+      secret_store.return_value.save_model_test_provider_credentials.return_value = "secret-cid"
+      secret_store.return_value.last_key_metadata = {}
+      artifacts.return_value.put_job_config.side_effect = lambda config, **kw: captured.append(deepcopy(config)) or "config-cid"
+      result = launch_model_test(self.owner, **{**_valid_launch_kwargs(),
+        "tested_model": {"provider_label": "Saved provider"}, **changes}, execution_context=context)
+    return result, captured
+
+  def test_question_sets_stay_within_the_engagement_and_default_to_it(self):
+    # RM-107: the engagement's model asset lists the question sets a launch may run.
+    narrow = self.model_context({**self.engagement, "authorized_tests": ["prompt_injection_v1"]})
+    for selection in ({"test_set_id": "cbrn_safety_v1"}, {"test_set_id": None, "test_sets": [{"id": "cbrn_safety_v1"}]}):
+      with self.subTest(selection=selection):
+        result, captured = self.launch(narrow, **selection)
+        self.assertEqual((result.get("error"), result.get("status_code")), ("tests_exceed_authorization", 400))
+        self.assertEqual(result["unauthorized_features"], ["cbrn_safety_v1"])
+        self.assertEqual(captured, [])
+    result, captured = self.launch(narrow, test_set_id=None)
+    self.assertNotIn("error", result, result)
+    self.assertEqual([item["id"] for item in captured[0]["test_sets"]], ["prompt_injection_v1"])
+
+  def test_a_model_launch_needs_an_engagement_that_allows_single_pass(self):
+    continuous = self.model_context({**self.engagement, "allowed_run_modes": ["continuous"]})
+    with patch(LAUNCH + "attach_model_test_provider_secret") as attach:
+      result, captured = self.launch(continuous)
+    attach.assert_not_called()
+    self.assertEqual((result.get("error"), result.get("status_code"), result.get("allowed_run_modes")),
+                     ("run_mode_not_authorized", 400, ["continuous"]))
+    self.assertEqual(captured, [])
+
+  def test_a_provider_preflight_needs_an_engagement_that_allows_single_pass(self):
+    continuous = self.model_context({**self.engagement, "allowed_run_modes": ["continuous"]})
+    with patch(LAUNCH + "OpenAICompatibleProviderClient") as client:
+      result = preflight_model_test_provider(self.owner, created_by_id="actor", tested_model=_provider(),
+        tested_model_secret_payload={"api_key": "test-only"}, execution_context=continuous)
+    self.assertEqual((result["ok"], result.get("error"), result.get("allowed_run_modes")),
+                     (False, "run_mode_not_authorized", ["continuous"]))
+    client.assert_not_called()
+
+  def test_a_model_launch_on_a_scan_asset_is_a_target_mismatch(self):
+    from .test_tenant_execution_effects import context
+    for selection in ({"test_set_id": None}, {}):
+      with self.subTest(selection=selection):
+        result, captured = self.launch(context({"kind": "network", "address": "192.0.2.10"}), **selection)
+        self.assertEqual(result.get("error_class"), "execution_target_mismatch")
+        self.assertEqual(captured, [])
+
+  def test_the_job_config_carries_the_engagement_snapshot(self):
+    result, captured = self.launch(self.context)
+    self.assertNotIn("error", result, result)
+    engagement = self.engagement
+    self.assertEqual({key: captured[0][key] for key in ("engagement_id", "engagement_hash", "contract_sha256",
+                                                        "authorized_tests", "roe", "engagement", "authorization")},
+                     {"engagement_id": engagement["engagement_id"], "engagement_hash": engagement["engagement_hash"],
+                      "contract_sha256": engagement["contract_sha256"],
+                      "authorized_tests": engagement["authorized_tests"], "roe": engagement["roe"],
+                      "engagement": engagement["context"], "authorization": engagement["authorization"]})
 
   def test_conflicting_provider_denies_before_dns_client_or_secret_effects(self):
     for provider in ({**_provider(), "base_url": "https://foreign.example/v1"},

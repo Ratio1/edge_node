@@ -8,6 +8,7 @@ from uuid import uuid4
 from pydantic import create_model
 
 from .test_tenant_administration import FakeAdministrationStore
+from .contract_fixture import install_contract
 
 
 class TestTenantNodePlugin(unittest.TestCase):
@@ -37,7 +38,7 @@ class TestTenantNodePlugin(unittest.TestCase):
     admin = "initial" if domain == "one" else f"initial-{domain}"
     if admin != "initial":
       self.storage.account(admin)
-    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, admin)
+    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, admin, **install_contract(self.plugin))
     self.assertTrue(result["success"], result)
     tenant = result["data"]["tenantId"]
     self.storage.grant(admin, tenant)

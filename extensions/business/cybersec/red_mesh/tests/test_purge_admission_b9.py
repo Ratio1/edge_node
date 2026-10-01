@@ -17,6 +17,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
+from .contract_fixture import contract_terms
 
 SECRET = "mock-only-b9-canary"
 
@@ -45,7 +46,7 @@ class PurgeAdmissionCase(unittest.TestCase):
     administration = TenantAdministrationService(CstoreAuthAccountReader(self.store), self.tenants)
     request_id = str(uuid4())
     prepared = administration.prepare_tenant(
-      {"account_id": "creator"}, request_id, "Example", "example", "initial")
+      {"account_id": "creator"}, request_id, "Example", "example", "initial", **contract_terms())
     self.tenant_id = prepared["data"]["tenantId"]
     self.store.grant("initial", self.tenant_id)
     administration.activate_tenant({"account_id": "creator"}, request_id)

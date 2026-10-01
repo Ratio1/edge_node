@@ -382,8 +382,8 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snaps
 # ── Public API ──
 
 def _json_export_config(owner, job_specs):
-  """The MISP config a JSON download renders with: the tenant's record when it has one, node
-  config for a legacy unbound job, and the backend defaults for a bound tenant without a record.
+  """The MISP config a JSON download renders with: the tenant's record when it has one, and the
+  backend defaults for a bound tenant without a record or a job with no binding at all.
 
   A download has no destination, so the "exports nowhere" rule of tenant_export_binding does not
   apply (RM-093). The defaults are used rather than node config so a tenant's output never carries

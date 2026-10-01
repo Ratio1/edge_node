@@ -9,10 +9,24 @@ from extensions.business.cybersec.red_mesh.services.event_hooks import (
   emit_lifecycle_event,
 )
 from extensions.business.cybersec.red_mesh.services.integration_status import get_integration_status
+from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
+
+
+class _TenantEventOwner(MagicMock):
+  """A `_get_tenant_integration_config` lookup goes through the class, not the instance.
+
+  RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this fixture's
+  tenant needs its own wazuh record on file -- the same effective config as node-level, since
+  these tests are about event delivery, not tenant destination resolution.
+  """
+  def _get_tenant_integration_config(self, tenant_id, integration_id):
+    if integration_id == "wazuh":
+      return {"config": dict(self.cfg_wazuh_export)}
+    return None
 
 
 def _owner(event_export=None, wazuh_export=None):
-  owner = MagicMock()
+  owner = _TenantEventOwner()
   owner.cfg_instance_id = "tenant-a"
   owner.cfg_ee_node_network = "devnet"
   owner.cfg_event_export = {
@@ -49,6 +63,8 @@ def _job_specs():
     "target": "198.51.100.10",
     "authorized": True,
     "timeline": [],
+    # RM-108 phase 5: admission never yields a job with no execution_binding.
+    "execution_binding": binding_payload(),
   }
 
 
@@ -169,7 +185,8 @@ class TestEventLifecycleHooks(unittest.TestCase):
     self.assertEqual(result["status"], "error")
     self.assertEqual(result["error"], "RuntimeError")
     self.assertEqual(job_specs["soc_event_status"]["last_status"], "error")
-    status = get_integration_status(owner)["integrations"]["wazuh"]
+    tenant_id = job_specs["execution_binding"]["tenant_id"]
+    status = get_integration_status(owner, tenant_id=tenant_id)["integrations"]["wazuh"]
     self.assertEqual(status["last_error_class"], "RuntimeError")
     self.assertIsNotNone(status["last_failure_at"])
 
@@ -249,3 +266,20 @@ class TestEventLifecycleHooks(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestEngagementIdentifiesTheEventAuthorization(unittest.TestCase):
+  """RM-095: an engagement-bound job carries no document reference or scope_id; its events name the
+  engagement instead."""
+
+  def test_engagement_fields_fill_the_authorization_identifiers(self):
+    from extensions.business.cybersec.red_mesh.services.event_hooks import _job_specs_for_event
+    owner = MagicMock()
+    owner._get_job_config.return_value = {
+      "authorized": True, "scope_id": "", "authorization_ref": "",
+      "authorization": {"document_cid": "", "document_sha256": "a" * 64},
+      "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
+    }
+    specs = _job_specs_for_event(owner, _job_specs())
+    self.assertEqual((specs["authorization_id"], specs["authorization_ref"]),
+                     ("en_00000000-0000-4000-8000-000000000003", "e" * 64))

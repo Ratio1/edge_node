@@ -12,6 +12,7 @@ import pytest
 from .test_rulebook_assessment import _Owner, checked_read_producer
 from .read_endpoint_fixtures import as_role, read_endpoint_fixture
 from .test_tenant_read_native import assert_json_response, install, read_native, request, scheduler_comms
+from .test_execution_binding_models import binding_payload
 from extensions.business.cybersec.red_mesh.services import rulebook_assessment as service
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
@@ -19,15 +20,31 @@ from extensions.business.cybersec.red_mesh.tenancy.administration import Adminis
 
 PROFILE = service.DEFAULT_RULEBOOK_PROFILE_ID
 READERS = (service.get_rulebook_assessment_status, service.get_rulebook_review)
+BINDING = binding_payload()
+
+
+def _bind(owner):
+  """Attach a tenant binding to a producer fixture and its archived config for the checked path.
+
+  RM-108 phase 5: the checked-read boundary now requires a binding (there is no more legacy_unbound
+  mode), so a producer fixture built for the trusted global path needs one to exercise the same
+  reader through the checked path.
+  """
+  owner.job_specs["execution_binding"] = deepcopy(BINDING)
+  archive = getattr(owner, "archive", None) or owner.artifacts.get(owner.job_specs.get("job_cid"))
+  if isinstance(archive, dict) and isinstance(archive.get("job_config"), dict):
+    archive["job_config"]["execution_binding"] = deepcopy(BINDING)
+  return owner.job_specs
 
 
 @pytest.mark.parametrize("reader", READERS)
 def test_missing_rulebook_records_use_only_checked_job_and_exact_record_keys(reader):
   owner = _Owner()
+  _bind(owner)
   owner._get_job_from_cstore = MagicMock(side_effect=AssertionError("global fallback"))
   owner.artifact_repo.get_json = MagicMock(side_effect=AssertionError("unneeded artifact"))
   checked = deepcopy(owner.job_specs)
-  result = reader(owner, "job-1", checked_job=checked, snapshot_mode="legacy_unbound")
+  result = reader(owner, "job-1", checked_job=checked, snapshot_mode="tenant_bound")
   assert result["job_id"] == "job-1"
   assert result["submissions"] == [] and result["latest_submission"] is None
   if reader is service.get_rulebook_review:
@@ -76,8 +93,9 @@ def test_corrupt_or_foreign_selected_records_are_not_coerced_to_success(reader, 
 ))
 def test_checked_known_domain_errors_are_typed(reader, profile, job, status, code):
   owner = _Owner()
+  checked_job = {"job_id": "job-1", "execution_binding": deepcopy(BINDING), **job}
   with pytest.raises(AdministrationDenied) as caught:
-    reader(owner, "job-1", profile, checked_job={"job_id": "job-1", **job}, snapshot_mode="legacy_unbound")
+    reader(owner, "job-1", profile, checked_job=checked_job, snapshot_mode="tenant_bound")
   assert (caught.value.status_code, caught.value.error) == (status, code)
 
 
@@ -128,11 +146,12 @@ def install_rulebook_producer(fixture, state):
 def test_actual_producer_records_preserve_read_projection_without_effects(reader, state):
   owner = checked_read_producer(state)
   expected = reader(owner, "job-1")
+  _bind(owner)
   owner._get_job_from_cstore = MagicMock(side_effect=AssertionError("unchecked lookup"))
   owner.chainstore_hset = MagicMock(side_effect=AssertionError("write"))
   owner.r1fs.reset_mock()
   owner.r1fs.add_json.side_effect = AssertionError("artifact write")
-  actual = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+  actual = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
   assert actual == expected
   owner.r1fs.add_json.assert_not_called()
 
@@ -315,7 +334,8 @@ def test_checked_profile_defaults_and_historical_metadata(reader, profile):
   meta = owner.job_specs["rulebook_assessments"][PROFILE]
   del meta["profile_id"]
   meta["profile_version"] = "0.9.0"
-  result = reader(owner, "job-1", profile, checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+  _bind(owner)
+  result = reader(owner, "job-1", profile, checked_job=owner.job_specs, snapshot_mode="tenant_bound")
   assert result.get("profile_id", result.get("profile", {}).get("profile_id")) == PROFILE
   if reader is service.get_rulebook_assessment_status:
     assert result["profile_version"] == "0.9.0" and result["generated"] is True
@@ -325,18 +345,19 @@ def test_checked_profile_defaults_and_historical_metadata(reader, profile):
 @pytest.mark.parametrize("corrupt", (False, True))
 def test_explicit_unsupported_contract_is_distinct_from_child_corruption(reader, corrupt):
   owner = checked_read_producer("submitted")
+  _bind(owner)
   row = owner.records[(owner.cfg_instance_id + ":rulebook_review:submissions", "job-1:" + PROFILE)]
   row["contract_version"] = "future"
   if corrupt:
     row["submissions"][0]["profile_id"] = "foreign"
     with pytest.raises(TenantStoreError):
-      reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+      reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
   elif reader is service.get_rulebook_review:
     with pytest.raises(AdministrationDenied) as caught:
-      reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+      reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
     assert (caught.value.status_code, caught.value.error) == (503, "submission_contract_unsupported")
   else:
-    result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+    result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
     assert result["submission_contract_version"] is None and result["submission_contract_unsupported"] is True
     assert "submissions" not in result
 
@@ -356,6 +377,7 @@ def test_audit_integrity_is_not_hidden_by_compatibility_getter(value):
 @pytest.mark.parametrize("fault", ("foreign", "missing", "binding", "nonfinite", "no_pass", "last_order"))
 def test_staleness_uses_checked_pass_parents_only_and_does_not_hide_integrity_errors(reader, fault):
   owner = checked_read_producer("submitted")
+  _bind(owner)
   archive = owner.archive
   if fault == "foreign":
     archive["job_id"] = "foreign"
@@ -378,11 +400,11 @@ def test_staleness_uses_checked_pass_parents_only_and_does_not_hide_integrity_er
   owner.artifact_repo.get_json = read
   owner._get_job_from_cstore = MagicMock(side_effect=AssertionError("unchecked lookup"))
   if fault in ("no_pass", "last_order"):
-    result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+    result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
     assert result["latest_submission"]["stale"] is False
   else:
     with pytest.raises(TenantStoreError):
-      reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+      reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
   assert reads == ["archive-cid"]
 
 
@@ -455,6 +477,7 @@ def test_deepcopied_records_are_validated_after_copy(reader, kind):
 @pytest.mark.parametrize("reader", READERS)
 def test_record_copy_precedes_the_next_storage_read_and_output_is_detached(reader):
   owner = checked_read_producer("draft")
+  _bind(owner)
   original = owner.chainstore_hget
   review_key = (owner.cfg_instance_id + ":rulebook_review", "job-1:" + PROFILE)
   def get(hkey, key):
@@ -462,7 +485,7 @@ def test_record_copy_precedes_the_next_storage_read_and_output_is_detached(reade
       owner.records[review_key]["profile_id"] = "mutated-after-review-read"
     return original(hkey, key)
   owner.chainstore_hget = get
-  result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+  result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
   assert result["review_revision"] == 1
   if reader is service.get_rulebook_review:
     assert result["review"]["profile_id"] == PROFILE
@@ -473,6 +496,7 @@ def test_record_copy_precedes_the_next_storage_read_and_output_is_detached(reade
 @pytest.mark.parametrize("reader", READERS)
 def test_live_staleness_reads_pass_parents_in_producer_order_without_hydrating_children(reader):
   owner = checked_read_producer("submitted")
+  _bind(owner)
   owner.job_specs.pop("job_cid")
   owner.job_specs["pass_reports"] = [{"pass_nr": 99, "report_cid": "older"}, {"pass_nr": 3, "report_cid": "newest"}]
   owner.artifacts.update({"older": {"pass_nr": 99, "aggregated_report_cid": "private-aggregate"},
@@ -483,7 +507,7 @@ def test_live_staleness_reads_pass_parents_in_producer_order_without_hydrating_c
     assert cid in ("older", "newest")
     return owner.artifacts[cid]
   owner.artifact_repo.get_json = read
-  result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+  result = reader(owner, "job-1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
   assert result["latest_submission"]["stale"] is False and reads == ["older", "newest"]
 
 
@@ -491,8 +515,9 @@ def test_live_staleness_reads_pass_parents_in_producer_order_without_hydrating_c
 def test_colon_bearing_job_uses_the_exact_canonical_profile_record_key(reader):
   owner = _Owner()
   owner.job_specs["job_id"] = "job:1"
+  _bind(owner)
   owner.chainstore_hget = MagicMock(return_value=None)
-  result = reader(owner, "job:1", checked_job=owner.job_specs, snapshot_mode="legacy_unbound")
+  result = reader(owner, "job:1", checked_job=owner.job_specs, snapshot_mode="tenant_bound")
   assert result["job_id"] == "job:1"
   assert all(call.kwargs["key"] == "job:1:" + PROFILE for call in owner.chainstore_hget.call_args_list)
 

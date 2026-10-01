@@ -9,6 +9,7 @@ from extensions.business.cybersec.red_mesh.tenancy.administration import TenantA
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+from .contract_fixture import contract_terms
 
 
 def assignment_location(*ids):
@@ -36,7 +37,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     admin = "initial" if domain == "one" else f"initial-{domain}"
     if admin != "initial":
       self.owner.account(admin)
-    prepared = self.service.prepare_tenant(self.actor, request, domain, domain, admin)
+    prepared = self.service.prepare_tenant(self.actor, request, domain, domain, admin, **contract_terms())
     self.assertTrue(prepared["success"], prepared)
     tenant = prepared["data"]["tenantId"]
     self.owner.grant(admin, tenant)
@@ -240,7 +241,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
       self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["status_code"], 503)
     self.owner.account("initial-pending")
     pending = self.service.prepare_tenant(self.actor, str(uuid4()), "Pending", "pending",
-                                          "initial-pending")["data"]["tenantId"]
+                                          "initial-pending", **contract_terms())["data"]["tenantId"]
     self.assertEqual(self.service.get_tenant_nodes(self.actor, pending)["status_code"], 404)
     self.assertEqual(self.service.set_tenant_node_assignment(self.actor, pending, "Node-A", True)["status_code"], 404)
 

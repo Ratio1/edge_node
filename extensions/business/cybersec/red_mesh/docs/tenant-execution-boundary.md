@@ -17,16 +17,31 @@ launch, no legacy read path and no rollout: `ExecutionRollout`, the `execution_r
 `TENANT_EXECUTION_ENABLED`/`TENANT_EXECUTION_STAGE`, `LegacyReadAccess` and `_admit_actor_only` are
 deleted. Every launch names `tenant_id`, `asset_id` and `expected_target_digest` (an incomplete
 selector is `400 invalid_request`); every job read names `tenant_id`; an unbound record can no longer
-be operated on. Paragraphs below that describe compatibility admission, `legacy_unbound` snapshots or
+be operated on.
+
+**RM-107 phase 2 (2026-09-28): the engagement owns its assets.** The launch selectors are now
+`tenant_id`, `engagement_id` and `engagement_asset_id` on all five routes (a blank `engagement_id`
+is `400 engagement_required`, any other incomplete selector `400 invalid_request`); `asset_id`,
+`expected_target_digest` and the 409 on a changed digest are gone, and model launches and preflight
+are engagement-gated. The binding is schema 2 (`engagement_id`, `engagement_asset_id`,
+`engagement_hash` instead of `asset_id`); schema 1 still parses for reads but is never reauthorized.
+Reauthorization re-reads the engagement entry (same target and hash), `tasks:launch` and Allow
+Pentester. The tenant asset record and its operations are removed. Phase 3: a scan launch whose
+normalized run mode (empty is continuous) is outside the engagement's `allowed_run_modes` is
+`400 run_mode_not_authorized`, before any unsafe-launch confirmation. The selector paragraphs below are
+the RM-084 history. Current contract: the hub's `docs/resources/redmesh/contracts/engagements.md`
+§Target v2. Paragraphs below that describe compatibility admission, `legacy_unbound` snapshots or
 rollout stages are the history of how the boundary was built, not current behaviour. The current
 account and authority contract is the hub's `docs/resources/redmesh/contracts/redmesh-auth.md`.
 
 ## Admission and compatibility
 
-The four launch endpoints and model-provider preflight append `tenant_id`, `asset_id` and
-`expected_target_digest`, preserving existing positional arguments. All three selectors are required
-together for tenant execution. A saved target is derived server-side; repeated matching target
-values are accepted, different protected values are denied. A changed target digest returns 409.
+The four launch endpoints and model-provider preflight append `tenant_id`, `engagement_id` and
+`engagement_asset_id` (RM-107), preserving existing positional arguments. All three selectors are
+required together for tenant execution. The target is taken from the engagement's asset entry
+server-side; repeated matching target values are accepted, different protected values are denied. An
+unknown `engagement_asset_id` is `400 engagement_asset_not_locked`; the entry is the definition, so
+there is no target drift and no digest selector.
 Model preflight now also accepts the trusted forwarded actor. Only the two original model endpoints
 retain their existing token requirement; no new shared token or wallet proof is introduced.
 

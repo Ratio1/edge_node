@@ -1,5 +1,4 @@
-"""Strict preset asset values and persisted domain records; no runtime target requests."""
-from datetime import datetime, timezone
+"""Strict target, port-scope and digest values shared by engagements and execution; no runtime target requests."""
 from hashlib import sha256
 from ipaddress import IPv4Address, IPv6Address
 import json
@@ -7,7 +6,6 @@ import re
 from uuid import UUID
 from urllib.parse import unquote
 
-from .identity import canonical_account_id
 from ..graybox.http_client import path_in_scope
 
 
@@ -192,25 +190,3 @@ def ports_outside_scope(ports, scope):
   ranges = port_scope_ranges(scope)
   return sorted(port for port in set(ports)
                 if not any(low <= port <= high for low, high in ranges))
-
-
-def validate_asset(row, ids):
-  if (len(ids) != 2 or row.get("tenant_id") != ids[0] or row.get("asset_id") != ids[1]
-      or ids[1] != "as_" + canonical_uuid(row.get("request_id"))
-      or type(row.get("active")) is not bool
-      or normalize_name(row.get("display_name")) != row["display_name"]
-      or normalize_target(row.get("target")) != row["target"]
-      or not valid_digest(row.get("create_intent_digest"))
-      or canonical_digest(row["target"]) != row.get("target_digest")):
-    raise ValueError("Invalid asset")
-  for field in ("created_by", "changed_by"):
-    if not row.get(field) or canonical_account_id(row[field]) != row[field]:
-      raise ValueError("Invalid asset attribution")
-  for field in ("created_at", "changed_at"):
-    if not isinstance(row.get(field), str) or datetime.fromisoformat(row[field]).tzinfo != timezone.utc:
-      raise ValueError("Invalid asset timestamp")
-  if "authorized_ports" in row and (row["target"]["kind"] != "network"
-      or normalize_port_scope(row["authorized_ports"]) != row["authorized_ports"]):
-    raise ValueError("Invalid asset port scope")
-  # Unknown stored fields are preserved, but must still form a valid JSON version/readback value.
-  canonical_digest(row)

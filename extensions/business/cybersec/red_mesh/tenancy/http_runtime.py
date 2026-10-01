@@ -10,7 +10,7 @@ _ROUTES = (
   "launch_model_test", "preflight_model_test_provider",
 )
 _ERROR = "Incompatible generated execution API"
-_SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
+_SELECTORS = ("tenant_id", "engagement_id", "engagement_asset_id")
 
 
 def _validate_model(model, base_model, validation_error, field_info):

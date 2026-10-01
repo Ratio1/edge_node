@@ -177,6 +177,11 @@ class AggregatedScanData:
   graybox_results: dict = None
   target: str = None
   scan_type: str = None
+  # RM-094: the port-discovery scan mode this pass ran (connect | syn). Same
+  # round-trip caveat as the fields above — undeclared here means dropped from
+  # the archive. Refuse-at-launch means it equals the requested mode, so it is
+  # the effective mode of the pass.
+  scan_mode: str = None
   # Graybox safety-gate abort state, merged across workers by
   # `GrayboxLocalWorker.get_worker_specific_result_fields`. None (stripped)
   # on a network scan or a clean graybox run; the same round-trip caveat as
@@ -207,6 +212,7 @@ class AggregatedScanData:
       graybox_results=d.get("graybox_results"),
       target=d.get("target"),
       scan_type=d.get("scan_type"),
+      scan_mode=d.get("scan_mode"),
       aborted=d.get("aborted") or None,
       abort_reason=d.get("abort_reason") or None,
       abort_phase=d.get("abort_phase") or None,

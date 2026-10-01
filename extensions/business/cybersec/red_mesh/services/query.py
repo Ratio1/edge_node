@@ -579,11 +579,7 @@ def list_network_jobs(owner, *, checked_jobs=_UNSET, snapshot_mode="tenant_bound
   # are in `pass_reports`, which the listing projection drops).
   review_specs = {}
   for job_key, job_spec in raw_network_jobs.items():
-    if scoped and snapshot_mode == "legacy_unbound":
-      # The trusted reader already normalized the captured row without migrating its alias key.
-      normalized_key, normalized_spec = job_key, job_spec
-    else:
-      normalized_key, normalized_spec = owner._normalize_job_record(job_key, job_spec)
+    normalized_key, normalized_spec = owner._normalize_job_record(job_key, job_spec)
     if scoped and snapshot_mode == "tenant_bound":
       if normalized_key != job_key:
         raise TenantStoreError("Tenant jobs are unavailable")

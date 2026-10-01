@@ -39,8 +39,11 @@ class FakeContext:
 
 
 class TestExportBinding(unittest.TestCase):
-  def test_an_unbound_job_is_legacy_and_uses_the_node(self):
-    self.assertEqual(tenant_export_binding(Owner(), {"job_id": "j"}, "misp"), (None, None))
+  def test_an_unbound_job_is_refused_not_treated_as_legacy(self):
+    # RM-108 phase 5: admission never yields an unbound job; an absent binding is refused like a
+    # malformed one.
+    self.assertEqual(tenant_export_binding(Owner(), {"job_id": "j"}, "misp"),
+                     (None, TENANT_INTEGRATION_NOT_CONFIGURED))
 
   def test_a_bound_job_whose_tenant_configured_the_integration_resolves_it(self):
     owner = Owner(records={(TENANT, "misp"): record()})

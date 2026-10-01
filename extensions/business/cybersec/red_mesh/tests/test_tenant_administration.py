@@ -8,7 +8,7 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService, TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
-from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_tenant import CstoreTenantReader
+from .contract_fixture import contract_terms, install_contract
 
 
 class FakeAdministrationStore:
@@ -88,7 +88,8 @@ class TestTenantAdministration(unittest.TestCase):
     self.request = str(uuid4())
 
   def prepare(self, **changes):
-    values = dict(request_id=self.request, display_name=" Example ", domain_id="example", initial_admin_id=" INITIAL ")
+    values = dict(request_id=self.request, display_name=" Example ", domain_id="example", initial_admin_id=" INITIAL ",
+                  **contract_terms())
     values.update(changes)
     return self.service.prepare_tenant(self.actor, **values)
 
@@ -105,7 +106,7 @@ class TestTenantAdministration(unittest.TestCase):
     tenant_id = prepared["tenantId"]
     self.assertEqual(prepared["state"], "pending")
     self.assertEqual(len(tenant_id), 39)
-    self.assertIsNone(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id))
+    self.assertFalse(self.repo.get("tenant", tenant_id)["active"])
     self.assertEqual(self.service.list_tenants(self.actor)["data"], [])
     self.assertEqual(self.service.activate_tenant(self.actor, self.request)["status_code"], 409)
     self.store.grant("initial", tenant_id)
@@ -113,12 +114,13 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(activated["tenantId"], tenant_id)
     self.assertEqual(activated["displayName"], "Example")
     self.assertFalse(activated["allowPentester"])
-    self.assertEqual((activated["memberCount"], activated["adminCount"], activated["assetCount"]), (1, 1, 0))
+    self.assertEqual((activated["memberCount"], activated["adminCount"]), (1, 1))
+    self.assertNotIn("assetCount", activated)
     self.assertTrue(activated["canUpdateAllowPentester"])
     self.assertEqual(self.service.get_tenant({"account_id": "initial"}, tenant_id)["data"],
                      {**activated, "canUpdateAllowPentester": False,
                       "assignableMemberRoles": ["tenant_admin", "tenant_user"]})
-    self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).active)
+    self.assertTrue(self.repo.get("tenant", tenant_id)["active"])
 
   def test_matching_pending_retry_resumes_but_changed_intent_never_writes(self):
     first = self.prepare()["data"]
@@ -140,7 +142,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(result["data"]["allowPentesterChangedBy"], "creator")
     self.assertTrue(result["data"]["allowPentesterChangedAt"])
     self.assertEqual(self.service.get_tenant(self.actor, tenant_id)["data"], result["data"])
-    self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).allow_pentester)
+    self.assertTrue(self.repo.get("tenant", tenant_id)["allow_pentester"])
     stored = self.repo.get("tenant", tenant_id)
     for field, value in before.items():
       if field != "allow_pentester":
@@ -336,7 +338,8 @@ class TestTenantAdministration(unittest.TestCase):
     other = {"account_id": "other"}
     before = len(self.store.writes)
     self.assertEqual(self.service.activate_tenant(other, self.request)["status_code"], 404)
-    self.assertEqual(self.service.prepare_tenant(other, self.request, "Example", "example", "initial")["status_code"], 409)
+    self.assertEqual(self.service.prepare_tenant(other, self.request, "Example", "example", "initial",
+                                                 **contract_terms(uploaded_by="other"))["status_code"], 409)
     self.assertEqual(len(self.store.writes), before)
 
   def test_each_observable_failed_write_is_unavailable_and_retryable(self):
@@ -409,7 +412,7 @@ class TestTenantAdministration(unittest.TestCase):
 
     def prepare(_):
       service = TenantAdministrationService(CstoreAuthAccountReader(self.store), self.repo)
-      return service.prepare_tenant(self.actor, self.request, "Example", "example", "initial")
+      return service.prepare_tenant(self.actor, self.request, "Example", "example", "initial", **contract_terms())
 
     with ThreadPoolExecutor(max_workers=8) as executor:
       results = list(executor.map(prepare, range(16)))
@@ -634,7 +637,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     actor = {"account_id": "creator"}
     request_id = str(uuid4())
     with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
-      tenant_id = plugin.prepare_tenant(actor, request_id, "Tenant", "tenant", "initial")["data"]["tenantId"]
+      tenant_id = plugin.prepare_tenant(actor, request_id, "Tenant", "tenant", "initial", **install_contract(plugin))["data"]["tenantId"]
       store.grant("initial", tenant_id)
       plugin.activate_tenant(actor, request_id)
       for value in (True, False, 0, 1, "true", "false", None, [], {}):
@@ -652,11 +655,12 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
   def test_missing_namespace_denies_every_administration_method_before_store_access(self):
     from unittest.mock import MagicMock
     methods = ("prepare_tenant", "activate_tenant", "list_tenants", "get_tenant", "get_tenant_members",
-               "check_tenant_domain", "authorize_tenant_membership", "authorize_tenant_account_creation",
+               "check_tenant_domain", "upload_tenant_contract", "get_tenant_contract",
+               "download_tenant_contract", "authorize_tenant_membership",
+               "authorize_tenant_account_creation",
                "authorize_account_state_change",
                "update_tenant_allow_pentester",
-               "get_tenant_nodes", "set_tenant_node_assignment", "list_tenant_assets",
-               "get_tenant_asset", "create_tenant_asset", "update_tenant_asset")
+               "get_tenant_nodes", "set_tenant_node_assignment")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
     for namespace in (None, " ", 7):
       for name in methods:
@@ -680,7 +684,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
     actor = {"account_id": "creator", "namespace": "browser-ignored"}
     request = str(uuid4())
     with patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"}):
-      prepared = plugin.prepare_tenant(actor, request, "Tenant", "tenant", "initial")
+      prepared = plugin.prepare_tenant(actor, request, "Tenant", "tenant", "initial", **install_contract(plugin))
       self.assertTrue(prepared["success"], prepared)
       tenant_id = prepared["data"]["tenantId"]
       store.grant("initial", tenant_id)

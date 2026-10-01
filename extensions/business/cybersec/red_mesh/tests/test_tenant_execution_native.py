@@ -76,7 +76,7 @@ TENANT_REQUIRED_READ_ROUTES = (JOB_READ_ROUTES + TENANT_EXPORT_STATUS_ROUTES + T
                                + TENANT_JSON_EXPORT_ROUTES + TENANT_REVIEW_READ_ROUTES
                                + TENANT_ARTIFACT_READ_ROUTES)
 READ_ROUTES = LEGACY_READ_ROUTES + TENANT_REQUIRED_READ_ROUTES
-SELECTORS = ("tenant_id", "asset_id", "expected_target_digest")
+SELECTORS = ("tenant_id", "engagement_id", "engagement_asset_id")
 ERROR = "Incompatible generated execution API"
 
 
@@ -411,10 +411,10 @@ def test_raw_json_preserves_positional_dispatch_and_rejects_malformed_selectors(
     assert parameters[selector].default is None
 
   async def checks():
-    for payload in ({}, dict(zip(SELECTORS, ("tenant-A", "asset-A", "digest-A"))),
+    for payload in ({}, dict(zip(SELECTORS, ("tenant-A", "engagement-A", "asset-A"))),
                     {"tenant_id": ""}, {"tenant_id": " \t "},
-                    {"tenant_id": "tenant-A"}, {"asset_id": "asset-A"},
-                    {"expected_target_digest": "digest-A"}):
+                    {"tenant_id": "tenant-A"}, {"engagement_id": "engagement-A"},
+                    {"engagement_asset_id": "asset-A"}):
       assert await _request(module, name, payload) == (200, 1)
       expected_args = tuple(
         "fixture-only-token" if key == "token" else payload.get(key, parameter.default)

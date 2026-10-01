@@ -413,6 +413,17 @@ class TestJwtWeakAlgPTA0212(unittest.TestCase):
     self.assertEqual(f[0].status, "vulnerable")
     self.assertEqual(f[0].severity, "HIGH")
 
+  def test_pt_a02_12_is_located_at_the_protected_endpoint(self):
+    """The forged token is accepted at the protected endpoint, so that is where the finding lives.
+    Its evidence names both paths, which `location_from_evidence` treats as ambiguous (no asset at
+    all), so the probe states the location explicitly."""
+    me = _mock_response(status=200, content_type="application/json")
+    me.json = MagicMock(return_value={"username": "alice", "is_admin": True, "alg": "none"})
+    probe = self._setup(me)
+    probe._test_jwt_weak_alg()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-12" and x.status == "vulnerable"]
+    self.assertEqual(f[0].url, probe.target_url + "/api/me/")
+
   def test_pt_a02_12_not_vulnerable_when_alg_none_rejected(self):
     me = _mock_response(status=401, content_type="application/json")
     me.json = MagicMock(return_value={"error": "invalid_token"})

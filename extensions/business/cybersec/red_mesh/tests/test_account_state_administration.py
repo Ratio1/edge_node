@@ -12,6 +12,7 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 
 from .test_tenant_administration import FakeAdministrationStore
+from .contract_fixture import contract_terms
 
 
 class TestAccountStateAdministration(unittest.TestCase):
@@ -32,7 +33,7 @@ class TestAccountStateAdministration(unittest.TestCase):
   def create(self):
     request = str(uuid4())
     prepared = self.service.prepare_tenant(self.creator, request_id=request, display_name="Example",
-                                           domain_id="example", initial_admin_id="initial")
+                                           domain_id="example", initial_admin_id="initial", **contract_terms())
     self.assertTrue(prepared["success"], prepared)
     tenant_id = prepared["data"]["tenantId"]
     self.store.grant("initial", tenant_id)
@@ -97,7 +98,7 @@ class TestAccountStateAdministration(unittest.TestCase):
     request = str(uuid4())
     self.store.account("second_admin")
     prepared = self.service.prepare_tenant(self.creator, request_id=request, display_name="Second",
-                                           domain_id="second", initial_admin_id="second_admin")
+                                           domain_id="second", initial_admin_id="second_admin", **contract_terms())
     tenant_id = prepared["data"]["tenantId"]
     self.store.grant("second_admin", tenant_id)
     self.assertTrue(self.service.activate_tenant(self.creator, request)["success"])

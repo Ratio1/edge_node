@@ -124,7 +124,16 @@ class TestHappyPath(unittest.TestCase):
     self.assertIsNone(sanitized["engagement_metadata"])
     self.assertEqual(sanitized["authorization_ref"], "")
     self.assertEqual(sanitized["scope_id"], "")
-    self.assertIsNone(sanitized["target_allowlist"])
+
+  def test_target_allowlist_survives_for_runtime_enforcement(self):
+    """The allowlist is technical scope the graybox worker enforces on every later pass: redacting
+    a continuous job must not let its later passes run without it (RM-095, owner 2026-09-28)."""
+    specs, repo = _build_specs()
+    result = delete_engagement_data(
+      job_id="abc123", job_specs=specs, artifact_repo=repo,
+    )
+    sanitized = repo.configs[result.new_job_config_cid]
+    self.assertEqual(sanitized["target_allowlist"], ["10.0.0.1"])
 
   def test_technical_scan_record_preserved(self):
     """Target / ports / mode must survive the deletion."""
@@ -148,6 +157,19 @@ class TestHappyPath(unittest.TestCase):
     expected = {"QmAuthDoc1", "QmAuthThumb1", "QmCloudAuth1",
                 "QmMsspAuth1", "QmLegacyAuthRef"}
     self.assertEqual(set(repo.deleted), expected)
+
+  def test_engagement_bound_job_keeps_the_engagement_documents(self):
+    # RM-095: the snapshot points at the engagement's documents, which other jobs share and the
+    # engagement hash covers; `third_party_auth_cids` are free text. Only the snapshot goes.
+    _, repo = _build_specs()
+    config = {**repo.configs["QmInitial1"], "engagement_id": "en_00000000-0000-4000-8000-000000000003",
+              "engagement_hash": "a" * 64}
+    specs, repo = _build_specs(config=config)
+    result = delete_engagement_data(job_id="abc123", job_specs=specs, artifact_repo=repo)
+    self.assertEqual((result.documents_deleted, result.documents_failed, repo.deleted), (0, 0, []))
+    sanitized = repo.configs[result.new_job_config_cid]
+    self.assertEqual([sanitized[key] for key in ("engagement", "roe", "authorization")], [None] * 3)
+    self.assertEqual(sanitized["engagement_id"], config["engagement_id"])
 
   def test_job_specs_updated_to_new_cid(self):
     specs, repo = _build_specs()

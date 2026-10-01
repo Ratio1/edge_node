@@ -14,6 +14,7 @@ from extensions.business.cybersec.red_mesh.tests.test_stix_export import (
   _sample_aggregated,
   _sample_archive,
 )
+from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
 
 
 def _owner(opencti_config=None, job_specs=None):
@@ -26,6 +27,8 @@ def _owner(opencti_config=None, job_specs=None):
     "job_config_cid": "config-cid",
     "date_created": 1770000000.0,
     "date_completed": 1770000300.0,
+    # RM-108 phase 5: admission never yields an unbound job.
+    "execution_binding": binding_payload(),
   }
 
   class Owner:
@@ -67,6 +70,16 @@ def _owner(opencti_config=None, job_specs=None):
     def _write_job_record(self, job_id, updated, context=""):
       self.job_specs = updated
       return updated
+
+    def _get_tenant_integration_config(self, tenant_id, integration_id):
+      # RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this
+      # fixture's tenant needs its own record on file -- the same effective config as node-level,
+      # since these tests are about export behavior, not tenant destination resolution.
+      if integration_id == "opencti":
+        return {"config": dict(self.cfg_opencti_export)}
+      if integration_id == "stix":
+        return {"config": dict(self.cfg_stix_export)}
+      return None
 
     def chainstore_hget(self, hkey, key):
       return records.get((hkey, key))
@@ -159,6 +172,7 @@ class TestOpenCtiExport(unittest.TestCase):
       "job_type": "model_test",
       "scan_type": "model_test",
       "job_cid": "model-archive",
+      "execution_binding": binding_payload(),
     })
 
     dry_run = dry_run_opencti_export(owner, "job-1")

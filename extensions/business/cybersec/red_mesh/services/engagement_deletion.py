@@ -19,7 +19,6 @@ What gets deleted
     JobConfig.engagement_metadata
     JobConfig.authorization_ref
     JobConfig.scope_id
-    JobConfig.target_allowlist
 
   R1FS objects (when delete_documents=True, default):
     The R1FS object pointed to by authorization.document_cid
@@ -30,7 +29,9 @@ What is preserved
 -----------------
 
   Everything else on the JobConfig (target, ports, mode, features,
-  worker count, etc.). Findings, pass reports, scan metrics,
+  worker count, etc.), including `target_allowlist`: it is technical
+  scope the graybox worker enforces on every later pass, so a redacted
+  continuous job keeps its path limits (RM-095). Findings, pass reports, scan metrics,
   timeline events. The job remains discoverable and viewable; it
   just no longer carries client identity / objectives / contacts /
   authorization paperwork.
@@ -235,7 +236,6 @@ _LEGACY_FIELDS = (
   "engagement_metadata",
   "authorization_ref",
   "scope_id",
-  "target_allowlist",
 )
 
 
@@ -266,7 +266,15 @@ def _strip_engagement(config: dict) -> tuple[dict, int]:
 
 def collect_engagement_document_cids(config: dict) -> list[str]:
   """Walk the AuthorizationRef and legacy authorization_ref fields and
-  return every R1FS CID that points to an uploaded auth document."""
+  return every R1FS CID that points to an uploaded auth document.
+
+  A job launched under an engagement (RM-095) owns no documents: its
+  snapshot points at the engagement's, which other jobs share and the
+  engagement record hashes, and its `third_party_auth_cids` are free
+  text. Nothing is returned for it, so only the snapshot is redacted.
+  """
+  if config.get("engagement_id"):
+    return []
   out: list[str] = []
   auth = config.get("authorization") or {}
   if isinstance(auth, dict):

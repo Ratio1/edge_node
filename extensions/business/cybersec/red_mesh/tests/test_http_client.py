@@ -45,9 +45,10 @@ class TestBoundGrayboxHttpClient(unittest.TestCase):
     target = target or {"kind": "webapp", "url": "https://target.example/api/public",
                         "allowedPathPrefix": "/api/public"}
     return ExecutionBinding({
-      "schema_version": 1, "namespace": "deployment",
+      "schema_version": 2, "namespace": "deployment",
       "tenant_id": "tn_11111111-1111-4111-8111-111111111111",
-      "asset_id": "as_22222222-2222-4222-8222-222222222222",
+      "engagement_id": "en_33333333-3333-4333-8333-333333333333",
+      "engagement_asset_id": "ea_1", "engagement_hash": "e" * 64,
       "asset_target": target, "asset_target_digest": canonical_digest(target),
       "actor_id": "actor", "actor_generation": "generation-1",
       "node_failure_policy": "stop", "original_launcher": "node-a",

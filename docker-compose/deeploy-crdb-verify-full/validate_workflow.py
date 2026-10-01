@@ -15,7 +15,7 @@ from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_
 NETWORK = "deeploy-crdb-verify-full"
 IMAGE = os.environ.get(
   "CRDB_IMAGE",
-  "ghcr.io/ratio1/r1-meshdb@sha256:3be00a63467628d0f5c3382be8ae7a885c5b658762dfd095fba0cb0b5549fab4",
+  "ghcr.io/ratio1/r1db@sha256:c87fd7d8203eb9ded1abd0e0470c0858828ab2139434481d65341de863228f93",
 )
 CLIENT_IMAGE = os.environ.get("CRDB_CLIENT_IMAGE", "postgres:16-alpine")
 SNIFFER_IMAGE = os.environ.get("CRDB_SNIFFER_IMAGE", "nicolaka/netshoot:v0.13")
