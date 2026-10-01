@@ -129,7 +129,7 @@ class CstoreTenantAdministrationStore:
       raise TenantStoreError("Tenant storage enumeration is unavailable")
     return records
 
-  def _fields(self, kind, tenant_id=None):
+  def _fields(self, kind, tenant_id=None, node_address=None):
     for key, raw in self._records().items():
       # A deleted record (RM-107 `delete`) is a tombstone, not a row.
       if raw is None:
@@ -143,6 +143,10 @@ class CstoreTenantAdministrationStore:
           and field[:2] == [kind, self._namespace]):
         if tenant_id is not None and field[2] != tenant_id:
           continue
+        # RM-102: the cross-tenant read for one node skips rows naming another node, so their
+        # corruption cannot block an unrelated assignment.
+        if node_address is not None and (len(field) < 4 or field[3] != node_address):
+          continue
         if key != self._location(kind, field[2:])[1]:
           raise TenantStoreError("Invalid tenant storage field")
         yield field[2:], raw
@@ -151,6 +155,14 @@ class CstoreTenantAdministrationStore:
     self._location("tenant_node", (tenant_id,))
     return [self._validate(raw, "tenant_node", ids)
             for ids, raw in self._fields("tenant_node", tenant_id)]
+
+  def list_node_assignments_for_node(self, node_address):
+    """RM-102: every tenant's row for one node, for the write validator's cross-tenant conflict
+    check. Rows are selected by the node in their field key; a malformed row naming this node
+    fails the read closed, one naming another node is never decoded."""
+    self._location("tenant_node", (node_address,))
+    return [self._validate(raw, "tenant_node", ids)
+            for ids, raw in self._fields("tenant_node", node_address=node_address)]
 
   def list_engagements(self, tenant_id):
     self._location("engagement", (tenant_id,))

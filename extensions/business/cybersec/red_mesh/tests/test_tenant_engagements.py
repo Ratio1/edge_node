@@ -36,7 +36,9 @@ class TestTenantEngagements(unittest.TestCase):
     self.addCleanup(env.stop)
     self.owner = FakeAdministrationStore()
     self.store = CstoreTenantAdministrationStore(self.owner, "deployment")
-    self.service = TenantAdministrationService(CstoreAuthAccountReader(self.owner), self.store)
+    # RM-102: this fixture models no job records, so a release always finds none running.
+    self.service = TenantAdministrationService(CstoreAuthAccountReader(self.owner), self.store,
+      tenant_node_jobs_reader=lambda tenant_id, node_address: False)
     self.actor = {"account_id": "creator"}
     self.tenant = self.new_tenant("tenant", contract=True)
     self.request = str(uuid4())

@@ -236,6 +236,25 @@ class TestTenantExecution(unittest.TestCase):
     with self.assertRaises(AdministrationDenied):
       self.service.reauthorize_execution(binding)
 
+  def test_a_draining_row_blocks_new_launches_but_still_reauthorizes_its_own_job(self):
+    """RM-102. Release while the tenant's job keeps running on the node enters `draining`: a new
+    launch no longer sees the node, but the job already running on it still reauthorizes."""
+    asset = self.ready()
+    binding = self.admit(self.actor, asset).build_binding("coordinator", ["node-a"])
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: True
+    result = self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-a", False)
+    self.assertEqual(result["data"]["state"], "draining")
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.admit(self.actor, asset, ["node-a"])
+    self.assertEqual(denied.exception.error, "ineligible_node")
+    self.assertEqual(self.admit(self.actor, asset).to_dict()["selected_candidates"], ["node-b"])
+    # The job ends: the row reads as released, and launches see the node eligible again once it is
+    # written back in (release once more, then a fresh assignment).
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: False
+    self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
+                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned"}])
+
   def test_existing_execution_checks_namespace_publication_engagement_and_current_configuration(self):
     asset = self.ready()
     binding = self.admit(self.actor, asset).build_binding(
