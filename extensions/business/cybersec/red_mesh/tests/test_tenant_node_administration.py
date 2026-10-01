@@ -296,13 +296,12 @@ class TestTenantNodeAdministration(unittest.TestCase):
         self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["status_code"], 503)
         self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["status_code"], 503)
 
-  def test_validator_rejects_bad_mode_draining_and_draining_without_active(self):
+  def test_validator_rejects_bad_mode_and_draining_values(self):
     self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)
     good = self.store.get("tenant_node", self.tenant, "Node-A")
     location = assignment_location(self.tenant, "Node-A")
     for changes in ({"mode": "Private"}, {"mode": ""}, {"mode": None}, {"mode": 1},
-                    {"draining": "true"}, {"draining": 1}, {"draining": None},
-                    {"active": False, "draining": True}):
+                    {"draining": "true"}, {"draining": 1}, {"draining": None}):
       with self.subTest(changes=changes):
         bad = {**good, **changes}
         self.owner.data[location] = bad
@@ -311,7 +310,8 @@ class TestTenantNodeAdministration(unittest.TestCase):
         with self.assertRaises(TenantStoreError):
           self.store.put("tenant_node", self.tenant, "Node-A", record=bad)
     self.owner.data[location] = good
-    for changes in ({"mode": "private"}, {"mode": "shared"}, {"draining": True}, {"draining": False}):
+    for changes in ({"mode": "private"}, {"mode": "shared"}, {"draining": True}, {"draining": False},
+                    {"active": False, "draining": True}):
       with self.subTest(changes=changes):
         ok = {**good, **changes}
         self.owner.data[location] = ok
@@ -369,6 +369,43 @@ class TestTenantNodeAdministration(unittest.TestCase):
     for mode in ("shared", "private"):
       self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, mode)["error"],
                        "node_draining")
+
+  def test_inactive_draining_row_from_an_old_backend_reads_as_released(self):
+    # A pre-RM-102 backend releasing a draining row writes {**row, active: False}, keeping draining.
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "private")["success"])
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", True)["success"])
+    self.jobs[(self.tenant, "Node-A")] = True
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["data"]["state"],
+                     "draining")
+    leftover = {**self.store.get("tenant_node", self.tenant, "Node-A"), "active": False}
+    self.owner.data[assignment_location(self.tenant, "Node-A")] = leftover
+    self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
+                     [{"nodeAddress": "Node-B", "mode": "shared", "state": "assigned"}])
+    self.assertEqual(self.service._launch_eligible_nodes(self.tenant), ["Node-B"])
+    self.assertEqual(self.service._reauth_eligible_nodes(self.tenant), ["Node-B"])
+    before = len(self.owner.writes)
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["data"]["state"],
+                     "released")
+    self.assertEqual(len(self.owner.writes), before)
+    other = self.create_tenant("other")
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True, "private")["success"])
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", False)["success"])
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "shared")["success"])
+    stored = self.store.get("tenant_node", self.tenant, "Node-A")
+    self.assertEqual((stored["active"], stored["draining"], stored["mode"]), (True, False, "shared"))
+
+  def test_another_tenants_live_draining_row_counts_until_its_jobs_end(self):
+    other, third = self.create_tenant("other"), self.create_tenant("third")
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True, "shared")["success"])
+    self.jobs[(other, "Node-A")] = True
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", False)["data"]["state"],
+                     "draining")
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, third, "Node-A", True, "private")["error"],
+                     "node_shared_assigned")
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, third, "Node-A", True, "shared")["success"])
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, third, "Node-A", False)["success"])
+    self.jobs[(other, "Node-A")] = False
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, third, "Node-A", True, "private")["success"])
 
   def test_release_drains_running_jobs_then_releases_once_they_end_and_stays_idempotent(self):
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])

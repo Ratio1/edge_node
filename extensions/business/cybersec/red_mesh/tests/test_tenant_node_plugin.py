@@ -149,11 +149,13 @@ class TestTenantNodePlugin(unittest.TestCase):
     reader = self.plugin._execution_service().tenant_node_jobs_reader
     binding = {"namespace": "deployment", "tenant_id": self.tenant, "participant_order": ["Node-A"]}
     cases = {
-      "worker_entry": ({"execution_binding": binding, "workers": {"Node-A": {}}}, True),
+      "worker_entry": ({"execution_binding": binding, "workers": {"Node-A": {}}, "job_status": "RUNNING"}, True),
       "participant_order_only": ({"execution_binding": binding, "workers": {}}, True),
       "absent_status_counts_as_running": ({"execution_binding": binding, "workers": {"Node-A": {}}}, True),
       "terminal_status": ({"execution_binding": binding, "workers": {"Node-A": {}},
                            "job_status": "FINALIZED"}, False),
+      "stopped_status": ({"execution_binding": binding, "workers": {"Node-A": {}},
+                          "job_status": "STOPPED"}, False),
       "has_job_cid": ({"execution_binding": binding, "workers": {"Node-A": {}}, "job_cid": "cid-1"}, False),
       "other_tenant": ({"execution_binding": {**binding, "tenant_id": "tn_other"},
                         "workers": {"Node-A": {}}}, False),

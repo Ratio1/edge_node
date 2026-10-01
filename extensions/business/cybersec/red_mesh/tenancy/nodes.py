@@ -14,6 +14,8 @@ def valid_node_address(value):
 
 # RM-102: a row written before modes existed carries neither field; absent `mode` reads as
 # `shared` (the backend already allowed overlapping assignments), absent `draining` as not draining.
+# `draining` means nothing on an inactive row: a pre-RM-102 backend releasing a draining row keeps
+# the field, and that row must still read as released rather than fail every read of the tenant.
 NODE_ASSIGNMENT_MODES = ("private", "shared")
 
 
@@ -29,8 +31,7 @@ def validate_node_assignment(row, ids):
       or type(row.get("active")) is not bool or not row.get("changed_by")
       or canonical_account_id(row["changed_by"]) != row["changed_by"]
       or ("mode" in row and row["mode"] not in NODE_ASSIGNMENT_MODES)
-      or ("draining" in row and type(row["draining"]) is not bool)
-      or (row.get("draining") is True and row.get("active") is not True)):
+      or ("draining" in row and type(row["draining"]) is not bool)):
     raise TenantStoreError("Invalid tenant node assignment")
   try:
     changed_at = datetime.fromisoformat(row.get("changed_at"))
