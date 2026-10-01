@@ -192,6 +192,22 @@ class TestTenantExecution(unittest.TestCase):
     fresh = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
     self.service.reauthorize_execution(fresh, worker_node="node-a")
 
+  def test_a_password_reset_leaves_a_running_job_authorized(self):
+    """RM-114. The Navigator ends a reset account's sessions through `passwordChangedAt` and keeps the
+    generation, so the binding of a job the account is running still reauthorizes."""
+    asset = self.ready()
+    self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
+    self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
+    binding = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
+    raw = self.owner.data[("auth", "pentester")]
+    raw.update(
+      password={**raw["password"], "salt": "bmV3c2FsdG5ld3NhbHRuZQ==",
+                "hash": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4="},
+      passwordChangedAt="2026-10-01T12:00:00.000Z", updatedAt="2026-10-01T12:00:00.000Z",
+      updatedBy="tenant-admin",
+    )
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+
   def test_existing_execution_rejects_incarnation_revocation_and_ineligible_workers(self):
     asset = self.ready()
     self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
@@ -211,7 +227,7 @@ class TestTenantExecution(unittest.TestCase):
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
     raw = self.owner.data[("auth", "pentester")]
     original = raw["generation"]
-    raw["generation"] = str(uuid4())  # the account was recreated, or its password reset
+    raw["generation"] = str(uuid4())  # the account was recreated, or archived and restored
     with self.assertRaises(AdministrationDenied) as denied:
       self.service.reauthorize_execution(binding)
     self.assertEqual(denied.exception.error, "account_changed")
