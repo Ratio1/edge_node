@@ -38,7 +38,7 @@ from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 
 
-__VER__ = '0.2.0'
+__VER__ = '0.2.1'
 
 _CONFIG = {
   # mandatory area
@@ -60,6 +60,8 @@ _CONFIG = {
   'MAX_THRESHOLD_REWARDS' : 100,
   'MIN_THRESHOLD_CLOSE_JOB' : 1,
   'MAX_THRESHOLD_CLOSE_JOB' : 250,
+  # Observe an unstarted pending job without a visible pipeline before voting zero.
+  'PENDING_EMPTY_OBSERVATION_SECONDS' : 3600,
 }
 
 class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
@@ -77,6 +79,9 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
   def on_init(self):
     self.epochs_closed = {}
     self.jobs_to_close = {}
+    self.pending_empty_since = {}
+    self.positive_recovery_since = {}
+    self.last_positive_recovery_check = 0
     self.chainstore_hset(
       hkey='chain_dist_monitor',
       key=self.node_addr,
@@ -89,54 +94,93 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
   
   
   def check_all_jobs(self):
-    # check if there are any jobs that need to be validated bc.web3_get_unvalidated_jobs() (returns PENDING or IN-CHANGE jobs)
-    # for each unvalidated job:
-      # get all running apps via netmon.network_known_apps
-        # find in these apps the one with the same deeploy_specs.job_id -> collect all running nodes
-           # bc.web3_submit_node_update
-           
-    unvalidated_job_ids = self.bc.get_unvalidated_job_ids(oracle_address=self.bc.eth_address)
-    if not unvalidated_job_ids or not len(unvalidated_job_ids):
-      pass
-    else:
-      known_apps = self.netmon.network_known_apps()
-      first_closable_job_id = self.bc.get_first_closable_job_id()
-      jobs_preview = ", ".join(str(job) for job in unvalidated_job_ids)
-      self.Pd(
-        f"Evaluating {len(unvalidated_job_ids)} unvalidated job(s): {jobs_preview}",
-        verbosity=3,
-      )
-      for job_id in unvalidated_job_ids:
-        if not job_id:
-          continue
-        
-        # find all running apps with the same job_id
-        running_nodes = []
-        self.Pd(f"Checking for running nodes for job {job_id}...", verbosity=6)
+    unvalidated_job_ids = self.bc.get_unvalidated_job_ids(oracle_address=self.bc.eth_address) or []
+    known_apps = self.netmon.network_known_apps()
+    running_nodes_by_job = {}
+    for node, apps in known_apps.items():
+      for pipeline in apps.values():
+        job_id = pipeline.get('deeploy_specs', {}).get('job_id')
+        if job_id:
+          running_nodes_by_job.setdefault(job_id, set()).add(node)
 
-        for node, apps in known_apps.items():
-          for pipeline_name, pipeline in apps.items():
-            # TODO: Use const from sdk for deeploy_specs.
-            deeploy_specs = pipeline.get('deeploy_specs', {})
-            if deeploy_specs.get('job_id') == job_id:
-              running_nodes.append(node)
-            #endif
-          #endfor
-        #endfor
-        
-        # if we have running nodes, submit the update
-        is_job_to_be_closed = first_closable_job_id == job_id
-        if ((not is_job_to_be_closed) and len(running_nodes) > 0) or (is_job_to_be_closed and (len(running_nodes) == 0)):
-          running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
-          running_nodes_eth = sorted(running_nodes_eth)
-          self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes_eth}", verbosity=3)
-          self.bc.submit_node_update( 
-            job_id=job_id,
-            nodes=running_nodes_eth,
-          )
-        #endif
-      #endfor
-    #endif
+    now = self.time()
+    first_closable_job_id = self.bc.get_first_closable_job_id() if unvalidated_job_ids else None
+    self.pending_empty_since = {
+      job_id: since for job_id, since in self.pending_empty_since.items()
+      if job_id in unvalidated_job_ids
+    }
+    self.positive_recovery_since = {
+      job_id: since for job_id, since in self.positive_recovery_since.items()
+      if job_id in running_nodes_by_job and job_id not in unvalidated_job_ids
+    }
+    submitted_job_ids = set()
+
+    for job_id in unvalidated_job_ids:
+      if not job_id:
+        continue
+      job = self.bc.get_job_details(job_id=job_id)
+      running_nodes = running_nodes_by_job.get(job_id, set())
+      if running_nodes:
+        self.pending_empty_since.pop(job_id, None)
+
+      # A job with a start timestamp and no active nodes has already closed.
+      # It can remain pending in PoAIManager even though the escrow no longer
+      # returns it as the first closable job.
+      already_closed = job['startTimestamp'] > 0 and not job['activeNodes']
+      if already_closed:
+        nodes = []
+      elif first_closable_job_id == job_id:
+        if running_nodes:
+          continue
+        nodes = []
+      elif running_nodes:
+        nodes = sorted(self.bc.node_address_to_eth_address(node) for node in running_nodes)
+      elif job['startTimestamp'] == 0 and not job['activeNodes']:
+        if not known_apps:
+          self.pending_empty_since.pop(job_id, None)
+          continue
+        since = self.pending_empty_since.setdefault(job_id, now)
+        observation_seconds = self.cfg_pending_empty_observation_seconds
+        if now - since < observation_seconds or now - job['requestTimestamp'] < observation_seconds:
+          continue
+        nodes = []
+      else:
+        continue
+
+      self.Pd(f"Submitting {len(nodes)} observed node(s) for pending job {job_id}: {nodes}", verbosity=3)
+      self.bc.submit_node_update(job_id=job_id, nodes=nodes)
+      submitted_job_ids.add(job_id)
+
+    # A zero-node consensus can clear a pending launch before its pipeline
+    # becomes visible. Recover that launch if the pipeline appears later.
+    if running_nodes_by_job and now - self.last_positive_recovery_check >= 300:
+      active_jobs = {
+        job['jobId']: job for job in self.bc.get_all_active_jobs()
+        if job['startTimestamp'] == 0 and not job['activeNodes']
+      }
+      self.last_positive_recovery_check = now
+      recovery_job_ids = set(running_nodes_by_job) & set(active_jobs) - submitted_job_ids
+      if recovery_job_ids:
+        # The zero address cannot be a proposer, so this returns every pending job.
+        all_pending_job_ids = set(self.bc.get_unvalidated_job_ids(
+          oracle_address='0x0000000000000000000000000000000000000000',
+        ))
+        recovery_job_ids -= all_pending_job_ids
+      self.positive_recovery_since = {
+        job_id: since for job_id, since in self.positive_recovery_since.items()
+        if job_id in recovery_job_ids
+      }
+      for job_id in recovery_job_ids:
+        since = self.positive_recovery_since.setdefault(job_id, now)
+        if now - since < 300:
+          continue
+        # Give PoAIManager's five-minute consensus cooldown time to pass
+        # after first observing this visible, nonpending job.
+        running_nodes = running_nodes_by_job[job_id]
+        nodes = sorted(self.bc.node_address_to_eth_address(node) for node in running_nodes)
+        self.Pd(f"Recovering visible launch for job {job_id}: {nodes}", verbosity=3)
+        self.bc.submit_node_update(job_id=job_id, nodes=nodes)
+        self.positive_recovery_since[job_id] = now
     return
     
     
