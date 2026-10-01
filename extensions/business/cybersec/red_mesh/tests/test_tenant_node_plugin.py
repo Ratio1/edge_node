@@ -9,6 +9,7 @@ from pydantic import create_model
 
 from .test_tenant_administration import FakeAdministrationStore
 from .contract_fixture import install_contract
+from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 
 
 class TestTenantNodePlugin(unittest.TestCase):
@@ -27,6 +28,9 @@ class TestTenantNodePlugin(unittest.TestCase):
     self.plugin = object.__new__(self.Plugin)
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.cfg_chainstore_peers = ["Node-A", "Node-B"]
+    # RM-102: the jobs reader lists this instance's job hkey; a real instance id so an empty
+    # enumeration reads as "no jobs", not a storage failure.
+    self.plugin.cfg_instance_id = "pentester-api-01"
     for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.actor = {"account_id": "creator"}
@@ -57,10 +61,12 @@ class TestTenantNodePlugin(unittest.TestCase):
     }))
     result = self.plugin.set_tenant_node_assignment(**request.model_dump())
     self.assertEqual(result, {"success": True, "status_code": 200, "data": {
-      "tenantId": self.tenant, "nodeAddress": "Node-A", "active": True,
+      "tenantId": self.tenant, "nodeAddress": "Node-A", "active": True, "mode": "shared", "state": "assigned",
     }})
     self.assertEqual(self.plugin.get_tenant_nodes({"account_id": "initial"}, self.tenant)["data"], {
-      "tenantId": self.tenant, "nodes": [{"nodeAddress": "Node-A"}], "canManageAssignments": False,
+      "tenantId": self.tenant,
+      "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}],
+      "canManageAssignments": False,
     })
 
   def test_generated_json_model_does_not_coerce_assignment_input(self):
@@ -134,3 +140,49 @@ class TestTenantNodePlugin(unittest.TestCase):
         "success": False, "status": "error", "status_code": 503, "error": "unavailable",
       })
       config.assert_called_once()
+
+  def test_jobs_reader_predicate_checks_cid_status_tenant_binding_and_workers(self):
+    """RM-102. The injected `tenant_node_jobs_reader` reuses the `_tenant_job_ids` read path: a
+    live job needs no `job_cid`, a non-terminal status (absent counts as running), a binding bound
+    to this namespace and tenant, and the node among `workers` or `participant_order`."""
+    self.assertTrue(self.plugin.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])
+    reader = self.plugin._execution_service().tenant_node_jobs_reader
+    binding = {"namespace": "deployment", "tenant_id": self.tenant, "participant_order": ["Node-A"]}
+    cases = {
+      "worker_entry": ({"execution_binding": binding, "workers": {"Node-A": {}}}, True),
+      "participant_order_only": ({"execution_binding": binding, "workers": {}}, True),
+      "absent_status_counts_as_running": ({"execution_binding": binding, "workers": {"Node-A": {}}}, True),
+      "terminal_status": ({"execution_binding": binding, "workers": {"Node-A": {}},
+                           "job_status": "FINALIZED"}, False),
+      "has_job_cid": ({"execution_binding": binding, "workers": {"Node-A": {}}, "job_cid": "cid-1"}, False),
+      "other_tenant": ({"execution_binding": {**binding, "tenant_id": "tn_other"},
+                        "workers": {"Node-A": {}}}, False),
+      "other_namespace": ({"execution_binding": {**binding, "namespace": "foreign"},
+                          "workers": {"Node-A": {}}}, False),
+      "neither_worker_nor_participant": ({"execution_binding": {**binding, "participant_order": ["Node-B"]},
+                                         "workers": {}}, False),
+    }
+    for name, (record, expected) in cases.items():
+      with self.subTest(case=name):
+        self.storage.data.pop(("pentester-api-01", "job-under-test"), None)
+        self.storage.chainstore_hset(hkey="pentester-api-01", key="job-under-test", value=record)
+        self.assertEqual(reader(self.tenant, "Node-A"), expected)
+    self.storage.data.pop(("pentester-api-01", "job-under-test"), None)
+    with patch.object(self.plugin, "chainstore_hgetall", side_effect=RuntimeError("private storage")):
+      with self.assertRaises(TenantStoreError):
+        reader(self.tenant, "Node-A")
+
+  def test_mode_passthrough_preserves_json_types_and_rejects_invalid_values(self):
+    model = self.request_model()
+    for mode, status in (("private", 200), ("shared", 200), (None, 200),
+                         ("Private", 400), (1, 400), (True, 400), ([], 400), ({}, 400)):
+      with self.subTest(mode=mode):
+        request = model.model_validate_json(json.dumps({
+          "actor": self.actor, "tenant_id": self.tenant, "node_address": "Node-A", "active": True,
+          "mode": mode,
+        }))
+        result = self.plugin.set_tenant_node_assignment(**request.model_dump())
+        self.assertEqual(result["status_code"], status, result)
+        if status == 200:
+          self.assertEqual(result["data"]["mode"], mode if mode is not None else "shared")
+          self.assertTrue(self.plugin.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])

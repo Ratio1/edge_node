@@ -26,10 +26,17 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.owner = FakeAdministrationStore()
     self.store = CstoreTenantAdministrationStore(self.owner, "deployment")
     self.peers = ["Node-B", "Node-A"]
+    # RM-102: `(tenant_id, node_address) -> bool`, a test seam a case sets per pair; absent means
+    # no running job, matching legacy behaviour (an immediate release).
+    self.jobs = {}
     self.service = TenantAdministrationService(CstoreAuthAccountReader(self.owner), self.store,
-                                              configured_peers_reader=lambda: self.peers)
+                                              configured_peers_reader=lambda: self.peers,
+                                              tenant_node_jobs_reader=self.has_running_job)
     self.actor = {"account_id": "creator"}
     self.tenant = self.create_tenant("one")
+
+  def has_running_job(self, tenant_id, node_address):
+    return self.jobs.get((tenant_id, node_address), False)
 
   def create_tenant(self, domain):
     request = str(uuid4())
@@ -49,12 +56,15 @@ class TestTenantNodeAdministration(unittest.TestCase):
                      {"tenantId": self.tenant, "nodes": [], "canManageAssignments": True})
     for address in self.peers:
       result = self.service.set_tenant_node_assignment(self.actor, self.tenant, address, True)
-      self.assertEqual(result["data"], {"tenantId": self.tenant, "nodeAddress": address, "active": True})
+      self.assertEqual(result["data"], {"tenantId": self.tenant, "nodeAddress": address, "active": True,
+                                        "mode": "shared", "state": "assigned"})
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "Node-A"}, {"nodeAddress": "Node-B"}])
+                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"},
+                      {"nodeAddress": "Node-B", "mode": "shared", "state": "assigned"}])
     self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", False)
     view = self.service.get_tenant_nodes({"account_id": "initial"}, self.tenant)["data"]
-    self.assertEqual(view, {"tenantId": self.tenant, "nodes": [{"nodeAddress": "Node-A"}],
+    self.assertEqual(view, {"tenantId": self.tenant,
+                            "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}],
                             "canManageAssignments": False})
 
   def test_activation_requires_lazy_valid_current_config_even_on_retry(self):
@@ -107,7 +117,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
                   ["tenant_node", "foreign", self.tenant, None]):
       # Noncanonical whitespace, malformed IDs and payload are foreign to this projection.
       self.owner.data[(hkey, json.dumps(field))] = "private corrupt data"
-    expected = [{"nodeAddress": "Node-A"}]
+    expected = [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}]
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"], expected)
     for ids in ((self.tenant,), (self.tenant, "Node-B", "extra"), (self.tenant, None)):
       with self.subTest(ids=ids):
@@ -119,8 +129,14 @@ class TestTenantNodeAdministration(unittest.TestCase):
     noncanonical = (hkey, json.dumps(["tenant_node", "deployment", self.tenant, "Node-B"]))
     self.owner.data[noncanonical] = "corrupt"
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["status_code"], 503)
-    # A canonical target mutation neither enumerates nor silently repairs another physical row.
-    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", True)["success"])
+    # A canonical target mutation neither enumerates the tenant nor silently repairs another
+    # physical row. RM-102: it reads every tenant's rows for its own node, so a corrupt duplicate
+    # naming that node fails it closed, while one naming another node does not block it.
+    before = len(self.owner.writes)
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", True)["status_code"], 503)
+    self.assertEqual(len(self.owner.writes), before)
+    self.peers.append("Node-C")
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-C", True)["success"])
     self.assertEqual(self.owner.data[noncanonical], "corrupt")
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["status_code"], 503)
 
@@ -224,7 +240,8 @@ class TestTenantNodeAdministration(unittest.TestCase):
     second_owner = FakeAdministrationStore()
     second_owner.data = self.owner.data
     second_service = TenantAdministrationService(CstoreAuthAccountReader(second_owner),
-      CstoreTenantAdministrationStore(second_owner, "deployment"))
+      CstoreTenantAdministrationStore(second_owner, "deployment"),
+      tenant_node_jobs_reader=self.has_running_job)
     for tenant in (self.tenant, other):
       self.assertEqual(second_service.get_tenant_nodes(self.actor, tenant),
                        self.service.get_tenant_nodes(self.actor, tenant))
@@ -278,3 +295,130 @@ class TestTenantNodeAdministration(unittest.TestCase):
         self.owner.data[location] = raw
         self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["status_code"], 503)
         self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["status_code"], 503)
+
+  def test_validator_rejects_bad_mode_draining_and_draining_without_active(self):
+    self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)
+    good = self.store.get("tenant_node", self.tenant, "Node-A")
+    location = assignment_location(self.tenant, "Node-A")
+    for changes in ({"mode": "Private"}, {"mode": ""}, {"mode": None}, {"mode": 1},
+                    {"draining": "true"}, {"draining": 1}, {"draining": None},
+                    {"active": False, "draining": True}):
+      with self.subTest(changes=changes):
+        bad = {**good, **changes}
+        self.owner.data[location] = bad
+        with self.assertRaises(TenantStoreError):
+          self.store.get("tenant_node", self.tenant, "Node-A")
+        with self.assertRaises(TenantStoreError):
+          self.store.put("tenant_node", self.tenant, "Node-A", record=bad)
+    self.owner.data[location] = good
+    for changes in ({"mode": "private"}, {"mode": "shared"}, {"draining": True}, {"draining": False}):
+      with self.subTest(changes=changes):
+        ok = {**good, **changes}
+        self.owner.data[location] = ok
+        self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A"), ok)
+    self.owner.data[location] = good
+
+  def test_legacy_row_without_mode_reads_as_shared_and_blocks_a_private_request(self):
+    self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)
+    row = self.store.get("tenant_node", self.tenant, "Node-A")
+    del row["mode"]
+    self.store.put("tenant_node", self.tenant, "Node-A", record=row)
+    view = self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"]
+    self.assertEqual(view, [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}])
+    other = self.create_tenant("other")
+    # The legacy row is offered for a shared request (idempotent for its own tenant, additive for
+    # another) and blocks a private one, exactly as a `mode: "shared"` row would.
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])
+    self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A"), row)
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True)["success"])
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True,
+                                                             "private")["error"], "node_shared_assigned")
+
+  def test_conflict_table_precedence_for_private_and_shared_requests(self):
+    other = self.create_tenant("other")
+    # Rows 2-3: own live row, same mode is idempotent with no write; the other mode is denied.
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "private")["success"])
+    before = len(self.owner.writes)
+    result = self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "private")
+    self.assertEqual(result["data"], {"tenantId": self.tenant, "nodeAddress": "Node-A", "active": True,
+                                      "mode": "private", "state": "assigned"})
+    self.assertEqual(len(self.owner.writes), before)
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "shared")["error"],
+                     "node_private_assigned")
+    self.assertEqual(len(self.owner.writes), before)
+    # Row 4: another tenant's live private row refuses, whatever mode is requested.
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True, "shared")["error"],
+                     "node_private_assigned")
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True, "private")["error"],
+                     "node_private_assigned")
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
+    # Row 5: a private request refuses while any other tenant's live row exists, even a shared one.
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True, "shared")["success"])
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "private")["error"],
+                     "node_shared_assigned")
+    # Row 6: shared alongside another tenant's shared row writes.
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "shared")["success"])
+    # Row 3, the other direction: own live shared row refuses a private re-request.
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "private")["error"],
+                     "node_shared_assigned")
+    # Row 1: own row draining (live, a job still runs) refuses any further write, any mode.
+    self.jobs[(self.tenant, "Node-A")] = True
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
+    self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
+                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "draining"}])
+    for mode in ("shared", "private"):
+      self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, mode)["error"],
+                       "node_draining")
+
+  def test_release_drains_running_jobs_then_releases_once_they_end_and_stays_idempotent(self):
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])
+    self.jobs[(self.tenant, "Node-A")] = True
+    result = self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)
+    self.assertEqual(result["data"], {"tenantId": self.tenant, "nodeAddress": "Node-A", "active": False,
+                                      "mode": "shared", "state": "draining"})
+    stored = self.store.get("tenant_node", self.tenant, "Node-A")
+    self.assertEqual((stored["active"], stored["draining"]), (True, True))
+    # A second release while the job still runs is idempotent: no further write.
+    before = len(self.owner.writes)
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["data"]["state"],
+                     "draining")
+    self.assertEqual(len(self.owner.writes), before)
+    self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A"), stored)
+    # Once the job ends, a dead draining row reads as released and unblocks other tenants...
+    self.jobs[(self.tenant, "Node-A")] = False
+    self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"], [])
+    other = self.create_tenant("other")
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", True, "private")["success"])
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, other, "Node-A", False)["success"])
+    # ...and the same tenant can be re-assigned, which now writes active=False, draining=False.
+    before = len(self.owner.writes)
+    result = self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)
+    self.assertEqual(result["data"], {"tenantId": self.tenant, "nodeAddress": "Node-A", "active": False,
+                                      "mode": "shared", "state": "released"})
+    self.assertGreater(len(self.owner.writes), before)
+    released = self.store.get("tenant_node", self.tenant, "Node-A")
+    self.assertEqual((released["active"], released["draining"]), (False, False))
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, "private")["success"])
+
+  def test_reader_failure_and_missing_reader_fail_closed_on_release_without_a_write(self):
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])
+    before_row = self.store.get("tenant_node", self.tenant, "Node-A")
+    def broken_reader():
+      raise RuntimeError("private job state")
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: broken_reader()
+    before = len(self.owner.writes)
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["status_code"], 503)
+    self.assertEqual(len(self.owner.writes), before)
+    self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A"), before_row)
+    self.service.tenant_node_jobs_reader = None
+    self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["status_code"], 503)
+    self.assertEqual(len(self.owner.writes), before)
+    self.assertEqual(self.store.get("tenant_node", self.tenant, "Node-A"), before_row)
+
+  def test_launch_eligibility_excludes_a_draining_row_while_reauth_eligibility_keeps_it(self):
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True)["success"])
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", True)["success"])
+    self.jobs[(self.tenant, "Node-A")] = True
+    self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
+    self.assertEqual(self.service._launch_eligible_nodes(self.tenant), ["Node-B"])
+    self.assertEqual(self.service._reauth_eligible_nodes(self.tenant), ["Node-A", "Node-B"])

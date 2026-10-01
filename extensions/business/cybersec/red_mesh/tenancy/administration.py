@@ -16,7 +16,7 @@ from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_o
                      resolve_operation_roles, valid_account_scope)
 from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
-from .nodes import valid_node_address
+from .nodes import NODE_ASSIGNMENT_MODES, node_assignment_mode, valid_node_address
 from .assets import canonical_digest, normalize_name, valid_digest
 from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
@@ -114,10 +114,14 @@ def _same_contract(stored, requested):
 
 
 class TenantAdministrationService:
-  def __init__(self, accounts, store, configured_peers_reader=None):
+  def __init__(self, accounts, store, configured_peers_reader=None, tenant_node_jobs_reader=None):
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
+    # RM-102: `(tenant_id, node_address) -> bool`, whether the tenant still has a running job on
+    # the node. Injected like `configured_peers_reader`; a draining row is read at every point that
+    # matters, never written by a background sweep.
+    self.tenant_node_jobs_reader = tenant_node_jobs_reader
     # The engagement window is checked against this clock at launch (a test seam).
     self.clock = lambda: datetime.now(timezone.utc)
 
@@ -471,16 +475,51 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "engagement_asset_not_locked")
     return tenant, account, row, entry
 
-  def _execution_eligible_nodes(self, tenant_id):
-    assignments = self.store.list_node_assignments(tenant_id)
+  def _tenant_node_has_jobs(self, tenant_id, node_address):
+    """RM-102: whether tenant jobs still run on the node, read fresh through the injected reader.
+    A missing reader or a failed read is unavailable, never "no jobs" -- a release or an
+    eligibility read must not cut off a job it cannot actually see."""
+    if self.tenant_node_jobs_reader is None:
+      raise TenantStoreError("Node job state is unavailable")
+    try:
+      running = self.tenant_node_jobs_reader(tenant_id, node_address)
+    except Exception as exc:
+      raise TenantStoreError("Node job state is unavailable") from exc
+    if type(running) is not bool:
+      raise TenantStoreError("Node job state is unavailable")
+    return running
+
+  def _assignment_live(self, tenant_id, row):
+    """RM-102: a draining row counts as released once its tenant's jobs are gone -- re-evaluated
+    here, never written by a background sweep. The reader is called only for a draining row."""
+    if row["active"] is not True:
+      return False
+    if not row.get("draining"):
+      return True
+    return self._tenant_node_has_jobs(tenant_id, row["node_address"])
+
+  def _configured_peers(self):
     try:
       configured = self.configured_peers_reader()
     except Exception as exc:
       raise TenantStoreError("Node eligibility is unavailable") from exc
     if not isinstance(configured, list) or any(not valid_node_address(peer) for peer in configured):
       raise TenantStoreError("Node eligibility is unavailable")
-    eligible = {row["node_address"] for row in assignments if row["active"]} & set(configured)
-    return sorted(eligible)
+    return set(configured)
+
+  def _launch_eligible_nodes(self, tenant_id):
+    """RM-102: a launch never starts on a draining row, whatever a (possibly stale) job check
+    would say -- it is the reauthorization path that must never cut off a running job, not this one."""
+    assignments = self.store.list_node_assignments(tenant_id)
+    eligible = {row["node_address"] for row in assignments if row["active"] and not row.get("draining")}
+    return sorted(eligible & self._configured_peers())
+
+  def _reauth_eligible_nodes(self, tenant_id):
+    """RM-102: reauthorization keeps a draining row eligible, with no job check -- a stale local
+    job view must never be the reason a still-running job is cut off."""
+    assignments = self.store.list_node_assignments(tenant_id)
+    eligible = {row["node_address"] for row in assignments if row["active"]}
+    return sorted(eligible & self._configured_peers())
 
   def _execution_engagement(self, tenant, row, entry):
     """The launch gate's engagement facts, from the stored row (never the DTO, which has no refs).
@@ -535,7 +574,7 @@ class TenantAdministrationService:
     tenant, account, row, entry = self._execution_entry_for_account(
       account, tenant_id, engagement_id, engagement_asset_id)
     engagement, ports = self._execution_engagement(tenant, row, entry)
-    eligible = self._execution_eligible_nodes(tenant_id)
+    eligible = self._launch_eligible_nodes(tenant_id)
     if selected_peers is not None and (not isinstance(selected_peers, list)
         or any(not valid_node_address(peer) for peer in selected_peers)
         or len(set(selected_peers)) != len(selected_peers)):
@@ -576,7 +615,9 @@ class TenantAdministrationService:
     current = self._entry_facts(row, entry)
     if any(current[key] != saved[key] for key in current):
       raise AdministrationDenied(409, "invalid_execution_binding")
-    eligible = self._execution_eligible_nodes(saved["tenant_id"])
+    # RM-102: eligibility here includes a draining row (no job check); a stale job view on this
+    # backend node must never cut off a job that is actually still running.
+    eligible = self._reauth_eligible_nodes(saved["tenant_id"])
     if worker_node is not None and (not valid_node_address(worker_node)
         or worker_node not in saved["participant_order"] or worker_node not in eligible):
       raise AdministrationDenied(403, "ineligible_node")
@@ -606,13 +647,26 @@ class TenantAdministrationService:
       return "engagement_expired"
     return None
 
+  def _tenant_node_row(self, tenant_id, row):
+    """RM-102: the read DTO for one live row, or None for a released or a dead-draining one. The
+    jobs reader is called only for a draining row."""
+    if row["active"] is not True:
+      return None
+    if row.get("draining"):
+      if not self._tenant_node_has_jobs(tenant_id, row["node_address"]):
+        return None
+      state = "draining"
+    else:
+      state = "assigned"
+    return {"nodeAddress": row["node_address"], "mode": node_assignment_mode(row), "state": state}
+
   @_endpoint
   def get_tenant_nodes(self, actor, tenant_id):
     tenant, account = self._authorized_tenant(actor, tenant_id)
     assignments = self.store.list_node_assignments(tenant_id)
-    return {"tenantId": tenant_id,
-            "nodes": [{"nodeAddress": row["node_address"]} for row in
-                      sorted(assignments, key=lambda row: row["node_address"]) if row["active"]],
+    nodes = [self._tenant_node_row(tenant_id, row) for row in
+             sorted(assignments, key=lambda row: row["node_address"])]
+    return {"tenantId": tenant_id, "nodes": [node for node in nodes if node is not None],
             "canManageAssignments": authorize_tenant_operation(
               account, "node_assignments:manage", TenantPolicyContext(
                 tenant_id, tenant["active"], tenant["allow_pentester"])).allowed}
@@ -892,29 +946,72 @@ class TenantAdministrationService:
       "updated_at": datetime.now(timezone.utc).isoformat()})
     return self._integration_row(self.store.get("integration", tenant_id, integration_id))
 
+  def _assign_node(self, account, tenant_id, node_address, mode, row):
+    """RM-102 conflict precedence for (tenant, node, mode), over every tenant's live row for the
+    node: own row draining; own live row, same mode (idempotent); own live row, the other mode;
+    another tenant's live private row; private requested while any other live row exists; else
+    write. Rows are "live" per `_assignment_live` -- a dead-draining row is released everywhere."""
+    others = [other for other in self.store.list_node_assignments_for_node(node_address)
+              if self._assignment_live(other["tenant_id"], other)]
+    own = next((other for other in others if other["tenant_id"] == tenant_id), None)
+    foreign = [other for other in others if other["tenant_id"] != tenant_id]
+    if own is not None:
+      if own.get("draining"):
+        raise AdministrationDenied(409, "node_draining")
+      own_mode = node_assignment_mode(own)
+      if own_mode == mode:
+        return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True,
+                "mode": own_mode, "state": "assigned"}
+      raise AdministrationDenied(409, "node_private_assigned" if own_mode == "private" else "node_shared_assigned")
+    if any(node_assignment_mode(other) == "private" for other in foreign):
+      raise AdministrationDenied(409, "node_private_assigned")
+    if mode == "private" and foreign:
+      raise AdministrationDenied(409, "node_shared_assigned")
+    new_row = {**(row or {}), "tenant_id": tenant_id, "node_address": node_address, "active": True,
+               "mode": mode, "draining": False, "changed_by": account.account_id,
+               "changed_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("tenant_node", tenant_id, node_address, record=new_row)
+    return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True, "mode": mode, "state": "assigned"}
+
+  def _release_node(self, account, tenant_id, node_address, row):
+    """RM-102 release: inactive is idempotent; an active row with running jobs enters (or stays)
+    `draining`; one with none releases, including a draining row whose jobs just ended."""
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    if row["active"] is not True:
+      return {"tenantId": tenant_id, "nodeAddress": node_address, "active": False,
+              "mode": node_assignment_mode(row), "state": "released"}
+    if self._tenant_node_has_jobs(tenant_id, node_address):
+      if row.get("draining"):
+        return {"tenantId": tenant_id, "nodeAddress": node_address, "active": False,
+                "mode": node_assignment_mode(row), "state": "draining"}
+      new_row = {**row, "active": True, "draining": True, "changed_by": account.account_id,
+                 "changed_at": datetime.now(timezone.utc).isoformat()}
+    else:
+      new_row = {**row, "active": False, "draining": False, "changed_by": account.account_id,
+                 "changed_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("tenant_node", tenant_id, node_address, record=new_row)
+    return {"tenantId": tenant_id, "nodeAddress": node_address, "active": False,
+            "mode": node_assignment_mode(new_row), "state": "draining" if new_row["draining"] else "released"}
+
   @_endpoint
-  def set_tenant_node_assignment(self, actor, tenant_id, node_address, active):
+  def set_tenant_node_assignment(self, actor, tenant_id, node_address, active, mode=None):
     _, account = self._authorized_tenant(actor, tenant_id, "node_assignments:manage")
-    if not valid_node_address(node_address) or type(active) is not bool:
+    if (not valid_node_address(node_address) or type(active) is not bool
+        or (mode is not None and mode not in NODE_ASSIGNMENT_MODES)):
       raise AdministrationDenied(400, "invalid_request")
     row = self.store.get("tenant_node", tenant_id, node_address)
-    if active:
-      try:
-        peers = self.configured_peers_reader()
-      except Exception as exc:
-        raise TenantStoreError("Node eligibility is unavailable") from exc
-      if not isinstance(peers, list) or any(not valid_node_address(peer) for peer in peers):
-        raise TenantStoreError("Node eligibility is unavailable")
-      if node_address not in peers:
-        raise AdministrationDenied(400, "ineligible_node")
-    elif row is None:
-      raise AdministrationDenied(404, "not_found")
-    if row is None or row["active"] is not active:
-      row = {**(row or {}), "tenant_id": tenant_id, "node_address": node_address,
-             "active": active, "changed_by": account.account_id,
-             "changed_at": datetime.now(timezone.utc).isoformat()}
-      self.store.put("tenant_node", tenant_id, node_address, record=row)
-    return {"tenantId": tenant_id, "nodeAddress": node_address, "active": active}
+    if not active:
+      return self._release_node(account, tenant_id, node_address, row)
+    try:
+      peers = self.configured_peers_reader()
+    except Exception as exc:
+      raise TenantStoreError("Node eligibility is unavailable") from exc
+    if not isinstance(peers, list) or any(not valid_node_address(peer) for peer in peers):
+      raise TenantStoreError("Node eligibility is unavailable")
+    if node_address not in peers:
+      raise AdministrationDenied(400, "ineligible_node")
+    return self._assign_node(account, tenant_id, node_address, mode if mode is not None else "shared", row)
 
   @_endpoint
   def get_tenant_contract(self, actor, tenant_id):
