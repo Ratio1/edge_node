@@ -280,6 +280,20 @@ class _DeeployJobMixin:
       self.Pd(f"Unable to verify staged Deeploy rollback for job {job_id}: {exc}", color='y')
     return restored
 
+  def settle_failed_staged_job_pipeline_and_secrets(self, state, reason, dispatch_uncertain=False):
+    """Keep a failed new job's secrets while dispatched configs may still need them."""
+    if not isinstance(state, dict):
+      return False
+    if state.get("retain_on_failed_dispatch") and (
+      dispatch_uncertain or state.get("dispatch_attempted")
+    ):
+      self.P(
+        f"Keeping staged dAuth metadata for job {state.get('job_id')} after {reason}: "
+        "node configs may still be running.", color='y'
+      )
+      return True
+    return self.rollback_staged_job_pipeline_and_secrets(state)
+
   def list_all_deployed_jobs_from_cstore(self):
     """
     Get all the job pipelines from CSTORE.

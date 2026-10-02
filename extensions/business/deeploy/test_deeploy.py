@@ -378,9 +378,9 @@ class DeeployPostponedTests(unittest.TestCase):
     self.assertEqual(str_status, DEEPLOY_STATUS.PENDING)
     self.assertFalse(done)
 
-  def test_solve_postponed_pipeline_timeout(self):
+  def test_solve_postponed_pipeline_timeout_retains_staged_metadata(self):
     """
-    Ensure pipeline pending state times out correctly.
+    A timed-out dispatched pipeline may still have running node configs.
     """
     pending_id = "pid1"
     self.plugin._DeeployManagerApiPlugin__pending_deploy_requests[pending_id] = {
@@ -400,11 +400,14 @@ class DeeployPostponedTests(unittest.TestCase):
     self.plugin._now = 5
     rolled_back = []
     self.plugin.rollback_staged_job_pipeline_and_secrets = lambda state: rolled_back.append(state)
-    self.plugin._DeeployManagerApiPlugin__pending_deploy_requests[pending_id]['staging'] = {"cid": "staged"}
+    self.plugin._DeeployManagerApiPlugin__pending_deploy_requests[pending_id]['staging'] = {
+      "cid": "staged",
+      "retain_on_failed_dispatch": True,
+    }
     res = self.plugin.solve_postponed_deploy_request(pending_id)
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.TIMEOUT)
     self.assertEqual(res[DEEPLOY_KEYS.APP_ID], "app1")
-    self.assertEqual(rolled_back, [{"cid": "staged"}])
+    self.assertEqual(rolled_back, [])
 
   def test_solve_postponed_scale_up_timeout(self):
     """

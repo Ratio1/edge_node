@@ -1229,6 +1229,9 @@ class DeeployManagerApiPlugin(
         job_id=job_id,
         secret_bundle=complete_secret_bundle,
       )
+      staging_state["retain_on_failed_dispatch"] = bool(
+        is_create and staging_state.get("prior_cid") is None
+      )
 
       if delete_existing_after_stage:
         self.delete_pipeline_from_nodes(
@@ -1255,6 +1258,7 @@ class DeeployManagerApiPlugin(
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
         cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
+        dispatch_state=staging_state,
       )
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
@@ -1353,7 +1357,7 @@ class DeeployManagerApiPlugin(
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
         self.commit_staged_job_pipeline_and_secrets(staging_state)
       else:
-        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, str_status)
       staging_state = None
 
       result = {
@@ -1368,7 +1372,7 @@ class DeeployManagerApiPlugin(
         self.P(f"Request Result: status={str_status}, app_id={app_id}")
     except Exception as e:
       if staging_state is not None:
-        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, "dispatch error")
       result = self.__handle_error(e, request)
     #endtry
     finally:
@@ -1427,8 +1431,8 @@ class DeeployManagerApiPlugin(
     if now is None:
       now = self.time()
     if (now - pending['start_time']) > pending['timeout']:
-      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
       if pending.get('kind') == 'scale_up':
+        self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
         result = {
           DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
           DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
@@ -1437,6 +1441,9 @@ class DeeployManagerApiPlugin(
           DEEPLOY_KEYS.AUTH: pending.get('auth'),
         }
       else:
+        self.settle_failed_staged_job_pipeline_and_secrets(
+          pending.get('staging'), "timeout", dispatch_uncertain=True
+        )
         result = {
           DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
           DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
@@ -1511,7 +1518,9 @@ class DeeployManagerApiPlugin(
       if str_status == DEEPLOY_STATUS.SUCCESS and managed_action:
         self._mark_managed_update_action_applied(managed_action)
     else:
-      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
+      self.settle_failed_staged_job_pipeline_and_secrets(
+        pending.get('staging'), str_status, dispatch_uncertain=True
+      )
 
     self._release_managed_update_action(
       pending.get('managed_update_action_claim_key')

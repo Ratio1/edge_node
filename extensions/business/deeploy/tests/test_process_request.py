@@ -221,6 +221,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
     res = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
 
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertTrue(captured["dispatch_state"]["retain_on_failed_dispatch"])
     deployed_inputs = captured["inputs"]
     self.assertNotIn("PER_NODE_CONFIG", deployed_inputs)
     deployed_plugin = deployed_inputs[DEEPLOY_KEYS.PLUGINS][0]
