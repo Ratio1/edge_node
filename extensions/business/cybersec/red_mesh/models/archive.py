@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
+from extensions.business.cybersec.red_mesh.models.finding_schema import read_archived_findings
 from ..tenancy.execution import (
   ExecutionBinding, binding_from_record, binding_value, copy_bound_config, checked_archive_config,
 )
@@ -407,7 +408,7 @@ class PassReport:
       quick_summary=d.get("quick_summary"),
       llm_failed=d.get("llm_failed"),
       llm_report_sections=d.get("llm_report_sections"),
-      findings=d.get("findings"),
+      findings=read_archived_findings(d.get("findings")),
       scan_metrics=d.get("scan_metrics"),
       worker_scan_metrics=d.get("worker_scan_metrics"),
       redmesh_test_attestation=d.get("redmesh_test_attestation"),
@@ -471,6 +472,13 @@ class UiAggregate:
     )
 
 
+def _read_archived_pass(pass_dict):
+  """Gate an archived pass's findings without reshaping the pass (RM-062)."""
+  if not isinstance(pass_dict, dict) or "findings" not in pass_dict:
+    return pass_dict
+  return {**pass_dict, "findings": read_archived_findings(pass_dict["findings"])}
+
+
 @dataclass(frozen=True)
 class JobArchive:
   """
@@ -522,7 +530,7 @@ class JobArchive:
       job_id=d["job_id"],
       job_config=d.get("job_config", {}),
       timeline=d.get("timeline", []),
-      passes=d.get("passes", []),
+      passes=[_read_archived_pass(p) for p in d.get("passes", [])],
       ui_aggregate=d.get("ui_aggregate", {}),
       duration=d.get("duration", 0),
       date_created=d.get("date_created", 0),

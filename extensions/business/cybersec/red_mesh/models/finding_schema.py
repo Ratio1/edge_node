@@ -251,3 +251,20 @@ def flat_finding_from_dict(payload: dict) -> FlatFinding:
 
   extra = {key: value for key, value in payload.items() if key not in _KNOWN_FIELDS}
   return FlatFinding(**known, extra=extra, _present=present)
+
+
+def read_archived_findings(findings: Any) -> Any:
+  """Read an archived findings list through the contract (RM-062).
+
+  Each finding goes through `flat_finding_from_dict`, so a schema or version
+  this build does not understand raises instead of being read under the wrong
+  assumptions. The round trip loses nothing, and the source key order is kept so
+  the stored content does not change. `None` (no findings key) passes through.
+  """
+  if findings is None:
+    return None
+  out = []
+  for payload in findings:
+    restored = flat_finding_from_dict(payload).to_dict()
+    out.append({key: restored[key] for key in payload})
+  return out
