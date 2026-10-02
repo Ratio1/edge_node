@@ -2,9 +2,10 @@ import re as _re
 import time as _time
 import secrets as _secrets
 import requests
+from html import unescape as _html_unescape
 from urllib.parse import quote, urlsplit
 
-from ...findings import Finding, Severity, probe_result, probe_error
+from ...findings import AffectedAsset, Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
@@ -419,6 +420,10 @@ class _WebHardeningMixin:
     r'<input[^>]*type\s*=\s*["\']?hidden["\']?[^>]*name\s*=\s*["\']?([^"\'>\s]+)',
     _re.IGNORECASE,
   )
+  _FORM_TAG_ACTION_RE = _re.compile(
+    r'^<form\b[^>]*?\saction\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+    _re.IGNORECASE,
+  )
   _CSRF_FIELD_NAMES = frozenset({
     "csrf_token", "_token", "csrfmiddlewaretoken",
     "authenticity_token", "__requestverificationtoken",
@@ -486,9 +491,7 @@ class _WebHardeningMixin:
           if hidden_names & self._CSRF_FIELD_NAMES:
             continue  # has CSRF token — OK
 
-          # Extract form action for evidence
-          action_match = _re.search(r'action\s*=\s*["\']?([^"\'>\s]+)', form_match.group(0), _re.IGNORECASE)
-          action = action_match.group(1) if action_match else path
+          action = self._csrf_form_action(form_match.group(0), path)
 
           findings_list.append(Finding(
             severity=Severity.MEDIUM,
@@ -500,11 +503,41 @@ class _WebHardeningMixin:
             owasp_id="A01:2021",
             cwe_id="CWE-352",
             confidence="firm",
+            # Page + normalised action is the identity (RM-117): two forms on
+            # one page shared a title, and with no asset `dedup_key` fell back
+            # to it, so job 22f4998c printed two findings under one id.
+            affected_assets=(AffectedAsset(
+              host=target, port=port, url=path,
+              parameter=self._csrf_identity_action(action, path), method="POST",
+            ),),
           ))
       except Exception:
         continue
 
     return probe_result(findings=findings_list)
+
+  @classmethod
+  def _csrf_form_action(cls, form_html, path):
+    """The raw `action` of the opening `<form>` tag, or the page path.
+
+    Read from the tag only: searching the whole form picked up `formaction=`
+    or `data-action=` from the body when the tag had no action of its own.
+    """
+    match = cls._FORM_TAG_ACTION_RE.match(form_html)
+    if not match:
+      return path
+    action = next((group for group in match.groups() if group is not None), "")
+    return action.strip() or path
+
+  @staticmethod
+  def _csrf_identity_action(action, path):
+    """The action as an identity input: entities decoded, then the query,
+    fragment and `;param` path parameters dropped, since a cache-buster or a
+    session id there would hand the finding a new id on every run. The raw
+    action stays in `evidence`."""
+    decoded = _html_unescape(action)
+    stable = _re.split(r"[?#;]", decoded, maxsplit=1)[0].strip()
+    return stable or path
 
 
   # ── A04:2021 — Insecure Design probes ──────────────────────────────

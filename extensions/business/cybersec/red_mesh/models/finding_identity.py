@@ -229,7 +229,8 @@ def dedup_key(finding: dict, *, asset_canonical: str | None = None) -> str:
   neither a scenario id nor a specific location. Blackbox probes do not yet
   attach url/parameter — RM-061 owns that — so for them the title is the only
   thing separating "reflected XSS in search" from "stored XSS in comment": same
-  port, same probe, same CWE, same synthesised `{host, port}` asset. Dropping it
+  port, same probe, same CWE, same synthesised `{host, port}` asset. (The CSRF
+  probe already sets page + form action, RM-117.) Dropping it
   unconditionally would merge two real findings into one, which is a worse
   failure than the wording-fork it avoids. Findings that do carry a location or
   a scenario id — every graybox finding, and every blackbox finding once RM-061
