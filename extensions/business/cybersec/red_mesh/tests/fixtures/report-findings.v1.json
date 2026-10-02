@@ -1,5 +1,5 @@
 {
-  "catchAllWithheld": {
+  "catch_all_withheld": {
     "http://198.51.100.20": [
       {
         "path": "/admin",
@@ -385,20 +385,20 @@
       ],
       "cwe_id": "CWE-20",
       "declared_severity": "HIGH",
-      "description": "openssh 8.2p1 is vulnerable to CVE-2021-41617. Backport status unknown: a distribution package was detected but no advisory data covers this CVE for it, so the fix may already be applied.",
+      "description": "openssh 8.2 is vulnerable to CVE-2021-41617. Backport status unknown: a distribution package was detected but no advisory data covers this CVE for it, so the fix may already be applied.",
       "ease_of_resolution": "",
       "epss_score": null,
-      "evidence": "Detected version: 8.2p1, affected: >=6.2,<8.8",
+      "evidence": "Detected version: 8.2, affected: >=6.2,<8.8",
       "evidence_items": [
         {
           "caption": "_service_info_ssh evidence",
           "kind": "log",
-          "snippet": "Detected version: 8.2p1, affected: >=6.2,<8.8"
+          "snippet": "Detected version: 8.2, affected: >=6.2,<8.8"
         }
       ],
       "exploitability_status": "",
-      "finding_id": "7eaa2e573a03b747",
-      "finding_signature": "58416261806425a1b8df8029eb1cd1d47979baa4193884d72e0d978c544c36ff",
+      "finding_id": "5c5bcbd2ad8f52c1",
+      "finding_signature": "af2b47441340faf28f7644f79373942954a971768f20ea105324d5c7efc34f51",
       "first_seen": "",
       "impact": "",
       "kev": false,
@@ -428,7 +428,7 @@
       "source": "automated",
       "steps_to_reproduce": [],
       "tags": [],
-      "title": "CVE-2021-41617: Supplemental groups not initialized (openssh 8.2p1)",
+      "title": "CVE-2021-41617: Supplemental groups not initialized (openssh 8.2)",
       "triage_state": "new",
       "verified_by": ""
     },
@@ -510,76 +510,6 @@
         }
       ],
       "ai_generated": false,
-      "authenticated_action": "not_permitted",
-      "backport_status": "",
-      "category": "service",
-      "confidence": "firm",
-      "created_by": "",
-      "cve": [],
-      "cvss_data_freshness": "",
-      "cvss_score": 9.8,
-      "cvss_score_env": null,
-      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-      "cvss_vector_env": "",
-      "cvss_version": "3.1",
-      "cwe": [
-        798
-      ],
-      "cwe_id": "CWE-798",
-      "declared_severity": "CRITICAL",
-      "description": "The SSH server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair. No authenticated action was attempted; not permitted by the Rules of Engagement for this job.",
-      "ease_of_resolution": "",
-      "epss_score": null,
-      "evidence": "Accepted credential: pi:***",
-      "evidence_items": [
-        {
-          "caption": "_service_info_ssh evidence",
-          "kind": "log",
-          "snippet": "Accepted credential: pi:***"
-        }
-      ],
-      "exploitability_status": "",
-      "finding_id": "ff3a309821dbf386",
-      "finding_signature": "971538ebddb7047b1badeb0c7be9809d13e253ef2fd53ea063b805ebe5e99d8c",
-      "first_seen": "",
-      "impact": "",
-      "kev": false,
-      "last_seen": "",
-      "owasp_id": "A07:2021",
-      "owasp_top10": [
-        "A07:2021"
-      ],
-      "port": 22,
-      "probe": "_service_info_ssh",
-      "probe_display_name": "SSH service detection",
-      "protocol": "ssh",
-      "references": [],
-      "remediation": "Change default passwords immediately and enforce strong credential policies.",
-      "remediation_structured": {
-        "compensating": "",
-        "mitigation": "",
-        "primary": "Change default passwords immediately and enforce strong credential policies."
-      },
-      "schema": "redmesh.finding.v1",
-      "schema_version": "1.0.0",
-      "severity": "CRITICAL",
-      "severity_justification": "",
-      "severity_source": "cvss",
-      "source": "automated",
-      "steps_to_reproduce": [],
-      "tags": [],
-      "title": "SSH default credential accepted: pi:***",
-      "triage_state": "new",
-      "verified_by": ""
-    },
-    {
-      "affected_assets": [
-        {
-          "host": "198.51.100.20",
-          "port": 22
-        }
-      ],
-      "ai_generated": false,
       "authenticated_action": "performed",
       "backport_status": "",
       "category": "service",
@@ -646,11 +576,291 @@
       "affected_assets": [
         {
           "host": "198.51.100.20",
-          "port": 22
+          "port": 2022
         }
       ],
       "ai_generated": false,
-      "authenticated_action": "attempted",
+      "authenticated_action": "",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "certain",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.8,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        287
+      ],
+      "cwe_id": "CWE-287",
+      "declared_severity": "CRITICAL",
+      "description": "Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Randomly generated credentials were accepted by the SSH service.",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Randomly generated credentials were accepted by the SSH service."
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "19ff96ccd6a621e0",
+      "finding_signature": "c12612ce61066e6d03d6d3a7f1d13497bb528de3ee36311156da7bc4f0d08950",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 2022,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Investigate immediately \u2014 authentication is non-functional.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Investigate immediately \u2014 authentication is non-functional."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH accepts arbitrary credentials",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 2022
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "not_permitted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "tentative",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": null,
+      "cvss_score_env": null,
+      "cvss_vector": "",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "INFO",
+      "description": "The SSH server accepted a well-known default credential, but it also accepted a randomly generated one, so this does not demonstrate a default credential in use. See the \"accepts arbitrary credentials\" finding on this port.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: admin:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: admin:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "afac952cf71055a0",
+      "finding_signature": "37115dd0947f3b022fe2aa29edf8e46dca34b2bf4c2cb323218e96b4b262ae75",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 2022,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Investigate why the service accepts arbitrary credentials first.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Investigate why the service accepts arbitrary credentials first."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "INFO",
+      "severity_justification": "",
+      "severity_source": "probe_policy",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: admin:*** (inconclusive: service accepts arbitrary credentials)",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 2022
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "not_permitted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "tentative",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": null,
+      "cvss_score_env": null,
+      "cvss_vector": "",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "INFO",
+      "description": "The SSH server accepted a well-known default credential, but it also accepted a randomly generated one, so this does not demonstrate a default credential in use. See the \"accepts arbitrary credentials\" finding on this port.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: root:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: root:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "47a49ca3acf64fb2",
+      "finding_signature": "2b9e970145633bef62a41291c55e6eccf39600d7920e96638b43c778cfc48634",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 2022,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Investigate why the service accepts arbitrary credentials first.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Investigate why the service accepts arbitrary credentials first."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "INFO",
+      "severity_justification": "",
+      "severity_source": "probe_policy",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: root:*** (inconclusive: service accepts arbitrary credentials)",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 2022
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "not_permitted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "tentative",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": null,
+      "cvss_score_env": null,
+      "cvss_vector": "",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "INFO",
+      "description": "The SSH server accepted a well-known default credential, but it also accepted a randomly generated one, so this does not demonstrate a default credential in use. See the \"accepts arbitrary credentials\" finding on this port.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: test:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: test:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "85f805857385ad45",
+      "finding_signature": "5dc4bb9bb676348c2b95ca04a6e455732bf54290ef12ddc6884607ea0d94bdd0",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 2022,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Investigate why the service accepts arbitrary credentials first.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Investigate why the service accepts arbitrary credentials first."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "INFO",
+      "severity_justification": "",
+      "severity_source": "probe_policy",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: test:*** (inconclusive: service accepts arbitrary credentials)",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 2022
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "not_permitted",
       "backport_status": "",
       "category": "service",
       "confidence": "tentative",
@@ -679,8 +889,8 @@
         }
       ],
       "exploitability_status": "",
-      "finding_id": "701abae7783f90ea",
-      "finding_signature": "d48f7b642287f8d5e13d02fdfeaecbbe4ad5f43dc1cb8a84b4a5c0bd07819e46",
+      "finding_id": "d3f30cbcc178af05",
+      "finding_signature": "b4a62de501d2486b68e2f9e66b65576bdc8c2d90a29a82aa0cf59903827a8a33",
       "first_seen": "",
       "impact": "",
       "kev": false,
@@ -689,7 +899,7 @@
       "owasp_top10": [
         "A07:2021"
       ],
-      "port": 22,
+      "port": 2022,
       "probe": "_service_info_ssh",
       "probe_display_name": "SSH service detection",
       "protocol": "ssh",
@@ -709,6 +919,76 @@
       "steps_to_reproduce": [],
       "tags": [],
       "title": "SSH default credential accepted: user:*** (inconclusive: service accepts arbitrary credentials)",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 2222
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "not_permitted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "firm",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.8,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "CRITICAL",
+      "description": "The SSH server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair. No authenticated action was attempted; not permitted by the Rules of Engagement for this job.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: root:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: root:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "ef140424fa9294c6",
+      "finding_signature": "958e7b6c42dd077fda1250151a84e8e510a3a505ee6455a25adb666fe76fadd3",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 2222,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Change default passwords immediately and enforce strong credential policies.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Change default passwords immediately and enforce strong credential policies."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: root:***",
       "triage_state": "new",
       "verified_by": ""
     },

@@ -22,8 +22,8 @@ from extensions.business.cybersec.red_mesh.cvss import cvss31_base_score, severi
 from extensions.business.cybersec.red_mesh.tests.fixtures import report_findings
 
 # Every pair the fixture's fake services accept, in plain text. None may appear.
-_PLAINTEXT_PAIRS = ("root:toor", "admin:admin", "pi:raspberry", "user:user", "ftp:ftp",
-                    "root:root", "root:password", "root:(empty)")
+_PLAINTEXT_PAIRS = ("root:toor", "root:root", "root:password", "admin:admin", "admin:password",
+                    "user:user", "test:test", "ftp:ftp", "root:(empty)")
 
 
 class TestReportFindingsFixture(unittest.TestCase):
@@ -35,6 +35,10 @@ class TestReportFindingsFixture(unittest.TestCase):
       report_findings.FIXTURE_PATH.write_text(cls.generated)
     cls.fixture = json.loads(report_findings.FIXTURE_PATH.read_text())
     cls.findings = cls.fixture["findings"]
+    # The promises are checked on what the backend produces now as well as on
+    # the committed copy, so a regression fails under its own name rather than
+    # only as "regenerate".
+    cls.sources = {"committed": cls.fixture, "generated": json.loads(cls.generated)}
 
   def test_the_committed_fixture_is_what_the_backend_produces(self):
     self.assertEqual(
@@ -43,26 +47,31 @@ class TestReportFindingsFixture(unittest.TestCase):
     )
 
   def test_one_finding_id_per_finding(self):
-    ids = [f["finding_id"] for f in self.findings]
-    self.assertEqual(len(ids), len(set(ids)))
+    for source, fixture in self.sources.items():
+      ids = [f["finding_id"] for f in fixture["findings"]]
+      with self.subTest(source=source):
+        self.assertEqual(len(ids), len(set(ids)))
 
   def test_credentials_are_masked_at_source(self):
-    text = report_findings.FIXTURE_PATH.read_text()
-    for pair in _PLAINTEXT_PAIRS:
-      self.assertNotIn(pair, text)
-    logins = [f for f in self.findings if "default credential accepted" in f["title"]]
-    self.assertTrue(logins)
-    for finding in logins:
-      self.assertRegex(finding["title"], r"default credential accepted: [\w.-]+:\*\*\*")
+    for source, fixture in self.sources.items():
+      text = json.dumps(fixture)
+      with self.subTest(source=source):
+        for pair in _PLAINTEXT_PAIRS:
+          self.assertNotIn(pair, text)
+        logins = [f for f in fixture["findings"] if "default credential accepted" in f["title"]]
+        self.assertTrue(logins)
+        for finding in logins:
+          self.assertRegex(finding["title"], r"default credential accepted: [\w.-]+:\*\*\*")
 
   def test_the_cvss_band_matches_the_label_unless_it_is_probe_policy(self):
-    for finding in self.findings:
-      vector = finding.get("cvss_vector") or ""
-      if finding.get("severity_source") == "probe_policy" or not vector.startswith("CVSS:3.1/"):
-        continue
-      with self.subTest(title=finding["title"]):
-        band = severity_band(cvss31_base_score(vector))
-        self.assertEqual("INFO" if band == "NONE" else band, finding["severity"])
+    for source, fixture in self.sources.items():
+      for finding in fixture["findings"]:
+        vector = finding.get("cvss_vector") or ""
+        if finding.get("severity_source") == "probe_policy" or not vector.startswith("CVSS:3.1/"):
+          continue
+        with self.subTest(source=source, title=finding["title"]):
+          band = severity_band(cvss31_base_score(vector))
+          self.assertEqual("INFO" if band == "NONE" else band, finding["severity"])
 
   def test_it_covers_every_case_the_report_reads(self):
     actions = {f.get("authenticated_action") for f in self.findings}
@@ -73,7 +82,8 @@ class TestReportFindingsFixture(unittest.TestCase):
     self.assertEqual({f["affected_assets"][0]["parameter"] for f in csrf}, {"/users/sign_in", "/users"})
     self.assertTrue(any(f.get("backport_status") for f in self.findings))
     self.assertTrue(all(f.get("probe_display_name") for f in self.findings))
-    self.assertTrue(self.fixture["catchAllWithheld"])
+    self.assertEqual(self.fixture["catch_all_withheld"],
+                     {"http://198.51.100.20": [{"path": "/admin", "probe": "_web_test_common"}]})
     self.assertTrue(re.fullmatch(r"198\.51\.100\.\d+", self.fixture["target"]))
 
 
