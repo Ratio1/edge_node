@@ -1,5 +1,6 @@
 import copy
 import sys
+import threading
 import types
 import unittest
 from collections import defaultdict
@@ -55,7 +56,8 @@ class _BCStub:
 
 class _ProcessRequestStub(DeeployManagerApiPlugin):
   def __init__(self):
-    pass
+    self._create_job_claim_lock = threading.Lock()
+    self._active_create_job_ids = set()
 
   def _DeeployManagerApiPlugin__ensure_eth_balance(self):
     return True
@@ -130,6 +132,9 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
   def _load_dauth_job_secret_bundle(self, job_id):
     return None
 
+  def _get_pipeline_from_cstore(self, job_id):
+    return getattr(self, "existing_pipeline_cid", None)
+
   def stage_job_pipeline_and_secrets(self, pipeline, job_id, secret_bundle):
     self.chainstore_hset(
       hkey=DEEPLOY_DAUTH_JOB_SECRETS_HKEY,
@@ -148,7 +153,7 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
 class DeeployProcessRequestTests(unittest.TestCase):
 
   def test_create_pipeline_accepts_ui_cockroach_single_plugin_top_level_per_node_config(self):
-    plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)
+    plugin = _ProcessRequestStub()
     plugin.ct = ct
     plugin.bc = _BCStub()
     plugin.deepcopy = copy.deepcopy
@@ -218,6 +223,15 @@ class DeeployProcessRequestTests(unittest.TestCase):
     self.assertEqual(captured, {})
     self.assertEqual(plugin.bc.submitted, [])
 
+    plugin._claim_create_job(97)
+    overlapping_result = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
+    self.assertEqual(overlapping_result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertTrue(overlapping_result["dispatch_uncertain"])
+    self.assertIn("already in progress", overlapping_result[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(captured, {})
+    self.assertEqual(plugin.chainstore_writes, [])
+    plugin._release_create_job("97")
+
     res = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
 
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
@@ -256,8 +270,27 @@ class DeeployProcessRequestTests(unittest.TestCase):
       DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
     )
 
+    plugin.existing_pipeline_cid = "retained-first-attempt-cid"
+    captured.clear()
+    prior_writes = len(plugin.chainstore_writes)
+    retry_result = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
+    self.assertEqual(retry_result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertTrue(retry_result["dispatch_uncertain"])
+    self.assertIn("may still", retry_result[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(captured, {})
+    self.assertEqual(len(plugin.chainstore_writes), prior_writes)
+
+    plugin.existing_pipeline_cid = None
+    def failed_after_dispatch(**kwargs):
+      kwargs["dispatch_state"]["dispatch_attempted"] = True
+      return {}, DEEPLOY_STATUS.FAIL, {}, None
+    plugin.check_and_deploy_pipelines = failed_after_dispatch
+    failed_result = plugin._process_pipeline_request(request, is_create=True, async_mode=False)
+    self.assertEqual(failed_result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertTrue(failed_result["dispatch_uncertain"])
+
   def test_create_rejects_reserved_cockroachdb_user_before_payment_or_node_lookup(self):
-    plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)
+    plugin = _ProcessRequestStub()
     plugin.ct = ct
     plugin.bc = _BCStub()
     plugin.deepcopy = copy.deepcopy
@@ -310,7 +343,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
     self.assertEqual(plugin.bc.submitted, [])
 
   def test_create_rejects_per_node_cockroachdb_credentials_before_payment_or_node_lookup(self):
-    plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)
+    plugin = _ProcessRequestStub()
     plugin.ct = ct
     plugin.bc = _BCStub()
     plugin.deepcopy = copy.deepcopy
@@ -368,7 +401,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
     self.assertEqual(plugin.bc.submitted, [])
 
   def test_error_handler_redacts_secret_request_values(self):
-    plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)
+    plugin = _ProcessRequestStub()
     plugin.deepcopy = copy.deepcopy
     plugin.cfg_deeploy_verbose = 0
     request = {

@@ -287,6 +287,7 @@ class _DeeployJobMixin:
     if state.get("retain_on_failed_dispatch") and (
       dispatch_uncertain or state.get("dispatch_attempted")
     ):
+      state["dispatch_uncertain"] = True
       self.P(
         f"Keeping staged dAuth metadata for job {state.get('job_id')} after {reason}: "
         "node configs may still be running.", color='y'

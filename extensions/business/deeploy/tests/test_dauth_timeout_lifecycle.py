@@ -102,22 +102,44 @@ class DeeployDauthTimeoutLifecycleTests(unittest.TestCase):
     ))
     self.assertEqual(plugin._get_pipeline_from_cstore(116), state["staged_cid"])
 
-  def test_pre_dispatch_failure_restores_prior_metadata(self):
+  def test_pre_dispatch_create_failure_removes_staged_metadata(self):
     plugin = _LifecyclePlugin()
     state = plugin.stage_job_pipeline_and_secrets(
-      _pipeline(), 7, {"job_id": "7", "job_secrets": {"PLUGINS": []}}
+      _pipeline(), 116, {"job_id": "116", "job_secrets": {"PLUGINS": []}}
     )
+    state["retain_on_failed_dispatch"] = True
 
     self.assertTrue(plugin.settle_failed_staged_job_pipeline_and_secrets(
       state, "validation error"
     ))
-    self.assertEqual(plugin._get_pipeline_from_cstore(7), "prior-cid")
-    self.assertEqual(
-      plugin._load_dauth_job_secret_bundle(7), state["prior_bundle"]
-    )
+    self.assertIsNone(plugin._get_pipeline_from_cstore(116))
+    self.assertIsNone(plugin._load_dauth_job_secret_bundle(116))
+    self.assertNotIn("dispatch_uncertain", state)
     self.assertIn("staged-cid", [event[1] for event in plugin.events if event[0] == "r1fs_delete"])
 
-  def test_update_without_prior_cid_is_not_treated_as_new_create(self):
+  def test_failed_dispatched_create_reports_uncertainty(self):
+    plugin = _LifecyclePlugin()
+    state = plugin.stage_job_pipeline_and_secrets(
+      _pipeline(), 116, {"job_id": "116", "job_secrets": {"PLUGINS": []}}
+    )
+    state["retain_on_failed_dispatch"] = True
+    state["dispatch_attempted"] = True
+    pending = {
+      "kind": "pipeline",
+      "staging": state,
+      "confirm": {},
+      "base_result": {},
+    }
+
+    response = DeeployManagerApiPlugin.finalize_pending_request_pipeline(
+      plugin, pending, {}, DEEPLOY_STATUS.FAIL
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
+    self.assertTrue(response["dispatch_uncertain"])
+    self.assertEqual(plugin._get_pipeline_from_cstore(116), state["staged_cid"])
+
+  def test_unmarked_stage_without_prior_cid_rolls_back(self):
     plugin = _LifecyclePlugin()
     state = plugin.stage_job_pipeline_and_secrets(
       _pipeline(), 116, {"job_id": "116", "job_secrets": {"PLUGINS": []}}
@@ -167,6 +189,7 @@ class DeeployDauthTimeoutLifecycleTests(unittest.TestCase):
     )
 
     self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.TIMEOUT)
+    self.assertTrue(response["dispatch_uncertain"])
     self.assertIn("node-a", plugin.worker_configs)
     self.assertEqual(
       plugin._load_dauth_job_secret_bundle(job_id)["pipeline_cid"],

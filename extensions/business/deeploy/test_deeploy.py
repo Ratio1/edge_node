@@ -406,6 +406,7 @@ class DeeployPostponedTests(unittest.TestCase):
     }
     res = self.plugin.solve_postponed_deploy_request(pending_id)
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.TIMEOUT)
+    self.assertTrue(res["dispatch_uncertain"])
     self.assertEqual(res[DEEPLOY_KEYS.APP_ID], "app1")
     self.assertEqual(rolled_back, [])
 
