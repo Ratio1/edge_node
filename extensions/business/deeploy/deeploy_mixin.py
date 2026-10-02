@@ -1006,6 +1006,7 @@ class _DeeployMixin:
     prepared_pipeline_configs=None,
     skip_response_key_reset=False,
     full_target_nodes=None,
+    dispatch_state=None,
   ):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
@@ -1054,6 +1055,8 @@ class _DeeployMixin:
 
       if addr is not None:
         saved_pipeline = pipeline_config
+        if dispatch_state is not None:
+          dispatch_state["dispatch_attempted"] = True
         dispatch_pipeline_config(self, addr, pipeline_config)
 
       # endif addr is valid
@@ -5936,6 +5939,7 @@ class _DeeployMixin:
       skip_create_response_key_reset=False,
       wait_for_responses=True,
       cockroachdb_legacy_compat_contexts=None,
+      dispatch_state=None,
   ):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
@@ -6004,6 +6008,7 @@ class _DeeployMixin:
         prepared_deploy_plan=prepared_create_deploy_plan,
         prepared_pipeline_configs=prepared_pipeline_configs,
         skip_response_key_reset=skip_create_response_key_reset,
+        dispatch_state=dispatch_state,
       )
       response_keys.update(new_response_keys)
       if created_pipeline_to_persist is not None:

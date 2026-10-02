@@ -71,9 +71,12 @@ class DeeployManagerApiPlugin(
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
   """
   CONFIG = _CONFIG
+  _create_claim_init_lock = threading.Lock()
 
   def __init__(self, **kwargs):
     super(DeeployManagerApiPlugin, self).__init__(**kwargs)
+    self._create_job_claim_lock = threading.Lock()
+    self._active_create_job_ids = set()
     return
 
   def check_debug_logging_enabled(self):
@@ -258,6 +261,24 @@ class DeeployManagerApiPlugin(
         raise ValueError("Another managed service update action is already in progress for this job.")
       pending[key] = (action_kind, operation_id, intent_hash)
     return key
+
+  def _claim_create_job(self, job_id):
+    job_id = str(job_id)
+    if not hasattr(self, "_create_job_claim_lock"):
+      with self._create_claim_init_lock:
+        if not hasattr(self, "_create_job_claim_lock"):
+          self._create_job_claim_lock = threading.Lock()
+          self._active_create_job_ids = set()
+    with self._create_job_claim_lock:
+      if job_id in self._active_create_job_ids:
+        raise ValueError(f"A create for job {job_id} is already in progress on this manager.")
+      self._active_create_job_ids.add(job_id)
+    return job_id
+
+  def _release_create_job(self, job_id):
+    if job_id is not None:
+      with self._create_job_claim_lock:
+        self._active_create_job_ids.discard(job_id)
 
   def _release_managed_update_action(self, claim_key):
     lock = getattr(self, "_managed_update_action_lock", None)
@@ -822,6 +843,8 @@ class DeeployManagerApiPlugin(
     service_kind = None
     cockroachdb_legacy_compat_contexts = None
     staging_state = None
+    retry_has_staged_pipeline = False
+    create_job_claim_key = None
     try:
       self.__ensure_eth_balance()
       request_type = "create pipeline" if is_create else "update pipeline"
@@ -906,6 +929,17 @@ class DeeployManagerApiPlugin(
         if not is_valid:
           msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
           raise ValueError(msg)
+        try:
+          create_job_claim_key = self._claim_create_job(job_id)
+        except ValueError:
+          retry_has_staged_pipeline = True
+          raise
+        if self._get_pipeline_from_cstore(job_id):
+          retry_has_staged_pipeline = True
+          raise ValueError(
+            f"A previous create for job {job_id} may still be running. "
+            "Its staged metadata must be resolved before another create."
+          )
         # TODO: Add check if jobType resources match the requested resources.
 
         deployment_nodes = self._check_nodes_availability(inputs)
@@ -1229,6 +1263,9 @@ class DeeployManagerApiPlugin(
         job_id=job_id,
         secret_bundle=complete_secret_bundle,
       )
+      staging_state["retain_on_failed_dispatch"] = bool(
+        is_create and staging_state.get("prior_cid") is None
+      )
 
       if delete_existing_after_stage:
         self.delete_pipeline_from_nodes(
@@ -1255,6 +1292,7 @@ class DeeployManagerApiPlugin(
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
         cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
+        dispatch_state=staging_state,
       )
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
@@ -1353,7 +1391,8 @@ class DeeployManagerApiPlugin(
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
         self.commit_staged_job_pipeline_and_secrets(staging_state)
       else:
-        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, str_status)
+      dispatch_uncertain = bool(staging_state.get("dispatch_uncertain"))
       staging_state = None
 
       result = {
@@ -1363,15 +1402,22 @@ class DeeployManagerApiPlugin(
         DEEPLOY_KEYS.REQUEST: dct_request,
         DEEPLOY_KEYS.AUTH: auth_result,
       }
+      if dispatch_uncertain:
+        result["dispatch_uncertain"] = True
 
       if self.cfg_deeploy_verbose > 1:
         self.P(f"Request Result: status={str_status}, app_id={app_id}")
     except Exception as e:
       if staging_state is not None:
-        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, "dispatch error")
       result = self.__handle_error(e, request)
+      if retry_has_staged_pipeline or (
+        staging_state is not None and staging_state.get("dispatch_uncertain")
+      ):
+        result["dispatch_uncertain"] = True
     #endtry
     finally:
+      self._release_create_job(create_job_claim_key)
       if managed_action_claim_key is not None and not keep_managed_action_claim:
         self._release_managed_update_action(managed_action_claim_key)
     
@@ -1427,8 +1473,8 @@ class DeeployManagerApiPlugin(
     if now is None:
       now = self.time()
     if (now - pending['start_time']) > pending['timeout']:
-      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
       if pending.get('kind') == 'scale_up':
+        self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
         result = {
           DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
           DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
@@ -1437,11 +1483,16 @@ class DeeployManagerApiPlugin(
           DEEPLOY_KEYS.AUTH: pending.get('auth'),
         }
       else:
+        self.settle_failed_staged_job_pipeline_and_secrets(
+          pending.get('staging'), "timeout", dispatch_uncertain=True
+        )
         result = {
           DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
           DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
           **pending.get('base_result', {})
         }
+        if (pending.get('staging') or {}).get("dispatch_uncertain"):
+          result["dispatch_uncertain"] = True
       self.__pending_deploy_requests.pop(pending_id, None)
       self._release_managed_update_action(
         pending.get('managed_update_action_claim_key')
@@ -1511,16 +1562,21 @@ class DeeployManagerApiPlugin(
       if str_status == DEEPLOY_STATUS.SUCCESS and managed_action:
         self._mark_managed_update_action_applied(managed_action)
     else:
-      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
+      self.settle_failed_staged_job_pipeline_and_secrets(
+        pending.get('staging'), str_status, dispatch_uncertain=True
+      )
 
     self._release_managed_update_action(
       pending.get('managed_update_action_claim_key')
     )
-    return {
+    result = {
       DEEPLOY_KEYS.STATUS: str_status,
       DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
       **pending.get('base_result', {})
     }
+    if (pending.get('staging') or {}).get("dispatch_uncertain"):
+      result["dispatch_uncertain"] = True
+    return result
 
   def finalize_pending_request_scale_up(
       self, pending, dct_status, str_status
