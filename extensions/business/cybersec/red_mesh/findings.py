@@ -180,6 +180,10 @@ class Finding:
   # `enrich_finding_for_probe`; the report labels the latter as policy instead
   # of printing a bare badge (RM-086 item 5).
   severity_source: str = ""
+  # What happened after an accepted login, for findings that record one
+  # (`models.finding_schema.AUTHENTICATED_ACTIONS`); "" otherwise. Not identity
+  # and not content: `finding_identity` reads neither (RM-118).
+  authenticated_action: str = ""
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data
