@@ -468,6 +468,10 @@ class _WebHardeningMixin:
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
 
+    # One finding per page + normalised action: two forms whose actions differ
+    # only in a query or fragment would otherwise print two findings under one
+    # `finding_id`, the very symptom this identity exists to remove (RM-117).
+    seen = set()
     for path in ("/", "/login", "/contact", "/register"):
       try:
         resp = requests.get(base_url + path, timeout=self._target_timeout(3), verify=False)
@@ -492,6 +496,10 @@ class _WebHardeningMixin:
             continue  # has CSRF token — OK
 
           action = self._csrf_form_action(form_match.group(0), path)
+          identity_action = self._csrf_identity_action(action, path)
+          if (path, identity_action) in seen:
+            continue
+          seen.add((path, identity_action))
 
           findings_list.append(Finding(
             severity=Severity.MEDIUM,
@@ -508,7 +516,7 @@ class _WebHardeningMixin:
             # to it, so job 22f4998c printed two findings under one id.
             affected_assets=(AffectedAsset(
               host=target, port=port, url=path,
-              parameter=self._csrf_identity_action(action, path), method="POST",
+              parameter=identity_action, method="POST",
             ),),
           ))
       except Exception:

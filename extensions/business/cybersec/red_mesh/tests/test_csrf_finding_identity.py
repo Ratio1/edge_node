@@ -86,11 +86,16 @@ class TestCsrfFindingIdentity(unittest.TestCase):
     [finding] = self._run({"/contact": _page(_form(body=body))})
     self.assertEqual(finding["affected_assets"][0]["parameter"], "/contact")
 
-  def test_forms_posting_to_one_place_stay_one_identity(self):
+  def test_forms_posting_to_one_place_are_one_finding(self):
     """Stated limit: two forms without an action post back to the page, so
-    they are the same unprotected endpoint and share an id."""
-    findings = self._run({"/": _page(_form(), _form())})
-    self.assertEqual(len({f["finding_id"] for f in findings}), 1)
+    they are the same unprotected endpoint: one finding, never two findings
+    sharing an id."""
+    self.assertEqual(len(self._run({"/": _page(_form(), _form())})), 1)
+
+  def test_actions_differing_only_in_a_query_are_one_finding(self):
+    findings = self._run({"/": _page(_form("/search?t=1"), _form("/search?t=2"))})
+    self.assertEqual(len(findings), 1)
+    self.assertIn("/search?t=1", findings[0]["evidence"])
 
   def test_the_probe_time_id_survives_the_flat_walk(self):
     findings = self._run({"/": _page(_form("/users/sign_in"), _form("/users"))})
