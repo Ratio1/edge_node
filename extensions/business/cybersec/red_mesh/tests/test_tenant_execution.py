@@ -192,6 +192,22 @@ class TestTenantExecution(unittest.TestCase):
     fresh = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
     self.service.reauthorize_execution(fresh, worker_node="node-a")
 
+  def test_a_password_reset_leaves_a_running_job_authorized(self):
+    """RM-114. The Navigator ends a reset account's sessions through `passwordChangedAt` and keeps the
+    generation, so the binding of a job the account is running still reauthorizes."""
+    asset = self.ready()
+    self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
+    self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
+    binding = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
+    raw = self.owner.data[("auth", "pentester")]
+    raw.update(
+      password={**raw["password"], "salt": "bmV3c2FsdG5ld3NhbHRuZQ==",
+                "hash": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4="},
+      passwordChangedAt="2026-10-01T12:00:00.000Z", updatedAt="2026-10-01T12:00:00.000Z",
+      updatedBy="tenant-admin",
+    )
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+
   def test_existing_execution_rejects_incarnation_revocation_and_ineligible_workers(self):
     asset = self.ready()
     self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
@@ -211,7 +227,7 @@ class TestTenantExecution(unittest.TestCase):
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
     raw = self.owner.data[("auth", "pentester")]
     original = raw["generation"]
-    raw["generation"] = str(uuid4())  # the account was recreated, or its password reset
+    raw["generation"] = str(uuid4())  # the account was recreated, or archived and restored
     with self.assertRaises(AdministrationDenied) as denied:
       self.service.reauthorize_execution(binding)
     self.assertEqual(denied.exception.error, "account_changed")
@@ -219,6 +235,25 @@ class TestTenantExecution(unittest.TestCase):
     raw["memberships"] = []
     with self.assertRaises(AdministrationDenied):
       self.service.reauthorize_execution(binding)
+
+  def test_a_draining_row_blocks_new_launches_but_still_reauthorizes_its_own_job(self):
+    """RM-102. Release while the tenant's job keeps running on the node enters `draining`: a new
+    launch no longer sees the node, but the job already running on it still reauthorizes."""
+    asset = self.ready()
+    binding = self.admit(self.actor, asset).build_binding("coordinator", ["node-a"])
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: True
+    result = self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-a", False)
+    self.assertEqual(result["data"]["state"], "draining")
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.admit(self.actor, asset, ["node-a"])
+    self.assertEqual(denied.exception.error, "ineligible_node")
+    self.assertEqual(self.admit(self.actor, asset).to_dict()["selected_candidates"], ["node-b"])
+    # The job ends: the row reads as released, and launches see the node eligible again once it is
+    # written back in (release once more, then a fresh assignment).
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: False
+    self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
+                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned"}])
 
   def test_existing_execution_checks_namespace_publication_engagement_and_current_configuration(self):
     asset = self.ready()
