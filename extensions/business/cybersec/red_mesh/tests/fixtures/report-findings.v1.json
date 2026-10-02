@@ -1,0 +1,864 @@
+{
+  "catchAllWithheld": {
+    "http://198.51.100.20": [
+      {
+        "path": "/admin",
+        "probe": "_web_test_common"
+      }
+    ]
+  },
+  "findings": [
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 21
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "attempted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "certain",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 7.5,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        287
+      ],
+      "cwe_id": "CWE-287",
+      "declared_severity": "HIGH",
+      "description": "The FTP server permits unauthenticated access via anonymous login.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Anonymous login succeeded.",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ftp evidence",
+          "kind": "log",
+          "snippet": "Anonymous login succeeded."
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "0f1aba97574cf858",
+      "finding_signature": "8ecc89ed4cb14dcf2b4dbd342c137641f492413b362cc0d4e43159130e5a3acd",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 21,
+      "probe": "_service_info_ftp",
+      "probe_display_name": "FTP service detection",
+      "protocol": "ftp",
+      "references": [],
+      "remediation": "Disable anonymous FTP access unless explicitly required.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Disable anonymous FTP access unless explicitly required."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "HIGH",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "FTP allows anonymous login.",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 21
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "performed",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "certain",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.1,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        434
+      ],
+      "cwe_id": "CWE-434",
+      "declared_severity": "CRITICAL",
+      "description": "Anonymous users can upload files to the FTP server.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "STOR command succeeded with anonymous session.",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ftp evidence",
+          "kind": "log",
+          "snippet": "STOR command succeeded with anonymous session."
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "643c687b92a692aa",
+      "finding_signature": "ce1865b8473b4724dfaf3aa31d54b8c660a33b3346f05fe6c6bc23485529ba1d",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A01:2021",
+      "owasp_top10": [
+        "A01:2021"
+      ],
+      "port": 21,
+      "probe": "_service_info_ftp",
+      "probe_display_name": "FTP service detection",
+      "protocol": "ftp",
+      "references": [],
+      "remediation": "Remove write permissions for anonymous FTP users.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Remove write permissions for anonymous FTP users."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "FTP anonymous write access enabled (file upload possible).",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 21
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "performed",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "certain",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.8,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "CRITICAL",
+      "description": "The FTP server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: ftp:***; authenticated action: PWD -> /home/ftp",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ftp evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: ftp:***; authenticated action: PWD -> /home/ftp"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "669c46d8b3de5b8b",
+      "finding_signature": "255c4a89917644afb14d33f73d4378b7f94d788aff8ecb93f1f7a3752ddee1e5",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 21,
+      "probe": "_service_info_ftp",
+      "probe_display_name": "FTP service detection",
+      "protocol": "ftp",
+      "references": [],
+      "remediation": "Change default passwords immediately and enforce strong credential policies.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Change default passwords immediately and enforce strong credential policies."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "FTP default credential accepted: ftp:***",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 21
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "certain",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 5.3,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        319
+      ],
+      "cwe_id": "CWE-319",
+      "declared_severity": "MEDIUM",
+      "description": "Credentials and data are transmitted in cleartext over the network.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "AUTH TLS command rejected or not supported.",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ftp evidence",
+          "kind": "log",
+          "snippet": "AUTH TLS command rejected or not supported."
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "1223a71717397203",
+      "finding_signature": "1033ab9a4c7e744c8a7a21e6f5734dae9e1fad9d70c84602da2f05827a945218",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A02:2021",
+      "owasp_top10": [
+        "A02:2021"
+      ],
+      "port": 21,
+      "probe": "_service_info_ftp",
+      "probe_display_name": "FTP service detection",
+      "protocol": "ftp",
+      "references": [],
+      "remediation": "Enable FTPS (AUTH TLS) or migrate to SFTP.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Enable FTPS (AUTH TLS) or migrate to SFTP."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "MEDIUM",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "FTP does not support TLS encryption (cleartext credentials).",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 3306
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "not_applicable",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "certain",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.8,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "CRITICAL",
+      "description": "MySQL on 198.51.100.20:3306 accepts root:***.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Auth response OK for root:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_mysql_creds evidence",
+          "kind": "log",
+          "snippet": "Auth response OK for root:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "eae4c4089ea5ad1a",
+      "finding_signature": "ba03083dc911e0c12a990645a2c8ca94e66ee1d9ae404af83139cda77b1b0740",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 3306,
+      "probe": "_service_info_mysql_creds",
+      "probe_display_name": "MySQL credential check",
+      "protocol": "mysql",
+      "references": [],
+      "remediation": "Change default passwords and restrict access.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Change default passwords and restrict access."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "MySQL default credential accepted: root:***",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 22
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "",
+      "backport_status": "unknown",
+      "category": "service",
+      "confidence": "tentative",
+      "created_by": "",
+      "cve": [
+        "CVE-2021-41617"
+      ],
+      "cvss_data_freshness": "",
+      "cvss_score": 7.0,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        20
+      ],
+      "cwe_id": "CWE-20",
+      "declared_severity": "HIGH",
+      "description": "openssh 8.2p1 is vulnerable to CVE-2021-41617. Backport status unknown: a distribution package was detected but no advisory data covers this CVE for it, so the fix may already be applied.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Detected version: 8.2p1, affected: >=6.2,<8.8",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Detected version: 8.2p1, affected: >=6.2,<8.8"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "7eaa2e573a03b747",
+      "finding_signature": "58416261806425a1b8df8029eb1cd1d47979baa4193884d72e0d978c544c36ff",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A03:2021",
+      "owasp_top10": [
+        "A03:2021"
+      ],
+      "port": 22,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2021-41617"
+      ],
+      "remediation": "Upgrade openssh to a patched version, or verify backport status with the OS vendor.",
+      "remediation_structured": {
+        "compensating": "Use host or network controls to reduce exploitability for the affected service.",
+        "mitigation": "Restrict exposure to trusted networks until patch status is confirmed.",
+        "primary": "Upgrade openssh to a patched version, or verify backport status with the OS vendor."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "HIGH",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "CVE-2021-41617: Supplemental groups not initialized (openssh 8.2p1)",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 22
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "attempted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "firm",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.8,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "CRITICAL",
+      "description": "The SSH server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair. No authenticated action was completed; the handshake alone was observed.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: admin:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: admin:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "6c67b98efead130b",
+      "finding_signature": "39b413de74eb10e14b6f0b097aee7eaf2898bb8b66e7667f55398fde7c419402",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 22,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Change default passwords immediately and enforce strong credential policies.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Change default passwords immediately and enforce strong credential policies."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: admin:***",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 22
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "not_permitted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "firm",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.8,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "CRITICAL",
+      "description": "The SSH server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair. No authenticated action was attempted; not permitted by the Rules of Engagement for this job.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: pi:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: pi:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "ff3a309821dbf386",
+      "finding_signature": "971538ebddb7047b1badeb0c7be9809d13e253ef2fd53ea063b805ebe5e99d8c",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 22,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Change default passwords immediately and enforce strong credential policies.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Change default passwords immediately and enforce strong credential policies."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: pi:***",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 22
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "performed",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "certain",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 9.8,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "CRITICAL",
+      "description": "The SSH server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: root:***; authenticated action: exec id -> uid=0(root) gid=0(root)",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: root:***; authenticated action: exec id -> uid=0(root) gid=0(root)"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "3d800f0810ed0693",
+      "finding_signature": "ae76cce86dd44c1b55c3a1e9d2e844e3bba8dc06a819c8138c10363f3cdeec4a",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 22,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Change default passwords immediately and enforce strong credential policies.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Change default passwords immediately and enforce strong credential policies."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "CRITICAL",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: root:***",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "port": 22
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "attempted",
+      "backport_status": "",
+      "category": "service",
+      "confidence": "tentative",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": null,
+      "cvss_score_env": null,
+      "cvss_vector": "",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        798
+      ],
+      "cwe_id": "CWE-798",
+      "declared_severity": "INFO",
+      "description": "The SSH server accepted a well-known default credential, but it also accepted a randomly generated one, so this does not demonstrate a default credential in use. See the \"accepts arbitrary credentials\" finding on this port.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Accepted credential: user:***",
+      "evidence_items": [
+        {
+          "caption": "_service_info_ssh evidence",
+          "kind": "log",
+          "snippet": "Accepted credential: user:***"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "701abae7783f90ea",
+      "finding_signature": "d48f7b642287f8d5e13d02fdfeaecbbe4ad5f43dc1cb8a84b4a5c0bd07819e46",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A07:2021",
+      "owasp_top10": [
+        "A07:2021"
+      ],
+      "port": 22,
+      "probe": "_service_info_ssh",
+      "probe_display_name": "SSH service detection",
+      "protocol": "ssh",
+      "references": [],
+      "remediation": "Investigate why the service accepts arbitrary credentials first.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Investigate why the service accepts arbitrary credentials first."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "INFO",
+      "severity_justification": "",
+      "severity_source": "probe_policy",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "SSH default credential accepted: user:*** (inconclusive: service accepts arbitrary credentials)",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "method": "POST",
+          "parameter": "/users/sign_in",
+          "port": 80,
+          "url": "/"
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "",
+      "backport_status": "",
+      "category": "web",
+      "confidence": "firm",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 6.5,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        352
+      ],
+      "cwe_id": "CWE-352",
+      "declared_severity": "MEDIUM",
+      "description": "A form submitting via POST has no hidden CSRF token field, making it vulnerable to cross-site request forgery.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Form action=/users/sign_in, hidden fields=none",
+      "evidence_items": [
+        {
+          "caption": "_web_test_csrf evidence",
+          "kind": "log",
+          "snippet": "Form action=/users/sign_in, hidden fields=none"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "2e3810dcbc7372bf",
+      "finding_signature": "a8b2dba8cfe6abebc63e10881777214c7c19c1a7fd106a32dbdab6297492b270",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A01:2021",
+      "owasp_top10": [
+        "A01:2021"
+      ],
+      "port": 80,
+      "probe": "_web_test_csrf",
+      "probe_display_name": "CSRF token presence",
+      "protocol": "http",
+      "references": [],
+      "remediation": "Add a CSRF token to all state-changing forms.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Add a CSRF token to all state-changing forms."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "MEDIUM",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "POST form at / missing CSRF token",
+      "triage_state": "new",
+      "verified_by": ""
+    },
+    {
+      "affected_assets": [
+        {
+          "host": "198.51.100.20",
+          "method": "POST",
+          "parameter": "/users",
+          "port": 80,
+          "url": "/"
+        }
+      ],
+      "ai_generated": false,
+      "authenticated_action": "",
+      "backport_status": "",
+      "category": "web",
+      "confidence": "firm",
+      "created_by": "",
+      "cve": [],
+      "cvss_data_freshness": "",
+      "cvss_score": 6.5,
+      "cvss_score_env": null,
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N",
+      "cvss_vector_env": "",
+      "cvss_version": "3.1",
+      "cwe": [
+        352
+      ],
+      "cwe_id": "CWE-352",
+      "declared_severity": "MEDIUM",
+      "description": "A form submitting via POST has no hidden CSRF token field, making it vulnerable to cross-site request forgery.",
+      "ease_of_resolution": "",
+      "epss_score": null,
+      "evidence": "Form action=/users?ref=nav, hidden fields=none",
+      "evidence_items": [
+        {
+          "caption": "_web_test_csrf evidence",
+          "kind": "log",
+          "snippet": "Form action=/users?ref=nav, hidden fields=none"
+        }
+      ],
+      "exploitability_status": "",
+      "finding_id": "d56019d1ff092aff",
+      "finding_signature": "c63e15088f08a151755b43af25410372671e54b3087556ae7ac7457d53cbead9",
+      "first_seen": "",
+      "impact": "",
+      "kev": false,
+      "last_seen": "",
+      "owasp_id": "A01:2021",
+      "owasp_top10": [
+        "A01:2021"
+      ],
+      "port": 80,
+      "probe": "_web_test_csrf",
+      "probe_display_name": "CSRF token presence",
+      "protocol": "http",
+      "references": [],
+      "remediation": "Add a CSRF token to all state-changing forms.",
+      "remediation_structured": {
+        "compensating": "",
+        "mitigation": "",
+        "primary": "Add a CSRF token to all state-changing forms."
+      },
+      "schema": "redmesh.finding.v1",
+      "schema_version": "1.0.0",
+      "severity": "MEDIUM",
+      "severity_justification": "",
+      "severity_source": "cvss",
+      "source": "automated",
+      "steps_to_reproduce": [],
+      "tags": [],
+      "title": "POST form at / missing CSRF token",
+      "triage_state": "new",
+      "verified_by": ""
+    }
+  ],
+  "schemaVersion": 1,
+  "target": "198.51.100.20"
+}
