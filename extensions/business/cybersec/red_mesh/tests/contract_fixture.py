@@ -16,6 +16,8 @@ class FakeDocumentStore:
     self.envelopes = {}
     self.puts = []
     self.fail = False
+    self.fail_delete = set()
+    self.deleted = []
 
   def put(self, envelope):
     if self.fail:
@@ -30,6 +32,13 @@ class FakeDocumentStore:
       raise DocumentStoreError("fake store down")
     envelope = self.envelopes.get(ref)
     return copy.deepcopy(envelope) if isinstance(envelope, dict) else None
+
+  def delete(self, ref):
+    # RM-107. `fail_delete` names the refs whose delete the backend does not confirm.
+    if self.fail or ref in self.fail_delete:
+      raise DocumentStoreError("fake store down")
+    self.deleted.append(ref)
+    self.envelopes.pop(ref, None)
 
 
 def contract_b64(raw=CONTRACT_PDF):

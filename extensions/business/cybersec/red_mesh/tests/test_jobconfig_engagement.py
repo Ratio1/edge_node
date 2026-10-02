@@ -5,9 +5,8 @@ Verifies:
     `authorization` dict fields.
   - get_engagement() / get_roe() / get_authorization() resolve the
     typed accessors correctly.
-  - Backward-compat: when only the legacy `engagement_metadata` /
-    `authorization_ref` fields are populated, the accessors still
-    return useful values.
+  - RM-108 phase 5: the legacy `engagement_metadata` / `authorization_ref`
+    fields are no longer read by the accessors.
   - Round-trip through to_dict / from_dict preserves the typed shape.
   - get_kickoff_questionnaire() bundles the three sub-models.
 """
@@ -78,7 +77,7 @@ class TestEngagementFieldsTyped(unittest.TestCase):
 
   def test_engagement_fields_round_trip_and_stay_absent_on_old_jobs(self):
     fields = {"engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "a" * 64,
-              "authorized_tests": ["service_info_common"]}
+              "authorized_tests": ["service_info_common"], "contract_sha256": "c" * 64}
     restored = JobConfig.from_dict(JobConfig(**_base_jobconfig_kwargs(), **fields).to_dict())
     self.assertEqual({key: getattr(restored, key) for key in fields}, fields)
     self.assertFalse(set(fields) & set(JobConfig(**_base_jobconfig_kwargs()).to_dict()))
@@ -115,40 +114,26 @@ class TestEngagementFieldsTyped(unittest.TestCase):
     self.assertEqual(restored.get_authorization().document_cid, "QmAuthCID")
 
 
-class TestEngagementBackwardCompat(unittest.TestCase):
-  """Pre-Phase-3 archives stored engagement-adjacent data in legacy
-  fields. The typed accessors fall back gracefully so existing
-  archives still surface usable engagement context."""
+class TestEngagementLegacyFieldsAreIgnored(unittest.TestCase):
+  """RM-108 phase 5: the pre-PR-3.3 free-form fallback fields are still stored (backward-compat
+  with old field names) but no longer read. Storage holds no archive that needs them."""
 
-  def test_legacy_engagement_metadata_dict_resolves(self):
-    """An archive with only `engagement_metadata` (free-form dict) and
-    no typed `engagement` field should still produce an
-    EngagementContext via get_engagement()."""
+  def test_legacy_engagement_metadata_dict_is_not_resolved(self):
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       engagement_metadata={"client_name": "Legacy Co.",
                            "primary_objective": "old format"},
     )
-    resolved = cfg.get_engagement()
-    self.assertIsNotNone(resolved)
-    self.assertEqual(resolved.client_name, "Legacy Co.")
-    self.assertEqual(resolved.primary_objective, "old format")
+    self.assertIsNone(cfg.get_engagement())
 
-  def test_legacy_authorization_ref_str_resolves(self):
-    """An archive with only `authorization_ref` (just a CID string)
-    resolves to an AuthorizationRef with document_cid set and
-    everything else empty."""
+  def test_legacy_authorization_ref_str_is_not_resolved(self):
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       authorization_ref="QmLegacyAuthCID",
     )
-    resolved = cfg.get_authorization()
-    self.assertIsNotNone(resolved)
-    self.assertEqual(resolved.document_cid, "QmLegacyAuthCID")
-    self.assertEqual(resolved.authorized_signer_name, "")
+    self.assertIsNone(cfg.get_authorization())
 
-  def test_typed_field_takes_precedence_over_legacy(self):
-    """When both shapes are present, the typed field wins."""
+  def test_typed_field_is_the_only_source(self):
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       engagement={"client_name": "Typed Co."},

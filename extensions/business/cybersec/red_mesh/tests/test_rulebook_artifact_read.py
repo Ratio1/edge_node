@@ -14,13 +14,15 @@ import pytest
 from .test_rulebook_assessment import _Owner, checked_read_producer
 from .read_endpoint_fixtures import as_role, read_endpoint_fixture
 from .test_tenant_read_native import assert_json_response, install, read_native, request, scheduler_comms
-from .test_tenant_rulebook_reads import install_rulebook_producer
+from .test_tenant_rulebook_reads import install_rulebook_producer, _bind
+from .test_execution_binding_models import binding_payload
 from extensions.business.cybersec.red_mesh.services import rulebook_assessment as service
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 
 
 PROFILE = service.DEFAULT_RULEBOOK_PROFILE_ID
+BINDING = binding_payload()
 
 
 def producer_with_history():
@@ -34,9 +36,15 @@ def producer_with_history():
 
 
 def read(owner, cid, profile_id=PROFILE, job=None):
+  # RM-108 phase 5: the checked path now requires a real binding (legacy_unbound mode is gone).
+  if job is None:
+    _bind(owner)
+    job = owner.job_specs
+  else:
+    job = {"execution_binding": deepcopy(BINDING), **job}
   return service.get_rulebook_artifact(owner, "job-1", cid, profile_id,
-                                       checked_job=owner.job_specs if job is None else job,
-                                       snapshot_mode="legacy_unbound")
+                                       checked_job=job,
+                                       snapshot_mode="tenant_bound")
 
 
 def guard_effects(owner):

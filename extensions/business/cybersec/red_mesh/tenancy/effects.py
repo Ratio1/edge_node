@@ -138,6 +138,8 @@ _PUBLIC_CONFIGURATION_ERRORS = frozenset({
   # authorization_upload outcome codes: structured, and the prose that accompanied them embedded
   # R1FS and virus-scan exception text.
   "invalid_base64", "empty", "too_large", "bad_mime", "virus_detected", "storage_failed",
+  # tenant_export_binding: a bound tenant with no record for this integration pushes nowhere (RM-093).
+  "tenant_integration_not_configured",
 })
 
 # invalid_jsonl_line_<n> carries a bounded line index, not caller text.

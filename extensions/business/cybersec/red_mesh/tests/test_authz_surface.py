@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 87  # +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2)
+EXPECTED_ENDPOINTS = 89  # +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -17,10 +17,6 @@ ENDPOINT_FIRST_ARGS = {
   'get_tenant': 'actor',
   'get_tenant_nodes': 'actor',
   'set_tenant_node_assignment': 'actor',
-  'list_tenant_assets': 'actor',
-  'get_tenant_asset': 'actor',
-  'create_tenant_asset': 'actor',
-  'update_tenant_asset': 'actor',
   # RM-081: tenant integration configuration, same administration seam as assets and nodes.
   'list_tenant_integrations': 'actor',
   'get_tenant_integration': 'actor',
@@ -33,6 +29,14 @@ ENDPOINT_FIRST_ARGS = {
   'upload_tenant_contract': 'actor',
   'get_tenant_contract': 'actor',
   'download_tenant_contract': 'actor',
+  # RM-107: removes a tenant with no members and no jobs.
+  'delete_tenant': 'actor',
+  # RM-108, temporary.
+  'export_redmesh_records': 'actor',
+  'export_redmesh_file': 'actor',
+  'cleanup_redmesh_old_data': 'actor',
+  'restore_redmesh_file': 'actor',
+  'restore_redmesh_records': 'actor',
   'upload_engagement_document': 'actor',
   'create_engagement': 'actor',
   'list_engagements': 'actor',
@@ -123,8 +127,7 @@ def _known_rollout(plugin):
   plugin.cfg_instance_id = "fixture-instance"
   plugin._execution_service = lambda: MagicMock()
 
-  def admit(actor, tenant_id=None, asset_id=None, expected_target_digest=None, selected_peers=None,
-            engagement_id=None, require_engagement=False):
+  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None):
     account, denial = plugin._resolve_launch_actor(actor)
     if denial:
       return None, None, denial
@@ -361,12 +364,13 @@ class TestAuthzSurface(unittest.TestCase):
           launch.assert_not_called()
 
   def test_preflight_accepts_trimmed_configured_token(self):
-    from .test_api import _stub_launch_actor
+    from .test_api import _engagement, _stub_launch_actor
     plugin = _stub_launch_actor(MagicMock())
     with patch.dict("os.environ", {"REDMESH_BACKEND_TOKEN": TEST_CHANNEL_TOKEN + "\n"}, clear=True), \
          patch("extensions.business.cybersec.red_mesh.pentester_api_01.preflight_model_test_provider", return_value={"ok": True}) as preflight:
       self.assertEqual(self.Plugin.preflight_model_test_provider(
-        plugin, TEST_CHANNEL_TOKEN, actor={"account_id": "tester"}), {"ok": True})
+        plugin, TEST_CHANNEL_TOKEN, actor={"account_id": "tester"},
+        engagement_id=_engagement()["engagement_id"], engagement_asset_id="ea_1"), {"ok": True})
     preflight.assert_called_once()
 
 

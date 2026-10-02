@@ -8,7 +8,6 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService, TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
-from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_tenant import CstoreTenantReader
 from .contract_fixture import contract_terms, install_contract
 
 
@@ -107,7 +106,7 @@ class TestTenantAdministration(unittest.TestCase):
     tenant_id = prepared["tenantId"]
     self.assertEqual(prepared["state"], "pending")
     self.assertEqual(len(tenant_id), 39)
-    self.assertIsNone(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id))
+    self.assertFalse(self.repo.get("tenant", tenant_id)["active"])
     self.assertEqual(self.service.list_tenants(self.actor)["data"], [])
     self.assertEqual(self.service.activate_tenant(self.actor, self.request)["status_code"], 409)
     self.store.grant("initial", tenant_id)
@@ -115,12 +114,13 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(activated["tenantId"], tenant_id)
     self.assertEqual(activated["displayName"], "Example")
     self.assertFalse(activated["allowPentester"])
-    self.assertEqual((activated["memberCount"], activated["adminCount"], activated["assetCount"]), (1, 1, 0))
+    self.assertEqual((activated["memberCount"], activated["adminCount"]), (1, 1))
+    self.assertNotIn("assetCount", activated)
     self.assertTrue(activated["canUpdateAllowPentester"])
     self.assertEqual(self.service.get_tenant({"account_id": "initial"}, tenant_id)["data"],
                      {**activated, "canUpdateAllowPentester": False,
                       "assignableMemberRoles": ["tenant_admin", "tenant_user"]})
-    self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).active)
+    self.assertTrue(self.repo.get("tenant", tenant_id)["active"])
 
   def test_matching_pending_retry_resumes_but_changed_intent_never_writes(self):
     first = self.prepare()["data"]
@@ -142,7 +142,7 @@ class TestTenantAdministration(unittest.TestCase):
     self.assertEqual(result["data"]["allowPentesterChangedBy"], "creator")
     self.assertTrue(result["data"]["allowPentesterChangedAt"])
     self.assertEqual(self.service.get_tenant(self.actor, tenant_id)["data"], result["data"])
-    self.assertTrue(CstoreTenantReader(self.store, "test-deployment").get_tenant_policy(tenant_id).allow_pentester)
+    self.assertTrue(self.repo.get("tenant", tenant_id)["allow_pentester"])
     stored = self.repo.get("tenant", tenant_id)
     for field, value in before.items():
       if field != "allow_pentester":
@@ -660,8 +660,7 @@ class TestAdministrationPluginBoundary(unittest.TestCase):
                "authorize_tenant_account_creation",
                "authorize_account_state_change",
                "update_tenant_allow_pentester",
-               "get_tenant_nodes", "set_tenant_node_assignment", "list_tenant_assets",
-               "get_tenant_asset", "create_tenant_asset", "update_tenant_asset")
+               "get_tenant_nodes", "set_tenant_node_assignment")
     self.assertTrue(all(getattr(self.Plugin, name).__http_method__ == "post" for name in methods))
     for namespace in (None, " ", 7):
       for name in methods:

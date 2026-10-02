@@ -23,6 +23,8 @@ from .raw_evidence import sanitize_raw_evidence_metadata
 MODEL_TEST_JOB_CONFIG_SCHEMA = "model_test_job_config_v1"
 MODEL_TEST_ARCHIVE_SCHEMA = "model_test_archive_v1"
 MODEL_TEST_WORKER_RESULT_SCHEMA = "model_test_worker_result_v1"
+_ENGAGEMENT_SNAPSHOT_KEYS = ("engagement_id", "engagement_hash", "contract_sha256", "authorized_tests",
+                             "roe", "engagement", "authorization")
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,14 @@ class ModelTestJobConfig:
   start_attestation_required: bool = False
   end_attestation_required: bool = False
   execution_binding: ExecutionBinding | None = None
+  # RM-107: the engagement snapshot, the same keys a scan JobConfig carries (absent before RM-107).
+  engagement_id: str | None = None
+  engagement_hash: str | None = None
+  contract_sha256: str | None = None
+  authorized_tests: list | None = None
+  roe: dict | None = None
+  engagement: dict | None = None
+  authorization: dict | None = None
 
   def __post_init__(self):
     object.__setattr__(self, "execution_binding", binding_value(self.execution_binding))
@@ -96,6 +106,7 @@ class ModelTestJobConfig:
       blockchain_attestation_enabled=bool(d.get("blockchain_attestation_enabled", False)),
       start_attestation_required=bool(d.get("start_attestation_required", False)),
       end_attestation_required=bool(d.get("end_attestation_required", False)),
+      **{key: d.get(key) for key in _ENGAGEMENT_SNAPSHOT_KEYS},
     )
 
 

@@ -14,21 +14,19 @@
     "super_pentester": [
       "allow_pentester:update",
       "analysis:run",
-      "assets:create",
-      "assets:update",
       "authorization:upload",
       "engagements:documents",
       "evidence:read",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tasks:launch",
+      "tasks:stop",
       "tasks:update"
     ],
     "super_tenant_admin": [
       "allow_pentester:update",
       "analysis:run",
-      "assets:create",
-      "assets:update",
       "attestation_keys:manage",
       "audit:view",
       "authorization:upload",
@@ -42,10 +40,13 @@
       "node_assignments:manage",
       "node_failure_policy:update",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tasks:launch",
+      "tasks:stop",
       "tasks:update",
       "tenant_users:manage",
+      "tenants:delete",
       "tenants:manage"
     ],
     "tenant_admin": [
@@ -61,8 +62,10 @@
       "analysis:run",
       "authorization:upload",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tasks:launch",
+      "tasks:stop",
       "tasks:update"
     ],
     "tenant_user": [

@@ -42,6 +42,7 @@ class JobConfig:
   timeout_profile: str = TIMEOUT_PROFILE_STANDARD  # STANDARD | THOROUGH (network scans)
   scan_min_delay: float = 0
   scan_max_delay: float = 0
+  scan_mode: str = "connect"        # connect (full handshake) | syn (half-open)
   ics_safe_mode: bool = False
   redact_credentials: bool = True
   scanner_identity: str = ""
@@ -135,8 +136,10 @@ class JobConfig:
   authorization_update: dict = None
   # The signed engagement the job ran under (RM-095): its id and hash, and the asset's
   # authorized FEATURE_CATALOG ids. `engagement`, `roe` and `authorization` above are its snapshot.
+  # RM-107: the SHA-256 of the tenant contract the engagement extends (the signed basis).
   engagement_id: str = None
   engagement_hash: str = None
+  contract_sha256: str = None
   authorized_tests: list = None
   execution_binding: ExecutionBinding | None = None
 
@@ -166,6 +169,7 @@ class JobConfig:
       timeout_profile=normalize_timeout_profile(d.get("timeout_profile")),
       scan_min_delay=d.get("scan_min_delay", 0),
       scan_max_delay=d.get("scan_max_delay", 0),
+      scan_mode=d.get("scan_mode", "connect"),
       ics_safe_mode=d.get("ics_safe_mode", False),
       redact_credentials=d.get("redact_credentials", True),
       scanner_identity=d.get("scanner_identity", ""),
@@ -242,21 +246,20 @@ class JobConfig:
       authorization_update=d.get("authorization_update"),
       engagement_id=d.get("engagement_id"),
       engagement_hash=d.get("engagement_hash"),
+      contract_sha256=d.get("contract_sha256"),
       authorized_tests=d.get("authorized_tests"),
     )
 
   # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
 
   def get_engagement(self):
-    """Return EngagementContext or None. Resolves the typed `engagement`
-    field first; falls back to the legacy free-form `engagement_metadata`
-    dict for backward compat with archives created before PR-3.3."""
+    """Return EngagementContext from the typed `engagement` field, or None.
+
+    RM-108 phase 5: the pre-PR-3.3 free-form `engagement_metadata` fallback is gone; storage
+    holds no archive that needs it.
+    """
     from .engagement import EngagementContext
-    if self.engagement:
-      return EngagementContext.from_dict(self.engagement)
-    if self.engagement_metadata:
-      return EngagementContext.from_dict(self.engagement_metadata)
-    return None
+    return EngagementContext.from_dict(self.engagement) if self.engagement else None
 
   def get_roe(self):
     """Return RulesOfEngagement or None."""
@@ -264,15 +267,13 @@ class JobConfig:
     return RulesOfEngagement.from_dict(self.roe) if self.roe else None
 
   def get_authorization(self):
-    """Return AuthorizationRef or None. Falls back to the legacy
-    string `authorization_ref` (just a CID, no signer) when the typed
-    field is absent."""
+    """Return AuthorizationRef from the typed `authorization` field, or None.
+
+    RM-108 phase 5: the pre-PR-3.3 bare `authorization_ref` CID-string fallback is gone; storage
+    holds no archive that needs it.
+    """
     from .engagement import AuthorizationRef
-    if self.authorization:
-      return AuthorizationRef.from_dict(self.authorization)
-    if self.authorization_ref:
-      return AuthorizationRef(document_cid=self.authorization_ref)
-    return None
+    return AuthorizationRef.from_dict(self.authorization) if self.authorization else None
 
   def get_kickoff_questionnaire(self):
     """Return a KickoffQuestionnaire bundling engagement/roe/authorization

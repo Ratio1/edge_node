@@ -33,6 +33,12 @@ class _Repo:
       raise RuntimeError("r1fs down")
     return self.stored.get(cid)
 
+  def delete(self, cid, *, show_logs=False, raise_on_error=False, purge=False):
+    if self.fail:
+      raise RuntimeError("r1fs down")
+    self.deletes = getattr(self, "deletes", []) + [(cid, purge)]
+    return self.stored.pop(cid, None) is not None
+
 
 class TestValidateDocument(unittest.TestCase):
   def test_returns_the_decoded_facts(self):
@@ -81,6 +87,17 @@ class TestR1fsDocumentStore(unittest.TestCase):
       store.get("QmA")
     with self.assertRaises(DocumentStoreError):
       R1fsDocumentStore(_Repo(cid="")).put({"kind": "k"})
+
+  def test_delete_unpins_for_good_and_fails_unless_confirmed(self):
+    # RM-107: `delete_tenant` deletes the tenant's documents the way `purge_job` deletes artifacts.
+    repo = _Repo(stored={"QmA": {"kind": "k"}})
+    store = R1fsDocumentStore(repo)
+    self.assertIsNone(store.delete("QmA"))
+    self.assertEqual(repo.deletes, [("QmA", True)])
+    with self.assertRaises(DocumentStoreError):
+      store.delete("QmA")  # not confirmed by the backend
+    with self.assertRaises(DocumentStoreError):
+      R1fsDocumentStore(_Repo(fail=True)).delete("QmA")
 
   def test_store_errors_are_tenant_store_errors(self):
     # The administration endpoint maps TenantStoreError to 503 unavailable.

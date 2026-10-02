@@ -8,15 +8,18 @@ from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_diges
 from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
 
 
-def context(target, engagement=False):
+def context(target, engagement=True):
+  """RM-107: every resolved context carries its engagement; `engagement` is kept for the callers."""
   from .test_api import _engagement
+  facts = _engagement(target["kind"])
   return ResolvedExecutionContext({
     "namespace": "deployment", "tenant_id": "tn_00000000-0000-4000-8000-000000000001",
-    "asset_id": "as_00000000-0000-4000-8000-000000000002", "asset_target": target,
+    "engagement_id": facts["engagement_id"], "engagement_asset_id": "ea_1",
+    "engagement_hash": facts["engagement_hash"], "asset_target": target,
     "asset_target_digest": canonical_digest(target), "actor_id": "creator",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
-    "selected_candidates": ["node-1", "node-2"],
-    **({"engagement": _engagement(target["kind"]), "asset_authorized_ports": "1-65535"} if engagement else {}),
+    "selected_candidates": ["node-1", "node-2"], "engagement": facts,
+    **({"asset_authorized_ports": "1-65535"} if target["kind"] == "network" else {}),
   })
 
 
@@ -57,21 +60,22 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
   from uuid import uuid4
   from .test_tenant_execution import TestTenantExecution
   from .test_tenant_engagements import doc
+  from .contract_fixture import CONTRACT_SHA256
   from .test_api import TestPhase1ConfigCID
   from extensions.business.cybersec.red_mesh.constants import FEATURE_CATALOG
   from extensions.business.cybersec.red_mesh.tenancy.identity import resolve_actor, TenantMembership
   fixture = TestTenantExecution()
   fixture.setUp()
   try:
-    asset = fixture.ready()
+    fixture.ready()
     fixture.service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
     engagement = fixture.service.create_engagement(
-      fixture.actor, fixture.tenant, str(uuid4()), "Q4", "point-in-time", "2026-10-01T00:00:00Z",
+      fixture.actor, fixture.tenant, str(uuid4()), "Q4", ["continuous", "single_pass"], "2026-10-01T00:00:00Z",
       "2026-10-31T00:00:00Z", {}, {"client_name": "Example"},
-      [{"asset_id": asset["assetId"], "authorized_ports": "1-1024",
+      [{"display_name": "Edge", "target": fixture.target, "authorized_ports": "1-1024",
         "authorized_tests": sorted(item["id"] for item in FEATURE_CATALOG
                                    if item["category"] in ("service", "web", "correlation"))}],
-      doc("1" * 64, "QmEngagementRoeRef"), doc("2" * 64, "QmEngagementAuthRef"), "Ana Pop", "CISO")
+      [doc("1" * 64, "QmEngagementRoeRef"), doc("2" * 64, "QmEngagementAuthRef")])
     assert engagement["success"], engagement
     owner = TestPhase1ConfigCID._build_mock_plugin()
     TestPhase1ConfigCID._bind_launch_helpers(owner)
@@ -80,24 +84,24 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
     owner._resolve_launch_actor = lambda actor: resolve_actor(actor, fixture.service.accounts)
     # The launch helpers stub admission for the configuration suites; this one is about admission.
     owner._admit_execution = lambda *args, **kwargs: PentesterApi01Plugin._admit_execution(owner, *args, **kwargs)
-    kwargs = dict(actor=fixture.actor, tenant_id=fixture.tenant, asset_id=asset["assetId"],
-                  selected_peers=["node-a"], authorized=True, start_port=1, end_port=4)
+    kwargs = dict(actor=fixture.actor, tenant_id=fixture.tenant, selected_peers=["node-a"], authorized=True,
+                  start_port=1, end_port=4)
+    engagement_id = engagement["data"]["engagementId"]
     with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
          patch.object(fixture.service.accounts, "get_account", wraps=fixture.service.accounts.get_account) as reads:
-      denied = PentesterApi01Plugin.launch_network_scan(owner, expected_target_digest="0" * 64,
-                                                        engagement_id=engagement["data"]["engagementId"], **kwargs)
-      assert denied["status_code"] == 409
+      denied = PentesterApi01Plugin.launch_network_scan(owner, engagement_id=engagement_id,
+                                                        engagement_asset_id="ea_2", **kwargs)
+      assert (denied["error"], denied["status_code"]) == ("engagement_asset_not_locked", 400)
       assert reads.call_count == 1
       # RM-095: no engagement, no launch; refused before any tenant store read.
       with patch.object(fixture.service, "_resolve_execution_admission_for_account") as admission:
-        required = PentesterApi01Plugin.launch_network_scan(owner, expected_target_digest=asset["targetDigest"],
-                                                            **kwargs)
+        required = PentesterApi01Plugin.launch_network_scan(owner, engagement_asset_id="ea_1", **kwargs)
       assert (required["error"], required["status_code"]) == ("engagement_required", 400)
       admission.assert_not_called()
       owner.r1fs.add_json.assert_not_called()
       owner.chainstore_hset.assert_not_called()
-    allowed = PentesterApi01Plugin.launch_network_scan(owner, expected_target_digest=asset["targetDigest"],
-                                                       engagement_id=engagement["data"]["engagementId"], **kwargs)
+    allowed = PentesterApi01Plugin.launch_network_scan(owner, engagement_id=engagement_id,
+                                                       engagement_asset_id="ea_1", **kwargs)
     assert allowed["job_config"]["target"] == fixture.target["address"]
     assert allowed["job_config"]["engagement_id"] == engagement["data"]["engagementId"]
     assert allowed["job_config"]["authorized_ports"] == "1-1024"
@@ -114,8 +118,12 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
     audit = [call[0][1] for call in owner._log_audit_event.call_args_list if call[0][0] == "scan_launched"]
     leaked = {"QmEngagementRoeRef", "QmEngagementAuthRef"} & set(values([allowed, audit]))
     assert not leaked, leaked
-    assert allowed["job_config"]["authorization"]["document_sha256"] == "2" * 64
+    # RM-107: the snapshot's signed basis is the tenant contract, not an engagement document.
+    assert allowed["job_config"]["authorization"]["document_sha256"] == CONTRACT_SHA256
+    assert allowed["job_config"]["contract_sha256"] == CONTRACT_SHA256
     assert allowed["job_specs"]["execution_binding"]["participant_order"] == ["node-a"]
+    assert allowed["job_specs"]["execution_binding"]["engagement_asset_id"] == "ea_1"
+    assert audit[-1]["engagement_asset_id"] == "ea_1" and "asset_id" not in audit[-1]
   finally:
     fixture.doCleanups()
 
@@ -149,30 +157,29 @@ def test_bound_network_denials_precede_config_and_secret_writes():
     assert result.get("error"), result
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
-  # RM-095 defence in depth: a tenant context without engagement facts never launches.
-  owner = TestPhase1ConfigCID._build_mock_plugin()
-  TestPhase1ConfigCID._bind_launch_helpers(owner)
-  result = launch_network_scan(owner, execution_context=context({"kind": "network", "address": "192.0.2.1"}),
-                               authorized=True, start_port=1, end_port=4, exceptions="")
-  assert result["error"] == "engagement_required", result
-  owner.r1fs.add_json.assert_not_called()
 
 
 def test_endpoint_admission_refuses_an_incomplete_selector_after_one_account_read():
-  """RM-084 P6: the unbound launch is gone. A launch naming no tenant, asset or digest is malformed,
-  and it is refused before any tenant admission runs -- still after exactly one account read."""
+  """RM-084 P6: the unbound launch is gone. A launch naming no tenant or engagement asset is malformed
+  (RM-107), and one naming no engagement is `engagement_required`; both are refused before any tenant
+  admission runs -- still after exactly one account read."""
   from .test_api import TestPhase1ConfigCID
   TestPhase1ConfigCID._mock_plugin_modules()
   from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
   from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
   service = MagicMock()
   actor = {"account_id": "creator"}
-  for selectors in ((None, None, None), ("tn_x", None, None), ("tn_x", "as_x", " ")):
+  for selectors, expected in (
+      ((None, "en_x", "ea_1"), {"error": "invalid_request", "status_code": 400}),
+      (("tn_x", "en_x", None), {"error": "invalid_request", "status_code": 400}),
+      (("tn_x", "en_x", " "), {"error": "invalid_request", "status_code": 400}),
+      ((None, None, None), {"error": "engagement_required", "status_code": 400, "success": False}),
+      (("tn_x", " ", "ea_1"), {"error": "engagement_required", "status_code": 400, "success": False})):
     account = AccountView("creator", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
     owner = SimpleNamespace(_resolve_launch_actor=MagicMock(return_value=(account, None)),
       _execution_service=lambda: service, cfg_instance_id="deployment")
     result_account, admission, error = PentesterApi01Plugin._admit_execution(owner, actor, *selectors)
-    assert error == {"error": "invalid_request", "status_code": 400}
+    assert error == expected
     assert result_account is None and admission is None
     owner._resolve_launch_actor.assert_called_once_with(actor)
   service._resolve_execution_admission_for_account.assert_not_called()
@@ -461,15 +468,10 @@ def test_model_identity_change_during_secret_read_denies_provider_start():
   assert worker.state["model_test_summary"]["overall_status"] == "failed"
 
 
-def test_bound_legacy_wrapper_and_revised_network_batch_cannot_start_workers():
+def test_revised_network_batch_cannot_start_workers():
   from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
   from extensions.business.cybersec.red_mesh.constants import ScanType
-  plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
-  with patch("extensions.business.cybersec.red_mesh.services.launch.get_scan_strategy") as strategy:
-    with pytest.raises(ValueError, match="Execution unavailable"):
-      plugin._launch_job(owner, job_id="job", target="192.0.2.1", network_worker_address="launcher",
-        start_port=10, end_port=20)
-  strategy.assert_not_called()
+  _plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
   guard = owner._require_worker_execution
   checks = []
   def revise_before_batch(*args, **kwargs):
@@ -488,7 +490,7 @@ def test_bound_legacy_wrapper_and_revised_network_batch_cannot_start_workers():
 
 
 def test_unbound_network_job_never_starts_a_worker():
-  """RM-084 P6: an unbound job has no tenant to reauthorize against, so no worker starts for it."""
+  """RM-108 phase 5: admission never yields an unbound job, so one is refused, not tolerated."""
   from extensions.business.cybersec.red_mesh.services.launch import launch_local_jobs
   _plugin, owner, config, current, _artifacts = _worker_identity_fixture("network")
   config.pop("execution_binding")
@@ -500,7 +502,7 @@ def test_unbound_network_job_never_starts_a_worker():
     def start(self):
       pass
   with patch("extensions.business.cybersec.red_mesh.worker.base.threading.Thread", DeferredThread), \
-       pytest.raises(ValueError, match="Execution unavailable"):
+       pytest.raises(ValueError, match="Execution target mismatch"):
     launch_local_jobs(owner, job_id="job", target="192.0.2.1", launcher="launcher",
       start_port=10, end_port=20, nr_local_workers_override=1, job_config=config, execution_identity=None)
   assert deferred == []

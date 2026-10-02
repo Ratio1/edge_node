@@ -1,4 +1,5 @@
-"""Non-HTTP admission facts at real identity/publication/asset/storage seams."""
+"""Non-HTTP admission facts at real identity/publication/engagement/storage seams."""
+from datetime import datetime, timezone
 import json
 import unittest
 from unittest.mock import patch
@@ -8,34 +9,58 @@ from extensions.business.cybersec.red_mesh.tenancy.administration import Adminis
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
 
-from . import test_tenant_asset_administration as fixtures
+from . import test_tenant_engagements as fixtures
 from .contract_fixture import contract_terms
+
+INSIDE = datetime(2026, 10, 15, tzinfo=timezone.utc)
+
+
+def engagement_location(tenant_id, engagement_id):
+  return ('["redmesh","tenancy",1,"deployment"]',
+          json.dumps(["engagement", "deployment", tenant_id, engagement_id], separators=(",", ":")))
 
 
 class TestTenantExecution(unittest.TestCase):
-  setUp = fixtures.TestTenantAssetAdministration.setUp
-  create = fixtures.TestTenantAssetAdministration.create
+  """RM-107: a job runs on one asset of one engagement; admission and reauthorization read it."""
+  setUp_engagements = fixtures.TestTenantEngagements.setUp
+  new_tenant = fixtures.TestTenantEngagements.new_tenant
+  fields = fixtures.TestTenantEngagements.fields
+
+  def setUp(self):
+    self.setUp_engagements()
+    self.service.clock = lambda: INSIDE
+    self.target = fixtures.NETWORK
+
+  def create(self, **changes):
+    result = self.service.create_engagement(**self.fields(**changes))
+    self.assertTrue(result["success"], result)
+    return result["data"]
 
   def ready(self):
-    asset = self.create()["data"]
+    engagement = self.create()
     self.service.configured_peers_reader = lambda: ["node-a", "node-b", "global-only"]
     for node in ("node-a", "node-b"):
       self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, node, True)["success"])
-    return asset
+    return engagement
 
-  def test_resolves_saved_target_and_builds_actual_worker_binding(self):
-    asset = self.create()["data"]
+  def admit(self, actor, engagement, *args, tenant=None, asset="ea_1"):
+    return self.service.resolve_execution_admission(actor, tenant or self.tenant, engagement["engagementId"],
+                                                    asset, *args)
+
+  def test_resolves_the_engagement_target_and_builds_actual_worker_binding(self):
+    asset = self.create()
     self.service.configured_peers_reader = lambda: ["node-b", "node-a", "global-only"]
     for node in ("node-a", "node-b"):
       self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, node, True)["success"])
     before = len(self.owner.writes)
-    context = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
+    context = self.admit(self.actor, asset)
     self.assertEqual(context.to_dict()["selected_candidates"], ["node-a", "node-b"])
     binding = context.build_binding("coordinator-only", ["node-b"])
     self.assertEqual(binding.to_dict(), {
-      "schema_version": 1, "namespace": "deployment", "tenant_id": self.tenant,
-      "asset_id": asset["assetId"], "asset_target": self.target,
-      "asset_target_digest": asset["targetDigest"], "actor_id": "creator",
+      "schema_version": 2, "namespace": "deployment", "tenant_id": self.tenant,
+      "engagement_id": asset["engagementId"], "engagement_asset_id": "ea_1",
+      "engagement_hash": asset["engagementHash"], "asset_target": self.target,
+      "asset_target_digest": asset["assets"][0]["targetDigest"], "actor_id": "creator",
       "actor_generation": self.owner.data[("auth", "creator")]["generation"], "node_failure_policy": "stop",
       "original_launcher": "coordinator-only", "participant_order": ["node-b"],
     })
@@ -46,23 +71,22 @@ class TestTenantExecution(unittest.TestCase):
     with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
          patch("requests.sessions.Session.request", side_effect=AssertionError("No HTTP")), \
          patch.object(self.service.accounts, "get_account", wraps=self.service.accounts.get_account) as reads:
-      context = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
+      context = self.admit(self.actor, asset)
       self.assertEqual(reads.call_count, 1)
     original = context.to_dict()
     self.assertTrue(self.service.update_tenant_node_failure_policy(self.actor, self.tenant, "continue")["success"])
     self.assertEqual(context.to_dict(), original)
-    self.assertEqual(self.service.resolve_execution_admission(
-      self.actor, self.tenant, asset["assetId"]).to_dict()["node_failure_policy"], "continue")
+    self.assertEqual(self.admit(self.actor, asset).to_dict()["node_failure_policy"], "continue")
     self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
     actor = {"account_id": "pentester"}
     with self.assertRaises(AdministrationDenied) as denied:
-      self.service.resolve_execution_admission(actor, self.tenant, asset["assetId"])
+      self.admit(actor, asset)
     self.assertEqual(denied.exception.error, "pentesting_disabled")
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
-    self.assertEqual(self.service.resolve_execution_admission(actor, self.tenant, asset["assetId"]).to_dict()["actor_id"], "pentester")
+    self.assertEqual(self.admit(actor, asset).to_dict()["actor_id"], "pentester")
     self.owner.data[("auth", "pentester")]["memberships"] = []
     with self.assertRaises(AdministrationDenied):
-      self.service.resolve_execution_admission(actor, self.tenant, asset["assetId"])
+      self.admit(actor, asset)
 
   def test_memberships_are_the_stored_rows_and_a_malformed_list_is_no_account(self):
     # RM-084 P6: "no memberships key" (the legacy seam) is gone; an empty list is the "none" scope.
@@ -75,7 +99,7 @@ class TestTenantExecution(unittest.TestCase):
       self.owner.data[("auth", "explicit")]["memberships"] = malformed
       self.assertIsNone(self.service.accounts.get_account("explicit"))
 
-  def test_private_admission_reuses_exact_resolved_account_and_digest_is_precondition(self):
+  def test_private_admission_reuses_exact_resolved_account(self):
     asset = self.ready()
     account = self.service.accounts.get_account("creator")
     before = len(self.owner.writes)
@@ -83,22 +107,16 @@ class TestTenantExecution(unittest.TestCase):
          patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
          patch("requests.sessions.Session.request", side_effect=AssertionError("No HTTP")):
       context = self.service._resolve_execution_admission_for_account(
-        account, self.tenant, asset["assetId"], ["node-a"], expected_target_digest=asset["targetDigest"])
+        account, self.tenant, asset["engagementId"], "ea_1", ["node-a"])
       self.assertEqual(context.to_dict()["actor_id"], "creator")
-      for digest, status in (("0" * 64, 409), ("", 400), (False, 400), ({}, 400)):
-        with self.subTest(digest=digest), self.assertRaises(AdministrationDenied) as denied:
-          self.service._resolve_execution_admission_for_account(
-            account, self.tenant, asset["assetId"], expected_target_digest=digest)
-        self.assertEqual(denied.exception.status_code, status)
     self.assertEqual(len(self.owner.writes), before)
     with patch.object(self.service.accounts, "get_account", wraps=self.service.accounts.get_account) as reads:
-      self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"],
-        expected_target_digest=asset["targetDigest"])
+      self.admit(self.actor, asset)
       self.assertEqual(reads.call_count, 1)
 
   def test_existing_execution_reauthorizes_current_facts_without_rewriting_saved_policy(self):
     asset = self.ready()
-    binding = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"]).build_binding(
+    binding = self.admit(self.actor, asset).build_binding(
       "coordinator", ["node-a"])
     saved = binding.to_dict()
     self.service.update_tenant_node_failure_policy(self.actor, self.tenant, "continue")
@@ -118,21 +136,38 @@ class TestTenantExecution(unittest.TestCase):
     detached["eligible_nodes"].clear()
     self.assertEqual(facts.to_dict()["eligible_nodes"], ["node-a", "node-b"])
 
-  def test_name_edit_keeps_admission_and_reauthorization_digest_stable(self):
+  def test_reauthorization_reads_the_engagement_entry_not_its_window(self):
     asset = self.ready()
-    binding = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"]).build_binding(
-      "coordinator", ["node-a"])
-    updated = self.service.update_tenant_asset(self.actor, self.tenant, asset["assetId"], asset["version"],
-      "Renamed", self.target, True)["data"]
-    self.assertEqual(updated["targetDigest"], asset["targetDigest"])
-    self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"],
-      expected_target_digest=asset["targetDigest"])
+    binding = self.admit(self.actor, asset).build_binding("coordinator", ["node-a"])
+    # The engagement's end is the hard stop's to act on (`engagement_end_reason`), so a stop's own
+    # finalization still reauthorizes after `valid_until` or a revoke.
+    self.service.clock = lambda: datetime(2027, 1, 1, tzinfo=timezone.utc)
     self.service.reauthorize_execution(binding, worker_node="node-a")
-    self.service.update_tenant_asset(self.actor, self.tenant, asset["assetId"], updated["version"],
-      "Renamed", {"kind": "network", "address": "192.0.2.99"}, True)
-    with self.assertRaises(AdministrationDenied) as denied:
-      self.service.reauthorize_execution(binding)
-    self.assertEqual((denied.exception.status_code, denied.exception.error), (409, "target_changed"))
+    self.assertTrue(self.service.revoke_engagement(self.actor, self.tenant, asset["engagementId"], "done")["success"])
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+    self.assertEqual(self.service.engagement_end_reason(self.tenant, asset["engagementId"]), "engagement_revoked")
+
+  def test_a_changed_engagement_entry_or_a_schema_1_binding_is_never_reauthorized(self):
+    asset = self.ready()
+    binding = self.admit(self.actor, asset).build_binding("coordinator", ["node-a"])
+    location = engagement_location(self.tenant, asset["engagementId"])
+    stored = self.owner.data[location]
+    changed = json.loads(json.dumps(stored))
+    changed["assets"][0]["target"] = {"kind": "network", "address": "192.0.2.99"}
+    for tampered in ({**stored, "engagement_hash": "0" * 64}, changed):
+      self.owner.data[location] = tampered
+      with self.assertRaises((AdministrationDenied, TenantStoreError)):
+        self.service.reauthorize_execution(binding)
+    self.owner.data[location] = stored
+    self.service.reauthorize_execution(binding)
+    saved = binding.to_dict()
+    legacy = {key: value for key, value in saved.items()
+              if key not in ("engagement_id", "engagement_asset_id", "engagement_hash")}
+    legacy.update(schema_version=1, asset_id="as_" + str(uuid4()))
+    for value in (legacy, {**saved, "engagement_asset_id": "ea_2"}):
+      with self.subTest(value=value), self.assertRaises(AdministrationDenied) as denied:
+        self.service.reauthorize_execution(value)
+      self.assertEqual(denied.exception.error, "invalid_execution_binding")
 
   def test_an_archived_launcher_loses_its_running_job_and_restoring_does_not_give_it_back(self):
     """RM-084 P7. Archiving ends a running job's authority (the actor no longer resolves); restoring
@@ -140,8 +175,7 @@ class TestTenantExecution(unittest.TestCase):
     asset = self.ready()
     self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
-    binding = self.service.resolve_execution_admission({"account_id": "pentester"}, self.tenant,
-      asset["assetId"]).build_binding("coordinator", ["node-a"])
+    binding = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
     self.service.reauthorize_execution(binding, worker_node="node-a")
     self.owner.account("pentester", state="deactivated",
                        memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
@@ -155,16 +189,30 @@ class TestTenantExecution(unittest.TestCase):
       self.service.reauthorize_execution(binding, worker_node="node-a")
     self.assertEqual((denied.exception.status_code, denied.exception.error), (409, "account_changed"))
     # A job launched after the restore runs on the new incarnation.
-    fresh = self.service.resolve_execution_admission({"account_id": "pentester"}, self.tenant,
-      asset["assetId"]).build_binding("coordinator", ["node-a"])
+    fresh = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
     self.service.reauthorize_execution(fresh, worker_node="node-a")
+
+  def test_a_password_reset_leaves_a_running_job_authorized(self):
+    """RM-114. The Navigator ends a reset account's sessions through `passwordChangedAt` and keeps the
+    generation, so the binding of a job the account is running still reauthorizes."""
+    asset = self.ready()
+    self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
+    self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
+    binding = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
+    raw = self.owner.data[("auth", "pentester")]
+    raw.update(
+      password={**raw["password"], "salt": "bmV3c2FsdG5ld3NhbHRuZQ==",
+                "hash": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4="},
+      passwordChangedAt="2026-10-01T12:00:00.000Z", updatedAt="2026-10-01T12:00:00.000Z",
+      updatedBy="tenant-admin",
+    )
+    self.service.reauthorize_execution(binding, worker_node="node-a")
 
   def test_existing_execution_rejects_incarnation_revocation_and_ineligible_workers(self):
     asset = self.ready()
     self.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": self.tenant}])
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
-    binding = self.service.resolve_execution_admission({"account_id": "pentester"}, self.tenant,
-      asset["assetId"]).build_binding("coordinator", ["node-a"])
+    binding = self.admit({"account_id": "pentester"}, asset).build_binding("coordinator", ["node-a"])
     for worker in ("node-b", "global-only", "coordinator", "", False):
       with self.subTest(worker=worker), self.assertRaises(AdministrationDenied):
         self.service.reauthorize_execution(binding, worker_node=worker)
@@ -179,7 +227,7 @@ class TestTenantExecution(unittest.TestCase):
     self.service.update_tenant_allow_pentester(self.actor, self.tenant, True)
     raw = self.owner.data[("auth", "pentester")]
     original = raw["generation"]
-    raw["generation"] = str(uuid4())  # the account was recreated, or its password reset
+    raw["generation"] = str(uuid4())  # the account was recreated, or archived and restored
     with self.assertRaises(AdministrationDenied) as denied:
       self.service.reauthorize_execution(binding)
     self.assertEqual(denied.exception.error, "account_changed")
@@ -188,9 +236,28 @@ class TestTenantExecution(unittest.TestCase):
     with self.assertRaises(AdministrationDenied):
       self.service.reauthorize_execution(binding)
 
-  def test_existing_execution_checks_namespace_publication_active_asset_and_current_configuration(self):
+  def test_a_draining_row_blocks_new_launches_but_still_reauthorizes_its_own_job(self):
+    """RM-102. Release while the tenant's job keeps running on the node enters `draining`: a new
+    launch no longer sees the node, but the job already running on it still reauthorizes."""
     asset = self.ready()
-    binding = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"]).build_binding(
+    binding = self.admit(self.actor, asset).build_binding("coordinator", ["node-a"])
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: True
+    result = self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-a", False)
+    self.assertEqual(result["data"]["state"], "draining")
+    self.service.reauthorize_execution(binding, worker_node="node-a")
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.admit(self.actor, asset, ["node-a"])
+    self.assertEqual(denied.exception.error, "ineligible_node")
+    self.assertEqual(self.admit(self.actor, asset).to_dict()["selected_candidates"], ["node-b"])
+    # The job ends: the row reads as released, and launches see the node eligible again once it is
+    # written back in (release once more, then a fresh assignment).
+    self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: False
+    self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
+                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned"}])
+
+  def test_existing_execution_checks_namespace_publication_engagement_and_current_configuration(self):
+    asset = self.ready()
+    binding = self.admit(self.actor, asset).build_binding(
       "coordinator", ["node-a"])
     before = len(self.owner.writes)
     with patch("socket.getaddrinfo", side_effect=AssertionError("No DNS")), \
@@ -217,13 +284,13 @@ class TestTenantExecution(unittest.TestCase):
       with self.assertRaises(AdministrationDenied):
         self.service.reauthorize_execution(binding)
       self.owner.data[tenant_key] = tenant
-      asset_key = fixtures.asset_location(self.tenant, asset["assetId"])
-      self.owner.data[asset_key]["active"] = False
-      with self.assertRaises(AdministrationDenied):
+      self.owner.data[engagement_location(self.tenant, asset["engagementId"])] = None
+      with self.assertRaises(AdministrationDenied) as denied:
         self.service.reauthorize_execution(binding)
+      self.assertEqual(denied.exception.error, "engagement_not_found")
     self.assertEqual(len(self.owner.writes), before)
 
-  def test_scope_role_generation_and_asset_denials(self):
+  def test_scope_role_generation_and_engagement_denials(self):
     asset = self.ready()
     for memberships in ([{"role": "tenant_admin", "tenant_id": self.tenant}],
                         [{"role": "tenant_user", "tenant_id": self.tenant}],
@@ -234,45 +301,43 @@ class TestTenantExecution(unittest.TestCase):
         self.owner.account("operator", memberships=memberships)
         with patch.object(self.store, "get", wraps=self.store.get) as reads:
           with self.assertRaises(AdministrationDenied):
-            self.service.resolve_execution_admission({"account_id": "operator", "role": "super_tenant_admin"},
-                                                     self.tenant, asset["assetId"])
-          self.assertFalse(any(call.args[0] == "asset" for call in reads.call_args_list))
+            self.admit({"account_id": "operator", "role": "super_tenant_admin"}, asset)
+          self.assertFalse(any(call.args[0] == "engagement" for call in reads.call_args_list))
     # A record with no generation is not an account (RM-084 P6 removed the legacy creation-time
     # incarnation that used to stand in for one), so it is unknown rather than changed.
     self.owner.account("operator", memberships=[{"role": "super_pentester", "tenant_id": self.tenant}])
     self.owner.data[("auth", "operator")].pop("generation")
     with self.assertRaises(AdministrationDenied) as denied:
-      self.service.resolve_execution_admission({"account_id": "operator"}, self.tenant, asset["assetId"])
+      self.admit({"account_id": "operator"}, asset)
     self.assertEqual(denied.exception.status_code, 404)
-    self.service.update_tenant_asset(self.actor, self.tenant, asset["assetId"], asset["version"],
-                                     asset["displayName"], asset["target"], False)
-    with self.assertRaises(AdministrationDenied):
-      self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
+    self.service.revoke_engagement(self.actor, self.tenant, asset["engagementId"], "done")
+    with self.assertRaises(AdministrationDenied) as denied:
+      self.admit(self.actor, asset)
+    self.assertEqual(denied.exception.error, "engagement_revoked")
 
   def test_selection_is_tenant_intersection_and_configuration_failures_are_closed(self):
     asset = self.ready()
     self.service.set_tenant_node_assignment(self.actor, self.tenant, "node-b", False)
     for selection in (None, [], ["node-a"]):
-      self.assertEqual(self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"],
-                        selection).to_dict()["selected_candidates"], ["node-a"])
+      self.assertEqual(self.admit(self.actor, asset, selection).to_dict()["selected_candidates"], ["node-a"])
     for selection in (["global-only"], ["node-b"], ["node-a", "node-a"], "node-a", {}, [None]):
       with self.subTest(selection=selection), self.assertRaises(AdministrationDenied) as denied:
-        self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"], selection)
+        self.admit(self.actor, asset, selection)
       self.assertNotIn("global-only", str(denied.exception))
     for configured in (None, "node-a", [None]):
       self.service.configured_peers_reader = lambda: configured
       with self.assertRaises(TenantStoreError):
-        self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
+        self.admit(self.actor, asset)
     def unavailable():
       raise RuntimeError("private reader failure")
     self.service.configured_peers_reader = unavailable
     with self.assertRaises(TenantStoreError):
-      self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
+      self.admit(self.actor, asset)
 
   def test_actual_participants_and_nested_values_are_not_caller_aliases(self):
     asset = self.ready()
     selection = ["node-b", "node-a"]
-    context = self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"], selection)
+    context = self.admit(self.actor, asset, selection)
     selection.clear()
     detached = context.to_dict()
     detached["asset_target"]["address"] = "192.0.2.99"
@@ -298,7 +363,7 @@ class TestTenantExecution(unittest.TestCase):
         self.assertIsNone(self.service.accounts.get_account("creator"))
         self.assertNotIn("creator", [view.account_id for view in self.service.accounts.list_accounts()])
         with self.assertRaises(AdministrationDenied) as denied:
-          self.service.resolve_execution_admission(self.actor, self.tenant, asset["assetId"])
+          self.admit(self.actor, asset)
         self.assertEqual(denied.exception.status_code, 404)
 
   def test_two_published_tenants_never_admit_foreign_assets_or_nodes(self):
@@ -308,16 +373,17 @@ class TestTenantExecution(unittest.TestCase):
     foreign = self.service.prepare_tenant(self.actor, request, "Other", "other", "initial-other", **contract_terms())["data"]["tenantId"]
     self.owner.grant("initial-other", foreign)
     self.assertTrue(self.service.activate_tenant(self.actor, request)["success"])
-    foreign_asset = self.service.create_tenant_asset(self.actor, foreign, str(uuid4()), "Other asset", self.target)["data"]
+    self.request = str(uuid4())
+    foreign_engagement = self.create(tenant_id=foreign)
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, foreign, "global-only", True)["success"])
     self.owner.account("scoped", memberships=[{"role": "super_pentester", "tenant_id": self.tenant}])
     actor = {"account_id": "scoped"}
     before = len(self.owner.writes)
-    self.assertEqual(self.service.resolve_execution_admission(actor, self.tenant,
-      own_asset["assetId"]).to_dict()["tenant_id"], self.tenant)
-    for tenant, asset, peers in ((foreign, foreign_asset["assetId"], None),
-                                  (self.tenant, foreign_asset["assetId"], None),
-                                  (self.tenant, own_asset["assetId"], ["global-only"])):
-      with self.subTest(tenant=tenant, asset=asset, peers=peers), self.assertRaises(AdministrationDenied):
-        self.service.resolve_execution_admission(actor, tenant, asset, peers)
+    self.assertEqual(self.admit(actor, own_asset).to_dict()["tenant_id"], self.tenant)
+    for tenant, engagement, peers in ((foreign, foreign_engagement, None),
+                                       (self.tenant, foreign_engagement, None),
+                                       (self.tenant, own_asset, ["global-only"])):
+      with self.subTest(tenant=tenant, engagement=engagement["engagementId"], peers=peers), \
+           self.assertRaises(AdministrationDenied):
+        self.admit(actor, engagement, peers, tenant=tenant)
     self.assertEqual(len(self.owner.writes), before)

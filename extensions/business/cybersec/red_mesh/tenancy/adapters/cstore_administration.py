@@ -7,10 +7,12 @@ import json
 from ..ports import TenantStoreError
 from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
-from ..assets import validate_asset
 from ..engagements import validate_engagement
 
 MAX_ENUMERATED_RECORDS = 10000
+# RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
+# is never read or written, so a leftover row cannot come back through a new code path.
+_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement"})
 
 
 class CstoreTenantAdministrationStore:
@@ -24,7 +26,7 @@ class CstoreTenantAdministrationStore:
 
   def _location(self, kind, ids):
     if (not isinstance(self._namespace, str) or not self._namespace.strip()
-        or not isinstance(kind, str) or not kind.strip() or not ids
+        or kind not in _KINDS or not ids
         or any(not isinstance(value, str) or not value.strip() for value in ids)):
       raise TenantStoreError("Invalid tenant storage binding")
     hkey = json.dumps(["redmesh", "tenancy", 1, self._namespace], separators=(",", ":"))
@@ -57,11 +59,6 @@ class CstoreTenantAdministrationStore:
       validate_node_assignment(raw, ids)
     if kind == "integration":
       validate_integration(raw, ids)
-    if kind == "asset":
-      try:
-        validate_asset(raw, ids)
-      except (ValueError, TypeError, RecursionError) as exc:
-        raise TenantStoreError("Invalid asset storage record") from exc
     if kind == "engagement":
       try:
         validate_engagement(raw, ids)
@@ -95,6 +92,33 @@ class CstoreTenantAdministrationStore:
     if observed != expected:
       raise TenantStoreError("Tenant storage write could not be verified")
 
+  def delete(self, kind, *ids):
+    """RM-107. Remove one record (a CStore tombstone) and verify it reads back as absent."""
+    hkey, key = self._location(kind, ids)
+    try:
+      self._owner.chainstore_hset(hkey=hkey, key=key, value=None)
+      remaining = self._owner.chainstore_hget(hkey=hkey, key=key)
+    except Exception as exc:
+      raise TenantStoreError("Tenant storage delete could not be verified") from exc
+    if remaining is not None:
+      raise TenantStoreError("Tenant storage delete could not be verified")
+
+  def tenant_record_ids(self, kind, tenant_id):
+    """RM-107. The ids of a tenant's rows of one kind, without validating them: a delete must clear
+    rows the current validator refuses (an engagement written by an older release)."""
+    self._location(kind, (tenant_id,))
+    return [ids for ids, _ in self._fields(kind, tenant_id)]
+
+  def raw_record(self, kind, *ids):
+    """RM-107. One row decoded but not validated, for the same reason; None when absent or unreadable."""
+    hkey, key = self._location(kind, ids)
+    try:
+      raw = self._owner.chainstore_hget(hkey=hkey, key=key)
+      raw = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+    except Exception as exc:
+      raise TenantStoreError("Tenant storage cannot be read") from exc
+    return raw if isinstance(raw, dict) else None
+
   def _records(self):
     hkey, _ = self._location("tenant", ("enumeration",))
     try:
@@ -105,8 +129,11 @@ class CstoreTenantAdministrationStore:
       raise TenantStoreError("Tenant storage enumeration is unavailable")
     return records
 
-  def _fields(self, kind, tenant_id=None):
+  def _fields(self, kind, tenant_id=None, node_address=None):
     for key, raw in self._records().items():
+      # A deleted record (RM-107 `delete`) is a tombstone, not a row.
+      if raw is None:
+        continue
       try:
         field = json.loads(key) if isinstance(key, str) else None
       except (ValueError, RecursionError):
@@ -115,6 +142,10 @@ class CstoreTenantAdministrationStore:
       if (isinstance(field, list) and len(field) >= 3
           and field[:2] == [kind, self._namespace]):
         if tenant_id is not None and field[2] != tenant_id:
+          continue
+        # RM-102: the cross-tenant read for one node skips rows naming another node, so their
+        # corruption cannot block an unrelated assignment.
+        if node_address is not None and (len(field) < 4 or field[3] != node_address):
           continue
         if key != self._location(kind, field[2:])[1]:
           raise TenantStoreError("Invalid tenant storage field")
@@ -125,9 +156,13 @@ class CstoreTenantAdministrationStore:
     return [self._validate(raw, "tenant_node", ids)
             for ids, raw in self._fields("tenant_node", tenant_id)]
 
-  def list_assets(self, tenant_id):
-    self._location("asset", (tenant_id,))
-    return [self._validate(raw, "asset", ids) for ids, raw in self._fields("asset", tenant_id)]
+  def list_node_assignments_for_node(self, node_address):
+    """RM-102: every tenant's row for one node, for the write validator's cross-tenant conflict
+    check. Rows are selected by the node in their field key; a malformed row naming this node
+    fails the read closed, one naming another node is never decoded."""
+    self._location("tenant_node", (node_address,))
+    return [self._validate(raw, "tenant_node", ids)
+            for ids, raw in self._fields("tenant_node", node_address=node_address)]
 
   def list_engagements(self, tenant_id):
     self._location("engagement", (tenant_id,))
@@ -160,5 +195,3 @@ class CstoreTenantAdministrationStore:
         rows.append(row)
     return rows
 
-  def count_assets(self, tenant_id):
-    return sum(row["active"] for row in self.list_assets(tenant_id))

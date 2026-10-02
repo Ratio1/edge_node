@@ -292,6 +292,17 @@ def _target_label(model_config):
   return label or model or "Model Test"
 
 
+def _single_pass_error(engagement):
+  """RM-107: a model test is a single pass, so its engagement must allow single pass."""
+  if engagement is None or "single_pass" in engagement["allowed_run_modes"]:
+    return None
+  return {
+    "error": "run_mode_not_authorized", "status_code": 400,
+    "message": "The engagement does not allow this run mode.",
+    "allowed_run_modes": list(engagement["allowed_run_modes"]),
+  }
+
+
 def preflight_model_test_provider(
   owner,
   *,
@@ -302,6 +313,10 @@ def preflight_model_test_provider(
   execution_context=None,
 ):
   """Validate and transiently exercise a tested-model provider before launch."""
+  if execution_context is None:
+    # RM-108 phase 5: admission always supplies one; reaching here without it is a refusal, not a
+    # licence for an unbound preflight.
+    return {"ok": False, **_validation_error("Execution admission is required")}
   cfg = get_model_testing_config(owner)
   if not cfg["ENABLED"]:
     return {
@@ -319,6 +334,10 @@ def preflight_model_test_provider(
   created_by_id, err = _bounded_text(created_by_id, "created_by_id")
   if err:
     return {"ok": False, **err}
+  # Before any outbound call: an engagement that cannot run a model test gets no provider probe.
+  run_mode_err = _single_pass_error(execution_context.to_dict().get("engagement"))
+  if run_mode_err:
+    return {"ok": False, **run_mode_err}
   normalized_limits, err = _normalize_limits(limits, cfg)
   if err:
     return {"ok": False, **err}
@@ -401,6 +420,10 @@ def launch_model_test(
   execution_context=None,
 ):
   """Validate Model Testing launch input and fail closed until execution lands."""
+  if execution_context is None:
+    # RM-108 phase 5: admission always supplies one; reaching here without it is a refusal, not a
+    # licence for an unbound launch.
+    return _validation_error("Execution admission is required")
   cfg = get_model_testing_config(owner)
   if not cfg["ENABLED"]:
     return {
@@ -425,12 +448,31 @@ def launch_model_test(
   soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
   if soc_error:
     return soc_error
+  admitted = execution_context.to_dict()
+  if admitted["asset_target"]["kind"] != "model":
+    # Before the question-set gate, so a model launch on a scan asset is named for what it is.
+    return _validation_error("Execution target mismatch", error_class="execution_target_mismatch")
+  engagement = admitted.get("engagement")
+  run_mode_err = _single_pass_error(engagement)
+  if run_mode_err:
+    return run_mode_err
+  if engagement is not None and test_sets is None and not test_set_id:
+    # RM-107: no selection means every question set the engagement authorizes for this model.
+    test_sets = [{"id": test_set} for test_set in engagement["authorized_tests"]]
   normalized_test_sets, selection_err = normalize_model_test_selection(
     test_sets,
     legacy_test_set_id=test_set_id if test_sets is None else None,
   )
   if selection_err:
     return _validation_error(selection_err)
+  if engagement is not None:
+    unauthorized = sorted({item["id"] for item in normalized_test_sets} - set(engagement["authorized_tests"]))
+    if unauthorized:
+      return {
+        "error": "tests_exceed_authorization", "status_code": 400,
+        "message": "The selected question sets exceed the engagement's authorized tests for this model.",
+        "unauthorized_features": unauthorized,
+      }
   if _raw_evidence_requested(raw_evidence) and not cfg["RAW_EVIDENCE_ENABLED"]:
     return _validation_error(
       "raw_evidence is disabled by policy",
@@ -467,17 +509,15 @@ def launch_model_test(
   if err:
     return err
 
-  candidates = execution_context.to_dict()["selected_candidates"] if execution_context is not None else selected_peers
+  candidates = admitted["selected_candidates"]
   node_selection, err = select_model_test_execution_node(owner, candidates)
   if err:
-    return _validation_error("Execution node unavailable") if execution_context is not None else err
-  execution_binding = None
-  if execution_context is not None:
-    try:
-      execution_binding = execution_context.build_binding(getattr(owner, "ee_addr", ""),
-        [node_selection["selected_execution_node"]])
-    except (ValueError, TypeError):
-      return _validation_error("Execution node unavailable")
+    return _validation_error("Execution node unavailable")
+  try:
+    execution_binding = execution_context.build_binding(getattr(owner, "ee_addr", ""),
+      [node_selection["selected_execution_node"]])
+  except (ValueError, TypeError):
+    return _validation_error("Execution node unavailable")
 
   job_id = _new_job_id(owner)
   sanitized_config = {
@@ -509,8 +549,14 @@ def launch_model_test(
     "start_attestation_required": bool(blockchain_attestation_enabled),
     "end_attestation_required": bool(blockchain_attestation_enabled),
   }
-  if execution_binding is not None:
-    sanitized_config["execution_binding"] = execution_binding.to_dict()
+  sanitized_config["execution_binding"] = execution_binding.to_dict()
+  if engagement is not None:
+    # The engagement snapshot (RM-107), as a scan JobConfig carries it.
+    sanitized_config.update({
+      "engagement": engagement["context"], "roe": engagement["roe"],
+      "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
+      "engagement_hash": engagement["engagement_hash"], "contract_sha256": engagement["contract_sha256"],
+      "authorized_tests": engagement["authorized_tests"]})
 
   persisted_config, secret_ref = attach_model_test_provider_secret(
     owner,

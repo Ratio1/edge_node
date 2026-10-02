@@ -55,11 +55,7 @@ def _job_specs_for_event(owner, job_specs):
                                  or config.get("engagement_id"))
   if not specs.get("authorization_ref"):
     typed_auth = config.get("authorization") if isinstance(config.get("authorization"), dict) else {}
-    specs["authorization_ref"] = (
-      config.get("authorization_ref")
-      or typed_auth.get("document_cid")
-      or config.get("engagement_hash")
-    )
+    specs["authorization_ref"] = typed_auth.get("document_cid") or config.get("engagement_hash")
   return specs
 
 

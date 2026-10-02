@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 
-from .read_endpoint_fixtures import as_role, read_endpoint_fixture
+from .read_endpoint_fixtures import allow_pentester, as_role, read_endpoint_fixture
 from .contract_fixture import contract_terms
 
 PROFILE = "nis2.eu_baseline.v1"
@@ -46,6 +46,11 @@ ALL = READS + MUTATIONS + EVIDENCE + ARTIFACT
 VIEW_ROLES = ("tenant_user", "tenant_pentester", "tenant_admin", "super_pentester",
               "super_tenant_admin")
 EXPORT_ROLES = ("tenant_pentester", "tenant_admin", "super_pentester", "super_tenant_admin")
+# Owner, 2026-09-30: the review mutations run as `reports:review`, held by the launch roles under the
+# launch Allow Pentester rule. `correlate_suricata_eve` is an ingest and stays `reports:export`.
+REVIEW_ROLES = ("tenant_pentester", "super_pentester", "super_tenant_admin")
+REVIEW = tuple(row for row in MUTATIONS if row[0] != "correlate_suricata_eve")
+EXPORT_MUTATIONS = tuple(row for row in MUTATIONS if row[0] == "correlate_suricata_eve")
 EVIDENCE_ROLES = ("super_pentester", "super_tenant_admin")
 OTHER_TENANT = "tn_2f4b7c1e-9a35-4d02-8f61-7c3b5d9e1a4f"
 
@@ -67,6 +72,12 @@ def second_tenant(fixture):
   fixture.store.grant("other-admin", tenant_id)
   assert fixture.administration.activate_tenant({"account_id": "creator"}, request_id)["success"]
   return tenant_id
+
+
+def allow_pentester_in(fixture, tenant_id):
+  """Switch Allow Pentester on for a tenant other than the fixture's own."""
+  tenant = fixture.tenant_store.get("tenant", tenant_id)
+  fixture.tenant_store.put("tenant", tenant_id, record={**tenant, "allow_pentester": True})
 
 
 def record_artifact(fixture, name):
@@ -108,7 +119,10 @@ def test_a_job_owned_by_another_tenant_is_not_found(name, extra):
     # ownership and not the role: raw evidence needs a platform role for `evidence:read`.
     fixture.store.data[("auth", "reader")]["memberships"] = [
       {"role": "super_tenant_admin", "tenant_id": None} if (name, extra) in EVIDENCE
-      else {"role": "tenant_admin", "tenant_id": other}]
+      else {"role": "tenant_pentester" if (name, extra) in REVIEW else "tenant_admin",
+            "tenant_id": other}]
+    if (name, extra) in REVIEW:
+      allow_pentester_in(fixture, other)
     record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=other)
     assert_denied(result, 404, "not_found")
@@ -179,12 +193,49 @@ def test_every_tenant_role_reads_a_recorded_rulebook_artifact(name, extra, role)
     assert result.get("cid") == "rulebook" and result.get("report") == fixture.artifacts["rulebook"], result
 
 
-@pytest.mark.parametrize("name,extra", MUTATIONS)
+@pytest.mark.parametrize("name,extra", EXPORT_MUTATIONS)
 @pytest.mark.parametrize("role", EXPORT_ROLES)
-def test_every_export_role_is_admitted_to_the_mutations(name, extra, role):
+def test_every_export_role_is_admitted_to_the_ingest(name, extra, role):
   with read_endpoint_fixture(bound=True) as fixture:
     tenant_id = as_role(fixture, role)
     assert_admitted(invoke(fixture, name, extra, tenant_id=tenant_id))
+
+
+@pytest.mark.parametrize("name,extra", REVIEW)
+@pytest.mark.parametrize("role", REVIEW_ROLES)
+def test_every_launch_role_is_admitted_to_the_review_mutations(name, extra, role):
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, role)
+    allow_pentester(fixture)
+    assert_admitted(invoke(fixture, name, extra, tenant_id=tenant_id))
+
+
+@pytest.mark.parametrize("name,extra", REVIEW)
+def test_a_tenant_admin_cannot_mutate_a_review(name, extra):
+  """A Tenant Admin downloads reports (`reports:export`) but does not sign them off."""
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, "tenant_admin")
+    allow_pentester(fixture)
+    writes = list(fixture.store.writes)
+    result = invoke(fixture, name, extra, tenant_id=tenant_id)
+    assert_denied(result, 403, "forbidden")
+    assert fixture.artifact_reads == [] and fixture.store.writes == writes
+
+
+@pytest.mark.parametrize("name,extra", REVIEW)
+@pytest.mark.parametrize("role,bound", (("tenant_pentester", True), ("super_pentester", False),
+                                        ("super_tenant_admin", False)))
+def test_the_review_mutations_follow_the_launch_pentesting_rule(name, extra, role, bound):
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, role)
+    allow_pentester(fixture, False)
+    writes = list(fixture.store.writes)
+    result = invoke(fixture, name, extra, tenant_id=tenant_id)
+    if bound:
+      assert_denied(result, 403, "pentesting_disabled")
+      assert fixture.artifact_reads == [] and fixture.store.writes == writes
+    else:
+      assert_admitted(result)
 
 
 @pytest.mark.parametrize("name,extra", EVIDENCE)
@@ -209,7 +260,8 @@ def test_a_typed_review_conflict_code_survives_the_tenant_path(name, extra, code
   """The revision fence is the reason these four keep their own response shape; scoping them must
   not route them through the effect wrapper's `effect_incomplete` rewrite."""
   with read_endpoint_fixture(bound=True) as fixture:
-    tenant_id = as_role(fixture, "tenant_admin")
+    tenant_id = as_role(fixture, "tenant_pentester")
+    allow_pentester(fixture)
     result = invoke(fixture, name, dict(extra, expected_review_revision=999), tenant_id=tenant_id)
     assert result.get("error") != "effect_incomplete", result
     assert result.get("error_code") == code, result

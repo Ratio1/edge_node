@@ -43,14 +43,14 @@ FAULTS = (
 
 def apply_fault(fixture, fault):
   """Return (actor, tenant_id) for a call that must be refused, from real store state."""
-  actor, tenant_id = fixture.actor, as_role(fixture, "tenant_admin")
+  actor, tenant_id = fixture.actor, as_role(fixture, "super_pentester")
   if fault == "actor":
     actor = None
   elif fault == "deleted":
     fixture.store.data.pop(("auth", "reader"))
   elif fault == "inactive":
     fixture.store.account("reader", active=False,
-      memberships=[{"role": "tenant_admin", "tenant_id": fixture.tenant_id}])
+      memberships=[{"role": "super_pentester", "tenant_id": fixture.tenant_id}])
   elif fault == "none_scope":
     fixture.store.data[("auth", "reader")]["memberships"] = []
   elif fault == "user":
@@ -87,7 +87,7 @@ def test_the_stored_signer_is_the_admitted_account():
   with read_endpoint_fixture(bound=True) as fixture:
     result = fixture.Plugin.update_rulebook_review(
       fixture.owner, **body_for("update_rulebook_review"), request_actor=fixture.actor,
-      tenant_id=as_role(fixture, "tenant_admin"))
+      tenant_id=as_role(fixture, "super_pentester"))
   assert result.get("status") == "ok"
   assert result["review"]["reviewer"] == "reader", (
     "the stored signer was not the admitted account: %r" % (result["review"]["reviewer"],))
@@ -106,7 +106,7 @@ def test_the_derived_signer_is_what_reaches_the_service(name):
   seen = {}
   plugin_module = None
   with read_endpoint_fixture(bound=True) as fixture:
-    tenant_id = as_role(fixture, "tenant_admin")
+    tenant_id = as_role(fixture, "super_pentester")
     plugin_module = sys.modules[fixture.Plugin.__module__]
     real = getattr(plugin_module, name)
 
@@ -133,7 +133,7 @@ def test_a_validation_failure_publishes_a_typed_code_without_echoing_the_body():
     result = getattr(fixture.Plugin, name)(
       fixture.owner, job_id="job-1", profile_id="nis2.eu_baseline.v1",
       answers={probe: "yes"}, request_actor=fixture.actor,
-      tenant_id=as_role(fixture, "tenant_admin"))
+      tenant_id=as_role(fixture, "super_pentester"))
   assert probe not in repr(result), "the request body was echoed back in the response"
   assert result.get("error_code") in ("invalid_review_answer", "invalid_profile")
 
@@ -151,7 +151,7 @@ def test_the_review_payload_survives_the_wire(read_native, name, response_format
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, name,
       {**body_for(name), "request_actor": fixture.actor,
-       "tenant_id": as_role(fixture, "tenant_admin")})), 200)
+       "tenant_id": as_role(fixture, "super_pentester")})), 200)
     body = result["result"] if response_format == "WRAPPED" else result
     assert calls == 1
     assert isinstance(body, dict)
@@ -172,7 +172,7 @@ def test_a_typed_conflict_code_is_not_flattened_to_effect_incomplete(read_native
     result, _calls = assert_json_response(asyncio.run(request(module,
       "save_rulebook_review_draft",
       {**body_for("save_rulebook_review_draft"), "expected_review_revision": 999,
-       "request_actor": fixture.actor, "tenant_id": as_role(fixture, "tenant_admin")})), 200)
+       "request_actor": fixture.actor, "tenant_id": as_role(fixture, "super_pentester")})), 200)
     body = result["result"] if response_format == "WRAPPED" else result
     assert body.get("error") != "effect_incomplete", (
       "a typed conflict code was collapsed by the effect wrapper")

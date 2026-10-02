@@ -13,7 +13,9 @@ from .ports import TenantStoreError
 # its own slice (B6, B8, B9) rather than by appearing here.
 _TENANT_OPERATIONS = frozenset({
   "reports:view", "audit:view", "analysis:run", "engagement:delete", "jobs:purge",
-  "reports:export",  # stop_monitoring (RM-026 MVP)
+  "reports:export",  # the JSON exports and export/publish effects
+  "tasks:stop",  # stop_monitoring (RM-026 MVP; its own operation since 2026-09-30)
+  "reports:review",  # approve/reject and the rulebook review mutations (2026-09-30)
   "evidence:read"})  # get_raw_model_test_evidence (RM-084 P2)
 
 
