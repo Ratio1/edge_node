@@ -7,6 +7,7 @@ import requests
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import check_cves
+from ...models.finding_schema import AUTHENTICATED_ACTION_NOT_APPLICABLE
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -249,6 +250,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
               owasp_id="A07:2021",
               cwe_id="CWE-798",
               confidence="certain",
+              # A database login has no RoE-gated action (RM-118).
+              authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
             ))
       except Exception:
         continue
@@ -955,6 +958,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   owasp_id="A07:2021",
                   cwe_id="CWE-798",
                   confidence="certain",
+                  # A database login has no RoE-gated action (RM-118).
+                  authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)
           elif auth_code == 5 and len(data) >= 13:
@@ -981,6 +986,8 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   owasp_id="A07:2021",
                   cwe_id="CWE-798",
                   confidence="certain",
+                  # A database login has no RoE-gated action (RM-118).
+                  authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)
         raw["tested_credentials"] += 1

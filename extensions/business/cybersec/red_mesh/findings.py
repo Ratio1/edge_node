@@ -180,6 +180,10 @@ class Finding:
   # `enrich_finding_for_probe`; the report labels the latter as policy instead
   # of printing a bare badge (RM-086 item 5).
   severity_source: str = ""
+  # What happened after an accepted login, for findings that record one
+  # (`models.finding_schema.AUTHENTICATED_ACTIONS`); "" otherwise. Not identity
+  # and not content: `finding_identity` reads neither (RM-118).
+  authenticated_action: str = ""
 
   # Metadata
   ai_generated: bool = False             # P12 invariant — must stay False for finding data
@@ -267,14 +271,15 @@ class Finding:
     normalised asset and classification from that payload, and ignores
     `description` and `severity`.
 
-    It does **not** yet ignore the title, and the difference matters here. No
-    blackbox probe sets `affected_assets`, so every `Finding` reaching this
-    method falls to `dedup_key`'s last-resort branch, which folds in the
-    lowercased title to keep two genuinely different findings from one probe
-    from colliding. So rewording a *description* preserves the key — the defect
-    B2 exists to fix — while rewording a *title* still forks it. RM-061 owns
-    giving blackbox findings a url and parameter; until it lands, this is as
-    stable as identity can honestly be.
+    It does **not** yet ignore the title, and the difference matters here.
+    Almost no blackbox probe sets `affected_assets` (the CSRF probe is the
+    exception, RM-117), so most `Finding`s reaching this method fall to
+    `dedup_key`'s last-resort branch, which folds in the lowercased title to
+    keep two genuinely different findings from one probe from colliding. So
+    rewording a *description* preserves the key — the defect B2 exists to fix —
+    while rewording a *title* still forks it. RM-061 owns giving the remaining
+    blackbox findings a url and parameter; until it lands, this is as stable as
+    identity can honestly be.
     """
     return _dedup_key(
       self._identity_payload(probe_id), asset_canonical=asset_canonical,
