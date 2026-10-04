@@ -8,7 +8,9 @@ A new endpoint is a new finding and inherits nothing.
 The order follows production: triage is refused until the job has a `job_cid`,
 and only finalization sets that, so every pass is already in the archive when
 triage is written. Nothing carries triage from one job to the next; that is not
-claimed here.
+claimed here. The public `update_finding_triage` endpoint currently returns 503
+pending its scoped workspace contract, so the write goes through the service
+function; the read is the path `get_job_archive` uses.
 
 The identity unit tests in `test_finding_identity_contract.py` prove the key
 itself. This file proves the chain around it: real producers, the archive write
@@ -167,7 +169,7 @@ class TestTriageAppliesAcrossPasses(unittest.TestCase):
       with self.subTest(pass_nr=2, title=finding["title"]):
         self.assertEqual(
           finding.get("triage", {}).get("status"), "accepted_risk",
-          "a triage decision did not follow its finding into the re-scan",
+          "a triage decision did not follow its finding into the later pass",
         )
 
   def test_a_new_endpoint_inherits_no_triage(self):
