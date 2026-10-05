@@ -358,7 +358,9 @@ from extensions.business.cybersec.edgeguard.egx2 import brief_profile, field_cat
 from extensions.business.cybersec.edgeguard.egx2 import insight_brief as egx2_runtime  # noqa: E402
 
 PINNED_CATALOG_SHA256 = "f33f8f417df901e2586fed9b9659b5acf883df78e13627a4b306fc6937d7bec4"
-PINNED_PROFILE_SHA256 = "962afb38da1fd79bcdd45e5a33cf94768234e8bbd313ca4f1bd69753cc287827"
+# Re-pinned for spec v0.4 (the manifest gained the MISP reference constants); the v0.3
+# value 962afb38... is kept in test_eg018_v04.py. CATALOG_SHA256 above did not move.
+PINNED_PROFILE_SHA256 = "a099ba2bc7dd053858fccffb63a5e1cab0626b273731874a4acb37aa90b2e5de"
 
 
 def enrichment_graph():

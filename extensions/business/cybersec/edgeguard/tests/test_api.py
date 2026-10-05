@@ -727,6 +727,7 @@ def _make_api(**overrides):
   plugin._last_request_time = None
   plugin._misp_enrichment_error_count = 0
   plugin._misp_citation_drop_count = 0
+  plugin._misp_ref_drop_count = 0
   plugin._misp_bad_templates_logged = set()
   plugin._misp_enrichment_last_error = None
   plugin.time = lambda: 1000

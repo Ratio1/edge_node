@@ -168,6 +168,18 @@ def _event_url(template: str, event_id: str) -> str:
   return template.replace(EVENT_URL_PLACEHOLDER, event_id)
 
 
+def event_url_is_valid(url: Any, event_id: str) -> bool:
+  """Explanation spec v0.4 §5.2: an emitted event URL is inside the v0.3 §4
+  URL language, at most 200 characters, and ends in its own event id."""
+  if not isinstance(url, str) or not 0 < len(url) <= EVENT_URL_TEMPLATE_MAX_CHARS:
+    return False
+  match = _EVENT_URL_RE.fullmatch(url)
+  if match is None or not url.endswith("/" + event_id):
+    return False
+  port = match.group("port")
+  return port is None or 1 <= int(port) <= 65535
+
+
 def parse_source_timestamp(value: Any) -> Optional[datetime]:
   """Explanation spec v0.3 §3.1: an ISO 8601 date or date-time (`T` or space
   separator, optional fraction, optional offset; naive = UTC; date-only =
