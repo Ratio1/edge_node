@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+from collections import Counter
 from typing import Any, Callable, Collection, Mapping, Optional, Sequence
 
 from . import brief_gates
@@ -223,7 +224,7 @@ def _misp_references(view: Optional[Mapping[str, Any]], event_url_template: str)
 def _reference_index(table: list[dict[str, Any]], node_ids: Mapping[str, str]) -> list[dict[str, Any]]:
   return [{
     "id": ref["id"], "event_id": ref["event_id"], "event_url": ref["event_url"],
-    "node_refs": list(ref["node_refs"]), "entity_ids": [str(node_ids[node_ref]) for node_ref in ref["node_refs"]],
+    "node_refs": list(ref["node_refs"]), "entity_ids": [node_ids.get(node_ref) for node_ref in ref["node_refs"]],
   } for ref in table]
 
 
@@ -246,7 +247,7 @@ def public_references_are_valid(
     if not (isinstance(ref_id, str) and len(ref_id) <= MISP_REF_MAX_CHARS and MISP_REF_RE.fullmatch(ref_id)) or ref_id in ids:
       return False
     ids.add(ref_id)
-    if not (isinstance(event_id, str) and misp.EVENT_ID_RE.match(event_id) and misp.event_url_is_valid(entry["event_url"], event_id)):
+    if not (isinstance(event_id, str) and misp.EVENT_ID_RE.fullmatch(event_id) and misp.event_url_is_valid(entry["event_url"], event_id)):
       return False
     if not (isinstance(node_refs, list) and 1 <= len(node_refs) <= MISP_REFERENCE_NODE_REFS_MAX):
       return False
@@ -267,11 +268,11 @@ def public_references_are_valid(
 def _public_refs(
   item: Mapping[str, Any],
   table: Mapping[str, Mapping[str, Any]],
-) -> tuple[list[str], dict[str, int]]:
+) -> tuple[list[str], Counter]:
   """Explanation spec v0.4 §4: the observation's surviving `misp_refs` (sorted by
   number) and a drop count per fixed code. Never raises, never fails the brief."""
   about = {str(e).strip().lower() for e in item.get("exemplar_entities") or []}
-  drops: dict[str, int] = {}
+  drops: Counter = Counter()
   kept: list[str] = []
   for token in dict.fromkeys(item.get("misp_refs") or []):
     ref = table.get(token)
@@ -284,7 +285,7 @@ def _public_refs(
     else:
       kept.append(token)
       continue
-    drops[code] = drops.get(code, 0) + 1
+    drops[code] += 1
   return sorted(kept, key=lambda token: int(token[1:])), drops
 
 
@@ -387,7 +388,8 @@ def _parse_brief(content: str, trace: Optional[Mapping[str, Any]]) -> dict[str, 
     if citations:
       parsed_observation["misp_citations"] = citations
     # Spec v0.4 §4: optional `misp_refs`, strings only; checked in `_model_case`.
-    refs = [ref for ref in item.get("misp_refs") or [] if isinstance(ref, str)] if isinstance(item.get("misp_refs"), list) else []
+    raw_refs = item.get("misp_refs")
+    refs = [ref for ref in raw_refs if isinstance(ref, str)] if isinstance(raw_refs, list) else []
     if refs:
       parsed_observation["misp_refs"] = refs
     brief["observations"].append(parsed_observation)
@@ -485,16 +487,19 @@ def _model_case(
   enrichment_view: Optional[Mapping[str, Any]] = None,
   node_ids: Optional[Mapping[str, str]] = None,
   references: Optional[list[dict[str, Any]]] = None,
-) -> tuple[dict[str, Any], int, dict[str, int]]:
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
+) -> tuple[dict[str, Any], int, Counter, int]:
   """The public case, the count of citations dropped for breaking a client
-  rule (a value-free number) and the `misp_refs` drop count per fixed code.
+  rule (a value-free number), the `misp_refs` drop count per fixed code and
+  the number of observations whose refs were withheld for breaking a client rule.
   With an enrichment view, gate-passed citations are shaped by
   `_public_citations` and `misp_refs` by `_public_refs` against `references`."""
   id_map = _entity_id_map(graph)
   graph_ids = {str(node.get("id")) for node in graph.get("nodes", []) or []}
   observations = []
   dropped = 0
-  ref_drops: dict[str, int] = {}
+  ref_drops: Counter = Counter()
+  withheld = 0
   table = {ref["id"]: ref for ref in references or []}
   for item in brief["observations"]:
     entity_ids = _entity_ids_for(item.get("exemplar_entities") or [], id_map)
@@ -510,8 +515,7 @@ def _model_case(
         observation["misp_citations"] = public
     if enrichment_view is not None and item.get("misp_refs"):
       refs, counts = _public_refs(item, table)
-      for code, count in counts.items():
-        ref_drops[code] = ref_drops.get(code, 0) + count
+      ref_drops.update(counts)
       if refs:
         observation["misp_refs"] = refs
     observations.append(observation)
@@ -531,12 +535,16 @@ def _model_case(
     # Spec v0.4 §5: the index lists every input reference; a client-rule break
     # is a bug, so the whole feature is withheld rather than the response rejected.
     index = _reference_index(references or [], node_ids or {})
-    if public_references_are_valid(with_refs, index, graph_ids):
+    # `event_url` is a pure function of the template and the id (§5.1).
+    if public_references_are_valid(with_refs, index, graph_ids) and all(
+      entry["event_url"] == misp._event_url(event_url_template, entry["event_id"]) for entry in index
+    ):
       case["misp_reference_index"] = index
     else:
       for observation in observations:
-        observation.pop("misp_refs", None)
-  return case, dropped, ref_drops
+        if observation.pop("misp_refs", None):
+          withheld += 1
+  return case, dropped, ref_drops, withheld
 
 
 def _trace(calls: list[Mapping[str, Any]], status: str, safe_code: Optional[str]) -> dict[str, Any]:
@@ -680,12 +688,16 @@ def run_insight_brief(
         continue
       call["status"] = "supported"
       calls.append(call)
-      case, drops, ref_drops = _model_case(brief, sheet, graph, enrichment_view, misp_node_ids, references)
+      case, drops, ref_drops, withheld = _model_case(
+        brief, sheet, graph, enrichment_view, misp_node_ids, references, event_url_template,
+      )
       result = {"case_explanation": case, "explanation_trace": _trace(calls, "supported", None)}
       if drops:
         result["citation_drops"] = drops
       if ref_drops:
-        result["misp_ref_drops"] = ref_drops
+        result["misp_ref_drops"] = dict(ref_drops)
+      if withheld:
+        result["misp_ref_withheld"] = withheld
       return result
     except GraphFirstRuntimeError as exc:
       failure_code = exc.code

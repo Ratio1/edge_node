@@ -157,11 +157,7 @@ def validate_event_url_template(value: Any) -> bool:
     return False
   if value.count(EVENT_URL_PLACEHOLDER) != 1 or not value.endswith("/" + EVENT_URL_PLACEHOLDER):
     return False
-  match = _EVENT_URL_RE.fullmatch(value.replace(EVENT_URL_PLACEHOLDER, "123"))
-  if match is None:
-    return False
-  port = match.group("port")
-  return port is None or 1 <= int(port) <= 65535
+  return event_url_is_valid(value.replace(EVENT_URL_PLACEHOLDER, "123"), "123")
 
 
 def _event_url(template: str, event_id: str) -> str:

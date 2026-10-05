@@ -396,10 +396,11 @@ class ApiTemplateTests(unittest.TestCase):
     )
     with patch(
       "extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
-      return_value={**result, "misp_ref_drops": {"ref_unknown": 2, "ref_over_cap": 1}},
+      return_value={**result, "misp_ref_drops": {"ref_unknown": 2, "ref_over_cap": 1}, "misp_ref_withheld": 2},
     ):
       self._explain(plugin)
     self.assertEqual(plugin._misp_ref_drop_count, 3)
+    self.assertEqual(plugin._misp_ref_withheld_count, 2)
 
   def test_prepared_execution_path_carries_no_block_and_no_citations(self):
     from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode

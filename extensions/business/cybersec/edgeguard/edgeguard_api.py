@@ -3394,6 +3394,7 @@ class EdgeguardApiPlugin(BasePlugin):
     self._misp_bad_templates_logged = set()
     self._misp_citation_drop_count = 0
     self._misp_ref_drop_count = 0
+    self._misp_ref_withheld_count = 0
     self._explanation_token = self._resolve_secret(
       explicit=self.cfg_edgeguard_explanation_model_token,
       env_name=self.cfg_edgeguard_explanation_model_token_env,
@@ -4927,6 +4928,9 @@ class EdgeguardApiPlugin(BasePlugin):
     if result.get("misp_ref_drops"):
       with self._metrics_lock:
         self._misp_ref_drop_count += sum(result["misp_ref_drops"].values())
+    if result.get("misp_ref_withheld"):
+      with self._metrics_lock:
+        self._misp_ref_withheld_count += int(result["misp_ref_withheld"])
     outcome_status = result["explanation_trace"].get("outcome", {}).get("status")
     return self._bounded_graph_first_success({
       "status": STATUS_OK,
@@ -5413,6 +5417,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "misp_enrichment_last_error": self._misp_enrichment_last_error,
         "misp_citation_drop_count": self._misp_citation_drop_count,
         "misp_ref_drop_count": self._misp_ref_drop_count,
+        "misp_ref_withheld_count": self._misp_ref_withheld_count,
       }
     explanation_url, explanation_error = self._explanation_url()
     worker_readiness = self._worker_readiness()

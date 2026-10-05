@@ -148,12 +148,21 @@ class PromptTests(unittest.TestCase):
     self.assertEqual(egx2.PROFILE_SHA256, egx2_tests.PINNED_PROFILE_SHA256)
     self.assertEqual(field_catalog.CATALOG_SHA256, egx2_tests.PINNED_CATALOG_SHA256)
     manifest = runtime.PROFILE_MANIFEST
-    self.assertEqual(manifest["misp_references_template"], brief_profile.MISP_REFERENCES_TEMPLATE)
-    self.assertEqual(manifest["misp_references_instruction"], brief_profile.MISP_REFERENCES_INSTRUCTION)
     self.assertEqual(
       (manifest["misp_references_max_lines"], manifest["misp_references_max_bytes"], manifest["misp_refs_max_per_observation"]),
       (8, 1_024, 3),
     )
+
+
+def _direct_case(observation, nodes, node_ids, template=TEMPLATE):
+  """`_model_case` on a hand-built view, for rules the gates would not let through an e2e run."""
+  view = {"nodes": nodes}
+  graph = {"nodes": [{"id": pid, "labels": ["CVE"], "properties": {"cve_id": pid}} for pid in set(node_ids.values())]}
+  brief = {
+    "assessment": "a", "why_it_matters": "w", "next_checks": [], "confidence": {"tier": "low", "basis": "b"},
+    "observations": [{"insight_ids": [], **observation}],
+  }
+  return runtime._model_case(brief, [], graph, view, node_ids, runtime._misp_references(view, template), template)
 
 
 class RefValidationTests(unittest.TestCase):
@@ -207,6 +216,49 @@ class RefValidationTests(unittest.TestCase):
     result, _ = _egx2_run(_with_refs(["M1", "M1", "M1"]))
     self.assertEqual(self._refs(result)[0], ["M1"])
     self.assertNotIn("misp_ref_drops", result)
+
+  def test_exemplar_rule_alone_keeps_the_ref(self):
+    nodes = [_node("N0", "Alpha", ["101"])]
+    obs = {"text": "Nothing named here.", "misp_refs": ["M1"], "exemplar_entities": [" ALPHA "]}
+    case, _dropped, drops, _withheld = _direct_case(obs, nodes, {"N0": "n:a"})
+    self.assertEqual(case["observations"][0]["misp_refs"], ["M1"])
+    self.assertFalse(drops)
+    case, _dropped, drops, _withheld = _direct_case({**obs, "exemplar_entities": []}, nodes, {"N0": "n:a"})
+    self.assertNotIn("misp_refs", case["observations"][0])
+    self.assertEqual(drops, {"ref_entity_not_in_observation": 1})
+
+  def test_fifty_one_nodes_on_one_event_cap_node_refs_at_fifty(self):
+    nodes = [_node(f"N{i}", f"E{i}", ["101"]) for i in range(51)]
+    node_ids = {f"N{i}": f"n:{i}" for i in range(51)}
+    obs = {"text": "E0 appears.", "misp_refs": ["M1"], "exemplar_entities": ["E0"]}
+    case, _dropped, _drops, withheld = _direct_case(obs, nodes, node_ids)
+    entry = case["misp_reference_index"][0]
+    self.assertEqual((len(entry["node_refs"]), len(entry["entity_ids"]), withheld), (50, 50, 0))
+    self.assertEqual(case["observations"][0]["misp_refs"], ["M1"])
+
+  def test_unresolved_node_ref_withholds_index_and_refs_and_counts_it(self):
+    nodes = [_node("N0", "Alpha", ["101"])]
+    obs = {"text": "Alpha appears.", "misp_refs": ["M1"], "exemplar_entities": ["Alpha"]}
+    case, _dropped, _drops, withheld = _direct_case(obs, nodes, {})
+    self.assertNotIn("misp_reference_index", case)
+    self.assertNotIn("misp_refs", case["observations"][0])
+    self.assertEqual(withheld, 1)
+
+  def test_event_url_must_equal_the_template_expansion(self):
+    nodes = [_node("N0", "Alpha", ["101"])]
+    obs = {"text": "Alpha appears.", "misp_refs": ["M1"], "exemplar_entities": ["Alpha"]}
+    table = runtime._misp_references({"nodes": nodes}, TEMPLATE)
+    table[0]["event_url"] = misp._event_url("https://other.example.test/events/view/{event_id}", "101")
+    with patch.object(runtime, "_misp_references", return_value=table):
+      case, _dropped, _drops, withheld = _direct_case(obs, nodes, {"N0": "n:a"})
+    self.assertNotIn("misp_reference_index", case)
+    self.assertEqual(withheld, 1)
+
+  def test_refs_on_a_no_block_run_leave_no_drop_key(self):
+    result, _ = _egx2_run(_with_refs(["M9", "M1"]), block=None)
+    self.assertNotIn("misp_ref_drops", result)
+    self.assertNotIn("misp_ref_withheld", result)
+    self.assertNotIn("misp_ref", json.dumps(result["case_explanation"]))
 
   def test_cut_event_is_unknown(self):
     block = _many_events_block(10)
