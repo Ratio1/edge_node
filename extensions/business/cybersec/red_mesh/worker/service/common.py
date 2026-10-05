@@ -12,6 +12,9 @@ import paramiko
 from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import check_cves, parse_distro_package
+from ...models.finding_schema import (
+  AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_NOT_PERMITTED, AUTHENTICATED_ACTION_PERFORMED,
+)
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
@@ -56,6 +59,11 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None, ac
   proofs = proofs or {}
   for cred in accepted:
     proof = proofs.get(cred)
+    action = (
+      AUTHENTICATED_ACTION_PERFORMED if proof
+      else AUTHENTICATED_ACTION_ATTEMPTED if action_permitted
+      else AUTHENTICATED_ACTION_NOT_PERMITTED
+    )
     evidence = f"Accepted credential: {cred}"
     if proof:
       evidence += f"; authenticated action: {proof}"
@@ -77,6 +85,7 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None, ac
         owasp_id="A07:2021",
         cwe_id="CWE-798",
         confidence="tentative",
+        authenticated_action=action,
       ))
       continue
     if control == CONTROL_NOT_RUN:
@@ -105,6 +114,7 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None, ac
       owasp_id="A07:2021",
       cwe_id="CWE-798",
       confidence=confidence,
+      authenticated_action=action,
     ))
   return findings
 
@@ -740,6 +750,12 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
+        # The upload test below is the RoE-gated action; when it succeeds its
+        # own finding says `performed`, and "any performed" wins in the report.
+        authenticated_action=(
+          AUTHENTICATED_ACTION_ATTEMPTED if getattr(self, "authenticated_action", False)
+          else AUTHENTICATED_ACTION_NOT_PERMITTED
+        ),
       ))
     except Exception:
       # Anonymous failed — close and move on to credential tests
@@ -818,6 +834,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
             owasp_id="A01:2021",
             cwe_id="CWE-434",
             confidence="certain",
+            authenticated_action=AUTHENTICATED_ACTION_PERFORMED,
           ))
           try:
             ftp.delete("__redmesh_probe.txt")

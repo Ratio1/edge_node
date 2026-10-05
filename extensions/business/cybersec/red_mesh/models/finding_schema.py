@@ -31,6 +31,21 @@ FINDING_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 # half-confidence finding with nothing anywhere saying it was not understood.
 FINDING_CONFIDENCES = ("certain", "firm", "tentative")
 
+# What happened after an accepted login (RM-118). The report read this from
+# prose — a `; authenticated action:` marker in evidence and title phrases — so a
+# probe rewording flipped a client-facing line with every test green. ""
+# means the finding records no login.
+AUTHENTICATED_ACTION_PERFORMED = "performed"          # the RoE-gated action ran and returned output
+AUTHENTICATED_ACTION_ATTEMPTED = "attempted"          # permitted; tried or ran, completed nothing
+AUTHENTICATED_ACTION_NOT_PERMITTED = "not_permitted"  # the RoE withheld it
+AUTHENTICATED_ACTION_NOT_APPLICABLE = "not_applicable"  # no action exists for the service
+AUTHENTICATED_ACTIONS = (
+  AUTHENTICATED_ACTION_PERFORMED,
+  AUTHENTICATED_ACTION_ATTEMPTED,
+  AUTHENTICATED_ACTION_NOT_PERMITTED,
+  AUTHENTICATED_ACTION_NOT_APPLICABLE,
+)
+
 REQUIRED_FINDING_FIELDS = (
   "finding_id",
   "title",
@@ -73,6 +88,8 @@ _KNOWN_FIELDS = (
   # opened, so the caveat the letter promised was recorded and not shown.
   "severity_source",
   "backport_status",
+  # Read by name for §3.5.2 (RM-118).
+  "authenticated_action",
   "affected_assets",
   "evidence_items",
   "evidence_artifacts",
@@ -149,6 +166,7 @@ class FlatFinding:
   status: str = ""
   severity_source: str = ""
   backport_status: str = ""
+  authenticated_action: str = ""
   # Verbatim carrier for anything the contract does not name. Not a dumping
   # ground: it is what makes "the contract does not know this field" different
   # from "this field did not exist", which is the distinction the whitelists
@@ -214,6 +232,9 @@ def validate_flat_finding(payload: Any) -> list[str]:
     errors.append(f"severity is invalid: {payload['severity']}")
   if "confidence" in payload and payload["confidence"] not in FINDING_CONFIDENCES:
     errors.append(f"confidence is invalid: {payload['confidence']}")
+  action = payload.get("authenticated_action", "")
+  if action and action not in AUTHENTICATED_ACTIONS:
+    errors.append(f"authenticated_action is invalid: {action}")
 
   return errors
 
@@ -251,3 +272,20 @@ def flat_finding_from_dict(payload: dict) -> FlatFinding:
 
   extra = {key: value for key, value in payload.items() if key not in _KNOWN_FIELDS}
   return FlatFinding(**known, extra=extra, _present=present)
+
+
+def read_archived_findings(findings: Any) -> Any:
+  """Read an archived findings list through the contract (RM-062).
+
+  Each finding goes through `flat_finding_from_dict`, so a schema or version
+  this build does not understand raises instead of being read under the wrong
+  assumptions. The round trip loses nothing, and the source key order is kept so
+  the stored content does not change. `None` (no findings key) passes through.
+  """
+  if findings is None:
+    return None
+  out = []
+  for payload in findings:
+    restored = flat_finding_from_dict(payload).to_dict()
+    out.append({key: restored[key] for key in payload})
+  return out

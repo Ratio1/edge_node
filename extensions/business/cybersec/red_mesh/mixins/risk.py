@@ -31,6 +31,22 @@ from ..constants import (
 )
 
 
+def _probe_display_name(probe_id):
+  """The registered `display_name` for a probe id, or "" when it has none.
+
+  Importing `worker` is what registers the probes (`@register_probe` runs at
+  import), so a host that never imported a worker still resolves names.
+  Graybox probes are not in this registry and keep their id in the report.
+  """
+  try:
+    from .. import worker as _worker  # noqa: F401  (registers the probes)
+    from ..worker.probe_registry import get_probe_metadata
+    metadata = get_probe_metadata(probe_id)
+  except Exception:
+    return ""
+  return getattr(metadata, "display_name", "") or ""
+
+
 def normalize_risk_score(raw_total):
   """
   Map a raw risk total onto 0-100 without saturating.
@@ -202,6 +218,11 @@ class _RiskScoringMixin:
       # had, reading a raw severity string where `Finding.compute_signature`
       # read `Severity.value`.
       item["probe"] = probe_name
+      # What the report prints for the probe (RM-118). Not identity and not
+      # content: `finding_identity` reads neither.
+      display_name = _probe_display_name(probe_name)
+      if display_name:
+        item["probe_display_name"] = display_name
       # The probe-time signature wins over anything computed here.
       #
       # This walk runs on opposite sides of `_redact_report` depending on the

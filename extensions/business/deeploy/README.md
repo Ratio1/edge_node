@@ -67,3 +67,23 @@ PYTHONPATH=../naeural_core:../ratio1_sdk python -m unittest discover -s extensio
 Rollout keeps compatibility with old clients that omit selectors. Do not roll back
 to a backend without selection-aware handling while selected-secret jobs are
 being updated; retain canonical metadata and dAuth bundles together.
+
+## Uncertain Create Outcomes
+
+For a new `create_pipeline` request, `dispatch_uncertain: true` on a `fail` or
+`timeout` response means a node may already have received the configuration.
+The job's CID and dAuth bundle remain available so a late worker can resolve
+secrets. This is not a cancellation, and the node may still start even though
+the request failed. The field is omitted for ordinary failures and successful
+responses. It is additive to the existing response shape.
+
+While a job ID has stored pipeline metadata, another `create_pipeline` request
+for that ID fails before staging or dispatch. Retrying would replace the only
+CID-bound bundle while workers from the first attempt may still run. Inspect
+the target nodes and resolve the old attempt before creating a new job; do not
+assume that a timeout or a stop command proves all nodes have stopped. There is
+no automatic expiry or safe cleanup protocol for this retained bundle yet.
+Overlapping creates handled by one manager process are also rejected, but
+ChainStore has no atomic cross-manager claim; independent managers must not
+accept concurrent creates for the same job ID until a distributed claim or
+generation-aware protocol exists.

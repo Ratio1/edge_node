@@ -390,9 +390,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._launch(plugin)
     from extensions.business.cybersec.red_mesh.models import JobConfig
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.12.0"})
+    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.13.0"})
     restored = JobConfig.from_dict(config_dict).to_dict()
-    self.assertEqual(restored["redmesh_release"], {"backend": "0.12.0"})
+    self.assertEqual(restored["redmesh_release"], {"backend": "0.13.0"})
 
   def test_launch_records_the_console_and_report_pipeline_it_was_sent(self):
     """RM-103 item 12: the release names all three deployables. Only the

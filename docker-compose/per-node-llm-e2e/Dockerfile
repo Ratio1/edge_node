@@ -3,7 +3,8 @@ FROM ${BASE_IMAGE}
 
 ARG KUBO_VERSION=v0.35.0
 RUN set -eux; \
-    curl -fsSLo kubo.tar.gz https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
+    curl -fsSLo kubo.tar.gz https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz \
+      || curl -fsSLo kubo.tar.gz https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
     tar -xzf kubo.tar.gz; \
     cd kubo && bash install.sh; \
     cd / && rm -rf kubo kubo.tar.gz

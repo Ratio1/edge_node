@@ -344,3 +344,59 @@ class TestNormalisationDoesNotHideTheViolation(unittest.TestCase):
       }]}}},
     })
     self.assertEqual(risk["breakdown"]["schema_violations"]["count"], 0)
+
+
+class TestTheArchiveReadBoundaryUsesTheContract(unittest.TestCase):
+  """RM-062: archived findings are read through `flat_finding_from_dict`.
+
+  Before this, nothing in production called the deserializer, so the version
+  stamp was decorative on the read path: a `schema_version` this build does not
+  understand was read under v1 assumptions. Both archive deserializers now route
+  findings through the contract, the way `JobArchive.from_dict` already gates
+  `archive_version`.
+  """
+
+  def _pass(self, *findings):
+    return {
+      "pass_nr": 1, "date_started": 1.0, "date_completed": 2.0, "duration": 1.0,
+      "aggregated_report_cid": "QmAggregate", "worker_reports": {},
+      "findings": list(findings),
+    }
+
+  def _archive(self, *passes):
+    return {
+      "job_id": "job-1", "job_config": {}, "timeline": [], "passes": list(passes),
+      "ui_aggregate": {}, "duration": 1.0, "date_created": 1.0, "date_completed": 2.0,
+    }
+
+  def test_a_pass_report_refuses_a_finding_from_a_future_schema(self):
+    from extensions.business.cybersec.red_mesh.models.archive import PassReport
+    with self.assertRaises(ValueError):
+      PassReport.from_dict(self._pass(_minimal(schema_version="9.0.0")))
+
+  def test_a_job_archive_refuses_a_pass_holding_a_future_schema_finding(self):
+    from extensions.business.cybersec.red_mesh.models.archive import JobArchive
+    with self.assertRaises(ValueError):
+      JobArchive.from_dict(self._archive(self._pass(_minimal(schema_version="9.0.0"))))
+
+  def test_reading_a_pass_report_changes_nothing_including_key_order(self):
+    from extensions.business.cybersec.red_mesh.models.archive import PassReport
+    unstamped = _minimal(unknown_producer_field={"kept": True})
+    del unstamped["schema"]
+    del unstamped["schema_version"]
+    findings = [_minimal(), unstamped]
+    restored = PassReport.from_dict(self._pass(*findings)).to_dict()["findings"]
+    self.assertEqual(restored, findings)
+    self.assertEqual([list(f) for f in restored], [list(f) for f in findings])
+
+  def test_reading_a_job_archive_changes_no_finding(self):
+    from extensions.business.cybersec.red_mesh.models.archive import JobArchive
+    archive = self._archive(self._pass(_minimal()), {"pass_nr": 2})
+    restored = JobArchive.from_dict(archive).to_dict()["passes"]
+    self.assertEqual(restored, archive["passes"])
+
+  def test_a_pass_report_without_findings_stays_without_findings(self):
+    from extensions.business.cybersec.red_mesh.models.archive import PassReport
+    payload = self._pass()
+    del payload["findings"]
+    self.assertNotIn("findings", PassReport.from_dict(payload).to_dict())
