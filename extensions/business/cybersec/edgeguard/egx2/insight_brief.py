@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Collection, Mapping, Optional, Sequence
 
 from . import brief_gates
 from . import brief_profile
@@ -34,6 +35,14 @@ MAX_TOKENS = 768
 TEMPERATURE = 0.7
 TOP_P = 0.8
 MAX_OBSERVATIONS = 4
+# Explanation spec v0.3 §2: public `misp_citations` per observation.
+MAX_PUBLIC_CITATIONS = 8
+CITATION_ENTITY_MAX_CHARS = 256
+CITATION_FIELD_MAX_CHARS = 64
+CITATION_VALUE_MAX_CHARS = 500
+CITATION_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+CITATION_NODE_REF_RE = re.compile(r"^N(?:0|[1-9][0-9]*)$")
+PUBLIC_CITATION_KEYS = frozenset({"entity", "field", "value", "node_ref", "entity_id"})
 MAX_NEXT_CHECKS = 3
 # Mode-scaled prompt budgets (observations, next_checks): thorough reads more
 # rows, so it earns a richer brief. Parse caps above stay the superset the
@@ -45,6 +54,10 @@ TEXT_LIMIT = 1_000
 # in the user message (the field legend is bounded by the catalog).
 ENRICHMENT_VIEW_MAX_BYTES = 2_048
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# The playground's control-free string rule (`string()` in explanation-contract.ts).
+CITATION_CONTROL_RE = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]")
+# Largest integer a JSON number carries exactly in the browser.
+MAX_CITATION_INTEGER = 2**53
 
 RETRY_NOTE_TEMPLATE = (
   "\n\nRETRY: your previous brief failed these deterministic checks: {failures}. "
@@ -118,6 +131,7 @@ def _enrichment_view(
   block: Optional[Mapping[str, Any]],
   graph: Mapping[str, Any],
   node_ids: Optional[Mapping[str, str]],
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
 ) -> Optional[dict[str, Any]]:
   """Explanation spec v0.2 §5: the compact `misp_enrichment` view for the
   prompt. Each block node is joined to its packet-graph node through
@@ -146,6 +160,7 @@ def _enrichment_view(
     max_bytes=ENRICHMENT_VIEW_MAX_BYTES,
     entity_by_ref=entity_by_ref,
     fields_by_label=fc.MISP_ENRICHMENT_CATALOG,
+    event_url_template=event_url_template,
   )
 
 
@@ -280,15 +295,99 @@ def _parse_brief(content: str, trace: Optional[Mapping[str, Any]]) -> dict[str, 
   return brief
 
 
-def _model_case(brief: Mapping[str, Any], sheet: list[Mapping[str, Any]], graph: Mapping[str, Any]) -> dict[str, Any]:
+def public_citation_is_valid(
+  citation: Any,
+  entity_ids: Sequence[str],
+  graph_ids: Collection[str],
+) -> bool:
+  """Explanation spec v0.3 §2.3: the client rules for one public citation,
+  written once and shared (as `tests/fixtures/misp_citation_cases.json`) with
+  the playground validator, which rejects a whole response on one bad key."""
+  if not isinstance(citation, Mapping) or set(citation) != PUBLIC_CITATION_KEYS:
+    return False
+  entity, field, value = citation["entity"], citation["field"], citation["value"]
+  node_ref, entity_id = citation["node_ref"], citation["entity_id"]
+  if not (isinstance(entity, str) and 0 < len(entity) <= CITATION_ENTITY_MAX_CHARS):
+    return False
+  if not (isinstance(field, str) and len(field) <= CITATION_FIELD_MAX_CHARS and CITATION_FIELD_RE.fullmatch(field)):
+    return False
+  if isinstance(value, str):
+    if not 0 < len(value) <= CITATION_VALUE_MAX_CHARS:
+      return False
+  elif isinstance(value, int) and not isinstance(value, bool):
+    if abs(value) > MAX_CITATION_INTEGER:
+      return False
+  elif not (isinstance(value, float) and math.isfinite(value)):
+    return False
+  if any(CITATION_CONTROL_RE.search(text) for text in (entity, field, value) if isinstance(text, str)):
+    return False
+  if not (isinstance(node_ref, str) and CITATION_NODE_REF_RE.fullmatch(node_ref)):
+    return False
+  return isinstance(entity_id, str) and entity_id in graph_ids and entity_id in entity_ids
+
+
+def _public_citations(
+  item: Mapping[str, Any],
+  entity_ids: list[str],
+  view: Optional[Mapping[str, Any]],
+  node_ids: Optional[Mapping[str, str]],
+  graph_ids: set[str],
+) -> tuple[list[dict[str, Any]], int]:
+  """Explanation spec v0.3 §2: the observation's gate-passed citations as
+  public `{entity, field, value, node_ref, entity_id}` objects, plus the count
+  dropped for breaking a client rule (never the values). `node_ref` and
+  `entity_id` come from the model view the gate graded against."""
+  nodes = brief_gates.enrichment_nodes(view)
+  public: list[dict[str, Any]] = []
+  seen: set[tuple[Any, ...]] = set()
+  dropped = 0
+  for citation in item.get("misp_citations") or []:
+    value = citation["value"].strip() if isinstance(citation["value"], str) else citation["value"]
+    node = nodes.get(citation["entity"].strip().lower())
+    node_ref = node.get("node_ref") if node else None
+    candidate = {
+      "entity": citation["entity"], "field": citation["field"], "value": value,
+      "node_ref": node_ref, "entity_id": str((node_ids or {})[node_ref]) if node_ref in (node_ids or {}) else None,
+    }
+    if not public_citation_is_valid(candidate, entity_ids, graph_ids):
+      dropped += 1
+      continue
+    key = (candidate["entity"].lower(), candidate["field"], value.lower() if isinstance(value, str) else value)
+    if key in seen:
+      continue
+    seen.add(key)
+    if len(public) < MAX_PUBLIC_CITATIONS:
+      public.append(candidate)
+  return public, dropped
+
+
+def _model_case(
+  brief: Mapping[str, Any],
+  sheet: list[Mapping[str, Any]],
+  graph: Mapping[str, Any],
+  enrichment_view: Optional[Mapping[str, Any]] = None,
+  node_ids: Optional[Mapping[str, str]] = None,
+) -> tuple[dict[str, Any], int]:
+  """The public case and the count of citations dropped for breaking a client
+  rule (a value-free number). With an enrichment view, gate-passed citations
+  are shaped by `_public_citations`."""
   id_map = _entity_id_map(graph)
+  graph_ids = {str(node.get("id")) for node in graph.get("nodes", []) or []}
   observations = []
+  dropped = 0
   for item in brief["observations"]:
-    observations.append({
+    entity_ids = _entity_ids_for(item.get("exemplar_entities") or [], id_map)
+    observation = {
       "text": item["text"],
       "insight_ids": item["insight_ids"],
-      "entity_ids": _entity_ids_for(item.get("exemplar_entities") or [], id_map),
-    })
+      "entity_ids": entity_ids,
+    }
+    if enrichment_view is not None and item.get("misp_citations"):
+      public, count = _public_citations(item, entity_ids, enrichment_view, node_ids, graph_ids)
+      dropped += count
+      if public:
+        observation["misp_citations"] = public
+    observations.append(observation)
   cited = [ids for item in brief["observations"] for ids in item["insight_ids"]]
   return {
     "schema_version": CASE_EXPLANATION_VERSION,
@@ -299,7 +398,7 @@ def _model_case(brief: Mapping[str, Any], sheet: list[Mapping[str, Any]], graph:
     "confidence": dict(brief["confidence"]),
     "insight_index": _insight_index(sheet),
     "provenance": {"mode": "model", "profile_id": PROFILE_ID, "profile_sha256": PROFILE_SHA256},
-  }
+  }, dropped
 
 
 def _trace(calls: list[Mapping[str, Any]], status: str, safe_code: Optional[str]) -> dict[str, Any]:
@@ -342,6 +441,7 @@ def run_insight_brief(
   mode: Optional[str] = None,
   misp_enrichment: Optional[Mapping[str, Any]] = None,
   misp_node_ids: Optional[Mapping[str, str]] = None,
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
 ) -> dict[str, Any]:
   sheet = insights.build_insight_sheet(graph)
   substantive = [ins for ins in sheet if ins.get("kind") != "confidence"]
@@ -367,7 +467,7 @@ def run_insight_brief(
     return {"case_explanation": case, "explanation_trace": _trace([], "fallback", "model_not_admitted")}
 
   max_observations, max_next_checks = MODE_BRIEF_BUDGETS.get(mode or "", DEFAULT_BRIEF_BUDGET)
-  enrichment_view = _enrichment_view(misp_enrichment, graph, misp_node_ids)
+  enrichment_view = _enrichment_view(misp_enrichment, graph, misp_node_ids, event_url_template)
   prompt = brief_profile.build_brief_prompt(
     sheet, question,
     max_observations=max_observations,
@@ -429,6 +529,8 @@ def run_insight_brief(
       }
       call["gates"] = {name: passed for name, (passed, _detail, _tier) in results.items()}
       if hard_failures:
+        # Spec v0.3 §5: value-free reason codes beside the gate map.
+        call["gate_failures"] = brief_gates.failure_codes(brief, sheet, enrichment_view)
         failure_code = "deterministic_validation_failed"
         call["status"] = "failed"
         calls.append(call)
@@ -438,10 +540,11 @@ def run_insight_brief(
         continue
       call["status"] = "supported"
       calls.append(call)
-      return {
-        "case_explanation": _model_case(brief, sheet, graph),
-        "explanation_trace": _trace(calls, "supported", None),
-      }
+      case, drops = _model_case(brief, sheet, graph, enrichment_view, misp_node_ids)
+      result = {"case_explanation": case, "explanation_trace": _trace(calls, "supported", None)}
+      if drops:
+        result["citation_drops"] = drops
+      return result
     except GraphFirstRuntimeError as exc:
       failure_code = exc.code
       if call.get("status") == "started":

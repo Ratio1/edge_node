@@ -1539,6 +1539,10 @@ def _has_misp_id_property(properties: Mapping[str, Any]) -> bool:
   return False
 
 
+# Distinct invalid event URL templates logged per process (spec v0.3 §4.1).
+MISP_BAD_TEMPLATE_LOG_CAP = 16
+
+
 def _collect_misp_candidate_nodes(records: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
   """Contract §7.1. Returns `{element_id: {"packet_id": ..., "labels": [...]}}`
   for every distinct node that carries a non-empty `misp_event_ids` or
@@ -3283,6 +3287,9 @@ _CONFIG = {
   # The internal enrichment read's own bounded timeout, independent of
   # `cfg_neo4j_query_timeout_seconds`.
   "MISP_ENRICHMENT_TIMEOUT_SECONDS": misp_enrichment.DEFAULT_TIMEOUT_SECONDS,
+  # Explanation spec v0.3 §4: event link template, read once per explain
+  # request; an invalid value turns enrichment off for that request.
+  "MISP_ENRICHMENT_EVENT_URL_TEMPLATE": misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
 
   "API_TITLE": "EdgeGuard API",
   "API_SUMMARY": "Guarded EdgeGuard text-to-Cypher and playground Neo4j API.",
@@ -3382,6 +3389,10 @@ class EdgeguardApiPlugin(BasePlugin):
     # never the message or any raw data.
     self._misp_enrichment_error_count = 0
     self._misp_enrichment_last_error = None
+    # Spec v0.3: distinct bad templates already logged (bounded), and the
+    # value-free count of citations dropped for breaking a client rule.
+    self._misp_bad_templates_logged = set()
+    self._misp_citation_drop_count = 0
     self._explanation_token = self._resolve_secret(
       explicit=self.cfg_edgeguard_explanation_model_token,
       env_name=self.cfg_edgeguard_explanation_model_token_env,
@@ -4523,12 +4534,42 @@ class EdgeguardApiPlugin(BasePlugin):
       query_scope="expand" if plan.get("broadening", {}).get("enabled") else "exact",
     )
 
+  def _misp_event_url_template(self) -> Optional[str]:
+    """Explanation spec v0.3 §4.1: the configured event URL template, read
+    and validated once per explain request. `None` means the configured
+    value is invalid: enrichment is off for that request, the error counter
+    moves with the fixed name `invalid_event_url_template`, and one value-free
+    log line is written per distinct bad value (a short hash, never the
+    value, which may carry credentials)."""
+    if not getattr(self, "cfg_misp_enrichment_enabled", False):
+      return misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
+    value = getattr(self, "cfg_misp_enrichment_event_url_template", None)
+    if value is None:
+      return misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
+    if misp_enrichment.validate_event_url_template(value):
+      return value
+    with self._metrics_lock:
+      self._misp_enrichment_error_count += 1
+      self._misp_enrichment_last_error = "invalid_event_url_template"
+      seen = self._misp_bad_templates_logged
+      digest = hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()[:12]
+      first_time = digest not in seen and len(seen) < MISP_BAD_TEMPLATE_LOG_CAP
+      if first_time:
+        seen.add(digest)
+    if first_time:
+      self.P(
+        f"MISP_ENRICHMENT_EVENT_URL_TEMPLATE is invalid (sha256 {digest}); enrichment is off for this request",
+        color="r",
+      )
+    return None
+
   def _misp_enrichment_for_response(
     self,
     *,
     driver: Any,
     records: Optional[list[Dict[str, Any]]],
     node_source_aliases: Optional[Mapping[str, str]] = None,
+    event_url_template: Optional[str] = None,
   ) -> Optional[Dict[str, Any]]:
     """Contract §7.1-§7.3: the block returned beside `result_digest`.
     Explanation models see it only through `_admit_misp_enrichment_for_model`
@@ -4545,6 +4586,10 @@ class EdgeguardApiPlugin(BasePlugin):
       return None
     if driver is None or not records:
       return None
+    if event_url_template is None:
+      event_url_template = self._misp_event_url_template()
+      if event_url_template is None:
+        return None
     try:
       candidates = _collect_misp_candidate_nodes(records)
       if not candidates:
@@ -4571,6 +4616,7 @@ class EdgeguardApiPlugin(BasePlugin):
         node_ref_by_element_id,
         truncated=total_candidates > misp_enrichment.MAX_NODES,
         omitted_nodes=max(total_candidates - misp_enrichment.MAX_NODES, 0),
+        event_url_template=event_url_template,
       )
     except Exception as exc:  # noqa: BLE001 - fail-open by contract §7.3.
       # A bounded, value-free observability note -- never the exception
@@ -4581,7 +4627,7 @@ class EdgeguardApiPlugin(BasePlugin):
       return None
     if block is None:
       return None
-    if not misp_enrichment.validate_misp_enrichment_block(block):
+    if not misp_enrichment.validate_misp_enrichment_block(block, event_url_template):
       # Same counter as the exception path above, with a fixed reason name
       # instead of an exception class -- never the block content.
       with self._metrics_lock:
@@ -4594,6 +4640,7 @@ class EdgeguardApiPlugin(BasePlugin):
     self,
     packet: Mapping[str, Any],
     block: Optional[Mapping[str, Any]],
+    event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
   ) -> Optional[Mapping[str, Any]]:
     """Explanation spec v0.2 §4: runs before any EAB/1 or EGX/2 model call.
     Re-validates the block that would be admitted, computes
@@ -4607,7 +4654,7 @@ class EdgeguardApiPlugin(BasePlugin):
     redaction = packet.get("redaction") if isinstance(packet.get("redaction"), Mapping) else {}
     model_redaction = {
       **dict(redaction),
-      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(block),
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(block, event_url_template),
     }
     errors: list[Dict[str, str]] = []
     _validate_packet_redaction(model_redaction, errors)
@@ -4673,12 +4720,15 @@ class EdgeguardApiPlugin(BasePlugin):
     deadline: float,
     projection_digest: Optional[Mapping[str, Any]] = None,
     misp_enrichment_block: Optional[Mapping[str, Any]] = None,
+    misp_event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
   ) -> Dict[str, Any]:
     # Contract §4.3/§7.3: siblings of `result_digest`; `projection_digest`
     # only for `ranked_projection` results, `misp_enrichment` fail-open.
     # Explanation spec v0.2: the block reaches `run_analyst_brief` only
     # after the model-admission check.
-    misp_enrichment_block = self._admit_misp_enrichment_for_model(packet, misp_enrichment_block)
+    misp_enrichment_block = self._admit_misp_enrichment_for_model(
+      packet, misp_enrichment_block, misp_event_url_template,
+    )
     digest_siblings = {"projection_digest": dict(projection_digest)} if projection_digest is not None else {}
     if misp_enrichment_block is not None:
       digest_siblings["misp_enrichment"] = dict(misp_enrichment_block)
@@ -4755,6 +4805,7 @@ class EdgeguardApiPlugin(BasePlugin):
         provider_call=self._call_graph_first_provider,
         projection_digest=projection_digest,
         misp_enrichment=misp_enrichment_block,
+        event_url_template=misp_event_url_template,
       )
       return self._bounded_graph_first_success({
         "status": STATUS_OK,
@@ -4829,12 +4880,15 @@ class EdgeguardApiPlugin(BasePlugin):
     mode: Optional[str] = None,
     misp_enrichment_block: Optional[Mapping[str, Any]] = None,
     misp_node_aliases: Optional[Mapping[str, str]] = None,
+    misp_event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
   ) -> Dict[str, Any]:
     # Contract §7.3: `misp_enrichment` is a sibling of `result_digest`.
     # Explanation spec v0.2: it reaches `egx2.run_insight_brief` only after
     # the model-admission check; `misp_node_aliases` (packet node id ->
     # digest node ref) joins block nodes to packet-graph nodes.
-    misp_enrichment_block = self._admit_misp_enrichment_for_model(packet, misp_enrichment_block)
+    misp_enrichment_block = self._admit_misp_enrichment_for_model(
+      packet, misp_enrichment_block, misp_event_url_template,
+    )
     graph = packet.get("graph") or {}
     returned_rows = digest.get("counts", {}).get("returned_rows")
     deterministic_reason = None
@@ -4861,10 +4915,14 @@ class EdgeguardApiPlugin(BasePlugin):
       deterministic_reason=deterministic_reason,
       mode=mode,
       misp_enrichment=misp_enrichment_block,
+      event_url_template=misp_event_url_template,
       misp_node_ids={
         node_ref: packet_id for packet_id, node_ref in (misp_node_aliases or {}).items()
       },
     )
+    if result.get("citation_drops"):
+      with self._metrics_lock:
+        self._misp_citation_drop_count += int(result["citation_drops"])
     outcome_status = result["explanation_trace"].get("outcome", {}).get("status")
     return self._bounded_graph_first_success({
       "status": STATUS_OK,
@@ -5349,6 +5407,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "last_request_time": self._last_request_time,
         "misp_enrichment_error_count": self._misp_enrichment_error_count,
         "misp_enrichment_last_error": self._misp_enrichment_last_error,
+        "misp_citation_drop_count": self._misp_citation_drop_count,
       }
     explanation_url, explanation_error = self._explanation_url()
     worker_readiness = self._worker_readiness()
@@ -6811,9 +6870,13 @@ class EdgeguardApiPlugin(BasePlugin):
         misp_node_aliases = node_alias_map(query_result_evidence, evidence_catalog)
       except Exception:  # noqa: BLE001 - fail-open by contract §7.3.
         misp_node_aliases = {}
-      misp_block = self._misp_enrichment_for_response(
+      misp_event_url_template = self._misp_event_url_template()
+      misp_block = None if misp_event_url_template is None else self._misp_enrichment_for_response(
         driver=driver, records=query_result["rows"], node_source_aliases=misp_node_aliases,
+        event_url_template=misp_event_url_template,
       )
+      if misp_event_url_template is None:
+        misp_event_url_template = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
       if packet["execution"]["truncated"]:
         if self._active_explanation_strategy() == "insight_brief":
           result = egx2.run_insight_brief(
@@ -6876,6 +6939,7 @@ class EdgeguardApiPlugin(BasePlugin):
           mode=mode_plan.mode if mode_plan is not None else None,
           misp_enrichment_block=misp_block,
           misp_node_aliases=misp_node_aliases,
+          misp_event_url_template=misp_event_url_template,
         )
       if effective_strategy == "one_call":
         projection_digest = self._projection_digest_for_ranked_result(
@@ -6892,6 +6956,7 @@ class EdgeguardApiPlugin(BasePlugin):
           deadline=deadline,
           projection_digest=projection_digest,
           misp_enrichment_block=misp_block,
+          misp_event_url_template=misp_event_url_template,
         )
       try:
         graph_first = self._run_graph_first(

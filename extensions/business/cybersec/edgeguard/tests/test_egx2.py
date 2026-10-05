@@ -445,7 +445,8 @@ class Egx2EnrichmentCatalogTests(unittest.TestCase):
       with self.subTest(label=label):
         self.assertEqual(
           set(field_catalog.MISP_ENRICHMENT_CATALOG[label]),
-          set(misp_enrichment.allowed_fields_for_label(label)) - {"last_imported_from"},
+          # Spec v0.3 §3.2: UI-only fields are whitelisted but never catalogued.
+          set(misp_enrichment.allowed_fields_for_label(label)) - {"last_imported_from"} - misp_enrichment.UI_ONLY_FIELDS,
         )
 
 
@@ -470,8 +471,12 @@ class Egx2EnrichmentRuntimeTests(unittest.TestCase):
     self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
     self.assertEqual(len(payloads), 1)
     self.assertIs(result["explanation_trace"]["calls"][0]["gates"]["enrichment_grounding"], True)
-    # Citations are a grounding device only; the public case shape is unchanged.
-    self.assertNotIn("misp_citations", json.dumps(result["case_explanation"]))
+    # Spec v0.3 §2: gate-passed citations are public, with a server-resolved node link.
+    public = [o.get("misp_citations") for o in result["case_explanation"]["observations"]]
+    self.assertEqual(public[0], [{
+      "entity": "CVE-2000-0001", "field": "cwe", "value": "CWE-79", "node_ref": "N0", "entity_id": "c1",
+    }])
+    self.assertEqual(public[1][0]["entity_id"], "i1")
 
   def test_prompt_carries_the_view_as_data_and_states_it_is_untrusted(self):
     _result, payloads = self._run(enrichment_brief)

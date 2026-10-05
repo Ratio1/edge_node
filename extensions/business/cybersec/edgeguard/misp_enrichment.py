@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - neo4j is an optional runtime dependency in tests.
@@ -31,7 +31,12 @@ except Exception:  # noqa: BLE001 - exercised by the test suite (no neo4j instal
 
 MISP_ENRICHMENT_SCHEMA_VERSION = "edgeguard.misp_enrichment.v1"
 MISP_ENRICHMENT_SOURCE = "neo4j_raw_data"
-MISP_EVENT_URL_TEMPLATE = "https://misp.edgeguard.org/events/view/{event_id}"
+# Explanation spec v0.3 §4: the default event URL template; the plugin config
+# `MISP_ENRICHMENT_EVENT_URL_TEMPLATE` overrides it per request and every
+# build/validate path takes the resolved value as `event_url_template`.
+DEFAULT_EVENT_URL_TEMPLATE = "https://misp.edgeguard.org/events/view/{event_id}"
+EVENT_URL_PLACEHOLDER = "{event_id}"
+EVENT_URL_TEMPLATE_MAX_CHARS = 200
 
 # Contract §7.1/§7.3: bounded to 50 nodes per response, 64 KiB per node.
 MAX_NODES = 50
@@ -87,17 +92,33 @@ FIELD_WHITELIST: Dict[Tuple[str, str], Tuple[str, ...]] = {
   ("CVE", "alienvault_otx"): _CVE_NVD_FIELDS,
   ("Indicator", "alienvault_otx"): (
     "pulse_name", "pulse_references", "pulse_tlp", "otx_industries", "indicator_role",
+    "pulse_id",
   ),
   ("Indicator", "threatfox"): (
     "threat_type", "threat_type_desc", "tf_tags", "reference", "malware_alias",
+    "ioc_id",
   ),
   ("Indicator", "urlhaus"): (
     "threat_type", "threat_type_desc", "tf_tags", "reference", "malware_alias",
+    "ioc_id",
   ),
 }
 # `source`/`last_imported_from` are envelope fields (§7.2) that move into
 # `fields` as flat scalars -- allowed for every label.
 ENVELOPE_FIELD_KEYS = frozenset({"source", "last_imported_from"})
+# Explanation spec v0.3 §3.1: freshness timestamps, built from every sourced
+# entry of any label (envelope-only sources included), allowed for every label.
+SOURCE_TIMESTAMP_FIELDS = ("first_seen_at_source", "last_seen_at_source")
+# Spec v0.3 §3.2: fields shown to playground users only; no model view
+# (EAB/1 or EGX/2) ever carries them.
+UI_ONLY_FIELDS = frozenset({*SOURCE_TIMESTAMP_FIELDS, "pulse_id", "ioc_id"})
+SOURCE_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", re.ASCII)
+_SOURCE_TIMESTAMP_INPUT_RE = re.compile(
+  r"^(\d{4})-(\d{2})-(\d{2})"
+  r"(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,]\d+)?)?"
+  r"(Z|z|[+-]\d{2}(?::?\d{2})?)?)?$",
+  re.ASCII,
+)
 # URL-shaped fields keep only `http(s)://` values.
 _URL_FIELD_NAMES = frozenset({"reference_urls", "pulse_references", "reference"})
 _HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -108,14 +129,75 @@ for _label_key, _source_key in FIELD_WHITELIST:
     _ALLOWED_FIELDS_BY_LABEL.get(_label_key, frozenset()) | frozenset(FIELD_WHITELIST[(_label_key, _source_key)])
   )
 for _label_key in list(_ALLOWED_FIELDS_BY_LABEL):
-  _ALLOWED_FIELDS_BY_LABEL[_label_key] = _ALLOWED_FIELDS_BY_LABEL[_label_key] | ENVELOPE_FIELD_KEYS
+  _ALLOWED_FIELDS_BY_LABEL[_label_key] = _ALLOWED_FIELDS_BY_LABEL[_label_key] | ENVELOPE_FIELD_KEYS | frozenset(SOURCE_TIMESTAMP_FIELDS)
 
 
 def allowed_fields_for_label(label: str) -> FrozenSet[str]:
   """Contract §7.2: the whitelist for one node's label, unioned over every
   source that whitelists fields for it, plus the two envelope keys (allowed
   for every label, whitelisted or not)."""
-  return _ALLOWED_FIELDS_BY_LABEL.get(label, ENVELOPE_FIELD_KEYS)
+  return _ALLOWED_FIELDS_BY_LABEL.get(label, ENVELOPE_FIELD_KEYS | frozenset(SOURCE_TIMESTAMP_FIELDS))
+
+
+# Explanation spec v0.3 §4: the URL language of an expanded template, written
+# once and shared (as `tests/fixtures/misp_event_url_template_cases.json`) with
+# the playground validator: lowercase `https`, an ASCII host, an optional port,
+# non-empty path segments, the event id last. No userinfo, query or fragment.
+_EVENT_URL_RE = re.compile(
+  r"https://[A-Za-z0-9][A-Za-z0-9.-]*(?::(?P<port>[1-9][0-9]{0,4}))?(?:/[A-Za-z0-9._~%-]+)*/[0-9]+",
+  re.ASCII,
+)
+
+
+def validate_event_url_template(value: Any) -> bool:
+  """Explanation spec v0.3 §4: at most 200 printable ASCII characters, with
+  `{event_id}` exactly once as the last path segment, and the expansion with a
+  sample id inside the playground's event URL language (port 1-65535)."""
+  if not isinstance(value, str) or not 0 < len(value) <= EVENT_URL_TEMPLATE_MAX_CHARS:
+    return False
+  if value.count(EVENT_URL_PLACEHOLDER) != 1 or not value.endswith("/" + EVENT_URL_PLACEHOLDER):
+    return False
+  match = _EVENT_URL_RE.fullmatch(value.replace(EVENT_URL_PLACEHOLDER, "123"))
+  if match is None:
+    return False
+  port = match.group("port")
+  return port is None or 1 <= int(port) <= 65535
+
+
+def _event_url(template: str, event_id: str) -> str:
+  return template.replace(EVENT_URL_PLACEHOLDER, event_id)
+
+
+def parse_source_timestamp(value: Any) -> Optional[datetime]:
+  """Explanation spec v0.3 §3.1: an ISO 8601 date or date-time (`T` or space
+  separator, optional fraction, optional offset; naive = UTC; date-only =
+  00:00:00Z) as an aware UTC datetime, whole seconds. Anything else -- empty,
+  garbage, epoch numbers, non-strings -- is `None`."""
+  if not isinstance(value, str):
+    return None
+  match = _SOURCE_TIMESTAMP_INPUT_RE.fullmatch(value.strip())
+  if match is None:
+    return None
+  year, month, day, hour, minute, second, zone = match.groups()
+  try:
+    moment = datetime(
+      int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0),
+      tzinfo=timezone.utc,
+    )
+    if zone and zone not in {"Z", "z"}:
+      digits = zone[1:].replace(":", "")
+      offset_hours, offset_minutes = int(digits[:2]), int(digits[2:] or 0)
+      if offset_hours > 23 or offset_minutes > 59:
+        return None
+      offset = timedelta(hours=offset_hours, minutes=offset_minutes)
+      moment = moment - offset if zone[0] == "+" else moment + offset
+  except (ValueError, OverflowError):
+    return None
+  return moment
+
+
+def _format_source_timestamp(moment: datetime) -> str:
+  return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # Contract §7.1: internal, parameterised, read-only, keyed on node element
@@ -281,6 +363,14 @@ def _normalize_field_value(field_name: str, value: Any) -> Any:
     if not cleaned:
       return None
     return cleaned[0] if was_scalar and len(cleaned) == 1 else cleaned
+  if field_name in {"pulse_id", "ioc_id"}:
+    # Source-record ids: a non-empty string, or (ioc_id) an integer; never a
+    # float, bool or container.
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+      return None
+    if isinstance(value, int):
+      return value if field_name == "ioc_id" else str(value)
+    return _clean_scalar(value)
   if isinstance(value, (list, tuple)):
     items = []
     for item in value:
@@ -310,6 +400,7 @@ def build_misp_enrichment_block(
   truncated: bool = False,
   omitted_nodes: int = 0,
   now: Optional[datetime] = None,
+  event_url_template: str = DEFAULT_EVENT_URL_TEMPLATE,
 ) -> Optional[Dict[str, Any]]:
   """Contract §7.3. Returns `None` (block absent) when no supplied row
   carries any MISP-derived content, so an all-empty or all-Campaign result
@@ -320,6 +411,8 @@ def build_misp_enrichment_block(
   the validator stays as a backstop. A row whose element id is not in
   `node_ref_by_element_id` (never reached the digest) is skipped entirely,
   not emitted with a fallback ref."""
+  if not validate_event_url_template(event_url_template):
+    raise ValueError("invalid event url template")
   nodes_out: List[Dict[str, Any]] = []
   oversize_skipped = 0
   for row in rows[:MAX_NODES]:
@@ -346,6 +439,8 @@ def build_misp_enrichment_block(
       # edge -- Campaign in practice, but the check is label-agnostic.
       continue
     fields: Dict[str, Any] = {}
+    first_seen: List[datetime] = []
+    last_seen: List[datetime] = []
     for entry in sourced_entries:
       source_id = str(entry.get("source_id") or "").strip().lower()
       try:
@@ -354,6 +449,10 @@ def build_misp_enrichment_block(
         continue
       if not isinstance(parsed, Mapping):
         continue
+      for timestamps, key in ((first_seen, SOURCE_TIMESTAMP_FIELDS[0]), (last_seen, SOURCE_TIMESTAMP_FIELDS[1])):
+        moment = parse_source_timestamp(parsed.get(key))
+        if moment is not None:
+          timestamps.append(moment)
       allowed_fields = FIELD_WHITELIST.get((label, source_id), ())
       for field_name in allowed_fields:
         if field_name in fields:
@@ -362,6 +461,11 @@ def build_misp_enrichment_block(
         if normalized is None:
           continue
         fields[field_name] = normalized
+    # Spec v0.3 §3.1: earliest first-seen, latest last-seen across entries.
+    if first_seen:
+      fields[SOURCE_TIMESTAMP_FIELDS[0]] = _format_source_timestamp(min(first_seen))
+    if last_seen:
+      fields[SOURCE_TIMESTAMP_FIELDS[1]] = _format_source_timestamp(max(last_seen))
     # `source`/`last_imported_from` move into `fields` as flat scalars
     # instead of top-level node keys.
     source_value = _clean_scalar(row.get("source"))
@@ -378,7 +482,7 @@ def build_misp_enrichment_block(
       "misp_event_ids": misp_event_ids,
       "misp_attribute_ids": misp_attribute_ids,
       "misp_event_urls": [
-        MISP_EVENT_URL_TEMPLATE.format(event_id=event_id) for event_id in misp_event_ids
+        _event_url(event_url_template, event_id) for event_id in misp_event_ids
       ],
       "fields": fields,
     }
@@ -462,16 +566,16 @@ def _validate_attribute_ids(values: Any) -> bool:
   return all(isinstance(value, str) and 0 < len(value) <= ATTRIBUTE_ID_MAX_CHARS for value in values)
 
 
-def _validate_event_urls(event_ids: Any, urls: Any) -> bool:
+def _validate_event_urls(event_ids: Any, urls: Any, event_url_template: str) -> bool:
   if not isinstance(event_ids, list) or not isinstance(urls, list):
     return False
   if len(urls) != len(event_ids):
     return False
-  expected = [MISP_EVENT_URL_TEMPLATE.format(event_id=event_id) for event_id in event_ids]
+  expected = [_event_url(event_url_template, event_id) for event_id in event_ids]
   return urls == expected
 
 
-def _validate_misp_enrichment_node(node: Any) -> bool:
+def _validate_misp_enrichment_node(node: Any, event_url_template: str) -> bool:
   """Contract §7.3: exactly the six keys, always present; §7.2: flat,
   whitelisted, bounded, parity-checked; the 64 KiB per-node cap stays as a
   backstop behind the builder's own oversize skip."""
@@ -488,7 +592,7 @@ def _validate_misp_enrichment_node(node: Any) -> bool:
     return False
   if not _validate_attribute_ids(node.get("misp_attribute_ids")):
     return False
-  if not _validate_event_urls(event_ids, node.get("misp_event_urls")):
+  if not _validate_event_urls(event_ids, node.get("misp_event_urls"), event_url_template):
     return False
   fields = node.get("fields")
   if not isinstance(fields, dict) or len(fields) > 20:
@@ -501,6 +605,8 @@ def _validate_misp_enrichment_node(node: Any) -> bool:
       return False
     if not _field_value_is_clean(value):
       return False
+    if key in SOURCE_TIMESTAMP_FIELDS and not (isinstance(value, str) and SOURCE_TIMESTAMP_RE.fullmatch(value)):
+      return False
   try:
     encoded = json.dumps(node, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
   except (TypeError, ValueError):
@@ -508,11 +614,13 @@ def _validate_misp_enrichment_node(node: Any) -> bool:
   return len(encoded) <= MAX_NODE_BYTES
 
 
-def validate_misp_enrichment_block(block: Any) -> bool:
+def validate_misp_enrichment_block(block: Any, event_url_template: str = DEFAULT_EVENT_URL_TEMPLATE) -> bool:
   """Contract §7.3/§7.5: reuses `FORBIDDEN_PACKET_PROPERTY_RE` on every key,
   enforces the caps, flatness and whitelist rules, recomputes `sha256`, and
   fails closed -- any violation drops the whole block rather than emitting
   a partially invalid one."""
+  if not validate_event_url_template(event_url_template):
+    return False
   if misp_block_contains_raw_payload(block):
     return False
   if not isinstance(block, dict) or set(block) != MISP_ENRICHMENT_ALLOWED_BLOCK_KEYS:
@@ -535,7 +643,7 @@ def validate_misp_enrichment_block(block: Any) -> bool:
     return False
   if not truncated and omitted_nodes != 0:
     return False
-  if not all(_validate_misp_enrichment_node(node) for node in nodes):
+  if not all(_validate_misp_enrichment_node(node, event_url_template) for node in nodes):
     return False
   sha256_value = block.get("sha256")
   if not isinstance(sha256_value, str) or not MISP_ENRICHMENT_SHA256_RE.match(sha256_value):
@@ -545,14 +653,14 @@ def validate_misp_enrichment_block(block: Any) -> bool:
   return recomputed == sha256_value
 
 
-def contains_raw_misp_payload(block: Any) -> bool:
+def contains_raw_misp_payload(block: Any, event_url_template: str = DEFAULT_EVENT_URL_TEMPLATE) -> bool:
   """Explanation spec v0.2 §4: `redaction.contains_raw_misp_payload`,
   computed against the block that would accompany a model input -- `False`
   when no block accompanies it, `True` when the block breaks any
   validation rule. Never declared by the producer."""
   if block is None:
     return False
-  return not validate_misp_enrichment_block(block)
+  return not validate_misp_enrichment_block(block, event_url_template)
 
 
 # Explanation spec v0.2 §5: the compact, model-facing view of a validated
@@ -563,7 +671,7 @@ def contains_raw_misp_payload(block: Any) -> bool:
 # and a node whose envelope alone does not fit is omitted.
 MODEL_VIEW_SCHEMA_VERSION = "edgeguard.misp_enrichment_model_view.v1"
 MODEL_VIEW_ARRAY_ITEMS = 5
-_MODEL_VIEW_EXCLUDED_FIELDS = frozenset({"last_imported_from"})
+_MODEL_VIEW_EXCLUDED_FIELDS = frozenset({"last_imported_from"}) | UI_ONLY_FIELDS
 
 
 def _model_view_bytes(view: Mapping[str, Any]) -> int:
@@ -576,6 +684,7 @@ def build_model_view(
   max_bytes: int,
   entity_by_ref: Optional[Mapping[str, str]] = None,
   fields_by_label: Optional[Mapping[str, Any]] = None,
+  event_url_template: str = DEFAULT_EVENT_URL_TEMPLATE,
 ) -> Optional[Dict[str, Any]]:
   """The model view of `block`, or `None` when there is no valid block or
   not even one node fits `max_bytes` (canonical JSON, sorted keys). Values
@@ -585,7 +694,7 @@ def build_model_view(
   `entity` display name (EGX/2 links enrichment to sheet entities); with
   `fields_by_label`, only the fields it lists for a node's label are kept
   (the EGX/2 field catalog). Deterministic for a given block and budget."""
-  if block is None or not validate_misp_enrichment_block(block):
+  if block is None or not validate_misp_enrichment_block(block, event_url_template):
     return None
   truncated = bool(block["truncated"])
   candidates: List[Dict[str, Any]] = []

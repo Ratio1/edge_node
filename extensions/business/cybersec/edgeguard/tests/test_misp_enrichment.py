@@ -467,7 +467,10 @@ class FieldWhitelistTests(unittest.TestCase):
 
   def test_unknown_label_gets_envelope_keys_only(self):
     allowed = misp_enrichment.allowed_fields_for_label("Malware")
-    self.assertEqual(allowed, misp_enrichment.ENVELOPE_FIELD_KEYS)
+    # Spec v0.3 §3.1: the two freshness timestamps are allowed for every label.
+    self.assertEqual(
+      allowed, misp_enrichment.ENVELOPE_FIELD_KEYS | frozenset(misp_enrichment.SOURCE_TIMESTAMP_FIELDS),
+    )
 
 
 class BlockValidatorTests(unittest.TestCase):
@@ -1035,7 +1038,7 @@ class ExplainGraphEndToEndTests(unittest.TestCase):
               # digest / graph arguments stay free of it.
               other_args = {
                 key: value for key, value in fake_call.call_args.kwargs.items()
-                if key not in {"misp_enrichment", "provider_call"}
+                if key not in {"misp_enrichment", "provider_call", "event_url_template"}
               }
               _assert_text_has_no_block(self, repr(other_args))
 

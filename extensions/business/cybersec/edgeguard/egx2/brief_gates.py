@@ -58,7 +58,7 @@ _GENERIC_DESCRIPTORS = {
 _OTHERS_PHRASE = re.compile(r"^(and\s+)?\d+\s+(others?|more)$", re.IGNORECASE)
 
 
-def _enrichment_nodes(enrichment):
+def enrichment_nodes(enrichment):
     """Explanation spec v0.2: `{entity (lower-cased): view node}` for the
     `misp_enrichment` model view the prompt carried (empty without one)."""
     nodes = {}
@@ -77,7 +77,7 @@ def entity_linking(brief, sheet, enrichment=None):
     feed-authored field values). CWE ids in prose are graded by
     `enrichment_grounding` (`ungrounded_cwe`), against the sheet and view."""
     universe = {e.lower() for e in I.sheet_entities(sheet)} | _GENERIC_DESCRIPTORS
-    universe.update(_enrichment_nodes(enrichment))
+    universe.update(enrichment_nodes(enrichment))
     unknown = []
     for o in brief.get("observations", []) or []:
         for e in o.get("exemplar_entities", []) or []:
@@ -238,20 +238,13 @@ def confidence_comparisons(brief, sheet, enrichment=None):
     return True, "no unbacked confidence comparisons"
 
 
-def enrichment_grounding(brief, sheet, enrichment=None):
-    """Explanation spec v0.2 §5. Fail-closed:
-
-    - every `misp_citations` entry names an entity listed in the same
-      observation's `exemplar_entities` (the entity the claim is about),
-      that entity has a node in the enrichment view, and the cited value is
-      that node's value for the cited field (verbatim, or one item of it);
-    - the shared lexical rules (`misp_enrichment.enrichment_grounding_error`):
-      every brief text is about each sheet or view entity it mentions, and an
-      observation also about all of its exemplar entities, enriched or not;
-      evidence is the sheet text and entities.
-    """
-    nodes = _enrichment_nodes(enrichment)
-    problems = []
+def _grounding_findings(brief, sheet, enrichment=None):
+    """`[(code, detail)]` for `enrichment_grounding`: one entry per failed
+    citation check, plus the shared lexical code if any. The code is a fixed
+    string chosen here (never built from model output); the detail is the
+    human text that feeds the retry note only."""
+    nodes = enrichment_nodes(enrichment)
+    findings = []
     claims = []
     for o in brief.get("observations", []) or []:
         about = {str(e).strip().lower() for e in o.get("exemplar_entities", []) or []}
@@ -262,15 +255,15 @@ def enrichment_grounding(brief, sheet, enrichment=None):
             value = c.get("value")
             node = nodes.get(entity)
             if entity not in about:
-                problems.append(f"citation entity '{c.get('entity')}' is not an exemplar of its observation")
+                findings.append(("citation_entity_not_exemplar", f"citation entity '{c.get('entity')}' is not an exemplar of its observation"))
             elif node is None:
-                problems.append(f"citation entity '{c.get('entity')}' has no enrichment")
+                findings.append(("citation_entity_no_enrichment", f"citation entity '{c.get('entity')}' has no enrichment"))
             elif field != "misp_event_ids" and field not in (node.get("fields") or {}):
-                problems.append(f"field '{field}' is not in the enrichment of '{c.get('entity')}'")
+                findings.append(("citation_field_not_in_node", f"field '{field}' is not in the enrichment of '{c.get('entity')}'"))
             else:
                 items = (node.get("misp_event_ids") or []) if field == "misp_event_ids" else node["fields"][field]
                 if not any(str(item) == str(value).strip() for item in (items if isinstance(items, list) else [items])):
-                    problems.append(f"cited value is not the enrichment {field} of '{c.get('entity')}'")
+                    findings.append(("citation_value_mismatch", f"cited value is not the enrichment {field} of '{c.get('entity')}'"))
     other_texts = [brief.get("assessment", ""), brief.get("why_it_matters", "")]
     other_texts += [c.get("text", "") for c in brief.get("next_checks", []) or []]
     other_texts.append((brief.get("confidence") or {}).get("basis", ""))
@@ -287,7 +280,23 @@ def enrichment_grounding(brief, sheet, enrichment=None):
         known_names=sheet_entities + sorted(nodes),
     )
     if code is not None:
-        problems.append(code)
+        findings.append((code, code))
+    return findings
+
+
+def enrichment_grounding(brief, sheet, enrichment=None):
+    """Explanation spec v0.2 §5. Fail-closed:
+
+    - every `misp_citations` entry names an entity listed in the same
+      observation's `exemplar_entities` (the entity the claim is about),
+      that entity has a node in the enrichment view, and the cited value is
+      that node's value for the cited field (verbatim, or one item of it);
+    - the shared lexical rules (`misp_enrichment.enrichment_grounding_error`):
+      every brief text is about each sheet or view entity it mentions, and an
+      observation also about all of its exemplar entities, enriched or not;
+      evidence is the sheet text and entities.
+    """
+    problems = [detail for _code, detail in _grounding_findings(brief, sheet, enrichment)]
     if problems:
         return False, "; ".join(sorted(set(problems))[:3])
     return True, "enrichment citations, URLs and CWE ids resolve"
@@ -315,4 +324,32 @@ def grade(brief, sheet, enrichment=None):
         out[name] = fn(brief, sheet, enrichment=enrichment) + ("hard",)
     for name, fn in ADVISORY_GATES.items():
         out[name] = fn(brief, sheet) + ("advisory",)
+    return out
+
+
+# Explanation spec v0.3 §5: fixed, value-free reason codes for the hard gates
+# other than `enrichment_grounding` (which has one code per failure branch).
+GATE_FAILURE_CODES = {
+    "entity_linking": "entity_not_in_sheet",
+    "insight_id_validity": "unknown_insight_id",
+    "count_claims": "count_not_in_sheet",
+    "confidence_comparisons": "unbacked_comparison",
+}
+MAX_FAILURE_CODES_PER_GATE = 8
+
+
+def failure_codes(brief, sheet, enrichment=None):
+    """`{hard gate: [fixed codes]}` for the hard gates that fail, sorted and
+    de-duplicated, at most 8 per gate. A gate is listed exactly when `grade()`
+    reports it as a hard failure (a test pins the two together). Codes never
+    contain model output, entity names or values."""
+    out = {}
+    for name, fn in HARD_GATES.items():
+        if name == "enrichment_grounding":
+            codes = sorted({code for code, _detail in _grounding_findings(brief, sheet, enrichment)})
+        else:
+            passed, _detail = fn(brief, sheet, enrichment=enrichment)
+            codes = [] if passed else [GATE_FAILURE_CODES[name]]
+        if codes:
+            out[name] = codes[:MAX_FAILURE_CODES_PER_GATE]
     return out

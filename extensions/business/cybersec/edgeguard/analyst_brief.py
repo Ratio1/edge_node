@@ -408,6 +408,7 @@ def _validate_grounding(
 def _enrichment_model_view(
   misp_enrichment: Optional[Mapping[str, Any]],
   base_user_content: str,
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
 ) -> Optional[dict[str, Any]]:
   """Spec v0.2 §5: the compact block view, trimmed to the prompt bytes the
   digest view left over -- the digest view is chosen first and never
@@ -422,7 +423,7 @@ def _enrichment_model_view(
   remaining = MAX_PROMPT_BYTES - len(base_user_content.encode("utf-8")) - overhead
   if remaining <= 0:
     return None
-  return misp.build_model_view(misp_enrichment, max_bytes=remaining)
+  return misp.build_model_view(misp_enrichment, max_bytes=remaining, event_url_template=event_url_template)
 
 
 def _string_leaves(value: Any) -> list[str]:
@@ -481,6 +482,7 @@ def run_analyst_brief(
   provider_call: Callable[[Mapping[str, Any]], Mapping[str, Any]],
   projection_digest: Optional[Mapping[str, Any]] = None,
   misp_enrichment: Optional[Mapping[str, Any]] = None,
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
 ) -> dict[str, Any]:
   group_ids = [item.get("id") for item in digest.get("groups", []) if isinstance(item, Mapping)]
   if any(not isinstance(item, str) or not re.fullmatch(r"R(?:0|[1-9][0-9]*)", item) for item in group_ids):
@@ -494,7 +496,7 @@ def run_analyst_brief(
     user_content = json.dumps(user_document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
   if len(user_content.encode("utf-8")) > MAX_PROMPT_BYTES:
     raise GraphFirstRuntimeError("brief_context_oversized", "completion", "complete digest exceeds the brief prompt cap")
-  enrichment_view = _enrichment_model_view(misp_enrichment, user_content)
+  enrichment_view = _enrichment_model_view(misp_enrichment, user_content, event_url_template)
   if enrichment_view is not None:
     user_document = {**user_document, "misp_enrichment": enrichment_view}
     user_content = json.dumps(user_document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
