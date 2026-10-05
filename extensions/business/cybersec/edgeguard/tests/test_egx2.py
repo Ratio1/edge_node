@@ -360,7 +360,9 @@ from extensions.business.cybersec.edgeguard.egx2 import insight_brief as egx2_ru
 PINNED_CATALOG_SHA256 = "f33f8f417df901e2586fed9b9659b5acf883df78e13627a4b306fc6937d7bec4"
 # Re-pinned for spec v0.4 (the manifest gained the MISP reference constants); the v0.3
 # value 962afb38... is kept in test_eg018_v04.py. CATALOG_SHA256 above did not move.
-PINNED_PROFILE_SHA256 = "a099ba2bc7dd053858fccffb63a5e1cab0626b273731874a4acb37aa90b2e5de"
+# Re-pinned again: ENRICHMENT_TEMPLATE is citation wording C (operator ruling 2026-10-05, variant F).
+# Intermediate v0.4 value with the v0.3 wording: a099ba2b...
+PINNED_PROFILE_SHA256 = "9cd04929f5b010b1e82cf02482f1a0659394fa9fe7afba8599ebd6f953f00328"
 
 
 def enrichment_graph():

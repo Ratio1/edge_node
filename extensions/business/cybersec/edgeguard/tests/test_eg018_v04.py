@@ -23,9 +23,10 @@ from extensions.business.cybersec.edgeguard.egx2 import insight_brief as runtime
 
 VECTOR_PATH = Path(__file__).parent / "fixtures" / "misp_ref_cases.json"
 TEMPLATE = misp.DEFAULT_EVENT_URL_TEMPLATE
-# Request hash of the v0.3 user message for a block whose nodes carry no event id
-# (computed on 8c675f4 with the `_no_event_block` fixture below).
-PRE_CHANGE_NO_LINES_SHA = "8587b37e5dcfe6d0739b9fe6b1ed117993eac3f89e1fcb61917281a08d733026"
+# Request hash of the user message for a block whose nodes carry no event id, i.e. USER +
+# ENRICHMENT_TEMPLATE only (the `_no_event_block` fixture below). Re-pinned for wording C
+# (operator ruling 2026-10-05); with the v0.3 wording on 8c675f4 it was 8587b37e...
+NO_LINES_SHA = "8d26454d25d19519b20455676e0ff3356961a019fd28612e9ce47cb584f7696f"
 # v0.4 manifest (spec §2.5); CATALOG_SHA256 is not allowed to move.
 V03_PROFILE_SHA256 = "962afb38da1fd79bcdd45e5a33cf94768234e8bbd313ca4f1bd69753cc287827"
 
@@ -135,13 +136,22 @@ class PromptTests(unittest.TestCase):
     self.assertEqual(result["explanation_trace"]["calls"][0]["request_sha256"], PRE_CHANGE_NO_BLOCK_SHA)
     self.assertNotIn("MISP", payloads[0]["messages"][1]["content"])
 
-  def test_block_without_lines_keeps_the_v03_message(self):
+  def test_block_without_lines_sends_only_the_enrichment_template(self):
     result, payloads = _egx2_run(block=_no_event_block(), node_ids={"N0": "c1"})
     user = payloads[0]["messages"][1]["content"]
     self.assertIn("MISP ENRICHMENT", user)
     self.assertNotIn("MISP REFERENCES", user)
-    self.assertEqual(result["explanation_trace"]["calls"][0]["request_sha256"], PRE_CHANGE_NO_LINES_SHA)
-    self.assertEqual(hashlib.sha256(user.encode("utf-8")).hexdigest(), PRE_CHANGE_NO_LINES_SHA)
+    self.assertTrue(user.endswith(brief_profile.ENRICHMENT_TEMPLATE.split("{enrichment}")[1].replace("{{", "{").replace("}}", "}")))
+    self.assertEqual(result["explanation_trace"]["calls"][0]["request_sha256"], NO_LINES_SHA)
+    self.assertEqual(hashlib.sha256(user.encode("utf-8")).hexdigest(), NO_LINES_SHA)
+
+  def test_enrichment_template_keeps_the_citation_safety_phrases(self):
+    for phrase in (
+      "Never cite a value that is not listed under that entity",
+      "write no URL that is not listed there verbatim",
+      "misp_event_ids",
+    ):
+      self.assertIn(phrase, brief_profile.ENRICHMENT_TEMPLATE)
 
   def test_profile_pin_moves_and_catalog_pin_does_not(self):
     self.assertNotEqual(egx2.PROFILE_SHA256, V03_PROFILE_SHA256)
