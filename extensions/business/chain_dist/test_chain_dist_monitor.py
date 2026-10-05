@@ -2,6 +2,7 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 
 def load_monitor_class():
@@ -78,6 +79,58 @@ class ChainDistMonitorTests(unittest.TestCase):
 
   def visible(self, job_id=1):
     self.apps['node1'] = {'pipeline': {'deeploy_specs': {'job_id': job_id}}}
+
+  def test_malformed_pipelines_do_not_stop_process_without_pending_jobs(self):
+    self.monitor.maybe_update_liveness = Mock()
+    self.monitor.check_closable_jobs = Mock()
+    self.monitor.maybe_distribute_rewards = Mock()
+    self.monitor.P = Mock()
+    self.monitor.trace_info = lambda: 'unexpected process error'
+    self.monitor.sleep = Mock()
+    self.monitor.cfg_sleep_period = 30
+    invalid_ids = ([1], {'id': 1}, '1', 1.0, True, False, None, 0, -1)
+    invalid_pipelines = [{'deeploy_specs': {'job_id': job_id}} for job_id in invalid_ids]
+    invalid_pipelines.extend((None, [], {'deeploy_specs': None}, {'deeploy_specs': []}, {'deeploy_specs': 'invalid'}))
+    for pipeline in invalid_pipelines:
+      with self.subTest(pipeline=pipeline):
+        self.apps = {'node1': {'pipeline': pipeline}}
+        self.monitor.check_closable_jobs.reset_mock()
+        self.monitor.maybe_distribute_rewards.reset_mock()
+        self.monitor.sleep.reset_mock()
+        self.monitor.process()
+        self.monitor.check_closable_jobs.assert_called_once_with()
+        self.monitor.maybe_distribute_rewards.assert_called_once_with()
+        self.monitor.sleep.assert_not_called()
+    self.assertEqual(self.bc.submissions, [])
+
+  def test_invalid_job_ids_do_not_contaminate_valid_job_node_vote(self):
+    self.bc.pending = [1]
+    self.bc.all_pending = [1]
+    self.bc.jobs[1] = self.job()
+    self.apps = {
+      'bad-node': {
+        str(index): {'deeploy_specs': {'job_id': job_id}}
+        for index, job_id in enumerate(([1], {'id': 1}, '1', 1.0, True))
+      },
+      'good-node': {'pipeline': {'deeploy_specs': {'job_id': 1}}},
+    }
+    self.monitor.check_all_jobs()
+    self.assertEqual(self.bc.submissions, [(1, ['0xgood-node'])])
+
+  def test_malformed_pipeline_does_not_block_valid_pipeline_recovery(self):
+    self.bc.jobs[1] = self.job()
+    self.monitor.P = Mock()
+    self.apps = {
+      'node1': {
+        'malformed-pipeline': None,
+        'malformed-specs': {'deeploy_specs': None},
+        'valid-pipeline': {'deeploy_specs': {'job_id': 1}},
+      },
+    }
+    self.monitor.check_all_jobs()
+    self.now += 300
+    self.monitor.check_all_jobs()
+    self.assertEqual(self.bc.submissions, [(1, ['0xnode1'])])
 
   def test_empty_unstarted_job_waits_one_hour_and_positive_observation_resets_timer(self):
     self.bc.pending = [1]

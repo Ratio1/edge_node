@@ -98,10 +98,17 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
     known_apps = self.netmon.network_known_apps()
     running_nodes_by_job = {}
     for node, apps in known_apps.items():
-      for pipeline in apps.values():
-        job_id = pipeline.get('deeploy_specs', {}).get('job_id')
-        if job_id:
+      for pipeline_name, pipeline in apps.items():
+        try:
+          job_id = pipeline.get('deeploy_specs', {}).get('job_id')
+          if type(job_id) is not int or job_id <= 0:
+            continue
           running_nodes_by_job.setdefault(job_id, set()).add(node)
+        except Exception as e:
+          self.P(
+            f"Skipping invalid metadata for pipeline {pipeline_name} on node {node}: {type(e).__name__}",
+            color='r',
+          )
 
     now = self.time()
     first_closable_job_id = self.bc.get_first_closable_job_id() if unvalidated_job_ids else None
