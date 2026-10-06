@@ -42,9 +42,12 @@ LEVEL_PROVENANCE_KINDS = ("risk_score", "declared")
 REMEDIATION_ITEM_MAX = 32
 TEXT_MAX = 200
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+# The `job:` grammar is one object: the evidence-ref validator and the ownership check in
+# `services/framework_evidence.py` share it, so a ref one accepts the other always sees.
+JOB_REF = re.compile(r"job:([A-Za-z0-9_-]{1,80}):[0-9]{1,6}\Z")
 _EVIDENCE_REF = re.compile(
   r"(?:engagement:[A-Za-z0-9_-]{1,80}/document:ed_[0-9]{1,4}|contract"
-  r"|nis2:[A-Za-z0-9_-]{1,80}:[0-9]{1,6}|job:[A-Za-z0-9_-]{1,80}:[0-9]{1,6})\Z")
+  r"|nis2:[A-Za-z0-9_-]{1,80}:[0-9]{1,6}|" + JOB_REF.pattern[:-2] + r")\Z")
 _REVIEW_STATES = ("linked",)
 
 
@@ -482,15 +485,25 @@ def _expected_revision(row, expected):
     raise _denied(409, "assessment_stale", current_assessment_revision=row["assessment_revision"])
 
 
-def get_assessment(service, actor, tenant_id, pack_id):
+def get_assessment(service, actor, tenant_id, pack_id, include_pack=True):
+  """The current row as the DTO; with `include_pack` the official text rides along (a console read)."""
   tenant, account = service._authorized_tenant(actor, tenant_id, VIEW)
   pack = pack_for(pack_id)
-  try:
-    text = load_framework_text(pack_id)
-  except FrameworkPackError as exc:
-    raise TenantStoreError("Framework pack text unavailable") from exc
+  text = None
+  if include_pack:
+    try:
+      text = load_framework_text(pack_id)
+    except FrameworkPackError as exc:
+      raise TenantStoreError("Framework pack text unavailable") from exc
   row = _row(service, tenant_id, pack_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
   return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE), text=text)
+
+
+def authorize_manage(service, actor, tenant_id, pack_id):
+  """The manage decision alone, for the plugin's pre-checks that read jobs outside the lock."""
+  tenant, account = service._authorized_tenant(actor, tenant_id, MANAGE)
+  pack_for(pack_id)
+  return {"accountId": account.account_id}
 
 
 def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_revision):

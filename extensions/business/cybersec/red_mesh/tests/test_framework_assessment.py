@@ -33,7 +33,9 @@ def _no_refs(value, path="$"):
       _no_refs(inner, f"{path}[{index}]")
 
 
-class TestFrameworkAssessment(unittest.TestCase):
+class FrameworkAssessmentFixture(unittest.TestCase):
+  """The plugin, a tenant, four actors and the helpers; the test classes below and phase 5's share it."""
+
   @classmethod
   def setUpClass(cls):
     from .conftest import mock_plugin_modules
@@ -126,6 +128,9 @@ class TestFrameworkAssessment(unittest.TestCase):
     key = json.dumps([compliance.KIND, "deployment", self.tenant, PACK], separators=(",", ":"))
     self.storage.data[(COMPLIANCE_HKEY, key)] = row
 
+
+
+class TestFrameworkAssessment(FrameworkAssessmentFixture):
   # -- reads and roles --------------------------------------------------------------------------
 
   def test_get_returns_an_empty_draft_without_writing(self):
@@ -187,10 +192,11 @@ class TestFrameworkAssessment(unittest.TestCase):
     too_many = self.save({"scores": {"GV.OC-03.1": {"documentation": 3, "implementation": 2,
                                                      "evidence_refs": ["contract"] * 6}}}, 2)
     self.assertEqual(too_many["errors"], [{"code": "evidence_ref_invalid", "ids": ["GV.OC-03.1"]}])
+    # A `job:` ref needs a scan this tenant owns and has finalized (phase 5, test_framework_evidence).
     refs = self.ok(self.save({"scores": {"GV.OC-03.1": {"documentation": 3, "implementation": 2,
                                                          "evidence_refs": ["contract", "engagement:eng_1/document:ed_2",
-                                                                           "nis2:job-1:3", "job:job-1:2"]}}}, 2))
-    self.assertEqual([r["review_state"] for r in refs["scores"]["GV.OC-03.1"]["evidence_refs"]], ["linked"] * 4)
+                                                                           "nis2:job-1:3"]}}}, 2))
+    self.assertEqual([r["review_state"] for r in refs["scores"]["GV.OC-03.1"]["evidence_refs"]], ["linked"] * 3)
     removed = self.ok(self.save({"scores": {"GV.OC-03.1": None}}, 3))
     self.assertEqual(removed["scores"], {})
 

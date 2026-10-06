@@ -1154,8 +1154,12 @@ class TenantAdministrationService:
   # `framework_assessment_artifact_ref` resolved it under the lock.
 
   @_endpoint
-  def get_framework_assessment(self, actor, tenant_id, pack_id):
-    return compliance.get_assessment(self, actor, tenant_id, pack_id)
+  def get_framework_assessment(self, actor, tenant_id, pack_id, include_pack=True):
+    return compliance.get_assessment(self, actor, tenant_id, pack_id, include_pack=include_pack)
+
+  @_endpoint
+  def authorize_framework_assessment_manage(self, actor, tenant_id, pack_id):
+    return compliance.authorize_manage(self, actor, tenant_id, pack_id)
 
   @_endpoint
   def save_framework_assessment_draft(self, actor, tenant_id, pack_id, patch, expected_assessment_revision):
