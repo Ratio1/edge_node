@@ -364,7 +364,9 @@ PINNED_CATALOG_SHA256 = "f33f8f417df901e2586fed9b9659b5acf883df78e13627a4b306fc6
 # Intermediate v0.4 value with the v0.3 wording: a099ba2b...; wording C alone: 9cd04929...
 # Re-pinned a last time: budget-aware retry note for a length cut (operator 2026-10-06 revision;
 # the first 2026-10-06 text gave d04ea158...).
-PINNED_PROFILE_SHA256 = "1c8003cd9656d7de010911f365857fee71c338efa8a421c8f023732f1b675193"
+# Re-pinned once more: the retry note asks for no citations (operator 2026-10-06 no-citations retry;
+# the previous text gave 1c8003cd...).
+PINNED_PROFILE_SHA256 = "32a1ad553a38c0b14909229aef5ccac256401301e3c686c1d5b1c956c540a3a7"
 
 
 def enrichment_graph():

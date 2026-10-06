@@ -349,7 +349,7 @@ def _truncation_note(limit, citations=False, refs=False):
   return (
     "\n\nRETRY: your previous brief was cut off at the length limit. Write a shorter brief: "
     f"at most {limit} observations, one sentence each"
-    + (", at most one misp_citations entry per observation" if citations else "")
+    + (", with no misp_citations" if citations else "")
     + (", and keep the misp_refs rules above" if refs else "")
     + "."
   )
@@ -409,6 +409,6 @@ class TruncationRetryTests(unittest.TestCase):
   def test_note_pieces_are_in_the_manifest(self):
     manifest = runtime.PROFILE_MANIFEST
     self.assertEqual(manifest["retry_note_truncated"].format(max_observations=4), _truncation_note(4)[:-1])
-    self.assertEqual(manifest["retry_note_truncated_citations"], ", at most one misp_citations entry per observation")
+    self.assertEqual(manifest["retry_note_truncated_citations"], ", with no misp_citations")
     self.assertEqual(manifest["retry_note_truncated_refs"], ", and keep the misp_refs rules above")
     self.assertNotIn("retry_note_truncated_misp", manifest)

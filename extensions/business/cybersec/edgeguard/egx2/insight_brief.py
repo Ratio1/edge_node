@@ -75,12 +75,13 @@ RETRY_NOTE_TEMPLATE = (
 
 # Operator ruling 2026-10-06 (revised): a length cut (`output_truncated`) is not a
 # gate failure, so it asks for a shorter brief within the request's observation
-# budget; each MISP clause is added only when the prompt carries what it names.
+# budget, with no MISP citations; each MISP clause is added only when the prompt
+# carries what it names.
 RETRY_NOTE_TRUNCATED = (
   "\n\nRETRY: your previous brief was cut off at the length limit. Write a shorter brief: "
   "at most {max_observations} observations, one sentence each"
 )
-RETRY_NOTE_TRUNCATED_CITATIONS = ", at most one misp_citations entry per observation"
+RETRY_NOTE_TRUNCATED_CITATIONS = ", with no misp_citations"
 RETRY_NOTE_TRUNCATED_REFS = ", and keep the misp_refs rules above"
 
 PROFILE_MANIFEST = {
