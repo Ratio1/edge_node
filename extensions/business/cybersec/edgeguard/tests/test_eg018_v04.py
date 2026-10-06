@@ -343,3 +343,57 @@ class SharedRefVectorTests(unittest.TestCase):
     for url, event_id in ((TEMPLATE.replace("{event_id}", "5"), "6"), ("https://a.test/5?x=1", "5"), (7, "7")):
       self.assertFalse(misp.event_url_is_valid(url, event_id))
 
+
+
+BASE_TRUNCATION_NOTE = (
+  "\n\nRETRY: your previous brief was cut off at the length limit. Write a shorter brief: "
+  "at most 3 observations, one sentence each."
+)
+MISP_TRUNCATION_NOTE = (
+  "\n\nRETRY: your previous brief was cut off at the length limit. Write a shorter brief: "
+  "at most 3 observations, one sentence each, at most one misp_citations entry per observation, "
+  "and keep the misp_refs rules above."
+)
+
+
+class TruncationRetryTests(unittest.TestCase):
+  """Operator ruling 2026-10-06: a length cut gets its own retry note."""
+
+  def _retry_user(self, first, *, block="default"):
+    graph = egx2_tests.enrichment_graph()
+    sheet = insights.build_insight_sheet(graph)
+    payloads = []
+    replies = [first, {"finish_reason": "stop", "completion_tokens": 9, "content": json.dumps(egx2_tests.enrichment_brief(sheet))}]
+
+    def provider(payload):
+      payloads.append(payload)
+      return replies.pop(0)
+
+    kwargs = {} if block is None else {
+      "misp_enrichment": egx2_tests.enrichment_block(), "misp_node_ids": egx2_tests.ENRICHMENT_NODE_IDS,
+    }
+    egx2.run_insight_brief(question="q", graph=graph, model=None, provider_call=provider, **kwargs)
+    self.assertEqual(len(payloads), 2)
+    return [p["messages"][1]["content"] for p in payloads]
+
+  def test_length_cut_without_a_block_gets_the_base_note(self):
+    first, retry = self._retry_user({"finish_reason": "length", "completion_tokens": 768, "content": "{"}, block=None)
+    self.assertEqual(retry, first + BASE_TRUNCATION_NOTE)
+
+  def test_length_cut_with_a_block_gets_the_misp_note(self):
+    first, retry = self._retry_user({"finish_reason": "length", "completion_tokens": 768, "content": "{"})
+    self.assertEqual(retry, first + MISP_TRUNCATION_NOTE)
+
+  def test_other_failures_keep_the_generic_note(self):
+    for reply, code in (
+      ({"finish_reason": "stop", "completion_tokens": 9, "content": "not json"}, "invalid_brief_json"),
+      ({"finish_reason": "stop", "completion_tokens": 9, "content": ""}, "missing_content"),
+    ):
+      with self.subTest(code=code):
+        first, retry = self._retry_user(reply)
+        self.assertEqual(retry, first + runtime.RETRY_NOTE_TEMPLATE.format(failures=code))
+
+  def test_notes_are_in_the_manifest_and_fit_the_observation_schema(self):
+    self.assertEqual(runtime.PROFILE_MANIFEST["retry_note_truncated"], BASE_TRUNCATION_NOTE)
+    self.assertEqual(runtime.PROFILE_MANIFEST["retry_note_truncated_misp"], MISP_TRUNCATION_NOTE)
+    self.assertLessEqual(3, runtime.MAX_OBSERVATIONS)  # the parse accepts 1..MAX_OBSERVATIONS
