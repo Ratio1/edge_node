@@ -8,11 +8,13 @@ from ..ports import TenantStoreError
 from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
 from ..engagements import validate_engagement
+from ..drafts import validate_tenant_draft
 
 MAX_ENUMERATED_RECORDS = 10000
 # RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
 # is never read or written, so a leftover row cannot come back through a new code path.
-_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement"})
+# RM-109: `tenant_draft` is keyed by its draft id alone; a draft has no tenant.
+_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft"})
 
 
 class CstoreTenantAdministrationStore:
@@ -64,6 +66,11 @@ class CstoreTenantAdministrationStore:
         validate_engagement(raw, ids)
       except (ValueError, TypeError, KeyError, RecursionError) as exc:
         raise TenantStoreError("Invalid engagement storage record") from exc
+    if kind == "tenant_draft":
+      try:
+        validate_tenant_draft(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid tenant draft storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):
@@ -172,6 +179,10 @@ class CstoreTenantAdministrationStore:
     self._location("integration", (tenant_id,))
     return [self._validate(raw, "integration", ids)
             for ids, raw in self._fields("integration", tenant_id)]
+
+  def list_tenant_drafts(self):
+    """RM-109. Every draft of the namespace; a malformed one fails the read closed."""
+    return [self._validate(raw, "tenant_draft", ids) for ids, raw in self._fields("tenant_draft")]
 
   def list_tenants(self):
     rows = []

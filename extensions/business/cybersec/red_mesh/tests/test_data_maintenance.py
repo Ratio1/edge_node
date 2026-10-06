@@ -246,6 +246,42 @@ class TestDataMaintenance(unittest.TestCase):
                       rows[(f"{JOBS}:integrations:{self.tenant}", "wazuh")]["reason"]), ("old", "old_tenant"))
     self.assertEqual(rows[(JOBS, "new1")]["class"], "current")
 
+  def draft_row(self):
+    """RM-109. A tenant draft with a signed contract file, written through the real endpoint."""
+    created = self.plugin.create_tenant_draft(self.actor, str(uuid4()), "Draft", ["nis2"])
+    self.assertTrue(created["success"], created)
+    draft_id = created["data"]["draft_id"]
+    field = json.dumps(["tenant_draft", "deployment", draft_id], separators=(",", ":"))
+    row = self.storage.data[(TENANCY, field)]
+    row["items"]["contract"].update(state="signed", document={
+      "store": "r1fs", "ref": cid(40), "filename": "contract.pdf", "mime": "application/pdf",
+      "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator", "sha256": "a" * 64, "size_bytes": 10})
+    self.events.clear()
+    return field
+
+  def test_a_tenant_draft_is_current_its_files_are_listed_and_cleanup_keeps_it(self):
+    # A draft has no tenant: it must never read as an orphan of the tenant its id is not.
+    field = self.draft_row()
+    rows = self.scan()
+    row = rows[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
+    self.assertTrue(row["files_complete"])
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertIsNotNone(self.storage.data[(TENANCY, field)])
+    self.assertEqual(self.files.deleted, [])
+    # Still current once every tenant is gone.
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]["contract"]
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+
+  def test_a_malformed_tenant_draft_is_old_not_orphan(self):
+    field = self.draft_row()
+    self.storage.data[(TENANCY, field)]["items"]["contract"]["state"] = "done"
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("old", "unrecognized"))
+    self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
+
   def test_a_file_is_served_only_for_a_row_that_references_it(self):
     with patch.object(data_maintenance, "read_stored_file", return_value={"cid": CONFIG}) as read:
       self.assertTrue(self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)["success"])

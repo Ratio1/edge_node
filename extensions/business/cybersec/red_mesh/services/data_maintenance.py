@@ -56,7 +56,7 @@ _PER_JOB = (
   (":report_review", dict, True),
   (":report_review:audit", list, False),
 )
-_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement")
+_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -286,6 +286,10 @@ class Inventory:
       row = self._store._validate(value, kind, ids)
     except Exception:
       return OLD, "unrecognized"
+    if kind == "tenant_draft":
+      # RM-109: a draft has no tenant; its id is not one, so the related-tenant check below would
+      # call every draft an orphan. Current while the store reads it, never orphan or old_tenant.
+      return CURRENT, ""
     if kind in ("tenant", "receipt"):
       if not isinstance(row.get("contract"), dict) or not isinstance(row.get("legal"), dict):
         return OLD, "tenant_without_contract"

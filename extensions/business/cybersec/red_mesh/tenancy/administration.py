@@ -24,6 +24,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_context, normalize_engagement_assets, normalize_roe,
                           normalize_run_modes, normalize_window, valid_doc_ref, valid_engagement_id)
+from . import drafts
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -1145,6 +1146,128 @@ class TenantAdministrationService:
   def check_tenant_domain(self, actor, domain_id):
     self._actor(actor, creator=True)
     return {"available": self.store.get("domain", _domain(domain_id)) is None}
+
+  # RM-109 phase 2: tenant drafts. A full-portfolio Super-Tenant Admin only, as tenant creation; a
+  # draft has no tenant, so these are not rows of the tenant policy matrix. Every document read,
+  # write and delete is the plugin's, outside this lock: these methods return stored rows and the
+  # refs whose files the plugin deletes after the write. Phase 3 sets `activation`; while it is set
+  # the draft is locked.
+
+  def _tenant_draft(self, draft_id):
+    if not drafts.valid_draft_id(draft_id):
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("tenant_draft", draft_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    return row
+
+  def _unlocked_tenant_draft(self, draft_id):
+    row = self._tenant_draft(draft_id)
+    if row["activation"] is not None:
+      raise AdministrationDenied(409, "draft_locked")
+    return row
+
+  @staticmethod
+  def _draft_document_kind(value):
+    if not isinstance(value, str) or value not in drafts.DOCUMENT_KINDS:
+      raise AdministrationDenied(400, "invalid_request")
+    return value
+
+  def _write_tenant_draft(self, row, account, previous=None):
+    """Write a changed row with its attribution; an unchanged one is not written."""
+    if previous is not None and row == previous:
+      return previous
+    row = {**row, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("tenant_draft", row["draft_id"], record=row)
+    return self.store.get("tenant_draft", row["draft_id"])
+
+  @_endpoint
+  def create_tenant_draft(self, actor, request_id, display_name, compliance_types):
+    account = self._actor(actor, creator=True)
+    draft_id = drafts.draft_id_for(_request_id(request_id))
+    existing = self.store.get("tenant_draft", draft_id)
+    if existing is not None:
+      return existing
+    try:
+      row = drafts.new_draft(draft_id, display_name, compliance_types, account.account_id,
+                             datetime.now(timezone.utc).isoformat())
+    except drafts.DraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    self.store.put("tenant_draft", draft_id, record=row)
+    return self.store.get("tenant_draft", draft_id)
+
+  @_endpoint
+  def get_tenant_draft(self, actor, draft_id):
+    self._actor(actor, creator=True)
+    return self._tenant_draft(draft_id)
+
+  @_endpoint
+  def list_tenant_drafts(self, actor):
+    self._actor(actor, creator=True)
+    rows = sorted(self.store.list_tenant_drafts(), key=lambda row: row["draft_id"])
+    rows.sort(key=lambda row: row["created_at"], reverse=True)
+    return [drafts.draft_list_row(row) for row in rows]
+
+  @_endpoint
+  def update_tenant_draft(self, actor, draft_id, changes, gone_refs=()):
+    """`gone_refs`: draft files the plugin found gone from the store; their items are corrected to
+    `missing` in this write. Answers the row and the refs whose files the plugin deletes."""
+    account = self._actor(actor, creator=True)
+    previous = self._unlocked_tenant_draft(draft_id)
+    try:
+      row, dropped = drafts.apply_changes(drafts.without_documents(previous, gone_refs), changes)
+    except drafts.DraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    return {"draft": self._write_tenant_draft(row, account, previous), "dropped": dropped}
+
+  @_endpoint
+  def authorize_tenant_draft_upload(self, actor, draft_id, document_kind):
+    account = self._actor(actor, creator=True)
+    row = self._unlocked_tenant_draft(draft_id)
+    self._draft_document_kind(document_kind)
+    return {"accountId": account.account_id, "draft": row}
+
+  @_endpoint
+  def attach_tenant_draft_document(self, actor, draft_id, document_kind, document, gone_refs=()):
+    """Bind an uploaded file (`store_draft_document`) to its slot and sign the item. Answers the row
+    and the ref the slot held before, whose file the plugin deletes after this write."""
+    account = self._actor(actor, creator=True)
+    previous = self._unlocked_tenant_draft(draft_id)
+    kind = self._draft_document_kind(document_kind)
+    if not valid_doc_ref(document) or document["uploaded_by"] != account.account_id:
+      raise AdministrationDenied(400, "contract_invalid" if kind == "contract" else "document_invalid")
+    row = drafts.without_documents(previous, gone_refs)
+    replaced = row["items"][kind]["document"]
+    row = {**row, "items": {**row["items"], kind: {**row["items"][kind], "state": "signed",
+                                                   "document": dict(document)}}}
+    return {"draft": self._write_tenant_draft(row, account),
+            "replaced": replaced["ref"] if replaced is not None else None}
+
+  @_endpoint
+  def tenant_draft_document_ref(self, actor, draft_id, document_kind):
+    self._actor(actor, creator=True)
+    row = self._tenant_draft(draft_id)
+    document = row["items"][self._draft_document_kind(document_kind)]["document"]
+    if document is None:
+      raise AdministrationDenied(404, "not_found")
+    return document
+
+  @_endpoint
+  def begin_tenant_draft_delete(self, actor, draft_id):
+    account = self._actor(actor, creator=True)
+    row = self._unlocked_tenant_draft(draft_id)
+    return {"accountId": account.account_id, "documentRefs": drafts.document_refs(row)}
+
+  @_endpoint
+  def finish_tenant_draft_delete(self, actor, draft_id, deleted_refs):
+    """Delete the record once every file it names is gone. A file attached since the plugin
+    started deleting is a conflict; the next attempt deletes it too."""
+    self._actor(actor, creator=True)
+    row = self._unlocked_tenant_draft(draft_id)
+    if not set(drafts.document_refs(row)) <= set(deleted_refs):
+      raise AdministrationDenied(409, "conflict")
+    self.store.delete("tenant_draft", draft_id)
+    return {"draft_id": draft_id}
 
   def _assignable_member_roles(self, account, tenant):
     """RM-083. Roles this caller may write in the tenant; tenant_pentester is the platform's to give."""

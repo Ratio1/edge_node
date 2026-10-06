@@ -32,13 +32,31 @@ def contract_result(operation):
 
 def store_contract(documents, *, filename, content_b64, uploaded_by, now_fn=None):
   """Validate one contract (PDF only) and store it; return its document reference."""
+  return _store(documents, filename, content_b64, uploaded_by, now_fn, refusal=None,
+                envelope_fields={"schema_version": "1.0"})
+
+
+def store_draft_document(documents, *, draft_id, document_kind, filename, content_b64, uploaded_by,
+                         now_fn=None):
+  """RM-109. One signed tenant-draft document, checked as a contract; return its document reference.
+
+  The envelope is the contract's at `schema_version` 1.1, naming the draft and the slot; the
+  reference keeps the contract's key set (the slot it sits in names its kind). Any failed check is
+  `contract_invalid` for the contract slot and `document_invalid` for the other two.
+  """
+  return _store(documents, filename, content_b64, uploaded_by, now_fn,
+                refusal="contract_invalid" if document_kind == "contract" else "document_invalid",
+                envelope_fields={"schema_version": "1.1", "document_kind": document_kind, "draft_id": draft_id})
+
+
+def _store(documents, filename, content_b64, uploaded_by, now_fn, *, refusal, envelope_fields):
   try:
     document = validate_document(filename, content_b64, accepted=CONTRACT_FORMATS)
   except AuthorizationUploadError as exc:
-    raise ContractRefused(400, exc.code) from None
+    raise ContractRefused(400, refusal or exc.code) from None
   uploaded_at = (now_fn or (lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))()
   envelope = {
-    "kind": CONTRACT_KIND, "schema_version": "1.0", "filename": document.filename,
+    "kind": CONTRACT_KIND, **envelope_fields, "filename": document.filename,
     "mime": document.mime, "size_bytes": document.size_bytes, "sha256": document.sha256_hex,
     "uploaded_at": uploaded_at, "uploaded_by": uploaded_by,
     "content_b64": content_b64 if isinstance(content_b64, str) else "",
