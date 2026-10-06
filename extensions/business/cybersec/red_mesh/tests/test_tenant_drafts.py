@@ -940,8 +940,13 @@ class TestDraftRelease(_ActivationCase):
     self.assertEqual(released["tenant_id"], prepared["tenantId"])
     self.assertIsNone(self.stored(draft_id)["activation"])
     self.assertTrue(all(item["state"] == "signed" for item in self.stored(draft_id)["items"].values()))
-    # Finishing a release that already removed its rows is a replay: no audit event of its own.
-    self.assertEqual(self.events, [])
+    # The crashed call emitted nothing; the call that clears the marker emits the one event, with
+    # only its own deletes counted.
+    self.assertEqual(self.events, [("tenant_draft_activation_released",
+                                    {"draft_id": draft_id, "actor": "creator", "rows_deleted": 0})])
+    # A further call answers the release again and emits nothing.
+    self.assertEqual(ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))["released"], released)
+    self.assertEqual(len(self.events), 1)
 
   def test_tenant_delete_lists_every_tenant_document(self):
     for combined, count in ((False, 3), (True, 1)):

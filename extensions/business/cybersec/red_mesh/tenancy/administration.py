@@ -1405,9 +1405,9 @@ class TenantAdministrationService:
     if marker is None:
       if draft["last_release"] is None:
         raise AdministrationDenied(409, "not_activating")
-      return {"draft_id": draft_id, "released": draft["last_release"], "replayed": True, "rows_deleted": 0}
+      return {"draft_id": draft_id, "released": draft["last_release"], "cleared": False, "rows_deleted": 0}
     receipt, tenant = self._marker_tenant(marker)
-    deleted, replayed = 0, False
+    deleted = 0
     if receipt is not None:
       if tenant is not None and "deleting" in tenant:
         # Being deleted: `delete_tenant` finishes it, and its rows are not this release's.
@@ -1428,10 +1428,9 @@ class TenantAdministrationService:
         deleted += 1
       self.store.delete("receipt", marker["actor_id"], marker["request_id"])
       deleted += 1
-    elif (draft["last_release"] or {}).get("request_id") == marker["request_id"]:
-      # A release that stopped after its receipt delete: only the marker is left to clear.
-      replayed = True
-    else:
+    # Otherwise, when `last_release` names the marker's request, a release stopped after its receipt
+    # delete and only the marker is left to clear.
+    elif (draft["last_release"] or {}).get("request_id") != marker["request_id"]:
       domain = self.store.get("domain", draft["domain_id"]) if draft["domain_id"] else None
       tenant_deleted = domain is not None and (domain.get("actor_id"), domain.get("request_id")) == (
         marker["actor_id"], marker["request_id"])
@@ -1444,7 +1443,9 @@ class TenantAdministrationService:
         "request_id": marker["request_id"], "tenant_id": None, "initial_admin_id": None}}
     draft = {**draft, "activation": None}
     self.store.put("tenant_draft", draft_id, record=draft)
-    return {"draft_id": draft_id, "released": draft["last_release"], "replayed": replayed, "rows_deleted": deleted}
+    # `cleared`: this call cleared the marker, which every release does exactly once; the plugin
+    # audits on it. `rows_deleted` counts this call's deletes only.
+    return {"draft_id": draft_id, "released": draft["last_release"], "cleared": True, "rows_deleted": deleted}
 
   @_endpoint
   def close_tenant_draft(self, actor, draft_id):
