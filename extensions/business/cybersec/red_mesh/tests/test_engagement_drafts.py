@@ -594,6 +594,24 @@ class TestTenantDraftCascade(_EngagementDraftCase):
     self.documents.fail_delete = set()
     self.assertEqual(ok(self, self.plugin.delete_tenant_draft(self.actor, parent))["engagement_drafts_deleted"], 1)
 
+  def test_a_child_deleted_meanwhile_does_not_stop_the_cascade(self):
+    parent = self.create()["draft_id"]
+    ok(self, self.upload(parent))
+    engagement_draft_id = self.child(parent)["engagement_draft_id"]
+    ok(self, self.upload_pack(engagement_draft_id))
+    call = self.plugin._call_tenant_administration
+
+    def racing(operation, actor, **kwargs):
+      if operation == "finish_engagement_draft_delete":
+        # Another call removed the child between the file deletes and its row delete.
+        self.repo.delete("engagement_draft", kwargs["engagement_draft_id"])
+      return call(operation, actor, **kwargs)
+    self.plugin._call_tenant_administration = racing
+    data = ok(self, self.plugin.delete_tenant_draft(self.actor, parent))
+    self.assertEqual(data, {"draft_id": parent, "files_deleted": 2, "engagement_drafts_deleted": 1})
+    self.assertIsNone(self.stored(parent))
+    self.assertIsNone(self.stored_child(engagement_draft_id))
+
   def test_close_re_homes_the_children_and_a_crash_between_the_two_is_finished_by_the_next_call(self):
     draft_id, request_id = self.ready(), str(uuid4())
     children = [self.child(draft_id, "Pack %d" % index)["engagement_draft_id"] for index in range(2)]

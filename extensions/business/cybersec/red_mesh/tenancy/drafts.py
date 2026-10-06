@@ -40,7 +40,8 @@ _COVERABLE = {
   "data_handling": frozenset({"data_handling", *ENGAGEMENT_RECORDS}),
 }
 _ITEM_FIELDS = ("state", "document", "covers", "effective_from", "effective_until", "generated")
-_ITEM_CHANGES = ("state", "covers", "effective_from", "effective_until")
+# `covers` and applicability are fixed by the pack, never edited (owner, 2026-10-07).
+_ITEM_CHANGES = ("state", "effective_from", "effective_until")
 # RM-110 writes the `generated` block (the unsigned pack and its baseline); nothing here does yet.
 DOC_REF_KEYS = ("store", "ref", "filename", "mime", "uploaded_at", "uploaded_by", "sha256", "size_bytes")
 _GENERATED_FIELDS = ("snapshot_sha256", "generated_at", "generated_by")
@@ -175,16 +176,15 @@ def apply_changes(row, changes):
 
   Formats are checked, emptiness is allowed. An update may set an item `missing` (its file goes) or
   `awaiting_signature` (only without a file); `signed` is set by an upload alone. Neither transition
-  touches `generated`: the unsigned pack and its baseline outlive a dropped signed copy.
+  touches `generated`: the unsigned pack and its baseline outlive a dropped signed copy. `covers`
+  and `applicability` are not change keys: the pack fixes them.
   """
   if not isinstance(changes, dict):
     raise DraftInvalid()
-  allowed = {"display_name", "domain_id", "initial_admin_id", "legal", "compliance_types", "items",
-             "applicability"}
+  allowed = {"display_name", "domain_id", "initial_admin_id", "legal", "compliance_types", "items"}
   if any(key not in allowed for key in changes):
     raise DraftInvalid()
-  row = {**row, "legal": dict(row["legal"]), "items": {kind: dict(item) for kind, item in row["items"].items()},
-         "applicability": dict(row["applicability"])}
+  row = {**row, "legal": dict(row["legal"]), "items": {kind: dict(item) for kind, item in row["items"].items()}}
   dropped = []
   if "display_name" in changes:
     row["display_name"] = normalize_display_name(changes["display_name"])
@@ -204,8 +204,6 @@ def apply_changes(row, changes):
       if not isinstance(change, dict) or any(key not in _ITEM_CHANGES for key in change):
         raise DraftInvalid()
       item = row["items"][kind]
-      if "covers" in change:
-        item["covers"] = normalize_covers(kind, change["covers"])
       for key in ("effective_from", "effective_until"):
         if key in change:
           item[key] = _effective_date(change[key])
@@ -219,12 +217,6 @@ def apply_changes(row, changes):
           item["state"] = "awaiting_signature"
         else:
           raise DraftInvalid()
-  if "applicability" in changes:
-    decisions = changes["applicability"]
-    if not isinstance(decisions, dict) or any(record not in TENANT_RECORDS for record in decisions):
-      raise DraftInvalid()
-    for record, decision in decisions.items():
-      row["applicability"][record] = normalize_applicability(decision)
   return row, dropped
 
 
@@ -332,7 +324,12 @@ def _same(normalize, value):
 
 
 def validate_tenant_draft(row, ids):
-  """Refuse a stored draft the operations could not have written. Unknown fields are kept."""
+  """Refuse a stored draft the operations could not have written. Unknown fields are kept. Answers the
+  row as the operations read it: an item written before the `generated` slot existed (RM-109 phases
+  2-3) gains `generated: None`, on a copy, so the stored value itself is never changed by a read."""
+  if isinstance(row.get("items"), dict):
+    row = {**row, "items": {kind: {"generated": None, **item} if isinstance(item, dict) else item
+                            for kind, item in row["items"].items()}}
   items, applicability, legal = row.get("items"), row.get("applicability"), row.get("legal")
   if (len(ids) != 1 or row.get("draft_id") != ids[0] or not valid_draft_id(ids[0])
       or not _same(normalize_display_name, row.get("display_name"))

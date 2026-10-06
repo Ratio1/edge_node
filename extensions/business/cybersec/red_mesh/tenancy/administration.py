@@ -1367,6 +1367,10 @@ class TenantAdministrationService:
     kind = self._draft_document_kind(document_kind)
     if not valid_doc_ref(document) or document["uploaded_by"] != account.account_id:
       raise AdministrationDenied(400, "contract_invalid" if kind == "contract" else "document_invalid")
+    generated = previous["items"][kind]["generated"]
+    if generated is not None and generated["sha256"] == document["sha256"]:
+      # The unsigned pack's bytes are not a signed copy (a byte comparison, not a signature check).
+      raise AdministrationDenied(409, "same_as_generated")
     row = previous
     replaced = row["items"][kind]["document"]
     row = {**row, "items": {**row["items"], kind: {**row["items"][kind], "state": "signed",
@@ -1647,8 +1651,8 @@ class TenantAdministrationService:
     existing = self.store.get("engagement", tenant_id, engagement_id)
     if existing is not None:
       self.store.delete("engagement_draft", engagement_draft_id)
-      return {"engagementId": engagement_id, "replayed": True, "engagementHash": existing["engagement_hash"],
-              "actor": account.account_id}
+      return {"engagementId": engagement_id, "tenantId": tenant_id, "replayed": True,
+              "engagementHash": existing["engagement_hash"], "actor": account.account_id}
     slot = row["document"]
     stored = {"signed": slot["document"], "generated": self._generated_ref(slot["generated"])}
     resolved = documents if isinstance(documents, dict) else {}
@@ -1682,8 +1686,8 @@ class TenantAdministrationService:
     record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, packs, None)
     self.store.put("engagement", tenant_id, engagement_id, record=record)
     self.store.delete("engagement_draft", engagement_draft_id)
-    return {"engagementId": engagement_id, "replayed": False, "engagementHash": record["engagement_hash"],
-            "actor": account.account_id}
+    return {"engagementId": engagement_id, "tenantId": tenant_id, "replayed": False,
+            "engagementHash": record["engagement_hash"], "actor": account.account_id}
 
   def _assignable_member_roles(self, account, tenant):
     """RM-083. Roles this caller may write in the tenant; tenant_pentester is the platform's to give."""

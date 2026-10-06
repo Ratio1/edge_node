@@ -275,6 +275,16 @@ class TestDataMaintenance(unittest.TestCase):
     del self.storage.data[(TENANCY, tenant)]["contract"]
     self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
 
+  def test_a_tenant_draft_written_before_the_generated_slot_is_current(self):
+    # RM-109 phases 2-3 wrote items without `generated`; such a row must not be cleaned up as old.
+    field = self.draft_row()
+    for item in self.storage.data[(TENANCY, field)]["items"].values():
+      del item["generated"]
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertEqual(self.files.deleted, [])
+
   def test_a_malformed_tenant_draft_is_old_not_orphan(self):
     field = self.draft_row()
     self.storage.data[(TENANCY, field)]["items"]["contract"]["state"] = "done"

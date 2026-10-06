@@ -634,6 +634,8 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   `close_tenant_draft` re-homes the children before deleting the row; `delete_tenant_draft`
   cascades (children's files, rows, then its own); `delete_tenant` does not cascade, so data
   maintenance classifies a child with no parent `orphan/parent_gone`. `ted_` ids answer 404 as
-  tenant and as engagement ids.
+  tenant and as engagement ids. `_engagement_draft_children` validates every `engagement_draft`
+  row of the namespace, so one malformed child row fails `close_tenant_draft`, `delete_tenant_draft`
+  and `list_engagement_drafts` closed (503) until data maintenance removes it.
 - Verification: `tests/test_engagement_drafts.py` (new), `test_tenant_drafts.py` (collapsed
   checklist), `test_data_maintenance.py`, `test_authz_surface.py` (107 endpoints).

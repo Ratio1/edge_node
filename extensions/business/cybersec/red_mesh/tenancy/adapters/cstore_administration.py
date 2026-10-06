@@ -71,7 +71,8 @@ class CstoreTenantAdministrationStore:
         raise TenantStoreError("Invalid engagement storage record") from exc
     if kind == "tenant_draft":
       try:
-        validate_tenant_draft(raw, ids)
+        # The validator completes a row written before the `generated` slot existed, on a copy.
+        raw = validate_tenant_draft(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid tenant draft storage record") from exc
     if kind == "engagement_draft":
