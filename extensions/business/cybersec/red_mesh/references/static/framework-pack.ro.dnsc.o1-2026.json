@@ -1,0 +1,2048 @@
+{
+  "source": "https://legislatie.just.ro/Public/DetaliiDocument/314360",
+  "version": "MO 712 bis/2026-08-27 + MO 792/2026-09-18",
+  "last_refreshed": "2026-10-06",
+  "pack_id": "ro.dnsc.o1-2026",
+  "catalogue": "DNSC Ordin 1/2026, Anexa 1 (CyFun 2025 translated)",
+  "scoring": "maturity_two_axis.v1",
+  "language": "ro",
+  "acts": [
+    "MO 712 bis/2026-08-27",
+    "MO 792/2026-09-18 (Ordin 2/2026)"
+  ],
+  "levels": [
+    "basic",
+    "important",
+    "essential"
+  ],
+  "thresholds": {
+    "basic": {
+      "key_measure_min": 2.5,
+      "category_min": null,
+      "total_min": 2.5,
+      "excluded_value": 2.5,
+      "max_excluded": 1
+    },
+    "important": {
+      "key_measure_min": 3.0,
+      "category_min": null,
+      "total_min": 3.0,
+      "excluded_value": 3.0,
+      "max_excluded": 3
+    },
+    "essential": {
+      "key_measure_min": 3.0,
+      "category_min": 3.0,
+      "total_min": 3.5,
+      "excluded_value": 3.0,
+      "max_excluded": 5,
+      "management_aspect_excludable": false
+    }
+  },
+  "counts": {
+    "controls": 218,
+    "by_level": {
+      "basic": 34,
+      "important": 133,
+      "essential": 218
+    },
+    "key_measures": {
+      "basic": 13,
+      "important": 22,
+      "essential": 29
+    },
+    "management_aspect": 15,
+    "categories": 22,
+    "subcategories": 90
+  },
+  "provenance": {
+    "generated_by": "project-red-mesh:workbooks/redmesh-framework-pack/scripts/build_framework_pack.py",
+    "generated_on": "2026-10-06",
+    "sources": {
+      "table": {
+        "file": "anexa1-applicability-table.tsv",
+        "sha256": "5378b8c7c6b510a784473f3bced9bbfa0c11d59a1904eecfab619915d1724a59",
+        "pinned": true
+      },
+      "annex1": {
+        "file": "lj-314360_masuri-anexa1-ordin-1-2026.txt",
+        "sha256": "bc1b97fc8fe7536fc6174b010c900ac08cdda795f1f89a1ec7abda980851f4c9",
+        "pinned": true
+      },
+      "annex2": {
+        "file": "lj-314361_metodologie-maturitate-anexa2-ordin-1-2026.txt",
+        "sha256": "f653028f182642609708b9e1d1337d0b1a42a30eb90333e056bd82ba58fc081f",
+        "pinned": true
+      }
+    },
+    "portal": {
+      "annex1": "https://legislatie.just.ro/Public/DetaliiDocument/314360",
+      "annex2": "https://legislatie.just.ro/Public/DetaliiDocument/314361"
+    },
+    "licence": "Official administrative text, not protected (Law 8/1996 art. 9(b)); CCB English text not included"
+  },
+  "controls": [
+    {
+      "ref_id": "GV.OC-01.1",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 1
+    },
+    {
+      "ref_id": "GV.OC-02.1",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 2
+    },
+    {
+      "ref_id": "GV.OC-03.1",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-03",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 3
+    },
+    {
+      "ref_id": "GV.OC-03.2",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 4
+    },
+    {
+      "ref_id": "GV.OC-04.1",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 5
+    },
+    {
+      "ref_id": "GV.OC-04.2",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 6
+    },
+    {
+      "ref_id": "GV.OC-04.3",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 7
+    },
+    {
+      "ref_id": "GV.OC-04.4",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 8
+    },
+    {
+      "ref_id": "GV.OC-05.1",
+      "category": "GV.OC",
+      "subcategory": "GV.OC-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 9
+    },
+    {
+      "ref_id": "GV.OV-02.1",
+      "category": "GV.OV",
+      "subcategory": "GV.OV-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 10
+    },
+    {
+      "ref_id": "GV.OV-03.1",
+      "category": "GV.OV",
+      "subcategory": "GV.OV-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 11
+    },
+    {
+      "ref_id": "GV.PO-01.1",
+      "category": "GV.PO",
+      "subcategory": "GV.PO-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 12
+    },
+    {
+      "ref_id": "GV.PO-01.2",
+      "category": "GV.PO",
+      "subcategory": "GV.PO-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 13
+    },
+    {
+      "ref_id": "GV.RM-01.1",
+      "category": "GV.RM",
+      "subcategory": "GV.RM-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 14
+    },
+    {
+      "ref_id": "GV.RM-02.1",
+      "category": "GV.RM",
+      "subcategory": "GV.RM-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 15
+    },
+    {
+      "ref_id": "GV.RM-03.1",
+      "category": "GV.RM",
+      "subcategory": "GV.RM-03",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 16
+    },
+    {
+      "ref_id": "GV.RM-03.2",
+      "category": "GV.RM",
+      "subcategory": "GV.RM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 17
+    },
+    {
+      "ref_id": "GV.RM-04.1",
+      "category": "GV.RM",
+      "subcategory": "GV.RM-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 18
+    },
+    {
+      "ref_id": "GV.RM-05.1",
+      "category": "GV.RM",
+      "subcategory": "GV.RM-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 19
+    },
+    {
+      "ref_id": "GV.RR-01.1",
+      "category": "GV.RR",
+      "subcategory": "GV.RR-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 20
+    },
+    {
+      "ref_id": "GV.RR-02.1",
+      "category": "GV.RR",
+      "subcategory": "GV.RR-02",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": true,
+      "order": 21
+    },
+    {
+      "ref_id": "GV.RR-02.2",
+      "category": "GV.RR",
+      "subcategory": "GV.RR-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 22
+    },
+    {
+      "ref_id": "GV.RR-03.1",
+      "category": "GV.RR",
+      "subcategory": "GV.RR-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 23
+    },
+    {
+      "ref_id": "GV.RR-03.2",
+      "category": "GV.RR",
+      "subcategory": "GV.RR-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 24
+    },
+    {
+      "ref_id": "GV.RR-04.1",
+      "category": "GV.RR",
+      "subcategory": "GV.RR-04",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 25
+    },
+    {
+      "ref_id": "GV.RR-04.2",
+      "category": "GV.RR",
+      "subcategory": "GV.RR-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 26
+    },
+    {
+      "ref_id": "GV.SC-01.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 27
+    },
+    {
+      "ref_id": "GV.SC-02.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 28
+    },
+    {
+      "ref_id": "GV.SC-03.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 29
+    },
+    {
+      "ref_id": "GV.SC-05.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 30
+    },
+    {
+      "ref_id": "GV.SC-05.2",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-05",
+      "entry_level": "essential",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 31
+    },
+    {
+      "ref_id": "GV.SC-05.3",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-05",
+      "entry_level": "essential",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 32
+    },
+    {
+      "ref_id": "GV.SC-06.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-06",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 33
+    },
+    {
+      "ref_id": "GV.SC-07.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-07",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 34
+    },
+    {
+      "ref_id": "GV.SC-07.2",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-07",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 35
+    },
+    {
+      "ref_id": "GV.SC-07.3",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-07",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 36
+    },
+    {
+      "ref_id": "GV.SC-07.4",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-07",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 37
+    },
+    {
+      "ref_id": "GV.SC-08.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 38
+    },
+    {
+      "ref_id": "GV.SC-09.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-09",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 39
+    },
+    {
+      "ref_id": "GV.SC-10.1",
+      "category": "GV.SC",
+      "subcategory": "GV.SC-10",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 40
+    },
+    {
+      "ref_id": "ID.AM-01.1",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 41
+    },
+    {
+      "ref_id": "ID.AM-01.2",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 42
+    },
+    {
+      "ref_id": "ID.AM-01.3",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 43
+    },
+    {
+      "ref_id": "ID.AM-01.4",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 44
+    },
+    {
+      "ref_id": "ID.AM-02.1",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-02",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 45
+    },
+    {
+      "ref_id": "ID.AM-02.2",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 46
+    },
+    {
+      "ref_id": "ID.AM-02.3",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 47
+    },
+    {
+      "ref_id": "ID.AM-02.4",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 48
+    },
+    {
+      "ref_id": "ID.AM-02.5",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 49
+    },
+    {
+      "ref_id": "ID.AM-03.2",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 50
+    },
+    {
+      "ref_id": "ID.AM-03.3",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-03",
+      "entry_level": "essential",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 51
+    },
+    {
+      "ref_id": "ID.AM-04.1",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 52
+    },
+    {
+      "ref_id": "ID.AM-04.2",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 53
+    },
+    {
+      "ref_id": "ID.AM-05.1",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-05",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 54
+    },
+    {
+      "ref_id": "ID.AM-07.1",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-07",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 55
+    },
+    {
+      "ref_id": "ID.AM-07.2",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-07",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 56
+    },
+    {
+      "ref_id": "ID.AM-08.2",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 57
+    },
+    {
+      "ref_id": "ID.AM-08.3",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 58
+    },
+    {
+      "ref_id": "ID.AM-08.4",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 59
+    },
+    {
+      "ref_id": "ID.AM-08.5",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 60
+    },
+    {
+      "ref_id": "ID.AM-08.6",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 61
+    },
+    {
+      "ref_id": "ID.AM-08.7",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "essential",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 62
+    },
+    {
+      "ref_id": "ID.AM-08.8",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 63
+    },
+    {
+      "ref_id": "ID.AM-08.9",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "essential",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 64
+    },
+    {
+      "ref_id": "ID.AM-08.10",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "essential",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 65
+    },
+    {
+      "ref_id": "ID.AM-08.11",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 66
+    },
+    {
+      "ref_id": "ID.AM-08.12",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 67
+    },
+    {
+      "ref_id": "ID.AM-08.13",
+      "category": "ID.AM",
+      "subcategory": "ID.AM-08",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 68
+    },
+    {
+      "ref_id": "ID.IM-02.1",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 69
+    },
+    {
+      "ref_id": "ID.IM-03.1",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 70
+    },
+    {
+      "ref_id": "ID.IM-03.2",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 71
+    },
+    {
+      "ref_id": "ID.IM-03.3",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 72
+    },
+    {
+      "ref_id": "ID.IM-03.4",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 73
+    },
+    {
+      "ref_id": "ID.IM-03.5",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 74
+    },
+    {
+      "ref_id": "ID.IM-03.6",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 75
+    },
+    {
+      "ref_id": "ID.IM-03.7",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 76
+    },
+    {
+      "ref_id": "ID.IM-03.8",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 77
+    },
+    {
+      "ref_id": "ID.IM-03.9",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 78
+    },
+    {
+      "ref_id": "ID.IM-04.1",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 79
+    },
+    {
+      "ref_id": "ID.IM-04.2",
+      "category": "ID.IM",
+      "subcategory": "ID.IM-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 80
+    },
+    {
+      "ref_id": "ID.RA-01.1",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 81
+    },
+    {
+      "ref_id": "ID.RA-01.2",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 82
+    },
+    {
+      "ref_id": "ID.RA-01.3",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 83
+    },
+    {
+      "ref_id": "ID.RA-01.4",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 84
+    },
+    {
+      "ref_id": "ID.RA-01.5",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 85
+    },
+    {
+      "ref_id": "ID.RA-01.6",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 86
+    },
+    {
+      "ref_id": "ID.RA-02.1",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 87
+    },
+    {
+      "ref_id": "ID.RA-02.2",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 88
+    },
+    {
+      "ref_id": "ID.RA-03.1",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 89
+    },
+    {
+      "ref_id": "ID.RA-05.1",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-05",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 90
+    },
+    {
+      "ref_id": "ID.RA-05.2",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 91
+    },
+    {
+      "ref_id": "ID.RA-05.3",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-05",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 92
+    },
+    {
+      "ref_id": "ID.RA-06.1",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 93
+    },
+    {
+      "ref_id": "ID.RA-08.1",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-08",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 94
+    },
+    {
+      "ref_id": "ID.RA-08.2",
+      "category": "ID.RA",
+      "subcategory": "ID.RA-08",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 95
+    },
+    {
+      "ref_id": "PR.AA-01.1",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-01",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 96
+    },
+    {
+      "ref_id": "PR.AA-01.2",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 97
+    },
+    {
+      "ref_id": "PR.AA-01.3",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 98
+    },
+    {
+      "ref_id": "PR.AA-01.4",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 99
+    },
+    {
+      "ref_id": "PR.AA-01.5",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 100
+    },
+    {
+      "ref_id": "PR.AA-02.1",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 101
+    },
+    {
+      "ref_id": "PR.AA-02.2",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 102
+    },
+    {
+      "ref_id": "PR.AA-03.1",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-03",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 103
+    },
+    {
+      "ref_id": "PR.AA-03.2",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-03",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 104
+    },
+    {
+      "ref_id": "PR.AA-03.3",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-03",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 105
+    },
+    {
+      "ref_id": "PR.AA-03.4",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 106
+    },
+    {
+      "ref_id": "PR.AA-03.5",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 107
+    },
+    {
+      "ref_id": "PR.AA-04.1",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 108
+    },
+    {
+      "ref_id": "PR.AA-05.1",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 109
+    },
+    {
+      "ref_id": "PR.AA-05.2",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 110
+    },
+    {
+      "ref_id": "PR.AA-05.3",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 111
+    },
+    {
+      "ref_id": "PR.AA-05.4",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 112
+    },
+    {
+      "ref_id": "PR.AA-05.5",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 113
+    },
+    {
+      "ref_id": "PR.AA-05.6",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 114
+    },
+    {
+      "ref_id": "PR.AA-05.7",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 115
+    },
+    {
+      "ref_id": "PR.AA-05.8",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 116
+    },
+    {
+      "ref_id": "PR.AA-05.9",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-05",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 117
+    },
+    {
+      "ref_id": "PR.AA-06.1",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-06",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 118
+    },
+    {
+      "ref_id": "PR.AA-06.2",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 119
+    },
+    {
+      "ref_id": "PR.AA-06.3",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-06",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 120
+    },
+    {
+      "ref_id": "PR.AA-06.4",
+      "category": "PR.AA",
+      "subcategory": "PR.AA-06",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 121
+    },
+    {
+      "ref_id": "PR.AT-01.1",
+      "category": "PR.AT",
+      "subcategory": "PR.AT-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 122
+    },
+    {
+      "ref_id": "PR.AT-01.2",
+      "category": "PR.AT",
+      "subcategory": "PR.AT-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 123
+    },
+    {
+      "ref_id": "PR.AT-01.3",
+      "category": "PR.AT",
+      "subcategory": "PR.AT-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 124
+    },
+    {
+      "ref_id": "PR.AT-01.4",
+      "category": "PR.AT",
+      "subcategory": "PR.AT-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 125
+    },
+    {
+      "ref_id": "PR.AT-02.1",
+      "category": "PR.AT",
+      "subcategory": "PR.AT-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 126
+    },
+    {
+      "ref_id": "PR.AT-02.2",
+      "category": "PR.AT",
+      "subcategory": "PR.AT-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 127
+    },
+    {
+      "ref_id": "PR.AT-02.3",
+      "category": "PR.AT",
+      "subcategory": "PR.AT-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 128
+    },
+    {
+      "ref_id": "PR.DS-01.1",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 129
+    },
+    {
+      "ref_id": "PR.DS-01.2",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 130
+    },
+    {
+      "ref_id": "PR.DS-01.3",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 131
+    },
+    {
+      "ref_id": "PR.DS-01.4",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 132
+    },
+    {
+      "ref_id": "PR.DS-01.5",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 133
+    },
+    {
+      "ref_id": "PR.DS-01.6",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 134
+    },
+    {
+      "ref_id": "PR.DS-01.9",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 135
+    },
+    {
+      "ref_id": "PR.DS-02.1",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-02",
+      "entry_level": "essential",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 136
+    },
+    {
+      "ref_id": "PR.DS-02.2",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 137
+    },
+    {
+      "ref_id": "PR.DS-10.1",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-10",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 138
+    },
+    {
+      "ref_id": "PR.DS-11.1",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-11",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 139
+    },
+    {
+      "ref_id": "PR.DS-11.2",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-11",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 140
+    },
+    {
+      "ref_id": "PR.DS-11.3",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-11",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 141
+    },
+    {
+      "ref_id": "PR.DS-11.4",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-11",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 142
+    },
+    {
+      "ref_id": "PR.DS-11.5",
+      "category": "PR.DS",
+      "subcategory": "PR.DS-11",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 143
+    },
+    {
+      "ref_id": "PR.IR-01.1",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 144
+    },
+    {
+      "ref_id": "PR.IR-01.2",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 145
+    },
+    {
+      "ref_id": "PR.IR-01.3",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 146
+    },
+    {
+      "ref_id": "PR.IR-01.4",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 147
+    },
+    {
+      "ref_id": "PR.IR-01.5",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 148
+    },
+    {
+      "ref_id": "PR.IR-01.6",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 149
+    },
+    {
+      "ref_id": "PR.IR-01.7",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 150
+    },
+    {
+      "ref_id": "PR.IR-01.8",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 151
+    },
+    {
+      "ref_id": "PR.IR-01.9",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 152
+    },
+    {
+      "ref_id": "PR.IR-02.1",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 153
+    },
+    {
+      "ref_id": "PR.IR-02.2",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 154
+    },
+    {
+      "ref_id": "PR.IR-03.1",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 155
+    },
+    {
+      "ref_id": "PR.IR-04.1",
+      "category": "PR.IR",
+      "subcategory": "PR.IR-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 156
+    },
+    {
+      "ref_id": "PR.PS-01.1",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-01",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 157
+    },
+    {
+      "ref_id": "PR.PS-01.2",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 158
+    },
+    {
+      "ref_id": "PR.PS-01.3",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 159
+    },
+    {
+      "ref_id": "PR.PS-01.4",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 160
+    },
+    {
+      "ref_id": "PR.PS-01.5",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 161
+    },
+    {
+      "ref_id": "PR.PS-02.1",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 162
+    },
+    {
+      "ref_id": "PR.PS-03.1",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 163
+    },
+    {
+      "ref_id": "PR.PS-04.1",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-04",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 164
+    },
+    {
+      "ref_id": "PR.PS-04.2",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 165
+    },
+    {
+      "ref_id": "PR.PS-04.3",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 166
+    },
+    {
+      "ref_id": "PR.PS-04.4",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 167
+    },
+    {
+      "ref_id": "PR.PS-04.5",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 168
+    },
+    {
+      "ref_id": "PR.PS-05.1",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-05",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 169
+    },
+    {
+      "ref_id": "PR.PS-05.2",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 170
+    },
+    {
+      "ref_id": "PR.PS-06.1",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 171
+    },
+    {
+      "ref_id": "PR.PS-06.2",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 172
+    },
+    {
+      "ref_id": "PR.PS-06.3",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-06",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 173
+    },
+    {
+      "ref_id": "PR.PS-06.4",
+      "category": "PR.PS",
+      "subcategory": "PR.PS-06",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 174
+    },
+    {
+      "ref_id": "DE.AE-02.1",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 175
+    },
+    {
+      "ref_id": "DE.AE-02.2",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 176
+    },
+    {
+      "ref_id": "DE.AE-03.1",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-03",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 177
+    },
+    {
+      "ref_id": "DE.AE-03.2",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 178
+    },
+    {
+      "ref_id": "DE.AE-03.3",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 179
+    },
+    {
+      "ref_id": "DE.AE-04.1",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 180
+    },
+    {
+      "ref_id": "DE.AE-06.1",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 181
+    },
+    {
+      "ref_id": "DE.AE-08.1",
+      "category": "DE.AE",
+      "subcategory": "DE.AE-08",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 182
+    },
+    {
+      "ref_id": "DE.CM-01.1",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 183
+    },
+    {
+      "ref_id": "DE.CM-01.2",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-01",
+      "entry_level": "basic",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 184
+    },
+    {
+      "ref_id": "DE.CM-01.3",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-01",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 185
+    },
+    {
+      "ref_id": "DE.CM-01.4",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-01",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 186
+    },
+    {
+      "ref_id": "DE.CM-02.1",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 187
+    },
+    {
+      "ref_id": "DE.CM-02.2",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 188
+    },
+    {
+      "ref_id": "DE.CM-03.1",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-03",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 189
+    },
+    {
+      "ref_id": "DE.CM-03.2",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 190
+    },
+    {
+      "ref_id": "DE.CM-06.1",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 191
+    },
+    {
+      "ref_id": "DE.CM-06.2",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 192
+    },
+    {
+      "ref_id": "DE.CM-09.1",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-09",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 193
+    },
+    {
+      "ref_id": "DE.CM-09.2",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-09",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 194
+    },
+    {
+      "ref_id": "DE.CM-09.3",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-09",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 195
+    },
+    {
+      "ref_id": "DE.CM-09.4",
+      "category": "DE.CM",
+      "subcategory": "DE.CM-09",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 196
+    },
+    {
+      "ref_id": "RS.AN-03.1",
+      "category": "RS.AN",
+      "subcategory": "RS.AN-03",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 197
+    },
+    {
+      "ref_id": "RS.AN-06.1",
+      "category": "RS.AN",
+      "subcategory": "RS.AN-06",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 198
+    },
+    {
+      "ref_id": "RS.AN-07.1",
+      "category": "RS.AN",
+      "subcategory": "RS.AN-07",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 199
+    },
+    {
+      "ref_id": "RS.AN-08.1",
+      "category": "RS.AN",
+      "subcategory": "RS.AN-08",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 200
+    },
+    {
+      "ref_id": "RS.CO-02.1",
+      "category": "RS.CO",
+      "subcategory": "RS.CO-02",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 201
+    },
+    {
+      "ref_id": "RS.CO-02.2",
+      "category": "RS.CO",
+      "subcategory": "RS.CO-02",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 202
+    },
+    {
+      "ref_id": "RS.MA-01.1",
+      "category": "RS.MA",
+      "subcategory": "RS.MA-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 203
+    },
+    {
+      "ref_id": "RS.MA-01.2",
+      "category": "RS.MA",
+      "subcategory": "RS.MA-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 204
+    },
+    {
+      "ref_id": "RS.MA-02.1",
+      "category": "RS.MA",
+      "subcategory": "RS.MA-02",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 205
+    },
+    {
+      "ref_id": "RS.MA-02.2",
+      "category": "RS.MA",
+      "subcategory": "RS.MA-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 206
+    },
+    {
+      "ref_id": "RS.MA-03.1",
+      "category": "RS.MA",
+      "subcategory": "RS.MA-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 207
+    },
+    {
+      "ref_id": "RS.MA-05.1",
+      "category": "RS.MA",
+      "subcategory": "RS.MA-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 208
+    },
+    {
+      "ref_id": "RS.MI-01.1",
+      "category": "RS.MI",
+      "subcategory": "RS.MI-01",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 209
+    },
+    {
+      "ref_id": "RS.MI-01.2",
+      "category": "RS.MI",
+      "subcategory": "RS.MI-01",
+      "entry_level": "important",
+      "key_measure": true,
+      "management_aspect": false,
+      "order": 210
+    },
+    {
+      "ref_id": "RC.CO-03.1",
+      "category": "RC.CO",
+      "subcategory": "RC.CO-03",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": true,
+      "order": 211
+    },
+    {
+      "ref_id": "RC.CO-04.1",
+      "category": "RC.CO",
+      "subcategory": "RC.CO-04",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 212
+    },
+    {
+      "ref_id": "RC.CO-04.2",
+      "category": "RC.CO",
+      "subcategory": "RC.CO-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 213
+    },
+    {
+      "ref_id": "RC.CO-04.3",
+      "category": "RC.CO",
+      "subcategory": "RC.CO-04",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 214
+    },
+    {
+      "ref_id": "RC.RP-01.1",
+      "category": "RC.RP",
+      "subcategory": "RC.RP-01",
+      "entry_level": "basic",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 215
+    },
+    {
+      "ref_id": "RC.RP-02.1",
+      "category": "RC.RP",
+      "subcategory": "RC.RP-02",
+      "entry_level": "essential",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 216
+    },
+    {
+      "ref_id": "RC.RP-05.1",
+      "category": "RC.RP",
+      "subcategory": "RC.RP-05",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 217
+    },
+    {
+      "ref_id": "RC.RP-06.1",
+      "category": "RC.RP",
+      "subcategory": "RC.RP-06",
+      "entry_level": "important",
+      "key_measure": false,
+      "management_aspect": false,
+      "order": 218
+    }
+  ]
+}
