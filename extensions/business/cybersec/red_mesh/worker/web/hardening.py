@@ -540,11 +540,14 @@ class _WebHardeningMixin:
   @staticmethod
   def _csrf_identity_action(action, path):
     """The action as an identity input: entities decoded, then the query,
-    fragment and `;param` path parameters dropped, since a cache-buster or a
-    session id there would hand the finding a new id on every run. The raw
-    action stays in `evidence`."""
+    fragment and each segment's `;param` path parameters dropped, since a
+    cache-buster or a session id there would hand the finding a new id on
+    every run. The segments after a `;param` stay: `/a;jsessionid=X/delete`
+    and `/a;jsessionid=X/update` are two endpoints. The raw action stays in
+    `evidence`."""
     decoded = _html_unescape(action)
-    stable = _re.split(r"[?#;]", decoded, maxsplit=1)[0].strip()
+    stable = _re.split(r"[?#]", decoded, maxsplit=1)[0]
+    stable = _re.sub(r";[^/]*", "", stable).strip()
     return stable or path
 
 
