@@ -128,6 +128,28 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertTrue(done["success"], done)
     return done["data"]["outcomes"]
 
+  # -- RM-120: framework assessment rows in their own hkey ---------------------------------------
+
+  def assessment_row(self, tenant_id):
+    return {"schemaVersion": 1, "namespace": "deployment", "kind": "framework_assessment", "ids": [tenant_id, "ro.dnsc.o1-2026"],
+            "tenant_id": tenant_id, "pack_id": "ro.dnsc.o1-2026", "pack_acts": [], "assurance_level": None,
+            "level_provenance": None, "sectoral_requirements": "", "completion_date": "", "management_signoff": None,
+            "remediation": [], "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
+            "scores": {}, "submissions": [], "created_by": "initial", "created_at": "t", "updated_by": "initial", "updated_at": "t"}
+
+  def test_assessment_rows_are_registered_and_classified_by_their_tenant(self):
+    field = lambda tenant_id: json.dumps(["framework_assessment", "deployment", tenant_id, "ro.dnsc.o1-2026"], separators=(",", ":"))
+    self.put(COMPLIANCE, field(self.tenant), self.assessment_row(self.tenant))
+    self.put(COMPLIANCE, field("tn_gone"), self.assessment_row("tn_gone"))
+    self.put(COMPLIANCE, field("tn_bad"), {**self.assessment_row("tn_bad"), "state": "lost"})
+    rows = self.scan()
+    self.assertEqual(rows[(COMPLIANCE, field(self.tenant))]["class"], "current")
+    self.assertEqual((rows[(COMPLIANCE, field("tn_gone"))]["class"], rows[(COMPLIANCE, field("tn_gone"))]["reason"]), ("orphan", "tenant_gone"))
+    self.assertEqual((rows[(COMPLIANCE, field("tn_bad"))]["class"], rows[(COMPLIANCE, field("tn_bad"))]["reason"]), ("old", "unrecognized"))
+    # The tenancy rows stay what they were: the compliance hkey is read on its own.
+    tenancy = [row for (hkey, _), row in rows.items() if hkey == TENANCY]
+    self.assertEqual({row["class"] for row in tenancy}, {"current"})
+
   # -- authorization ----------------------------------------------------------------------------
 
   def test_only_a_full_portfolio_super_tenant_admin_calls_any_of_the_five(self):

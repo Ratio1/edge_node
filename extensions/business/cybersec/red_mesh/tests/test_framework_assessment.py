@@ -194,6 +194,47 @@ class TestFrameworkAssessment(unittest.TestCase):
     removed = self.ok(self.save({"scores": {"GV.OC-03.1": None}}, 3))
     self.assertEqual(removed["scores"], {})
 
+  def test_level_provenance_is_stamped_with_the_actor_and_a_level_change_prunes_off_level_scores(self):
+    data = self.ok(self.save({"assurance_level": "important", "level_provenance": {"kind": "declared", "declared_by": "someone else"},
+                              "scores": {"GV.OC-01.1": {"documentation": 3, "implementation": 3}}}, 1))
+    self.assertEqual(data["levelProvenance"], {"kind": "declared", "declared_by": "initial"})
+    self.assertIn("GV.OC-01.1", data["scores"])  # an Important control
+    data = self.ok(self.save({"assurance_level": "basic"}, data["assessmentRevision"]))
+    self.assertNotIn("GV.OC-01.1", data["scores"])  # rule 1: it does not count at Basic, so it is pruned
+    self.assertEqual(data["packActs"], self.pack["acts"])
+
+  def test_pack_amendment_refuses_submit_until_the_draft_is_saved_again(self):
+    revision = self.complete_basic_draft()
+    row = self.stored_row()
+    self.write_row({**row, "pack_acts": ["MO 712 bis/2026-08-27"]})  # a draft from before Order 2/2026
+    stale = self.submit(revision, str(uuid4()))
+    self.refused(stale, 409, "assessment_pack_stale")
+    self.assertEqual(stale["current_pack_acts"], self.pack["acts"])
+    self.assertTrue(self.ok(self.get())["stale"]["newerPackActs"])
+    saved = self.ok(self.save({"sectoral_requirements": "-"}, revision))  # any save adopts the current acts
+    self.assertFalse(saved["stale"]["newerPackActs"])
+    self.ok(self.submit(saved["assessmentRevision"], str(uuid4())))
+
+  def test_replay_after_reopen_or_by_another_actor_is_a_conflict(self):
+    revision = self.complete_basic_draft()
+    request = str(uuid4())
+    self.ok(self.submit(revision, request))
+    self.refused(self.submit(revision, request, self.creator), 409, "conflict")  # same id, another actor
+    current = self.ok(self.get())["assessmentRevision"]
+    self.ok(self.reopen(current, str(uuid4())))
+    self.refused(self.submit(revision, request), 409, "conflict")  # the match is no longer submitted
+
+  def test_submit_reopen_and_clear_pending_are_refused_for_viewers_and_pentesters_and_audited(self):
+    revision = self.complete_basic_draft()
+    self.events.clear()
+    self.refused(self.submit(revision, str(uuid4()), self.viewer), 403, "forbidden")
+    self.refused(self.submit(revision, str(uuid4()), self.pentester), 403, "forbidden")
+    self.refused(self.submit(None, None, self.viewer, action="clear_pending"), 403, "forbidden")
+    self.refused(self.reopen(revision, str(uuid4()), self.viewer), 403, "forbidden")
+    self.assertEqual([(e, d["operation"]) for e, d in self.events],
+                     [("framework_assessment_refused", "submit"), ("framework_assessment_refused", "submit"),
+                      ("framework_assessment_refused", "clear_pending"), ("framework_assessment_refused", "reopen")])
+
   def test_exclusion_rules_are_enforced_at_submit_not_at_save(self):
     scores = self.basic_scores()
     scores["PR.AA-01.1"] = {"documentation": "N/A", "implementation": "N/A", "excluded": True,
@@ -266,6 +307,7 @@ class TestFrameworkAssessment(unittest.TestCase):
     request = str(uuid4())
     self.documents.fail = True
     self.refused(self.submit(revision, request), 503, "unavailable")
+    self.assertEqual((self.events[-1][0], self.events[-1][1]["step"]), ("framework_assessment_refused", "put"))
     row = self.stored_row()
     self.assertEqual((row["state"], row["pending"]["request_id"], row["pending"]["revision"]), ("draft", request, 1))
     self.assertEqual(row["assessment_revision"], revision + 1)

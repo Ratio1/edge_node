@@ -80,11 +80,13 @@ class CstoreComplianceStore:
     if written is not True:
       raise TenantStoreError("Compliance storage write could not be verified")
     try:
-      observed = json.dumps(self.get(kind, *ids), sort_keys=True, allow_nan=False)
+      stored = self.get(kind, *ids)
+      observed = json.dumps(stored, sort_keys=True, allow_nan=False)
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Compliance storage write could not be verified") from exc
     if observed != expected:
       raise TenantStoreError("Compliance storage write could not be verified")
+    return stored
 
   def delete(self, kind, *ids):
     hkey, key = self._location(kind, ids)

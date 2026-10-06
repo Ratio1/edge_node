@@ -126,7 +126,8 @@ def normalize_level(value):
   return value
 
 
-def normalize_level_provenance(value):
+def normalize_level_provenance(value, *, actor):
+  """`declared_by` is the acting account (trusted boundary), never a client-supplied string."""
   if value is None:
     return None
   if not isinstance(value, dict) or value.get("kind") not in LEVEL_PROVENANCE_KINDS:
@@ -137,7 +138,7 @@ def normalize_level_provenance(value):
     if type(score_value) is not int or not 0 <= score_value <= 100000:
       raise AssessmentInvalid("invalid_request")
     out["score"] = score_value
-  out["declared_by"] = _text(value.get("declared_by"), TEXT_MAX)
+  out["declared_by"] = actor
   return out
 
 
@@ -216,7 +217,9 @@ def normalize_score_entry(entry, *, actor, now):
   }
 
 
-_SHAPE_ERRORS = frozenset({"unknown_level", "unknown_control", "control_not_in_level", "invalid_score_value",
+# `control_not_in_level` is not a shape error: rule 1 says such a score does not count, and a level
+# change prunes the stored entries that fell outside the level (apply_patch).
+_SHAPE_ERRORS = frozenset({"unknown_level", "unknown_control", "invalid_score_value",
                            "na_without_exclusion", "excluded_not_na"})
 
 
@@ -233,7 +236,7 @@ def apply_patch(row, patch, pack, *, actor, now):
   if "assurance_level" in patch:
     out["assurance_level"] = normalize_level(patch["assurance_level"])
   if "level_provenance" in patch:
-    out["level_provenance"] = normalize_level_provenance(patch["level_provenance"])
+    out["level_provenance"] = normalize_level_provenance(patch["level_provenance"], actor=actor)
   if "sectoral_requirements" in patch:
     out["sectoral_requirements"] = _text(patch["sectoral_requirements"], CAPS["sectoral_requirements"])
   if "completion_date" in patch:
@@ -264,10 +267,14 @@ def apply_patch(row, patch, pack, *, actor, now):
     out["scores"] = scores
   level = out.get("assurance_level")
   if level is not None:
-    shape = [e for e in validate_scores(pack, level, out.get("scores") or {}) if e["code"] in _SHAPE_ERRORS]
+    counted = {c["ref_id"] for c in controls_for_level(pack, level)}
+    out["scores"] = {k: v for k, v in (out.get("scores") or {}).items() if k in counted}
+    shape = [e for e in validate_scores(pack, level, out["scores"]) if e["code"] in _SHAPE_ERRORS]
     if shape:
       first = shape[0]
       raise AssessmentInvalid(first["code"], first.get("ids"))
+  # A draft follows the current acts of the pack; a submission records the acts it was scored under.
+  out["pack_acts"] = list(pack["acts"])
   return out
 
 
@@ -313,7 +320,8 @@ def validate_framework_assessment(row, ids):
     if (not isinstance(sub, dict) or type(sub.get("revision")) is not int or sub["revision"] < 1
         or not _valid_ref(sub.get("ref")) or not isinstance(sub.get("request_id"), str)
         or not isinstance(sub.get("fingerprint"), str) or not isinstance(sub.get("verdict"), dict)
-        or not isinstance(sub.get("actor"), str)):
+        or not isinstance(sub.get("actor"), str) or not isinstance(sub.get("submitted_at"), str)
+        or not isinstance(sub.get("pack_acts"), list) or sub.get("assurance_level") not in FRAMEWORK_LEVELS):
       raise ValueError("Invalid framework assessment submission")
     revisions.append(sub["revision"])
   if revisions != list(range(1, len(revisions) + 1)):
@@ -322,6 +330,7 @@ def validate_framework_assessment(row, ids):
   if pending is not None and (not isinstance(pending.get("request_id"), str)
                               or not isinstance(pending.get("actor"), str)
                               or not isinstance(pending.get("intent_digest"), str)
+                              or not isinstance(pending.get("submitted_at"), str)
                               or type(pending.get("revision")) is not int
                               or type(pending.get("started_at")) is not int):
     raise ValueError("Invalid framework assessment pending marker")
@@ -460,8 +469,8 @@ def _row(service, tenant_id, pack_id):
 
 
 def _put(service, row):
-  _store(service).put(KIND, row["tenant_id"], row["pack_id"], record=row)
-  return _store(service).get(KIND, row["tenant_id"], row["pack_id"])
+  # The adapter verifies the write by reading it back and returns that row: no third read.
+  return _store(service).put(KIND, row["tenant_id"], row["pack_id"], record=row)
 
 
 def _stamp(row, actor):
@@ -558,27 +567,25 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
           "envelope": build_snapshot(stored, tenant, computed, pending)}
 
 
-def _tenant_deleting(service, actor, tenant_id):
-  """True when the tenant carries the delete marker: `begin_tenant_delete` sets it before the
-  documents go and the compliance row is untouched until `finish_tenant_delete`."""
-  from .identity import resolve_actor
+def _authorized_unless_deleting(service, actor, tenant_id):
+  """The manage authorization of the record step, with one twist: a tenant carrying the delete
+  marker (`begin_tenant_delete` sets it before the documents go; the compliance row is untouched
+  until `finish_tenant_delete`) answers 409 `assessment_submit_superseded`, where the ordinary
+  authorization would answer 404 for an inactive tenant."""
   from .policy import resolve_tenant_roles
-  account, denial = resolve_actor(actor, service.accounts)
-  if denial:
-    return False
-  _, role_denial = resolve_tenant_roles(account, tenant_id)
-  if role_denial:
-    return False
-  tenant = service.store.get("tenant", tenant_id)
-  return isinstance(tenant, dict) and isinstance(tenant.get("deleting"), dict)
+  account = service._actor(actor)
+  _, denial = resolve_tenant_roles(account, tenant_id)
+  if not denial:
+    tenant = service.store.get("tenant", tenant_id)
+    if isinstance(tenant, dict) and isinstance(tenant.get("deleting"), dict):
+      raise _denied(409, "assessment_submit_superseded")
+  return service.authorize_tenant_for_account(account, tenant_id, MANAGE)
 
 
 def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision):
   """Step 3 of a submit: bind the written snapshot to revision N, or 409 `assessment_submit_superseded`."""
   from .administration import _request_id
-  if _tenant_deleting(service, actor, tenant_id):
-    raise _denied(409, "assessment_submit_superseded")
-  _, account = service._authorized_tenant(actor, tenant_id, MANAGE)
+  _, account = _authorized_unless_deleting(service, actor, tenant_id)
   pack = pack_for(pack_id)
   request_id = _request_id(request_id)
   if not _valid_ref(ref):
