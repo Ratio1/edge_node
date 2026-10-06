@@ -22,8 +22,10 @@ from datetime import datetime, timezone
 from ..references.framework_packs import (
   FRAMEWORK_LEVELS,
   FrameworkPackError,
+  controls_for_level,
   list_framework_pack_ids,
   load_framework_pack,
+  load_framework_text,
 )
 from ..services.framework_scoring import AXES, CAPS, NA, SCORE_VALUES, score, validate_for_submit, validate_scores
 from .ports import TenantStoreError
@@ -398,12 +400,34 @@ def _pending_view(pending):
           "ageSeconds": max(0, _epoch() - pending["started_at"]), "revision": pending["revision"]}
 
 
-def assessment_view(row, pack, *, can_manage):
-  """The DTO. Never a document reference."""
+def pack_view(pack, text, level):
+  """The controls the form renders (the chosen level, or the whole catalogue before one is chosen)
+  with the official text, plus the titles and the five maturity definitions. Only `get` carries it:
+  a save or reopen answer leaves it out, the client keeps the copy it loaded."""
+  controls = controls_for_level(pack, level) if level else pack["controls"]
+  return {
+    "controls": [{
+      "refId": c["ref_id"], "order": c["order"], "category": c["category"], "subcategory": c["subcategory"],
+      "entryLevel": c["entry_level"], "keyMeasure": c["key_measure"], "managementAspect": c["management_aspect"],
+      "requirement": text["controls"][c["ref_id"]]["requirement"],
+      "guidance": text["controls"][c["ref_id"]]["guidance"],
+    } for c in controls],
+    "functions": dict(text["functions"]),
+    "categories": {k: dict(v) for k, v in text["categories"].items()},
+    "subcategories": {k: dict(v) for k, v in text["subcategories"].items()},
+    "maturityLevels": [dict(m) for m in text["maturity_levels"]],
+    "language": text["language"],
+    "catalogue": pack["catalogue"],
+  }
+
+
+def assessment_view(row, pack, *, can_manage, text=None):
+  """The DTO. Never a document reference. With `text`, the pack view rides along (reads only)."""
   level = row.get("assurance_level")
   computed = score(pack, level, row.get("scores") or {}) if level else None
   submit_errors = validate_for_submit(pack, level, row)[0] if level else [{"code": "level_missing"}]
   return {
+    "pack": pack_view(pack, text, level) if text is not None else None,
     "tenantId": row["tenant_id"], "packId": row["pack_id"], "packActs": list(row["pack_acts"]),
     "currentPackActs": list(pack["acts"]), "stale": {"newerPackActs": list(row["pack_acts"]) != list(pack["acts"])},
     "assuranceLevel": level, "levelProvenance": row.get("level_provenance"),
@@ -452,8 +476,12 @@ def _expected_revision(row, expected):
 def get_assessment(service, actor, tenant_id, pack_id):
   tenant, account = service._authorized_tenant(actor, tenant_id, VIEW)
   pack = pack_for(pack_id)
+  try:
+    text = load_framework_text(pack_id)
+  except FrameworkPackError as exc:
+    raise TenantStoreError("Framework pack text unavailable") from exc
   row = _row(service, tenant_id, pack_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
-  return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE))
+  return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE), text=text)
 
 
 def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_revision):

@@ -135,6 +135,12 @@ class TestFrameworkAssessment(unittest.TestCase):
     self.assertEqual(data["packId"], PACK)
     self.assertEqual(data["submitErrors"], [{"code": "level_missing"}])
     self.assertTrue(data["canManage"])
+    # The pack rides along on a read: the whole catalogue before a level is chosen, with the text.
+    self.assertEqual(len(data["pack"]["controls"]), 218)
+    self.assertEqual(data["pack"]["controls"][0]["refId"], "GV.OC-01.1")
+    self.assertTrue(data["pack"]["controls"][0]["requirement"].startswith("Misiunea organizației"))
+    self.assertEqual([m["name"] for m in data["pack"]["maturityLevels"]][:2], ["Inițial", "Repetabil"])
+    self.assertEqual(data["pack"]["categories"]["GV.OC"]["title"], "CONTEXT ORGANIZAȚIONAL")
     self.assertFalse(self.ok(self.get(self.viewer))["canManage"])
     self.assertEqual(len(self.storage.writes), writes)
     self.assertEqual(self.compliance_rows(), {})
@@ -160,6 +166,8 @@ class TestFrameworkAssessment(unittest.TestCase):
   def test_save_validates_bumps_the_revision_and_is_audited(self):
     data = self.ok(self.save({"assurance_level": "basic", "scores": {"GV.OC-03.1": {"documentation": 3, "implementation": 2}}}, 1))
     self.assertEqual(data["assessmentRevision"], 2)
+    self.assertIsNone(data["pack"])  # a save answers without the pack; the client keeps its copy
+    self.assertEqual(len(self.ok(self.get())["pack"]["controls"]), 34)
     self.assertEqual(data["scores"]["GV.OC-03.1"]["documentation"], 3)
     self.assertEqual(data["scores"]["GV.OC-03.1"]["updated_by"], "initial")
     self.assertIn("unscored", [e["code"] for e in data["submitErrors"]])
