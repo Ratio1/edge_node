@@ -142,6 +142,31 @@ except Exception:  # pragma: no cover - exercised through dependency-missing tes
 NEO4J_AUTH_ERROR_TYPES = (Neo4jAuthError, Neo4jForbidden, Neo4jTokenExpired)
 
 try:
+  # I-076: driver connectivity failures, the only exceptions `explain_graph`
+  # still labels `neo4j_connection_error`.
+  from neo4j.exceptions import (
+    DatabaseUnavailable as Neo4jDatabaseUnavailable,
+    ServiceUnavailable as Neo4jServiceUnavailable,
+    SessionExpired as Neo4jSessionExpired,
+  )
+except Exception:  # pragma: no cover - exercised through dependency-missing tests.
+  class Neo4jServiceUnavailable(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jSessionExpired(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jDatabaseUnavailable(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+# DatabaseUnavailable: the database is starting/stopping (transient). OSError
+# covers ConnectionError, TimeoutError and socket/DNS failures; note it also
+# labels any other escaped I/O error as connectivity.
+NEO4J_CONNECTIVITY_ERROR_TYPES = (
+  Neo4jServiceUnavailable, Neo4jSessionExpired, Neo4jDatabaseUnavailable, OSError,
+)
+
+try:
   import websocket
 except Exception:  # pragma: no cover - exercised through dependency-missing tests.
   websocket = None
@@ -3576,6 +3601,23 @@ class EdgeguardApiPlugin(BasePlugin):
     if secret:
       message = message.replace(secret, "<redacted>")
     return message
+
+  def _explain_graph_error(
+    self, exc: Exception, error_code: str, status_code: int,
+    connection: Dict[str, Any], analysis: Dict[str, Any], started: float,
+  ) -> Dict[str, Any]:
+    """Wrapper-safe `/explain_graph` error body shared by the outer chain."""
+    elapsed = round((time.monotonic() - started) * 1000, 1)
+    return _wrapper_safe_error({
+      "status": STATUS_ERROR,
+      "ok": False,
+      "executed": False,
+      "explained": False,
+      "error": self._sanitize_error(exc, connection["password"]),
+      "error_code": error_code,
+      "validation": analysis,
+      "metrics": {"edgeguard_api_ms": elapsed, "server_total_ms": elapsed},
+    }, status_code)
 
   def _extract_explanation_completion(self, response: Any) -> Dict[str, Any]:
     def parse_envelope(value: Any, path: str) -> Optional[Dict[str, Any]]:
@@ -7020,59 +7062,29 @@ class EdgeguardApiPlugin(BasePlugin):
         )
       return success
     except NEO4J_AUTH_ERROR_TYPES as exc:
-      # Fix round 4 (re-review-3 findings 3 and 6): same auth/credential
-      # family as `/neo4j_query` — a server-side misconfiguration, not the
+      # Fix round 4 (re-review-3 findings 1 and 6): auth/credential family,
+      # same as `/neo4j_query` — a server-side misconfiguration, not the
       # caller's fault, so this listens ahead of the generic
       # `Neo4jClientError` clause and answers 503, not 422.
-      return _wrapper_safe_error({
-        "status": STATUS_ERROR,
-        "ok": False,
-        "executed": False,
-        "explained": False,
-        "error": self._sanitize_error(exc, connection["password"]),
-        "error_code": "neo4j_auth_error",
-        "validation": analysis,
-        "metrics": {
-          "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
-          "server_total_ms": round((time.monotonic() - started) * 1000, 1),
-        },
-      }, 503)
+      return self._explain_graph_error(exc, "neo4j_auth_error", 503, connection, analysis, started)
     except Neo4jClientError as exc:
-      # Fix round 3, L2a: same distinct error code as `/neo4j_query` — a
-      # query the guard accepted can still be rejected by Neo4j itself
-      # (syntax, type or constraint error), the caller's fault, not a
-      # connection/timeout failure.
-      # Fix round 4 (re-review-3 finding 3): wrapper-safe transport at 422 —
-      # see the identical branch in `/neo4j_query` for the wrapper rule.
-      return _wrapper_safe_error({
-        "status": STATUS_ERROR,
-        "ok": False,
-        "executed": False,
-        "explained": False,
-        "error": self._sanitize_error(exc, connection["password"]),
-        "error_code": "neo4j_client_error",
-        "validation": analysis,
-        "metrics": {
-          "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
-          "server_total_ms": round((time.monotonic() - started) * 1000, 1),
-        },
-      }, 422)
+      # Fix round 3, L2a / round 4: a query the guard accepted can still be
+      # rejected by Neo4j itself (syntax, type or constraint error) — the
+      # caller's fault, 422 like `/neo4j_query`.
+      return self._explain_graph_error(exc, "neo4j_client_error", 422, connection, analysis, started)
+    except GraphFirstRuntimeError as exc:
+      # I-076: a graph-first failure that escaped the inner handler (e.g. the
+      # EGX/2 truncated path, `explanation_response_size`) is a server-side
+      # explanation failure, not a Neo4j connectivity problem.
+      return self._explain_graph_error(
+        exc, str(getattr(exc, "code", None) or "explain_internal_error"), 500, connection, analysis, started,
+      )
+    except NEO4J_CONNECTIVITY_ERROR_TYPES as exc:
+      # Driver connectivity failure (unreachable host, DNS, expired session,
+      # database starting, timeout): service unavailable, not the query.
+      return self._explain_graph_error(exc, "neo4j_connection_error", 503, connection, analysis, started)
     except Exception as exc:
-      # Fix round 4: connection/timeout/driver failure below Neo4j's own
-      # statement validation — connectivity/service-unavailable, not the
-      # caller's query content, so 503 via the wrapper-safe transport.
-      return _wrapper_safe_error({
-        "status": STATUS_ERROR,
-        "ok": False,
-        "executed": False,
-        "explained": False,
-        "error": self._sanitize_error(exc, connection["password"]),
-        "error_code": "neo4j_connection_error",
-        "validation": analysis,
-        "metrics": {
-          "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
-          "server_total_ms": round((time.monotonic() - started) * 1000, 1),
-        },
-      }, 503)
+      # I-076: anything else is an unexpected server-side failure.
+      return self._explain_graph_error(exc, "explain_internal_error", 500, connection, analysis, started)
     finally:
       self._close_neo4j_driver(driver)

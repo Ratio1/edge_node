@@ -374,6 +374,9 @@ _MATCH_CLAUSE_BOUNDARY = re.compile(
 # bare-pattern search below runs.
 _WHERE_CLAUSE_START = re.compile(r"\bWHERE\b", re.I)
 _SUBQUERY_PREDICATE_OPEN = re.compile(r"\b(?:EXISTS|COUNT)\s*\{", re.I)
+# The multi-statement check (I-079) also masks `COLLECT { ... }` bodies; the
+# WHERE pattern-predicate checks keep `_SUBQUERY_PREDICATE_OPEN` unchanged.
+_SUBQUERY_BODY_OPEN = re.compile(r"\b(?:EXISTS|COUNT|COLLECT)\s*\{", re.I)
 _NODE_VAR_HEAD = re.compile(r"\(\s*([A-Za-z_][A-Za-z0-9_]*)")
 _REL_VAR_HEAD = re.compile(r"\[\s*([A-Za-z_][A-Za-z0-9_]*)")
 # Fix round 4 (re-review-3 findings 1 and 5): a `WITH ... AS name` or bare
@@ -1003,13 +1006,13 @@ def _where_clause_texts(stripped: str) -> list[str]:
   return texts
 
 
-def _mask_subquery_predicate_blocks(text: str) -> str:
+def _mask_subquery_predicate_blocks(text: str, open_pattern: re.Pattern = _SUBQUERY_PREDICATE_OPEN) -> str:
   """Blank out every `EXISTS { ... }` / `COUNT { ... }` span (balanced
   braces), so the bare-pattern-predicate search below never looks inside a
   Cypher subquery expression — it legitimately binds its own new variables
   via its own `MATCH` (fix round 3, L2b)."""
   chars = list(text)
-  for open_match in _SUBQUERY_PREDICATE_OPEN.finditer(text):
+  for open_match in open_pattern.finditer(text):
     depth = 0
     brace_start = open_match.end() - 1
     for pos in range(brace_start, len(text)):
@@ -1252,6 +1255,20 @@ _BRACKET_TYPE_RE = re.compile(r":\s*(" + IDENT + r"(?:\s*\|\s*" + IDENT + r")*)"
 _NODE_HEAD = re.compile(
   r"^\(\s*(" + IDENT + r")?\s*(:\s*" + IDENT + r"(?:\s*[:|&]\s*" + IDENT + r")*)?"
 )
+# A candidate that glues two or more Cypher statements together (I-079):
+# own code so the schema-correction retry and callers can tell it apart.
+MULTI_STATEMENT_CODE = "multi_statement_cypher"
+MULTI_STATEMENT_MESSAGE = (
+  "return exactly one Cypher statement; join the parts with `WITH`, "
+  "`OPTIONAL MATCH` or a comma pattern, one final `RETURN`"
+)
+# Aliases (`AS match`, also what a backticked alias becomes in the analysis
+# text) and map keys (`match:`) are not clause keywords; blanked before the
+# keyword scan. The other write/CALL clauses are rejected by the read-only
+# checks long before this rule runs.
+_ALIAS_OR_MAP_KEY = re.compile(r"\bAS\s+\w+|\b\w+\s*:", re.I)
+_STARTS_ENDS_WITH = re.compile(r"\b(?:STARTS|ENDS)\s+WITH\b", re.I)
+_CLAUSE_AFTER_RETURN = re.compile(r"(?<![.\w])(?:MATCH|OPTIONAL|WITH|UNWIND)\b", re.I)
 
 
 def _iter_top_level_parens(text: str) -> Any:
@@ -1691,6 +1708,24 @@ def _execution_safety_error(
   return None
 
 
+def _multi_statement_error(stripped: str) -> str | None:
+  """I-079: per `UNION` branch of the analysis text (strings masked,
+  `EXISTS{}`/`COUNT{}` blocks masked), more than one `RETURN`, or a clause
+  keyword after the branch's final `RETURN ... [ORDER BY] [SKIP] [LIMIT]`,
+  means several statements were glued into one candidate (Neo4j then fails
+  with `RETURN can only be used at the end of the query`)."""
+  masked = _mask_subquery_predicate_blocks(stripped, _SUBQUERY_BODY_OPEN)
+  for branch in UNION_SPLIT.split(masked):
+    branch = _ALIAS_OR_MAP_KEY.sub(" ", _STARTS_ENDS_WITH.sub(" ", branch))
+    # RETURN_CLAUSE also matches a property named `return` (no schema property has that name).
+    returns = list(RETURN_CLAUSE.finditer(branch))
+    if len(returns) > 1:
+      return MULTI_STATEMENT_MESSAGE
+    if returns and _CLAUSE_AFTER_RETURN.search(branch, returns[-1].end()):
+      return MULTI_STATEMENT_MESSAGE
+  return None
+
+
 def analyze_generated_cypher(
   output: str,
   allowed: dict[str, set[str]] | None = None,
@@ -1759,7 +1794,13 @@ def analyze_generated_cypher(
     )
     if execution_safety_error is not None:
       execution_safety_error_code = EXECUTION_SAFETY_ERROR_CODE
-    elif enforce_pattern_endpoints and schema_compatible:
+    else:
+      # Runs after every other execution-safety rule so their first-violation
+      # messages are unchanged; own code through this code-returning path.
+      execution_safety_error = _multi_statement_error(_analysis_text(candidate))
+      if execution_safety_error is not None:
+        execution_safety_error_code = MULTI_STATEMENT_CODE
+    if execution_safety_error is None and enforce_pattern_endpoints and schema_compatible:
       # Contract §2.2/§3.2/§5.2, v0.11 profile only: only once the flat
       # schema and every other execution-safety rule already pass — a
       # completely unknown label or relationship type is the flat-schema
