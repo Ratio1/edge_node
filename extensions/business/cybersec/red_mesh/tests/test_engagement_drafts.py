@@ -13,7 +13,7 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
 from extensions.business.cybersec.red_mesh.tenancy.engagements import ROE_DEFAULTS
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from .contract_fixture import envelope
-from .test_tenant_drafts import PNG, SCHEDULE_PDF, TENANCY_HKEY, _ActivationCase, ok, refused
+from .test_tenant_drafts import GENERATED_AT, PNG, SCHEDULE_PDF, SNAPSHOT, TENANCY_HKEY, _ActivationCase, ok, refused
 
 PACK_PDF = b"%PDF-1.7\n%fixture signed engagement pack\n%%EOF\n"
 GENERATED_PDF = b"%PDF-1.7\n%fixture generated engagement pack\n%%EOF\n"
@@ -26,7 +26,7 @@ COMPLETE = {"display_name": " Q4 external ", "allowed_run_modes": ["single_pass"
             "roe": {"authenticated_action": True}, "context": {"client_name": "Example"}, "assets": [NETWORK]}
 LIST_KEYS = {"engagement_draft_id", "parent", "display_name", "assets_count", "document_state", "created_at",
              "updated_at"}
-SNAPSHOT_SHA256 = "c" * 64
+SNAPSHOT_SHA256 = hashlib.sha256(SNAPSHOT.encode("utf-8")).hexdigest()
 
 
 class _EngagementDraftCase(_ActivationCase):
@@ -53,8 +53,14 @@ class _EngagementDraftCase(_ActivationCase):
     ok(self, self.activate(draft_id, request_id))
     return draft_id, self.finish(draft_id, request_id)
 
+  def generate_pack(self, engagement_draft_id, raw=GENERATED_PDF, actor=None, snapshot=SNAPSHOT):
+    """RM-110 `store_generated_document` on the pack slot; answers the `generated` block."""
+    draft = ok(self, self.generate(None, raw=raw, snapshot=snapshot, actor=actor, document_kind="engagement_pack",
+                                   engagement_draft_id=engagement_draft_id))
+    return draft["document"]["generated"]
+
   def write_generated(self, engagement_draft_id, raw=GENERATED_PDF, uploaded_by="creator", ref="doc-generated"):
-    """Nothing generates yet (RM-110): the generated pack's envelope and block are written directly."""
+    """A generated block written directly, for an uploader the endpoint could not have recorded."""
     self.documents.envelopes[ref] = envelope(uploaded_by, raw, schema_version="1.1", document_kind="engagement_pack",
                                              engagement_draft_id=engagement_draft_id, role="generated",
                                              filename="generated.pdf", snapshot={"x": 1})
@@ -216,7 +222,8 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
               lambda: self.plugin.delete_engagement_draft(self.actor, engagement_draft_id),
               lambda: self.upload_pack(engagement_draft_id),
               lambda: self.plugin.download_engagement_draft_document(self.actor, engagement_draft_id),
-              lambda: self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+              lambda: self.plugin.activate_engagement_draft(self.actor, engagement_draft_id),
+              lambda: self.generate(None, engagement_draft_id=engagement_draft_id, document_kind="engagement_pack"))
     for engagement_draft_id in ("", "td_" + str(uuid4()), "tn_" + str(uuid4()), "ted_not-a-uuid",
                                 "ted_" + str(uuid4()).upper(), None, 7):
       for call in calls(engagement_draft_id):
@@ -244,6 +251,9 @@ class TestEngagementDraftRoles(_EngagementDraftCase):
         actor, engagement_draft_id, "s.pdf", base64.b64encode(SCHEDULE_PDF).decode("ascii")),
       "download": lambda actor: self.plugin.download_engagement_draft_document(actor, engagement_draft_id),
       "activate": lambda actor: self.plugin.activate_engagement_draft(actor, engagement_draft_id),
+      "generate": lambda actor: self.plugin.store_generated_document(
+        actor, engagement_draft_id=engagement_draft_id, document_kind="engagement_pack", filename="g.pdf",
+        content_b64=base64.b64encode(GENERATED_PDF).decode("ascii"), snapshot=SNAPSHOT, generated_at=GENERATED_AT),
     }
     data, puts, deleted = copy.deepcopy(self.store.data), len(self.documents.puts), list(self.documents.deleted)
     actors = {"tenant account": {"account_id": "initial"}, "super pentester": {"account_id": "pentester"},
@@ -288,6 +298,7 @@ class TestEngagementDraftLock(_EngagementDraftCase):
       "state": lambda: self.update_child(engagement_draft_id, {"document": {"state": "missing"}}),
       "upload": lambda: self.upload_pack(engagement_draft_id, SCHEDULE_PDF),
       "delete": lambda: self.plugin.delete_engagement_draft(self.actor, engagement_draft_id),
+      "generate": lambda: self.generate(None, engagement_draft_id=engagement_draft_id, document_kind="engagement_pack"),
     }.items():
       with self.subTest(label):
         refused(self, call(), 409, "draft_locked")
@@ -347,32 +358,73 @@ class TestEngagementDraftDocuments(_EngagementDraftCase):
     refused(self, self.upload_pack(engagement_draft_id), 503, "unavailable")
     self.assertEqual(self.stored_child(engagement_draft_id)["document"]["state"], "missing")
 
+  def test_generation_stores_the_pack_with_its_snapshot_in_the_pack_envelope(self):
+    parent = self.create()["draft_id"]
+    engagement_draft_id = self.child(parent)["engagement_draft_id"]
+    draft = ok(self, self.generate(None, raw=GENERATED_PDF, engagement_draft_id=engagement_draft_id,
+                                   document_kind="engagement_pack", actor={"account_id": "other-sta"}))
+    slot = draft["document"]
+    self.assertEqual((slot["state"], slot["document"]), ("generated", None))
+    generated = slot["generated"]
+    self.assertEqual((generated["sha256"], generated["snapshot_sha256"], generated["uploaded_by"], generated["generated_by"],
+                      generated["generated_at"]),
+                     (hashlib.sha256(GENERATED_PDF).hexdigest(), SNAPSHOT_SHA256, "other-sta", "other-sta", GENERATED_AT))
+    stored, = self.documents.puts
+    self.assertEqual((stored["kind"], stored["schema_version"], stored["document_kind"], stored["engagement_draft_id"],
+                      stored["role"], stored["snapshot"]),
+                     ("redmesh_tenant_contract", "1.1", "engagement_pack", engagement_draft_id, "generated", SNAPSHOT))
+    self.assertNotIn("draft_id", stored)
+    self.assertNotIn("tenant_id", stored)
+    self.assertEqual(self.stored_child(engagement_draft_id)["document"]["generated"], generated)
+    # Not signed: the list says so, completeness still waits, the signed download is empty.
+    self.assertEqual(ok(self, self.plugin.list_engagement_drafts(self.actor, parent))[0]["document_state"], "generated")
+    self.assertIn("item:engagement_pack", draft["completeness"]["missing"])
+    refused(self, self.plugin.download_engagement_draft_document(self.actor, engagement_draft_id), 404, "not_found")
+    for raw in (PNG, b""):
+      with self.subTest(raw=raw):
+        refused(self, self.generate(None, raw=raw, engagement_draft_id=engagement_draft_id,
+                                    document_kind="engagement_pack"), 400, "document_invalid")
+
   def test_the_generated_bytes_are_not_a_signed_copy(self):
     engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
-    self.write_generated(engagement_draft_id)
+    generated = self.generate_pack(engagement_draft_id)
     writes = len(self.store.writes)
     refused(self, self.upload_pack(engagement_draft_id, GENERATED_PDF), 409, "same_as_generated")
     self.assertEqual(len(self.store.writes), writes)
     # The refused upload's file is discarded; the draft is unchanged.
-    self.assertEqual(self.documents.deleted, ["doc-1"])
-    self.assertEqual(self.stored_child(engagement_draft_id)["document"]["state"], "missing")
-    self.assertTrue(ok(self, self.upload_pack(engagement_draft_id))["document"]["generated"])
+    self.assertEqual(self.documents.deleted, ["doc-2"])
+    self.assertEqual(self.stored_child(engagement_draft_id)["document"],
+                     {"state": "generated", "document": None, "generated": generated})
+    # Other bytes are a signed copy, and the block survives the upload.
+    self.assertEqual(ok(self, self.upload_pack(engagement_draft_id))["document"]["generated"], generated)
 
   def test_state_transitions_as_a_tenant_item_and_missing_keeps_generated(self):
     engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
-    generated = self.write_generated(engagement_draft_id)
+    generated = self.generate_pack(engagement_draft_id)
     draft = ok(self, self.update_child(engagement_draft_id, {"document": {"state": "awaiting_signature"}}))
     self.assertEqual((draft["document"]["state"], draft["document"]["generated"]), ("awaiting_signature", generated))
     ok(self, self.upload_pack(engagement_draft_id))
     refused(self, self.update_child(engagement_draft_id, {"document": {"state": "awaiting_signature"}}), 400, "invalid_request")
     draft = ok(self, self.update_child(engagement_draft_id, {"document": {"state": "missing"}}))
     self.assertEqual(draft["document"], {"state": "missing", "document": None, "generated": generated})
-    self.assertEqual(self.documents.deleted, ["doc-1"])
-    self.assertIn("doc-generated", self.documents.envelopes)
+    self.assertEqual(self.documents.deleted, ["doc-2"])
+    self.assertIn("doc-1", self.documents.envelopes)
+    # `generated` is set by generation alone, from missing here; the previous generated file goes
+    # after the write. Once signed, generation is refused.
+    refused(self, self.update_child(engagement_draft_id, {"document": {"state": "generated"}}), 400, "invalid_request")
+    again = self.generate_pack(engagement_draft_id, raw=SCHEDULE_PDF)
+    self.assertEqual((again["ref"], self.documents.deleted), ("doc-3", ["doc-2", "doc-1"]))
+    self.assertEqual(self.stored_child(engagement_draft_id)["document"]["state"], "generated")
+    ok(self, self.upload_pack(engagement_draft_id))
+    puts = len(self.documents.puts)
+    refused(self, self.generate(None, engagement_draft_id=engagement_draft_id, document_kind="engagement_pack"),
+            409, "already_signed")
+    self.assertEqual(len(self.documents.puts), puts)
+    self.assertEqual(self.stored_child(engagement_draft_id)["document"]["generated"], again)
 
   def test_delete_removes_both_files_then_the_record(self):
     engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
-    self.write_generated(engagement_draft_id)
+    self.generate_pack(engagement_draft_id)
     ok(self, self.upload_pack(engagement_draft_id))
     present = []
     delete = self.documents.delete
@@ -384,7 +436,7 @@ class TestEngagementDraftDocuments(_EngagementDraftCase):
     data = ok(self, self.plugin.delete_engagement_draft(self.actor, engagement_draft_id))
     self.assertEqual(data, {"engagement_draft_id": engagement_draft_id, "files_deleted": 2})
     self.assertEqual(present, [True, True])
-    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-generated"])
+    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2"])
     self.assertIsNone(self.stored_child(engagement_draft_id))
     self.assertEqual(self.events, [("engagement_draft_deleted", {
       "engagement_draft_id": engagement_draft_id, "actor": "creator", "files_deleted": 2})])
@@ -406,7 +458,7 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     engagement_draft_id = self.child(parent)["engagement_draft_id"]
     self.fill(engagement_draft_id)
     if generated:
-      self.write_generated(engagement_draft_id, uploaded_by=(uploader or self.actor)["account_id"])
+      self.generate_pack(engagement_draft_id, actor=uploader)
     ok(self, self.upload_pack(engagement_draft_id, actor=uploader))
     return engagement_draft_id
 
@@ -470,6 +522,11 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
       downloaded = ok(self, self.plugin.download_engagement_document(self.actor, tenant_id, engagement_id, document_id))
       self.assertEqual(downloaded["sha256"], hashlib.sha256(raw).hexdigest())
       self.assertEqual(base64.b64decode(downloaded["content_b64"]), raw)
+    # The baseline readers (RM-111, RM-068) find the snapshot in the second document's envelope.
+    baseline = self.documents.get(engagement["documents"][1]["ref"])
+    self.assertEqual((baseline["role"], baseline["snapshot"], baseline["engagement_draft_id"]),
+                     ("generated", SNAPSHOT, engagement_draft_id))
+    self.assertEqual(hashlib.sha256(baseline["snapshot"].encode("utf-8")).hexdigest(), SNAPSHOT_SHA256)
     self.assertEqual([item["engagement_draft_id"] for item in ok(self, self.plugin.list_engagement_drafts(self.actor, tenant_id))], [])
 
   def test_without_a_generated_pack_the_signed_pack_is_the_only_document(self):
@@ -549,7 +606,8 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     self.documents.envelopes[ref]["engagement_draft_id"] = "ted_" + str(uuid4())
     refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id), 400, "document_invalid")
     self.documents.envelopes[ref]["engagement_draft_id"] = engagement_draft_id
-    self.documents.envelopes["doc-generated"]["content_b64"] = base64.b64encode(PNG).decode("ascii")
+    generated_ref = self.stored_child(engagement_draft_id)["document"]["generated"]["ref"]
+    self.documents.envelopes[generated_ref]["content_b64"] = base64.b64encode(PNG).decode("ascii")
     refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id), 400, "document_invalid")
     self.assertEqual(self.engagement_rows(), [])
 
@@ -559,8 +617,8 @@ class TestTenantDraftCascade(_EngagementDraftCase):
     parent = self.create()["draft_id"]
     ok(self, self.upload(parent))
     first, second = (self.child(parent)["engagement_draft_id"] for _ in range(2))
+    self.generate_pack(first)
     ok(self, self.upload_pack(first))
-    self.write_generated(first)
     ok(self, self.upload_pack(second, SCHEDULE_PDF))
     order = []
     delete = self.documents.delete
@@ -571,10 +629,11 @@ class TestTenantDraftCascade(_EngagementDraftCase):
     self.documents.delete = observed_delete
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, parent))
     self.assertEqual(data, {"draft_id": parent, "files_deleted": 4, "engagement_drafts_deleted": 2})
-    # Children's files (the parent row still there), their rows, then the parent's own file and row.
-    self.assertEqual(order[:3], [("doc-2", True, True), ("doc-generated", True, True), ("doc-3", True, False)])
+    # Children's files (the parent row still there; the signed pack, then the generated one), their
+    # rows, then the parent's own file and row.
+    self.assertEqual(order[:3], [("doc-3", True, True), ("doc-2", True, True), ("doc-4", True, False)])
     self.assertEqual(order[3][:2], ("doc-1", True))
-    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2", "doc-3", "doc-generated"])
+    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2", "doc-3", "doc-4"])
     for engagement_draft_id in (first, second):
       self.assertIsNone(self.stored_child(engagement_draft_id))
     self.assertIsNone(self.stored(parent))

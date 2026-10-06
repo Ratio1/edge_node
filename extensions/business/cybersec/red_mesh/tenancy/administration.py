@@ -24,7 +24,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_context, normalize_engagement_assets, normalize_roe,
                           normalize_run_modes, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import drafts, engagement_drafts
+from . import drafts, engagement_drafts, super_tenant_profile
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -85,21 +85,39 @@ def _domain(value):
   return value
 
 
-# RM-095 phase 1: a tenant is created around a signed contract and its legal details.
-_LEGAL_FIELDS = ("name", "registration_id", "signer_name", "signer_role")
+# RM-095 phase 1: a tenant is created around a signed contract and its legal details. RM-110: the
+# party block may carry the optional customer fields too (`drafts.LEGAL_OPTIONAL_FIELDS`, empty
+# allowed); a block written before them has the four keys only and is accepted as it is.
+_LEGAL_FIELDS = drafts.LEGAL_FIELDS
+_LEGAL_OPTIONAL_FIELDS = drafts.LEGAL_OPTIONAL_FIELDS
 _CONTRACT_TEXT_FIELDS = ("store", "ref", "filename", "mime", "uploaded_at", "uploaded_by")
 
 
 def _legal(value):
-  if not isinstance(value, dict) or set(value) != set(_LEGAL_FIELDS):
+  """The normalized party block: exactly the keys given (the four required ones 1-200, an optional
+  one 0-200), so a stored four-key block reads back unchanged and no default is written."""
+  if (not isinstance(value, dict) or not set(_LEGAL_FIELDS) <= set(value)
+      or not set(value) <= set(drafts.LEGAL_ALL_FIELDS)):
     raise AdministrationDenied(400, "legal_details_required")
   legal = {}
-  for key in _LEGAL_FIELDS:
+  for key in drafts.LEGAL_ALL_FIELDS:
+    if key not in value:
+      continue
     text = value[key].strip() if isinstance(value[key], str) else ""
-    if not 1 <= len(text) <= 200:
+    if not (0 if key in _LEGAL_OPTIONAL_FIELDS else 1) <= len(text) <= 200:
       raise AdministrationDenied(400, "legal_details_required")
     legal[key] = text
   return legal
+
+
+def _legal_dto(legal):
+  """RM-110: a stored block answers every party field, the optional ones empty when absent."""
+  return None if legal is None else {**{key: "" for key in _LEGAL_OPTIONAL_FIELDS}, **legal}
+
+
+def _valid_generated_block(value):
+  """RM-110 `contract_generated` on a receipt or tenant: when the key is there, a full block."""
+  return value is not None and drafts.valid_generated(value)
 
 
 def _valid_contract(value):
@@ -173,6 +191,10 @@ class TenantAdministrationService:
       raise TenantStoreError("Invalid creation receipt") from None
     if "contract" in receipt and not _valid_contract(receipt["contract"]):
       raise TenantStoreError("Invalid creation receipt")
+    # RM-110: the contract's generated baseline, optional and outside the all-or-none set below, so
+    # receipts written before it stay valid.
+    if "contract_generated" in receipt and not _valid_generated_block(receipt["contract_generated"]):
+      raise TenantStoreError("Invalid creation receipt")
     # RM-109: a receipt of a draft activation carries the draft's terms, all of them or none.
     if any(key in receipt for key in _DRAFT_RECEIPT_FIELDS):
       if (any(key not in receipt for key in _DRAFT_RECEIPT_FIELDS)
@@ -193,8 +215,10 @@ class TenantAdministrationService:
   def _tenant_payload(receipt):
     # RM-095: `legal` and `contract` exist only on tenants created since contracts were required;
     # the tenant copies them from its receipt, so both sides match exactly or not at all. RM-109:
-    # the same for the terms a draft activation adds (the draft id stays on the receipt).
-    contract_terms = {key: receipt[key] for key in ("legal", "contract", *_DRAFT_TENANT_FIELDS) if key in receipt}
+    # the same for the terms a draft activation adds (the draft id stays on the receipt); RM-110:
+    # and for the contract's generated baseline.
+    contract_terms = {key: receipt[key] for key in ("legal", "contract", *_DRAFT_TENANT_FIELDS, "contract_generated")
+                      if key in receipt}
     return {**contract_terms,
       "tenant_id": receipt["tenant_id"], "actor_id": receipt["actor_id"],
       "request_id": receipt["request_id"], "display_name": receipt["display_name"],
@@ -233,7 +257,7 @@ class TenantAdministrationService:
     optional = () if "root_admin_id" in tenant else ("root_admin_id",)
     if (any(tenant.get(key) != value for key, value in expected.items()
             if key not in mutable and key not in optional)
-        or any(key in tenant and key not in expected for key in _DRAFT_TENANT_FIELDS)
+        or any(key in tenant and key not in expected for key in (*_DRAFT_TENANT_FIELDS, "contract_generated"))
         or type(tenant.get("active")) is not bool or type(tenant.get("allow_pentester")) is not bool):
       raise TenantStoreError("Tenant receipt binding mismatch")
     if "allow_pentester_changed_by" in tenant or "allow_pentester_changed_at" in tenant:
@@ -353,6 +377,10 @@ class TenantAdministrationService:
     terms = {"draft_id": draft_id, "compliance_types": list(draft["compliance_types"]),
              "framework_agreement": stored["framework_agreement"], "data_handling": stored["data_handling"],
              "governance": drafts.governance(draft)}
+    # RM-110: the unsigned baseline outlives the draft as the tenant's `contract_generated`; a draft
+    # whose pack was never generated adds nothing.
+    if draft["items"]["contract"]["generated"] is not None:
+      terms["contract_generated"] = dict(draft["items"]["contract"]["generated"])
     return draft, intent, _legal(draft["legal"]), stored["contract"], terms
 
   @staticmethod
@@ -363,9 +391,9 @@ class TenantAdministrationService:
     return (receipt.get("draft_id") == terms["draft_id"]
             and receipt.get("compliance_types") == terms["compliance_types"]
             and receipt.get("governance") == terms["governance"]
-            and all((receipt.get(kind) is None) == (terms[kind] is None)
-                    and (terms[kind] is None or _same_contract(receipt[kind], terms[kind]))
-                    for kind in _TENANT_DOCUMENT_KINDS[1:]))
+            and all((receipt.get(key) is None) == (terms.get(key) is None)
+                    and (terms.get(key) is None or _same_contract(receipt[key], terms[key]))
+                    for key in (*_TENANT_DOCUMENT_KINDS[1:], "contract_generated")))
 
   def _first_preparation_documents(self, documents):
     """RM-109, both paths, first preparation only (a replay is bound by its receipt's sha256):
@@ -1144,12 +1172,16 @@ class TenantAdministrationService:
         valid_legal = False
       if not valid_legal:
         raise TenantStoreError("Invalid tenant contract record")
-    # RM-109: the terms a draft activation added; a one-step tenant has none of them.
+    # RM-109: the terms a draft activation added; a one-step tenant has none of them. RM-110: nor
+    # the contract's generated baseline (hashes and ids, never the bytes).
     if any(tenant.get(kind) is not None and not _valid_contract(tenant[kind])
            for kind in _TENANT_DOCUMENT_KINDS[1:]):
       raise TenantStoreError("Invalid tenant contract record")
-    return {"legal": legal, "contract": contract,
-            **{key: tenant.get(key) for key in _DRAFT_TENANT_FIELDS}}
+    if "contract_generated" in tenant and not _valid_generated_block(tenant["contract_generated"]):
+      raise TenantStoreError("Invalid tenant contract record")
+    return {"legal": _legal_dto(legal), "contract": contract,
+            **{key: tenant.get(key) for key in _DRAFT_TENANT_FIELDS},
+            "contract_generated": tenant.get("contract_generated")}
 
   # RM-107: delete a tenant. Owner, 2026-09-28: it exists so tenants created before contracts can be
   # removed; it deletes the tenant's records and its stored documents, refuses while the tenant has
@@ -1185,8 +1217,9 @@ class TenantAdministrationService:
     return tenant, account
 
   def _tenant_document_refs(self, tenant):
-    """Every stored document the tenant's records point at, read from the raw rows."""
-    refs = [tenant[kind] for kind in _TENANT_DOCUMENT_KINDS if isinstance(tenant.get(kind), dict)]
+    """Every stored document the tenant's records point at, read from the raw rows. RM-110: the
+    contract's generated baseline (`contract_generated.ref`) is one of them."""
+    refs = [tenant[key] for key in (*_TENANT_DOCUMENT_KINDS, "contract_generated") if isinstance(tenant.get(key), dict)]
     for ids in self.store.tenant_record_ids("engagement", tenant["tenant_id"]):
       row = self.store.raw_record("engagement", *ids) or {}
       documents = row.get("documents") if isinstance(row.get("documents"), list) else []
@@ -1260,6 +1293,34 @@ class TenantAdministrationService:
   def check_tenant_domain(self, actor, domain_id):
     self._actor(actor, creator=True)
     return {"available": self.store.get("domain", _domain(domain_id)) is None}
+
+  # RM-110 phase 1: the super-tenant profile, one row per deployment, a full-portfolio Super-Tenant
+  # Admin only (contract `onboarding-drafts.md` §Super-tenant profile). A deployment without the row
+  # reads as the empty profile; a read never writes it.
+
+  @_endpoint
+  def get_super_tenant_profile(self, actor):
+    self._actor(actor, creator=True)
+    row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
+    return super_tenant_profile.profile_dto(row if row is not None else super_tenant_profile.empty_profile())
+
+  @_endpoint
+  def update_super_tenant_profile(self, actor, changes):
+    """Partial `changes`, formats checked, emptiness allowed. Answers the profile and the keys whose
+    value changed (the plugin audits those, never the values); nothing changed, nothing written."""
+    account = self._actor(actor, creator=True)
+    previous = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
+    if previous is None:
+      previous = super_tenant_profile.empty_profile()
+    try:
+      row, changed = super_tenant_profile.apply_changes(previous, changes)
+    except drafts.DraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    if changed:
+      row = {**row, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+      self.store.put("super_tenant_profile", super_tenant_profile.RECORD_ID, record=row)
+      row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
+    return {"profile": super_tenant_profile.profile_dto(row), "changed": changed, "accountId": account.account_id}
 
   # RM-109 phase 2: tenant drafts. A full-portfolio Super-Tenant Admin only, as tenant creation; a
   # draft has no tenant, so these are not rows of the tenant policy matrix. Every document read,
@@ -1623,6 +1684,66 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "conflict")
     self.store.delete("engagement_draft", engagement_draft_id)
     return {"engagement_draft_id": engagement_draft_id}
+
+  # RM-110: the generated pack (`store_generated_document`), one operation for both draft kinds. The
+  # same split as the uploads: the plugin stores the bytes (with the snapshot, one envelope) outside
+  # this lock between `authorize_generated_document` and `attach_generated_document`, and discards
+  # the file when the attach is refused. The slot's previous generated file goes after the write.
+
+  def _generated_slot(self, draft_id, engagement_draft_id, document_kind):
+    """The unlocked draft a generated pack goes to, its slot and the slot's refusal code: exactly one
+    id names the draft, and `document_kind` must be that slot's."""
+    if bool(draft_id) == bool(engagement_draft_id):
+      raise AdministrationDenied(400, "invalid_request")
+    if draft_id:
+      row = self._unlocked_tenant_draft(draft_id)
+      if document_kind != "contract":
+        raise AdministrationDenied(400, "invalid_request")
+      return row, row["items"]["contract"], "contract_invalid"
+    row = self._unlocked_engagement_draft(engagement_draft_id)
+    if document_kind != engagement_drafts.DOCUMENT_KIND:
+      raise AdministrationDenied(400, "invalid_request")
+    return row, row["document"], "document_invalid"
+
+  @_endpoint
+  def authorize_generated_document(self, actor, draft_id, engagement_draft_id, document_kind, snapshot, generated_at):
+    """Everything but the bytes is checked before the plugin stores them: role, the draft and its
+    lock, the slot, the snapshot and `generated_at` formats, and that the item is not `signed`."""
+    account = self._actor(actor, creator=True)
+    _, slot, _ = self._generated_slot(draft_id, engagement_draft_id, document_kind)
+    try:
+      drafts.normalize_snapshot(snapshot)
+      drafts.normalize_generated_at(generated_at)
+    except drafts.DraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    if slot["state"] == "signed":
+      raise AdministrationDenied(409, "already_signed")
+    return {"accountId": account.account_id}
+
+  @_endpoint
+  def attach_generated_document(self, actor, draft_id, engagement_draft_id, document_kind, document, snapshot_sha256,
+                                generated_at):
+    """Write the `generated` block (the stored ref plus the baseline stamps; `uploaded_by` and
+    `generated_by` are the generating admin) and set the item `generated`, from `missing`,
+    `generated` or `awaiting_signature` (never from `signed`). Answers the row and the ref of the
+    generated file the slot held before, whose file the plugin deletes after this write."""
+    account = self._actor(actor, creator=True)
+    previous, slot, refusal = self._generated_slot(draft_id, engagement_draft_id, document_kind)
+    if not isinstance(document, dict):
+      raise AdministrationDenied(400, refusal)
+    generated = {**document, "snapshot_sha256": snapshot_sha256, "generated_at": generated_at,
+                 "generated_by": account.account_id}
+    if not drafts.valid_generated(generated) or generated["uploaded_by"] != account.account_id:
+      raise AdministrationDenied(400, refusal)
+    if slot["state"] == "signed":
+      raise AdministrationDenied(409, "already_signed")
+    replaced = slot["generated"]["ref"] if slot["generated"] is not None else None
+    slot = {**slot, "state": "generated", "generated": generated}
+    if draft_id:
+      row = self._write_tenant_draft({**previous, "items": {**previous["items"], "contract": slot}}, account)
+    else:
+      row = self._write_engagement_draft({**previous, "document": slot}, account)
+    return {"draft": row, "replaced": replaced}
 
   @staticmethod
   def _generated_ref(generated):

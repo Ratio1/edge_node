@@ -639,3 +639,30 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   and `list_engagement_drafts` closed (503) until data maintenance removes it.
 - Verification: `tests/test_engagement_drafts.py` (new), `test_tenant_drafts.py` (collapsed
   checklist), `test_data_maintenance.py`, `test_authz_surface.py` (107 endpoints).
+
+### 2026-10-07 — RM-110 phase 1: super-tenant profile, party block, generated-pack baseline
+
+- BUILDER: `super_tenant_profile` record kind (`tenancy/super_tenant_profile.py`, one row per
+  deployment, `ids = ["deployment"]`, eight 0-200 text fields) with `get_/update_super_tenant_profile`
+  (`authorize_platform`-gated; the empty profile is answered without a write; `update` is partial
+  and audited as `super_tenant_profile_updated` with the changed keys only). Tenant draft and tenant
+  `legal` gain the optional party fields `address`, `vat_id`, `contact_name`, `contact_email`,
+  `contact_phone` (`drafts.LEGAL_OPTIONAL_FIELDS`): `_legal` accepts a four-key block unchanged and
+  writes no default, the draft validator completes an old block on a copy, DTOs answer absent
+  optional fields as `""`. `store_generated_document` (one endpoint for `draft_id`/`contract` and
+  `engagement_draft_id`/`engagement_pack`): the plugin stores bytes + `snapshot` in one
+  `redmesh_tenant_contract` 1.1 envelope (`role: generated`) outside the lock, hashing both itself;
+  the service writes the `generated` block and item state `generated` (new in `ITEM_STATES`; from
+  `missing`, `generated`, `awaiting_signature`; `409 already_signed` otherwise). The draft's
+  `contract` baseline is copied at activation as `contract_generated` on receipt and tenant.
+- CRITIC/response: `contract_generated` sits outside the receipt's all-or-none draft set and is
+  compared only when present, with the extra-on-tenant guard, so pre-RM-110 rows stay valid;
+  `_tenant_document_refs` includes its ref so tenant delete removes the baseline file. The snapshot
+  is checked as one JSON object of at most 64 KB and hashed exactly as sent (a strict canonical
+  re-serialization check would refuse valid JS output over number formatting). `already_signed` and
+  the formats are refused in the authorize step, before any store write; a stored row with state
+  `generated` and no block is unreadable. `items_done` and completeness still count `signed` only.
+- Verification: `tests/test_super_tenant_profile.py` (new), `test_tenant_drafts.py`,
+  `test_engagement_drafts.py` (the generated pack now comes from the real endpoint),
+  `test_tenant_administration.py`, `test_tenant_delete.py`, `test_tenancy_administration_store.py`,
+  `test_data_maintenance.py`, `test_authz_surface.py` (110 endpoints).

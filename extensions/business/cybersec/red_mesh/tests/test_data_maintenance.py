@@ -337,8 +337,26 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage.data[(TENANCY, under_tenant)]["document"]["state"] = "done"
     self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
 
+  def test_the_super_tenant_profile_is_current_and_cleanup_keeps_it(self):
+    # RM-110: one row per deployment, no tenant and no file; never an orphan of a tenant it is not.
+    updated = self.plugin.update_super_tenant_profile(self.actor, {"legal_name": "RedMesh SRL"})
+    self.assertTrue(updated["success"], updated)
+    self.events.clear()
+    field = json.dumps(["super_tenant_profile", "deployment", "deployment"], separators=(",", ":"))
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"], row["cids"]), ("current", "", []))
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertIsNotNone(self.storage.data[(TENANCY, field)])
+    # Still current once every tenant is gone; malformed, old/unrecognized as every refused row.
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+    self.storage.data[(TENANCY, field)]["legal_name"] = 7
+    self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
+
   def test_a_tenant_activated_from_a_draft_is_current_with_all_its_files(self):
     # RM-109 phase 3: the receipt carries the draft id; tenant and receipt name three documents.
+    # RM-110: and the contract's generated baseline, whose file the draft row names too.
     from .contract_fixture import FakeDocumentStore
 
     class CidDocuments(FakeDocumentStore):
@@ -356,6 +374,11 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertTrue(self.plugin.update_tenant_draft(self.actor, draft_id, {
       "domain_id": "acme", "initial_admin_id": "acme.admin",
       "legal": {"name": "A", "registration_id": "B", "signer_name": "C", "signer_role": "D"}})["success"])
+    generated = self.plugin.store_generated_document(
+      self.actor, draft_id=draft_id, document_kind="contract", filename="generated.pdf",
+      content_b64=base64.b64encode(b"%PDF-1.7\n%generated\n%%EOF\n").decode("ascii"), snapshot='{"v":1}',
+      generated_at="2026-10-07T10:00:00Z")
+    self.assertTrue(generated["success"], generated)
     for number, kind in enumerate(("contract", "framework_agreement", "data_handling")):
       raw = b"%PDF-1.7\n%" + kind.encode() + b"\n%%EOF\n"
       uploaded = self.plugin.upload_tenant_draft_document(self.actor, draft_id, kind, f"{kind}.pdf",
@@ -369,12 +392,16 @@ class TestDataMaintenance(unittest.TestCase):
     receipt = json.dumps(["receipt", "deployment", "creator", request], separators=(",", ":"))
     tenant = json.dumps(["tenant", "deployment", prepared["data"]["tenantId"]], separators=(",", ":"))
     draft = json.dumps(["tenant_draft", "deployment", draft_id], separators=(",", ":"))
-    files = {cid(61): "contract.ref", cid(62): "framework_agreement.ref", cid(63): "data_handling.ref"}
+    files = {cid(61): "contract_generated.ref", cid(62): "contract.ref", cid(63): "framework_agreement.ref",
+             cid(64): "data_handling.ref"}
     for field in (receipt, tenant):
       row = rows[(TENANCY, field)]
       self.assertEqual((row["class"], row["reason"]), ("current", ""), field)
       self.assertEqual({item["cid"]: item["role"] for item in row["cids"]}, files)
     self.assertEqual(rows[(TENANCY, draft)]["class"], "current")
+    self.assertEqual({item["cid"]: item["role"] for item in rows[(TENANCY, draft)]["cids"]},
+                     {cid(61): "items.contract.generated.ref", cid(62): "items.contract.document.ref",
+                      cid(63): "items.framework_agreement.document.ref", cid(64): "items.data_handling.document.ref"})
 
   def test_a_file_is_served_only_for_a_row_that_references_it(self):
     with patch.object(data_maintenance, "read_stored_file", return_value={"cid": CONFIG}) as read:

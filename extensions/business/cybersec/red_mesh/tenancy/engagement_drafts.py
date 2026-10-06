@@ -108,7 +108,8 @@ def apply_changes(row, changes):
 
   Every field is checked with the engagement normalizers, emptiness allowed; the refusal is the
   normalizer's code. `document.state` moves as a tenant item: `missing` drops the signed file (and
-  keeps `generated`), `awaiting_signature` only without a file; `signed` is set by an upload alone.
+  keeps `generated`), `awaiting_signature` only without a file; `signed` is set by an upload alone
+  and `generated` by `store_generated_document` alone.
   """
   if not isinstance(changes, dict) or any(key not in (*FIELDS, "document") for key in changes):
     raise EngagementDraftInvalid()
@@ -229,6 +230,7 @@ def validate_engagement_draft(row, ids):
       or not isinstance(slot, dict) or set(slot) != {"state", "document", "generated"}
       or slot["state"] not in ITEM_STATES
       or (slot["state"] == "signed") != (slot["document"] is not None)
+      or (slot["state"] == "generated" and slot["generated"] is None)
       or (slot["document"] is not None and (not valid_doc_ref(slot["document"])
                                             or slot["document"]["mime"] != "application/pdf"))
       or not valid_generated(slot["generated"])

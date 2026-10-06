@@ -5,7 +5,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from .contract_fixture import (CONTRACT_PDF, CONTRACT_SHA256, LEGAL, FakeDocumentStore, contract_b64,
-                               contract_ref, contract_terms, envelope, install_contract)
+                               contract_ref, contract_terms, envelope, install_contract, legal_dto)
 from . import test_tenant_administration as administration_tests
 from .test_tenant_administration import FakeAdministrationStore
 
@@ -279,9 +279,10 @@ class TestReadTenantContract(_PluginCase):
   def test_a_super_tenant_admin_reads_the_legal_details_and_contract_record(self):
     result = self.plugin.get_tenant_contract(self.actor, self.tenant_id)
     self.assertEqual(result["status_code"], 200, result)
-    self.assertEqual(result["data"], {"legal": LEGAL, "contract": contract_ref(store="fake"),
+    # RM-110: the stored four-key block answers the optional party fields empty; no baseline.
+    self.assertEqual(result["data"], {"legal": legal_dto(LEGAL), "contract": contract_ref(store="fake"),
                                       "compliance_types": None, "framework_agreement": None,
-                                      "data_handling": None, "governance": None})
+                                      "data_handling": None, "governance": None, "contract_generated": None})
 
   def test_the_tenant_admin_cannot_read_or_download_the_contract(self):
     initial = {"account_id": "initial"}
@@ -313,7 +314,7 @@ class TestReadTenantContract(_PluginCase):
         value.pop("contract", None)
     self.assertEqual(self.plugin.get_tenant_contract(self.actor, self.tenant_id)["data"],
                      {"legal": None, "contract": None, "compliance_types": None, "framework_agreement": None,
-                      "data_handling": None, "governance": None})
+                      "data_handling": None, "governance": None, "contract_generated": None})
     result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
     self.assertEqual((result["status_code"], result["error"]), (404, "not_found"))
 

@@ -48,6 +48,13 @@ def contract_b64(raw=CONTRACT_PDF):
 
 LEGAL = {"name": "Example Holdings SRL", "registration_id": "RO12345678",
          "signer_name": "Ana Pop", "signer_role": "Director"}
+# RM-110: the optional party-block fields; a block without them reads back with them empty.
+PARTY_FIELDS = ("address", "vat_id", "contact_name", "contact_email", "contact_phone")
+
+
+def legal_dto(legal=LEGAL):
+  """A `legal` block as the DTOs answer it: every party field, the absent optional ones empty."""
+  return {**{key: "" for key in PARTY_FIELDS}, **legal}
 
 
 def contract_ref(uploaded_by="creator", ref="doc-fixture", store="fake"):

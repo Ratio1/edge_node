@@ -10,14 +10,16 @@ from ..nodes import validate_node_assignment
 from ..engagements import validate_engagement
 from ..drafts import validate_tenant_draft
 from ..engagement_drafts import validate_engagement_draft
+from ..super_tenant_profile import validate_super_tenant_profile
 
 MAX_ENUMERATED_RECORDS = 10000
 # RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
 # is never read or written, so a leftover row cannot come back through a new code path.
 # RM-109: `tenant_draft` is keyed by its draft id alone; a draft has no tenant. `engagement_draft`
 # is keyed by its own id too; its parent (a tenant draft or a tenant) is a field of the row.
+# RM-110: `super_tenant_profile` is one row per deployment, keyed by the fixed id `deployment`.
 _KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
-                    "engagement_draft"})
+                    "engagement_draft", "super_tenant_profile"})
 
 
 class CstoreTenantAdministrationStore:
@@ -80,6 +82,11 @@ class CstoreTenantAdministrationStore:
         validate_engagement_draft(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid engagement draft storage record") from exc
+    if kind == "super_tenant_profile":
+      try:
+        validate_super_tenant_profile(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid super-tenant profile storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):

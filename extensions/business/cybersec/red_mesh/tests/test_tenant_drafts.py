@@ -11,15 +11,24 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
   CstoreTenantAdministrationStore,
 )
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
-from .contract_fixture import CONTRACT_PDF, CONTRACT_SHA256, FakeDocumentStore, contract_b64
+from .contract_fixture import CONTRACT_PDF, CONTRACT_SHA256, FakeDocumentStore, contract_b64, legal_dto
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY_HKEY = '["redmesh","tenancy",1,"deployment"]'
 PNG = b"\x89PNG\r\n\x1a\nnot a contract"
 SCHEDULE_PDF = b"%PDF-1.7\n%fixture data handling schedule\n%%EOF\n"
+GENERATED_PDF = b"%PDF-1.7\n%fixture generated tenant pack\n%%EOF\n"
 LEGAL = {"name": "Example Holdings SRL", "registration_id": "RO12345678",
          "signer_name": "Ana Pop", "signer_role": "Director"}
+PARTY = {"address": "Str. Exemplu 1, Cluj-Napoca", "vat_id": "RO12345678", "contact_name": "Ion Pop",
+         "contact_email": "ion.pop@example.com", "contact_phone": "+40 700 000 000"}
 KINDS = ("contract", "framework_agreement", "data_handling")
+GENERATED_AT = "2026-10-07T10:00:00Z"
+# The baseline as the Navigator sends it: canonical JSON of what the pack was rendered from.
+SNAPSHOT = json.dumps({"generated_at": GENERATED_AT, "legal": LEGAL, "profile": {"legal_name": "RedMesh SRL"}},
+                      sort_keys=True, separators=(",", ":"))
+GENERATED_KEYS = {"store", "ref", "filename", "mime", "uploaded_at", "uploaded_by", "sha256", "size_bytes",
+                  "snapshot_sha256", "generated_at", "generated_by"}
 
 
 def ok(case, result):
@@ -75,6 +84,15 @@ class _DraftCase(unittest.TestCase):
     return self.plugin.upload_tenant_draft_document(actor or self.actor, draft_id, kind, filename,
                                                     base64.b64encode(raw).decode("ascii"))
 
+  def generate(self, draft_id, raw=GENERATED_PDF, snapshot=SNAPSHOT, generated_at=GENERATED_AT, actor=None,
+               filename="generated.pdf", document_kind="contract", engagement_draft_id=None):
+    """RM-110 `store_generated_document`: the rendered pack and its baseline, for a tenant draft's
+    `contract` slot or (with `engagement_draft_id`) an engagement draft's pack."""
+    return self.plugin.store_generated_document(actor or self.actor, draft_id=draft_id,
+                                                engagement_draft_id=engagement_draft_id, document_kind=document_kind,
+                                                filename=filename, content_b64=base64.b64encode(raw).decode("ascii"),
+                                                snapshot=snapshot, generated_at=generated_at)
+
   def stored(self, draft_id):
     return self.repo.get("tenant_draft", draft_id)
 
@@ -97,7 +115,8 @@ class TestDraftRecord(_DraftCase):
     self.assertEqual(draft["display_name"], "Acme")
     self.assertEqual(draft["compliance_types"], ["cra", "nis2"])
     self.assertEqual((draft["domain_id"], draft["initial_admin_id"]), ("", ""))
-    self.assertEqual(draft["legal"], {key: "" for key in LEGAL})
+    # RM-110: the party block carries the optional customer fields too, all empty at creation.
+    self.assertEqual(draft["legal"], legal_dto({key: "" for key in LEGAL}))
     # The collapsed checklist (RM-109 phase 4): the tenant agreement pack in the `contract` slot covers
     # both tenant records, applicability is `required` for both; the other two slots stay in the record.
     self.assertEqual(draft["items"]["contract"], {
@@ -120,8 +139,8 @@ class TestDraftRecord(_DraftCase):
       "domain_id": "acme", "legal": {"name": " Acme SRL "},
       "items": {"framework_agreement": {"effective_from": "2026-11-01", "effective_until": None}}}))
     self.assertEqual(changed["domain_id"], "acme")
-    self.assertEqual(changed["legal"], {"name": "Acme SRL", "registration_id": "", "signer_name": "",
-                                        "signer_role": ""})
+    self.assertEqual(changed["legal"], legal_dto({"name": "Acme SRL", "registration_id": "", "signer_name": "",
+                                                  "signer_role": ""}))
     self.assertEqual(changed["items"]["framework_agreement"]["effective_from"], "2026-11-01")
     self.assertEqual(changed["display_name"], "Acme")
     self.assertEqual(ok(self, self.plugin.get_tenant_draft(self.actor, draft["draft_id"])), changed)
@@ -196,6 +215,9 @@ class TestDraftRoles(_DraftCase):
       "upload": lambda actor: self.plugin.upload_tenant_draft_document(
         actor, draft_id, "data_handling", "s.pdf", contract_b64(SCHEDULE_PDF)),
       "download": lambda actor: self.plugin.download_tenant_draft_document(actor, draft_id, "contract"),
+      "generate": lambda actor: self.plugin.store_generated_document(
+        actor, draft_id=draft_id, document_kind="contract", filename="g.pdf", content_b64=contract_b64(GENERATED_PDF),
+        snapshot=SNAPSHOT, generated_at=GENERATED_AT),
     }
     data, puts, deleted = copy.deepcopy(self.store.data), len(self.documents.puts), list(self.documents.deleted)
     actors = {"tenant account": {"account_id": "initial"}, "super pentester": {"account_id": "pentester"},
@@ -218,7 +240,8 @@ class TestDraftRoles(_DraftCase):
   def test_no_namespace_means_unavailable_before_any_storage_access(self):
     self.plugin.cfg_tenancy_namespace = None
     for name in ("create_tenant_draft", "update_tenant_draft", "get_tenant_draft", "list_tenant_drafts",
-                 "delete_tenant_draft", "upload_tenant_draft_document", "download_tenant_draft_document"):
+                 "delete_tenant_draft", "upload_tenant_draft_document", "download_tenant_draft_document",
+                 "store_generated_document"):
       with self.subTest(name):
         self.assertEqual(getattr(self.Plugin, name).__http_method__, "post")
         self.assertEqual(getattr(self.plugin, name)(actor=self.actor)["status_code"], 503)
@@ -250,7 +273,8 @@ class TestDraftValidation(_DraftCase):
                    lambda: self.update(draft_id, {"display_name": "X"}),
                    lambda: self.plugin.delete_tenant_draft(self.actor, draft_id),
                    lambda: self.upload(draft_id),
-                   lambda: self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract")):
+                   lambda: self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"),
+                   lambda: self.generate(draft_id)):
         with self.subTest(draft_id=draft_id):
           self.assert_refused_without_writes(call, 400, "invalid_request")
 
@@ -260,7 +284,8 @@ class TestDraftValidation(_DraftCase):
                  lambda: self.update(draft_id, {"display_name": "X"}),
                  lambda: self.plugin.delete_tenant_draft(self.actor, draft_id),
                  lambda: self.upload(draft_id),
-                 lambda: self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract")):
+                 lambda: self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"),
+                 lambda: self.generate(draft_id)):
       with self.subTest(call=call):
         self.assert_refused_without_writes(call, 404, "not_found")
 
@@ -275,6 +300,8 @@ class TestDraftValidation(_DraftCase):
       "legal key": {"legal": {"vat": "1"}},
       "legal long": {"legal": {"name": "x" * 201}},
       "legal type": {"legal": "Acme"},
+      "party long": {"legal": {"address": "x" * 201}},
+      "party type": {"legal": {"contact_email": 7}},
       "compliance type": {"compliance_types": ["gdpr"]},
       "item kind": {"items": {"scope_of_work": {"state": "missing"}}},
       "item field": {"items": {"contract": {"document": None}}},
@@ -525,7 +552,8 @@ class TestDraftLockAndMissingFiles(_DraftCase):
     for call in (lambda: self.update(draft_id, {"display_name": "X"}),
                  lambda: self.update(draft_id, {"items": {"contract": {"state": "missing"}}}),
                  lambda: self.plugin.delete_tenant_draft(self.actor, draft_id),
-                 lambda: self.upload(draft_id, "data_handling", SCHEDULE_PDF)):
+                 lambda: self.upload(draft_id, "data_handling", SCHEDULE_PDF),
+                 lambda: self.generate(draft_id)):
       refused(self, call(), 409, "draft_locked")
     self.assertEqual((len(self.store.writes), len(self.documents.puts)), (writes, puts))
     self.assertEqual(self.documents.deleted, [])
@@ -615,6 +643,132 @@ class TestDraftLockAndMissingFiles(_DraftCase):
       self.assertIn(part, logged[0][0])
 
 
+class TestGeneratedDocuments(_DraftCase):
+  """RM-110 `store_generated_document` on the tenant draft's `contract` slot."""
+
+  def test_generation_hashes_the_bytes_and_the_snapshot_and_stores_both_in_one_envelope(self):
+    draft_id = self.create()["draft_id"]
+    draft = ok(self, self.generate(draft_id, filename="Tenant Pack.pdf", actor={"account_id": "other-sta"}))
+    item = draft["items"]["contract"]
+    self.assertEqual((item["state"], item["document"]), ("generated", None))
+    generated = item["generated"]
+    self.assertEqual(set(generated), GENERATED_KEYS)
+    # Hashed here, never taken from the caller.
+    self.assertEqual(generated["sha256"], hashlib.sha256(GENERATED_PDF).hexdigest())
+    self.assertEqual(generated["snapshot_sha256"], hashlib.sha256(SNAPSHOT.encode("utf-8")).hexdigest())
+    self.assertEqual((generated["store"], generated["ref"], generated["filename"], generated["mime"],
+                      generated["size_bytes"]), ("fake", "doc-1", "Tenant_Pack.pdf", "application/pdf", len(GENERATED_PDF)))
+    self.assertEqual((generated["uploaded_by"], generated["generated_by"], generated["generated_at"]),
+                     ("other-sta", "other-sta", GENERATED_AT))
+    self.assertTrue(generated["uploaded_at"])
+    self.assertEqual(draft["updated_by"], "other-sta")
+    # One envelope: the draft envelope with the generated role, the snapshot next to the bytes.
+    envelope, = self.documents.puts
+    self.assertEqual((envelope["kind"], envelope["schema_version"], envelope["document_kind"], envelope["draft_id"],
+                      envelope["role"]), ("redmesh_tenant_contract", "1.1", "contract", draft_id, "generated"))
+    self.assertNotIn("engagement_draft_id", envelope)
+    self.assertEqual((envelope["snapshot"], envelope["sha256"], envelope["uploaded_by"]),
+                     (SNAPSHOT, generated["sha256"], "other-sta"))
+    self.assertEqual(base64.b64decode(envelope["content_b64"]), GENERATED_PDF)
+    self.assertEqual(self.documents.get("doc-1")["snapshot"], SNAPSHOT)
+    self.assertEqual(self.stored(draft_id)["items"]["contract"]["generated"], generated)
+    # Not a signed copy: completeness and the list still wait for one, and the signed download is empty.
+    self.assertIn("item:contract", draft["completeness"]["missing"])
+    self.assertEqual(ok(self, self.plugin.list_tenant_drafts(self.actor))[0]["items_done"], 0)
+    refused(self, self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"), 404, "not_found")
+    self.assertEqual(self.events, [])
+
+  def test_generation_transitions_and_replaces_the_previous_generated_file_after_the_write(self):
+    draft_id = self.create()["draft_id"]
+    ok(self, self.update(draft_id, {"items": {"contract": {"state": "awaiting_signature"}}}))
+    self.assertEqual(ok(self, self.generate(draft_id))["items"]["contract"]["state"], "generated")
+    seen = []
+    delete = self.documents.delete
+
+    def observed_delete(ref):
+      seen.append((ref, self.stored(draft_id)["items"]["contract"]["generated"]["ref"]))
+      delete(ref)
+    self.documents.delete = observed_delete
+    second = ok(self, self.generate(draft_id, raw=SCHEDULE_PDF, snapshot=json.dumps({"v": 2})))["items"]["contract"]
+    self.assertEqual((second["state"], second["generated"]["ref"]), ("generated", "doc-2"))
+    self.assertEqual(second["generated"]["snapshot_sha256"], hashlib.sha256(b'{"v": 2}').hexdigest())
+    self.assertEqual(seen, [("doc-1", "doc-2")])
+    self.assertNotIn("doc-1", self.documents.envelopes)
+    # An update may set the item missing or awaiting_signature, both keep the block; `generated` is
+    # never set by an update.
+    draft = ok(self, self.update(draft_id, {"items": {"contract": {"state": "missing"}}}))
+    self.assertEqual((draft["items"]["contract"]["state"], draft["items"]["contract"]["generated"]),
+                     ("missing", second["generated"]))
+    draft = ok(self, self.update(draft_id, {"items": {"contract": {"state": "awaiting_signature"}}}))
+    self.assertEqual(draft["items"]["contract"]["state"], "awaiting_signature")
+    refused(self, self.update(draft_id, {"items": {"contract": {"state": "generated"}}}), 400, "invalid_request")
+    # The generated bytes are not a signed copy; other bytes are, and the block survives the upload.
+    refused(self, self.upload(draft_id, raw=SCHEDULE_PDF), 409, "same_as_generated")
+    signed = ok(self, self.upload(draft_id))["items"]["contract"]
+    self.assertEqual((signed["state"], signed["document"]["ref"], signed["generated"]),
+                     ("signed", "doc-4", second["generated"]))
+    # Signed: generation is refused before anything is stored; the row is unchanged.
+    row, writes, puts = self.stored(draft_id), len(self.store.writes), len(self.documents.puts)
+    refused(self, self.generate(draft_id), 409, "already_signed")
+    self.assertEqual((len(self.store.writes), len(self.documents.puts)), (writes, puts))
+    self.assertEqual(self.stored(draft_id), row)
+    self.assertEqual(self.documents.deleted, ["doc-1", "doc-3"])
+    # The stored shape is checked: a `generated` item without its block is not readable.
+    row["items"]["contract"].update(state="generated", document=None, generated=None)
+    with self.assertRaises(TenantStoreError):
+      self.repo.put("tenant_draft", draft_id, record=row)
+
+  def test_generation_refuses_malformed_input_before_any_store_write(self):
+    draft_id = self.create()["draft_id"]
+    child = ok(self, self.plugin.create_engagement_draft(self.actor, draft_id, str(uuid4()), "Pack"))["engagement_draft_id"]
+    cases = {
+      "no id": dict(draft_id=None),
+      "both ids": dict(engagement_draft_id=child),
+      "another slot": dict(document_kind="data_handling"),
+      "the pack slot on a tenant draft": dict(document_kind="engagement_pack"),
+      "the contract slot on an engagement draft": dict(draft_id=None, engagement_draft_id=child, document_kind="contract"),
+      "snapshot type": dict(snapshot={"a": 1}),
+      "snapshot empty": dict(snapshot=""),
+      "snapshot not json": dict(snapshot="{nope"),
+      "snapshot not an object": dict(snapshot="[1]"),
+      "snapshot too large": dict(snapshot=json.dumps({"x": "a" * (64 * 1024)})),
+      "generated_at type": dict(generated_at=None),
+      "generated_at date only": dict(generated_at="2026-10-07"),
+      "generated_at not utc": dict(generated_at="2026-10-07T10:00:00+02:00"),
+      "generated_at impossible": dict(generated_at="2026-13-07T10:00:00Z"),
+    }
+    for label, changes in cases.items():
+      with self.subTest(label):
+        refused(self, self.generate(**{"draft_id": draft_id, **changes}), 400, "invalid_request")
+    for raw in (PNG, b""):
+      with self.subTest(raw=raw):
+        refused(self, self.generate(draft_id, raw=raw), 400, "contract_invalid")
+    refused(self, self.plugin.store_generated_document(self.actor, draft_id=draft_id, document_kind="contract",
+                                                       filename="g.pdf", content_b64="not base64!", snapshot=SNAPSHOT,
+                                                       generated_at=GENERATED_AT), 400, "contract_invalid")
+    self.assertEqual(self.documents.puts, [])
+    self.assertEqual(self.stored(draft_id)["items"]["contract"]["state"], "missing")
+    # `+00:00` and fractional seconds are UTC instants too.
+    self.assertTrue(ok(self, self.generate(draft_id, generated_at="2026-10-07T10:00:00.250+00:00")))
+    # An absent engagement draft, as every engagement draft operation.
+    refused(self, self.generate(None, engagement_draft_id="ted_" + str(uuid4()), document_kind="engagement_pack"),
+            404, "not_found")
+    self.documents.fail = True
+    refused(self, self.generate(draft_id), 503, "unavailable")
+
+  def test_a_refused_attach_discards_the_stored_file(self):
+    # The marker set between the authorization and the locked write: the file goes, the row is kept.
+    draft_id = self.create()["draft_id"]
+    self.set_activation(draft_id)
+    attach = self.plugin._call_tenant_administration
+    self.plugin._call_tenant_administration = lambda operation, actor, **kwargs: (
+      {"success": True, "status_code": 200, "data": {"accountId": "creator"}}
+      if operation == "authorize_generated_document" else attach(operation, actor, **kwargs))
+    refused(self, self.generate(draft_id), 409, "draft_locked")
+    self.assertEqual((len(self.documents.puts), self.documents.deleted), (1, ["doc-1"]))
+    self.assertIsNone(self.stored(draft_id)["items"]["contract"]["generated"])
+
+
 class _ActivationCase(_DraftCase):
   def setUp(self):
     super().setUp()
@@ -664,7 +818,9 @@ class TestDraftActivation(_ActivationCase):
     self.assertEqual(receipt["draft_id"], draft_id)
     tenant, = self.rows("tenant")
     self.assertNotIn("draft_id", tenant)
-    self.assertEqual((tenant["display_name"], tenant["domain_id"], tenant["legal"]), ("Acme SRL", "acme", LEGAL))
+    # The whole party block is copied, the optional fields empty here (RM-110).
+    self.assertEqual((tenant["display_name"], tenant["domain_id"], tenant["legal"]),
+                     ("Acme SRL", "acme", legal_dto(LEGAL)))
     self.assertEqual(tenant["compliance_types"], ["cra", "nis2"])
     for kind in KINDS:
       self.assertEqual(receipt[kind], draft["items"][kind]["document"])
@@ -985,6 +1141,110 @@ class TestDraftRelease(_ActivationCase):
         self.repo.delete("tenant", tenant_id)
         self.repo.delete("receipt", "creator", request_id)
         self.repo.delete("domain", "acme")
+
+
+class TestPartyBlockAndBaseline(_ActivationCase):
+  """RM-110: the party-block fields and the generated baseline at activation."""
+
+  def key(self, kind, *ids):
+    return TENANCY_HKEY, json.dumps([kind, "deployment", *ids], separators=(",", ":"))
+
+  def test_the_party_fields_are_saved_bound_at_activation_and_read_from_the_tenant(self):
+    draft_id, request_id = self.ready(combined=True), str(uuid4())
+    draft = ok(self, self.update(draft_id, {"legal": {**PARTY, "contact_phone": " +40 700 000 000 "}}))
+    self.assertEqual(draft["legal"], {**LEGAL, **PARTY})
+    # Optional: emptiness is allowed and never a completeness gap.
+    draft = ok(self, self.update(draft_id, {"legal": {"vat_id": ""}}))
+    self.assertEqual((draft["legal"]["vat_id"], draft["completeness"]["complete"]), ("", True))
+    ok(self, self.update(draft_id, {"legal": {"vat_id": PARTY["vat_id"]}}))
+    ok(self, self.activate(draft_id, request_id))
+    receipt, = self.rows("receipt")
+    tenant, = self.rows("tenant")
+    self.assertEqual((receipt["legal"], tenant["legal"]), ({**LEGAL, **PARTY}, {**LEGAL, **PARTY}))
+    tenant_id = self.finish(draft_id, request_id)
+    self.assertEqual(ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["legal"], {**LEGAL, **PARTY})
+    # Bound as the four fields: a tenant whose party block differs from its receipt's fails closed.
+    self.store.data[self.key("tenant", tenant_id)]["legal"]["contact_email"] = "other@example.com"
+    self.assertEqual(self.plugin.get_tenant_contract(self.actor, tenant_id)["status_code"], 503)
+    self.assertEqual(self.plugin.get_tenant(self.actor, tenant_id)["status_code"], 503)
+
+  def test_a_legacy_four_key_legal_block_reads_back_with_empty_party_fields(self):
+    draft_id = self.create()["draft_id"]
+    self.store.data[self.key("tenant_draft", draft_id)]["legal"] = dict(LEGAL)
+    draft = ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))
+    self.assertEqual(draft["legal"], legal_dto(LEGAL))
+    self.assertNotIn("field:legal.name", draft["completeness"]["missing"])
+    # The read did not write; the next write stores the completed block.
+    self.assertEqual(self.store.data[self.key("tenant_draft", draft_id)]["legal"], LEGAL)
+    ok(self, self.update(draft_id, {"display_name": "Renamed"}))
+    self.assertEqual(self.store.data[self.key("tenant_draft", draft_id)]["legal"], legal_dto(LEGAL))
+
+  def test_the_generated_baseline_becomes_the_tenants_contract_generated_and_is_deleted_with_it(self):
+    draft_id, request_id = self.create()["draft_id"], str(uuid4())
+    self.complete_fields(draft_id)
+    generated = ok(self, self.generate(draft_id))["items"]["contract"]["generated"]
+    ok(self, self.upload(draft_id))
+    ok(self, self.activate(draft_id, request_id))
+    receipt, = self.rows("receipt")
+    tenant, = self.rows("tenant")
+    self.assertEqual((receipt["contract_generated"], tenant["contract_generated"]), (generated, generated))
+    # A replay carries the same baseline.
+    self.assertEqual(ok(self, self.activate(draft_id, request_id))["tenantId"], tenant["tenant_id"])
+    tenant_id = self.finish(draft_id, request_id)
+    contract = ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))
+    self.assertEqual((contract["contract_generated"], contract["contract"]["sha256"]), (generated, CONTRACT_SHA256))
+    # The envelope behind its ref carries the bytes and the snapshot for the baseline readers.
+    envelope = self.documents.get(generated["ref"])
+    self.assertEqual((envelope["role"], envelope["snapshot"], base64.b64decode(envelope["content_b64"])),
+                     ("generated", SNAPSHOT, GENERATED_PDF))
+    # A tenant document for delete, next to the signed contract.
+    ok(self, self.plugin.close_tenant_draft(self.actor, draft_id))
+    self.store.account("acme.admin", memberships=[])
+    self.plugin.cfg_instance_id = "jobs"
+    begun = ok(self, self.plugin._call_tenant_administration("begin_tenant_delete", self.actor, tenant_id=tenant_id))
+    self.assertEqual(sorted(ref["ref"] for ref in begun["documentRefs"]), sorted([generated["ref"], tenant["contract"]["ref"]]))
+    deleted = ok(self, self.plugin.delete_tenant(self.actor, tenant_id))
+    self.assertEqual(deleted["documents"], 2)
+    self.assertEqual(sorted(self.documents.deleted), sorted([generated["ref"], tenant["contract"]["ref"]]))
+
+  def test_contract_generated_is_optional_on_receipt_and_tenant_and_bound_when_present(self):
+    draft_id, request_id = self.ready(combined=True), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    receipt_key, tenant_key = self.key("receipt", "creator", request_id), self.key("tenant", tenant_id)
+    # Never generated: no key on either row, null in the answer (so pre-RM-110 rows read the same).
+    self.assertNotIn("contract_generated", self.store.data[receipt_key])
+    self.assertNotIn("contract_generated", self.store.data[tenant_key])
+    self.assertIsNone(ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["contract_generated"])
+    block = {"store": "fake", "ref": "doc-generated", "filename": "generated.pdf", "mime": "application/pdf",
+             "size_bytes": len(GENERATED_PDF), "sha256": hashlib.sha256(GENERATED_PDF).hexdigest(),
+             "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator", "snapshot_sha256": "c" * 64,
+             "generated_at": GENERATED_AT, "generated_by": "creator"}
+    original = copy.deepcopy(self.store.data)
+    cases = {
+      "extra on the tenant": (None, block),
+      "missing on the tenant": (block, None),
+      "different on the tenant": (block, {**block, "sha256": "f" * 64}),
+      "malformed": ({**block, "snapshot_sha256": "nope"}, {**block, "snapshot_sha256": "nope"}),
+      "null": (None, None),
+    }
+    for label, (on_receipt, on_tenant) in cases.items():
+      with self.subTest(label):
+        self.store.data = copy.deepcopy(original)
+        if label == "null" or on_receipt is not None:
+          self.store.data[receipt_key]["contract_generated"] = on_receipt
+        if label == "null" or on_tenant is not None:
+          self.store.data[tenant_key]["contract_generated"] = on_tenant
+        writes = len(self.store.writes)
+        self.assertEqual(self.plugin.get_tenant(self.actor, tenant_id)["status_code"], 503)
+        self.assertEqual(self.plugin.get_tenant_contract(self.actor, tenant_id)["status_code"], 503)
+        self.assertEqual(len(self.store.writes), writes)
+    # On both and well formed: bound, read, and one of the tenant's documents.
+    self.store.data = copy.deepcopy(original)
+    for key in (receipt_key, tenant_key):
+      self.store.data[key]["contract_generated"] = block
+    self.assertEqual(ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["contract_generated"], block)
+    self.assertTrue(ok(self, self.plugin.get_tenant(self.actor, tenant_id)))
 
 
 class TestRefusalShape(unittest.TestCase):

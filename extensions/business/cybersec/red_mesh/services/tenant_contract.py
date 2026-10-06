@@ -5,6 +5,7 @@ and `prepare_tenant` holds a process-wide lock. The administration service only 
 resulting document reference.
 """
 from datetime import datetime, timezone
+import hashlib
 
 from ..tenancy.ports import DocumentStoreError
 from .authorization_upload import AuthorizationUploadError, validate_document
@@ -56,6 +57,22 @@ def store_engagement_pack(documents, *, engagement_draft_id, filename, content_b
   return _store(documents, filename, content_b64, uploaded_by, now_fn, refusal="document_invalid",
                 envelope_fields={"schema_version": "1.1", "document_kind": "engagement_pack",
                                  "engagement_draft_id": engagement_draft_id})
+
+
+def store_generated_document(documents, *, draft_id, engagement_draft_id, document_kind, filename, content_b64,
+                             snapshot, uploaded_by, now_fn=None):
+  """RM-110. The unsigned pack the Navigator rendered, checked as a contract, stored with the
+  baseline it was rendered from in ONE envelope: the 1.1 draft envelope naming the draft (a tenant
+  draft's `draft_id` or an engagement draft's `engagement_draft_id`) and the slot, `role: generated`,
+  and `snapshot` next to `content_b64`. The bytes and the snapshot are hashed here, never trusted
+  from the caller; answers the document reference (the contract's key set) and `snapshot_sha256`.
+  `snapshot` was checked by the service (`drafts.normalize_snapshot`): hashed exactly as sent."""
+  binding = {"draft_id": draft_id} if draft_id else {"engagement_draft_id": engagement_draft_id}
+  document = _store(documents, filename, content_b64, uploaded_by, now_fn,
+                    refusal="contract_invalid" if document_kind == "contract" else "document_invalid",
+                    envelope_fields={"schema_version": "1.1", "document_kind": document_kind, **binding,
+                                     "role": "generated", "snapshot": snapshot})
+  return {"document": document, "snapshot_sha256": hashlib.sha256(snapshot.encode("utf-8")).hexdigest()}
 
 
 def _store(documents, filename, content_b64, uploaded_by, now_fn, *, refusal, envelope_fields):
@@ -116,7 +133,10 @@ def resolve_engagement_pack(documents, ref, *, engagement_draft_id):
 
 def _resolve(documents, ref, refusal):
   """The verified reference and the envelope's draft binding; an absent `document_kind` (a
-  schema 1.0 envelope) reads as `contract`."""
+  schema 1.0 envelope) reads as `contract`. A generated pack's envelope (RM-110, `role: generated`,
+  `snapshot` beside the bytes) resolves and reads like an upload's: the extra keys are not checked
+  here, so tenant delete, data maintenance and the baseline readers (RM-111, RM-068) can follow
+  its ref."""
   envelope = documents.get(ref)
   if not isinstance(envelope, dict) or envelope.get("kind") != CONTRACT_KIND:
     raise ContractRefused(400, refusal)

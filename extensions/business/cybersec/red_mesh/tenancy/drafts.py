@@ -8,7 +8,8 @@ hashed and never anchored, and it is not a tenant: its id (`td_<uuid>`) is never
 `last_release` records the last release of a stuck activation. Both are written by
 `tenancy.administration`.
 """
-from datetime import date
+from datetime import date, datetime
+import json
 import re
 
 from .assets import normalize_name, valid_digest
@@ -25,9 +26,15 @@ ENGAGEMENT_RECORDS = ("scope_of_work", "authorization_to_test", "rules_of_engage
 # Governance records (Compliance Workspace v5.0 §7): the values of `covers`, in this order.
 RECORDS = TENANT_RECORDS + ENGAGEMENT_RECORDS
 COMPLIANCE_TYPES = ("ai_act", "cra", "nis2")
-ITEM_STATES = ("missing", "awaiting_signature", "signed")
+# `generated` (RM-110): a pack was generated and its baseline recorded, no signed file yet.
+ITEM_STATES = ("missing", "generated", "awaiting_signature", "signed")
 DECISIONS = ("required", "not_required", "unknown")
+# The four fields activation requires, and the RM-110 party-block fields (optional: `address` and
+# `contact_email` are needed by generation, never by activation). A row written before RM-110 has
+# the first four only; the validator completes it on a copy, so the stored row is never rewritten.
 LEGAL_FIELDS = ("name", "registration_id", "signer_name", "signer_role")
+LEGAL_OPTIONAL_FIELDS = ("address", "vat_id", "contact_name", "contact_email", "contact_phone")
+LEGAL_ALL_FIELDS = LEGAL_FIELDS + LEGAL_OPTIONAL_FIELDS
 # The checklist is fixed and the same for every compliance type (owner, 2026-09-29). No item is a
 # duty of NIS2, the CRA or the AI Act.
 BASIS = {kind: "Contractual obligation" for kind in DOCUMENT_KINDS}
@@ -42,12 +49,15 @@ _COVERABLE = {
 _ITEM_FIELDS = ("state", "document", "covers", "effective_from", "effective_until", "generated")
 # `covers` and applicability are fixed by the pack, never edited (owner, 2026-10-07).
 _ITEM_CHANGES = ("state", "effective_from", "effective_until")
-# RM-110 writes the `generated` block (the unsigned pack and its baseline); nothing here does yet.
+# The `generated` block (RM-110 `store_generated_document`): the stored ref of the unsigned pack,
+# whose envelope also holds the snapshot, plus the baseline stamps. Hashes only on the row.
 DOC_REF_KEYS = ("store", "ref", "filename", "mime", "uploaded_at", "uploaded_by", "sha256", "size_bytes")
 _GENERATED_FIELDS = ("snapshot_sha256", "generated_at", "generated_by")
+SNAPSHOT_MAX_BYTES = 64 * 1024
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _DOMAIN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+_INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|\+00:00)\Z")
 _DISPLAY_NAME_MAX = 120
 _LEGAL_MAX = 200
 _REASON_MAX = 500
@@ -112,9 +122,33 @@ def normalize_compliance_types(value):
 
 def normalize_legal(value, current):
   """A partial change: only the keys sent are replaced."""
-  if not isinstance(value, dict) or any(key not in LEGAL_FIELDS for key in value):
+  if not isinstance(value, dict) or any(key not in LEGAL_ALL_FIELDS for key in value):
     raise DraftInvalid()
   return {**current, **{key: _text(text, _LEGAL_MAX) for key, text in value.items()}}
+
+
+def normalize_snapshot(value):
+  """The baseline a pack was generated from: one JSON object, at most 64 KB, hashed as sent."""
+  if (not isinstance(value, str) or not value or len(value.encode("utf-8")) > SNAPSHOT_MAX_BYTES):
+    raise DraftInvalid()
+  try:
+    parsed = json.loads(value)
+  except (ValueError, RecursionError):
+    raise DraftInvalid() from None
+  if not isinstance(parsed, dict):
+    raise DraftInvalid()
+  return value
+
+
+def normalize_generated_at(value):
+  """An ISO-8601 UTC instant (`Z` or `+00:00`), stored as sent."""
+  if not isinstance(value, str) or not _INSTANT.match(value):
+    raise DraftInvalid()
+  try:
+    datetime.fromisoformat(value.replace("Z", "+00:00"))
+  except ValueError:
+    raise DraftInvalid() from None
+  return value
 
 
 def _effective_date(value):
@@ -160,7 +194,7 @@ def valid_generated(value):
 def new_draft(draft_id, display_name, compliance_types, actor_id, now):
   return {
     "draft_id": draft_id, "display_name": normalize_display_name(display_name), "domain_id": "",
-    "initial_admin_id": "", "legal": {key: "" for key in LEGAL_FIELDS},
+    "initial_admin_id": "", "legal": {key: "" for key in LEGAL_ALL_FIELDS},
     "compliance_types": normalize_compliance_types(compliance_types),
     "items": {kind: {"state": "missing", "document": None,
                      "covers": list(TENANT_RECORDS) if _OWN_RECORD[kind] is None else [_OWN_RECORD[kind]],
@@ -175,9 +209,10 @@ def apply_changes(row, changes):
   """The row with `changes` applied (`update_tenant_draft`), and the `(slot, ref)` files it drops.
 
   Formats are checked, emptiness is allowed. An update may set an item `missing` (its file goes) or
-  `awaiting_signature` (only without a file); `signed` is set by an upload alone. Neither transition
-  touches `generated`: the unsigned pack and its baseline outlive a dropped signed copy. `covers`
-  and `applicability` are not change keys: the pack fixes them.
+  `awaiting_signature` (only without a file); `signed` is set by an upload alone and `generated` by
+  `store_generated_document` alone. Neither transition touches `generated`: the unsigned pack and
+  its baseline outlive a dropped signed copy. `covers` and `applicability` are not change keys: the
+  pack fixes them.
   """
   if not isinstance(changes, dict):
     raise DraftInvalid()
@@ -326,17 +361,20 @@ def _same(normalize, value):
 def validate_tenant_draft(row, ids):
   """Refuse a stored draft the operations could not have written. Unknown fields are kept. Answers the
   row as the operations read it: an item written before the `generated` slot existed (RM-109 phases
-  2-3) gains `generated: None`, on a copy, so the stored value itself is never changed by a read."""
+  2-3) gains `generated: None`, and a `legal` block written before the RM-110 party fields gains them
+  empty, on a copy, so the stored value itself is never changed by a read."""
   if isinstance(row.get("items"), dict):
     row = {**row, "items": {kind: {"generated": None, **item} if isinstance(item, dict) else item
                             for kind, item in row["items"].items()}}
+  if isinstance(row.get("legal"), dict) and set(row["legal"]) >= set(LEGAL_FIELDS):
+    row = {**row, "legal": {**{key: "" for key in LEGAL_OPTIONAL_FIELDS}, **row["legal"]}}
   items, applicability, legal = row.get("items"), row.get("applicability"), row.get("legal")
   if (len(ids) != 1 or row.get("draft_id") != ids[0] or not valid_draft_id(ids[0])
       or not _same(normalize_display_name, row.get("display_name"))
       or not _same(normalize_domain, row.get("domain_id"))
       or not _same(normalize_initial_admin, row.get("initial_admin_id"))
-      or not isinstance(legal, dict) or set(legal) != set(LEGAL_FIELDS)
-      or not all(_same(lambda text: _text(text, _LEGAL_MAX), legal[key]) for key in LEGAL_FIELDS)
+      or not isinstance(legal, dict) or set(legal) != set(LEGAL_ALL_FIELDS)
+      or not all(_same(lambda text: _text(text, _LEGAL_MAX), legal[key]) for key in LEGAL_ALL_FIELDS)
       or not _same(normalize_compliance_types, row.get("compliance_types"))
       or not isinstance(items, dict) or set(items) != set(DOCUMENT_KINDS)
       or not isinstance(applicability, dict) or set(applicability) != set(TENANT_RECORDS)
@@ -352,6 +390,7 @@ def validate_tenant_draft(row, ids):
     item = items[kind]
     if (not isinstance(item, dict) or set(item) != set(_ITEM_FIELDS) or item["state"] not in ITEM_STATES
         or (item["state"] == "signed") != (item["document"] is not None)
+        or (item["state"] == "generated" and item["generated"] is None)
         or (item["document"] is not None and (not valid_doc_ref(item["document"])
                                               or item["document"]["mime"] != "application/pdf"))
         or not _same(lambda covers: normalize_covers(kind, covers), item["covers"])
