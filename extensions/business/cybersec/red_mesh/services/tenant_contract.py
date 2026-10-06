@@ -49,6 +49,15 @@ def store_draft_document(documents, *, draft_id, document_kind, filename, conten
                 envelope_fields={"schema_version": "1.1", "document_kind": document_kind, "draft_id": draft_id})
 
 
+def store_engagement_pack(documents, *, engagement_draft_id, filename, content_b64, uploaded_by, now_fn=None):
+  """RM-109 phase 4. The signed engagement pack of an engagement draft, checked as a contract. The
+  envelope is the 1.1 draft envelope naming the engagement draft and the `engagement_pack` slot; no
+  tenant draft or tenant is named, since none may exist yet. Any failed check is `document_invalid`."""
+  return _store(documents, filename, content_b64, uploaded_by, now_fn, refusal="document_invalid",
+                envelope_fields={"schema_version": "1.1", "document_kind": "engagement_pack",
+                                 "engagement_draft_id": engagement_draft_id})
+
+
 def _store(documents, filename, content_b64, uploaded_by, now_fn, *, refusal, envelope_fields):
   try:
     document = validate_document(filename, content_b64, accepted=CONTRACT_FORMATS)
@@ -75,7 +84,7 @@ def resolve_contract(documents, ref):
   if not isinstance(ref, str) or not ref.strip():
     raise ContractRefused(400, "contract_required")
   document, binding = _resolve(documents, ref, "contract_invalid")
-  if binding != {"draft_id": None, "document_kind": "contract"}:
+  if binding != {"draft_id": None, "engagement_draft_id": None, "document_kind": "contract"}:
     raise ContractRefused(400, "contract_invalid")
   return document
 
@@ -88,8 +97,20 @@ def resolve_draft_document(documents, ref, *, draft_id, document_kind):
   if not isinstance(ref, str) or not ref.strip():
     raise ContractRefused(400, refusal)
   document, binding = _resolve(documents, ref, refusal)
-  if binding != {"draft_id": draft_id, "document_kind": document_kind}:
+  if binding != {"draft_id": draft_id, "engagement_draft_id": None, "document_kind": document_kind}:
     raise ContractRefused(400, refusal)
+  return document
+
+
+def resolve_engagement_pack(documents, ref, *, engagement_draft_id):
+  """RM-109 phase 4. An engagement draft's pack (the signed copy or the generated one) re-verified
+  from its bytes; its envelope must name this engagement draft and the `engagement_pack` slot.
+  Every refusal is `document_invalid`."""
+  if not isinstance(ref, str) or not ref.strip():
+    raise ContractRefused(400, "document_invalid")
+  document, binding = _resolve(documents, ref, "document_invalid")
+  if binding != {"draft_id": None, "engagement_draft_id": engagement_draft_id, "document_kind": "engagement_pack"}:
+    raise ContractRefused(400, "document_invalid")
   return document
 
 
@@ -107,7 +128,8 @@ def _resolve(documents, ref, refusal):
       or document.filename != envelope.get("filename") or document.mime != envelope.get("mime")
       or any(not isinstance(envelope.get(key), str) or not envelope[key] for key in ("uploaded_at", "uploaded_by"))):
     raise ContractRefused(400, refusal)
-  binding = {"draft_id": envelope.get("draft_id"), "document_kind": envelope.get("document_kind", "contract")}
+  binding = {"draft_id": envelope.get("draft_id"), "engagement_draft_id": envelope.get("engagement_draft_id"),
+             "document_kind": envelope.get("document_kind", "contract")}
   return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}, binding
 
 

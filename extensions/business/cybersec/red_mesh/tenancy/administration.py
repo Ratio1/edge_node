@@ -24,7 +24,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_context, normalize_engagement_assets, normalize_roe,
                           normalize_run_modes, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import drafts
+from . import drafts, engagement_drafts
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -813,6 +813,9 @@ class TenantAdministrationService:
 
   @staticmethod
   def _engagement_id(value):
+    if engagement_drafts.valid_engagement_draft_id(value):
+      # RM-109 phase 4: an engagement draft id is never an engagement id.
+      raise AdministrationDenied(404, "not_found")
     if not valid_engagement_id(value):
       raise AdministrationDenied(400, "invalid_request")
     return value
@@ -839,7 +842,9 @@ class TenantAdministrationService:
   @staticmethod
   def _engagement_request(display_name, allowed_run_modes, valid_from, valid_until, roe, context, assets,
                           documents, supersedes, creator):
-    """The request as sent, normalized without any store read: the replay intent."""
+    """The request as sent, normalized without any store read: the replay intent. RM-109 phase 4:
+    `creator` None skips the uploader rule (an engagement draft's packs are checked for the platform
+    role instead, by `activate_engagement_draft`)."""
     try:
       display_name = normalize_name(display_name)
     except (ValueError, TypeError):
@@ -856,7 +861,8 @@ class TenantAdministrationService:
     # The plugin verified every document; the uploader rule is re-checked here (phase-1 precedent).
     # The same file twice is refused: its hash says nothing the first entry did not.
     if (not isinstance(documents, list) or len(documents) > MAX_ENGAGEMENT_DOCUMENTS
-        or any(not valid_doc_ref(document, labels=True) or document["uploaded_by"] != creator
+        or any(not valid_doc_ref(document, labels=True)
+               or (creator is not None and document["uploaded_by"] != creator)
                for document in documents)
         or len({document["sha256"] for document in documents}) != len(documents)):
       raise AdministrationDenied(400, "document_invalid")
@@ -886,17 +892,27 @@ class TenantAdministrationService:
     request = self._engagement_request(
       display_name, allowed_run_modes, valid_from, valid_until, roe, context, assets, documents,
       supersedes, account.account_id)
-    intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "engagement_id": engagement_id,
-              "request_id": request_id, "created_by": account.account_id, "request": request}
+    record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, documents, supersedes)
     # Replay is decided on the request alone.
     existing = self.store.get("engagement", tenant_id, engagement_id)
     if existing is not None:
-      if existing["create_intent_digest"] != canonical_digest(intent) or existing["created_by"] != account.account_id:
+      if (existing["create_intent_digest"] != record["create_intent_digest"]
+          or existing["created_by"] != account.account_id):
         raise AdministrationDenied(409, "conflict")
       return {**self._engagement_row(existing), "replayed": True}
     if supersedes is not None and (supersedes == engagement_id
                                    or self.store.get("engagement", tenant_id, supersedes) is None):
       raise AdministrationDenied(400, "supersedes_invalid")
+    self.store.put("engagement", tenant_id, engagement_id, record=record)
+    # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
+    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
+
+  def _engagement_record(self, account, tenant_id, request_id, request, contract_sha256, documents, supersedes):
+    """The stored row of a new engagement, hashed; `request` is `_engagement_request`'s answer and
+    `documents` the verified references in the order they are numbered."""
+    engagement_id = engagement_id_for(request_id)
+    intent = {"namespace": self.store.namespace, "tenant_id": tenant_id, "engagement_id": engagement_id,
+              "request_id": request_id, "created_by": account.account_id, "request": request}
     record = {
       "tenant_id": tenant_id, "engagement_id": engagement_id, "request_id": request_id,
       "display_name": request["display_name"], "allowed_run_modes": request["allowed_run_modes"],
@@ -912,9 +928,7 @@ class TenantAdministrationService:
       "create_intent_digest": canonical_digest(intent),
     }
     record["engagement_hash"] = engagement_hash(record)
-    self.store.put("engagement", tenant_id, engagement_id, record=record)
-    # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
-    return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
+    return record
 
   @_endpoint
   def list_engagements(self, actor, tenant_id, active=None):
@@ -1371,17 +1385,23 @@ class TenantAdministrationService:
 
   @_endpoint
   def begin_tenant_draft_delete(self, actor, draft_id):
+    """RM-109 phase 4: the delete cascades, so the children and their files are listed too; the
+    plugin deletes the children (files, then rows) before the draft's own files and row."""
     account = self._actor(actor, creator=True)
     row = self._unlocked_tenant_draft(draft_id)
-    return {"accountId": account.account_id, "documentRefs": drafts.document_refs(row)}
+    return {"accountId": account.account_id, "documentRefs": drafts.document_refs(row),
+            "children": [{"engagement_draft_id": child["engagement_draft_id"],
+                          "documentRefs": engagement_drafts.document_refs(child)}
+                         for child in self._engagement_draft_children({"draft_id": draft_id})]}
 
   @_endpoint
   def finish_tenant_draft_delete(self, actor, draft_id, deleted_refs):
-    """Delete the record once every file it names is gone. A file attached since the plugin
-    started deleting is a conflict; the next attempt deletes it too."""
+    """Delete the record once every file it names is gone and no child is left. A file attached or
+    a child created since the plugin started deleting is a conflict; the next attempt removes it too."""
     self._actor(actor, creator=True)
     row = self._unlocked_tenant_draft(draft_id)
-    if not set(drafts.document_refs(row)) <= set(deleted_refs):
+    if (not set(drafts.document_refs(row)) <= set(deleted_refs)
+        or self._engagement_draft_children({"draft_id": draft_id})):
       raise AdministrationDenied(409, "conflict")
     self.store.delete("tenant_draft", draft_id)
     return {"draft_id": draft_id}
@@ -1450,14 +1470,220 @@ class TenantAdministrationService:
   @_endpoint
   def close_tenant_draft(self, actor, draft_id):
     """Delete the draft record once its activation produced an active tenant; the files are the
-    tenant's now, so none is deleted."""
-    self._actor(actor, creator=True)
+    tenant's now, so none is deleted. RM-109 phase 4: every child is re-homed to the tenant first,
+    so a crash between the two is finished by the next close call."""
+    account = self._actor(actor, creator=True)
     draft = self._tenant_draft(draft_id)
     tenant = self._marker_tenant(draft["activation"])[1] if draft["activation"] is not None else None
     if tenant is None or tenant.get("active") is not True:
       raise AdministrationDenied(409, "activation_not_complete")
+    for child in self._engagement_draft_children({"draft_id": draft_id}):
+      self._write_engagement_draft({**child, "parent": {"tenant_id": tenant["tenant_id"]}}, account)
     self.store.delete("tenant_draft", draft_id)
     return {"draft_id": draft_id, "tenant_id": tenant["tenant_id"]}
+
+  # RM-109 phase 4: engagement drafts, the children of a tenant draft (or of an active tenant). The
+  # same conventions as the tenant draft: a full-portfolio Super-Tenant Admin only, every document
+  # read, write and delete the plugin's, outside this lock, and every write refused `draft_locked`
+  # while the parent tenant draft's marker is set. Activation is one locked call with no marker.
+
+  def _engagement_draft(self, engagement_draft_id):
+    if not engagement_drafts.valid_engagement_draft_id(engagement_draft_id):
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("engagement_draft", engagement_draft_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    return row
+
+  def _parent_unlocked(self, parent):
+    """The parent tenant draft's marker locks every child; a tenant parent has no marker."""
+    if "draft_id" in parent:
+      tenant_draft = self.store.get("tenant_draft", parent["draft_id"])
+      if tenant_draft is not None and tenant_draft["activation"] is not None:
+        raise AdministrationDenied(409, "draft_locked")
+
+  def _unlocked_engagement_draft(self, engagement_draft_id):
+    row = self._engagement_draft(engagement_draft_id)
+    self._parent_unlocked(row["parent"])
+    return row
+
+  def _engagement_draft_parent(self, value, present=True):
+    """`{draft_id}` or `{tenant_id}`; with `present`, an existing tenant draft or a live tenant."""
+    if drafts.valid_draft_id(value):
+      if present and self.store.get("tenant_draft", value) is None:
+        raise AdministrationDenied(404, "not_found")
+      return {"draft_id": value}
+    if engagement_drafts.valid_tenant_id(value):
+      if present:
+        tenant = self.store.get("tenant", value)
+        if tenant is None or tenant.get("active") is not True:
+          raise AdministrationDenied(404, "not_found")
+      return {"tenant_id": value}
+    raise AdministrationDenied(400, "invalid_request")
+
+  def _engagement_draft_children(self, parent):
+    return [row for row in self.store.list_engagement_drafts() if row["parent"] == parent]
+
+  def _write_engagement_draft(self, row, account, previous=None):
+    """Write a changed row with its attribution; an unchanged one is not written."""
+    if previous is not None and row == previous:
+      return previous
+    row = {**row, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("engagement_draft", row["engagement_draft_id"], record=row)
+    return self.store.get("engagement_draft", row["engagement_draft_id"])
+
+  @_endpoint
+  def create_engagement_draft(self, actor, parent, request_id, display_name):
+    account = self._actor(actor, creator=True)
+    engagement_draft_id = engagement_drafts.engagement_draft_id_for(_request_id(request_id))
+    existing = self.store.get("engagement_draft", engagement_draft_id)
+    if existing is not None:
+      return existing
+    parent = self._engagement_draft_parent(parent)
+    self._parent_unlocked(parent)
+    try:
+      row = engagement_drafts.new_draft(engagement_draft_id, parent, display_name, account.account_id,
+                                        datetime.now(timezone.utc).isoformat())
+    except engagement_drafts.EngagementDraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    self.store.put("engagement_draft", engagement_draft_id, record=row)
+    return self.store.get("engagement_draft", engagement_draft_id)
+
+  @_endpoint
+  def get_engagement_draft(self, actor, engagement_draft_id):
+    self._actor(actor, creator=True)
+    return self._engagement_draft(engagement_draft_id)
+
+  @_endpoint
+  def list_engagement_drafts(self, actor, parent):
+    """The children of one parent, newest first; a parent that does not exist has none."""
+    self._actor(actor, creator=True)
+    rows = self._engagement_draft_children(self._engagement_draft_parent(parent, present=False))
+    rows.sort(key=lambda row: row["engagement_draft_id"])
+    rows.sort(key=lambda row: row["created_at"], reverse=True)
+    return [engagement_drafts.draft_list_row(row) for row in rows]
+
+  @_endpoint
+  def update_engagement_draft(self, actor, engagement_draft_id, changes):
+    """Answers the row and the refs whose files the plugin deletes after this write."""
+    account = self._actor(actor, creator=True)
+    previous = self._unlocked_engagement_draft(engagement_draft_id)
+    try:
+      row, dropped = engagement_drafts.apply_changes(previous, changes)
+    except engagement_drafts.EngagementDraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    return {"draft": self._write_engagement_draft(row, account, previous), "dropped": dropped}
+
+  @_endpoint
+  def authorize_engagement_draft_upload(self, actor, engagement_draft_id):
+    account = self._actor(actor, creator=True)
+    self._unlocked_engagement_draft(engagement_draft_id)
+    return {"accountId": account.account_id}
+
+  @_endpoint
+  def attach_engagement_draft_document(self, actor, engagement_draft_id, document):
+    """Bind an uploaded pack (`store_engagement_pack`) to the slot and sign it. A file whose bytes
+    are the generated pack's is not a signed copy (`same_as_generated`). Answers the row and the
+    ref the slot held before, whose file the plugin deletes after this write."""
+    account = self._actor(actor, creator=True)
+    previous = self._unlocked_engagement_draft(engagement_draft_id)
+    if not valid_doc_ref(document) or document["uploaded_by"] != account.account_id:
+      raise AdministrationDenied(400, "document_invalid")
+    slot = previous["document"]
+    if slot["generated"] is not None and slot["generated"]["sha256"] == document["sha256"]:
+      raise AdministrationDenied(409, "same_as_generated")
+    row = {**previous, "document": {**slot, "state": "signed", "document": dict(document)}}
+    return {"draft": self._write_engagement_draft(row, account),
+            "replaced": slot["document"]["ref"] if slot["document"] is not None else None}
+
+  @_endpoint
+  def engagement_draft_document_ref(self, actor, engagement_draft_id):
+    self._actor(actor, creator=True)
+    document = self._engagement_draft(engagement_draft_id)["document"]["document"]
+    if document is None:
+      raise AdministrationDenied(404, "not_found")
+    return document
+
+  @_endpoint
+  def begin_engagement_draft_delete(self, actor, engagement_draft_id):
+    account = self._actor(actor, creator=True)
+    row = self._unlocked_engagement_draft(engagement_draft_id)
+    return {"accountId": account.account_id, "documentRefs": engagement_drafts.document_refs(row)}
+
+  @_endpoint
+  def finish_engagement_draft_delete(self, actor, engagement_draft_id, deleted_refs):
+    """As `finish_tenant_draft_delete`: the row goes once both its files are gone."""
+    self._actor(actor, creator=True)
+    row = self._unlocked_engagement_draft(engagement_draft_id)
+    if not set(engagement_drafts.document_refs(row)) <= set(deleted_refs):
+      raise AdministrationDenied(409, "conflict")
+    self.store.delete("engagement_draft", engagement_draft_id)
+    return {"engagement_draft_id": engagement_draft_id}
+
+  @staticmethod
+  def _generated_ref(generated):
+    """The stored ref inside a `generated` block (what `resolve_engagement_pack` answers for it)."""
+    return None if generated is None else {key: generated[key] for key in drafts.DOC_REF_KEYS}
+
+  @_endpoint
+  def activate_engagement_draft(self, actor, engagement_draft_id, documents=None):
+    """One locked step, no marker. `documents` are the draft's packs (`signed`, `generated`) as
+    `resolve_engagement_pack` verified them outside this lock, each bound to this draft and the
+    pack slot; this method never reads the document store.
+
+    In the contract's order: the parent must be a tenant (`parent_not_active`); an engagement
+    `en_<uuid>` already under it means an earlier call crashed after `create_engagement`, so the row
+    is deleted and the call answers `replayed`, whoever calls; otherwise the refs must still be the
+    draft's, the draft complete, then the engagement is created from the draft alone with the signed
+    pack as its `agreement` document and the generated pack, when there is one, as a second `other`
+    document, and the row deleted (the files are the engagement's).
+    """
+    account = self._actor(actor, creator=True)
+    row = self._engagement_draft(engagement_draft_id)
+    if "draft_id" in row["parent"]:
+      raise AdministrationDenied(409, "parent_not_active")
+    tenant_id, request_id = row["parent"]["tenant_id"], engagement_draft_id[4:]
+    engagement_id = engagement_id_for(request_id)
+    existing = self.store.get("engagement", tenant_id, engagement_id)
+    if existing is not None:
+      self.store.delete("engagement_draft", engagement_draft_id)
+      return {"engagementId": engagement_id, "replayed": True, "engagementHash": existing["engagement_hash"],
+              "actor": account.account_id}
+    slot = row["document"]
+    stored = {"signed": slot["document"], "generated": self._generated_ref(slot["generated"])}
+    resolved = documents if isinstance(documents, dict) else {}
+    if {key: resolved.get(key) for key in stored} != stored:
+      raise AdministrationDenied(409, "draft_changed")
+    completeness = engagement_drafts.completeness(row)
+    if not completeness["complete"]:
+      raise AdministrationDenied(409, "draft_incomplete", missing=completeness["missing"],
+                                 reasons=completeness["reasons"])
+    tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
+    contract_sha256 = self._tenant_contract_sha256(tenant)
+    generated = slot["generated"]
+    packs = [{**stored["signed"], "kind": "agreement", "title": "Engagement pack",
+              "comment": "" if generated is None else "baseline sha256 " + generated["sha256"]}]
+    if generated is not None:
+      packs.append({**stored["generated"], "kind": "other", "title": "Generated engagement pack (unsigned)",
+                    "comment": "snapshot sha256 " + generated["snapshot_sha256"]})
+    # Instead of "uploader equals creator": each pack's uploader holds the platform role now, as the
+    # tenant documents (`_first_preparation_documents`).
+    for pack in packs:
+      uploader = self.accounts.get_account(pack["uploaded_by"])
+      if uploader is None or not uploader.active or not holds_platform_role(uploader):
+        raise AdministrationDenied(400, "document_invalid")
+    for other in self.store.raw_rows("engagement"):
+      bound = other.get("documents") if isinstance(other.get("documents"), list) else []
+      if any(isinstance(document, dict) and document.get("ref") == stored["signed"]["ref"] for document in bound):
+        raise AdministrationDenied(409, "contract_in_use")
+    request = self._engagement_request(
+      row["display_name"], row["allowed_run_modes"], row["valid_from"], row["valid_until"], row["roe"],
+      row["context"], engagement_drafts.asset_requests(row["assets"]), packs, None, None)
+    record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, packs, None)
+    self.store.put("engagement", tenant_id, engagement_id, record=record)
+    self.store.delete("engagement_draft", engagement_draft_id)
+    return {"engagementId": engagement_id, "replayed": False, "engagementHash": record["engagement_hash"],
+            "actor": account.account_id}
 
   def _assignable_member_roles(self, account, tenant):
     """RM-083. Roles this caller may write in the tenant; tenant_pentester is the platform's to give."""

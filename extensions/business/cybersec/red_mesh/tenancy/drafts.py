@@ -11,11 +11,14 @@ hashed and never anchored, and it is not a tenant: its id (`td_<uuid>`) is never
 from datetime import date
 import re
 
-from .assets import normalize_name
+from .assets import normalize_name, valid_digest
 from .engagements import valid_doc_ref
 from .identity import canonical_account_id
 
 DOCUMENT_KINDS = ("contract", "framework_agreement", "data_handling")
+# The collapsed checklist (owner, 2026-10-07): one tenant agreement pack in the `contract` slot, which
+# covers both tenant records; the other two slots stay in the record, null and not shown.
+SHOWN_KINDS = ("contract",)
 TENANT_RECORDS = ("framework_agreement", "data_handling")
 ENGAGEMENT_RECORDS = ("scope_of_work", "authorization_to_test", "rules_of_engagement", "third_party",
                       "elevated_risk")
@@ -36,8 +39,11 @@ _COVERABLE = {
   "framework_agreement": frozenset({"framework_agreement", "data_handling", *ENGAGEMENT_RECORDS}),
   "data_handling": frozenset({"data_handling", *ENGAGEMENT_RECORDS}),
 }
-_ITEM_FIELDS = ("state", "document", "covers", "effective_from", "effective_until")
+_ITEM_FIELDS = ("state", "document", "covers", "effective_from", "effective_until", "generated")
 _ITEM_CHANGES = ("state", "covers", "effective_from", "effective_until")
+# RM-110 writes the `generated` block (the unsigned pack and its baseline); nothing here does yet.
+DOC_REF_KEYS = ("store", "ref", "filename", "mime", "uploaded_at", "uploaded_by", "sha256", "size_bytes")
+_GENERATED_FIELDS = ("snapshot_sha256", "generated_at", "generated_by")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _DOMAIN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
@@ -141,15 +147,24 @@ def normalize_applicability(value):
   return {"decision": value["decision"], "reason": reason}
 
 
+def valid_generated(value):
+  """The `generated` block: the stored ref of the unsigned pack plus its baseline stamps, or null."""
+  return (value is None
+          or (isinstance(value, dict) and set(value) == {*DOC_REF_KEYS, *_GENERATED_FIELDS}
+              and valid_doc_ref({key: value[key] for key in DOC_REF_KEYS})
+              and value["mime"] == "application/pdf" and valid_digest(value["snapshot_sha256"])
+              and all(_nonempty_text(value[key]) for key in ("generated_at", "generated_by"))))
+
+
 def new_draft(draft_id, display_name, compliance_types, actor_id, now):
   return {
     "draft_id": draft_id, "display_name": normalize_display_name(display_name), "domain_id": "",
     "initial_admin_id": "", "legal": {key: "" for key in LEGAL_FIELDS},
     "compliance_types": normalize_compliance_types(compliance_types),
     "items": {kind: {"state": "missing", "document": None,
-                     "covers": [] if _OWN_RECORD[kind] is None else [_OWN_RECORD[kind]],
-                     "effective_from": None, "effective_until": None} for kind in DOCUMENT_KINDS},
-    "applicability": {record: {"decision": "unknown", "reason": None} for record in TENANT_RECORDS},
+                     "covers": list(TENANT_RECORDS) if _OWN_RECORD[kind] is None else [_OWN_RECORD[kind]],
+                     "effective_from": None, "effective_until": None, "generated": None} for kind in DOCUMENT_KINDS},
+    "applicability": {record: {"decision": "required", "reason": None} for record in TENANT_RECORDS},
     "activation": None, "last_release": None,
     "created_by": actor_id, "created_at": now, "updated_by": actor_id, "updated_at": now,
   }
@@ -159,7 +174,8 @@ def apply_changes(row, changes):
   """The row with `changes` applied (`update_tenant_draft`), and the `(slot, ref)` files it drops.
 
   Formats are checked, emptiness is allowed. An update may set an item `missing` (its file goes) or
-  `awaiting_signature` (only without a file); `signed` is set by an upload alone.
+  `awaiting_signature` (only without a file); `signed` is set by an upload alone. Neither transition
+  touches `generated`: the unsigned pack and its baseline outlive a dropped signed copy.
   """
   if not isinstance(changes, dict):
     raise DraftInvalid()
@@ -213,7 +229,9 @@ def apply_changes(row, changes):
 
 
 def document_refs(row):
-  return [item["document"]["ref"] for item in row["items"].values() if item["document"] is not None]
+  """Every file the draft names: the signed copies and the generated packs."""
+  return [block["ref"] for item in row["items"].values() for block in (item["document"], item["generated"])
+          if block is not None]
 
 
 def _covered_by(row, kind):
@@ -244,8 +262,9 @@ def completeness(row):
   if row["items"]["contract"]["state"] != "signed":
     missing.append("item:contract")
   for record in TENANT_RECORDS:
-    # A covered record is never a gap; `unknown` is never read as `not_required`.
-    if not _covered(row, record) and row["applicability"][record]["decision"] != "not_required":
+    # Rule 3 (owner, 2026-10-07): a record in the contract's fixed covers is decided by rule 2, and no
+    # applicability is asked. A record dropped from those covers must be covered by a signed item.
+    if record not in row["items"]["contract"]["covers"] and not _covered(row, record):
       missing.append(f"record:{record}")
   return {"complete": not missing, "missing": missing}
 
@@ -288,11 +307,11 @@ def draft_dto(row):
 
 
 def draft_list_row(row):
-  done = sum(1 for kind in DOCUMENT_KINDS
-             if row["items"][kind]["state"] == "signed" or _covered_by(row, kind) is not None)
+  """`items_total` counts the shown items, `items_done` those of them that are signed."""
+  done = sum(1 for kind in SHOWN_KINDS if row["items"][kind]["state"] == "signed")
   return {"draft_id": row["draft_id"], "display_name": row["display_name"],
           "compliance_types": row["compliance_types"], "created_at": row["created_at"],
-          "updated_at": row["updated_at"], "items_done": done, "items_total": len(DOCUMENT_KINDS),
+          "updated_at": row["updated_at"], "items_done": done, "items_total": len(SHOWN_KINDS),
           "activation": row["activation"]}
 
 
@@ -340,6 +359,7 @@ def validate_tenant_draft(row, ids):
                                               or item["document"]["mime"] != "application/pdf"))
         or not _same(lambda covers: normalize_covers(kind, covers), item["covers"])
         or not _same(_effective_date, item["effective_from"])
-        or not _same(_effective_date, item["effective_until"])):
+        or not _same(_effective_date, item["effective_until"])
+        or not valid_generated(item["generated"])):
       raise ValueError("Invalid tenant draft item")
   return row

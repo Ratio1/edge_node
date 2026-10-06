@@ -282,6 +282,51 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((row["class"], row["reason"]), ("old", "unrecognized"))
     self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
 
+  def engagement_draft_row(self, parent, first_cid):
+    """RM-109 phase 4. A child with a signed and a generated pack file, written through the real endpoint."""
+    created = self.plugin.create_engagement_draft(self.actor, parent, str(uuid4()), "Pack")
+    self.assertTrue(created["success"], created)
+    field = json.dumps(["engagement_draft", "deployment", created["data"]["engagement_draft_id"]],
+                       separators=(",", ":"))
+    ref = {"store": "r1fs", "ref": cid(first_cid), "filename": "pack.pdf", "mime": "application/pdf",
+           "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator", "sha256": "a" * 64, "size_bytes": 10}
+    self.storage.data[(TENANCY, field)]["document"].update(state="signed", document=ref, generated={
+      **ref, "ref": cid(first_cid + 1), "sha256": "b" * 64, "snapshot_sha256": "c" * 64,
+      "generated_at": "2026-10-07T00:00:00Z", "generated_by": "creator"})
+    self.events.clear()
+    return field
+
+  def test_an_engagement_draft_is_current_with_a_live_parent_and_parent_gone_without(self):
+    parent = self.draft_row()
+    draft_id = json.loads(parent)[2]
+    child = self.engagement_draft_row(draft_id, 41)
+    under_tenant = self.engagement_draft_row(self.tenant, 43)
+    rows = self.scan()
+    for field, first_cid in ((child, 41), (under_tenant, 43)):
+      row = rows[(TENANCY, field)]
+      self.assertEqual((row["class"], row["reason"]), ("current", ""), field)
+      self.assertEqual(row["cids"], [{"cid": cid(first_cid), "role": "document.document.ref", "withheld": False},
+                                     {"cid": cid(first_cid + 1), "role": "document.generated.ref", "withheld": False}])
+      self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertEqual(self.files.deleted, [])
+    # The parent tenant draft gone: orphan, never old_tenant, and cleanup removes it with its files.
+    del self.storage.data[(TENANCY, parent)]
+    row = self.scan()[(TENANCY, child)]
+    self.assertEqual((row["class"], row["reason"]), ("orphan", "parent_gone"))
+    self.assertEqual(self.clean(row)[0]["outcome"], "deleted")
+    self.assertEqual(sorted(self.files.deleted), sorted([cid(41), cid(42)]))
+    # The parent tenant deleted (`delete_tenant` does not cascade to drafts): parent_gone too, even
+    # while the tenant is still known as an old row.
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]["contract"]
+    row = self.scan()[(TENANCY, under_tenant)]
+    self.assertEqual((row["class"], row["reason"]), ("orphan", "parent_gone"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "parent_gone")
+    # A malformed child is old/unrecognized, whatever its parent.
+    self.storage.data[(TENANCY, under_tenant)]["document"]["state"] = "done"
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
+
   def test_a_tenant_activated_from_a_draft_is_current_with_all_its_files(self):
     # RM-109 phase 3: the receipt carries the draft id; tenant and receipt name three documents.
     from .contract_fixture import FakeDocumentStore

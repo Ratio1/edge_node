@@ -98,13 +98,16 @@ class TestDraftRecord(_DraftCase):
     self.assertEqual(draft["compliance_types"], ["cra", "nis2"])
     self.assertEqual((draft["domain_id"], draft["initial_admin_id"]), ("", ""))
     self.assertEqual(draft["legal"], {key: "" for key in LEGAL})
+    # The collapsed checklist (RM-109 phase 4): the tenant agreement pack in the `contract` slot covers
+    # both tenant records, applicability is `required` for both; the other two slots stay in the record.
     self.assertEqual(draft["items"]["contract"], {
-      "state": "missing", "document": None, "covers": [], "effective_from": None,
-      "effective_until": None, "basis": "Contractual obligation", "covered_by": None})
+      "state": "missing", "document": None, "covers": ["framework_agreement", "data_handling"],
+      "effective_from": None, "effective_until": None, "generated": None, "basis": "Contractual obligation",
+      "covered_by": None})
     self.assertEqual(draft["items"]["framework_agreement"]["covers"], ["framework_agreement"])
     self.assertEqual(draft["items"]["data_handling"]["covers"], ["data_handling"])
-    self.assertEqual(draft["applicability"], {"framework_agreement": {"decision": "unknown", "reason": None},
-                                              "data_handling": {"decision": "unknown", "reason": None}})
+    self.assertEqual(draft["applicability"], {"framework_agreement": {"decision": "required", "reason": None},
+                                              "data_handling": {"decision": "required", "reason": None}})
     self.assertIsNone(draft["activation"])
     self.assertIsNone(draft["last_release"])
     self.assertEqual((draft["created_by"], draft["updated_by"]), ("creator", "creator"))
@@ -147,15 +150,16 @@ class TestDraftRecord(_DraftCase):
     first = self.create("First")
     second = self.create("Second", ["ai_act"])
     ok(self, self.upload(second["draft_id"]))
-    ok(self, self.update(second["draft_id"], {"items": {"contract": {"covers": ["data_handling"]}}}))
+    # The hidden slots never count, signed or not.
+    ok(self, self.upload(second["draft_id"], "data_handling", SCHEDULE_PDF))
     rows = ok(self, self.plugin.list_tenant_drafts(self.actor))
     by_id = {row["draft_id"]: row for row in rows}
     self.assertEqual(set(by_id), {first["draft_id"], second["draft_id"]})
     self.assertEqual(set(by_id[first["draft_id"]]), {"draft_id", "display_name", "compliance_types", "created_at",
                                                      "updated_at", "items_done", "items_total", "activation"})
-    self.assertEqual((by_id[first["draft_id"]]["items_done"], by_id[first["draft_id"]]["items_total"]), (0, 3))
-    # The signed contract and the data handling item it covers.
-    self.assertEqual(by_id[second["draft_id"]]["items_done"], 2)
+    # One shown item since the two-pack shape; done once the pack is signed.
+    self.assertEqual((by_id[first["draft_id"]]["items_done"], by_id[first["draft_id"]]["items_total"]), (0, 1))
+    self.assertEqual((by_id[second["draft_id"]]["items_done"], by_id[second["draft_id"]]["items_total"]), (1, 1))
     self.assertEqual(by_id[second["draft_id"]]["compliance_types"], ["ai_act"])
 
   def test_a_draft_id_is_never_a_tenant_and_tenants_are_never_drafts(self):
@@ -316,42 +320,35 @@ class TestDraftCompleteness(_DraftCase):
 
   def test_a_new_draft_lists_every_gap(self):
     draft = self.create("", ())
+    # Rule 3 (collapsed checklist): the two tenant records sit in the contract's fixed covers, so
+    # the signed pack decides them and no `record:` gap is listed.
     self.assertEqual(draft["completeness"], {"complete": False, "missing": [
       "field:display_name", "field:domain_id", "field:initial_admin_id", "field:legal.name",
       "field:legal.registration_id", "field:legal.signer_name", "field:legal.signer_role",
-      "field:compliance_types", "item:contract", "record:framework_agreement", "record:data_handling"]})
+      "field:compliance_types", "item:contract"]})
 
-  def test_unknown_and_required_records_are_gaps_until_covered_or_not_required(self):
+  def test_applicability_is_not_asked_the_signed_pack_decides_the_tenant_records(self):
     draft_id = self.create()["draft_id"]
     self.complete_fields(draft_id)
-    ok(self, self.upload(draft_id))
-    self.assertEqual(self.completeness(draft_id)["missing"], ["record:framework_agreement", "record:data_handling"])
-    ok(self, self.update(draft_id, {"applicability": {"framework_agreement": {"decision": "required", "reason": None}}}))
-    self.assertEqual(self.completeness(draft_id)["missing"], ["record:framework_agreement", "record:data_handling"])
+    self.assertEqual(self.completeness(draft_id)["missing"], ["item:contract"])
+    # Neither `unknown` nor `not_required` changes the outcome.
     ok(self, self.update(draft_id, {"applicability": {
-      "framework_agreement": {"decision": "not_required", "reason": "Combined in the contract"},
+      "framework_agreement": {"decision": "unknown", "reason": None},
       "data_handling": {"decision": "not_required", "reason": "No data leaves the client"}}}))
-    self.assertEqual(self.completeness(draft_id), {"complete": True, "missing": []})
-
-  def test_a_covered_record_is_never_a_gap_whatever_its_decision(self):
-    draft_id = self.create()["draft_id"]
-    self.complete_fields(draft_id)
-    ok(self, self.update(draft_id, {
-      "items": {"contract": {"covers": ["framework_agreement", "data_handling"]}},
-      "applicability": {"framework_agreement": {"decision": "required", "reason": None}}}))
-    # Coverage counts only while the covering item is signed.
-    self.assertEqual(self.completeness(draft_id)["missing"],
-                     ["item:contract", "record:framework_agreement", "record:data_handling"])
+    self.assertEqual(self.completeness(draft_id)["missing"], ["item:contract"])
     draft = ok(self, self.upload(draft_id))
     self.assertEqual(draft["completeness"], {"complete": True, "missing": []})
     self.assertEqual(draft["items"]["framework_agreement"]["covered_by"], "contract")
     self.assertEqual(draft["items"]["data_handling"]["covered_by"], "contract")
     self.assertIsNone(draft["items"]["contract"]["covered_by"])
 
-  def test_a_signed_agreement_covers_its_schedule_but_an_awaiting_one_does_not(self):
+  def test_a_record_dropped_from_the_contract_covers_needs_a_signed_item(self):
     draft_id = self.create()["draft_id"]
     self.complete_fields(draft_id)
     ok(self, self.upload(draft_id))
+    ok(self, self.update(draft_id, {"items": {"contract": {"covers": []}}}))
+    self.assertEqual(self.completeness(draft_id)["missing"], ["record:framework_agreement", "record:data_handling"])
+    # Coverage counts only while the covering item is signed.
     ok(self, self.update(draft_id, {"items": {"framework_agreement": {
       "state": "awaiting_signature", "covers": ["framework_agreement", "data_handling"]}}}))
     self.assertEqual(self.completeness(draft_id)["missing"], ["record:framework_agreement", "record:data_handling"])
@@ -364,12 +361,10 @@ class TestDraftCompleteness(_DraftCase):
     draft_id = self.create()["draft_id"]
     self.complete_fields(draft_id)
     ok(self, self.upload(draft_id))
-    draft = ok(self, self.update(draft_id, {
-      "items": {"contract": {"covers": ["scope_of_work", "rules_of_engagement"]}},
-      "applicability": {"framework_agreement": {"decision": "not_required", "reason": "None"},
-                        "data_handling": {"decision": "not_required", "reason": "None"}}}))
+    draft = ok(self, self.update(draft_id, {"items": {"contract": {
+      "covers": ["framework_agreement", "data_handling", "scope_of_work", "rules_of_engagement"]}}}))
     self.assertEqual(draft["completeness"], {"complete": True, "missing": []})
-    ok(self, self.update(draft_id, {"items": {"contract": {"covers": []}}}))
+    ok(self, self.update(draft_id, {"items": {"contract": {"covers": ["framework_agreement", "data_handling"]}}}))
     self.assertTrue(self.completeness(draft_id)["complete"])
 
   def test_the_contract_item_is_always_required(self):
@@ -379,6 +374,32 @@ class TestDraftCompleteness(_DraftCase):
       "framework_agreement": {"decision": "not_required", "reason": "x"},
       "data_handling": {"decision": "not_required", "reason": "y"}}}))
     self.assertEqual(self.completeness(draft_id)["missing"], ["item:contract"])
+
+  def test_missing_and_awaiting_signature_keep_the_generated_block(self):
+    # Nothing generates yet (RM-110); the block is written into the record directly.
+    draft_id = self.create()["draft_id"]
+    ok(self, self.upload(draft_id))
+    row = self.stored(draft_id)
+    generated = {**row["items"]["contract"]["document"], "ref": "doc-generated", "sha256": "b" * 64,
+                 "snapshot_sha256": "c" * 64, "generated_at": "2026-10-07T00:00:00Z", "generated_by": "creator"}
+    row["items"]["contract"]["generated"] = generated
+    self.repo.put("tenant_draft", draft_id, record=row)
+    draft = ok(self, self.update(draft_id, {"items": {"contract": {"state": "missing"}}}))
+    self.assertEqual((draft["items"]["contract"]["state"], draft["items"]["contract"]["generated"]),
+                     ("missing", generated))
+    self.assertEqual(self.documents.deleted, ["doc-1"])
+    draft = ok(self, self.update(draft_id, {"items": {"contract": {"state": "awaiting_signature"}}}))
+    self.assertEqual((draft["items"]["contract"]["state"], draft["items"]["contract"]["generated"]),
+                     ("awaiting_signature", generated))
+    # A malformed block is refused by the store.
+    row = self.stored(draft_id)
+    row["items"]["contract"]["generated"] = {**generated, "snapshot_sha256": "nope"}
+    with self.assertRaises(TenantStoreError):
+      self.repo.put("tenant_draft", draft_id, record=row)
+    # Delete removes the generated file too.
+    self.assertEqual(ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))["files_deleted"], 1)
+    self.assertEqual(self.documents.deleted, ["doc-1", "doc-generated"])
+    self.assertIsNone(self.stored(draft_id))
 
 
 class TestDraftDocuments(_DraftCase):
@@ -475,13 +496,13 @@ class TestDraftDocuments(_DraftCase):
       delete(ref)
     self.documents.delete = observed_delete
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))
-    self.assertEqual(data, {"draft_id": draft_id, "files_deleted": 2})
+    self.assertEqual(data, {"draft_id": draft_id, "files_deleted": 2, "engagement_drafts_deleted": 0})
     self.assertEqual(present, [True, True])
     self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2"])
     self.assertIsNone(self.stored(draft_id))
     refused(self, self.plugin.get_tenant_draft(self.actor, draft_id), 404, "not_found")
     self.assertEqual(self.events, [("tenant_draft_deleted", {"draft_id": draft_id, "actor": "creator",
-                                                             "files_deleted": 2})])
+                                                             "files_deleted": 2, "engagement_drafts_deleted": 0})])
 
   def test_a_failed_file_delete_keeps_the_record_for_a_retry(self):
     draft_id = self.create()["draft_id"]
@@ -693,7 +714,7 @@ class TestDraftActivation(_ActivationCase):
     result = self.activate(draft_id, str(uuid4()))
     refused(self, result, 409, "draft_incomplete")
     self.assertEqual(result["missing"][:2], ["field:initial_admin_id", "field:legal.name"])
-    self.assertIn("record:framework_agreement", result["missing"])
+    self.assertIn("item:contract", result["missing"])
     self.assertEqual(len(self.store.writes), writes)
     self.assertIsNone(self.stored(draft_id)["activation"])
 

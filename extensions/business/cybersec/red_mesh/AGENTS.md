@@ -615,3 +615,25 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   neither (preparation stopped before the receipt: files intact). No release deletes a file.
 - Verification: `tests/test_tenant_drafts.py`, `test_tenant_contract.py` (uploader relaxed,
   draft envelope refused, `contract_in_use`), `test_data_maintenance.py`, `test_authz_surface.py`.
+
+### 2026-10-07 — RM-109 phase 4: engagement drafts inside the tenant draft
+
+- BUILDER: `engagement_draft` record kind (`tenancy/engagement_drafts.py`, `ted_<uuid>`, `parent` =
+  `{draft_id}` or `{tenant_id}`), eight `authorize_platform`-gated endpoints (create/update/get/list/
+  delete, pack upload/download, `activate_engagement_draft`). Fields are checked with the
+  `tenancy/engagements.py` normalizers on every write (emptiness allowed) and in full at activation.
+  The pack envelope is `redmesh_tenant_contract` 1.1 with `document_kind: engagement_pack` and
+  `engagement_draft_id`; `read_engagement_document` accepts it. Collapsed tenant checklist: the
+  `contract` item covers both tenant records, applicability is `required` and no longer decides
+  completeness; `items.*.generated` and `document.generated` are validated (written by RM-110).
+- CRITIC/response: activation is one locked call with no marker. An engagement `en_<uuid>` already
+  under the parent tenant means a crash after `create_engagement`, so the row is deleted and the
+  call answers `replayed`, whoever calls; the refs are re-resolved outside the lock
+  (`resolve_engagement_pack`) and compared under it (`draft_changed`); pack uploaders need the
+  platform role instead of "equals creator"; `contract_in_use` covers engagement `documents[]`.
+  `close_tenant_draft` re-homes the children before deleting the row; `delete_tenant_draft`
+  cascades (children's files, rows, then its own); `delete_tenant` does not cascade, so data
+  maintenance classifies a child with no parent `orphan/parent_gone`. `ted_` ids answer 404 as
+  tenant and as engagement ids.
+- Verification: `tests/test_engagement_drafts.py` (new), `test_tenant_drafts.py` (collapsed
+  checklist), `test_data_maintenance.py`, `test_authz_surface.py` (107 endpoints).

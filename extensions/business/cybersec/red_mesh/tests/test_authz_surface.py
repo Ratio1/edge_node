@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 99  # +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3)
+EXPECTED_ENDPOINTS = 107  # +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -43,6 +43,15 @@ ENDPOINT_FIRST_ARGS = {
   'release_tenant_draft_activation': 'actor',
   'close_tenant_draft': 'actor',
   'download_tenant_document': 'actor',
+  # RM-109 phase 4: engagement drafts inside the tenant draft.
+  'create_engagement_draft': 'actor',
+  'get_engagement_draft': 'actor',
+  'list_engagement_drafts': 'actor',
+  'update_engagement_draft': 'actor',
+  'upload_engagement_draft_document': 'actor',
+  'download_engagement_draft_document': 'actor',
+  'delete_engagement_draft': 'actor',
+  'activate_engagement_draft': 'actor',
   # RM-108, temporary.
   'export_redmesh_records': 'actor',
   'export_redmesh_file': 'actor',

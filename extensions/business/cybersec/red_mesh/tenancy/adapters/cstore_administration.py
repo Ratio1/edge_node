@@ -9,12 +9,15 @@ from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
 from ..engagements import validate_engagement
 from ..drafts import validate_tenant_draft
+from ..engagement_drafts import validate_engagement_draft
 
 MAX_ENUMERATED_RECORDS = 10000
 # RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
 # is never read or written, so a leftover row cannot come back through a new code path.
-# RM-109: `tenant_draft` is keyed by its draft id alone; a draft has no tenant.
-_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft"})
+# RM-109: `tenant_draft` is keyed by its draft id alone; a draft has no tenant. `engagement_draft`
+# is keyed by its own id too; its parent (a tenant draft or a tenant) is a field of the row.
+_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
+                    "engagement_draft"})
 
 
 class CstoreTenantAdministrationStore:
@@ -71,6 +74,11 @@ class CstoreTenantAdministrationStore:
         validate_tenant_draft(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid tenant draft storage record") from exc
+    if kind == "engagement_draft":
+      try:
+        validate_engagement_draft(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid engagement draft storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):
@@ -197,6 +205,11 @@ class CstoreTenantAdministrationStore:
   def list_tenant_drafts(self):
     """RM-109. Every draft of the namespace; a malformed one fails the read closed."""
     return [self._validate(raw, "tenant_draft", ids) for ids, raw in self._fields("tenant_draft")]
+
+  def list_engagement_drafts(self):
+    """RM-109 phase 4. Every engagement draft of the namespace (the parent is a field, not a key),
+    the same way."""
+    return [self._validate(raw, "engagement_draft", ids) for ids, raw in self._fields("engagement_draft")]
 
   def list_tenants(self):
     rows = []
