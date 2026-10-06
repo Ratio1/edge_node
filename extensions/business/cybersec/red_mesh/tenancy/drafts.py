@@ -248,6 +248,35 @@ def completeness(row):
   return {"complete": not missing, "missing": missing}
 
 
+def governance(row):
+  """What activation copies onto the receipt and the tenant: per record the signed item that covers
+  it (its own item first), the applicability decisions, and the signed items' effective dates."""
+  signed = [kind for kind in DOCUMENT_KINDS if row["items"][kind]["state"] == "signed"]
+  coverage = {}
+  for record in RECORDS:
+    covering = [kind for kind in signed if record in row["items"][kind]["covers"]]
+    if covering:
+      coverage[record] = record if record in covering else covering[0]
+  return {"coverage": coverage,
+          "applicability": {record: dict(row["applicability"][record]) for record in TENANT_RECORDS},
+          "effective": {kind: {key: row["items"][kind][key] for key in ("effective_from", "effective_until")}
+                        for kind in signed}}
+
+
+def valid_governance(value):
+  """The stored shape `governance` writes; values from the vocabulary."""
+  return (isinstance(value, dict) and set(value) == {"coverage", "applicability", "effective"}
+          and isinstance(value["coverage"], dict)
+          and all(record in RECORDS and kind in DOCUMENT_KINDS for record, kind in value["coverage"].items())
+          and isinstance(value["applicability"], dict) and set(value["applicability"]) == set(TENANT_RECORDS)
+          and all(_same(normalize_applicability, value["applicability"][record]) for record in TENANT_RECORDS)
+          and isinstance(value["effective"], dict)
+          and all(kind in DOCUMENT_KINDS and isinstance(dates, dict)
+                  and set(dates) == {"effective_from", "effective_until"}
+                  and all(_same(_effective_date, dates[key]) for key in dates)
+                  for kind, dates in value["effective"].items()))
+
+
 def draft_dto(row):
   dto = {key: row[key] for key in DTO_FIELDS}
   dto["items"] = {kind: {**{key: row["items"][kind][key] for key in _ITEM_FIELDS}, "basis": BASIS[kind],

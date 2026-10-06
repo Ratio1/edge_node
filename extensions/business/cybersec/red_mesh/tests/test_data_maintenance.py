@@ -282,6 +282,45 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((row["class"], row["reason"]), ("old", "unrecognized"))
     self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
 
+  def test_a_tenant_activated_from_a_draft_is_current_with_all_its_files(self):
+    # RM-109 phase 3: the receipt carries the draft id; tenant and receipt name three documents.
+    from .contract_fixture import FakeDocumentStore
+
+    class CidDocuments(FakeDocumentStore):
+      """Refs as R1FS gives them (CIDs), so the inventory follows them."""
+      def put(self, envelope):
+        ref = super().put(envelope)
+        address = cid(60 + int(ref[4:]))
+        self.envelopes[address] = self.envelopes.pop(ref)
+        return address
+    documents = CidDocuments()
+    self.plugin._document_store = lambda: documents
+    self.storage.account("acme.admin")
+    request = str(uuid4())
+    draft_id = self.plugin.create_tenant_draft(self.actor, request, "Acme", ["nis2"])["data"]["draft_id"]
+    self.assertTrue(self.plugin.update_tenant_draft(self.actor, draft_id, {
+      "domain_id": "acme", "initial_admin_id": "acme.admin",
+      "legal": {"name": "A", "registration_id": "B", "signer_name": "C", "signer_role": "D"}})["success"])
+    for number, kind in enumerate(("contract", "framework_agreement", "data_handling")):
+      raw = b"%PDF-1.7\n%" + kind.encode() + b"\n%%EOF\n"
+      uploaded = self.plugin.upload_tenant_draft_document(self.actor, draft_id, kind, f"{kind}.pdf",
+                                                          base64.b64encode(raw).decode("ascii"))
+      self.assertTrue(uploaded["success"], uploaded)
+    prepared = self.plugin.prepare_tenant(self.actor, request, draft_id=draft_id)
+    self.assertTrue(prepared["success"], prepared)
+    self.storage.grant("acme.admin", prepared["data"]["tenantId"])
+    self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
+    rows = self.scan()
+    receipt = json.dumps(["receipt", "deployment", "creator", request], separators=(",", ":"))
+    tenant = json.dumps(["tenant", "deployment", prepared["data"]["tenantId"]], separators=(",", ":"))
+    draft = json.dumps(["tenant_draft", "deployment", draft_id], separators=(",", ":"))
+    files = {cid(61): "contract.ref", cid(62): "framework_agreement.ref", cid(63): "data_handling.ref"}
+    for field in (receipt, tenant):
+      row = rows[(TENANCY, field)]
+      self.assertEqual((row["class"], row["reason"]), ("current", ""), field)
+      self.assertEqual({item["cid"]: item["role"] for item in row["cids"]}, files)
+    self.assertEqual(rows[(TENANCY, draft)]["class"], "current")
+
   def test_a_file_is_served_only_for_a_row_that_references_it(self):
     with patch.object(data_maintenance, "read_stored_file", return_value={"cid": CONFIG}) as read:
       self.assertTrue(self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)["success"])

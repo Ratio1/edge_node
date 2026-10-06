@@ -593,6 +593,329 @@ class TestDraftLockAndMissingFiles(_DraftCase):
       self.assertIn(part, logged[0][0])
 
 
+class _ActivationCase(_DraftCase):
+  def setUp(self):
+    super().setUp()
+    self.store.account("acme.admin")
+
+  def ready(self, combined=False, uploader=None):
+    """A complete draft: the contract, plus the agreement and the schedule unless `combined`."""
+    draft_id = self.create(compliance_types=("nis2", "cra"))["draft_id"]
+    self.complete_fields(draft_id)
+    ok(self, self.upload(draft_id, actor=uploader))
+    if combined:
+      ok(self, self.update(draft_id, {"items": {"contract": {
+        "covers": ["framework_agreement", "data_handling", "scope_of_work"]}}}))
+    else:
+      ok(self, self.update(draft_id, {"items": {"framework_agreement": {"effective_from": "2026-11-01"}}}))
+      ok(self, self.upload(draft_id, "framework_agreement", b"%PDF-1.7\n%agreement\n%%EOF\n", actor=uploader))
+      ok(self, self.upload(draft_id, "data_handling", SCHEDULE_PDF, actor=uploader))
+    return draft_id
+
+  def activate(self, draft_id, request_id, actor=None):
+    # Every creation argument the caller sends is ignored on the draft path.
+    return self.plugin.prepare_tenant(actor or self.actor, request_id, "Ignored", "ignored", "nobody",
+                                      legal_name="Ignored", registration_id="X", signer_name="Y",
+                                      signer_role="Z", contract_ref="doc-ignored", draft_id=draft_id)
+
+  def rows(self, kind):
+    return [value for (hkey, key), value in self.store.data.items()
+            if hkey == TENANCY_HKEY and value is not None and json.loads(key)[0] == kind]
+
+  def finish(self, draft_id, request_id):
+    """The Navigator side after `prepare_tenant`: membership, `activate_tenant`."""
+    tenant_id = self.rows("receipt")[-1]["tenant_id"]
+    self.store.grant("acme.admin", tenant_id)
+    ok(self, self.plugin.activate_tenant(self.actor, request_id))
+    return tenant_id
+
+
+class TestDraftActivation(_ActivationCase):
+  def test_the_tenant_is_created_from_the_draft_alone(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    draft = ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))
+    prepared = ok(self, self.activate(draft_id, request_id))
+    self.assertEqual((prepared["state"], prepared["initialAdminId"]), ("pending", "acme.admin"))
+    marker = self.stored(draft_id)["activation"]
+    self.assertEqual((marker["actor_id"], marker["request_id"]), ("creator", request_id))
+    self.assertEqual(ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))["activation"]["tenant_state"],
+                     "pending")
+    receipt, = self.rows("receipt")
+    self.assertEqual(receipt["draft_id"], draft_id)
+    tenant, = self.rows("tenant")
+    self.assertNotIn("draft_id", tenant)
+    self.assertEqual((tenant["display_name"], tenant["domain_id"], tenant["legal"]), ("Acme SRL", "acme", LEGAL))
+    self.assertEqual(tenant["compliance_types"], ["cra", "nis2"])
+    for kind in KINDS:
+      self.assertEqual(receipt[kind], draft["items"][kind]["document"])
+      self.assertEqual(tenant[kind], draft["items"][kind]["document"])
+    self.assertEqual(tenant["governance"], {
+      "coverage": {"framework_agreement": "framework_agreement", "data_handling": "data_handling"},
+      "applicability": draft["applicability"],
+      "effective": {"contract": {"effective_from": None, "effective_until": None},
+                    "framework_agreement": {"effective_from": "2026-11-01", "effective_until": None},
+                    "data_handling": {"effective_from": None, "effective_until": None}}})
+    self.assertIsNone(self.repo.get("domain", "ignored"))
+    tenant_id = self.finish(draft_id, request_id)
+    self.assertEqual(ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))["activation"]["tenant_state"],
+                     "active")
+    contract = ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))
+    self.assertEqual(contract["compliance_types"], ["cra", "nis2"])
+    self.assertEqual(contract["framework_agreement"], draft["items"]["framework_agreement"]["document"])
+    downloaded = ok(self, self.plugin.download_tenant_document(self.actor, tenant_id, "data_handling"))
+    self.assertEqual(downloaded["sha256"], hashlib.sha256(SCHEDULE_PDF).hexdigest())
+    refused(self, self.plugin.download_tenant_document(self.actor, tenant_id, "other"), 400, "invalid_request")
+    refused(self, self.plugin.download_tenant_document({"account_id": "acme.admin"}, tenant_id, "contract"),
+            403, "forbidden")
+    # Close: the record goes, the files are the tenant's.
+    closed = ok(self, self.plugin.close_tenant_draft({"account_id": "other-sta"}, draft_id))
+    self.assertEqual(closed, {"draft_id": draft_id, "tenant_id": tenant_id})
+    self.assertIsNone(self.stored(draft_id))
+    self.assertEqual(self.documents.deleted, [])
+    refused(self, self.plugin.close_tenant_draft(self.actor, draft_id), 404, "not_found")
+
+  def test_a_combined_contract_leaves_the_other_slots_empty(self):
+    draft_id, request_id = self.ready(combined=True), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    tenant, = self.rows("tenant")
+    self.assertEqual((tenant["framework_agreement"], tenant["data_handling"]), (None, None))
+    self.assertEqual(tenant["governance"]["coverage"], {"framework_agreement": "contract",
+                                                        "data_handling": "contract", "scope_of_work": "contract"})
+    refused(self, self.plugin.download_tenant_document(self.actor, tenant_id, "framework_agreement"),
+            404, "not_found")
+    self.assertTrue(ok(self, self.plugin.download_tenant_document(self.actor, tenant_id, "contract")))
+
+  def test_an_incomplete_draft_is_refused_with_its_gaps_and_writes_nothing(self):
+    draft_id = self.create()["draft_id"]
+    ok(self, self.update(draft_id, {"domain_id": "acme"}))
+    writes = len(self.store.writes)
+    result = self.activate(draft_id, str(uuid4()))
+    refused(self, result, 409, "draft_incomplete")
+    self.assertEqual(result["missing"][:2], ["field:initial_admin_id", "field:legal.name"])
+    self.assertIn("record:framework_agreement", result["missing"])
+    self.assertEqual(len(self.store.writes), writes)
+    self.assertIsNone(self.stored(draft_id)["activation"])
+
+  def test_a_replay_is_the_same_creation(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    first = ok(self, self.activate(draft_id, request_id))
+    self.assertEqual(ok(self, self.activate(draft_id, request_id)), first)
+    self.finish(draft_id, request_id)
+    again = ok(self, self.activate(draft_id, request_id))
+    self.assertEqual((again["tenantId"], again["state"]), (first["tenantId"], "active"))
+    self.assertEqual(len(self.rows("tenant")), 1)
+
+  def test_another_activation_is_refused_while_the_marker_is_held(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    marker = self.stored(draft_id)["activation"]
+    for actor, request in (({"account_id": "other-sta"}, request_id), ({"account_id": "other-sta"}, str(uuid4())),
+                           (self.actor, str(uuid4()))):
+      with self.subTest(actor=actor, request=request):
+        writes = len(self.store.writes)
+        result = self.activate(draft_id, request, actor=actor)
+        refused(self, result, 409, "activation_in_progress")
+        self.assertEqual(result["holder"], {"actor_id": "creator", "started_at": marker["started_at"]})
+        self.assertEqual(len(self.store.writes), writes)
+
+  def test_a_super_tenant_admin_other_than_the_uploader_activates_and_a_lost_role_replays(self):
+    draft_id, request_id = self.ready(uploader={"account_id": "other-sta"}), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    self.store.account("other-sta", memberships=[])
+    self.assertEqual(self.activate(draft_id, request_id)["status_code"], 200)
+
+  def test_a_first_activation_refuses_an_uploader_without_the_role(self):
+    draft_id = self.ready(uploader={"account_id": "other-sta"})
+    self.store.account("other-sta", memberships=[])
+    writes = len(self.store.writes)
+    refused(self, self.activate(draft_id, str(uuid4())), 400, "contract_invalid")
+    self.assertEqual(len(self.store.writes), writes)
+
+  def test_a_ref_from_another_draft_or_slot_is_refused(self):
+    other_id = self.ready()
+    other = self.stored(other_id)
+    draft_id = self.ready()
+    row = self.stored(draft_id)
+    cases = {
+      "contract of another draft": ("contract", other["items"]["contract"]["document"], "contract_invalid"),
+      "schedule of another draft": ("data_handling", other["items"]["data_handling"]["document"], "document_invalid"),
+      "this draft's contract in the agreement slot": (
+        "framework_agreement", row["items"]["contract"]["document"], "document_invalid"),
+    }
+    for label, (kind, document, code) in cases.items():
+      with self.subTest(label):
+        changed = copy.deepcopy(row)
+        changed["items"][kind]["document"] = document
+        self.repo.put("tenant_draft", draft_id, record=changed)
+        writes = len(self.store.writes)
+        refused(self, self.activate(draft_id, str(uuid4())), 400, code)
+        self.assertEqual(len(self.store.writes), writes)
+
+  def test_a_ref_changed_after_resolution_is_draft_changed(self):
+    draft_id = self.ready()
+    resolved = {kind: item["document"] for kind, item in self.stored(draft_id)["items"].items()}
+    ok(self, self.upload(draft_id, "data_handling", b"%PDF-1.7\n%new schedule\n%%EOF\n"))
+    writes = len(self.store.writes)
+    result = self.plugin._call_tenant_administration("prepare_tenant", self.actor, request_id=str(uuid4()),
+                                                     draft_id=draft_id, draft_documents=resolved)
+    refused(self, result, 409, "draft_changed")
+    self.assertEqual(len(self.store.writes), writes)
+
+  def test_a_file_bound_to_a_tenant_is_in_use_for_a_draft(self):
+    draft_id = self.ready()
+    row = self.stored(draft_id)
+    # Another creation receipt already binds this draft's contract file (same CID); the scan reads
+    # raw rows, so even one the validator would refuse counts.
+    self.store.data[(TENANCY_HKEY, '["receipt","deployment","creator","x"]')] = {
+      "contract": row["items"]["contract"]["document"]}
+    refused(self, self.activate(draft_id, str(uuid4())), 409, "contract_in_use")
+
+  def test_a_draft_id_is_never_a_tenant_id(self):
+    from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
+    draft_id, request_id = self.ready(), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    self.finish(draft_id, request_id)
+    calls = {
+      "nodes": lambda: self.plugin.get_tenant_nodes(self.actor, draft_id),
+      "node assignment": lambda: self.plugin.set_tenant_node_assignment(self.actor, draft_id, "0xai_node", True),
+      "membership": lambda: self.plugin.authorize_tenant_membership(self.actor, draft_id, "acme.admin", "tenant_user"),
+      "engagements": lambda: self.plugin.list_engagements(self.actor, draft_id),
+      "engagement create": lambda: self.plugin.create_engagement(self.actor, draft_id, str(uuid4())),
+      "tenant": lambda: self.plugin.get_tenant(self.actor, draft_id),
+      "tenant document": lambda: self.plugin.download_tenant_document(self.actor, draft_id, "contract"),
+    }
+    for label, call in calls.items():
+      with self.subTest(label):
+        refused(self, call(), 404, "not_found")
+    service = self.plugin._execution_service()
+    with self.assertRaises(AdministrationDenied) as denied:
+      service.resolve_execution_admission(self.actor, draft_id, "en_" + str(uuid4()), "ea_1")
+    self.assertEqual((denied.exception.status_code, denied.exception.error), (404, "not_found"))
+
+
+class TestDraftRelease(_ActivationCase):
+  def test_a_crash_after_the_marker_leaves_no_receipt_and_a_retry_recovers(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    # The marker write is the first of this preparation, the receipt the second.
+    self.store.fail_write = len(self.store.writes) + 2
+    refused(self, self.activate(draft_id, request_id), 503, "unavailable")
+    self.store.fail_write = None
+    self.assertEqual(self.stored(draft_id)["activation"]["request_id"], request_id)
+    self.assertEqual(self.rows("receipt"), [])
+    self.assertEqual(ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))["activation"]["tenant_state"], "none")
+    prepared = ok(self, self.activate(draft_id, request_id))
+    self.assertEqual(self.rows("receipt")[0]["tenant_id"], prepared["tenantId"])
+
+  def test_a_crash_after_the_marker_is_released_without_touching_the_files(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    self.store.fail_write = len(self.store.writes) + 2
+    refused(self, self.activate(draft_id, request_id), 503, "unavailable")
+    self.store.fail_write = None
+    before = self.stored(draft_id)["items"]
+    released = ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))["released"]
+    self.assertEqual((released["request_id"], released["tenant_id"], released["initial_admin_id"]),
+                     (request_id, None, None))
+    self.assertEqual(self.stored(draft_id)["items"], before)
+    self.assertIsNone(self.stored(draft_id)["activation"])
+    self.assertEqual(ok(self, self.activate(draft_id, str(uuid4())))["state"], "pending")
+
+  def test_release_removes_the_pending_tenant_keeps_the_files_and_frees_them(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    prepared = ok(self, self.activate(draft_id, request_id))
+    self.store.grant("acme.admin", prepared["tenantId"])
+    result = ok(self, self.plugin.release_tenant_draft_activation({"account_id": "other-sta"}, draft_id))
+    released = result["released"]
+    self.assertEqual(set(result), {"draft_id", "released"})
+    self.assertEqual({key: released[key] for key in ("actor_id", "request_id", "tenant_id", "initial_admin_id")},
+                     {"actor_id": "other-sta", "request_id": request_id, "tenant_id": prepared["tenantId"],
+                      "initial_admin_id": "acme.admin"})
+    self.assertEqual((self.rows("tenant"), self.rows("receipt")), ([], []))
+    self.assertIsNone(self.repo.get("domain", "acme"))
+    self.assertEqual(self.documents.deleted, [])
+    row = self.stored(draft_id)
+    self.assertIsNone(row["activation"])
+    self.assertEqual(row["last_release"], released)
+    self.assertTrue(all(item["state"] == "signed" for item in row["items"].values()))
+    self.assertEqual(self.events, [("tenant_draft_activation_released",
+                                    {"draft_id": draft_id, "actor": "other-sta", "rows_deleted": 3})])
+    # A retry answers the release again, without a second event.
+    self.assertEqual(ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))["released"], released)
+    self.assertEqual(len(self.events), 1)
+    # The Navigator removes the membership; a fresh activation then uses the same files.
+    self.store.account("acme.admin", memberships=[])
+    fresh = str(uuid4())
+    prepared = ok(self, self.activate(draft_id, fresh))
+    self.assertIsNone(self.stored(draft_id)["last_release"])
+    self.finish(draft_id, fresh)
+    self.assertEqual(len(self.rows("tenant")), 1)
+
+  def test_release_is_refused_once_active_and_close_needs_an_active_tenant(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    refused(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id), 409, "not_activating")
+    refused(self, self.plugin.close_tenant_draft(self.actor, draft_id), 409, "activation_not_complete")
+    ok(self, self.activate(draft_id, request_id))
+    refused(self, self.plugin.close_tenant_draft(self.actor, draft_id), 409, "activation_not_complete")
+    self.finish(draft_id, request_id)
+    writes = len(self.store.writes)
+    refused(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id), 409, "tenant_active")
+    self.assertEqual(len(self.store.writes), writes)
+    refused(self, self.plugin.delete_tenant_draft(self.actor, draft_id), 409, "draft_locked")
+    ok(self, self.plugin.close_tenant_draft({"account_id": "other-sta"}, draft_id))
+
+  def test_release_after_the_tenant_was_deleted_removes_no_row_and_empties_the_items(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    # What `delete_tenant` leaves: no receipt, no tenant row, the domain still reserved.
+    self.repo.delete("receipt", "creator", request_id)
+    self.repo.delete("tenant", tenant_id)
+    domain = self.repo.get("domain", "acme")
+    released = ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))["released"]
+    self.assertEqual((released["tenant_id"], released["initial_admin_id"]), (None, None))
+    self.assertEqual(self.repo.get("domain", "acme"), domain)
+    row = self.stored(draft_id)
+    self.assertTrue(all(item["state"] == "missing" and item["document"] is None for item in row["items"].values()))
+    self.assertEqual(self.events[-1][1]["rows_deleted"], 0)
+    self.assertEqual(ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))["files_deleted"], 0)
+
+  def test_a_release_resumed_after_its_receipt_went_keeps_the_ids_and_the_files(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    prepared = ok(self, self.activate(draft_id, request_id))
+    # Stop after the receipt delete, before the marker is cleared.
+    service_store = self.plugin._execution_service().store
+    real_put = type(service_store).put
+
+    def put(store, kind, *ids, record):
+      if kind == "tenant_draft" and record.get("activation") is None and record.get("last_release"):
+        raise TenantStoreError("crash")
+      return real_put(store, kind, *ids, record=record)
+    with patch.object(type(service_store), "put", put):
+      refused(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id), 503, "unavailable")
+    self.assertEqual(self.rows("receipt"), [])
+    released = ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))["released"]
+    self.assertEqual(released["tenant_id"], prepared["tenantId"])
+    self.assertTrue(all(item["state"] == "signed" for item in self.stored(draft_id)["items"].values()))
+
+  def test_tenant_delete_lists_every_tenant_document(self):
+    for combined, count in ((False, 3), (True, 1)):
+      with self.subTest(combined=combined):
+        draft_id, request_id = self.ready(combined=combined), str(uuid4())
+        ok(self, self.activate(draft_id, request_id))
+        tenant_id = self.finish(draft_id, request_id)
+        ok(self, self.plugin.close_tenant_draft(self.actor, draft_id))
+        self.store.account("acme.admin", memberships=[])
+        begun = ok(self, self.plugin._call_tenant_administration("begin_tenant_delete", self.actor, tenant_id=tenant_id))
+        tenant = self.repo.get("tenant", tenant_id)
+        expected = sorted(tenant[kind]["ref"] for kind in KINDS if tenant[kind] is not None)
+        self.assertEqual(len(expected), count)
+        self.assertEqual([ref["ref"] for ref in begun["documentRefs"]], expected)
+        # The next draft needs another domain.
+        self.repo.delete("tenant", tenant_id)
+        self.repo.delete("receipt", "creator", request_id)
+        self.repo.delete("domain", "acme")
+
+
 class TestDraftStoreKind(unittest.TestCase):
   def setUp(self):
     self.owner = FakeAdministrationStore()

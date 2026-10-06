@@ -39,9 +39,11 @@ _VISIBLE_MEMBER_STATES = frozenset(_ACCOUNT_STATES)
 
 
 class AdministrationDenied(Exception):
-  def __init__(self, status_code, error):
+  def __init__(self, status_code, error, **details):
     self.status_code = status_code
     self.error = error
+    # RM-109: a refusal may carry what the caller needs to act on it (`missing`, `holder`).
+    self.details = details
 
 
 def administration_unavailable():
@@ -57,7 +59,8 @@ def _endpoint(method):
         data = method(*args, **kwargs)
       return {"success": True, "status_code": 200, "data": data}
     except AdministrationDenied as exc:
-      return {"success": False, "status": "error", "status_code": exc.status_code, "error": exc.error}
+      return {"success": False, "status": "error", "status_code": exc.status_code, "error": exc.error,
+              **exc.details}
     except (IdentityStoreError, TenantStoreError):
       return administration_unavailable()
   return call
@@ -104,6 +107,12 @@ def _valid_contract(value):
           and all(isinstance(value[key], str) and value[key] for key in _CONTRACT_TEXT_FIELDS)
           and isinstance(value["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None
           and type(value["size_bytes"]) is int and value["size_bytes"] > 0)
+
+
+# RM-109: what a draft activation adds to the receipt; the tenant copies all but the draft id.
+_DRAFT_TENANT_FIELDS = ("compliance_types", "framework_agreement", "data_handling", "governance")
+_DRAFT_RECEIPT_FIELDS = ("draft_id", *_DRAFT_TENANT_FIELDS)
+_TENANT_DOCUMENT_KINDS = ("contract", "framework_agreement", "data_handling")
 
 
 def _same_contract(stored, requested):
@@ -163,6 +172,16 @@ class TenantAdministrationService:
       raise TenantStoreError("Invalid creation receipt") from None
     if "contract" in receipt and not _valid_contract(receipt["contract"]):
       raise TenantStoreError("Invalid creation receipt")
+    # RM-109: a receipt of a draft activation carries the draft's terms, all of them or none.
+    if any(key in receipt for key in _DRAFT_RECEIPT_FIELDS):
+      if (any(key not in receipt for key in _DRAFT_RECEIPT_FIELDS)
+          or not drafts.valid_draft_id(receipt["draft_id"])
+          or not isinstance(receipt["compliance_types"], list) or not receipt["compliance_types"]
+          or drafts.normalize_compliance_types(receipt["compliance_types"]) != receipt["compliance_types"]
+          or any(receipt[key] is not None and not _valid_contract(receipt[key])
+                 for key in ("framework_agreement", "data_handling"))
+          or not drafts.valid_governance(receipt["governance"])):
+        raise TenantStoreError("Invalid creation receipt")
     return receipt
 
   @staticmethod
@@ -172,8 +191,9 @@ class TenantAdministrationService:
   @staticmethod
   def _tenant_payload(receipt):
     # RM-095: `legal` and `contract` exist only on tenants created since contracts were required;
-    # the tenant copies them from its receipt, so both sides match exactly or not at all.
-    contract_terms = {key: receipt[key] for key in ("legal", "contract") if key in receipt}
+    # the tenant copies them from its receipt, so both sides match exactly or not at all. RM-109:
+    # the same for the terms a draft activation adds (the draft id stays on the receipt).
+    contract_terms = {key: receipt[key] for key in ("legal", "contract", *_DRAFT_TENANT_FIELDS) if key in receipt}
     return {**contract_terms,
       "tenant_id": receipt["tenant_id"], "actor_id": receipt["actor_id"],
       "request_id": receipt["request_id"], "display_name": receipt["display_name"],
@@ -212,6 +232,7 @@ class TenantAdministrationService:
     optional = () if "root_admin_id" in tenant else ("root_admin_id",)
     if (any(tenant.get(key) != value for key, value in expected.items()
             if key not in mutable and key not in optional)
+        or any(key in tenant and key not in expected for key in _DRAFT_TENANT_FIELDS)
         or type(tenant.get("active")) is not bool or type(tenant.get("allow_pentester")) is not bool):
       raise TenantStoreError("Tenant receipt binding mismatch")
     if "allow_pentester_changed_by" in tenant or "allow_pentester_changed_at" in tenant:
@@ -244,26 +265,36 @@ class TenantAdministrationService:
     return policy
 
   @_endpoint
-  def prepare_tenant(self, actor, request_id, display_name, domain_id, initial_admin_id, legal=None,
-                     contract=None):
+  def prepare_tenant(self, actor, request_id, display_name=None, domain_id=None, initial_admin_id=None, legal=None,
+                     contract=None, draft_id=None, draft_documents=None):
     """`contract` is the document reference `services.tenant_contract.resolve_contract` verified
-    outside this lock; this method never reads the document store."""
+    outside this lock; this method never reads the document store.
+
+    RM-109: with `draft_id` every creation field comes from the draft and the caller's are
+    ignored; `draft_documents` are the draft's refs as `resolve_draft_document` verified them.
+    """
     creator = self._actor(actor, creator=True)
     request_id = _request_id(request_id)
-    domain_id = _domain(domain_id)
-    initial_admin_id = canonical_account_id(initial_admin_id)
-    if not isinstance(display_name, str) or not 1 <= len(display_name.strip()) <= 120 or not initial_admin_id:
-      raise AdministrationDenied(400, "invalid_request")
-    legal = _legal(legal)
-    if contract is None:
-      raise AdministrationDenied(400, "contract_required")
-    if not _valid_contract(contract) or contract["uploaded_by"] != creator.account_id:
-      raise AdministrationDenied(400, "contract_invalid")
-    intent = {"display_name": display_name.strip(), "domain_id": domain_id, "initial_admin_id": initial_admin_id}
+    if draft_id is not None:
+      draft, intent, legal, contract, terms = self._draft_terms(creator, request_id, draft_id, draft_documents)
+    else:
+      draft, terms = None, {}
+      domain_id = _domain(domain_id)
+      initial_admin_id = canonical_account_id(initial_admin_id)
+      if not isinstance(display_name, str) or not 1 <= len(display_name.strip()) <= 120 or not initial_admin_id:
+        raise AdministrationDenied(400, "invalid_request")
+      legal = _legal(legal)
+      if contract is None:
+        raise AdministrationDenied(400, "contract_required")
+      if not _valid_contract(contract):
+        raise AdministrationDenied(400, "contract_invalid")
+      intent = {"display_name": display_name.strip(), "domain_id": domain_id, "initial_admin_id": initial_admin_id}
+    domain_id, initial_admin_id = intent["domain_id"], intent["initial_admin_id"]
     receipt = self._receipt(creator.account_id, request_id)
     if receipt is not None:
       if (any(receipt.get(key) != value for key, value in intent.items())
-          or receipt.get("legal") != legal or not _same_contract(receipt.get("contract"), contract)):
+          or receipt.get("legal") != legal or not _same_contract(receipt.get("contract"), contract)
+          or not self._same_draft_terms(receipt, terms)):
         raise AdministrationDenied(409, "request_conflict")
       domain, tenant = self._reserved_tenant(receipt)
     else:
@@ -275,7 +306,15 @@ class TenantAdministrationService:
       # finds its own tenant_admin membership already written.
       if admin.tenant_memberships:
         raise AdministrationDenied(409, "scope_conflict")
-      receipt = {**intent, "legal": legal, "contract": dict(contract),
+      documents = {"contract": contract, **{kind: terms[kind] for kind in _TENANT_DOCUMENT_KINDS[1:] if kind in terms}}
+      self._first_preparation_documents(documents)
+      if draft is not None and draft["activation"] is None:
+        # The marker goes before the receipt, so every receipt of a draft has one.
+        self.store.put("tenant_draft", draft["draft_id"], record={
+          **draft, "activation": {"actor_id": creator.account_id, "request_id": request_id,
+                                  "started_at": datetime.now(timezone.utc).isoformat()},
+          "last_release": None})
+      receipt = {**intent, "legal": legal, "contract": dict(contract), **terms,
                  "actor_id": creator.account_id, "request_id": request_id,
                  "initial_admin_generation": admin.account_generation, "tenant_id": "tn_" + str(uuid4()),
                  "created_at": datetime.now(timezone.utc).isoformat()}
@@ -292,6 +331,61 @@ class TenantAdministrationService:
     return {"requestId": request_id, "tenantId": receipt["tenant_id"], "initialAdminId": initial_admin_id,
             "initialAdminGeneration": receipt["initial_admin_generation"],
             "state": "active" if tenant is not None and tenant["active"] else "pending"}
+
+  def _draft_terms(self, creator, request_id, draft_id, draft_documents):
+    """RM-109 locked step of `prepare_tenant` with a draft, in the contract's order: the refs the
+    plugin resolved are still the draft's, the marker, completeness; then the creation fields."""
+    draft = self._tenant_draft(draft_id)
+    stored = {kind: draft["items"][kind]["document"] for kind in drafts.DOCUMENT_KINDS}
+    resolved = draft_documents if isinstance(draft_documents, dict) else {}
+    if set(resolved) - set(drafts.DOCUMENT_KINDS) or {kind: resolved.get(kind) for kind in stored} != stored:
+      raise AdministrationDenied(409, "draft_changed")
+    marker = draft["activation"]
+    if marker is not None and (marker["actor_id"], marker["request_id"]) != (creator.account_id, request_id):
+      raise AdministrationDenied(409, "activation_in_progress",
+                                 holder={"actor_id": marker["actor_id"], "started_at": marker["started_at"]})
+    completeness = drafts.completeness(draft)
+    if not completeness["complete"]:
+      raise AdministrationDenied(409, "draft_incomplete", missing=completeness["missing"])
+    intent = {"display_name": draft["display_name"], "domain_id": _domain(draft["domain_id"]),
+              "initial_admin_id": draft["initial_admin_id"]}
+    terms = {"draft_id": draft_id, "compliance_types": list(draft["compliance_types"]),
+             "framework_agreement": stored["framework_agreement"], "data_handling": stored["data_handling"],
+             "governance": drafts.governance(draft)}
+    return draft, intent, _legal(draft["legal"]), stored["contract"], terms
+
+  @staticmethod
+  def _same_draft_terms(receipt, terms):
+    """A replay carries the same draft terms as its receipt; documents compare by bytes."""
+    if not terms:
+      return not any(key in receipt for key in _DRAFT_RECEIPT_FIELDS)
+    return (receipt.get("draft_id") == terms["draft_id"]
+            and receipt.get("compliance_types") == terms["compliance_types"]
+            and receipt.get("governance") == terms["governance"]
+            and all((receipt.get(kind) is None) == (terms[kind] is None)
+                    and (terms[kind] is None or _same_contract(receipt[kind], terms[kind]))
+                    for kind in _TENANT_DOCUMENT_KINDS[1:]))
+
+  def _first_preparation_documents(self, documents):
+    """RM-109, both paths, first preparation only (a replay is bound by its receipt's sha256):
+    every uploader holds the full-portfolio Super-Tenant Admin role now, and no file is already the
+    document of a tenant or a creation receipt (`contract_in_use`)."""
+    for kind, document in documents.items():
+      if document is None:
+        continue
+      refusal = "contract_invalid" if kind == "contract" else "document_invalid"
+      if not _valid_contract(document):
+        raise AdministrationDenied(400, refusal)
+      uploader = self.accounts.get_account(document["uploaded_by"])
+      if uploader is None or not uploader.active or not holds_platform_role(uploader):
+        raise AdministrationDenied(400, refusal)
+    wanted = {document["ref"] for document in documents.values() if document is not None}
+    for kind in ("tenant", "receipt"):
+      for row in self.store.raw_rows(kind):
+        for slot in _TENANT_DOCUMENT_KINDS:
+          bound = row.get(slot)
+          if isinstance(bound, dict) and bound.get("ref") in wanted:
+            raise AdministrationDenied(409, "contract_in_use")
 
   @_endpoint
   def activate_tenant(self, actor, request_id):
@@ -1035,7 +1129,12 @@ class TenantAdministrationService:
         valid_legal = False
       if not valid_legal:
         raise TenantStoreError("Invalid tenant contract record")
-    return {"legal": legal, "contract": contract}
+    # RM-109: the terms a draft activation added; a one-step tenant has none of them.
+    if any(tenant.get(kind) is not None and not _valid_contract(tenant[kind])
+           for kind in _TENANT_DOCUMENT_KINDS[1:]):
+      raise TenantStoreError("Invalid tenant contract record")
+    return {"legal": legal, "contract": contract,
+            **{key: tenant.get(key) for key in _DRAFT_TENANT_FIELDS}}
 
   # RM-107: delete a tenant. Owner, 2026-09-28: it exists so tenants created before contracts can be
   # removed; it deletes the tenant's records and its stored documents, refuses while the tenant has
@@ -1072,7 +1171,7 @@ class TenantAdministrationService:
 
   def _tenant_document_refs(self, tenant):
     """Every stored document the tenant's records point at, read from the raw rows."""
-    refs = [tenant["contract"]] if isinstance(tenant.get("contract"), dict) else []
+    refs = [tenant[kind] for kind in _TENANT_DOCUMENT_KINDS if isinstance(tenant.get(kind), dict)]
     for ids in self.store.tenant_record_ids("engagement", tenant["tenant_id"]):
       row = self.store.raw_record("engagement", *ids) or {}
       documents = row.get("documents") if isinstance(row.get("documents"), list) else []
@@ -1182,13 +1281,28 @@ class TenantAdministrationService:
     self.store.put("tenant_draft", row["draft_id"], record=row)
     return self.store.get("tenant_draft", row["draft_id"])
 
+  def _marker_tenant(self, marker):
+    """The receipt the marker names and its tenant row; either may be None."""
+    receipt = self._receipt(marker["actor_id"], marker["request_id"])
+    tenant = self.store.get("tenant", receipt["tenant_id"]) if receipt is not None else None
+    return receipt, tenant
+
+  def _draft_answer(self, row):
+    """RM-109 phase 3: while the marker is set, its tenant's state: `none` (no receipt), `pending`
+    or `active`. Answer only; never written."""
+    if row["activation"] is None:
+      return row
+    receipt, tenant = self._marker_tenant(row["activation"])
+    state = "none" if receipt is None else "active" if tenant is not None and tenant.get("active") is True else "pending"
+    return {**row, "activation": {**row["activation"], "tenant_state": state}}
+
   @_endpoint
   def create_tenant_draft(self, actor, request_id, display_name, compliance_types):
     account = self._actor(actor, creator=True)
     draft_id = drafts.draft_id_for(_request_id(request_id))
     existing = self.store.get("tenant_draft", draft_id)
     if existing is not None:
-      return existing
+      return self._draft_answer(existing)
     try:
       row = drafts.new_draft(draft_id, display_name, compliance_types, account.account_id,
                              datetime.now(timezone.utc).isoformat())
@@ -1200,14 +1314,14 @@ class TenantAdministrationService:
   @_endpoint
   def get_tenant_draft(self, actor, draft_id):
     self._actor(actor, creator=True)
-    return self._tenant_draft(draft_id)
+    return self._draft_answer(self._tenant_draft(draft_id))
 
   @_endpoint
   def list_tenant_drafts(self, actor):
     self._actor(actor, creator=True)
     rows = sorted(self.store.list_tenant_drafts(), key=lambda row: row["draft_id"])
     rows.sort(key=lambda row: row["created_at"], reverse=True)
-    return [drafts.draft_list_row(row) for row in rows]
+    return [drafts.draft_list_row(self._draft_answer(row)) for row in rows]
 
   @_endpoint
   def update_tenant_draft(self, actor, draft_id, changes):
@@ -1268,6 +1382,72 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "conflict")
     self.store.delete("tenant_draft", draft_id)
     return {"draft_id": draft_id}
+
+  @_endpoint
+  def release_tenant_draft_activation(self, actor, draft_id):
+    """Undo a stuck activation, any full-portfolio Super-Tenant Admin. The receipt is the marker's,
+    never the caller's. Deletes the inactive tenant row, the domain reservation bound to the receipt
+    and the receipt, in that order, and no document file: the files stay the draft's.
+
+    `last_release` is written while the marker is still set, so a retry after a crash part-way
+    finds the ids it must answer. A receipt that is gone means one of three things: this release
+    already removed it (`last_release` names the marker's request), the tenant was activated and
+    deleted (its domain reservation, kept by the delete, is still bound to the marker; the delete
+    removed the draft's files, so every item with a document reads `missing`), or the preparation
+    stopped between the marker and the receipt (nothing to remove, the files are intact).
+    """
+    account = self._actor(actor, creator=True)
+    draft = self._tenant_draft(draft_id)
+    marker = draft["activation"]
+    if marker is None:
+      if draft["last_release"] is None:
+        raise AdministrationDenied(409, "not_activating")
+      return {"draft_id": draft_id, "released": draft["last_release"], "replayed": True, "rows_deleted": 0}
+    receipt, tenant = self._marker_tenant(marker)
+    deleted = 0
+    if receipt is not None:
+      if tenant is not None and (tenant.get("active") is True or "deleting" in tenant):
+        raise AdministrationDenied(409, "tenant_active")
+      release = {"actor_id": account.account_id, "released_at": datetime.now(timezone.utc).isoformat(),
+                 "request_id": marker["request_id"], "tenant_id": receipt["tenant_id"],
+                 "initial_admin_id": receipt["initial_admin_id"]}
+      draft = {**draft, "last_release": release}
+      self.store.put("tenant_draft", draft_id, record=draft)
+      if tenant is not None:
+        self.store.delete("tenant", receipt["tenant_id"])
+        deleted += 1
+      domain = self.store.get("domain", receipt["domain_id"])
+      if domain is not None and all(domain.get(key) == value for key, value in self._binding(receipt).items()):
+        self.store.delete("domain", receipt["domain_id"])
+        deleted += 1
+      self.store.delete("receipt", marker["actor_id"], marker["request_id"])
+      deleted += 1
+    elif (draft["last_release"] or {}).get("request_id") != marker["request_id"]:
+      domain = self.store.get("domain", draft["domain_id"]) if draft["domain_id"] else None
+      tenant_deleted = domain is not None and (domain.get("actor_id"), domain.get("request_id")) == (
+        marker["actor_id"], marker["request_id"])
+      items = draft["items"]
+      if tenant_deleted:
+        items = {kind: ({**item, "state": "missing", "document": None} if item["document"] is not None else item)
+                 for kind, item in items.items()}
+      draft = {**draft, "items": items, "last_release": {
+        "actor_id": account.account_id, "released_at": datetime.now(timezone.utc).isoformat(),
+        "request_id": marker["request_id"], "tenant_id": None, "initial_admin_id": None}}
+    draft = {**draft, "activation": None}
+    self.store.put("tenant_draft", draft_id, record=draft)
+    return {"draft_id": draft_id, "released": draft["last_release"], "replayed": False, "rows_deleted": deleted}
+
+  @_endpoint
+  def close_tenant_draft(self, actor, draft_id):
+    """Delete the draft record once its activation produced an active tenant; the files are the
+    tenant's now, so none is deleted."""
+    self._actor(actor, creator=True)
+    draft = self._tenant_draft(draft_id)
+    tenant = self._marker_tenant(draft["activation"])[1] if draft["activation"] is not None else None
+    if tenant is None or tenant.get("active") is not True:
+      raise AdministrationDenied(409, "activation_not_complete")
+    self.store.delete("tenant_draft", draft_id)
+    return {"draft_id": draft_id, "tenant_id": tenant["tenant_id"]}
 
   def _assignable_member_roles(self, account, tenant):
     """RM-083. Roles this caller may write in the tenant; tenant_pentester is the platform's to give."""

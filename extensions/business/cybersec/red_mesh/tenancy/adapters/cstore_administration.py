@@ -126,6 +126,20 @@ class CstoreTenantAdministrationStore:
       raise TenantStoreError("Tenant storage cannot be read") from exc
     return raw if isinstance(raw, dict) else None
 
+  def raw_rows(self, kind):
+    """RM-109. Every row of one kind, decoded but not validated (as `raw_record`), for the
+    `contract_in_use` scan. Past the enumeration cap, or with a row it cannot decode, it fails
+    closed: a row it cannot read may hold the reference it looks for."""
+    rows = []
+    for _, raw in self._fields(kind):
+      try:
+        decoded = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+      except (ValueError, UnicodeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid tenant storage record") from exc
+      if isinstance(decoded, dict):
+        rows.append(decoded)
+    return rows
+
   def _records(self):
     hkey, _ = self._location("tenant", ("enumeration",))
     try:

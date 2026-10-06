@@ -66,25 +66,49 @@ def _store(documents, filename, content_b64, uploaded_by, now_fn, *, refusal, en
 
 
 def resolve_contract(documents, ref):
-  """The document reference for a stored contract, re-verified from its bytes.
+  """The document reference for a stored contract, re-verified from its bytes (one-step path).
 
   Unreadable, foreign-kind, non-PDF and tampered envelopes are all `contract_invalid`: the caller
-  learns nothing about which one it was.
+  learns nothing about which one it was. RM-109: so is a tenant-draft upload (an envelope naming a
+  draft, or a slot other than the contract); a draft's documents are bound through its draft.
   """
   if not isinstance(ref, str) or not ref.strip():
     raise ContractRefused(400, "contract_required")
+  document, binding = _resolve(documents, ref, "contract_invalid")
+  if binding != {"draft_id": None, "document_kind": "contract"}:
+    raise ContractRefused(400, "contract_invalid")
+  return document
+
+
+def resolve_draft_document(documents, ref, *, draft_id, document_kind):
+  """RM-109. One tenant-draft document re-verified from its bytes, as `resolve_contract`; its
+  envelope must name this draft and this slot. Refused `contract_invalid` for the contract slot,
+  `document_invalid` for the other two."""
+  refusal = "contract_invalid" if document_kind == "contract" else "document_invalid"
+  if not isinstance(ref, str) or not ref.strip():
+    raise ContractRefused(400, refusal)
+  document, binding = _resolve(documents, ref, refusal)
+  if binding != {"draft_id": draft_id, "document_kind": document_kind}:
+    raise ContractRefused(400, refusal)
+  return document
+
+
+def _resolve(documents, ref, refusal):
+  """The verified reference and the envelope's draft binding; an absent `document_kind` (a
+  schema 1.0 envelope) reads as `contract`."""
   envelope = documents.get(ref)
   if not isinstance(envelope, dict) or envelope.get("kind") != CONTRACT_KIND:
-    raise ContractRefused(400, "contract_invalid")
+    raise ContractRefused(400, refusal)
   try:
     document = validate_document(envelope.get("filename"), envelope.get("content_b64"), accepted=CONTRACT_FORMATS)
   except AuthorizationUploadError:
-    raise ContractRefused(400, "contract_invalid") from None
+    raise ContractRefused(400, refusal) from None
   if (document.sha256_hex != envelope.get("sha256") or document.size_bytes != envelope.get("size_bytes")
       or document.filename != envelope.get("filename") or document.mime != envelope.get("mime")
       or any(not isinstance(envelope.get(key), str) or not envelope[key] for key in ("uploaded_at", "uploaded_by"))):
-    raise ContractRefused(400, "contract_invalid")
-  return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}
+    raise ContractRefused(400, refusal)
+  binding = {"draft_id": envelope.get("draft_id"), "document_kind": envelope.get("document_kind", "contract")}
+  return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}, binding
 
 
 def read_contract(documents, contract, absent=None):

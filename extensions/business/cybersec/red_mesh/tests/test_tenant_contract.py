@@ -144,11 +144,52 @@ class TestPrepareBindsTheContract(_PluginCase):
                                             signer_name="C", signer_role="D", contract_ref="doc-fixture")
         self.assertEqual((result["status_code"], result["error"]), (400, "contract_invalid"))
 
-  def test_a_contract_uploaded_by_someone_else_is_refused(self):
+  def test_a_contract_uploaded_by_another_super_tenant_admin_is_accepted(self):
+    # RM-109 (owner, 2026-10-07): the uploader must hold the platform role, not be the creator.
     self.store.account("other-sta", memberships=[{"role": "super_tenant_admin", "tenant_id": None}])
     fields = install_contract(self.plugin, uploaded_by="other-sta")
     result = self.plugin.prepare_tenant(self.actor, str(uuid4()), "Tenant", "tenant", "initial", **fields)
-    self.assertEqual((result["status_code"], result["error"]), (400, "contract_invalid"))
+    self.assertEqual(result["status_code"], 200, result)
+
+  def test_a_contract_whose_uploader_lacks_the_platform_role_is_refused(self):
+    for uploader, memberships in (("pentester", [{"role": "super_pentester", "tenant_id": None}]),
+                                  ("former-sta", []), ("gone", None)):
+      with self.subTest(uploader=uploader):
+        if memberships is not None:
+          self.store.account(uploader, memberships=memberships)
+        fields = install_contract(self.plugin, uploaded_by=uploader)
+        before = len(self.store.writes)
+        result = self.plugin.prepare_tenant(self.actor, str(uuid4()), "Tenant", "tenant", "initial", **fields)
+        self.assertEqual((result["status_code"], result["error"]), (400, "contract_invalid"))
+        self.assertEqual(len(self.store.writes), before)
+
+  def test_the_one_step_path_refuses_a_draft_envelope(self):
+    for changes in ({"schema_version": "1.1", "document_kind": "contract", "draft_id": "td_" + str(uuid4())},
+                    {"document_kind": "data_handling"}):
+      with self.subTest(changes=changes):
+        fields = install_contract(self.plugin)
+        self.plugin._document_store().envelopes["doc-fixture"] = envelope(**changes)
+        result = self.plugin.prepare_tenant(self.actor, str(uuid4()), "Tenant", "tenant", "initial", **fields)
+        self.assertEqual((result["status_code"], result["error"]), (400, "contract_invalid"))
+
+  def test_a_file_bound_to_one_tenant_is_refused_for_a_second(self):
+    fields = install_contract(self.plugin)
+    first = self.plugin.prepare_tenant(self.actor, str(uuid4()), "Tenant", "tenant", "initial", **fields)
+    self.assertEqual(first["status_code"], 200, first)
+    self.store.account("initial-2")
+    before = len(self.store.writes)
+    second = self.plugin.prepare_tenant(self.actor, str(uuid4()), "Other", "other", "initial-2", **fields)
+    self.assertEqual((second["status_code"], second["error"]), (409, "contract_in_use"))
+    self.assertEqual(len(self.store.writes), before)
+
+  def test_the_contract_in_use_scan_fails_closed_past_the_namespace_cap(self):
+    from extensions.business.cybersec.red_mesh.tenancy.adapters import cstore_administration
+    fields = install_contract(self.plugin)
+    # One row in the namespace, over a cap of zero.
+    self.store.data[('["redmesh","tenancy",1,"deployment"]', '["domain","deployment","elsewhere"]')] = {"x": 1}
+    with patch.object(cstore_administration, "MAX_ENUMERATED_RECORDS", 0):
+      result = self.plugin.prepare_tenant(self.actor, str(uuid4()), "Tenant", "tenant", "initial", **fields)
+    self.assertEqual((result["status_code"], result["error"]), (503, "unavailable"))
 
   def test_the_contract_is_not_read_for_an_unauthorized_caller(self):
     install_contract(self.plugin)
@@ -178,13 +219,14 @@ class TestContractReplay(unittest.TestCase):
   def test_the_same_file_uploaded_again_replays_the_same_creation(self):
     # A second upload of the same bytes gets a new reference (the envelope carries its upload time);
     # a retry after a page reload, or a seeded rerun, must still be the same creation.
-    first = self.prepare(**contract_terms())
+    terms = contract_terms()
+    first = self.prepare(**terms)
     again = contract_terms()
     again["contract"] = {**contract_ref(ref="doc-reuploaded"), "uploaded_at": "2026-09-28T08:00:00Z"}
     replay = self.prepare(**again)
     self.assertEqual(replay["data"]["tenantId"], first["data"]["tenantId"])
     receipt = next(v for v in self.store.data.values() if isinstance(v, dict) and v.get("kind") == "receipt")
-    self.assertEqual(receipt["contract"]["ref"], "doc-fixture")
+    self.assertEqual(receipt["contract"]["ref"], terms["contract"]["ref"])
 
   def test_a_replay_with_a_different_contract_or_legal_details_conflicts(self):
     self.prepare(**contract_terms())
@@ -237,7 +279,9 @@ class TestReadTenantContract(_PluginCase):
   def test_a_super_tenant_admin_reads_the_legal_details_and_contract_record(self):
     result = self.plugin.get_tenant_contract(self.actor, self.tenant_id)
     self.assertEqual(result["status_code"], 200, result)
-    self.assertEqual(result["data"], {"legal": LEGAL, "contract": contract_ref(store="fake")})
+    self.assertEqual(result["data"], {"legal": LEGAL, "contract": contract_ref(store="fake"),
+                                      "compliance_types": None, "framework_agreement": None,
+                                      "data_handling": None, "governance": None})
 
   def test_the_tenant_admin_cannot_read_or_download_the_contract(self):
     initial = {"account_id": "initial"}
@@ -268,7 +312,8 @@ class TestReadTenantContract(_PluginCase):
         value.pop("legal", None)
         value.pop("contract", None)
     self.assertEqual(self.plugin.get_tenant_contract(self.actor, self.tenant_id)["data"],
-                     {"legal": None, "contract": None})
+                     {"legal": None, "contract": None, "compliance_types": None, "framework_agreement": None,
+                      "data_handling": None, "governance": None})
     result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
     self.assertEqual((result["status_code"], result["error"]), (404, "not_found"))
 

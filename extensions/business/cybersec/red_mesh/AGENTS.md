@@ -598,3 +598,20 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   activation yet: `activation`/`last_release` stay null and a set marker locks the draft (phase 3).
 - Verification: `tests/test_tenant_drafts.py` (new), `test_data_maintenance.py` (draft current, files
   in the inventory, malformed draft old/unrecognized) and `test_authz_surface.py` (96 endpoints).
+
+### 2026-10-06 — RM-109 phase 3: draft activation, release, close
+
+- BUILDER: `prepare_tenant(draft_id)` takes every creation field from the draft (caller fields are
+  ignored); the plugin re-resolves the draft's files bound to draft and slot. Locked order:
+  `draft_changed`, marker (`activation_in_progress` with `holder`), `draft_incomplete` with
+  `missing`, existing checks, then on first preparation the uploader rule (platform role through
+  the identity port, both paths) and `contract_in_use` (raw tenant/receipt scan, 503 past the cap).
+  The marker is written before the receipt. Receipt and tenant gain the draft terms, bound like
+  `contract`; tenant delete and `download_tenant_document` cover all three documents.
+- CRITIC/response: release writes `last_release` while the marker is still set, then deletes tenant
+  row, domain reservation and receipt, then clears the marker, so every crash point resumes. A
+  marker without a receipt is told apart by `last_release` (resumed release), the domain
+  reservation still bound to the marker (tenant activated then deleted: items set `missing`), or
+  neither (preparation stopped before the receipt: files intact). No release deletes a file.
+- Verification: `tests/test_tenant_drafts.py`, `test_tenant_contract.py` (uploader relaxed,
+  draft envelope refused, `contract_in_use`), `test_data_maintenance.py`, `test_authz_surface.py`.
