@@ -1207,6 +1207,58 @@ class TestPartyBlockAndBaseline(_ActivationCase):
     self.assertEqual(deleted["documents"], 2)
     self.assertEqual(sorted(self.documents.deleted), sorted([generated["ref"], tenant["contract"]["ref"]]))
 
+  def test_the_generated_pack_is_verified_at_activation_like_the_signed_documents(self):
+    draft_id = self.create()["draft_id"]
+    self.complete_fields(draft_id)
+    generated = ok(self, self.generate(draft_id))["items"]["contract"]["generated"]
+    ok(self, self.upload(draft_id))
+    row = self.stored(draft_id)
+    resolved = {**{kind: item["document"] for kind, item in row["items"].items()},
+                "contract_generated": {key: generated[key] for key in row["items"]["contract"]["document"]}}
+    # The generated ref changed between resolution and the locked step.
+    ok(self, self.update(draft_id, {"items": {"contract": {"state": "missing"}}}))
+    ok(self, self.generate(draft_id, raw=SCHEDULE_PDF))
+    ok(self, self.upload(draft_id))
+    writes = len(self.store.writes)
+    result = self.plugin._call_tenant_administration("prepare_tenant", self.actor, request_id=str(uuid4()),
+                                                     draft_id=draft_id, draft_documents=resolved)
+    refused(self, result, 409, "draft_changed")
+    self.assertEqual(len(self.store.writes), writes)
+    # A tampered generated file, or one bound to another draft, does not verify: the contract slot's code.
+    ref = self.stored(draft_id)["items"]["contract"]["generated"]["ref"]
+    original = self.documents.envelopes[ref]["content_b64"]
+    self.documents.envelopes[ref]["content_b64"] = base64.b64encode(PNG).decode("ascii")
+    refused(self, self.activate(draft_id, str(uuid4())), 400, "contract_invalid")
+    self.documents.envelopes[ref]["content_b64"] = original
+    self.documents.envelopes[ref]["draft_id"] = "td_" + str(uuid4())
+    refused(self, self.activate(draft_id, str(uuid4())), 400, "contract_invalid")
+    self.documents.envelopes[ref]["draft_id"] = draft_id
+    self.assertEqual(len(self.store.writes), writes)
+    self.assertEqual(self.rows("receipt"), [])
+    # Intact: the activation goes through.
+    self.assertTrue(ok(self, self.activate(draft_id, str(uuid4()))))
+
+  def test_release_after_the_tenant_was_deleted_drops_the_generated_baseline_too(self):
+    # The tenant delete removed `contract_generated.ref`, the draft's generated file: the block goes
+    # with the signed copy, and a fresh generation replaces nothing.
+    draft_id, request_id = self.create()["draft_id"], str(uuid4())
+    self.complete_fields(draft_id)
+    generated = ok(self, self.generate(draft_id))["items"]["contract"]["generated"]
+    ok(self, self.upload(draft_id))
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    self.plugin.cfg_instance_id = "jobs"
+    self.store.account("acme.admin", memberships=[])
+    self.assertEqual(ok(self, self.plugin.delete_tenant(self.actor, tenant_id))["documents"], 2)
+    self.assertNotIn(generated["ref"], self.documents.envelopes)
+    ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))
+    item = self.stored(draft_id)["items"]["contract"]
+    self.assertEqual((item["state"], item["document"], item["generated"]), ("missing", None, None))
+    deleted = list(self.documents.deleted)
+    again = ok(self, self.generate(draft_id, raw=SCHEDULE_PDF))["items"]["contract"]
+    self.assertEqual((again["state"], again["generated"]["ref"]), ("generated", "doc-3"))
+    self.assertEqual(self.documents.deleted, deleted)
+
   def test_contract_generated_is_optional_on_receipt_and_tenant_and_bound_when_present(self):
     draft_id, request_id = self.ready(combined=True), str(uuid4())
     ok(self, self.activate(draft_id, request_id))

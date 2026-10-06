@@ -5,7 +5,7 @@ of outline 01 C1/C6/C9, 03 A3 and 04 D3. Vocabulary, formats, the stored-record 
 DTO; no storage I/O (contract: `onboarding-drafts.md` §Super-tenant profile). Every field may be
 empty here; generation (Navigator) refuses `profile_required` on the ones a pack needs.
 """
-from .drafts import DraftInvalid, _LEGAL_MAX, _nonempty_text, _text
+from .drafts import LEGAL_MAX, DraftInvalid, nonempty_text, text
 
 RECORD_ID = "deployment"
 FIELDS = ("legal_name", "registration_id", "vat_id", "address", "signer_name", "signer_role", "contact_email",
@@ -23,8 +23,8 @@ def apply_changes(row, changes):
   value changed. Formats are checked, emptiness is allowed; an unknown key is refused."""
   if not isinstance(changes, dict) or any(key not in FIELDS for key in changes):
     raise DraftInvalid()
-  changed = {key: _text(text, _LEGAL_MAX) for key, text in changes.items()}
-  return {**row, **changed}, sorted(key for key, text in changed.items() if row[key] != text)
+  changed = {key: text(value, LEGAL_MAX) for key, value in changes.items()}
+  return {**row, **changed}, sorted(key for key, value in changed.items() if row[key] != value)
 
 
 def profile_dto(row):
@@ -33,7 +33,7 @@ def profile_dto(row):
 
 def _same(value):
   try:
-    return _text(value, _LEGAL_MAX) == value
+    return text(value, LEGAL_MAX) == value
   except DraftInvalid:
     return False
 
@@ -41,6 +41,6 @@ def _same(value):
 def validate_super_tenant_profile(row, ids):
   """Refuse a stored profile the operations could not have written. Unknown fields are kept."""
   if (list(ids) != [RECORD_ID] or any(not _same(row.get(key)) for key in FIELDS)
-      or not all(_nonempty_text(row.get(key)) for key in ("updated_by", "updated_at"))):
+      or not all(nonempty_text(row.get(key)) for key in ("updated_by", "updated_at"))):
     raise ValueError("Invalid super-tenant profile record")
   return row

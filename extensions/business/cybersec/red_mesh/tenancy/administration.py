@@ -362,8 +362,11 @@ class TenantAdministrationService:
     plugin resolved are still the draft's, the marker, completeness; then the creation fields."""
     draft = self._tenant_draft(draft_id)
     stored = {kind: draft["items"][kind]["document"] for kind in drafts.DOCUMENT_KINDS}
+    # RM-110: the generated baseline is re-verified by the plugin too, as `activate_engagement_draft`
+    # does for its pack; its stored ref is the block's document part.
+    stored["contract_generated"] = self._generated_ref(draft["items"]["contract"]["generated"])
     resolved = draft_documents if isinstance(draft_documents, dict) else {}
-    if set(resolved) - set(drafts.DOCUMENT_KINDS) or {kind: resolved.get(kind) for kind in stored} != stored:
+    if set(resolved) - set(stored) or {key: resolved.get(key) for key in stored} != stored:
       raise AdministrationDenied(409, "draft_changed")
     marker = draft["activation"]
     if marker is not None and (marker["actor_id"], marker["request_id"]) != (creator.account_id, request_id):
@@ -1521,7 +1524,11 @@ class TenantAdministrationService:
         marker["actor_id"], marker["request_id"])
       items = draft["items"]
       if tenant_deleted:
-        items = {kind: ({**item, "state": "missing", "document": None} if item["document"] is not None else item)
+        # The tenant delete removed the signed files and (RM-110) the generated baseline, the
+        # same CIDs the draft names: an item with a file reads `missing`, a block is dropped.
+        items = {kind: {**item,
+                        "state": "missing" if item["document"] is not None or item["state"] == "generated" else item["state"],
+                        "document": None, "generated": None}
                  for kind, item in items.items()}
       draft = {**draft, "items": items, "last_release": {
         "actor_id": account.account_id, "released_at": datetime.now(timezone.utc).isoformat(),

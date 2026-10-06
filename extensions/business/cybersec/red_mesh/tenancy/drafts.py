@@ -59,7 +59,8 @@ _DOMAIN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|\+00:00)\Z")
 _DISPLAY_NAME_MAX = 120
-_LEGAL_MAX = 200
+LEGAL_MAX = 200
+_LEGAL_MAX = LEGAL_MAX
 _REASON_MAX = 500
 DTO_FIELDS = ("draft_id", "display_name", "domain_id", "initial_admin_id", "legal", "compliance_types",
               "items", "applicability", "activation", "last_release", "created_by", "created_at",
@@ -80,8 +81,9 @@ def valid_draft_id(value):
   return isinstance(value, str) and value.startswith("td_") and _UUID.match(value[3:]) is not None
 
 
-def _text(value, maximum):
-  """Free text, empty allowed in a draft; the formats of `normalize_name` otherwise."""
+def text(value, maximum):
+  """Free text, empty allowed in a draft; the formats of `normalize_name` otherwise. Shared with the
+  super-tenant profile (RM-110)."""
   if not isinstance(value, str):
     raise DraftInvalid()
   if not value.strip():
@@ -90,6 +92,9 @@ def _text(value, maximum):
     return normalize_name(value, maximum)
   except (ValueError, TypeError, UnicodeError):
     raise DraftInvalid() from None
+
+
+_text = text
 
 
 def normalize_display_name(value):
@@ -129,7 +134,8 @@ def normalize_legal(value, current):
 
 def normalize_snapshot(value):
   """The baseline a pack was generated from: one JSON object, at most 64 KB, hashed as sent."""
-  if (not isinstance(value, str) or not value or len(value.encode("utf-8")) > SNAPSHOT_MAX_BYTES):
+  if (not isinstance(value, str) or not value or len(value) > SNAPSHOT_MAX_BYTES
+      or len(value.encode("utf-8")) > SNAPSHOT_MAX_BYTES):
     raise DraftInvalid()
   try:
     parsed = json.loads(value)
@@ -342,8 +348,11 @@ def draft_list_row(row):
           "activation": row["activation"]}
 
 
-def _nonempty_text(value):
+def nonempty_text(value):
   return isinstance(value, str) and bool(value)
+
+
+_nonempty_text = nonempty_text
 
 
 def _valid_stamp(value, keys, optional=()):
