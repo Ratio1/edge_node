@@ -13,6 +13,7 @@ from .test_execution_binding_models import binding_payload
 from .test_tenant_administration import FakeAdministrationStore
 
 TENANCY = '["redmesh","tenancy",1,"deployment"]'
+COMPLIANCE = '["redmesh","tenancy-compliance",1,"deployment"]'
 JOBS = "jobs"
 
 
@@ -177,7 +178,7 @@ class TestDataMaintenance(unittest.TestCase):
     hkeys = self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]
     names = {item["hkey"] for item in hkeys}
     self.assertEqual({JOBS + suffix for suffix in built} - names, set())
-    self.assertLessEqual({JOBS, TENANCY, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
+    self.assertLessEqual({JOBS, TENANCY, COMPLIANCE, "auth", f"{JOBS}:integrations:{self.tenant}"}, names)
     self.assertEqual([item["hkey"] for item in hkeys if item["account"]], ["auth"])
 
   def test_a_job_lists_the_files_its_record_config_and_archive_name(self):

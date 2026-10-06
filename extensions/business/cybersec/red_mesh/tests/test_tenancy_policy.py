@@ -55,6 +55,9 @@ class TestTenantPolicy(unittest.TestCase):
       ("reports:export",          (True, True, True, True, False)),
       ("evidence:read",           (True, True, False, False, False)),
       ("audit:view",              (True, False, True, False, False)),
+      # RM-120 (owner, 2026-10-06): pentesters never see a self-assessment.
+      ("compliance_assessments:view",   (True, False, True, False, True)),
+      ("compliance_assessments:manage", (True, False, True, False, False)),
     )
     for operation, expected in rows:
       for role, allowed in zip(roles, expected):

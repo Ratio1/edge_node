@@ -89,7 +89,8 @@ class TestTenantDelete(unittest.TestCase):
     result = self.plugin.delete_tenant(self.actor, self.tenant)
     self.assertTrue(result["success"], result)
     self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1,
-                                      "integrations": 0, "nodeAssignments": 0, "documents": 3})
+                                      "integrations": 0, "nodeAssignments": 0, "assessments": 0,
+                                      "documents": 3})
     self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", *self.engagement_refs]))
     rows = self.tenancy_rows()
     for kind in ("tenant", "receipt", "engagement", "asset"):

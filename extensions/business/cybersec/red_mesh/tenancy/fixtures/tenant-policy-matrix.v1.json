@@ -30,6 +30,8 @@
       "attestation_keys:manage",
       "audit:view",
       "authorization:upload",
+      "compliance_assessments:manage",
+      "compliance_assessments:view",
       "engagement:delete",
       "engagements:create",
       "engagements:documents",
@@ -52,6 +54,8 @@
     "tenant_admin": [
       "attestation_keys:manage",
       "audit:view",
+      "compliance_assessments:manage",
+      "compliance_assessments:view",
       "integrations:manage",
       "node_failure_policy:update",
       "reports:export",
@@ -69,6 +73,7 @@
       "tasks:update"
     ],
     "tenant_user": [
+      "compliance_assessments:view",
       "reports:view"
     ]
   }

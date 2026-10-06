@@ -24,6 +24,8 @@ import tempfile
 
 from ..constants import JOB_STATUS_FAILED, JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED
 from ..tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
+from ..tenancy.adapters.cstore_compliance import CstoreComplianceStore
+from ..tenancy.compliance import KIND as ASSESSMENT_KIND
 from ..tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from ..tenancy.execution import BINDING_SCHEMA_VERSION, ExecutionBinding
 from .integration_status import _STATUS_BUILDERS
@@ -119,6 +121,9 @@ class Inventory:
     self._namespace = namespace
     self._read_json = read_json
     self._tenancy_hkey = json.dumps(["redmesh", "tenancy", 1, namespace], separators=(",", ":"))
+    # RM-120: the compliance key space (framework maturity self-assessments), its own hkey.
+    self._compliance = CstoreComplianceStore(owner, namespace)
+    self._compliance_hkey = self._compliance.hkey
     self._account_hkey = CstoreAuthAccountReader(owner)._hkey()
     self._rows = {}
     self._files = {}
@@ -218,7 +223,7 @@ class Inventory:
     names = [self._instance] + [self._instance + suffix for suffix, _, _ in _PER_JOB]
     names.append(f"{self._instance}:integrations")
     names.extend(f"{self._instance}:integrations:{tenant}" for tenant in self.tenant_ids())
-    names.extend([self._tenancy_hkey, self._account_hkey])
+    names.extend([self._tenancy_hkey, self._compliance_hkey, self._account_hkey])
     return names
 
   def accepts(self, hkey):
@@ -335,9 +340,34 @@ class Inventory:
             return OLD, "unrecognized"
           return self._tenancy_class(field, kind, ids, value)
       return OLD, "unrecognized"
+    if hkey == self._compliance_hkey:
+      return self._compliance_class(field, value)
     if self.is_status_hkey(hkey):
       return self._status_class(hkey, field, value)
     raise MaintenanceError(400, "invalid_request")
+
+  def _compliance_class(self, field, value):
+    """RM-120: an assessment row is current while its validator passes and its tenant is live;
+    with the tenant gone it is an orphan (its snapshots are the files it names)."""
+    try:
+      ids = json.loads(field) if isinstance(field, str) else None
+    except (ValueError, RecursionError):
+      ids = None
+    if not (isinstance(ids, list) and len(ids) == 4 and ids[0] == ASSESSMENT_KIND
+            and ids[1] == self._namespace):
+      return OLD, "unrecognized"
+    try:
+      if field != self._compliance._location(ids[0], ids[2:])[1]:
+        return OLD, "unrecognized"
+      self._compliance._validate(value, ids[0], ids[2:])
+    except Exception:
+      return OLD, "unrecognized"
+    tenant_id = ids[2]
+    if tenant_id not in self._live_tenants():
+      known = any(k == "tenant" and i == [tenant_id] and v is not None
+                  for _, k, i, v in self._tenancy_fields())
+      return (OLD, "old_tenant") if known else (ORPHAN, "tenant_gone")
+    return CURRENT, ""
 
   # -- files ------------------------------------------------------------------------------------
 
