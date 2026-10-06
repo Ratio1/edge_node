@@ -72,16 +72,16 @@ RETRY_NOTE_TEMPLATE = (
   "entities only from an insight's [examples: ...] list, and state only counts "
   "the sheet itself states."
 )
-# Operator ruling 2026-10-06: a length cut (`output_truncated`) is not a gate
-# failure, so it asks for a shorter brief; the second text applies only when the
-# prompt carries the MISP enrichment block.
+
+# Operator ruling 2026-10-06 (revised): a length cut (`output_truncated`) is not a
+# gate failure, so it asks for a shorter brief within the request's observation
+# budget; each MISP clause is added only when the prompt carries what it names.
 RETRY_NOTE_TRUNCATED = (
   "\n\nRETRY: your previous brief was cut off at the length limit. Write a shorter brief: "
-  "at most 3 observations, one sentence each."
+  "at most {max_observations} observations, one sentence each"
 )
-RETRY_NOTE_TRUNCATED_MISP = RETRY_NOTE_TRUNCATED[:-1] + (
-  ", at most one misp_citations entry per observation, and keep the misp_refs rules above."
-)
+RETRY_NOTE_TRUNCATED_CITATIONS = ", at most one misp_citations entry per observation"
+RETRY_NOTE_TRUNCATED_REFS = ", and keep the misp_refs rules above"
 
 PROFILE_MANIFEST = {
   "profile_id": PROFILE_ID,
@@ -97,7 +97,8 @@ PROFILE_MANIFEST = {
   "user_template": brief_profile.USER_TEMPLATE,
   "retry_note_template": RETRY_NOTE_TEMPLATE,
   "retry_note_truncated": RETRY_NOTE_TRUNCATED,
-  "retry_note_truncated_misp": RETRY_NOTE_TRUNCATED_MISP,
+  "retry_note_truncated_citations": RETRY_NOTE_TRUNCATED_CITATIONS,
+  "retry_note_truncated_refs": RETRY_NOTE_TRUNCATED_REFS,
   "enrichment_template": brief_profile.ENRICHMENT_TEMPLATE,
   "enrichment_system_sentence": brief_profile.ENRICHMENT_SYSTEM_SENTENCE,
   "enrichment_view_max_bytes": ENRICHMENT_VIEW_MAX_BYTES,
@@ -719,7 +720,12 @@ def run_insight_brief(
       if exc.code in {"model_not_configured", "model_not_ready"}:
         break
       if exc.code == "output_truncated":
-        retry_note = RETRY_NOTE_TRUNCATED_MISP if enrichment_view is not None else RETRY_NOTE_TRUNCATED
+        retry_note = (
+          RETRY_NOTE_TRUNCATED.format(max_observations=max_observations)
+          + (RETRY_NOTE_TRUNCATED_CITATIONS if enrichment_view is not None else "")
+          + (RETRY_NOTE_TRUNCATED_REFS if references else "")
+          + "."
+        )
       else:
         retry_note = RETRY_NOTE_TEMPLATE.format(failures=exc.code)
       continue

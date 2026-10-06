@@ -362,8 +362,9 @@ PINNED_CATALOG_SHA256 = "f33f8f417df901e2586fed9b9659b5acf883df78e13627a4b306fc6
 # value 962afb38... is kept in test_eg018_v04.py. CATALOG_SHA256 above did not move.
 # Re-pinned again: ENRICHMENT_TEMPLATE is citation wording C (operator ruling 2026-10-05, variant F).
 # Intermediate v0.4 value with the v0.3 wording: a099ba2b...; wording C alone: 9cd04929...
-# Re-pinned a last time: dedicated retry notes for a length cut (operator 2026-10-06).
-PINNED_PROFILE_SHA256 = "d04ea15853f0eb9146d202739c450384699c4a0ee01f84472a897c50650ae604"
+# Re-pinned a last time: budget-aware retry note for a length cut (operator 2026-10-06 revision;
+# the first 2026-10-06 text gave d04ea158...).
+PINNED_PROFILE_SHA256 = "1c8003cd9656d7de010911f365857fee71c338efa8a421c8f023732f1b675193"
 
 
 def enrichment_graph():
