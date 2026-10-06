@@ -1,10 +1,12 @@
-"""RM-109 phase 2: the tenant draft, a tenant prepared before its documents are signed.
+"""RM-109: the tenant draft, a tenant prepared before its documents are signed.
 
-Vocabulary, formats, the stored-record validator, the completeness rule and the DTO; no storage
-I/O. Contract: `docs/resources/redmesh/contracts/onboarding-drafts.md` (project hub). A draft is
-mutable, never hashed and never anchored, and it is not a tenant: its id (`td_<uuid>`) is never a
-tenant id. Activation (`prepare_tenant` with `draft_id`, the marker, release, close) is phase 3;
-until then `activation` and `last_release` stay null on every row this release writes.
+Vocabulary, formats, the stored-record validator, the completeness rule, the governance terms an
+activation copies onto the receipt and the tenant, and the DTO; no storage I/O. Contract:
+`docs/resources/redmesh/contracts/onboarding-drafts.md` (project hub). A draft is mutable, never
+hashed and never anchored, and it is not a tenant: its id (`td_<uuid>`) is never a tenant id.
+`activation` is the marker `prepare_tenant` writes before the receipt (it locks the draft);
+`last_release` records the last release of a stuck activation. Both are written by
+`tenancy.administration`.
 """
 from datetime import date
 import re

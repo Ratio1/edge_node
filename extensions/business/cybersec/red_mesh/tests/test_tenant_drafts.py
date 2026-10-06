@@ -863,21 +863,64 @@ class TestDraftRelease(_ActivationCase):
     refused(self, self.plugin.delete_tenant_draft(self.actor, draft_id), 409, "draft_locked")
     ok(self, self.plugin.close_tenant_draft({"account_id": "other-sta"}, draft_id))
 
-  def test_release_after_the_tenant_was_deleted_removes_no_row_and_empties_the_items(self):
-    draft_id, request_id = self.ready(), str(uuid4())
-    ok(self, self.activate(draft_id, request_id))
-    tenant_id = self.finish(draft_id, request_id)
-    # What `delete_tenant` leaves: no receipt, no tenant row, the domain still reserved.
-    self.repo.delete("receipt", "creator", request_id)
-    self.repo.delete("tenant", tenant_id)
+  def delete_tenant(self, tenant_id):
+    """The real `delete_tenant`: members removed first, no jobs (an empty job hash)."""
+    self.plugin.cfg_instance_id = "jobs"
+    self.store.account("acme.admin", memberships=[])
+    return self.plugin.delete_tenant(self.actor, tenant_id)
+
+  def assert_released_after_the_tenant_delete(self, draft_id):
     domain = self.repo.get("domain", "acme")
+    self.assertIsNotNone(domain)
     released = ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))["released"]
     self.assertEqual((released["tenant_id"], released["initial_admin_id"]), (None, None))
     self.assertEqual(self.repo.get("domain", "acme"), domain)
     row = self.stored(draft_id)
+    self.assertIsNone(row["activation"])
     self.assertTrue(all(item["state"] == "missing" and item["document"] is None for item in row["items"].values()))
-    self.assertEqual(self.events[-1][1]["rows_deleted"], 0)
+    self.assertEqual(self.events[-1], ("tenant_draft_activation_released",
+                                       {"draft_id": draft_id, "actor": "creator", "rows_deleted": 0}))
     self.assertEqual(ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))["files_deleted"], 0)
+
+  def test_release_after_the_tenant_was_deleted_removes_no_row_and_empties_the_items(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    files = sorted(item["document"]["ref"] for item in self.stored(draft_id)["items"].values())
+    deleted = ok(self, self.delete_tenant(tenant_id))
+    self.assertEqual(deleted["documents"], 3)
+    self.assertEqual(sorted(self.documents.deleted), files)
+    self.assertEqual((self.rows("tenant"), self.rows("receipt")), ([], []))
+    self.assert_released_after_the_tenant_delete(draft_id)
+
+  def test_release_after_a_tenant_delete_that_stopped_before_the_tenant_row(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    real_delete = CstoreTenantAdministrationStore.delete
+
+    def delete(store, kind, *ids):
+      if kind == "tenant":
+        raise TenantStoreError("crash between the receipt and the tenant row")
+      return real_delete(store, kind, *ids)
+    with patch.object(CstoreTenantAdministrationStore, "delete", delete):
+      refused(self, self.delete_tenant(tenant_id), 503, "unavailable")
+    self.assertEqual(self.rows("receipt"), [])
+    self.assertIn("deleting", self.repo.raw_record("tenant", tenant_id))
+    self.assert_released_after_the_tenant_delete(draft_id)
+    # The tenant delete is still finished by calling it again.
+    self.assertTrue(ok(self, self.delete_tenant(tenant_id))["deleted"])
+
+  def test_a_tenant_being_deleted_refuses_release(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    self.store.account("acme.admin", memberships=[])
+    ok(self, self.plugin._call_tenant_administration("begin_tenant_delete", self.actor, tenant_id=tenant_id,
+                                                     mark=True))
+    writes = len(self.store.writes)
+    refused(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id), 409, "tenant_deleting")
+    self.assertEqual(len(self.store.writes), writes)
 
   def test_a_release_resumed_after_its_receipt_went_keeps_the_ids_and_the_files(self):
     draft_id, request_id = self.ready(), str(uuid4())
@@ -895,7 +938,10 @@ class TestDraftRelease(_ActivationCase):
     self.assertEqual(self.rows("receipt"), [])
     released = ok(self, self.plugin.release_tenant_draft_activation(self.actor, draft_id))["released"]
     self.assertEqual(released["tenant_id"], prepared["tenantId"])
+    self.assertIsNone(self.stored(draft_id)["activation"])
     self.assertTrue(all(item["state"] == "signed" for item in self.stored(draft_id)["items"].values()))
+    # Finishing a release that already removed its rows is a replay: no audit event of its own.
+    self.assertEqual(self.events, [])
 
   def test_tenant_delete_lists_every_tenant_document(self):
     for combined, count in ((False, 3), (True, 1)):
@@ -916,6 +962,20 @@ class TestDraftRelease(_ActivationCase):
         self.repo.delete("domain", "acme")
 
 
+class TestRefusalShape(unittest.TestCase):
+  def test_refusal_details_never_override_the_fixed_keys(self):
+    from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied, _endpoint
+
+    @_endpoint
+    def refuse():
+      raise AdministrationDenied(409, "draft_incomplete", missing=["item:contract"], success=True, status="ok")
+    self.assertEqual(refuse(), {"success": False, "status": "error", "status_code": 409,
+                                "error": "draft_incomplete", "missing": ["item:contract"]})
+    # `status_code` and `error` are the refusal's own arguments; a detail cannot carry them.
+    with self.assertRaises(TypeError):
+      AdministrationDenied(409, "draft_incomplete", status_code=200)
+
+
 class TestDraftStoreKind(unittest.TestCase):
   def setUp(self):
     self.owner = FakeAdministrationStore()
@@ -934,6 +994,15 @@ class TestDraftStoreKind(unittest.TestCase):
           self.repo.list_tenant_drafts()
     with self.assertRaises(TenantStoreError):
       self.repo.put("tenant_draft", draft_id, record={"draft_id": draft_id})
+
+  def test_the_raw_scan_fails_closed_on_a_row_it_cannot_decode(self):
+    self.owner.data[(TENANCY_HKEY, '["receipt","deployment","creator","r1"]')] = {"contract": {"ref": "doc-1"}}
+    self.assertEqual(self.repo.raw_rows("receipt"), [{"contract": {"ref": "doc-1"}}])
+    self.owner.data[(TENANCY_HKEY, '["receipt","deployment","creator","r2"]')] = "{not json"
+    with self.assertRaises(TenantStoreError):
+      self.repo.raw_rows("receipt")
+    # Other kinds are not decoded.
+    self.assertEqual(self.repo.raw_rows("tenant"), [])
 
 
 if __name__ == "__main__":

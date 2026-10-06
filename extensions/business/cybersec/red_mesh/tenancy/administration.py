@@ -59,8 +59,9 @@ def _endpoint(method):
         data = method(*args, **kwargs)
       return {"success": True, "status_code": 200, "data": data}
     except AdministrationDenied as exc:
-      return {"success": False, "status": "error", "status_code": exc.status_code, "error": exc.error,
-              **exc.details}
+      # Details first: they never override the fixed keys of the refusal.
+      return {**exc.details, "success": False, "status": "error", "status_code": exc.status_code,
+              "error": exc.error}
     except (IdentityStoreError, TenantStoreError):
       return administration_unavailable()
   return call
@@ -1289,7 +1290,9 @@ class TenantAdministrationService:
 
   def _draft_answer(self, row):
     """RM-109 phase 3: while the marker is set, its tenant's state: `none` (no receipt), `pending`
-    or `active`. Answer only; never written."""
+    or `active`. Answer only; never written. A corrupt receipt is a store failure here as on every
+    tenant read, so one such receipt fails `list_tenant_drafts` closed (503) on purpose: the list
+    never shows a state it could not read."""
     if row["activation"] is None:
       return row
     receipt, tenant = self._marker_tenant(row["activation"])
@@ -1404,9 +1407,12 @@ class TenantAdministrationService:
         raise AdministrationDenied(409, "not_activating")
       return {"draft_id": draft_id, "released": draft["last_release"], "replayed": True, "rows_deleted": 0}
     receipt, tenant = self._marker_tenant(marker)
-    deleted = 0
+    deleted, replayed = 0, False
     if receipt is not None:
-      if tenant is not None and (tenant.get("active") is True or "deleting" in tenant):
+      if tenant is not None and "deleting" in tenant:
+        # Being deleted: `delete_tenant` finishes it, and its rows are not this release's.
+        raise AdministrationDenied(409, "tenant_deleting")
+      if tenant is not None and tenant.get("active") is True:
         raise AdministrationDenied(409, "tenant_active")
       release = {"actor_id": account.account_id, "released_at": datetime.now(timezone.utc).isoformat(),
                  "request_id": marker["request_id"], "tenant_id": receipt["tenant_id"],
@@ -1422,7 +1428,10 @@ class TenantAdministrationService:
         deleted += 1
       self.store.delete("receipt", marker["actor_id"], marker["request_id"])
       deleted += 1
-    elif (draft["last_release"] or {}).get("request_id") != marker["request_id"]:
+    elif (draft["last_release"] or {}).get("request_id") == marker["request_id"]:
+      # A release that stopped after its receipt delete: only the marker is left to clear.
+      replayed = True
+    else:
       domain = self.store.get("domain", draft["domain_id"]) if draft["domain_id"] else None
       tenant_deleted = domain is not None and (domain.get("actor_id"), domain.get("request_id")) == (
         marker["actor_id"], marker["request_id"])
@@ -1435,7 +1444,7 @@ class TenantAdministrationService:
         "request_id": marker["request_id"], "tenant_id": None, "initial_admin_id": None}}
     draft = {**draft, "activation": None}
     self.store.put("tenant_draft", draft_id, record=draft)
-    return {"draft_id": draft_id, "released": draft["last_release"], "replayed": False, "rows_deleted": deleted}
+    return {"draft_id": draft_id, "released": draft["last_release"], "replayed": replayed, "rows_deleted": deleted}
 
   @_endpoint
   def close_tenant_draft(self, actor, draft_id):
