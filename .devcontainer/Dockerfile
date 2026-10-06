@@ -21,7 +21,8 @@ RUN set -eux; \
     ninja-build; \
     rm -rf /var/lib/apt/lists/*
          
-RUN wget https://dist.ipfs.tech/kubo/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz && \
+RUN (wget https://github.com/ipfs/kubo/releases/download/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz \
+  || wget https://dist.ipfs.tech/kubo/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz) && \
   tar -xvzf kubo_v0.35.0_linux-amd64.tar.gz && \
   cd kubo && \
   bash install.sh

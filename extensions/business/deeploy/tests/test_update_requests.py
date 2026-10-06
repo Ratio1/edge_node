@@ -411,6 +411,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
     self.assertEqual(called["delete"], 1)
     self.assertEqual(called["deploy"], 1)
+    self.assertFalse(called["deploy_kwargs"]["dispatch_state"]["retain_on_failed_dispatch"])
     self.assertEqual(called["deploy_kwargs"]["job_app_type"], JOB_APP_TYPES.SERVICE)
     redeploy_inputs = called["deploy_kwargs"]["inputs"]
     self.assertEqual(len(redeploy_inputs[DEEPLOY_KEYS.PLUGINS]), 1)
