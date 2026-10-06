@@ -1151,7 +1151,8 @@ class TenantAdministrationService:
   # draft has no tenant, so these are not rows of the tenant policy matrix. Every document read,
   # write and delete is the plugin's, outside this lock: these methods return stored rows and the
   # refs whose files the plugin deletes after the write. Phase 3 sets `activation`; while it is set
-  # the draft is locked.
+  # the draft is locked. No method here reads the document store, and a stored row never changes
+  # because a file could not be read (contract §Missing files).
 
   def _tenant_draft(self, draft_id):
     if not drafts.valid_draft_id(draft_id):
@@ -1209,13 +1210,12 @@ class TenantAdministrationService:
     return [drafts.draft_list_row(row) for row in rows]
 
   @_endpoint
-  def update_tenant_draft(self, actor, draft_id, changes, gone_refs=()):
-    """`gone_refs`: draft files the plugin found gone from the store; their items are corrected to
-    `missing` in this write. Answers the row and the refs whose files the plugin deletes."""
+  def update_tenant_draft(self, actor, draft_id, changes):
+    """Answers the row and the `(slot, ref)` pairs whose files the plugin deletes after this write."""
     account = self._actor(actor, creator=True)
     previous = self._unlocked_tenant_draft(draft_id)
     try:
-      row, dropped = drafts.apply_changes(drafts.without_documents(previous, gone_refs), changes)
+      row, dropped = drafts.apply_changes(previous, changes)
     except drafts.DraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     return {"draft": self._write_tenant_draft(row, account, previous), "dropped": dropped}
@@ -1228,7 +1228,7 @@ class TenantAdministrationService:
     return {"accountId": account.account_id, "draft": row}
 
   @_endpoint
-  def attach_tenant_draft_document(self, actor, draft_id, document_kind, document, gone_refs=()):
+  def attach_tenant_draft_document(self, actor, draft_id, document_kind, document):
     """Bind an uploaded file (`store_draft_document`) to its slot and sign the item. Answers the row
     and the ref the slot held before, whose file the plugin deletes after this write."""
     account = self._actor(actor, creator=True)
@@ -1236,7 +1236,7 @@ class TenantAdministrationService:
     kind = self._draft_document_kind(document_kind)
     if not valid_doc_ref(document) or document["uploaded_by"] != account.account_id:
       raise AdministrationDenied(400, "contract_invalid" if kind == "contract" else "document_invalid")
-    row = drafts.without_documents(previous, gone_refs)
+    row = previous
     replaced = row["items"][kind]["document"]
     row = {**row, "items": {**row["items"], kind: {**row["items"][kind], "state": "signed",
                                                    "document": dict(document)}}}

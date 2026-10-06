@@ -580,7 +580,7 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   renamed `test_missing_namespace_*`; stray `cfg_tenant_administration_enabled` fixture attributes
   dropped. Dev-node stream configs may still carry the key; the plugin ignores unknown config keys.
 
-### 2026-10-07 — RM-109 phase 2: tenant drafts
+### 2026-10-06 — RM-109 phase 2: tenant drafts
 
 - BUILDER: `tenant_draft` record kind (`tenancy/drafts.py`: vocabulary, validator, completeness, DTO)
   and seven `authorize_platform`-gated POST endpoints (create/update/get/list/delete, document
@@ -591,8 +591,9 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - CRITIC/response: a draft id is not a tenant id, so data maintenance classifies `tenant_draft`
   before its related-tenant check (current when the validator passes, else old/unrecognized; never
   orphan). A replaced or dropped file is deleted after the row stops naming it; a failed delete is
-  logged, the write stands (the file is then unreferenced). A file gone from the store reads as
-  `missing` and the row is corrected on the next write; detecting it reads each file's envelope.
+  logged with draft, slot and ref, the write stands (the file is then unreferenced). No draft
+  answer reads the store: R1FS answers a timeout as no file, so a read failure must never be
+  persisted as `missing`. An unreadable file is a 404 on download and is skipped on delete.
   Draft delete removes files first and refuses (`409 conflict`) a file attached meanwhile. No
   activation yet: `activation`/`last_release` stay null and a set marker locks the draft (phase 3).
 - Verification: `tests/test_tenant_drafts.py` (new), `test_data_maintenance.py` (draft current, files

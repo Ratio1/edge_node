@@ -154,7 +154,7 @@ def new_draft(draft_id, display_name, compliance_types, actor_id, now):
 
 
 def apply_changes(row, changes):
-  """The row with `changes` applied (`update_tenant_draft`), and the refs whose files it drops.
+  """The row with `changes` applied (`update_tenant_draft`), and the `(slot, ref)` files it drops.
 
   Formats are checked, emptiness is allowed. An update may set an item `missing` (its file goes) or
   `awaiting_signature` (only without a file); `signed` is set by an upload alone.
@@ -195,7 +195,7 @@ def apply_changes(row, changes):
         state = change["state"]
         if state == "missing":
           if item["document"] is not None:
-            dropped.append(item["document"]["ref"])
+            dropped.append((kind, item["document"]["ref"]))
           item.update(state="missing", document=None)
         elif state == "awaiting_signature" and item["document"] is None:
           item["state"] = "awaiting_signature"
@@ -208,19 +208,6 @@ def apply_changes(row, changes):
     for record, decision in decisions.items():
       row["applicability"][record] = normalize_applicability(decision)
   return row, dropped
-
-
-def without_documents(row, refs):
-  """The row with every item whose file is in `refs` (gone from the store) read as `missing`."""
-  refs = set(refs)
-  if not any(item["document"] is not None and item["document"]["ref"] in refs for item in row["items"].values()):
-    return row
-  items = {}
-  for kind, item in row["items"].items():
-    if item["document"] is not None and item["document"]["ref"] in refs:
-      item = {**item, "state": "missing", "document": None}
-    items[kind] = item
-  return {**row, "items": items}
 
 
 def document_refs(row):
@@ -318,7 +305,8 @@ def validate_tenant_draft(row, ids):
     item = items[kind]
     if (not isinstance(item, dict) or set(item) != set(_ITEM_FIELDS) or item["state"] not in ITEM_STATES
         or (item["state"] == "signed") != (item["document"] is not None)
-        or (item["document"] is not None and not valid_doc_ref(item["document"]))
+        or (item["document"] is not None and (not valid_doc_ref(item["document"])
+                                              or item["document"]["mime"] != "application/pdf"))
         or not _same(lambda covers: normalize_covers(kind, covers), item["covers"])
         or not _same(_effective_date, item["effective_from"])
         or not _same(_effective_date, item["effective_until"])):

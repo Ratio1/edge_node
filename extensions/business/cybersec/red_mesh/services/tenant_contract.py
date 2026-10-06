@@ -87,15 +87,18 @@ def resolve_contract(documents, ref):
   return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}
 
 
-def read_contract(documents, contract):
+def read_contract(documents, contract, absent=None):
   """The stored contract file, served only if it still matches the tenant record.
 
   The tenant record is the authority: the file's bytes are hashed and sized here and compared with
   the record, never with the envelope's own claims. Anything else is 409 `contract_integrity`.
+  `absent` (status, error) answers a file the store does not return (RM-109 draft downloads: 404).
   """
   if contract.get("store") != documents.name:
     raise ContractRefused(503, "unavailable")
   envelope = documents.get(contract["ref"])
+  if envelope is None and absent is not None:
+    raise ContractRefused(*absent)
   if not isinstance(envelope, dict) or envelope.get("kind") != CONTRACT_KIND:
     raise ContractRefused(409, "contract_integrity")
   try:

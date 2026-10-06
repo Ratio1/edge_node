@@ -513,34 +513,84 @@ class TestDraftLockAndMissingFiles(_DraftCase):
     rows = ok(self, self.plugin.list_tenant_drafts(self.actor))
     self.assertEqual(rows[0]["activation"]["actor_id"], "creator")
 
-  def test_a_gone_file_reads_as_missing_and_delete_skips_it(self):
+  def test_an_unreadable_file_never_changes_the_row(self):
+    # R1FS answers a timeout as no file: a read failure must not be persisted as `missing`.
     draft_id = self.create()["draft_id"]
     self.complete_fields(draft_id)
     ok(self, self.upload(draft_id))
-    ok(self, self.upload(draft_id, "data_handling", SCHEDULE_PDF))
-    self.documents.envelopes.pop("doc-1")
+    signed = self.stored(draft_id)["items"]["contract"]
+    reads = []
+    self.documents.get = lambda ref: reads.append(ref)
     draft = ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))
-    self.assertEqual((draft["items"]["contract"]["state"], draft["items"]["contract"]["document"]), ("missing", None))
-    self.assertEqual(draft["items"]["data_handling"]["state"], "signed")
-    self.assertIn("item:contract", draft["completeness"]["missing"])
-    refused(self, self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"), 404, "not_found")
-    # The stored row is corrected on the next write.
-    self.assertEqual(self.stored(draft_id)["items"]["contract"]["state"], "signed")
+    self.assertEqual((draft["items"]["contract"]["state"], draft["items"]["contract"]["document"]),
+                     ("signed", signed["document"]))
     ok(self, self.update(draft_id, {"display_name": "Acme Renamed"}))
-    self.assertEqual((self.stored(draft_id)["items"]["contract"]["state"],
-                      self.stored(draft_id)["items"]["contract"]["document"]), ("missing", None))
-    # A gone file whose delete is not confirmed is skipped, not a failure.
-    self.documents.envelopes.pop("doc-2")
-    self.documents.fail_delete = {"doc-2"}
-    data = ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))
-    self.assertEqual(data["files_deleted"], 0)
-    self.assertIsNone(self.stored(draft_id))
+    ok(self, self.upload(draft_id, "data_handling", SCHEDULE_PDF))
+    ok(self, self.plugin.create_tenant_draft(self.actor, draft_id[3:], "Replay", ["nis2"]))
+    self.assertEqual(self.stored(draft_id)["items"]["contract"], signed)
+    self.assertNotIn("item:contract", ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))
+                     ["completeness"]["missing"])
+    # No answer reads the store; only a download does.
+    self.assertEqual(reads, [])
+    refused(self, self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"), 404, "not_found")
+    self.assertEqual(reads, ["doc-1"])
+    self.assertEqual(self.stored(draft_id)["items"]["contract"], signed)
 
-  def test_an_unreadable_document_store_is_unavailable_not_missing(self):
+  def test_answers_do_not_need_the_document_store(self):
     draft_id = self.create()["draft_id"]
     ok(self, self.upload(draft_id))
     self.documents.fail = True
+    self.assertEqual(ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))["items"]["contract"]["state"],
+                     "signed")
+    ok(self, self.update(draft_id, {"display_name": "Acme Renamed"}))
+    refused(self, self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"), 503, "unavailable")
+
+  def test_a_stored_document_that_is_not_a_pdf_fails_closed(self):
+    draft_id = self.create()["draft_id"]
+    ok(self, self.upload(draft_id))
+    key = json.dumps(["tenant_draft", "deployment", draft_id], separators=(",", ":"))
+    self.store.data[(TENANCY_HKEY, key)]["items"]["contract"]["document"]["mime"] = "image/png"
     refused(self, self.plugin.get_tenant_draft(self.actor, draft_id), 503, "unavailable")
+
+  def test_a_gone_file_is_not_found_on_download_and_skipped_on_delete(self):
+    draft_id = self.create()["draft_id"]
+    ok(self, self.upload(draft_id))
+    ok(self, self.upload(draft_id, "data_handling", SCHEDULE_PDF))
+    self.documents.envelopes.pop("doc-1")
+    refused(self, self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"), 404, "not_found")
+    self.assertEqual(self.stored(draft_id)["items"]["contract"]["state"], "signed")
+    # A gone file whose delete is not confirmed is skipped, not a failure.
+    self.documents.fail_delete = {"doc-1"}
+    data = ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))
+    self.assertEqual(data["files_deleted"], 1)
+    self.assertEqual(self.documents.deleted, ["doc-2"])
+    self.assertIsNone(self.stored(draft_id))
+
+  def test_a_failed_delete_of_an_unreferenced_file_is_logged_with_its_slot_and_ref(self):
+    draft_id = self.create()["draft_id"]
+    ok(self, self.upload(draft_id))
+    logged = []
+    self.plugin.P = lambda message, **kwargs: logged.append((message, kwargs.get("color")))
+    self.documents.fail_delete = {"doc-1"}
+    item = ok(self, self.upload(draft_id, raw=b"%PDF-1.7\n%second copy\n%%EOF\n"))["items"]["contract"]
+    self.assertEqual(item["document"]["ref"], "doc-2")
+    self.assertEqual(len(logged), 1)
+    message, color = logged[0]
+    self.assertEqual(color, "r")
+    for part in (draft_id, "contract", "doc-1"):
+      self.assertIn(part, message)
+    # The rollback of an upload whose write is refused logs the same way.
+    logged.clear()
+    self.set_activation(draft_id)
+    self.documents.fail_delete = {"doc-3"}
+    attach = self.plugin._call_tenant_administration
+    self.plugin._call_tenant_administration = lambda operation, actor, **kwargs: (
+      {"success": True, "status_code": 200, "data": {"accountId": "creator"}}
+      if operation == "authorize_tenant_draft_upload" else attach(operation, actor, **kwargs))
+    refused(self, self.upload(draft_id, "data_handling", SCHEDULE_PDF), 409, "draft_locked")
+    self.assertEqual(len(logged), 1)
+    for part in (draft_id, "data_handling", "doc-3"):
+      self.assertIn(part, logged[0][0])
 
 
 class TestDraftStoreKind(unittest.TestCase):
