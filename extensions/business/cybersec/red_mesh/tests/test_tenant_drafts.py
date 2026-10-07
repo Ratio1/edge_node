@@ -172,7 +172,8 @@ class TestDraftRecord(_DraftCase):
     by_id = {row["draft_id"]: row for row in rows}
     self.assertEqual(set(by_id), {first["draft_id"], second["draft_id"]})
     self.assertEqual(set(by_id[first["draft_id"]]), {"draft_id", "display_name", "compliance_types", "created_at",
-                                                     "updated_at", "items_done", "items_total", "activation"})
+                                                     "updated_at", "items_done", "items_total", "nodes",
+                                                     "activation"})
     # One shown item since the two-pack shape; done once the pack is signed.
     self.assertEqual((by_id[first["draft_id"]]["items_done"], by_id[first["draft_id"]]["items_total"]), (0, 1))
     self.assertEqual((by_id[second["draft_id"]]["items_done"], by_id[second["draft_id"]]["items_total"]), (1, 1))
@@ -364,9 +365,9 @@ class TestDraftCompleteness(_DraftCase):
   def test_a_new_draft_lists_every_gap(self):
     draft = self.create("", ())
     # Rule 3 (collapsed checklist): the two tenant records sit in the contract's fixed covers, so
-    # the signed pack decides them and no `record:` gap is listed.
+    # the signed pack decides them and no `record:` gap is listed. RM-112: the admin is optional.
     self.assertEqual(draft["completeness"], {"complete": False, "missing": [
-      "field:display_name", "field:domain_id", "field:initial_admin_id", "field:legal.name",
+      "field:display_name", "field:domain_id", "field:legal.name",
       "field:legal.registration_id", "field:legal.signer_name", "field:legal.signer_role",
       "field:compliance_types", "item:contract"]})
 
@@ -513,9 +514,9 @@ class TestDraftDocuments(_DraftCase):
     self.assertIsNone(self.stored(draft_id)["items"]["contract"]["document"])
 
   def test_delete_removes_every_file_then_the_record(self):
+    # RM-112: a draft with a signed document is kept, so the file here is the unsigned pack.
     draft_id = self.create()["draft_id"]
-    ok(self, self.upload(draft_id))
-    ok(self, self.upload(draft_id, "data_handling", SCHEDULE_PDF))
+    ok(self, self.generate(draft_id))
     present = []
     delete = self.documents.delete
 
@@ -524,17 +525,17 @@ class TestDraftDocuments(_DraftCase):
       delete(ref)
     self.documents.delete = observed_delete
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))
-    self.assertEqual(data, {"draft_id": draft_id, "files_deleted": 2, "engagement_drafts_deleted": 0})
-    self.assertEqual(present, [True, True])
-    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2"])
+    self.assertEqual(data, {"draft_id": draft_id, "files_deleted": 1, "engagement_drafts_deleted": 0})
+    self.assertEqual(present, [True])
+    self.assertEqual(self.documents.deleted, ["doc-1"])
     self.assertIsNone(self.stored(draft_id))
     refused(self, self.plugin.get_tenant_draft(self.actor, draft_id), 404, "not_found")
     self.assertEqual(self.events, [("tenant_draft_deleted", {"draft_id": draft_id, "actor": "creator",
-                                                             "files_deleted": 2, "engagement_drafts_deleted": 0})])
+                                                             "files_deleted": 1, "engagement_drafts_deleted": 0})])
 
   def test_a_failed_file_delete_keeps_the_record_for_a_retry(self):
     draft_id = self.create()["draft_id"]
-    ok(self, self.upload(draft_id))
+    ok(self, self.generate(draft_id))
     self.documents.fail_delete = {"doc-1"}
     refused(self, self.plugin.delete_tenant_draft(self.actor, draft_id), 503, "unavailable")
     self.assertIsNotNone(self.stored(draft_id))
@@ -609,11 +610,15 @@ class TestDraftLockAndMissingFiles(_DraftCase):
     self.documents.envelopes.pop("doc-1")
     refused(self, self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"), 404, "not_found")
     self.assertEqual(self.stored(draft_id)["items"]["contract"]["state"], "signed")
-    # A gone file whose delete is not confirmed is skipped, not a failure.
-    self.documents.fail_delete = {"doc-1"}
+    # A gone file whose delete is not confirmed is skipped, not a failure. RM-112: a signed draft is
+    # kept, so the delete runs on an unsigned one whose pack file is gone.
+    draft_id = self.create()["draft_id"]
+    ok(self, self.generate(draft_id))
+    self.documents.envelopes.pop("doc-3")
+    self.documents.fail_delete = {"doc-3"}
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))
-    self.assertEqual(data["files_deleted"], 1)
-    self.assertEqual(self.documents.deleted, ["doc-2"])
+    self.assertEqual(data["files_deleted"], 0)
+    self.assertEqual(self.documents.deleted, [])
     self.assertIsNone(self.stored(draft_id))
 
   def test_a_failed_delete_of_an_unreferenced_file_is_logged_with_its_slot_and_ref(self):
@@ -868,7 +873,7 @@ class TestDraftActivation(_ActivationCase):
     writes = len(self.store.writes)
     result = self.activate(draft_id, str(uuid4()))
     refused(self, result, 409, "draft_incomplete")
-    self.assertEqual(result["missing"][:2], ["field:initial_admin_id", "field:legal.name"])
+    self.assertEqual(result["missing"][:2], ["field:legal.name", "field:legal.registration_id"])
     self.assertIn("item:contract", result["missing"])
     self.assertEqual(len(self.store.writes), writes)
     self.assertIsNone(self.stored(draft_id)["activation"])

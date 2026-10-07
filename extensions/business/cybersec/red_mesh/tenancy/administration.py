@@ -177,9 +177,14 @@ class TenantAdministrationService:
     if (receipt.get("actor_id") != actor_id or receipt.get("request_id") != request_id
         or not isinstance(receipt.get("tenant_id"), str) or not receipt["tenant_id"].startswith("tn_")
         or not isinstance(receipt.get("display_name"), str) or not receipt["display_name"].strip()
-        or canonical_account_id(receipt.get("initial_admin_id")) != receipt.get("initial_admin_id")
-        or not receipt.get("initial_admin_id")
-        or not isinstance(receipt.get("initial_admin_generation"), str) or not receipt["initial_admin_generation"]
+        # RM-112: a tenant activated from a draft may have no initial admin; both fields are then None.
+        or "initial_admin_id" not in receipt or "initial_admin_generation" not in receipt
+        or (receipt["initial_admin_id"] is None) != (receipt["initial_admin_generation"] is None)
+        or (receipt["initial_admin_id"] is not None
+            and (canonical_account_id(receipt["initial_admin_id"]) != receipt["initial_admin_id"]
+                 or not receipt["initial_admin_id"]
+                 or not isinstance(receipt["initial_admin_generation"], str)
+                 or not receipt["initial_admin_generation"]))
         or not isinstance(receipt.get("created_at"), str) or not receipt["created_at"]):
       raise TenantStoreError("Invalid creation receipt")
     try:
@@ -228,6 +233,7 @@ class TenantAdministrationService:
       # The tenant's root administrator: the account the tenant was created around. Recorded so a
       # tenant admin cannot reset the founder's credential and take the tenant over. Tenants created
       # before this field existed simply do not carry it; absence means "unknown", never "anyone".
+      # RM-112: None for a tenant activated without an admin, for good.
       "root_admin_id": receipt["initial_admin_id"],
     }
 
@@ -325,11 +331,12 @@ class TenantAdministrationService:
     else:
       if self.store.get("domain", domain_id) is not None:
         raise AdministrationDenied(409, "domain_conflict")
-      admin = self._initial_admin(initial_admin_id)
+      # RM-112: a draft activation may name no admin; then no account is read or touched.
+      admin = self._initial_admin(initial_admin_id) if initial_admin_id is not None else None
       # RM-083. The initial administrator becomes this tenant's account; one that already holds any
       # scope (platform or another tenant) cannot take a second. Only on first preparation: a retry
       # finds its own tenant_admin membership already written.
-      if admin.tenant_memberships:
+      if admin is not None and admin.tenant_memberships:
         raise AdministrationDenied(409, "scope_conflict")
       documents = {"contract": contract, **{kind: terms[kind] for kind in _TENANT_DOCUMENT_KINDS[1:] if kind in terms}}
       self._first_preparation_documents(documents)
@@ -341,14 +348,16 @@ class TenantAdministrationService:
           "last_release": None})
       receipt = {**intent, "legal": legal, "contract": dict(contract), **terms,
                  "actor_id": creator.account_id, "request_id": request_id,
-                 "initial_admin_generation": admin.account_generation, "tenant_id": "tn_" + str(uuid4()),
+                 "initial_admin_generation": admin.account_generation if admin is not None else None,
+                 "tenant_id": "tn_" + str(uuid4()),
                  "created_at": datetime.now(timezone.utc).isoformat()}
       self.store.put("receipt", creator.account_id, request_id, record=receipt)
       domain, tenant = None, None
     if tenant is None or not tenant["active"]:
-      admin = self._initial_admin(initial_admin_id, receipt["initial_admin_generation"])
-      if admin.tenant_memberships not in ((), (TenantMembership("tenant_admin", receipt["tenant_id"]),)):
-        raise AdministrationDenied(409, "scope_conflict")
+      if initial_admin_id is not None:
+        admin = self._initial_admin(initial_admin_id, receipt["initial_admin_generation"])
+        if admin.tenant_memberships not in ((), (TenantMembership("tenant_admin", receipt["tenant_id"]),)):
+          raise AdministrationDenied(409, "scope_conflict")
       if domain is None:
         self.store.put("domain", domain_id, record=self._binding(receipt))
       if tenant is None:
@@ -375,8 +384,9 @@ class TenantAdministrationService:
     completeness = drafts.completeness(draft)
     if not completeness["complete"]:
       raise AdministrationDenied(409, "draft_incomplete", missing=completeness["missing"])
+    # RM-112: the draft's "" (no admin) is None on the intent, the receipt and the tenant.
     intent = {"display_name": draft["display_name"], "domain_id": _domain(draft["domain_id"]),
-              "initial_admin_id": draft["initial_admin_id"]}
+              "initial_admin_id": draft["initial_admin_id"] or None}
     terms = {"draft_id": draft_id, "compliance_types": list(draft["compliance_types"]),
              "framework_agreement": stored["framework_agreement"], "data_handling": stored["data_handling"],
              "governance": drafts.governance(draft)}
@@ -429,9 +439,10 @@ class TenantAdministrationService:
     if domain is None or tenant is None:
       raise AdministrationDenied(409, "creation_pending")
     if not tenant["active"]:
-      admin = self._initial_admin(receipt["initial_admin_id"], receipt["initial_admin_generation"])
-      if TenantMembership("tenant_admin", receipt["tenant_id"]) not in admin.tenant_memberships:
-        raise AdministrationDenied(409, "initial_admin_required")
+      if receipt["initial_admin_id"] is not None:
+        admin = self._initial_admin(receipt["initial_admin_id"], receipt["initial_admin_generation"])
+        if TenantMembership("tenant_admin", receipt["tenant_id"]) not in admin.tenant_memberships:
+          raise AdministrationDenied(409, "initial_admin_required")
       tenant = {**tenant, "active": True}
       self.store.put("tenant", receipt["tenant_id"], record=tenant)
     return self._detail(tenant, creator)
@@ -496,8 +507,12 @@ class TenantAdministrationService:
     members = self._members(tenant["tenant_id"], accounts)
     # RM-084 P7: an archived member is not a member for counting; the counts state present access.
     active = [m for m in members if m["state"] == _ACTIVE_STATE]
+    # RM-112: live assignments, as `get_tenant_nodes` lists them (a dead-draining row is released).
+    node_count = sum(1 for row in self.store.list_node_assignments(tenant["tenant_id"])
+                     if self._assignment_live(tenant["tenant_id"], row))
     return {"tenantId": tenant["tenant_id"], "displayName": tenant["display_name"], "domainId": tenant["domain_id"],
             "lifecycle": "active", "memberCount": len({m["accountId"] for m in active}),
+            "nodeCount": node_count,
             "adminCount": len({m["accountId"] for m in active if m["role"] == "tenant_admin"}),
             "allowPentester": tenant["allow_pentester"], "createdBy": tenant["created_by"],
             "rootAdminId": tenant.get("root_admin_id"),
@@ -1090,8 +1105,9 @@ class TenantAdministrationService:
   def _assign_node(self, account, tenant_id, node_address, mode, row):
     """RM-102 conflict precedence for (tenant, node, mode), over every tenant's live row for the
     node: own row draining; own live row, same mode (idempotent); own live row, the other mode;
-    another tenant's live private row; private requested while any other live row exists; else
-    write. Rows are "live" per `_assignment_live` -- a dead-draining row is released everywhere."""
+    another tenant's live private row; private requested while any other live row exists; RM-112: a
+    draft's private plan of the node, unless this tenant was activated from that draft; else write.
+    Rows are "live" per `_assignment_live` -- a dead-draining row is released everywhere."""
     others = [other for other in self.store.list_node_assignments_for_node(node_address)
               if self._assignment_live(other["tenant_id"], other)]
     own = next((other for other in others if other["tenant_id"] == tenant_id), None)
@@ -1108,11 +1124,52 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "node_private_assigned")
     if mode == "private" and foreign:
       raise AdministrationDenied(409, "node_shared_assigned")
+    holder = self._private_plan_holder(node_address)
+    if holder is not None and holder["draft_id"] != self._tenant_source_draft(tenant_id):
+      raise self._planned_private(account, holder)
     new_row = {**(row or {}), "tenant_id": tenant_id, "node_address": node_address, "active": True,
                "mode": mode, "draining": False, "changed_by": account.account_id,
                "changed_at": datetime.now(timezone.utc).isoformat()}
     self.store.put("tenant_node", tenant_id, node_address, record=new_row)
     return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True, "mode": mode, "state": "assigned"}
+
+  def _private_plan_holder(self, node_address, exclude_draft_id=None):
+    """RM-112: the draft whose plan holds the node privately, or None. Reads every draft."""
+    return next((draft for draft in sorted(self.store.list_tenant_drafts(), key=lambda row: row["draft_id"])
+                 if draft["draft_id"] != exclude_draft_id
+                 and {"node_address": node_address, "mode": "private"} in draft["nodes"]), None)
+
+  def _tenant_source_draft(self, tenant_id):
+    """RM-112: the draft a tenant was activated from, through its receipt (the tenant row has no
+    draft id); None for a tenant created in one step."""
+    tenant = self.store.get("tenant", tenant_id)
+    receipt = self._receipt(tenant["actor_id"], tenant["request_id"]) if tenant is not None else None
+    return receipt.get("draft_id") if receipt is not None else None
+
+  @staticmethod
+  def _planned_private(account, holder):
+    """`node_planned_private`, naming the draft only to a full-portfolio Super-Tenant Admin (who may
+    read drafts); anyone else learns only that the node is reserved."""
+    details = {"holder": {"draft_id": holder["draft_id"], "display_name": holder["display_name"]}} \
+      if holds_platform_role(account) else {}
+    return AdministrationDenied(409, "node_planned_private", **details)
+
+  def _check_node_plan(self, account, previous, row):
+    """RM-112: the plan entries this update adds or changes. No node held privately by another
+    draft is planned; a private entry also needs the node free of every live assignment."""
+    for entry in row["nodes"]:
+      if entry in previous["nodes"]:
+        continue
+      holder = self._private_plan_holder(entry["node_address"], exclude_draft_id=row["draft_id"])
+      if holder is not None:
+        raise self._planned_private(account, holder)
+      if entry["mode"] == "private":
+        live = [other for other in self.store.list_node_assignments_for_node(entry["node_address"])
+                if self._assignment_live(other["tenant_id"], other)]
+        if any(node_assignment_mode(other) == "private" for other in live):
+          raise AdministrationDenied(409, "node_private_assigned")
+        if live:
+          raise AdministrationDenied(409, "node_shared_assigned")
 
   def _release_node(self, account, tenant_id, node_address, row):
     """RM-102 release: inactive is idempotent; an active row with running jobs enters (or stays)
@@ -1413,6 +1470,7 @@ class TenantAdministrationService:
       row, dropped = drafts.apply_changes(previous, changes)
     except drafts.DraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
+    self._check_node_plan(account, previous, row)
     return {"draft": self._write_tenant_draft(row, account, previous), "dropped": dropped}
 
   @_endpoint
@@ -1454,13 +1512,19 @@ class TenantAdministrationService:
   @_endpoint
   def begin_tenant_draft_delete(self, actor, draft_id):
     """RM-109 phase 4: the delete cascades, so the children and their files are listed too; the
-    plugin deletes the children (files, then rows) before the draft's own files and row."""
+    plugin deletes the children (files, then rows) before the draft's own files and row. RM-112: a
+    draft holding a signed document (its agreement pack or a child's engagement pack) is kept; the
+    delete drops the node plan with the row."""
     account = self._actor(actor, creator=True)
     row = self._unlocked_tenant_draft(draft_id)
+    children = self._engagement_draft_children({"draft_id": draft_id})
+    if (any(item["state"] == "signed" for item in row["items"].values())
+        or any(child["document"]["state"] == "signed" for child in children)):
+      raise AdministrationDenied(409, "draft_has_signed_documents")
     return {"accountId": account.account_id, "documentRefs": drafts.document_refs(row),
             "children": [{"engagement_draft_id": child["engagement_draft_id"],
                           "documentRefs": engagement_drafts.document_refs(child)}
-                         for child in self._engagement_draft_children({"draft_id": draft_id})]}
+                         for child in children]}
 
   @_endpoint
   def finish_tenant_draft_delete(self, actor, draft_id, deleted_refs):

@@ -6,7 +6,8 @@ activation copies onto the receipt and the tenant, and the DTO; no storage I/O. 
 hashed and never anchored, and it is not a tenant: its id (`td_<uuid>`) is never a tenant id.
 `activation` is the marker `prepare_tenant` writes before the receipt (it locks the draft);
 `last_release` records the last release of a stuck activation. Both are written by
-`tenancy.administration`.
+`tenancy.administration`. RM-112: `nodes` is the node plan, assigned when the tenant is activated;
+a private entry holds its node (checked by `tenancy.administration`, which reads every draft).
 """
 from datetime import date, datetime
 import json
@@ -15,6 +16,7 @@ import re
 from .assets import normalize_name, valid_digest
 from .engagements import valid_doc_ref
 from .identity import canonical_account_id
+from .nodes import NODE_ASSIGNMENT_MODES, valid_node_address
 
 DOCUMENT_KINDS = ("contract", "framework_agreement", "data_handling")
 # The collapsed checklist (owner, 2026-10-07): one tenant agreement pack in the `contract` slot, which
@@ -63,7 +65,7 @@ LEGAL_MAX = 200
 _LEGAL_MAX = LEGAL_MAX
 _REASON_MAX = 500
 DTO_FIELDS = ("draft_id", "display_name", "domain_id", "initial_admin_id", "legal", "compliance_types",
-              "items", "applicability", "activation", "last_release", "created_by", "created_at",
+              "items", "applicability", "nodes", "activation", "last_release", "created_by", "created_at",
               "updated_by", "updated_at")
 
 
@@ -123,6 +125,18 @@ def normalize_compliance_types(value):
       or len(set(value)) != len(value)):
     raise DraftInvalid()
   return sorted(value)
+
+
+def normalize_nodes(value):
+  """RM-112 node plan: `{node_address, mode}` entries, one per node, sorted by address."""
+  if (not isinstance(value, list)
+      or any(not isinstance(entry, dict) or set(entry) != {"node_address", "mode"}
+             or not valid_node_address(entry["node_address"]) or entry["mode"] not in NODE_ASSIGNMENT_MODES
+             for entry in value)
+      or len({entry["node_address"] for entry in value}) != len(value)):
+    raise DraftInvalid()
+  return sorted(({"node_address": entry["node_address"], "mode": entry["mode"]} for entry in value),
+                key=lambda entry: entry["node_address"])
 
 
 def normalize_legal(value, current):
@@ -206,7 +220,7 @@ def new_draft(draft_id, display_name, compliance_types, actor_id, now):
                      "covers": list(TENANT_RECORDS) if _OWN_RECORD[kind] is None else [_OWN_RECORD[kind]],
                      "effective_from": None, "effective_until": None, "generated": None} for kind in DOCUMENT_KINDS},
     "applicability": {record: {"decision": "required", "reason": None} for record in TENANT_RECORDS},
-    "activation": None, "last_release": None,
+    "nodes": [], "activation": None, "last_release": None,
     "created_by": actor_id, "created_at": now, "updated_by": actor_id, "updated_at": now,
   }
 
@@ -222,7 +236,7 @@ def apply_changes(row, changes):
   """
   if not isinstance(changes, dict):
     raise DraftInvalid()
-  allowed = {"display_name", "domain_id", "initial_admin_id", "legal", "compliance_types", "items"}
+  allowed = {"display_name", "domain_id", "initial_admin_id", "legal", "compliance_types", "items", "nodes"}
   if any(key not in allowed for key in changes):
     raise DraftInvalid()
   row = {**row, "legal": dict(row["legal"]), "items": {kind: dict(item) for kind, item in row["items"].items()}}
@@ -237,6 +251,8 @@ def apply_changes(row, changes):
     row["legal"] = normalize_legal(changes["legal"], row["legal"])
   if "compliance_types" in changes:
     row["compliance_types"] = normalize_compliance_types(changes["compliance_types"])
+  if "nodes" in changes:
+    row["nodes"] = normalize_nodes(changes["nodes"])
   if "items" in changes:
     items = changes["items"]
     if not isinstance(items, dict) or any(kind not in DOCUMENT_KINDS for kind in items):
@@ -281,14 +297,13 @@ def _covered(row, record):
 
 
 def completeness(row):
-  """The activation rule, one `missing` entry per gap. Engagement-level records never block."""
+  """The activation rule, one `missing` entry per gap. Engagement-level records never block. RM-112:
+  the initial admin is optional (a tenant may be activated without one)."""
   missing = []
   if not row["display_name"]:
     missing.append("field:display_name")
   if not row["domain_id"]:
     missing.append("field:domain_id")
-  if not row["initial_admin_id"]:
-    missing.append("field:initial_admin_id")
   missing.extend(f"field:legal.{key}" for key in LEGAL_FIELDS if not row["legal"][key])
   if not row["compliance_types"]:
     missing.append("field:compliance_types")
@@ -345,7 +360,7 @@ def draft_list_row(row):
   return {"draft_id": row["draft_id"], "display_name": row["display_name"],
           "compliance_types": row["compliance_types"], "created_at": row["created_at"],
           "updated_at": row["updated_at"], "items_done": done, "items_total": len(SHOWN_KINDS),
-          "activation": row["activation"]}
+          "nodes": row["nodes"], "activation": row["activation"]}
 
 
 def nonempty_text(value):
@@ -371,7 +386,10 @@ def validate_tenant_draft(row, ids):
   """Refuse a stored draft the operations could not have written. Unknown fields are kept. Answers the
   row as the operations read it: an item written before the `generated` slot existed (RM-109 phases
   2-3) gains `generated: None`, and a `legal` block written before the RM-110 party fields gains them
-  empty, on a copy, so the stored value itself is never changed by a read."""
+  empty, on a copy, so the stored value itself is never changed by a read. RM-112: a row written
+  before the node plan existed gains `nodes: []` the same way."""
+  if "nodes" not in row:
+    row = {**row, "nodes": []}
   if isinstance(row.get("items"), dict):
     row = {**row, "items": {kind: {"generated": None, **item} if isinstance(item, dict) else item
                             for kind, item in row["items"].items()}}
@@ -388,6 +406,7 @@ def validate_tenant_draft(row, ids):
       or not isinstance(items, dict) or set(items) != set(DOCUMENT_KINDS)
       or not isinstance(applicability, dict) or set(applicability) != set(TENANT_RECORDS)
       or not all(_same(normalize_applicability, applicability[record]) for record in TENANT_RECORDS)
+      or not _same(normalize_nodes, row["nodes"])
       or not (row.get("activation") is None
               or _valid_stamp(row["activation"], ("actor_id", "request_id", "started_at")))
       or not (row.get("last_release") is None

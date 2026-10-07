@@ -614,12 +614,12 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
 
 class TestTenantDraftCascade(_EngagementDraftCase):
   def test_delete_tenant_draft_removes_the_children_their_files_then_its_own(self):
+    # RM-112: a draft holding a signed document is kept, so every file here is an unsigned pack.
     parent = self.create()["draft_id"]
-    ok(self, self.upload(parent))
+    ok(self, self.generate(parent))
     first, second = (self.child(parent)["engagement_draft_id"] for _ in range(2))
     self.generate_pack(first)
-    ok(self, self.upload_pack(first))
-    ok(self, self.upload_pack(second, SCHEDULE_PDF))
+    self.generate_pack(second, raw=SCHEDULE_PDF)
     order = []
     delete = self.documents.delete
 
@@ -628,22 +628,21 @@ class TestTenantDraftCascade(_EngagementDraftCase):
       delete(ref)
     self.documents.delete = observed_delete
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, parent))
-    self.assertEqual(data, {"draft_id": parent, "files_deleted": 4, "engagement_drafts_deleted": 2})
-    # Children's files (the parent row still there; the signed pack, then the generated one), their
-    # rows, then the parent's own file and row.
-    self.assertEqual(order[:3], [("doc-3", True, True), ("doc-2", True, True), ("doc-4", True, False)])
-    self.assertEqual(order[3][:2], ("doc-1", True))
-    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2", "doc-3", "doc-4"])
+    self.assertEqual(data, {"draft_id": parent, "files_deleted": 3, "engagement_drafts_deleted": 2})
+    # Children's files (the parent row still there), their rows, then the parent's own file and row.
+    self.assertEqual(order[:2], [("doc-2", True, True), ("doc-3", True, False)])
+    self.assertEqual(order[2][:2], ("doc-1", True))
+    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2", "doc-3"])
     for engagement_draft_id in (first, second):
       self.assertIsNone(self.stored_child(engagement_draft_id))
     self.assertIsNone(self.stored(parent))
     self.assertEqual(self.events[-1], ("tenant_draft_deleted", {
-      "draft_id": parent, "actor": "creator", "files_deleted": 4, "engagement_drafts_deleted": 2}))
+      "draft_id": parent, "actor": "creator", "files_deleted": 3, "engagement_drafts_deleted": 2}))
 
   def test_a_child_created_meanwhile_is_a_conflict_and_a_failed_child_file_keeps_everything(self):
     parent = self.create()["draft_id"]
     engagement_draft_id = self.child(parent)["engagement_draft_id"]
-    ok(self, self.upload_pack(engagement_draft_id))
+    self.generate_pack(engagement_draft_id)
     service = self.plugin._execution_service()
     refused(self, service.finish_tenant_draft_delete(self.actor, parent, []), 409, "conflict")
     self.documents.fail_delete = {"doc-1"}
@@ -655,9 +654,9 @@ class TestTenantDraftCascade(_EngagementDraftCase):
 
   def test_a_child_deleted_meanwhile_does_not_stop_the_cascade(self):
     parent = self.create()["draft_id"]
-    ok(self, self.upload(parent))
+    ok(self, self.generate(parent))
     engagement_draft_id = self.child(parent)["engagement_draft_id"]
-    ok(self, self.upload_pack(engagement_draft_id))
+    self.generate_pack(engagement_draft_id)
     call = self.plugin._call_tenant_administration
 
     def racing(operation, actor, **kwargs):
