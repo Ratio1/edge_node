@@ -727,6 +727,7 @@ class TestEngagementDraftIdsNeverResolve(_EngagementDraftCase):
     calls = {
       "tenant": lambda: self.plugin.get_tenant(self.actor, engagement_draft_id),
       "nodes": lambda: self.plugin.get_tenant_nodes(self.actor, engagement_draft_id),
+      "node assignment": lambda: self.plugin.set_tenant_node_assignment(self.actor, engagement_draft_id, "0xai_node", True),
       "membership": lambda: self.plugin.authorize_tenant_membership(self.actor, engagement_draft_id, "acme.admin", "tenant_user"),
       "engagements": lambda: self.plugin.list_engagements(self.actor, engagement_draft_id),
       "engagement create": lambda: self.plugin.create_engagement(self.actor, engagement_draft_id, str(uuid4())),
