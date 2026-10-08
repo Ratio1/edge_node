@@ -42,7 +42,7 @@ class TestTenantNodePlugin(unittest.TestCase):
     admin = "initial" if domain == "one" else f"initial-{domain}"
     if admin != "initial":
       self.storage.account(admin)
-    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, admin, **install_contract(self.plugin))
+    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, admin, **install_contract(self.plugin, ref=f"doc-{domain}"))
     self.assertTrue(result["success"], result)
     tenant = result["data"]["tenantId"]
     self.storage.grant(admin, tenant)

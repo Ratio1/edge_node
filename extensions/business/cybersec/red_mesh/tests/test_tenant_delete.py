@@ -213,6 +213,28 @@ class TestTenantDelete(unittest.TestCase):
     self.refused(self.plugin.delete_tenant(self.actor, "tn_" + str(uuid4())), 404, "not_found")
     self.assertTrue(self.plugin.get_tenant(self.actor, self.tenant)["success"])
 
+  def test_the_contracts_generated_baseline_is_deleted_with_the_tenant(self):
+    # RM-110: `contract_generated` (copied from a draft activation; given to this one-step tenant on
+    # both rows, as the receipt binds it) is a tenant document, deleted with the others.
+    self.remove_members()
+    self.documents.envelopes["doc-generated"] = {"kind": "redmesh_tenant_contract", "role": "generated"}
+    block = {"store": "fake", "ref": "doc-generated", "filename": "generated.pdf", "mime": "application/pdf",
+             "size_bytes": 10, "sha256": "b" * 64, "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator",
+             "snapshot_sha256": "c" * 64, "generated_at": "2026-10-07T10:00:00Z", "generated_by": "creator"}
+    for (hkey, key), row in self.storage.data.items():
+      if (hkey == TENANCY_HKEY and isinstance(row, dict) and row.get("tenant_id") == self.tenant
+          and row.get("kind") in ("tenant", "receipt")):
+        row["contract_generated"] = block
+    begun = self.plugin._call_tenant_administration("begin_tenant_delete", self.actor, tenant_id=self.tenant)
+    self.assertTrue(begun["success"], begun)
+    self.assertIn("doc-generated", [ref["ref"] for ref in begun["data"]["documentRefs"]])
+    result = self.plugin.delete_tenant(self.actor, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertEqual(result["data"]["documents"], 4)
+    self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", "doc-generated", *self.engagement_refs]))
+    self.assertNotIn("doc-generated", self.documents.envelopes)
+    self.assertNotIn("tenant", self.tenancy_rows())
+
   def test_a_tenant_created_before_contracts_deletes_and_a_v1_engagement_rows_document_is_left_alone(self):
     # RM-108 phase 5: storage holds no v1 engagement row any more, so the delete no longer reads
     # its legacy `roe_document` / `authorization_document` fields; such a document is neither

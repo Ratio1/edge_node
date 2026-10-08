@@ -10,7 +10,7 @@ service only sees the verified document references.
 from datetime import datetime, timezone
 
 from .authorization_upload import AuthorizationUploadError, validate_document
-from .tenant_contract import ContractRefused
+from .tenant_contract import CONTRACT_KIND, ContractRefused
 from ..tenancy.engagements import EngagementInvalid, normalize_document_labels
 
 ENGAGEMENT_DOCUMENT_KIND = "redmesh_engagement_document"
@@ -76,12 +76,19 @@ def resolve_engagement_document(documents, ref, *, tenant_id, uploaded_by):
   return {"store": documents.name, "ref": ref, **labels, **{key: envelope[key] for key in _REF_FIELDS}}
 
 
+def _pack_envelope(envelope):
+  """RM-109 phase 4: an engagement pack attached at an engagement draft's activation keeps the
+  draft upload envelope (`redmesh_tenant_contract` 1.1, slot `engagement_pack`)."""
+  return envelope.get("kind") == CONTRACT_KIND and envelope.get("document_kind") == "engagement_pack"
+
+
 def read_engagement_document(documents, ref):
   """The stored file, served only while its bytes still match the engagement record."""
   if ref.get("store") != documents.name:
     raise ContractRefused(503, "unavailable")
   envelope = documents.get(ref["ref"])
-  if not isinstance(envelope, dict) or envelope.get("kind") != ENGAGEMENT_DOCUMENT_KIND:
+  if not isinstance(envelope, dict) or (envelope.get("kind") != ENGAGEMENT_DOCUMENT_KIND
+                                        and not _pack_envelope(envelope)):
     raise ContractRefused(409, "document_integrity")
   try:
     document = validate_document(ref["filename"], envelope.get("content_b64"), accepted=DOCUMENT_FORMATS)

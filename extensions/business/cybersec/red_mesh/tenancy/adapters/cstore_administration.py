@@ -8,11 +8,18 @@ from ..ports import TenantStoreError
 from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
 from ..engagements import validate_engagement
+from ..drafts import validate_tenant_draft
+from ..engagement_drafts import validate_engagement_draft
+from ..super_tenant_profile import validate_super_tenant_profile
 
 MAX_ENUMERATED_RECORDS = 10000
 # RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
 # is never read or written, so a leftover row cannot come back through a new code path.
-_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement"})
+# RM-109: `tenant_draft` is keyed by its draft id alone; a draft has no tenant. `engagement_draft`
+# is keyed by its own id too; its parent (a tenant draft or a tenant) is a field of the row.
+# RM-110: `super_tenant_profile` is one row per deployment, keyed by the fixed id `deployment`.
+_KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
+                    "engagement_draft", "super_tenant_profile"})
 
 
 class CstoreTenantAdministrationStore:
@@ -64,6 +71,22 @@ class CstoreTenantAdministrationStore:
         validate_engagement(raw, ids)
       except (ValueError, TypeError, KeyError, RecursionError) as exc:
         raise TenantStoreError("Invalid engagement storage record") from exc
+    if kind == "tenant_draft":
+      try:
+        # The validator completes a row written before the `generated` slot existed, on a copy.
+        raw = validate_tenant_draft(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid tenant draft storage record") from exc
+    if kind == "engagement_draft":
+      try:
+        validate_engagement_draft(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid engagement draft storage record") from exc
+    if kind == "super_tenant_profile":
+      try:
+        validate_super_tenant_profile(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid super-tenant profile storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):
@@ -119,6 +142,20 @@ class CstoreTenantAdministrationStore:
       raise TenantStoreError("Tenant storage cannot be read") from exc
     return raw if isinstance(raw, dict) else None
 
+  def raw_rows(self, kind):
+    """RM-109. Every row of one kind, decoded but not validated (as `raw_record`), for the
+    `contract_in_use` scan. Past the enumeration cap, or with a row it cannot decode, it fails
+    closed: a row it cannot read may hold the reference it looks for."""
+    rows = []
+    for _, raw in self._fields(kind):
+      try:
+        decoded = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+      except (ValueError, UnicodeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid tenant storage record") from exc
+      if isinstance(decoded, dict):
+        rows.append(decoded)
+    return rows
+
   def _records(self):
     hkey, _ = self._location("tenant", ("enumeration",))
     try:
@@ -172,6 +209,15 @@ class CstoreTenantAdministrationStore:
     self._location("integration", (tenant_id,))
     return [self._validate(raw, "integration", ids)
             for ids, raw in self._fields("integration", tenant_id)]
+
+  def list_tenant_drafts(self):
+    """RM-109. Every draft of the namespace; a malformed one fails the read closed."""
+    return [self._validate(raw, "tenant_draft", ids) for ids, raw in self._fields("tenant_draft")]
+
+  def list_engagement_drafts(self):
+    """RM-109 phase 4. Every engagement draft of the namespace (the parent is a field, not a key),
+    the same way."""
+    return [self._validate(raw, "engagement_draft", ids) for ids, raw in self._fields("engagement_draft")]
 
   def list_tenants(self):
     rows = []

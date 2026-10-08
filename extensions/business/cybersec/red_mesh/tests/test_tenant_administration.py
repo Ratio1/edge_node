@@ -8,7 +8,7 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService, TenantStoreError
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
-from .contract_fixture import contract_terms, install_contract
+from .contract_fixture import LEGAL, contract_terms, install_contract, legal_dto
 
 
 class FakeAdministrationStore:
@@ -610,6 +610,44 @@ class TestTenantAdministration(unittest.TestCase):
                        self.service.get_tenant_members(self.actor, tenant_id),
                        self.service.authorize_tenant_membership(self.actor, tenant_id, "initial", "tenant_admin")):
           self.assertEqual(result["status_code"], 503, result)
+        self.assertEqual(len(self.store.writes), before)
+
+  def test_a_pre_rm110_pair_reads_as_today_and_the_generated_baseline_binds_when_present(self):
+    # RM-110: a one-step tenant has the four-key `legal` and no `contract_generated`; both are read
+    # as they are, the optional party fields answered empty. The baseline, when both rows carry it,
+    # is bound like the contract; an extended party block binds like the four fields.
+    tenant_id = self.create()["tenantId"]
+    hkey = '["redmesh","tenancy",1,"test-deployment"]'
+    tenant_key = json.dumps(["tenant", "test-deployment", tenant_id], separators=(",", ":"))
+    receipt_key = json.dumps(["receipt", "test-deployment", "creator", self.request], separators=(",", ":"))
+    for key in (tenant_key, receipt_key):
+      self.assertEqual(set(self.store.data[(hkey, key)]["legal"]), set(LEGAL))
+      self.assertNotIn("contract_generated", self.store.data[(hkey, key)])
+    contract = self.service.get_tenant_contract(self.actor, tenant_id)["data"]
+    self.assertEqual((contract["legal"], contract["contract_generated"]), (legal_dto(LEGAL), None))
+    block = {"store": "fake", "ref": "doc-generated", "filename": "generated.pdf", "mime": "application/pdf",
+             "size_bytes": 10, "sha256": "b" * 64, "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator",
+             "snapshot_sha256": "c" * 64, "generated_at": "2026-10-07T10:00:00Z", "generated_by": "creator"}
+    for key in (receipt_key, tenant_key):
+      self.store.data[(hkey, key)]["contract_generated"] = block
+      self.store.data[(hkey, key)]["legal"] = {**LEGAL, "address": "Str. Exemplu 1"}
+    contract = self.service.get_tenant_contract(self.actor, tenant_id)["data"]
+    self.assertEqual((contract["legal"], contract["contract_generated"]),
+                     (legal_dto({**LEGAL, "address": "Str. Exemplu 1"}), block))
+    self.assertEqual(self.service.get_tenant(self.actor, tenant_id)["status_code"], 200)
+    original = copy.deepcopy(self.store.data)
+    for label, key, change in (("baseline differs", tenant_key, {"contract_generated": {**block, "sha256": "f" * 64}}),
+                               ("baseline only on the tenant", receipt_key, None),
+                               ("party field differs", tenant_key, {"legal": {**LEGAL, "address": "Str. Exemplu 2"}})):
+      with self.subTest(label):
+        self.store.data = copy.deepcopy(original)
+        if change is None:
+          del self.store.data[(hkey, key)]["contract_generated"]
+        else:
+          self.store.data[(hkey, key)].update(change)
+        before = len(self.store.writes)
+        self.assertEqual(self.service.get_tenant(self.actor, tenant_id)["status_code"], 503)
+        self.assertEqual(self.service.get_tenant_contract(self.actor, tenant_id)["status_code"], 503)
         self.assertEqual(len(self.store.writes), before)
 
 

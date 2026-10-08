@@ -56,7 +56,8 @@ _PER_JOB = (
   (":report_review", dict, True),
   (":report_review:audit", list, False),
 )
-_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement")
+_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
+                  "engagement_draft", "super_tenant_profile")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -286,6 +287,21 @@ class Inventory:
       row = self._store._validate(value, kind, ids)
     except Exception:
       return OLD, "unrecognized"
+    if kind in ("tenant_draft", "super_tenant_profile"):
+      # RM-109: a draft has no tenant; its id is not one, so the related-tenant check below would
+      # call every draft an orphan. Current while the store reads it, never orphan or old_tenant.
+      # RM-110: the same for the deployment's one super-tenant profile row.
+      return CURRENT, ""
+    if kind == "engagement_draft":
+      # RM-109 phase 4: current while its parent exists (a tenant draft row, or a live tenant); a
+      # tenant deleted with children under it leaves them `parent_gone`. Never old_tenant.
+      parent = row["parent"]
+      if "tenant_id" in parent:
+        present = parent["tenant_id"] in self._live_tenants()
+      else:
+        present = any(k == "tenant_draft" and i == [parent["draft_id"]] and v is not None
+                      for _, k, i, v in self._tenancy_fields())
+      return (CURRENT, "") if present else (ORPHAN, "parent_gone")
     if kind in ("tenant", "receipt"):
       if not isinstance(row.get("contract"), dict) or not isinstance(row.get("legal"), dict):
         return OLD, "tenant_without_contract"
