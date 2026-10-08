@@ -1742,8 +1742,11 @@ class TenantAdministrationService:
 
   @_endpoint
   def begin_engagement_draft_delete(self, actor, engagement_draft_id):
+    """RM-112: a draft whose pack is signed is kept, as a tenant draft holding a signed document."""
     account = self._actor(actor, creator=True)
     row = self._unlocked_engagement_draft(engagement_draft_id)
+    if row["document"]["state"] == "signed":
+      raise AdministrationDenied(409, "draft_has_signed_documents")
     return {"accountId": account.account_id, "documentRefs": engagement_drafts.document_refs(row)}
 
   @_endpoint

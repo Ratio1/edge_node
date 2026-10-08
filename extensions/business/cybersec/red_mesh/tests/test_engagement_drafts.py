@@ -422,10 +422,10 @@ class TestEngagementDraftDocuments(_EngagementDraftCase):
     self.assertEqual(len(self.documents.puts), puts)
     self.assertEqual(self.stored_child(engagement_draft_id)["document"]["generated"], again)
 
-  def test_delete_removes_both_files_then_the_record(self):
+  def test_delete_removes_the_generated_file_then_the_record(self):
     engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
     self.generate_pack(engagement_draft_id)
-    ok(self, self.upload_pack(engagement_draft_id))
+    ok(self, self.update_child(engagement_draft_id, {"document": {"state": "awaiting_signature"}}))
     present = []
     delete = self.documents.delete
 
@@ -434,16 +434,34 @@ class TestEngagementDraftDocuments(_EngagementDraftCase):
       delete(ref)
     self.documents.delete = observed_delete
     data = ok(self, self.plugin.delete_engagement_draft(self.actor, engagement_draft_id))
-    self.assertEqual(data, {"engagement_draft_id": engagement_draft_id, "files_deleted": 2})
-    self.assertEqual(present, [True, True])
-    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2"])
+    self.assertEqual(data, {"engagement_draft_id": engagement_draft_id, "files_deleted": 1})
+    self.assertEqual(present, [True])
+    self.assertEqual(self.documents.deleted, ["doc-1"])
     self.assertIsNone(self.stored_child(engagement_draft_id))
     self.assertEqual(self.events, [("engagement_draft_deleted", {
-      "engagement_draft_id": engagement_draft_id, "actor": "creator", "files_deleted": 2})])
+      "engagement_draft_id": engagement_draft_id, "actor": "creator", "files_deleted": 1})])
+
+  def test_a_draft_without_a_pack_file_is_deleted(self):
+    engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
+    data = ok(self, self.plugin.delete_engagement_draft(self.actor, engagement_draft_id))
+    self.assertEqual(data, {"engagement_draft_id": engagement_draft_id, "files_deleted": 0})
+    self.assertIsNone(self.stored_child(engagement_draft_id))
+
+  def test_a_signed_pack_keeps_the_draft_and_its_files(self):
+    # RM-112: as a tenant draft holding a signed document; unsigning (`missing`) first allows it.
+    engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
+    self.generate_pack(engagement_draft_id)
+    ok(self, self.upload_pack(engagement_draft_id))
+    data = copy.deepcopy(self.store.data)
+    refused(self, self.plugin.delete_engagement_draft(self.actor, engagement_draft_id), 409, "draft_has_signed_documents")
+    self.assertEqual((self.store.data, self.documents.deleted, self.events), (data, [], []))
+    ok(self, self.update_child(engagement_draft_id, {"document": {"state": "missing"}}))
+    self.assertEqual(ok(self, self.plugin.delete_engagement_draft(self.actor, engagement_draft_id))["files_deleted"], 1)
+    self.assertEqual(sorted(self.documents.deleted), ["doc-1", "doc-2"])
 
   def test_a_failed_file_delete_keeps_the_record_and_a_late_upload_is_a_conflict(self):
     engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
-    ok(self, self.upload_pack(engagement_draft_id))
+    self.generate_pack(engagement_draft_id)
     self.documents.fail_delete = {"doc-1"}
     refused(self, self.plugin.delete_engagement_draft(self.actor, engagement_draft_id), 503, "unavailable")
     self.assertIsNotNone(self.stored_child(engagement_draft_id))
