@@ -3328,8 +3328,9 @@ _CONFIG = {
   # and re-run the full guard (`correct_reversed_relationship_arrows`); the
   # attempt records the rewrite under `auto_corrected` (also on attempts a later check
   # rejects, so count rewrites on accepted attempts only). False restores the
-  # plain reject-and-retry behaviour (e.g. to compare runs).
-  "EDGEGUARD_DIRECTION_CORRECTOR": True,
+  # plain reject-and-retry behaviour. Off by default so runs pinned to the
+  # plain guard stay comparable; a deployment opts in through its config.
+  "EDGEGUARD_DIRECTION_CORRECTOR": False,
   "EDGEGUARD_EXPLANATION_MODEL_PATH": "/create_chat_completion",
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN": None,
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN_ENV": "EDGEGUARD_EXPLANATION_MODEL_TOKEN",
