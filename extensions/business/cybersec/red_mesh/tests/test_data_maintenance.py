@@ -373,7 +373,8 @@ class TestDataMaintenance(unittest.TestCase):
     draft_id = self.plugin.create_tenant_draft(self.actor, request, "Acme", ["nis2"])["data"]["draft_id"]
     self.assertTrue(self.plugin.update_tenant_draft(self.actor, draft_id, {
       "domain_id": "acme", "initial_admin_id": "acme.admin",
-      "legal": {"name": "A", "registration_id": "B", "signer_name": "C", "signer_role": "D"}})["success"])
+      "legal": {"name": "A", "registration_id": "B", "signer_name": "C", "signer_role": "D"},
+      "items": {"contract": {"effective_from": "2026-11-01"}}})["success"])
     generated = self.plugin.store_generated_document(
       self.actor, draft_id=draft_id, document_kind="contract", filename="generated.pdf",
       content_b64=base64.b64encode(b"%PDF-1.7\n%generated\n%%EOF\n").decode("ascii"), snapshot='{"v":1}',

@@ -19,7 +19,8 @@ class _SetupCase(_EngagementDraftCase):
 
   def ready_without_admin(self, display_name="Acme SRL", domain_id="acme", compliance_types=("nis2",)):
     draft_id = self.create(compliance_types=compliance_types)["draft_id"]
-    ok(self, self.update(draft_id, {"display_name": display_name, "domain_id": domain_id, "legal": dict(LEGAL)}))
+    ok(self, self.update(draft_id, {"display_name": display_name, "domain_id": domain_id, "legal": dict(LEGAL),
+                                    "items": {"contract": {"effective_from": "2026-11-01"}}}))
     ok(self, self.upload(draft_id))
     return draft_id
 
@@ -45,7 +46,18 @@ class TestActivationWithoutAdmin(_SetupCase):
     draft = self.create("", ())
     self.assertEqual(draft["completeness"]["missing"], [
       "field:display_name", "field:domain_id", "field:legal.name", "field:legal.registration_id",
-      "field:legal.signer_name", "field:legal.signer_role", "field:compliance_types", "item:contract"])
+      "field:legal.signer_name", "field:legal.signer_role", "field:compliance_types", "field:contract.effective_from",
+      "item:contract"])
+
+  def test_activation_needs_the_contract_start_date_but_not_an_end_date(self):
+    """Decision 24: the term is printed in the pack; no end date means an indefinite term."""
+    draft_id = self.ready_without_admin()
+    ok(self, self.update(draft_id, {"items": {"contract": {"effective_from": None, "effective_until": None}}}))
+    result = self.activate(draft_id, str(uuid4()))
+    refused(self, result, 409, "draft_incomplete")
+    self.assertEqual(result["missing"], ["field:contract.effective_from"])
+    ok(self, self.update(draft_id, {"items": {"contract": {"effective_from": "2026-11-01"}}}))
+    self.assertEqual(ok(self, self.activate(draft_id, str(uuid4())))["state"], "pending")
 
   def test_a_draft_created_without_compliance_types_cannot_activate_until_one_is_set(self):
     draft_id = self.ready_without_admin(compliance_types=())

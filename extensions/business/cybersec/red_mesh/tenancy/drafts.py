@@ -307,6 +307,10 @@ def completeness(row):
   missing.extend(f"field:legal.{key}" for key in LEGAL_FIELDS if not row["legal"][key])
   if not row["compliance_types"]:
     missing.append("field:compliance_types")
+  # RM-112 decision 24: the contract term is set before the pack is generated and printed in it; an
+  # end date is optional (none = indefinite), the start date is not.
+  if not row["items"]["contract"]["effective_from"]:
+    missing.append("field:contract.effective_from")
   if row["items"]["contract"]["state"] != "signed":
     missing.append("item:contract")
   for record in TENANT_RECORDS:

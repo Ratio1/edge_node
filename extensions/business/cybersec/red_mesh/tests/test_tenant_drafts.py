@@ -98,7 +98,8 @@ class _DraftCase(unittest.TestCase):
 
   def complete_fields(self, draft_id):
     return ok(self, self.update(draft_id, {"display_name": "Acme SRL", "domain_id": "acme",
-                                           "initial_admin_id": "Acme.Admin", "legal": dict(LEGAL)}))
+                                           "initial_admin_id": "Acme.Admin", "legal": dict(LEGAL),
+                                           "items": {"contract": {"effective_from": "2026-11-01"}}}))
 
   def set_activation(self, draft_id):
     row = self.stored(draft_id)
@@ -369,7 +370,7 @@ class TestDraftCompleteness(_DraftCase):
     self.assertEqual(draft["completeness"], {"complete": False, "missing": [
       "field:display_name", "field:domain_id", "field:legal.name",
       "field:legal.registration_id", "field:legal.signer_name", "field:legal.signer_role",
-      "field:compliance_types", "item:contract"]})
+      "field:compliance_types", "field:contract.effective_from", "item:contract"]})
 
   def test_the_signed_pack_alone_decides_the_records_and_engagement_records_never_block(self):
     draft_id = self.create()["draft_id"]
@@ -833,7 +834,7 @@ class TestDraftActivation(_ActivationCase):
     self.assertEqual(tenant["governance"], {
       "coverage": {"framework_agreement": "framework_agreement", "data_handling": "data_handling"},
       "applicability": draft["applicability"],
-      "effective": {"contract": {"effective_from": None, "effective_until": None},
+      "effective": {"contract": {"effective_from": "2026-11-01", "effective_until": None},
                     "framework_agreement": {"effective_from": "2026-11-01", "effective_until": None},
                     "data_handling": {"effective_from": None, "effective_until": None}}})
     self.assertIsNone(self.repo.get("domain", "ignored"))
