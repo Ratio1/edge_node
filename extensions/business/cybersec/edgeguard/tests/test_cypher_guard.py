@@ -15,6 +15,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
   SCHEMA_VERSION,
   SCHEMA_VERSION_V0_11,
   analyze_generated_cypher,
+  correct_reversed_relationship_arrows,
   build_empty_result_broadening_cypher,
   build_direct_cypher_system_prompt,
   build_schema_prompt_context,
@@ -1957,3 +1958,83 @@ class V0_11_TokenBudgetTests(unittest.TestCase):
     # contract's check and is not a substitute for the token test above.
     system_prompt = build_v0_11_pattern_schema_system_prompt()
     self.assertLessEqual(len(system_prompt), 3350)
+
+
+def _v0_11_guard(cypher):
+  return analyze_generated_cypher(
+    cypher, allow_limit_optional_graph=True, enforce_hop_bounds=True, enforce_pattern_endpoints=True,
+  )
+
+
+class DirectionCorrectorTests(unittest.TestCase):
+  """EGM-065 phase 1: `correct_reversed_relationship_arrows` flips only arrows
+  the guard named as reversed and returns only a variant the guard accepts."""
+
+  def test_flips_a_reversed_arrow_left_to_right(self):
+    corrected = correct_reversed_relationship_arrows(
+      "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5", _v0_11_guard,
+    )
+    self.assertEqual(corrected[0], "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5")
+    self.assertTrue(corrected[1]["accepted"])
+    self.assertEqual(corrected[2], 1)
+
+  def test_flips_a_reversed_arrow_right_to_left(self):
+    corrected = correct_reversed_relationship_arrows(
+      "MATCH p=(t:Technique)<-[r:IN_TACTIC]-(ta:Tactic) RETURN p LIMIT 5", _v0_11_guard,
+    )
+    self.assertEqual(corrected[0], "MATCH p=(t:Technique)-[r:IN_TACTIC]->(ta:Tactic) RETURN p LIMIT 5")
+
+  def test_two_reversed_hops_of_different_types(self):
+    corrected = correct_reversed_relationship_arrows(
+      "MATCH p=(a:ThreatActor)-[:ATTRIBUTED_TO]->(m:Malware), (ta:Tactic)-[:IN_TACTIC]->(t:Technique) "
+      "RETURN p LIMIT 5",
+      _v0_11_guard,
+    )
+    self.assertEqual(corrected[2], 2)
+    self.assertIn("(a:ThreatActor)<-[:ATTRIBUTED_TO]-(m:Malware)", corrected[0])
+    self.assertIn("(ta:Tactic)<-[:IN_TACTIC]-(t:Technique)", corrected[0])
+
+  def test_arrow_text_inside_a_string_literal_is_not_touched(self):
+    corrected = correct_reversed_relationship_arrows(
+      "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) WHERE t.name <> 'a-[:IN_TACTIC]->b' RETURN p LIMIT 5",
+      _v0_11_guard,
+    )
+    self.assertIn("'a-[:IN_TACTIC]->b'", corrected[0])
+    self.assertIn("(ta:Tactic)<-[:IN_TACTIC]-(t:Technique)", corrected[0])
+
+  def test_accepted_query_and_other_rejections_are_left_alone(self):
+    self.assertIsNone(correct_reversed_relationship_arrows(
+      "MATCH p=(t:Technique)-[:IN_TACTIC]->(ta:Tactic) RETURN p LIMIT 5", _v0_11_guard,
+    ))
+    # wrong type between the labels: no flip fixes it
+    self.assertIsNone(correct_reversed_relationship_arrows(
+      "MATCH p=(i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN p LIMIT 5", _v0_11_guard,
+    ))
+    # reversed arrow plus an unrelated defect (no LIMIT on a projection): still rejected
+    self.assertIsNone(correct_reversed_relationship_arrows(
+      "MATCH (ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN t.name AS name", _v0_11_guard,
+    ))
+
+  def test_backticks_or_comments_disable_the_corrector(self):
+    for cypher in (
+      "MATCH p=(ta:`Tactic`)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5",
+      "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) // note\nRETURN p LIMIT 5",
+    ):
+      self.assertIsNone(correct_reversed_relationship_arrows(cypher, _v0_11_guard), cypher)
+
+  def test_variable_length_and_alternation_brackets(self):
+    corrected = correct_reversed_relationship_arrows(
+      "MATCH p=(ta:Tactic)-[r:IN_TACTIC*1..1]->(t:Technique) RETURN p LIMIT 5", _v0_11_guard,
+    )
+    self.assertIsNotNone(corrected)
+    self.assertIn("<-[r:IN_TACTIC*1..1]-", corrected[0])
+    # an alternation is never rewritten: the corrector cannot tell which type was meant
+    self.assertIsNone(correct_reversed_relationship_arrows(
+      "MATCH p=(ta:Tactic)-[:IN_TACTIC|USES_TECHNIQUE]->(t:Technique) RETURN p LIMIT 5", _v0_11_guard,
+    ))
+
+  def test_guard_exception_inside_the_corrector_propagates_to_the_caller(self):
+    def broken(cypher):
+      raise RuntimeError("boom")
+    with self.assertRaises(RuntimeError):
+      correct_reversed_relationship_arrows("MATCH (t:Technique) RETURN t LIMIT 1", broken)

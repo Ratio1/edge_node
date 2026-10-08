@@ -1726,6 +1726,130 @@ def _multi_statement_error(stripped: str) -> str | None:
   return None
 
 
+_REVERSED_ARROW_FEEDBACK = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)` goes \w+→\w+; reverse the arrow")
+# Bounds the corrector's search: at most this many arrows are flipped in one
+# query, and at most this many partially corrected variants are carried from
+# one flip to the next.
+MAX_DIRECTION_CORRECTIONS = 3
+_MAX_DIRECTION_FRONTIER = 8
+
+
+def _offset_preserving_mask(cypher: str) -> str | None:
+  """The query with every string literal's contents replaced by `x`, same
+  length, so bracket offsets in the mask are offsets in the query. None when
+  the query has a backtick identifier, a comment or an unterminated string:
+  the corrector then does nothing rather than guess at offsets."""
+  if "`" in cypher or "//" in cypher or "/*" in cypher:
+    return None
+  out = list(cypher)
+  i, n = 0, len(cypher)
+  while i < n:
+    ch = cypher[i]
+    if ch in "'\"":
+      j = i + 1
+      while j < n:
+        if cypher[j] == "\\":
+          j += 2
+          continue
+        if cypher[j] == ch:
+          if j + 1 < n and cypher[j + 1] == ch:
+            j += 2
+            continue
+          break
+        j += 1
+      if j >= n:
+        return None
+      for k in range(i + 1, j):
+        out[k] = "x"
+      i = j + 1
+    else:
+      i += 1
+  return "".join(out)
+
+
+def _single_arrow_flips(cypher: str, rel_type: str) -> list[str]:
+  """Every variant of `cypher` with exactly one directed `[...:rel_type...]`
+  arrow reversed (`<-[..]-` to `-[..]->` and back). Only brackets whose type
+  is `rel_type` alone are touched; undirected and two-headed arrows are left
+  alone."""
+  masked = _offset_preserving_mask(cypher)
+  if masked is None:
+    return []
+  variants = []
+  for match in RELATIONSHIP_BRACKET.finditer(masked):
+    type_match = _BRACKET_TYPE_RE.search(match.group(1))
+    if not type_match or type_match.group(1).strip() != rel_type:
+      continue
+    before = re.search(r"<-\s*$", masked[max(0, match.start() - _EDGE_DIRECTION_WINDOW):match.start()])
+    after = re.match(r"^\s*->", masked[match.end():match.end() + _EDGE_DIRECTION_WINDOW])
+    if bool(before) == bool(after):
+      continue
+    left_end = match.start()
+    right_start = match.end()
+    if before:
+      # `<-[..]-` : drop the `<` and turn the trailing `-` into `->`.
+      lt = match.start() - len(before.group(0)) + before.group(0).index("<")
+      dash = re.match(r"^\s*-", masked[right_start:])
+      if not dash:
+        continue
+      dash_end = right_start + dash.end()
+      variants.append(cypher[:lt] + cypher[lt + 1:dash_end] + ">" + cypher[dash_end:])
+    else:
+      # `-[..]->` : turn the leading `-` into `<-` and drop the `>`.
+      dash = re.search(r"-\s*$", masked[:left_end])
+      if not dash:
+        continue
+      gt = right_start + after.group(0).index(">")
+      variants.append(cypher[:dash.start()] + "<" + cypher[dash.start():gt] + cypher[gt + 1:])
+  return variants
+
+
+def correct_reversed_relationship_arrows(
+  cypher: str, analyze: Any,
+) -> tuple[str, dict[str, Any], int] | None:
+  """Deterministic repair of the one rejection a model keeps making and the
+  schema can settle on its own: a relationship type written against its only
+  schema direction (`_pattern_endpoint_feedback`'s "reverse the arrow").
+
+  `analyze(cypher) -> analysis` is the caller's full guard (the same
+  `analyze_generated_cypher` call it would make anyway). Starting from a
+  rejected `cypher`, flip one arrow of the named relationship type at a time
+  and re-run that guard; a variant whose only remaining defect is another
+  reversed arrow is searched again, up to `MAX_DIRECTION_CORRECTIONS` flips.
+  Returns `(corrected_cypher, its_analysis, flips)` for the first variant the
+  guard accepts, else None. Only arrows the guard itself named are flipped,
+  and only an accepted variant is returned, so the corrector never widens
+  what the guard accepts beyond queries it would accept verbatim."""
+  def _named_reversal(text_analysis: dict[str, Any]) -> str | None:
+    if text_analysis.get("execution_safety_error_code") != PATTERN_ENDPOINT_MISMATCH_CODE:
+      return None
+    named = _REVERSED_ARROW_FEEDBACK.search(text_analysis.get("execution_safety_error") or "")
+    return named.group(1) if named else None
+
+  first = _named_reversal(analyze(cypher))
+  if first is None:
+    return None
+  frontier = [(cypher, first)]
+  seen = {cypher}
+  for flips in range(1, MAX_DIRECTION_CORRECTIONS + 1):
+    next_frontier: list[tuple[str, str]] = []
+    for text, rel_type in frontier:
+      for variant in _single_arrow_flips(text, rel_type):
+        if variant in seen:
+          continue
+        seen.add(variant)
+        variant_analysis = analyze(variant)
+        if variant_analysis.get("accepted"):
+          return variant, variant_analysis, flips
+        named = _named_reversal(variant_analysis)
+        if named is not None:
+          next_frontier.append((variant, named))
+    frontier = next_frontier[:_MAX_DIRECTION_FRONTIER]
+    if not frontier:
+      break
+  return None
+
+
 def analyze_generated_cypher(
   output: str,
   allowed: dict[str, set[str]] | None = None,

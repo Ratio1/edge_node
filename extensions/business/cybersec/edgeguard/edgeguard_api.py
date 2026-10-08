@@ -44,6 +44,7 @@ from .edgeguard_cypher_guard import (
   canonical_schema_surface,
   classify_empty_reason,
   classify_result_shape,
+  correct_reversed_relationship_arrows,
   derive_ranking_rule,
   normalize_user_literal_text,
   schema_sets,
@@ -3322,6 +3323,13 @@ _CONFIG = {
   "EDGEGUARD_EXPLANATION_MODEL_URL": None,
   "EDGEGUARD_EXPLANATION_MODEL_HOST": "127.0.0.1",
   "EDGEGUARD_EXPLANATION_MODEL_PORT": None,
+  # v0.11 profile only: before a generated query is rejected for a
+  # relationship written against its only schema direction, flip that arrow
+  # and re-run the full guard (`correct_reversed_relationship_arrows`); the
+  # attempt records the rewrite under `auto_corrected` (also on attempts a later check
+  # rejects, so count rewrites on accepted attempts only). False restores the
+  # plain reject-and-retry behaviour (e.g. to compare runs).
+  "EDGEGUARD_DIRECTION_CORRECTOR": True,
   "EDGEGUARD_EXPLANATION_MODEL_PATH": "/create_chat_completion",
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN": None,
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN_ENV": "EDGEGUARD_EXPLANATION_MODEL_TOKEN",
@@ -4365,14 +4373,38 @@ class EdgeguardApiPlugin(BasePlugin):
         raw_output, llm_model, timing_ms, completion = self._call_generation_model(
           url, messages, model, timeout=remaining,
         )
-        validation = analyze_generated_cypher(
-          raw_output,
-          allowed=guard_schema_allowed,
-          max_limit=int(self.cfg_neo4j_max_rows),
-          allow_limit_optional_graph=use_v0_11_schema,
-          enforce_hop_bounds=use_v0_11_schema,
-          enforce_pattern_endpoints=use_v0_11_schema,
-        )
+        def _guard(cypher_text: str) -> Dict[str, Any]:
+          return analyze_generated_cypher(
+            cypher_text,
+            allowed=guard_schema_allowed,
+            max_limit=int(self.cfg_neo4j_max_rows),
+            allow_limit_optional_graph=use_v0_11_schema,
+            enforce_hop_bounds=use_v0_11_schema,
+            enforce_pattern_endpoints=use_v0_11_schema,
+          )
+
+        validation = _guard(raw_output)
+        guarded_output = raw_output
+        auto_corrected = None
+        if (
+          use_v0_11_schema
+          and self.cfg_edgeguard_direction_corrector
+          and not validation.get("accepted")
+        ):
+          try:
+            correction = correct_reversed_relationship_arrows(validation.get("candidate") or "", _guard)
+          except Exception:
+            # The corrector is an optional repair: a failure inside it must
+            # leave the plain rejection (and its retry) in place, not turn the
+            # request into a `generation_failed` error.
+            correction = None
+          if correction is not None:
+            guarded_output, validation, flips = correction
+            auto_corrected = {
+              "kind": "relationship_direction",
+              "flips": flips,
+              "uncorrected_cypher": str(raw_output or "").strip(),
+            }
         validation["result_shape"] = classify_result_shape(validation.get("candidate") or raw_output)
         if completion.get("finish_reason") != "stop":
           validation = {
@@ -4387,7 +4419,7 @@ class EdgeguardApiPlugin(BasePlugin):
         else:
           validation = self._apply_literal_grounding_guard(
             validation,
-            raw_output,
+            guarded_output,
             normalized_request,
             retained_closed_vocabulary_literals,
             use_v0_11=use_v0_11_schema,
@@ -4433,6 +4465,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "result_shape": validation.get("result_shape"),
           "invented_temporal_properties": validation.get("invented_temporal_properties") or [],
           "validation_feedback": validation.get("validation_feedback") or "",
+          "auto_corrected": auto_corrected,
           "prompt_messages": messages,
           "model_key": selected_key,
           "model_display_name": model.get("display_name"),

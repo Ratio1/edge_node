@@ -685,6 +685,7 @@ def _make_api(**overrides):
     1024,
   )
   plugin.cfg_edgeguard_explanation_temperature = overrides.get("edgeguard_explanation_temperature", 0.1)
+  plugin.cfg_edgeguard_direction_corrector = overrides.get("edgeguard_direction_corrector", True)
   plugin.cfg_edgeguard_explanation_top_p = overrides.get("edgeguard_explanation_top_p", 1.0)
   plugin.cfg_edgeguard_explanation_output_mode = overrides.get(
     "edgeguard_explanation_output_mode",
@@ -5776,6 +5777,84 @@ class V0_11GenerateRuntimeTests(unittest.TestCase):
       self.assertEqual(attempt["result_shape"], "other")
     self.assertIn("graph", result["validation_feedback"])
     self.assertIn("ranked_projection", result["validation_feedback"])
+
+  def _generate_v0_11(self, outputs, **overrides):
+    plugin = _make_api(
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+      worker_semaphore_env={V0_11_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53002"}},
+      **overrides,
+    )
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [self._response(cypher) for cypher in outputs]
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Which tactics do techniques belong to?", model_key=V0_11_MODEL_KEY)
+    return result, session
+
+  def test_reversed_arrow_is_corrected_in_place_without_a_correction_turn(self):
+    reversed_cypher = "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    result, session = self._generate_v0_11([reversed_cypher])
+
+    self.assertTrue(result["accepted"], result)
+    self.assertEqual(result["accepted_cypher"], "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5")
+    self.assertEqual(len(result["attempts"]), 1)
+    self.assertEqual(session.post.call_count, 1)
+    attempt = result["attempts"][0]
+    self.assertEqual(attempt["raw_output"], reversed_cypher)
+    self.assertEqual(attempt["auto_corrected"], {
+      "kind": "relationship_direction", "flips": 1, "uncorrected_cypher": reversed_cypher,
+    })
+
+  def test_direction_corrector_off_keeps_reject_and_retry(self):
+    reversed_cypher = "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    fixed = "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5"
+    result, _ = self._generate_v0_11([reversed_cypher, fixed], edgeguard_direction_corrector=False)
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 2)
+    self.assertIn("reverse the arrow", result["attempts"][0]["validation_feedback"])
+    self.assertIsNone(result["attempts"][0]["auto_corrected"])
+
+  def test_corrected_query_still_goes_through_literal_grounding(self):
+    # The flip fixes the arrow, but the literal is not in the request, so the
+    # attempt stays rejected and the corrected text is what the retry sees.
+    reversed_cypher = (
+      "MATCH p=(ta:Tactic {name: 'Nowhere Tactic'})-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    )
+    good = "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5"
+    result, _ = self._generate_v0_11([reversed_cypher, good])
+
+    first = result["attempts"][0]
+    self.assertFalse(first["accepted"])
+    self.assertIn("Nowhere Tactic", first["validation_feedback"])
+    self.assertNotIn("reverse the arrow", first["validation_feedback"])
+    self.assertIn("<-[:IN_TACTIC]-", first["candidate_cypher"])
+    self.assertTrue(result["accepted"])
+
+  def test_corrector_failure_keeps_the_plain_rejection(self):
+    reversed_cypher = "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    fixed = "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5"
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.correct_reversed_relationship_arrows",
+      side_effect=RuntimeError("boom"),
+    ):
+      result, _ = self._generate_v0_11([reversed_cypher, fixed])
+    self.assertTrue(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 2)
+    self.assertIn("reverse the arrow", result["attempts"][0]["validation_feedback"])
+
+  def test_wrong_relationship_type_is_not_corrected(self):
+    # `EMPLOYS_TECHNIQUE` from an Indicator is a wrong type, not a reversed
+    # arrow: no flip makes it valid, so the guard's feedback stands.
+    wrong = "MATCH p=(i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN p LIMIT 5"
+    result, _ = self._generate_v0_11([wrong] * 3)
+
+    self.assertFalse(result["accepted"])
+    for attempt in result["attempts"]:
+      self.assertIsNone(attempt["auto_corrected"])
 
   def test_v0_10_profile_generate_response_is_unaffected(self):
     plugin = _make_api(worker_semaphore_env={
