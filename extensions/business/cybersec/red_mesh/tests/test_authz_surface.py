@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 89  # +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107)
+EXPECTED_ENDPOINTS = 110  # +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -31,6 +31,31 @@ ENDPOINT_FIRST_ARGS = {
   'download_tenant_contract': 'actor',
   # RM-107: removes a tenant with no members and no jobs.
   'delete_tenant': 'actor',
+  # RM-109 phase 2: tenant drafts, Super-Tenant Admin only.
+  'create_tenant_draft': 'actor',
+  'update_tenant_draft': 'actor',
+  'get_tenant_draft': 'actor',
+  'list_tenant_drafts': 'actor',
+  'delete_tenant_draft': 'actor',
+  'upload_tenant_draft_document': 'actor',
+  'download_tenant_draft_document': 'actor',
+  # RM-109 phase 3.
+  'release_tenant_draft_activation': 'actor',
+  'close_tenant_draft': 'actor',
+  'download_tenant_document': 'actor',
+  # RM-109 phase 4: engagement drafts inside the tenant draft.
+  'create_engagement_draft': 'actor',
+  'get_engagement_draft': 'actor',
+  'list_engagement_drafts': 'actor',
+  'update_engagement_draft': 'actor',
+  'upload_engagement_draft_document': 'actor',
+  'download_engagement_draft_document': 'actor',
+  'delete_engagement_draft': 'actor',
+  'activate_engagement_draft': 'actor',
+  # RM-110 phase 1: the super-tenant profile and the generated pack baseline.
+  'get_super_tenant_profile': 'actor',
+  'update_super_tenant_profile': 'actor',
+  'store_generated_document': 'actor',
   # RM-108, temporary.
   'export_redmesh_records': 'actor',
   'export_redmesh_file': 'actor',

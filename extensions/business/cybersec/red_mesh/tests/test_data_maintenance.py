@@ -246,6 +246,164 @@ class TestDataMaintenance(unittest.TestCase):
                       rows[(f"{JOBS}:integrations:{self.tenant}", "wazuh")]["reason"]), ("old", "old_tenant"))
     self.assertEqual(rows[(JOBS, "new1")]["class"], "current")
 
+  def draft_row(self):
+    """RM-109. A tenant draft with a signed contract file, written through the real endpoint."""
+    created = self.plugin.create_tenant_draft(self.actor, str(uuid4()), "Draft", ["nis2"])
+    self.assertTrue(created["success"], created)
+    draft_id = created["data"]["draft_id"]
+    field = json.dumps(["tenant_draft", "deployment", draft_id], separators=(",", ":"))
+    row = self.storage.data[(TENANCY, field)]
+    row["items"]["contract"].update(state="signed", document={
+      "store": "r1fs", "ref": cid(40), "filename": "contract.pdf", "mime": "application/pdf",
+      "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator", "sha256": "a" * 64, "size_bytes": 10})
+    self.events.clear()
+    return field
+
+  def test_a_tenant_draft_is_current_its_files_are_listed_and_cleanup_keeps_it(self):
+    # A draft has no tenant: it must never read as an orphan of the tenant its id is not.
+    field = self.draft_row()
+    rows = self.scan()
+    row = rows[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
+    self.assertTrue(row["files_complete"])
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertIsNotNone(self.storage.data[(TENANCY, field)])
+    self.assertEqual(self.files.deleted, [])
+    # Still current once every tenant is gone.
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]["contract"]
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+
+  def test_a_tenant_draft_written_before_the_generated_slot_is_current(self):
+    # RM-109 phases 2-3 wrote items without `generated`; such a row must not be cleaned up as old.
+    field = self.draft_row()
+    for item in self.storage.data[(TENANCY, field)]["items"].values():
+      del item["generated"]
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertEqual(self.files.deleted, [])
+
+  def test_a_malformed_tenant_draft_is_old_not_orphan(self):
+    field = self.draft_row()
+    self.storage.data[(TENANCY, field)]["items"]["contract"]["state"] = "done"
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("old", "unrecognized"))
+    self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
+
+  def engagement_draft_row(self, parent, first_cid):
+    """RM-109 phase 4. A child with a signed and a generated pack file, written through the real endpoint."""
+    created = self.plugin.create_engagement_draft(self.actor, parent, str(uuid4()), "Pack")
+    self.assertTrue(created["success"], created)
+    field = json.dumps(["engagement_draft", "deployment", created["data"]["engagement_draft_id"]],
+                       separators=(",", ":"))
+    ref = {"store": "r1fs", "ref": cid(first_cid), "filename": "pack.pdf", "mime": "application/pdf",
+           "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator", "sha256": "a" * 64, "size_bytes": 10}
+    self.storage.data[(TENANCY, field)]["document"].update(state="signed", document=ref, generated={
+      **ref, "ref": cid(first_cid + 1), "sha256": "b" * 64, "snapshot_sha256": "c" * 64,
+      "generated_at": "2026-10-07T00:00:00Z", "generated_by": "creator"})
+    self.events.clear()
+    return field
+
+  def test_an_engagement_draft_is_current_with_a_live_parent_and_parent_gone_without(self):
+    parent = self.draft_row()
+    draft_id = json.loads(parent)[2]
+    child = self.engagement_draft_row(draft_id, 41)
+    under_tenant = self.engagement_draft_row(self.tenant, 43)
+    rows = self.scan()
+    for field, first_cid in ((child, 41), (under_tenant, 43)):
+      row = rows[(TENANCY, field)]
+      self.assertEqual((row["class"], row["reason"]), ("current", ""), field)
+      self.assertEqual(row["cids"], [{"cid": cid(first_cid), "role": "document.document.ref", "withheld": False},
+                                     {"cid": cid(first_cid + 1), "role": "document.generated.ref", "withheld": False}])
+      self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertEqual(self.files.deleted, [])
+    # The parent tenant draft gone: orphan, never old_tenant, and cleanup removes it with its files.
+    del self.storage.data[(TENANCY, parent)]
+    row = self.scan()[(TENANCY, child)]
+    self.assertEqual((row["class"], row["reason"]), ("orphan", "parent_gone"))
+    self.assertEqual(self.clean(row)[0]["outcome"], "deleted")
+    self.assertEqual(sorted(self.files.deleted), sorted([cid(41), cid(42)]))
+    # The parent tenant deleted (`delete_tenant` does not cascade to drafts): parent_gone too, even
+    # while the tenant is still known as an old row.
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]["contract"]
+    row = self.scan()[(TENANCY, under_tenant)]
+    self.assertEqual((row["class"], row["reason"]), ("orphan", "parent_gone"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "parent_gone")
+    # A malformed child is old/unrecognized, whatever its parent.
+    self.storage.data[(TENANCY, under_tenant)]["document"]["state"] = "done"
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
+
+  def test_the_super_tenant_profile_is_current_and_cleanup_keeps_it(self):
+    # RM-110: one row per deployment, no tenant and no file; never an orphan of a tenant it is not.
+    updated = self.plugin.update_super_tenant_profile(self.actor, {"legal_name": "RedMesh SRL"})
+    self.assertTrue(updated["success"], updated)
+    self.events.clear()
+    field = json.dumps(["super_tenant_profile", "deployment", "deployment"], separators=(",", ":"))
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"], row["cids"]), ("current", "", []))
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    self.assertIsNotNone(self.storage.data[(TENANCY, field)])
+    # Still current once every tenant is gone; malformed, old/unrecognized as every refused row.
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+    self.storage.data[(TENANCY, field)]["legal_name"] = 7
+    self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
+
+  def test_a_tenant_activated_from_a_draft_is_current_with_all_its_files(self):
+    # RM-109 phase 3: the receipt carries the draft id; tenant and receipt name three documents.
+    # RM-110: and the contract's generated baseline, whose file the draft row names too.
+    from .contract_fixture import FakeDocumentStore
+
+    class CidDocuments(FakeDocumentStore):
+      """Refs as R1FS gives them (CIDs), so the inventory follows them."""
+      def put(self, envelope):
+        ref = super().put(envelope)
+        address = cid(60 + int(ref[4:]))
+        self.envelopes[address] = self.envelopes.pop(ref)
+        return address
+    documents = CidDocuments()
+    self.plugin._document_store = lambda: documents
+    self.storage.account("acme.admin")
+    request = str(uuid4())
+    draft_id = self.plugin.create_tenant_draft(self.actor, request, "Acme", ["nis2"])["data"]["draft_id"]
+    self.assertTrue(self.plugin.update_tenant_draft(self.actor, draft_id, {
+      "domain_id": "acme", "initial_admin_id": "acme.admin",
+      "legal": {"name": "A", "registration_id": "B", "signer_name": "C", "signer_role": "D"},
+      "items": {"contract": {"effective_from": "2026-11-01"}}})["success"])
+    generated = self.plugin.store_generated_document(
+      self.actor, draft_id=draft_id, document_kind="contract", filename="generated.pdf",
+      content_b64=base64.b64encode(b"%PDF-1.7\n%generated\n%%EOF\n").decode("ascii"), snapshot='{"v":1}',
+      generated_at="2026-10-07T10:00:00Z")
+    self.assertTrue(generated["success"], generated)
+    for number, kind in enumerate(("contract", "framework_agreement", "data_handling")):
+      raw = b"%PDF-1.7\n%" + kind.encode() + b"\n%%EOF\n"
+      uploaded = self.plugin.upload_tenant_draft_document(self.actor, draft_id, kind, f"{kind}.pdf",
+                                                          base64.b64encode(raw).decode("ascii"))
+      self.assertTrue(uploaded["success"], uploaded)
+    prepared = self.plugin.prepare_tenant(self.actor, request, draft_id=draft_id)
+    self.assertTrue(prepared["success"], prepared)
+    self.storage.grant("acme.admin", prepared["data"]["tenantId"])
+    self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
+    rows = self.scan()
+    receipt = json.dumps(["receipt", "deployment", "creator", request], separators=(",", ":"))
+    tenant = json.dumps(["tenant", "deployment", prepared["data"]["tenantId"]], separators=(",", ":"))
+    draft = json.dumps(["tenant_draft", "deployment", draft_id], separators=(",", ":"))
+    files = {cid(61): "contract_generated.ref", cid(62): "contract.ref", cid(63): "framework_agreement.ref",
+             cid(64): "data_handling.ref"}
+    for field in (receipt, tenant):
+      row = rows[(TENANCY, field)]
+      self.assertEqual((row["class"], row["reason"]), ("current", ""), field)
+      self.assertEqual({item["cid"]: item["role"] for item in row["cids"]}, files)
+    self.assertEqual(rows[(TENANCY, draft)]["class"], "current")
+    self.assertEqual({item["cid"]: item["role"] for item in rows[(TENANCY, draft)]["cids"]},
+                     {cid(61): "items.contract.generated.ref", cid(62): "items.contract.document.ref",
+                      cid(63): "items.framework_agreement.document.ref", cid(64): "items.data_handling.document.ref"})
+
   def test_a_file_is_served_only_for_a_row_that_references_it(self):
     with patch.object(data_maintenance, "read_stored_file", return_value={"cid": CONFIG}) as read:
       self.assertTrue(self.plugin.export_redmesh_file(self.actor, JOBS, "old1", CONFIG)["success"])
