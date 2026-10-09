@@ -24,10 +24,9 @@ def binding_payload():
 
 
 ENGAGEMENT_FACTS = {"engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
-                    "authorized_tests": ["service_info_common"], "authorized_scan_modes": ["connect"],
                     "roe": {"authenticated_action": False, "stateful_probes_allowed": False,
                             "ics_safe_mode_required": True},
-                    "context": {}, "authorization": {}, "allowed_run_modes": ["single_pass"]}
+                    "context": {}, "authorization": {}}
 
 
 class TestExecutionBindingModels(unittest.TestCase):
@@ -85,7 +84,7 @@ class TestExecutionBindingModels(unittest.TestCase):
 
   def test_model_test_config_keeps_the_engagement_snapshot(self):
     snapshot = {"engagement_id": "en_" + str(uuid4()), "engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
-                "authorized_tests": ["prompt_injection_v1"], "roe": {"ics_safe_mode_required": True},
+                "roe": {"ics_safe_mode_required": True},
                 "engagement": {"client_name": "Example"}, "authorization": {"document_cid": ""}}
     raw = {"job_type": "model_test", "execution_binding": binding_payload(), **snapshot}
     stored = ModelTestJobConfig.from_dict(raw).to_dict()
@@ -221,15 +220,13 @@ class TestResolvedContextCarriesThePolicy(unittest.TestCase):
   def test_every_launch_carries_its_engagement(self):
     engagement = self.engagement
     broken = (..., {**engagement, "engagement_id": "en_x"}, {**engagement, "engagement_id": "en_" + str(uuid4())},
-              {**engagement, "engagement_hash": "f" * 64}, {**engagement, "authorized_tests": []},
+              {**engagement, "engagement_hash": "f" * 64},
               {**engagement, "roe": {"authenticated_action": "yes"}}, {**engagement, "extra": 1},
               {**engagement, "contract_sha256": None},
-              {key: value for key, value in engagement.items() if key != "authorized_scan_modes"},
-              # RM-107: the allowed run modes, as the record stores them (non-empty, known, sorted).
-              {key: value for key, value in engagement.items() if key != "allowed_run_modes"},
-              {**engagement, "allowed_run_modes": []}, {**engagement, "allowed_run_modes": "single_pass"},
-              {**engagement, "allowed_run_modes": ["single_pass", "continuous"]},
-              {**engagement, "allowed_run_modes": ["SINGLEPASS"]})
+              # RM-125: the removed picks are no longer part of the engagement facts.
+              {**engagement, "authorized_tests": ["service_info_common"]},
+              {**engagement, "authorized_scan_modes": ["connect"]},
+              {**engagement, "allowed_run_modes": ["single_pass"]})
     for value in broken:
       with self.subTest(value=value), self.assertRaises(ValueError):
         self._context(engagement=value)

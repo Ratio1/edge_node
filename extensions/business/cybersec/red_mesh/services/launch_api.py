@@ -43,7 +43,7 @@ from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 from ..tenancy.assets import collapse_ports, format_port_ranges, ports_outside_scope
-from ..tenancy.engagements import RUN_MODE_LAUNCH_VALUES, SCAN_MODES
+from ..tenancy.engagements import SCAN_MODES
 from ..tenancy.execution import context_tenant_id
 from .soc_export_policy import required_soc_launch_error
 
@@ -128,40 +128,17 @@ def _normalize_scan_mode(value):
   return mode, None
 
 
-def check_authorized_scan_mode(scan_mode, authorized_scan_modes):
-  """Refuse a scan mode outside the asset's authorized modes (RM-094 phase 2).
+def resolve_network_scan_mode(value):
+  """Validate and capability-check a network scan_mode.
 
-  ``authorized_scan_modes`` is the engagement network asset's allow-list; a
-  non-tenant launch passes ``None`` and is not gated (mirrors
-  ``check_allowed_run_mode`` on an absent engagement). Returns an error or None.
-  """
-  if authorized_scan_modes is None:
-    return None
-  if scan_mode in set(authorized_scan_modes):
-    return None
-  return {
-    "error": "scan_mode_not_authorized", "status_code": 400,
-    "message": "The engagement does not authorize this scan mode for this asset.",
-    "authorized_scan_modes": list(authorized_scan_modes),
-  }
-
-
-def resolve_network_scan_mode(value, authorized_scan_modes=None):
-  """Validate, authorize, and capability-check a network scan_mode.
-
-  Returns ``(mode, None)`` on success or ``(None, error_payload)``. Precedence is
-  format validation > engagement authorization > node capability: a mode outside
-  the asset's ``authorized_scan_modes`` is refused with ``scan_mode_not_authorized``
-  before the raw-socket probe, and a ``syn`` request on a node without a raw socket
-  is refused at launch with a typed ``scan_mode_unavailable`` error rather than
-  downgraded to a full handshake. RM-094.
+  Returns ``(mode, None)`` on success or ``(None, error_payload)``. Format validation comes
+  before the node capability check: a ``syn`` request on a node without a raw socket is refused
+  at launch with a typed ``scan_mode_unavailable`` error rather than downgraded to a full
+  handshake. RM-094. RM-125: an engagement no longer gates the scan mode.
   """
   mode, error = _normalize_scan_mode(value)
   if error:
     return None, error
-  authz_error = check_authorized_scan_mode(mode, authorized_scan_modes)
-  if authz_error:
-    return None, authz_error
   if mode == "syn" and not _raw_socket_available():
     return None, {"error": "scan_mode_unavailable",
                   "message": "SYN scan mode requires a raw socket (CAP_NET_RAW) on the node"}
@@ -648,43 +625,6 @@ def check_engagement_roe(engagement, *, ics_safe_mode=True, allow_stateful_probe
   return {
     "error": "roe_forbids", "status_code": 400, "field": field,
     "message": f"The engagement's rules of engagement do not allow {field} for this job.",
-  }
-
-
-def check_allowed_run_mode(engagement, run_mode):
-  """Refuse a normalized run mode the engagement does not allow (RM-107). Returns an error or None.
-
-  Called on the normalized mode, so an empty one (continuous) is gated like an explicit one.
-  """
-  if engagement is None:
-    return None
-  allowed = engagement["allowed_run_modes"]
-  if run_mode in {RUN_MODE_LAUNCH_VALUES[mode] for mode in allowed}:
-    return None
-  return {
-    "error": "run_mode_not_authorized", "status_code": 400,
-    "message": "The engagement does not allow this run mode.",
-    "allowed_run_modes": list(allowed),
-  }
-
-
-def check_authorized_tests(enabled_features, authorized_tests):
-  """Refuse enabled probe methods outside the asset's authorized tests (RM-095).
-
-  Each method maps to its live `FEATURE_CATALOG` id; an authorized id that the live
-  catalog no longer has authorizes nothing. Returns an error or None.
-  """
-  owner_of = {method: item["id"] for item in FEATURE_CATALOG for method in item.get("methods", [])}
-  authorized = set(authorized_tests)
-  # A method without a catalog id cannot be authorized by any engagement.
-  unauthorized = sorted({owner_of.get(method, method) for method in enabled_features
-                         if owner_of.get(method) not in authorized})
-  if not unauthorized:
-    return None
-  return {
-    "error": "tests_exceed_authorization", "status_code": 400,
-    "message": "The enabled tests exceed the engagement's authorized tests for this asset.",
-    "unauthorized_features": unauthorized,
   }
 
 
@@ -1185,12 +1125,6 @@ def announce_launch(
         full_mirror=(distribution_strategy == DISTRIBUTION_MIRROR),
       )
 
-  # After the comparison bundle, which enables tests too (RM-095).
-  if engagement is not None:
-    tests_error = check_authorized_tests(enabled_features, engagement["authorized_tests"])
-    if tests_error:
-      return tests_error
-
   if not scanner_identity:
     scanner_identity = owner.cfg_scanner_identity
   if not scanner_user_agent:
@@ -1265,12 +1199,11 @@ def announce_launch(
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
     graybox_assignment_strategy=graybox_assignment_strategy,
-    # The engagement snapshot (RM-095): reports and exports keep reading these three fields.
+    # The engagement snapshot (RM-095): reports and exports keep reading these fields.
     **({"engagement": engagement["context"], "roe": engagement["roe"],
         "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
         "engagement_hash": engagement["engagement_hash"],
-        "contract_sha256": engagement["contract_sha256"],
-        "authorized_tests": engagement["authorized_tests"]} if engagement is not None else {}),
+        "contract_sha256": engagement["contract_sha256"]} if engagement is not None else {}),
     # OWASP API Top 10 (Subphase 1.5 commit #8): runtime-only secret
     # fields. Blanked by `_blank_graybox_secret_fields` before persistence;
     # `has_bearer_token` / `has_api_key` capability flags are set on the
@@ -1543,13 +1476,9 @@ def launch_network_scan(
   timeout_profile, timeout_profile_error = normalize_network_timeout_profile(timeout_profile)
   if timeout_profile_error:
     return timeout_profile_error
-  # scan_mode: format-validate, gate against the engagement's authorized modes
-  # (RM-094 phase 2), then the raw-socket capability rule. SYN needs CAP_NET_RAW;
-  # refuse at launch, never downgrade.
-  scan_mode, scan_mode_error = resolve_network_scan_mode(
-    scan_mode,
-    authorized_scan_modes=engagement.get("authorized_scan_modes") if engagement is not None else None,
-  )
+  # scan_mode: format-validate, then the raw-socket capability rule. SYN needs CAP_NET_RAW;
+  # refuse at launch, never downgrade. RM-125: the engagement does not gate the mode.
+  scan_mode, scan_mode_error = resolve_network_scan_mode(scan_mode)
   if scan_mode_error:
     return scan_mode_error
   start_port = int(start_port)
@@ -1575,10 +1504,6 @@ def launch_network_scan(
   )
   if "error" in options:
     return options
-  # RM-107: first after normalization, before any confirmation or comparison work.
-  run_mode_error = check_allowed_run_mode(engagement, options["run_mode"])
-  if run_mode_error:
-    return run_mode_error
   # Comparison mode keeps the operator's MIRROR/SLICE choice: MIRROR mirrors the
   # whole range to every node (full comparison); SLICE uses the tiered scheme
   # (mirror the comparison tier, slice the bulk). See build_comparison_workers.
@@ -1891,10 +1816,6 @@ def launch_webapp_scan(
   )
   if "error" in options:
     return options
-  # RM-107: first after normalization, before any confirmation or comparison work.
-  run_mode_error = check_allowed_run_mode(engagement, options["run_mode"])
-  if run_mode_error:
-    return run_mode_error
   required_confirmation_ids = required_unsafe_confirmation_ids(
     scan_type=ScanType.WEBAPP.value,
     options=options,

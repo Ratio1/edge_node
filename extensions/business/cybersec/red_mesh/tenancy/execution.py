@@ -19,8 +19,8 @@ BINDING_SCHEMA_VERSION = 2
 _ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
 # Launch-time policy, read by the launch gate and never part of the binding.
 _POLICY_FIELDS = frozenset({"asset_authorized_ports", "engagement"})
-_ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "authorized_tests", "roe", "context",
-                                "authorization", "contract_sha256", "allowed_run_modes"})
+_ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "roe", "context",
+                                "authorization", "contract_sha256"})
 
 
 def _validate_facts(value, *, failure_policy=True):
@@ -57,20 +57,16 @@ def _node_order(value):
   return value
 
 
-def _validate_engagement(value, kind):
+def _validate_engagement(value):
   """The engagement facts a launch is gated on and snapshots (RM-095); shape only."""
   # Imported here: `engagements` loads the models package, which imports this module.
-  from .engagements import normalize_roe, normalize_run_modes, valid_engagement_id
-  fields = _ENGAGEMENT_FIELDS | ({"authorized_scan_modes"} if kind == "network" else set())
-  if (not isinstance(value, dict) or set(value) != fields
+  from .engagements import normalize_roe, valid_engagement_id
+  if (not isinstance(value, dict) or set(value) != _ENGAGEMENT_FIELDS
       or not valid_engagement_id(value["engagement_id"]) or not valid_digest(value["engagement_hash"])
       or not valid_digest(value["contract_sha256"])
-      or not isinstance(value["authorized_tests"], list) or not value["authorized_tests"]
-      or any(not isinstance(item, str) or not item for item in value["authorized_tests"])
       or not isinstance(value["context"], dict) or not isinstance(value["authorization"], dict)):
     raise ValueError("Invalid execution engagement")
-  if (normalize_roe(value["roe"]) != value["roe"] or not isinstance(value["allowed_run_modes"], list)
-      or normalize_run_modes(value["allowed_run_modes"]) != value["allowed_run_modes"]):
+  if normalize_roe(value["roe"]) != value["roe"]:
     raise ValueError("Invalid execution engagement")
 
 
@@ -114,7 +110,7 @@ class ResolvedExecutionContext:
       raise ValueError("Invalid resolved execution fields")
     _validate_facts(value)
     _node_order(value["selected_candidates"])
-    _validate_engagement(value["engagement"], value["asset_target"]["kind"])
+    _validate_engagement(value["engagement"])
     if (value["engagement"]["engagement_id"] != value["engagement_id"]
         or value["engagement"]["engagement_hash"] != value["engagement_hash"]):
       raise ValueError("Invalid execution engagement")

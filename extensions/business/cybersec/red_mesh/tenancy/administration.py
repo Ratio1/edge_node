@@ -23,7 +23,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            valid_integration_id)
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_context, normalize_engagement_assets, normalize_roe,
-                          normalize_run_modes, normalize_window, valid_doc_ref, valid_engagement_id)
+                          normalize_window, valid_doc_ref, valid_engagement_id)
 from . import drafts, engagement_drafts, super_tenant_profile, tenant_assets
 
 
@@ -683,8 +683,7 @@ class TenantAdministrationService:
     facts = {
       "engagement_id": row["engagement_id"], "engagement_hash": row["engagement_hash"],
       "contract_sha256": row["contract_sha256"],
-      "authorized_tests": list(entry["authorized_tests"]), "roe": dict(row["roe"]),
-      "context": row["context"], "allowed_run_modes": list(row["allowed_run_modes"]),
+      "roe": dict(row["roe"]), "context": row["context"],
       # `AuthorizationRef` shape, so reports, exports and SIEM hooks read the job snapshot as
       # before. The signed basis is the tenant contract, signed by the tenant's legal signer. No
       # document reference: the job is readable under `reports:view`, while the contract itself is
@@ -703,7 +702,7 @@ class TenantAdministrationService:
     }
     if entry["kind"] != "network":
       return facts, None
-    return {**facts, "authorized_scan_modes": list(entry["authorized_scan_modes"])}, entry["authorized_ports"]
+    return facts, entry["authorized_ports"]
 
   @staticmethod
   def _entry_facts(row, entry):
@@ -834,15 +833,13 @@ class TenantAdministrationService:
     assets = []
     for entry in row["assets"]:
       asset = {"engagementAssetId": entry["engagement_asset_id"], "displayName": entry["display_name"],
-               "kind": entry["kind"], "target": entry["target"], "targetDigest": entry["target_digest"],
-               "authorizedTests": entry["authorized_tests"]}
+               "kind": entry["kind"], "target": entry["target"], "targetDigest": entry["target_digest"]}
       if entry["kind"] == "network":
-        asset.update(authorizedPorts=entry["authorized_ports"],
-                     authorizedScanModes=entry["authorized_scan_modes"])
+        asset.update(authorizedPorts=entry["authorized_ports"])
       assets.append(asset)
     return {
       "tenantId": row["tenant_id"], "engagementId": row["engagement_id"],
-      "displayName": row["display_name"], "allowedRunModes": row["allowed_run_modes"],
+      "displayName": row["display_name"],
       "validFrom": row["valid_from"], "validUntil": row["valid_until"],
       "contractSha256": row["contract_sha256"],
       "documents": [{"documentId": document["document_id"], "kind": document["kind"],
@@ -886,7 +883,7 @@ class TenantAdministrationService:
     return {"accountId": account.account_id}
 
   @staticmethod
-  def _engagement_request(display_name, allowed_run_modes, valid_from, valid_until, roe, context, assets,
+  def _engagement_request(display_name, valid_from, valid_until, roe, context, assets,
                           documents, supersedes, creator):
     """The request as sent, normalized without any store read: the replay intent. RM-109 phase 4:
     `creator` None skips the uploader rule (an engagement draft's packs are checked for the platform
@@ -896,10 +893,6 @@ class TenantAdministrationService:
     except (ValueError, TypeError):
       raise AdministrationDenied(400, "invalid_request") from None
     try:
-      allowed_run_modes = normalize_run_modes(allowed_run_modes)
-      if "single_pass" not in allowed_run_modes:
-        # RM-107 (owner, 2026-09-28): single pass is always allowed; continuous is the opt-in.
-        raise EngagementInvalid("run_modes_invalid")
       valid_from, valid_until = normalize_window(valid_from, valid_until)
       roe, context = normalize_roe(roe), normalize_context(context)
     except EngagementInvalid as exc:
@@ -919,14 +912,14 @@ class TenantAdministrationService:
       assets = normalize_engagement_assets(assets)
     except EngagementInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
-    return {"display_name": display_name, "allowed_run_modes": allowed_run_modes, "valid_from": valid_from,
-            "valid_until": valid_until, "roe": roe, "context": context,
+    return {"display_name": display_name, "valid_from": valid_from, "valid_until": valid_until,
+            "roe": roe, "context": context,
             "documents": [[document[key] for key in ("kind", "sha256", "title", "comment")]
                           for document in documents],
             "supersedes": supersedes, "assets": assets}
 
   @_endpoint
-  def create_engagement(self, actor, tenant_id, request_id, display_name, allowed_run_modes, valid_from,
+  def create_engagement(self, actor, tenant_id, request_id, display_name, valid_from,
                         valid_until, roe, context, assets, documents=None, supersedes=None):
     """`documents` are the references `services.engagement_documents.resolve_engagement_document`
     verified outside this lock, in the order they are numbered (`ed_1`, `ed_2`, ...)."""
@@ -936,7 +929,7 @@ class TenantAdministrationService:
     engagement_id = engagement_id_for(request_id)
     documents = [] if documents is None else documents
     request = self._engagement_request(
-      display_name, allowed_run_modes, valid_from, valid_until, roe, context, assets, documents,
+      display_name, valid_from, valid_until, roe, context, assets, documents,
       supersedes, account.account_id)
     record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, documents, supersedes)
     # Replay is decided on the request alone.
@@ -961,7 +954,7 @@ class TenantAdministrationService:
               "request_id": request_id, "created_by": account.account_id, "request": request}
     record = {
       "tenant_id": tenant_id, "engagement_id": engagement_id, "request_id": request_id,
-      "display_name": request["display_name"], "allowed_run_modes": request["allowed_run_modes"],
+      "display_name": request["display_name"],
       "valid_from": request["valid_from"], "valid_until": request["valid_until"],
       "contract_sha256": contract_sha256,
       "documents": [{"document_id": document_id_for(index), **document}
@@ -2026,7 +2019,7 @@ class TenantAdministrationService:
       if any(isinstance(document, dict) and document.get("ref") == stored["signed"]["ref"] for document in bound):
         raise AdministrationDenied(409, "contract_in_use")
     request = self._engagement_request(
-      row["display_name"], row["allowed_run_modes"], row["valid_from"], row["valid_until"], row["roe"],
+      row["display_name"], row["valid_from"], row["valid_until"], row["roe"],
       row["context"], engagement_drafts.asset_requests(row["assets"]), packs, None, None)
     record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, packs, None)
     self.store.put("engagement", tenant_id, engagement_id, record=record)

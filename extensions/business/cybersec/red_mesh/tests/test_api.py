@@ -23,22 +23,19 @@ from .test_execution_binding_models import binding_payload
 
 
 def _engagement(kind="network", **roe):
-  """Engagement facts as admission loads them (RM-095): every test of the kind, a permissive RoE.
+  """Engagement facts as admission loads them (RM-095): a permissive RoE (RM-125: no test or mode picks).
 
   Suites about launch configuration launch inside an engagement that allows what they configure;
   the refusals have their own tests.
   """
-  from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
   return {
     "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
-    "contract_sha256": "c" * 64, "allowed_run_modes": ["continuous", "single_pass"],
-    "authorized_tests": sorted(feature_ids_for_kind(kind)),
+    "contract_sha256": "c" * 64,
     "roe": {"authenticated_action": False, "stateful_probes_allowed": True, "ics_safe_mode_required": False,
             **roe},
     "context": {"client_name": "Example"},
     "authorization": {"document_cid": "", "authorized_signer_name": "Ana Pop", "authorized_signer_role": "CISO",
                       "document_sha256": "a" * 64},
-    **({"authorized_scan_modes": ["connect"]} if kind == "network" else {}),
   }
 
 
@@ -534,46 +531,32 @@ class TestPhase1ConfigCID(unittest.TestCase):
         plugin = self._build_mock_plugin(job_id="engagement-forwarded-ok")
         self.assertNotIn("error", launch(plugin, **extra))
 
-  def test_engagement_tests_exceeding_authorization_are_refused(self):
-    engagement = {**_engagement("network"), "authorized_tests": ["service_info_common"]}
-    plugin = self._build_mock_plugin(job_id="engagement-tests")
-    result = self._launch_network(plugin, engagement=engagement)
-    self.assertEqual(result["error"], "tests_exceed_authorization")
-    self.assertIn("web_discovery", result["unauthorized_features"])
-    self.assertNotIn("service_info_common", result["unauthorized_features"])
-    plugin.r1fs.add_json.assert_not_called()
-    # Excluding everything else is within the authorization.
-    from extensions.business.cybersec.red_mesh.constants import FEATURE_CATALOG
-    excluded = [method for item in FEATURE_CATALOG if item["category"] in ("service", "web", "correlation")
-                and item["id"] != "service_info_common" for method in item["methods"]]
-    plugin = self._build_mock_plugin(job_id="engagement-tests-ok")
-    result = self._launch_network(plugin, engagement=engagement, excluded_features=excluded)
-    self.assertNotIn("error", result)
-    self.assertEqual(self._latest_job_config(plugin)["authorized_tests"], ["service_info_common"])
+  def test_an_engagement_launch_runs_every_feature_of_the_kind(self):
+    # RM-125: an engagement picks no tests, so nothing is excluded and no test list is snapshotted.
+    for kind, launch in (("network", self._launch_network), ("webapp", self._launch_webapp)):
+      with self.subTest(kind):
+        plugin = self._build_mock_plugin(job_id="engagement-all-tests")
+        self.assertNotIn("error", launch(plugin))
+        config = self._latest_job_config(plugin)
+        self.assertEqual(config["excluded_features"], [])
+        self.assertNotIn("authorized_tests", config)
 
-  def test_engagement_refuses_a_probe_the_catalog_does_not_know(self):
-    # Features are discovered from the worker classes, not the catalog: an uncatalogued method is
-    # authorized by no engagement, so it fails closed.
-    plugin = self._build_mock_plugin(job_id="engagement-uncatalogued")
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    self._bind_launch_helpers(plugin)
-    plugin._get_all_features = lambda categs=False, scan_type=None: [
-      *PentesterApi01Plugin._get_all_features(plugin, categs=categs, scan_type=scan_type),
-      "_service_info_uncatalogued"]
-    _stub_launch_actor(plugin, "network", "192.0.2.10")
-    result = PentesterApi01Plugin.launch_network_scan(plugin, target="192.0.2.10", start_port=1, end_port=1024,
-                                                      exceptions="", authorized=True,
-                                                      engagement_id=_engagement()["engagement_id"])
-    self._refused(plugin, result, "tests_exceed_authorization",
-                  unauthorized_features=["_service_info_uncatalogued"])
+  def test_an_engagement_admits_single_pass_and_continuous_launches(self):
+    # RM-125: both run modes are always allowed (an empty run mode is continuous).
+    for launch in (self._launch_network, self._launch_webapp):
+      for run_mode, expected in (("SINGLEPASS", "SINGLEPASS"), ("CONTINUOUS_MONITORING", "CONTINUOUS_MONITORING"),
+                                 ("", "CONTINUOUS_MONITORING")):
+        with self.subTest(launch=launch.__name__, run_mode=run_mode):
+          plugin = self._build_mock_plugin(job_id="engagement-run-modes")
+          self.assertNotIn("error", launch(plugin, run_mode=run_mode))
+          self.assertEqual(self._latest_job_config(plugin)["run_mode"], expected)
 
-  def test_engagement_comparison_bundle_counts_against_authorized_tests(self):
-    # Comparison mode force-enables the graybox bundle: it must be authorized like any test.
-    engagement = {**_engagement("webapp"), "authorized_tests": ["service_info_common"]}
+  def test_engagement_comparison_mode_still_launches_a_webapp(self):
+    # Comparison mode force-enables the graybox bundle; no test allow-list gates it (RM-125).
     plugin = self._build_mock_plugin(job_id="engagement-bundle")
-    result = self._launch_webapp(plugin, engagement=engagement, comparison_mode=True)
-    self._refused(plugin, result, "tests_exceed_authorization", unauthorized_features=["graybox"])
+    result = self._launch_webapp(plugin, comparison_mode=True)
+    self.assertNotIn("error", result)
+    self.assertIsNotNone(self._latest_job_config(plugin))
 
   def test_engagement_comparison_tier_outside_the_port_scope_needs_an_update(self):
     plugin = self._build_mock_plugin(job_id="engagement-tier")
@@ -597,42 +580,6 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin = self._build_mock_plugin(job_id="engagement-stateful-ok")
     self.assertNotIn("error", self._launch_webapp(plugin, engagement=no_stateful))
 
-  def test_engagement_run_mode_outside_the_allowed_modes_is_refused(self):
-    # RM-107: the gate reads the normalized run mode, so an empty one (continuous) is gated too.
-    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
-    for run_mode in ("", "CONTINUOUS_MONITORING", "bogus"):
-      with self.subTest(run_mode=run_mode):
-        plugin = self._build_mock_plugin(job_id="engagement-run-mode")
-        result = self._launch_network(plugin, engagement=single, run_mode=run_mode)
-        self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["single_pass"])
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-ok")
-    result = self._launch_network(plugin, engagement=single, run_mode="SINGLEPASS")
-    self.assertNotIn("error", result)
-    self.assertEqual(self._latest_job_config(plugin)["run_mode"], "SINGLEPASS")
-    continuous = {**_engagement("webapp"), "allowed_run_modes": ["continuous"]}
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp")
-    result = self._launch_webapp(plugin, engagement=continuous, run_mode="SINGLEPASS")
-    self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["continuous"])
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp-ok")
-    self.assertNotIn("error", self._launch_webapp(plugin, engagement=continuous))
-
-  def test_launch_test_reaches_the_run_mode_gate(self):
-    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-test")
-    self._refused(plugin, self._launch(plugin, engagement=single), "run_mode_not_authorized",
-                  allowed_run_modes=["single_pass"])
-
-  def test_the_run_mode_gate_comes_before_the_unsafe_confirmations(self):
-    # A disallowed mode is the answer, not a confirmation the operator could never usefully give.
-    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first")
-    result = self._launch_network(plugin, engagement=single, monitor_interval=1)
-    self._refused(plugin, result, "run_mode_not_authorized")
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first-webapp")
-    result = self._launch_webapp(plugin, engagement={**_engagement("webapp"), "allowed_run_modes": ["single_pass"]},
-                                 monitor_interval=1)
-    self._refused(plugin, result, "run_mode_not_authorized")
-
   def test_engagement_port_scope_admits_a_narrower_run(self):
     # Owner, 2026-09-28: a run may use any part of the engagement's scope.
     plugin = self._build_mock_plugin(job_id="engagement-narrow")
@@ -642,13 +589,6 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual((config["start_port"], config["end_port"], config["authorized_ports"]),
                      (8080, 8090, "22,443,8000-9000"))
     self.assertNotIn("authorization_update", config)
-
-  def test_engagement_authorization_update_widens_ports_only(self):
-    engagement = {**_engagement("network"), "authorized_tests": ["service_info_common"]}
-    plugin = self._build_mock_plugin(job_id="engagement-update")
-    result = self._launch_network(plugin, engagement=engagement, authorized_ports="1-1024", end_port=1100,
-                                  authorization_update=dict(self._UPDATE))
-    self._refused(plugin, result, "tests_exceed_authorization")
 
   def test_launch_test_widened_without_an_update_is_refused(self):
     plugin = self._build_mock_plugin(job_id="scope-test-2")
@@ -1817,7 +1757,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
     self.assertEqual(config_dict["target_confirmation"], "example.com")
     self.assertEqual(config_dict["engagement_id"], "en_00000000-0000-4000-8000-000000000003")
-    self.assertEqual(config_dict["authorized_tests"], ["graybox"])
+    self.assertNotIn("authorized_tests", config_dict)
     self.assertNotIn("engagement_metadata", config_dict)
     # The node's configured allowlist still reaches the worker, which enforces its path scopes.
     self.assertEqual(config_dict["target_allowlist"], ["example.com", "/api/"])
@@ -2065,8 +2005,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(config_dict["engagement"], engagement["context"])
     self.assertEqual(config_dict["roe"], engagement["roe"])
     self.assertEqual(config_dict["authorization"], engagement["authorization"])
-    self.assertEqual((config_dict["engagement_id"], config_dict["engagement_hash"], config_dict["authorized_tests"]),
-                     (engagement["engagement_id"], engagement["engagement_hash"], engagement["authorized_tests"]))
+    self.assertEqual((config_dict["engagement_id"], config_dict["engagement_hash"]),
+                     (engagement["engagement_id"], engagement["engagement_hash"]))
 
   def test_the_job_level_context_parameters_are_gone(self):
     """RM-095 hard gate: the request can no longer carry its own RoE, context or authorization."""

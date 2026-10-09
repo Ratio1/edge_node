@@ -61,12 +61,11 @@ class TestTenantEngagements(unittest.TestCase):
   def fields(self, **changes):
     fields = {
       "actor": self.actor, "tenant_id": self.tenant, "request_id": self.request,
-      "display_name": " Q4 external ", "allowed_run_modes": ["single_pass", "continuous"],
+      "display_name": " Q4 external ",
       "valid_from": "2026-10-01T00:00:00Z", "valid_until": "2026-10-31T00:00:00+00:00",
       "roe": {"authenticated_action": True}, "context": {"client_name": "Example", "asset_exposure": "external"},
-      "assets": [network(authorized_tests=["service_info_common", "active_auth"]),
-                 {"display_name": "Customer portal", "target": WEBAPP, "authorized_tests": ["graybox"]},
-                 {"display_name": "Support bot", "target": MODEL, "authorized_tests": ["prompt_injection_v1"]}],
+      "assets": [network(), {"display_name": "Customer portal", "target": WEBAPP},
+                 {"display_name": "Support bot", "target": MODEL}],
       "documents": [doc(SHA_ROE, "roe", title="Rules of engagement"),
                     doc(SHA_AUTH, "auth", kind="third_party_consent", title="Hosting consent",
                         comment="provider ticket 42")],
@@ -104,14 +103,14 @@ class TestTenantEngagements(unittest.TestCase):
                       "target": NETWORK})
     self.assertRegex(network_asset["targetDigest"], r"^[a-f0-9]{64}$")
     self.assertEqual(network_asset["authorizedPorts"], "22,443")
-    self.assertEqual(network_asset["authorizedScanModes"], ["connect"])
-    self.assertEqual(network_asset["authorizedTests"], ["active_auth", "service_info_common"])
     self.assertEqual((webapp["engagementAssetId"], webapp["kind"]), ("ea_2", "webapp"))
     self.assertNotIn("authorizedPorts", webapp)
-    self.assertEqual((model["engagementAssetId"], model["kind"], model["target"], model["authorizedTests"]),
-                     ("ea_3", "model", MODEL, ["prompt_injection_v1"]))
-    self.assertNotIn("authorizedScanModes", model)
-    self.assertEqual(engagement["allowedRunModes"], ["continuous", "single_pass"])
+    self.assertEqual((model["engagementAssetId"], model["kind"], model["target"]), ("ea_3", "model", MODEL))
+    # RM-125: no test, scan mode or run mode picks on the engagement or its assets.
+    for entry in engagement["assets"]:
+      for gone in ("authorizedTests", "authorizedScanModes"):
+        self.assertNotIn(gone, entry)
+    self.assertNotIn("allowedRunModes", engagement)
     self.assertEqual([(item["documentId"], item["kind"], item["title"], item["comment"], item["sha256"])
                       for item in engagement["documents"]],
                      [("ed_1", "agreement", "Rules of engagement", "", SHA_ROE),
@@ -136,26 +135,17 @@ class TestTenantEngagements(unittest.TestCase):
   def test_a_tenant_without_a_contract_creates_no_engagement(self):
     legacy = self.new_tenant("legacy", contract=False)
     writes = len(self.owner.writes)
-    self.refused(self.create(tenant_id=legacy, assets=[network(authorized_tests=["active_auth"])]),
+    self.refused(self.create(tenant_id=legacy, assets=[network()]),
                  400, "contract_required")
     self.refused(self.service.authorize_engagement_create(self.actor, legacy), 400, "contract_required")
     self.assertEqual(len(self.owner.writes), writes)
 
-  def test_ports_and_scan_modes_are_normalized(self):
-    assets = [network(authorized_ports="80, 443", authorized_scan_modes=["syn", "connect"],
-                      authorized_tests=["service_info_common"])]
-    engagement = self.create(assets=assets)["data"]
+  def test_ports_are_normalized(self):
+    engagement = self.create(assets=[network(authorized_ports="80, 443")])["data"]
     self.assertEqual(engagement["assets"][0]["authorizedPorts"], "80,443")
-    self.assertEqual(engagement["assets"][0]["authorizedScanModes"], ["connect", "syn"])
-
-  def test_scan_mode_order_does_not_change_the_request(self):
-    assets = lambda modes: [network(authorized_scan_modes=modes, authorized_tests=["active_auth"])]
-    first = self.view(self.create(assets=assets(["syn", "connect"])))
-    self.assertEqual(self.view(self.create(assets=assets(["connect", "syn"]))), first)
-    self.refused(self.create(request_id=str(uuid4()), assets=assets([["connect"]])), 400, "engagement_asset_invalid")
 
   def test_a_network_asset_needs_a_port_scope(self):
-    bare = {"display_name": "Bare", "target": NETWORK, "authorized_tests": ["service_info_common"]}
+    bare = {"display_name": "Bare", "target": NETWORK}
     self.refused(self.create(assets=[bare]), 400, "ports_required")
     for blank in (None, "", "   "):
       with self.subTest(ports=blank):
@@ -164,24 +154,20 @@ class TestTenantEngagements(unittest.TestCase):
     self.assertTrue(self.create(assets=[dict(bare, authorized_ports="443")])["success"])
 
   def test_asset_refusals(self):
-    portal = {"display_name": "Portal", "target": WEBAPP, "authorized_tests": ["graybox"]}
+    portal = {"display_name": "Portal", "target": WEBAPP}
     cases = [
-      ([dict(network(), authorized_tests=["active_auth"], asset_id="as_" + str(uuid4()))], "engagement_asset_invalid"),
-      ([{"display_name": "Bot", "target": MODEL, "authorized_tests": []}], "tests_invalid"),
-      ([{"display_name": "Bot", "target": MODEL, "authorized_tests": ["graybox"]}], "tests_invalid"),
-      ([{"display_name": "Bot", "target": MODEL, "authorized_ports": "443",
-         "authorized_tests": ["cbrn_safety_v1"]}], "engagement_asset_invalid"),
-      ([dict(portal, authorized_tests=["service_info_common"])], "tests_invalid"),
-      ([network(authorized_tests=["graybox"])], "tests_invalid"),
-      ([network(authorized_tests=["nope"])], "tests_invalid"),
+      ([dict(network(), asset_id="as_" + str(uuid4()))], "engagement_asset_invalid"),
+      ([{"display_name": "Bot", "target": MODEL, "authorized_ports": "443"}], "engagement_asset_invalid"),
+      # RM-125: an entry picking tests or scan modes is refused, on every kind.
+      ([network(authorized_tests=["service_info_common"])], "engagement_asset_invalid"),
+      ([network(authorized_scan_modes=["connect"])], "engagement_asset_invalid"),
+      ([dict(portal, authorized_tests=["graybox"])], "engagement_asset_invalid"),
+      ([{"display_name": "Bot", "target": MODEL, "authorized_tests": ["cbrn_safety_v1"]}],
+       "engagement_asset_invalid"),
       ([dict(portal, authorized_ports="80")], "engagement_asset_invalid"),
-      ([dict(portal, authorized_scan_modes=["connect"])], "engagement_asset_invalid"),
-      ([network(authorized_scan_modes=["udp"], authorized_tests=["active_auth"])], "engagement_asset_invalid"),
-      ([network(authorized_scan_modes=[], authorized_tests=["active_auth"])], "engagement_asset_invalid"),
-      ([network(authorized_tests=["active_auth"])] * 2, "engagement_asset_invalid"),
-      ([network(authorized_tests=["active_auth"], display_name="")], "engagement_asset_invalid"),
-      ([network(authorized_tests=["active_auth"], target={"kind": "network", "address": "bad host"})],
-       "asset_target_invalid"),
+      ([network()] * 2, "engagement_asset_invalid"),
+      ([network(display_name="")], "engagement_asset_invalid"),
+      ([network(target={"kind": "network", "address": "bad host"})], "asset_target_invalid"),
       ([dict(portal, target={"kind": "webapp", "url": "ftp://x", "allowedPathPrefix": "/"})], "asset_target_invalid"),
       ([], "engagement_asset_invalid"),
     ]
@@ -191,9 +177,7 @@ class TestTenantEngagements(unittest.TestCase):
 
   def test_request_value_refusals(self):
     cases = [
-      ({"allowed_run_modes": ["forever"]}, "run_modes_invalid"),
-      ({"allowed_run_modes": ["continuous"]}, "run_modes_invalid"), ({"allowed_run_modes": []}, "run_modes_invalid"),
-      ({"allowed_run_modes": None}, "run_modes_invalid"), ({"display_name": ""}, "invalid_request"),
+      ({"display_name": ""}, "invalid_request"),
       ({"valid_until": "2026-09-01T00:00:00Z"}, "window_invalid"), ({"valid_from": "tomorrow"}, "window_invalid"),
       ({"roe": {"dos_allowed": True}}, "roe_invalid"), ({"roe": {"authenticated_action": "yes"}}, "roe_invalid"),
       ({"context": {"client_name": None}}, "context_invalid"),
@@ -229,7 +213,7 @@ class TestTenantEngagements(unittest.TestCase):
     self.refused(self.create(documents=[doc("3" * 64, "roe", title="Rules of engagement"), documents[1]]),
                  409, "conflict")
     self.refused(self.create(documents=[doc(SHA_ROE, "roe", title="SOW"), documents[1]]), 409, "conflict")
-    self.refused(self.create(allowed_run_modes=["single_pass"]), 409, "conflict")
+    self.refused(self.create(valid_until="2026-10-30T00:00:00Z"), 409, "conflict")
     self.refused(self.create(assets=list(reversed(self.fields()["assets"]))), 409, "conflict")
 
   def test_roles(self):
@@ -324,11 +308,10 @@ class TestEngagementTargetGrammar(unittest.TestCase):
   setUp = TestTenantEngagements.setUp
   new_tenant = TestTenantEngagements.new_tenant
   fields = TestTenantEngagements.fields
-  _TESTS = {"network": ["service_info_common"], "webapp": ["graybox"], "model": ["prompt_injection_v1"]}
 
   def create(self, target, display_name="Asset"):
     kind = target.get("kind") if isinstance(target, dict) else None
-    asset = {"display_name": display_name, "target": target, "authorized_tests": self._TESTS.get(kind, ["graybox"]),
+    asset = {"display_name": display_name, "target": target,
              **({"authorized_ports": "443"} if kind == "network" else {})}
     return self.service.create_engagement(**self.fields(request_id=str(uuid4()), assets=[asset], documents=[]))
 
@@ -416,8 +399,7 @@ class TestEngagementTargetGrammar(unittest.TestCase):
     network = {"kind": "network", "address": "192.0.2.10"}
 
     def create(ports):
-      asset = {"display_name": "Edge", "target": network, "authorized_ports": ports,
-               "authorized_tests": ["service_info_common"]}
+      asset = {"display_name": "Edge", "target": network, "authorized_ports": ports}
       return self.service.create_engagement(**self.fields(request_id=str(uuid4()), assets=[asset], documents=[]))
     created = create(" 8080, 1-1024,1000-1030 ,22 ")
     self.assertEqual(created["data"]["assets"][0]["authorizedPorts"], "1-1030,8080")

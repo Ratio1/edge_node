@@ -45,10 +45,10 @@ class TestTenantDelete(unittest.TestCase):
     self.plugin.configured_peers_reader = None
     refs = [self.upload("Rules of engagement"), self.upload("Scope email", kind="other", raw=PDF + b"2")]
     created = self.plugin.create_engagement(
-      self.actor, self.tenant, str(uuid4()), "Q4", ["single_pass"], "2026-10-01T00:00:00Z",
+      self.actor, self.tenant, str(uuid4()), "Q4", "2026-10-01T00:00:00Z",
       "2027-10-01T00:00:00Z", {}, {"client_name": "Example"},
       [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
-        "authorized_ports": "443", "authorized_tests": ["service_info_common"]}], refs)
+        "authorized_ports": "443"}], refs)
     self.assertTrue(created["success"], created)
     self.engagement_refs = refs
     self.events.clear()

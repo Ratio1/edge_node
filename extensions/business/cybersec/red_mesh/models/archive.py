@@ -141,7 +141,6 @@ class JobConfig:
   engagement_id: str = None
   engagement_hash: str = None
   contract_sha256: str = None
-  authorized_tests: list = None
   execution_binding: ExecutionBinding | None = None
 
   def __post_init__(self):
@@ -248,7 +247,6 @@ class JobConfig:
       engagement_id=d.get("engagement_id"),
       engagement_hash=d.get("engagement_hash"),
       contract_sha256=d.get("contract_sha256"),
-      authorized_tests=d.get("authorized_tests"),
     )
 
   # -- Phase 3 PR-3.3: convenience accessors for the typed shape --

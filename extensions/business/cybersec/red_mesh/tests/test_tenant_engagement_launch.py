@@ -47,8 +47,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertEqual(context["asset_target_digest"], self.engagement["assets"][0]["targetDigest"])
     self.assertEqual(context["engagement"], {
       "engagement_id": self.engagement["engagementId"], "engagement_hash": self.engagement["engagementHash"],
-      "contract_sha256": CONTRACT_SHA256, "allowed_run_modes": ["continuous", "single_pass"],
-      "authorized_tests": ["active_auth", "service_info_common"], "authorized_scan_modes": ["connect"],
+      "contract_sha256": CONTRACT_SHA256,
       "roe": {"authenticated_action": True, "stateful_probes_allowed": False, "ics_safe_mode_required": True},
       "context": self.engagement["context"],
       # RM-107: the signed basis is the tenant contract and its legal signer; the consents are
@@ -80,8 +79,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
   def test_webapp_admission_has_no_port_scope_or_scan_modes(self):
     context = self.admit(asset="ea_2").to_dict()
     self.assertNotIn("asset_authorized_ports", context)
-    self.assertNotIn("authorized_scan_modes", context["engagement"])
-    self.assertEqual(context["engagement"]["authorized_tests"], ["graybox"])
+    self.assertFalse(set(context["engagement"]) & {"authorized_tests", "authorized_scan_modes", "allowed_run_modes"})
 
   def test_the_binding_names_the_engagement_asset_and_keeps_policy_out(self):
     binding = self.admit().build_binding("launcher", ["node-a"]).to_dict()
@@ -94,7 +92,6 @@ class TestTenantEngagementLaunch(unittest.TestCase):
   def test_a_model_asset_is_admitted_with_its_question_sets(self):
     context = self.admit(asset="ea_3").to_dict()
     self.assertEqual(context["asset_target"]["kind"], "model")
-    self.assertEqual(context["engagement"]["authorized_tests"], ["prompt_injection_v1"])
     self.assertNotIn("asset_authorized_ports", context)
 
   def test_refusals(self):

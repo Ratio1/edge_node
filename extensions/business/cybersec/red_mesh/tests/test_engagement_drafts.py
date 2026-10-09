@@ -18,10 +18,9 @@ from .test_tenant_drafts import GENERATED_AT, PNG, SCHEDULE_PDF, SNAPSHOT, TENAN
 PACK_PDF = b"%PDF-1.7\n%fixture signed engagement pack\n%%EOF\n"
 GENERATED_PDF = b"%PDF-1.7\n%fixture generated engagement pack\n%%EOF\n"
 NETWORK = {"display_name": "Edge gateway", "target": {"kind": "network", "address": "192.0.2.10"},
-           "authorized_ports": "22,443", "authorized_tests": ["service_info_common"]}
-WEBAPP = {"display_name": "Portal", "target": {"kind": "webapp", "url": "https://app.example.com/", "allowedPathPrefix": "/"},
-          "authorized_tests": ["graybox"]}
-COMPLETE = {"display_name": " Q4 external ", "allowed_run_modes": ["single_pass"],
+           "authorized_ports": "22,443"}
+WEBAPP = {"display_name": "Portal", "target": {"kind": "webapp", "url": "https://app.example.com/", "allowedPathPrefix": "/"}}
+COMPLETE = {"display_name": " Q4 external ",
             "valid_from": "2026-10-01T00:00:00Z", "valid_until": "2026-10-31T00:00:00+00:00",
             "roe": {"authenticated_action": True}, "context": {"client_name": "Example"}, "assets": [NETWORK]}
 LIST_KEYS = {"engagement_draft_id", "parent", "display_name", "assets_count", "document_state", "created_at",
@@ -85,18 +84,17 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
     self.assertEqual(draft["engagement_draft_id"], "ted_" + request_id)
     self.assertEqual(draft["parent"], {"draft_id": parent})
     self.assertEqual(draft["display_name"], "Pack")
-    self.assertEqual((draft["allowed_run_modes"], draft["valid_from"], draft["valid_until"], draft["assets"]),
-                     ([], "", "", []))
+    self.assertEqual((draft["valid_from"], draft["valid_until"], draft["assets"]), ("", "", []))
+    self.assertNotIn("allowed_run_modes", draft)
     self.assertEqual(draft["roe"], ROE_DEFAULTS)
     self.assertIsInstance(draft["context"], dict)
     self.assertEqual(draft["document"], {"state": "missing", "document": None, "generated": None})
     self.assertEqual((draft["created_by"], draft["updated_by"]), ("creator", "creator"))
     self.assertEqual(draft["completeness"], {
       "complete": False,
-      "missing": ["field:allowed_run_modes", "field:valid_from", "field:valid_until", "field:assets",
-                  "item:engagement_pack"],
-      "reasons": {"allowed_run_modes": "run_modes_invalid", "valid_from": "window_invalid",
-                  "valid_until": "window_invalid", "assets": "engagement_asset_invalid"}})
+      "missing": ["field:valid_from", "field:valid_until", "field:assets", "item:engagement_pack"],
+      "reasons": {"valid_from": "window_invalid", "valid_until": "window_invalid",
+                  "assets": "engagement_asset_invalid"}})
     self.assertNotIn("schemaVersion", draft)
     self.assertEqual(ok(self, self.plugin.get_engagement_draft(self.actor, draft["engagement_draft_id"])), draft)
     # A replay answers the existing draft without a write, whatever else it sends.
@@ -142,8 +140,7 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
       "unknown key": ({"tenant_id": "tn_x"}, "invalid_request"),
       "name type": ({"display_name": 7}, "invalid_request"),
       "name long": ({"display_name": "x" * 121}, "invalid_request"),
-      "run mode": ({"allowed_run_modes": ["forever"]}, "run_modes_invalid"),
-      "run modes type": ({"allowed_run_modes": "single_pass"}, "run_modes_invalid"),
+      "run modes are gone": ({"allowed_run_modes": ["single_pass"]}, "invalid_request"),
       "instant": ({"valid_from": "tomorrow"}, "window_invalid"),
       "instant type": ({"valid_until": None}, "window_invalid"),
       "window order": ({"valid_until": "2026-09-01T00:00:00Z"}, "window_invalid"),
@@ -152,7 +149,10 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
       "context": ({"context": {"client_name": None}}, "context_invalid"),
       "asset ports": ({"assets": [{key: value for key, value in NETWORK.items() if key != "authorized_ports"}]},
                       "ports_required"),
-      "asset tests": ({"assets": [{**NETWORK, "authorized_tests": ["graybox"]}]}, "tests_invalid"),
+      "asset tests": ({"assets": [{**NETWORK, "authorized_tests": ["service_info_common"]}]},
+                      "engagement_asset_invalid"),
+      "asset scan modes": ({"assets": [{**NETWORK, "authorized_scan_modes": ["connect"]}]},
+                           "engagement_asset_invalid"),
       "asset target": ({"assets": [{**NETWORK, "target": {"kind": "network", "address": "bad host"}}]},
                        "asset_target_invalid"),
       "asset twice": ({"assets": [NETWORK, NETWORK]}, "engagement_asset_invalid"),
@@ -176,18 +176,15 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
     self.assertEqual(draft["roe"], {**ROE_DEFAULTS, "authenticated_action": True})
     self.assertEqual(draft["context"]["client_name"], "Example")
     asset = draft["assets"][0]
-    self.assertEqual((asset["engagement_asset_id"], asset["kind"], asset["authorized_ports"], asset["authorized_scan_modes"]),
-                     ("ea_1", "network", "22,443", ["connect"]))
+    self.assertEqual((asset["engagement_asset_id"], asset["kind"], asset["authorized_ports"]),
+                     ("ea_1", "network", "22,443"))
+    self.assertNotIn("authorized_scan_modes", asset)
+    self.assertNotIn("authorized_tests", asset)
     self.assertEqual(draft["completeness"], {"complete": False, "missing": ["item:engagement_pack"], "reasons": {}})
-    # Continuous without single pass is a format the normalizer accepts; completeness names it.
-    draft = ok(self, self.update_child(engagement_draft_id, {"allowed_run_modes": ["continuous"]}))
-    self.assertEqual(draft["completeness"]["missing"], ["field:allowed_run_modes", "item:engagement_pack"])
-    self.assertEqual(draft["completeness"]["reasons"], {"allowed_run_modes": "run_modes_invalid"})
     emptied = ok(self, self.update_child(engagement_draft_id, {
-      "display_name": "", "allowed_run_modes": [], "valid_from": "", "valid_until": "", "roe": None, "context": None,
+      "display_name": "", "valid_from": "", "valid_until": "", "roe": None, "context": None,
       "assets": []}, actor={"account_id": "other-sta"}))
-    self.assertEqual((emptied["display_name"], emptied["allowed_run_modes"], emptied["valid_from"], emptied["assets"]),
-                     ("", [], "", []))
+    self.assertEqual((emptied["display_name"], emptied["valid_from"], emptied["assets"]), ("", "", []))
     self.assertEqual(emptied["roe"], ROE_DEFAULTS)
     self.assertEqual((emptied["updated_by"], emptied["created_by"]), ("other-sta", "creator"))
     self.assertEqual(emptied["completeness"]["reasons"]["display_name"], "invalid_request")
@@ -494,14 +491,13 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     writes = len(self.store.writes)
     result = self.plugin.activate_engagement_draft(self.actor, engagement_draft_id)
     refused(self, result, 409, "draft_incomplete")
-    self.assertEqual(result["missing"], ["field:display_name", "field:allowed_run_modes", "field:valid_from",
+    self.assertEqual(result["missing"], ["field:display_name", "field:valid_from",
                                          "field:valid_until", "field:assets", "item:engagement_pack"])
     self.assertEqual(result["reasons"]["display_name"], "invalid_request")
-    self.fill(engagement_draft_id, allowed_run_modes=["continuous"])
+    self.fill(engagement_draft_id)
     result = self.plugin.activate_engagement_draft(self.actor, engagement_draft_id)
     refused(self, result, 409, "draft_incomplete")
-    self.assertEqual((result["missing"], result["reasons"]),
-                     (["field:allowed_run_modes", "item:engagement_pack"], {"allowed_run_modes": "run_modes_invalid"}))
+    self.assertEqual((result["missing"], result["reasons"]), (["item:engagement_pack"], {}))
     # The one write is the fill; neither refusal wrote.
     self.assertEqual(len(self.store.writes) - writes, 1)
     self.assertEqual(self.engagement_rows(), [])
@@ -520,8 +516,9 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     engagement, = self.engagement_rows()
     self.assertEqual((engagement["tenant_id"], engagement["engagement_id"], engagement["request_id"]),
                      (tenant_id, engagement_id, engagement_draft_id[4:]))
-    self.assertEqual((engagement["display_name"], engagement["allowed_run_modes"], engagement["valid_until"]),
-                     ("Q4 external", ["single_pass"], "2026-10-31T00:00:00Z"))
+    self.assertEqual((engagement["display_name"], engagement["valid_until"]),
+                     ("Q4 external", "2026-10-31T00:00:00Z"))
+    self.assertNotIn("allowed_run_modes", engagement)
     self.assertEqual(engagement["assets"], row["assets"])
     self.assertEqual((engagement["roe"], engagement["context"]), (row["roe"], row["context"]))
     self.assertEqual(engagement["documents"], [

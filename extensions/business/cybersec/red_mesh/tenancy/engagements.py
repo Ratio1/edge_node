@@ -4,7 +4,7 @@ An engagement is immutable: the only change after creation is a revoke. Its hash
 field a launch will rely on, with documents by SHA-256 (never by reference, so a re-upload of the
 same bytes is the same engagement). RM-107 (`redmesh.engagement/2`): the tenant contract is the
 permission, so there is no separate authorization document or typed signer; the engagement carries
-a set of titled documents and the run modes a launch may use. The on-chain anchor is not part of the
+a set of titled documents (RM-125: every test and both run modes are allowed, so it picks neither). The on-chain anchor is not part of the
 row: until a registry function exists every engagement's anchor is `pending`, and the follow-up
 keeps it in its own record so an anchor write can never race a revoke.
 """
@@ -14,20 +14,16 @@ import re
 from .assets import (canonical_digest, canonical_uuid, normalize_name, normalize_port_scope,
                      normalize_target, valid_digest)
 from .identity import canonical_account_id
-from ..constants import FEATURE_CATALOG, RUN_MODE_CONTINUOUS_MONITORING, RUN_MODE_SINGLEPASS
+from ..constants import FEATURE_CATALOG
 from ..models.engagement import Contact, EngagementContext
 
-# RM-107. The engagement's vocabulary, and the launch `run_mode` value each one allows.
-RUN_MODES = ("continuous", "single_pass")
-RUN_MODE_LAUNCH_VALUES = {"single_pass": RUN_MODE_SINGLEPASS, "continuous": RUN_MODE_CONTINUOUS_MONITORING}
 # `agreement`: signed between the client and the Super-Tenant (RoE, SOW, contract annex, permission
 # letter; the title says which). `third_party_consent`: a hosting, cloud or MSSP consent.
 DOCUMENT_KINDS = ("agreement", "other", "third_party_consent")
 MAX_ENGAGEMENT_DOCUMENTS = 20
 _DOCUMENT_TITLE_MAX = 200
 _DOCUMENT_COMMENT_MAX = 2000
-SCAN_MODES = ("connect", "syn")
-DEFAULT_SCAN_MODES = ("connect",)
+SCAN_MODES = ("connect", "syn")  # launch vocabulary; an engagement no longer picks (RM-125)
 ROE_DEFAULTS = {"authenticated_action": False, "stateful_probes_allowed": False,
                 "ics_safe_mode_required": True}
 # The asset kinds an engagement owns (RM-107). Scan categories mirror
@@ -37,7 +33,8 @@ _KIND_CATEGORIES = {"network": ("service", "web", "correlation"), "webapp": ("gr
 ENGAGEMENT_ASSET_KINDS = ("model", "network", "webapp")
 MAX_ENGAGEMENT_ASSETS = 64
 _ASSET_NAME_MAX = 200
-HASH_SCHEMA = "redmesh.engagement/2"
+# RM-125: /3 drops the per-engagement test, scan-mode and run-mode picks (every test, both run modes).
+HASH_SCHEMA = "redmesh.engagement/3"
 # v1 fields a v2 row can never carry: their presence means a v1 record (refused, never migrated).
 _V1_FIELDS = ("engagement_kind", "roe_document", "authorization_document")
 
@@ -144,13 +141,6 @@ def normalize_window(valid_from, valid_until):
   return start, end
 
 
-def normalize_run_modes(value):
-  if (not isinstance(value, list) or not value or not all(isinstance(mode, str) for mode in value)
-      or len(set(value)) != len(value) or any(mode not in RUN_MODES for mode in value)):
-    raise EngagementInvalid("run_modes_invalid")
-  return sorted(value)
-
-
 def normalize_document_labels(kind, title, comment):
   """A document's kind, title and comment as stored and hashed; every refusal is `document_invalid`."""
   if kind not in DOCUMENT_KINDS:
@@ -169,24 +159,6 @@ def normalize_document_labels(kind, title, comment):
   if len(comment) > _DOCUMENT_COMMENT_MAX:
     raise EngagementInvalid("document_invalid")
   return {"kind": kind, "title": title, "comment": comment}
-
-
-def normalize_scan_modes(value):
-  if value is None:
-    return list(DEFAULT_SCAN_MODES)
-  if (not isinstance(value, list) or not value or not all(isinstance(mode, str) for mode in value)
-      or len(set(value)) != len(value) or any(mode not in SCAN_MODES for mode in value)):
-    raise EngagementInvalid("engagement_asset_invalid")
-  return sorted(value)
-
-
-def normalize_tests(kind, value):
-  if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
-    raise EngagementInvalid("tests_invalid")
-  allowed = feature_ids_for_kind(kind)
-  if len(set(value)) != len(value) or any(item not in allowed for item in value):
-    raise EngagementInvalid("tests_invalid")
-  return sorted(value)
 
 
 def valid_doc_ref(value, *, labels=False, stored=False):
@@ -217,11 +189,10 @@ def normalize_engagement_asset(index, entry):
   """One requested asset as stored and hashed: the target is defined here, never read from a row.
 
   The kind is the target's. A network asset always ends with an explicit port scope, so a signed
-  engagement never means "any port"; scan modes and ports apply to network assets only.
+  engagement never means "any port"; ports apply to network assets only.
   """
   if (not isinstance(entry, dict)
-      or not set(entry) <= {"display_name", "target", "authorized_ports", "authorized_scan_modes",
-                            "authorized_tests"}):
+      or not set(entry) <= {"display_name", "target", "authorized_ports"}):
     raise EngagementInvalid("engagement_asset_invalid")
   try:
     display_name = normalize_name(entry.get("display_name"), _ASSET_NAME_MAX)
@@ -233,10 +204,9 @@ def normalize_engagement_asset(index, entry):
     raise EngagementInvalid("asset_target_invalid") from None
   kind = target["kind"]
   stored = {"engagement_asset_id": engagement_asset_id_for(index), "display_name": display_name,
-            "kind": kind, "target": target, "target_digest": canonical_digest(target),
-            "authorized_tests": normalize_tests(kind, entry.get("authorized_tests"))}
+            "kind": kind, "target": target, "target_digest": canonical_digest(target)}
   if kind != "network":
-    if "authorized_ports" in entry or "authorized_scan_modes" in entry:
+    if "authorized_ports" in entry:
       raise EngagementInvalid("engagement_asset_invalid")
     return stored
   try:
@@ -245,8 +215,7 @@ def normalize_engagement_asset(index, entry):
     raise EngagementInvalid("engagement_asset_invalid") from None
   if ports is None:  # absent, None or blank
     raise EngagementInvalid("ports_required")
-  return {**stored, "authorized_ports": ports,
-          "authorized_scan_modes": normalize_scan_modes(entry.get("authorized_scan_modes"))}
+  return {**stored, "authorized_ports": ports}
 
 
 def normalize_engagement_assets(value):
@@ -275,32 +244,23 @@ def _documents_valid(documents):
   return len({document["sha256"] for document in documents}) == len(documents)
 
 
-def _stored_tests_valid(tests):
-  # Shape only: catalog membership was checked at creation, and a later catalog change must not
-  # make an immutable, hashed record unreadable. Launch re-checks membership (phase 3).
-  return (isinstance(tests, list) and bool(tests) and all(isinstance(item, str) and item for item in tests)
-          and tests == sorted(set(tests)))
-
-
 def _asset_entry_valid(index, entry):
   if not isinstance(entry, dict) or not isinstance(entry.get("kind"), str):
     return False
   kind = entry["kind"]
-  common = {"engagement_asset_id", "display_name", "kind", "target", "target_digest", "authorized_tests"}
-  expected = common | ({"authorized_ports", "authorized_scan_modes"} if kind == "network" else set())
+  common = {"engagement_asset_id", "display_name", "kind", "target", "target_digest"}
+  expected = common | ({"authorized_ports"} if kind == "network" else set())
   if kind not in ENGAGEMENT_ASSET_KINDS or set(entry) != expected:
     return False
   try:
     if (entry["engagement_asset_id"] != engagement_asset_id_for(index)
         or normalize_name(entry["display_name"], _ASSET_NAME_MAX) != entry["display_name"]
         or normalize_target(entry["target"]) != entry["target"] or entry["target"]["kind"] != kind
-        or canonical_digest(entry["target"]) != entry["target_digest"]
-        or not _stored_tests_valid(entry["authorized_tests"])):
+        or canonical_digest(entry["target"]) != entry["target_digest"]):
       return False
     if kind == "network":
       return (entry["authorized_ports"] is not None
-              and normalize_port_scope(entry["authorized_ports"]) == entry["authorized_ports"]
-              and normalize_scan_modes(entry["authorized_scan_modes"]) == entry["authorized_scan_modes"])
+              and normalize_port_scope(entry["authorized_ports"]) == entry["authorized_ports"])
   except (ValueError, TypeError, EngagementInvalid):
     return False
   return True
@@ -310,7 +270,7 @@ def hashed_fields(record):
   """The exact content the engagement hash commits to (and RM-068 will later sign)."""
   return {
     "schema": HASH_SCHEMA, "tenant_id": record["tenant_id"], "engagement_id": record["engagement_id"],
-    "display_name": record["display_name"], "allowed_run_modes": record["allowed_run_modes"],
+    "display_name": record["display_name"],
     "valid_from": record["valid_from"], "valid_until": record["valid_until"],
     "contract_sha256": record["contract_sha256"],
     # Content, never position: the same files with the same labels are the same engagement.
@@ -345,8 +305,6 @@ def validate_engagement(row, ids):
       or ids[1] != engagement_id_for(row.get("request_id"))
       or type(row.get("active")) is not bool
       or normalize_name(row.get("display_name")) != row["display_name"]
-      or not isinstance(row.get("allowed_run_modes"), list)
-      or normalize_run_modes(row["allowed_run_modes"]) != row["allowed_run_modes"]
       or normalize_window(row.get("valid_from"), row.get("valid_until"))
          != (row["valid_from"], row["valid_until"])
       or not valid_digest(row.get("contract_sha256"))
