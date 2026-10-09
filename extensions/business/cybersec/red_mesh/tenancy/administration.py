@@ -17,6 +17,7 @@ from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_o
 from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
 from .nodes import NODE_ASSIGNMENT_MODES, node_assignment_mode, valid_node_address
+from .deployment_nodes import named_entry
 from .assets import canonical_digest, normalize_name, valid_digest
 from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
@@ -143,10 +144,15 @@ def _same_contract(stored, requested):
 
 
 class TenantAdministrationService:
-  def __init__(self, accounts, store, configured_peers_reader=None, tenant_node_jobs_reader=None):
+  def __init__(self, accounts, store, configured_peers_reader=None, tenant_node_jobs_reader=None,
+               node_directory_reader=None):
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
+    # RM-126: `[address] -> {address: {"alias", "tags"}}`, the network monitor's names for the
+    # configured peers. Injected like `configured_peers_reader`; it only decorates reads, so a
+    # missing or failing reader names nothing and never fails a read.
+    self.node_directory_reader = node_directory_reader
     # RM-102: `(tenant_id, node_address) -> bool`, whether the tenant still has a running job on
     # the node. Injected like `configured_peers_reader`; a draining row is read at every point that
     # matters, never written by a background sweep.
@@ -640,14 +646,29 @@ class TenantAdministrationService:
       return True
     return self._tenant_node_has_jobs(tenant_id, row["node_address"])
 
-  def _configured_peers(self):
+  def _configured_peer_list(self):
+    """The configured peers, validated, in configured order (RM-126 lists them in that order)."""
     try:
       configured = self.configured_peers_reader()
     except Exception as exc:
       raise TenantStoreError("Node eligibility is unavailable") from exc
     if not isinstance(configured, list) or any(not valid_node_address(peer) for peer in configured):
       raise TenantStoreError("Node eligibility is unavailable")
-    return set(configured)
+    return list(configured)
+
+  def _configured_peers(self):
+    return set(self._configured_peer_list())
+
+  def _node_directory(self, addresses):
+    """RM-126: names for `addresses` from the injected reader; nothing on a missing or failing one."""
+    addresses = list(addresses)
+    if self.node_directory_reader is None or not addresses:
+      return {}
+    try:
+      directory = self.node_directory_reader(addresses)
+    except Exception:
+      return {}
+    return directory if isinstance(directory, dict) else {}
 
   def _launch_eligible_nodes(self, tenant_id):
     """RM-102: a launch never starts on a draining row, whatever a (possibly stale) job check
@@ -808,10 +829,25 @@ class TenantAdministrationService:
     assignments = self.store.list_node_assignments(tenant_id)
     nodes = [self._tenant_node_row(tenant_id, row) for row in
              sorted(assignments, key=lambda row: row["node_address"])]
-    return {"tenantId": tenant_id, "nodes": [node for node in nodes if node is not None],
+    nodes = [node for node in nodes if node is not None]
+    # RM-126: the tenant's own nodes carry their name and tags, under the read the caller already has.
+    directory = self._node_directory(node["nodeAddress"] for node in nodes)
+    return {"tenantId": tenant_id,
+            "nodes": [{**node, **named_entry(directory, node["nodeAddress"])} for node in nodes],
             "canManageAssignments": authorize_tenant_operation(
               account, "node_assignments:manage", TenantPolicyContext(
                 tenant_id, tenant["active"], tenant["allow_pentester"])).allowed}
+
+  @_endpoint
+  def list_deployment_nodes(self, actor):
+    """RM-126: the configured peers, in configured order, each with the network monitor's alias and
+    tags (`alias` null when the node has not seen the peer). A full-portfolio Super-Tenant Admin
+    read: this is the deployment's whole node list, which no tenant-scoped read or error carries.
+    A malformed configuration is unavailable, as for eligibility."""
+    self._actor(actor, creator=True)
+    peers = self._configured_peer_list()
+    directory = self._node_directory(peers)
+    return {"nodes": [{"nodeAddress": peer, **named_entry(directory, peer)} for peer in peers]}
 
   @staticmethod
   def _permission(account, tenant, operation):
