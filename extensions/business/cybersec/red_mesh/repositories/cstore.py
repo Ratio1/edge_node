@@ -166,8 +166,8 @@ class JobStateRepository:
 
   def put_node_info(self, node_address, value):
     # A short, single attempt: the publish runs inside `process()` and is retried by the caller.
-    self.owner.chainstore_hset(hkey=self._node_info_hkey, key=node_address, value=value, timeout=2, max_retries=0)
-    return value
+    # `chainstore_hset` answers False for an unconfirmed write; the caller retries on it.
+    return self.owner.chainstore_hset(hkey=self._node_info_hkey, key=node_address, value=value, timeout=2, max_retries=0)
 
   @staticmethod
   def _safe_int(value, default=0):

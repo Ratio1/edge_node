@@ -32,6 +32,8 @@ class TestNodeInfoPublish(unittest.TestCase):
       if self.fail:
         raise RuntimeError("cstore down")
       self.writes.append((hkey, key, value, kwargs))
+      return self.confirmed
+    self.confirmed = True
     self.plugin.chainstore_hset = hset
 
   def tick(self, seconds=0):
@@ -73,6 +75,18 @@ class TestNodeInfoPublish(unittest.TestCase):
     self.assertEqual(self.writes, [])
     self.tick(30)
     self.assertEqual(len(self.writes), 1)
+
+  def test_an_unconfirmed_write_is_retried_after_the_short_delay(self):
+    self.confirmed = False
+    self.tick()
+    self.assertEqual((len(self.writes), len(self.logged)), (1, 1))
+    self.confirmed = True
+    self.tick(30)
+    self.assertEqual(len(self.writes), 1)
+    self.tick(30)
+    self.assertEqual(len(self.writes), 2)
+    self.tick(60)
+    self.assertEqual(len(self.writes), 2)
 
   def test_the_registry_reads_the_hash_and_keeps_the_names_when_it_cannot(self):
     self.plugin.chainstore_hgetall = lambda hkey: {"0xai_rm3": {"ip": PUBLIC, "published_at":
