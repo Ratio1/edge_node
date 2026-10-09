@@ -55,6 +55,8 @@ class TestTenantPolicy(unittest.TestCase):
       ("reports:export",          (True, True, True, True, False)),
       ("evidence:read",           (True, True, False, False, False)),
       ("audit:view",              (True, False, True, False, False)),
+      # RM-125: only the Super-Tenant Admin registers assets.
+      ("assets:manage",           (True, False, False, False, False)),
     )
     for operation, expected in rows:
       for role, allowed in zip(roles, expected):

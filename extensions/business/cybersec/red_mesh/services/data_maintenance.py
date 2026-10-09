@@ -57,7 +57,7 @@ _PER_JOB = (
   (":report_review:audit", list, False),
 )
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
-                  "engagement_draft", "super_tenant_profile")
+                  "engagement_draft", "super_tenant_profile", "tenant_asset")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -292,9 +292,10 @@ class Inventory:
       # call every draft an orphan. Current while the store reads it, never orphan or old_tenant.
       # RM-110: the same for the deployment's one super-tenant profile row.
       return CURRENT, ""
-    if kind == "engagement_draft":
+    if kind in ("engagement_draft", "tenant_asset"):
       # RM-109 phase 4: current while its parent exists (a tenant draft row, or a live tenant); a
       # tenant deleted with children under it leaves them `parent_gone`. Never old_tenant.
+      # RM-125: a tenant asset has the same parent.
       parent = row["parent"]
       if "tenant_id" in parent:
         present = parent["tenant_id"] in self._live_tenants()

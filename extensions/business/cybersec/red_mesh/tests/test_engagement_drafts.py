@@ -646,7 +646,8 @@ class TestTenantDraftCascade(_EngagementDraftCase):
       delete(ref)
     self.documents.delete = observed_delete
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, parent))
-    self.assertEqual(data, {"draft_id": parent, "files_deleted": 3, "engagement_drafts_deleted": 2})
+    self.assertEqual(data, {"draft_id": parent, "files_deleted": 3, "engagement_drafts_deleted": 2,
+                            "assets_deleted": 0})
     # Children's files (the parent row still there), their rows, then the parent's own file and row.
     self.assertEqual(order[:2], [("doc-2", True, True), ("doc-3", True, False)])
     self.assertEqual(order[2][:2], ("doc-1", True))
@@ -655,7 +656,8 @@ class TestTenantDraftCascade(_EngagementDraftCase):
       self.assertIsNone(self.stored_child(engagement_draft_id))
     self.assertIsNone(self.stored(parent))
     self.assertEqual(self.events[-1], ("tenant_draft_deleted", {
-      "draft_id": parent, "actor": "creator", "files_deleted": 3, "engagement_drafts_deleted": 2}))
+      "draft_id": parent, "actor": "creator", "files_deleted": 3, "engagement_drafts_deleted": 2,
+      "assets_deleted": 0}))
 
   def test_a_child_created_meanwhile_is_a_conflict_and_a_failed_child_file_keeps_everything(self):
     parent = self.create()["draft_id"]
@@ -684,7 +686,8 @@ class TestTenantDraftCascade(_EngagementDraftCase):
       return call(operation, actor, **kwargs)
     self.plugin._call_tenant_administration = racing
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, parent))
-    self.assertEqual(data, {"draft_id": parent, "files_deleted": 2, "engagement_drafts_deleted": 1})
+    self.assertEqual(data, {"draft_id": parent, "files_deleted": 2, "engagement_drafts_deleted": 1,
+                            "assets_deleted": 0})
     self.assertIsNone(self.stored(parent))
     self.assertIsNone(self.stored_child(engagement_draft_id))
 

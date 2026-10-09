@@ -337,6 +337,34 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage.data[(TENANCY, under_tenant)]["document"]["state"] = "done"
     self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
 
+  def tenant_asset_row(self, parent, address):
+    """RM-125. A tenant asset written through the real endpoint."""
+    created = self.plugin.create_tenant_asset(self.actor, parent, str(uuid4()), "Host",
+                                              {"kind": "network", "address": address})
+    self.assertTrue(created["success"], created)
+    self.events.clear()
+    return json.dumps(["tenant_asset", "deployment", created["data"]["asset_id"]], separators=(",", ":"))
+
+  def test_a_tenant_asset_is_current_with_a_live_parent_and_parent_gone_without(self):
+    parent = self.draft_row()
+    under_draft = self.tenant_asset_row(json.loads(parent)[2], "192.0.2.30")
+    under_tenant = self.tenant_asset_row(self.tenant, "192.0.2.31")
+    rows = self.scan()
+    for field in (under_draft, under_tenant):
+      row = rows[(TENANCY, field)]
+      self.assertEqual((row["class"], row["reason"], row["cids"]), ("current", "", []), field)
+      self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    del self.storage.data[(TENANCY, parent)]
+    row = self.scan()[(TENANCY, under_draft)]
+    self.assertEqual((row["class"], row["reason"]), ("orphan", "parent_gone"))
+    self.assertEqual(self.clean(row)[0]["outcome"], "deleted")
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "parent_gone")
+    # A malformed asset is old/unrecognized, whatever its parent.
+    self.storage.data[(TENANCY, under_tenant)]["target_digest"] = "0" * 64
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
+
   def test_the_super_tenant_profile_is_current_and_cleanup_keeps_it(self):
     # RM-110: one row per deployment, no tenant and no file; never an orphan of a tenant it is not.
     updated = self.plugin.update_super_tenant_profile(self.actor, {"legal_name": "RedMesh SRL"})

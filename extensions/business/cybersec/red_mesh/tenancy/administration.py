@@ -24,7 +24,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_context, normalize_engagement_assets, normalize_roe,
                           normalize_run_modes, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import drafts, engagement_drafts, super_tenant_profile
+from . import drafts, engagement_drafts, super_tenant_profile, tenant_assets
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -1336,10 +1336,14 @@ class TenantAdministrationService:
       for record_ids in ids:
         self.store.delete(kind, *record_ids)
       counts[kind] = len(ids)
+    # RM-125: the assets name their tenant in the row, not the key; found unvalidated, as above.
+    asset_ids = self.store.child_record_ids("tenant_asset", {"tenant_id": tenant_id})
+    for record_ids in asset_ids:
+      self.store.delete("tenant_asset", *record_ids)
     self.store.delete("receipt", tenant["actor_id"], tenant["request_id"])
     self.store.delete("tenant", tenant_id)
     return {"tenantId": tenant_id, "deleted": True, "engagements": counts["engagement"],
-            "integrations": counts["integration"],
+            "integrations": counts["integration"], "assets": len(asset_ids),
             "nodeAssignments": counts["tenant_node"],
             "documents": len(tenant["deleting"]["deleted_refs"])}
 
@@ -1535,8 +1539,12 @@ class TenantAdministrationService:
     if (not set(drafts.document_refs(row)) <= set(deleted_refs)
         or self._engagement_draft_children({"draft_id": draft_id})):
       raise AdministrationDenied(409, "conflict")
+    # RM-125: the draft's assets hold no file; they go with the draft.
+    asset_ids = self.store.child_record_ids("tenant_asset", {"draft_id": draft_id})
+    for record_ids in asset_ids:
+      self.store.delete("tenant_asset", *record_ids)
     self.store.delete("tenant_draft", draft_id)
-    return {"draft_id": draft_id}
+    return {"draft_id": draft_id, "assets_deleted": len(asset_ids)}
 
   @_endpoint
   def release_tenant_draft_activation(self, actor, draft_id):
@@ -1615,6 +1623,9 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "activation_not_complete")
     for child in self._engagement_draft_children({"draft_id": draft_id}):
       self._write_engagement_draft({**child, "parent": {"tenant_id": tenant["tenant_id"]}}, account)
+    # RM-125: the draft's assets become the tenant's the same way.
+    for asset in self._tenant_asset_children({"draft_id": draft_id}):
+      self._write_tenant_asset({**asset, "parent": {"tenant_id": tenant["tenant_id"]}}, account)
     self.store.delete("tenant_draft", draft_id)
     return {"draft_id": draft_id, "tenant_id": tenant["tenant_id"]}
 
@@ -1758,6 +1769,145 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "conflict")
     self.store.delete("engagement_draft", engagement_draft_id)
     return {"engagement_draft_id": engagement_draft_id}
+
+  # RM-125: tenant assets, registered before an engagement picks them, under a live tenant or a
+  # tenant draft. Writes: the Super-Tenant Admin only (`assets:manage` on a tenant; the draft rule,
+  # full-portfolio Super-Tenant Admin, on a tenant draft, refused `draft_locked` while its marker is
+  # set). Reads: every tenant role on a tenant (`reports:view`), the draft rule on a draft. A write
+  # answers `{asset, changed}`: the plugin audits only a write that changed the row.
+
+  def _asset_parent(self, actor, parent, operation, present=True):
+    """`(account, parent, can_manage)` for a parent id; `operation` is `assets:manage` or
+    `reports:view`. With `present`, a draft parent must exist (and be unlocked for a write)."""
+    if drafts.valid_draft_id(parent):
+      account = self._actor(actor, creator=True)
+      if present:
+        if operation == "assets:manage":
+          self._unlocked_tenant_draft(parent)
+        else:
+          self._tenant_draft(parent)
+      return account, {"draft_id": parent}, True
+    if engagement_drafts.valid_tenant_id(parent):
+      tenant, account = self._authorized_tenant(actor, parent, operation)
+      return account, {"tenant_id": parent}, self._permission(account, tenant, "assets:manage")
+    raise AdministrationDenied(400, "invalid_request")
+
+  @staticmethod
+  def _parent_id(parent):
+    return parent.get("draft_id") or parent.get("tenant_id")
+
+  def _tenant_asset(self, actor, asset_id, operation):
+    """The stored asset and the caller's `(account, can_manage)` on its parent."""
+    if not tenant_assets.valid_asset_id(asset_id):
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("tenant_asset", asset_id)
+    if row is None:
+      raise AdministrationDenied(404, "asset_not_found")
+    account, _, manage = self._asset_parent(actor, self._parent_id(row["parent"]), operation)
+    return row, account, manage
+
+  def _tenant_asset_children(self, parent):
+    return [row for row in self.store.list_tenant_assets() if row["parent"] == parent]
+
+  def _asset_link_sources(self, parent):
+    """The engagements and engagement drafts an asset of `parent` can be linked from: a tenant's
+    engagements whatever their state, and the engagement drafts under the same parent."""
+    engagements = self.store.list_engagements(parent["tenant_id"]) if "tenant_id" in parent else []
+    return engagements, self._engagement_draft_children(parent)
+
+  def _asset_dto(self, row, sources=None):
+    engagements, children = sources if sources is not None else self._asset_link_sources(row["parent"])
+    return tenant_assets.asset_dto(row, tenant_assets.links(row["asset_id"], engagements, children, self.clock()))
+
+  def _asset_linked(self, row):
+    """Referenced by any engagement or engagement draft: the target is locked, no delete."""
+    engagements, children = self._asset_link_sources(row["parent"])
+    return any(tenant_assets.entry_references(source["assets"], row["asset_id"])
+               for source in (*engagements, *children))
+
+  def _check_asset_unique(self, row):
+    if any(other["asset_id"] != row["asset_id"] and other["target_digest"] == row["target_digest"]
+           for other in self._tenant_asset_children(row["parent"])):
+      raise AdministrationDenied(409, "asset_duplicate")
+
+  def _write_tenant_asset(self, row, account, previous=None):
+    """Write a changed row with its attribution; an unchanged one is not written."""
+    if previous is not None and row == previous:
+      return previous
+    row = {**row, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("tenant_asset", row["asset_id"], record=row)
+    return self.store.get("tenant_asset", row["asset_id"])
+
+  @_endpoint
+  def create_tenant_asset(self, actor, parent, request_id, display_name, target, notes=""):
+    account, parent, _ = self._asset_parent(actor, parent, "assets:manage")
+    asset_id = tenant_assets.asset_id_for(_request_id(request_id))
+    existing = self.store.get("tenant_asset", asset_id)
+    if existing is not None:
+      # A replay answers the stored row; the same id under another parent is not a replay.
+      if existing["parent"] != parent:
+        raise AdministrationDenied(409, "conflict")
+      return {"asset": self._asset_dto(existing), "changed": False}
+    try:
+      row = tenant_assets.new_asset(asset_id, parent, display_name, target, notes, account.account_id,
+                                    datetime.now(timezone.utc).isoformat())
+    except tenant_assets.TenantAssetInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    self._check_asset_unique(row)
+    self.store.put("tenant_asset", asset_id, record=row)
+    return {"asset": self._asset_dto(self.store.get("tenant_asset", asset_id)), "changed": True}
+
+  @_endpoint
+  def update_tenant_asset(self, actor, asset_id, changes):
+    """Name and notes always; the target only while no engagement or engagement draft names it."""
+    previous, account, _ = self._tenant_asset(actor, asset_id, "assets:manage")
+    try:
+      row = tenant_assets.apply_changes(previous, changes)
+    except tenant_assets.TenantAssetInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    if row["target_digest"] != previous["target_digest"]:
+      if self._asset_linked(previous):
+        raise AdministrationDenied(409, "asset_linked")
+      self._check_asset_unique(row)
+    return {"asset": self._asset_dto(self._write_tenant_asset(row, account, previous)), "changed": row != previous}
+
+  @_endpoint
+  def archive_tenant_asset(self, actor, asset_id, archived):
+    """Archived assets are hidden from the pickers and refused on new entries; reversible."""
+    if type(archived) is not bool:
+      raise AdministrationDenied(400, "invalid_request")
+    previous, account, _ = self._tenant_asset(actor, asset_id, "assets:manage")
+    if (previous["archived_at"] is not None) == archived:
+      return {"asset": self._asset_dto(previous), "changed": False}
+    marker = ({"archived_at": datetime.now(timezone.utc).isoformat(), "archived_by": account.account_id}
+              if archived else {"archived_at": None, "archived_by": None})
+    return {"asset": self._asset_dto(self._write_tenant_asset({**previous, **marker}, account, previous)),
+            "changed": True}
+
+  @_endpoint
+  def delete_tenant_asset(self, actor, asset_id):
+    row, account, _ = self._tenant_asset(actor, asset_id, "assets:manage")
+    if self._asset_linked(row):
+      raise AdministrationDenied(409, "asset_linked")
+    self.store.delete("tenant_asset", asset_id)
+    return {"asset_id": asset_id, "parent": row["parent"], "deleted": True, "deleted_by": account.account_id}
+
+  @_endpoint
+  def list_tenant_assets(self, actor, parent, include_archived=False):
+    """The parent's assets by name; a tenant draft that does not exist has none."""
+    if type(include_archived) is not bool:
+      raise AdministrationDenied(400, "invalid_request")
+    _, parent, manage = self._asset_parent(actor, parent, "reports:view", present=False)
+    rows = [row for row in self._tenant_asset_children(parent)
+            if include_archived or row["archived_at"] is None]
+    rows.sort(key=lambda row: (row["display_name"].casefold(), row["asset_id"]))
+    sources = self._asset_link_sources(parent)
+    return {"assets": [self._asset_dto(row, sources) for row in rows], "can_manage": manage}
+
+  @_endpoint
+  def get_tenant_asset(self, actor, asset_id):
+    row, _, manage = self._tenant_asset(actor, asset_id, "reports:view")
+    return {"asset": self._asset_dto(row), "can_manage": manage}
 
   # RM-110: the generated pack (`store_generated_document`), one operation for both draft kinds. The
   # same split as the uploads: the plugin stores the bytes (with the snapshot, one envelope) outside

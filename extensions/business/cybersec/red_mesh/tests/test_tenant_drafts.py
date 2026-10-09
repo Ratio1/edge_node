@@ -526,13 +526,15 @@ class TestDraftDocuments(_DraftCase):
       delete(ref)
     self.documents.delete = observed_delete
     data = ok(self, self.plugin.delete_tenant_draft(self.actor, draft_id))
-    self.assertEqual(data, {"draft_id": draft_id, "files_deleted": 1, "engagement_drafts_deleted": 0})
+    self.assertEqual(data, {"draft_id": draft_id, "files_deleted": 1, "engagement_drafts_deleted": 0,
+                            "assets_deleted": 0})
     self.assertEqual(present, [True])
     self.assertEqual(self.documents.deleted, ["doc-1"])
     self.assertIsNone(self.stored(draft_id))
     refused(self, self.plugin.get_tenant_draft(self.actor, draft_id), 404, "not_found")
     self.assertEqual(self.events, [("tenant_draft_deleted", {"draft_id": draft_id, "actor": "creator",
-                                                             "files_deleted": 1, "engagement_drafts_deleted": 0})])
+                                                             "files_deleted": 1, "engagement_drafts_deleted": 0,
+                                                             "assets_deleted": 0})])
 
   def test_a_failed_file_delete_keeps_the_record_for_a_retry(self):
     draft_id = self.create()["draft_id"]

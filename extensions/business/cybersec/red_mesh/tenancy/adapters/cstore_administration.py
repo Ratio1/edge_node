@@ -11,6 +11,7 @@ from ..engagements import validate_engagement
 from ..drafts import validate_tenant_draft
 from ..engagement_drafts import validate_engagement_draft
 from ..super_tenant_profile import validate_super_tenant_profile
+from ..tenant_assets import validate_tenant_asset
 
 MAX_ENUMERATED_RECORDS = 10000
 # RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
@@ -18,8 +19,9 @@ MAX_ENUMERATED_RECORDS = 10000
 # RM-109: `tenant_draft` is keyed by its draft id alone; a draft has no tenant. `engagement_draft`
 # is keyed by its own id too; its parent (a tenant draft or a tenant) is a field of the row.
 # RM-110: `super_tenant_profile` is one row per deployment, keyed by the fixed id `deployment`.
+# RM-125: `tenant_asset` is keyed by its own id, its parent a field of the row (as `engagement_draft`).
 _KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
-                    "engagement_draft", "super_tenant_profile"})
+                    "engagement_draft", "super_tenant_profile", "tenant_asset"})
 
 
 class CstoreTenantAdministrationStore:
@@ -82,6 +84,11 @@ class CstoreTenantAdministrationStore:
         validate_engagement_draft(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid engagement draft storage record") from exc
+    if kind == "tenant_asset":
+      try:
+        validate_tenant_asset(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid tenant asset storage record") from exc
     if kind == "super_tenant_profile":
       try:
         validate_super_tenant_profile(raw, ids)
@@ -218,6 +225,23 @@ class CstoreTenantAdministrationStore:
     """RM-109 phase 4. Every engagement draft of the namespace (the parent is a field, not a key),
     the same way."""
     return [self._validate(raw, "engagement_draft", ids) for ids, raw in self._fields("engagement_draft")]
+
+  def list_tenant_assets(self):
+    """RM-125. Every tenant asset of the namespace (the parent is a field), as the engagement drafts."""
+    return [self._validate(raw, "tenant_asset", ids) for ids, raw in self._fields("tenant_asset")]
+
+  def child_record_ids(self, kind, parent):
+    """RM-125. The ids of the rows of one kind whose `parent` field equals `parent`, without
+    validating them, so a tenant delete also clears a row the current validator refuses."""
+    found = []
+    for ids, raw in self._fields(kind):
+      try:
+        decoded = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+      except (ValueError, UnicodeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid tenant storage record") from exc
+      if isinstance(decoded, dict) and decoded.get("parent") == parent:
+        found.append(ids)
+    return found
 
   def list_tenants(self):
     rows = []
