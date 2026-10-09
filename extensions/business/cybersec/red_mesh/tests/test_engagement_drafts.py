@@ -517,6 +517,24 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
                      [("engagement", engagement["engagement_id"])])
     self.assertEqual(linked["display_name"], "Renamed")
 
+  def test_a_draft_save_keeps_its_copy_of_a_held_asset_and_changes_only_its_ports(self):
+    # Contract: to take a newer copy into a draft, remove and re-pick the asset.
+    _, tenant_id = self.active_tenant()
+    engagement_draft_id = self.ready_child(tenant_id)
+    asset_id = self.asset_in(tenant_id)
+    drafted = self.stored_child(engagement_draft_id)["assets"]
+    ok(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"display_name": "Renamed"}))
+    ok(self, self.plugin.archive_tenant_asset(self.actor, asset_id, True))
+    ok(self, self.update_child(engagement_draft_id, {"assets": [pick(asset_id, "22")]}))
+    kept = self.stored_child(engagement_draft_id)["assets"]
+    self.assertEqual(kept, [{**drafted[0], "authorized_ports": "22"}])
+    # Re-picked (removed, then picked again): the archived asset is refused, a live one is re-copied.
+    ok(self, self.update_child(engagement_draft_id, {"assets": []}))
+    refused(self, self.update_child(engagement_draft_id, {"assets": [pick(asset_id, "22")]}), 409, "asset_archived")
+    ok(self, self.plugin.archive_tenant_asset(self.actor, asset_id, False))
+    ok(self, self.update_child(engagement_draft_id, {"assets": [pick(asset_id, "22")]}))
+    self.assertEqual(self.stored_child(engagement_draft_id)["assets"][0]["display_name"], "Renamed")
+
   def test_the_parent_must_be_a_tenant(self):
     parent = self.create()["draft_id"]
     engagement_draft_id = self.ready_child(parent)

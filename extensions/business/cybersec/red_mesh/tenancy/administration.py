@@ -949,10 +949,14 @@ class TenantAdministrationService:
     # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
     return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
 
-  def _engagement_assets(self, requests, parent):
+  def _engagement_assets(self, requests, parent, kept=()):
     """RM-125 phase 2b: the stored entries for normalized request entries, each copied from the
-    registered asset of `parent`. Another parent's asset is `asset_not_found`, never revealed."""
+    registered asset of `parent`. Another parent's asset is `asset_not_found`, never revealed.
+    `kept`: stored entries whose copy stands (a draft keeps its copy until the asset is re-picked)."""
+    copies = {entry["asset_id"]: entry for entry in kept}
     def lookup(asset_id):
+      if asset_id in copies:
+        return copies[asset_id]
       row = self.store.get("tenant_asset", asset_id)
       if row is None or row["parent"] != parent:
         raise AdministrationDenied(404, "asset_not_found")
@@ -1731,23 +1735,25 @@ class TenantAdministrationService:
     account = self._actor(actor, creator=True)
     previous = self._unlocked_engagement_draft(engagement_draft_id)
     if isinstance(changes, dict) and "assets" in changes:
-      changes = {**changes, "assets": self._draft_assets(changes["assets"], previous["parent"])}
+      changes = {**changes, "assets": self._draft_assets(changes["assets"], previous["parent"], previous["assets"])}
     try:
       row, dropped = engagement_drafts.apply_changes(previous, changes)
     except engagement_drafts.EngagementDraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     return {"draft": self._write_engagement_draft(row, account, previous), "dropped": dropped}
 
-  def _draft_assets(self, requests, parent):
-    """RM-125 phase 2b: an `assets` change as stored entries, copied from the parent's registered
-    assets now (an empty list clears them)."""
+  def _draft_assets(self, requests, parent, previous):
+    """RM-125 phase 2b: an `assets` change as stored entries (an empty list clears them). An asset
+    the draft already holds keeps its stored copy, only its ports change; a newly picked one is
+    copied from the parent's registered assets now. A later rename or archive of a held asset
+    therefore never reaches the draft (contract: remove and re-pick to take a newer copy)."""
     if requests == []:
       return []
     try:
       requests = normalize_asset_requests(requests)
     except EngagementInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
-    return self._engagement_assets(requests, parent)
+    return self._engagement_assets(requests, parent, previous)
 
   @_endpoint
   def authorize_engagement_draft_upload(self, actor, engagement_draft_id):
