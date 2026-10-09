@@ -26,11 +26,11 @@ is `400 engagement_required`, any other incomplete selector `400 invalid_request
 are engagement-gated. The binding is schema 2 (`engagement_id`, `engagement_asset_id`,
 `engagement_hash` instead of `asset_id`); schema 1 still parses for reads but is never reauthorized.
 Reauthorization re-reads the engagement entry (same target and hash), `tasks:launch` and Allow
-Pentester. The tenant asset record and its operations are removed. Phase 3: a scan launch whose
-normalized run mode (empty is continuous) is outside the engagement's `allowed_run_modes` is
-`400 run_mode_not_authorized`, before any unsafe-launch confirmation. The selector paragraphs below are
-the RM-084 history. Current contract: the hub's `docs/resources/redmesh/contracts/engagements.md`
-§Target v2. Paragraphs below that describe compatibility admission, `legacy_unbound` snapshots or
+Pentester. RM-125 (hash schema `redmesh.engagement/3`): the engagement no longer carries run modes,
+tests or scan modes, so a launch takes either run mode and any test of the asset kind, and only the
+window, the asset entry and its `authorized_ports` gate it; each entry copies a registered tenant
+asset (`asset_id`). The selector paragraphs below are the RM-084 history. Current contract: the hub's
+`docs/resources/redmesh/contracts/engagements.md` §Target v3 and `contracts/tenant-assets.md`. Paragraphs below that describe compatibility admission, `legacy_unbound` snapshots or
 rollout stages are the history of how the boundary was built, not current behaviour. The current
 account and authority contract is the hub's `docs/resources/redmesh/contracts/redmesh-auth.md`.
 
