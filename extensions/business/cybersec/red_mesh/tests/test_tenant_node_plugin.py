@@ -65,7 +65,7 @@ class TestTenantNodePlugin(unittest.TestCase):
     }})
     self.assertEqual(self.plugin.get_tenant_nodes({"account_id": "initial"}, self.tenant)["data"], {
       "tenantId": self.tenant,
-      "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}],
+      "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": []}],
       "canManageAssignments": False,
     })
 

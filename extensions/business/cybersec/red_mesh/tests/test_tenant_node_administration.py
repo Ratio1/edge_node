@@ -59,12 +59,12 @@ class TestTenantNodeAdministration(unittest.TestCase):
       self.assertEqual(result["data"], {"tenantId": self.tenant, "nodeAddress": address, "active": True,
                                         "mode": "shared", "state": "assigned"})
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"},
-                      {"nodeAddress": "Node-B", "mode": "shared", "state": "assigned"}])
+                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": []},
+                      {"nodeAddress": "Node-B", "mode": "shared", "state": "assigned", "alias": None, "tags": []}])
     self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-B", False)
     view = self.service.get_tenant_nodes({"account_id": "initial"}, self.tenant)["data"]
     self.assertEqual(view, {"tenantId": self.tenant,
-                            "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}],
+                            "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": []}],
                             "canManageAssignments": False})
 
   def test_activation_requires_lazy_valid_current_config_even_on_retry(self):
@@ -117,7 +117,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
                   ["tenant_node", "foreign", self.tenant, None]):
       # Noncanonical whitespace, malformed IDs and payload are foreign to this projection.
       self.owner.data[(hkey, json.dumps(field))] = "private corrupt data"
-    expected = [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}]
+    expected = [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": []}]
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"], expected)
     for ids in ((self.tenant,), (self.tenant, "Node-B", "extra"), (self.tenant, None)):
       with self.subTest(ids=ids):
@@ -324,7 +324,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     del row["mode"]
     self.store.put("tenant_node", self.tenant, "Node-A", record=row)
     view = self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"]
-    self.assertEqual(view, [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}])
+    self.assertEqual(view, [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": []}])
     other = self.create_tenant("other")
     # The legacy row is offered for a shared request (idempotent for its own tenant, additive for
     # another) and blocks a private one, exactly as a `mode: "shared"` row would.
@@ -369,7 +369,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     self.jobs[(self.tenant, "Node-A")] = True
     self.assertTrue(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", False)["success"])
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "draining"}])
+                     [{"nodeAddress": "Node-A", "mode": "shared", "state": "draining", "alias": None, "tags": []}])
     for mode in ("shared", "private"):
       self.assertEqual(self.service.set_tenant_node_assignment(self.actor, self.tenant, "Node-A", True, mode)["error"],
                        "node_draining")
@@ -384,7 +384,7 @@ class TestTenantNodeAdministration(unittest.TestCase):
     leftover = {**self.store.get("tenant_node", self.tenant, "Node-A"), "active": False}
     self.owner.data[assignment_location(self.tenant, "Node-A")] = leftover
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "Node-B", "mode": "shared", "state": "assigned"}])
+                     [{"nodeAddress": "Node-B", "mode": "shared", "state": "assigned", "alias": None, "tags": []}])
     self.assertEqual(self.service._launch_eligible_nodes(self.tenant), ["Node-B"])
     self.assertEqual(self.service._reauth_eligible_nodes(self.tenant), ["Node-B"])
     before = len(self.owner.writes)

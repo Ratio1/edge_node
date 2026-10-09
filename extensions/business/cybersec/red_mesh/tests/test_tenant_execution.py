@@ -254,7 +254,7 @@ class TestTenantExecution(unittest.TestCase):
     # written back in (release once more, then a fresh assignment).
     self.service.tenant_node_jobs_reader = lambda tenant_id, node_address: False
     self.assertEqual(self.service.get_tenant_nodes(self.actor, self.tenant)["data"]["nodes"],
-                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned"}])
+                     [{"nodeAddress": "node-b", "mode": "shared", "state": "assigned", "alias": None, "tags": []}])
 
   def test_existing_execution_checks_namespace_publication_engagement_and_current_configuration(self):
     asset = self.ready()
