@@ -8,7 +8,10 @@ from .contract_fixture import contract_terms, install_contract
 from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_identity import CstoreAuthAccountReader
-from extensions.business.cybersec.red_mesh.tenancy.deployment_nodes import MISSING_ID, named_entry, node_directory
+from datetime import datetime, timedelta, timezone
+
+from extensions.business.cybersec.red_mesh.tenancy.deployment_nodes import (
+  MISSING_ID, named_entry, node_directory, node_info_entry)
 
 
 class FakeNetmon:
@@ -42,10 +45,10 @@ NETMON = FakeNetmon({
 class TestNodeDirectory(unittest.TestCase):
   def test_names_a_seen_peer_and_keeps_only_string_tags(self):
     self.assertEqual(node_directory(NETMON, ["0xai_rm3"]),
-                     {"0xai_rm3": {"alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"]}})
+                     {"0xai_rm3": {"alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"], "ip": None}})
 
   def test_an_unseen_peer_a_missing_monitor_and_a_failing_one_name_nothing(self):
-    unseen = {"alias": None, "tags": []}
+    unseen = {"alias": None, "tags": [], "ip": None}
     self.assertEqual(node_directory(NETMON, ["0xai_rm4", "0xai_new"]), {"0xai_rm4": unseen, "0xai_new": unseen})
     self.assertEqual(node_directory(None, ["0xai_rm3"]), {"0xai_rm3": unseen})
     self.assertEqual(node_directory(BrokenNetmon(), ["0xai_rm3"]), {"0xai_rm3": unseen})
@@ -56,12 +59,53 @@ class TestNodeDirectory(unittest.TestCase):
     self.assertEqual(netmon.asked, ["0xai_b", "0xai_a"])
 
   def test_named_entry_sanitizes_a_malformed_directory(self):
-    unseen = {"alias": None, "tags": []}
+    unseen = {"alias": None, "tags": [], "ip": None}
     self.assertEqual(named_entry({}, "x"), unseen)
     self.assertEqual(named_entry(None, "x"), unseen)
     self.assertEqual(named_entry({"x": "rm3"}, "x"), unseen)
     self.assertEqual(named_entry({"x": {"alias": "", "tags": None}}, "x"), unseen)
-    self.assertEqual(named_entry({"x": {"alias": 3, "tags": ["a", 1]}}, "x"), {"alias": None, "tags": ["a"]})
+    self.assertEqual(named_entry({"x": {"alias": 3, "tags": ["a", 1]}}, "x"), {"alias": None, "tags": ["a"], "ip": None})
+
+
+NOW = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
+PUBLIC = "34.62.240.212"
+
+
+class TestNodePublicIp(unittest.TestCase):
+  """RM-127: the IP each node published for itself in `<instance_id>:node_info`."""
+
+  def ip(self, info, address="0xai_rm3"):
+    return node_directory(NETMON, [address], info, now=NOW)[address]["ip"]
+
+  def test_a_fresh_global_entry_is_the_nodes_ip_and_keeps_the_names(self):
+    info = {"0xai_rm3": node_info_entry(PUBLIC, NOW - timedelta(minutes=30))}
+    self.assertEqual(node_directory(NETMON, ["0xai_rm3"], info, now=NOW),
+                     {"0xai_rm3": {"alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"], "ip": PUBLIC}})
+    self.assertEqual(self.ip(info, "0xai_rm4"), None)
+
+  def test_a_malformed_non_global_or_stale_entry_names_no_ip(self):
+    fresh = (NOW - timedelta(minutes=5)).isoformat()
+    for label, entry in {
+      "private": {"ip": "10.132.0.2", "published_at": fresh},
+      "docker bridge": {"ip": "172.17.0.2", "published_at": fresh},
+      "loopback": {"ip": "127.0.0.1", "published_at": fresh},
+      "not an ip": {"ip": "rm3.example", "published_at": fresh},
+      "not a string": {"ip": 7, "published_at": fresh},
+      "no stamp": {"ip": PUBLIC},
+      "naive stamp": {"ip": PUBLIC, "published_at": "2026-10-09T11:55:00"},
+      "bad stamp": {"ip": PUBLIC, "published_at": "yesterday"},
+      "stale": node_info_entry(PUBLIC, NOW - timedelta(hours=2, minutes=1)),
+      "future": node_info_entry(PUBLIC, NOW + timedelta(hours=1)),
+      "not a dict": PUBLIC,
+    }.items():
+      with self.subTest(label):
+        self.assertIsNone(self.ip({"0xai_rm3": entry}))
+    for info in (None, "not a dict", []):
+      self.assertIsNone(self.ip(info))
+
+  def test_named_entry_rechecks_the_ip(self):
+    self.assertEqual(named_entry({"x": {"alias": "a", "tags": [], "ip": PUBLIC}}, "x")["ip"], PUBLIC)
+    self.assertIsNone(named_entry({"x": {"alias": "a", "tags": [], "ip": "192.168.1.1"}}, "x")["ip"])
 
 
 class TestDeploymentNodeReads(unittest.TestCase):
@@ -90,8 +134,8 @@ class TestDeploymentNodeReads(unittest.TestCase):
 
   def test_lists_the_configured_peers_in_configured_order_with_names(self):
     self.assertEqual(self.service.list_deployment_nodes(self.actor), {"success": True, "status_code": 200, "data": {
-      "nodes": [{"nodeAddress": "0xai_rm4", "alias": None, "tags": []},
-                {"nodeAddress": "0xai_rm3", "alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"]}]}})
+      "nodes": [{"nodeAddress": "0xai_rm4", "alias": None, "tags": [], "ip": None},
+                {"nodeAddress": "0xai_rm3", "alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"], "ip": None}]}})
 
   def test_only_a_full_portfolio_super_tenant_admin_reads_the_list(self):
     tenant = self.create_tenant()
@@ -119,8 +163,8 @@ class TestDeploymentNodeReads(unittest.TestCase):
     for reader in (None, explode, lambda addresses: "not a dict"):
       self.service.node_directory_reader = reader
       self.assertEqual(self.service.list_deployment_nodes(self.actor)["data"]["nodes"],
-                       [{"nodeAddress": "0xai_rm4", "alias": None, "tags": []},
-                        {"nodeAddress": "0xai_rm3", "alias": None, "tags": []}])
+                       [{"nodeAddress": "0xai_rm4", "alias": None, "tags": [], "ip": None},
+                        {"nodeAddress": "0xai_rm3", "alias": None, "tags": [], "ip": None}])
 
   def test_the_tenants_own_rows_carry_the_same_names(self):
     tenant = self.create_tenant()
@@ -128,8 +172,8 @@ class TestDeploymentNodeReads(unittest.TestCase):
       self.assertTrue(self.service.set_tenant_node_assignment(self.actor, tenant, address, True)["success"])
     rows = self.service.get_tenant_nodes({"account_id": "initial"}, tenant)["data"]["nodes"]
     self.assertEqual(rows, [
-      {"nodeAddress": "0xai_rm3", "mode": "shared", "state": "assigned", "alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"]},
-      {"nodeAddress": "0xai_rm4", "mode": "shared", "state": "assigned", "alias": None, "tags": []}])
+      {"nodeAddress": "0xai_rm3", "mode": "shared", "state": "assigned", "alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"], "ip": None},
+      {"nodeAddress": "0xai_rm4", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}])
     self.service.node_directory_reader = None
     rows = self.service.get_tenant_nodes({"account_id": "initial"}, tenant)["data"]["nodes"]
     self.assertEqual([row["alias"] for row in rows], [None, None])
@@ -159,8 +203,15 @@ class TestDeploymentNodesPlugin(unittest.TestCase):
   def test_the_endpoint_names_the_peers_from_the_network_monitor(self):
     self.plugin.netmon = NETMON
     self.assertEqual(self.plugin.list_deployment_nodes(self.actor)["data"]["nodes"], [
-      {"nodeAddress": "0xai_rm3", "alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"]},
-      {"nodeAddress": "0xai_rm4", "alias": None, "tags": []}])
+      {"nodeAddress": "0xai_rm3", "alias": "rm3", "tags": ["KYB", "DC:google", "CT:BE"], "ip": None},
+      {"nodeAddress": "0xai_rm4", "alias": None, "tags": [], "ip": None}])
+
+  def test_the_endpoint_carries_the_public_ip_each_peer_published(self):
+    self.plugin.netmon = NETMON
+    self.plugin.chainstore_hset(hkey="pentester-api-01:node_info", key="0xai_rm4", value=node_info_entry(PUBLIC))
+    nodes = self.plugin.list_deployment_nodes(self.actor)["data"]["nodes"]
+    self.assertEqual([(node["nodeAddress"], node["alias"], node["ip"]) for node in nodes],
+                     [("0xai_rm3", "rm3", None), ("0xai_rm4", None, PUBLIC)])
 
   def test_without_a_network_monitor_the_endpoint_still_lists_the_peers(self):
     self.assertEqual([node["alias"] for node in self.plugin.list_deployment_nodes(self.actor)["data"]["nodes"]],

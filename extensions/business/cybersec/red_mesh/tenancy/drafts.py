@@ -202,10 +202,14 @@ def normalize_applicability(value):
   return {"decision": value["decision"], "reason": reason}
 
 
-def valid_generated(value):
-  """The `generated` block: the stored ref of the unsigned pack plus its baseline stamps, or null."""
+def valid_generated(value, with_nodes=False):
+  """The `generated` block: the stored ref of the unsigned pack plus its baseline stamps, or null.
+  RM-127: `with_nodes` (the tenant contract) also allows `nodes`, the non-empty node plan the pack
+  printed, in the `normalize_nodes` shape; a block written before RM-127 has none."""
+  nodes = isinstance(value, dict) and with_nodes and "nodes" in value
   return (value is None
-          or (isinstance(value, dict) and set(value) == {*DOC_REF_KEYS, *_GENERATED_FIELDS}
+          or (isinstance(value, dict) and set(value) == {*DOC_REF_KEYS, *_GENERATED_FIELDS, *(("nodes",) if nodes else ())}
+              and (not nodes or (bool(value["nodes"]) and _same(normalize_nodes, value["nodes"])))
               and valid_doc_ref({key: value[key] for key in DOC_REF_KEYS})
               and value["mime"] == "application/pdf" and valid_digest(value["snapshot_sha256"])
               and all(_nonempty_text(value[key]) for key in ("generated_at", "generated_by"))))
@@ -307,18 +311,32 @@ def completeness(row):
   missing.extend(f"field:legal.{key}" for key in LEGAL_FIELDS if not row["legal"][key])
   if not row["compliance_types"]:
     missing.append("field:compliance_types")
+  # RM-127: the contract prints the nodes, so they are planned first.
+  if not row["nodes"]:
+    missing.append("field:nodes")
   # RM-112 decision 24: the contract term is set before the pack is generated and printed in it; an
   # end date is optional (none = indefinite), the start date is not.
   if not row["items"]["contract"]["effective_from"]:
     missing.append("field:contract.effective_from")
   if row["items"]["contract"]["state"] != "signed":
     missing.append("item:contract")
+  if contract_stale(row):
+    missing.append("item:contract_stale")
   for record in TENANT_RECORDS:
     # Rule 3 (owner, 2026-10-07): a record in the contract's fixed covers is decided by rule 2, and no
     # applicability is asked. A record dropped from those covers must be covered by a signed item.
     if record not in row["items"]["contract"]["covers"] and not _covered(row, record):
       missing.append(f"record:{record}")
   return {"complete": not missing, "missing": missing}
+
+
+def contract_stale(row):
+  """RM-127: the contract no longer matches the node plan: its generated pack printed other nodes (or
+  none, before RM-127), or a signed copy was uploaded with no generated pack behind it."""
+  contract = row["items"]["contract"]
+  if contract["generated"] is None:
+    return contract["state"] == "signed"
+  return contract["generated"].get("nodes") != row["nodes"]
 
 
 def governance(row):
@@ -428,6 +446,6 @@ def validate_tenant_draft(row, ids):
         or not _same(lambda covers: normalize_covers(kind, covers), item["covers"])
         or not _same(_effective_date, item["effective_from"])
         or not _same(_effective_date, item["effective_until"])
-        or not valid_generated(item["generated"])):
+        or not valid_generated(item["generated"], with_nodes=kind == "contract")):
       raise ValueError("Invalid tenant draft item")
   return row

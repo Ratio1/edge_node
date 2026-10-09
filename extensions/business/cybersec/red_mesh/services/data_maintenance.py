@@ -219,6 +219,8 @@ class Inventory:
     names = [self._instance] + [self._instance + suffix for suffix, _, _ in _PER_JOB]
     names.append(f"{self._instance}:integrations")
     names.extend(f"{self._instance}:integrations:{tenant}" for tenant in self.tenant_ids())
+    # RM-127: each node's self-published public IP, keyed by the node's address.
+    names.append(f"{self._instance}:node_info")
     names.extend([self._tenancy_hkey, self._account_hkey])
     return names
 
@@ -359,6 +361,8 @@ class Inventory:
       return OLD, "unrecognized"
     if self.is_status_hkey(hkey):
       return self._status_class(hkey, field, value)
+    if hkey == f"{self._instance}:node_info":
+      return (CURRENT, "") if isinstance(value, dict) and set(value) == {"ip", "published_at"} else (OLD, "unrecognized")
     raise MaintenanceError(400, "invalid_request")
 
   # -- files ------------------------------------------------------------------------------------

@@ -24,11 +24,22 @@ PARTY = {"address": "Str. Exemplu 1, Cluj-Napoca", "vat_id": "RO12345678", "cont
          "contact_email": "ion.pop@example.com", "contact_phone": "+40 700 000 000"}
 KINDS = ("contract", "framework_agreement", "data_handling")
 GENERATED_AT = "2026-10-07T10:00:00Z"
-# The baseline as the Navigator sends it: canonical JSON of what the pack was rendered from.
-SNAPSHOT = json.dumps({"generated_at": GENERATED_AT, "legal": LEGAL, "profile": {"legal_name": "RedMesh SRL"}},
-                      sort_keys=True, separators=(",", ":"))
+# RM-127: the node plan a draft gets by default (`create`), which the contract prints.
+PLAN = [{"node_address": "Node-A", "mode": "shared"}]
+
+
+def snapshot_of(plan, **extra):
+  """The baseline as the Navigator sends it: canonical JSON of what the pack was rendered from,
+  RM-127 the planned nodes with the console's names and IPs."""
+  nodes = [{"nodeAddress": entry["node_address"], "mode": entry["mode"], "alias": None, "ip": None} for entry in plan]
+  return json.dumps({"generated_at": GENERATED_AT, "legal": LEGAL, "profile": {"legal_name": "RedMesh SRL"},
+                     "nodes": nodes, **extra}, sort_keys=True, separators=(",", ":"))
+
+
+SNAPSHOT = snapshot_of(PLAN)
+# RM-127: a tenant contract's block also records the nodes the pack printed.
 GENERATED_KEYS = {"store", "ref", "filename", "mime", "uploaded_at", "uploaded_by", "sha256", "size_bytes",
-                  "snapshot_sha256", "generated_at", "generated_by"}
+                  "snapshot_sha256", "generated_at", "generated_by", "nodes"}
 
 
 def ok(case, result):
@@ -70,12 +81,18 @@ class _DraftCase(unittest.TestCase):
     self.plugin._log_audit_event = lambda event, details: self.events.append((event, details))
     self.repo = CstoreTenantAdministrationStore(self.store, "deployment")
     self.actor = {"account_id": "creator"}
+    # RM-127: activation assigns the contract's nodes, which must be configured peers.
+    self.plugin.cfg_chainstore_peers = ["Node-A", "Node-B", "Node-C"]
 
   # -- helpers ----------------------------------------------------------------------------------
 
-  def create(self, display_name="Acme", compliance_types=("nis2",), request_id=None):
+  def create(self, display_name="Acme", compliance_types=("nis2",), request_id=None, nodes=PLAN):
+    """A new draft; RM-127: with `nodes` planned (none for an empty plan)."""
     request_id = request_id or str(uuid4())
-    return ok(self, self.plugin.create_tenant_draft(self.actor, request_id, display_name, list(compliance_types)))
+    draft = ok(self, self.plugin.create_tenant_draft(self.actor, request_id, display_name, list(compliance_types)))
+    if nodes and not draft["nodes"]:
+      draft = ok(self, self.update(draft["draft_id"], {"nodes": list(nodes)}))
+    return draft
 
   def update(self, draft_id, changes, actor=None):
     return self.plugin.update_tenant_draft(actor or self.actor, draft_id, changes)
@@ -97,9 +114,12 @@ class _DraftCase(unittest.TestCase):
     return self.repo.get("tenant_draft", draft_id)
 
   def complete_fields(self, draft_id):
-    return ok(self, self.update(draft_id, {"display_name": "Acme SRL", "domain_id": "acme",
-                                           "initial_admin_id": "Acme.Admin", "legal": dict(LEGAL),
-                                           "items": {"contract": {"effective_from": "2026-11-01"}}}))
+    """Every field activation needs, and RM-127 the contract generated from the plan: only the
+    signed copy is left."""
+    ok(self, self.update(draft_id, {"display_name": "Acme SRL", "domain_id": "acme",
+                                    "initial_admin_id": "Acme.Admin", "legal": dict(LEGAL),
+                                    "items": {"contract": {"effective_from": "2026-11-01"}}}))
+    return ok(self, self.generate(draft_id, snapshot=snapshot_of(self.stored(draft_id)["nodes"])))
 
   def set_activation(self, draft_id):
     row = self.stored(draft_id)
@@ -587,7 +607,7 @@ class TestDraftLockAndMissingFiles(_DraftCase):
     # No answer reads the store; only a download does.
     self.assertEqual(reads, [])
     refused(self, self.plugin.download_tenant_draft_document(self.actor, draft_id, "contract"), 404, "not_found")
-    self.assertEqual(reads, ["doc-1"])
+    self.assertEqual(reads, [signed["document"]["ref"]])
     self.assertEqual(self.stored(draft_id)["items"]["contract"], signed)
 
   def test_answers_do_not_need_the_document_store(self):
@@ -697,9 +717,10 @@ class TestGeneratedDocuments(_DraftCase):
       seen.append((ref, self.stored(draft_id)["items"]["contract"]["generated"]["ref"]))
       delete(ref)
     self.documents.delete = observed_delete
-    second = ok(self, self.generate(draft_id, raw=SCHEDULE_PDF, snapshot=json.dumps({"v": 2})))["items"]["contract"]
+    snapshot = snapshot_of(PLAN, v=2)
+    second = ok(self, self.generate(draft_id, raw=SCHEDULE_PDF, snapshot=snapshot))["items"]["contract"]
     self.assertEqual((second["state"], second["generated"]["ref"]), ("generated", "doc-2"))
-    self.assertEqual(second["generated"]["snapshot_sha256"], hashlib.sha256(b'{"v": 2}').hexdigest())
+    self.assertEqual(second["generated"]["snapshot_sha256"], hashlib.sha256(snapshot.encode("utf-8")).hexdigest())
     self.assertEqual(seen, [("doc-1", "doc-2")])
     self.assertNotIn("doc-1", self.documents.envelopes)
     # An update may set the item missing or awaiting_signature, both keep the block; `generated` is
@@ -1070,9 +1091,12 @@ class TestDraftRelease(_ActivationCase):
     draft_id, request_id = self.ready(), str(uuid4())
     ok(self, self.activate(draft_id, request_id))
     tenant_id = self.finish(draft_id, request_id)
-    files = sorted(item["document"]["ref"] for item in self.stored(draft_id)["items"].values())
+    # The signed copies and (RM-127, every contract is generated) the generated pack.
+    items = self.stored(draft_id)["items"].values()
+    files = sorted([item["document"]["ref"] for item in items]
+                   + [item["generated"]["ref"] for item in items if item["generated"] is not None])
     deleted = ok(self, self.delete_tenant(tenant_id))
-    self.assertEqual(deleted["documents"], 3)
+    self.assertEqual(deleted["documents"], 4)
     self.assertEqual(sorted(self.documents.deleted), files)
     self.assertEqual((self.rows("tenant"), self.rows("receipt")), ([], []))
     self.assert_released_after_the_tenant_delete(draft_id)
@@ -1142,8 +1166,10 @@ class TestDraftRelease(_ActivationCase):
         self.store.account("acme.admin", memberships=[])
         begun = ok(self, self.plugin._call_tenant_administration("begin_tenant_delete", self.actor, tenant_id=tenant_id))
         tenant = self.repo.get("tenant", tenant_id)
-        expected = sorted(tenant[kind]["ref"] for kind in KINDS if tenant[kind] is not None)
-        self.assertEqual(len(expected), count)
+        # RM-127: every contract is generated first, so the generated pack is one of them too.
+        expected = sorted([tenant[kind]["ref"] for kind in KINDS if tenant[kind] is not None]
+                          + [tenant["contract_generated"]["ref"]])
+        self.assertEqual(len(expected), count + 1)
         self.assertEqual([ref["ref"] for ref in begun["documentRefs"]], expected)
         # The next draft needs another domain.
         self.repo.delete("tenant", tenant_id)
@@ -1189,8 +1215,7 @@ class TestPartyBlockAndBaseline(_ActivationCase):
 
   def test_the_generated_baseline_becomes_the_tenants_contract_generated_and_is_deleted_with_it(self):
     draft_id, request_id = self.create()["draft_id"], str(uuid4())
-    self.complete_fields(draft_id)
-    generated = ok(self, self.generate(draft_id))["items"]["contract"]["generated"]
+    generated = self.complete_fields(draft_id)["items"]["contract"]["generated"]
     ok(self, self.upload(draft_id))
     ok(self, self.activate(draft_id, request_id))
     receipt, = self.rows("receipt")
@@ -1217,8 +1242,7 @@ class TestPartyBlockAndBaseline(_ActivationCase):
 
   def test_the_generated_pack_is_verified_at_activation_like_the_signed_documents(self):
     draft_id = self.create()["draft_id"]
-    self.complete_fields(draft_id)
-    generated = ok(self, self.generate(draft_id))["items"]["contract"]["generated"]
+    generated = self.complete_fields(draft_id)["items"]["contract"]["generated"]
     ok(self, self.upload(draft_id))
     row = self.stored(draft_id)
     resolved = {**{kind: item["document"] for kind, item in row["items"].items()},
@@ -1250,8 +1274,7 @@ class TestPartyBlockAndBaseline(_ActivationCase):
     # The tenant delete removed `contract_generated.ref`, the draft's generated file: the block goes
     # with the signed copy, and a fresh generation replaces nothing.
     draft_id, request_id = self.create()["draft_id"], str(uuid4())
-    self.complete_fields(draft_id)
-    generated = ok(self, self.generate(draft_id))["items"]["contract"]["generated"]
+    generated = self.complete_fields(draft_id)["items"]["contract"]["generated"]
     ok(self, self.upload(draft_id))
     ok(self, self.activate(draft_id, request_id))
     tenant_id = self.finish(draft_id, request_id)
@@ -1272,6 +1295,9 @@ class TestPartyBlockAndBaseline(_ActivationCase):
     ok(self, self.activate(draft_id, request_id))
     tenant_id = self.finish(draft_id, request_id)
     receipt_key, tenant_key = self.key("receipt", "creator", request_id), self.key("tenant", tenant_id)
+    # A tenant activated before RM-110 was never generated: no key on either row.
+    for key in (receipt_key, tenant_key):
+      del self.store.data[key]["contract_generated"]
     # Never generated: no key on either row, null in the answer (so pre-RM-110 rows read the same).
     self.assertNotIn("contract_generated", self.store.data[receipt_key])
     self.assertNotIn("contract_generated", self.store.data[tenant_key])

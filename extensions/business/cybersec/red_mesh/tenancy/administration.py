@@ -7,6 +7,8 @@ distributed consistency limitations still apply.
 """
 from datetime import datetime, timezone
 from functools import wraps
+import copy
+import json
 import re
 from threading import RLock
 from uuid import UUID, uuid4
@@ -117,8 +119,15 @@ def _legal_dto(legal):
 
 
 def _valid_generated_block(value):
-  """RM-110 `contract_generated` on a receipt or tenant: when the key is there, a full block."""
-  return value is not None and drafts.valid_generated(value)
+  """RM-110 `contract_generated` on a receipt or tenant: when the key is there, a full block. RM-127:
+  with the nodes the pack printed, when it was generated since."""
+  return value is not None and drafts.valid_generated(value, with_nodes=True)
+
+
+def _contract_nodes(tenant):
+  """RM-127: the nodes the tenant's generated contract printed; empty for a one-step tenant and for
+  one activated from a pack generated before RM-127."""
+  return list((tenant.get("contract_generated") or {}).get("nodes") or ())
 
 
 def _valid_contract(value):
@@ -399,7 +408,7 @@ class TenantAdministrationService:
     # RM-110: the unsigned baseline outlives the draft as the tenant's `contract_generated`; a draft
     # whose pack was never generated adds nothing.
     if draft["items"]["contract"]["generated"] is not None:
-      terms["contract_generated"] = dict(draft["items"]["contract"]["generated"])
+      terms["contract_generated"] = copy.deepcopy(draft["items"]["contract"]["generated"])
     return draft, intent, _legal(draft["legal"]), stored["contract"], terms
 
   @staticmethod
@@ -449,9 +458,33 @@ class TenantAdministrationService:
         admin = self._initial_admin(receipt["initial_admin_id"], receipt["initial_admin_generation"])
         if TenantMembership("tenant_admin", receipt["tenant_id"]) not in admin.tenant_memberships:
           raise AdministrationDenied(409, "initial_admin_required")
+      self._assign_contract_nodes(creator, tenant)
       tenant = {**tenant, "active": True}
       self.store.put("tenant", receipt["tenant_id"], record=tenant)
     return self._detail(tenant, creator)
+
+  def _assign_contract_nodes(self, account, tenant):
+    """RM-127: assign every node the contract printed, before the tenant turns active. All are checked
+    first (eligibility as `set_tenant_node_assignment`, conflicts as `_assign_node`; the draft's own
+    private plan holds for this tenant), and any refusal writes nothing. A replay after a crash
+    part-way finds its own rows assigned and fills the gaps; a release removes them."""
+    nodes = _contract_nodes(tenant)
+    if not nodes:
+      return
+    peers = self._configured_peers()
+    failures = []
+    for entry in nodes:
+      address = entry["node_address"]
+      error = "ineligible_node" if address not in peers else \
+        self._assignment_conflict(tenant["tenant_id"], address, entry["mode"])[0]
+      if error not in (None, "assigned"):
+        failures.append({"nodeAddress": address, "error": error})
+    if failures:
+      raise AdministrationDenied(409, "contract_nodes_unavailable", nodes=failures)
+    for entry in nodes:
+      address = entry["node_address"]
+      self._assign_node(account, tenant["tenant_id"], address, entry["mode"],
+                        self.store.get("tenant_node", tenant["tenant_id"], address))
 
   def _authorized_tenant(self, actor, tenant_id, operation="reports:view"):
     account = self._actor(actor)
@@ -831,11 +864,14 @@ class TenantAdministrationService:
     nodes = [node for node in nodes if node is not None]
     # RM-126: the tenant's own nodes carry their name and tags, under the read the caller already has.
     directory = self._node_directory(node["nodeAddress"] for node in nodes)
+    # RM-127: a tenant whose contract lists its nodes keeps them; amendments will change them.
+    fixed = bool(_contract_nodes(tenant))
     return {"tenantId": tenant_id,
             "nodes": [{**node, **named_entry(directory, node["nodeAddress"])} for node in nodes],
-            "canManageAssignments": authorize_tenant_operation(
+            "canManageAssignments": not fixed and authorize_tenant_operation(
               account, "node_assignments:manage", TenantPolicyContext(
-                tenant_id, tenant["active"], tenant["allow_pentester"])).allowed}
+                tenant_id, tenant["active"], tenant["allow_pentester"])).allowed,
+            "nodesFixed": fixed}
 
   @_endpoint
   def list_deployment_nodes(self, actor):
@@ -1157,31 +1193,43 @@ class TenantAdministrationService:
       "updated_at": datetime.now(timezone.utc).isoformat()})
     return self._integration_row(self.store.get("integration", tenant_id, integration_id))
 
-  def _assign_node(self, account, tenant_id, node_address, mode, row):
+  def _assignment_conflict(self, tenant_id, node_address, mode):
     """RM-102 conflict precedence for (tenant, node, mode), over every tenant's live row for the
-    node: own row draining; own live row, same mode (idempotent); own live row, the other mode;
-    another tenant's live private row; private requested while any other live row exists; RM-112: a
-    draft's private plan of the node, unless this tenant was activated from that draft; else write.
-    Rows are "live" per `_assignment_live` -- a dead-draining row is released everywhere."""
+    node: own row draining; own live row, same mode (`assigned`, idempotent); own live row, the other
+    mode; another tenant's live private row; private requested while any other live row exists;
+    RM-112: a draft's private plan of the node, unless this tenant was activated from that draft.
+    Answers `(error, holder)`: `(None, None)` when the node is free, `holder` only for
+    `node_planned_private`. Rows are "live" per `_assignment_live` -- a dead-draining row is
+    released everywhere. RM-127: shared by `_assign_node` and the contract nodes' activation check."""
     others = [other for other in self.store.list_node_assignments_for_node(node_address)
               if self._assignment_live(other["tenant_id"], other)]
     own = next((other for other in others if other["tenant_id"] == tenant_id), None)
     foreign = [other for other in others if other["tenant_id"] != tenant_id]
     if own is not None:
       if own.get("draining"):
-        raise AdministrationDenied(409, "node_draining")
+        return "node_draining", None
       own_mode = node_assignment_mode(own)
       if own_mode == mode:
-        return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True,
-                "mode": own_mode, "state": "assigned"}
-      raise AdministrationDenied(409, "node_private_assigned" if own_mode == "private" else "node_shared_assigned")
+        return "assigned", None
+      return "node_private_assigned" if own_mode == "private" else "node_shared_assigned", None
     if any(node_assignment_mode(other) == "private" for other in foreign):
-      raise AdministrationDenied(409, "node_private_assigned")
+      return "node_private_assigned", None
     if mode == "private" and foreign:
-      raise AdministrationDenied(409, "node_shared_assigned")
+      return "node_shared_assigned", None
     holder = self._private_plan_holder(node_address)
     if holder is not None and holder["draft_id"] != self._tenant_source_draft(tenant_id):
+      return "node_planned_private", holder
+    return None, None
+
+  def _assign_node(self, account, tenant_id, node_address, mode, row):
+    """Assign (tenant, node, mode) unless `_assignment_conflict` refuses; idempotent."""
+    error, holder = self._assignment_conflict(tenant_id, node_address, mode)
+    if error == "assigned":
+      return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True, "mode": mode, "state": "assigned"}
+    if error == "node_planned_private":
       raise self._planned_private(account, holder)
+    if error is not None:
+      raise AdministrationDenied(409, error)
     new_row = {**(row or {}), "tenant_id": tenant_id, "node_address": node_address, "active": True,
                "mode": mode, "draining": False, "changed_by": account.account_id,
                "changed_at": datetime.now(timezone.utc).isoformat()}
@@ -1251,10 +1299,17 @@ class TenantAdministrationService:
 
   @_endpoint
   def set_tenant_node_assignment(self, actor, tenant_id, node_address, active, mode=None):
-    _, account = self._authorized_tenant(actor, tenant_id, "node_assignments:manage")
+    tenant, account = self._authorized_tenant(actor, tenant_id, "node_assignments:manage")
     if (not valid_node_address(node_address) or type(active) is not bool
         or (mode is not None and mode not in NODE_ASSIGNMENT_MODES)):
       raise AdministrationDenied(400, "invalid_request")
+    # RM-127: the contract lists the tenant's nodes; a change waits for contract amendments. Asking
+    # for an assignment the tenant already holds is still answered, as `_assign_node` does.
+    if _contract_nodes(tenant):
+      if active and self._assignment_conflict(tenant_id, node_address, mode or "shared")[0] == "assigned":
+        return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True, "mode": mode or "shared",
+                "state": "assigned"}
+      raise AdministrationDenied(409, "nodes_fixed_by_contract")
     row = self.store.get("tenant_node", tenant_id, node_address)
     if not active:
       return self._release_node(account, tenant_id, node_address, row)
@@ -1529,6 +1584,9 @@ class TenantAdministrationService:
       row, dropped = drafts.apply_changes(previous, changes)
     except drafts.DraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
+    # RM-127: the signed contract lists the nodes; the copy is dropped first, in its own update.
+    if previous["items"]["contract"]["state"] == "signed" and row["nodes"] != previous["nodes"]:
+      raise AdministrationDenied(409, "nodes_locked")
     self._check_node_plan(account, previous, row)
     return {"draft": self._write_tenant_draft(row, account, previous), "dropped": dropped}
 
@@ -1634,6 +1692,10 @@ class TenantAdministrationService:
                  "initial_admin_id": receipt["initial_admin_id"]}
       draft = {**draft, "last_release": release}
       self.store.put("tenant_draft", draft_id, record=draft)
+      # RM-127: the contract nodes an activation stopped part-way assigned go before their tenant.
+      for row in self.store.list_node_assignments(receipt["tenant_id"]):
+        self.store.delete("tenant_node", receipt["tenant_id"], row["node_address"])
+        deleted += 1
       if tenant is not None:
         self.store.delete("tenant", receipt["tenant_id"])
         deleted += 1
@@ -2004,7 +2066,7 @@ class TenantAdministrationService:
     """Everything but the bytes is checked before the plugin stores them: role, the draft and its
     lock, the slot, the snapshot and `generated_at` formats, and that the item is not `signed`."""
     account = self._actor(actor, creator=True)
-    _, slot, _ = self._generated_slot(draft_id, engagement_draft_id, document_kind)
+    row, slot, _ = self._generated_slot(draft_id, engagement_draft_id, document_kind)
     try:
       drafts.normalize_snapshot(snapshot)
       drafts.normalize_generated_at(generated_at)
@@ -2012,11 +2074,30 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, exc.code) from None
     if slot["state"] == "signed":
       raise AdministrationDenied(409, "already_signed")
-    return {"accountId": account.account_id}
+    if not draft_id:
+      return {"accountId": account.account_id}
+    # RM-127: the contract prints the node plan, so it needs one, and the snapshot must be of it.
+    if not row["nodes"]:
+      raise AdministrationDenied(409, "draft_incomplete", missing=["field:nodes"])
+    nodes = self._snapshot_nodes(snapshot)
+    if nodes != row["nodes"]:
+      raise AdministrationDenied(409, "draft_changed")
+    return {"accountId": account.account_id, "nodes": nodes}
+
+  @staticmethod
+  def _snapshot_nodes(snapshot):
+    """RM-127: the snapshot's `nodes` (`[{nodeAddress, mode, ...}]`, the console's names and IPs
+    beside them) as the draft stores its plan; an absent list is empty, a malformed one invalid."""
+    nodes = json.loads(snapshot).get("nodes", [])
+    if (not isinstance(nodes, list)
+        or any(not isinstance(entry, dict) or not valid_node_address(entry.get("nodeAddress"))
+               or entry.get("mode") not in NODE_ASSIGNMENT_MODES for entry in nodes)):
+      raise AdministrationDenied(400, "invalid_request")
+    return [{"node_address": entry["nodeAddress"], "mode": entry["mode"]} for entry in nodes]
 
   @_endpoint
   def attach_generated_document(self, actor, draft_id, engagement_draft_id, document_kind, document, snapshot_sha256,
-                                generated_at):
+                                generated_at, nodes=None):
     """Write the `generated` block (the stored ref plus the baseline stamps; `uploaded_by` and
     `generated_by` are the generating admin) and set the item `generated`, from `missing`,
     `generated` or `awaiting_signature` (never from `signed`). Answers the row and the ref of the
@@ -2027,10 +2108,16 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, refusal)
     generated = {**document, "snapshot_sha256": snapshot_sha256, "generated_at": generated_at,
                  "generated_by": account.account_id}
-    if not drafts.valid_generated(generated) or generated["uploaded_by"] != account.account_id:
+    if draft_id:
+      generated["nodes"] = nodes
+    if (not drafts.valid_generated(generated, with_nodes=bool(draft_id))
+        or generated["uploaded_by"] != account.account_id):
       raise AdministrationDenied(400, refusal)
     if slot["state"] == "signed":
       raise AdministrationDenied(409, "already_signed")
+    # RM-127: the plan may have changed since `authorize_generated_document` read the snapshot's.
+    if draft_id and nodes != previous["nodes"]:
+      raise AdministrationDenied(409, "draft_changed")
     replaced = slot["generated"]["ref"] if slot["generated"] is not None else None
     slot = {**slot, "state": "generated", "generated": generated}
     if draft_id:

@@ -426,10 +426,12 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertTrue(self.plugin.update_tenant_draft(self.actor, draft_id, {
       "domain_id": "acme", "initial_admin_id": "acme.admin",
       "legal": {"name": "A", "registration_id": "B", "signer_name": "C", "signer_role": "D"},
-      "items": {"contract": {"effective_from": "2026-11-01"}}})["success"])
+      "items": {"contract": {"effective_from": "2026-11-01"}},
+      "nodes": [{"node_address": "node-a", "mode": "shared"}]})["success"])
     generated = self.plugin.store_generated_document(
       self.actor, draft_id=draft_id, document_kind="contract", filename="generated.pdf",
-      content_b64=base64.b64encode(b"%PDF-1.7\n%generated\n%%EOF\n").decode("ascii"), snapshot='{"v":1}',
+      content_b64=base64.b64encode(b"%PDF-1.7\n%generated\n%%EOF\n").decode("ascii"),
+      snapshot='{"nodes":[{"mode":"shared","nodeAddress":"node-a"}],"v":1}',
       generated_at="2026-10-07T10:00:00Z")
     self.assertTrue(generated["success"], generated)
     for number, kind in enumerate(("contract", "framework_agreement", "data_handling")):
@@ -440,6 +442,8 @@ class TestDataMaintenance(unittest.TestCase):
     prepared = self.plugin.prepare_tenant(self.actor, request, draft_id=draft_id)
     self.assertTrue(prepared["success"], prepared)
     self.storage.grant("acme.admin", prepared["data"]["tenantId"])
+    # RM-127: activation assigns the contract's node, a configured peer.
+    self.plugin.cfg_chainstore_peers = ["node-a"]
     self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
     rows = self.scan()
     receipt = json.dumps(["receipt", "deployment", "creator", request], separators=(",", ":"))
