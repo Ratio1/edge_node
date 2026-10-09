@@ -185,47 +185,75 @@ def engagement_asset_id_for(index):
   return "ea_%d" % (index + 1)
 
 
-def normalize_engagement_asset(index, entry):
-  """One requested asset as stored and hashed: the target is defined here, never read from a row.
+def valid_asset_id(value):
+  """`ta_<uuid>`, as `tenant_assets.valid_asset_id` (not imported: that module imports this one)."""
+  try:
+    return isinstance(value, str) and value.startswith("ta_") and canonical_uuid(value[3:]) == value[3:]
+  except ValueError:
+    return False
+
+
+def normalize_asset_requests(value):
+  """RM-125 phase 2b: the public request form, each entry exactly `{asset_id, authorized_ports?}`.
+
+  Pure (no store read): this is what the replay intent covers. The target, name and kind are never
+  sent; `build_engagement_assets` copies them from the registered asset at write time.
+  """
+  if not isinstance(value, list) or not 1 <= len(value) <= MAX_ENGAGEMENT_ASSETS:
+    raise EngagementInvalid("engagement_asset_invalid")
+  requests = []
+  for entry in value:
+    if (not isinstance(entry, dict) or not set(entry) <= {"asset_id", "authorized_ports"}
+        or not valid_asset_id(entry.get("asset_id"))):
+      raise EngagementInvalid("engagement_asset_invalid")
+    request = {"asset_id": entry["asset_id"]}
+    if "authorized_ports" in entry:
+      try:
+        request["authorized_ports"] = normalize_port_scope(entry["authorized_ports"])
+      except (ValueError, TypeError):
+        raise EngagementInvalid("engagement_asset_invalid") from None
+    requests.append(request)
+  if len({request["asset_id"] for request in requests}) != len(requests):
+    raise EngagementInvalid("engagement_asset_invalid")
+  return requests
+
+
+def build_engagement_assets(requests, lookup):
+  """The stored entries for normalized `requests`, in order. `lookup(asset_id)` answers the
+  registered asset row or raises (the administration's `asset_not_found` / `asset_archived`).
 
   The kind is the target's. A network asset always ends with an explicit port scope, so a signed
   engagement never means "any port"; ports apply to network assets only.
   """
-  if (not isinstance(entry, dict)
-      or not set(entry) <= {"display_name", "target", "authorized_ports"}):
-    raise EngagementInvalid("engagement_asset_invalid")
-  try:
-    display_name = normalize_name(entry.get("display_name"), _ASSET_NAME_MAX)
-  except (ValueError, TypeError):
-    raise EngagementInvalid("engagement_asset_invalid") from None
-  try:
-    target = normalize_target(entry.get("target"))
-  except (ValueError, TypeError):
-    raise EngagementInvalid("asset_target_invalid") from None
-  kind = target["kind"]
-  stored = {"engagement_asset_id": engagement_asset_id_for(index), "display_name": display_name,
-            "kind": kind, "target": target, "target_digest": canonical_digest(target)}
-  if kind != "network":
-    if "authorized_ports" in entry:
-      raise EngagementInvalid("engagement_asset_invalid")
-    return stored
-  try:
-    ports = normalize_port_scope(entry.get("authorized_ports"))
-  except (ValueError, TypeError):
-    raise EngagementInvalid("engagement_asset_invalid") from None
-  if ports is None:  # absent, None or blank
-    raise EngagementInvalid("ports_required")
-  return {**stored, "authorized_ports": ports}
-
-
-def normalize_engagement_assets(value):
-  """The requested assets in the order given; the same target twice is refused."""
-  if not isinstance(value, list) or not 1 <= len(value) <= MAX_ENGAGEMENT_ASSETS:
-    raise EngagementInvalid("engagement_asset_invalid")
-  assets = [normalize_engagement_asset(index, entry) for index, entry in enumerate(value)]
+  assets = []
+  for index, request in enumerate(requests):
+    row = lookup(request["asset_id"])
+    target = row["target"]
+    kind = target["kind"]
+    stored = {"engagement_asset_id": engagement_asset_id_for(index), "asset_id": row["asset_id"],
+              "display_name": row["display_name"], "kind": kind, "target": target,
+              "target_digest": row["target_digest"]}
+    if kind != "network":
+      if "authorized_ports" in request:
+        raise EngagementInvalid("engagement_asset_invalid")
+    elif request.get("authorized_ports") is None:  # absent or blank
+      raise EngagementInvalid("ports_required")
+    else:
+      stored["authorized_ports"] = request["authorized_ports"]
+    assets.append(stored)
   if len({entry["target_digest"] for entry in assets}) != len(assets):
     raise EngagementInvalid("engagement_asset_invalid")
   return assets
+
+
+def normalize_engagement_assets(value):
+  """Stored (snapshot) entries as the draft keeps them; the engagement keeps exactly these."""
+  if (not isinstance(value, list) or not 1 <= len(value) <= MAX_ENGAGEMENT_ASSETS
+      or not all(_asset_entry_valid(index, entry) for index, entry in enumerate(value))
+      or len({entry["target_digest"] for entry in value}) != len(value)
+      or len({entry["asset_id"] for entry in value}) != len(value)):
+    raise EngagementInvalid("engagement_asset_invalid")
+  return [dict(entry) for entry in value]
 
 
 def document_id_for(index):
@@ -248,12 +276,12 @@ def _asset_entry_valid(index, entry):
   if not isinstance(entry, dict) or not isinstance(entry.get("kind"), str):
     return False
   kind = entry["kind"]
-  common = {"engagement_asset_id", "display_name", "kind", "target", "target_digest"}
+  common = {"engagement_asset_id", "asset_id", "display_name", "kind", "target", "target_digest"}
   expected = common | ({"authorized_ports"} if kind == "network" else set())
   if kind not in ENGAGEMENT_ASSET_KINDS or set(entry) != expected:
     return False
   try:
-    if (entry["engagement_asset_id"] != engagement_asset_id_for(index)
+    if (entry["engagement_asset_id"] != engagement_asset_id_for(index) or not valid_asset_id(entry["asset_id"])
         or normalize_name(entry["display_name"], _ASSET_NAME_MAX) != entry["display_name"]
         or normalize_target(entry["target"]) != entry["target"] or entry["target"]["kind"] != kind
         or canonical_digest(entry["target"]) != entry["target_digest"]):
@@ -317,6 +345,7 @@ def validate_engagement(row, ids):
       or not isinstance(assets, list) or not 1 <= len(assets) <= MAX_ENGAGEMENT_ASSETS
       or not all(_asset_entry_valid(index, entry) for index, entry in enumerate(assets))
       or len({entry["target_digest"] for entry in assets}) != len(assets)
+      or len({entry["asset_id"] for entry in assets}) != len(assets)
       or not valid_digest(row.get("create_intent_digest"))
       or row.get("engagement_hash") != engagement_hash(row)):
     raise ValueError("Invalid engagement")

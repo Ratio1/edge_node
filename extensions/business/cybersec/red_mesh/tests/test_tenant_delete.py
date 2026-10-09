@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from .asset_fixture import pick, register_asset
 from .test_tenant_administration import FakeAdministrationStore
 from .contract_fixture import install_contract
 
@@ -44,11 +45,10 @@ class TestTenantDelete(unittest.TestCase):
     self.documents = self.plugin._document_store()
     self.plugin.configured_peers_reader = None
     refs = [self.upload("Rules of engagement"), self.upload("Scope email", kind="other", raw=PDF + b"2")]
+    asset_id = register_asset(self.plugin, self.actor, self.tenant, {"kind": "network", "address": "192.0.2.10"})
     created = self.plugin.create_engagement(
       self.actor, self.tenant, str(uuid4()), "Q4", "2026-10-01T00:00:00Z",
-      "2027-10-01T00:00:00Z", {}, {"client_name": "Example"},
-      [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
-        "authorized_ports": "443"}], refs)
+      "2027-10-01T00:00:00Z", {}, {"client_name": "Example"}, [pick(asset_id, "443")], refs)
     self.assertTrue(created["success"], created)
     self.engagement_refs = refs
     self.events.clear()
@@ -84,8 +84,8 @@ class TestTenantDelete(unittest.TestCase):
     self.assertEqual(self.documents.deleted, [])
 
   def test_delete_removes_records_and_documents_keeps_the_domain_and_is_audited(self):
-    # RM-125: two assets, one of them a row the current validator refuses; both go.
-    for address in ("192.0.2.20", "192.0.2.21"):
+    # RM-125: two assets (the engagement's and this one), the latter a row the current validator refuses; both go.
+    for address in ("192.0.2.20",):
       registered = self.plugin.create_tenant_asset(self.actor, self.tenant, str(uuid4()), "Host " + address,
                                                    {"kind": "network", "address": address})
       self.assertTrue(registered["success"], registered)

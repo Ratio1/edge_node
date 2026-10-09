@@ -25,6 +25,7 @@ class TestTenantExecution(unittest.TestCase):
   setUp_engagements = fixtures.TestTenantEngagements.setUp
   new_tenant = fixtures.TestTenantEngagements.new_tenant
   fields = fixtures.TestTenantEngagements.fields
+  default_assets = fixtures.TestTenantEngagements.default_assets
 
   def setUp(self):
     self.setUp_engagements()

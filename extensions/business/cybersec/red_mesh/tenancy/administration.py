@@ -22,8 +22,8 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
                            normalize_integration_config, public_integration_config,
                            valid_integration_id)
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
-                          engagement_id_for, normalize_context, normalize_engagement_assets, normalize_roe,
-                          normalize_window, valid_doc_ref, valid_engagement_id)
+                          engagement_id_for, normalize_asset_requests, normalize_context,
+                          build_engagement_assets, normalize_engagement_assets, normalize_roe, normalize_window, valid_doc_ref, valid_engagement_id)
 from . import drafts, engagement_drafts, super_tenant_profile, tenant_assets
 
 
@@ -832,8 +832,9 @@ class TenantAdministrationService:
       raise TenantStoreError("Engagement readback is unavailable")
     assets = []
     for entry in row["assets"]:
-      asset = {"engagementAssetId": entry["engagement_asset_id"], "displayName": entry["display_name"],
-               "kind": entry["kind"], "target": entry["target"], "targetDigest": entry["target_digest"]}
+      asset = {"engagementAssetId": entry["engagement_asset_id"], "assetId": entry["asset_id"],
+               "displayName": entry["display_name"], "kind": entry["kind"], "target": entry["target"],
+               "targetDigest": entry["target_digest"]}
       if entry["kind"] == "network":
         asset.update(authorizedPorts=entry["authorized_ports"])
       assets.append(asset)
@@ -907,9 +908,10 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "document_invalid")
     if supersedes is not None and not valid_engagement_id(supersedes):
       raise AdministrationDenied(400, "supersedes_invalid")
-    # RM-107: the engagement defines its targets; nothing is read from a tenant asset row.
+    # RM-125 phase 2b: only the request form `{asset_id, authorized_ports?}`, so the replay intent
+    # needs no store read; `_engagement_assets` copies the asset rows at write time, after the replay.
     try:
-      assets = normalize_engagement_assets(assets)
+      assets = normalize_asset_requests(assets)
     except EngagementInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     return {"display_name": display_name, "valid_from": valid_from, "valid_until": valid_until,
@@ -942,9 +944,29 @@ class TenantAdministrationService:
     if supersedes is not None and (supersedes == engagement_id
                                    or self.store.get("engagement", tenant_id, supersedes) is None):
       raise AdministrationDenied(400, "supersedes_invalid")
+    record = self._with_assets(record, self._engagement_assets(request["assets"], {"tenant_id": tenant_id}))
     self.store.put("engagement", tenant_id, engagement_id, record=record)
     # `replayed` says whether this call wrote, decided under the lock (the plugin audits on it).
     return {**self._engagement_row(self.store.get("engagement", tenant_id, engagement_id)), "replayed": False}
+
+  def _engagement_assets(self, requests, parent):
+    """RM-125 phase 2b: the stored entries for normalized request entries, each copied from the
+    registered asset of `parent`. Another parent's asset is `asset_not_found`, never revealed."""
+    def lookup(asset_id):
+      row = self.store.get("tenant_asset", asset_id)
+      if row is None or row["parent"] != parent:
+        raise AdministrationDenied(404, "asset_not_found")
+      if row["archived_at"] is not None:
+        raise AdministrationDenied(409, "asset_archived")
+      return row
+    try:
+      return build_engagement_assets(requests, lookup)
+    except EngagementInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+
+  @staticmethod
+  def _with_assets(record, assets):
+    return {**record, "assets": assets, "engagement_hash": engagement_hash({**record, "assets": assets})}
 
   def _engagement_record(self, account, tenant_id, request_id, request, contract_sha256, documents, supersedes):
     """The stored row of a new engagement, hashed; `request` is `_engagement_request`'s answer and
@@ -1708,11 +1730,24 @@ class TenantAdministrationService:
     """Answers the row and the refs whose files the plugin deletes after this write."""
     account = self._actor(actor, creator=True)
     previous = self._unlocked_engagement_draft(engagement_draft_id)
+    if isinstance(changes, dict) and "assets" in changes:
+      changes = {**changes, "assets": self._draft_assets(changes["assets"], previous["parent"])}
     try:
       row, dropped = engagement_drafts.apply_changes(previous, changes)
     except engagement_drafts.EngagementDraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     return {"draft": self._write_engagement_draft(row, account, previous), "dropped": dropped}
+
+  def _draft_assets(self, requests, parent):
+    """RM-125 phase 2b: an `assets` change as stored entries, copied from the parent's registered
+    assets now (an empty list clears them)."""
+    if requests == []:
+      return []
+    try:
+      requests = normalize_asset_requests(requests)
+    except EngagementInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    return self._engagement_assets(requests, parent)
 
   @_endpoint
   def authorize_engagement_draft_upload(self, actor, engagement_draft_id):
@@ -2022,6 +2057,8 @@ class TenantAdministrationService:
       row["display_name"], row["valid_from"], row["valid_until"], row["roe"],
       row["context"], engagement_drafts.asset_requests(row["assets"]), packs, None, None)
     record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, packs, None)
+    # The draft's own copies (already validated by `completeness`); the library is not read.
+    record = self._with_assets(record, normalize_engagement_assets(row["assets"]))
     self.store.put("engagement", tenant_id, engagement_id, record=record)
     self.store.delete("engagement_draft", engagement_draft_id)
     return {"engagementId": engagement_id, "tenantId": tenant_id, "replayed": False,

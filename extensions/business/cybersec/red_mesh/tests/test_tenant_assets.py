@@ -1,9 +1,11 @@
 """RM-125 phase 1: tenant assets on a live tenant and on a tenant draft, through the real plugin endpoints."""
+from datetime import datetime, timedelta, timezone
 import json
 import unittest
 from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
+from .asset_fixture import pick
 from .test_engagement_drafts import _EngagementDraftCase
 from .test_tenant_drafts import TENANCY_HKEY, ok, refused
 
@@ -252,6 +254,121 @@ class TestTenantAssetLifecycle(_AssetCase):
     field = json.dumps(["tenant_asset", "deployment", asset["asset_id"]], separators=(",", ":"))
     self.store.data[(TENANCY_HKEY, field)]["target_digest"] = "0" * 64
     refused(self, self.plugin.list_tenant_assets(self.actor, tenant_id), 503, "unavailable")
+
+
+class TestTenantAssetLinks(_AssetCase):
+  """RM-125 phase 2b: engagements and engagement drafts pick registered assets; links, status and lock."""
+
+  def engage(self, tenant_id, asset_id, start=-10, end=10, ports="443"):
+    """An engagement over `asset_id`, its window `start`..`end` days from now (no documents)."""
+    now = datetime.now(timezone.utc)
+    window = [(now + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ") for days in (start, end)]
+    created = self.plugin.create_engagement(self.actor, tenant_id, str(uuid4()), "Q4", *window, {},
+                                            {"client_name": "Example"}, [pick(asset_id, ports)], [])
+    return ok(self, created)
+
+  def draft_over(self, parent, asset_id):
+    draft = self.child(parent)
+    ok(self, self.update_child(draft["engagement_draft_id"], {"assets": [pick(asset_id, "443")]}))
+    return draft["engagement_draft_id"]
+
+  def linked(self, asset_id):
+    return ok(self, self.plugin.get_tenant_asset(self.actor, asset_id))["asset"]
+
+  def test_the_status_follows_the_links(self):
+    tenant_id = self.tenant()
+    expectations = {}
+    for label, window in (("testable", (-10, 10)), ("scheduled", (5, 10)), ("expired", (-10, -5))):
+      asset = self.asset(tenant_id, target={"kind": "network", "address": "192.0.2.%d" % (40 + len(expectations))})
+      engagement = self.engage(tenant_id, asset["asset_id"], *window)
+      expectations[label] = (asset["asset_id"], engagement["engagementId"])
+    unlinked = self.asset(tenant_id, target=WEBAPP)
+    self.assertEqual((unlinked["status"], unlinked["links"]), ("unlinked", []))
+    states = {"testable": "active", "scheduled": "scheduled", "expired": "ended"}
+    for label, (asset_id, engagement_id) in expectations.items():
+      with self.subTest(label):
+        asset = self.linked(asset_id)
+        self.assertEqual(asset["status"], label)
+        self.assertEqual(asset["links"], [{"source": "engagement", "id": engagement_id, "display_name": "Q4",
+                                           "state": states[label]}])
+    # A revoked engagement is a link, and the asset is no longer testable through it.
+    asset_id, engagement_id = expectations["testable"]
+    ok(self, self.plugin.revoke_engagement(self.actor, tenant_id, engagement_id, "done"))
+    asset = self.linked(asset_id)
+    self.assertEqual((asset["status"], [link["state"] for link in asset["links"]]), ("expired", ["revoked"]))
+    # The list carries the same links.
+    self.assertEqual({row["asset_id"]: row["status"] for row in self.listed(tenant_id)["assets"]},
+                     {expectations["testable"][0]: "expired", expectations["scheduled"][0]: "scheduled",
+                      expectations["expired"][0]: "expired", unlinked["asset_id"]: "unlinked"})
+
+  def test_a_draft_link_alone_is_unlinked_but_locks_the_asset(self):
+    tenant_id = self.tenant()
+    asset = self.asset(tenant_id)
+    draft_id = self.draft_over(tenant_id, asset["asset_id"])
+    linked = self.linked(asset["asset_id"])
+    self.assertEqual((linked["status"], linked["links"]), ("unlinked", [{
+      "source": "engagement_draft", "id": draft_id, "display_name": "Pack", "state": "draft"}]))
+    self.assert_locked(asset["asset_id"])
+
+  def assert_locked(self, asset_id):
+    writes = len(self.store.writes)
+    refused(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"target": WEBAPP}), 409, "asset_linked")
+    refused(self, self.plugin.delete_tenant_asset(self.actor, asset_id), 409, "asset_linked")
+    self.assertEqual(len(self.store.writes), writes)
+    # The name and notes stay editable; archiving is not a delete.
+    ok(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"display_name": "Renamed " + str(uuid4())[:4]}))
+
+  def test_a_revoked_or_ended_engagement_still_locks_the_asset(self):
+    tenant_id = self.tenant()
+    revoked = self.asset(tenant_id)
+    ok(self, self.plugin.revoke_engagement(self.actor, tenant_id,
+                                           self.engage(tenant_id, revoked["asset_id"])["engagementId"], "done"))
+    self.assert_locked(revoked["asset_id"])
+    ended = self.asset(tenant_id, target=WEBAPP)
+    self.engage(tenant_id, ended["asset_id"], -10, -5, ports=None)
+    self.assertEqual(self.linked(ended["asset_id"])["links"][0]["state"], "ended")
+    refused(self, self.plugin.update_tenant_asset(self.actor, ended["asset_id"], {"target": NETWORK}), 409,
+            "asset_linked")
+    refused(self, self.plugin.delete_tenant_asset(self.actor, ended["asset_id"]), 409, "asset_linked")
+
+  def test_an_engagement_draft_picks_the_assets_of_its_own_parent_only(self):
+    first, second = self.create()["draft_id"], self.create()["draft_id"]
+    own, other = self.asset(first), self.asset(second)
+    draft_id = self.draft_over(first, own["asset_id"])
+    stored = self.stored_child(draft_id)["assets"]
+    self.assertEqual(stored, [{"engagement_asset_id": "ea_1", "asset_id": own["asset_id"],
+                               "display_name": own["display_name"], "kind": "network", "target": NETWORK,
+                               "target_digest": own["target_digest"], "authorized_ports": "443"}])
+    tenant_id = self.tenant()
+    live = self.asset(tenant_id, target=WEBAPP)
+    under_tenant = self.child(tenant_id)["engagement_draft_id"]
+    writes = len(self.store.writes)
+    for assets in ([pick(other["asset_id"], "443")], [pick("ta_" + str(uuid4()), "443")]):
+      refused(self, self.update_child(draft_id, {"assets": assets}), 404, "asset_not_found")
+    # A tenant's asset is not a tenant draft's, nor the reverse.
+    refused(self, self.update_child(draft_id, {"assets": [pick(live["asset_id"])]}), 404, "asset_not_found")
+    refused(self, self.update_child(under_tenant, {"assets": [pick(own["asset_id"], "443")]}), 404, "asset_not_found")
+    self.assertEqual(len(self.store.writes), writes)
+    # Archived assets are refused, and the picked entry keeps its copy.
+    ok(self, self.plugin.archive_tenant_asset(self.actor, other["asset_id"], True))
+    refused(self, self.update_child(self.child(second)["engagement_draft_id"],
+                                    {"assets": [pick(other["asset_id"], "443")]}), 409, "asset_archived")
+
+  def test_closing_the_tenant_draft_keeps_the_links(self):
+    draft_id, request_id = self.ready(), str(uuid4())
+    asset = self.asset(draft_id)
+    engagement_draft_id = self.draft_over(draft_id, asset["asset_id"])
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    ok(self, self.plugin.close_tenant_draft(self.actor, draft_id))
+    self.assertEqual(self.stored_child(engagement_draft_id)["parent"], {"tenant_id": tenant_id})
+    moved = self.linked(asset["asset_id"])
+    self.assertEqual(moved["parent"], {"tenant_id": tenant_id})
+    self.assertEqual([(link["source"], link["id"]) for link in moved["links"]],
+                     [("engagement_draft", engagement_draft_id)])
+    self.assert_locked(asset["asset_id"])
+    # The draft still resolves its (re-homed) asset under the tenant.
+    ok(self, self.update_child(engagement_draft_id, {"assets": [pick(asset["asset_id"], "443")]}))
 
 
 if __name__ == "__main__":

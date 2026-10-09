@@ -68,6 +68,8 @@ def _instant(value):
 
 
 def _assets(value):
+  # RM-125: the administration resolved the public `{asset_id, authorized_ports?}` entries into
+  # stored entries (asset copy included) before this runs.
   if value == []:
     return []
   return _refused(normalize_engagement_assets, value, "engagement_asset_invalid")
@@ -134,11 +136,11 @@ def document_refs(row):
   return [block["ref"] for block in (row["document"]["document"], row["document"]["generated"]) if block is not None]
 
 
-_ASSET_REQUEST_KEYS = ("display_name", "target", "authorized_ports")
+_ASSET_REQUEST_KEYS = ("asset_id", "authorized_ports")
 
 
 def asset_requests(assets):
-  """The stored (normalized) assets as `create_engagement` takes them, for the full validation."""
+  """The stored entries as the public `create_engagement` request form (RM-125 phase 2b)."""
   return [{key: entry[key] for key in _ASSET_REQUEST_KEYS if key in entry} for entry in assets]
 
 
@@ -169,7 +171,7 @@ def completeness(row):
     except EngagementInvalid as exc:
       gap(field, exc.code)
   try:
-    normalize_engagement_assets(asset_requests(row["assets"]))
+    normalize_engagement_assets(row["assets"])
   except EngagementInvalid as exc:
     gap("assets", exc.code)
   if row["document"]["state"] != "signed":
@@ -200,7 +202,8 @@ def _stored_assets_valid(assets):
   # draft unreadable; activation re-normalizes them in full.
   return (isinstance(assets, list) and len(assets) <= MAX_ENGAGEMENT_ASSETS
           and all(_asset_entry_valid(index, entry) for index, entry in enumerate(assets))
-          and len({entry["target_digest"] for entry in assets}) == len(assets))
+          and len({entry["target_digest"] for entry in assets}) == len(assets)
+          and len({entry["asset_id"] for entry in assets}) == len(assets))
 
 
 def validate_engagement_draft(row, ids):

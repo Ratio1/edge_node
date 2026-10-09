@@ -68,10 +68,11 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
   try:
     fixture.ready()
     fixture.service.clock = lambda: datetime(2026, 10, 15, tzinfo=timezone.utc)
+    from .asset_fixture import pick
+    asset_id = fixture.net  # the fixture's registered network asset (`fixture.target`)
     engagement = fixture.service.create_engagement(
       fixture.actor, fixture.tenant, str(uuid4()), "Q4", "2026-10-01T00:00:00Z",
-      "2026-10-31T00:00:00Z", {}, {"client_name": "Example"},
-      [{"display_name": "Edge", "target": fixture.target, "authorized_ports": "1-1024"}],
+      "2026-10-31T00:00:00Z", {}, {"client_name": "Example"}, [pick(asset_id, "1-1024")],
       [doc("1" * 64, "QmEngagementRoeRef"), doc("2" * 64, "QmEngagementAuthRef")])
     assert engagement["success"], engagement
     owner = TestPhase1ConfigCID._build_mock_plugin()

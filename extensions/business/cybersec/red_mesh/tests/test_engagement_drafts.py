@@ -12,17 +12,17 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
 )
 from extensions.business.cybersec.red_mesh.tenancy.engagements import ROE_DEFAULTS
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+from .asset_fixture import pick, register_asset
 from .contract_fixture import envelope
 from .test_tenant_drafts import GENERATED_AT, PNG, SCHEDULE_PDF, SNAPSHOT, TENANCY_HKEY, _ActivationCase, ok, refused
 
 PACK_PDF = b"%PDF-1.7\n%fixture signed engagement pack\n%%EOF\n"
 GENERATED_PDF = b"%PDF-1.7\n%fixture generated engagement pack\n%%EOF\n"
-NETWORK = {"display_name": "Edge gateway", "target": {"kind": "network", "address": "192.0.2.10"},
-           "authorized_ports": "22,443"}
-WEBAPP = {"display_name": "Portal", "target": {"kind": "webapp", "url": "https://app.example.com/", "allowedPathPrefix": "/"}}
+NETWORK = {"kind": "network", "address": "192.0.2.10"}
+WEBAPP = {"kind": "webapp", "url": "https://app.example.com/", "allowedPathPrefix": "/"}
 COMPLETE = {"display_name": " Q4 external ",
             "valid_from": "2026-10-01T00:00:00Z", "valid_until": "2026-10-31T00:00:00+00:00",
-            "roe": {"authenticated_action": True}, "context": {"client_name": "Example"}, "assets": [NETWORK]}
+            "roe": {"authenticated_action": True}, "context": {"client_name": "Example"}}
 LIST_KEYS = {"engagement_draft_id", "parent", "display_name", "assets_count", "document_state", "created_at",
              "updated_at"}
 SNAPSHOT_SHA256 = hashlib.sha256(SNAPSHOT.encode("utf-8")).hexdigest()
@@ -43,8 +43,21 @@ class _EngagementDraftCase(_ActivationCase):
   def stored_child(self, engagement_draft_id):
     return self.repo.get("engagement_draft", engagement_draft_id)
 
+  def asset_in(self, parent, target=NETWORK):
+    """RM-125 phase 2b: the registered asset of `target` under `parent` (`draft_id` or `tenant_id`), made once."""
+    if isinstance(parent, dict):
+      parent = parent.get("draft_id") or parent["tenant_id"]
+    assets = self.__dict__.setdefault("_registered", {})
+    key = (parent, json.dumps(target, sort_keys=True))
+    if key not in assets:
+      assets[key] = register_asset(self.plugin, self.actor, parent, target, target["kind"].title())
+    return assets[key]
+
   def fill(self, engagement_draft_id, **changes):
-    return ok(self, self.update_child(engagement_draft_id, {**COMPLETE, **changes}))
+    """Complete every creation field; `assets` defaults to the draft parent's network asset."""
+    parent = self.stored_child(engagement_draft_id)["parent"]
+    assets = changes.pop("assets", None) or [pick(self.asset_in(parent), "22,443")]
+    return ok(self, self.update_child(engagement_draft_id, {**COMPLETE, **changes, "assets": assets}))
 
   def active_tenant(self):
     """A tenant activated from a draft; the draft is not closed. Returns (draft_id, tenant_id)."""
@@ -133,8 +146,11 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
     self.assertEqual(ok(self, self.plugin.list_engagement_drafts(self.actor, "td_" + str(uuid4()))), [])
 
   def test_update_checks_every_field_with_the_engagement_normalizers(self):
-    engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
+    parent = self.create()["draft_id"]
+    engagement_draft_id = self.child(parent)["engagement_draft_id"]
     self.fill(engagement_draft_id)
+    net, web = self.asset_in(parent), self.asset_in(parent, WEBAPP)
+    ports = pick(net, "22,443")
     cases = {
       "not a dict": (None, "invalid_request"),
       "unknown key": ({"tenant_id": "tn_x"}, "invalid_request"),
@@ -147,16 +163,18 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
       "roe flag": ({"roe": {"dos_allowed": True}}, "roe_invalid"),
       "roe type": ({"roe": {"authenticated_action": "yes"}}, "roe_invalid"),
       "context": ({"context": {"client_name": None}}, "context_invalid"),
-      "asset ports": ({"assets": [{key: value for key, value in NETWORK.items() if key != "authorized_ports"}]},
-                      "ports_required"),
-      "asset tests": ({"assets": [{**NETWORK, "authorized_tests": ["service_info_common"]}]},
+      "asset ports": ({"assets": [pick(net)]}, "ports_required"),
+      "asset tests": ({"assets": [{**ports, "authorized_tests": ["service_info_common"]}]},
                       "engagement_asset_invalid"),
-      "asset scan modes": ({"assets": [{**NETWORK, "authorized_scan_modes": ["connect"]}]},
+      "asset scan modes": ({"assets": [{**ports, "authorized_scan_modes": ["connect"]}]},
                            "engagement_asset_invalid"),
-      "asset target": ({"assets": [{**NETWORK, "target": {"kind": "network", "address": "bad host"}}]},
-                       "asset_target_invalid"),
-      "asset twice": ({"assets": [NETWORK, NETWORK]}, "engagement_asset_invalid"),
-      "stored asset echoed back": ({"assets": [{**NETWORK, "engagement_asset_id": "ea_1"}]}, "engagement_asset_invalid"),
+      "asset target": ({"assets": [{**ports, "target": NETWORK}]}, "engagement_asset_invalid"),
+      "asset name": ({"assets": [{**ports, "display_name": "Edge"}]}, "engagement_asset_invalid"),
+      "asset kind": ({"assets": [{**ports, "kind": "network"}]}, "engagement_asset_invalid"),
+      "asset twice": ({"assets": [ports, ports]}, "engagement_asset_invalid"),
+      "web asset with ports": ({"assets": [pick(web, "80")]}, "engagement_asset_invalid"),
+      "asset id malformed": ({"assets": [{"asset_id": "as_" + str(uuid4())}]}, "engagement_asset_invalid"),
+      "stored asset echoed back": ({"assets": [{**ports, "engagement_asset_id": "ea_1"}]}, "engagement_asset_invalid"),
       "document shape": ({"document": {"document": None}}, "invalid_request"),
       "document signed": ({"document": {"state": "signed"}}, "invalid_request"),
       "document state": ({"document": {"state": "done"}}, "invalid_request"),
@@ -170,14 +188,16 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
     self.assertEqual(self.stored_child(engagement_draft_id), before)
 
   def test_update_accepts_emptiness_and_stores_normalized_values(self):
-    engagement_draft_id = self.child(self.create()["draft_id"])["engagement_draft_id"]
+    parent = self.create()["draft_id"]
+    engagement_draft_id = self.child(parent)["engagement_draft_id"]
     draft = self.fill(engagement_draft_id)
     self.assertEqual((draft["display_name"], draft["valid_until"]), ("Q4 external", "2026-10-31T00:00:00Z"))
     self.assertEqual(draft["roe"], {**ROE_DEFAULTS, "authenticated_action": True})
     self.assertEqual(draft["context"]["client_name"], "Example")
     asset = draft["assets"][0]
-    self.assertEqual((asset["engagement_asset_id"], asset["kind"], asset["authorized_ports"]),
-                     ("ea_1", "network", "22,443"))
+    self.assertEqual((asset["engagement_asset_id"], asset["asset_id"], asset["kind"], asset["authorized_ports"]),
+                     ("ea_1", self.asset_in(parent), "network", "22,443"))
+    self.assertEqual((asset["display_name"], asset["target"]), ("Network", NETWORK))
     self.assertNotIn("authorized_scan_modes", asset)
     self.assertNotIn("authorized_tests", asset)
     self.assertEqual(draft["completeness"], {"complete": False, "missing": ["item:engagement_pack"], "reasons": {}})
@@ -203,7 +223,7 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
         ids.append(self.child(parent, "Pack %d" % day)["engagement_draft_id"])
       clock.now.return_value = datetime(2026, 10, 9, tzinfo=timezone.utc)
       elsewhere = self.child(other)["engagement_draft_id"]
-    self.fill(ids[0], assets=[NETWORK, WEBAPP])
+    self.fill(ids[0], assets=[pick(self.asset_in(parent), "22,443"), pick(self.asset_in(parent, WEBAPP))])
     ok(self, self.upload_pack(ids[0]))
     rows = ok(self, self.plugin.list_engagement_drafts(self.actor, parent))
     self.assertEqual([row["engagement_draft_id"] for row in rows], [ids[1], ids[2], ids[0]])
@@ -477,6 +497,26 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     ok(self, self.upload_pack(engagement_draft_id, actor=uploader))
     return engagement_draft_id
 
+  def test_activation_keeps_the_drafted_copy_after_the_asset_is_renamed_archived_or_changed(self):
+    _, tenant_id = self.active_tenant()
+    engagement_draft_id = self.ready_child(tenant_id)
+    asset_id = self.asset_in(tenant_id)
+    drafted = self.stored_child(engagement_draft_id)["assets"]
+    self.assertEqual((drafted[0]["asset_id"], drafted[0]["display_name"]), (asset_id, "Network"))
+    ok(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"display_name": "Renamed"}))
+    ok(self, self.plugin.archive_tenant_asset(self.actor, asset_id, True))
+    # The target is locked by the draft; the signed copy is the one drafted.
+    refused(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"target": WEBAPP}), 409, "asset_linked")
+    ok(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id))
+    engagement, = self.engagement_rows()
+    self.assertEqual(engagement["assets"], drafted)
+    self.assertEqual(engagement["assets"][0]["display_name"], "Network")
+    # The activated engagement links the asset, whatever the asset was renamed to.
+    linked = ok(self, self.plugin.get_tenant_asset(self.actor, asset_id))["asset"]
+    self.assertEqual([(link["source"], link["id"]) for link in linked["links"]],
+                     [("engagement", engagement["engagement_id"])])
+    self.assertEqual(linked["display_name"], "Renamed")
+
   def test_the_parent_must_be_a_tenant(self):
     parent = self.create()["draft_id"]
     engagement_draft_id = self.ready_child(parent)
@@ -498,8 +538,8 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     result = self.plugin.activate_engagement_draft(self.actor, engagement_draft_id)
     refused(self, result, 409, "draft_incomplete")
     self.assertEqual((result["missing"], result["reasons"]), (["item:engagement_pack"], {}))
-    # The one write is the fill; neither refusal wrote.
-    self.assertEqual(len(self.store.writes) - writes, 1)
+    # The writes are the asset registration and the fill; neither refusal wrote.
+    self.assertEqual(len(self.store.writes) - writes, 2)
     self.assertEqual(self.engagement_rows(), [])
 
   def test_the_engagement_is_created_from_the_draft_with_both_packs(self):
@@ -725,13 +765,13 @@ class TestTenantDraftCascade(_EngagementDraftCase):
     draft_id, tenant_id = self.active_tenant()
     ok(self, self.plugin.close_tenant_draft(self.actor, draft_id))
     engagement_draft_id = self.child(tenant_id)["engagement_draft_id"]
+    self.fill(engagement_draft_id)  # picks an asset: deleting the tenant deletes its library
     self.plugin.cfg_instance_id = "jobs"
     self.store.account("acme.admin", memberships=[])
     self.assertTrue(ok(self, self.plugin.delete_tenant(self.actor, tenant_id))["deleted"])
     # No cascade from `delete_tenant` (accepted): the row stays for data maintenance, and activation
     # finds no tenant.
     self.assertIsNotNone(self.stored_child(engagement_draft_id))
-    self.fill(engagement_draft_id)
     ok(self, self.upload_pack(engagement_draft_id))
     refused(self, self.plugin.activate_engagement_draft(self.actor, engagement_draft_id), 404, "not_found")
 

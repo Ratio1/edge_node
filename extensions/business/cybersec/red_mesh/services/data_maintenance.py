@@ -281,6 +281,11 @@ class Inventory:
     if kind == "engagement" and isinstance(value, dict) and any(
         name in value for name in _ENGAGEMENT_V1_FIELDS):
       return OLD, "engagement_v1"
+    # RM-125 phase 2b: an entry without `asset_id`, or still with the v2 `authorized_tests`.
+    if kind in ("engagement", "engagement_draft") and isinstance(value, dict) and any(
+        isinstance(entry, dict) and ("asset_id" not in entry or "authorized_tests" in entry)
+        for entry in (value["assets"] if isinstance(value.get("assets"), list) else ())):
+      return OLD, "engagement_v2" if kind == "engagement" else "engagement_draft_v1"
     try:
       if field != self._store._location(kind, ids)[1]:
         return OLD, "unrecognized"
