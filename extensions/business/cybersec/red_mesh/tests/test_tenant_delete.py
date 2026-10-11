@@ -48,7 +48,7 @@ class TestTenantDelete(unittest.TestCase):
     asset_id = register_asset(self.plugin, self.actor, self.tenant, {"kind": "network", "address": "192.0.2.10"})
     created = self.plugin.create_engagement(
       self.actor, self.tenant, str(uuid4()), "Q4", "2026-10-01T00:00:00Z",
-      "2027-10-01T00:00:00Z", {"client_name": "Example"}, [pick(asset_id, "443")], refs)
+      "2027-10-01T00:00:00Z", {"client_name": "Example"}, [pick(asset_id)], refs)
     self.assertTrue(created["success"], created)
     self.engagement_refs = refs
     self.events.clear()

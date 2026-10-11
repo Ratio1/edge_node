@@ -55,7 +55,7 @@ class _EngagementDraftCase(_ActivationCase):
   def fill(self, engagement_draft_id, **changes):
     """Complete every creation field; `assets` defaults to the draft parent's network asset."""
     parent = self.stored_child(engagement_draft_id)["parent"]
-    assets = changes.pop("assets", None) or [pick(self.asset_in(parent), "22,443")]
+    assets = changes.pop("assets", None) or [pick(self.asset_in(parent))]
     return ok(self, self.update_child(engagement_draft_id, {**COMPLETE, **changes, "assets": assets}))
 
   def active_tenant(self):
@@ -220,7 +220,7 @@ class TestEngagementDraftRecord(_EngagementDraftCase):
         ids.append(self.child(parent, "Pack %d" % day)["engagement_draft_id"])
       clock.now.return_value = datetime(2026, 10, 9, tzinfo=timezone.utc)
       elsewhere = self.child(other)["engagement_draft_id"]
-    self.fill(ids[0], assets=[pick(self.asset_in(parent), "22,443"), pick(self.asset_in(parent, WEBAPP))])
+    self.fill(ids[0], assets=[pick(self.asset_in(parent)), pick(self.asset_in(parent, WEBAPP))])
     ok(self, self.upload_pack(ids[0]))
     rows = ok(self, self.plugin.list_engagement_drafts(self.actor, parent))
     self.assertEqual([row["engagement_draft_id"] for row in rows], [ids[1], ids[2], ids[0]])
@@ -618,6 +618,10 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     for document_id, ref in (("ed_1", signed["ref"]), ("ed_2", generated["ref"])):
       downloaded = ok(self, self.plugin.download_engagement_document(self.actor, tenant_id, engagement_id, document_id))
       self.assertEqual(downloaded["sha256"], hashlib.sha256(GENERATED_PDF).hexdigest())
+    # Tenant delete collects files by ref, so both copies are deleted with the tenant.
+    collected = [ref["ref"] for ref in self.plugin._execution_service()._tenant_document_refs({"tenant_id": tenant_id})]
+    self.assertIn(signed["ref"], collected)
+    self.assertIn(generated["ref"], collected)
 
   def test_without_a_generated_pack_the_signed_pack_is_the_only_document(self):
     _, tenant_id = self.active_tenant()

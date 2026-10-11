@@ -673,8 +673,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     1. Banner grab and SYST/FEAT fingerprint.
     2. Anonymous login attempt.
-    3. Write access test (STOR) after anonymous login, only when the job's RoE
-       permit an authenticated action (RM-103).
+    3. Write access test (STOR) after anonymous login.
     4. Directory listing and traversal.
     5. TLS support check (AUTH TLS).
     6. Default credential check.
@@ -1106,7 +1105,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       result["accepted_credentials"] = accepted_creds
       findings += _default_credential_findings(
         "SSH", accepted_creds, control=control, proofs=proofs,
-        )
+      )
 
     # --- 5. Cipher/KEX audit ---
     cipher_findings, weak_labels = self._ssh_check_ciphers(target, port)
@@ -1618,8 +1617,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     2. Default credential check — try common user:pass combos.
     3. Privilege escalation check — report if root shell is obtained.
     4. System fingerprint — run ``id`` and ``uname -a`` on successful login.
-       Steps 3 and 4 run only when the job's RoE permit an authenticated
-       action (RM-103); otherwise the login outcome is all that is recorded.
     5. Arbitrary credential acceptance test.
 
     Parameters

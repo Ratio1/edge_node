@@ -13,6 +13,6 @@ def register_asset(endpoint, actor, parent, target, display_name="Asset"):
   return data.get("asset", data)["asset_id"]
 
 
-def pick(asset_id, authorized_ports=None):
-  """The public request entry for a registered asset (RM-128: ports dropped; arg ignored)."""
+def pick(asset_id):
+  """The public request entry for a registered asset."""
   return {"asset_id": asset_id}
