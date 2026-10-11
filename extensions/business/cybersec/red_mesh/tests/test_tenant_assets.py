@@ -263,7 +263,7 @@ class TestTenantAssetLinks(_AssetCase):
     """An engagement over `asset_id`, its window `start`..`end` days from now (no documents)."""
     now = datetime.now(timezone.utc)
     window = [(now + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ") for days in (start, end)]
-    created = self.plugin.create_engagement(self.actor, tenant_id, str(uuid4()), "Q4", *window, {},
+    created = self.plugin.create_engagement(self.actor, tenant_id, str(uuid4()), "Q4", *window,
                                             {"client_name": "Example"}, [pick(asset_id, ports)], [])
     return ok(self, created)
 
@@ -338,7 +338,7 @@ class TestTenantAssetLinks(_AssetCase):
     stored = self.stored_child(draft_id)["assets"]
     self.assertEqual(stored, [{"engagement_asset_id": "ea_1", "asset_id": own["asset_id"],
                                "display_name": own["display_name"], "kind": "network", "target": NETWORK,
-                               "target_digest": own["target_digest"], "authorized_ports": "443"}])
+                               "target_digest": own["target_digest"]}])
     tenant_id = self.tenant()
     live = self.asset(tenant_id, target=WEBAPP)
     under_tenant = self.child(tenant_id)["engagement_draft_id"]

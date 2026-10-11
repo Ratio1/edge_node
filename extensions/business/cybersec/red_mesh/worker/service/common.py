@@ -13,7 +13,7 @@ from ...findings import Finding, Severity, probe_result, probe_error
 from ... import cvss_vectors as V
 from ...cve_db import check_cves, parse_distro_package
 from ...models.finding_schema import (
-  AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_NOT_PERMITTED, AUTHENTICATED_ACTION_PERFORMED,
+  AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_PERFORMED,
 )
 from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
@@ -24,7 +24,7 @@ CONTROL_ACCEPTED = "accepted"
 CONTROL_NOT_RUN = "not_run"
 
 
-def _default_credential_findings(protocol, accepted, *, control, proofs=None, action_permitted=False):
+def _default_credential_findings(protocol, accepted, *, control, proofs=None):
   """
   Build the default-credential findings for one service, gated on the
   negative control (RM-069).
@@ -48,9 +48,9 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None, ac
   with a proof is `certain`; a handshake alone is `firm` — the server said
   yes, but nothing was done with the session.
 
-  `action_permitted` is the job's RoE consent to that action (RM-103). When
-  it is false the probe never ran one, and the finding says the RoE, not a
-  failed attempt, is why the handshake is the whole evidence.
+  RM-128: the authenticated action always runs, so a pair with no proof means
+  the handshake alone was observed (the action completed nothing), never that
+  consent was withheld.
 
   The evidence keeps the `Accepted credential: <pair>` lead the redaction rule
   is anchored on; the proof follows a `;` so the pair still terminates there.
@@ -59,11 +59,7 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None, ac
   proofs = proofs or {}
   for cred in accepted:
     proof = proofs.get(cred)
-    action = (
-      AUTHENTICATED_ACTION_PERFORMED if proof
-      else AUTHENTICATED_ACTION_ATTEMPTED if action_permitted
-      else AUTHENTICATED_ACTION_NOT_PERMITTED
-    )
+    action = AUTHENTICATED_ACTION_PERFORMED if proof else AUTHENTICATED_ACTION_ATTEMPTED
     evidence = f"Accepted credential: {cred}"
     if proof:
       evidence += f"; authenticated action: {proof}"
@@ -103,11 +99,8 @@ def _default_credential_findings(protocol, accepted, *, control, proofs=None, ac
       title=f"{protocol} default credential accepted: {cred}",
       description=(
         f"The {protocol} server accepted a well-known default credential.{control_note}"
-        + ("" if proof else (
-          " No authenticated action was completed; the handshake alone was observed."
-          if action_permitted else
-          " No authenticated action was attempted; not permitted by the Rules of Engagement for this job."
-        ))
+        + ("" if proof else
+           " No authenticated action was completed; the handshake alone was observed.")
       ),
       evidence=evidence,
       remediation="Change default passwords immediately and enforce strong credential policies.",
@@ -750,12 +743,9 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
-        # The upload test below is the RoE-gated action; when it succeeds its
-        # own finding says `performed`, and "any performed" wins in the report.
-        authenticated_action=(
-          AUTHENTICATED_ACTION_ATTEMPTED if getattr(self, "authenticated_action", False)
-          else AUTHENTICATED_ACTION_NOT_PERMITTED
-        ),
+        # The upload test below always runs (RM-128); when it succeeds its own
+        # finding says `performed`, and "any performed" wins in the report.
+        authenticated_action=AUTHENTICATED_ACTION_ATTEMPTED,
       ))
     except Exception:
       # Anonymous failed — close and move on to credential tests
@@ -812,11 +802,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         pass
 
     # --- 3. Write access test (only if anonymous login succeeded) ---
-    # Uploading a file changes the target, so it needs the same RoE consent as
-    # the post-login action (RM-103); without it the test is recorded as not run.
-    if ftp and result["anonymous_access"] and not getattr(self, "authenticated_action", False):
-      result["write_access_test"] = "not_permitted_by_roe"
-    elif ftp and result["anonymous_access"]:
+    if ftp and result["anonymous_access"]:
       import io
       try:
         ftp.set_pasv(True)
@@ -913,15 +899,13 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 6. Default credential check ---
     accepted_creds = []
     proofs = {}
-    action_permitted = getattr(self, "authenticated_action", False)
     for user, passwd in _FTP_DEFAULT_CREDS:
       try:
         ftp_cred = _ftp_connect(user, passwd)
         cred = f"{user}:{passwd}"
         accepted_creds.append(cred)
         result["accepted_credentials"].append(cred)
-        if action_permitted:
-          proofs[cred] = _ftp_authenticated_action(ftp_cred)
+        proofs[cred] = _ftp_authenticated_action(ftp_cred)
         try:
           ftp_cred.quit()
         except Exception:
@@ -966,7 +950,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     result["auth_control"] = {"random_credentials": control}
     findings += _default_credential_findings(
       "FTP", accepted_creds, control=control, proofs=proofs,
-      action_permitted=action_permitted,
     )
 
     return probe_result(raw_data=result, findings=findings)
@@ -1058,7 +1041,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     # --- 3. Default credential check ---
     accepted_creds = []
     proofs = {}
-    action_permitted = getattr(self, "authenticated_action", False)
 
     for username, password in _SSH_DEFAULT_CREDS:
       try:
@@ -1072,8 +1054,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
         )
         cred = f"{username}:{password}"
         accepted_creds.append(cred)
-        if action_permitted:
-          proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
+        proofs[cred] = _ssh_authenticated_action(client, self._target_timeout(3))
         client.close()
       except paramiko.AuthenticationException:
         continue
@@ -1125,8 +1106,7 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       result["accepted_credentials"] = accepted_creds
       findings += _default_credential_findings(
         "SSH", accepted_creds, control=control, proofs=proofs,
-        action_permitted=action_permitted,
-      )
+        )
 
     # --- 5. Cipher/KEX audit ---
     cipher_findings, weak_labels = self._ssh_check_ciphers(target, port)
@@ -1832,16 +1812,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     system_info_captured = False
     accepted_creds = []
     proofs = {}
-    action_permitted = getattr(self, "authenticated_action", False)
     for user, passwd in _TELNET_DEFAULT_CREDS:
-      success, uid_line, uname_line = _try_telnet_login(user, passwd, act=action_permitted)
+      success, uid_line, uname_line = _try_telnet_login(user, passwd, act=True)
       if success:
         cred = f"{user}:{passwd}"
         accepted_creds.append(cred)
         result["accepted_credentials"].append(cred)
         # The `id`/`uname` capture above is the authenticated action.
-        if action_permitted:
-          proofs[cred] = " | ".join(p for p in (uid_line, uname_line) if p) or None
+        proofs[cred] = " | ".join(p for p in (uid_line, uname_line) if p) or None
         # Check for root access
         if uid_line and "uid=0" in uid_line:
           findings.append(Finding(
@@ -1894,7 +1872,6 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     result["auth_control"] = {"random_credentials": control}
     findings += _default_credential_findings(
       "Telnet", accepted_creds, control=control, proofs=proofs,
-      action_permitted=action_permitted,
     )
 
     return probe_result(raw_data=result, findings=findings)

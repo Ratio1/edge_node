@@ -7,7 +7,7 @@ Verifies:
   - Round-trip through to_dict / from_dict preserves all fields.
   - Empty / null serialized input round-trips to None or empty
     instance per the documented contract.
-  - KickoffQuestionnaire bundles the three sub-models correctly.
+  - KickoffQuestionnaire bundles engagement and authorization correctly.
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from extensions.business.cybersec.red_mesh.models.engagement import (
   DATA_CLASSIFICATIONS,
   EngagementContext,
   KickoffQuestionnaire,
-  RulesOfEngagement,
 )
 
 
@@ -114,40 +113,6 @@ class TestEngagementContext(unittest.TestCase):
     self.assertIsNone(EngagementContext.from_dict({}))
 
 
-class TestRulesOfEngagement(unittest.TestCase):
-  """RM-095: the RoE is the three flags workers enforce."""
-
-  def test_default_is_empty_and_safe(self):
-    roe = RulesOfEngagement()
-    self.assertTrue(roe.is_empty())
-    self.assertEqual(roe.to_dict(), {"authenticated_action": False, "stateful_probes_allowed": False,
-                                     "ics_safe_mode_required": True})
-
-  def test_round_trip(self):
-    roe = RulesOfEngagement(authenticated_action=True, stateful_probes_allowed=True,
-                            ics_safe_mode_required=False)
-    self.assertFalse(roe.is_empty())
-    self.assertEqual(RulesOfEngagement.from_dict(roe.to_dict()), roe)
-
-  def test_an_archive_written_before_rm095_still_loads(self):
-    old = {"strength_of_test": "aggressive", "dos_allowed": True, "post_exploit_rules": "pivot",
-           "blackout_windows": [["a", "b"]], "retest_window_end": "2026-06-30", "authenticated_action": True}
-    roe = RulesOfEngagement.from_dict(old)
-    self.assertEqual(roe.validate(), [])
-    self.assertEqual(roe.to_dict(), {"authenticated_action": True, "stateful_probes_allowed": False,
-                                     "ics_safe_mode_required": True})
-
-  def test_flags_accept_only_booleans_and_fail_safe(self):
-    # Consents must not fail open: `bool("false")` is True.
-    for name in ("authenticated_action", "stateful_probes_allowed", "ics_safe_mode_required"):
-      for raw in ("false", "true", 1, 0, "yes"):
-        with self.subTest(name=name, raw=raw):
-          roe = RulesOfEngagement.from_dict({name: raw})
-          self.assertTrue(any(name in e for e in roe.validate()))
-          self.assertEqual(roe.to_dict()[name], name == "ics_safe_mode_required")
-    self.assertEqual(RulesOfEngagement.from_dict({"authenticated_action": True}).validate(), [])
-
-
 class TestAuthorizationRef(unittest.TestCase):
 
   def test_default_is_empty_no_doc(self):
@@ -232,7 +197,6 @@ class TestKickoffQuestionnaire(unittest.TestCase):
         client_name="ACME", data_classification="PCI",
         asset_exposure="external",
       ),
-      roe=RulesOfEngagement(stateful_probes_allowed=True),
       authorization=AuthorizationRef(
         document_cid="QmAuthCID", authorized_signer_name="Jane",
       ),
@@ -242,18 +206,16 @@ class TestKickoffQuestionnaire(unittest.TestCase):
     d = q.to_dict()
     restored = KickoffQuestionnaire.from_dict(d)
     self.assertEqual(restored.engagement.client_name, "ACME")
-    self.assertTrue(restored.roe.stateful_probes_allowed)
     self.assertEqual(restored.authorization.document_cid, "QmAuthCID")
     self.assertEqual(restored.created_at, "2026-05-05T10:00:00Z")
 
   def test_partial_questionnaire(self):
-    """User filled engagement context but not RoE or authorization."""
+    """User filled engagement context but not authorization."""
     q = KickoffQuestionnaire(
       engagement=EngagementContext(client_name="ACME"),
     )
     self.assertFalse(q.is_empty())
     d = q.to_dict()
-    self.assertIsNone(d["roe"])
     self.assertIsNone(d["authorization"])
 
   def test_from_dict_returns_none_for_none(self):

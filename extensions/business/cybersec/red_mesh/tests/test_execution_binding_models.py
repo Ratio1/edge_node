@@ -24,8 +24,6 @@ def binding_payload():
 
 
 ENGAGEMENT_FACTS = {"engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
-                    "roe": {"authenticated_action": False, "stateful_probes_allowed": False,
-                            "ics_safe_mode_required": True},
                     "context": {}, "authorization": {}}
 
 
@@ -84,7 +82,6 @@ class TestExecutionBindingModels(unittest.TestCase):
 
   def test_model_test_config_keeps_the_engagement_snapshot(self):
     snapshot = {"engagement_id": "en_" + str(uuid4()), "engagement_hash": "e" * 64, "contract_sha256": "c" * 64,
-                "roe": {"ics_safe_mode_required": True},
                 "engagement": {"client_name": "Example"}, "authorization": {"document_cid": ""}}
     raw = {"job_type": "model_test", "execution_binding": binding_payload(), **snapshot}
     stored = ModelTestJobConfig.from_dict(raw).to_dict()
@@ -198,30 +195,21 @@ class TestResolvedContextCarriesThePolicy(unittest.TestCase):
 
   def _context(self, **extra):
     from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
-    value = {**self.facts, "selected_candidates": ["node-a"], "engagement": self.engagement,
-             "asset_authorized_ports": "1-1024", **extra}
+    value = {**self.facts, "selected_candidates": ["node-a"], "engagement": self.engagement, **extra}
     return ResolvedExecutionContext({key: item for key, item in value.items() if item is not ...})
 
   def test_the_policy_is_carried_and_kept_out_of_the_binding(self):
     context = self._context()
-    self.assertEqual(context.to_dict()["asset_authorized_ports"], "1-1024")
     self.assertEqual(context.to_dict()["engagement"], self.engagement)
     binding = context.build_binding("coordinator", ["node-a"]).to_dict()
-    self.assertEqual(set(binding) & {"asset_authorized_ports", "engagement"}, set())
+    self.assertEqual(set(binding) & {"engagement"}, set())
     self.assertEqual(binding["schema_version"], 2)
-    self.assertEqual(binding, self._context(asset_authorized_ports="443").build_binding(
-      "coordinator", ["node-a"]).to_dict())
-
-  def test_a_non_canonical_or_missing_scope_is_refused(self):
-    for scope in ("1024-1", "22, 80", None, 80, ...):
-      with self.subTest(scope=scope), self.assertRaises(ValueError):
-        self._context(asset_authorized_ports=scope)
 
   def test_every_launch_carries_its_engagement(self):
     engagement = self.engagement
     broken = (..., {**engagement, "engagement_id": "en_x"}, {**engagement, "engagement_id": "en_" + str(uuid4())},
               {**engagement, "engagement_hash": "f" * 64},
-              {**engagement, "roe": {"authenticated_action": "yes"}}, {**engagement, "extra": 1},
+              {**engagement, "extra": 1}, {**engagement, "roe": {"authenticated_action": False}},
               {**engagement, "contract_sha256": None},
               # RM-125: the removed picks are no longer part of the engagement facts.
               {**engagement, "authorized_tests": ["service_info_common"]},

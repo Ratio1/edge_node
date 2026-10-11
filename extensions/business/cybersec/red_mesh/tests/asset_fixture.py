@@ -14,5 +14,5 @@ def register_asset(endpoint, actor, parent, target, display_name="Asset"):
 
 
 def pick(asset_id, authorized_ports=None):
-  """The public request entry for a registered asset."""
-  return {"asset_id": asset_id, **({} if authorized_ports is None else {"authorized_ports": authorized_ports})}
+  """The public request entry for a registered asset (RM-128: ports dropped; arg ignored)."""
+  return {"asset_id": asset_id}

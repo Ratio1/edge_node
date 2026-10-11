@@ -75,8 +75,8 @@ class TestTenantEngagementPlugin(unittest.TestCase):
   def create(self, actor=None, **changes):
     body = {"actor": actor or self.actor, "tenant_id": self.tenant, "request_id": str(uuid4()),
             "display_name": "Q4", "valid_from": "2026-10-01T00:00:00Z",
-            "valid_until": "2027-10-01T00:00:00Z", "roe": {}, "context": {"client_name": "Example"},
-            "assets": [pick(self.asset, "443")]}
+            "valid_until": "2027-10-01T00:00:00Z", "context": {"client_name": "Example"},
+            "assets": [pick(self.asset)]}
     body.update(changes)
     if "document_refs" not in body:
       body["document_refs"] = [self.upload(PNG, "roe.png", title="Rules of engagement (scan)"),

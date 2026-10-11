@@ -14,8 +14,7 @@ The four gates differ, which is the point of the matrix:
   * `tasks:stop` -- stop-monitoring, and `reports:review` -- approve/reject: the launch roles with
     launch's Allow Pentester rule (owner, 2026-09-30). A Tenant Admin holds neither.
 
-The confused-deputy this phase closes is at the end: a permission-to-test document uploaded in one
-tenant cannot authorize a launch in another.
+(RM-128 removed the per-launch authorization-document gate; the upload endpoint stays tenant-scoped.)
 """
 import base64
 import sys
@@ -210,57 +209,3 @@ def test_the_uploaded_document_records_the_tenant_that_authorized_it():
     assert stored.get("tenant_id") == tenant_id, stored
     # Both attributions come from admission, never from the request body.
     assert stored.get("uploaded_by") == "reader", stored
-
-
-@pytest.mark.parametrize("stored_tenant,admitted", (("same", True), ("other", False),
-                                                    (None, False), ("unreadable", False)))
-def test_a_document_from_another_tenant_cannot_authorize_a_launch(stored_tenant, admitted):
-  """The acceptance criterion: an upload from tenant A cannot launch in tenant B.
-
-  A document with no tenant, and one whose envelope cannot be read, are refused the same way -- a
-  caller probing for a fallback cannot tell the three apart.
-  """
-  with read_endpoint_fixture(bound=True) as fixture:
-    context = Mock()
-    context.to_dict = Mock(return_value={"tenant_id": fixture.tenant_id})
-    envelope = {"kind": "redmesh_authorization_document"}
-    if stored_tenant == "same":
-      envelope["tenant_id"] = fixture.tenant_id
-    elif stored_tenant == "other":
-      envelope["tenant_id"] = OTHER_TENANT
-    repo = Mock()
-    repo.get_json = Mock(side_effect=(RuntimeError("R1FS down") if stored_tenant == "unreadable"
-                                      else lambda _cid, **_kwargs: envelope))
-    with patch.object(fixture.Plugin, "_get_artifact_repository", return_value=repo):
-      denial = fixture.Plugin._admit_authorization_document(fixture.owner, context, "cid-1", None)
-    if admitted:
-      assert denial is None
-    else:
-      assert_denied(denial, 404, "not_found")
-
-
-def test_the_typed_authorization_payload_is_checked_as_well_as_the_flat_reference():
-  """`authorization.document_cid` and the legacy flat `authorization_ref` are the same document by
-  two names; checking only one leaves the other as the way around the tenant binding."""
-  with read_endpoint_fixture(bound=True) as fixture:
-    context = Mock()
-    context.to_dict = Mock(return_value={"tenant_id": fixture.tenant_id})
-    repo = Mock()
-    repo.get_json = Mock(return_value={"tenant_id": OTHER_TENANT})
-    with patch.object(fixture.Plugin, "_get_artifact_repository", return_value=repo):
-      for reference, typed in (("cid-1", None), ("", {"document_cid": "cid-1"})):
-        denial = fixture.Plugin._admit_authorization_document(fixture.owner, context, reference,
-                                                              typed)
-        assert_denied(denial, 404, "not_found")
-
-
-def test_a_launch_with_no_document_is_not_gated_on_one():
-  """Not every engagement files a document through us; the check must only bind the ones that do."""
-  with read_endpoint_fixture(bound=True) as fixture:
-    context = Mock()
-    context.to_dict = Mock(return_value={"tenant_id": fixture.tenant_id})
-    repo = Mock()
-    with patch.object(fixture.Plugin, "_get_artifact_repository", return_value=repo):
-      assert fixture.Plugin._admit_authorization_document(fixture.owner, context, "", None) is None
-      assert fixture.Plugin._admit_authorization_document(fixture.owner, context, "", {}) is None
-    repo.get_json.assert_not_called()

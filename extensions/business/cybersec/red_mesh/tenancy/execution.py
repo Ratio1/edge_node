@@ -4,7 +4,7 @@ from copy import deepcopy
 import json
 import re
 
-from .assets import canonical_digest, canonical_uuid, normalize_port_scope, normalize_target, valid_digest
+from .assets import canonical_digest, canonical_uuid, normalize_target, valid_digest
 from .identity import canonical_account_id
 from .nodes import valid_node_address
 
@@ -18,9 +18,9 @@ _BINDING_FIELDS = _FACT_FIELDS | _BINDING_EXTRA
 BINDING_SCHEMA_VERSION = 2
 _ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
 # Launch-time policy, read by the launch gate and never part of the binding.
-_POLICY_FIELDS = frozenset({"asset_authorized_ports", "engagement"})
-_ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "roe", "context",
-                                "authorization", "contract_sha256"})
+_POLICY_FIELDS = frozenset({"engagement"})
+_ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "context", "authorization",
+                                "contract_sha256"})
 
 
 def _validate_facts(value, *, failure_policy=True):
@@ -60,13 +60,11 @@ def _node_order(value):
 def _validate_engagement(value):
   """The engagement facts a launch is gated on and snapshots (RM-095); shape only."""
   # Imported here: `engagements` loads the models package, which imports this module.
-  from .engagements import normalize_roe, valid_engagement_id
+  from .engagements import valid_engagement_id
   if (not isinstance(value, dict) or set(value) != _ENGAGEMENT_FIELDS
       or not valid_engagement_id(value["engagement_id"]) or not valid_digest(value["engagement_hash"])
       or not valid_digest(value["contract_sha256"])
       or not isinstance(value["context"], dict) or not isinstance(value["authorization"], dict)):
-    raise ValueError("Invalid execution engagement")
-  if normalize_roe(value["roe"]) != value["roe"]:
     raise ValueError("Invalid execution engagement")
 
 
@@ -101,10 +99,8 @@ class ResolvedExecutionContext:
   _snapshot: str
 
   def __init__(self, value):
-    # `engagement` (the facts the launch gate reads and snapshots, RM-095) and, for a network
-    # asset, `asset_authorized_ports` are launch-time policy, never part of the binding. RM-107:
-    # every launch runs inside an engagement, and a network entry always has a port scope (a
-    # signed engagement never means "any port").
+    # `engagement` (the facts the launch gate reads and snapshots, RM-095) is launch-time policy,
+    # never part of the binding. RM-107: every launch runs inside an engagement.
     if (not isinstance(value, dict) or "engagement" not in value
         or set(value) - _POLICY_FIELDS != _FACT_FIELDS | {"selected_candidates"}):
       raise ValueError("Invalid resolved execution fields")
@@ -114,13 +110,6 @@ class ResolvedExecutionContext:
     if (value["engagement"]["engagement_id"] != value["engagement_id"]
         or value["engagement"]["engagement_hash"] != value["engagement_hash"]):
       raise ValueError("Invalid execution engagement")
-    if value["asset_target"]["kind"] == "network" and "asset_authorized_ports" not in value:
-      raise ValueError("Invalid execution port scope")
-    if "asset_authorized_ports" in value and (
-        value["asset_target"]["kind"] != "network"
-        or normalize_port_scope(value["asset_authorized_ports"]) != value["asset_authorized_ports"]
-        or value["asset_authorized_ports"] is None):
-      raise ValueError("Invalid execution port scope")
     object.__setattr__(self, "_snapshot", _snapshot(value))
 
   def to_dict(self):

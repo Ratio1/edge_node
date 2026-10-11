@@ -93,10 +93,9 @@ class TestTenantExecutionModel(unittest.TestCase):
     self.assertNotIn("error", result, result)
     engagement = self.engagement
     self.assertEqual({key: captured[0][key] for key in ("engagement_id", "engagement_hash", "contract_sha256",
-                                                        "roe", "engagement", "authorization")},
+                                                        "engagement", "authorization")},
                      {"engagement_id": engagement["engagement_id"], "engagement_hash": engagement["engagement_hash"],
                       "contract_sha256": engagement["contract_sha256"],
-                      "roe": engagement["roe"],
                       "engagement": engagement["context"], "authorization": engagement["authorization"]})
 
   def test_conflicting_provider_denies_before_dns_client_or_secret_effects(self):

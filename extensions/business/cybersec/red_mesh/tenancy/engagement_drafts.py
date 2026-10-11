@@ -10,11 +10,11 @@ Its id (`ted_<uuid>`) is never a tenant or an engagement id; activation creates 
 from .assets import normalize_name
 from .drafts import ITEM_STATES, _UUID, _nonempty_text, valid_draft_id, valid_generated
 from .engagements import (EngagementInvalid, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, normalize_context,
-                          normalize_engagement_assets, normalize_instant, normalize_roe,
-                          normalize_window, valid_doc_ref)
+                          normalize_engagement_assets, normalize_instant, normalize_window,
+                          valid_doc_ref)
 
 # The `create_engagement` argument set, in the order `missing[]` reports them.
-FIELDS = ("display_name", "valid_from", "valid_until", "roe", "context", "assets")
+FIELDS = ("display_name", "valid_from", "valid_until", "context", "assets")
 # The pack slot's `document_kind` in the upload envelope; the engagement pack is one PDF.
 DOCUMENT_KIND = "engagement_pack"
 DTO_FIELDS = ("engagement_draft_id", "parent", *FIELDS, "document", "created_by", "created_at",
@@ -68,7 +68,7 @@ def _instant(value):
 
 
 def _assets(value):
-  # RM-125: the administration resolved the public `{asset_id, authorized_ports?}` entries into
+  # RM-125: the administration resolved the public `{asset_id}` entries into
   # stored entries (asset copy included) before this runs.
   if value == []:
     return []
@@ -76,11 +76,9 @@ def _assets(value):
 
 
 # Per field: the write-time normalizer (emptiness allowed) and the empty value a new draft starts with.
-_NORMALIZE = {"display_name": _display_name, "valid_from": _instant,
-              "valid_until": _instant, "roe": lambda value: _refused(normalize_roe, value, "roe_invalid"),
+_NORMALIZE = {"display_name": _display_name, "valid_from": _instant, "valid_until": _instant,
               "context": lambda value: _refused(normalize_context, value, "context_invalid"), "assets": _assets}
-_EMPTY = {"display_name": "", "valid_from": "", "valid_until": "", "roe": None,
-          "context": None, "assets": []}
+_EMPTY = {"display_name": "", "valid_from": "", "valid_until": "", "context": None, "assets": []}
 
 
 def _check_window(row):
@@ -136,12 +134,9 @@ def document_refs(row):
   return [block["ref"] for block in (row["document"]["document"], row["document"]["generated"]) if block is not None]
 
 
-_ASSET_REQUEST_KEYS = ("asset_id", "authorized_ports")
-
-
 def asset_requests(assets):
   """The stored entries as the public `create_engagement` request form (RM-125 phase 2b)."""
-  return [{key: entry[key] for key in _ASSET_REQUEST_KEYS if key in entry} for entry in assets]
+  return [{"asset_id": entry["asset_id"]} for entry in assets]
 
 
 def completeness(row):
@@ -165,11 +160,10 @@ def completeness(row):
       normalize_window(row["valid_from"], row["valid_until"])
     except EngagementInvalid as exc:
       gap("valid_until", exc.code)
-  for field, normalize in (("roe", normalize_roe), ("context", normalize_context)):
-    try:
-      normalize(row[field])
-    except EngagementInvalid as exc:
-      gap(field, exc.code)
+  try:
+    normalize_context(row["context"])
+  except EngagementInvalid as exc:
+    gap("context", exc.code)
   try:
     normalize_engagement_assets(row["assets"])
   except EngagementInvalid as exc:
@@ -213,7 +207,6 @@ def validate_engagement_draft(row, ids):
       or not valid_parent(row.get("parent"))
       or not _same(_display_name, row.get("display_name"))
       or not _same(_instant, row.get("valid_from")) or not _same(_instant, row.get("valid_until"))
-      or not _same(_NORMALIZE["roe"], row.get("roe"))
       # Shape only for the context: `EngagementContext` may gain fields.
       or not isinstance(row.get("context"), dict)
       or not _stored_assets_valid(row.get("assets"))

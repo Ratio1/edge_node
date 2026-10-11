@@ -19,7 +19,6 @@ def context(target, engagement=True):
     "asset_target_digest": canonical_digest(target), "actor_id": "creator",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
     "selected_candidates": ["node-1", "node-2"], "engagement": facts,
-    **({"asset_authorized_ports": "1-65535"} if target["kind"] == "network" else {}),
   })
 
 
@@ -72,7 +71,7 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
     asset_id = fixture.net  # the fixture's registered network asset (`fixture.target`)
     engagement = fixture.service.create_engagement(
       fixture.actor, fixture.tenant, str(uuid4()), "Q4", "2026-10-01T00:00:00Z",
-      "2026-10-31T00:00:00Z", {}, {"client_name": "Example"}, [pick(asset_id, "1-1024")],
+      "2026-10-31T00:00:00Z", {"client_name": "Example"}, [pick(asset_id, "1-1024")],
       [doc("1" * 64, "QmEngagementRoeRef"), doc("2" * 64, "QmEngagementAuthRef")])
     assert engagement["success"], engagement
     owner = TestPhase1ConfigCID._build_mock_plugin()
@@ -102,7 +101,7 @@ def test_real_endpoint_fresh_admission_conflict_denies_before_target_effects():
                                                        engagement_asset_id="ea_1", **kwargs)
     assert allowed["job_config"]["target"] == fixture.target["address"]
     assert allowed["job_config"]["engagement_id"] == engagement["data"]["engagementId"]
-    assert allowed["job_config"]["authorized_ports"] == "1-1024"
+    assert "authorized_ports" not in allowed["job_config"]
     # The job is tenant-readable and feeds reports and SIEM events: no engagement document ref.
     def values(node):
       if isinstance(node, dict):

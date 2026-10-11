@@ -40,11 +40,11 @@ class _Host(_ReportMixin, _RiskScoringMixin):
   pass
 
 
-def _worker(ports, authenticated_action=True):
+def _worker(ports):
   from extensions.business.cybersec.red_mesh.tests.conftest import DummyOwner, PentestLocalWorker
   worker = PentestLocalWorker(
     owner=DummyOwner(), target=TARGET, job_id="fixture", initiator="fixture@example",
-    local_id_prefix="1", worker_target_ports=ports, authenticated_action=authenticated_action,
+    local_id_prefix="1", worker_target_ports=ports,
   )
   worker.stop_event = MagicMock()
   worker.stop_event.is_set.return_value = False
@@ -74,7 +74,7 @@ def _csrf():
 _COMMON = "extensions.business.cybersec.red_mesh.worker.service.common."
 
 
-def _ssh(port, banner, accept, outputs, *, authenticated_action, cves=True):
+def _ssh(port, banner, accept, outputs, *, cves=True):
   """The real SSH probe against a fake server.
 
   `accept(user, password)` decides logins; `outputs[user]` is what `id` prints
@@ -100,7 +100,7 @@ def _ssh(port, banner, accept, outputs, *, authenticated_action, cves=True):
       return MagicMock(), stdout, MagicMock()
     def close(self): pass
 
-  worker = _worker([port], authenticated_action)
+  worker = _worker([port])
   extra = [] if cves else [patch(_COMMON + "check_cves", return_value=[])]
   with patch(_COMMON + "socket.socket", return_value=_Socket()), \
        patch(_COMMON + "paramiko.Transport", side_effect=OSError("no transport")), \
@@ -174,21 +174,21 @@ def build():
       "port_protocols": {"21": "ftp", "22": "ssh", "2222": "ssh", "2022": "ssh", "80": "http", "3306": "mysql"},
       "service_info": {
         "21": {"_service_info_ftp": _only_findings(_ftp())},
-        # RoE permits the action: root's `id` returns output (performed), admin's
-        # returns nothing (attempted). The banner is a distribution package, so
-        # the CVE carries `backport_status`.
+        # The action always runs (RM-128): root's `id` returns output (performed),
+        # admin's returns nothing (attempted). The banner is a distribution
+        # package, so the CVE carries `backport_status`.
         "22": {"_service_info_ssh": _only_findings(_ssh(
           22, b"SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.1",
           lambda u, p: (u, p) in {("root", "toor"), ("admin", "admin")},
-          {"root": b"uid=0(root) gid=0(root)"}, authenticated_action=True))},
-        # RoE withholds the action.
+          {"root": b"uid=0(root) gid=0(root)"}))},
+        # The handshake alone, with the action completing nothing (attempted).
         "2222": {"_service_info_ssh": _only_findings(_ssh(
           2222, b"SSH-2.0-OpenSSH_9.9p1", lambda u, p: (u, p) == ("root", "root"),
-          {}, authenticated_action=False, cves=False))},
+          {}, cves=False))},
         # A service that accepts any pair: the inconclusive variant.
         "2022": {"_service_info_ssh": _only_findings(_ssh(
           2022, b"SSH-2.0-OpenSSH_9.9p1", lambda u, p: True,
-          {}, authenticated_action=False, cves=False))},
+          {}, cves=False))},
         "3306": {"_service_info_mysql_creds": _only_findings(_mysql())},
       },
       "web_tests_info": {

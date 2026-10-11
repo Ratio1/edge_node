@@ -524,7 +524,7 @@ def launch_model_test(
   if engagement is not None:
     # The engagement snapshot (RM-107), as a scan JobConfig carries it.
     sanitized_config.update({
-      "engagement": engagement["context"], "roe": engagement["roe"],
+      "engagement": engagement["context"],
       "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
       "engagement_hash": engagement["engagement_hash"], "contract_sha256": engagement["contract_sha256"]})
 

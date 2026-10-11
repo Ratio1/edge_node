@@ -122,7 +122,6 @@ def _context(*, candidates=("node-a",), tested_model=None):
   engagement = {
     "engagement_id": "en_00000000-0000-4000-8000-000000000099", "engagement_hash": "e" * 64,
     "contract_sha256": "c" * 64,
-    "roe": {"authenticated_action": False, "stateful_probes_allowed": False, "ics_safe_mode_required": False},
     "context": {}, "authorization": {},
   }
   return ResolvedExecutionContext({

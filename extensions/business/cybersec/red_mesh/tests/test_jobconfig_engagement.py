@@ -1,14 +1,12 @@
 """Phase 3 PR-3.3 — JobConfig engagement-context wiring tests.
 
 Verifies:
-  - JobConfig accepts the new typed `engagement` / `roe` /
-    `authorization` dict fields.
-  - get_engagement() / get_roe() / get_authorization() resolve the
-    typed accessors correctly.
+  - JobConfig accepts the new typed `engagement` / `authorization` dict fields.
+  - get_engagement() / get_authorization() resolve the typed accessors correctly.
   - RM-108 phase 5: the legacy `engagement_metadata` / `authorization_ref`
     fields are no longer read by the accessors.
   - Round-trip through to_dict / from_dict preserves the typed shape.
-  - get_kickoff_questionnaire() bundles the three sub-models.
+  - get_kickoff_questionnaire() bundles engagement and authorization.
 """
 from __future__ import annotations
 
@@ -19,7 +17,6 @@ from extensions.business.cybersec.red_mesh.models.engagement import (
   AuthorizationRef,
   Contact,
   EngagementContext,
-  RulesOfEngagement,
 )
 
 
@@ -43,10 +40,8 @@ class TestEngagementFieldsDefault(unittest.TestCase):
   def test_no_engagement_data_means_none(self):
     cfg = JobConfig(**_base_jobconfig_kwargs())
     self.assertIsNone(cfg.engagement)
-    self.assertIsNone(cfg.roe)
     self.assertIsNone(cfg.authorization)
     self.assertIsNone(cfg.get_engagement())
-    self.assertIsNone(cfg.get_roe())
     self.assertIsNone(cfg.get_authorization())
     self.assertIsNone(cfg.get_kickoff_questionnaire())
 
@@ -69,11 +64,6 @@ class TestEngagementFieldsTyped(unittest.TestCase):
     self.assertEqual(resolved.client_name, "ACME")
     self.assertEqual(resolved.data_classification, "PCI")
     self.assertEqual(resolved.point_of_contact.email, "jane@acme.example")
-
-  def test_with_typed_roe_dict(self):
-    roe = RulesOfEngagement(authenticated_action=True, stateful_probes_allowed=True)
-    cfg = JobConfig(**_base_jobconfig_kwargs(), roe=roe.to_dict())
-    self.assertEqual(cfg.get_roe(), roe)
 
   def test_engagement_fields_round_trip_and_stay_absent_on_old_jobs(self):
     fields = {"engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "a" * 64,
@@ -98,20 +88,35 @@ class TestEngagementFieldsTyped(unittest.TestCase):
 
   def test_round_trip_through_to_dict_from_dict(self):
     eng = EngagementContext(client_name="ACME", asset_exposure="dmz")
-    roe = RulesOfEngagement(stateful_probes_allowed=True)
     auth = AuthorizationRef(document_cid="QmAuthCID")
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       engagement=eng.to_dict(),
-      roe=roe.to_dict(),
       authorization=auth.to_dict(),
     )
     payload = cfg.to_dict()
     restored = JobConfig.from_dict(payload)
     self.assertEqual(restored.get_engagement().client_name, "ACME")
     self.assertEqual(restored.get_engagement().asset_exposure, "dmz")
-    self.assertTrue(restored.get_roe().stateful_probes_allowed)
     self.assertEqual(restored.get_authorization().document_cid, "QmAuthCID")
+
+
+class TestRemovedFieldsStillLoad(unittest.TestCase):
+  """RM-128: an archive written with the dropped `roe` / `authorized_ports` / `authorization_update`
+  keys still loads; `from_dict` reads named keys, so the stray keys are ignored."""
+
+  def test_an_old_archive_with_roe_and_ports_loads(self):
+    payload = {**JobConfig(**_base_jobconfig_kwargs()).to_dict(),
+               "roe": {"authenticated_action": True, "stateful_probes_allowed": True,
+                       "ics_safe_mode_required": False},
+               "authorized_ports": "1-1024",
+               "authorization_update": {"reference": "AUTH-1"}}
+    restored = JobConfig.from_dict(payload)
+    self.assertFalse(hasattr(restored, "roe"))
+    self.assertNotIn("roe", restored.to_dict())
+    self.assertNotIn("authorized_ports", restored.to_dict())
+    self.assertNotIn("authorization_update", restored.to_dict())
+    self.assertIsNone(restored.get_kickoff_questionnaire())
 
 
 class TestEngagementLegacyFieldsAreIgnored(unittest.TestCase):
@@ -144,17 +149,15 @@ class TestEngagementLegacyFieldsAreIgnored(unittest.TestCase):
 
 class TestKickoffQuestionnaireBundle(unittest.TestCase):
 
-  def test_questionnaire_bundles_all_three(self):
+  def test_questionnaire_bundles_engagement_and_authorization(self):
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       engagement=EngagementContext(client_name="ACME").to_dict(),
-      roe=RulesOfEngagement(stateful_probes_allowed=True).to_dict(),
       authorization=AuthorizationRef(document_cid="QmAuthCID").to_dict(),
     )
     q = cfg.get_kickoff_questionnaire()
     self.assertIsNotNone(q)
     self.assertEqual(q.engagement.client_name, "ACME")
-    self.assertTrue(q.roe.stateful_probes_allowed)
     self.assertEqual(q.authorization.document_cid, "QmAuthCID")
 
   def test_returns_none_when_all_empty(self):
@@ -164,19 +167,18 @@ class TestKickoffQuestionnaireBundle(unittest.TestCase):
     self.assertIsNone(cfg.get_kickoff_questionnaire())
 
   def test_returns_none_when_all_default_objects(self):
-    """Default-constructed engagement/roe/auth are still 'empty' for
+    """Default-constructed engagement/auth are still 'empty' for
     persistence purposes."""
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       engagement=EngagementContext().to_dict(),
-      roe=RulesOfEngagement().to_dict(),
       authorization=AuthorizationRef().to_dict(),
     )
     self.assertIsNone(cfg.get_kickoff_questionnaire())
 
   def test_returns_questionnaire_when_only_authorization_set(self):
-    """If only the authorization document is uploaded (engagement /
-    RoE skipped), the questionnaire still wraps it for persistence."""
+    """If only the authorization document is uploaded (engagement skipped),
+    the questionnaire still wraps it for persistence."""
     cfg = JobConfig(
       **_base_jobconfig_kwargs(),
       authorization=AuthorizationRef(document_cid="QmAuthCID").to_dict(),

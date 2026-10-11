@@ -9,7 +9,7 @@ from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administratio
 from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
 from extensions.business.cybersec.red_mesh.tenancy.engagements import (
   EngagementInvalid, build_engagement_assets, engagement_hash, normalize_asset_requests, feature_ids_for_kind, normalize_context, normalize_document_labels,
-  normalize_engagement_assets, normalize_instant, normalize_roe, normalize_window,
+  normalize_engagement_assets, normalize_instant, normalize_window,
   validate_engagement)
 from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
 from .test_tenant_administration import FakeAdministrationStore
@@ -54,11 +54,10 @@ def record(**changes):
     "contract_sha256": SHA_C,
     "documents": [document(1, SHA_A),
                   document(2, SHA_B, "third_party_consent", "Hosting consent", "AWS case 123")],
-    "roe": normalize_roe({}), "context": normalize_context({"client_name": "Example"}),
+    "context": normalize_context({"client_name": "Example"}),
     "assets": [
       {"engagement_asset_id": "ea_1", "asset_id": ASSET_1, "display_name": "Edge gateway", "kind": "network",
-       "target": NETWORK_TARGET, "target_digest": canonical_digest(NETWORK_TARGET),
-       "authorized_ports": "22,443"},
+       "target": NETWORK_TARGET, "target_digest": canonical_digest(NETWORK_TARGET)},
       {"engagement_asset_id": "ea_2", "asset_id": ASSET_2, "display_name": "Customer portal", "kind": "webapp",
        "target": WEBAPP_TARGET, "target_digest": canonical_digest(WEBAPP_TARGET)},
     ],
@@ -79,15 +78,6 @@ class TestEngagementValues(unittest.TestCase):
     self.assertEqual(feature_ids_for_kind("webapp"), ("graybox",))
     # A model asset's tests are the Model Testing question sets.
     self.assertEqual(feature_ids_for_kind("model"), ("cbrn_safety_v1", "prompt_injection_v1"))
-
-  def test_roe_is_the_three_enforced_flags_with_safe_defaults(self):
-    self.assertEqual(normalize_roe(None), {"authenticated_action": False, "stateful_probes_allowed": False,
-                                           "ics_safe_mode_required": True})
-    self.assertTrue(normalize_roe({"authenticated_action": True})["authenticated_action"])
-    for bad in ({"authenticated_action": "false"}, {"dos_allowed": False}, ["x"], {"ics_safe_mode_required": 0}):
-      with self.assertRaises(EngagementInvalid) as caught:
-        normalize_roe(bad)
-      self.assertEqual(caught.exception.code, "roe_invalid")
 
   def test_context_is_strict_and_never_coerces(self):
     empty = normalize_context({})
@@ -135,15 +125,12 @@ class TestEngagementAssets(unittest.TestCase):
     return build_engagement_assets(normalize_asset_requests(requests), rows.__getitem__)
 
   def test_assets_are_copied_from_the_rows_and_numbered_in_the_order_given(self):
-    assets = self.build([{"asset_id": ASSET_1, "authorized_ports": "443, 22"}, {"asset_id": ASSET_2},
-                         {"asset_id": ASSET_3}])
+    assets = self.build([{"asset_id": ASSET_1}, {"asset_id": ASSET_2}, {"asset_id": ASSET_3}])
     self.assertEqual(assets[0], {
       "engagement_asset_id": "ea_1", "asset_id": ASSET_1, "display_name": "Edge gateway", "kind": "network",
-      "target": NETWORK_TARGET, "target_digest": canonical_digest(NETWORK_TARGET),
-      "authorized_ports": "22,443"})
+      "target": NETWORK_TARGET, "target_digest": canonical_digest(NETWORK_TARGET)})
     self.assertEqual([(entry["engagement_asset_id"], entry["kind"]) for entry in assets],
                      [("ea_1", "network"), ("ea_2", "webapp"), ("ea_3", "model")])
-    self.assertNotIn("authorized_ports", assets[2])
 
   def test_ten_or_more_assets_keep_their_numeric_order(self):
     rows = {}
@@ -152,42 +139,37 @@ class TestEngagementAssets(unittest.TestCase):
       asset_id = "ta_%08d-0000-4000-8000-000000000000" % index
       rows[asset_id] = {"asset_id": asset_id, "display_name": "Host %d" % index, "target": target,
                         "target_digest": canonical_digest(target)}
-    assets = self.build([{"asset_id": asset_id, "authorized_ports": "443"} for asset_id in rows], rows)
+    assets = self.build([{"asset_id": asset_id} for asset_id in rows], rows)
     self.assertEqual([entry["engagement_asset_id"] for entry in assets], ["ea_%d" % n for n in range(1, 12)])
     validate_engagement(record(assets=assets), (TENANT, ENGAGEMENT))
 
   def test_the_stored_entries_are_exactly_what_the_stored_validator_accepts(self):
-    assets = self.build([{"asset_id": ASSET_1, "authorized_ports": "443"}, {"asset_id": ASSET_3}])
+    assets = self.build([{"asset_id": ASSET_1}, {"asset_id": ASSET_3}])
     self.assertEqual(normalize_engagement_assets(assets), assets)
     validate_engagement(record(assets=assets), (TENANT, ENGAGEMENT))
 
   def test_refusals(self):
-    network = {"asset_id": ASSET_1, "authorized_ports": "443"}
-    cases = {
-      "engagement_asset_invalid": ([], None, [network, dict(network, authorized_ports="22")],
-                                   [{"asset_id": "as_x"}], [{"asset_id": "ta_x"}], [{}], ["ta"],
-                                   [{"asset_id": ASSET_2, "authorized_ports": "80"}],
-                                   # The request never carries the target, name, kind or tests.
-                                   [dict(network, target=NETWORK_TARGET)], [dict(network, display_name="Edge")],
-                                   [dict(network, kind="network")],
-                                   [dict(network, authorized_tests=["service_info_common"])],
-                                   [dict(network, authorized_scan_modes=["connect"])],
-                                   [{"display_name": "Edge", "target": NETWORK_TARGET, "authorized_ports": "443"}],
-                                   [dict(network, authorized_ports="0-70000")]),
-      "ports_required": ([{"asset_id": ASSET_1}], [{"asset_id": ASSET_1, "authorized_ports": None}]),
-    }
-    for code, values in cases.items():
-      for value in values:
-        with self.subTest(code=code, value=value), self.assertRaises(EngagementInvalid) as caught:
-          self.build(value)
-        self.assertEqual(caught.exception.code, code)
+    network = {"asset_id": ASSET_1}
+    # RM-128: the request is exactly `{asset_id}`; any other key (including the dropped
+    # `authorized_ports`) is refused.
+    values = ([], None, [{"asset_id": "as_x"}], [{"asset_id": "ta_x"}], [{}], ["ta"],
+              # The request never carries the target, name, kind, tests or ports.
+              [dict(network, target=NETWORK_TARGET)], [dict(network, display_name="Edge")],
+              [dict(network, kind="network")],
+              [dict(network, authorized_tests=["service_info_common"])],
+              [dict(network, authorized_scan_modes=["connect"])],
+              [dict(network, authorized_ports="443")],
+              [{"display_name": "Edge", "target": NETWORK_TARGET}])
+    for value in values:
+      with self.subTest(value=value), self.assertRaises(EngagementInvalid) as caught:
+        self.build(value)
+      self.assertEqual(caught.exception.code, "engagement_asset_invalid")
 
   def test_two_assets_with_the_same_target_are_refused(self):
     rows = library()
     rows[ASSET_2] = {**rows[ASSET_1], "asset_id": ASSET_2}
     with self.assertRaises(EngagementInvalid) as caught:
-      self.build([{"asset_id": ASSET_1, "authorized_ports": "443"},
-                  {"asset_id": ASSET_2, "authorized_ports": "443"}], rows)
+      self.build([{"asset_id": ASSET_1}, {"asset_id": ASSET_2}], rows)
     self.assertEqual(caught.exception.code, "engagement_asset_invalid")
 
 
@@ -204,14 +186,13 @@ class TestEngagementHash(unittest.TestCase):
       "valid_until": "2026-11-30T00:00:00Z", "contract_sha256": "9" * 64,
       "documents": record()["documents"][:1],
       "supersedes": "en_" + "2" * 8 + "-2222-4222-8222-" + "2" * 12,
-      "roe": normalize_roe({"authenticated_action": True}),
       "context": normalize_context({"client_name": "Other"}),
       "assets": record()["assets"][:1],
     }
     for field, value in changes.items():
       with self.subTest(field=field):
         self.assertNotEqual(record(**{field: value})["engagement_hash"], base)
-    for field, value in (("authorized_ports", "22"), ("display_name", "Edge 2"),
+    for field, value in (("display_name", "Edge 2"),
                          ("target", {"kind": "network", "address": "192.0.2.11"})):
       with self.subTest(asset=field):
         scoped = copy.deepcopy(record()["assets"])
@@ -225,10 +206,11 @@ class TestEngagementHash(unittest.TestCase):
 
   def test_the_hash_schema_is_v3(self):
     from extensions.business.cybersec.red_mesh.tenancy.engagements import HASH_SCHEMA, hashed_fields
-    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/3")
+    self.assertEqual(HASH_SCHEMA, "redmesh.engagement/4")
     fields = hashed_fields(record())
-    self.assertEqual(fields["schema"], "redmesh.engagement/3")
+    self.assertEqual(fields["schema"], "redmesh.engagement/4")
     self.assertNotIn("allowed_run_modes", fields)
+    self.assertNotIn("roe", fields)
 
   def test_document_references_and_bookkeeping_do_not_enter_the_hash(self):
     base = record()["engagement_hash"]
@@ -250,6 +232,16 @@ class TestEngagementValidator(unittest.TestCase):
 
   def test_an_engagement_without_documents_is_valid(self):
     validate_engagement(record(documents=[]), (TENANT, ENGAGEMENT))
+
+  def test_the_same_file_under_two_kinds_is_valid_but_one_kind_twice_is_not(self):
+    # RM-128: uniqueness is per (kind, sha256), so the generated pack may also be the signed copy.
+    both = record(documents=[document(1, SHA_A, kind="agreement", title="Engagement pack"),
+                             document(2, SHA_A, kind="other", title="Generated pack")])
+    validate_engagement(both, (TENANT, ENGAGEMENT))
+    same_kind = record(documents=[document(1, SHA_A, kind="agreement"),
+                                  document(2, SHA_A, kind="agreement", title="Again")])
+    with self.assertRaises((ValueError, KeyError)):
+      validate_engagement(same_kind, (TENANT, ENGAGEMENT))
 
   def test_unknown_fields_are_kept(self):
     validate_engagement({**record(), "signature": {"future": True}}, (TENANT, ENGAGEMENT))
@@ -280,14 +272,10 @@ class TestEngagementValidator(unittest.TestCase):
     phase_one["assets"][0]["asset_id"] = "as_0a7e3c52-9d0e-4f6f-8a3c-5f2d1b9e7c41"
     same_asset = record()
     same_asset["assets"][1] = {**same_asset["assets"][1], "asset_id": ASSET_1}
-    webapp_ports = record()
-    webapp_ports["assets"][1]["authorized_ports"] = "80"
-    network_without_ports = record()
-    network_without_ports["assets"][0]["authorized_ports"] = None
+    network_with_ports = record()
+    network_with_ports["assets"][0]["authorized_ports"] = "80"
     picked_tests = record()
     picked_tests["assets"][0]["authorized_tests"] = ["service_info_common"]
-    picked_scan_modes = record()
-    picked_scan_modes["assets"][0]["authorized_scan_modes"] = ["connect"]
     cases = {
       "hash": {**record(), "engagement_hash": "0" * 64},
       "ids": record(engagement_id="en_" + "3" * 8 + "-3333-4333-8333-" + "3" * 12),
@@ -307,8 +295,8 @@ class TestEngagementValidator(unittest.TestCase):
       "21 documents": record(documents=[document(index + 1, "%064x" % index) for index in range(21)]),
       "v1 kind": {**record(), "engagement_kind": "continuous"},
       "v1 documents": {**record(), "roe_document": doc_ref(), "authorization_document": doc_ref(SHA_B)},
-      "webapp ports": webapp_ports, "network without ports": network_without_ports,
-      "asset test picks": picked_tests, "asset scan mode picks": picked_scan_modes,
+      "network with a dropped ports key": network_with_ports,
+      "asset test picks": picked_tests,
       "context not an object": record(context="Example"),
     }
     for name, row in cases.items():
@@ -334,7 +322,7 @@ class TestEngagementStoreKind(unittest.TestCase):
     hkey = '["redmesh","tenancy",1,"deployment"]'
     key = json.dumps(["engagement", "deployment", TENANT, ENGAGEMENT], separators=(",", ":"))
     self.owner.data[(hkey, key)] = {**record(), "schemaVersion": 1, "namespace": "deployment",
-                                                 "kind": "engagement", "ids": [TENANT, ENGAGEMENT], "roe": {}}
+                                                 "kind": "engagement", "ids": [TENANT, ENGAGEMENT], "active": "yes"}  # non-bool active refused
     with self.assertRaises(TenantStoreError):
       self.store.get("engagement", TENANT, ENGAGEMENT)
 

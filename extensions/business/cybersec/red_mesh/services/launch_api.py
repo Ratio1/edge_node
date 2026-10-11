@@ -42,7 +42,6 @@ from ..graybox.scenario_runtime import (
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
-from ..tenancy.assets import collapse_ports, format_port_ranges, ports_outside_scope
 from ..tenancy.engagements import SCAN_MODES
 from ..tenancy.execution import context_tenant_id
 from .soc_export_policy import required_soc_launch_error
@@ -610,24 +609,6 @@ def require_engagement(execution_context):
   return engagement, None
 
 
-def check_engagement_roe(engagement, *, ics_safe_mode=True, allow_stateful_probes=False):
-  """The engagement RoE is a ceiling: a job may be stricter, never wider."""
-  if engagement is None:
-    return None
-  roe = engagement["roe"]
-  field = None
-  if roe["ics_safe_mode_required"] and not ics_safe_mode:
-    field = "ics_safe_mode"
-  elif not roe["stateful_probes_allowed"] and allow_stateful_probes:
-    field = "allow_stateful_probes"
-  if field is None:
-    return None
-  return {
-    "error": "roe_forbids", "status_code": 400, "field": field,
-    "message": f"The engagement's rules of engagement do not allow {field} for this job.",
-  }
-
-
 def _apply_launch_safety_policy(
   owner,
   *,
@@ -1089,8 +1070,6 @@ def announce_launch(
   blockchain_attestation_enabled=False,
   comparison_mode=False,
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
-  authorized_ports=None,
-  authorization_update=None,
   console_version="",
   report_pipeline_version="",
 ):
@@ -1176,8 +1155,6 @@ def announce_launch(
     selected_peers=active_peers,
     comparison_mode=comparison_mode,
     comparison_ports=comparison_ports,
-    authorized_ports=authorized_ports,
-    authorization_update=authorization_update,
     created_by_name=created_by_name or "",
     created_by_id=created_by_id or "",
     authorized=True,
@@ -1200,7 +1177,7 @@ def announce_launch(
     allow_stateful_probes=allow_stateful_probes,
     graybox_assignment_strategy=graybox_assignment_strategy,
     # The engagement snapshot (RM-095): reports and exports keep reading these fields.
-    **({"engagement": engagement["context"], "roe": engagement["roe"],
+    **({"engagement": engagement["context"],
         "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
         "engagement_hash": engagement["engagement_hash"],
         "contract_sha256": engagement["contract_sha256"]} if engagement is not None else {}),
@@ -1347,10 +1324,6 @@ def announce_launch(
     "has_target_allowlist": bool(target_allowlist),
     **({"engagement_id": engagement["engagement_id"], "engagement_hash": engagement["engagement_hash"]}
        if engagement is not None else {}),
-    **({"authorized_ports": authorized_ports} if authorized_ports else {}),
-    **({"authorization_update_reference": authorization_update["reference"],
-        "out_of_scope_ports": authorization_update["out_of_scope_ports"]}
-       if authorization_update else {}),
     "safety_warning_count": len((safety_policy or {}).get("warnings", [])),
     **({"tenant_id": binding.to_dict()["tenant_id"],
         "engagement_asset_id": binding.to_dict()["engagement_asset_id"]} if binding is not None else {}),
@@ -1359,70 +1332,6 @@ def announce_launch(
   # RM-108 phase 5: admission never yields an unbound launch, so the response never lists the
   # other current jobs a pre-tenancy console once needed to find its own job in.
   return {"job_specs": job_specs, "worker": owner.ee_addr, "job_config": persisted_config}
-
-
-_AUTHORIZATION_UPDATE_REQUIRED = ("reference", "authorized_signer_name", "authorized_signer_role")
-_AUTHORIZATION_UPDATE_TEXT_MAX = 200
-
-
-def _normalize_authorization_update(value):
-  """The typed reference that authorizes scanning beyond the asset's recorded port scope.
-
-  Field names follow `AuthorizationRef`; `reference` names the signed update itself. RM-068
-  replaces the typed reference with a wallet signature.
-  """
-  allowed = set(_AUTHORIZATION_UPDATE_REQUIRED) | {"document_cid"}
-  message = ("authorization_update requires reference, authorized_signer_name and "
-             "authorized_signer_role (document_cid optional)")
-  if not isinstance(value, dict) or not set(value) <= allowed:
-    return None, validation_error(message)
-  update = {}
-  for key in sorted(allowed):
-    text = value.get(key)
-    if text is None and key == "document_cid":
-      continue
-    if not isinstance(text, str) or not text.strip() or len(text.strip()) > _AUTHORIZATION_UPDATE_TEXT_MAX:
-      return None, validation_error(message)
-    update[key] = text.strip()
-  return update, None
-
-
-def check_authorized_port_scope(execution_context, workers, exceptions, authorization_update):
-  """Refuse a launch whose derived ports exceed the engagement's port scope for the asset.
-
-  The derived set is what the workers will actually scan: each worker's explicit `target_ports`
-  (comparison mode mirrors COMMON_PORTS outside the operator's range) or its start-end slice,
-  minus the excepted ports. Every network entry of an engagement has a scope (RM-095, RM-107);
-  only a launch with no tenant context (the legacy path tests still drive) is not gated.
-
-  Returns (authorized_ports, recorded_update, error).
-  """
-  if execution_context is None:
-    return None, None, None
-  scope = execution_context.to_dict().get("asset_authorized_ports")
-  if not scope:
-    return None, None, None
-  derived = set()
-  for worker in workers.values():
-    derived.update(worker.get("target_ports")
-                   or range(worker["start_port"], worker["end_port"] + 1))
-  outside = ports_outside_scope(derived - set(exceptions), scope)
-  if not outside:
-    return scope, None, None
-  outside_text = format_port_ranges(collapse_ports(outside))
-  if authorization_update is None:
-    return None, None, {
-      "error": "scope_exceeds_authorization",
-      "status_code": 400,
-      "message": (f"The requested ports exceed the engagement's authorized port scope for this asset ({scope}). "
-                  "Record an authorization update to widen it."),
-      "authorized_ports": scope,
-      "out_of_scope_ports": outside_text,
-    }
-  update, error = _normalize_authorization_update(authorization_update)
-  if error:
-    return None, None, error
-  return scope, {**update, "out_of_scope_ports": outside_text}, None
 
 
 def launch_network_scan(
@@ -1457,7 +1366,6 @@ def launch_network_scan(
   comparison_mode=False,
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
   scan_mode="connect",
-  authorization_update=None,
   console_version="",
   report_pipeline_version="",
 ):
@@ -1521,9 +1429,6 @@ def launch_network_scan(
   )
   if confirmation_error:
     return confirmation_error
-  roe_error = check_engagement_roe(engagement, ics_safe_mode=bool(ics_safe_mode))
-  if roe_error:
-    return roe_error
 
   if execution_context is not None:
     active_peers, peer_error = execution_context.to_dict()["selected_candidates"], None
@@ -1569,13 +1474,6 @@ def launch_network_scan(
   if worker_error:
     return worker_error
   exception_ports = parse_exceptions(owner, exceptions)
-  authorized_ports, recorded_update, scope_error = check_authorized_port_scope(
-    execution_context, workers, exception_ports, authorization_update)
-  if scope_error:
-    return scope_error
-  if recorded_update is not None and engagement is not None:
-    # The one-off widening is recorded against the engagement it goes beyond (never re-anchored).
-    recorded_update = {**recorded_update, "engagement_id": engagement["engagement_id"]}
 
   return announce_launch(
     owner,
@@ -1622,8 +1520,6 @@ def launch_network_scan(
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,
     timeout_profile=timeout_profile,
-    authorized_ports=authorized_ports,
-    authorization_update=recorded_update,
     console_version=console_version,
     report_pipeline_version=report_pipeline_version,
   )
@@ -1708,11 +1604,6 @@ def launch_webapp_scan(
   engagement, engagement_error = require_engagement(execution_context)
   if engagement_error:
     return engagement_error
-  # The requested stateful options, before any policy budget narrows them: ICS applies to network.
-  roe_error = check_engagement_roe(
-    engagement, allow_stateful_probes=bool(allow_stateful_probes) or bool(allow_mirror_stateful))
-  if roe_error:
-    return roe_error
   max_weak_attempts, numeric_error = _parse_positive_int(
     max_weak_attempts, "max_weak_attempts", default=5,
   )
@@ -2004,7 +1895,6 @@ def launch_test(
   blockchain_attestation_enabled=False,
   comparison_mode=False,
   timeout_profile=TIMEOUT_PROFILE_STANDARD,
-  authorization_update=None,
   console_version="",
   report_pipeline_version="",
 ):
@@ -2103,7 +1993,6 @@ def launch_test(
     blockchain_attestation_enabled=blockchain_attestation_enabled,
     comparison_mode=comparison_mode,
     timeout_profile=timeout_profile,
-    authorization_update=authorization_update,
     console_version=console_version,
     report_pipeline_version=report_pipeline_version,
   )
