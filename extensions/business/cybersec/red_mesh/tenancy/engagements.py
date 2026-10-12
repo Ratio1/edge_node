@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import re
 
 from .assets import canonical_digest, canonical_uuid, normalize_name, normalize_target, valid_digest
+from .contacts import valid_email, valid_phone
 from .identity import canonical_account_id
 from ..constants import FEATURE_CATALOG
 from ..models.engagement import Contact, EngagementContext
@@ -90,6 +91,9 @@ def _contact(value):
   if not isinstance(value, dict) or not set(value) <= set(_CONTACT_FIELDS):
     raise EngagementInvalid("context_invalid")
   contact = Contact(**{key: _context_text(value.get(key, "")) for key in _CONTACT_FIELDS})
+  # RM-132: a contact's e-mail and phone have a format; the code stays `context_invalid`.
+  if (contact.email and not valid_email(contact.email)) or (contact.phone and not valid_phone(contact.phone)):
+    raise EngagementInvalid("context_invalid")
   return None if contact.is_empty() else contact
 
 

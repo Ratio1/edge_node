@@ -100,6 +100,15 @@ class TestProfileRecord(_ProfileCase):
     self.assertEqual(self.store.data[PROFILE_KEY], before)
     self.assertEqual(len(self.events), 1)
 
+  def test_contact_formats_are_refused_by_field_without_a_write(self):
+    # RM-132: the provider contacts have a format; emptiness stays allowed.
+    for field, code in (("contact_email", "contact_email_invalid"), ("contact_phone", "contact_phone_invalid")):
+      with self.subTest(field=field):
+        refused(self, self.update({"legal_name": "X", field: "foo"}), 400, code)
+    self.assertEqual((self.store.writes, self.events), ([], []))
+    profile = ok(self, self.update({"contact_email": "a@b.co", "contact_phone": ""}))
+    self.assertEqual((profile["contact_email"], profile["contact_phone"]), ("a@b.co", ""))
+
 
 class TestProfileRoles(_ProfileCase):
   def test_only_a_full_portfolio_super_tenant_admin_reads_or_writes(self):

@@ -88,8 +88,11 @@ class TestEngagementValues(unittest.TestCase):
                               "point_of_contact": {"name": "Ana", "email": "ana@example.com"}})
     self.assertEqual(full["client_name"], "Example")
     self.assertEqual(full["point_of_contact"], {"name": "Ana", "email": "ana@example.com", "phone": "", "role": ""})
+    # RM-132: a contact's e-mail and phone have a format, under the same code.
     for bad in ({"client_name": None}, {"client_name": 5}, {"unknown": "x"}, {"asset_exposure": "moon"},
-                {"client_name": "x" * 501}, {"point_of_contact": {"pager": "1"}}, "text"):
+                {"client_name": "x" * 501}, {"point_of_contact": {"pager": "1"}}, "text",
+                {"point_of_contact": {"name": "Ana", "email": "foo"}},
+                {"emergency_contact": {"name": "Ana", "phone": "foo"}}):
       with self.assertRaises(EngagementInvalid) as caught:
         normalize_context(bad)
       self.assertEqual(caught.exception.code, "context_invalid")

@@ -1,0 +1,55 @@
+{
+  "_comment": "RM-132 contact formats (onboarding-drafts.md §Contact formats). `accept` values are stored as given; `refuse` values answer contact_email_invalid / contact_phone_invalid (party block, super-tenant profile) or context_invalid (engagement contacts). Empty is allowed by every caller and is not listed.",
+  "email": {
+    "accept": [
+      "a@b.co",
+      "ion.pop@example.com",
+      "Ion.Pop+legal@sub.example-corp.co.uk",
+      "first_last@example.io",
+      "o'neil@example.org",
+      "x@a-b.c1"
+    ],
+    "refuse": [
+      "foo",
+      "user@localhost",
+      "user@127.0.0.1",
+      "user@[192.168.0.1]",
+      "@example.com",
+      "user@",
+      "user@.com",
+      "user@example.",
+      "user@exa mple.com",
+      "us er@example.com",
+      "user@@example.com",
+      "a@b@c.com",
+      "user@exam_ple.com",
+      "ünïcode@example.com",
+      "user@exämple.com",
+      "mailto:user@example.com",
+      "user@example.com,other@example.com"
+    ]
+  },
+  "phone": {
+    "accept": [
+      "+40 700 000 000",
+      "0700000000",
+      "+1 (555) 123-4567",
+      "555.123.4567",
+      "123456",
+      "+12345678901234567890"
+    ],
+    "refuse": [
+      "foo",
+      "12345",
+      "+123456789012345678901",
+      "+40 700 000 000 ext. 12",
+      "0700 000 000 x12",
+      "++40700000000",
+      "40+700000000",
+      "+40/700/000/000",
+      "+40 7OO OOO OOO",
+      "٠٧٠٠٠٠٠٠٠٠",
+      "tel:+40700000000"
+    ]
+  }
+}

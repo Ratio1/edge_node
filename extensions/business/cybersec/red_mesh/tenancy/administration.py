@@ -113,6 +113,17 @@ def _legal(value):
   return legal
 
 
+def _legal_input(value):
+  """RM-132: the one-step `prepare_tenant` party block as the caller sent it: `_legal`, then the
+  contact formats. Only here: `_legal` alone is also the stored-row check, and a block written
+  before the formats existed must keep reading, activating and replaying."""
+  legal = _legal(value)
+  try:
+    return {**legal, **{key: drafts.LEGAL_FORMATS[key](legal[key]) for key in drafts.LEGAL_FORMATS if key in legal}}
+  except drafts.DraftInvalid as exc:
+    raise AdministrationDenied(400, exc.code) from None
+
+
 def _legal_dto(legal):
   """RM-110: a stored block answers every party field, the optional ones empty when absent."""
   return None if legal is None else {**{key: "" for key in _LEGAL_OPTIONAL_FIELDS}, **legal}
@@ -329,7 +340,7 @@ class TenantAdministrationService:
       initial_admin_id = canonical_account_id(initial_admin_id)
       if not isinstance(display_name, str) or not 1 <= len(display_name.strip()) <= 120 or not initial_admin_id:
         raise AdministrationDenied(400, "invalid_request")
-      legal = _legal(legal)
+      legal = _legal_input(legal)
       if contract is None:
         raise AdministrationDenied(400, "contract_required")
       if not _valid_contract(contract):

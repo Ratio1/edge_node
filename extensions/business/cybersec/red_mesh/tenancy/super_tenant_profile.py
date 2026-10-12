@@ -5,7 +5,7 @@ of outline 01 C1/C6/C9, 03 A3 and 04 D3. Vocabulary, formats, the stored-record 
 DTO; no storage I/O (contract: `onboarding-drafts.md` §Super-tenant profile). Every field may be
 empty here; generation (Navigator) refuses `profile_required` on the ones a pack needs.
 """
-from .drafts import LEGAL_MAX, DraftInvalid, nonempty_text, text
+from .drafts import LEGAL_FORMATS, LEGAL_MAX, DraftInvalid, nonempty_text, text
 
 RECORD_ID = "deployment"
 FIELDS = ("legal_name", "registration_id", "vat_id", "address", "signer_name", "signer_role", "contact_email",
@@ -20,10 +20,12 @@ def empty_profile():
 
 def apply_changes(row, changes):
   """The row with the partial `changes` applied (`update_super_tenant_profile`) and the keys whose
-  value changed. Formats are checked, emptiness is allowed; an unknown key is refused."""
+  value changed. Formats are checked (RM-132: the contact fields' too), emptiness is allowed; an
+  unknown key is refused."""
   if not isinstance(changes, dict) or any(key not in FIELDS for key in changes):
     raise DraftInvalid()
-  changed = {key: text(value, LEGAL_MAX) for key, value in changes.items()}
+  changed = {key: LEGAL_FORMATS[key](value) if key in LEGAL_FORMATS else text(value, LEGAL_MAX)
+             for key, value in changes.items()}
   return {**row, **changed}, sorted(key for key, value in changed.items() if row[key] != value)
 
 

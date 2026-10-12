@@ -1197,6 +1197,28 @@ class TestPartyBlockAndBaseline(_ActivationCase):
     self.assertEqual(self.plugin.get_tenant_contract(self.actor, tenant_id)["status_code"], 503)
     self.assertEqual(self.plugin.get_tenant(self.actor, tenant_id)["status_code"], 503)
 
+  def test_contact_formats_are_checked_on_write_and_never_on_a_stored_row(self):
+    # RM-132: the party contacts have a format; the refusal names the field and writes nothing.
+    draft_id = self.ready(combined=True)
+    before = copy.deepcopy(self.store.data[self.key("tenant_draft", draft_id)])
+    for field, value, code in (("contact_email", "foo", "contact_email_invalid"),
+                               ("contact_phone", "foo", "contact_phone_invalid"),
+                               ("contact_phone", "+40 700 000 000 ext. 12", "contact_phone_invalid")):
+      with self.subTest(field=field, value=value):
+        refused(self, self.update(draft_id, {"legal": {field: value}}), 400, code)
+    self.assertEqual(self.store.data[self.key("tenant_draft", draft_id)], before)
+    draft = ok(self, self.update(draft_id, {"legal": {"contact_email": " a@b.co ", "contact_phone": ""}}))
+    self.assertEqual((draft["legal"]["contact_email"], draft["legal"]["contact_phone"]), ("a@b.co", ""))
+    # A row written before the rule (free text in both contacts) keeps reading, activating and replaying.
+    request_id = str(uuid4())
+    self.store.data[self.key("tenant_draft", draft_id)]["legal"].update({"contact_email": "foo", "contact_phone": "bar"})
+    self.assertEqual(ok(self, self.plugin.get_tenant_draft(self.actor, draft_id))["legal"]["contact_email"], "foo")
+    ok(self, self.activate(draft_id, request_id))
+    tenant_id = self.finish(draft_id, request_id)
+    self.assertEqual(ok(self, self.activate(draft_id, request_id))["tenantId"], tenant_id)
+    legal = ok(self, self.plugin.get_tenant_contract(self.actor, tenant_id))["legal"]
+    self.assertEqual((legal["contact_email"], legal["contact_phone"]), ("foo", "bar"))
+
   def test_a_legacy_four_key_legal_block_reads_back_with_empty_party_fields(self):
     draft_id = self.create()["draft_id"]
     self.store.data[self.key("tenant_draft", draft_id)]["legal"] = dict(LEGAL)

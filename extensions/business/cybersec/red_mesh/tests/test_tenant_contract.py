@@ -237,6 +237,20 @@ class TestContractReplay(unittest.TestCase):
     renamed["legal"]["name"] = "Someone Else SRL"
     self.assertEqual(self.prepare(**renamed)["error"], "request_conflict")
 
+  def test_a_malformed_contact_is_refused_by_field_on_the_one_step_input(self):
+    # RM-132: the contact formats apply to the party block as sent; a four-key block still passes
+    # (the plugin endpoint sends four keys; a caller of the service may send the party fields).
+    for field, code in (("contact_email", "contact_email_invalid"), ("contact_phone", "contact_phone_invalid")):
+      with self.subTest(field=field):
+        terms = contract_terms()
+        terms["legal"][field] = "foo"
+        result = self.prepare(**terms)
+        self.assertEqual((result["status_code"], result["error"]), (400, code))
+    self.assertFalse(any(isinstance(v, dict) and v.get("kind") == "receipt" for v in self.store.data.values()))
+    terms = contract_terms()
+    terms["legal"].update({"contact_email": "a@b.co", "contact_phone": ""})
+    self.assertEqual(self.prepare(**terms)["status_code"], 200)
+
   def test_the_service_refuses_missing_terms_even_without_the_plugin(self):
     self.assertEqual(self.prepare(contract=None)["error"], "contract_required")
     self.assertEqual(self.prepare(legal=None)["error"], "legal_details_required")
