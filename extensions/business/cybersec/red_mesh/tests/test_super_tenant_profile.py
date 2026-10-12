@@ -43,7 +43,13 @@ class _ProfileCase(unittest.TestCase):
     self.actor = {"account_id": "creator"}
 
   def get(self, actor=None):
-    return self.plugin.get_super_tenant_profile(actor or self.actor)
+    """The profile out of the RM-132 envelope `{"profile", "permissions"}` (`permissions` asserted
+    in `TestProfilePermissions`)."""
+    result = self.plugin.get_super_tenant_profile(actor or self.actor)
+    if result.get("success"):
+      self.assertEqual(set(result["data"]), {"profile", "permissions"})
+      return {**result, "data": result["data"]["profile"]}
+    return result
 
   def update(self, changes, actor=None):
     return self.plugin.update_super_tenant_profile(actor or self.actor, changes)
@@ -108,6 +114,52 @@ class TestProfileRecord(_ProfileCase):
     self.assertEqual((self.store.writes, self.events), ([], []))
     profile = ok(self, self.update({"contact_email": "a@b.co", "contact_phone": ""}))
     self.assertEqual((profile["contact_email"], profile["contact_phone"]), ("a@b.co", ""))
+
+
+class TestProfilePermissions(_ProfileCase):
+  """RM-132: `SUPER_TENANT_PERMISSIONS`, deployment configuration read through the plugin's `cfg_*`."""
+
+  def permissions(self):
+    result = self.plugin.get_super_tenant_profile(self.actor)
+    return ok(self, result)["permissions"]
+
+  def test_the_read_reports_the_flags_and_the_default_is_open(self):
+    # The test plugin has no `cfg_super_tenant_permissions`: the class CONFIG default applies.
+    self.assertEqual(self.permissions(), {"edit_company_details": True})
+    self.assertEqual(ok(self, self.update({"legal_name": "X"}))["legal_name"], "X")
+
+  def test_a_locked_deployment_refuses_the_update_before_any_read_and_still_answers_the_profile(self):
+    ok(self, self.update({"legal_name": "X"}))
+    before, events = copy.deepcopy(self.store.data), list(self.events)
+    self.plugin.cfg_super_tenant_permissions = {"edit_company_details": False}
+    refused(self, self.update({"legal_name": "Y"}), 403, "company_details_locked")
+    self.assertEqual((self.store.data, self.events), (before, events))
+    data = ok(self, self.plugin.get_super_tenant_profile(self.actor))
+    self.assertEqual((data["profile"]["legal_name"], data["permissions"]), ("X", {"edit_company_details": False}))
+    # The PUT answer stays the bare profile on the wire; the GET carries the envelope.
+    self.plugin.cfg_super_tenant_permissions = {"edit_company_details": True}
+    self.assertEqual(set(ok(self, self.update({"legal_name": "Z"}))), set(EMPTY))
+
+  def test_the_flag_is_coerced_and_unknown_keys_are_dropped(self):
+    cases = {"absent": {}, "yes": {"edit_company_details": "yes"}, "one": {"edit_company_details": 1},
+             "true string": {"edit_company_details": "True"}, "extra": {"edit_company_details": True, "edit_branding": False},
+             "not a dict": "nope"}
+    for label, value in cases.items():
+      with self.subTest(label):
+        self.plugin.cfg_super_tenant_permissions = value
+        self.assertEqual(self.permissions(), {"edit_company_details": True})
+    for label, value in {"false": False, "zero": 0, "false string": " False ", "no": "no", "off": "OFF", "zero string": "0",
+                         "empty string": ""}.items():
+      with self.subTest(label):
+        self.plugin.cfg_super_tenant_permissions = {"edit_company_details": value}
+        self.assertEqual(self.permissions(), {"edit_company_details": False})
+        refused(self, self.update({"legal_name": "Y"}), 403, "company_details_locked")
+
+  def test_the_service_without_a_reader_is_open(self):
+    from extensions.business.cybersec.red_mesh.tenancy.administration import TenantAdministrationService
+    self.assertEqual(TenantAdministrationService(None, None)._super_tenant_permissions(), {"edit_company_details": True})
+    broken = TenantAdministrationService(None, None, super_tenant_permissions_reader=lambda: "nope")
+    self.assertEqual(broken._super_tenant_permissions(), {"edit_company_details": True})
 
 
 class TestProfileRoles(_ProfileCase):

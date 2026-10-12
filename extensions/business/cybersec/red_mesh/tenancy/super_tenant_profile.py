@@ -11,6 +11,9 @@ RECORD_ID = "deployment"
 FIELDS = ("legal_name", "registration_id", "vat_id", "address", "signer_name", "signer_role", "contact_email",
           "contact_phone")
 DTO_FIELDS = (*FIELDS, "updated_by", "updated_at")
+# RM-132: the deployment permission flags the profile read reports, with their defaults. The
+# values come from `services.config.get_super_tenant_permissions` through the service's reader.
+PERMISSIONS = {"edit_company_details": True}
 
 
 def empty_profile():

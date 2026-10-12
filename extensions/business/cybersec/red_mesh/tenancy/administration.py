@@ -165,10 +165,13 @@ def _same_contract(stored, requested):
 
 class TenantAdministrationService:
   def __init__(self, accounts, store, configured_peers_reader=None, tenant_node_jobs_reader=None,
-               node_directory_reader=None):
+               node_directory_reader=None, super_tenant_permissions_reader=None):
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
+    # RM-132: `() -> {key: bool}`, the deployment's `SUPER_TENANT_PERMISSIONS` (read-only here, set
+    # by Ratio1). Injected like `configured_peers_reader`; without one, every key is `True`.
+    self.super_tenant_permissions_reader = super_tenant_permissions_reader
     # RM-126: `[address] -> {address: {"alias", "tags"}}`, the network monitor's names for the
     # configured peers. Injected like `configured_peers_reader`; it only decorates reads, so a
     # missing or failing reader names nothing and never fails a read.
@@ -1486,17 +1489,29 @@ class TenantAdministrationService:
   # Admin only (contract `onboarding-drafts.md` §Super-tenant profile). A deployment without the row
   # reads as the empty profile; a read never writes it.
 
+  def _super_tenant_permissions(self):
+    """RM-132: the deployment's flags, the known keys only; every key `True` without a reader."""
+    reader = self.super_tenant_permissions_reader
+    flags = reader() if callable(reader) else None
+    flags = flags if isinstance(flags, dict) else {}
+    return {key: bool(flags.get(key, default)) for key, default in super_tenant_profile.PERMISSIONS.items()}
+
   @_endpoint
   def get_super_tenant_profile(self, actor):
+    """RM-132: the envelope `{"profile", "permissions"}`; `permissions` never enters the DTO."""
     self._actor(actor, creator=True)
     row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
-    return super_tenant_profile.profile_dto(row if row is not None else super_tenant_profile.empty_profile())
+    profile = super_tenant_profile.profile_dto(row if row is not None else super_tenant_profile.empty_profile())
+    return {"profile": profile, "permissions": self._super_tenant_permissions()}
 
   @_endpoint
   def update_super_tenant_profile(self, actor, changes):
     """Partial `changes`, formats checked, emptiness allowed. Answers the profile and the keys whose
-    value changed (the plugin audits those, never the values); nothing changed, nothing written."""
+    value changed (the plugin audits those, never the values); nothing changed, nothing written.
+    RM-132: refused while the deployment locks the company details, before any read of the row."""
     account = self._actor(actor, creator=True)
+    if not self._super_tenant_permissions()["edit_company_details"]:
+      raise AdministrationDenied(403, "company_details_locked")
     previous = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
     if previous is None:
       previous = super_tenant_profile.empty_profile()

@@ -125,6 +125,15 @@ DEFAULT_ATTESTATION_CONFIG = {
   "RETRIES": 2,
 }
 
+# RM-132: what the super-tenant may still edit about itself (contract: `onboarding-drafts.md`
+# §Contact formats and the Ratio1 lock). Deployment configuration set by Ratio1, read-only in the
+# API, named booleans, every key `True` unless the deployment says otherwise. `edit_branding` is
+# reserved by the contract and added here by the task that consumes it (RM-134).
+DEFAULT_SUPER_TENANT_PERMISSIONS = {
+  "edit_company_details": True,
+}
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off"})
+
 DEFAULT_GRAYBOX_BUDGETS_CONFIG = {
   "AUTH_ATTEMPTS": 10,
   "ROUTE_DISCOVERY": 100,
@@ -388,6 +397,30 @@ def get_llm_agent_config(owner):
     owner,
     "LLM_AGENT",
     DEFAULT_LLM_AGENT_CONFIG,
+    normalizer=_normalize,
+  )
+
+
+def config_flag(value, default):
+  """A boolean deployment flag: the strings `false`, `0`, `no`, `off` (any case, stripped) are
+  `False`, `None` is the default, anything else is `bool(value)`. `bool("false")` is `True`, which
+  would silently unlock a permission typed as a string."""
+  if value is None:
+    return bool(default)
+  if isinstance(value, str):
+    return value.strip().lower() not in _FALSE_STRINGS and bool(value.strip())
+  return bool(value)
+
+
+def get_super_tenant_permissions(owner):
+  """RM-132: `SUPER_TENANT_PERMISSIONS`, the known keys only, each a boolean."""
+  def _normalize(merged, defaults):
+    return {key: config_flag(merged.get(key), default) for key, default in defaults.items()}
+
+  return resolve_config_block(
+    owner,
+    "SUPER_TENANT_PERMISSIONS",
+    DEFAULT_SUPER_TENANT_PERMISSIONS,
     normalizer=_normalize,
   )
 
