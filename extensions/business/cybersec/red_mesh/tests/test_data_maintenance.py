@@ -313,6 +313,14 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual(rows[(TENANCY, tenant)]["class"], "current")
     self.assertEqual(self.clean(scanned)[0]["outcome"], "not_old")
     self.assertEqual(self.files.deleted, [])
+    # A tenant row carrying a further contract stays current and its files are in the inventory.
+    block = {"contract": {**row["document"], "ref": cid(71)}, "contract_generated": None, "effective_from": "2027-01-01", "effective_until": None,
+             "nodes": [{"node_address": "Node-A", "mode": "shared"}], "activated_by": "creator", "activated_at": "2026-10-13T00:00:00Z",
+             "supersedes": None, "superseded_by": None}
+    self.storage.data[(TENANCY, tenant)]["contracts"] = {"c_2": block}
+    with_contracts = self.scan()[(TENANCY, tenant)]
+    self.assertEqual(with_contracts["class"], "current")
+    self.assertIn({"cid": cid(71), "role": "contracts.c_2.contract.ref", "withheld": False}, with_contracts["cids"])
     # A malformed row is old; one whose tenant is gone is an orphan.
     self.storage.data[(TENANCY, field)]["state"] = "done"
     self.assertEqual(self.scan()[(TENANCY, field)]["class"], "old")

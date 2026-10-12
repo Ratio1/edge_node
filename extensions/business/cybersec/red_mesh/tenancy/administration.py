@@ -2020,16 +2020,18 @@ class TenantAdministrationService:
       row, dropped = engagement_drafts.apply_changes(previous, changes)
     except engagement_drafts.EngagementDraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
-    # RM-133: a pick names a contract the parent tenant holds; a draft under a tenant draft has one
-    # contract and takes none.
+    # RM-133: a pick names a contract the parent tenant holds and nobody replaced (`c_1` when the
+    # pick is empty); a draft under a tenant draft has one contract and takes none.
     pick = engagement_drafts.contract_pick(row)
-    if pick is not None and pick != engagement_drafts.contract_pick(previous):
+    if isinstance(changes, dict) and engagement_drafts.CONTRACT_PICK in changes:
       if "tenant_id" not in row["parent"]:
-        raise AdministrationDenied(400, "contract_unknown")
-      tenant = self.store.get("tenant", row["parent"]["tenant_id"])
-      if tenant is None:
-        raise AdministrationDenied(404, "not_found")
-      self._tenant_contract_sha256(tenant, pick)
+        if pick is not None:
+          raise AdministrationDenied(400, "contract_unknown")
+      else:
+        tenant = self.store.get("tenant", row["parent"]["tenant_id"])
+        if tenant is None:
+          raise AdministrationDenied(404, "not_found")
+        self._tenant_contract_sha256(tenant, pick)
     return {"draft": self._write_engagement_draft(row, account, previous), "dropped": dropped}
 
   def _draft_assets(self, requests, parent, previous):
@@ -2495,10 +2497,15 @@ class TenantAdministrationService:
   def attach_tenant_contract_document(self, actor, tenant_id, contract_id, document):
     """Bind an uploaded signed copy (`store_tenant_contract_document`) and sign the draft. Answers
     the row and the ref the slot held before, whose file the plugin deletes after this write."""
-    _, account = self._platform_tenant(actor, tenant_id)
+    tenant, account = self._platform_tenant(actor, tenant_id)
     previous = self._tenant_contract_draft(tenant_id, contract_id)
     if not valid_doc_ref(document) or document["uploaded_by"] != account.account_id:
       raise AdministrationDenied(400, "contract_invalid")
+    # The same bytes as another contract of the tenant would make two contracts share a sha256,
+    # which readers resolve by: refused as in use (a fresh upload has a fresh ref, so the ref scan
+    # alone would let it through).
+    if document["sha256"] in _contract_sha256s(tenant):
+      raise AdministrationDenied(409, "contract_in_use")
     replaced = previous["document"]
     row = {**previous, "state": "signed", "document": dict(document)}
     return {"draft": self._write_tenant_contract_draft(row, account),
@@ -2565,6 +2572,8 @@ class TenantAdministrationService:
       if uploader is None or not uploader.active or not holds_platform_role(uploader):
         raise AdministrationDenied(400, "contract_invalid")
     self._refuse_documents_in_use({row["document"]["ref"], row["generated"]["ref"]}, exclude=(tenant_id, contract_id))
+    if row["document"]["sha256"] in _contract_sha256s(tenant):
+      raise AdministrationDenied(409, "contract_in_use")
     # RM-133 step 3: a revision replaces a contract nobody else replaced meanwhile; the replaced
     # contract stays in force for its own engagements and takes no new one.
     replaced = {}

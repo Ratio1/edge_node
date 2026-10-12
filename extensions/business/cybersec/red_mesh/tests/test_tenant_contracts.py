@@ -370,6 +370,10 @@ class TestInUseAndDelete(_ContractSetCase):
                                     legal={"name": "Other SRL", "registration_id": "RO2", "signer_name": "A", "signer_role": "B"},
                                     contract=dict(block["contract"]))
     refused(self, result, 409, "contract_in_use")
+    # The same bytes as an activated contract, uploaded afresh (a new ref): refused at the upload.
+    same = ok(self, self.contract_draft(tenant_id))["contract_id"]
+    refused(self, self.upload_contract(tenant_id, same, raw=SIGNED_2), 409, "contract_in_use")
+    self.assertEqual(self.stored_contract(tenant_id, same)["state"], "missing")
     # And a contract draft's own files, before activation, hold their refs too.
     fourth = self.ready_contract(tenant_id, [SHARED_A], signed=b"%PDF-1.7\n%four\n%%EOF\n", generated=b"%PDF-1.7\n%gen four\n%%EOF\n")
     held = self.stored_contract(tenant_id, fourth)["document"]
@@ -546,9 +550,12 @@ class TestRevisions(_ContractSetCase):
     activated = ok(self, self.plugin.activate_engagement_draft(self.actor, child))
     engagement = ok(self, self.plugin.get_engagement(self.actor, tenant_id, activated["engagementId"]))["engagement"]
     self.assertEqual(engagement["contractSha256"], self.tenant_row(tenant_id)["contracts"][revision["contract_id"]]["contract"]["sha256"])
-    # A re-pick onto the replaced contract is refused on the write.
+    # A re-pick onto the replaced contract is refused on the write, spelled out or empty (`c_1`).
     other = self.child(tenant_id)["engagement_draft_id"]
     refused(self, self.update_child(other, {"contract_id": "c_1"}), 409, "contract_superseded")
+    refused(self, self.update_child(other, {"contract_id": ""}), 409, "contract_superseded")
+    refused(self, self.update_child(other, {"contract_id": None}), 409, "contract_superseded")
+    ok(self, self.update_child(other, {"display_name": "Still editable"}))
 
 
 class TestEnvelopeBinding(_ContractSetCase):
