@@ -1015,13 +1015,30 @@ class TenantAdministrationService:
     if not _valid_contract(contract):
       raise TenantStoreError("Invalid tenant contract record")
     if contract_id is None or contract_id == tenant_contracts.FIRST_CONTRACT_ID:
+      # RM-133 step 3: a replaced contract takes no new engagement (its own keep running).
+      if tenant.get("contract_superseded_by") is not None:
+        raise AdministrationDenied(409, "contract_superseded")
       return contract["sha256"]
     if not tenant_contracts.valid_contract_id(contract_id):
       raise AdministrationDenied(400, "contract_unknown")
     block = _contract_blocks(tenant).get(contract_id)
     if block is None:
       raise AdministrationDenied(400, "contract_unknown")
+    if block["superseded_by"] is not None:
+      raise AdministrationDenied(409, "contract_superseded")
     return block["contract"]["sha256"]
+
+  @staticmethod
+  def _contract_lineage(tenant, contract_id):
+    """RM-133 step 3: `(exists, superseded_by, nodes)` of one contract of the set, `c_1` included."""
+    if contract_id == tenant_contracts.FIRST_CONTRACT_ID:
+      if tenant.get("contract") is None:
+        return False, None, []
+      return True, tenant.get("contract_superseded_by"), list((tenant.get("contract_generated") or {}).get("nodes") or ())
+    block = _contract_blocks(tenant).get(contract_id)
+    if block is None:
+      return False, None, []
+    return True, block["superseded_by"], list(block["nodes"])
 
   def _contracts_dto(self, tenant):
     """RM-133: the member-visible contract list, `c_1` synthesized from the tenant's own fields,
@@ -1041,11 +1058,16 @@ class TenantAdministrationService:
     return entries
 
   @_endpoint
-  def authorize_engagement_create(self, actor, tenant_id):
+  def authorize_engagement_create(self, actor, tenant_id, contract_id=None, pick=False):
     """The plugin reads the documents outside this lock, and only after this check. Refusing a
-    tenant without a contract here spares the uploads and the document reads."""
+    tenant without a contract here spares the uploads and the document reads. RM-133: with `pick`,
+    the contract the creation names (`contract_id`, `c_1` when absent) must be one the tenant holds
+    and nobody replaced; an upload, made before the pick is known, needs only a contract."""
     tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
-    self._tenant_contract_sha256(tenant)
+    if pick:
+      self._tenant_contract_sha256(tenant, None if contract_id in (None, "") else contract_id)
+    elif tenant.get("contract") is None:
+      raise AdministrationDenied(400, "contract_required")
     return {"accountId": account.account_id}
 
   @staticmethod
@@ -2398,16 +2420,29 @@ class TenantAdministrationService:
     return self.store.get("tenant_contract_draft", row["tenant_id"], row["contract_id"])
 
   @_endpoint
-  def create_tenant_contract_draft(self, actor, tenant_id, request_id):
+  def create_tenant_contract_draft(self, actor, tenant_id, request_id, supersedes=None):
     """Allocate `c_<n>` from the tenant row's counter and write the draft. The counter goes on the
     tenant row first, so a crash between the two writes leaves a gap, never a collision; a number is
-    never reused. A create replayed with the same `request_id` answers the existing draft."""
+    never reused. A create replayed with the same `request_id` answers the existing draft. RM-133
+    step 3: with `supersedes` (`c_<k>`, a contract the tenant holds that nobody replaced) the draft
+    is a revision, prefilled from it: its nodes, a term proposed from today."""
     tenant, account = self._platform_tenant(actor, tenant_id)
-    self._tenant_contract_sha256(tenant)
+    if tenant.get("contract") is None:
+      raise AdministrationDenied(400, "contract_required")
     request_id = _request_id(request_id)
     existing = next((row for row in self.store.list_tenant_contract_drafts(tenant_id) if row["request_id"] == request_id), None)
     if existing is not None:
       return existing
+    supersedes = None if supersedes in (None, "") else supersedes
+    nodes = []
+    if supersedes is not None:
+      if not tenant_contracts.valid_contract_id(supersedes):
+        raise AdministrationDenied(400, "contract_unknown")
+      exists, superseded_by, nodes = self._contract_lineage(tenant, supersedes)
+      if not exists:
+        raise AdministrationDenied(400, "contract_unknown")
+      if superseded_by is not None:
+        raise AdministrationDenied(409, "contract_superseded")
     blocks = _contract_blocks(tenant)
     number = tenant.get("next_contract_no")
     if type(number) is not int or number < tenant_contracts.FIRST_CONTRACT_NO:
@@ -2417,8 +2452,10 @@ class TenantAdministrationService:
       number += 1
     contract_id = tenant_contracts.contract_id_for(number)
     self.store.put("tenant", tenant_id, record={**tenant, "next_contract_no": number + 1})
-    row = tenant_contracts.new_draft(tenant_id, contract_id, request_id, account.account_id,
-                                     datetime.now(timezone.utc).isoformat())
+    now = datetime.now(timezone.utc)
+    row = tenant_contracts.new_draft(tenant_id, contract_id, request_id, account.account_id, now.isoformat())
+    if supersedes is not None:
+      row = {**row, "supersedes": supersedes, "nodes": nodes, "effective_from": now.date().isoformat()}
     self.store.put("tenant_contract_draft", tenant_id, contract_id, record=row)
     return self.store.get("tenant_contract_draft", tenant_id, contract_id)
 
@@ -2528,10 +2565,23 @@ class TenantAdministrationService:
       if uploader is None or not uploader.active or not holds_platform_role(uploader):
         raise AdministrationDenied(400, "contract_invalid")
     self._refuse_documents_in_use({row["document"]["ref"], row["generated"]["ref"]}, exclude=(tenant_id, contract_id))
+    # RM-133 step 3: a revision replaces a contract nobody else replaced meanwhile; the replaced
+    # contract stays in force for its own engagements and takes no new one.
+    replaced = {}
+    if row["supersedes"] is not None:
+      exists, superseded_by, _ = self._contract_lineage(tenant, row["supersedes"])
+      if not exists:
+        raise AdministrationDenied(400, "contract_unknown")
+      if superseded_by is not None:
+        raise AdministrationDenied(409, "contract_superseded")
+      if row["supersedes"] == tenant_contracts.FIRST_CONTRACT_ID:
+        replaced = {"contract_superseded_by": contract_id}
+      else:
+        blocks = {**blocks, row["supersedes"]: {**blocks[row["supersedes"]], "superseded_by": contract_id}}
     self._assign_contract_nodes(account, tenant, row["nodes"])
     now = datetime.now(timezone.utc).isoformat()
     block = tenant_contracts.block_for(row, row["document"], row["generated"], account.account_id, now)
-    self.store.put("tenant", tenant_id, record={**tenant, "contracts": {**blocks, contract_id: block}})
+    self.store.put("tenant", tenant_id, record={**tenant, **replaced, "contracts": {**blocks, contract_id: block}})
     self.store.delete("tenant_contract_draft", tenant_id, contract_id)
     return {"tenantId": tenant_id, "contractId": contract_id, "replayed": False, "actor": account.account_id}
 
