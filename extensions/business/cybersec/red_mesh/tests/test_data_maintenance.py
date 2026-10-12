@@ -337,6 +337,58 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage.data[(TENANCY, under_tenant)]["document"]["state"] = "done"
     self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
 
+  def test_v2_shaped_engagements_and_drafts_are_old_and_cleanup_removes_them(self):
+    # RM-125 phase 2b: entries without `asset_id` (or with the v2 test picks) predate the asset library.
+    tenant = self.tenant
+    field = self.engagement_draft_row(tenant, 60)
+    entry = {"engagement_asset_id": "ea_1", "display_name": "Edge", "kind": "network",
+             "target": {"kind": "network", "address": "192.0.2.10"}, "target_digest": "d" * 64,
+             "authorized_ports": "443"}
+    self.storage.data[(TENANCY, field)]["assets"] = [entry]
+    engagement = json.dumps(["engagement", "deployment", tenant, "en_" + str(uuid4())], separators=(",", ":"))
+    self.put(TENANCY, engagement, {"tenant_id": tenant, "assets": [{**entry, "authorized_tests": ["x"]}]})
+    with_id = self.engagement_draft_row(tenant, 62)
+    self.storage.data[(TENANCY, with_id)]["assets"] = [{**entry, "asset_id": "ta_" + str(uuid4()),
+                                                        "authorized_tests": ["x"]}]
+    rows = self.scan()
+    self.assertEqual((rows[(TENANCY, field)]["class"], rows[(TENANCY, field)]["reason"]),
+                     ("old", "engagement_draft_v1"))
+    self.assertEqual((rows[(TENANCY, with_id)]["class"], rows[(TENANCY, with_id)]["reason"]),
+                     ("old", "engagement_draft_v1"))
+    self.assertEqual((rows[(TENANCY, engagement)]["class"], rows[(TENANCY, engagement)]["reason"]),
+                     ("old", "engagement_v2"))
+    self.assertEqual(self.clean(rows[(TENANCY, field)])[0]["outcome"], "deleted")
+    self.assertEqual(sorted(self.files.deleted), sorted([cid(60), cid(61)]))
+    self.assertEqual(self.clean(rows[(TENANCY, engagement)])[0]["outcome"], "deleted")
+
+  def tenant_asset_row(self, parent, address):
+    """RM-125. A tenant asset written through the real endpoint."""
+    created = self.plugin.create_tenant_asset(self.actor, parent, str(uuid4()), "Host",
+                                              {"kind": "network", "address": address}, environment="dev")
+    self.assertTrue(created["success"], created)
+    self.events.clear()
+    return json.dumps(["tenant_asset", "deployment", created["data"]["asset_id"]], separators=(",", ":"))
+
+  def test_a_tenant_asset_is_current_with_a_live_parent_and_parent_gone_without(self):
+    parent = self.draft_row()
+    under_draft = self.tenant_asset_row(json.loads(parent)[2], "192.0.2.30")
+    under_tenant = self.tenant_asset_row(self.tenant, "192.0.2.31")
+    rows = self.scan()
+    for field in (under_draft, under_tenant):
+      row = rows[(TENANCY, field)]
+      self.assertEqual((row["class"], row["reason"], row["cids"]), ("current", "", []), field)
+      self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    del self.storage.data[(TENANCY, parent)]
+    row = self.scan()[(TENANCY, under_draft)]
+    self.assertEqual((row["class"], row["reason"]), ("orphan", "parent_gone"))
+    self.assertEqual(self.clean(row)[0]["outcome"], "deleted")
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "parent_gone")
+    # A malformed asset is old/unrecognized, whatever its parent.
+    self.storage.data[(TENANCY, under_tenant)]["target_digest"] = "0" * 64
+    self.assertEqual(self.scan()[(TENANCY, under_tenant)]["reason"], "unrecognized")
+
   def test_the_super_tenant_profile_is_current_and_cleanup_keeps_it(self):
     # RM-110: one row per deployment, no tenant and no file; never an orphan of a tenant it is not.
     updated = self.plugin.update_super_tenant_profile(self.actor, {"legal_name": "RedMesh SRL"})
@@ -374,10 +426,12 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertTrue(self.plugin.update_tenant_draft(self.actor, draft_id, {
       "domain_id": "acme", "initial_admin_id": "acme.admin",
       "legal": {"name": "A", "registration_id": "B", "signer_name": "C", "signer_role": "D"},
-      "items": {"contract": {"effective_from": "2026-11-01"}}})["success"])
+      "items": {"contract": {"effective_from": "2026-11-01"}},
+      "nodes": [{"node_address": "node-a", "mode": "shared"}]})["success"])
     generated = self.plugin.store_generated_document(
       self.actor, draft_id=draft_id, document_kind="contract", filename="generated.pdf",
-      content_b64=base64.b64encode(b"%PDF-1.7\n%generated\n%%EOF\n").decode("ascii"), snapshot='{"v":1}',
+      content_b64=base64.b64encode(b"%PDF-1.7\n%generated\n%%EOF\n").decode("ascii"),
+      snapshot='{"nodes":[{"mode":"shared","nodeAddress":"node-a"}],"v":1}',
       generated_at="2026-10-07T10:00:00Z")
     self.assertTrue(generated["success"], generated)
     for number, kind in enumerate(("contract", "framework_agreement", "data_handling")):
@@ -388,6 +442,8 @@ class TestDataMaintenance(unittest.TestCase):
     prepared = self.plugin.prepare_tenant(self.actor, request, draft_id=draft_id)
     self.assertTrue(prepared["success"], prepared)
     self.storage.grant("acme.admin", prepared["data"]["tenantId"])
+    # RM-127: activation assigns the contract's node, a configured peer.
+    self.plugin.cfg_chainstore_peers = ["node-a"]
     self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
     rows = self.scan()
     receipt = json.dumps(["receipt", "deployment", "creator", request], separators=(",", ":"))

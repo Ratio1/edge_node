@@ -250,7 +250,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
               owasp_id="A07:2021",
               cwe_id="CWE-798",
               confidence="certain",
-              # A database login has no RoE-gated action (RM-118).
+              # A database login has no authenticated action (RM-118).
               authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
             ))
       except Exception:
@@ -958,7 +958,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   owasp_id="A07:2021",
                   cwe_id="CWE-798",
                   confidence="certain",
-                  # A database login has no RoE-gated action (RM-118).
+                  # A database login has no authenticated action (RM-118).
                   authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)
@@ -986,7 +986,7 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
                   owasp_id="A07:2021",
                   cwe_id="CWE-798",
                   confidence="certain",
-                  # A database login has no RoE-gated action (RM-118).
+                  # A database login has no authenticated action (RM-118).
                   authenticated_action=AUTHENTICATED_ACTION_NOT_APPLICABLE,
                 ))
                 findings += self._pg_extract_version_findings(resp)

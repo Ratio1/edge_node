@@ -31,6 +31,8 @@ _ROLE_OPERATIONS = {
     "engagements:create", "engagements:revoke", "engagements:documents",
     # RM-107. Removes a tenant with no members and no jobs (owner, 2026-09-28).
     "tenants:delete",
+    # RM-125. Registers, edits, archives and deletes the tenant's assets (owner, 2026-10-09).
+    "assets:manage",
   }),
   "super_pentester": frozenset({
     "allow_pentester:update", "tasks:launch", "tasks:update",

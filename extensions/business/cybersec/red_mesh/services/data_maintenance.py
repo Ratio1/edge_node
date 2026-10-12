@@ -57,7 +57,7 @@ _PER_JOB = (
   (":report_review:audit", list, False),
 )
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
-                  "engagement_draft", "super_tenant_profile")
+                  "engagement_draft", "super_tenant_profile", "tenant_asset")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -219,6 +219,8 @@ class Inventory:
     names = [self._instance] + [self._instance + suffix for suffix, _, _ in _PER_JOB]
     names.append(f"{self._instance}:integrations")
     names.extend(f"{self._instance}:integrations:{tenant}" for tenant in self.tenant_ids())
+    # RM-127: each node's self-published public IP, keyed by the node's address.
+    names.append(f"{self._instance}:node_info")
     names.extend([self._tenancy_hkey, self._account_hkey])
     return names
 
@@ -281,6 +283,11 @@ class Inventory:
     if kind == "engagement" and isinstance(value, dict) and any(
         name in value for name in _ENGAGEMENT_V1_FIELDS):
       return OLD, "engagement_v1"
+    # RM-125 phase 2b: an entry without `asset_id`, or still with the v2 `authorized_tests`.
+    if kind in ("engagement", "engagement_draft") and isinstance(value, dict) and any(
+        isinstance(entry, dict) and ("asset_id" not in entry or "authorized_tests" in entry)
+        for entry in (value["assets"] if isinstance(value.get("assets"), list) else ())):
+      return OLD, "engagement_v2" if kind == "engagement" else "engagement_draft_v1"
     try:
       if field != self._store._location(kind, ids)[1]:
         return OLD, "unrecognized"
@@ -292,9 +299,10 @@ class Inventory:
       # call every draft an orphan. Current while the store reads it, never orphan or old_tenant.
       # RM-110: the same for the deployment's one super-tenant profile row.
       return CURRENT, ""
-    if kind == "engagement_draft":
+    if kind in ("engagement_draft", "tenant_asset"):
       # RM-109 phase 4: current while its parent exists (a tenant draft row, or a live tenant); a
       # tenant deleted with children under it leaves them `parent_gone`. Never old_tenant.
+      # RM-125: a tenant asset has the same parent.
       parent = row["parent"]
       if "tenant_id" in parent:
         present = parent["tenant_id"] in self._live_tenants()
@@ -353,6 +361,8 @@ class Inventory:
       return OLD, "unrecognized"
     if self.is_status_hkey(hkey):
       return self._status_class(hkey, field, value)
+    if hkey == f"{self._instance}:node_info":
+      return (CURRENT, "") if isinstance(value, dict) and set(value) == {"ip", "published_at"} else (OLD, "unrecognized")
     raise MaintenanceError(400, "invalid_request")
 
   # -- files ------------------------------------------------------------------------------------

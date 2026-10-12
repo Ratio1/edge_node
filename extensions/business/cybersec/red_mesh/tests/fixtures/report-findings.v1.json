@@ -650,7 +650,7 @@
         }
       ],
       "ai_generated": false,
-      "authenticated_action": "not_permitted",
+      "authenticated_action": "attempted",
       "backport_status": "",
       "category": "service",
       "confidence": "tentative",
@@ -720,7 +720,7 @@
         }
       ],
       "ai_generated": false,
-      "authenticated_action": "not_permitted",
+      "authenticated_action": "attempted",
       "backport_status": "",
       "category": "service",
       "confidence": "tentative",
@@ -790,7 +790,7 @@
         }
       ],
       "ai_generated": false,
-      "authenticated_action": "not_permitted",
+      "authenticated_action": "attempted",
       "backport_status": "",
       "category": "service",
       "confidence": "tentative",
@@ -860,7 +860,7 @@
         }
       ],
       "ai_generated": false,
-      "authenticated_action": "not_permitted",
+      "authenticated_action": "attempted",
       "backport_status": "",
       "category": "service",
       "confidence": "tentative",
@@ -930,7 +930,7 @@
         }
       ],
       "ai_generated": false,
-      "authenticated_action": "not_permitted",
+      "authenticated_action": "attempted",
       "backport_status": "",
       "category": "service",
       "confidence": "firm",
@@ -947,7 +947,7 @@
       ],
       "cwe_id": "CWE-798",
       "declared_severity": "CRITICAL",
-      "description": "The SSH server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair. No authenticated action was attempted; not permitted by the Rules of Engagement for this job.",
+      "description": "The SSH server accepted a well-known default credential. A randomly generated credential was rejected, so the acceptance is specific to this pair. No authenticated action was completed; the handshake alone was observed.",
       "ease_of_resolution": "",
       "epss_score": null,
       "evidence": "Accepted credential: root:***",
@@ -960,7 +960,7 @@
       ],
       "exploitability_status": "",
       "finding_id": "ef140424fa9294c6",
-      "finding_signature": "958e7b6c42dd077fda1250151a84e8e510a3a505ee6455a25adb666fe76fadd3",
+      "finding_signature": "022da34d71c4fada865af2fdbb5b09a13b79e90ac22174c5f29dc452691a2753",
       "first_seen": "",
       "impact": "",
       "kev": false,

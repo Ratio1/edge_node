@@ -7,7 +7,10 @@ from uuid import uuid4
 from extensions.business.cybersec.red_mesh.tenancy.administration import AdministrationDenied
 from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
 from .test_engagement_drafts import _EngagementDraftCase
-from .test_tenant_drafts import LEGAL, TENANCY_HKEY, ok, refused
+from .test_tenant_drafts import LEGAL, TENANCY_HKEY, ok, refused, snapshot_of
+
+# RM-127: the node a ready draft plans when a test names none; these tests plan Node-A and Node-B.
+OWN_NODE = [{"node_address": "Node-C", "mode": "shared"}]
 
 
 class _SetupCase(_EngagementDraftCase):
@@ -17,22 +20,38 @@ class _SetupCase(_EngagementDraftCase):
     # An empty job hash: a release finds no running job.
     self.plugin.cfg_instance_id = "jobs"
 
-  def ready_without_admin(self, display_name="Acme SRL", domain_id="acme", compliance_types=("nis2",)):
+  def create(self, display_name="Acme", compliance_types=("nis2",), request_id=None, nodes=()):
+    # These tests plan the nodes themselves.
+    return super().create(display_name, compliance_types, request_id, nodes)
+
+  def ready_without_admin(self, display_name="Acme SRL", domain_id="acme", compliance_types=("nis2",), nodes=None):
+    """RM-127: the plan (`OWN_NODE` by default) is set and the contract generated from it first."""
     draft_id = self.create(compliance_types=compliance_types)["draft_id"]
     ok(self, self.update(draft_id, {"display_name": display_name, "domain_id": domain_id, "legal": dict(LEGAL),
-                                    "items": {"contract": {"effective_from": "2026-11-01"}}}))
+                                    "items": {"contract": {"effective_from": "2026-11-01"}},
+                                    "nodes": OWN_NODE if nodes is None else nodes}))
+    ok(self, self.generate(draft_id, snapshot=snapshot_of(self.stored(draft_id)["nodes"])))
     ok(self, self.upload(draft_id))
     return draft_id
 
-  def tenant(self, domain_id, nodes=None):
-    """An active tenant from a draft without an admin; the draft stays (not closed)."""
-    draft_id = self.ready_without_admin(display_name=domain_id, domain_id=domain_id)
-    if nodes is not None:
-      ok(self, self.update(draft_id, {"nodes": nodes}))
+  def tenant(self, domain_id, nodes=None, fixed=False):
+    """An active tenant from a draft without an admin; the draft stays (not closed). Unless `fixed`,
+    it reads as a tenant activated before RM-127, whose nodes stay editable."""
+    draft_id = self.ready_without_admin(display_name=domain_id, domain_id=domain_id, nodes=nodes)
     request_id = str(uuid4())
     ok(self, self.activate(draft_id, request_id))
     tenant_id = ok(self, self.plugin.activate_tenant(self.actor, request_id))["tenantId"]
+    if not fixed:
+      self.unfix(tenant_id)
     return draft_id, tenant_id
+
+  def unfix(self, tenant_id):
+    """Drop the contract's node list from the tenant and its receipt (a pre-RM-127 contract)."""
+    tenant = self.repo.get("tenant", tenant_id)
+    receipt = self.repo.get("receipt", tenant["actor_id"], tenant["request_id"])
+    generated = {key: value for key, value in tenant["contract_generated"].items() if key != "nodes"}
+    self.repo.put("receipt", tenant["actor_id"], tenant["request_id"], record={**receipt, "contract_generated": generated})
+    self.repo.put("tenant", tenant_id, record={**tenant, "contract_generated": generated})
 
   def assign(self, tenant_id, node_address, mode="shared"):
     return self.plugin.set_tenant_node_assignment(self.actor, tenant_id, node_address, True, mode)
@@ -46,8 +65,8 @@ class TestActivationWithoutAdmin(_SetupCase):
     draft = self.create("", ())
     self.assertEqual(draft["completeness"]["missing"], [
       "field:display_name", "field:domain_id", "field:legal.name", "field:legal.registration_id",
-      "field:legal.signer_name", "field:legal.signer_role", "field:compliance_types", "field:contract.effective_from",
-      "item:contract"])
+      "field:legal.signer_name", "field:legal.signer_role", "field:compliance_types", "field:nodes",
+      "field:contract.effective_from", "item:contract"])
 
   def test_activation_needs_the_contract_start_date_but_not_an_end_date(self):
     """Decision 24: the term is printed in the pack; no end date means an indefinite term."""
@@ -244,12 +263,16 @@ class TestDraftNodePlan(_SetupCase):
   def test_activation_assigns_its_own_private_plan_and_close_lifts_the_hold(self):
     _, other_tenant = self.tenant("other")
     draft_id, tenant_id = self.tenant("acme", nodes=[{"node_address": "Node-A", "mode": "private"}])
-    refused(self, self.assign(other_tenant, "Node-A"), 409, "node_planned_private")
+    # RM-127: activation assigned it; the live private row is the refusal now.
+    refused(self, self.assign(other_tenant, "Node-A"), 409, "node_private_assigned")
     # The tenant whose receipt names the holding draft assigns it, retries included.
     for _ in range(2):
       self.assertEqual(ok(self, self.assign(tenant_id, "Node-A", "private"))["mode"], "private")
+    # Released, the plan still holds it until the draft is closed.
+    ok(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-A", False))
+    refused(self, self.assign(other_tenant, "Node-A"), 409, "node_planned_private")
+    ok(self, self.assign(tenant_id, "Node-A", "private"))
     ok(self, self.plugin.close_tenant_draft(self.actor, draft_id))
-    # No hold left: the refusal is the live private assignment's.
     refused(self, self.assign(other_tenant, "Node-A"), 409, "node_private_assigned")
     ok(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-A", False))
     ok(self, self.assign(other_tenant, "Node-A"))
@@ -291,6 +314,7 @@ class TestDraftDeleteWithSignedDocuments(_SetupCase):
 class TestTenantNodeCount(_SetupCase):
   def test_the_row_counts_live_assignments(self):
     _, tenant_id = self.tenant("acme")
+    ok(self, self.plugin.set_tenant_node_assignment(self.actor, tenant_id, "Node-C", False))
     self.assertEqual(ok(self, self.plugin.list_tenants(self.actor))[0]["nodeCount"], 0)
     ok(self, self.assign(tenant_id, "Node-A"))
     ok(self, self.assign(tenant_id, "Node-B", "private"))
