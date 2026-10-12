@@ -554,6 +554,25 @@ class TestEngagementDraftActivation(_EngagementDraftCase):
     self.assertEqual(len(self.store.writes) - writes, 2)
     self.assertEqual(self.engagement_rows(), [])
 
+  def test_a_draft_stored_with_a_malformed_contact_is_incomplete_until_fixed(self):
+    # RM-132: completeness re-normalizes the stored context, so a contact written before the
+    # format rule surfaces as a gap at activation; the row itself still reads.
+    _, tenant_id = self.active_tenant()
+    engagement_draft_id = self.child(tenant_id, "")["engagement_draft_id"]
+    self.fill(engagement_draft_id)
+    row = self.store.data[(TENANCY_HKEY, json.dumps(["engagement_draft", "deployment", engagement_draft_id], separators=(",", ":")))]
+    row["context"] = {**row["context"], "point_of_contact": {"name": "Ana", "email": "foo", "phone": "", "role": ""}}
+    draft = ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))
+    self.assertEqual(draft["context"]["point_of_contact"]["email"], "foo")
+    self.assertIn("field:context", draft["completeness"]["missing"])
+    result = self.plugin.activate_engagement_draft(self.actor, engagement_draft_id)
+    refused(self, result, 409, "draft_incomplete")
+    self.assertEqual(result["reasons"]["context"], "context_invalid")
+    ok(self, self.plugin.update_engagement_draft(self.actor, engagement_draft_id,
+                                                {"context": {"point_of_contact": {"name": "Ana", "email": "ana@example.com"}}}))
+    draft = ok(self, self.plugin.get_engagement_draft(self.actor, engagement_draft_id))
+    self.assertNotIn("field:context", draft["completeness"]["missing"])
+
   def test_the_engagement_is_created_from_the_draft_with_both_packs(self):
     _, tenant_id = self.active_tenant()
     engagement_draft_id = self.ready_child(tenant_id)
