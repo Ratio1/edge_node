@@ -364,7 +364,7 @@ class TestDataMaintenance(unittest.TestCase):
   def tenant_asset_row(self, parent, address):
     """RM-125. A tenant asset written through the real endpoint."""
     created = self.plugin.create_tenant_asset(self.actor, parent, str(uuid4()), "Host",
-                                              {"kind": "network", "address": address})
+                                              {"kind": "network", "address": address}, environment="dev")
     self.assertTrue(created["success"], created)
     self.events.clear()
     return json.dumps(["tenant_asset", "deployment", created["data"]["asset_id"]], separators=(",", ":"))

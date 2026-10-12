@@ -131,6 +131,8 @@ def _context(*, candidates=("node-a",), tested_model=None):
     "asset_target_digest": canonical_digest(target), "actor_id": "tester",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
     "selected_candidates": list(candidates), "engagement": engagement,
+    # RM-131: a prod asset; model tests have no Dune, so the prod floor never applies to them.
+    "asset_environment": "prod",
   })
 
 

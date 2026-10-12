@@ -41,14 +41,15 @@ _UNSET = object()
 
 
 def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-0000-4000-8000-000000000001",
-                   candidates=("node-1",), engagement=_UNSET):
+                   candidates=("node-1",), engagement=_UNSET, environment="dev"):
   """A resolved execution admission, as `_resolve_execution_admission_for_account` returns one.
 
   RM-084 P6 removed the unbound launch: `_admit_execution` now refuses a request with no tenant,
   engagement and engagement asset (RM-107). These suites are about launch configuration and endpoint shape rather than about
   who is admitted (which has its own suites), so they stub the admission -- with a real context,
   because the launch path derives the destination, the worker set and the stored binding from it.
-  A network asset is an IPv4 literal, so the network suites launch against one.
+  A network asset is an IPv4 literal, so the network suites launch against one. The asset is `dev`
+  (RM-131), so the prod Dune floor stays out of the way unless a suite asks for it.
   """
   from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest, normalize_target
   from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
@@ -62,7 +63,7 @@ def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-
     "asset_target_digest": canonical_digest(target), "actor_id": "tester",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
     "selected_candidates": list(candidates),
-    "engagement": engagement,
+    "engagement": engagement, "asset_environment": environment,
   })
 
 
@@ -79,7 +80,7 @@ def _file_authorization(plugin, *references, tenant_id="tn_00000000-0000-4000-80
   plugin.r1fs.get_json.side_effect = lambda cid, *args, **kwargs: deepcopy(filed.get(cid))
 
 
-def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", engagement=_UNSET):
+def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", engagement=_UNSET, environment="dev"):
   """A known stored platform account, admitted into a bound tenant execution.
 
   The admitted asset is the one the test launches against (`kind`, `target`), and its candidate
@@ -107,11 +108,12 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", engagement=_
     else:
       candidates = ["node-1"]
     try:
-      context = _bound_context(kind, target, candidates=candidates, engagement=engagement)
+      context = _bound_context(kind, target, candidates=candidates, engagement=engagement, environment=environment)
     except ValueError:
       # No asset can carry a malformed destination; the request is then launching somewhere other
       # than the saved asset, which is what the launch path has to refuse.
-      context = _bound_context(kind, _DEFAULT_ASSET[kind], candidates=candidates, engagement=engagement)
+      context = _bound_context(kind, _DEFAULT_ASSET[kind], candidates=candidates, engagement=engagement,
+                               environment=environment)
     return resolved, context, None
 
   plugin._resolve_launch_actor = lambda actor=None: (account, None)
@@ -345,7 +347,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
                        engagement=engagement)
     return PentesterApi01Plugin.launch_test(plugin, **defaults)
 
-  def _launch_network(self, plugin, engagement=_UNSET, **kwargs):
+  def _launch_network(self, plugin, engagement=_UNSET, environment="dev", **kwargs):
     """Call launch_network_scan with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -353,10 +355,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
     defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True,
                     engagement_id=_engagement()["engagement_id"])
     defaults.update(kwargs)
-    _stub_launch_actor(plugin, "network", defaults.get("target"), engagement=engagement)
+    _stub_launch_actor(plugin, "network", defaults.get("target"), engagement=engagement, environment=environment)
     return PentesterApi01Plugin.launch_network_scan(plugin, **defaults)
 
-  def _launch_webapp(self, plugin, engagement=_UNSET, **kwargs):
+  def _launch_webapp(self, plugin, engagement=_UNSET, environment="dev", **kwargs):
     """Call launch_webapp_scan with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -371,7 +373,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
       engagement_id=_engagement("webapp")["engagement_id"],
     )
     defaults.update(kwargs)
-    _stub_launch_actor(plugin, "webapp", defaults.get("target_url"), engagement=engagement)
+    _stub_launch_actor(plugin, "webapp", defaults.get("target_url"), engagement=engagement,
+                       environment=environment)
     return PentesterApi01Plugin.launch_webapp_scan(plugin, **defaults)
 
   def test_launch_records_the_backend_release_that_ran_the_scan(self):
@@ -809,6 +812,42 @@ class TestPhase1ConfigCID(unittest.TestCase):
     config_dict = self._latest_job_config(plugin)
     self.assertEqual(config_dict["scan_min_delay"], 3.0)
     self.assertEqual(config_dict["scan_max_delay"], 10.0)
+
+  def test_a_prod_asset_keeps_dune_at_or_above_the_network_defaults(self):
+    """RM-131: below the floor or with Dune off, a prod (or unset) asset is refused before any write."""
+    for environment in ("prod", None):
+      for delays in ({"scan_min_delay": 10, "scan_max_delay": 70}, {"scan_min_delay": 25, "scan_max_delay": 30},
+                     {"scan_min_delay": 15, "scan_max_delay": 15,
+                      "unsafe_launch_confirmations": ["dune-delay-below-production"]},
+                     {"scan_min_delay": 0, "scan_max_delay": 0, "unsafe_launch_confirmations": ["dune-disabled"]}):
+        with self.subTest(environment=environment, delays=delays):
+          plugin = self._build_mock_plugin(job_id="test-job-prod-floor")
+          result = self._launch_network(plugin, environment=environment, **delays)
+          self.assertEqual((result["error"], result["environment"], result["min_seconds"], result["max_seconds"]),
+                           ("environment_dune_floor", "prod", 25.0, 70.0))
+          self.assertIsNone(self._latest_job_config(plugin))
+    # At or above the defaults (zeros take the defaults) it runs.
+    for delays in ({}, {"scan_min_delay": 25, "scan_max_delay": 70}, {"scan_min_delay": 30, "scan_max_delay": 90}):
+      with self.subTest(delays=delays):
+        plugin = self._build_mock_plugin(job_id="test-job-prod-raised")
+        self.assertNotIn("error", self._launch_network(plugin, environment="prod", **delays))
+
+  def test_a_prod_asset_keeps_dune_at_or_above_the_webapp_defaults(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-prod-floor")
+    result = self._launch_webapp(plugin, environment="prod", scan_min_delay=2, scan_max_delay=10)
+    self.assertEqual((result["error"], result["min_seconds"], result["max_seconds"]),
+                     ("environment_dune_floor", 3.0, 10.0))
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-prod-ok")
+    self.assertNotIn("error", self._launch_webapp(plugin, environment="prod", scan_min_delay=3, scan_max_delay=12))
+
+  def test_a_non_prod_asset_keeps_the_confirmations(self):
+    for environment in ("dev", "test", "qa", "staging"):
+      with self.subTest(environment=environment):
+        plugin = self._build_mock_plugin(job_id="test-job-dev-dune-off")
+        result = self._launch_network(plugin, environment=environment, scan_min_delay=0, scan_max_delay=0,
+                                      unsafe_launch_confirmations=["dune-disabled"])
+        self.assertNotIn("error", result)
+        self.assertEqual(self._latest_job_config(plugin)["scan_min_delay"], 0.0)
 
   def test_launch_rejects_unconfirmed_unsafe_network_settings_before_persistence(self):
     plugin = self._build_mock_plugin(job_id="test-job-unsafe-network")

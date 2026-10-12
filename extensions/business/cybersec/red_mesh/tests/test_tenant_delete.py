@@ -87,7 +87,7 @@ class TestTenantDelete(unittest.TestCase):
     # RM-125: two assets (the engagement's and this one), the latter a row the current validator refuses; both go.
     for address in ("192.0.2.20",):
       registered = self.plugin.create_tenant_asset(self.actor, self.tenant, str(uuid4()), "Host " + address,
-                                                   {"kind": "network", "address": address})
+                                                   {"kind": "network", "address": address}, environment="dev")
       self.assertTrue(registered["success"], registered)
     field = json.dumps(["tenant_asset", "deployment", registered["data"]["asset_id"]], separators=(",", ":"))
     self.storage.data[(TENANCY_HKEY, field)]["target_digest"] = "0" * 64

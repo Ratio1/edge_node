@@ -17,8 +17,9 @@ _BINDING_EXTRA = frozenset({"schema_version", "original_launcher", "participant_
 _BINDING_FIELDS = _FACT_FIELDS | _BINDING_EXTRA
 BINDING_SCHEMA_VERSION = 2
 _ENGAGEMENT_ASSET_ID = re.compile(r"ea_[1-9][0-9]*")
-# Launch-time policy, read by the launch gate and never part of the binding.
-_POLICY_FIELDS = frozenset({"engagement"})
+# Launch-time policy, read by the launch gate and never part of the binding. RM-131:
+# `asset_environment` is the registered asset's environment (None when unset or unknown).
+_POLICY_FIELDS = frozenset({"engagement", "asset_environment"})
 _ENGAGEMENT_FIELDS = frozenset({"engagement_id", "engagement_hash", "context", "authorization",
                                 "contract_sha256"})
 
@@ -107,6 +108,10 @@ class ResolvedExecutionContext:
     _validate_facts(value)
     _node_order(value["selected_candidates"])
     _validate_engagement(value["engagement"])
+    # Imported here, as `engagements` above: `tenant_assets` loads modules that import this one.
+    from .tenant_assets import ENVIRONMENTS
+    if value.get("asset_environment") not in (None, *ENVIRONMENTS):
+      raise ValueError("Invalid execution asset environment")
     if (value["engagement"]["engagement_id"] != value["engagement_id"]
         or value["engagement"]["engagement_hash"] != value["engagement_hash"]):
       raise ValueError("Invalid execution engagement")

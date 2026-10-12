@@ -89,6 +89,27 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertNotIn("asset_id", binding)
     self.assertFalse(set(binding) & {"engagement", "asset_authorized_ports"})
 
+  def test_admission_carries_the_asset_environment_as_policy(self):
+    # RM-131: the registered asset's environment; the binding never carries it.
+    context = self.admit()
+    self.assertEqual(context.to_dict()["asset_environment"], "dev")
+    self.assertNotIn("asset_environment", context.build_binding("launcher", ["node-a"]).to_dict())
+    # A row written before RM-131 (no environment) or a missing row is None, held to prod at launch.
+    for key, row in list(self.owner.data.items()):
+      if isinstance(row, dict) and row.get("asset_id") == self.net and "environment" in row:
+        self.owner.data[key] = {name: value for name, value in row.items() if name != "environment"}
+    self.assertIsNone(self.admit().to_dict()["asset_environment"])
+
+  def test_the_context_refuses_an_unknown_environment(self):
+    from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
+    value = self.admit().to_dict()
+    for bad in ("production", "", 3):
+      with self.subTest(bad=bad), self.assertRaises(ValueError):
+        ResolvedExecutionContext({**value, "asset_environment": bad})
+    # A context without the key (a caller that predates RM-131) still builds; the launch reads it as prod.
+    value.pop("asset_environment")
+    ResolvedExecutionContext(value)
+
   def test_a_model_asset_is_admitted_with_its_question_sets(self):
     context = self.admit(asset="ea_3").to_dict()
     self.assertEqual(context["asset_target"]["kind"], "model")

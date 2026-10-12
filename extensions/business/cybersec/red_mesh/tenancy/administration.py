@@ -762,6 +762,15 @@ class TenantAdministrationService:
             "engagement_hash": row["engagement_hash"], "asset_target": entry["target"],
             "asset_target_digest": entry["target_digest"]}
 
+  def _entry_environment(self, entry):
+    """RM-131: the registered asset's environment for the launch policy. The asset is locked once
+    the engagement names it, so the live row is the agreed one; a missing row or an unset value is
+    `None`, which the launch policy holds to `prod`."""
+    asset_id = entry.get("asset_id")
+    row = self.store.get("tenant_asset", asset_id) if tenant_assets.valid_asset_id(asset_id) else None
+    environment = row.get("environment") if row is not None else None
+    return environment if environment in tenant_assets.ENVIRONMENTS else None
+
   def _resolve_execution_admission_for_account(self, account, tenant_id, engagement_id, engagement_asset_id,
                                                selected_peers=None):
     tenant, account, row, entry = self._execution_entry_for_account(
@@ -780,7 +789,7 @@ class TenantAdministrationService:
         **self._entry_facts(row, entry), "actor_id": account.account_id,
         "actor_generation": account.account_generation,
         "node_failure_policy": self._node_failure_policy(tenant), "selected_candidates": selected,
-        "engagement": engagement})
+        "engagement": engagement, "asset_environment": self._entry_environment(entry)})
     except (ValueError, TypeError, RecursionError) as exc:
       raise TenantStoreError("Invalid stored execution facts") from exc
 
@@ -1958,7 +1967,7 @@ class TenantAdministrationService:
     return self.store.get("tenant_asset", row["asset_id"])
 
   @_endpoint
-  def create_tenant_asset(self, actor, parent, request_id, display_name, target, notes=""):
+  def create_tenant_asset(self, actor, parent, request_id, display_name, target, notes="", environment=None):
     account, parent, _ = self._asset_parent(actor, parent, "assets:manage")
     asset_id = tenant_assets.asset_id_for(_request_id(request_id))
     existing = self.store.get("tenant_asset", asset_id)
@@ -1969,7 +1978,7 @@ class TenantAdministrationService:
       return {"asset": self._asset_dto(existing), "changed": False}
     try:
       row = tenant_assets.new_asset(asset_id, parent, display_name, target, notes, account.account_id,
-                                    datetime.now(timezone.utc).isoformat())
+                                    datetime.now(timezone.utc).isoformat(), environment)
     except tenant_assets.TenantAssetInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
     self._check_asset_unique(row)
@@ -1978,7 +1987,8 @@ class TenantAdministrationService:
 
   @_endpoint
   def update_tenant_asset(self, actor, asset_id, changes):
-    """Name and notes always; the target only while no engagement or engagement draft names it."""
+    """Name and notes always; the target and the environment only while no engagement or engagement
+    draft names it (RM-131: the environment may change what the engagement agreed to)."""
     previous, account, _ = self._tenant_asset(actor, asset_id, "assets:manage")
     try:
       row = tenant_assets.apply_changes(previous, changes)
@@ -1988,6 +1998,8 @@ class TenantAdministrationService:
       if self._asset_linked(previous):
         raise AdministrationDenied(409, "asset_linked")
       self._check_asset_unique(row)
+    elif row.get("environment") != previous.get("environment") and self._asset_linked(previous):
+      raise AdministrationDenied(409, "asset_linked")
     return {"asset": self._asset_dto(self._write_tenant_asset(row, account, previous)), "changed": row != previous}
 
   @_endpoint

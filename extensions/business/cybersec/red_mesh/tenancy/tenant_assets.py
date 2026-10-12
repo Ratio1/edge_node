@@ -6,6 +6,10 @@ own signed copy of each asset it picks (ADR 0003), so nothing here is read at la
 formats, the stored-record validator, the derived status and the DTO; no storage I/O (contract:
 `tenant-assets.md`). Its id (`ta_<uuid>`) is global; the parent is a field of the row. The row has no
 `kind` of its own (the storage envelope's `kind` is the record kind): the DTO answers `target.kind`.
+
+RM-131: the asset's `environment` names where the target lives. It is required on create and locked
+with the target once an engagement or engagement draft names the asset. A row written before RM-131
+has none, and the launch policy reads that as `prod`.
 """
 from datetime import datetime
 
@@ -16,7 +20,12 @@ from .engagement_drafts import valid_parent
 KIND = "tenant_asset"
 NAME_MAX = 200
 NOTES_MAX = 2000
-CHANGE_FIELDS = ("display_name", "notes", "target")
+CHANGE_FIELDS = ("display_name", "notes", "target", "environment")
+ENVIRONMENTS = ("dev", "test", "qa", "staging", "prod")
+# RM-131: per-environment launch limits. `dune_floor`: Dune sand walking stays on and its delays
+# stay at or above the scan type's defaults (they may only be raised).
+ENVIRONMENT_POLICY = {"prod": {"dune_floor": True}}
+UNSET_ENVIRONMENT = "prod"
 STATUSES = ("testable", "scheduled", "expired", "unlinked")
 DTO_FIELDS = ("asset_id", "parent", "display_name", "target", "target_digest", "notes", "archived_at",
               "archived_by", "created_by", "created_at", "updated_by", "updated_at")
@@ -66,16 +75,29 @@ def normalize_asset_target(value):
     raise TenantAssetInvalid("asset_target_invalid") from None
 
 
-def new_asset(asset_id, parent, display_name, target, notes, actor_id, now):
+def normalize_environment(value):
+  if not isinstance(value, str) or value not in ENVIRONMENTS:
+    raise TenantAssetInvalid("asset_environment_invalid")
+  return value
+
+
+def launch_environment(value):
+  """The environment a launch is held to: an unset (pre-RM-131) or unknown one is `prod`."""
+  return value if isinstance(value, str) and value in ENVIRONMENTS else UNSET_ENVIRONMENT
+
+
+def new_asset(asset_id, parent, display_name, target, notes, actor_id, now, environment=None):
   target = normalize_asset_target(target)
   return {"asset_id": asset_id, "parent": dict(parent), "display_name": normalize_display_name(display_name),
           "target": target, "target_digest": canonical_digest(target),
+          "environment": normalize_environment(environment),
           "notes": normalize_notes("" if notes is None else notes), "archived_at": None, "archived_by": None,
           "created_by": actor_id, "created_at": now, "updated_by": actor_id, "updated_at": now}
 
 
 def apply_changes(row, changes):
-  """The row with `changes` applied (`update_tenant_asset`); the caller checks the target lock."""
+  """The row with `changes` applied (`update_tenant_asset`); the caller checks the target and
+  environment lock."""
   if not isinstance(changes, dict) or not changes or any(key not in CHANGE_FIELDS for key in changes):
     raise TenantAssetInvalid()
   row = dict(row)
@@ -86,6 +108,8 @@ def apply_changes(row, changes):
   if "target" in changes:
     target = normalize_asset_target(changes["target"])
     row.update(target=target, target_digest=canonical_digest(target))
+  if "environment" in changes:
+    row["environment"] = normalize_environment(changes["environment"])
   return row
 
 
@@ -105,6 +129,7 @@ def validate_tenant_asset(row, ids):
       or not _same(normalize_notes, row.get("notes"))
       or not _same(normalize_asset_target, row.get("target"))
       or not valid_digest(row.get("target_digest")) or row["target_digest"] != canonical_digest(row["target"])
+      or ("environment" in row and row["environment"] not in ENVIRONMENTS)
       or (archived is None) != (row.get("archived_by") is None)
       or (archived is not None and not (_nonempty_text(archived) and _nonempty_text(row["archived_by"])))
       or not all(_nonempty_text(row.get(key)) for key in ("created_by", "created_at", "updated_by", "updated_at"))):
@@ -150,5 +175,6 @@ def status(asset_links):
 
 
 def asset_dto(row, asset_links):
-  return {**{key: row[key] for key in DTO_FIELDS}, "kind": row["target"]["kind"], "links": asset_links,
+  return {**{key: row[key] for key in DTO_FIELDS}, "environment": row.get("environment"),
+          "kind": row["target"]["kind"], "links": asset_links,
           "status": status(asset_links)}

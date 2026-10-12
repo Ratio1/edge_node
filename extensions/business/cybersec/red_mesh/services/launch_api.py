@@ -44,6 +44,7 @@ from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 from ..tenancy.engagements import SCAN_MODES
 from ..tenancy.execution import context_tenant_id
+from ..tenancy.tenant_assets import ENVIRONMENT_POLICY, launch_environment
 from .soc_export_policy import required_soc_launch_error
 
 
@@ -607,6 +608,29 @@ def require_engagement(execution_context):
       "message": "A tenant launch requires an engagement_id.",
     }
   return engagement, None
+
+
+def environment_floor_error(execution_context, scan_type, options):
+  """RM-131: a tenant launch on an asset whose environment carries `dune_floor` (prod, and an
+  unset environment) keeps Dune on with delays at or above the scan type's defaults."""
+  if execution_context is None:
+    return None
+  environment = launch_environment(execution_context.to_dict().get("asset_environment"))
+  if not ENVIRONMENT_POLICY.get(environment, {}).get("dune_floor"):
+    return None
+  profile = _dune_delay_profile(scan_type)
+  if (options.get("dune_sand_walking_enabled", True)
+      and float(options.get("scan_min_delay") or 0) >= profile["min_seconds"]
+      and float(options.get("scan_max_delay") or 0) >= profile["max_seconds"]):
+    return None
+  return {
+    "error": "environment_dune_floor", "status_code": 400,
+    "message": (f"A {environment} asset keeps Dune sand walking on, with probe delays of at least "
+                f"{profile['min_seconds']:g}s (min) and {profile['max_seconds']:g}s (max)."),
+    "environment": environment,
+    "min_seconds": profile["min_seconds"],
+    "max_seconds": profile["max_seconds"],
+  }
 
 
 def _apply_launch_safety_policy(
@@ -1412,6 +1436,9 @@ def launch_network_scan(
   )
   if "error" in options:
     return options
+  floor_error = environment_floor_error(execution_context, ScanType.NETWORK.value, options)
+  if floor_error:
+    return floor_error
   # Comparison mode keeps the operator's MIRROR/SLICE choice: MIRROR mirrors the
   # whole range to every node (full comparison); SLICE uses the tiered scheme
   # (mirror the comparison tier, slice the bulk). See build_comparison_workers.
@@ -1707,6 +1734,9 @@ def launch_webapp_scan(
   )
   if "error" in options:
     return options
+  floor_error = environment_floor_error(execution_context, ScanType.WEBAPP.value, options)
+  if floor_error:
+    return floor_error
   required_confirmation_ids = required_unsafe_confirmation_ids(
     scan_type=ScanType.WEBAPP.value,
     options=options,

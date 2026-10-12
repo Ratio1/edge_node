@@ -347,7 +347,8 @@ class TestEngagementTargetGrammar(unittest.TestCase):
 
   def create(self, target, display_name="Asset"):
     """Register the target (the grammar gate), then pick it; a registration refusal is answered as is."""
-    registered = self.service.create_tenant_asset(self.actor, self.tenant, str(uuid4()), display_name, target)
+    registered = self.service.create_tenant_asset(self.actor, self.tenant, str(uuid4()), display_name, target,
+                                                  environment="dev")
     if not registered["success"]:
       return registered
     return self.service.create_engagement(**self.fields(

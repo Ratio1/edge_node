@@ -13,14 +13,15 @@ NETWORK = {"kind": "network", "address": "192.0.2.10"}
 WEBAPP = {"kind": "webapp", "url": "https://app.example.com/", "allowedPathPrefix": "/"}
 MODEL = {"kind": "model", "adapter": "openai_compatible",
          "endpointUrl": "https://llm.example.com/v1/chat/completions", "model": "gpt-test"}
-DTO_KEYS = {"asset_id", "parent", "display_name", "kind", "target", "target_digest", "notes", "archived_at",
+DTO_KEYS = {"asset_id", "parent", "display_name", "environment", "kind", "target", "target_digest", "notes", "archived_at",
             "archived_by", "created_by", "created_at", "updated_by", "updated_at", "links", "status"}
 
 
 class _AssetCase(_EngagementDraftCase):
-  def register(self, parent, display_name="Edge gateway", target=None, notes="", request_id=None, actor=None):
+  def register(self, parent, display_name="Edge gateway", target=None, notes="", request_id=None, actor=None,
+               environment="dev"):
     return self.plugin.create_tenant_asset(actor or self.actor, parent, request_id or str(uuid4()), display_name,
-                                           NETWORK if target is None else target, notes)
+                                           NETWORK if target is None else target, notes, environment)
 
   def asset(self, parent, **kwargs):
     return ok(self, self.register(parent, **kwargs))
@@ -49,6 +50,7 @@ class TestTenantAssetRecord(_AssetCase):
     self.assertEqual((asset["kind"], asset["target"]), ("network", NETWORK))
     self.assertEqual(asset["target_digest"], canonical_digest(NETWORK))
     self.assertEqual((asset["archived_at"], asset["archived_by"]), (None, None))
+    self.assertEqual(asset["environment"], "dev")
     self.assertEqual((asset["links"], asset["status"]), ([], "unlinked"))
     self.assertEqual(self.events, [("tenant_asset_created", {
       "asset_id": asset["asset_id"], "parent": {"tenant_id": tenant_id}, "actor": "creator"})])
@@ -155,7 +157,37 @@ class TestTenantAssetValidation(_AssetCase):
       refused(self, self.register(tenant_id, notes=notes), 400, "invalid_request")
     refused(self, self.plugin.create_tenant_asset(self.actor, tenant_id, "not-a-uuid", "Name", NETWORK),
             400, "invalid_request")
+    # RM-131: the environment is required and from the closed list.
+    refused(self, self.plugin.create_tenant_asset(self.actor, tenant_id, str(uuid4()), "Name", NETWORK),
+            400, "asset_environment_invalid")
+    for environment in ("", "Prod", "production", 3, ["prod"]):
+      with self.subTest(environment=environment):
+        refused(self, self.register(tenant_id, environment=environment), 400, "asset_environment_invalid")
     self.assertEqual(len(self.store.writes), writes)
+
+  def test_every_environment_is_accepted(self):
+    tenant_id = self.tenant()
+    for index, environment in enumerate(("dev", "test", "qa", "staging", "prod")):
+      asset = self.asset(tenant_id, environment=environment,
+                         target={"kind": "network", "address": "192.0.2.%d" % (20 + index)})
+      self.assertEqual(asset["environment"], environment)
+
+  def test_a_row_written_before_rm131_reads_without_an_environment(self):
+    tenant_id = self.tenant()
+    asset = self.asset(tenant_id)
+    field = json.dumps(["tenant_asset", "deployment", asset["asset_id"]], separators=(",", ":"))
+    del self.store.data[(TENANCY_HKEY, field)]["environment"]
+    self.assertIsNone(ok(self, self.plugin.get_tenant_asset(self.actor, asset["asset_id"]))["asset"]["environment"])
+    # It may be given one while unlinked.
+    changed = ok(self, self.plugin.update_tenant_asset(self.actor, asset["asset_id"], {"environment": "qa"}))
+    self.assertEqual(changed["environment"], "qa")
+
+  def test_a_stored_unknown_environment_fails_closed(self):
+    tenant_id = self.tenant()
+    asset = self.asset(tenant_id)
+    field = json.dumps(["tenant_asset", "deployment", asset["asset_id"]], separators=(",", ":"))
+    self.store.data[(TENANCY_HKEY, field)]["environment"] = "production"
+    refused(self, self.plugin.list_tenant_assets(self.actor, tenant_id), 503, "unavailable")
 
   def test_a_target_is_registered_once_per_parent_archived_included(self):
     tenant_id = self.tenant()
@@ -196,6 +228,18 @@ class TestTenantAssetChanges(_AssetCase):
             400, "asset_target_invalid")
     refused(self, self.plugin.update_tenant_asset(self.actor, asset["asset_id"], {"target": WEBAPP}),
             409, "asset_duplicate")
+    refused(self, self.plugin.update_tenant_asset(self.actor, asset["asset_id"], {"environment": "live"}),
+            400, "asset_environment_invalid")
+
+  def test_an_unlinked_environment_changes_and_is_audited(self):
+    tenant_id = self.tenant()
+    asset = self.asset(tenant_id)
+    self.events.clear()
+    changed = ok(self, self.plugin.update_tenant_asset(self.actor, asset["asset_id"], {"environment": "prod"}))
+    self.assertEqual(changed["environment"], "prod")
+    self.assertEqual(self.events, [("tenant_asset_updated", {
+      "asset_id": asset["asset_id"], "parent": {"tenant_id": tenant_id}, "actor": "creator",
+      "fields": ["environment"]})])
 
   def test_archive_hides_the_asset_until_unarchived(self):
     tenant_id = self.tenant()
@@ -313,8 +357,12 @@ class TestTenantAssetLinks(_AssetCase):
   def assert_locked(self, asset_id):
     writes = len(self.store.writes)
     refused(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"target": WEBAPP}), 409, "asset_linked")
+    refused(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"environment": "prod"}), 409,
+            "asset_linked")
     refused(self, self.plugin.delete_tenant_asset(self.actor, asset_id), 409, "asset_linked")
     self.assertEqual(len(self.store.writes), writes)
+    # Sending the environment it already has is not a change.
+    ok(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"environment": "dev"}))
     # The name and notes stay editable; archiving is not a delete.
     ok(self, self.plugin.update_tenant_asset(self.actor, asset_id, {"display_name": "Renamed " + str(uuid4())[:4]}))
 
