@@ -292,6 +292,38 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((row["class"], row["reason"]), ("old", "unrecognized"))
     self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
 
+  # RM-133: a contract draft is keyed by its tenant and takes the related-tenant rule; the tenant
+  # row that counts its contracts stays current.
+  def test_a_contract_draft_is_current_under_its_tenant_with_its_files_and_old_without(self):
+    created = self.plugin.create_tenant_contract_draft(self.actor, self.tenant, str(uuid4()))
+    self.assertTrue(created["success"], created)
+    field = json.dumps(["tenant_contract_draft", "deployment", self.tenant, created["data"]["contract_id"]],
+                       separators=(",", ":"))
+    row = self.storage.data[(TENANCY, field)]
+    row.update(state="signed", document={
+      "store": "r1fs", "ref": cid(70), "filename": "contract.pdf", "mime": "application/pdf",
+      "uploaded_at": "2026-10-12T00:00:00Z", "uploaded_by": "creator", "sha256": "b" * 64, "size_bytes": 10})
+    self.events.clear()
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    self.assertEqual(self.storage.data[(TENANCY, tenant)]["next_contract_no"], 3)
+    rows = self.scan()
+    scanned = rows[(TENANCY, field)]
+    self.assertEqual((scanned["class"], scanned["reason"]), ("current", ""))
+    self.assertEqual(scanned["cids"], [{"cid": cid(70), "role": "document.ref", "withheld": False}])
+    self.assertEqual(rows[(TENANCY, tenant)]["class"], "current")
+    self.assertEqual(self.clean(scanned)[0]["outcome"], "not_old")
+    self.assertEqual(self.files.deleted, [])
+    # A malformed row is old; one whose tenant is gone is an orphan.
+    self.storage.data[(TENANCY, field)]["state"] = "done"
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "old")
+    self.storage.data[(TENANCY, field)]["state"] = "signed"
+    del self.storage.data[(TENANCY, tenant)]["contract"]
+    scanned = self.scan()[(TENANCY, field)]
+    self.assertEqual((scanned["class"], scanned["reason"]), ("old", "old_tenant"))
+    self.storage.data[(TENANCY, tenant)] = None
+    scanned = self.scan()[(TENANCY, field)]
+    self.assertEqual((scanned["class"], scanned["reason"]), ("orphan", "tenant_gone"))
+
   def engagement_draft_row(self, parent, first_cid):
     """RM-109 phase 4. A child with a signed and a generated pack file, written through the real endpoint."""
     created = self.plugin.create_engagement_draft(self.actor, parent, str(uuid4()), "Pack")

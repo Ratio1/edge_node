@@ -56,8 +56,9 @@ _PER_JOB = (
   (":report_review", dict, True),
   (":report_review:audit", list, False),
 )
+# RM-133: `tenant_contract_draft` is keyed `(tenant_id, contract_id)` and takes the generic related-tenant rule.
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
-                  "engagement_draft", "super_tenant_profile", "tenant_asset")
+                  "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).

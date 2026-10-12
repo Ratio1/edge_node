@@ -27,7 +27,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_asset_requests, normalize_context,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import drafts, engagement_drafts, super_tenant_profile, tenant_assets
+from . import drafts, engagement_drafts, super_tenant_profile, tenant_assets, tenant_contracts
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -135,10 +135,37 @@ def _valid_generated_block(value):
   return value is not None and drafts.valid_generated(value, with_nodes=True)
 
 
+def _contract_blocks(tenant):
+  """RM-133: the tenant's further contracts (`contracts[c_<n>]`), validated, in id order; `{}` for a
+  row written before the map existed. A malformed block fails the read closed."""
+  blocks = tenant.get("contracts")
+  if blocks is None:
+    return {}
+  if (not isinstance(blocks, dict)
+      or any(not tenant_contracts.valid_block(contract_id, block, _valid_contract) for contract_id, block in blocks.items())):
+    raise TenantStoreError("Invalid tenant contracts record")
+  return {contract_id: blocks[contract_id] for contract_id in tenant_contracts.sorted_ids(blocks)}
+
+
 def _contract_nodes(tenant):
   """RM-127: the nodes the tenant's generated contract printed; empty for a one-step tenant and for
-  one activated from a pack generated before RM-127."""
-  return list((tenant.get("contract_generated") or {}).get("nodes") or ())
+  one activated from a pack generated before RM-127. RM-133: the union over `c_1` and every further
+  contract, active or superseded (nothing is released); one entry per node."""
+  nodes = list((tenant.get("contract_generated") or {}).get("nodes") or ())
+  seen = {entry["node_address"] for entry in nodes}
+  for block in _contract_blocks(tenant).values():
+    for entry in block["nodes"]:
+      if entry["node_address"] not in seen:
+        seen.add(entry["node_address"])
+        nodes.append(dict(entry))
+  return nodes
+
+
+def _contract_sha256s(tenant):
+  """RM-133: the sha256 of every contract of the tenant, `c_1` first."""
+  contract = tenant.get("contract")
+  return ([contract["sha256"]] if _valid_contract(contract) else []) + [
+    block["contract"]["sha256"] for block in _contract_blocks(tenant).values()]
 
 
 def _valid_contract(value):
@@ -450,13 +477,32 @@ class TenantAdministrationService:
       uploader = self.accounts.get_account(document["uploaded_by"])
       if uploader is None or not uploader.active or not holds_platform_role(uploader):
         raise AdministrationDenied(400, refusal)
-    wanted = {document["ref"] for document in documents.values() if document is not None}
+    self._refuse_documents_in_use({document["ref"] for document in documents.values() if document is not None})
+
+  def _refuse_documents_in_use(self, wanted, exclude=None):
+    """RM-109 `contract_in_use` over every tenant document slot of the tenant and receipt rows;
+    RM-133: and over the further contracts' blocks and every contract draft's files (`exclude`: the
+    draft being activated, whose own files are wanted). Raw rows: a row the validator refuses may
+    still hold the reference."""
     for kind in ("tenant", "receipt"):
       for row in self.store.raw_rows(kind):
         for slot in _TENANT_DOCUMENT_KINDS:
           bound = row.get(slot)
           if isinstance(bound, dict) and bound.get("ref") in wanted:
             raise AdministrationDenied(409, "contract_in_use")
+        blocks = row.get("contracts") if isinstance(row.get("contracts"), dict) else {}
+        for block in blocks.values():
+          for key in ("contract", "contract_generated"):
+            bound = block.get(key) if isinstance(block, dict) else None
+            if isinstance(bound, dict) and bound.get("ref") in wanted:
+              raise AdministrationDenied(409, "contract_in_use")
+    for row in self.store.raw_rows("tenant_contract_draft"):
+      if (row.get("tenant_id"), row.get("contract_id")) == exclude:
+        continue
+      for key in ("document", "generated"):
+        bound = row.get(key)
+        if isinstance(bound, dict) and bound.get("ref") in wanted:
+          raise AdministrationDenied(409, "contract_in_use")
 
   @_endpoint
   def activate_tenant(self, actor, request_id):
@@ -472,17 +518,18 @@ class TenantAdministrationService:
         admin = self._initial_admin(receipt["initial_admin_id"], receipt["initial_admin_generation"])
         if TenantMembership("tenant_admin", receipt["tenant_id"]) not in admin.tenant_memberships:
           raise AdministrationDenied(409, "initial_admin_required")
-      self._assign_contract_nodes(creator, tenant)
+      self._assign_contract_nodes(creator, tenant, _contract_nodes(tenant))
       tenant = {**tenant, "active": True}
       self.store.put("tenant", receipt["tenant_id"], record=tenant)
     return self._detail(tenant, creator)
 
-  def _assign_contract_nodes(self, account, tenant):
+  def _assign_contract_nodes(self, account, tenant, nodes):
     """RM-127: assign every node the contract printed, before the tenant turns active. All are checked
     first (eligibility as `set_tenant_node_assignment`, conflicts as `_assign_node`; the draft's own
     private plan holds for this tenant), and any refusal writes nothing. A replay after a crash
-    part-way finds its own rows assigned and fills the gaps; a release removes them."""
-    nodes = _contract_nodes(tenant)
+    part-way finds its own rows assigned and fills the gaps; a release removes them. RM-133: `nodes`
+    is the list to assign (the tenant's union, or one further contract's plan), so a node the tenant
+    already holds in the same mode is the existing assignment and another mode is refused."""
     if not nodes:
       return
     peers = self._configured_peers()
@@ -582,7 +629,9 @@ class TenantAdministrationService:
               "canManageMembers": authorize_tenant_operation(
                 account, "tenant_users:manage", TenantPolicyContext(
                   tenant["tenant_id"], tenant["active"], tenant["allow_pentester"])).allowed,
-              "assignableMemberRoles": self._assignable_member_roles(account, tenant)}
+              "assignableMemberRoles": self._assignable_member_roles(account, tenant),
+              # RM-133: every contract of the tenant, hashes and dates only (no file name, no ref).
+              "contracts": self._contracts_dto(tenant)}
     for stored, public in (("allow_pentester_changed_by", "allowPentesterChangedBy"),
                            ("allow_pentester_changed_at", "allowPentesterChangedAt"),
                            ("node_failure_policy_changed_by", "nodeFailurePolicyChangedBy"),
@@ -743,10 +792,12 @@ class TenantAdministrationService:
     if not (datetime.fromisoformat(row["valid_from"]) <= now < datetime.fromisoformat(row["valid_until"])):
       raise AdministrationDenied(400, "engagement_expired")
     contract, legal = tenant.get("contract"), tenant.get("legal")
+    # RM-133: the engagement was created under one of the tenant's contracts (`c_1` or a further
+    # one, superseded included); the contract cannot change after creation (there is no attach
+    # operation), so a sha256 outside the set is a damaged record, never a reason to launch under a
+    # different signed basis.
     if (not _valid_contract(contract) or not isinstance(legal, dict)
-        or contract["sha256"] != row["contract_sha256"]):
-      # The contract cannot change after creation (there is no attach operation): a mismatch is a
-      # damaged record, never a reason to launch under a different signed basis.
+        or row["contract_sha256"] not in _contract_sha256s(tenant)):
       raise TenantStoreError("Engagement contract does not match its tenant")
     facts = {
       "engagement_id": row["engagement_id"], "engagement_hash": row["engagement_hash"],
@@ -953,15 +1004,41 @@ class TenantAdministrationService:
     return value
 
   @staticmethod
-  def _tenant_contract_sha256(tenant):
+  def _tenant_contract_sha256(tenant, contract_id=None):
     """RM-107: the tenant contract is the permission an engagement extends, so it must exist.
-    Tenants created before contracts were required keep `contract: null` and create no engagement."""
+    Tenants created before contracts were required keep `contract: null` and create no engagement.
+    RM-133: with `contract_id`, that contract of the tenant (`c_1` or a `contracts[*]` block); an id
+    the tenant does not hold, or a malformed one, is `contract_unknown`."""
     contract = tenant.get("contract")
     if contract is None:
       raise AdministrationDenied(400, "contract_required")
     if not _valid_contract(contract):
       raise TenantStoreError("Invalid tenant contract record")
-    return contract["sha256"]
+    if contract_id is None or contract_id == tenant_contracts.FIRST_CONTRACT_ID:
+      return contract["sha256"]
+    if not tenant_contracts.valid_contract_id(contract_id):
+      raise AdministrationDenied(400, "contract_unknown")
+    block = _contract_blocks(tenant).get(contract_id)
+    if block is None:
+      raise AdministrationDenied(400, "contract_unknown")
+    return block["contract"]["sha256"]
+
+  def _contracts_dto(self, tenant):
+    """RM-133: the member-visible contract list, `c_1` synthesized from the tenant's own fields,
+    then the further contracts in id order; `[]` for a tenant without a contract."""
+    contract = tenant.get("contract")
+    if contract is None:
+      return []
+    effective = ((tenant.get("governance") or {}).get("effective") or {}).get("contract") or {}
+    entries = [tenant_contracts.contract_entry(
+      tenant_contracts.FIRST_CONTRACT_ID, contract, tenant.get("contract_generated"), effective,
+      (tenant.get("contract_generated") or {}).get("nodes") or [], None, tenant.get("contract_superseded_by"))]
+    for contract_id, block in _contract_blocks(tenant).items():
+      entries.append(tenant_contracts.contract_entry(
+        contract_id, block["contract"], block["contract_generated"],
+        {key: block[key] for key in ("effective_from", "effective_until")}, block["nodes"],
+        block["supersedes"], block["superseded_by"]))
+    return entries
 
   @_endpoint
   def authorize_engagement_create(self, actor, tenant_id):
@@ -973,10 +1050,11 @@ class TenantAdministrationService:
 
   @staticmethod
   def _engagement_request(display_name, valid_from, valid_until, context, assets,
-                          documents, supersedes, creator):
+                          documents, supersedes, creator, contract_id=None):
     """The request as sent, normalized without any store read: the replay intent. RM-109 phase 4:
     `creator` None skips the uploader rule (an engagement draft's packs are checked for the platform
-    role instead, by `activate_engagement_draft`)."""
+    role instead, by `activate_engagement_draft`). RM-133: `contract_id` enters the intent only when
+    it was sent, so a request made before the pick existed replays unchanged."""
     try:
       display_name = normalize_name(display_name)
     except (ValueError, TypeError):
@@ -1007,21 +1085,24 @@ class TenantAdministrationService:
             "context": context,
             "documents": [[document[key] for key in ("kind", "sha256", "title", "comment")]
                           for document in documents],
-            "supersedes": supersedes, "assets": assets}
+            "supersedes": supersedes, "assets": assets,
+            **({"contract_id": contract_id} if contract_id is not None else {})}
 
   @_endpoint
   def create_engagement(self, actor, tenant_id, request_id, display_name, valid_from,
-                        valid_until, context, assets, documents=None, supersedes=None):
+                        valid_until, context, assets, documents=None, supersedes=None, contract_id=None):
     """`documents` are the references `services.engagement_documents.resolve_engagement_document`
-    verified outside this lock, in the order they are numbered (`ed_1`, `ed_2`, ...)."""
+    verified outside this lock, in the order they are numbered (`ed_1`, `ed_2`, ...). RM-133:
+    `contract_id` picks one of the tenant's contracts; absent, `c_1` as before."""
     tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
-    contract_sha256 = self._tenant_contract_sha256(tenant)
+    contract_id = None if contract_id in (None, "") else contract_id
+    contract_sha256 = self._tenant_contract_sha256(tenant, contract_id)
     request_id = _request_id(request_id)
     engagement_id = engagement_id_for(request_id)
     documents = [] if documents is None else documents
     request = self._engagement_request(
       display_name, valid_from, valid_until, context, assets, documents,
-      supersedes, account.account_id)
+      supersedes, account.account_id, contract_id)
     record = self._engagement_record(account, tenant_id, request_id, request, contract_sha256, documents, supersedes)
     # Replay is decided on the request alone.
     existing = self.store.get("engagement", tenant_id, engagement_id)
@@ -1234,9 +1315,16 @@ class TenantAdministrationService:
     if mode == "private" and foreign:
       return "node_shared_assigned", None
     holder = self._private_plan_holder(node_address)
-    if holder is not None and holder["draft_id"] != self._tenant_source_draft(tenant_id):
+    if holder is not None and not self._holder_is_own(holder, tenant_id):
       return "node_planned_private", holder
     return None, None
+
+  def _holder_is_own(self, holder, tenant_id):
+    """RM-112: a tenant activated from the holding draft is its own holder. RM-133: so is the tenant
+    whose contract draft plans the node."""
+    if "tenant_id" in holder:
+      return holder["tenant_id"] == tenant_id
+    return holder["draft_id"] == self._tenant_source_draft(tenant_id)
 
   def _assign_node(self, account, tenant_id, node_address, mode, row):
     """Assign (tenant, node, mode) unless `_assignment_conflict` refuses; idempotent."""
@@ -1253,11 +1341,19 @@ class TenantAdministrationService:
     self.store.put("tenant_node", tenant_id, node_address, record=new_row)
     return {"tenantId": tenant_id, "nodeAddress": node_address, "active": True, "mode": mode, "state": "assigned"}
 
-  def _private_plan_holder(self, node_address, exclude_draft_id=None):
-    """RM-112: the draft whose plan holds the node privately, or None. Reads every draft."""
-    return next((draft for draft in sorted(self.store.list_tenant_drafts(), key=lambda row: row["draft_id"])
-                 if draft["draft_id"] != exclude_draft_id
-                 and {"node_address": node_address, "mode": "private"} in draft["nodes"]), None)
+  def _private_plan_holder(self, node_address, exclude=None):
+    """RM-112: the draft whose plan holds the node privately, or None. Reads every draft. RM-133:
+    a contract draft's plan holds it the same way, from the plan write; its holder names the
+    tenant and the contract id. `exclude` is the holder key of the row being written
+    (`("tenant_draft", draft_id)` or `("tenant_contract_draft", tenant_id, contract_id)`)."""
+    entry = {"node_address": node_address, "mode": "private"}
+    for draft in sorted(self.store.list_tenant_drafts(), key=lambda row: row["draft_id"]):
+      if ("tenant_draft", draft["draft_id"]) != exclude and entry in draft["nodes"]:
+        return {"draft_id": draft["draft_id"], "display_name": draft["display_name"]}
+    for row in sorted(self.store.list_tenant_contract_drafts(), key=lambda row: (row["tenant_id"], row["contract_id"])):
+      if ("tenant_contract_draft", row["tenant_id"], row["contract_id"]) != exclude and entry in row["nodes"]:
+        return {"tenant_id": row["tenant_id"], "contract_id": row["contract_id"]}
+    return None
 
   def _tenant_source_draft(self, tenant_id):
     """RM-112: the draft a tenant was activated from, through its receipt (the tenant row has no
@@ -1268,19 +1364,27 @@ class TenantAdministrationService:
 
   @staticmethod
   def _planned_private(account, holder):
-    """`node_planned_private`, naming the draft only to a full-portfolio Super-Tenant Admin (who may
-    read drafts); anyone else learns only that the node is reserved."""
-    details = {"holder": {"draft_id": holder["draft_id"], "display_name": holder["display_name"]}} \
-      if holds_platform_role(account) else {}
+    """`node_planned_private`, naming the draft (RM-133: or the tenant and contract draft) only to a
+    full-portfolio Super-Tenant Admin (who may read drafts); anyone else learns only that the node
+    is reserved."""
+    details = {"holder": dict(holder)} if holds_platform_role(account) else {}
     return AdministrationDenied(409, "node_planned_private", **details)
+
+  @staticmethod
+  def _holder_key(row):
+    """The holder key of a plan-carrying row: a tenant draft's or a contract draft's."""
+    if "draft_id" in row:
+      return ("tenant_draft", row["draft_id"])
+    return ("tenant_contract_draft", row["tenant_id"], row["contract_id"])
 
   def _check_node_plan(self, account, previous, row):
     """RM-112: the plan entries this update adds or changes. No node held privately by another
-    draft is planned; a private entry also needs the node free of every live assignment."""
+    draft is planned; a private entry also needs the node free of every live assignment. RM-133:
+    the same for a contract draft's plan."""
     for entry in row["nodes"]:
       if entry in previous["nodes"]:
         continue
-      holder = self._private_plan_holder(entry["node_address"], exclude_draft_id=row["draft_id"])
+      holder = self._private_plan_holder(entry["node_address"], exclude=self._holder_key(row))
       if holder is not None:
         raise self._planned_private(account, holder)
       if entry["mode"] == "private":
@@ -1341,12 +1445,12 @@ class TenantAdministrationService:
     return self._assign_node(account, tenant_id, node_address, mode if mode is not None else "shared", row)
 
   @_endpoint
-  def get_tenant_contract(self, actor, tenant_id):
+  def get_tenant_contract(self, actor, tenant_id, contract_id=None):
     """RM-095. The tenant's legal details and contract record (never the file), for a full-portfolio
-    Super-Tenant Admin only. Tenants created before contracts were required read as not recorded."""
-    tenant, account = self._authorized_tenant(actor, tenant_id)
-    if not holds_platform_role(account):
-      raise AdministrationDenied(403, "forbidden")
+    Super-Tenant Admin only. Tenants created before contracts were required read as not recorded.
+    RM-133: with `contract_id`, one of the further contracts (its block's record, baseline, dates
+    and nodes; the pack records belong to `c_1`); absent or `c_1`, the first contract as before."""
+    tenant, account = self._platform_tenant(actor, tenant_id)
     legal, contract = tenant.get("legal"), tenant.get("contract")
     # The receipt binding covers tenants whose receipt carries the terms; this covers the reverse
     # (a record that gained terms its receipt never bound). Both or neither, and well formed.
@@ -1366,9 +1470,31 @@ class TenantAdministrationService:
       raise TenantStoreError("Invalid tenant contract record")
     if "contract_generated" in tenant and not _valid_generated_block(tenant["contract_generated"]):
       raise TenantStoreError("Invalid tenant contract record")
+    if contract_id not in (None, "", tenant_contracts.FIRST_CONTRACT_ID):
+      if not tenant_contracts.valid_contract_id(contract_id):
+        raise AdministrationDenied(400, "invalid_request")
+      block = _contract_blocks(tenant).get(contract_id)
+      if block is None:
+        raise AdministrationDenied(404, "not_found")
+      return {"legal": _legal_dto(legal), "contract": block["contract"],
+              "compliance_types": tenant.get("compliance_types"),
+              "framework_agreement": None, "data_handling": None, "governance": None,
+              "contract_generated": block["contract_generated"], "contract_id": contract_id,
+              **{key: block[key] for key in ("effective_from", "effective_until", "nodes", "supersedes", "superseded_by")}}
     return {"legal": _legal_dto(legal), "contract": contract,
             **{key: tenant.get(key) for key in _DRAFT_TENANT_FIELDS},
-            "contract_generated": tenant.get("contract_generated")}
+            "contract_generated": tenant.get("contract_generated"),
+            # RM-133: a tenant without a contract names none.
+            "contract_id": tenant_contracts.FIRST_CONTRACT_ID if contract is not None else None, "supersedes": None,
+            "superseded_by": tenant.get("contract_superseded_by")}
+
+  def _platform_tenant(self, actor, tenant_id):
+    """An active tenant read by a full-portfolio Super-Tenant Admin: the tenant check first, then
+    the platform role (as `get_tenant_contract` has always done)."""
+    tenant, account = self._authorized_tenant(actor, tenant_id)
+    if not holds_platform_role(account):
+      raise AdministrationDenied(403, "forbidden")
+    return tenant, account
 
   # RM-107: delete a tenant. Owner, 2026-09-28: it exists so tenants created before contracts can be
   # removed; it deletes the tenant's records and its stored documents, refuses while the tenant has
@@ -1376,7 +1502,8 @@ class TenantAdministrationService:
   # reserved. The plugin runs it in steps so every document read and delete is outside this lock and
   # a failed attempt can be retried: `begin_tenant_delete` (check, then mark), the job checks,
   # the document deletes (`record_tenant_documents_deleted`), `finish_tenant_delete`.
-  _DELETABLE_KINDS = ("engagement", "integration", "tenant_node")
+  # RM-133: the tenant's contract drafts go with it (their files are in `_tenant_document_refs`).
+  _DELETABLE_KINDS = ("engagement", "integration", "tenant_node", "tenant_contract_draft")
 
   def _tenant_for_delete(self, actor, tenant_id):
     account = self._actor(actor)
@@ -1407,6 +1534,14 @@ class TenantAdministrationService:
     """Every stored document the tenant's records point at, read from the raw rows. RM-110: the
     contract's generated baseline (`contract_generated.ref`) is one of them."""
     refs = [tenant[key] for key in (*_TENANT_DOCUMENT_KINDS, "contract_generated") if isinstance(tenant.get(key), dict)]
+    # RM-133: the further contracts' signed copies and baselines, and every contract draft's files.
+    blocks = tenant.get("contracts") if isinstance(tenant.get("contracts"), dict) else {}
+    for block in blocks.values():
+      if isinstance(block, dict):
+        refs.extend(block.get(key) for key in ("contract", "contract_generated"))
+    for ids in self.store.tenant_record_ids("tenant_contract_draft", tenant["tenant_id"]):
+      row = self.store.raw_record("tenant_contract_draft", *ids) or {}
+      refs.extend(row.get(key) for key in ("document", "generated"))
     for ids in self.store.tenant_record_ids("engagement", tenant["tenant_id"]):
       row = self.store.raw_record("engagement", *ids) or {}
       documents = row.get("documents") if isinstance(row.get("documents"), list) else []
@@ -1471,7 +1606,7 @@ class TenantAdministrationService:
     self.store.delete("tenant", tenant_id)
     return {"tenantId": tenant_id, "deleted": True, "engagements": counts["engagement"],
             "integrations": counts["integration"], "assets": len(asset_ids),
-            "nodeAssignments": counts["tenant_node"],
+            "nodeAssignments": counts["tenant_node"], "contractDrafts": counts["tenant_contract_draft"],
             "documents": len(tenant["deleting"]["deleted_refs"])}
 
   @_endpoint
@@ -1863,6 +1998,16 @@ class TenantAdministrationService:
       row, dropped = engagement_drafts.apply_changes(previous, changes)
     except engagement_drafts.EngagementDraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
+    # RM-133: a pick names a contract the parent tenant holds; a draft under a tenant draft has one
+    # contract and takes none.
+    pick = engagement_drafts.contract_pick(row)
+    if pick is not None and pick != engagement_drafts.contract_pick(previous):
+      if "tenant_id" not in row["parent"]:
+        raise AdministrationDenied(400, "contract_unknown")
+      tenant = self.store.get("tenant", row["parent"]["tenant_id"])
+      if tenant is None:
+        raise AdministrationDenied(404, "not_found")
+      self._tenant_contract_sha256(tenant, pick)
     return {"draft": self._write_engagement_draft(row, account, previous), "dropped": dropped}
 
   def _draft_assets(self, requests, parent, previous):
@@ -2071,27 +2216,35 @@ class TenantAdministrationService:
   # this lock between `authorize_generated_document` and `attach_generated_document`, and discards
   # the file when the attach is refused. The slot's previous generated file goes after the write.
 
-  def _generated_slot(self, draft_id, engagement_draft_id, document_kind):
+  def _generated_slot(self, draft_id, engagement_draft_id, document_kind, tenant_id=None, contract_id=None):
     """The unlocked draft a generated pack goes to, its slot and the slot's refusal code: exactly one
-    id names the draft, and `document_kind` must be that slot's."""
-    if bool(draft_id) == bool(engagement_draft_id):
+    of the three id forms names the draft (a tenant draft, an engagement draft, RM-133 a contract
+    draft `(tenant_id, contract_id)`), and `document_kind` must be that slot's. A contract draft's
+    slot is the row itself (state, document and generated sit at its top level)."""
+    if sum(map(bool, (draft_id, engagement_draft_id, contract_id))) != 1:
       raise AdministrationDenied(400, "invalid_request")
     if draft_id:
       row = self._unlocked_tenant_draft(draft_id)
       if document_kind != "contract":
         raise AdministrationDenied(400, "invalid_request")
       return row, row["items"]["contract"], "contract_invalid"
+    if contract_id:
+      row = self._tenant_contract_draft(tenant_id, contract_id)
+      if document_kind != "contract":
+        raise AdministrationDenied(400, "invalid_request")
+      return row, row, "contract_invalid"
     row = self._unlocked_engagement_draft(engagement_draft_id)
     if document_kind != engagement_drafts.DOCUMENT_KIND:
       raise AdministrationDenied(400, "invalid_request")
     return row, row["document"], "document_invalid"
 
   @_endpoint
-  def authorize_generated_document(self, actor, draft_id, engagement_draft_id, document_kind, snapshot, generated_at):
+  def authorize_generated_document(self, actor, draft_id, engagement_draft_id, document_kind, snapshot, generated_at,
+                                   tenant_id=None, contract_id=None):
     """Everything but the bytes is checked before the plugin stores them: role, the draft and its
     lock, the slot, the snapshot and `generated_at` formats, and that the item is not `signed`."""
     account = self._actor(actor, creator=True)
-    row, slot, _ = self._generated_slot(draft_id, engagement_draft_id, document_kind)
+    row, slot, _ = self._generated_slot(draft_id, engagement_draft_id, document_kind, tenant_id, contract_id)
     try:
       drafts.normalize_snapshot(snapshot)
       drafts.normalize_generated_at(generated_at)
@@ -2099,7 +2252,7 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, exc.code) from None
     if slot["state"] == "signed":
       raise AdministrationDenied(409, "already_signed")
-    if not draft_id:
+    if engagement_draft_id:
       return {"accountId": account.account_id}
     # RM-127: the contract prints the node plan, so it needs one, and the snapshot must be of it.
     if not row["nodes"]:
@@ -2122,33 +2275,37 @@ class TenantAdministrationService:
 
   @_endpoint
   def attach_generated_document(self, actor, draft_id, engagement_draft_id, document_kind, document, snapshot_sha256,
-                                generated_at, nodes=None):
+                                generated_at, nodes=None, tenant_id=None, contract_id=None):
     """Write the `generated` block (the stored ref plus the baseline stamps; `uploaded_by` and
     `generated_by` are the generating admin) and set the item `generated`, from `missing`,
     `generated` or `awaiting_signature` (never from `signed`). Answers the row and the ref of the
     generated file the slot held before, whose file the plugin deletes after this write."""
     account = self._actor(actor, creator=True)
-    previous, slot, refusal = self._generated_slot(draft_id, engagement_draft_id, document_kind)
+    previous, slot, refusal = self._generated_slot(draft_id, engagement_draft_id, document_kind, tenant_id, contract_id)
     if not isinstance(document, dict):
       raise AdministrationDenied(400, refusal)
     generated = {**document, "snapshot_sha256": snapshot_sha256, "generated_at": generated_at,
                  "generated_by": account.account_id}
-    if draft_id:
+    # The two contract slots (a tenant draft's, RM-133 a contract draft's) print the node plan.
+    with_nodes = not engagement_draft_id
+    if with_nodes:
       generated["nodes"] = nodes
-    if (not drafts.valid_generated(generated, with_nodes=bool(draft_id))
+    if (not drafts.valid_generated(generated, with_nodes=with_nodes)
         or generated["uploaded_by"] != account.account_id):
       raise AdministrationDenied(400, refusal)
     if slot["state"] == "signed":
       raise AdministrationDenied(409, "already_signed")
     # RM-127: the plan may have changed since `authorize_generated_document` read the snapshot's.
-    if draft_id and nodes != previous["nodes"]:
+    if with_nodes and nodes != previous["nodes"]:
       raise AdministrationDenied(409, "draft_changed")
     replaced = slot["generated"]["ref"] if slot["generated"] is not None else None
-    slot = {**slot, "state": "generated", "generated": generated}
     if draft_id:
+      slot = {**slot, "state": "generated", "generated": generated}
       row = self._write_tenant_draft({**previous, "items": {**previous["items"], "contract": slot}}, account)
+    elif contract_id:
+      row = self._write_tenant_contract_draft({**previous, "state": "generated", "generated": generated}, account)
     else:
-      row = self._write_engagement_draft({**previous, "document": slot}, account)
+      row = self._write_engagement_draft({**previous, "document": {**slot, "state": "generated", "generated": generated}}, account)
     return {"draft": row, "replaced": replaced}
 
   @staticmethod
@@ -2190,7 +2347,8 @@ class TenantAdministrationService:
       raise AdministrationDenied(409, "draft_incomplete", missing=completeness["missing"],
                                  reasons=completeness["reasons"])
     tenant, account = self._authorized_tenant(actor, tenant_id, "engagements:create")
-    contract_sha256 = self._tenant_contract_sha256(tenant)
+    # RM-133: the draft's pick, checked again now (the contract may have gone since the pick).
+    contract_sha256 = self._tenant_contract_sha256(tenant, engagement_drafts.contract_pick(row))
     generated = slot["generated"]
     packs = [{**stored["signed"], "kind": "agreement", "title": "Engagement pack",
               "comment": "" if generated is None else "baseline sha256 " + generated["sha256"]}]
@@ -2217,6 +2375,165 @@ class TenantAdministrationService:
     self.store.delete("engagement_draft", engagement_draft_id)
     return {"engagementId": engagement_id, "tenantId": tenant_id, "replayed": False,
             "engagementHash": record["engagement_hash"], "actor": account.account_id}
+
+  # RM-133 step 2: contract drafts, a tenant's further contracts prepared on the active tenant. A
+  # full-portfolio Super-Tenant Admin only, after the tenant check (as `get_tenant_contract`). The
+  # same split as the tenant draft: the service authorizes and writes under this lock; every
+  # document read, write and delete is the plugin's, outside it. Activation is one locked call.
+
+  def _tenant_contract_draft(self, tenant_id, contract_id):
+    if not engagement_drafts.valid_tenant_id(tenant_id) or not tenant_contracts.valid_contract_id(contract_id):
+      raise AdministrationDenied(400, "invalid_request")
+    row = self.store.get("tenant_contract_draft", tenant_id, contract_id)
+    if row is None:
+      raise AdministrationDenied(404, "not_found")
+    return row
+
+  def _write_tenant_contract_draft(self, row, account, previous=None):
+    """Write a changed row with its attribution; an unchanged one is not written."""
+    if previous is not None and row == previous:
+      return previous
+    row = {**row, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put("tenant_contract_draft", row["tenant_id"], row["contract_id"], record=row)
+    return self.store.get("tenant_contract_draft", row["tenant_id"], row["contract_id"])
+
+  @_endpoint
+  def create_tenant_contract_draft(self, actor, tenant_id, request_id):
+    """Allocate `c_<n>` from the tenant row's counter and write the draft. The counter goes on the
+    tenant row first, so a crash between the two writes leaves a gap, never a collision; a number is
+    never reused. A create replayed with the same `request_id` answers the existing draft."""
+    tenant, account = self._platform_tenant(actor, tenant_id)
+    self._tenant_contract_sha256(tenant)
+    request_id = _request_id(request_id)
+    existing = next((row for row in self.store.list_tenant_contract_drafts(tenant_id) if row["request_id"] == request_id), None)
+    if existing is not None:
+      return existing
+    blocks = _contract_blocks(tenant)
+    number = tenant.get("next_contract_no")
+    if type(number) is not int or number < tenant_contracts.FIRST_CONTRACT_NO:
+      number = tenant_contracts.FIRST_CONTRACT_NO
+    while (tenant_contracts.contract_id_for(number) in blocks
+           or self.store.get("tenant_contract_draft", tenant_id, tenant_contracts.contract_id_for(number)) is not None):
+      number += 1
+    contract_id = tenant_contracts.contract_id_for(number)
+    self.store.put("tenant", tenant_id, record={**tenant, "next_contract_no": number + 1})
+    row = tenant_contracts.new_draft(tenant_id, contract_id, request_id, account.account_id,
+                                     datetime.now(timezone.utc).isoformat())
+    self.store.put("tenant_contract_draft", tenant_id, contract_id, record=row)
+    return self.store.get("tenant_contract_draft", tenant_id, contract_id)
+
+  @_endpoint
+  def get_tenant_contract_draft(self, actor, tenant_id, contract_id):
+    self._platform_tenant(actor, tenant_id)
+    return self._tenant_contract_draft(tenant_id, contract_id)
+
+  @_endpoint
+  def list_tenant_contract_drafts(self, actor, tenant_id):
+    self._platform_tenant(actor, tenant_id)
+    rows = sorted(self.store.list_tenant_contract_drafts(tenant_id), key=lambda row: tenant_contracts.contract_no(row["contract_id"]))
+    return [tenant_contracts.draft_list_row(row) for row in rows]
+
+  @_endpoint
+  def update_tenant_contract_draft(self, actor, tenant_id, contract_id, changes):
+    """Answers the row and the refs whose files the plugin deletes after this write."""
+    _, account = self._platform_tenant(actor, tenant_id)
+    previous = self._tenant_contract_draft(tenant_id, contract_id)
+    try:
+      row, dropped = tenant_contracts.apply_changes(previous, changes)
+    except (tenant_contracts.TenantContractInvalid, drafts.DraftInvalid) as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    # RM-127: the signed contract lists the nodes; the copy is dropped first, in its own update.
+    if previous["state"] == "signed" and row["nodes"] != previous["nodes"]:
+      raise AdministrationDenied(409, "nodes_locked")
+    self._check_node_plan(account, previous, row)
+    return {"draft": self._write_tenant_contract_draft(row, account, previous), "dropped": dropped}
+
+  @_endpoint
+  def authorize_tenant_contract_upload(self, actor, tenant_id, contract_id):
+    _, account = self._platform_tenant(actor, tenant_id)
+    self._tenant_contract_draft(tenant_id, contract_id)
+    return {"accountId": account.account_id}
+
+  @_endpoint
+  def attach_tenant_contract_document(self, actor, tenant_id, contract_id, document):
+    """Bind an uploaded signed copy (`store_tenant_contract_document`) and sign the draft. Answers
+    the row and the ref the slot held before, whose file the plugin deletes after this write."""
+    _, account = self._platform_tenant(actor, tenant_id)
+    previous = self._tenant_contract_draft(tenant_id, contract_id)
+    if not valid_doc_ref(document) or document["uploaded_by"] != account.account_id:
+      raise AdministrationDenied(400, "contract_invalid")
+    replaced = previous["document"]
+    row = {**previous, "state": "signed", "document": dict(document)}
+    return {"draft": self._write_tenant_contract_draft(row, account),
+            "replaced": replaced["ref"] if replaced is not None else None}
+
+  @_endpoint
+  def tenant_contract_draft_document_ref(self, actor, tenant_id, contract_id):
+    self._platform_tenant(actor, tenant_id)
+    document = self._tenant_contract_draft(tenant_id, contract_id)["document"]
+    if document is None:
+      raise AdministrationDenied(404, "not_found")
+    return document
+
+  @_endpoint
+  def begin_tenant_contract_draft_delete(self, actor, tenant_id, contract_id):
+    """A draft holding a signed copy is kept, as the other drafts; the number is not given back."""
+    _, account = self._platform_tenant(actor, tenant_id)
+    row = self._tenant_contract_draft(tenant_id, contract_id)
+    if row["state"] == "signed":
+      raise AdministrationDenied(409, "draft_has_signed_documents")
+    return {"accountId": account.account_id, "documentRefs": tenant_contracts.document_refs(row)}
+
+  @_endpoint
+  def finish_tenant_contract_draft_delete(self, actor, tenant_id, contract_id, deleted_refs):
+    """As `finish_engagement_draft_delete`: the row goes once both its files are gone."""
+    self._platform_tenant(actor, tenant_id)
+    row = self._tenant_contract_draft(tenant_id, contract_id)
+    if not set(tenant_contracts.document_refs(row)) <= set(deleted_refs):
+      raise AdministrationDenied(409, "conflict")
+    self.store.delete("tenant_contract_draft", tenant_id, contract_id)
+    return {"contract_id": contract_id}
+
+  @_endpoint
+  def activate_tenant_contract(self, actor, tenant_id, contract_id, documents=None):
+    """One locked step, the RM-127 activation applied to one further contract. `documents` are the
+    draft's signed copy and generated pack as `resolve_tenant_contract_document` verified them
+    outside this lock; this method never reads the document store.
+
+    In the contract's order: a block already on the tenant row means an earlier call crashed after
+    the tenant write, so any draft row left is deleted and the call answers `replayed`; otherwise
+    the refs must still be the draft's, the draft complete, every uploader a platform account, the
+    signed copy's file bound nowhere else, every planned node assignable (a node the tenant holds in
+    the same mode is the existing assignment; another mode, or another tenant, refuses and nothing
+    is written); then the nodes are assigned, the block written, the draft row deleted.
+    """
+    tenant, account = self._platform_tenant(actor, tenant_id)
+    if not tenant_contracts.valid_contract_id(contract_id):
+      raise AdministrationDenied(400, "invalid_request")
+    blocks = _contract_blocks(tenant)
+    if contract_id in blocks:
+      if self.store.get("tenant_contract_draft", tenant_id, contract_id) is not None:
+        self.store.delete("tenant_contract_draft", tenant_id, contract_id)
+      return {"tenantId": tenant_id, "contractId": contract_id, "replayed": True, "actor": account.account_id}
+    row = self._tenant_contract_draft(tenant_id, contract_id)
+    stored = {"signed": row["document"], "generated": self._generated_ref(row["generated"])}
+    resolved = documents if isinstance(documents, dict) else {}
+    if {key: resolved.get(key) for key in stored} != stored:
+      raise AdministrationDenied(409, "draft_changed")
+    completeness = tenant_contracts.completeness(row)
+    if not completeness["complete"]:
+      raise AdministrationDenied(409, "draft_incomplete", missing=completeness["missing"])
+    for block in (row["document"], row["generated"]):
+      uploader = self.accounts.get_account(block["uploaded_by"])
+      if uploader is None or not uploader.active or not holds_platform_role(uploader):
+        raise AdministrationDenied(400, "contract_invalid")
+    self._refuse_documents_in_use({row["document"]["ref"], row["generated"]["ref"]}, exclude=(tenant_id, contract_id))
+    self._assign_contract_nodes(account, tenant, row["nodes"])
+    now = datetime.now(timezone.utc).isoformat()
+    block = tenant_contracts.block_for(row, row["document"], row["generated"], account.account_id, now)
+    self.store.put("tenant", tenant_id, record={**tenant, "contracts": {**blocks, contract_id: block}})
+    self.store.delete("tenant_contract_draft", tenant_id, contract_id)
+    return {"tenantId": tenant_id, "contractId": contract_id, "replayed": False, "actor": account.account_id}
 
   def _assignable_member_roles(self, account, tenant):
     """RM-083. Roles this caller may write in the tenant; tenant_pentester is the platform's to give."""

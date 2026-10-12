@@ -13,6 +13,9 @@ from .authorization_upload import AuthorizationUploadError, validate_document
 CONTRACT_KIND = "redmesh_tenant_contract"
 CONTRACT_FORMATS = ("application/pdf",)
 _REF_FIELDS = ("sha256", "filename", "mime", "size_bytes", "uploaded_at", "uploaded_by")
+# The binding keys an envelope may carry (RM-109 drafts, RM-133 contract drafts); a resolver names
+# the ones it expects, the rest must be absent.
+_UNBOUND = {"draft_id": None, "engagement_draft_id": None, "tenant_id": None, "contract_id": None}
 
 
 class ContractRefused(Exception):
@@ -59,15 +62,27 @@ def store_engagement_pack(documents, *, engagement_draft_id, filename, content_b
                                  "engagement_draft_id": engagement_draft_id})
 
 
+def store_tenant_contract_document(documents, *, tenant_id, contract_id, filename, content_b64, uploaded_by,
+                                   now_fn=None):
+  """RM-133. The signed copy of a further contract of an active tenant (a contract draft), checked
+  as a contract. The envelope is the 1.1 draft envelope naming the tenant and the contract id in the
+  `contract` slot (no `draft_id`): no other resolver accepts it. Any failed check is `contract_invalid`."""
+  return _store(documents, filename, content_b64, uploaded_by, now_fn, refusal="contract_invalid",
+                envelope_fields={"schema_version": "1.1", "document_kind": "contract", "tenant_id": tenant_id,
+                                 "contract_id": contract_id})
+
+
 def store_generated_document(documents, *, draft_id, engagement_draft_id, document_kind, filename, content_b64,
-                             snapshot, uploaded_by, now_fn=None):
+                             snapshot, uploaded_by, now_fn=None, tenant_id=None, contract_id=None):
   """RM-110. The unsigned pack the Navigator rendered, checked as a contract, stored with the
   baseline it was rendered from in ONE envelope: the 1.1 draft envelope naming the draft (a tenant
   draft's `draft_id` or an engagement draft's `engagement_draft_id`) and the slot, `role: generated`,
   and `snapshot` next to `content_b64`. The bytes and the snapshot are hashed here, never trusted
   from the caller; answers the document reference (the contract's key set) and `snapshot_sha256`.
   `snapshot` was checked by the service (`drafts.normalize_snapshot`): hashed exactly as sent."""
-  binding = {"draft_id": draft_id} if draft_id else {"engagement_draft_id": engagement_draft_id}
+  # RM-133: the third id form, a contract draft of an active tenant.
+  binding = ({"draft_id": draft_id} if draft_id else {"engagement_draft_id": engagement_draft_id} if engagement_draft_id
+             else {"tenant_id": tenant_id, "contract_id": contract_id})
   document = _store(documents, filename, content_b64, uploaded_by, now_fn,
                     refusal="contract_invalid" if document_kind == "contract" else "document_invalid",
                     envelope_fields={"schema_version": "1.1", "document_kind": document_kind, **binding,
@@ -101,7 +116,7 @@ def resolve_contract(documents, ref):
   if not isinstance(ref, str) or not ref.strip():
     raise ContractRefused(400, "contract_required")
   document, binding = _resolve(documents, ref, "contract_invalid")
-  if binding != {"draft_id": None, "engagement_draft_id": None, "document_kind": "contract"}:
+  if binding != {**_UNBOUND, "document_kind": "contract"}:
     raise ContractRefused(400, "contract_invalid")
   return document
 
@@ -114,7 +129,7 @@ def resolve_draft_document(documents, ref, *, draft_id, document_kind):
   if not isinstance(ref, str) or not ref.strip():
     raise ContractRefused(400, refusal)
   document, binding = _resolve(documents, ref, refusal)
-  if binding != {"draft_id": draft_id, "engagement_draft_id": None, "document_kind": document_kind}:
+  if binding != {**_UNBOUND, "draft_id": draft_id, "document_kind": document_kind}:
     raise ContractRefused(400, refusal)
   return document
 
@@ -126,8 +141,21 @@ def resolve_engagement_pack(documents, ref, *, engagement_draft_id):
   if not isinstance(ref, str) or not ref.strip():
     raise ContractRefused(400, "document_invalid")
   document, binding = _resolve(documents, ref, "document_invalid")
-  if binding != {"draft_id": None, "engagement_draft_id": engagement_draft_id, "document_kind": "engagement_pack"}:
+  if binding != {**_UNBOUND, "engagement_draft_id": engagement_draft_id, "document_kind": "engagement_pack"}:
     raise ContractRefused(400, "document_invalid")
+  return document
+
+
+def resolve_tenant_contract_document(documents, ref, *, tenant_id, contract_id):
+  """RM-133. A contract draft's signed copy or generated pack re-verified from its bytes; its
+  envelope must name this tenant and this contract id in the `contract` slot. Every refusal is
+  `contract_invalid`: a `c_1` file, a draft's or an engagement pack never passes here, and a
+  contract draft's file never passes the other resolvers."""
+  if not isinstance(ref, str) or not ref.strip():
+    raise ContractRefused(400, "contract_invalid")
+  document, binding = _resolve(documents, ref, "contract_invalid")
+  if binding != {**_UNBOUND, "tenant_id": tenant_id, "contract_id": contract_id, "document_kind": "contract"}:
+    raise ContractRefused(400, "contract_invalid")
   return document
 
 
@@ -148,8 +176,8 @@ def _resolve(documents, ref, refusal):
       or document.filename != envelope.get("filename") or document.mime != envelope.get("mime")
       or any(not isinstance(envelope.get(key), str) or not envelope[key] for key in ("uploaded_at", "uploaded_by"))):
     raise ContractRefused(400, refusal)
-  binding = {"draft_id": envelope.get("draft_id"), "engagement_draft_id": envelope.get("engagement_draft_id"),
-             "document_kind": envelope.get("document_kind", "contract")}
+  binding = {key: envelope.get(key) for key in _UNBOUND}
+  binding["document_kind"] = envelope.get("document_kind", "contract")
   return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}, binding
 
 

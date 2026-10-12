@@ -12,6 +12,7 @@ from ..drafts import validate_tenant_draft
 from ..engagement_drafts import validate_engagement_draft
 from ..super_tenant_profile import validate_super_tenant_profile
 from ..tenant_assets import validate_tenant_asset
+from ..tenant_contracts import validate_tenant_contract_draft
 
 MAX_ENUMERATED_RECORDS = 10000
 # RM-107 retired the tenant `asset` kind (the engagement owns its targets): a kind outside this list
@@ -20,8 +21,9 @@ MAX_ENUMERATED_RECORDS = 10000
 # is keyed by its own id too; its parent (a tenant draft or a tenant) is a field of the row.
 # RM-110: `super_tenant_profile` is one row per deployment, keyed by the fixed id `deployment`.
 # RM-125: `tenant_asset` is keyed by its own id, its parent a field of the row (as `engagement_draft`).
+# RM-133: `tenant_contract_draft` is keyed `(tenant_id, contract_id)`, a further contract of an active tenant.
 _KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
-                    "engagement_draft", "super_tenant_profile", "tenant_asset"})
+                    "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft"})
 
 
 class CstoreTenantAdministrationStore:
@@ -94,6 +96,11 @@ class CstoreTenantAdministrationStore:
         validate_super_tenant_profile(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid super-tenant profile storage record") from exc
+    if kind == "tenant_contract_draft":
+      try:
+        validate_tenant_contract_draft(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid tenant contract draft storage record") from exc
     return raw
 
   def put(self, kind, *ids, record):
@@ -229,6 +236,14 @@ class CstoreTenantAdministrationStore:
   def list_tenant_assets(self):
     """RM-125. Every tenant asset of the namespace (the parent is a field), as the engagement drafts."""
     return [self._validate(raw, "tenant_asset", ids) for ids, raw in self._fields("tenant_asset")]
+
+  def list_tenant_contract_drafts(self, tenant_id=None):
+    """RM-133. The contract drafts of one tenant (or of the namespace, for the private-hold scan),
+    keyed by the tenant in the field; a malformed one fails the read closed."""
+    if tenant_id is not None:
+      self._location("tenant_contract_draft", (tenant_id,))
+    return [self._validate(raw, "tenant_contract_draft", ids)
+            for ids, raw in self._fields("tenant_contract_draft", tenant_id)]
 
   def child_record_ids(self, kind, parent):
     """RM-125. The ids of the rows of one kind whose `parent` field equals `parent`, without

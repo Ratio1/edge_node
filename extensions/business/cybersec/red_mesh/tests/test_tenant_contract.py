@@ -294,9 +294,11 @@ class TestReadTenantContract(_PluginCase):
     result = self.plugin.get_tenant_contract(self.actor, self.tenant_id)
     self.assertEqual(result["status_code"], 200, result)
     # RM-110: the stored four-key block answers the optional party fields empty; no baseline.
+    # RM-133: the read names its contract (`c_1`) and the lineage keys, null until a revision exists.
     self.assertEqual(result["data"], {"legal": legal_dto(LEGAL), "contract": contract_ref(store="fake"),
                                       "compliance_types": None, "framework_agreement": None,
-                                      "data_handling": None, "governance": None, "contract_generated": None})
+                                      "data_handling": None, "governance": None, "contract_generated": None,
+                                      "contract_id": "c_1", "supersedes": None, "superseded_by": None})
 
   def test_the_tenant_admin_cannot_read_or_download_the_contract(self):
     initial = {"account_id": "initial"}
@@ -328,7 +330,8 @@ class TestReadTenantContract(_PluginCase):
         value.pop("contract", None)
     self.assertEqual(self.plugin.get_tenant_contract(self.actor, self.tenant_id)["data"],
                      {"legal": None, "contract": None, "compliance_types": None, "framework_agreement": None,
-                      "data_handling": None, "governance": None, "contract_generated": None})
+                      "data_handling": None, "governance": None, "contract_generated": None,
+                      "contract_id": None, "supersedes": None, "superseded_by": None})
     result = self.plugin.download_tenant_contract(self.actor, self.tenant_id)
     self.assertEqual((result["status_code"], result["error"]), (404, "not_found"))
 
