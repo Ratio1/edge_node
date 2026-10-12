@@ -53,7 +53,7 @@ class TestTenantAssetRecord(_AssetCase):
     self.assertEqual(asset["environment"], "dev")
     self.assertEqual((asset["links"], asset["status"]), ([], "unlinked"))
     self.assertEqual(self.events, [("tenant_asset_created", {
-      "asset_id": asset["asset_id"], "parent": {"tenant_id": tenant_id}, "actor": "creator"})])
+      "asset_id": asset["asset_id"], "parent": {"tenant_id": tenant_id}, "actor": "creator", "environment": "dev"})])
     self.assertEqual(ok(self, self.plugin.get_tenant_asset(self.actor, asset["asset_id"])),
                      {"asset": asset, "can_manage": True})
     self.assertEqual(self.listed(tenant_id), {"assets": [asset], "can_manage": True})
@@ -239,7 +239,7 @@ class TestTenantAssetChanges(_AssetCase):
     self.assertEqual(changed["environment"], "prod")
     self.assertEqual(self.events, [("tenant_asset_updated", {
       "asset_id": asset["asset_id"], "parent": {"tenant_id": tenant_id}, "actor": "creator",
-      "fields": ["environment"]})])
+      "fields": ["environment"], "environment": "prod"})])
 
   def test_archive_hides_the_asset_until_unarchived(self):
     tenant_id = self.tenant()

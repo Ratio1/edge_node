@@ -2,7 +2,8 @@
 
 It lives under a live tenant (`parent: {tenant_id}`) or a tenant draft (`parent: {draft_id}`) and is
 re-homed to the tenant with the engagement drafts when that draft is closed. An engagement keeps its
-own signed copy of each asset it picks (ADR 0003), so nothing here is read at launch. Vocabulary,
+own signed copy of each asset it picks (ADR 0003), so its target is never read at launch; only the
+environment is (RM-131, below). Vocabulary,
 formats, the stored-record validator, the derived status and the DTO; no storage I/O (contract:
 `tenant-assets.md`). Its id (`ta_<uuid>`) is global; the parent is a field of the row. The row has no
 `kind` of its own (the storage envelope's `kind` is the record kind): the DTO answers `target.kind`.

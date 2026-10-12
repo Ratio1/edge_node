@@ -837,6 +837,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
     result = self._launch_webapp(plugin, environment="prod", scan_min_delay=2, scan_max_delay=10)
     self.assertEqual((result["error"], result["min_seconds"], result["max_seconds"]),
                      ("environment_dune_floor", 3.0, 10.0))
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-prod-dune-off")
+    result = self._launch_webapp(plugin, environment="prod", scan_min_delay=0, scan_max_delay=0,
+                                 unsafe_launch_confirmations=["dune-disabled"])
+    self.assertEqual(result["error"], "environment_dune_floor")
+    self.assertIsNone(self._latest_job_config(plugin))
     plugin = self._build_mock_plugin(job_id="test-job-webapp-prod-ok")
     self.assertNotIn("error", self._launch_webapp(plugin, environment="prod", scan_min_delay=3, scan_max_delay=12))
 
