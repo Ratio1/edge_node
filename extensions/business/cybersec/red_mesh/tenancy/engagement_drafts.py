@@ -202,7 +202,9 @@ def draft_list_row(row):
   return {"engagement_draft_id": row["engagement_draft_id"], "parent": row["parent"],
           "display_name": row["display_name"], "assets_count": len(row["assets"]),
           "document_state": row["document"]["state"], "created_at": row["created_at"],
-          "updated_at": row["updated_at"]}
+          "updated_at": row["updated_at"],
+          # RM-133: the contract pick, so the Documents page groups a draft under its contract.
+          CONTRACT_PICK: contract_pick(row)}
 
 
 def _same(normalize, value):
