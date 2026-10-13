@@ -92,7 +92,7 @@ def store_generated_document(documents, *, draft_id, engagement_draft_id, docume
 
 
 def store_branding_logo(documents, *, filename, content_b64, uploaded_by, now_fn=None):
-  """RM-134. The super-tenant's logo: PNG or JPEG, at most 512 KB and 1024x256 px, in an envelope
+  """RM-134. The super-tenant's logo: PNG or JPEG, at most 2 MB and 2048x512 px, in an envelope
   of this store's kind naming the `branding_logo` slot and nothing else, so no contract or draft
   resolver accepts it (and a contract resolver refuses its mime anyway). Every refusal is
   `logo_invalid`; nothing is written before every check passed."""

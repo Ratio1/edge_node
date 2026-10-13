@@ -12,8 +12,8 @@ RECORD_ID = "deployment"
 THEMES = ("midnight", "dark", "navy", "umber", "light")
 DEFAULT_THEME = "dark"
 LOGO_FORMATS = ("image/png", "image/jpeg")
-LOGO_MAX_BYTES = 512 * 1024
-LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT = 1024, 256
+LOGO_MAX_BYTES = 2 * 1024 * 1024
+LOGO_MAX_WIDTH, LOGO_MAX_HEIGHT = 2048, 512
 _LOGO_FIELDS = ("store", "ref", "sha256", "filename", "mime", "size_bytes", "uploaded_at", "uploaded_by")
 
 

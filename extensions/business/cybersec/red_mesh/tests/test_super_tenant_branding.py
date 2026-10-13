@@ -134,9 +134,9 @@ class TestBrandingLogo(_BrandingCase):
 
   def test_bad_logos_are_refused_logo_invalid_and_leave_no_file(self):
     svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
-    cases = {"600 KB": png(size=600 * 1024), "2000x300": png(2000, 300), "1024x257": png(1024, 257),
+    cases = {"2.5 MB": png(size=2560 * 1024), "4000x600": png(4000, 600), "2048x513": png(2048, 513),
              "zero width": png(0, 10), "svg": svg, "pdf": CONTRACT_PDF, "truncated png": png()[:20],
-             "progressive-less jpeg (SOF3)": jpeg().replace(b"\xff\xc0", b"\xff\xc3")}
+             "lossless jpeg (SOF3)": jpeg().replace(b"\xff\xc0", b"\xff\xc3")}
     for label, raw in cases.items():
       with self.subTest(label):
         refused(self, self.update({"logo": upload(raw)}), 400, "logo_invalid")
@@ -144,7 +144,7 @@ class TestBrandingLogo(_BrandingCase):
     self.assertEqual((self.documents.puts, self.store.writes, self.events), ([], [], []))
 
   def test_the_largest_accepted_logo(self):
-    ok(self, self.update({"logo": upload(png(1024, 256, size=512 * 1024))}))
+    ok(self, self.update({"logo": upload(png(2048, 512, size=2 * 1024 * 1024))}))
 
   def test_replace_and_remove_delete_the_old_file_after_the_write(self):
     ok(self, self.update({"logo": upload(png(size=1000))}))
@@ -242,7 +242,7 @@ class TestBrandingStoredRow(unittest.TestCase):
     good = {"theme": "navy", "logo": logo, "updated_by": "creator", "updated_at": "2026-10-13T00:00:00Z"}
     self.assertIs(validate_super_tenant_branding(good, ["deployment"]), good)
     bad = {"id": ({}, ["other"]), "theme": ({"theme": "pink"}, None), "mime": ({"logo": {**logo, "mime": "image/svg+xml"}}, None),
-           "size": ({"logo": {**logo, "size_bytes": 600 * 1024}}, None), "logo keys": ({"logo": {"ref": "doc-1"}}, None),
+           "size": ({"logo": {**logo, "size_bytes": 2 * 1024 * 1024 + 1}}, None), "logo keys": ({"logo": {"ref": "doc-1"}}, None),
            "attribution": ({"updated_by": ""}, None)}
     for label, (change, ids) in bad.items():
       with self.subTest(label), self.assertRaises(ValueError):
