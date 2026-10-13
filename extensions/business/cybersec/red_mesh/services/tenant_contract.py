@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 
 from ..tenancy.ports import DocumentStoreError
+from ..tenancy.super_tenant_branding import LOGO_FORMATS, LOGO_MAX_BYTES, LOGO_MAX_HEIGHT, LOGO_MAX_WIDTH
 from .authorization_upload import AuthorizationUploadError, validate_document
 
 CONTRACT_KIND = "redmesh_tenant_contract"
@@ -90,9 +91,61 @@ def store_generated_document(documents, *, draft_id, engagement_draft_id, docume
   return {"document": document, "snapshot_sha256": hashlib.sha256(snapshot.encode("utf-8")).hexdigest()}
 
 
-def _store(documents, filename, content_b64, uploaded_by, now_fn, *, refusal, envelope_fields):
+def store_branding_logo(documents, *, filename, content_b64, uploaded_by, now_fn=None):
+  """RM-134. The super-tenant's logo: PNG or JPEG, at most 512 KB and 1024x256 px, in an envelope
+  of this store's kind naming the `branding_logo` slot and nothing else, so no contract or draft
+  resolver accepts it (and a contract resolver refuses its mime anyway). Every refusal is
+  `logo_invalid`; nothing is written before every check passed."""
+  # Refused before decoding when the text alone is over the cap (base64 is 4 chars per 3 bytes).
+  if not isinstance(content_b64, str) or len(content_b64) > (LOGO_MAX_BYTES + 2) // 3 * 4:
+    raise ContractRefused(400, "logo_invalid")
   try:
-    document = validate_document(filename, content_b64, accepted=CONTRACT_FORMATS)
+    document = validate_document(filename, content_b64, accepted=LOGO_FORMATS)
+  except AuthorizationUploadError:
+    raise ContractRefused(400, "logo_invalid") from None
+  size = image_size(document.raw, document.mime)
+  if (document.size_bytes > LOGO_MAX_BYTES or size is None
+      or not (0 < size[0] <= LOGO_MAX_WIDTH and 0 < size[1] <= LOGO_MAX_HEIGHT)):
+    raise ContractRefused(400, "logo_invalid")
+  return _store(documents, filename, content_b64, uploaded_by, now_fn, refusal="logo_invalid",
+                envelope_fields={"schema_version": "1.1", "document_kind": "branding_logo"}, accepted=LOGO_FORMATS)
+
+
+def image_size(raw, mime):
+  """`(width, height)` of a PNG (IHDR) or a baseline/extended/progressive JPEG (SOF0/1/2); None for
+  anything else, a truncated file or another JPEG coding (which the PDF renderer cannot embed)."""
+  if mime == "image/png":
+    if len(raw) < 24 or raw[12:16] != b"IHDR":
+      return None
+    return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+  if mime != "image/jpeg":
+    return None
+  at = 2
+  while at + 4 <= len(raw):
+    if raw[at] != 0xFF:
+      return None
+    marker = raw[at + 1]
+    if marker == 0xFF:
+      at += 1
+      continue
+    if marker in (0x01, *range(0xD0, 0xD8)):
+      at += 2
+      continue
+    length = int.from_bytes(raw[at + 2:at + 4], "big")
+    if marker in (0xC0, 0xC1, 0xC2):
+      if length < 7 or at + 9 > len(raw):
+        return None
+      return int.from_bytes(raw[at + 7:at + 9], "big"), int.from_bytes(raw[at + 5:at + 7], "big")
+    if marker in (0xD9, 0xDA, *range(0xC3, 0xD0)) or length < 2:
+      return None
+    at += 2 + length
+  return None
+
+
+def _store(documents, filename, content_b64, uploaded_by, now_fn, *, refusal, envelope_fields,
+           accepted=CONTRACT_FORMATS):
+  try:
+    document = validate_document(filename, content_b64, accepted=accepted)
   except AuthorizationUploadError as exc:
     raise ContractRefused(400, refusal or exc.code) from None
   uploaded_at = (now_fn or (lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))()
@@ -179,6 +232,28 @@ def _resolve(documents, ref, refusal):
   binding = {key: envelope.get(key) for key in _UNBOUND}
   binding["document_kind"] = envelope.get("document_kind", "contract")
   return {"store": documents.name, "ref": ref, **{key: envelope[key] for key in _REF_FIELDS}}, binding
+
+
+def read_branding_logo(documents, logo):
+  """RM-134. The stored logo, served only if it still matches the branding record (the record is
+  the authority, as `read_contract`) and its envelope names the `branding_logo` slot. A file the
+  store does not return is 404 `not_found`; anything else is 409 `contract_integrity`."""
+  if logo.get("store") != documents.name:
+    raise ContractRefused(503, "unavailable")
+  envelope = documents.get(logo["ref"])
+  if envelope is None:
+    raise ContractRefused(404, "not_found")
+  if (not isinstance(envelope, dict) or envelope.get("kind") != CONTRACT_KIND
+      or envelope.get("document_kind") != "branding_logo"):
+    raise ContractRefused(409, "contract_integrity")
+  try:
+    document = validate_document(logo["filename"], envelope.get("content_b64"), accepted=LOGO_FORMATS)
+  except AuthorizationUploadError:
+    raise ContractRefused(409, "contract_integrity") from None
+  if document.sha256_hex != logo["sha256"] or document.size_bytes != logo["size_bytes"]:
+    raise ContractRefused(409, "contract_integrity")
+  return {"mime": document.mime, "size_bytes": document.size_bytes, "sha256": document.sha256_hex,
+          "content_b64": envelope["content_b64"]}
 
 
 def read_contract(documents, contract, absent=None):

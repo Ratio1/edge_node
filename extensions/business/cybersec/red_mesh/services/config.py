@@ -127,10 +127,11 @@ DEFAULT_ATTESTATION_CONFIG = {
 
 # RM-132: what the super-tenant may still edit about itself (contract: `onboarding-drafts.md`
 # §Contact formats and the Ratio1 lock). Deployment configuration set by Ratio1, read-only in the
-# API, named booleans, every key `True` unless the deployment says otherwise. `edit_branding` is
-# reserved by the contract and added here by the task that consumes it (RM-134).
+# API, named booleans, every key `True` unless the deployment says otherwise. RM-134 consumes
+# `edit_branding` (the super-tenant branding record).
 DEFAULT_SUPER_TENANT_PERMISSIONS = {
   "edit_company_details": True,
+  "edit_branding": True,
 }
 _FALSE_STRINGS = frozenset({"false", "0", "no", "off"})
 

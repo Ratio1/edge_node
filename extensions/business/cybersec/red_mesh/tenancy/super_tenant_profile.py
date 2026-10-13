@@ -14,8 +14,8 @@ DTO_FIELDS = (*FIELDS, "updated_by", "updated_at")
 # RM-132: the deployment permission flags the profile read reports, with their defaults. The
 # values come from `services.config.get_super_tenant_permissions` through the service's reader.
 # Kept in step with `services.config.DEFAULT_SUPER_TENANT_PERMISSIONS` and the plugin `_CONFIG`
-# block (the config layer cannot import tenancy); a new key (RM-134 `edit_branding`) lands in all three.
-PERMISSIONS = {"edit_company_details": True}
+# block (the config layer cannot import tenancy); a new key lands in all three (and the Navigator's).
+PERMISSIONS = {"edit_company_details": True, "edit_branding": True}
 
 
 def empty_profile():

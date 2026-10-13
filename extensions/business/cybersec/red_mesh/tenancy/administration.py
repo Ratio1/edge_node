@@ -27,7 +27,7 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_asset_requests, normalize_context,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import drafts, engagement_drafts, super_tenant_profile, tenant_assets, tenant_contracts
+from . import drafts, engagement_drafts, super_tenant_branding, super_tenant_profile, tenant_assets, tenant_contracts
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -1681,6 +1681,61 @@ class TenantAdministrationService:
       self.store.put("super_tenant_profile", super_tenant_profile.RECORD_ID, record=row)
       row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
     return {"profile": super_tenant_profile.profile_dto(row), "changed": changed, "accountId": account.account_id}
+
+  # RM-134: the super-tenant branding, one row per deployment (contract `onboarding-drafts.md`
+  # §Branding). Every active account reads it; a full-portfolio Super-Tenant Admin writes it while
+  # `edit_branding` allows. The logo's bytes never reach these methods: the plugin stores and deletes
+  # the file outside this lock and passes the reference.
+
+  def _branding_row(self):
+    row = self.store.get("super_tenant_branding", super_tenant_branding.RECORD_ID)
+    return row if row is not None else super_tenant_branding.empty_branding()
+
+  def _branding_writer(self, actor):
+    account = self._actor(actor, creator=True)
+    if not self._super_tenant_permissions()["edit_branding"]:
+      raise AdministrationDenied(403, "branding_locked")
+    return account
+
+  @_endpoint
+  def get_super_tenant_branding(self, actor):
+    self._actor(actor)
+    return super_tenant_branding.branding_dto(self._branding_row())
+
+  @_endpoint
+  def authorize_super_tenant_branding_update(self, actor):
+    """Step 1 of a logo write: refused before the plugin stores any bytes."""
+    return {"accountId": self._branding_writer(actor).account_id}
+
+  @_endpoint
+  def update_super_tenant_branding(self, actor, changes):
+    """`changes` = `{theme?, logo?}`, `logo` the plugin's stored reference or None. Answers the DTO,
+    the keys whose value changed and the reference the write dropped (the plugin deletes its file);
+    nothing changed, nothing written."""
+    account = self._branding_writer(actor)
+    previous = self._branding_row()
+    try:
+      row, changed = super_tenant_branding.apply_changes(previous, changes)
+    except drafts.DraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    replaced = None
+    if changed:
+      row = {**row, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+      self.store.put("super_tenant_branding", super_tenant_branding.RECORD_ID, record=row)
+      row = self.store.get("super_tenant_branding", super_tenant_branding.RECORD_ID)
+      if "logo" in changed and previous["logo"] is not None:
+        replaced = previous["logo"]["ref"]
+    return {"branding": super_tenant_branding.branding_dto(row), "changed": changed, "replaced": replaced,
+            "accountId": account.account_id}
+
+  @_endpoint
+  def super_tenant_branding_logo(self, actor):
+    """The stored logo's reference, for the plugin's download; 404 without a logo."""
+    self._actor(actor)
+    logo = self._branding_row()["logo"]
+    if logo is None:
+      raise AdministrationDenied(404, "not_found")
+    return logo
 
   # RM-109 phase 2: tenant drafts. A full-portfolio Super-Tenant Admin only, as tenant creation; a
   # draft has no tenant, so these are not rows of the tenant policy matrix. Every document read,

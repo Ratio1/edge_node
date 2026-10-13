@@ -446,6 +446,33 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage.data[(TENANCY, field)]["legal_name"] = 7
     self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
 
+  def test_the_super_tenant_branding_is_current_with_its_logo_and_cleanup_keeps_it(self):
+    # RM-134: one row per deployment, as the profile; its logo's ref is a file the row names.
+    from .contract_fixture import FakeDocumentStore
+    from .test_super_tenant_branding import png, upload
+
+    class CidDocuments(FakeDocumentStore):
+      def put(self, envelope):
+        ref = super().put(envelope)
+        address = cid(90 + int(ref[4:]))
+        self.envelopes[address] = self.envelopes.pop(ref)
+        return address
+    documents = CidDocuments()
+    self.plugin._document_store = lambda: documents
+    updated = self.plugin.update_super_tenant_branding(self.actor, {"theme": "navy", "logo": upload(png())})
+    self.assertTrue(updated["success"], updated)
+    self.events.clear()
+    field = json.dumps(["super_tenant_branding", "deployment", "deployment"], separators=(",", ":"))
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    self.assertEqual([(file["cid"], file["role"]) for file in row["cids"]], [(cid(91), "logo.ref")])
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+    self.storage.data[(TENANCY, field)]["theme"] = "pink"
+    self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
+
   def test_a_tenant_activated_from_a_draft_is_current_with_all_its_files(self):
     # RM-109 phase 3: the receipt carries the draft id; tenant and receipt name three documents.
     # RM-110: and the contract's generated baseline, whose file the draft row names too.
