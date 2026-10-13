@@ -35,9 +35,9 @@ FINDING_CONFIDENCES = ("certain", "firm", "tentative")
 # prose — a `; authenticated action:` marker in evidence and title phrases — so a
 # probe rewording flipped a client-facing line with every test green. ""
 # means the finding records no login.
-AUTHENTICATED_ACTION_PERFORMED = "performed"          # the RoE-gated action ran and returned output
-AUTHENTICATED_ACTION_ATTEMPTED = "attempted"          # permitted; tried or ran, completed nothing
-AUTHENTICATED_ACTION_NOT_PERMITTED = "not_permitted"  # the RoE withheld it
+AUTHENTICATED_ACTION_PERFORMED = "performed"          # the action ran and returned output
+AUTHENTICATED_ACTION_ATTEMPTED = "attempted"          # tried or ran, completed nothing
+AUTHENTICATED_ACTION_NOT_PERMITTED = "not_permitted"  # legacy: RoE withheld it (pre-RM-128 archives)
 AUTHENTICATED_ACTION_NOT_APPLICABLE = "not_applicable"  # no action exists for the service
 AUTHENTICATED_ACTIONS = (
   AUTHENTICATED_ACTION_PERFORMED,

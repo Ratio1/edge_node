@@ -2,6 +2,7 @@
 import base64
 import copy
 import hashlib
+from uuid import uuid4
 
 from extensions.business.cybersec.red_mesh.tenancy.ports import DocumentStoreError
 
@@ -47,6 +48,13 @@ def contract_b64(raw=CONTRACT_PDF):
 
 LEGAL = {"name": "Example Holdings SRL", "registration_id": "RO12345678",
          "signer_name": "Ana Pop", "signer_role": "Director"}
+# RM-110: the optional party-block fields; a block without them reads back with them empty.
+PARTY_FIELDS = ("address", "vat_id", "contact_name", "contact_email", "contact_phone")
+
+
+def legal_dto(legal=LEGAL):
+  """A `legal` block as the DTOs answer it: every party field, the absent optional ones empty."""
+  return {**{key: "" for key in PARTY_FIELDS}, **legal}
 
 
 def contract_ref(uploaded_by="creator", ref="doc-fixture", store="fake"):
@@ -56,9 +64,14 @@ def contract_ref(uploaded_by="creator", ref="doc-fixture", store="fake"):
           "uploaded_at": "2026-09-27T12:00:00Z", "uploaded_by": uploaded_by}
 
 
-def contract_terms(uploaded_by="creator"):
-  """Keyword arguments that make a direct `TenantAdministrationService.prepare_tenant` call valid."""
-  return {"legal": dict(LEGAL), "contract": contract_ref(uploaded_by)}
+def contract_terms(uploaded_by="creator", ref=None):
+  """Keyword arguments that make a direct `TenantAdministrationService.prepare_tenant` call valid.
+
+  Each call is a fresh upload of the fixture bytes, so a fresh reference (as R1FS gives a new CID to
+  every upload, the envelope carrying its upload time): RM-109 refuses a reference another tenant
+  or receipt already holds (`contract_in_use`). Same bytes, so a replay is still the same creation.
+  """
+  return {"legal": dict(LEGAL), "contract": contract_ref(uploaded_by, ref=ref or "doc-" + str(uuid4()))}
 
 
 def envelope(uploaded_by="creator", raw=CONTRACT_PDF, **changes):
@@ -70,11 +83,12 @@ def envelope(uploaded_by="creator", raw=CONTRACT_PDF, **changes):
   return record
 
 
-def install_contract(plugin, uploaded_by="creator"):
-  """Give a real plugin a document store holding one contract; return the prepare_tenant fields."""
+def install_contract(plugin, uploaded_by="creator", ref="doc-fixture"):
+  """Give a real plugin a document store holding one contract; return the prepare_tenant fields.
+  A second tenant on the same plugin needs its own `ref` (RM-109 `contract_in_use`)."""
   documents = FakeDocumentStore()
-  documents.envelopes["doc-fixture"] = envelope(uploaded_by)
+  documents.envelopes[ref] = envelope(uploaded_by)
   plugin._document_store = lambda: documents
   return {"legal_name": LEGAL["name"], "registration_id": LEGAL["registration_id"],
           "signer_name": LEGAL["signer_name"], "signer_role": LEGAL["signer_role"],
-          "contract_ref": "doc-fixture"}
+          "contract_ref": ref}

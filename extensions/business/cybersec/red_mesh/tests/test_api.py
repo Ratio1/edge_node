@@ -22,23 +22,18 @@ from .test_execution_binding_models import binding_payload
 
 
 
-def _engagement(kind="network", **roe):
-  """Engagement facts as admission loads them (RM-095): every test of the kind, a permissive RoE.
+def _engagement(kind="network", **ignored):
+  """Engagement facts as admission loads them (RM-095). RM-128: no rules of engagement.
 
-  Suites about launch configuration launch inside an engagement that allows what they configure;
-  the refusals have their own tests.
+  Suites about launch configuration launch inside an engagement; the refusals have their own tests.
+  `ignored` keeps old call sites that passed RoE flags working (the flags no longer exist).
   """
-  from extensions.business.cybersec.red_mesh.tenancy.engagements import feature_ids_for_kind
   return {
     "engagement_id": "en_00000000-0000-4000-8000-000000000003", "engagement_hash": "e" * 64,
-    "contract_sha256": "c" * 64, "allowed_run_modes": ["continuous", "single_pass"],
-    "authorized_tests": sorted(feature_ids_for_kind(kind)),
-    "roe": {"authenticated_action": False, "stateful_probes_allowed": True, "ics_safe_mode_required": False,
-            **roe},
+    "contract_sha256": "c" * 64,
     "context": {"client_name": "Example"},
     "authorization": {"document_cid": "", "authorized_signer_name": "Ana Pop", "authorized_signer_role": "CISO",
                       "document_sha256": "a" * 64},
-    **({"authorized_scan_modes": ["connect"]} if kind == "network" else {}),
   }
 
 
@@ -46,14 +41,15 @@ _UNSET = object()
 
 
 def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-0000-4000-8000-000000000001",
-                   candidates=("node-1",), authorized_ports=None, engagement=_UNSET):
+                   candidates=("node-1",), engagement=_UNSET, environment="dev"):
   """A resolved execution admission, as `_resolve_execution_admission_for_account` returns one.
 
   RM-084 P6 removed the unbound launch: `_admit_execution` now refuses a request with no tenant,
   engagement and engagement asset (RM-107). These suites are about launch configuration and endpoint shape rather than about
   who is admitted (which has its own suites), so they stub the admission -- with a real context,
   because the launch path derives the destination, the worker set and the stored binding from it.
-  A network asset is an IPv4 literal, so the network suites launch against one.
+  A network asset is an IPv4 literal, so the network suites launch against one. The asset is `dev`
+  (RM-131), so the prod Dune floor stays out of the way unless a suite asks for it.
   """
   from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest, normalize_target
   from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
@@ -67,9 +63,7 @@ def _bound_context(kind="network", address="192.0.2.10", tenant_id="tn_00000000-
     "asset_target_digest": canonical_digest(target), "actor_id": "tester",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
     "selected_candidates": list(candidates),
-    # An engagement's network entry always has a port scope; the full range when a suite sets none.
-    **({"asset_authorized_ports": authorized_ports or "1-65535"} if kind == "network" else {}),
-    "engagement": engagement,
+    "engagement": engagement, "asset_environment": environment,
   })
 
 
@@ -86,7 +80,7 @@ def _file_authorization(plugin, *references, tenant_id="tn_00000000-0000-4000-80
   plugin.r1fs.get_json.side_effect = lambda cid, *args, **kwargs: deepcopy(filed.get(cid))
 
 
-def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", authorized_ports=None, engagement=_UNSET):
+def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", engagement=_UNSET, environment="dev"):
   """A known stored platform account, admitted into a bound tenant execution.
 
   The admitted asset is the one the test launches against (`kind`, `target`), and its candidate
@@ -114,12 +108,12 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", authorized_p
     else:
       candidates = ["node-1"]
     try:
-      context = _bound_context(kind, target, candidates=candidates, authorized_ports=authorized_ports,
-                               engagement=engagement)
+      context = _bound_context(kind, target, candidates=candidates, engagement=engagement, environment=environment)
     except ValueError:
       # No asset can carry a malformed destination; the request is then launching somewhere other
       # than the saved asset, which is what the launch path has to refuse.
-      context = _bound_context(kind, _DEFAULT_ASSET[kind], candidates=candidates, engagement=engagement)
+      context = _bound_context(kind, _DEFAULT_ASSET[kind], candidates=candidates, engagement=engagement,
+                               environment=environment)
     return resolved, context, None
 
   plugin._resolve_launch_actor = lambda actor=None: (account, None)
@@ -340,7 +334,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
         return payload
     return None
 
-  def _launch(self, plugin, authorized_ports=None, engagement=_UNSET, **kwargs):
+  def _launch(self, plugin, engagement=_UNSET, **kwargs):
     """Call launch_test with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -350,10 +344,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
     defaults.update(kwargs)
     kind = "webapp" if defaults.get("scan_type") == "webapp" else "network"
     _stub_launch_actor(plugin, kind, defaults.get("target_url") if kind == "webapp" else defaults.get("target"),
-                       authorized_ports=authorized_ports, engagement=engagement)
+                       engagement=engagement)
     return PentesterApi01Plugin.launch_test(plugin, **defaults)
 
-  def _launch_network(self, plugin, authorized_ports=None, engagement=_UNSET, **kwargs):
+  def _launch_network(self, plugin, engagement=_UNSET, environment="dev", **kwargs):
     """Call launch_network_scan with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -361,11 +355,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
     defaults = dict(target="192.0.2.10", start_port=1, end_port=1024, exceptions="", authorized=True,
                     engagement_id=_engagement()["engagement_id"])
     defaults.update(kwargs)
-    _stub_launch_actor(plugin, "network", defaults.get("target"), authorized_ports=authorized_ports,
-                       engagement=engagement)
+    _stub_launch_actor(plugin, "network", defaults.get("target"), engagement=engagement, environment=environment)
     return PentesterApi01Plugin.launch_network_scan(plugin, **defaults)
 
-  def _launch_webapp(self, plugin, engagement=_UNSET, **kwargs):
+  def _launch_webapp(self, plugin, engagement=_UNSET, environment="dev", **kwargs):
     """Call launch_webapp_scan with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -380,7 +373,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
       engagement_id=_engagement("webapp")["engagement_id"],
     )
     defaults.update(kwargs)
-    _stub_launch_actor(plugin, "webapp", defaults.get("target_url"), engagement=engagement)
+    _stub_launch_actor(plugin, "webapp", defaults.get("target_url"), engagement=engagement,
+                       environment=environment)
     return PentesterApi01Plugin.launch_webapp_scan(plugin, **defaults)
 
   def test_launch_records_the_backend_release_that_ran_the_scan(self):
@@ -424,83 +418,25 @@ class TestPhase1ConfigCID(unittest.TestCase):
         self.assertIn("error", result)
         plugin.r1fs.add_json.assert_not_called()
 
-  _UPDATE = {"reference": "AUTH-2026-017", "authorized_signer_name": "Security Lead",
-             "authorized_signer_role": "CISO"}
-
-  def test_an_in_scope_launch_needs_no_authorization_update(self):
+  def test_a_launch_records_no_port_scope_or_authorization_update(self):
+    # RM-128: network scans have no engagement port bound; nothing records authorized_ports.
     plugin = self._build_mock_plugin(job_id="scope-1")
-    result = self._launch_network(plugin, authorized_ports="1-1024")
+    result = self._launch_network(plugin, end_port=1024)
     self.assertNotIn("error", result)
     config = self._latest_job_config(plugin)
-    self.assertEqual(config["authorized_ports"], "1-1024")
+    self.assertNotIn("authorized_ports", config)
     self.assertNotIn("authorization_update", config)
 
-  def test_a_widened_range_without_an_update_is_refused_with_the_ports(self):
-    plugin = self._build_mock_plugin(job_id="scope-2")
-    result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1100)
-    self.assertEqual(result["error"], "scope_exceeds_authorization")
-    self.assertEqual(result["status_code"], 400)
-    self.assertEqual(result["out_of_scope_ports"], "1025-1100")
-    self.assertIsNone(self._latest_job_config(plugin))
-
-  def test_comparison_mode_counts_as_widening(self):
-    """Comparison mode mirrors the COMMON_PORTS bundle to every node, outside
-    the operator's range; the asset's authorization has to cover it too."""
+  def test_comparison_mode_launches_without_a_port_bound(self):
     plugin = self._build_mock_plugin(job_id="scope-3")
-    result = self._launch_network(plugin, authorized_ports="1-100", end_port=100, comparison_mode=True)
-    self.assertEqual(result["error"], "scope_exceeds_authorization")
-    self.assertIn("443", result["out_of_scope_ports"])
-
-  def test_excepted_ports_do_not_count_as_widening(self):
-    import re
-    plugin = self._build_mock_plugin(job_id="scope-4")
-    plugin.re = re  # the plugin's `re` is the module; parse_exceptions reads it
-    result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1025, exceptions="1025")
+    result = self._launch_network(plugin, end_port=100, comparison_mode=True)
     self.assertNotIn("error", result)
 
-  def test_a_widened_launch_with_an_update_records_it(self):
-    plugin = self._build_mock_plugin(job_id="scope-5")
-    result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1100,
-                                  authorization_update=dict(self._UPDATE))
-    self.assertNotIn("error", result)
-    config = self._latest_job_config(plugin)
-    self.assertEqual(config["authorization_update"], {
-      **self._UPDATE, "out_of_scope_ports": "1025-1100",
-      "engagement_id": "en_00000000-0000-4000-8000-000000000003",
-    })
-    audit = [call for call in plugin._log_audit_event.call_args_list if call[0][0] == "scan_launched"]
-    self.assertEqual(audit[-1][0][1]["authorization_update_reference"], "AUTH-2026-017")
-
-  def test_an_incomplete_update_is_refused(self):
-    for missing in ("reference", "authorized_signer_name", "authorized_signer_role"):
-      with self.subTest(missing=missing):
-        plugin = self._build_mock_plugin(job_id="scope-6")
-        update = {k: v for k, v in self._UPDATE.items() if k != missing}
-        result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1100,
-                                      authorization_update=update)
-        self.assertEqual(result["error"], "validation_error")
-
-  def test_a_full_range_engagement_scope_admits_any_run(self):
-    # RM-095: an engagement's network entry always has a scope; the widest one admits every run.
+  def test_a_wide_range_launches_without_an_update(self):
     plugin = self._build_mock_plugin(job_id="scope-7")
     result = self._launch_network(plugin, end_port=65535, comparison_mode=True)
     self.assertNotIn("error", result)
-    self.assertEqual(self._latest_job_config(plugin)["authorized_ports"], "1-65535")
-
-  def test_launch_test_widened_with_an_update_records_it(self):
-    """launch_test must reach the same widen path as launch_network_scan, so a
-    test-typed launch can be authorized past the asset scope, not just refused."""
-    plugin = self._build_mock_plugin(job_id="scope-test-1")
-    result = self._launch(plugin, authorized_ports="1-1024", end_port=1100,
-                          authorization_update=dict(self._UPDATE))
-    self.assertNotIn("error", result)
-    config = self._latest_job_config(plugin)
-    self.assertEqual(config["authorization_update"], {
-      **self._UPDATE, "out_of_scope_ports": "1025-1100",
-      "engagement_id": "en_00000000-0000-4000-8000-000000000003",
-    })
-    audit = [call for call in plugin._log_audit_event.call_args_list if call[0][0] == "scan_launched"]
-    self.assertEqual(audit[-1][0][1]["authorization_update_reference"], "AUTH-2026-017")
+    self.assertNotIn("authorized_ports", self._latest_job_config(plugin))
 
   # -- RM-095: the engagement gate. Refusals come before anything is stored. --
 
@@ -534,136 +470,61 @@ class TestPhase1ConfigCID(unittest.TestCase):
         plugin = self._build_mock_plugin(job_id="engagement-forwarded-ok")
         self.assertNotIn("error", launch(plugin, **extra))
 
-  def test_engagement_tests_exceeding_authorization_are_refused(self):
-    engagement = {**_engagement("network"), "authorized_tests": ["service_info_common"]}
-    plugin = self._build_mock_plugin(job_id="engagement-tests")
-    result = self._launch_network(plugin, engagement=engagement)
-    self.assertEqual(result["error"], "tests_exceed_authorization")
-    self.assertIn("web_discovery", result["unauthorized_features"])
-    self.assertNotIn("service_info_common", result["unauthorized_features"])
-    plugin.r1fs.add_json.assert_not_called()
-    # Excluding everything else is within the authorization.
-    from extensions.business.cybersec.red_mesh.constants import FEATURE_CATALOG
-    excluded = [method for item in FEATURE_CATALOG if item["category"] in ("service", "web", "correlation")
-                and item["id"] != "service_info_common" for method in item["methods"]]
-    plugin = self._build_mock_plugin(job_id="engagement-tests-ok")
-    result = self._launch_network(plugin, engagement=engagement, excluded_features=excluded)
-    self.assertNotIn("error", result)
-    self.assertEqual(self._latest_job_config(plugin)["authorized_tests"], ["service_info_common"])
+  def test_an_engagement_launch_runs_every_feature_of_the_kind(self):
+    # RM-125: an engagement picks no tests, so nothing is excluded and no test list is snapshotted.
+    for kind, launch in (("network", self._launch_network), ("webapp", self._launch_webapp)):
+      with self.subTest(kind):
+        plugin = self._build_mock_plugin(job_id="engagement-all-tests")
+        self.assertNotIn("error", launch(plugin))
+        config = self._latest_job_config(plugin)
+        self.assertEqual(config["excluded_features"], [])
+        self.assertNotIn("authorized_tests", config)
 
-  def test_engagement_refuses_a_probe_the_catalog_does_not_know(self):
-    # Features are discovered from the worker classes, not the catalog: an uncatalogued method is
-    # authorized by no engagement, so it fails closed.
-    plugin = self._build_mock_plugin(job_id="engagement-uncatalogued")
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    self._bind_launch_helpers(plugin)
-    plugin._get_all_features = lambda categs=False, scan_type=None: [
-      *PentesterApi01Plugin._get_all_features(plugin, categs=categs, scan_type=scan_type),
-      "_service_info_uncatalogued"]
-    _stub_launch_actor(plugin, "network", "192.0.2.10")
-    result = PentesterApi01Plugin.launch_network_scan(plugin, target="192.0.2.10", start_port=1, end_port=1024,
-                                                      exceptions="", authorized=True,
-                                                      engagement_id=_engagement()["engagement_id"])
-    self._refused(plugin, result, "tests_exceed_authorization",
-                  unauthorized_features=["_service_info_uncatalogued"])
+  def test_an_engagement_admits_single_pass_and_continuous_launches(self):
+    # RM-125: both run modes are always allowed (an empty run mode is continuous).
+    for launch in (self._launch_network, self._launch_webapp):
+      for run_mode, expected in (("SINGLEPASS", "SINGLEPASS"), ("CONTINUOUS_MONITORING", "CONTINUOUS_MONITORING"),
+                                 ("", "CONTINUOUS_MONITORING")):
+        with self.subTest(launch=launch.__name__, run_mode=run_mode):
+          plugin = self._build_mock_plugin(job_id="engagement-run-modes")
+          self.assertNotIn("error", launch(plugin, run_mode=run_mode))
+          self.assertEqual(self._latest_job_config(plugin)["run_mode"], expected)
 
-  def test_engagement_comparison_bundle_counts_against_authorized_tests(self):
-    # Comparison mode force-enables the graybox bundle: it must be authorized like any test.
-    engagement = {**_engagement("webapp"), "authorized_tests": ["service_info_common"]}
+  def test_engagement_comparison_mode_still_launches_a_webapp(self):
+    # Comparison mode force-enables the graybox bundle; no test allow-list gates it (RM-125).
     plugin = self._build_mock_plugin(job_id="engagement-bundle")
-    result = self._launch_webapp(plugin, engagement=engagement, comparison_mode=True)
-    self._refused(plugin, result, "tests_exceed_authorization", unauthorized_features=["graybox"])
+    result = self._launch_webapp(plugin, comparison_mode=True)
+    self.assertNotIn("error", result)
+    self.assertIsNotNone(self._latest_job_config(plugin))
 
-  def test_engagement_comparison_tier_outside_the_port_scope_needs_an_update(self):
-    plugin = self._build_mock_plugin(job_id="engagement-tier")
-    result = self._launch_network(plugin, authorized_ports="1-1024", end_port=1024, comparison_mode=True)
-    self.assertEqual(result["error"], "scope_exceeds_authorization")
-
-  def test_engagement_roe_caps(self):
-    strict = _engagement("network", ics_safe_mode_required=True)
+  def test_an_engagement_never_blocks_ics_or_stateful_options(self):
+    # RM-128: the engagement no longer caps these; the launch form decides them.
     plugin = self._build_mock_plugin(job_id="engagement-ics")
-    result = self._launch_network(plugin, engagement=strict, ics_safe_mode=False,
-                                  unsafe_launch_confirmations=["ics-safe-mode-off"])
-    self._refused(plugin, result, "roe_forbids", field="ics_safe_mode")
-    plugin = self._build_mock_plugin(job_id="engagement-ics-ok")
-    self.assertNotIn("error", self._launch_network(plugin, engagement=strict, ics_safe_mode=True))
-    no_stateful = _engagement("webapp", stateful_probes_allowed=False)
-    for option in ("allow_stateful_probes", "allow_mirror_stateful"):
+    self.assertNotIn("error", self._launch_network(plugin, ics_safe_mode=False,
+                                                   unsafe_launch_confirmations=["ics-safe-mode-off"]))
+    for option, confirmation in (("allow_stateful_probes", "stateful-probes-on"),
+                                 ("allow_mirror_stateful", "mirror-stateful-on")):
       with self.subTest(option):
         plugin = self._build_mock_plugin(job_id="engagement-stateful")
-        result = self._launch_webapp(plugin, engagement=no_stateful, **{option: True})
-        self._refused(plugin, result, "roe_forbids", field="allow_stateful_probes")
-    plugin = self._build_mock_plugin(job_id="engagement-stateful-ok")
-    self.assertNotIn("error", self._launch_webapp(plugin, engagement=no_stateful))
+        self.assertNotIn("error", self._launch_webapp(plugin, unsafe_launch_confirmations=[confirmation],
+                                                      **{option: True}))
 
-  def test_engagement_run_mode_outside_the_allowed_modes_is_refused(self):
-    # RM-107: the gate reads the normalized run mode, so an empty one (continuous) is gated too.
-    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
-    for run_mode in ("", "CONTINUOUS_MONITORING", "bogus"):
-      with self.subTest(run_mode=run_mode):
-        plugin = self._build_mock_plugin(job_id="engagement-run-mode")
-        result = self._launch_network(plugin, engagement=single, run_mode=run_mode)
-        self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["single_pass"])
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-ok")
-    result = self._launch_network(plugin, engagement=single, run_mode="SINGLEPASS")
-    self.assertNotIn("error", result)
-    self.assertEqual(self._latest_job_config(plugin)["run_mode"], "SINGLEPASS")
-    continuous = {**_engagement("webapp"), "allowed_run_modes": ["continuous"]}
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp")
-    result = self._launch_webapp(plugin, engagement=continuous, run_mode="SINGLEPASS")
-    self._refused(plugin, result, "run_mode_not_authorized", allowed_run_modes=["continuous"])
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-webapp-ok")
-    self.assertNotIn("error", self._launch_webapp(plugin, engagement=continuous))
-
-  def test_launch_test_reaches_the_run_mode_gate(self):
-    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-test")
-    self._refused(plugin, self._launch(plugin, engagement=single), "run_mode_not_authorized",
-                  allowed_run_modes=["single_pass"])
-
-  def test_the_run_mode_gate_comes_before_the_unsafe_confirmations(self):
-    # A disallowed mode is the answer, not a confirmation the operator could never usefully give.
-    single = {**_engagement("network"), "allowed_run_modes": ["single_pass"]}
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first")
-    result = self._launch_network(plugin, engagement=single, monitor_interval=1)
-    self._refused(plugin, result, "run_mode_not_authorized")
-    plugin = self._build_mock_plugin(job_id="engagement-run-mode-first-webapp")
-    result = self._launch_webapp(plugin, engagement={**_engagement("webapp"), "allowed_run_modes": ["single_pass"]},
-                                 monitor_interval=1)
-    self._refused(plugin, result, "run_mode_not_authorized")
-
-  def test_engagement_port_scope_admits_a_narrower_run(self):
-    # Owner, 2026-09-28: a run may use any part of the engagement's scope.
+  def test_a_launch_uses_any_port_range(self):
+    # RM-128: any port range launches; the record has no authorized_ports.
     plugin = self._build_mock_plugin(job_id="engagement-narrow")
-    result = self._launch_network(plugin, authorized_ports="22,443,8000-9000", start_port=8080, end_port=8090)
+    result = self._launch_network(plugin, start_port=8080, end_port=8090)
     self.assertNotIn("error", result)
     config = self._latest_job_config(plugin)
-    self.assertEqual((config["start_port"], config["end_port"], config["authorized_ports"]),
-                     (8080, 8090, "22,443,8000-9000"))
+    self.assertEqual((config["start_port"], config["end_port"]), (8080, 8090))
+    self.assertNotIn("authorized_ports", config)
     self.assertNotIn("authorization_update", config)
 
-  def test_engagement_authorization_update_widens_ports_only(self):
-    engagement = {**_engagement("network"), "authorized_tests": ["service_info_common"]}
-    plugin = self._build_mock_plugin(job_id="engagement-update")
-    result = self._launch_network(plugin, engagement=engagement, authorized_ports="1-1024", end_port=1100,
-                                  authorization_update=dict(self._UPDATE))
-    self._refused(plugin, result, "tests_exceed_authorization")
-
-  def test_launch_test_widened_without_an_update_is_refused(self):
-    plugin = self._build_mock_plugin(job_id="scope-test-2")
-    result = self._launch(plugin, authorized_ports="1-1024", end_port=1100)
-    self.assertEqual(result["error"], "scope_exceeds_authorization")
-    self.assertEqual(result["status_code"], 400)
-    self.assertEqual(result["out_of_scope_ports"], "1025-1100")
-    self.assertIsNone(self._latest_job_config(plugin))
-
-  def test_launch_test_in_scope_is_unchanged(self):
+  def test_launch_test_uses_any_port_range(self):
     plugin = self._build_mock_plugin(job_id="scope-test-3")
-    result = self._launch(plugin, authorized_ports="1-1024")
+    result = self._launch(plugin, end_port=1100)
     self.assertNotIn("error", result)
     config = self._latest_job_config(plugin)
-    self.assertEqual(config["authorized_ports"], "1-1024")
+    self.assertNotIn("authorized_ports", config)
     self.assertNotIn("authorization_update", config)
 
   def test_the_plugin_version_is_the_recorded_release(self):
@@ -951,6 +812,47 @@ class TestPhase1ConfigCID(unittest.TestCase):
     config_dict = self._latest_job_config(plugin)
     self.assertEqual(config_dict["scan_min_delay"], 3.0)
     self.assertEqual(config_dict["scan_max_delay"], 10.0)
+
+  def test_a_prod_asset_keeps_dune_at_or_above_the_network_defaults(self):
+    """RM-131: below the floor or with Dune off, a prod (or unset) asset is refused before any write."""
+    for environment in ("prod", None):
+      for delays in ({"scan_min_delay": 10, "scan_max_delay": 70}, {"scan_min_delay": 25, "scan_max_delay": 30},
+                     {"scan_min_delay": 15, "scan_max_delay": 15,
+                      "unsafe_launch_confirmations": ["dune-delay-below-production"]},
+                     {"scan_min_delay": 0, "scan_max_delay": 0, "unsafe_launch_confirmations": ["dune-disabled"]}):
+        with self.subTest(environment=environment, delays=delays):
+          plugin = self._build_mock_plugin(job_id="test-job-prod-floor")
+          result = self._launch_network(plugin, environment=environment, **delays)
+          self.assertEqual((result["error"], result["environment"], result["min_seconds"], result["max_seconds"]),
+                           ("environment_dune_floor", "prod", 25.0, 70.0))
+          self.assertIsNone(self._latest_job_config(plugin))
+    # At or above the defaults (zeros take the defaults) it runs.
+    for delays in ({}, {"scan_min_delay": 25, "scan_max_delay": 70}, {"scan_min_delay": 30, "scan_max_delay": 90}):
+      with self.subTest(delays=delays):
+        plugin = self._build_mock_plugin(job_id="test-job-prod-raised")
+        self.assertNotIn("error", self._launch_network(plugin, environment="prod", **delays))
+
+  def test_a_prod_asset_keeps_dune_at_or_above_the_webapp_defaults(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-prod-floor")
+    result = self._launch_webapp(plugin, environment="prod", scan_min_delay=2, scan_max_delay=10)
+    self.assertEqual((result["error"], result["min_seconds"], result["max_seconds"]),
+                     ("environment_dune_floor", 3.0, 10.0))
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-prod-dune-off")
+    result = self._launch_webapp(plugin, environment="prod", scan_min_delay=0, scan_max_delay=0,
+                                 unsafe_launch_confirmations=["dune-disabled"])
+    self.assertEqual(result["error"], "environment_dune_floor")
+    self.assertIsNone(self._latest_job_config(plugin))
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-prod-ok")
+    self.assertNotIn("error", self._launch_webapp(plugin, environment="prod", scan_min_delay=3, scan_max_delay=12))
+
+  def test_a_non_prod_asset_keeps_the_confirmations(self):
+    for environment in ("dev", "test", "qa", "staging"):
+      with self.subTest(environment=environment):
+        plugin = self._build_mock_plugin(job_id="test-job-dev-dune-off")
+        result = self._launch_network(plugin, environment=environment, scan_min_delay=0, scan_max_delay=0,
+                                      unsafe_launch_confirmations=["dune-disabled"])
+        self.assertNotIn("error", result)
+        self.assertEqual(self._latest_job_config(plugin)["scan_min_delay"], 0.0)
 
   def test_launch_rejects_unconfirmed_unsafe_network_settings_before_persistence(self):
     plugin = self._build_mock_plugin(job_id="test-job-unsafe-network")
@@ -1817,7 +1719,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
     self.assertEqual(config_dict["target_confirmation"], "example.com")
     self.assertEqual(config_dict["engagement_id"], "en_00000000-0000-4000-8000-000000000003")
-    self.assertEqual(config_dict["authorized_tests"], ["graybox"])
+    self.assertNotIn("authorized_tests", config_dict)
     self.assertNotIn("engagement_metadata", config_dict)
     # The node's configured allowlist still reaches the worker, which enforces its path scopes.
     self.assertEqual(config_dict["target_allowlist"], ["example.com", "/api/"])
@@ -2054,7 +1956,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(webapp_kwargs["request_budget"], 42)
 
   def test_launch_test_snapshots_the_engagement(self):
-    """RM-095: the job's context, RoE and authorization come from the engagement."""
+    """RM-095: the job's context and authorization come from the engagement (RM-128: no RoE)."""
     plugin = self._build_mock_plugin(job_id="test-job-ptes-context")
 
     result = self._launch(plugin)
@@ -2063,10 +1965,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
     config_dict = self._latest_job_config(plugin)
     engagement = _engagement("network")
     self.assertEqual(config_dict["engagement"], engagement["context"])
-    self.assertEqual(config_dict["roe"], engagement["roe"])
+    self.assertNotIn("roe", config_dict)
     self.assertEqual(config_dict["authorization"], engagement["authorization"])
-    self.assertEqual((config_dict["engagement_id"], config_dict["engagement_hash"], config_dict["authorized_tests"]),
-                     (engagement["engagement_id"], engagement["engagement_hash"], engagement["authorized_tests"]))
+    self.assertEqual((config_dict["engagement_id"], config_dict["engagement_hash"]),
+                     (engagement["engagement_id"], engagement["engagement_hash"]))
 
   def test_the_job_level_context_parameters_are_gone(self):
     """RM-095 hard gate: the request can no longer carry its own RoE, context or authorization."""

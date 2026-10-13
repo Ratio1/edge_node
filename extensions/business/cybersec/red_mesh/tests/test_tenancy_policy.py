@@ -58,6 +58,8 @@ class TestTenantPolicy(unittest.TestCase):
       # RM-120 (owner, 2026-10-06): pentesters never see a self-assessment.
       ("compliance_assessments:view",   (True, False, True, False, True)),
       ("compliance_assessments:manage", (True, False, True, False, False)),
+      # RM-125: only the Super-Tenant Admin registers assets.
+      ("assets:manage",           (True, False, False, False, False)),
     )
     for operation, expected in rows:
       for role, allowed in zip(roles, expected):

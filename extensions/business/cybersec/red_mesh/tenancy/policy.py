@@ -34,6 +34,8 @@ _ROLE_OPERATIONS = {
     # RM-120. Framework maturity self-assessment: governance data, read by the tenant roles that
     # hold reports:view except the pentesters (owner, 2026-10-06), written by the admins.
     "compliance_assessments:view", "compliance_assessments:manage",
+    # RM-125. Registers, edits, archives and deletes the tenant's assets (owner, 2026-10-09).
+    "assets:manage",
   }),
   "super_pentester": frozenset({
     "allow_pentester:update", "tasks:launch", "tasks:update",

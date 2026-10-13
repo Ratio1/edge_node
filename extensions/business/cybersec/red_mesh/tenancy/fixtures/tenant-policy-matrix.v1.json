@@ -27,6 +27,7 @@
     "super_tenant_admin": [
       "allow_pentester:update",
       "analysis:run",
+      "assets:manage",
       "attestation_keys:manage",
       "audit:view",
       "authorization:upload",
