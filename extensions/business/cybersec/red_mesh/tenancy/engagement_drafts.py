@@ -12,6 +12,7 @@ from .drafts import ITEM_STATES, _UUID, _nonempty_text, valid_draft_id, valid_ge
 from .engagements import (EngagementInvalid, MAX_ENGAGEMENT_ASSETS, _asset_entry_valid, normalize_context,
                           normalize_engagement_assets, normalize_instant, normalize_window,
                           valid_doc_ref)
+from .tenant_contracts import valid_contract_id
 
 # The `create_engagement` argument set, in the order `missing[]` reports them.
 FIELDS = ("display_name", "valid_from", "valid_until", "context", "assets")
@@ -19,6 +20,10 @@ FIELDS = ("display_name", "valid_from", "valid_until", "context", "assets")
 DOCUMENT_KIND = "engagement_pack"
 DTO_FIELDS = ("engagement_draft_id", "parent", *FIELDS, "document", "created_by", "created_at",
               "updated_by", "updated_at")
+# RM-133: the contract the engagement binds to at activation (`c_<n>`), or None for `c_1`; a row
+# written before the key existed reads as None.
+CONTRACT_PICK = "contract_id"
+
 
 
 class EngagementDraftInvalid(Exception):
@@ -92,9 +97,23 @@ def new_draft(engagement_draft_id, parent, display_name, actor_id, now):
     "engagement_draft_id": engagement_draft_id, "parent": dict(parent),
     **{field: _NORMALIZE[field](_EMPTY[field]) for field in FIELDS},
     "display_name": _display_name(display_name),
-    "document": {"state": "missing", "document": None, "generated": None},
+    "document": {"state": "missing", "document": None, "generated": None}, CONTRACT_PICK: None,
     "created_by": actor_id, "created_at": now, "updated_by": actor_id, "updated_at": now,
   }
+
+
+def contract_pick(row):
+  return row.get(CONTRACT_PICK)
+
+
+def _contract_pick(value):
+  """RM-133: `c_<n>` or empty (None, `""`) for `c_1`; the format only, the administration checks
+  that the tenant holds it (`contract_unknown`)."""
+  if value is None or value == "":
+    return None
+  if not valid_contract_id(value):
+    raise EngagementDraftInvalid("contract_unknown")
+  return value
 
 
 def apply_changes(row, changes):
@@ -105,13 +124,15 @@ def apply_changes(row, changes):
   keeps `generated`), `awaiting_signature` only without a file; `signed` is set by an upload alone
   and `generated` by `store_generated_document` alone.
   """
-  if not isinstance(changes, dict) or any(key not in (*FIELDS, "document") for key in changes):
+  if not isinstance(changes, dict) or any(key not in (*FIELDS, "document", CONTRACT_PICK) for key in changes):
     raise EngagementDraftInvalid()
   row = {**row, "document": dict(row["document"])}
   dropped = []
   for field in FIELDS:
     if field in changes:
       row[field] = _NORMALIZE[field](changes[field])
+  if CONTRACT_PICK in changes:
+    row[CONTRACT_PICK] = _contract_pick(changes[CONTRACT_PICK])
   _check_window(row)
   if "document" in changes:
     change = changes["document"]
@@ -174,14 +195,16 @@ def completeness(row):
 
 
 def draft_dto(row):
-  return {**{key: row[key] for key in DTO_FIELDS}, "completeness": completeness(row)}
+  return {**{key: row[key] for key in DTO_FIELDS}, CONTRACT_PICK: contract_pick(row), "completeness": completeness(row)}
 
 
 def draft_list_row(row):
   return {"engagement_draft_id": row["engagement_draft_id"], "parent": row["parent"],
           "display_name": row["display_name"], "assets_count": len(row["assets"]),
           "document_state": row["document"]["state"], "created_at": row["created_at"],
-          "updated_at": row["updated_at"]}
+          "updated_at": row["updated_at"],
+          # RM-133: the contract pick, so the Documents page groups a draft under its contract.
+          CONTRACT_PICK: contract_pick(row)}
 
 
 def _same(normalize, value):
@@ -217,6 +240,7 @@ def validate_engagement_draft(row, ids):
       or (slot["document"] is not None and (not valid_doc_ref(slot["document"])
                                             or slot["document"]["mime"] != "application/pdf"))
       or not valid_generated(slot["generated"])
+      or not (contract_pick(row) is None or valid_contract_id(contract_pick(row)))
       or not all(_nonempty_text(row.get(key)) for key in ("created_by", "created_at", "updated_by", "updated_at"))):
     raise ValueError("Invalid engagement draft record")
   try:

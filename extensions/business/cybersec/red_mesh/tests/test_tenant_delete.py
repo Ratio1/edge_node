@@ -96,8 +96,10 @@ class TestTenantDelete(unittest.TestCase):
     self.put_job("other-job", "tn_" + str(uuid4()))
     result = self.plugin.delete_tenant(self.actor, self.tenant)
     self.assertTrue(result["success"], result)
+    # RM-133: the answer also counts the contract drafts that went with the tenant.
     self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1,
-                                      "integrations": 0, "assets": 2, "nodeAssignments": 0, "documents": 3})
+                                      "integrations": 0, "assets": 2, "nodeAssignments": 0, "contractDrafts": 0,
+                                      "documents": 3})
     self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", *self.engagement_refs]))
     rows = self.tenancy_rows()
     for kind in ("tenant", "receipt", "engagement", "asset", "tenant_asset"):

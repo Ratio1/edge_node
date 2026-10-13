@@ -14,6 +14,7 @@ import json
 import re
 
 from .assets import normalize_name, valid_digest
+from .contacts import valid_email, valid_phone
 from .engagements import valid_doc_ref
 from .identity import canonical_account_id
 from .nodes import NODE_ASSIGNMENT_MODES, valid_node_address
@@ -99,6 +100,26 @@ def text(value, maximum):
 _text = text
 
 
+def email_text(value):
+  """RM-132: a contact e-mail, empty allowed; otherwise `contacts.valid_email` (`contact_email_invalid`)."""
+  value = text(value, _LEGAL_MAX)
+  if value and not valid_email(value):
+    raise DraftInvalid("contact_email_invalid")
+  return value
+
+
+def phone_text(value):
+  """RM-132: a contact phone, empty allowed; otherwise `contacts.valid_phone` (`contact_phone_invalid`)."""
+  value = text(value, _LEGAL_MAX)
+  if value and not valid_phone(value):
+    raise DraftInvalid("contact_phone_invalid")
+  return value
+
+
+# RM-132: the party fields with a format beyond free text; every other field is `text`.
+LEGAL_FORMATS = {"contact_email": email_text, "contact_phone": phone_text}
+
+
 def normalize_display_name(value):
   return _text(value, _DISPLAY_NAME_MAX)
 
@@ -143,7 +164,8 @@ def normalize_legal(value, current):
   """A partial change: only the keys sent are replaced."""
   if not isinstance(value, dict) or any(key not in LEGAL_ALL_FIELDS for key in value):
     raise DraftInvalid()
-  return {**current, **{key: _text(text, _LEGAL_MAX) for key, text in value.items()}}
+  return {**current, **{key: LEGAL_FORMATS[key](text) if key in LEGAL_FORMATS else _text(text, _LEGAL_MAX)
+                        for key, text in value.items()}}
 
 
 def normalize_snapshot(value):

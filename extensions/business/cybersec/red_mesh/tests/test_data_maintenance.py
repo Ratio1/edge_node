@@ -292,6 +292,46 @@ class TestDataMaintenance(unittest.TestCase):
     self.assertEqual((row["class"], row["reason"]), ("old", "unrecognized"))
     self.assertEqual(row["cids"], [{"cid": cid(40), "role": "items.contract.document.ref", "withheld": False}])
 
+  # RM-133: a contract draft is keyed by its tenant and takes the related-tenant rule; the tenant
+  # row that counts its contracts stays current.
+  def test_a_contract_draft_is_current_under_its_tenant_with_its_files_and_old_without(self):
+    created = self.plugin.create_tenant_contract_draft(self.actor, self.tenant, str(uuid4()))
+    self.assertTrue(created["success"], created)
+    field = json.dumps(["tenant_contract_draft", "deployment", self.tenant, created["data"]["contract_id"]],
+                       separators=(",", ":"))
+    row = self.storage.data[(TENANCY, field)]
+    row.update(state="signed", document={
+      "store": "r1fs", "ref": cid(70), "filename": "contract.pdf", "mime": "application/pdf",
+      "uploaded_at": "2026-10-12T00:00:00Z", "uploaded_by": "creator", "sha256": "b" * 64, "size_bytes": 10})
+    self.events.clear()
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    self.assertEqual(self.storage.data[(TENANCY, tenant)]["next_contract_no"], 3)
+    rows = self.scan()
+    scanned = rows[(TENANCY, field)]
+    self.assertEqual((scanned["class"], scanned["reason"]), ("current", ""))
+    self.assertEqual(scanned["cids"], [{"cid": cid(70), "role": "document.ref", "withheld": False}])
+    self.assertEqual(rows[(TENANCY, tenant)]["class"], "current")
+    self.assertEqual(self.clean(scanned)[0]["outcome"], "not_old")
+    self.assertEqual(self.files.deleted, [])
+    # A tenant row carrying a further contract stays current and its files are in the inventory.
+    block = {"contract": {**row["document"], "ref": cid(71)}, "contract_generated": None, "effective_from": "2027-01-01", "effective_until": None,
+             "nodes": [{"node_address": "Node-A", "mode": "shared"}], "activated_by": "creator", "activated_at": "2026-10-13T00:00:00Z",
+             "supersedes": None, "superseded_by": None}
+    self.storage.data[(TENANCY, tenant)]["contracts"] = {"c_2": block}
+    with_contracts = self.scan()[(TENANCY, tenant)]
+    self.assertEqual(with_contracts["class"], "current")
+    self.assertIn({"cid": cid(71), "role": "contracts.c_2.contract.ref", "withheld": False}, with_contracts["cids"])
+    # A malformed row is old; one whose tenant is gone is an orphan.
+    self.storage.data[(TENANCY, field)]["state"] = "done"
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "old")
+    self.storage.data[(TENANCY, field)]["state"] = "signed"
+    del self.storage.data[(TENANCY, tenant)]["contract"]
+    scanned = self.scan()[(TENANCY, field)]
+    self.assertEqual((scanned["class"], scanned["reason"]), ("old", "old_tenant"))
+    self.storage.data[(TENANCY, tenant)] = None
+    scanned = self.scan()[(TENANCY, field)]
+    self.assertEqual((scanned["class"], scanned["reason"]), ("orphan", "tenant_gone"))
+
   def engagement_draft_row(self, parent, first_cid):
     """RM-109 phase 4. A child with a signed and a generated pack file, written through the real endpoint."""
     created = self.plugin.create_engagement_draft(self.actor, parent, str(uuid4()), "Pack")
@@ -404,6 +444,33 @@ class TestDataMaintenance(unittest.TestCase):
     del self.storage.data[(TENANCY, tenant)]
     self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
     self.storage.data[(TENANCY, field)]["legal_name"] = 7
+    self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
+
+  def test_the_super_tenant_branding_is_current_with_its_logo_and_cleanup_keeps_it(self):
+    # RM-134: one row per deployment, as the profile; its logo's ref is a file the row names.
+    from .contract_fixture import FakeDocumentStore
+    from .test_super_tenant_branding import png, upload
+
+    class CidDocuments(FakeDocumentStore):
+      def put(self, envelope):
+        ref = super().put(envelope)
+        address = cid(90 + int(ref[4:]))
+        self.envelopes[address] = self.envelopes.pop(ref)
+        return address
+    documents = CidDocuments()
+    self.plugin._document_store = lambda: documents
+    updated = self.plugin.update_super_tenant_branding(self.actor, {"theme": "navy", "logo": upload(png())})
+    self.assertTrue(updated["success"], updated)
+    self.events.clear()
+    field = json.dumps(["super_tenant_branding", "deployment", "deployment"], separators=(",", ":"))
+    row = self.scan()[(TENANCY, field)]
+    self.assertEqual((row["class"], row["reason"]), ("current", ""))
+    self.assertEqual([(file["cid"], file["role"]) for file in row["cids"]], [(cid(91), "logo.ref")])
+    self.assertEqual(self.clean(row)[0]["outcome"], "not_old")
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, field)]["class"], "current")
+    self.storage.data[(TENANCY, field)]["theme"] = "pink"
     self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
 
   def test_a_tenant_activated_from_a_draft_is_current_with_all_its_files(self):
