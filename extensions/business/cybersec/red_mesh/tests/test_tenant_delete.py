@@ -114,7 +114,7 @@ class TestTenantDelete(unittest.TestCase):
                                             **install_contract(self.plugin)), 409, "domain_conflict")
     self.assertEqual(self.events, [("tenant_deleted", {
       "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "integrations": 0, "assets": 2,
-      "nodeAssignments": 0, "documents": 3})])
+      "nodeAssignments": 0, "assessments": 0, "documents": 3})])
     self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 404, "not_found")
 
   def test_a_tenant_with_jobs_is_refused_before_anything_changes(self):
