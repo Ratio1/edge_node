@@ -124,6 +124,14 @@ class TestBrandingLogo(_BrandingCase):
   def test_a_jpeg_is_accepted(self):
     self.assertEqual(ok(self, self.update({"logo": upload(jpeg(), "logo.jpg")}))["logo"]["mime"], "image/jpeg")
 
+  def test_a_jpeg_with_its_tables_before_the_frame_header_is_accepted(self):
+    # DQT and DHT before SOF0 is a legal layout some encoders write; DHT (0xC4) is not a frame coding.
+    raw = jpeg()
+    tables = b"\xff\xdb\x00\x43\x00" + b"\x01" * 64 + b"\xff\xc4\x00\x14\x00" + b"\x00" * 17
+    at = raw.index(b"\xff\xc0")
+    data = ok(self, self.update({"logo": upload(raw[:at] + tables + raw[at:], "logo.jpg")}))
+    self.assertEqual(data["logo"]["mime"], "image/jpeg")
+
   def test_bad_logos_are_refused_logo_invalid_and_leave_no_file(self):
     svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
     cases = {"600 KB": png(size=600 * 1024), "2000x300": png(2000, 300), "1024x257": png(1024, 257),

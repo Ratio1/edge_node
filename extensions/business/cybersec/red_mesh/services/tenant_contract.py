@@ -136,7 +136,9 @@ def image_size(raw, mime):
       if length < 7 or at + 9 > len(raw):
         return None
       return int.from_bytes(raw[at + 7:at + 9], "big"), int.from_bytes(raw[at + 5:at + 7], "big")
-    if marker in (0xD9, 0xDA, *range(0xC3, 0xD0)) or length < 2:
+    # Other frame codings (SOF3, SOF5-7, SOF9-11, SOF13-15); DHT (C4), JPG (C8) and DAC (CC) are table
+    # segments and are skipped like any other.
+    if marker in (0xD9, 0xDA, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF) or length < 2:
       return None
     at += 2 + length
   return None
