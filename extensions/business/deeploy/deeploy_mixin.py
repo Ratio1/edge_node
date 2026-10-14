@@ -1744,7 +1744,7 @@ class _DeeployMixin:
 
   # Repairs Deeploy's off-chain pipeline metadata and live node configs after
   # PoAI Manager moves a CSP escrow to a new owner on-chain.
-  def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner):
+  def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner, transfer_id=None):
     pipeline_cid = self._get_pipeline_from_cstore(job_id)
     if not pipeline_cid:
       return {
@@ -1773,6 +1773,9 @@ class _DeeployMixin:
         DEEPLOY_KEYS.JOB_ID: job_id,
         DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid,
       }
+
+    if pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision"):
+      return self._admit_owner_transfer_operation(job_id, old_owner, new_owner, transfer_id)
 
     migrated_pipeline = self.deepcopy(pipeline)
     previous_owner = migrated_pipeline.get(NetMonCt.OWNER.upper())
@@ -4397,7 +4400,11 @@ class _DeeployMixin:
 
   def _cockroachdb_regeneration_intent_hash(self, inputs):
     payload = self.deepcopy(dict(inputs))
-    for key in (*DEEPLOY_V3_HASH_EXCLUDED_KEYS, DEEPLOY_KEYS.NONCE, COCKROACHDB_CERT_REGENERATION_REQUEST_KEY):
+    for key in (
+      *DEEPLOY_V3_HASH_EXCLUDED_KEYS, DEEPLOY_KEYS.NONCE,
+      COCKROACHDB_CERT_REGENERATION_REQUEST_KEY,
+      "request_id", "expected_revision", DEEPLOY_KEYS.CHAINSTORE_RESPONSE,
+    ):
       payload.pop(key, None)
     pipeline_params = payload.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
     allocation = (
@@ -4434,10 +4441,8 @@ class _DeeployMixin:
     if not regeneration_id:
       return None, None, False
 
-    if not bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False)):
-      raise ValueError(
-        "CockroachDB certificate regeneration requires all-node response confirmation."
-      )
+    # The durable deployment protocol requires node-owned readiness from every
+    # target; the removed plugin response flag cannot weaken this barrier.
     intent_hash = self._cockroachdb_regeneration_intent_hash(inputs)
     if applied_operation:
       applied_id, applied_intent = applied_operation

@@ -25,6 +25,7 @@ from naeural_core.business.default.web_app.supervisor_fast_api_web_app import Su
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
 from extensions.business.dauth.dauth_mixin import (
   DAUTH_JOB_SECRETS_CSTORE_HKEY,
+  DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
   _DauthMixin,
 )
 from extensions.business.dauth.dauth_registry import (
@@ -317,13 +318,15 @@ class DauthManagerPlugin(
       return None
 
     self._last_dauth_job_secrets_hsync = now
-    try:
-      return self.chainstore_hsync(
-        hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
-        **dauth_registry_write_kwargs(self),
-      )
-    except Exception as exc:
-      self.P(f"Could not sync dAuth job secrets: {exc}", color="y")
+    for hkey in (DAUTH_JOB_SECRETS_CSTORE_HKEY, DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY):
+      try:
+        self.chainstore_hsync(
+          hkey=hkey,
+          timeout=5,
+          **dauth_registry_write_kwargs(self),
+        )
+      except Exception as exc:
+        self.P(f"Could not sync dAuth job secrets: {exc}", color="y")
     return None
 
   def __get_current_epoch(self):
@@ -463,10 +466,11 @@ class DauthManagerPlugin(
   # /get_secrets
   def get_secrets(self, body: dict):
     """
-    Return an encrypted job secret bundle to a current R1FS job runner.
+    Return an encrypted secret revision to a node in its immutable execution plan.
 
     The signed request must include a hex-millisecond timestamp nonce no older
-    than 120 seconds. The signed response echoes that nonce.
+    than 120 seconds and the required secret revision. The signed response
+    echoes both and the encrypted bundle is bound to the revision.
     """
     request_nonce = body.get("nonce") if isinstance(body, dict) else None
     if not self._is_dauth_server_enabled():
@@ -481,7 +485,8 @@ class DauthManagerPlugin(
     except Exception as e:
       self.P("Error processing get_secrets request: {}".format(e), color='r')
       data = {
-        'error' : str(e)
+        'error': str(e),
+        'retryable': not isinstance(e, ValueError),
       }
 
     response = self.__get_response({

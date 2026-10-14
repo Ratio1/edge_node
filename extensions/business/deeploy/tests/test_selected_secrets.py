@@ -1,3 +1,4 @@
+from extensions.business.deeploy.tests.support import submit_deployment, capture_deployment_admission
 import copy
 import unittest
 
@@ -259,18 +260,20 @@ class SelectedSecretRequestTests(unittest.TestCase):
     }
     return plugin, called, request
 
-  def test_create_and_update_stage_selected_values_before_dispatch(self):
+  def test_create_and_update_prepare_selected_values_without_dispatch(self):
     for create in (True, False):
       with self.subTest(create=create):
         plugin, called, request = self.make_fixture()
-        response = plugin._process_pipeline_request(request, is_create=create)
-        self.assertEqual(response["status"], "success", response)
-        self.assertEqual(called["stage"], 1)
-        self.assertEqual(instance(called["staged_pipeline"])["ENV"]["CUSTOM_VALUE"], HIDDEN)
-        self.assertEqual(instance(called["staged_secret_bundle"]["job_secrets"])["ENV"]["CUSTOM_VALUE"], "selected-plaintext")
-        returned = response["request"]["plugins"][0]
-        self.assertEqual(returned["ENV"], {"CUSTOM_VALUE": HIDDEN, "PUBLIC": "visible"})
-        configs = called["deploy_kwargs"]["prepared_pipeline_configs"]
+        response = submit_deployment(plugin, request, is_create=create)
+        self.assertEqual(response["status"], "accepted", response)
+        self.assertEqual(called["stage"], 0)
+        self.assertEqual(instance(called["admitted_pipeline"])["ENV"]["CUSTOM_VALUE"], HIDDEN)
+        self.assertEqual(instance(called["admitted_secret_bundle"]["job_secrets"])["ENV"]["CUSTOM_VALUE"], "selected-plaintext")
+        self.assertNotIn("request", response)
+        returned = instance(called["admitted_pipeline"])
+        self.assertEqual(returned["ENV"]["CUSTOM_VALUE"], HIDDEN)
+        self.assertEqual(returned["ENV"]["PUBLIC"], "visible")
+        configs = called["admission_kwargs"]["prepared_pipeline_configs"]
         self.assertNotIn("selected-plaintext", str(configs))
 
   def test_invalid_or_injected_selections_fail_before_stage_delete_or_dispatch(self):
@@ -281,10 +284,10 @@ class SelectedSecretRequestTests(unittest.TestCase):
       ):
         plugin, called, request = self.make_fixture()
         change(request)
-        response = plugin._process_pipeline_request(request, is_create=create)
-        self.assertEqual(response["status"], "failed")
-        self.assertEqual((called["stage"], called["delete"], called["deploy"]), (0, 0, 0))
-        self.assertNotIn("selected-plaintext", response["error"])
+        response = submit_deployment(plugin, request, is_create=create)
+        self.assertEqual(response["status"], "error")
+        self.assertEqual((called["stage"], called["delete"], called["admitted"]), (0, 0, 0))
+        self.assertNotIn("selected-plaintext", response["error"]["message"])
 
   def test_old_client_update_preserves_metadata_and_hidden_value(self):
     plugin, called, request = self.make_fixture()
@@ -295,10 +298,10 @@ class SelectedSecretRequestTests(unittest.TestCase):
     plugin.get_job_pipeline_from_cstore = lambda *args, **kwargs: copy.deepcopy(prior)
     request.pop("secret_paths")
     request["plugins"][0]["ENV"]["CUSTOM_VALUE"] = HIDDEN
-    response = plugin._process_pipeline_request(request, is_create=False)
-    self.assertEqual(response["status"], "success", response)
-    self.assertEqual(instance(called["staged_pipeline"])["SECRET_PATHS"], [["ENV", "CUSTOM_VALUE"]])
-    self.assertEqual(instance(called["staged_secret_bundle"]["job_secrets"])["ENV"]["CUSTOM_VALUE"], "selected-plaintext")
+    response = submit_deployment(plugin, request, is_create=False)
+    self.assertEqual(response["status"], "accepted", response)
+    self.assertEqual(instance(called["admitted_pipeline"])["SECRET_PATHS"], [["ENV", "CUSTOM_VALUE"]])
+    self.assertEqual(instance(called["admitted_secret_bundle"]["job_secrets"])["ENV"]["CUSTOM_VALUE"], "selected-plaintext")
 
   def test_explicit_deselection_of_hidden_value_fails_before_delete(self):
     plugin, called, request = self.make_fixture()
@@ -309,9 +312,9 @@ class SelectedSecretRequestTests(unittest.TestCase):
     plugin.get_job_pipeline_from_cstore = lambda *args, **kwargs: copy.deepcopy(prior)
     request["secret_paths"] = []
     request["plugins"][0]["ENV"]["CUSTOM_VALUE"] = HIDDEN
-    response = plugin._process_pipeline_request(request, is_create=False)
-    self.assertIn("replacement plaintext", response["error"])
-    self.assertEqual((called["stage"], called["delete"], called["deploy"]), (0, 0, 0))
+    response = submit_deployment(plugin, request, is_create=False)
+    self.assertIn("replacement plaintext", response["error"]["message"])
+    self.assertEqual((called["stage"], called["delete"], called["admitted"]), (0, 0, 0))
 
   def test_missing_bundle_does_not_discard_persisted_selection(self):
     plugin, called, request = self.make_fixture()
@@ -320,10 +323,11 @@ class SelectedSecretRequestTests(unittest.TestCase):
     }))
     plugin.get_job_pipeline_from_cstore = lambda *args, **kwargs: copy.deepcopy(prior)
     request.pop("secret_paths")
-    response = plugin._process_pipeline_request(request, is_create=False)
-    self.assertEqual(response["status"], "success", response)
-    self.assertEqual(instance(called["staged_pipeline"])["ENV"]["CUSTOM_VALUE"], HIDDEN)
-    self.assertEqual(response["request"]["plugins"][0]["ENV"]["CUSTOM_VALUE"], HIDDEN)
+    response = submit_deployment(plugin, request, is_create=False)
+    self.assertEqual(response["status"], "accepted", response)
+    self.assertEqual(instance(called["admitted_pipeline"])["ENV"]["CUSTOM_VALUE"], HIDDEN)
+    self.assertNotIn("request", response)
+    self.assertNotIn("selected-plaintext", str(response))
 
   def test_response_redaction_uses_inferred_identity_for_old_client(self):
     plugin, _, request = self.make_fixture()
@@ -361,12 +365,16 @@ class SelectedSecretRequestTests(unittest.TestCase):
             request["perNodeConfig"] = overlay
           else:
             entry["perNodeConfig"] = overlay
-        response = plugin._process_pipeline_request(request, is_create=False)
-        self.assertEqual(response["status"], "success", response)
+        response = submit_deployment(plugin, request, is_create=False)
+        self.assertEqual(response["status"], "accepted", response)
         self.assertNotIn("alias-selected-plaintext", str(response))
-        self.assertNotIn("alias-selected-plaintext", str(called["staged_pipeline"]))
-        self.assertNotIn("app_params", response["request"])
-        returned = response["request"]
+        self.assertNotIn("alias-selected-plaintext", str(called["admitted_pipeline"]))
+        self.assertNotIn("request", response)
+        returned = plugin._redact_deeploy_dauth_secrets_for_response(
+          request, pipeline=called["admitted_pipeline"],
+          normalized_plugins=called["admission_kwargs"]["inputs"]["plugins"],
+        )
+        self.assertNotIn("alias-selected-plaintext", str(returned))
         if form == "plugin-alias":
           returned_overlay = returned["plugins"][0]["perNodeConfig"]
           self.assertNotIn("PER_NODE_CONFIG", returned["plugins"][0])
@@ -408,19 +416,24 @@ class SelectedSecretRequestTests(unittest.TestCase):
         plugin.get_job_pipeline_from_cstore = lambda *args, **kwargs: copy.deepcopy(prior)
         request.pop("secret_paths")
         request["plugins"][0]["PER_NODE_CONFIG"] = copy.deepcopy(aliased)
-        response = plugin._process_pipeline_request(request, is_create=False)
-        self.assertEqual(response["status"], "success", response)
-        self.assertNotIn("section-alias-secret", str(called["staged_pipeline"]))
-        self.assertEqual(response["request"]["plugins"][0]["PER_NODE_CONFIG"], hidden_values(aliased))
+        response = submit_deployment(plugin, request, is_create=False)
+        self.assertEqual(response["status"], "accepted", response)
+        self.assertNotIn("section-alias-secret", str(called["admitted_pipeline"]))
+        self.assertNotIn("request", response)
+        redacted_request = plugin._redact_deeploy_dauth_secrets_for_response(
+          request, pipeline=called["admitted_pipeline"],
+          normalized_plugins=called["admission_kwargs"]["inputs"]["plugins"],
+        )
+        self.assertEqual(redacted_request["plugins"][0]["PER_NODE_CONFIG"], hidden_values(aliased))
         # Explicit removal through an alias must still require real plaintext.
         plugin, called, _ = self.make_fixture()
         plugin._load_dauth_job_secret_bundle = lambda job_id: {"job_secrets": secrets}
         plugin.get_job_pipeline_from_cstore = lambda *args, **kwargs: copy.deepcopy(prior)
         request["secret_paths"] = []
         request["plugins"][0]["PER_NODE_CONFIG"] = hidden_values(aliased)
-        response = plugin._process_pipeline_request(request, is_create=False)
-        self.assertIn("replacement plaintext", response["error"])
-        self.assertEqual((called["stage"], called["delete"], called["deploy"]), (0, 0, 0))
+        response = submit_deployment(plugin, request, is_create=False)
+        self.assertIn("replacement plaintext", response["error"]["message"])
+        self.assertEqual((called["stage"], called["delete"], called["admitted"]), (0, 0, 0))
 
   def test_managed_update_preserves_custom_and_mandatory_secret_paths(self):
     fixture = update_tests.DeeployUpdateRequestPreparationTests()
@@ -434,10 +447,10 @@ class SelectedSecretRequestTests(unittest.TestCase):
       "target_nodes": nodes, "target_nodes_count": len(nodes), "plugins": [entry],
       "secret_paths": [["plugins", 0, "ENV", "CUSTOM_VALUE"]],
     }
-    response = plugin._process_pipeline_request(request, is_create=False)
-    self.assertEqual(response["status"], "success", response)
-    self.assertEqual(instance(called["staged_pipeline"])["ENV"]["CUSTOM_VALUE"], HIDDEN)
-    env = instance(called["staged_secret_bundle"]["job_secrets"])["ENV"]
+    response = submit_deployment(plugin, request, is_create=False)
+    self.assertEqual(response["status"], "accepted", response)
+    self.assertEqual(instance(called["admitted_pipeline"])["ENV"]["CUSTOM_VALUE"], HIDDEN)
+    env = instance(called["admitted_secret_bundle"]["job_secrets"])["ENV"]
     self.assertEqual(env["CUSTOM_VALUE"], "managed-custom-secret")
     self.assertIn("CRDB_PASSWORD", env)
 

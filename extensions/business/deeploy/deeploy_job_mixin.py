@@ -135,6 +135,42 @@ class _DeeployJobMixin:
 
     return result
 
+  def commit_deployment_revision(self, operation, pipeline, secret_bundle):
+    """Publish a versioned active revision after every workload is ready.
+
+    Metadata generations increase on each mutation, including restoration and
+    deletion. Content revision may return to the previous revision on rollback.
+    A partial write is repaired by replaying these exact signed records; never
+    compensate by writing an older generation over a newer one.
+    """
+    from .deployment_operations import SIGNATURE_KEYS
+
+    pipeline = self.extract_invariable_data_from_pipeline(pipeline)
+    pipeline.pop("DEEPLOY_OPERATION", None)
+    cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
+    if not cid:
+      raise RuntimeError("Deployment metadata persistence is pending.")
+    job_id = str(operation["job_id"])
+    previous_cid = self._get_pipeline_from_cstore(job_id)
+    bundle = self.deepcopy(secret_bundle)
+    for key in SIGNATURE_KEYS:
+      bundle.pop(key, None)
+    bundle.update(job_id=job_id, deployment_revision=operation["target_revision"],
+                  operation_id=operation["operation_id"], coordinator=operation["coordinator"],
+                  deleted=False)
+    bundle[DAUTH_SECRET_PIPELINE_CID_KEY] = cid
+    self.bc.sign(bundle, add_data=True, use_digest=True)
+    pointer = dict(job_id=job_id, revision=operation["target_revision"],
+                   operation_id=operation["operation_id"], coordinator=operation["coordinator"],
+                   pipeline_cid=cid, deleted=False)
+    self.bc.sign(pointer, add_data=True, use_digest=True)
+    if not self._write_dauth_job_secret_bundle(job_id, bundle):
+      raise RuntimeError("Deployment secret publication is pending.")
+    if not self._write_job_pipeline_cid(job_id, pointer):
+      raise RuntimeError("Deployment metadata publication is pending.")
+    if previous_cid and previous_cid != cid:
+      self._delete_pipeline_cid_from_r1fs(previous_cid)
+
   def _load_dauth_job_secret_bundle(self, job_id):
     return self.chainstore_hget(
       hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
@@ -299,7 +335,10 @@ class _DeeployJobMixin:
     """
     Get all the job pipelines from CSTORE.
     """
-    return self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY)
+    records = self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY) or {}
+    return {key: value.get("pipeline_cid") if isinstance(value, dict) else value
+            for key, value in records.items()
+            if not isinstance(value, dict) or not value.get("deleted")}
 
   def get_job_pipeline_from_cstore(
     self,
@@ -328,7 +367,8 @@ class _DeeployJobMixin:
     """
     Get the pipeline from CSTORE.
     """
-    return self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
+    value = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
+    return value.get("pipeline_cid") if isinstance(value, dict) else value
   
   def get_pipeline_from_r1fs(
     self,

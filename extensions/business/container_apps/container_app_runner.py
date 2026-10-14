@@ -65,6 +65,7 @@ EXTRA_TUNNELS Feature:
 import docker
 import os
 import requests
+import re
 import shlex
 import shutil
 import signal
@@ -82,6 +83,7 @@ from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTun
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 from .fixed_volume import safe_path_component
+from .cockroachdb_readiness import is_cockroachdb_service, probe_cockroachdb_readiness
 from .mixins import (
   _FixedSizeVolumesMixin,
   _ImagePullBackoffMixin,
@@ -309,6 +311,7 @@ _CONFIG = {
   },
   "RESTART_POLICY": "always",  # "always", "on-failure", "unless-stopped", "no"
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
+  "DEEPLOY_RUNTIME_ARTIFACTS": None,  # Immutable node-local bindings for restoration
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
   "AUTOUPDATE_INTERVAL": 100,
 
@@ -473,6 +476,31 @@ class ContainerAppRunnerPlugin(
       self.P(s, *args, **kwargs)
     return
 
+
+  # Docker can outlive the Python plugin and must have independent stop proof.
+  _deployment_external_workload = True
+
+  @classmethod
+  def cleanup_deployment_instance(cls, app_id, instance_id):
+    """Reap only this instance's deterministic container, preserving volumes."""
+    client = docker.from_env(timeout=10)
+    try:
+      name = cls._compute_container_name(app_id, instance_id)
+      try:
+        container = client.containers.get(name)
+      except docker.errors.NotFound:
+        return True
+      container.stop(timeout=5)
+      container.remove()
+      try:
+        client.containers.get(name)
+      except docker.errors.NotFound:
+        return True
+      return False
+    except docker.errors.DockerException:
+      return False
+    finally:
+      client.close()
 
   @staticmethod
   def _compute_container_name(stream_id, instance_id):
@@ -757,6 +785,58 @@ class ContainerAppRunnerPlugin(
     # Save back to disk (diskapi auto-routes to pipelines_data/{sid}/{iid}/plugin_data/)
     self.diskapi_save_pickle_to_data(state, _PERSISTENT_STATE_FILE)
     return
+
+  def _deployment_tracks_runtime(self):
+    return bool(getattr(self, "_deployment_operation_key", None) or
+                getattr(self, "cfg_deeploy_runtime_artifacts", None))
+
+  def _get_pinned_deployment_artifacts(self):
+    explicit = getattr(self, "cfg_deeploy_runtime_artifacts", None)
+    if explicit is not None:
+      if not isinstance(explicit, dict) or not re.fullmatch(r"sha256:[0-9a-f]{64}", explicit.get("image_id", "")):
+        raise ValueError("Invalid immutable deployment image binding")
+      commit = explicit.get("git_commit")
+      if commit is not None and not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("Invalid immutable deployment Git binding")
+      return dict(explicit)
+    operation_key = getattr(self, "_deployment_operation_key", None)
+    if not operation_key:
+      return {}
+    saved = self._load_persistent_state().get("deployment_runtime_artifacts", {})
+    if saved.get("operation_key") == operation_key:
+      return dict(saved.get("artifacts", {}))
+    return {}
+
+  def _save_deployment_artifacts(self, artifacts):
+    self._deployment_runtime_artifacts = dict(artifacts)
+    if getattr(self, "_deployment_operation_key", None):
+      binding = {
+        "operation_key": self._deployment_operation_key, "artifacts": dict(artifacts),
+      }
+      self._save_persistent_state(deployment_runtime_artifacts=binding)
+      if self._load_persistent_state().get("deployment_runtime_artifacts") != binding:
+        raise RuntimeError("Immutable runtime binding could not be persisted")
+
+  def get_deployment_runtime_artifacts(self):
+    """Expose immutable identifiers only; never Docker environment or credentials."""
+    return dict(getattr(self, "_deployment_runtime_artifacts", {}))
+
+  def _capture_deployment_image(self):
+    """Capture once on the plugin thread, keeping node publication free of I/O."""
+    artifacts = self._get_pinned_deployment_artifacts()
+    image_id = self.container.image.id
+    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+      if self._deployment_tracks_runtime():
+        raise RuntimeError("Running container image identity is unavailable")
+      return
+    if artifacts.get("image_id") and artifacts["image_id"] != image_id:
+      raise RuntimeError("Running container does not match the immutable image binding")
+    artifacts["image_id"] = image_id
+    self._save_deployment_artifacts(artifacts)
+
+  def _get_full_image_ref(self):
+    artifacts = self._get_pinned_deployment_artifacts()
+    return artifacts.get("image_id") or super()._get_full_image_ref()
 
 
   def _load_manual_stop_state(self):
@@ -2539,6 +2619,7 @@ class ContainerAppRunnerPlugin(
       )
 
       self.container_id = self.container.short_id
+      self._capture_deployment_image()
       self.P(f"Container started (ID: {self.container.short_id})")
 
       # Get container IP now that the container is running
@@ -2548,8 +2629,10 @@ class ContainerAppRunnerPlugin(
       self._set_container_state(ContainerState.RUNNING)
       self._record_restart_success()
 
-      # Signal plugin ready for chainstore response (auto-sent by _process loop)
-      self.set_plugin_ready(True)
+      # Docker startup is not application readiness. Health checks and build
+      # commands below determine when the workload can serve its contract.
+      self.set_plugin_ready(False)
+      self.report_deployment_status("starting")
 
       return self.container
 
@@ -2558,6 +2641,7 @@ class ContainerAppRunnerPlugin(
       self.container = None
       self._set_container_state(ContainerState.FAILED, StopReason.CRASH)
       self._record_restart_failure()
+      self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
     return None
 
 
@@ -2755,28 +2839,39 @@ class ContainerAppRunnerPlugin(
         return
 
       self.P("Running configured container exec command")
-      exec_kwargs = dict(
-        stream=True,
-        detach=False,
-      )
+      exec_kwargs = {}
       if self.cfg_container_user:
         exec_kwargs['user'] = self.cfg_container_user
-      exec_result = self.container.exec_run(
-        ["sh", "-c", shell_cmd],
-        **exec_kwargs,
+      execution = self.docker_client.api.exec_create(
+        self.container.id, ["sh", "-c", shell_cmd], **exec_kwargs,
       )
+      execution_id = execution["Id"]
+      output = self.docker_client.api.exec_start(execution_id, stream=True, detach=False)
       thread = threading.Thread(
-        target=self._stream_logs,
-        args=(exec_result.output, self._stop_event),
+        target=self._stream_deployment_exec,
+        args=(execution_id, output, self._stop_event),
         daemon=True,
       )
       thread.start()
       self.exec_threads.append(thread)
     except Exception as exc:
       self.P(f"Container exec command failed: {exc}", color='r')
+      self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
       self._commands_started = False
     return
 
+
+  def _stream_deployment_exec(self, execution_id, output, stop_event):
+    """Observe command exit independently of the long-running container."""
+    self._stream_logs(output, stop_event)
+    if stop_event.is_set():
+      return
+    try:
+      execution = self.docker_client.api.exec_inspect(execution_id)
+      if execution.get("ExitCode") not in (None, 0):
+        self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+    except Exception:
+      self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
 
   def _maybe_execute_build_and_run(self):
     """
@@ -2938,6 +3033,12 @@ class ContainerAppRunnerPlugin(
     return False
 
 
+  def _confirm_app_readiness(self):
+    """Publish readiness only after subclasses capture required runtime bindings."""
+    self._app_ready = True
+    self._semaphore_set_ready_flag()
+    return True
+
   def _is_app_ready(self):
     """
     Check if app is ready for tunnel startup.
@@ -2967,15 +3068,23 @@ class ContainerAppRunnerPlugin(
 
     current_time = self.time()
 
+    # Managed SQL services must authenticate against this certificate generation.
+    # Generic TCP/delay/disabled health settings cannot prove recovered credentials.
+    if is_cockroachdb_service(self.cfg_image, self.env):
+      if current_time - getattr(self, "_last_cockroachdb_probe", 0) < 5:
+        return False
+      self._last_cockroachdb_probe = current_time
+      if probe_cockroachdb_readiness(self.container, self.env):
+        self._confirm_app_readiness()
+      return self._app_ready
+
     # Get consolidated health config
     health = self._get_health_config()
     mode = self._get_effective_health_mode(health)
 
     # Mode: DISABLED - app is ready immediately when container is running
     if mode == HealthCheckMode.DISABLED:
-      self._app_ready = True
-      self._semaphore_set_ready_flag()
-      return True
+      return self._confirm_app_readiness()
 
     # Mode: DELAY - simple time-based waiting
     if mode == HealthCheckMode.DELAY or self._health_probing_disabled:
@@ -2983,8 +3092,7 @@ class ContainerAppRunnerPlugin(
       if elapsed >= health.delay:
         if health.delay > 0:
           self.P(f"Health check delay ({health.delay}s) elapsed - app assumed ready")
-        self._app_ready = True
-        self._semaphore_set_ready_flag()
+        self._confirm_app_readiness()
       return self._app_ready
 
     # Mode: TCP or ENDPOINT - active probing with delay/interval/timeout
@@ -3009,11 +3117,12 @@ class ContainerAppRunnerPlugin(
 
     # Check timeout (0 = unlimited, probe forever)
     if health.timeout > 0 and probe_elapsed > health.timeout:
+      if health.on_failure != "start":
+        self.report_deployment_status("failed", error_code="WORKLOAD_UNHEALTHY")
       self.P(f"Health probe timeout ({health.timeout}s) exceeded", color='r')
       if health.on_failure == "start":
         self.P("Starting tunnel anyway per HEALTH_CHECK.ON_FAILURE='start'", color='y')
-        self._app_ready = True
-        self._semaphore_set_ready_flag()
+        self._confirm_app_readiness()
       else:
         self.P("Tunnel startup skipped per HEALTH_CHECK.ON_FAILURE='skip'", color='y')
         self._app_ready = False  # Stay false, but stop probing
@@ -3051,8 +3160,7 @@ class ContainerAppRunnerPlugin(
 
     if probe_result:
       self.P(success_msg, color='g')
-      self._app_ready = True
-      self._semaphore_set_ready_flag()
+      self._confirm_app_readiness()
     else:
       self.Pd(f"Health probe returned False, will retry in {health.interval}s")
 
@@ -3107,6 +3215,7 @@ class ContainerAppRunnerPlugin(
     """
     try:
       if not self.container:
+        self.set_plugin_ready(False)
         return False
 
       # Refresh container status from Docker
@@ -3133,6 +3242,8 @@ class ContainerAppRunnerPlugin(
       was_running = self.container_state == ContainerState.RUNNING
 
       # Update state
+      self.set_plugin_ready(False)
+      self.report_deployment_status("failed", error_code="WORKLOAD_UNHEALTHY")
       self._set_container_state(ContainerState.FAILED, stop_reason)
 
       self.P(
@@ -3155,6 +3266,8 @@ class ContainerAppRunnerPlugin(
 
     except Exception as e:
       self.P(f"Could not check container status: {e}", color='r')
+      self.set_plugin_ready(False)
+      self.report_deployment_status("failed", error_code="WORKLOAD_UNHEALTHY")
       self.container = None
       self._commands_started = False
       self._set_container_state(ContainerState.FAILED, StopReason.UNKNOWN)
@@ -3389,7 +3502,14 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    self._stop_container_and_save_logs_to_disk()
+    self.report_deployment_status("stopping")
+    if self._stop_container_and_save_logs_to_disk():
+      # A lost Python handle is not proof that an orphaned Docker workload
+      # disappeared. Verify the deterministic identity before acknowledging.
+      if self.cleanup_deployment_instance(self.get_stream_id(), self.get_instance_id()):
+        self.set_deployment_stopped()
+    else:
+      self.report_deployment_status("failed", error_code="PLUGIN_STOP_FAILED")
 
     super(ContainerAppRunnerPlugin, self).on_close()
 
@@ -3434,6 +3554,7 @@ class ContainerAppRunnerPlugin(
 
     # Check if we've exhausted all retries
     if self._has_exceeded_image_pull_retries():
+      self.report_deployment_status("failed", error_code="IMAGE_PULL_FAILED")
       self.P(
         f"Image pull abandoned after {self._image_pull_failures} consecutive failures "
         f"(max: {self.cfg_image_pull_max_retries})",
@@ -3449,6 +3570,7 @@ class ContainerAppRunnerPlugin(
 
     full_image = self._get_full_image_ref()
     try:
+      self.report_deployment_status("pulling_image")
       self.P(f"Pulling image '{full_image}'...")
       img = self.docker_client.images.pull(full_image)
 
@@ -3645,7 +3767,7 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    if not self.cfg_autoupdate:
+    if self._deployment_tracks_runtime() or not self.cfg_autoupdate:
       return
 
     # Check if update check is due
@@ -3864,6 +3986,30 @@ class ContainerAppRunnerPlugin(
     bool
         True if image is available, False otherwise
     """
+    if self._deployment_tracks_runtime():
+      artifacts = self._get_pinned_deployment_artifacts()
+      if artifacts.get("image_id"):
+        try:
+          self.docker_client.images.get(artifacts["image_id"])
+          return True
+        except Exception:
+          self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+          return False
+      # Resolve a requested tag once, before any container is launched. Internal
+      # restarts and restored attempts must never resolve that mutable tag again.
+      image = self._pull_image_with_fallback() if self.cfg_image_pull_policy == "always" else self._get_local_image()
+      if image is None:
+        image = self._pull_image_with_fallback()
+      if image is None:
+        return False
+      image_id = image.id
+      if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+        return False
+      artifacts["image_id"] = image_id
+      self._save_deployment_artifacts(artifacts)
+      return True
+
     # Strategy 1: AUTOUPDATE (takes precedence)
     # When AUTOUPDATE is enabled, just ensure image exists locally
     # Update checking and pulling happens in _check_image_updates()
@@ -4210,13 +4356,18 @@ class ContainerAppRunnerPlugin(
       if not self.container:
         return
 
+    # Readiness applies to private workloads as well as tunneled apps.
+    self._maybe_execute_build_and_run()
+    app_ready = self._is_app_ready()
+    self.set_plugin_ready(app_ready)
+
     # Tunnel management (only if TUNNEL_ENGINE_ENABLED=True)
     if self.cfg_tunnel_engine_enabled:
       self.maybe_init_tunnel_engine()
       self.maybe_start_tunnel_engine()
 
       # Gate tunnel startup on app readiness
-      if self._is_app_ready():
+      if app_ready:
         if not self._tunnel_start_allowed:
           self.P("App is ready, enabling tunnel startup", color='g')
           self._tunnel_start_allowed = True
@@ -4272,10 +4423,6 @@ class ContainerAppRunnerPlugin(
 
     # Container is running normally - reset retry counter if appropriate
     self._maybe_reset_retry_counter()
-
-    # Signal semaphore readiness when container is running
-    # (for tunneled apps, readiness is signaled after health check passes)
-    self._semaphore_set_ready_flag()
 
     # ============================================================================
     # End of Restart Logic

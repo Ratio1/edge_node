@@ -1,3 +1,4 @@
+import threading
 import sys
 import types
 import unittest
@@ -186,91 +187,33 @@ class DeeployDeletePipelineCommandTests(unittest.TestCase):
 
 class DeeployDeletePipelineEndpointTests(unittest.TestCase):
 
-  def test_delete_endpoint_passes_target_nodes_to_delete_helper(self):
+  def test_delete_endpoint_returns_durable_acceptance_without_direct_stops(self):
+    from unittest.mock import Mock
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    captured = {}
-    plugin.cfg_deeploy_verbose = 0
-    plugin.P = lambda *args, **kwargs: None
-    plugin.Pd = lambda *args, **kwargs: None
-    plugin._get_response = lambda dct_data: dct_data
-    plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: ("0xSender", InputsStub(request))
-    plugin.deeploy_get_auth_result = lambda inputs: {
-      DEEPLOY_KEYS.SENDER: "0xSender",
-      DEEPLOY_KEYS.SENDER_ESCROW: "0xEscrow",
-      DEEPLOY_KEYS.ESCROW_OWNER: "0xOwner",
-    }
-    plugin._DeeployManagerApiPlugin__ensure_eth_balance = lambda: None
+    plugin._deployment_admission_lock = threading.RLock()
+    plugin._get_response = lambda result: result
+    plugin.deeploy_verify_and_get_inputs = lambda request, **kw: ("sender", InputsStub(request))
+    plugin.deeploy_get_auth_result = lambda inputs: {DEEPLOY_KEYS.ESCROW_OWNER: "owner"}
+    accepted = {"status_code": 202, "status": "accepted", "operation_id": "delete-op"}
+    plugin._admit_delete_operation = Mock(return_value=accepted)
+    plugin.cmdapi_stop_pipeline = Mock()
+    request = {"job_id": 1, "request_id": "delete", "expected_revision": 3}
+    self.assertEqual(plugin.delete_pipeline(request), accepted)
+    plugin._admit_delete_operation.assert_called_once_with(request, {DEEPLOY_KEYS.ESCROW_OWNER: "owner"})
+    plugin.cmdapi_stop_pipeline.assert_not_called()
 
-    def delete_pipeline_from_nodes(**kwargs):
-      captured.update(kwargs)
-      return []
-
-    plugin.delete_pipeline_from_nodes = delete_pipeline_from_nodes
-
-    res = plugin.delete_pipeline({
-      DEEPLOY_KEYS.APP_ID: "app-1",
-      DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_2"],
-      DEEPLOY_KEYS.NONCE: "0x1",
-    })
-
-    self.assertEqual(captured, {
-      "app_id": "app-1",
-      "job_id": None,
-      "owner": "0xOwner",
-      "target_nodes": ["0xai_node_2"],
-    })
-    self.assertEqual(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
-    self.assertEqual(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.TARGETS], [])
-
-  def test_delete_endpoint_omitted_target_nodes_discovers_all_targets(self):
+  def test_delete_endpoint_reports_uncertain_storage_without_false_success(self):
+    from unittest.mock import Mock
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin.stop_calls = []
-    plugin.discovery_calls = []
-    plugin.cfg_deeploy_verbose = 0
-    plugin.P = lambda *args, **kwargs: None
-    plugin.Pd = lambda *args, **kwargs: None
-    plugin._get_response = lambda dct_data: dct_data
-    plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: (
-      "0xSender",
-      InputsStub({
-        **request,
-        DEEPLOY_KEYS.TARGET_NODES: 0,
-      }),
-    )
-    plugin.deeploy_get_auth_result = lambda inputs: {
-      DEEPLOY_KEYS.SENDER: "0xSender",
-      DEEPLOY_KEYS.SENDER_ESCROW: "0xEscrow",
-      DEEPLOY_KEYS.ESCROW_OWNER: "0xOwner",
-    }
-    plugin._DeeployManagerApiPlugin__ensure_eth_balance = lambda: None
-    plugin.cmdapi_stop_pipeline = lambda node_address, name: plugin.stop_calls.append((node_address, name))
-
-    def discover(**kwargs):
-      plugin.discovery_calls.append(kwargs)
-      return [
-        _discovered_instance("app-1", "0xai_node_1", "PLUGIN_A", "a-1"),
-        _discovered_instance("app-1", "0xai_node_2", "PLUGIN_A", "a-2"),
-      ]
-
-    plugin._discover_plugin_instances = discover
-
-    res = plugin.delete_pipeline({
-      DEEPLOY_KEYS.APP_ID: "app-1",
-      DEEPLOY_KEYS.NONCE: "0x1",
-    })
-
-    self.assertEqual(plugin.discovery_calls, [{
-      "app_id": "app-1",
-      "job_id": None,
-      "owner": "0xOwner",
-      "target_nodes": None,
-    }])
-    self.assertEqual(plugin.stop_calls, [
-      ("0xai_node_1", "app-1"),
-      ("0xai_node_2", "app-1"),
-    ])
-    self.assertEqual(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
-    self.assertEqual(len(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.TARGETS]), 2)
+    plugin._deployment_admission_lock = threading.RLock()
+    plugin._get_response = lambda result: result
+    plugin.deeploy_verify_and_get_inputs = lambda request, **kw: ("sender", InputsStub(request))
+    plugin.deeploy_get_auth_result = lambda inputs: {DEEPLOY_KEYS.ESCROW_OWNER: "owner"}
+    plugin._admit_delete_operation = Mock(side_effect=RuntimeError("private storage failure"))
+    response = plugin.delete_pipeline({"job_id": 1, "request_id": "delete", "expected_revision": 3})
+    self.assertEqual(response["status_code"], 503)
+    self.assertTrue(response["error"]["retryable"])
+    self.assertNotIn("private storage failure", str(response))
 
 
 if __name__ == "__main__":
