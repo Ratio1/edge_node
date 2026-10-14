@@ -115,11 +115,12 @@ def test_unverified_tenant_and_unaudited_denials_write_no_row():
   with launch_fixture() as fixture:
     owner = fixture.owner_plugin
     fixture.owner.account("outsider", memberships=[])
-    # A non-member naming this tenant and an unknown engagement is `forbidden`, never `engagement_not_found`.
+    # A non-member naming this tenant and an unknown engagement is refused at the tenant check
+    # (`not_found`), never as `engagement_not_found`.
     result = launch(fixture, actor={"account_id": "outsider"}, engagement_id="en_" + str(uuid4()))
-    assert result["error"] != "engagement_not_found"
+    assert result["error"] == "not_found"
     # A spoofed tenant id the actor does not belong to.
-    launch(fixture, tenant_id="tn_00000000-0000-4000-8000-0000000000ff")
+    assert launch(fixture, tenant_id="tn_00000000-0000-4000-8000-0000000000ff")["error"] == "not_found"
     # `engagement_required` and a role denial (Allow Pentester is off).
     assert launch(fixture, engagement_id=None)["error"] == "engagement_required"
     fixture.owner.account("pentester", memberships=[{"role": "tenant_pentester", "tenant_id": fixture.tenant}])

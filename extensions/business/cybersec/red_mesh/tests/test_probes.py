@@ -2746,20 +2746,23 @@ class TestPhase17bMediumFeatures(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.models.finding_schema import (
       AUTHENTICATED_ACTIONS, AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_PERFORMED)
     _, worker = self._build_worker(ports=[80])
-    for status, body, expected in (
-      (200, b"<html>admin</html>", AUTHENTICATED_ACTION_PERFORMED),
-      (200, b"", AUTHENTICATED_ACTION_ATTEMPTED),
-      (302, b"", AUTHENTICATED_ACTION_ATTEMPTED),
+    redirect = MagicMock(status_code=302)
+    for status, body, history, expected in (
+      (200, b"<html>admin</html>", [], AUTHENTICATED_ACTION_PERFORMED),
+      (200, b"", [], AUTHENTICATED_ACTION_ATTEMPTED),
+      (302, b"", [], AUTHENTICATED_ACTION_ATTEMPTED),
+      # requests follows redirects: content after a redirect is not the login's own response.
+      (200, b"<html>landing</html>", [redirect], AUTHENTICATED_ACTION_ATTEMPTED),
     ):
       def mock_get(url, **kwargs):
         resp = MagicMock()
         if kwargs.get("auth") == ("admin", "admin"):
-          resp.status_code, resp.content, resp.headers = status, body, {}
+          resp.status_code, resp.content, resp.headers, resp.history = status, body, {}, history
         else:
-          resp.status_code, resp.content = 401, b""
+          resp.status_code, resp.content, resp.history = 401, b"", []
           resp.headers = {"WWW-Authenticate": 'Basic realm="test"'} if kwargs.get("auth") is None else {}
         return resp
-      with self.subTest(status=status, body=body), patch('requests.get', side_effect=mock_get):
+      with self.subTest(status=status, body=body, redirected=bool(history)), patch('requests.get', side_effect=mock_get):
         result = worker._service_info_http_basic_auth("10.0.0.1", 80)
       accepted = [f for f in result["findings"] if "default credential" in f["title"].lower()]
       self.assertEqual(len(accepted), 1)

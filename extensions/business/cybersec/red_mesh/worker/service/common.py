@@ -626,10 +626,11 @@ class _ServiceCommonMixin(_ServiceProbeBase):
             owasp_id="A07:2021",
             cwe_id="CWE-798",
             confidence="certain",
-            # The credentialed GET is the login (read-only). It is `performed` only when the
-            # response carried content; a redirect or an empty body is `attempted`.
+            # The credentialed GET is the login (read-only). It is `performed` only when that
+            # request itself returned content; a followed redirect (requests drops the credential
+            # on a cross-host hop), a redirect status or an empty body is `attempted`.
             authenticated_action=(AUTHENTICATED_ACTION_PERFORMED
-                                  if resp.status_code == 200 and resp.content
+                                  if resp.status_code == 200 and resp.content and not resp.history
                                   else AUTHENTICATED_ACTION_ATTEMPTED),
           ))
         elif resp.status_code == 401:
