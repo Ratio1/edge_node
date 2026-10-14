@@ -12,7 +12,8 @@ from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExport
 
 
 ENDPOINT = "get_misp_export_config_status"
-DEFAULT = {"enabled": False, "auto_export": False, "misp_configured": False, "min_severity": "LOW"}
+# RM-139: AUTO_EXPORT defaults to true when the Deeploy block leaves it out.
+DEFAULT = {"enabled": False, "auto_export": True, "misp_configured": False, "min_severity": "LOW"}
 SECRET = "mock-only-misp-key-canary"
 URL = "https://mock-only-misp-host.invalid"
 

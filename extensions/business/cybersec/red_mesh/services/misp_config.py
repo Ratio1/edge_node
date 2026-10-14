@@ -5,7 +5,7 @@ SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 
 DEFAULT_MISP_EXPORT_CONFIG = {
   "ENABLED": False,
-  "AUTO_EXPORT": False,
+  "AUTO_EXPORT": True,
   "MISP_URL": "",
   "MISP_API_KEY": "",
   "MISP_VERIFY_TLS": True,

@@ -958,7 +958,9 @@ class TestMispTenantSeparation(unittest.TestCase):
     self.assertIn("redmesh:tenant_name=Acme Corp", names)
 
   @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
-  def test_update_of_an_unmapped_tenant_uses_the_configured_distribution(self, MockPyMISP):
+  def test_update_of_an_unmapped_tenant_leaves_the_event_distribution(self, MockPyMISP):
+    # Coordinator decision (RM-139 phase 4): resetting to the configured distribution would widen
+    # an event once its tenant's mapping is removed, so an unmapped update keeps what the event has.
     mock_misp = MockPyMISP.return_value
     mock_misp.get_event.return_value = self._existing()
     mock_misp.update_event.side_effect = lambda event, pythonify=True: event
@@ -968,7 +970,7 @@ class TestMispTenantSeparation(unittest.TestCase):
     self.assertEqual(push_to_misp(owner, "test_job_1")["status"], "ok")
 
     updated = mock_misp.update_event.call_args.args[0]
-    self.assertEqual(updated.distribution, 3)
+    self.assertEqual(updated.distribution, 0)
     self.assertNotIn("sharing_group_id", updated.to_dict())
 
   @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")

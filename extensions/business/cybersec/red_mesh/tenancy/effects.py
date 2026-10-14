@@ -94,6 +94,9 @@ _PUBLIC_DISABLED_REASONS = frozenset({"misp_export_disabled"})
 _EFFECT_DENIALS = {
   "job_not_found": (404, "not_found"),
   "unsupported_job_type": (400, "unsupported_job_type"),
+  # RM-139: an automatic MISP push for the job is in flight or queued; a manual export now could
+  # create a second event. The caller retries once it has landed.
+  "misp_auto_export_in_flight": (409, "misp_auto_export_in_flight"),
 }
 
 

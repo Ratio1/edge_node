@@ -499,10 +499,13 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
 def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
                  snapshot_mode="tenant_bound", ledger=None):
   """
-  Build a MISP event and push it to the configured MISP server.
+  Build a MISP event and push it to the configured MISP server (the manual export).
 
   For continuous monitoring jobs, if a MISP event already exists (stored
   event_uuid in CStore), updates the existing event with new pass data.
+  Delivery is `deliver_misp_event`; this wrapper records the outcome on the job and emits the
+  export status event, as it always has. The automatic push merges the same outcome on the
+  launcher loop instead (RM-139, services/misp_auto_push.py).
   """
   # Checked snapshot replaces the unscoped global lookup (RM-026 I1b). Seam one of two.
   job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
@@ -533,6 +536,44 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     if ledger is not None:
       ledger.record(EffectState.PERSISTED)
 
+  outcome = deliver_misp_event(owner, job_id, pass_nr, job_specs=job_specs, export_config=cfg,
+                               sharing_groups=sharing_groups, checked_job=checked_job,
+                               snapshot_mode=snapshot_mode, ledger=ledger)
+  if outcome["status"] in ("disabled", "not_configured"):
+    # Deliberately nothing recorded: see deliver_misp_event.
+    return outcome
+  if outcome["status"] != "ok":
+    _record_export_status("failed")
+    return outcome
+
+  misp_export_meta = outcome.pop("meta")
+  if job_specs:
+    job_specs["misp_export"] = misp_export_meta
+    emit_export_status_event(
+      owner,
+      job_specs,
+      adapter_type="misp",
+      status="completed",
+      pass_nr=outcome["pass_nr"],
+      destination_label="misp",
+      artifact_refs={"misp_event_uuid": outcome["event_uuid"], "misp_event_id": outcome["event_id"]},
+    )
+    job_key = job_id
+    _write_job_record(owner, job_key, job_specs, context="misp_export")
+  return outcome
+
+
+def deliver_misp_event(owner, job_id, pass_nr=None, *, job_specs, export_config, sharing_groups,
+                       checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None):
+  """Build one pass's MISP event and send it: create, or update the job's existing event.
+
+  No persistence and no event emission: the caller records the outcome. `job_specs` is the job
+  as the caller read it; its `misp_export.event_uuid` selects update over create. Returns
+  `{"status": "ok", ..., "meta": <the job's next misp_export record>}`, `{"status": "error",
+  "error": <code>, ...}` for an attempt that failed, or `disabled` / `not_configured` when nothing
+  was attempted. Checked-snapshot denials raise, as build_misp_event does.
+  """
+  cfg = export_config
   if not cfg["ENABLED"]:
     # Deliberately no _record_export_status here. Routing export_misp through _effect_operation
     # makes this branch live for the first time, and emitting a SOC event plus a job-record write
@@ -553,7 +594,6 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
                                   snapshot_mode=snapshot_mode, export_config=cfg,
                                   sharing_groups=sharing_groups))
   if result["status"] != "ok":
-    _record_export_status("failed")
     return result
   event = result["event"]
   actual_pass_nr = result["pass_nr"]
@@ -584,7 +624,6 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     misp = PyMISP(cfg["MISP_URL"], cfg["MISP_API_KEY"],
                   ssl=cfg["MISP_VERIFY_TLS"], timeout=cfg["TIMEOUT"])
   except Exception as exc:
-    _record_export_status("failed")
     # Typed code, not prose: the exception text can carry the configured MISP URL.
     return {"status": "error", "error": "connection_failed", "retryable": True}
 
@@ -609,10 +648,12 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
                 # The remote now holds part of this export. A failure past this point must not
                 # report "nothing happened": a retry would duplicate what was already added.
                 ledger.record(EffectState.DELIVERED)
-          # Update tags, and the distribution the tenant's events go out with now (RM-139)
+          # Update tags (RM-139). A mapped tenant's event moves to its sharing group; an unmapped
+          # tenant's event keeps the distribution it has, so removing a mapping never widens it.
           for tag in event.tags:
             existing_event.add_tag(tag)
-          _set_distribution(existing_event, event.distribution, sharing_group_id)
+          if sharing_group_id is not None:
+            _set_distribution(existing_event, event.distribution, sharing_group_id)
           updated = _send(misp.update_event, existing_event)
           # Acceptance evidence, not the locally held event: assigning existing_event unconditionally
           # made the isinstance check below vacuous, so a fully rejected re-export reported ok.
@@ -638,7 +679,6 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
       error_msg = str(response_event)
       if isinstance(response_event, dict):
         error_msg = response_event.get("message", response_event.get("errors", str(response_event)))
-      _record_export_status("failed")
       return {"status": "error", "error": "api_error", "retryable": False}
 
     if ledger is not None and response_event.uuid:
@@ -656,12 +696,10 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
         pass  # Non-fatal
 
   except _SharingGroupRejected:
-    _record_export_status("failed")
     return {"status": "error", "error": "sharing_group_rejected", "retryable": False}
   except Exception as exc:
     error_str = str(exc)
     retryable = not any(code in error_str for code in ["401", "403", "404"])
-    _record_export_status("failed")
     return {"status": "error", "error": "push_failed", "retryable": retryable}
 
   # Store export metadata in CStore
@@ -683,20 +721,6 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     "findings_total": result.get("findings_total"),
   }
 
-  if job_specs:
-    job_specs["misp_export"] = misp_export_meta
-    emit_export_status_event(
-      owner,
-      job_specs,
-      adapter_type="misp",
-      status="completed",
-      pass_nr=actual_pass_nr,
-      destination_label="misp",
-      artifact_refs={"misp_event_uuid": event_uuid, "misp_event_id": event_id},
-    )
-    job_key = job_id
-    _write_job_record(owner, job_key, job_specs, context="misp_export")
-
   return {
     "status": "ok",
     "event_uuid": event_uuid,
@@ -706,6 +730,7 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     "findings_exported": result["findings_exported"],
     "findings_total": result["findings_total"],
     "ports_exported": result["ports_exported"],
+    "meta": misp_export_meta,
   }
 
 
@@ -788,7 +813,8 @@ def get_misp_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="
   return {
     "job_id": job_id,
     "found": True,
-    "exported": True,
+    # RM-139: an automatic push that failed before any event existed records only its failure.
+    "exported": not (export_meta.get("status") == "failed" and not export_meta.get("event_uuid")),
     "event_uuid": export_meta.get("event_uuid"),
     "event_id": export_meta.get("event_id"),
     "misp_url": export_meta.get("misp_url"),
@@ -799,4 +825,8 @@ def get_misp_export_status(owner, job_id, *, checked_job=_UNSET, snapshot_mode="
     "min_severity": export_meta.get("min_severity"),
     "findings_exported": export_meta.get("findings_exported"),
     "findings_total": export_meta.get("findings_total"),
+    # RM-139 automatic push: the last attempt's outcome and code (absent on manual exports).
+    "status": export_meta.get("status"),
+    "last_error": export_meta.get("last_error"),
+    "trigger": export_meta.get("trigger"),
   }
