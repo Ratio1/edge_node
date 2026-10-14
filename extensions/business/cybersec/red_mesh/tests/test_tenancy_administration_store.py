@@ -93,6 +93,28 @@ class TestAdministrationStore(unittest.TestCase):
         call()
     self.assertFalse(hasattr(store, "list_assets") or hasattr(store, "count_assets"))
 
+  def test_the_super_tenant_profile_kind_round_trips_and_is_validated(self):
+    # RM-110: one row per deployment under the fixed id; the validator refuses what the operations
+    # could not have written.
+    owner = Store()
+    store = CstoreTenantAdministrationStore(owner, "deployment-a")
+    fields = ("legal_name", "registration_id", "vat_id", "address", "signer_name", "signer_role", "contact_email",
+              "contact_phone")
+    record = {**{key: "" for key in fields}, "legal_name": "RedMesh SRL", "updated_by": "creator",
+              "updated_at": "2026-10-07T00:00:00+00:00"}
+    store.put("super_tenant_profile", "deployment", record=record)
+    self.assertEqual(store.get("super_tenant_profile", "deployment"),
+                     {"schemaVersion": 1, "namespace": "deployment-a", "kind": "super_tenant_profile",
+                      "ids": ["deployment"], **record})
+    for bad in ({**record, "legal_name": 7}, {**record, "address": "x" * 201},
+                {key: value for key, value in record.items() if key != "vat_id"}, {**record, "updated_at": ""}):
+      with self.subTest(bad=bad):
+        with self.assertRaises(TenantStoreError):
+          store.put("super_tenant_profile", "deployment", record=bad)
+    with self.assertRaises(TenantStoreError):
+      store.put("super_tenant_profile", "other", record=record)
+    self.assertEqual(store.get("super_tenant_profile", "deployment")["legal_name"], "RedMesh SRL")
+
   def test_every_observable_write_failure_denies_even_when_data_was_mutated(self):
     for result, noop in ((False, False), (None, False), (1, False), (True, True)):
       with self.subTest(result=result, noop=noop):

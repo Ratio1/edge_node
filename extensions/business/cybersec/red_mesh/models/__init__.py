@@ -80,7 +80,6 @@ from extensions.business.cybersec.red_mesh.models.engagement import (
   DATA_CLASSIFICATIONS,
   EngagementContext,
   KickoffQuestionnaire,
-  RulesOfEngagement,
 )
 from extensions.business.cybersec.red_mesh.models.event_schema import (
   REDMESH_EVENT_SCHEMA,
@@ -149,7 +148,6 @@ __all__ = [
   # engagement
   "Contact",
   "EngagementContext",
-  "RulesOfEngagement",
   "AuthorizationRef",
   "KickoffQuestionnaire",
   "DATA_CLASSIFICATIONS",

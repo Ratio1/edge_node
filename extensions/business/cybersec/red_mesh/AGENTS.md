@@ -579,3 +579,90 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
   503, no storage" tests were narrowed to the namespace cases (`None`, blank, non-string) and
   renamed `test_missing_namespace_*`; stray `cfg_tenant_administration_enabled` fixture attributes
   dropped. Dev-node stream configs may still carry the key; the plugin ignores unknown config keys.
+
+### 2026-10-06 — RM-109 phase 2: tenant drafts
+
+- BUILDER: `tenant_draft` record kind (`tenancy/drafts.py`: vocabulary, validator, completeness, DTO)
+  and seven `authorize_platform`-gated POST endpoints (create/update/get/list/delete, document
+  upload/download). Contract: hub `docs/resources/redmesh/contracts/onboarding-drafts.md`. The
+  service writes under the administration lock; every document read/write/delete is the plugin's,
+  outside it. Draft uploads reuse the contract checks with a `schema_version` 1.1 envelope naming
+  `draft_id` and `document_kind`; the stored ref keeps the `_valid_contract` key set.
+- CRITIC/response: a draft id is not a tenant id, so data maintenance classifies `tenant_draft`
+  before its related-tenant check (current when the validator passes, else old/unrecognized; never
+  orphan). A replaced or dropped file is deleted after the row stops naming it; a failed delete is
+  logged with draft, slot and ref, the write stands (the file is then unreferenced). No draft
+  answer reads the store: R1FS answers a timeout as no file, so a read failure must never be
+  persisted as `missing`. An unreadable file is a 404 on download and is skipped on delete.
+  Draft delete removes files first and refuses (`409 conflict`) a file attached meanwhile. No
+  activation yet: `activation`/`last_release` stay null and a set marker locks the draft (phase 3).
+- Verification: `tests/test_tenant_drafts.py` (new), `test_data_maintenance.py` (draft current, files
+  in the inventory, malformed draft old/unrecognized) and `test_authz_surface.py` (96 endpoints).
+
+### 2026-10-06 — RM-109 phase 3: draft activation, release, close
+
+- BUILDER: `prepare_tenant(draft_id)` takes every creation field from the draft (caller fields are
+  ignored); the plugin re-resolves the draft's files bound to draft and slot. Locked order:
+  `draft_changed`, marker (`activation_in_progress` with `holder`), `draft_incomplete` with
+  `missing`, existing checks, then on first preparation the uploader rule (platform role through
+  the identity port, both paths) and `contract_in_use` (raw tenant/receipt scan, 503 past the cap).
+  The marker is written before the receipt. Receipt and tenant gain the draft terms, bound like
+  `contract`; tenant delete and `download_tenant_document` cover all three documents.
+- CRITIC/response: release writes `last_release` while the marker is still set, then deletes tenant
+  row, domain reservation and receipt, then clears the marker, so every crash point resumes. A
+  marker without a receipt is told apart by `last_release` (resumed release), the domain
+  reservation still bound to the marker (tenant activated then deleted: items set `missing`), or
+  neither (preparation stopped before the receipt: files intact). No release deletes a file.
+- Verification: `tests/test_tenant_drafts.py`, `test_tenant_contract.py` (uploader relaxed,
+  draft envelope refused, `contract_in_use`), `test_data_maintenance.py`, `test_authz_surface.py`.
+
+### 2026-10-07 — RM-109 phase 4: engagement drafts inside the tenant draft
+
+- BUILDER: `engagement_draft` record kind (`tenancy/engagement_drafts.py`, `ted_<uuid>`, `parent` =
+  `{draft_id}` or `{tenant_id}`), eight `authorize_platform`-gated endpoints (create/update/get/list/
+  delete, pack upload/download, `activate_engagement_draft`). Fields are checked with the
+  `tenancy/engagements.py` normalizers on every write (emptiness allowed) and in full at activation.
+  The pack envelope is `redmesh_tenant_contract` 1.1 with `document_kind: engagement_pack` and
+  `engagement_draft_id`; `read_engagement_document` accepts it. Collapsed tenant checklist: the
+  `contract` item covers both tenant records, applicability is `required` and no longer decides
+  completeness; `items.*.generated` and `document.generated` are validated (written by RM-110).
+- CRITIC/response: activation is one locked call with no marker. An engagement `en_<uuid>` already
+  under the parent tenant means a crash after `create_engagement`, so the row is deleted and the
+  call answers `replayed`, whoever calls; the refs are re-resolved outside the lock
+  (`resolve_engagement_pack`) and compared under it (`draft_changed`); pack uploaders need the
+  platform role instead of "equals creator"; `contract_in_use` covers engagement `documents[]`.
+  `close_tenant_draft` re-homes the children before deleting the row; `delete_tenant_draft`
+  cascades (children's files, rows, then its own); `delete_tenant` does not cascade, so data
+  maintenance classifies a child with no parent `orphan/parent_gone`. `ted_` ids answer 404 as
+  tenant and as engagement ids. `_engagement_draft_children` validates every `engagement_draft`
+  row of the namespace, so one malformed child row fails `close_tenant_draft`, `delete_tenant_draft`
+  and `list_engagement_drafts` closed (503) until data maintenance removes it.
+- Verification: `tests/test_engagement_drafts.py` (new), `test_tenant_drafts.py` (collapsed
+  checklist), `test_data_maintenance.py`, `test_authz_surface.py` (107 endpoints).
+
+### 2026-10-07 — RM-110 phase 1: super-tenant profile, party block, generated-pack baseline
+
+- BUILDER: `super_tenant_profile` record kind (`tenancy/super_tenant_profile.py`, one row per
+  deployment, `ids = ["deployment"]`, eight 0-200 text fields) with `get_/update_super_tenant_profile`
+  (`authorize_platform`-gated; the empty profile is answered without a write; `update` is partial
+  and audited as `super_tenant_profile_updated` with the changed keys only). Tenant draft and tenant
+  `legal` gain the optional party fields `address`, `vat_id`, `contact_name`, `contact_email`,
+  `contact_phone` (`drafts.LEGAL_OPTIONAL_FIELDS`): `_legal` accepts a four-key block unchanged and
+  writes no default, the draft validator completes an old block on a copy, DTOs answer absent
+  optional fields as `""`. `store_generated_document` (one endpoint for `draft_id`/`contract` and
+  `engagement_draft_id`/`engagement_pack`): the plugin stores bytes + `snapshot` in one
+  `redmesh_tenant_contract` 1.1 envelope (`role: generated`) outside the lock, hashing both itself;
+  the service writes the `generated` block and item state `generated` (new in `ITEM_STATES`; from
+  `missing`, `generated`, `awaiting_signature`; `409 already_signed` otherwise). The draft's
+  `contract` baseline is copied at activation as `contract_generated` on receipt and tenant.
+- CRITIC/response: `contract_generated` sits outside the receipt's all-or-none draft set and is
+  compared only when present, with the extra-on-tenant guard, so pre-RM-110 rows stay valid;
+  `_tenant_document_refs` includes its ref so tenant delete removes the baseline file. The snapshot
+  is checked as one JSON object of at most 64 KB and hashed exactly as sent (a strict canonical
+  re-serialization check would refuse valid JS output over number formatting). `already_signed` and
+  the formats are refused in the authorize step, before any store write; a stored row with state
+  `generated` and no block is unreadable. `items_done` and completeness still count `signed` only.
+- Verification: `tests/test_super_tenant_profile.py` (new), `test_tenant_drafts.py`,
+  `test_engagement_drafts.py` (the generated pack now comes from the real endpoint),
+  `test_tenant_administration.py`, `test_tenant_delete.py`, `test_tenancy_administration_store.py`,
+  `test_data_maintenance.py`, `test_authz_surface.py` (110 endpoints).

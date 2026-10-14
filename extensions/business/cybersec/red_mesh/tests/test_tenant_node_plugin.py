@@ -42,7 +42,7 @@ class TestTenantNodePlugin(unittest.TestCase):
     admin = "initial" if domain == "one" else f"initial-{domain}"
     if admin != "initial":
       self.storage.account(admin)
-    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, admin, **install_contract(self.plugin))
+    result = self.plugin.prepare_tenant(self.actor, request, domain, domain, admin, **install_contract(self.plugin, ref=f"doc-{domain}"))
     self.assertTrue(result["success"], result)
     tenant = result["data"]["tenantId"]
     self.storage.grant(admin, tenant)
@@ -65,8 +65,8 @@ class TestTenantNodePlugin(unittest.TestCase):
     }})
     self.assertEqual(self.plugin.get_tenant_nodes({"account_id": "initial"}, self.tenant)["data"], {
       "tenantId": self.tenant,
-      "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned"}],
-      "canManageAssignments": False,
+      "nodes": [{"nodeAddress": "Node-A", "mode": "shared", "state": "assigned", "alias": None, "tags": [], "ip": None}],
+      "canManageAssignments": False, "nodesFixed": False,
     })
 
   def test_generated_json_model_does_not_coerce_assignment_input(self):

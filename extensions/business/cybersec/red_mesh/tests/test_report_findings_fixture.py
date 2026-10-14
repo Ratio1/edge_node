@@ -75,7 +75,9 @@ class TestReportFindingsFixture(unittest.TestCase):
 
   def test_it_covers_every_case_the_report_reads(self):
     actions = {f.get("authenticated_action") for f in self.findings}
-    self.assertTrue({"performed", "attempted", "not_permitted", "not_applicable"} <= actions)
+    # RM-128: `not_permitted` is no longer produced (the action always runs); the value stays
+    # valid in the schema for archives written before.
+    self.assertTrue({"performed", "attempted", "not_applicable"} <= actions)
     self.assertTrue(any("inconclusive" in f["title"] for f in self.findings))
     self.assertTrue(any(f["title"] == "SSH accepts arbitrary credentials" for f in self.findings))
     csrf = [f for f in self.findings if f["probe"] == "_web_test_csrf"]

@@ -92,6 +92,23 @@ class TestCsrfFindingIdentity(unittest.TestCase):
     sharing an id."""
     self.assertEqual(len(self._run({"/": _page(_form(), _form())})), 1)
 
+  def test_path_parameters_are_dropped_per_segment_not_at_the_first_semicolon(self):
+    findings = self._run({"/": _page(
+      _form("/account;jsessionid=ABC/delete"), _form("/account;jsessionid=ABC/update"),
+    )})
+    self.assertEqual(len({f["finding_id"] for f in findings}), 2)
+    self.assertEqual(
+      sorted(f["affected_assets"][0]["parameter"] for f in findings),
+      ["/account/delete", "/account/update"],
+    )
+
+  def test_a_session_id_in_a_middle_segment_does_not_move_the_id(self):
+    [clean] = self._run({"/": _page(_form("/a/b"))})
+    for volatile in ("/a;jsessionid=X/b", "/a;jsessionid=Y/b;v=2"):
+      with self.subTest(action=volatile):
+        [finding] = self._run({"/": _page(_form(volatile))})
+        self.assertEqual(finding["finding_id"], clean["finding_id"])
+
   def test_actions_differing_only_in_a_query_are_one_finding(self):
     findings = self._run({"/": _page(_form("/search?t=1"), _form("/search?t=2"))})
     self.assertEqual(len(findings), 1)

@@ -109,10 +109,6 @@ def _context(*, candidates=("node-a",), tested_model=None):
   Matches `_provider()`'s default target so a test's `tested_model` (unless it deliberately
   supplies a different one) needs no extra target-mismatch handling.
   """
-  from extensions.business.cybersec.red_mesh.model_testing.catalog import (
-    CBRN_SAFETY_V1_ID,
-    PROMPT_INJECTION_V1_ID,
-  )
   from extensions.business.cybersec.red_mesh.model_testing.runner import _chat_completions_url
   from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
   from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
@@ -125,9 +121,7 @@ def _context(*, candidates=("node-a",), tested_model=None):
   }
   engagement = {
     "engagement_id": "en_00000000-0000-4000-8000-000000000099", "engagement_hash": "e" * 64,
-    "contract_sha256": "c" * 64, "allowed_run_modes": ["continuous", "single_pass"],
-    "authorized_tests": [CBRN_SAFETY_V1_ID, PROMPT_INJECTION_V1_ID],
-    "roe": {"authenticated_action": False, "stateful_probes_allowed": False, "ics_safe_mode_required": False},
+    "contract_sha256": "c" * 64,
     "context": {}, "authorization": {},
   }
   return ResolvedExecutionContext({
@@ -137,6 +131,8 @@ def _context(*, candidates=("node-a",), tested_model=None):
     "asset_target_digest": canonical_digest(target), "actor_id": "tester",
     "actor_generation": "generation-1", "node_failure_policy": "stop",
     "selected_candidates": list(candidates), "engagement": engagement,
+    # RM-131: a prod asset; model tests have no Dune, so the prod floor never applies to them.
+    "asset_environment": "prod",
   })
 
 

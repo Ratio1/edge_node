@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from .asset_fixture import pick, register_asset
 from .test_tenant_administration import FakeAdministrationStore
 from .contract_fixture import install_contract
 
@@ -44,11 +45,10 @@ class TestTenantDelete(unittest.TestCase):
     self.documents = self.plugin._document_store()
     self.plugin.configured_peers_reader = None
     refs = [self.upload("Rules of engagement"), self.upload("Scope email", kind="other", raw=PDF + b"2")]
+    asset_id = register_asset(self.plugin, self.actor, self.tenant, {"kind": "network", "address": "192.0.2.10"})
     created = self.plugin.create_engagement(
-      self.actor, self.tenant, str(uuid4()), "Q4", ["single_pass"], "2026-10-01T00:00:00Z",
-      "2027-10-01T00:00:00Z", {}, {"client_name": "Example"},
-      [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
-        "authorized_ports": "443", "authorized_tests": ["service_info_common"]}], refs)
+      self.actor, self.tenant, str(uuid4()), "Q4", "2026-10-01T00:00:00Z",
+      "2027-10-01T00:00:00Z", {"client_name": "Example"}, [pick(asset_id)], refs)
     self.assertTrue(created["success"], created)
     self.engagement_refs = refs
     self.events.clear()
@@ -84,15 +84,25 @@ class TestTenantDelete(unittest.TestCase):
     self.assertEqual(self.documents.deleted, [])
 
   def test_delete_removes_records_and_documents_keeps_the_domain_and_is_audited(self):
+    # RM-125: two assets (the engagement's and this one), the latter a row the current validator refuses; both go.
+    for address in ("192.0.2.20",):
+      registered = self.plugin.create_tenant_asset(self.actor, self.tenant, str(uuid4()), "Host " + address,
+                                                   {"kind": "network", "address": address}, environment="dev")
+      self.assertTrue(registered["success"], registered)
+    field = json.dumps(["tenant_asset", "deployment", registered["data"]["asset_id"]], separators=(",", ":"))
+    self.storage.data[(TENANCY_HKEY, field)]["target_digest"] = "0" * 64
+    self.events.clear()
     self.remove_members()
     self.put_job("other-job", "tn_" + str(uuid4()))
     result = self.plugin.delete_tenant(self.actor, self.tenant)
     self.assertTrue(result["success"], result)
+    # RM-133: the answer also counts the contract drafts that went with the tenant.
     self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1,
-                                      "integrations": 0, "nodeAssignments": 0, "documents": 3})
+                                      "integrations": 0, "assets": 2, "nodeAssignments": 0, "contractDrafts": 0,
+                                      "documents": 3})
     self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", *self.engagement_refs]))
     rows = self.tenancy_rows()
-    for kind in ("tenant", "receipt", "engagement", "asset"):
+    for kind in ("tenant", "receipt", "engagement", "asset", "tenant_asset"):
       self.assertNotIn(kind, rows)
     self.assertEqual(len(rows["domain"]), 1)
     self.refused(self.plugin.get_tenant(self.actor, self.tenant), 404, "not_found")
@@ -102,7 +112,7 @@ class TestTenantDelete(unittest.TestCase):
     self.refused(self.plugin.prepare_tenant(self.actor, self.request, "Example", "example", "initial",
                                             **install_contract(self.plugin)), 409, "domain_conflict")
     self.assertEqual(self.events, [("tenant_deleted", {
-      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "integrations": 0,
+      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "integrations": 0, "assets": 2,
       "nodeAssignments": 0, "documents": 3})])
     self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 404, "not_found")
 
@@ -212,6 +222,28 @@ class TestTenantDelete(unittest.TestCase):
     self.refused(self.plugin.delete_tenant({"account_id": "stranger"}, self.tenant), 404, "not_found")
     self.refused(self.plugin.delete_tenant(self.actor, "tn_" + str(uuid4())), 404, "not_found")
     self.assertTrue(self.plugin.get_tenant(self.actor, self.tenant)["success"])
+
+  def test_the_contracts_generated_baseline_is_deleted_with_the_tenant(self):
+    # RM-110: `contract_generated` (copied from a draft activation; given to this one-step tenant on
+    # both rows, as the receipt binds it) is a tenant document, deleted with the others.
+    self.remove_members()
+    self.documents.envelopes["doc-generated"] = {"kind": "redmesh_tenant_contract", "role": "generated"}
+    block = {"store": "fake", "ref": "doc-generated", "filename": "generated.pdf", "mime": "application/pdf",
+             "size_bytes": 10, "sha256": "b" * 64, "uploaded_at": "2026-10-07T00:00:00Z", "uploaded_by": "creator",
+             "snapshot_sha256": "c" * 64, "generated_at": "2026-10-07T10:00:00Z", "generated_by": "creator"}
+    for (hkey, key), row in self.storage.data.items():
+      if (hkey == TENANCY_HKEY and isinstance(row, dict) and row.get("tenant_id") == self.tenant
+          and row.get("kind") in ("tenant", "receipt")):
+        row["contract_generated"] = block
+    begun = self.plugin._call_tenant_administration("begin_tenant_delete", self.actor, tenant_id=self.tenant)
+    self.assertTrue(begun["success"], begun)
+    self.assertIn("doc-generated", [ref["ref"] for ref in begun["data"]["documentRefs"]])
+    result = self.plugin.delete_tenant(self.actor, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertEqual(result["data"]["documents"], 4)
+    self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", "doc-generated", *self.engagement_refs]))
+    self.assertNotIn("doc-generated", self.documents.envelopes)
+    self.assertNotIn("tenant", self.tenancy_rows())
 
   def test_a_tenant_created_before_contracts_deletes_and_a_v1_engagement_rows_document_is_left_alone(self):
     # RM-108 phase 5: storage holds no v1 engagement row any more, so the delete no longer reads
