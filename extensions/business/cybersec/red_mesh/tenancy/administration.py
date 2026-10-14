@@ -1702,6 +1702,20 @@ class TenantAdministrationService:
     self._actor(actor)
     return super_tenant_branding.branding_dto(self._branding_row())
 
+  # The sign-in page shows the deployment's branding before anyone signs in, so these two take no
+  # actor. They answer only what the actor-bound reads answer: the DTO, and the logo's reference for
+  # the plugin's download.
+  @_endpoint
+  def public_super_tenant_branding(self):
+    return super_tenant_branding.branding_dto(self._branding_row())
+
+  @_endpoint
+  def public_super_tenant_branding_logo(self):
+    logo = self._branding_row()["logo"]
+    if logo is None:
+      raise AdministrationDenied(404, "not_found")
+    return logo
+
   @_endpoint
   def authorize_super_tenant_branding_update(self, actor):
     """Step 1 of a logo write: refused before the plugin stores any bytes."""
