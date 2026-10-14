@@ -91,7 +91,7 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", engagement=_
   from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
   account = AccountView("tester", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
 
-  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None):
+  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None, **_audit):
     # Through the actor seam, as the real admission does, so a suite that swaps the account in
     # (attribution tests) is admitted as that account.
     resolved, denial = plugin._resolve_launch_actor(actor)

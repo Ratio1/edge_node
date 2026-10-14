@@ -1019,6 +1019,38 @@ def build_webapp_workers(
 _RELEASE_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$")
 
 
+_REFUSAL_FIELD_MAX = 256
+
+
+def log_launch_refusal(owner, *, reason, scan_type, target, tenant_id, engagement_id,
+                       engagement_asset_id, actor):
+  """Audit one refused launch. Call only once the tenant is verified: the row is read per tenant.
+
+  The row carries the selectors, the target as requested (truncated) and the actor; never the
+  request body. A failure to audit never changes the refusal the caller returns.
+  """
+  def clip(value):
+    return value[:_REFUSAL_FIELD_MAX] if isinstance(value, str) else ""
+  try:
+    owner._log_audit_event("launch_refused", {
+      "tenant_id": clip(tenant_id), "engagement_id": clip(engagement_id),
+      "engagement_asset_id": clip(engagement_asset_id), "scan_type": clip(scan_type),
+      "target": clip(target), "reason": reason, "actor": clip(actor),
+    })
+  except Exception:
+    pass
+
+
+def _log_target_mismatch(owner, execution_context, scan_type, target):
+  """The refusal of a launch naming a target other than the engagement asset's."""
+  if execution_context is None:
+    return
+  facts = execution_context.to_dict()
+  log_launch_refusal(owner, reason="target_mismatch", scan_type=scan_type, target=target,
+    tenant_id=facts["tenant_id"], engagement_id=facts["engagement_id"],
+    engagement_asset_id=facts["engagement_asset_id"], actor=facts["actor_id"])
+
+
 def _redmesh_release(console_version, report_pipeline_version):
   """The job's release record: this backend, plus what the launching console reports.
 
@@ -1395,8 +1427,10 @@ def launch_network_scan(
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
   try:
+    requested_target = target
     target = resolve_launch_target(execution_context, "network", target)
   except ValueError:
+    _log_target_mismatch(owner, execution_context, ScanType.NETWORK.value, requested_target)
     return validation_error("Execution target mismatch")
   if not target:
     return validation_error("target required for network scan")
@@ -1623,8 +1657,10 @@ def launch_webapp_scan(
   blanked from the persisted JobConfig before archive write.
   """
   try:
+    requested_target = target_url
     target_url = resolve_launch_target(execution_context, "webapp", target_url)
   except ValueError:
+    _log_target_mismatch(owner, execution_context, ScanType.WEBAPP.value, requested_target)
     return validation_error("Execution target mismatch")
   if not target_url:
     return validation_error("target_url required for webapp scan")
@@ -1937,6 +1973,7 @@ def launch_test(
   if execution_context is not None:
     unused_target = target if scan_type_enum == ScanType.WEBAPP else target_url
     if unused_target not in (None, ""):
+      _log_target_mismatch(owner, execution_context, scan_type_enum.value, unused_target)
       return validation_error("Execution target mismatch")
 
   if scan_type_enum == ScanType.WEBAPP:
