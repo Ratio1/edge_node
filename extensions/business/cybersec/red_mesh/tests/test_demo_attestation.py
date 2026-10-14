@@ -163,6 +163,12 @@ class TestDemoAttestationBridge(unittest.TestCase):
     })
     self.assertNotIn(DEMO_KEY, str(result))
 
+  def test_an_unprefixed_sdk_hash_is_answered_with_0x(self):
+    # `HexBytes.hex()` drops the prefix with hexbytes >= 1.0 (rm3 runs 1.3.1).
+    host = _bridge_host()
+    host.bc.submit_attestation.return_value = "AB" * 32
+    self.assertEqual(_resolve(_submit(host))["tx_hash"], "0x" + "ab" * 32)
+
   def test_complete_clamps_the_score_to_100_and_sends_the_zero_cid(self):
     host = _bridge_host(demo={"ENABLED": True, "PRIVATE_KEY": DEMO_KEY, "NETWORK": "devnet", "SETTLE_SECONDS": 0})
     _resolve(_submit(host, event="complete", run_mode="CONTINUOUS_MONITORING", vulnerability_score=250))
@@ -186,9 +192,13 @@ class TestDemoAttestationBridge(unittest.TestCase):
       (_bridge_host(demo={"ENABLED": True, "PRIVATE_KEY": "  "}), {}, 409, "demo_attestation_not_configured"),
       (_bridge_host(attestation={"ENABLED": True, "PRIVATE_KEY": DEMO_KEY, "RETRIES": 2}), {}, 409,
        "demo_wallet_shared"),
+      # The same key written without `0x` and in another case is still the same wallet.
+      (_bridge_host(attestation={"ENABLED": True, "PRIVATE_KEY": DEMO_KEY[2:].upper(), "RETRIES": 2}), {}, 409,
+       "demo_wallet_shared"),
       (_bridge_host(), {"job_id": "abcd1234"}, 400, "demo_job_required"),
       (_bridge_host(), {"job_id": None}, 400, "demo_job_required"),
       (_bridge_host(), {"event": "pass-1"}, 400, "invalid_event"),
+      (_bridge_host(), {"event": ["start"]}, 400, "invalid_event"),
     )
     for host, overrides, status, error_class in cases:
       with self.subTest(error_class=error_class, overrides=overrides):

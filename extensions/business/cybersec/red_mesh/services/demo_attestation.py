@@ -67,6 +67,12 @@ def _bounded_int(value, maximum):
   return min(max(number, 0), maximum)
 
 
+def _normalize_tx_hash(tx_hash):
+  # The SDK answers `HexBytes.hex()`, which has no `0x` with hexbytes >= 1.0.
+  tx_hash = str(tx_hash).strip().lower()
+  return tx_hash if tx_hash.startswith("0x") else "0x" + tx_hash
+
+
 def _classify_submit_error(exc):
   # Only a class leaves the edge: the RPC body and the key never do.
   if "insufficient" in str(exc).lower():
@@ -113,14 +119,20 @@ def _run_demo_submit(owner, work):
       continue
     owner._demo_attestation_last_send = time.monotonic()
     if tx_hash:
-      return {"tx_hash": tx_hash}
+      return {"tx_hash": _normalize_tx_hash(tx_hash)}
   return {"error_class": _classify_submit_error(last_error) if last_error else "submit_failed"}
 
 
+def _key_material(key):
+  key = (key or "").strip().lower()
+  return key[2:] if key.startswith("0x") else key
+
+
 def _shares_the_live_wallet(owner, cfg):
-  # Two senders on one wallet would race its nonce outside the Demo worker.
-  live_key = get_attestation_config(owner)["PRIVATE_KEY"]
-  return bool(cfg["PRIVATE_KEY"]) and cfg["PRIVATE_KEY"] == (live_key or "").strip()
+  # Two senders on one wallet would race its nonce outside the Demo worker. Compared without the
+  # `0x` prefix and case, which do not change the key.
+  demo_key = _key_material(cfg["PRIVATE_KEY"])
+  return bool(demo_key) and demo_key == _key_material(get_attestation_config(owner)["PRIVATE_KEY"])
 
 
 def get_demo_attestation_status(owner):
@@ -145,7 +157,7 @@ def submit_demo_attestation(owner, *, job_id="", event="", target="", run_mode="
     return _error(409, "demo_wallet_shared", "Demo attestation needs a wallet other than the live one.")
   if not isinstance(job_id, str) or not job_id.startswith(DEMO_JOB_PREFIX) or len(job_id) > 128:
     return _error(400, "demo_job_required", "Only a Demo job can be attested here.")
-  function_name = DEMO_ATTESTATION_EVENTS.get(event)
+  function_name = DEMO_ATTESTATION_EVENTS.get(event) if isinstance(event, str) else None
   if function_name is None:
     return _error(400, "invalid_event", "event must be start or complete.")
   pending = _pending(owner)
