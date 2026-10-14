@@ -125,6 +125,17 @@ DEFAULT_ATTESTATION_CONFIG = {
   "RETRIES": 2,
 }
 
+# RM-141: Demo jobs attested on Base Sepolia through the Navigator bridge. Its own switch and key,
+# never the live ones; `NETWORK` is an SDK network that resolves to Base Sepolia.
+DEMO_ATTESTATION_NETWORKS = ("testnet", "devnet")
+DEFAULT_DEMO_ATTESTATION_CONFIG = {
+  "ENABLED": False,
+  "PRIVATE_KEY": "",
+  "NETWORK": "testnet",
+  "RETRIES": 2,
+  "SETTLE_SECONDS": 5.0,
+}
+
 # RM-132: what the super-tenant may still edit about itself (contract: `onboarding-drafts.md`
 # §Contact formats and the Ratio1 lock). Deployment configuration set by Ratio1, read-only in the
 # API, named booleans, every key `True` unless the deployment says otherwise. RM-134 consumes
@@ -468,6 +479,39 @@ def get_attestation_config(owner):
     owner,
     "ATTESTATION",
     DEFAULT_ATTESTATION_CONFIG,
+    normalizer=_normalize,
+  )
+
+
+def get_demo_attestation_config(owner):
+  """RM-141: the normalized `DEMO_ATTESTATION` block. The key is for the submit path only."""
+  def _normalize(merged, defaults):
+    private_key = merged.get("PRIVATE_KEY")
+    private_key = private_key.strip() if isinstance(private_key, str) else ""
+    network = merged.get("NETWORK")
+    network = network.strip().lower() if isinstance(network, str) else ""
+    if network not in DEMO_ATTESTATION_NETWORKS:
+      network = defaults["NETWORK"]
+    try:
+      retries = int(merged.get("RETRIES", defaults["RETRIES"]))
+    except (TypeError, ValueError):
+      retries = defaults["RETRIES"]
+    try:
+      settle_seconds = float(merged.get("SETTLE_SECONDS", defaults["SETTLE_SECONDS"]))
+    except (TypeError, ValueError):
+      settle_seconds = defaults["SETTLE_SECONDS"]
+    return {
+      "ENABLED": config_flag(merged.get("ENABLED"), defaults["ENABLED"]),
+      "PRIVATE_KEY": private_key,
+      "NETWORK": network,
+      "RETRIES": max(retries, 1),
+      "SETTLE_SECONDS": settle_seconds if settle_seconds >= 0 else defaults["SETTLE_SECONDS"],
+    }
+
+  return resolve_config_block(
+    owner,
+    "DEMO_ATTESTATION",
+    DEFAULT_DEMO_ATTESTATION_CONFIG,
     normalizer=_normalize,
   )
 

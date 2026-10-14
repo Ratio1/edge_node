@@ -6,8 +6,10 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 130  # +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125)
-TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
+EXPECTED_ENDPOINTS = 132  # +2 Demo attestation bridge (RM-141); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125)
+TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider",
+                   # RM-141: the Navigator Demo attestation bridge, server to server.
+                   "submit_demo_attestation", "get_demo_attestation_status"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
 ENDPOINT_FIRST_ARGS = {
@@ -104,6 +106,8 @@ ENDPOINT_FIRST_ARGS = {
   'launch_test': 'target',
   'launch_model_test': 'token',
   'preflight_model_test_provider': 'token',
+  'submit_demo_attestation': 'token',
+  'get_demo_attestation_status': 'token',
   'get_model_test_catalog': None,
   'get_job_status': 'job_id',
   'get_job_data': 'job_id',
@@ -230,7 +234,7 @@ class TestAuthzSurface(unittest.TestCase):
       actual[name] = parameters[0] if parameters else None
     self.assertEqual(actual, ENDPOINT_FIRST_ARGS)
 
-  def test_only_the_original_model_endpoints_require_the_bearer(self):
+  def test_only_the_model_and_demo_bridge_endpoints_require_the_bearer(self):
     protected = {n for n, fn in self.endpoints.items() if getattr(fn, "__require_token__", False)}
     self.assertEqual(protected, TOKEN_ENDPOINTS)
 
