@@ -58,7 +58,8 @@ _PER_JOB = (
   (":report_review:audit", list, False),
 )
 # RM-133: `tenant_contract_draft` is keyed `(tenant_id, contract_id)` and takes the generic related-tenant rule.
-_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
+# RM-139: the tenant `integration` kind is retired: its rows classify old and are never restored.
+_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "engagement", "tenant_draft",
                   "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
                   "super_tenant_branding", "super_tenant_integration")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
@@ -214,7 +215,7 @@ class Inventory:
       return self._tenants
     found = set()
     for _, kind, ids, value in self._tenancy_fields():
-      if kind in ("tenant", "tenant_node", "integration", "engagement", "asset") and ids:
+      if kind in ("tenant", "tenant_node", "engagement", "asset") and ids:
         found.add(ids[0])
       if kind == "receipt" and isinstance(value, dict) and isinstance(value.get("tenant_id"), str):
         found.add(value["tenant_id"])
@@ -245,6 +246,17 @@ class Inventory:
 
   def is_account_hkey(self, hkey):
     return hkey == self._account_hkey
+
+  def is_retired_field(self, hkey, field):
+    """RM-139. A tenant `integration` row: `accepts` admits the tenancy hkey as a whole, so a backup
+    taken before the start-up cleanup would otherwise bring those rows back."""
+    if hkey != self._tenancy_hkey:
+      return False
+    try:
+      decoded = json.loads(field)
+    except (ValueError, RecursionError):
+      return False
+    return isinstance(decoded, list) and bool(decoded) and decoded[0] == "integration"
 
   def is_job_hkey(self, hkey):
     return hkey == self._instance
@@ -736,7 +748,7 @@ def restore_records(owner, inventory, rows):
   for row in rows:
     hkey, field, value = row["hkey"], row["field"], row["value"]
     outcome = "written"
-    if not inventory.accepts(hkey):
+    if not inventory.accepts(hkey) or inventory.is_retired_field(hkey, field):
       outcome = "refused"
     else:
       stored = owner.chainstore_hget(hkey=hkey, key=field)

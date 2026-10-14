@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from .conftest import mock_plugin_modules
 
 TEST_CHANNEL_TOKEN = "test-model-token-material-at-least-32-bytes"
-EXPECTED_ENDPOINTS = 132  # +2 STA deployment integrations (RM-139); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125)
+EXPECTED_ENDPOINTS = 129  # +2 STA deployment integrations, -3 tenant integrations (RM-139); +2 public branding for the sign-in page; +3 super-tenant branding (RM-134); +1 list_deployment_nodes (RM-126); +5 data maintenance (RM-108, temporary); +3 tenant contract (RM-095 phase 1); +6 engagements (RM-095 phase 2); +1 delete_tenant, -4 tenant assets (RM-107); +7 tenant drafts (RM-109 phase 2); +3 draft release/close and tenant document download (RM-109 phase 3); +8 engagement drafts (RM-109 phase 4); +3 super-tenant profile and generated pack (RM-110 phase 1); +6 tenant assets (RM-125)
 TOKEN_ENDPOINTS = {"launch_model_test", "preflight_model_test_provider"}
 LAUNCH_ENDPOINTS = ("launch_network_scan", "launch_webapp_scan", "launch_test", "launch_model_test")
 # Pre-RM-075 public positional contract; account actor fields are appended to launches.
@@ -19,10 +19,6 @@ ENDPOINT_FIRST_ARGS = {
   # RM-126: the configured peers named by the network monitor, a full-portfolio STA read.
   'list_deployment_nodes': 'actor',
   'set_tenant_node_assignment': 'actor',
-  # RM-081: tenant integration configuration, same administration seam as assets and nodes.
-  'list_tenant_integrations': 'actor',
-  'get_tenant_integration': 'actor',
-  'put_tenant_integration': 'actor',
   'update_tenant_allow_pentester': 'actor',
   'update_tenant_node_failure_policy': 'actor',
   'get_tenant_members': 'actor',

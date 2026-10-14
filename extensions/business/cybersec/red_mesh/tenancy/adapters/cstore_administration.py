@@ -5,7 +5,6 @@ Verification is a local read-back, not a distributed transaction or freshness gu
 import json
 
 from ..ports import TenantStoreError
-from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
 from ..engagements import validate_engagement
 from ..drafts import validate_tenant_draft
@@ -74,7 +73,9 @@ class CstoreTenantAdministrationStore:
     if kind == "tenant_node":
       validate_node_assignment(raw, ids)
     if kind == "integration":
-      validate_integration(raw, ids)
+      # RM-139: the tenant integration kind is retired. It stays in `_KINDS` only so the start-up
+      # cleanup can address its rows; no row of it is read or written.
+      raise TenantStoreError("Retired tenant storage record")
     if kind == "engagement":
       try:
         validate_engagement(raw, ids)
@@ -161,6 +162,12 @@ class CstoreTenantAdministrationStore:
     self._location(kind, (tenant_id,))
     return [ids for ids, _ in self._fields(kind, tenant_id)]
 
+  def record_ids(self, kind):
+    """RM-139. The ids of every row of one kind in the namespace, without validating them, so a
+    cleanup reaches the rows of deleted tenants too."""
+    self._location(kind, ("enumeration",))
+    return [ids for ids, _ in self._fields(kind)]
+
   def raw_record(self, kind, *ids):
     """RM-107. One row decoded but not validated, for the same reason; None when absent or unreadable."""
     hkey, key = self._location(kind, ids)
@@ -233,11 +240,6 @@ class CstoreTenantAdministrationStore:
   def list_engagements(self, tenant_id):
     self._location("engagement", (tenant_id,))
     return [self._validate(raw, "engagement", ids) for ids, raw in self._fields("engagement", tenant_id)]
-
-  def list_integrations(self, tenant_id):
-    self._location("integration", (tenant_id,))
-    return [self._validate(raw, "integration", ids)
-            for ids, raw in self._fields("integration", tenant_id)]
 
   def list_tenant_drafts(self):
     """RM-109. Every draft of the namespace; a malformed one fails the read closed."""

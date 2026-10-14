@@ -1,38 +1,28 @@
-"""Per-tenant SOC/CTI destination config records (RM-081 Phase 1).
+"""Deployment SOC/CTI destination config: the configurable ids, their keys and credentials.
 
 Validation only. This module neither authorizes a caller nor resolves a destination; the
 administration service owns admission and the export services own resolution.
 
 Two facts shape it:
 
-1. Only four integration ids have a destination and credentials, which is what "configure per
-   tenant" means. `stix` is `destination_type: manual_download`, `event_export` is redaction and
-   signing transport policy, and `suricata` is an IDS reading node traffic (postponed by the owner).
-   A record for any of those three is refused outright rather than silently ignored, so the
-   node-level three can never acquire tenant state by accident.
-2. Config keys are the deployment block's own uppercase keys, not a translated shape. A tenant
-   record is a partial override of the same block the node already resolves, so the export path can
-   merge it without a mapping layer that could drift.
+1. Only four integration ids have a destination and credentials, which is what an STA override can
+   set (RM-139). `stix` is `destination_type: manual_download`, `event_export` is redaction and
+   signing transport policy, and `suricata` is an IDS reading node traffic; none of them is a valid
+   id here, so they can never acquire override state by accident.
+2. Config keys are the deployment block's own uppercase keys, not a translated shape. An override is
+   a partial override of the same block the node already resolves, so the export path can merge it
+   without a mapping layer that could drift.
 
 Credential values live in the record for now by owner decision (2026-09-16), which the deployment
 config already supports inline (`services/config.py:81-84` TOKEN, and MISP_API_KEY). They are
 write-only across the API: CREDENTIAL_KEYS names them so no projection can return one.
+
+RM-081 stored one such config per tenant (record kind `integration`). RM-139 retired those records:
+`retire_tenant_integration_records` deletes them once at plugin start.
 """
-from datetime import datetime, timezone
-
-from .identity import canonical_account_id
-from .ports import TenantStoreError
-
-
-TENANT_INTEGRATION_IDS = ("misp", "opencti", "taxii", "wazuh")
-
-# Refused outright, with their reason, rather than merely absent from the table above: a future
-# edit that adds one of these to TENANT_INTEGRATION_IDS has to delete its entry here and say why.
-NODE_LEVEL_INTEGRATION_IDS = {
-  "stix": "manual download format, no destination and no credential",
-  "event_export": "redaction and signing transport policy, no destination",
-  "suricata": "node sensor telemetry; per-tenant ownership postponed by the owner 2026-09-16",
-}
+INTEGRATION_IDS = ("misp", "opencti", "taxii", "wazuh")
+# The retired RM-081 per-tenant record kind, keyed `(tenant_id, integration_id)`.
+RETIRED_TENANT_KIND = "integration"
 
 _BOOL = (bool,)
 _STR = (str,)
@@ -80,12 +70,12 @@ _MAX_VALUE_LENGTH = 2048
 
 
 def integration_ids():
-  """The tenant-scopable ids, sorted, for callers that enumerate rather than hard-code."""
-  return TENANT_INTEGRATION_IDS
+  """The configurable ids, sorted, for callers that enumerate rather than hard-code."""
+  return INTEGRATION_IDS
 
 
 def valid_integration_id(value):
-  return isinstance(value, str) and value in TENANT_INTEGRATION_IDS
+  return isinstance(value, str) and value in INTEGRATION_IDS
 
 
 def normalize_integration_config(integration_id, config):
@@ -116,36 +106,11 @@ def normalize_integration_config(integration_id, config):
   return normalized
 
 
-def public_integration_config(integration_id, config):
-  """Project a stored config with every credential replaced by a configured/not-configured flag."""
-  if not valid_integration_id(integration_id):
-    raise ValueError("Unknown integration")
-  if not isinstance(config, dict):
-    raise ValueError("Invalid integration config")
-  credentials = CREDENTIAL_KEYS[integration_id]
-  projected = {key: value for key, value in config.items() if key not in credentials}
-  projected["credentialsConfigured"] = bool(
-    any(str(config.get(key) or "").strip() for key in credentials))
-  return projected
-
-
-def validate_integration(row, ids):
-  """Validate the domain payload at every persisted integration boundary, enabled or not."""
-  if len(ids) != 2 or not valid_integration_id(ids[1]):
-    raise TenantStoreError("Invalid tenant integration record")
-  if (row.get("tenant_id") != ids[0] or row.get("integration_id") != ids[1]
-      or type(row.get("enabled")) is not bool or not row.get("updated_by")
-      or canonical_account_id(row["updated_by"]) != row["updated_by"]):
-    raise TenantStoreError("Invalid tenant integration record")
-  # normalize_integration_config copies validated values verbatim and never coerces, so its
-  # returning at all is the whole check; comparing its result to the input would be dead code.
-  try:
-    normalize_integration_config(ids[1], row.get("config"))
-  except (ValueError, TypeError, RecursionError) as exc:
-    raise TenantStoreError("Invalid tenant integration record") from exc
-  try:
-    updated_at = datetime.fromisoformat(row.get("updated_at"))
-  except (TypeError, ValueError) as exc:
-    raise TenantStoreError("Invalid tenant integration record") from exc
-  if updated_at.tzinfo != timezone.utc:
-    raise TenantStoreError("Invalid tenant integration record")
+def retire_tenant_integration_records(store):
+  """Delete every stored per-tenant integration row of the store's namespace, orphans of deleted
+  tenants included, and answer how many went. Idempotent: a second run finds none. The rows are
+  found by their field keys and never decoded, so their credentials are never read."""
+  ids = store.record_ids(RETIRED_TENANT_KIND)
+  for record_ids in ids:
+    store.delete(RETIRED_TENANT_KIND, *record_ids)
+  return len(ids)

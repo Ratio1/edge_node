@@ -7,7 +7,7 @@ from extensions.business.cybersec.red_mesh.services.config import IntegrationOve
 from extensions.business.cybersec.red_mesh.services.integration_status import (
   _STATUS_BUILDERS, get_public_integration_config)
 from extensions.business.cybersec.red_mesh.tenancy.http_runtime import _EFFECT_FIELDS, _READ_FIELDS
-from extensions.business.cybersec.red_mesh.tenancy.integrations import TENANT_INTEGRATION_IDS
+from extensions.business.cybersec.red_mesh.tenancy.integrations import INTEGRATION_IDS
 
 
 class Owner:
@@ -82,10 +82,10 @@ class TestDeploymentReadinessPayload(unittest.TestCase):
 
   def test_no_credential_reaches_the_payload(self):
     owner = Owner(self.node, {integration_id: {"TOKEN": f"{integration_id}-secret"}
-                              for integration_id in TENANT_INTEGRATION_IDS if integration_id != "misp"})
+                              for integration_id in INTEGRATION_IDS if integration_id != "misp"})
     import json
     rendered = json.dumps(get_public_integration_config(owner))
-    for integration_id in TENANT_INTEGRATION_IDS:
+    for integration_id in INTEGRATION_IDS:
       self.assertNotIn(f"{integration_id}-secret", rendered)
 
 
