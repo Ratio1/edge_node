@@ -22,6 +22,8 @@ This is the durable reference for implementation across independent Ratio1 repos
 11. **2026-10-14 certificate recovery:** include CockroachDB certificate-regeneration recovery in this release. Preserve the prior credentials and data, stop every failed-generation node before restoring, and require authenticated TLS SQL readiness using the planned certificates. See [certificate recovery](deeploy-certificate-recovery.md).
 12. **2026-10-14 mutation scope:** scale-up and whole-job deletion are asynchronous and use the same polling endpoint. Scale-up is a full placement revision with rollback. Delete waits for confirmed stops before removing secrets and metadata. Partial node deletion is rejected; no compatibility mode. Deleted paid job IDs may be reused through a higher revision (user confirmed).
 
+13. **2026-10-14 completion clarification:** coordinator completion is the final deployment outcome. The UI must not wait for blockchain consensus: report deployment success and stop automatic polling once execution and required recovery are complete. Do not track, display, or gate deployment completion or subsequent operations on blockchain transactions. The existing ChainDistMonitor remains separate; authentication and paid-job admission validation are unchanged. The SDK examples use the same completion boundary.
+
 ## Repository orientation and inspected baseline
 
 The reference inspection used `edge_node` commit `7ba2adbf`, `naeural_core` commit `a4b2ad0`, and `deeploy-dapp` commit `56a90f4`. Recheck the relevant code before implementation; these commits describe the inspected baseline, not a required checkout state.
@@ -64,7 +66,7 @@ The following invariants are release requirements:
 - A failed update is not considered recovered until the previous configuration and placement have been restored and verified under their readiness contract.
 - Keep every secret/configuration revision that may still be needed by a live, unreachable, or restoring instance.
 - Never roll back application data or delete persistent volumes as an implicit deployment cleanup action.
-- Runtime execution, recovery, metadata, and blockchain settlement have independently recorded outcomes.
+- Runtime execution, recovery and metadata determine the deployment outcome. Blockchain transactions are outside this lifecycle.
 
 ## Deployment and operation records
 
@@ -75,9 +77,9 @@ Use a deployment identity scoped by network, escrow/owner authorization domain, 
 | Deployment index | Stable identity; active operation; desired and last successful revisions; exact previous placement; coordination ownership/version; bounded recent-operation references. |
 | Immutable revision | Redacted canonical configuration; canonical hash; exact materialized configuration references per node; required plugin identities; secret revision references; readiness requirements; image/content identifiers where available. |
 | Operation intent | Operation ID; signed client request ID; semantic request hash; create/update kind; expected prior revision; target revision; frozen node/instance plan; timestamps; deadlines; recovery policy. |
-| Operation progress | Execution phase; outcome; retry schedule; error details; abort decision; cleanup/restoration evidence; metadata and settlement progress; monotonically ordered changes. |
+| Operation progress | Execution phase; outcome; retry schedule; error details; abort decision; cleanup/restoration evidence; metadata progress; monotonically ordered changes. |
 | Node observation | Authenticated node; operation/revision/attempt; plugin identity; local phase; readiness; structured error; sequence/incarnation; emitted and received times. |
-| Action record | Dispatch/stop/restore/settlement action ID, scope, precondition, attempt history, acknowledgment, and completion evidence. |
+| Action record | Dispatch/stop/restore action ID, scope, precondition, attempt history, acknowledgment, and completion evidence. |
 
 Large immutable redacted definitions and bounded historical snapshots belong in R1FS. Frequently read operation indexes, small progress records, node observations, and recovery decisions belong in CStore. Store protected secret material through dAuth, not in public progress records or ordinary revision payloads.
 
@@ -155,7 +157,7 @@ A response must contain:
 - Last known workload health separately from operation outcome.
 - Observation timestamps, stale flags, source/authority version, and a suggested poll interval.
 - Structured errors with code, safe message, scope, failed phase, retryability, attempt count, and next retry time where applicable.
-- Cleanup/restoration state for each affected node; metadata and blockchain settlement state.
+- Cleanup/restoration state for each affected node; metadata state.
 - Bounded recent events and continuation information.
 
 Illustrative result body during failure recovery:
@@ -199,7 +201,7 @@ Register operation and instance identity in Core's command/config admission path
 | BusinessManager and execution supervision | Missing plugin code, constructor/init exceptions, lifecycle transitions, execution errors, and stopped/removed confirmation. |
 | Plugin through a local interface | Workload-specific preparation/progress, explicit failures, and application readiness. |
 | Independent node reporter | Durable pending observations, bounded publication retries, replay after restart, and authorized routing. |
-| Deeploy controller | Multi-node aggregation, deadlines, abort decisions, cleanup, restoration, and settlement. |
+| Deeploy controller | Multi-node aggregation, deadlines, abort decisions, cleanup and restoration. |
 
 Extend the existing readiness interface only as needed to carry phase/error information. Preserve semaphore semantics used by dependent plugins. A running plugin must not default to application-ready if the workload requires health checks; container and worker runners must report their actual readiness contract.
 
@@ -279,11 +281,9 @@ Keep canonical metadata consistent with desired intent and observed execution. N
 
 Reuse the paid job identity throughout submission, retry, cleanup, and restoration. A missing deploy response must never trigger another payment.
 
-Record blockchain action intent and transaction identity before treating submission as complete. After a crash or RPC timeout, reconcile the existing transaction/on-chain state before retransmitting. Separate runtime status from settlement status, for example `Application ready; confirmation pending`.
+Deployment operations do not prepare, broadcast, reconcile, cancel or track blockchain transactions. Completion and subsequent operation admission depend only on the coordinator's runtime, metadata and recovery state. Polling does not expose settlement fields, and the UI does not show settlement indicators.
 
-Runtime readiness on all required instances is the prerequisite for deployment-success confirmation. Metadata/settlement failures after readiness do not alone imply that an instance failed to start and must not automatically initiate destructive stop/redeploy loops.
-
-Document the precise existing contract calls and which may require compensation after a failed rollout. Never infer a refund, payment cancellation, or reversal from runtime cleanup. If restoration changes recorded membership, reconcile it using the confirmed previous placement and existing contract rules.
+The existing ChainDistMonitor continues its independent pending-job confirmation, launch-recovery and closable-job handling. This lifecycle does not promise blockchain reconciliation for arbitrary changes to an already-active job's placement. Payment/ownership/resource validation at admission remains unchanged. Runtime cleanup never implies a refund or payment reversal.
 
 ## Frontend behavior
 
@@ -310,7 +310,7 @@ Display recovery explicitly:
 - `Update failed — previous revision restored`.
 - `Recovery incomplete — waiting for node B`.
 
-Show recent timeline events in the same panel using the polling response. Keep detailed logs outside this scope unless already provided through an existing feature. Surface metadata/settlement progress separately from readiness.
+Show recent timeline events in the same panel using the polling response. Keep detailed logs outside this scope unless already provided through an existing feature. Do not include blockchain transaction state in deployment progress.
 
 Start with approximately two-second polling while active, configurable and jittered. Back off on transport errors and when the tab is hidden; fetch promptly on focus/reconnect. Share polling state so the modal, list, and detail view do not independently flood the API. Stop active operation polling only when execution and required recovery are complete; current-health monitoring remains a separate concern.
 
@@ -334,7 +334,7 @@ Test the coordinated release in an isolated environment. Verify that no old in-f
 - Inspect Core CStore persistence/merge/replication and establish the coordination mechanism described above.
 - Prove same-key retry reuse after replication, coordinator-only execution, stale-read repair, and crash recovery in focused tests; document the simultaneous cross-oracle admission limitation.
 - Define timeout/retry/retention configuration and how unavailable coordination is surfaced.
-- Map dAuth revision lookup and existing blockchain settlement/compensation requirements.
+- Map dAuth revision lookup and preserve existing paid-job validation.
 
 Exit: written algorithm and tests demonstrate the required guarantees. Do not start by wrapping today's in-memory pending dictionary in a polling endpoint.
 
@@ -362,7 +362,7 @@ Exit: missing code, constructor failure, startup error, stalled execution, stop 
 - Execute committed plans independently of API requests and UI polling.
 - Interpret typed node observations, enforce all-target readiness, and record side effects before/reconcile after dispatch.
 - Implement failed-create cleanup and failed-update restoration exactly as specified.
-- Coordinate stop/delete/scale and settlement with known active operations; prevent obsolete commands within an operation. Do not add cross-oracle consensus.
+- Coordinate stop/delete/scale with known active operations; prevent obsolete commands within an operation. Do not add cross-oracle consensus.
 - Replace timeout-triggered metadata rollback with evidence-based lifecycle finalization.
 
 Exit: three-node success/failure/deadline scenarios converge to either all-ready, confirmed stopped, confirmed restored, or an honest unresolved recovery state.
@@ -398,7 +398,7 @@ Exit: all acceptance criteria below pass or the feature remains incomplete. An A
 
 | Scenario | Required result |
 | --- | --- |
-| Three nodes become ready | One operation succeeds after all required instances are ready; metadata/settlement progress is accurate. |
+| Three nodes become ready | One operation succeeds after all required instances are ready; metadata is committed. |
 | Acceptance response lost | Same request ID returns the same operation through another oracle; no duplicate payment or workload. |
 | Crash before admission commit | No workload dispatch; same-key retry safely completes or rejects admission. |
 | Crash after commit or mid-dispatch | Recover exact plan/actions; reconcile and resume without duplicate effects. |
@@ -419,7 +419,7 @@ Exit: all acceptance criteria below pass or the feature remains incomplete. An A
 | Node disappears during cleanup | Recovery not marked complete; no speculative secret deletion. |
 | Attempted and previous revisions need different secrets | Both remain retrievable under correct authorization until confirmed retirement. |
 | CStore publish or R1FS retrieval fails | Retry/availability state exposed; no fabricated readiness or destructive cleanup. |
-| Runtime ready but blockchain result unknown | Reconcile transaction without deploying/paying again; show settlement pending. |
+| Runtime ready but blockchain result unknown | Report coordinator completion immediately; transactions do not participate in deployment status or mutation gates. |
 | Frontend refresh/reconnect/oracle switch | Same operation resumes, including cleanup/restoration; transport failure is not deployment failure. |
 | Unauthorized operation/node record access | Denied; no secret or cross-owner observation disclosure or forged status acceptance. |
 | Stop/delete/scale during update recovery | Defined serialization/conflict; no race that resurrects deleted work or drops required secret revisions. |
@@ -460,15 +460,15 @@ To resume after compaction:
 - CStore persists atomically with fsync before acknowledging. Replication requires distinct authenticated remote peers; default threshold is a strict majority of remote eligible peers, explicit `MIN_CONFIRMATIONS` overrides it. Self is excluded and zero remote peers fails closed. Identical-value retries recollect confirmation. This is durability acknowledgment, not distributed consensus or admission locking.
 - Operations and node observations use eight sequence slots per identity; signed writer/field bindings and monotonic slot merge reject stale or forged snapshots. Operation events are bounded to 128. Abort journals and operation identities are retained; automatic history expiry is not implemented, because deleting abort history could permit replay.
 - Redacted exact execution plans are stored in R1FS. Local plan persistence/pinning and durable coordinator volume are required; independent remote pinning and coordinator failover are not promised.
-- Edge `deployment_operations.py` owns admission, worker replay, readiness, stop barriers, restoration, canonical commit, secret revocation, settlement, and the single owner-authorized polling projection. HTTP400 validation and HTTP503 uncertain admission are separate from HTTP202 acceptance.
+- Edge `deployment_operations.py` owns admission, worker replay, readiness, stop barriers, restoration, canonical commit, secret revocation, and the single owner-authorized polling projection. HTTP400 validation and HTTP503 uncertain admission are separate from HTTP202 acceptance.
 - Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart; incomplete preparation is revoked after 120 seconds without changing the current revision. No dispatch occurs before accepted data is replicated. The local admission lock also serializes worker preparation with submissions.
 - dAuth stores immutable per-revision secrets with exact authorized node/instance configurations. Revocation is a separate durable marker followed by plaintext erasure. Previous secrets remain available until stop/restoration evidence allows retirement. Ordinary polling oracles cannot read protected secrets; an oracle lacking prior protected revision data rejects update admission safely. Polling from any oracle remains supported.
 - Container readiness reports actual health and build/pull failures. Cleanup verifies Docker absence and preserves volumes. Managed CockroachDB additionally verifies planned certificate fingerprints and authenticated verify-full SQL before readiness. Its isolated real-binary old/new/old certificate recovery test passed with data preservation; see the linked recovery document for the exact offline command and limitations.
 - Canonical pointers and current dAuth bundles carry signed monotonic storage generations. A restored runtime retains its previous content revision while its metadata commit advances the storage generation; later creates/updates/deletes advance beyond it. Delete tombstones reject stale repair, and explicit higher generations permit paid job reuse. Every new attempt also advances beyond all verified observed attempts for the job, including failed preparation/create attempts, so clock skew cannot hide a retry in job-only polling. The receiving oracle also coordinates existing CSP owner transfer through the revision lifecycle; rollback preserves the newly authorized owner.
 - Tracked containers pin local Docker image IDs before launch and retain them across restart. Worker sources pin and verify Git commits. Automatic image/source polling is disabled for tracked revisions; restoration uses captured node artifacts with no mutable-tag fallback. Missing local images or historical bindings block restoration. Arbitrary build commands can still depend on mutable external downloads; deterministic application dependencies remain an application build responsibility.
-- Settlement persists signed transaction bytes before broadcast, retries identical bytes, checks receipts, and distinguishes mined oracle confirmation from membership consensus. Shared signer locking and durable pending reservations prevent nonce reuse by local node-update writers. Runtime success and settlement status are independent.
+- Deployment transaction tracking and consensus gates were removed per the completion clarification. Existing blockchain monitor and SDK transaction submission behavior remain unchanged; no deployment nonce reservation, cancellation or prepared-transaction API is introduced.
 - Frontend implementation initially delegated to Claude; Codex completed final retry work after the specialist session limit. Persisted request identity, uncertain acceptance lookup, refresh/account/oracle-scoped polling, node/instance/recovery progress, and create/update/delete integration are implemented. Scale-up uses the update lifecycle. Unknown update acceptance blocks new payments/allocations; an exact signed resend is held in memory only. Missing replica state or elapsed time cannot authorize discarding an unresolved submission. Escrow node count is refreshed before another node-extension payment. These safeguards do not provide cross-tab or cross-oracle consensus.
-- Offline verification: Container Apps 484 tests passed; Worker 17 passed; dAuth/reveal 63 passed; SDK direct-client 6, prepared-transaction EVM 10, and secret-client 19 passed (35 in the final combined run); broader EVM regression checks also passed. Core lifecycle 49 and HSync 9 passed. Core broad discovery ran 467 tests with eight errors and one skip; an isolated base-HEAD run (415 tests) reproduced the identical eight errors and skip. Failures: five node-oracle fixtures missing `evm_network`, one shutdown fixture missing `config_data`, absent structured training pipeline module, and Torch stub missing `dtype`. These remain outside this change. Final full Deeploy suite: 373 tests passed, including retry-generation ordering under clock skew.
+- Offline verification: Container Apps 484 tests passed; Worker 17 passed; dAuth/reveal 63 passed; SDK direct-client 6 and secret-client 19 passed; transaction-specific additions and their tests were removed. Core focused lifecycle/CStore/secrets checks after transaction removal: 95 passed (lifecycle module now 45 tests). HSync 9 passed. Before removal, Core broad discovery ran 467 tests with eight errors and one skip; an isolated base-HEAD run (415 tests) reproduced the identical eight errors and skip. Failures: five node-oracle fixtures missing `evm_network`, one shutdown fixture missing `config_data`, absent structured training pipeline module, and Torch stub missing `dtype`. These remain outside this change. Final full Deeploy suite after transaction decoupling: 371 tests passed, including retry-generation ordering under clock skew.
 - Runtime image: `local_edge_node_dauth471_core219_arm64:1599b7e`, Python3.10.12, network disabled, worktrees mounted read-only. Host supported Python: `/Users/alessandro/.pyenv/versions/3.10.18/bin/python`. No live deployments or production changes performed.
 
 Final integration evidence:
@@ -493,3 +493,5 @@ Implementation and offline verification are complete; all four PRs are open and 
 - [deeploy-dapp](https://github.com/Ratio1/deeploy-dapp/pull/170)
 
 Implementation commits: Edge `f2ddd91`, Core `4f56e71`, SDK `9b47c02`, dApp `59de055`. No live deployment was performed. Follow-up implementation should start by reading this document and inspecting the current PR heads, preserving the confirmed decisions and verification limits above.
+
+2026-10-14 completion update: removed deployment transaction tracking, prepared-transaction APIs, nonce reservations, settlement polling fields/UI and transaction-based admission gates. Coordinator completion alone is final. Latest checks: Deeploy 371, ChainDistMonitor 12, Core focused 95, SDK async/secrets 25 and baseline EVM 11 passed; frontend lifecycle/UI scripts, TypeScript, ESLint, production build, and desktop/mobile completion preview passed. The earlier broad Core and 48-suite frontend runs above describe the initial implementation; final focused checks cover this removal.

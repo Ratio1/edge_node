@@ -174,8 +174,8 @@ class _DeploymentOperationsMixin:
   def _assert_no_active_deployment(self, job_id=None, app_id=None):
     """Serialize other job mutations against known deployment/recovery work."""
     self._repair_deployment_records(force=True)
-    if any((str(record["job_id"]) == str(job_id) or (app_id and record["app_id"] == app_id)) and (record["phase"] != "completed" or record.get("settlement", {}).get("status") in
-                   ("pending", "prepared", "submitted", "uncertain", "awaiting_consensus"))
+    if any((str(record["job_id"]) == str(job_id) or (app_id and record["app_id"] == app_id))
+           and record["phase"] != "completed"
            for record in self._operation_records().values()):
       raise DeploymentConflictError("Deployment or recovery is active; wait before changing this job.")
 
@@ -195,8 +195,7 @@ class _DeploymentOperationsMixin:
         if record["request_hash"] != digest:
           raise DeploymentConflictError("request_id was already used for different deployment input.")
         return record
-    if any(record["phase"] != "completed" or record.get("settlement", {}).get("status") in
-           ("pending", "prepared", "submitted", "uncertain", "awaiting_consensus") for record in records):
+    if any(record["phase"] != "completed" for record in records):
       raise DeploymentConflictError("A deployment operation or recovery is already active for this job.")
     return None
 
@@ -353,7 +352,7 @@ class _DeploymentOperationsMixin:
       phase="preparing", outcome=None, recovery=None, created_at=now, updated_at=now,
       preparation_deadline=now + 120,
       deadline=now + self.cfg_deployment_readiness_timeout,
-      sequence=0, events=[], sent_at={}, settlement={"status": "not_started"},
+      sequence=0, events=[], sent_at={},
       error=None,
     )
     # The recovery owner must exist before any plaintext revision is staged.
@@ -536,8 +535,6 @@ class _DeploymentOperationsMixin:
       active_configs = plan["previous_configs"] if restored else configs
       self._commit_operation_revision(operation, active_configs)
       self._release_unused_secret_revisions(operation, plan, active_attempt="restore" if restored else "deploy")
-      # Runtime recovery is independent of blockchain settlement. Persist before
-      # attempting the transaction; uncertain results are reconciled separately.
       operation.update(outcome="failed" if restored else "succeeded",
                        recovery="completed" if restored else None)
       self._save_operation(operation, "completed",
@@ -584,7 +581,6 @@ class _DeploymentOperationsMixin:
     bundle = copy.deepcopy(bundle)
     bundle.pop("pipelines", None)
     self.commit_deployment_revision(operation, representative, bundle)
-    operation["settlement"] = {"status": "pending"}
 
   def _release_unused_secret_revisions(self, operation, plan, active_attempt):
     """Remove plaintext from unused revisions only after positive stop evidence.
@@ -612,55 +608,8 @@ class _DeploymentOperationsMixin:
                                  **dauth_registry_write_kwargs(self)):
         raise RuntimeError("Secret cleanup is pending.")
 
-  def _reconcile_deployment_settlement(self, operation):
-    """Serialize prepare/persist/broadcast with every local node-update writer."""
-    with self.bc.node_update_transaction_lock:
-      return self._reconcile_deployment_settlement_locked(operation)
-
-  def _reconcile_deployment_settlement_locked(self, operation):
-    """Persist exact signed transaction bytes before any network broadcast."""
-    settlement = operation.get("settlement", {})
-    if settlement.get("status") not in ("pending", "prepared", "submitted", "uncertain", "awaiting_consensus"):
-      return
-    if self.time() - settlement.get("checked_at", 0) < 30:
-      return
-    nodes = operation["previous_nodes"] if operation["outcome"] == "failed" else operation["nodes"]
-    expected = sorted(self.bc.node_addr_to_eth_addr(node).lower() for node in nodes)
-    details = self.bc.get_job_details(int(operation["job_id"]))
-    actual = sorted(node.lower() for node in details["activeNodes"])
-    settlement["checked_at"] = self.time()
-    if actual == expected and (not settlement.get("transaction") or
-                               self.bc.get_transaction_receipt(settlement["transaction"]["transaction_hash"]) is not None):
-      settlement["status"] = "confirmed"
-      settlement.pop("transaction", None)
-      self._save_operation(operation, message="Blockchain membership confirmed.")
-      return
-    if settlement["status"] == "awaiting_consensus":
-      self._save_operation(operation)
-      return
-    transaction = settlement.get("transaction")
-    if not transaction:
-      transaction = self.bc.prepare_node_update(job_id=int(operation["job_id"]), nodes=expected)
-      settlement.update(status="prepared", nodes=expected, transaction=transaction)
-      self._save_operation(operation, message="Blockchain confirmation prepared.")
-    else:
-      receipt = self.bc.get_transaction_receipt(transaction["transaction_hash"])
-      if receipt is not None:
-        settlement.update(status="failed" if receipt["status"] == 0 else "awaiting_consensus",
-                          transaction_hash=transaction["transaction_hash"], receipt=receipt)
-        settlement.pop("transaction", None)
-        self._save_operation(operation, message="Blockchain confirmation reverted." if receipt["status"] == 0 else "Oracle confirmation mined; awaiting membership consensus.")
-        return
-    # Repeating identical signed bytes cannot create a second transaction.
-    self._replicate_operation(operation)
-    if self._deployment_operations_stop.is_set():
-      return
-    tx_hash = self.bc.send_prepared_transaction(transaction["raw_transaction"])
-    operation["settlement"].update(status="submitted", transaction_hash=tx_hash)
-    self._save_operation(operation)
-
   def _reconcile_coordinator_operations(self):
-    """Advance runtime work and reserve one unresolved settlement nonce locally."""
+    """Advance runtime execution and recovery for this receiving oracle."""
     own = [copy.deepcopy(operation) for operation in self._operation_records().values()
            if operation["coordinator"] == self.bc.address]
     for operation in own:
@@ -670,19 +619,6 @@ class _DeploymentOperationsMixin:
         self._advance_deployment_operation(operation)
       except Exception:
         self.P("Deployment operation waiting for storage or transport recovery.", color="y")
-    settlements = [operation for operation in own if operation["phase"] == "completed"
-                   and operation["settlement"].get("status") in
-                   ("pending", "prepared", "submitted", "uncertain", "awaiting_consensus")]
-    # Prepared and unmined transactions retain the signer's nonce reservation
-    # across restarts. A different job cannot prepare a conflicting transaction.
-    reserved = [operation for operation in settlements if operation["settlement"].get("transaction")]
-    pending = [operation for operation in settlements if operation["settlement"]["status"] == "pending"]
-    selected = min(reserved or pending, key=lambda op: op["created_at"], default=None)
-    if selected:
-      self._reconcile_deployment_settlement(selected)
-    for operation in settlements:
-      if operation["settlement"]["status"] == "awaiting_consensus":
-        self._reconcile_deployment_settlement(operation)
 
   def _deployment_operation_worker(self):
     """Resume coordinator-owned work independently of HTTP and UI polling."""
@@ -773,9 +709,8 @@ class _DeploymentOperationsMixin:
       ))
     fields = ("operation_id", "request_id", "job_id", "app_id", "kind", "mutation", "sequence",
               "target_revision", "previous_revision", "phase", "outcome", "recovery",
-              "coordinator", "created_at", "updated_at", "error", "settlement")
+              "coordinator", "created_at", "updated_at", "error")
     result = {key: copy.deepcopy(operation.get(key)) for key in fields}
-    result["settlement"].pop("transaction", None)
     limit = request.get("events_limit", 64)
     if type(limit) is not int or not 1 <= limit <= 128:
       raise ValueError("events_limit must be between 1 and 128.")

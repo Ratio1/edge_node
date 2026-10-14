@@ -234,7 +234,7 @@ class DeploymentMutationTests(unittest.TestCase):
     plugin.stop_report(operation, "B")
     plugin._advance_delete_operation(operation)
     self.assertEqual(operation["phase"], "completed")
-    self.assertEqual(operation["settlement"]["status"], "not_started")
+    self.assertNotIn("settlement", operation)
     self.assertTrue(plugin.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy|revoked"])
     self.assertTrue(plugin.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"]["revoked"])
     self.assertEqual(plugin.storage[DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"]["job_secrets"], {})

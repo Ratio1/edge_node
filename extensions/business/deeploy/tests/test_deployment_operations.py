@@ -22,7 +22,6 @@ class Coordinator(_DeploymentOperationsMixin):
     self.bc = SimpleNamespace(address=address, get_oracles=lambda **kw: (["oracle", "other"], []),
                               get_dauth_oracles=lambda: (["oracle", "other"], []),
                               verify=lambda record, return_full_info=True: SimpleNamespace(valid=record.get("EE_SIGN") == "valid"))
-    self.bc.node_update_transaction_lock = threading.RLock()
     self.bc.sign = lambda record, **kw: record.update(EE_SIGN="valid", EE_SENDER=address)
     self.evm_network = "test"
     self.storage = {}
@@ -72,8 +71,7 @@ class Coordinator(_DeploymentOperationsMixin):
                 phase="accepted", outcome=None, recovery=None, deadline=160,
                 created_at=100, updated_at=100, sent_at={}, events=[], error=None,
                 instances={n: [("RUNNER", "worker")] for n in ["A", "B", "C"]},
-                previous_instances={n: [("RUNNER", "worker")] for n in previous},
-                settlement={"status": "not_started"})
+                previous_instances={n: [("RUNNER", "worker")] for n in previous})
 
   def report(self, operation, node, status, attempt="deploy", sequence=1):
     report = dict(operation_id=operation["operation_id"], coordinator="oracle", app_id="app",
@@ -105,17 +103,16 @@ class DeploymentStatusTests(unittest.TestCase):
     plugin.bc.get_job_details.return_value = {"escrowOwner": "different-owner"}
     self.assertEqual(plugin._deployment_status({"job_id": 1})["status"], "synchronizing")
 
-  def test_other_oracle_polling_is_read_only_and_removes_prepared_transaction(self):
+  def test_other_oracle_polling_is_read_only(self):
     plugin = self.prepare()
     operation = plugin.operation()
-    operation["settlement"] = {"status": "prepared", "transaction": {"raw_transaction": "private-broadcast-bytes"}}
     plugin._save_operation(operation)
     plugin.bc.address = "other"
     result = plugin._deployment_status({"operation_id": operation["operation_id"]})
     self.assertEqual(result["coordinator"], "oracle")
     self.assertEqual(result["sequence"], 1)
     self.assertEqual(len(result["nodes"]), 3)
-    self.assertNotIn("private-broadcast-bytes", str(result))
+    self.assertNotIn("settlement", result)
     self.assertEqual(plugin.commands, [])
     plugin.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "someone-else"}
     self.assertEqual(plugin._deployment_status({"operation_id": operation["operation_id"]})["status"], "synchronizing")
@@ -242,73 +239,39 @@ class DeploymentOperationTests(unittest.TestCase):
       plugin._assert_no_active_deployment(app_id="app")
 
 
-class SettlementTests(unittest.TestCase):
-  def prepare(self):
+class RuntimeCompletionTests(unittest.TestCase):
+  def test_completion_and_new_admission_need_no_transaction_apis(self):
     plugin = Coordinator()
     operation = plugin.operation()
-    operation.update(phase="completed", outcome="succeeded", settlement={"status": "pending"})
-    plugin.bc.node_addr_to_eth_addr = lambda node: "eth:" + node.lower()
-    plugin.bc.get_job_details = Mock(return_value={"activeNodes": []})
-    plugin.bc.prepare_node_update = Mock(return_value={"raw_transaction": "0xsigned", "transaction_hash": "0xhash", "nonce": 7})
-    plugin.bc.get_transaction_receipt = Mock(return_value=None)
-    plugin.bc.send_prepared_transaction = Mock(return_value="0xhash")
+    operation["phase"] = "finalizing"
+    plugin._commit_operation_revision = lambda op, configs: _DeploymentOperationsMixin._commit_operation_revision(plugin, op, configs)
+    plugin.commit_deployment_revision = Mock()
+    plugin.storage[SECRET_REVISIONS_HKEY, "1|op:deploy"] = {"job_secrets": {}}
     plugin._save_operation(operation)
-    return plugin, operation
-
-  def test_lost_broadcast_response_reuses_exact_persisted_transaction(self):
-    plugin, operation = self.prepare()
-    plugin.bc.send_prepared_transaction.side_effect = [TimeoutError(), "0xhash"]
-    with self.assertRaises(TimeoutError):
-      plugin._reconcile_deployment_settlement(operation)
-    recovered = plugin._operation_records()[operation["operation_id"]]
-    self.assertEqual(recovered["settlement"]["status"], "prepared")
-    self.assertEqual(recovered["settlement"]["transaction"]["raw_transaction"], "0xsigned")
-    plugin.now += 31
-    plugin._reconcile_deployment_settlement(recovered)
-    plugin.bc.prepare_node_update.assert_called_once()
-    self.assertEqual([call.args for call in plugin.bc.send_prepared_transaction.call_args_list], [("0xsigned",), ("0xsigned",)])
-    self.assertEqual(recovered["settlement"]["status"], "submitted")
-
-  def test_two_jobs_cannot_prepare_conflicting_nonce_after_broadcast_failure(self):
-    plugin, first = self.prepare()
-    second = copy.deepcopy(first)
-    second.update(operation_id=first["operation_id"] + "2", job_id=2, created_at=101, sequence=0)
-    plugin._save_operation(second)
-    plugin.bc.send_prepared_transaction.side_effect = TimeoutError()
-    with self.assertRaises(TimeoutError):
-      plugin._reconcile_coordinator_operations()
-    plugin.now += 31
-    with self.assertRaises(TimeoutError):
-      plugin._reconcile_coordinator_operations()
-    plugin.bc.prepare_node_update.assert_called_once()
-    second = plugin._operation_records()[second["operation_id"]]
-    self.assertNotIn("transaction", second["settlement"])
-
-  def test_reverted_transaction_does_not_change_runtime_success(self):
-    plugin, operation = self.prepare()
-    plugin._reconcile_deployment_settlement(operation)
-    plugin.now += 31
-    plugin.bc.get_transaction_receipt.return_value = {"status": 0, "transaction_hash": "0xhash", "block_number": 123}
-    plugin._reconcile_deployment_settlement(operation)
-    self.assertEqual(operation["settlement"]["status"], "failed")
-    self.assertEqual(operation["outcome"], "succeeded")
+    plugin._reconcile_coordinator_operations()
+    completed = plugin._operation_records()[operation["operation_id"]]
+    self.assertEqual((completed["phase"], completed["outcome"]), ("completed", "succeeded"))
+    self.assertNotIn("settlement", completed)
+    plugin.commit_deployment_revision.assert_called_once()
+    plugin._assert_no_active_deployment(job_id=1, app_id="app")
+    for kind in ("update", "delete", "create"):
+      self.assertIsNone(plugin._find_request_operation(
+        {"job_id": 1, "request_id": "next"}, "owner", kind))
+    # Repeated background passes do not require a transaction API or modify
+    # completed runtime state. The normal ChainDistMonitor runs separately.
+    plugin._reconcile_coordinator_operations()
+    self.assertEqual(plugin._operation_records()[operation["operation_id"]], completed)
     self.assertEqual(plugin.commands, [])
 
-  def test_mined_vote_waits_for_membership_without_submitting_again(self):
-    plugin, operation = self.prepare()
-    plugin._reconcile_deployment_settlement(operation)
-    plugin.now += 31
-    plugin.bc.get_transaction_receipt.return_value = {"status": 1, "transaction_hash": "0xhash", "block_number": 123}
-    plugin._reconcile_deployment_settlement(operation)
-    self.assertEqual(operation["settlement"]["status"], "awaiting_consensus")
-    plugin.now += 31
-    plugin._reconcile_deployment_settlement(operation)
-    plugin.bc.prepare_node_update.assert_called_once()
-    plugin.bc.send_prepared_transaction.assert_called_once()
-    plugin.bc.get_job_details.return_value = {"activeNodes": ["eth:a", "eth:b", "eth:c"]}
-    plugin.now += 31
-    plugin._reconcile_deployment_settlement(operation)
-    self.assertEqual(operation["settlement"]["status"], "confirmed")
+  def test_failed_recovery_completion_also_releases_mutations(self):
+    plugin = Coordinator()
+    operation = plugin.operation("update")
+    operation.update(phase="completed", outcome="failed", recovery="completed")
+    plugin._save_operation(operation)
+    plugin._reconcile_coordinator_operations()
+    plugin._assert_no_active_deployment(job_id=1, app_id="app")
+    self.assertIsNone(plugin._find_request_operation(
+      {"job_id": 1, "request_id": "retry-update"}, "owner", "update"))
 
 
 if __name__ == "__main__":
