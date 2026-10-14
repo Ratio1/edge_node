@@ -482,3 +482,14 @@ Final integration evidence:
 - Real CockroachDB binary verification is isolated, network-disabled and preserves seeded data through old/new/old certificate activation. Full multi-node R1DB/Cloudflare deployment is not claimed.
 
 Release requires all four repositories together and persistent coordinator/node journal volumes. Do not downgrade one component to the old protocol while operations are active. For release rollback, stop new admissions, resolve or explicitly reconcile active operations, retain journals and revision secrets, and deploy a coordinated compatible revision; reverting code is not a database/application-data rollback. No production rollout has been performed.
+
+## Review handoff
+
+Implementation and offline verification are complete; all four PRs are open and must be released together:
+
+- [edge_node](https://github.com/Ratio1/edge_node/pull/533)
+- [naeural_core](https://github.com/Ratio1/naeural_core/pull/226)
+- [ratio1_sdk](https://github.com/Ratio1/ratio1_sdk/pull/184)
+- [deeploy-dapp](https://github.com/Ratio1/deeploy-dapp/pull/170)
+
+Implementation commits: Edge `f2ddd91`, Core `4f56e71`, SDK `9b47c02`, dApp `59de055`. No live deployment was performed. Follow-up implementation should start by reading this document and inspecting the current PR heads, preserving the confirmed decisions and verification limits above.
