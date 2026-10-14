@@ -11,6 +11,7 @@ from ..engagements import validate_engagement
 from ..drafts import validate_tenant_draft
 from ..engagement_drafts import validate_engagement_draft
 from ..super_tenant_branding import validate_super_tenant_branding
+from ..super_tenant_integrations import validate_super_tenant_integration
 from ..super_tenant_profile import validate_super_tenant_profile
 from ..tenant_assets import validate_tenant_asset
 from ..tenant_contracts import validate_tenant_contract_draft
@@ -24,9 +25,10 @@ MAX_ENUMERATED_RECORDS = 10000
 # RM-125: `tenant_asset` is keyed by its own id, its parent a field of the row (as `engagement_draft`).
 # RM-133: `tenant_contract_draft` is keyed `(tenant_id, contract_id)`, a further contract of an active tenant.
 # RM-134: `super_tenant_branding` is one row per deployment, keyed `deployment` (as the profile).
+# RM-139: `super_tenant_integration` is the STA override of one deployment integration, keyed by its id.
 _KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
                     "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                    "super_tenant_branding"})
+                    "super_tenant_branding", "super_tenant_integration"})
 
 
 class CstoreTenantAdministrationStore:
@@ -104,6 +106,11 @@ class CstoreTenantAdministrationStore:
         validate_super_tenant_branding(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid super-tenant branding storage record") from exc
+    if kind == "super_tenant_integration":
+      try:
+        validate_super_tenant_integration(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid super-tenant integration storage record") from exc
     if kind == "tenant_contract_draft":
       try:
         validate_tenant_contract_draft(raw, ids)

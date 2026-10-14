@@ -1589,12 +1589,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     result = self._launch_network(plugin)
 
-    # RM-084 P6: every launch is tenant-bound, and a bound job exports only to its tenant's own
-    # destination (RM-081). This tenant has none, so the required export is unavailable for that
-    # reason -- before the deployment credentials are ever consulted.
+    # RM-139: every launch gates on the deployment's effective wazuh destination, whose credential
+    # is missing here, so the required export is unavailable for that reason.
     self.assertEqual(result["error"], "soc_export_required_unavailable")
     self.assertEqual(result["integration_id"], "wazuh")
-    self.assertEqual(result["error_class"], "tenant_integration_not_configured")
+    self.assertEqual(result["error_class"], "missing_token")
     plugin.r1fs.add_json.assert_not_called()
     plugin.chainstore_hset.assert_not_called()
 
@@ -1632,11 +1631,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     result = self._launch_webapp(plugin)
 
-    # RM-084 P6: every launch is tenant-bound, and a bound job exports only to its tenant's own
-    # destination (RM-081). This tenant has none, so the required export is unavailable for that
-    # reason -- before the deployment credentials are ever consulted.
+    # RM-139: every launch gates on the deployment's effective wazuh destination, whose credential
+    # is missing here, so the required export is unavailable for that reason.
     self.assertEqual(result["error"], "soc_export_required_unavailable")
-    self.assertEqual(result["error_class"], "tenant_integration_not_configured")
+    self.assertEqual(result["error_class"], "missing_credentials")
     plugin.r1fs.add_json.assert_not_called()
     plugin.chainstore_hset.assert_not_called()
 

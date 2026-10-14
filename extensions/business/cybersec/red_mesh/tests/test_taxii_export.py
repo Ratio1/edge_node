@@ -70,16 +70,6 @@ def _owner(taxii_config=None, job_specs=None):
     def _get_artifact_repository(self):
       return _FakeArtifactRepo(_sample_archive(), _sample_aggregated(), self)
 
-    def _get_tenant_integration_config(self, tenant_id, integration_id):
-      # RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this
-      # fixture's tenant needs its own record on file -- the same effective config as node-level,
-      # since these tests are about export behavior, not tenant destination resolution.
-      if integration_id == "taxii":
-        return {"config": dict(self.cfg_taxii_export)}
-      if integration_id == "stix":
-        return {"config": dict(self.cfg_stix_export)}
-      return None
-
     def _write_job_record(self, job_id, updated, context=""):
       self.job_specs = updated
       return updated
@@ -195,15 +185,14 @@ class TestTaxiiExport(unittest.TestCase):
 
   def test_missing_collection_updates_taxii_status_only(self):
     owner = _owner({"COLLECTION_ID": ""})
-    tenant_id = owner.job_specs["execution_binding"]["tenant_id"]
 
     result = publish_to_taxii(owner, "job-1")
 
     self.assertEqual(result["status"], "not_configured")
     self.assertEqual(result["error"], "missing_collection_id")
-    status = get_integration_status(owner, tenant_id=tenant_id)["integrations"]["taxii"]
+    status = get_integration_status(owner)["integrations"]["taxii"]
     self.assertEqual(status["last_error_class"], "missing_collection_id")
-    self.assertIsNone(get_integration_status(owner, tenant_id=tenant_id)["integrations"]["stix"]["last_failure_at"])
+    self.assertIsNone(get_integration_status(owner)["integrations"]["stix"]["last_failure_at"])
 
   def test_missing_token_updates_taxii_status_only(self):
     os.environ.pop("REDMESH_TAXII_TOKEN_TEST", None)

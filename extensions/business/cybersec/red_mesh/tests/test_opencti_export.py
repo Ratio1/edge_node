@@ -71,16 +71,6 @@ def _owner(opencti_config=None, job_specs=None):
       self.job_specs = updated
       return updated
 
-    def _get_tenant_integration_config(self, tenant_id, integration_id):
-      # RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this
-      # fixture's tenant needs its own record on file -- the same effective config as node-level,
-      # since these tests are about export behavior, not tenant destination resolution.
-      if integration_id == "opencti":
-        return {"config": dict(self.cfg_opencti_export)}
-      if integration_id == "stix":
-        return {"config": dict(self.cfg_stix_export)}
-      return None
-
     def chainstore_hget(self, hkey, key):
       return records.get((hkey, key))
 

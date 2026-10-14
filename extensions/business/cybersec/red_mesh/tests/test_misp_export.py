@@ -467,12 +467,6 @@ def _make_integration_owner(misp_config=None, archive=None, aggregated=None, job
       return FakeArtifactRepo()
     def _write_job_record(self, job_key, job_specs, context=""):
       return job_specs
-    def _get_tenant_integration_config(self, tenant_id, integration_id):
-      # RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so a bound
-      # fixture's tenant needs its own record on file -- the same effective config as node-level,
-      # since these tests are about MISP behavior, not tenant destination resolution.
-      return {"config": dict(config)} if integration_id == "misp" else None
-
   return IntegrationOwner()
 
 
@@ -540,7 +534,9 @@ class TestExportMispJson(unittest.TestCase):
   def test_invalid_explicit_snapshot_and_mode_never_fall_back_to_unchecked_lookup(self):
     from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExportMixin
     from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
-    for builder in (export_misp_json, _MispExportMixin._build_misp_json):
+    # RM-139: build_misp_event's bare call resolves no tenant any more, so it reaches the same
+    # checked-snapshot validation and refuses the same way.
+    for builder in (export_misp_json, _MispExportMixin._build_misp_json, build_misp_event):
       for kwargs in ({"checked_job": None}, {"checked_job": {}},
                      {"snapshot_mode": "legacy_unbound"}, {"snapshot_mode": "invalid"}):
         with self.subTest(builder=builder.__name__, kwargs=kwargs):
@@ -549,19 +545,6 @@ class TestExportMispJson(unittest.TestCase):
             with self.assertRaises(TenantStoreError):
               builder(owner, "test_job_1", **kwargs)
             lookup.assert_not_called()
-    # build_misp_event's own bare call (no export_config) resolves the tenant from checked_job
-    # before ever reaching the checked-snapshot validation. RM-108 phase 5 made that resolution
-    # refuse an absent or malformed binding outright (services.config.tenant_export_binding), so
-    # it still never performs the unchecked lookup -- it reports the refusal as a result instead
-    # of raising, since a bare call has no snapshot-shape contract of its own to violate.
-    for kwargs in ({"checked_job": None}, {"checked_job": {}},
-                   {"snapshot_mode": "legacy_unbound"}, {"snapshot_mode": "invalid"}):
-      with self.subTest(builder=build_misp_event.__name__, kwargs=kwargs):
-        owner = _make_integration_owner({"ENABLED": False})
-        with patch.object(owner, "_get_job_from_cstore", side_effect=AssertionError("unchecked lookup")) as lookup:
-          result = build_misp_event(owner, "test_job_1", **kwargs)
-          self.assertEqual(result["status"], "error")
-          lookup.assert_not_called()
 
   def test_returns_misp_dict(self):
     owner = _make_integration_owner({"ENABLED": True})

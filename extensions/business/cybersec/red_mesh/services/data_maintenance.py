@@ -26,6 +26,7 @@ from ..constants import JOB_STATUS_FAILED, JOB_STATUS_FINALIZED, JOB_STATUS_STOP
 from ..tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from ..tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from ..tenancy.execution import BINDING_SCHEMA_VERSION, ExecutionBinding
+from ..tenancy.super_tenant_integrations import KIND as INTEGRATION_OVERRIDE_KIND, withheld_for_backup
 from .integration_status import _STATUS_BUILDERS
 
 
@@ -59,7 +60,7 @@ _PER_JOB = (
 # RM-133: `tenant_contract_draft` is keyed `(tenant_id, contract_id)` and takes the generic related-tenant rule.
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
                   "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                  "super_tenant_branding")
+                  "super_tenant_branding", "super_tenant_integration")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -79,6 +80,14 @@ class MaintenanceError(Exception):
 
 def valid_cid(value):
   return isinstance(value, str) and _CID.match(value) is not None
+
+
+def _tenancy_kind(field):
+  try:
+    decoded = json.loads(field) if isinstance(field, str) else None
+  except (ValueError, RecursionError):
+    return None
+  return decoded[0] if isinstance(decoded, list) and decoded and isinstance(decoded[0], str) else None
 
 
 def row_sha256(value):
@@ -296,10 +305,11 @@ class Inventory:
       row = self._store._validate(value, kind, ids)
     except Exception:
       return OLD, "unrecognized"
-    if kind in ("tenant_draft", "super_tenant_profile", "super_tenant_branding"):
+    if kind in ("tenant_draft", "super_tenant_profile", "super_tenant_branding", "super_tenant_integration"):
       # RM-109: a draft has no tenant; its id is not one, so the related-tenant check below would
       # call every draft an orphan. Current while the store reads it, never orphan or old_tenant.
-      # RM-110: the same for the deployment's one super-tenant profile row; RM-134 its branding row.
+      # RM-110: the same for the deployment's one super-tenant profile row; RM-134 its branding row;
+      # RM-139 its integration overrides.
       return CURRENT, ""
     if kind in ("engagement_draft", "tenant_asset"):
       # RM-109 phase 4: current while its parent exists (a tenant draft row, or a live tenant); a
@@ -434,7 +444,12 @@ class Inventory:
   def describe(self, hkey, field, value):
     group, reason = self.classify(hkey, field, value)
     files, complete = self.files(hkey, field, value)
-    return {"hkey": hkey, "field": field, "value": value, "sha256": row_sha256(value),
+    sha256 = row_sha256(value)
+    if hkey == self._tenancy_hkey and _tenancy_kind(field) == INTEGRATION_OVERRIDE_KIND:
+      # RM-139: an STA integration override is exported without its credential values. The hash
+      # stays the stored row's: it names the row for cleanup and for comparing two scans.
+      value = withheld_for_backup(value)
+    return {"hkey": hkey, "field": field, "value": value, "sha256": sha256,
             "class": group, "reason": reason, "cids": files, "files_complete": complete}
 
   def kept_files(self):

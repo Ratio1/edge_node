@@ -39,15 +39,6 @@ def no_export_effects(fixture):
     assert (fixture.store.data, fixture.store.jobs, fixture.store.writes, fixture.artifacts) == snapshot
 
 
-@pytest.fixture(autouse=True)
-def tenant_destination(monkeypatch):
-  """A bound job exports only to its tenant's destination. The stored record is not under test here
-  (test_tenant_export_destinations covers it), so the job's tenant resolves to node configuration."""
-  from extensions.business.cybersec.red_mesh.services import misp_export
-  monkeypatch.setattr(misp_export, "tenant_export_binding",
-    lambda owner, job_specs, integration_id: (job_specs["execution_binding"]["tenant_id"], None))
-
-
 def install_json_producer(fixture, *, enabled=True):
   fixture.owner.CONFIG = {"MISP_EXPORT": {"ENABLED": enabled}}
   fixture.owner.config_data = {}
@@ -211,20 +202,14 @@ def test_native_artifact_corruption_never_reaches_pymisp_or_effects(read_native,
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
-def test_native_download_without_a_tenant_misp_record_uses_backend_defaults(read_native, response_format, monkeypatch):
-  """RM-093 (supersedes the RM-090 typed 409): a download has no destination, so a bound tenant
-  without a MISP record still gets its JSON, rendered with the backend defaults (floor LOW,
-  distribution 0) and never with the node's values."""
-  from extensions.business.cybersec.red_mesh.services import misp_export
-  from extensions.business.cybersec.red_mesh.services.config import TENANT_INTEGRATION_NOT_CONFIGURED
-  monkeypatch.setattr(misp_export, "tenant_export_binding",
-    lambda owner, job_specs, integration_id: (job_specs["execution_binding"]["tenant_id"],
-                                              TENANT_INTEGRATION_NOT_CONFIGURED))
+def test_native_download_renders_with_the_deployment_effective_config(read_native, response_format):
+  """RM-139 (supersedes the RM-093 backend defaults): every job exports to the deployment's MISP, so
+  a download renders with the deployment's effective config, its severity floor and distribution."""
   module, _ = read_native
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
     install_json_producer(fixture, enabled=False)
-    # Node values that would show if they leaked: a HIGH floor exports 2 of the 4 sample findings.
+    # A HIGH floor exports 2 of the 4 sample findings.
     fixture.owner.CONFIG["MISP_EXPORT"].update({"MIN_SEVERITY": "HIGH", "MISP_DISTRIBUTION": 3})
     with no_export_effects(fixture):
       module.eng = scheduler_comms(fixture, response_format)
@@ -232,8 +217,8 @@ def test_native_download_without_a_tenant_misp_record_uses_backend_defaults(read
         {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
       actual = result["result"] if response_format == "WRAPPED" else result
       assert actual["status"] == "ok" and actual["job_id"] == "job-1"
-      assert actual["findings_exported"] == 3 and actual["findings_total"] == 4
-      assert actual["misp_event"]["distribution"] == "0"
+      assert actual["findings_exported"] == 2 and actual["findings_total"] == 4
+      assert actual["misp_event"]["distribution"] == "3"
 
 
 def test_a_failed_read_logs_its_exception_class_only():

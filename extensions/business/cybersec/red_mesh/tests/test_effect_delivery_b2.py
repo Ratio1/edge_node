@@ -55,7 +55,6 @@ def test_a_delivery_failure_after_a_persist_is_never_reported_as_nothing_happene
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(service, "_config_error", return_value=None), \
-         patch.object(service, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(service, "build_stix_bundle", return_value=dict(OK_BUNDLE)), \
          patch.object(service, "_persist_bundle", return_value="artifact-cid"), \
          patch.object(service, "build_auth_provider") as auth, \
@@ -81,7 +80,6 @@ def test_a_typed_configuration_failure_keeps_its_code_after_a_persist(name, serv
   from extensions.business.cybersec.red_mesh.services.auth import AuthError
   with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(service, "_config_error", return_value=None), \
-         patch.object(service, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(service, "build_stix_bundle", return_value=dict(OK_BUNDLE)), \
          patch.object(service, "_persist_bundle", return_value="artifact-cid"), \
          patch.object(service, "build_auth_provider",
@@ -112,7 +110,6 @@ def test_a_delivery_failure_publishes_both_the_state_and_the_reason():
   without the code the panel shows nothing actionable."""
   with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(opencti_export, "_config_error", return_value=None), \
-         patch.object(opencti_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(opencti_export, "build_stix_bundle", return_value=dict(OK_BUNDLE)), \
          patch.object(opencti_export, "_persist_bundle", return_value="artifact-cid"), \
          patch.object(opencti_export, "build_auth_provider") as auth, \
@@ -162,11 +159,7 @@ def misp_ready(monkeypatch):
   from pymisp import MISPEvent
   event = MISPEvent()
   event.uuid = "11111111-1111-1111-1111-111111111111"
-  monkeypatch.setattr(misp_export, "get_misp_export_config",
-                      lambda owner, tenant_id=None: dict(MISP_CONFIG))
-  # A tenant-bound job exports only to its tenant's destination; the record itself is not under test.
-  monkeypatch.setattr(misp_export, "tenant_export_binding",
-                      lambda owner, job_specs, integration_id: (job_specs["execution_binding"]["tenant_id"], None))
+  monkeypatch.setattr(misp_export, "get_misp_export_config", lambda owner, **kwargs: dict(MISP_CONFIG))
   monkeypatch.setattr(misp_export, "build_misp_event",
                       lambda *a, **k: {"status": "ok", "event": event, "job_id": "job-1",
                                        "pass_nr": 1, "findings_exported": 2, "ports_exported": 1})
@@ -270,7 +263,6 @@ def test_the_pre_outbound_checkpoint_stops_a_revoked_requester(read_native, name
       return "artifact-cid"
 
     with patch.object(service, "_config_error", return_value=None), \
-         patch.object(service, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(service, "build_stix_bundle", return_value=dict(OK_BUNDLE)), \
          patch.object(service, "_persist_bundle", persist_then_revoke), \
          patch.object(service, "build_auth_provider") as auth, \
@@ -332,7 +324,7 @@ def test_a_misconfigured_misp_does_not_emit_or_write(misp_ready, monkeypatch):
   emitting a SOC event and writing the job record now that the path is live."""
   service = misp_ready
   monkeypatch.setattr(service, "get_misp_export_config",
-                      lambda owner, tenant_id=None: {**MISP_CONFIG, "MISP_API_KEY": ""})
+                      lambda owner, **kwargs: {**MISP_CONFIG, "MISP_API_KEY": ""})
   with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(service, "emit_export_status_event",
                       side_effect=AssertionError(SECRET)) as emit, \
@@ -345,15 +337,16 @@ def test_a_misconfigured_misp_does_not_emit_or_write(misp_ready, monkeypatch):
 
 
 @pytest.mark.parametrize("endpoint", ["export_misp", "push_to_opencti", "publish_to_taxii"])
-def test_a_push_for_a_tenant_without_a_record_answers_not_configured(endpoint):
-  """RM-093: a bound tenant with no integration record pushes nowhere, and says so. The projection
-  used to drop the untyped code and publish {"status": "error", "configuration_error": null}."""
-  from extensions.business.cybersec.red_mesh.services import misp_export
+def test_a_push_with_an_unreadable_sta_override_is_unavailable_and_reaches_nothing(endpoint):
+  """RM-139: the destination is the deployment's effective config. When the STA override cannot be
+  read the push fails closed; it never goes out with the Deeploy values instead."""
+  from extensions.business.cybersec.red_mesh.services import config, misp_export
   with read_endpoint_fixture(bound=True) as fixture, \
+       patch.object(config, "integration_override",
+                    side_effect=config.IntegrationOverrideUnavailable(SECRET)), \
        patch.object(misp_export, "PyMISP", side_effect=AssertionError("reached MISP")), \
        patch.object(opencti_export, "build_stix_bundle", side_effect=AssertionError("built a bundle")), \
        patch.object(taxii_export, "build_stix_bundle", side_effect=AssertionError("built a bundle")):
     result = getattr(fixture.Plugin, endpoint)(fixture.owner, "job-1", request_actor=fixture.actor,
                                                tenant_id=fixture.tenant_id)
-  assert result.get("status") == "not_configured", result
-  assert result.get("configuration_error") == "tenant_integration_not_configured", result
+  assert result == {"success": False, "error": "unavailable", "status_code": 503}, result

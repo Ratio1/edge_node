@@ -1,24 +1,28 @@
-"""Job-less integration reads admit a tenant without changing the legacy path (RM-081 Phase 3c)."""
+"""Job-less integration reads admit a tenant; RM-139: they report the deployment's effective config."""
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from extensions.business.cybersec.red_mesh.services.config import IntegrationOverrideUnavailable
 from extensions.business.cybersec.red_mesh.services.integration_status import (
   _STATUS_BUILDERS, get_public_integration_config)
 from extensions.business.cybersec.red_mesh.tenancy.http_runtime import _EFFECT_FIELDS, _READ_FIELDS
-from extensions.business.cybersec.red_mesh.tenancy.integrations import (
-  NODE_LEVEL_INTEGRATION_IDS, TENANT_INTEGRATION_IDS)
+from extensions.business.cybersec.red_mesh.tenancy.integrations import TENANT_INTEGRATION_IDS
 
 
 class Owner:
   cfg_instance_id = "pdev5"
 
-  def __init__(self, blocks=None, records=None):
+  def __init__(self, blocks=None, overrides=None, raises=False):
     self.config_data = dict(blocks or {})
-    self._records = dict(records or {})
+    self._overrides = dict(overrides or {})
+    self._raises = raises
 
-  def _get_tenant_integration_config(self, tenant_id, integration_id):
-    return self._records.get((tenant_id, integration_id))
+  def _get_super_tenant_integration_override(self, integration_id):
+    if self._raises:
+      raise RuntimeError("storage unavailable")
+    config = self._overrides.get(integration_id)
+    return None if config is None else {"integration_id": integration_id, "config": config}
 
   def chainstore_hget(self, *, hkey, key):
     return None
@@ -39,12 +43,11 @@ class TestRegisteredFields(unittest.TestCase):
     self.assertEqual(_EFFECT_FIELDS["test_event_export"][-1], ("tenant_id", str, None))
 
 
-class TestScopedReadinessPayload(unittest.TestCase):
+class TestDeploymentReadinessPayload(unittest.TestCase):
   def setUp(self):
     env = patch.dict("os.environ", {"REDMESH_EVENT_HMAC_SECRET": "secret"})
     env.start()
     self.addCleanup(env.stop)
-    self.tenant = "tn_" + str(uuid4())
     self.node = {
       "EVENT_EXPORT": {"ENABLED": True},
       "WAZUH_EXPORT": {"ENABLED": True, "MODE": "http", "HTTP_URL": "https://node.example",
@@ -56,79 +59,32 @@ class TestScopedReadinessPayload(unittest.TestCase):
       "SURICATA_CORRELATION": {"ENABLED": True},
     }
 
-  def test_the_payload_keeps_every_key_even_when_scoped(self):
-    # get_public_integration_config raises unless the key set equals _STATUS_BUILDERS exactly,
-    # so a scoped call may not drop the node-level ids.
-    owner = Owner(self.node)
-    scoped = get_public_integration_config(owner, self.tenant)
-    self.assertEqual(set(scoped["integrations"]), set(_STATUS_BUILDERS))
+  def test_the_payload_keeps_every_key(self):
+    self.assertEqual(set(get_public_integration_config(Owner(self.node))["integrations"]), set(_STATUS_BUILDERS))
 
-  def test_a_scoped_read_reports_the_tenants_readiness_not_the_nodes(self):
-    # The public projection deliberately omits the host, so two different URLs look identical here.
-    # Readiness is the observable difference, and it is the one that matters: a tenant that has not
-    # finished configuring must not read as ready because the deployment is.
-    owner = Owner(self.node, {
-      (self.tenant, "opencti"): {"config": {"ENABLED": True, "URL": "", "TOKEN": ""}}})
-    scoped = get_public_integration_config(owner, self.tenant)["integrations"]
-    unscoped = get_public_integration_config(owner)["integrations"]
-    self.assertTrue(unscoped["opencti"]["configured"])
-    self.assertFalse(scoped["opencti"]["configured"])
-
-  def test_a_tenant_can_be_ready_where_the_node_is_not(self):
-    owner = Owner({**self.node, "TAXII_EXPORT": {"ENABLED": True, "SERVER_URL": "", "TOKEN": ""}}, {
-      (self.tenant, "taxii"): {"config": {"ENABLED": True, "SERVER_URL": "https://a.example",
-                                          "TOKEN": "a", "COLLECTION_ID": "a-collection"}}})
-    self.assertFalse(get_public_integration_config(owner)["integrations"]["taxii"]["configured"])
-    self.assertTrue(
-      get_public_integration_config(owner, self.tenant)["integrations"]["taxii"]["configured"])
-
-  def test_a_tenant_without_a_record_is_not_configured_even_when_the_node_is(self):
-    # RM-093 / I-039, the generic twin of the MISP status: a push for a tenant with no record goes
-    # nowhere, so readiness must not offer it on the strength of the node's own destination.
-    owner = Owner(self.node)
-    scoped = get_public_integration_config(owner, self.tenant)["integrations"]
-    unscoped = get_public_integration_config(owner)["integrations"]
+  def test_the_deeploy_config_alone_is_ready(self):
+    integrations = get_public_integration_config(Owner(self.node))["integrations"]
     for integration_id in ("opencti", "taxii", "wazuh"):
-      self.assertTrue(unscoped[integration_id]["configured"], integration_id)
-      self.assertFalse(scoped[integration_id]["configured"], integration_id)
-      self.assertEqual(scoped[integration_id]["status"], "not_configured", integration_id)
-      self.assertIsNone(scoped[integration_id]["configuration_error"], integration_id)
+      self.assertTrue(integrations[integration_id]["configured"], integration_id)
 
-  def test_the_test_button_for_a_tenant_without_a_record_contacts_nothing(self):
-    # RM-093 live check: the OpenCTI probe for a tenant with no record reached the node's server.
-    from extensions.business.cybersec.red_mesh.services import integration_status
-    owner = Owner(self.node)
-    with patch("requests.get", side_effect=AssertionError("probed a destination")), \
-         patch("requests.post", side_effect=AssertionError("delivered to a destination")), \
-         patch("socket.create_connection", side_effect=AssertionError("opened a socket")):
-      for integration_id in ("opencti", "taxii", "wazuh"):
-        result = integration_status.test_event_export(owner, integration_id, tenant_id=self.tenant)
-        self.assertEqual(result.get("status"), "not_configured", integration_id)
-        self.assertEqual(result.get("error"), "tenant_integration_not_configured", integration_id)
+  def test_an_override_decides_the_readiness(self):
+    # The public projection omits the host, so readiness is the observable difference.
+    owner = Owner({**self.node, "TAXII_EXPORT": {"ENABLED": True, "SERVER_URL": "", "TOKEN": ""}}, {
+      "opencti": {"ENABLED": False},
+      "taxii": {"SERVER_URL": "https://a.example", "TOKEN": "a", "COLLECTION_ID": "a-collection"}})
+    integrations = get_public_integration_config(owner)["integrations"]
+    self.assertEqual((integrations["opencti"]["configured"], integrations["opencti"]["status"]), (False, "disabled"))
+    self.assertTrue(integrations["taxii"]["configured"])
 
-  def test_the_node_level_three_read_identically_scoped_or_not(self):
-    owner = Owner(self.node, {
-      (self.tenant, "wazuh"): {"config": {"ENABLED": True, "MODE": "http",
-                                          "HTTP_URL": "https://a.example", "TOKEN": "a"}}})
-    scoped = get_public_integration_config(owner, self.tenant)["integrations"]
-    unscoped = get_public_integration_config(owner)["integrations"]
-    for integration_id in NODE_LEVEL_INTEGRATION_IDS:
-      self.assertEqual(scoped[integration_id], unscoped[integration_id], integration_id)
+  def test_an_unreadable_override_is_unavailable_not_the_deeploy_readiness(self):
+    with self.assertRaises(IntegrationOverrideUnavailable):
+      get_public_integration_config(Owner(self.node, raises=True))
 
-  def test_node_level_builders_ignore_the_tenant(self):
-    # The property that makes the node-level three tenant-invariant. get_public_integration_config
-    # also routes them through status_tenant(), which is a guard against this ceasing to be true.
-    owner = Owner(self.node)
-    for integration_id in NODE_LEVEL_INTEGRATION_IDS:
-      builder = _STATUS_BUILDERS[integration_id]
-      self.assertEqual(builder(owner, self.tenant), builder(owner), integration_id)
-
-  def test_no_credential_reaches_a_scoped_payload(self):
-    owner = Owner(self.node, {
-      (self.tenant, integration_id): {"config": {"TOKEN": f"{integration_id}-secret"}}
-      for integration_id in TENANT_INTEGRATION_IDS if integration_id != "misp"})
+  def test_no_credential_reaches_the_payload(self):
+    owner = Owner(self.node, {integration_id: {"TOKEN": f"{integration_id}-secret"}
+                              for integration_id in TENANT_INTEGRATION_IDS if integration_id != "misp"})
     import json
-    rendered = json.dumps(get_public_integration_config(owner, self.tenant))
+    rendered = json.dumps(get_public_integration_config(owner))
     for integration_id in TENANT_INTEGRATION_IDS:
       self.assertNotIn(f"{integration_id}-secret", rendered)
 

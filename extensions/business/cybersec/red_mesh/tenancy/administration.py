@@ -27,7 +27,8 @@ from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_asset_requests, normalize_context,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import drafts, engagement_drafts, super_tenant_branding, super_tenant_profile, tenant_assets, tenant_contracts
+from . import (drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
+               tenant_assets, tenant_contracts)
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -192,13 +193,17 @@ def _same_contract(stored, requested):
 
 class TenantAdministrationService:
   def __init__(self, accounts, store, configured_peers_reader=None, tenant_node_jobs_reader=None,
-               node_directory_reader=None, super_tenant_permissions_reader=None):
+               node_directory_reader=None, super_tenant_permissions_reader=None, integration_config_reader=None):
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
     # RM-132: `() -> {key: bool}`, the deployment's `SUPER_TENANT_PERMISSIONS` (read-only here, set
     # by Ratio1). Injected like `configured_peers_reader`; without one, every key is `True`.
     self.super_tenant_permissions_reader = super_tenant_permissions_reader
+    # RM-139: `(integration_id, override_row) -> (deployment, effective, deployment_configured,
+    # configured)`, the resolved blocks without and with the STA override. Injected like
+    # `super_tenant_permissions_reader`; without one the integration reads are unavailable.
+    self.integration_config_reader = integration_config_reader
     # RM-126: `[address] -> {address: {"alias", "tags"}}`, the network monitor's names for the
     # configured peers. Injected like `configured_peers_reader`; it only decorates reads, so a
     # missing or failing reader names nothing and never fails a read.
@@ -1750,6 +1755,57 @@ class TenantAdministrationService:
     if logo is None:
       raise AdministrationDenied(404, "not_found")
     return logo
+
+  # RM-139: the deployment integrations, one optional STA override row per integration (contract
+  # `multi-tenant-workspaces.md` §Deployment integrations). A full-portfolio Super-Tenant Admin reads
+  # and writes them, as the super-tenant profile; a read never returns a credential value.
+
+  def _integration_override_dto(self, integration_id, row):
+    reader = self.integration_config_reader
+    if not callable(reader):
+      raise TenantStoreError("Integration configuration is unavailable")
+    deployment, effective, deployment_configured, configured = reader(integration_id, row)
+    dto = super_tenant_integrations.integration_dto(integration_id, row, deployment, effective,
+                                                    deployment_configured, configured)
+    return {**dto, "version": canonical_digest(row) if row is not None else None}
+
+  @_endpoint
+  def list_super_tenant_integrations(self, actor):
+    self._actor(actor, creator=True)
+    return {"integrations": [
+      self._integration_override_dto(integration_id, self.store.get(super_tenant_integrations.KIND, integration_id))
+      for integration_id in integration_ids()]}
+
+  @_endpoint
+  def put_super_tenant_integration(self, actor, integration_id, changes, expected_version=None):
+    """Apply `changes` (see `super_tenant_integrations.apply_changes`) to one override. Absent
+    `expected_version` means no row yet; a stale one is 409. Answers the DTO and the names of the
+    keys that changed (the plugin audits those, never the values); a row cleared of every override
+    is deleted, so the integration falls back to the Deeploy config."""
+    account = self._actor(actor, creator=True)
+    if not valid_integration_id(integration_id):
+      raise AdministrationDenied(404, "not_found")
+    if expected_version is not None and not valid_digest(expected_version):
+      raise AdministrationDenied(400, "invalid_request")
+    kind = super_tenant_integrations.KIND
+    row = self.store.get(kind, integration_id)
+    if (row is None) != (expected_version is None) or (row is not None and canonical_digest(row) != expected_version):
+      raise AdministrationDenied(409, "conflict")
+    try:
+      merged, changed = super_tenant_integrations.apply_changes(
+        row if row is not None else super_tenant_integrations.empty_override(integration_id), integration_id, changes)
+    except super_tenant_integrations.OverrideInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    if changed:
+      if super_tenant_integrations.is_empty(merged):
+        self.store.delete(kind, integration_id)
+        row = None
+      else:
+        merged = {**merged, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+        self.store.put(kind, integration_id, record=merged)
+        row = self.store.get(kind, integration_id)
+    return {"integration": self._integration_override_dto(integration_id, row), "changed": changed,
+            "accountId": account.account_id}
 
   # RM-109 phase 2: tenant drafts. A full-portfolio Super-Tenant Admin only, as tenant creation; a
   # draft has no tenant, so these are not rows of the tenant policy matrix. Every document read,

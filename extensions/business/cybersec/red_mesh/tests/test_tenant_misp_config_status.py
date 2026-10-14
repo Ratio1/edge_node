@@ -24,7 +24,7 @@ def install_config_producer(fixture, config=None):
   owner.config_data = {}
   owner.P = MagicMock()
   owner._get_misp_export_config = MagicMock(
-    side_effect=lambda tenant_id=None: _MispExportMixin._get_misp_export_config(owner, tenant_id))
+    side_effect=lambda: _MispExportMixin._get_misp_export_config(owner))
   original_get = owner.chainstore_hget
   def read(hkey, key):
     assert hkey != owner.cfg_instance_id, "Forbidden job point-read"
@@ -55,7 +55,7 @@ def test_actual_native_tenant_config_read_preserves_defaults_and_no_store(read_n
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert actual == DEFAULT and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with(fixture.tenant_id)
+    fixture.owner._get_misp_export_config.assert_called_once_with()
     assert not any(row[0] == "list" or row[1] == fixture.owner.cfg_instance_id for row in fixture.store.reads)
 
 
@@ -76,7 +76,7 @@ def test_actual_native_rejects_invalid_or_extended_producer_payload_before_wrapp
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
-    fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: deepcopy(produced)
+    fixture.owner._get_misp_export_config.side_effect = lambda: deepcopy(produced)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503} and calls == 1
@@ -117,36 +117,36 @@ def test_real_configuration_producer_preserves_independent_flags_and_never_expos
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
-    # Node URL and key alone never make a tenant "configured": the fixture tenant has no record,
-    # and a push would be refused (RM-093, I-039).
+    # RM-139: every job pushes to the deployment's MISP, so its URL and key make it configured.
     assert actual == {"enabled": enabled, "auto_export": auto_export,
-                      "misp_configured": False, "min_severity": expected}
+                      "misp_configured": configured, "min_severity": expected}
     assert calls == 1 and SECRET not in str(result) and URL not in str(result)
     fixture.owner.P.assert_not_called()
 
 
-@pytest.mark.parametrize("record,node_credentials,expected", (
+@pytest.mark.parametrize("override,deeploy_credentials,expected", (
   ({"MISP_URL": URL, "MISP_API_KEY": SECRET}, False, True),
-  ({"MISP_URL": URL}, False, False),
+  # An overridden destination never borrows the Deeploy key.
+  ({"MISP_URL": URL}, True, False),
   ({"MIN_SEVERITY": "HIGH"}, True, True),
-  (None, True, False),
+  (None, True, True),
+  (None, False, False),
 ))
-def test_misp_configured_reflects_the_tenant_record(record, node_credentials, expected):
-  """RM-093 (I-039): the Push button is enabled from this flag, so it says whether THIS tenant's
-  destination is ready: a record whose merged config has URL and key. Node credentials count only
-  once the tenant has a record of its own."""
+def test_misp_configured_reflects_the_effective_deployment_config(override, deeploy_credentials, expected):
+  """RM-139: the Push button is enabled from this flag, so it says whether the deployment's
+  effective MISP (the Deeploy block, then the STA override) has a URL and a key."""
   from types import SimpleNamespace
 
-  class RecordOwner(SimpleNamespace):
-    def _get_tenant_integration_config(self, tenant_id, integration_id):
-      if record is None or (tenant_id, integration_id) != ("tn-1", "misp"):
+  class OverrideOwner(SimpleNamespace):
+    def _get_super_tenant_integration_override(self, integration_id):
+      if override is None or integration_id != "misp":
         return None
-      return {"tenant_id": tenant_id, "integration_id": integration_id, "enabled": True,
-              "config": deepcopy(record)}
+      return {"integration_id": integration_id, "config": deepcopy(override), "sharing_groups": None,
+              "auto_export": None}
 
-  node = {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET} if node_credentials else {"ENABLED": True}
-  owner = RecordOwner(CONFIG={"MISP_EXPORT": node}, config_data={})
-  actual = _MispExportMixin._get_misp_export_config(owner, "tn-1")
+  node = {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET} if deeploy_credentials else {"ENABLED": True}
+  owner = OverrideOwner(CONFIG={"MISP_EXPORT": node}, config_data={})
+  actual = _MispExportMixin._get_misp_export_config(owner)
   assert actual["misp_configured"] is expected
   assert set(actual) == set(DEFAULT) and SECRET not in str(actual) and URL not in str(actual)
 
@@ -240,14 +240,14 @@ def test_native_each_request_reauthorizes_after_account_revocation(read_native, 
     fixture.store.account("reader", active=False)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 404)
     assert result == {"success": False, "error": "not_found", "status_code": 404} and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with(fixture.tenant_id)
+    fixture.owner._get_misp_export_config.assert_called_once_with()
 
 
 def test_valid_producer_payload_is_detached_before_publication():
   with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     payload = dict(DEFAULT)
-    fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: payload
+    fixture.owner._get_misp_export_config.side_effect = lambda: payload
     result = getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor=fixture.actor,
                                                tenant_id=fixture.tenant_id)
     assert result == DEFAULT

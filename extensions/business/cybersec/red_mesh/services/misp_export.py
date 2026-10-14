@@ -22,7 +22,6 @@ from ..tenancy.administration import AdministrationDenied
 from ..tenancy.effects import EffectState
 from ..tenancy.job_artifacts import TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
-from .config import tenant_export_binding
 from .misp_config import DEFAULT_MISP_EXPORT_CONFIG, get_misp_export_config, SEVERITY_LEVELS
 from .event_hooks import emit_export_status_event
 from .scan_guards import reject_model_test_for_scan_operation
@@ -381,38 +380,18 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snaps
 
 # ── Public API ──
 
-def _json_export_config(owner, job_specs):
-  """The MISP config a JSON download renders with: the tenant's record when it has one, and the
-  backend defaults for a bound tenant without a record or a job with no binding at all.
-
-  A download has no destination, so the "exports nowhere" rule of tenant_export_binding does not
-  apply (RM-093). The defaults are used rather than node config so a tenant's output never carries
-  another deployment's severity floor or distribution.
-  """
-  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "misp")
-  if binding_error:
-    return dict(DEFAULT_MISP_EXPORT_CONFIG)
-  return get_misp_export_config(owner, tenant_id)
-
-
 def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound",
                      export_config=None):
   """
   Build a MISPEvent from a job's scan results.
 
-  `export_config` is the resolved MISP config to render with (severity floor, distribution). When
-  it is None the job's tenant record is required, as for a push.
+  `export_config` is the resolved MISP config to render with (severity floor, distribution); None
+  reads the deployment's effective config.
 
   Returns {"status": "ok", "event": <MISPEvent>, "job_id": ..., "pass_nr": ...}
   or {"status": "error", "error": "..."}.
   """
-  cfg = export_config
-  if cfg is None:
-    tenant_id, binding_error = tenant_export_binding(
-      owner, checked_job if isinstance(checked_job, dict) else None, "misp")
-    if binding_error:
-      return {"status": "error", "error": binding_error, "job_id": job_id}
-    cfg = get_misp_export_config(owner, tenant_id)
+  cfg = export_config if export_config is not None else get_misp_export_config(owner)
   min_severity = cfg["MIN_SEVERITY"]
   distribution = cfg["MISP_DISTRIBUTION"]
 
@@ -483,16 +462,13 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
   event_uuid in CStore), updates the existing event with new pass data.
   """
   # Checked snapshot replaces the unscoped global lookup (RM-026 I1b). Seam one of two.
-  # It is resolved before the config: which MISP this job publishes to is a property of the job's
-  # tenant, so the destination cannot be read until the job is known.
   job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "misp_export")
   if unsupported:
     return unsupported
-  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "misp")
-  if binding_error:
-    return {"status": "not_configured", "error": binding_error, "job_id": job_id}
-  cfg = get_misp_export_config(owner, tenant_id)
+  # RM-139: the deployment's MISP for every job. An unreadable STA override raises, so the effect
+  # answers `unavailable` instead of exporting with the Deeploy values.
+  cfg = get_misp_export_config(owner)
 
   def _record_export_status(status, artifact_refs=None):
     if not job_specs:
@@ -669,10 +645,10 @@ def export_misp_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
   """
   Build a MISP event and return it as a JSON-serializable dict.
 
-  No MISP server connection, tenant MISP record or ENABLED flag needed: a bound tenant without a
-  record renders with the backend defaults (RM-093).
+  No MISP server connection or ENABLED flag needed (RM-093); it renders with the deployment's
+  effective config, as a push does (RM-139).
   """
-  cfg = _json_export_config(owner, checked_job if isinstance(checked_job, dict) else None)
+  cfg = get_misp_export_config(owner)
   result = build_misp_event(owner, job_id, pass_nr=pass_nr,
     checked_job=checked_job, snapshot_mode=snapshot_mode, export_config=cfg)
   if checked_job is not _UNSET and (not isinstance(result, dict)

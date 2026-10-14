@@ -88,17 +88,6 @@ def valid_integration_id(value):
   return isinstance(value, str) and value in TENANT_INTEGRATION_IDS
 
 
-def status_tenant(integration_id, tenant_id):
-  """The one place the tenant/node split for status and history is decided.
-
-  The three node-level ids keep the node's key even under a tenant-scoped call, so what they report
-  never changes and existing deployment history is never re-attributed to whichever tenant reads it
-  first. Both services modules call this rather than testing membership themselves, so no call site
-  can drift from another.
-  """
-  return tenant_id if tenant_id is not None and integration_id in TENANT_INTEGRATION_IDS else None
-
-
 def normalize_integration_config(integration_id, config):
   """Return a detached, validated partial override. Raises ValueError for the 400 boundary."""
   if not valid_integration_id(integration_id):

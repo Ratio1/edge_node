@@ -43,7 +43,6 @@ from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 from ..tenancy.engagements import SCAN_MODES
-from ..tenancy.execution import context_tenant_id
 from ..tenancy.tenant_assets import ENVIRONMENT_POLICY, launch_environment
 from .soc_export_policy import required_soc_launch_error
 
@@ -1474,7 +1473,7 @@ def launch_network_scan(
   )
   if auth_error:
     return auth_error
-  soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
+  soc_error = required_soc_launch_error(owner)
   if soc_error:
     return soc_error
 
@@ -1716,7 +1715,7 @@ def launch_webapp_scan(
   )
   if path_scope_errors:
     return validation_error("; ".join(path_scope_errors))
-  soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
+  soc_error = required_soc_launch_error(owner)
   if soc_error:
     return soc_error
 
