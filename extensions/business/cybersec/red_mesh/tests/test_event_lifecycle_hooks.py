@@ -89,6 +89,9 @@ class TestEventLifecycleHooks(unittest.TestCase):
     delivered_event = deliver.call_args.args[1]
     self.assertEqual(delivered_event["target"]["display"], None)
     self.assertNotIn("198.51.100.10", str(delivered_event))
+    # RM-139: the instance envelope is unchanged; the job's tenant is a field of its own.
+    self.assertEqual(delivered_event["tenant_id"], "tenant-a")
+    self.assertEqual(delivered_event["redmesh_tenant_id"], job_specs["execution_binding"]["tenant_id"])
 
   @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
   def test_disabled_event_export_records_skipped_without_delivery(self, deliver):

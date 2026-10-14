@@ -133,6 +133,8 @@ _PUBLIC_CONFIGURATION_ERRORS = frozenset({
   # showed the panels' generic fallback.
   "timeout", "graphql_error", "artifact_write_failed", "connection_failed", "api_error",
   "push_failed",
+  # RM-139: MISP refused the tenant's sharing group; the export is never retried wider.
+  "sharing_group_rejected",
   # B3 ingest parse and write outcomes. Structured, bounded, no caller content.
   "eve_jsonl_too_large", "eve_payload_rejected", "job_record_not_written",
   # authorization_upload outcome codes: structured, and the prose that accompanied them embedded

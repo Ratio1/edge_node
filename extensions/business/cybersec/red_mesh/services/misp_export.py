@@ -16,18 +16,29 @@ import time as _time
 import math
 
 from pymisp import MISPEvent, MISPObject, MISPAttribute, PyMISP
+from requests.exceptions import RequestException
 
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.effects import EffectState
 from ..tenancy.job_artifacts import TenantJobArtifacts, checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
+from . import config as _service_config
+from .config import job_tenant_id
 from .misp_config import DEFAULT_MISP_EXPORT_CONFIG, get_misp_export_config, SEVERITY_LEVELS
+from .tenant_labels import TENANT_ID_PREFIX, misp_tenant_tags, tenant_label_value
 from .event_hooks import emit_export_status_event
 from .scan_guards import reject_model_test_for_scan_operation
 
 
 _UNSET = object()
+
+# MISP's distribution level for "this sharing group only"; valid only with a sharing_group_id.
+_SHARING_GROUP_DISTRIBUTION = 4
+
+
+class _SharingGroupRejected(Exception):
+  """MISP refused an event sent with a tenant's sharing group (RM-139). Never retried wider."""
 
 
 def _job_repo(owner):
@@ -78,9 +89,12 @@ _SEVERITY_TO_THREAT_LEVEL = {
 def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
                       report_cid, distribution, findings, open_ports,
                       port_banners, port_protocols, quick_summary,
-                      tls_data=None, redmesh_release=None):
+                      tls_data=None, redmesh_release=None, tenant_tags=(), sharing_group_id=None):
   """
   Construct a MISPEvent from RedMesh scan data.
+
+  `tenant_tags` are the job's tenant tags; a `sharing_group_id` (the STA's map for that tenant)
+  replaces `distribution` with "sharing group only" (RM-139).
 
   Returns a fully populated MISPEvent ready for push or JSON export.
   """
@@ -92,7 +106,7 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
   if task_name:
     info_parts.append(f"— {task_name}")
   event.info = " ".join(info_parts)
-  event.distribution = distribution
+  _set_distribution(event, distribution, sharing_group_id)
 
   # Determine threat level from highest-severity finding
   max_threat = 4
@@ -111,6 +125,8 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
   event.add_tag(f"redmesh:scan_type={scan_label}")
   event.add_tag(f"redmesh:risk_score={risk_score}")
   event.add_tag("tlp:amber")
+  for tag in tenant_tags:
+    event.add_tag(tag)
 
   # Target IP/domain attribute
   event.add_attribute("ip-dst", target, comment="Scan target")
@@ -224,6 +240,23 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
     event.add_object(x509)
 
   return event
+
+
+def _set_distribution(event, distribution, sharing_group_id):
+  """The configured distribution (0-3), or distribution 4 with the tenant's sharing group."""
+  if sharing_group_id is None:
+    event.distribution = distribution
+  else:
+    event.distribution = _SHARING_GROUP_DISTRIBUTION
+    event.sharing_group_id = sharing_group_id
+
+
+def _misp_config_and_sharing_groups(owner):
+  """The effective MISP config and the STA's tenant -> sharing group map, from one override read.
+  An unreadable override raises (fails closed), as the config read alone does."""
+  # Through the module, so the override read has one seam whichever export reads it.
+  row = _service_config.integration_override(owner, "misp")
+  return get_misp_export_config(owner, override=row), dict((row or {}).get("sharing_groups") or {})
 
 
 def _extract_tls_data(aggregated):
@@ -381,17 +414,21 @@ def _resolve_pass_data(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snaps
 # ── Public API ──
 
 def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound",
-                     export_config=None):
+                     export_config=None, sharing_groups=None):
   """
   Build a MISPEvent from a job's scan results.
 
-  `export_config` is the resolved MISP config to render with (severity floor, distribution); None
-  reads the deployment's effective config.
+  `export_config` is the resolved MISP config to render with (severity floor, distribution) and
+  `sharing_groups` the STA's tenant map; with no `export_config` both are read from the deployment.
+  The event carries the job's tenant tags (RM-139): its tenant, or `super-tenant` when unbound.
 
   Returns {"status": "ok", "event": <MISPEvent>, "job_id": ..., "pass_nr": ...}
   or {"status": "error", "error": "..."}.
   """
-  cfg = export_config if export_config is not None else get_misp_export_config(owner)
+  if export_config is None:
+    cfg, sharing_groups = _misp_config_and_sharing_groups(owner)
+  else:
+    cfg = export_config
   min_severity = cfg["MIN_SEVERITY"]
   distribution = cfg["MISP_DISTRIBUTION"]
 
@@ -399,6 +436,8 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     checked_job=checked_job, snapshot_mode=snapshot_mode)
   if err:
     return err
+  # The checked snapshot is always bound; only the unchecked internal path can be unbound.
+  tenant_id = job_tenant_id(checked_job if checked_job is not _UNSET else owner._get_job_from_cstore(job_id))
 
   target = job_config.get("target", "unknown")
   scan_type = job_config.get("scan_type", "network")
@@ -435,6 +474,8 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     quick_summary=quick_summary,
     tls_data=tls_data,
     redmesh_release=job_config.get("redmesh_release"),
+    tenant_tags=misp_tenant_tags(owner, tenant_id),
+    sharing_group_id=(sharing_groups or {}).get(tenant_id) if tenant_id else None,
   )
 
   return {
@@ -449,6 +490,8 @@ def build_misp_event(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     "findings_exported": len(filtered_findings),
     "findings_total": len(findings),
     "ports_exported": len(open_ports),
+    "tenant_id": tenant_id,
+    "sharing_group_id": getattr(event, "sharing_group_id", None),
     **({"report_cid": report_cid} if checked_job is not _UNSET else {}),
   }
 
@@ -468,7 +511,7 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
     return unsupported
   # RM-139: the deployment's MISP for every job. An unreadable STA override raises, so the effect
   # answers `unavailable` instead of exporting with the Deeploy values.
-  cfg = get_misp_export_config(owner)
+  cfg, sharing_groups = _misp_config_and_sharing_groups(owner)
 
   def _record_export_status(status, artifact_refs=None):
     if not job_specs:
@@ -504,14 +547,33 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
 
   # Build the event
   # Seam two: build_misp_event reaches the store again through _resolve_pass_data.
-  result = (build_misp_event(owner, job_id, pass_nr=pass_nr, export_config=cfg) if checked_job is _UNSET
+  result = (build_misp_event(owner, job_id, pass_nr=pass_nr, export_config=cfg,
+                             sharing_groups=sharing_groups) if checked_job is _UNSET
             else build_misp_event(owner, job_id, pass_nr=pass_nr, checked_job=checked_job,
-                                  snapshot_mode=snapshot_mode, export_config=cfg))
+                                  snapshot_mode=snapshot_mode, export_config=cfg,
+                                  sharing_groups=sharing_groups))
   if result["status"] != "ok":
     _record_export_status("failed")
     return result
   event = result["event"]
   actual_pass_nr = result["pass_nr"]
+  sharing_group_id = result.get("sharing_group_id")
+
+  def _send(call, *args):
+    """One MISP event write. With a sharing group, an error answer or a server-side refusal is the
+    group's rejection: recorded as such and never retried with a wider distribution. A transport
+    fault is not a rejection and keeps its own code."""
+    try:
+      sent = call(*args, pythonify=True)
+    except RequestException:
+      raise
+    except Exception:
+      if sharing_group_id is not None:
+        raise _SharingGroupRejected() from None
+      raise
+    if sharing_group_id is not None and not (isinstance(sent, MISPEvent) and sent.uuid):
+      raise _SharingGroupRejected()
+    return sent
 
   # Connect to MISP
   if ledger is not None:
@@ -547,10 +609,11 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
                 # The remote now holds part of this export. A failure past this point must not
                 # report "nothing happened": a retry would duplicate what was already added.
                 ledger.record(EffectState.DELIVERED)
-          # Update tags
+          # Update tags, and the distribution the tenant's events go out with now (RM-139)
           for tag in event.tags:
             existing_event.add_tag(tag)
-          updated = misp.update_event(existing_event, pythonify=True)
+          _set_distribution(existing_event, event.distribution, sharing_group_id)
+          updated = _send(misp.update_event, existing_event)
           # Acceptance evidence, not the locally held event: assigning existing_event unconditionally
           # made the isinstance check below vacuous, so a fully rejected re-export reported ok.
           if isinstance(updated, MISPEvent) and updated.uuid:
@@ -561,12 +624,14 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
             response_event = updated
         else:
           # Event deleted on MISP side — create new
-          response_event = misp.add_event(event, pythonify=True)
+          response_event = _send(misp.add_event, event)
+      except _SharingGroupRejected:
+        raise
       except Exception:
         # Event not found — create new
-        response_event = misp.add_event(event, pythonify=True)
+        response_event = _send(misp.add_event, event)
     else:
-      response_event = misp.add_event(event, pythonify=True)
+      response_event = _send(misp.add_event, event)
 
     if not isinstance(response_event, MISPEvent):
       # PyMISP returns dict on error
@@ -590,6 +655,9 @@ def push_to_misp(owner, job_id, pass_nr=None, *, checked_job=_UNSET,
       except Exception:
         pass  # Non-fatal
 
+  except _SharingGroupRejected:
+    _record_export_status("failed")
+    return {"status": "error", "error": "sharing_group_rejected", "retryable": False}
   except Exception as exc:
     error_str = str(exc)
     retryable = not any(code in error_str for code in ["401", "403", "404"])
@@ -648,9 +716,8 @@ def export_misp_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
   No MISP server connection or ENABLED flag needed (RM-093); it renders with the deployment's
   effective config, as a push does (RM-139).
   """
-  cfg = get_misp_export_config(owner)
   result = build_misp_event(owner, job_id, pass_nr=pass_nr,
-    checked_job=checked_job, snapshot_mode=snapshot_mode, export_config=cfg)
+    checked_job=checked_job, snapshot_mode=snapshot_mode)
   if checked_job is not _UNSET and (not isinstance(result, dict)
       or result.get("status") != "ok" or result.get("job_id") != job_id):
     raise TenantStoreError("MISP export unavailable")
@@ -683,7 +750,8 @@ def export_misp_json(owner, job_id, pass_nr=None, *, checked_job=_UNSET, snapsho
     if not isinstance(tags, list) or any(not isinstance(tag, dict) or not isinstance(tag.get("name"), str) for tag in tags):
       raise TenantStoreError("MISP export unavailable")
     names = [tag["name"] for tag in tags]
-    for prefix, expected in (("redmesh:job_id=", job_id), ("redmesh:report_cid=", result["report_cid"])):
+    for prefix, expected in (("redmesh:job_id=", job_id), ("redmesh:report_cid=", result["report_cid"]),
+                             (TENANT_ID_PREFIX, tenant_label_value(result["tenant_id"]))):
       if [name for name in names if name.startswith(prefix)] != ([prefix + expected] if expected else []):
         raise TenantStoreError("MISP export unavailable")
   return payload

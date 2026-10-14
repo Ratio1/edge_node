@@ -144,6 +144,9 @@ class TestOpenCtiExport(unittest.TestCase):
     uploaded = kwargs["files"]["0"][1].decode("utf-8")
     self.assertNotIn("10.0.0.1", uploaded)
     self.assertIn('"type": "bundle"', uploaded)
+    # RM-139: the uploaded report names the job's tenant, for filtering in OpenCTI.
+    report = next(obj for obj in json.loads(uploaded)["objects"] if obj["type"] == "report")
+    self.assertIn(f"redmesh:tenant_id={owner.job_specs['execution_binding']['tenant_id']}", report["labels"])
     emit_status.assert_called_once()
     self.assertEqual(emit_status.call_args.kwargs["adapter_type"], "opencti")
 

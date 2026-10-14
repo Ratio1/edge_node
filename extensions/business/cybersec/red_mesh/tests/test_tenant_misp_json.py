@@ -62,7 +62,19 @@ def test_public_download_uses_real_misp_producer_with_checked_job(archived, enab
     assert result["ports_exported"] == 3
     assert result["misp_event"]["distribution"] == "0"
     assert {tag["name"] for tag in result["misp_event"]["Tag"]} >= {
-      "redmesh:job_id=job-1", "redmesh:report_cid=aggregate"}
+      "redmesh:job_id=job-1", "redmesh:report_cid=aggregate",
+      f"redmesh:tenant_id={fixture.tenant_id}"}
+
+
+def test_plugin_reads_the_tenant_display_name_for_the_tenant_tag():
+  """RM-139: the name tag is read from the tenant record at export time; an unknown tenant has none."""
+  with read_endpoint_fixture(bound=True) as fixture:
+    display = fixture.tenant_store.get("tenant", fixture.tenant_id)["display_name"]
+    assert fixture.Plugin._get_tenant_display_name(fixture.owner, fixture.tenant_id) == display
+    assert fixture.Plugin._get_tenant_display_name(
+      fixture.owner, "tn_00000000-0000-4000-8000-000000000000") is None
+    fixture.owner.cfg_tenancy_namespace = ""
+    assert fixture.Plugin._get_tenant_display_name(fixture.owner, fixture.tenant_id) is None
 
 
 @pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))

@@ -152,6 +152,12 @@ class TestTaxiiExport(unittest.TestCase):
     self.assertEqual(list(parsed.keys()), ["objects"])
     self.assertNotIn("type", parsed)
     self.assertIsInstance(parsed["objects"], list)
+    # RM-139: the published objects name the job's tenant, for filtering in the collection.
+    label = f"redmesh:tenant_id={owner.job_specs['execution_binding']['tenant_id']}"
+    labelled = [obj for obj in parsed["objects"]
+                if obj["type"] in ("report", "vulnerability", "indicator", "observed-data")]
+    self.assertIn("report", {obj["type"] for obj in labelled})
+    self.assertTrue(all(label in obj["labels"] for obj in labelled))
     emit_status.assert_called_once()
     self.assertEqual(emit_status.call_args.kwargs["adapter_type"], "taxii")
 
