@@ -233,7 +233,7 @@ class _DeploymentMutationsMixin:
       instances={}, previous_instances={node: required_instances(config) for node, config in configs.items()},
       phase="retiring_previous", outcome=None, recovery=None, created_at=now, updated_at=now,
       deadline=now + self.cfg_deployment_readiness_timeout, sequence=0, events=[], sent_at={},
-      settlement={"status": "not_started"}, error=None,
+      error=None,
     )
     self._save_operation(operation, message="Whole-job deletion accepted; awaiting confirmed shutdown.")
     self._deployment_operations_event.set()
