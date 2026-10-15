@@ -15,7 +15,7 @@ This is the durable reference for implementation across independent Ratio1 repos
 5. Show deployment progress across every target node in Deeploy, including errors, cleanup, and restoration progress. Polling is sufficient; SSE and WebSockets are outside this scope.
 6. A create succeeds only when every required instance on every planned target node is ready. If the attempt fails, stop its pipeline on nodes where it started and prevent pending starts from completing afterward.
 7. A failed update must stop the failed rollout and restore the previous revision. The user explicitly chose restoration rather than stopping the entire application permanently.
-8. All affected components will be deployed together. No backward compatibility, legacy response handling, opt-in asynchronous flags, dual protocols, compatibility adapters, or migration code are required anywhere in this work.
+8. All affected components will be deployed together. No legacy deployment response handling, opt-in asynchronous flags, dual deployment protocols, or migration scripts are required. Decision 14 defines the narrow exception for existing pipelines resolving secrets after restart.
 9. Implementation and pull requests are authorized from current `develop` (Edge/frontend) and `main` (Core). Live deployments, chain writes, remote configuration changes, and production data changes remain outside scope.
 10. **2026-10-14 implementation clarification:** the coordinator is the oracle receiving each create/update request. Do not implement distributed locking, consensus, stable coordinator assignment, or automatic failover. Polling remains available through any oracle. Concurrent submissions through different oracles are not globally serialized; the client must reuse a request ID and discover an existing operation before deliberate retries.
 
@@ -23,6 +23,8 @@ This is the durable reference for implementation across independent Ratio1 repos
 12. **2026-10-14 mutation scope:** scale-up and whole-job deletion are asynchronous and use the same polling endpoint. Scale-up is a full placement revision with rollback. Delete waits for confirmed stops before removing secrets and metadata. Partial node deletion is rejected; no compatibility mode. Deleted paid job IDs may be reused through a higher revision (user confirmed).
 
 13. **2026-10-14 completion clarification:** coordinator completion is the final deployment outcome. The UI must not wait for blockchain consensus: report deployment success and stop automatic polling once execution and required recovery are complete. Do not track, display, or gate deployment completion or subsequent operations on blockchain transactions. The existing ChainDistMonitor remains separate; authentication and paid-job admission validation are unchanged. The SDK examples use the same completion boundary.
+
+14. **2026-10-15 existing-pipeline exception (user confirmed):** existing pipelines must continue working after restart without `secret_revision`. Retain unversioned secret resolution only for pre-lifecycle pipelines, authorized against current raw-CID metadata and runner placement. Reject versioned/deleted jobs on that path. New deployments and the first update's target/restoration configurations use immutable secret revisions. This exception does not restore the old deployment API or require operator migration.
 
 ## Repository orientation and inspected baseline
 
@@ -326,7 +328,7 @@ No new cancel/retry endpoints are required. A deliberate retry can use the exist
 
 This is one coordinated release across Core, Edge/Deeploy/dAuth, frontend, and affected direct clients/tutorials. Replace the old contracts directly. Delete obsolete pending-request/final-response assumptions when their replacement is integrated.
 
-Do not add migration scripts, legacy record converters, response fallbacks, dual publishers, or feature flags whose purpose is old/new coexistence. Internal schema identifiers for validation are allowed; they must not become a compatibility framework.
+Do not add migration scripts, legacy operation converters, deployment-response fallbacks, dual publishers, or feature flags whose purpose is old/new API coexistence. The required existing-pipeline secret lookup is the explicit exception: it uses existing CID binding/runner authorization, refreshes registry state, and cannot serve versioned or deleted jobs. Internal schema identifiers for validation are allowed; they must not become a compatibility framework.
 
 Existing running jobs can supply a canonical current configuration when accepting a new update; this is normal operation, not migration of historical operations. If a recoverable prior snapshot cannot be established, reject the update before dispatch. Jobs with no operation history show that fact through the same polling endpoint.
 
@@ -395,7 +397,7 @@ Exit: the user can follow the same operation through refresh and oracle changes,
 
 - Run deterministic Core/Edge/frontend checks and multi-node fault-injection tests.
 - Exercise CStore/R1FS/dAuth failures and blockchain uncertainty with controlled stubs/test environments.
-- Check no compatibility/migration/opt-in paths or additional public endpoints were introduced.
+- Check no compatibility/migration/opt-in paths beyond decision 14, or additional public endpoints, were introduced.
 - Record operational limits, retention settings, unresolved recovery procedures, coordinated release steps, and test evidence.
 
 Exit: all acceptance criteria below pass or the feature remains incomplete. An API/UI demo alone is insufficient.
@@ -441,7 +443,7 @@ Completed in this planning task:
 
 - [x] Inspect existing create/update, timeout, metadata/secret handling, node publication, and frontend submission behavior.
 - [x] Confirm CStore/R1FS persistence and any-oracle polling requirements.
-- [x] Confirm exactly one new polling API and no compatibility or migration work.
+- [x] Confirm exactly one new polling API; no migration work or compatibility beyond decision 14.
 - [x] Confirm failed-create cleanup and failed-update restoration policy with the user.
 - [x] Save this durable specification and implementation sequence.
 
@@ -449,13 +451,13 @@ Implementation and final review are recorded in the checkpoints below. Live depl
 
 To resume after compaction:
 
-1. Read this file first; preserve the confirmed product decisions, particularly automatic recovery and the absence of compatibility paths.
+1. Read this file first; preserve the confirmed product decisions, particularly automatic recovery and the narrow existing-pipeline secret exception in decision 14.
 2. Read applicable `AGENTS.md` files in each independent repository and inspect branches/dirty state before edits. Preserve unrelated work.
 3. Resume from the implementation checkpoints and PRs, not from work package 1. Preserve receiving-oracle coordination without distributed locking/consensus.
 4. Recheck the source map against current code; use exact function behavior over stale prose.
 5. Keep this document updated with completed work packages, chosen persistence/reporting settings, exact tests and results, affected commits, remaining blockers, and the next concrete step. Do not mark a package complete on code shape alone.
 6. Follow the user's delegation rule for substantial frontend implementation: Claude owns the agreed UI file scope while Codex remains responsible for architecture, integration, and verification. Documentation-only planning does not require UI delegation.
-7. Do not create compatibility shims, a second polling/event endpoint, or a new external storage dependency. Do not reinterpret failed-update recovery as leaving the partial new rollout running.
+7. Do not create compatibility shims beyond decision 14, a second polling/event endpoint, or a new external storage dependency. Do not reinterpret failed-update recovery as leaving the partial new rollout running.
 
 ## Implementation checkpoints
 
@@ -544,3 +546,45 @@ Local review evidence: `/tmp/deeploy-review-before-regressions.log`,
 `/tmp/deeploy-fresh-review-edge-final.log`, `/tmp/deeploy-fresh-review-core-final.log`,
 and `/tmp/deeploy-fresh-review-core-broad.log`. These temporary logs are not required
 to resume implementation; the regression tests and contract notes are committed.
+
+### Existing pipelines after restart — 2026-10-15
+
+Implemented decision 14 across Edge dAuth, Core runtime secret resolution, and
+the SDK. An existing persisted pipeline with no secret revision sends a signed
+unversioned request. dAuth refreshes the protected registries and requires an
+unversioned current CID, matching job identity, current runner placement, and a
+CID-bound secret bundle. It rejects deleted/versioned records and generation
+changes. Existing pre-CID bundles retain their structural binding procedure.
+No secrets or revision fields are written into the persisted node configuration.
+
+Tracked pipelines with a missing secret revision fail closed locally. Explicit
+revision requests retain signature, nonce, oracle, job, revision, and authorized
+runner checks and never retry through the unversioned path. The first update of
+an existing pipeline snapshots its old secrets into an immutable `:restore`
+revision, so failed-update restoration remains possible.
+
+Verification used the network-disabled
+`local_edge_node_dauth471_core219_arm64:1599b7e` runtime (Python 3.10.12), with
+Edge/Core/SDK source mounts:
+
+- PASS: Edge Deeploy discovery — 376 tests.
+- PASS: `python -m unittest extensions.business.dauth.test_unversioned_secret_resolution extensions.business.dauth.test_dauth_registry_gating extensions.business.dauth.test_dauth_secret_routing`
+  — 64 tests. The ten new cross-stack cases exercise two cold secret-cache
+  restarts from persisted redacted JSON through the real Core resolver, SDK
+  request path, and dAuth handler; first-update restoration; and authorization,
+  stale-pointer, deletion, and downgrade rejection. Crypto/network dependencies
+  are controlled test doubles. Run this integration suite separately from the
+  Deeploy suite, whose lightweight dependency mocks cannot load the full node.
+- PASS: Core lifecycle, HSync, runtime secrets, and response tests — 100 tests.
+- PASS: SDK async client and job-secret tests — 28 tests; compilation and diff
+  checks pass across changed Python files.
+- FAIL (unchanged baseline): Core broad discovery — 468 tests, the same eight
+  errors and one skip as the isolated baseline; failure details remain above.
+- PASS: an independent read-only critic reviewed the cross-repository exception
+  and reran restart/auth tests, finding no confirmed P1/P2 issue. No findings
+  required fixes. The additional first-update restoration case also passes.
+
+Live multi-node restart/rollback and production release were not performed.
+Update the existing Edge #533, Core #226, and SDK #184 PRs together; the frontend
+requires no change for this exception. Preserve unrelated local readiness-timeout
+edits separately from this change.
