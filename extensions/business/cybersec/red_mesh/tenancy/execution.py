@@ -151,17 +151,6 @@ class CurrentExecutionFacts:
     return json.loads(self._snapshot)
 
 
-def context_tenant_id(context):
-  """The launching tenant, or None when there is no execution context. Never raises at a launch gate."""
-  if context is None:
-    return None
-  try:
-    tenant_id = context.to_dict().get("tenant_id")
-  except Exception:
-    return None
-  return tenant_id if isinstance(tenant_id, str) and tenant_id.strip() else None
-
-
 def binding_from_record(record):
   """The record's binding, or None when the field is absent. An explicit null or malformed field
   is never absence -- it is a broken record, and `ExecutionBinding(...)` raises for it."""

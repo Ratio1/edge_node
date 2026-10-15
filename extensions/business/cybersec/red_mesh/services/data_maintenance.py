@@ -26,6 +26,7 @@ from ..constants import JOB_STATUS_FAILED, JOB_STATUS_FINALIZED, JOB_STATUS_STOP
 from ..tenancy.adapters.cstore_administration import CstoreTenantAdministrationStore
 from ..tenancy.adapters.cstore_identity import CstoreAuthAccountReader
 from ..tenancy.execution import BINDING_SCHEMA_VERSION, ExecutionBinding
+from ..tenancy.super_tenant_integrations import KIND as INTEGRATION_OVERRIDE_KIND, withheld_for_backup
 from .integration_status import _STATUS_BUILDERS
 
 
@@ -57,9 +58,10 @@ _PER_JOB = (
   (":report_review:audit", list, False),
 )
 # RM-133: `tenant_contract_draft` is keyed `(tenant_id, contract_id)` and takes the generic related-tenant rule.
-_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
+# RM-139: the tenant `integration` kind is retired: its rows classify old and are never restored.
+_TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "engagement", "tenant_draft",
                   "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                  "super_tenant_branding")
+                  "super_tenant_branding", "super_tenant_integration")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -79,6 +81,14 @@ class MaintenanceError(Exception):
 
 def valid_cid(value):
   return isinstance(value, str) and _CID.match(value) is not None
+
+
+def _tenancy_kind(field):
+  try:
+    decoded = json.loads(field) if isinstance(field, str) else None
+  except (ValueError, RecursionError):
+    return None
+  return decoded[0] if isinstance(decoded, list) and decoded and isinstance(decoded[0], str) else None
 
 
 def row_sha256(value):
@@ -205,7 +215,7 @@ class Inventory:
       return self._tenants
     found = set()
     for _, kind, ids, value in self._tenancy_fields():
-      if kind in ("tenant", "tenant_node", "integration", "engagement", "asset") and ids:
+      if kind in ("tenant", "tenant_node", "engagement", "asset") and ids:
         found.add(ids[0])
       if kind == "receipt" and isinstance(value, dict) and isinstance(value.get("tenant_id"), str):
         found.add(value["tenant_id"])
@@ -236,6 +246,43 @@ class Inventory:
 
   def is_account_hkey(self, hkey):
     return hkey == self._account_hkey
+
+  def is_retired_field(self, hkey, field):
+    """RM-139. A tenant `integration` row: `accepts` admits the tenancy hkey as a whole, so a backup
+    taken before the start-up cleanup would otherwise bring those rows back."""
+    if hkey != self._tenancy_hkey:
+      return False
+    try:
+      decoded = json.loads(field)
+    except (ValueError, RecursionError):
+      return False
+    return isinstance(decoded, list) and bool(decoded) and decoded[0] == "integration"
+
+  def _is_integration_override(self, hkey, field):
+    return hkey == self._tenancy_hkey and _tenancy_kind(field) == INTEGRATION_OVERRIDE_KIND
+
+  def row_hash(self, hkey, field, value):
+    """The hash a scan reports, a cleanup checks and a restore compares. RM-139: an STA integration
+    override is hashed without its credential values, as it is exported; an unsalted hash over a
+    credential would be an offline guessing oracle in every backup."""
+    if self._is_integration_override(hkey, field):
+      value = withheld_for_backup(value)
+    return row_sha256(value)
+
+  def is_unreadable_override(self, hkey, field, value):
+    """RM-139. An STA integration override the store would refuse (one a backup left with no
+    override at all): restored, every read of it would fail closed, so a restore never writes it."""
+    if not self._is_integration_override(hkey, field):
+      return False
+    try:
+      decoded = json.loads(field)
+      ids = decoded[2:]
+      if decoded[1] != self._namespace or field != self._store._location(INTEGRATION_OVERRIDE_KIND, ids)[1]:
+        return True
+      self._store._validate(value, INTEGRATION_OVERRIDE_KIND, ids)
+    except Exception:
+      return True
+    return False
 
   def is_job_hkey(self, hkey):
     return hkey == self._instance
@@ -296,10 +343,11 @@ class Inventory:
       row = self._store._validate(value, kind, ids)
     except Exception:
       return OLD, "unrecognized"
-    if kind in ("tenant_draft", "super_tenant_profile", "super_tenant_branding"):
+    if kind in ("tenant_draft", "super_tenant_profile", "super_tenant_branding", "super_tenant_integration"):
       # RM-109: a draft has no tenant; its id is not one, so the related-tenant check below would
       # call every draft an orphan. Current while the store reads it, never orphan or old_tenant.
-      # RM-110: the same for the deployment's one super-tenant profile row; RM-134 its branding row.
+      # RM-110: the same for the deployment's one super-tenant profile row; RM-134 its branding row;
+      # RM-139 its integration overrides.
       return CURRENT, ""
     if kind in ("engagement_draft", "tenant_asset"):
       # RM-109 phase 4: current while its parent exists (a tenant draft row, or a live tenant); a
@@ -434,7 +482,12 @@ class Inventory:
   def describe(self, hkey, field, value):
     group, reason = self.classify(hkey, field, value)
     files, complete = self.files(hkey, field, value)
-    return {"hkey": hkey, "field": field, "value": value, "sha256": row_sha256(value),
+    sha256 = self.row_hash(hkey, field, value)
+    if self._is_integration_override(hkey, field):
+      # RM-139: an STA integration override is exported without its credential values, and its
+      # hash is the exported row's (row_hash).
+      value = withheld_for_backup(value)
+    return {"hkey": hkey, "field": field, "value": value, "sha256": sha256,
             "class": group, "reason": reason, "cids": files, "files_complete": complete}
 
   def kept_files(self):
@@ -673,7 +726,7 @@ def _clean_row(owner, inventory, target, delete_file, job_id=None):
   inventory.refresh(hkey, field, value)
   if value is None:
     return {**result, "outcome": "absent"}
-  if row_sha256(value) != target["expected_sha256"]:
+  if inventory.row_hash(hkey, field, value) != target["expected_sha256"]:
     return {**result, "outcome": "changed"}
   if inventory.classify(hkey, field, value)[0] not in (OLD, ORPHAN):
     return {**result, "outcome": "not_old"}
@@ -721,12 +774,14 @@ def restore_records(owner, inventory, rows):
   for row in rows:
     hkey, field, value = row["hkey"], row["field"], row["value"]
     outcome = "written"
-    if not inventory.accepts(hkey):
+    if (not inventory.accepts(hkey) or inventory.is_retired_field(hkey, field)
+        or inventory.is_unreadable_override(hkey, field, value)):
       outcome = "refused"
     else:
       stored = owner.chainstore_hget(hkey=hkey, key=field)
       if stored is not None:
-        outcome = "same" if row_sha256(stored) == row_sha256(value) else "conflict"
+        same = inventory.row_hash(hkey, field, stored) == inventory.row_hash(hkey, field, value)
+        outcome = "same" if same else "conflict"
       else:
         owner.chainstore_hset(hkey=hkey, key=field, value=value)
     outcomes.append({"hkey": hkey, "field": field, "outcome": outcome})

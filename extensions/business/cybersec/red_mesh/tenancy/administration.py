@@ -21,13 +21,12 @@ from .ports import TenantStoreError
 from .nodes import NODE_ASSIGNMENT_MODES, node_assignment_mode, valid_node_address
 from .deployment_nodes import named_entry
 from .assets import canonical_digest, normalize_name, valid_digest
-from .integrations import (NODE_LEVEL_INTEGRATION_IDS, integration_ids,
-                           normalize_integration_config, public_integration_config,
-                           valid_integration_id)
+from .integrations import integration_ids, valid_integration_id
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_asset_requests, normalize_context,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import drafts, engagement_drafts, super_tenant_branding, super_tenant_profile, tenant_assets, tenant_contracts
+from . import (drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
+               tenant_assets, tenant_contracts)
 
 
 _ADMINISTRATION_LOCK = RLock()
@@ -192,13 +191,17 @@ def _same_contract(stored, requested):
 
 class TenantAdministrationService:
   def __init__(self, accounts, store, configured_peers_reader=None, tenant_node_jobs_reader=None,
-               node_directory_reader=None, super_tenant_permissions_reader=None):
+               node_directory_reader=None, super_tenant_permissions_reader=None, integration_config_reader=None):
     self.accounts = accounts
     self.store = store
     self.configured_peers_reader = configured_peers_reader
     # RM-132: `() -> {key: bool}`, the deployment's `SUPER_TENANT_PERMISSIONS` (read-only here, set
     # by Ratio1). Injected like `configured_peers_reader`; without one, every key is `True`.
     self.super_tenant_permissions_reader = super_tenant_permissions_reader
+    # RM-139: `(integration_id, override_row) -> (deployment, effective, deployment_configured,
+    # configured)`, the resolved blocks without and with the STA override. Injected like
+    # `super_tenant_permissions_reader`; without one the integration reads are unavailable.
+    self.integration_config_reader = integration_config_reader
     # RM-126: `[address] -> {address: {"alias", "tags"}}`, the network monitor's names for the
     # configured peers. Injected like `configured_peers_reader`; it only decorates reads, so a
     # missing or failing reader names nothing and never fails a read.
@@ -1243,76 +1246,6 @@ class TenantAdministrationService:
     return {"store": ref["store"], "ref": ref["ref"], "sha256": ref["sha256"], "filename": ref["filename"],
             "size_bytes": ref["size_bytes"], "engagement_hash": row["engagement_hash"]}
 
-  @staticmethod
-  def _integration_row(row):
-    if row is None:
-      raise TenantStoreError("Integration readback is unavailable")
-    return {"tenantId": row["tenant_id"], "integrationId": row["integration_id"],
-            "enabled": row["enabled"],
-            "config": public_integration_config(row["integration_id"], row["config"]),
-            "updatedBy": row["updated_by"], "updatedAt": row["updated_at"],
-            "version": canonical_digest(row)}
-
-  @staticmethod
-  def _integration_id(value):
-    # A node-level id is refused with its own reason rather than a bare not_found, so an operator
-    # who asks for suricata learns it is node-level instead of assuming the tenant is broken.
-    if isinstance(value, str) and value in NODE_LEVEL_INTEGRATION_IDS:
-      raise AdministrationDenied(400, "integration_not_tenant_scoped")
-    if not valid_integration_id(value):
-      raise AdministrationDenied(404, "not_found")
-    return value
-
-  @_endpoint
-  def list_tenant_integrations(self, actor, tenant_id):
-    """Every tenant-scopable id, configured or not, so the surface never hides an unset one."""
-    _, _account = self._authorized_tenant(actor, tenant_id, "integrations:manage")
-    stored = {row["integration_id"]: row for row in self.store.list_integrations(tenant_id)}
-    return {"tenantId": tenant_id,
-            "integrations": [self._integration_row(stored[integration_id])
-                             if integration_id in stored
-                             else {"tenantId": tenant_id, "integrationId": integration_id,
-                                   "enabled": False, "config": None, "updatedBy": None,
-                                   "updatedAt": None, "version": None}
-                             for integration_id in integration_ids()]}
-
-  @_endpoint
-  def get_tenant_integration(self, actor, tenant_id, integration_id):
-    self._authorized_tenant(actor, tenant_id, "integrations:manage")
-    integration_id = self._integration_id(integration_id)
-    row = self.store.get("integration", tenant_id, integration_id)
-    if row is None:
-      raise AdministrationDenied(404, "not_found")
-    return {"integration": self._integration_row(row)}
-
-  @_endpoint
-  def put_tenant_integration(self, actor, tenant_id, integration_id, enabled, config,
-                             expected_version=None):
-    """Replace one tenant's config for one integration. Absent expected_version means first write."""
-    _, account = self._authorized_tenant(actor, tenant_id, "integrations:manage")
-    integration_id = self._integration_id(integration_id)
-    try:
-      if type(enabled) is not bool:
-        raise ValueError("Invalid desired state")
-      config = normalize_integration_config(integration_id, config)
-      if expected_version is not None and not valid_digest(expected_version):
-        raise ValueError("Invalid expected version")
-    except (ValueError, TypeError, RecursionError):
-      raise AdministrationDenied(400, "invalid_request") from None
-    row = self.store.get("integration", tenant_id, integration_id)
-    if (row is None) != (expected_version is None):
-      raise AdministrationDenied(409, "conflict")
-    if row is not None:
-      if canonical_digest(row) != expected_version:
-        raise AdministrationDenied(409, "conflict")
-      if (row["enabled"], row["config"]) == (enabled, config):
-        return self._integration_row(row)
-    self.store.put("integration", tenant_id, integration_id, record={
-      "tenant_id": tenant_id, "integration_id": integration_id, "enabled": enabled,
-      "config": config, "updated_by": account.account_id,
-      "updated_at": datetime.now(timezone.utc).isoformat()})
-    return self._integration_row(self.store.get("integration", tenant_id, integration_id))
-
   def _assignment_conflict(self, tenant_id, node_address, mode):
     """RM-102 conflict precedence for (tenant, node, mode), over every tenant's live row for the
     node: own row draining; own live row, same mode (`assigned`, idempotent); own live row, the other
@@ -1525,7 +1458,8 @@ class TenantAdministrationService:
   # a failed attempt can be retried: `begin_tenant_delete` (check, then mark), the job checks,
   # the document deletes (`record_tenant_documents_deleted`), `finish_tenant_delete`.
   # RM-133: the tenant's contract drafts go with it (their files are in `_tenant_document_refs`).
-  _DELETABLE_KINDS = ("engagement", "integration", "tenant_node", "tenant_contract_draft")
+  # RM-139: the retired tenant `integration` rows are deleted at plugin start, not here.
+  _DELETABLE_KINDS = ("engagement", "tenant_node", "tenant_contract_draft")
 
   def _tenant_for_delete(self, actor, tenant_id):
     account = self._actor(actor)
@@ -1626,8 +1560,10 @@ class TenantAdministrationService:
       self.store.delete("tenant_asset", *record_ids)
     self.store.delete("receipt", tenant["actor_id"], tenant["request_id"])
     self.store.delete("tenant", tenant_id)
+    # RM-139: `integrations` is always 0 now (the kind is retired). It stays only for the
+    # compatibility window of a deployed Navigator that requires the count; drop it after that.
     return {"tenantId": tenant_id, "deleted": True, "engagements": counts["engagement"],
-            "integrations": counts["integration"], "assets": len(asset_ids),
+            "integrations": 0, "assets": len(asset_ids),
             "nodeAssignments": counts["tenant_node"], "contractDrafts": counts["tenant_contract_draft"],
             "documents": len(tenant["deleting"]["deleted_refs"])}
 
@@ -1750,6 +1686,58 @@ class TenantAdministrationService:
     if logo is None:
       raise AdministrationDenied(404, "not_found")
     return logo
+
+  # RM-139: the deployment integrations, one optional STA override row per integration (contract
+  # `multi-tenant-workspaces.md` §Deployment integrations). A full-portfolio Super-Tenant Admin reads
+  # and writes them, as the super-tenant profile; a read never returns a credential value.
+
+  def _integration_override_dto(self, integration_id, row):
+    reader = self.integration_config_reader
+    if not callable(reader):
+      raise TenantStoreError("Integration configuration is unavailable")
+    deployment, effective, deployment_configured, configured = reader(integration_id, row)
+    dto = super_tenant_integrations.integration_dto(integration_id, row, deployment, effective,
+                                                    deployment_configured, configured)
+    return {**dto, "version": super_tenant_integrations.row_version(row)}
+
+  @_endpoint
+  def list_super_tenant_integrations(self, actor):
+    self._actor(actor, creator=True)
+    return {"integrations": [
+      self._integration_override_dto(integration_id, self.store.get(super_tenant_integrations.KIND, integration_id))
+      for integration_id in integration_ids()]}
+
+  @_endpoint
+  def put_super_tenant_integration(self, actor, integration_id, changes, expected_version=None):
+    """Apply `changes` (see `super_tenant_integrations.apply_changes`) to one override. Absent
+    `expected_version` means no row yet; a stale one is 409. Answers the DTO and the names of the
+    keys that changed (the plugin audits those, never the values); a row cleared of every override
+    is deleted, so the integration falls back to the Deeploy config."""
+    account = self._actor(actor, creator=True)
+    if not valid_integration_id(integration_id):
+      raise AdministrationDenied(404, "not_found")
+    if expected_version is not None and not valid_digest(expected_version):
+      raise AdministrationDenied(400, "invalid_request")
+    kind = super_tenant_integrations.KIND
+    row = self.store.get(kind, integration_id)
+    if (row is None) != (expected_version is None) or super_tenant_integrations.row_version(row) != expected_version:
+      raise AdministrationDenied(409, "conflict")
+    try:
+      merged, changed = super_tenant_integrations.apply_changes(
+        row if row is not None else super_tenant_integrations.empty_override(integration_id), integration_id, changes)
+    except super_tenant_integrations.OverrideInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    if changed:
+      if super_tenant_integrations.is_empty(merged):
+        self.store.delete(kind, integration_id)
+        row = None
+      else:
+        merged = {**merged, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat(),
+                  "revision": super_tenant_integrations.new_revision()}
+        self.store.put(kind, integration_id, record=merged)
+        row = self.store.get(kind, integration_id)
+    return {"integration": self._integration_override_dto(integration_id, row), "changed": changed,
+            "accountId": account.account_id}
 
   # RM-109 phase 2: tenant drafts. A full-portfolio Super-Tenant Admin only, as tenant creation; a
   # draft has no tenant, so these are not rows of the tenant policy matrix. Every document read,

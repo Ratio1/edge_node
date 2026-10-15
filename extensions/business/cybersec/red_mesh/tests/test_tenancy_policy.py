@@ -46,7 +46,8 @@ class TestTenantPolicy(unittest.TestCase):
     rows = (
       ("tenants:manage",          (True, False, False, False, False)),
       ("tenant_users:manage",     (True, False, True, False, False)),
-      ("integrations:manage",     (True, False, True, False, False)),
+      # RM-139: integrations are the Super-Tenant Admin's deployment settings, not a tenant operation.
+      ("integrations:manage",     (False, False, False, False, False)),
       ("attestation_keys:manage", (True, False, True, False, False)),
       ("allow_pentester:update",  (True, True, False, False, False)),
       ("tasks:launch",            (True, True, False, True, False)),
@@ -79,7 +80,7 @@ class TestTenantPolicy(unittest.TestCase):
       with self.subTest(role=role):
         self.assertTrue(authorize_tenant_operation(account((role, None)), "allow_pentester:update", tenant).allowed)
     combined = account(("tenant_admin", "b"), ("tenant_pentester", "b"))
-    self.assertTrue(authorize_tenant_operation(combined, "integrations:manage", tenant).allowed)
+    self.assertTrue(authorize_tenant_operation(combined, "tenant_users:manage", tenant).allowed)
     self.assertTrue(authorize_tenant_operation(combined, "tasks:launch", tenant,
                                              asset_tenant_ids=("b",)).allowed)
     self.assertFalse(authorize_tenant_operation(combined, "allow_pentester:update", tenant).allowed)

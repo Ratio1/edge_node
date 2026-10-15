@@ -1,11 +1,11 @@
-from .config import resolve_config_block, tenant_integration_override
+from .config import _STORED, _resolve_integration
 
 
 SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 
 DEFAULT_MISP_EXPORT_CONFIG = {
   "ENABLED": False,
-  "AUTO_EXPORT": False,
+  "AUTO_EXPORT": True,
   "MISP_URL": "",
   "MISP_API_KEY": "",
   "MISP_VERIFY_TLS": True,
@@ -16,8 +16,8 @@ DEFAULT_MISP_EXPORT_CONFIG = {
 }
 
 
-def get_misp_export_config(owner, tenant_id=None):
-  """Return normalized MISP export config."""
+def get_misp_export_config(owner, *, override=_STORED):
+  """Return the normalized effective MISP export config (the Deeploy block, then the STA override)."""
   def _normalize(merged, defaults):
     enabled = bool(merged.get("ENABLED", defaults["ENABLED"]))
     auto_export = bool(merged.get("AUTO_EXPORT", defaults["AUTO_EXPORT"]))
@@ -59,10 +59,4 @@ def get_misp_export_config(owner, tenant_id=None):
       "MIN_SEVERITY": min_severity,
     }
 
-  return resolve_config_block(
-    owner,
-    "MISP_EXPORT",
-    DEFAULT_MISP_EXPORT_CONFIG,
-    normalizer=_normalize,
-    tenant_override=tenant_integration_override(owner, tenant_id, "misp"),
-  )
+  return _resolve_integration(owner, "misp", "MISP_EXPORT", DEFAULT_MISP_EXPORT_CONFIG, _normalize, override)

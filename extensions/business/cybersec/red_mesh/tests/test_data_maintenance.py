@@ -473,6 +473,35 @@ class TestDataMaintenance(unittest.TestCase):
     self.storage.data[(TENANCY, field)]["theme"] = "pink"
     self.assertEqual(self.scan()[(TENANCY, field)]["reason"], "unrecognized")
 
+  def test_a_retired_tenant_integration_is_old_and_the_deployment_override_is_current(self):
+    # RM-139: the tenant `integration` kind is retired; the STA override has no tenant and stays
+    # current once every tenant is gone, as the profile does.
+    from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_administration import (
+      CstoreTenantAdministrationStore)
+    from .test_tenant_integration_records import plant
+    orphan = "tn_" + str(uuid4())
+    plant(self.storage, self.tenant, "misp")
+    plant(self.storage, orphan, "taxii")
+    CstoreTenantAdministrationStore(self.storage, "deployment").put(
+      "super_tenant_integration", "misp", record={
+        "integration_id": "misp", "config": None, "sharing_groups": None, "auto_export": False,
+        "updated_by": "creator", "updated_at": "2026-10-14T00:00:00+00:00"})
+    retired = [json.dumps(["integration", "deployment", tenant, name], separators=(",", ":"))
+               for tenant, name in ((self.tenant, "misp"), (orphan, "taxii"))]
+    override = json.dumps(["super_tenant_integration", "deployment", "misp"], separators=(",", ":"))
+    rows = self.scan()
+    for field in retired:
+      self.assertEqual((rows[(TENANCY, field)]["class"], rows[(TENANCY, field)]["reason"]), ("old", "unrecognized"))
+    self.assertEqual((rows[(TENANCY, override)]["class"], rows[(TENANCY, override)]["reason"]), ("current", ""))
+    # A retired row no longer registers its tenant's status hkey.
+    self.assertNotIn((f"{JOBS}:integrations:{orphan}"),
+                     {item["hkey"] for item in self.plugin.export_redmesh_records(self.actor, 0, 0, 1)["data"]["hkeys"]})
+    self.assertEqual([item["outcome"] for item in self.clean(*(rows[(TENANCY, field)] for field in retired))],
+                     ["deleted", "deleted"])
+    tenant = json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":"))
+    del self.storage.data[(TENANCY, tenant)]
+    self.assertEqual(self.scan()[(TENANCY, override)]["class"], "current")
+
   def test_a_tenant_activated_from_a_draft_is_current_with_all_its_files(self):
     # RM-109 phase 3: the receipt carries the draft id; tenant and receipt name three documents.
     # RM-110: and the contract's generated baseline, whose file the draft row names too.
@@ -758,6 +787,31 @@ class TestDataMaintenance(unittest.TestCase):
                                                         "outcomes": {"written": 2, "conflict": 1, "refused": 2}}))
     again = self.plugin.restore_redmesh_records(self.actor, saved[:1])
     self.assertEqual(again["data"]["outcomes"][0]["outcome"], "same")
+
+  def test_restoring_a_backup_from_before_the_cleanup_never_brings_back_tenant_integrations(self):
+    # RM-139: the tenancy hkey is accepted as a whole, so the retired kind is refused by its field.
+    from .test_tenant_integration_records import SECRET, integration_location, plant
+    plant(self.storage, self.tenant, "misp")
+    plant(self.storage, "tn_" + str(uuid4()), "opencti")
+    rows = self.scan()
+    retired = sorted(key for key in rows if key[0] == TENANCY and json.loads(key[1])[0] == "integration")
+    self.assertEqual(len(retired), 2)
+    tenant = (TENANCY, json.dumps(["tenant", "deployment", self.tenant], separators=(",", ":")))
+    backup = [{"hkey": hkey, "field": field, "value": rows[(hkey, field)]["value"]}
+              for hkey, field in [*retired, tenant]]
+    self.Plugin._maybe_retire_tenant_integration_records(self.plugin)
+    tenant_row = self.storage.data.pop(tenant)
+    self.events.clear()
+    done = self.plugin.restore_redmesh_records(self.actor, backup)
+    self.assertTrue(done["success"], done)
+    self.assertEqual([item["outcome"] for item in done["data"]["outcomes"]], ["refused", "refused", "written"])
+    for hkey, field in retired:
+      self.assertIsNone(self.storage.data[(hkey, field)])
+    self.assertEqual(self.storage.data[tenant], tenant_row)
+    self.assertNotIn(SECRET, json.dumps([self.storage.data.get(integration_location(self.tenant, "misp"))]))
+    # A field that is not a tenancy key at all is still the hkey rule's to judge, never a crash.
+    odd = self.plugin.restore_redmesh_records(self.actor, [{"hkey": TENANCY, "field": "not json", "value": {"x": 1}}])
+    self.assertEqual(odd["data"]["outcomes"][0]["outcome"], "written")
 
 
 class TestStoredFiles(unittest.TestCase):
