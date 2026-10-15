@@ -24,14 +24,14 @@ def _plugin_class():
 ])
 def test_get_demo_only_reads_the_deployment_value(value, expected):
   from extensions.business.cybersec.red_mesh.services.config import get_demo_only
-  assert get_demo_only(SimpleNamespace(cfg_demo_only=value)) is expected
+  assert get_demo_only(SimpleNamespace(cfg_redmesh_demo_only=value)) is expected
 
 
 def test_get_demo_only_is_off_when_unset_or_not_a_deployment_value():
   from extensions.business.cybersec.red_mesh.services.config import get_demo_only
   assert get_demo_only(SimpleNamespace()) is False
   assert get_demo_only(MagicMock()) is False
-  assert get_demo_only(SimpleNamespace(cfg_demo_only={"ENABLED": True})) is False
+  assert get_demo_only(SimpleNamespace(cfg_redmesh_demo_only={"ENABLED": True})) is False
 
 
 def _admission_owner(flag):
@@ -39,7 +39,7 @@ def _admission_owner(flag):
   account = AccountView("creator", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
   service = MagicMock()
   owner = SimpleNamespace(_resolve_launch_actor=MagicMock(return_value=(account, None)),
-    _execution_service=lambda: service, cfg_instance_id="deployment", cfg_demo_only=flag)
+    _execution_service=lambda: service, cfg_instance_id="deployment", cfg_redmesh_demo_only=flag)
   return owner, service
 
 
@@ -77,7 +77,7 @@ def test_every_launch_and_the_provider_preflight_are_refused_with_no_job_record(
   plugin = _plugin_class()
   owner = TestPhase1ConfigCID._build_mock_plugin()
   TestPhase1ConfigCID._bind_launch_helpers(owner)
-  owner.cfg_demo_only = True
+  owner.cfg_redmesh_demo_only = True
   service = MagicMock()
   owner._execution_service = lambda: service
   # The launch helpers stub admission for the configuration suites; this one is about admission.
@@ -98,7 +98,7 @@ def test_feature_catalog_reports_the_lock():
   plugin = _plugin_class()
   owner = TestPhase1ConfigCID._bind_launch_helpers(MagicMock())
   assert plugin.get_feature_catalog(owner)["demo_only"] is False
-  owner.cfg_demo_only = True
+  owner.cfg_redmesh_demo_only = True
   assert plugin.get_feature_catalog(owner)["demo_only"] is True
 
 
@@ -112,7 +112,7 @@ def _announced(kind):
   owner.cfg_check_jobs_each = 0
   owner.scan_jobs, owner.model_test_jobs, owner.completed_jobs_reports = {}, {}, {}
   owner._get_job_config = lambda *args, **kwargs: plugin._get_job_config(owner, *args, **kwargs)
-  owner.cfg_demo_only = True
+  owner.cfg_redmesh_demo_only = True
   owner._demo_only_jobs_logged = set()
   return plugin, owner, config, artifacts
 
@@ -146,7 +146,7 @@ def test_an_announced_job_is_never_started_and_the_refusal_is_logged_once(kind):
 @pytest.mark.parametrize("kind", ["network", "model"])
 def test_the_same_job_starts_when_the_deployment_is_not_demo_only(kind):
   plugin, owner, config, artifacts = _announced(kind)
-  owner.cfg_demo_only = False
+  owner.cfg_redmesh_demo_only = False
   with patch.object(plugin, "_get_artifact_repository", return_value=artifacts), \
        patch.object(plugin, "_mark_worker_terminal_error"), \
        patch(f"{PLUGIN_MODULE}.resolve_job_config_secrets", return_value=config), \
