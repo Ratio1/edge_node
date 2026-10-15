@@ -267,10 +267,20 @@ class _DauthMixin(object):
     _, pipeline = self._load_dauth_job_pipeline_record(job_id)
     return pipeline
 
-  def _load_current_dauth_secret_bundle(self, job_id, pipeline_cid, pipeline):
+  def _load_current_dauth_secret_bundle(self, job_id, pipeline_cid, pipeline, require_unversioned=False):
+    """Load the exact current CID's secrets, binding pre-CID records if needed.
+
+    ``require_unversioned`` rejects lifecycle bundles before that binding can
+    remove their version metadata. Wallet reveal retains its existing behavior.
+    """
     secret_bundle = self._load_dauth_job_secret_bundle(job_id)
     if not isinstance(secret_bundle, dict):
       raise ValueError(f"No dAuth secret bundle found for job {job_id}.")
+    if require_unversioned and (
+      any(key in secret_bundle for key in ("revision", "deployment_revision", "operation_id"))
+      or secret_bundle.get("deleted") or secret_bundle.get("revoked")
+    ):
+      raise ValueError("Secret revision is required for this job.")
     if DAUTH_SECRET_PIPELINE_CID_KEY not in secret_bundle:
       secret_bundle = self._bind_legacy_secret_bundle(
         job_id=job_id,
@@ -461,12 +471,74 @@ class _DauthMixin(object):
       self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
     }
 
+  def _load_unversioned_runner_secret_bundle(self, job_id, requester):
+    """Authorize a pre-lifecycle pipeline against its current CID and placement.
+
+    Only the original raw-CID metadata format qualifies. Refresh metadata and
+    protected bundles before checking, reject versioned/tombstoned records, and
+    retain the existing exact-CID binding and generation-change checks.
+    """
+    for namespace in (DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY):
+      try:
+        synced = self.chainstore_hsync(hkey=namespace, timeout=5, **dauth_registry_write_kwargs(self))
+      except Exception as exc:
+        raise RuntimeError("Existing pipeline secret synchronization is unavailable.") from exc
+      if not synced:
+        raise RuntimeError("Existing pipeline secret synchronization is unavailable.")
+    pipeline_cid = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
+    if not isinstance(pipeline_cid, str) or not pipeline_cid:
+      raise ValueError("Secret revision is required or the existing pipeline is unavailable.")
+    pipeline = self.r1fs.get_json(pipeline_cid, show_logs=False)
+    if not isinstance(pipeline, dict):
+      raise RuntimeError("Existing pipeline configuration is unavailable.")
+    specs = pipeline.get("DEEPLOY_SPECS", {})
+    if (not isinstance(specs, dict) or str(specs.get("job_id")) != job_id
+        or "secret_revision" in specs or specs.get("revision", 0) != 0
+        or pipeline.get("DEEPLOY_OPERATION") is not None):
+      raise ValueError("Secret revision is required for this pipeline.")
+    nodes = [self._normalize_node_address_for_compare(node) for node in self._pipeline_runner_nodes(pipeline)]
+    if self._normalize_node_address_for_compare(requester) not in nodes:
+      raise ValueError("Sender is not running the existing job.")
+    bundle = self._load_current_dauth_secret_bundle(
+      job_id, pipeline_cid, pipeline, require_unversioned=True,
+    )
+    if bundle.get("job_id") != job_id:
+      raise ValueError("Existing secret bundle job identity mismatch.")
+    # A versioned pointer must not become eligible merely by retaining its CID.
+    if self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id) != pipeline_cid:
+      raise RuntimeError("Existing pipeline generation changed during secret resolution.")
+    return bundle
+
   def process_dauth_get_secret_request(self, body):
     requester, _ = self._verify_signed_dauth_body(body)
     request_nonce = self._validate_dauth_secret_request_nonce(body)
     job_id = self._normalize_dauth_job_id(body.get("job_id"))
 
-    revision = body.get("revision")
+    if "revision" not in body:
+      secret_bundle = self._load_unversioned_runner_secret_bundle(job_id, requester)
+      revision = None
+    else:
+      revision = body["revision"]
+      secret_bundle = self._load_revision_runner_secret_bundle(job_id, revision, requester)
+      revision = revision.strip()
+    encrypted_secret_bundle = self.bc.encrypt_str(
+      str_data=self.json_dumps(secret_bundle),
+      str_recipient=requester,
+    )
+    if not isinstance(encrypted_secret_bundle, str) or not encrypted_secret_bundle:
+      raise ValueError(f"Failed to encrypt dAuth secrets for job {job_id}.")
+    result = {
+      "status": "success",
+      "job_id": job_id,
+      self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
+      "encrypted_secret_bundle": encrypted_secret_bundle,
+    }
+    if revision is not None:
+      result["revision"] = revision
+    return result
+
+  def _load_revision_runner_secret_bundle(self, job_id, revision, requester):
+    """Authorize one exact immutable revision without a current-bundle fallback."""
     if not isinstance(revision, str) or not revision.strip():
       raise ValueError("Secret revision is required.")
     revision = revision.strip()
@@ -507,21 +579,7 @@ class _DauthMixin(object):
       self._normalize_node_address_for_compare(node) for node in pipelines
     ]:
       raise ValueError("Sender is not authorized for the requested job revision.")
-    secret_bundle = {key: value for key, value in secret_bundle.items() if key != "pipelines"}
-    encrypted_secret_bundle = self.bc.encrypt_str(
-      str_data=self.json_dumps(secret_bundle),
-      str_recipient=requester,
-    )
-    if not isinstance(encrypted_secret_bundle, str) or not encrypted_secret_bundle:
-      raise ValueError(f"Failed to encrypt dAuth secrets for job {job_id}.")
-
-    return {
-      "status": "success",
-      "job_id": job_id,
-      "revision": revision,
-      self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
-      "encrypted_secret_bundle": encrypted_secret_bundle,
-    }
+    return {key: value for key, value in secret_bundle.items() if key != "pipelines"}
 
   def process_dauth_reveal_secret_request(self, body):
     requester, requester_eth = self._verify_signed_dauth_body(body)
