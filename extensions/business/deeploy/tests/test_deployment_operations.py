@@ -3,6 +3,7 @@ import copy
 import hashlib
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -30,6 +31,8 @@ class Coordinator(_DeploymentOperationsMixin):
     self._deployment_operations_stop = threading.Event()
     self._deployment_operations_event = threading.Event()
     self._deployment_plans = {}
+    self._deployment_plan_cache_lock = threading.Lock()
+    self._deployment_preparations = {}
     self.cfg_deployment_readiness_timeout = 60
     self._get_response = lambda result: result
     self.P = lambda *args, **kw: None
@@ -119,6 +122,24 @@ class DeploymentStatusTests(unittest.TestCase):
 
 
 class DeploymentOperationTests(unittest.TestCase):
+  def test_plan_cache_allows_overlapping_downloads_and_keeps_results_after_eviction(self):
+    plugin = Coordinator()
+    plugin._deployment_plans = {str(index): {"configs": {}} for index in range(32)}
+    downloads = threading.Barrier(2)
+    def get_json(cid, **kwargs):
+      downloads.wait(timeout=5)
+      return {"configs": {cid: {"NAME": cid}}}
+    plugin.r1fs.get_json = get_json
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      first = executor.submit(plugin._load_operation_plan, {"plan_cid": "first"})
+      second = executor.submit(plugin._load_operation_plan, {"plan_cid": "second"})
+      results = [first.result(timeout=5), second.result(timeout=5)]
+    self.assertEqual(results, [{"configs": {cid: {"NAME": cid}}} for cid in ("first", "second")])
+    self.assertEqual(len(plugin._deployment_plans), 32)
+    results[0]["configs"].clear()
+    self.assertEqual(plugin._load_operation_plan({"plan_cid": "first"}),
+                     {"configs": {"first": {"NAME": "first"}}})
+
   def test_semantic_retry_ignores_nonce_but_not_payload(self):
     request = {"request_id": "same", "job_id": 1, "nonce": "old", "EE_ETH_SIGN": "sig"}
     self.assertEqual(request_digest(request), request_digest({**request, "nonce": "new", "EE_ETH_SIGN": "new"}))

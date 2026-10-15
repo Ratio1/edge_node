@@ -26,6 +26,8 @@ This is the durable reference for implementation across independent Ratio1 repos
 
 14. **2026-10-15 existing-pipeline exception (user confirmed):** existing pipelines must continue working after restart without `secret_revision`. Retain unversioned secret resolution only for pre-lifecycle pipelines, authorized against current raw-CID metadata and runner placement. Reject versioned/deleted jobs on that path. New deployments and the first update's target/restoration configurations use immutable secret revisions. This exception does not restore the old deployment API or require operator migration.
 
+15. **2026-10-15 local admission concurrency (user confirmed):** remove `_serialize_job_mutation` and the global admission lock, including the create/update and coordinator-worker lock scopes. Leave HTTP request handling as it was; do not add background preparation workers or postponed responses. The caller assumes no concurrent requests for the same job. Preserve observed-operation/revision conflicts and the handoff from live preparation to recovery without blocking other jobs. Core's sequential HTTP dispatch remains unchanged.
+
 ## Repository orientation and inspected baseline
 
 The reference inspection used `edge_node` commit `7ba2adbf`, `naeural_core` commit `a4b2ad0`, and `deeploy-dapp` commit `56a90f4`. Recheck the relevant code before implementation; these commits describe the inspected baseline, not a required checkout state.
@@ -469,7 +471,7 @@ To resume after compaction:
 - Operations and node observations use eight sequence slots per identity; signed writer/field bindings and monotonic slot merge reject stale or forged snapshots. Operation events are bounded to 128. Abort journals and operation identities are retained; automatic history expiry is not implemented, because deleting abort history could permit replay.
 - Redacted exact execution plans are stored in R1FS. Local plan persistence/pinning and durable coordinator volume are required; independent remote pinning and coordinator failover are not promised.
 - Edge `deployment_operations.py` owns admission, worker replay, readiness, stop barriers, restoration, canonical commit, secret revocation, and the single owner-authorized polling projection. HTTP400 validation and HTTP503 uncertain admission are separate from HTTP202 acceptance.
-- Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart; incomplete preparation is revoked after 120 seconds without changing the current revision. No dispatch occurs before accepted data is replicated. The local admission lock also serializes worker preparation with submissions.
+- Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart; interrupted incomplete preparation is revoked after its 120-second deadline without changing the current revision. No dispatch occurs before accepted data is replicated. A local per-operation marker keeps the worker from advancing live admission; completed handoffs are cleared before loading fresh snapshots. Other jobs continue without a global admission lock (decision 15).
 - dAuth stores immutable per-revision secrets with exact authorized node/instance configurations. Revocation is a separate durable marker followed by plaintext erasure. Previous secrets remain available until stop/restoration evidence allows retirement. Ordinary polling oracles cannot read protected secrets; an oracle lacking prior protected revision data rejects update admission safely. Polling from any oracle remains supported.
 - Container readiness reports actual health and build/pull failures. Cleanup verifies Docker absence and preserves volumes. Managed CockroachDB additionally verifies planned certificate fingerprints and authenticated verify-full SQL before readiness. Its isolated real-binary old/new/old certificate recovery test passed with data preservation; see the linked recovery document for the exact offline command and limitations.
 - Canonical pointers and current dAuth bundles carry signed monotonic storage generations. A restored runtime retains its previous content revision while its metadata commit advances the storage generation; later creates/updates/deletes advance beyond it. Delete tombstones reject stale repair, and explicit higher generations permit paid job reuse. Every new attempt also advances beyond all verified observed attempts for the job, including failed preparation/create attempts, so clock skew cannot hide a retry in job-only polling. The receiving oracle also coordinates existing CSP owner transfer through the revision lifecycle; rollback preserves the newly authorized owner.
@@ -588,3 +590,28 @@ Live multi-node restart/rollback and production release were not performed.
 Update the existing Edge #533, Core #226, and SDK #184 PRs together; the frontend
 requires no change for this exception. Preserve unrelated local readiness-timeout
 edits separately from this change.
+
+### Remove global admission serialization — 2026-10-15
+
+Implemented decision 15 in Edge only. Removed the mutation decorator and all
+global admission-lock scopes from create/update, scale/delete, commands, escrow
+reconciliation, and the coordinator worker. HTTP request execution and response
+shapes remain unchanged; this does not introduce parallel HTTP preparation.
+
+Live admission registers an operation marker before publishing `preparing` and
+marks it finished in `finally`. The worker skips marked operations, clears
+finished handoffs before reading fresh snapshots, and resumes interrupted
+preparation after failure or restart. This prevents competing state writes and
+premature secret cleanup without holding up unrelated jobs. The shared plan
+cache uses a short bookkeeping lock and retains a local plan reference across
+eviction; R1FS downloads remain outside the lock.
+
+Verification: all 380 Edge Deeploy tests passed in the network-disabled Python
+3.10 runtime. New regressions cover progress for another job during preparation,
+admission finishing during a stale record read, failed-publication/admission
+handoff cleanup, and overlapping plan downloads with bounded eviction. The
+independent read-only critic reran all 26 admission/operation tests and found no
+remaining P1/P2 issue after reviewing both handoff and cache correctness.
+No live deployment was performed. This change updates Edge PR #533; other
+components require no changes. Preserve the separate local 900-second timeout
+edit outside this commit.

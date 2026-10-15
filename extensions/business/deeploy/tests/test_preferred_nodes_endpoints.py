@@ -1,5 +1,4 @@
 import json
-import threading
 import sys
 import types
 import unittest
@@ -38,7 +37,6 @@ class _InputsStub(dict):
 
 def make_endpoint_plugin():
   plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-  plugin._deployment_admission_lock = threading.RLock()
   plugin._chainstore = {}
   plugin.cfg_deeploy_verbose = 0
   plugin.P = lambda *args, **kwargs: None

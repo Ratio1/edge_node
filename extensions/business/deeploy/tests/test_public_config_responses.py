@@ -1,4 +1,3 @@
-import threading
 import sys
 import types
 import unittest
@@ -40,7 +39,6 @@ class _InputsStub(dict):
 
 def make_api_plugin(request_inputs=None):
   plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-  plugin._deployment_admission_lock = threading.RLock()
   plugin._assert_no_active_deployment = lambda *args: None
   plugin.ct = ct
   plugin.cfg_deeploy_verbose = 0

@@ -2,7 +2,9 @@
 import copy
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS
 from extensions.business.deeploy.deployment_operations import (
@@ -36,6 +38,8 @@ class Admission(_DeploymentOperationsMixin):
     self.cfg_deployment_readiness_timeout = 60
     self._deployment_operations_event = threading.Event()
     self._deployment_plans = {}
+    self._deployment_plan_cache_lock = threading.Lock()
+    self._deployment_preparations = {}
     self.storage = {}
     self.writes = []
     self.plans = {}
@@ -85,6 +89,76 @@ class Admission(_DeploymentOperationsMixin):
 
 
 class DeploymentAdmissionTests(unittest.TestCase):
+  def test_live_admission_does_not_block_other_jobs_or_race_recovery(self):
+    plugin = Admission()
+    staging = threading.Event()
+    release = threading.Event()
+    store = plugin._store_secret_revision
+    def pause_staging(*args):
+      staging.set()
+      if not release.wait(5):
+        raise RuntimeError("Test did not release admission")
+      return store(*args)
+    plugin._store_secret_revision = pause_staging
+    plugin._advance_deployment_operation = Mock()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+      admission = executor.submit(plugin.admit)
+      try:
+        self.assertTrue(staging.wait(5))
+        live = next(iter(plugin._operation_records().values()))
+        other = copy.deepcopy(live)
+        other.update(operation_id=live["operation_id"] + "-other", job_id=8,
+                     phase="accepted", sequence=0)
+        plugin._save_operation(other)
+        plugin.time = lambda: live["preparation_deadline"] + 1
+        plugin._reconcile_coordinator_operations()
+        advanced = plugin._advance_deployment_operation.call_args_list
+        self.assertEqual([call.args[0]["job_id"] for call in advanced], [8])
+
+        # Admission finishes AFTER the worker captures `preparing`. It must
+        # still skip that stale snapshot, then reload `accepted` next pass.
+        read_records = plugin._operation_records
+        def finish_while_reading():
+          snapshots = read_records()
+          release.set()
+          admission.result(timeout=5)
+          return snapshots
+        plugin._operation_records = finish_while_reading
+        plugin._advance_deployment_operation.reset_mock()
+        plugin._reconcile_coordinator_operations()
+        self.assertEqual([call.args[0]["job_id"] for call in
+                          plugin._advance_deployment_operation.call_args_list], [8])
+        plugin._operation_records = read_records
+        plugin._advance_deployment_operation.reset_mock()
+        plugin._reconcile_coordinator_operations()
+        phases = {call.args[0]["job_id"]: call.args[0]["phase"] for call in
+                  plugin._advance_deployment_operation.call_args_list}
+        self.assertEqual(phases, {7: "accepted", 8: "accepted"})
+        self.assertEqual(plugin._deployment_preparations, {})
+      finally:
+        release.set()
+
+  def test_failed_admission_hands_preparing_operation_to_recovery(self):
+    plugin = Admission()
+    plugin._store_secret_revision = Mock(side_effect=RuntimeError("storage unavailable"))
+    with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
+      plugin.admit()
+    plugin._advance_deployment_operation = Mock()
+    plugin._reconcile_coordinator_operations()
+    plugin._advance_deployment_operation.assert_called_once()
+    self.assertEqual(plugin._advance_deployment_operation.call_args.args[0]["phase"], "preparing")
+    self.assertEqual(plugin._deployment_preparations, {})
+
+  def test_failed_initial_publication_does_not_leak_local_ownership(self):
+    plugin = Admission()
+    plugin._save_operation = Mock(side_effect=RuntimeError("storage unavailable"))
+    with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
+      plugin.admit()
+    plugin._advance_deployment_operation = Mock()
+    plugin._reconcile_coordinator_operations()
+    plugin._advance_deployment_operation.assert_not_called()
+    self.assertEqual(plugin._deployment_preparations, {})
+
   def test_acceptance_persists_plan_and_secret_revision_without_dispatch(self):
     plugin = Admission()
     result = plugin.admit()

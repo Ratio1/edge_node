@@ -4,7 +4,6 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
 import threading
-from functools import wraps
 
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
@@ -62,15 +61,6 @@ _CONFIG = {
 
 
 
-def _serialize_job_mutation(method):
-  """Serialize local API admission with other mutations of deployment state."""
-  @wraps(method)
-  def wrapped(self, *args, **kwargs):
-    with self._deployment_admission_lock:
-      return method(self, *args, **kwargs)
-  return wrapped
-
-
 class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
@@ -90,7 +80,6 @@ class DeeployManagerApiPlugin(
 
   def __init__(self, **kwargs):
     super(DeeployManagerApiPlugin, self).__init__(**kwargs)
-    self._deployment_admission_lock = threading.RLock()
     self._create_job_claim_lock = threading.Lock()
     self._active_create_job_ids = set()
     return
@@ -442,7 +431,6 @@ class DeeployManagerApiPlugin(
 
   @BasePlugin.endpoint(method="post")
   # /reconcile_csp_escrow_jobs
-  @_serialize_job_mutation
   def reconcile_csp_escrow_jobs(self, request: dict = None):
     """
     Reconcile Deeploy pipeline ownership after a CSP escrow owner transfer.
@@ -1261,9 +1249,7 @@ class DeeployManagerApiPlugin(
     acceptance; get_deployment_status reports execution and recovery.
     """
     self.Pd(f"Called Deeploy create_pipeline endpoint")
-    with self._deployment_admission_lock:
-      result = self._process_pipeline_request(request, is_create=True)
-    return result
+    return self._process_pipeline_request(request, is_create=True)
 
   @BasePlugin.endpoint(method="post")
   # /update_pipeline
@@ -1361,9 +1347,7 @@ class DeeployManagerApiPlugin(
         self.json_dumps(self._redact_failed_request_payload(request))
       )
     )
-    with self._deployment_admission_lock:
-      result = self._process_pipeline_request(request, is_create=False)
-    return result
+    return self._process_pipeline_request(request, is_create=False)
 
   @BasePlugin.endpoint(method="post")
   def get_deployment_status(self, request: dict):
@@ -1392,7 +1376,6 @@ class DeeployManagerApiPlugin(
                                   error=dict(code=name, message=message, retryable=retryable)))
 
   @BasePlugin.endpoint(method="post")
-  @_serialize_job_mutation
   def scale_up_job_workers(self, request: dict = DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST):
     """Accept a full revision rollout to a larger placement with automatic rollback.
 
@@ -1416,7 +1399,6 @@ class DeeployManagerApiPlugin(
       return self._deployment_admission_error(exc)
 
   @BasePlugin.endpoint(method="post")
-  @_serialize_job_mutation
   def delete_pipeline(self, request: dict = DEEPLOY_DELETE_REQUEST):
     """Accept whole-job deletion; retain credentials until all nodes prove stop.
 
@@ -1433,7 +1415,6 @@ class DeeployManagerApiPlugin(
 
 
   @BasePlugin.endpoint(method="post")
-  @_serialize_job_mutation
   def send_instance_command(self, 
     request: dict = DEEPLOY_INSTANCE_COMMAND_REQUEST
   ):
@@ -1491,7 +1472,6 @@ class DeeployManagerApiPlugin(
   
 
   @BasePlugin.endpoint(method="post")
-  @_serialize_job_mutation
   def send_app_command(self, 
     request: dict = DEEPLOY_APP_COMMAND_REQUEST
   ):

@@ -1,4 +1,3 @@
-import threading
 import sys
 import types
 import unittest
@@ -190,7 +189,6 @@ class DeeployDeletePipelineEndpointTests(unittest.TestCase):
   def test_delete_endpoint_returns_durable_acceptance_without_direct_stops(self):
     from unittest.mock import Mock
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin._deployment_admission_lock = threading.RLock()
     plugin._get_response = lambda result: result
     plugin.deeploy_verify_and_get_inputs = lambda request, **kw: ("sender", InputsStub(request))
     plugin.deeploy_get_auth_result = lambda inputs: {DEEPLOY_KEYS.ESCROW_OWNER: "owner"}
@@ -205,7 +203,6 @@ class DeeployDeletePipelineEndpointTests(unittest.TestCase):
   def test_delete_endpoint_reports_uncertain_storage_without_false_success(self):
     from unittest.mock import Mock
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin._deployment_admission_lock = threading.RLock()
     plugin._get_response = lambda result: result
     plugin.deeploy_verify_and_get_inputs = lambda request, **kw: ("sender", InputsStub(request))
     plugin.deeploy_get_auth_result = lambda inputs: {DEEPLOY_KEYS.ESCROW_OWNER: "owner"}
