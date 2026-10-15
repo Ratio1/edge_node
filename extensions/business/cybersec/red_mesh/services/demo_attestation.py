@@ -2,7 +2,7 @@
 
 The Navigator's Demo has no node and no wallet; it calls these two endpoints through its one Demo
 exit (`lib/demo/edgeBridge.ts`) with the backend token. The edge signs with the node key, pays with
-the `DEMO_ATTESTATION` wallet and sends on that block's `NETWORK`, never the live block or the
+the `DEMO.ATTESTATION` wallet and sends on that block's `NETWORK`, never the live block or the
 node's own network. It never reads a Demo job record: the caller passes the few fields that go on
 chain, and only a `demo-` job id is accepted.
 

@@ -23,7 +23,7 @@ def _host(attestation=None, demo=None):
       self.cfg_attestation = attestation if attestation is not None else {
         "ENABLED": True, "PRIVATE_KEY": "0xlive", "RETRIES": 2}
       if demo is not None:
-        self.cfg_demo_attestation = demo
+        self.cfg_demo = {"ATTESTATION": demo}
       self.bc = MagicMock()
       self.bc.eth_address = "0xsender"
       self.bc.submit_attestation.return_value = "0xtxhash"
@@ -135,6 +135,17 @@ class TestDemoAttestationConfig(unittest.TestCase):
     self.assertEqual((cfg["ENABLED"], cfg["PRIVATE_KEY"], cfg["NETWORK"]), (False, "", "testnet"))
     host = _host(demo={"NETWORK": " DEVNET "})
     self.assertEqual(get_demo_attestation_config(host)["NETWORK"], "devnet")
+
+  def test_the_block_lives_under_demo_and_a_partial_override_keeps_the_defaults(self):
+    from extensions.business.cybersec.red_mesh.services.config import get_demo_attestation_config
+    host = _host()
+    host.cfg_demo = {"ATTESTATION": {"ENABLED": True, "PRIVATE_KEY": DEMO_KEY}, "OTHER": {"X": 1}}
+    cfg = get_demo_attestation_config(host)
+    self.assertEqual((cfg["ENABLED"], cfg["PRIVATE_KEY"], cfg["NETWORK"], cfg["RETRIES"]), (True, DEMO_KEY, "testnet", 2))
+    # A flat block at the root is not read.
+    host = _host()
+    host.cfg_demo_attestation = {"ENABLED": True, "PRIVATE_KEY": DEMO_KEY}
+    self.assertEqual(get_demo_attestation_config(host)["ENABLED"], False)
 
   def test_status_says_configured_and_never_returns_the_key(self):
     from extensions.business.cybersec.red_mesh.services.demo_attestation import get_demo_attestation_status

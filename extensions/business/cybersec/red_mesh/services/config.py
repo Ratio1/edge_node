@@ -125,8 +125,10 @@ DEFAULT_ATTESTATION_CONFIG = {
   "RETRIES": 2,
 }
 
-# RM-141: Demo jobs attested on Base Sepolia through the Navigator bridge. Its own switch and key,
-# never the live ones; `NETWORK` is an SDK network that resolves to Base Sepolia.
+# The `DEMO` block holds what the edge does on behalf of the Navigator's Demo, one sub-block per
+# capability, so later ones sit beside `ATTESTATION`.
+# RM-141: `DEMO.ATTESTATION`, Demo jobs attested on Base Sepolia through the Navigator bridge. Its own
+# switch and key, never the live ones; `NETWORK` is an SDK network that resolves to Base Sepolia.
 DEMO_ATTESTATION_NETWORKS = ("testnet", "devnet")
 DEFAULT_DEMO_ATTESTATION_CONFIG = {
   "ENABLED": False,
@@ -134,6 +136,9 @@ DEFAULT_DEMO_ATTESTATION_CONFIG = {
   "NETWORK": "testnet",
   "RETRIES": 2,
   "SETTLE_SECONDS": 5.0,
+}
+DEFAULT_DEMO_CONFIG = {
+  "ATTESTATION": DEFAULT_DEMO_ATTESTATION_CONFIG,
 }
 
 # RM-132: what the super-tenant may still edit about itself (contract: `onboarding-drafts.md`
@@ -484,8 +489,12 @@ def get_attestation_config(owner):
 
 
 def get_demo_attestation_config(owner):
-  """RM-141: the normalized `DEMO_ATTESTATION` block. The key is for the submit path only."""
-  def _normalize(merged, defaults):
+  """RM-141: the normalized `DEMO.ATTESTATION` sub-block. The key is for the submit path only."""
+  def _normalize(demo, demo_defaults):
+    defaults = demo_defaults["ATTESTATION"]
+    merged = dict(defaults)
+    if isinstance(demo.get("ATTESTATION"), dict):
+      merged.update(demo["ATTESTATION"])
     private_key = merged.get("PRIVATE_KEY")
     private_key = private_key.strip() if isinstance(private_key, str) else ""
     network = merged.get("NETWORK")
@@ -510,8 +519,8 @@ def get_demo_attestation_config(owner):
 
   return resolve_config_block(
     owner,
-    "DEMO_ATTESTATION",
-    DEFAULT_DEMO_ATTESTATION_CONFIG,
+    "DEMO",
+    DEFAULT_DEMO_CONFIG,
     normalizer=_normalize,
   )
 
