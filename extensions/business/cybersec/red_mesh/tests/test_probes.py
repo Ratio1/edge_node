@@ -2741,6 +2741,34 @@ class TestPhase17bMediumFeatures(unittest.TestCase):
     titles = [f["title"] for f in result.get("findings", [])]
     self.assertTrue(any("default credential" in t.lower() for t in titles), f"titles={titles}")
 
+  def test_http_basic_auth_default_credential_sets_authenticated_action(self):
+    """The credentialed GET is the login: `performed` with content, `attempted` with none or a redirect."""
+    from extensions.business.cybersec.red_mesh.models.finding_schema import (
+      AUTHENTICATED_ACTIONS, AUTHENTICATED_ACTION_ATTEMPTED, AUTHENTICATED_ACTION_PERFORMED)
+    _, worker = self._build_worker(ports=[80])
+    redirect = MagicMock(status_code=302)
+    for status, body, history, expected in (
+      (200, b"<html>admin</html>", [], AUTHENTICATED_ACTION_PERFORMED),
+      (200, b"", [], AUTHENTICATED_ACTION_ATTEMPTED),
+      (302, b"", [], AUTHENTICATED_ACTION_ATTEMPTED),
+      # requests follows redirects: content after a redirect is not the login's own response.
+      (200, b"<html>landing</html>", [redirect], AUTHENTICATED_ACTION_ATTEMPTED),
+    ):
+      def mock_get(url, **kwargs):
+        resp = MagicMock()
+        if kwargs.get("auth") == ("admin", "admin"):
+          resp.status_code, resp.content, resp.headers, resp.history = status, body, {}, history
+        else:
+          resp.status_code, resp.content, resp.history = 401, b"", []
+          resp.headers = {"WWW-Authenticate": 'Basic realm="test"'} if kwargs.get("auth") is None else {}
+        return resp
+      with self.subTest(status=status, body=body, redirected=bool(history)), patch('requests.get', side_effect=mock_get):
+        result = worker._service_info_http_basic_auth("10.0.0.1", 80)
+      accepted = [f for f in result["findings"] if "default credential" in f["title"].lower()]
+      self.assertEqual(len(accepted), 1)
+      self.assertIn(accepted[0]["authenticated_action"], AUTHENTICATED_ACTIONS)
+      self.assertEqual(accepted[0]["authenticated_action"], expected)
+
   def test_http_basic_auth_skips_non_basic(self):
     """Probe returns None when no Basic auth is present."""
     _, worker = self._build_worker(ports=[80])
