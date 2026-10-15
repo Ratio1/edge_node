@@ -821,9 +821,21 @@ class DeeployManagerApiPlugin(
       if is_create:
         canonical = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(job_id))
         reusing_deleted_job = isinstance(canonical, dict) and canonical.get("deleted") is True
+        # Independent monitoring may mark a partially started create on chain.
+        # Confirmed lifecycle cleanup still permits reuse of that paid job.
+        previous = max(
+          (record for record in self._operation_records().values()
+           if str(record.get("job_id")) == str(job_id)
+           and record.get("owner", "").lower() == auth_result[DEEPLOY_KEYS.ESCROW_OWNER].lower()),
+          key=lambda record: record["target_revision"], default=None,
+        )
+        reusing_failed_create = previous is not None and (
+          previous["kind"] == "create" and previous["phase"] == "completed"
+          and previous.get("outcome") == "failed" and previous.get("recovery") == "completed"
+        )
         is_valid = self.deeploy_check_payment_and_job_owner(
           inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-          is_create=not reusing_deleted_job, debug=self.cfg_deeploy_verbose > 1,
+          is_create=not (reusing_deleted_job or reusing_failed_create), debug=self.cfg_deeploy_verbose > 1,
         )
         if not is_valid:
           msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."

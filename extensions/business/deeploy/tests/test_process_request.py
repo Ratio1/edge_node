@@ -5,6 +5,8 @@ import threading
 import types
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from naeural_core import constants as ct
 
@@ -156,6 +158,47 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
 
 
 class DeeployProcessRequestTests(unittest.TestCase):
+
+  def test_failed_create_retry_reuses_paid_job_only_after_confirmed_cleanup(self):
+    completed = dict(job_id=97, owner="owner", kind="create", phase="completed",
+                     outcome="failed", recovery="completed", target_revision=1,
+                     request_id="previous-request")
+    cases = [
+      ("cleaned", [completed], "owner", True),
+      ("no-history", [], "owner", False),
+      ("blocked", [dict(completed, recovery="blocked")], "owner", False),
+      ("still-stopping", [dict(completed, phase="stopping_failed_rollout")], "owner", False),
+      ("other-job", [dict(completed, job_id=98)], "owner", False),
+      ("other-owner", [dict(completed, owner="someone-else")], "owner", False),
+      ("changed-paid-owner", [completed], "someone-else", False),
+      ("newer-success", [completed, dict(completed, target_revision=2, outcome="succeeded")], "owner", False),
+    ]
+    for name, records, paid_owner, allowed in cases:
+      with self.subTest(name=name):
+        plugin = _ProcessRequestStub()
+        plugin.ct = ct
+        plugin.deepcopy = copy.deepcopy
+        plugin.uuid = lambda size=7: "retry-id"[:size]
+        plugin.cfg_deeploy_verbose = 0
+        plugin._operation_records = lambda: {str(i): record for i, record in enumerate(records)}
+        plugin.bc = SimpleNamespace(get_evm_network=lambda: "mainnet", get_job_details=lambda **kwargs: {
+          "escrowOwner": paid_owner, "startTimestamp": 1, "jobType": 1,
+        })
+        # Use the real payment/ownership validator, not the fixture's override.
+        plugin.deeploy_check_payment_and_job_owner = (
+          DeeployManagerApiPlugin.deeploy_check_payment_and_job_owner.__get__(plugin)
+        )
+        nodes = Mock(side_effect=ValueError("Reached node selection after payment validation"))
+        plugin._check_nodes_availability = nodes
+        response = submit_deployment(plugin, {
+          "job_id": 97, "app_alias": "native", "job_app_type": "native",
+          "pipeline_input_type": "void", "pipeline_input_uri": None, "pipeline_params": {},
+          "target_nodes": ["node"], "plugins": [{"plugin_signature": "CUSTOM_EXEC_01", "CODE": ""}],
+        })
+        self.assertEqual(nodes.called, allowed, response)
+        self.assertEqual(response["status_code"], 400 if name != "still-stopping" else 409)
+        if allowed:
+          self.assertIn("Reached node selection", response["error"]["message"])
 
   def test_create_pipeline_accepts_ui_cockroach_single_plugin_top_level_per_node_config(self):
     plugin = _ProcessRequestStub()
