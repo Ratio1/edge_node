@@ -38,6 +38,12 @@ def profile_dto(row):
   return {key: row[key] for key in DTO_FIELDS}
 
 
+def provider_dto(row):
+  """The provider block every active account reads for its reports: the eight fields only, never
+  the attribution (`updated_by`, `updated_at`) or the deployment's permission flags."""
+  return {key: row[key] for key in FIELDS}
+
+
 def _same(value):
   try:
     return text(value, LEGAL_MAX) == value
