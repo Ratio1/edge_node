@@ -426,6 +426,15 @@ def get_super_tenant_permissions(owner):
   )
 
 
+def get_demo_only(owner):
+  """RM-140: `REDMESH_DEMO_ONLY`, the deployment's demo-only lock. A deployment value is JSON, so only
+  None, bool, int and str are read; anything else (a test double) is off."""
+  value = getattr(owner, _config_attr_name("REDMESH_DEMO_ONLY"), None)
+  if value is not None and not isinstance(value, (bool, int, str)):
+    return False
+  return config_flag(value, False)
+
+
 def get_attestation_config(owner):
   """Return normalized attestation config."""
   def _normalize(merged, defaults):
