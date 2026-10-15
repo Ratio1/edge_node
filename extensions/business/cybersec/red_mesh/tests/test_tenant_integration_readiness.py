@@ -235,3 +235,52 @@ def test_repeated_calls_re_admit_against_current_stored_facts():
     assert fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
                                                   tenant_id=fixture.tenant_id) == {
       "success": False, "error": "not_found", "status_code": 404}
+
+
+# Review E3 (RM-139): the integrations are the deployment's, so the full-portfolio Super-Tenant Admin
+# reads their readiness without a tenant; every other caller still names its tenant.
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+@pytest.mark.parametrize("read_native", (None,), indirect=True)
+def test_a_full_portfolio_sta_reads_the_deployment_readiness_without_a_tenant(read_native, response_format):
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=True) as fixture:
+    fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
+    poison_history(fixture)
+    module.eng = scheduler_comms(fixture, response_format)
+    with no_history_or_effects(fixture):
+      result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT,
+        {"request_actor": {"account_id": "creator"}})), 200)
+    actual = result["result"] if response_format == "WRAPPED" else result
+    assert_public_shape(actual)
+    assert calls == 1 and fixture.artifact_reads == []
+
+
+@pytest.mark.parametrize("membership", (
+  [{"role": "tenant_admin", "tenant_id": "TENANT"}], [{"role": "super_tenant_admin", "tenant_id": "TENANT"}],
+  [{"role": "super_pentester", "tenant_id": None}],
+))
+def test_without_a_tenant_any_other_caller_is_refused_before_any_evaluation(membership):
+  with read_endpoint_fixture(bound=True) as fixture:
+    fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
+    poison_history(fixture)
+    fixture.store.account("reader", memberships=[
+      {**item, "tenant_id": fixture.tenant_id if item["tenant_id"] == "TENANT" else item["tenant_id"]}
+      for item in membership])
+    from extensions.business.cybersec.red_mesh import pentester_api_01
+    with no_history_or_effects(fixture), patch.object(pentester_api_01, "get_public_integration_config",
+        side_effect=AssertionError(SECRET)) as projection:
+      for tenant_id in (None, "", "  "):
+        assert fixture.Plugin.get_integration_status(fixture.owner, request_actor=fixture.actor,
+                                                     tenant_id=tenant_id) == {
+          "success": False, "error": "invalid_request", "status_code": 400}
+      projection.assert_not_called()
+
+
+def test_the_sta_read_without_a_tenant_fails_closed_when_identity_is_unreadable():
+  with read_endpoint_fixture(bound=True) as fixture:
+    fixture.owner.CONFIG, fixture.owner.config_data = {}, {}
+    fixture.store.fail_hkey = "auth"
+    assert fixture.Plugin.get_integration_status(fixture.owner, request_actor={"account_id": "creator"}) == {
+      "success": False, "error": "unavailable", "status_code": 503}

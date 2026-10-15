@@ -975,9 +975,14 @@ class TestMispTenantSeparation(unittest.TestCase):
 
   @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
   def test_rejected_group_on_create_fails_without_a_wider_retry(self, MockPyMISP):
-    from pymisp.exceptions import MISPServerError
-    for rejection in ({"errors": [403, {"message": "Invalid sharing group"}]},
-                      MISPServerError("Error code 500")):
+    from pymisp.exceptions import MISPServerError, PyMISPError
+    # Review E5: only MISP's refusal of the write is the group's rejection; a server error or an
+    # authentication failure is a failed push. Neither is ever retried wider.
+    for rejection, error, retryable in (
+        ({"errors": [403, {"message": "Invalid sharing group"}]}, "sharing_group_rejected", False),
+        ({"errors": [401, {"message": "Authentication failed"}]}, "push_failed", False),
+        (MISPServerError("Error code 500"), "push_failed", True),
+        (PyMISPError("Unexpected response"), "push_failed", True)):
       with self.subTest(rejection=rejection):
         MockPyMISP.reset_mock()
         mock_misp = MockPyMISP.return_value
@@ -994,8 +999,8 @@ class TestMispTenantSeparation(unittest.TestCase):
         result = push_to_misp(owner, "test_job_1")
 
         self.assertEqual(result["status"], "error")
-        self.assertEqual(result["error"], "sharing_group_rejected")
-        self.assertFalse(result["retryable"])
+        self.assertEqual(result["error"], error)
+        self.assertIs(result["retryable"], retryable)
         mock_misp.add_event.assert_called_once()
         self.assertEqual(mock_misp.add_event.call_args.args[0].distribution, 4)
         mock_misp.update_event.assert_not_called()
@@ -1004,8 +1009,8 @@ class TestMispTenantSeparation(unittest.TestCase):
   @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
   def test_rejected_group_on_update_fails_and_creates_no_new_event(self, MockPyMISP):
     from pymisp.exceptions import MISPServerError
-    for rejection in ({"errors": [403, {"message": "Invalid sharing group"}]},
-                      MISPServerError("Error code 500")):
+    for rejection, error in (({"errors": [403, {"message": "Invalid sharing group"}]}, "sharing_group_rejected"),
+                             (MISPServerError("Error code 500"), "push_failed")):
       with self.subTest(rejection=rejection):
         MockPyMISP.reset_mock()
         mock_misp = MockPyMISP.return_value
@@ -1020,10 +1025,42 @@ class TestMispTenantSeparation(unittest.TestCase):
 
         result = push_to_misp(owner, "test_job_1")
 
-        self.assertEqual(result["error"], "sharing_group_rejected")
-        self.assertFalse(result["retryable"])
+        self.assertEqual(result["error"], error)
+        if error == "sharing_group_rejected":
+          self.assertFalse(result["retryable"])
         mock_misp.update_event.assert_called_once()
         mock_misp.add_event.assert_not_called()
+        # Review E2: the event moves into its group first; refused, nothing is added to the event
+        # still at its old, wider distribution.
+        mock_misp.add_object.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_mapped_update_moves_the_event_before_adding_objects_that_inherit(self, MockPyMISP):
+    mock_misp = MockPyMISP.return_value
+    mock_misp.get_event.return_value = self._existing()
+    mock_misp.update_event.side_effect = lambda event, pythonify=True: event
+    mock_misp.add_object.return_value = MagicMock()
+    owner = self._mapped_owner(existing_export=dict(self._EXPORTED))
+
+    self.assertEqual(push_to_misp(owner, "test_job_1")["status"], "ok")
+
+    calls = [name for name, _, _ in mock_misp.method_calls if name in ("update_event", "add_object")]
+    self.assertIn("add_object", calls)
+    self.assertEqual(calls[0], "update_event")
+    moved = mock_misp.update_event.call_args_list[0].args[0]
+    self.assertEqual((moved.distribution, moved.sharing_group_id), (4, 7))
+    for call in mock_misp.add_object.call_args_list:
+      obj = call.args[1]
+      self.assertEqual(obj.distribution, 5)
+      self.assertTrue(all(attribute.distribution == 5 for attribute in obj.attributes))
+
+  def test_a_mapped_event_carries_nothing_with_a_distribution_of_its_own(self):
+    event = export_misp_json(self._mapped_owner(), "test_job_1")["misp_event"]
+    self.assertTrue(event["Object"])
+    for item in event["Object"] + event.get("Attribute", []):
+      self.assertEqual(int(item["distribution"]), 5)
+      for attribute in item.get("Attribute", []):
+        self.assertEqual(int(attribute["distribution"]), 5)
 
   @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
   def test_transport_failure_with_a_group_stays_push_failed(self, MockPyMISP):

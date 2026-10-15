@@ -18,7 +18,11 @@ Credential values stay in the record (I-052) and never leave it through the DTO.
 """
 from datetime import datetime, timezone
 import json
+import os
+import secrets
+from urllib.parse import urlsplit
 
+from .assets import canonical_digest, valid_digest
 from .engagement_drafts import valid_tenant_id
 from .identity import canonical_account_id
 from .integrations import CREDENTIAL_KEYS, normalize_integration_config, valid_integration_id
@@ -68,7 +72,20 @@ def _override_config(integration_id, config):
   # An empty secret is neither a value nor a clear (`clear_secrets` is): refused, not guessed.
   if any(key in config and not config[key] for key in CREDENTIAL_KEYS[integration_id]):
     raise OverrideInvalid()
+  # A destination never carries userinfo: a credential belongs in its own write-only key.
+  if any(key in config and _has_userinfo(config[key]) for key in DESTINATION_KEYS[integration_id]):
+    raise OverrideInvalid()
+  # 4 ("sharing group only") is the sharing-group map's to select, never a configured level.
+  if integration_id == "misp" and "MISP_DISTRIBUTION" in config and not 0 <= config["MISP_DISTRIBUTION"] <= 3:
+    raise OverrideInvalid()
   return config
+
+
+def _has_userinfo(url):
+  try:
+    return "@" in urlsplit(url).netloc
+  except ValueError:
+    return True
 
 
 def _sharing_groups(value):
@@ -125,6 +142,32 @@ def is_empty(row):
   return all(row[key] is None for key in ("config", "sharing_groups", "auto_export"))
 
 
+def new_revision():
+  """A random token per write: the row's `version`. Never a hash of the row, which holds
+  credentials and would be an offline guessing oracle wherever the version travels."""
+  return secrets.token_hex(32)
+
+
+def row_version(row):
+  """The `version` the STA echoes back as `expected_version`; None without a row. A row written
+  before revisions existed falls back to a digest of its credential-free form."""
+  if row is None:
+    return None
+  revision = row.get("revision")
+  return revision if valid_digest(revision) else canonical_digest(withheld_for_backup(row))
+
+
+_ENV_KEY_OF = {"TOKEN": "TOKEN_ENV", "PASSWORD": "PASSWORD_ENV"}
+
+
+def _env_credential_set(effective, key):
+  """A Deeploy credential named by its environment variable (`TOKEN_ENV`, `PASSWORD_ENV`) is set
+  when that variable is non-empty. An override never names one, and under an overridden
+  destination resolution blanks them, so this is always the deployment's."""
+  name = str(effective.get(_ENV_KEY_OF.get(key)) or "").strip()
+  return bool(name) and bool(os.environ.get(name, "").strip())
+
+
 def integration_dto(integration_id, row, deployment, effective, deployment_configured, configured):
   """What the STA reads. `deployment` and `effective` are the resolved blocks without and with the
   override; a credential reads as `{set, source}`, never as its value."""
@@ -136,17 +179,22 @@ def integration_dto(integration_id, row, deployment, effective, deployment_confi
   else:
     source = "none"
   credentials = CREDENTIAL_KEYS[integration_id]
-  fields, secrets = {}, {}
+  fields, secret_fields = {}, {}
   for key, value in effective.items():
     if key == "AUTO_EXPORT":
       continue
     origin = "override" if key in config else "deployment_config"
     if key in credentials:
-      secrets[key] = {"set": bool(value), "source": origin if value else "none"}
+      if value:
+        secret_fields[key] = {"set": True, "source": origin}
+      elif _env_credential_set(effective, key):
+        secret_fields[key] = {"set": True, "source": "deployment_config"}
+      else:
+        secret_fields[key] = {"set": False, "source": "none"}
     else:
       fields[key] = {"value": value, "source": origin}
   dto = {"integrationId": integration_id, "enabled": bool(effective.get("ENABLED")),
-         "configured": bool(configured), "source": source, "fields": fields, "secrets": secrets,
+         "configured": bool(configured), "source": source, "fields": fields, "secrets": secret_fields,
          "updatedBy": (row or {}).get("updated_by"), "updatedAt": (row or {}).get("updated_at")}
   if integration_id == "misp":
     auto_export = (row or {}).get("auto_export")
@@ -158,7 +206,9 @@ def integration_dto(integration_id, row, deployment, effective, deployment_confi
 
 def withheld_for_backup(row):
   """The stored row without its credential values: no plaintext credential leaves the node
-  (owner, 2026-09-29). A restored override needs its secrets re-entered."""
+  (owner, 2026-09-29). A restored override needs its secrets re-entered. A config left with no
+  key is no config override (`None`, as a clear writes it); a row left with no override at all
+  is refused by the restore, which never writes a row the store cannot read."""
   if isinstance(row, (str, bytes, bytearray)):
     try:
       row = json.loads(row)
@@ -167,7 +217,8 @@ def withheld_for_backup(row):
   if not isinstance(row, dict) or not isinstance(row.get("config"), dict):
     return row
   credentials = CREDENTIAL_KEYS.get(row.get("integration_id"), ())
-  return {**row, "config": {key: value for key, value in row["config"].items() if key not in credentials}}
+  config = {key: value for key, value in row["config"].items() if key not in credentials}
+  return {**row, "config": config or None}
 
 
 def validate_super_tenant_integration(row, ids):
@@ -186,6 +237,8 @@ def validate_super_tenant_integration(row, ids):
   if row.get("sharing_groups") is not None:
     _sharing_groups(row["sharing_groups"])
   if row.get("auto_export") is not None and type(row["auto_export"]) is not bool:
+    raise ValueError("Invalid super-tenant integration record")
+  if "revision" in row and not valid_digest(row["revision"]):
     raise ValueError("Invalid super-tenant integration record")
   if is_empty({key: row.get(key) for key in ("config", "sharing_groups", "auto_export")}):
     raise ValueError("Invalid super-tenant integration record")

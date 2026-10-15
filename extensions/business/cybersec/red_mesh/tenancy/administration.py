@@ -1698,7 +1698,7 @@ class TenantAdministrationService:
     deployment, effective, deployment_configured, configured = reader(integration_id, row)
     dto = super_tenant_integrations.integration_dto(integration_id, row, deployment, effective,
                                                     deployment_configured, configured)
-    return {**dto, "version": canonical_digest(row) if row is not None else None}
+    return {**dto, "version": super_tenant_integrations.row_version(row)}
 
   @_endpoint
   def list_super_tenant_integrations(self, actor):
@@ -1720,7 +1720,7 @@ class TenantAdministrationService:
       raise AdministrationDenied(400, "invalid_request")
     kind = super_tenant_integrations.KIND
     row = self.store.get(kind, integration_id)
-    if (row is None) != (expected_version is None) or (row is not None and canonical_digest(row) != expected_version):
+    if (row is None) != (expected_version is None) or super_tenant_integrations.row_version(row) != expected_version:
       raise AdministrationDenied(409, "conflict")
     try:
       merged, changed = super_tenant_integrations.apply_changes(
@@ -1732,7 +1732,8 @@ class TenantAdministrationService:
         self.store.delete(kind, integration_id)
         row = None
       else:
-        merged = {**merged, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+        merged = {**merged, "updated_by": account.account_id, "updated_at": datetime.now(timezone.utc).isoformat(),
+                  "revision": super_tenant_integrations.new_revision()}
         self.store.put(kind, integration_id, record=merged)
         row = self.store.get(kind, integration_id)
     return {"integration": self._integration_override_dto(integration_id, row), "changed": changed,

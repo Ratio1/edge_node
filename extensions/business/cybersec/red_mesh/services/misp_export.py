@@ -16,7 +16,6 @@ import time as _time
 import math
 
 from pymisp import MISPEvent, MISPObject, MISPAttribute, PyMISP
-from requests.exceptions import RequestException
 
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
@@ -37,8 +36,18 @@ _UNSET = object()
 _SHARING_GROUP_DISTRIBUTION = 4
 
 
+# MISP's "inherit the event's distribution": an object or attribute of a group-only event carries
+# no distribution of its own, so no server default can make it wider than its event.
+_INHERIT_DISTRIBUTION = 5
+
+
 class _SharingGroupRejected(Exception):
   """MISP refused an event sent with a tenant's sharing group (RM-139). Never retried wider."""
+
+
+class _PushFailed(Exception):
+  """A write with a tenant's sharing group failed without MISP refusing it: a server error, an
+  authentication failure or a transport fault. A failed push, and never retried wider."""
 
 
 def _job_repo(owner):
@@ -239,7 +248,26 @@ def _build_misp_event(target, scan_type, task_name, job_id, risk_score,
     x509.comment = f"TLS on port {port}"
     event.add_object(x509)
 
+  if sharing_group_id is not None:
+    _inherit_distribution(event)
   return event
+
+
+def _inherit_distribution(event):
+  for attribute in event.attributes:
+    attribute.distribution = _INHERIT_DISTRIBUTION
+  for obj in event.objects:
+    obj.distribution = _INHERIT_DISTRIBUTION
+    for attribute in obj.attributes:
+      attribute.distribution = _INHERIT_DISTRIBUTION
+
+
+def _error_status(response):
+  """The HTTP status of a PyMISP error answer (`{"errors": [status, body]}`), or None."""
+  errors = response.get("errors") if isinstance(response, dict) else None
+  if isinstance(errors, (list, tuple)) and errors and type(errors[0]) is int:
+    return errors[0]
+  return None
 
 
 def _set_distribution(event, distribution, sharing_group_id):
@@ -600,18 +628,19 @@ def deliver_misp_event(owner, job_id, pass_nr=None, *, job_specs, export_config,
   sharing_group_id = result.get("sharing_group_id")
 
   def _send(call, *args):
-    """One MISP event write. With a sharing group, an error answer or a server-side refusal is the
-    group's rejection: recorded as such and never retried with a wider distribution. A transport
-    fault is not a rejection and keeps its own code."""
+    """One MISP event write. With a sharing group, MISP's refusal of the write (an error answer
+    other than 401 or 5xx) is the group's rejection; an exception (server error, transport) or an
+    authentication failure is a failed push. Either stops the export: never retried wider."""
     try:
       sent = call(*args, pythonify=True)
-    except RequestException:
-      raise
-    except Exception:
+    except Exception as exc:
       if sharing_group_id is not None:
-        raise _SharingGroupRejected() from None
+        raise _PushFailed(str(exc)) from None
       raise
     if sharing_group_id is not None and not (isinstance(sent, MISPEvent) and sent.uuid):
+      status = _error_status(sent)
+      if status is not None and (status == 401 or status >= 500):
+        raise _PushFailed(str(status))
       raise _SharingGroupRejected()
     return sent
 
@@ -638,6 +667,15 @@ def deliver_misp_event(owner, job_id, pass_nr=None, *, job_specs, export_config,
       try:
         existing_event = misp.get_event(existing_uuid, pythonify=True)
         if isinstance(existing_event, MISPEvent) and existing_event.uuid:
+          # Update tags (RM-139). A mapped tenant's event moves to its sharing group first, so a
+          # refused move adds nothing to an event still at a wider distribution; an unmapped
+          # tenant's event keeps the distribution it has, so removing a mapping never widens it.
+          for tag in event.tags:
+            existing_event.add_tag(tag)
+          moved = None
+          if sharing_group_id is not None:
+            _set_distribution(existing_event, event.distribution, sharing_group_id)
+            moved = _send(misp.update_event, existing_event)
           # Add new objects to existing event
           accepted_objects = 0
           for obj in event.objects:
@@ -648,13 +686,7 @@ def deliver_misp_event(owner, job_id, pass_nr=None, *, job_specs, export_config,
                 # The remote now holds part of this export. A failure past this point must not
                 # report "nothing happened": a retry would duplicate what was already added.
                 ledger.record(EffectState.DELIVERED)
-          # Update tags (RM-139). A mapped tenant's event moves to its sharing group; an unmapped
-          # tenant's event keeps the distribution it has, so removing a mapping never widens it.
-          for tag in event.tags:
-            existing_event.add_tag(tag)
-          if sharing_group_id is not None:
-            _set_distribution(existing_event, event.distribution, sharing_group_id)
-          updated = _send(misp.update_event, existing_event)
+          updated = moved if moved is not None else _send(misp.update_event, existing_event)
           # Acceptance evidence, not the locally held event: assigning existing_event unconditionally
           # made the isinstance check below vacuous, so a fully rejected re-export reported ok.
           if isinstance(updated, MISPEvent) and updated.uuid:
@@ -666,7 +698,7 @@ def deliver_misp_event(owner, job_id, pass_nr=None, *, job_specs, export_config,
         else:
           # Event deleted on MISP side — create new
           response_event = _send(misp.add_event, event)
-      except _SharingGroupRejected:
+      except (_SharingGroupRejected, _PushFailed):
         raise
       except Exception:
         # Event not found — create new

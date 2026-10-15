@@ -128,6 +128,19 @@ class TestRead(_Case):
     client.assert_not_called()
 
 
+class TestEnvCredential(_Case):
+  def test_a_deeploy_credential_named_by_an_env_var_reads_as_set(self):
+    # Review E7: the Deeploy block may name the credential's env var instead of carrying it.
+    self.plugin.config_data["OPENCTI_EXPORT"] = {"ENABLED": True, "URL": "https://deploy-octi.example",
+                                                 "TOKEN": "", "TOKEN_ENV": "RM_TEST_OCTI_TOKEN"}
+    with patch.dict("os.environ", {"RM_TEST_OCTI_TOKEN": "deeploy-octi-token"}):
+      octi = self.listed()["opencti"]
+      self.assertEqual(octi["secrets"]["TOKEN"], {"set": True, "source": "deployment_config"})
+      self.assert_no_secret(octi)
+    with patch.dict("os.environ", {"RM_TEST_OCTI_TOKEN": ""}):
+      self.assertEqual(self.listed()["opencti"]["secrets"]["TOKEN"], {"set": False, "source": "none"})
+
+
 class TestWrite(_Case):
   def test_an_override_wins_for_export_and_clearing_it_falls_back_to_the_deeploy_config(self):
     ok(self, self.put("opencti", {"config": {"URL": "https://sta-octi.example", "TOKEN": "sta-octi-token"}}))
@@ -194,11 +207,25 @@ class TestWrite(_Case):
         ("misp", {"sharing_groups": {}}), ("misp", {"sharing_groups": {"tn_bad": 3}}),
         ("misp", {"sharing_groups": {self.tenant: 0}}), ("misp", {"sharing_groups": {self.tenant: True}}),
         ("misp", {"clear_secrets": ["MISP_URL"]}), ("opencti", {"auto_export": True}),
-        ("opencti", {"sharing_groups": {self.tenant: 3}})):
+        ("opencti", {"sharing_groups": {self.tenant: 3}}),
+        # Review E6: the distribution an override may set is 0-3; 4 needs a sharing group.
+        ("misp", {"config": {"MISP_DISTRIBUTION": 4}}), ("misp", {"config": {"MISP_DISTRIBUTION": -1}}),
+        ("misp", {"config": {"MISP_DISTRIBUTION": 9}}),
+        # Review E8: a URL never carries userinfo.
+        ("misp", {"config": {"MISP_URL": "https://user:pw@sta-misp.example", "MISP_API_KEY": "k"}}),
+        ("opencti", {"config": {"URL": "https://user@sta-octi.example", "TOKEN": "t"}}),
+        ("taxii", {"config": {"SERVER_URL": "https://u:p@taxii.example", "TOKEN": "t"}}),
+        ("wazuh", {"config": {"LOGIN_URL": "https://u:p@login.example", "PASSWORD": "p"}})):
       refused(self, self.put(integration_id, changes), 400, "invalid_request")
     refused(self, self.put("stix", {"auto_export": True}), 404, "not_found")
     refused(self, self.put("misp", {"auto_export": True}, "not-a-digest"), 400, "invalid_request")
     self.assertEqual(self.events, [])
+
+  def test_a_distribution_in_range_is_accepted(self):
+    for distribution in (0, 3):
+      result = ok(self, self.put("misp", {"config": {"MISP_DISTRIBUTION": distribution}},
+                                 self.version("misp")))
+      self.assertEqual(result["fields"]["MISP_DISTRIBUTION"], {"value": distribution, "source": "override"})
 
   def test_an_unchanged_write_is_not_written_or_audited(self):
     first = ok(self, self.put("misp", {"auto_export": True}))
@@ -208,15 +235,24 @@ class TestWrite(_Case):
 
 
 class TestBackup(_Case):
-  def test_a_backup_withholds_the_override_credentials(self):
-    ok(self, self.put("misp", {"config": {"MISP_URL": "https://sta-misp.example", "MISP_API_KEY": "sta-misp-key"},
-                               "sharing_groups": {self.tenant: 7}}))
+  def backup(self):
     self.plugin._get_artifact_repository = lambda: type("Files", (), {"get_json": lambda self, ref, **kw: None})()
     rows, cursor = [], {"hkey_index": 0, "offset": 0}
     while cursor:
       page = ok(self, self.plugin.export_redmesh_records(self.actor, cursor["hkey_index"], cursor["offset"], 50))
       rows += page["rows"]
       cursor = page["next"]
+    return rows
+
+  def restore(self, row):
+    restored = ok(self, self.plugin.restore_redmesh_records(
+      self.actor, [{"hkey": row["hkey"], "field": row["field"], "value": row["value"]}]))
+    return restored["outcomes"][0]["outcome"]
+
+  def test_a_backup_withholds_the_override_credentials(self):
+    ok(self, self.put("misp", {"config": {"MISP_URL": "https://sta-misp.example", "MISP_API_KEY": "sta-misp-key"},
+                               "sharing_groups": {self.tenant: 7}}))
+    rows = self.backup()
     row = next(item for item in rows if (item["hkey"], item["field"]) == row_key("misp"))
     self.assertEqual((row["class"], row["reason"]), ("current", ""))
     self.assertEqual(row["value"]["config"], {"MISP_URL": "https://sta-misp.example"})
@@ -232,6 +268,56 @@ class TestBackup(_Case):
     misp = self.listed()["misp"]
     self.assertEqual((misp["configured"], misp["secrets"]["MISP_API_KEY"]),
                      (False, {"set": False, "source": "none"}))
+
+  def test_a_credential_only_override_restores_as_a_valid_row(self):
+    # Review E1: stripping the only config keys left `config: {}`, a row the store refuses, so every
+    # read of it failed and the STA could not even overwrite it.
+    ok(self, self.put("misp", {"config": {"MISP_API_KEY": "sta-misp-key"}, "sharing_groups": {self.tenant: 7}}))
+    row = next(item for item in self.backup() if (item["hkey"], item["field"]) == row_key("misp"))
+    self.assertIsNone(row["value"]["config"])
+    self.assertEqual(row["value"]["sharing_groups"], {self.tenant: 7})
+    del self.store.data[row_key("misp")]
+    self.assertEqual(self.restore(row), "written")
+    misp = self.listed()["misp"]
+    self.assertEqual((misp["source"], misp["secrets"]["MISP_API_KEY"], misp["sharingGroups"]),
+                     ("deployment_config", {"set": True, "source": "deployment_config"}, {self.tenant: 7}))
+    self.assertEqual(get_misp_export_config(self.plugin)["MISP_API_KEY"], "deeploy-misp-key")
+    again = ok(self, self.put("misp", {"config": {"MISP_API_KEY": "sta-misp-key"}}, misp["version"]))
+    self.assertEqual(again["secrets"]["MISP_API_KEY"], {"set": True, "source": "override"})
+
+  def test_an_override_left_empty_by_the_backup_is_not_restored(self):
+    ok(self, self.put("opencti", {"config": {"TOKEN": "sta-octi-token"}}))
+    rows = self.backup()
+    self.assert_no_secret(rows)
+    row = next(item for item in rows if (item["hkey"], item["field"]) == row_key("opencti"))
+    self.assertIsNone(row["value"]["config"])
+    del self.store.data[row_key("opencti")]
+    self.assertEqual(self.restore(row), "refused")
+    self.assertIsNone(self.store.data.get(row_key("opencti")))
+    octi = self.listed()["opencti"]
+    self.assertEqual((octi["source"], octi["version"]), ("deployment_config", None))
+    ok(self, self.put("opencti", {"config": {"TOKEN": "sta-octi-token"}}))
+
+  def test_the_backup_hash_and_the_version_are_not_computed_over_a_credential(self):
+    # Review E4: an unsalted hash over the credential-bearing row is an offline guessing oracle.
+    from extensions.business.cybersec.red_mesh.services.data_maintenance import row_sha256
+    from extensions.business.cybersec.red_mesh.tenancy.assets import canonical_digest
+    ok(self, self.put("misp", {"config": {"MISP_URL": "https://sta-misp.example", "MISP_API_KEY": "sta-misp-key"}}))
+    stored = self.store.data[row_key("misp")]
+    version = self.version("misp")
+    self.assertNotEqual(version, canonical_digest(stored))
+    self.assertEqual(version, stored["revision"])
+    row = next(item for item in self.backup() if (item["hkey"], item["field"]) == row_key("misp"))
+    self.assertNotEqual(row["sha256"], row_sha256(stored))
+    self.assertEqual(row["sha256"], row_sha256(row["value"]))
+    # The backup row restored over the live one is `same`, and the live credential stays.
+    self.assertEqual(self.restore(row), "same")
+    self.assertEqual(get_misp_export_config(self.plugin)["MISP_API_KEY"], "sta-misp-key")
+    # Writing back an earlier value still gets a new version.
+    ok(self, self.put("misp", {"config": {"MISP_API_KEY": "sta-misp-key-2"}}, version))
+    changed = self.version("misp")
+    ok(self, self.put("misp", {"config": {"MISP_API_KEY": "sta-misp-key"}}, changed))
+    self.assertNotIn(self.version("misp"), (version, changed))
 
 
 class TestTestEventExportAuthority(_Case):
