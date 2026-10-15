@@ -127,6 +127,44 @@ class _AttestationMixin:
       return digest
     return "0x" + str(digest)
 
+  # The registry's two functions: the types the node signs (the domain, then the arguments in order).
+  _ATTESTATION_SIGNATURE_TYPES = {
+    "submitRedmeshTestAttestation": ["bytes32", "uint8", "uint16", "uint8", "bytes8", "bytes2", "bytes10"],
+    "submitRedmeshJobStartAttestation": ["bytes32", "uint8", "uint16", "bytes8", "bytes32", "bytes2"],
+  }
+  _ATTESTATION_RETRY_ACTIONS = {
+    "submitRedmeshTestAttestation": "submit_redmesh_test_attestation",
+    "submitRedmeshJobStartAttestation": "submit_redmesh_job_start_attestation",
+  }
+
+  def _attestation_submit_kwargs(self, function_name, function_args, *, tx_private_key, network=None):
+    """The `bc.submit_attestation` keyword arguments for already-packed registry arguments.
+
+    Shared by the live callers (node network, live key) and the RM-141 Demo bridge (its own network
+    and key). `network` is passed on only when set, so a live call is unchanged.
+    """
+    function_args = list(function_args)
+    submit_kwargs = {
+      "function_name": function_name,
+      "function_args": function_args,
+      "signature_types": list(self._ATTESTATION_SIGNATURE_TYPES[function_name]),
+      "signature_values": [self.REDMESH_ATTESTATION_DOMAIN, *function_args],
+      "tx_private_key": tx_private_key,
+    }
+    if network is not None:
+      submit_kwargs["network"] = network
+    return submit_kwargs
+
+  def _attestation_submit(self, function_name, function_args, *, retries, tx_private_key):
+    """Sign and submit a live attestation; the tx hash, or None after `retries`."""
+    submit_kwargs = self._attestation_submit_kwargs(function_name, function_args, tx_private_key=tx_private_key)
+    return run_bounded_retry(
+      self,
+      self._ATTESTATION_RETRY_ACTIONS[function_name],
+      retries,
+      lambda: self.bc.submit_attestation(**submit_kwargs),
+    )
+
   def _submit_redmesh_test_attestation(
     self,
     job_id: str,
@@ -166,32 +204,11 @@ class _AttestationMixin:
       f"cid={cid_obfuscated}, sender={node_eth_address}"
     )
     retries = max(int(attestation_cfg["RETRIES"] or 1), 1)
-    tx_hash = run_bounded_retry(
-      self,
-      "submit_redmesh_test_attestation",
-      retries,
-      lambda: self.bc.submit_attestation(
-        function_name="submitRedmeshTestAttestation",
-        function_args=[
-          test_mode,
-          node_count,
-          vulnerability_score,
-          execution_id,
-          ip_obfuscated,
-          cid_obfuscated,
-        ],
-        signature_types=["bytes32", "uint8", "uint16", "uint8", "bytes8", "bytes2", "bytes10"],
-        signature_values=[
-          self.REDMESH_ATTESTATION_DOMAIN,
-          test_mode,
-          node_count,
-          vulnerability_score,
-          execution_id,
-          ip_obfuscated,
-          cid_obfuscated,
-        ],
-        tx_private_key=tenant_private_key,
-      ),
+    tx_hash = self._attestation_submit(
+      "submitRedmeshTestAttestation",
+      [test_mode, node_count, vulnerability_score, execution_id, ip_obfuscated, cid_obfuscated],
+      retries=retries,
+      tx_private_key=tenant_private_key,
     )
     if not tx_hash:
       self.P(f"[ATTESTATION] Test attestation failed after {retries} attempts.", color='y')
@@ -252,30 +269,11 @@ class _AttestationMixin:
       f"workers={worker_addrs}, sender={node_eth_address}"
     )
     retries = max(int(attestation_cfg["RETRIES"] or 1), 1)
-    tx_hash = run_bounded_retry(
-      self,
-      "submit_redmesh_job_start_attestation",
-      retries,
-      lambda: self.bc.submit_attestation(
-        function_name="submitRedmeshJobStartAttestation",
-        function_args=[
-          test_mode,
-          node_count,
-          execution_id,
-          node_hashes,
-          ip_obfuscated,
-        ],
-        signature_types=["bytes32", "uint8", "uint16", "bytes8", "bytes32", "bytes2"],
-        signature_values=[
-          self.REDMESH_ATTESTATION_DOMAIN,
-          test_mode,
-          node_count,
-          execution_id,
-          node_hashes,
-          ip_obfuscated,
-        ],
-        tx_private_key=tenant_private_key,
-      ),
+    tx_hash = self._attestation_submit(
+      "submitRedmeshJobStartAttestation",
+      [test_mode, node_count, execution_id, node_hashes, ip_obfuscated],
+      retries=retries,
+      tx_private_key=tenant_private_key,
     )
     if not tx_hash:
       self.P(f"[ATTESTATION] Job-start attestation failed after {retries} attempts.", color='y')

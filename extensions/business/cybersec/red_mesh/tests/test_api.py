@@ -91,7 +91,7 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", engagement=_
   from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
   account = AccountView("tester", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
 
-  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None):
+  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None, **_audit):
     # Through the actor seam, as the real admission does, so a suite that swaps the account in
     # (attribution tests) is admitted as that account.
     resolved, denial = plugin._resolve_launch_actor(actor)
@@ -384,9 +384,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._launch(plugin)
     from extensions.business.cybersec.red_mesh.models import JobConfig
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.13.1"})
+    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.13.2"})
     restored = JobConfig.from_dict(config_dict).to_dict()
-    self.assertEqual(restored["redmesh_release"], {"backend": "0.13.1"})
+    self.assertEqual(restored["redmesh_release"], {"backend": "0.13.2"})
 
   def test_launch_records_the_console_and_report_pipeline_it_was_sent(self):
     """RM-103 item 12: the release names all three deployables. Only the
