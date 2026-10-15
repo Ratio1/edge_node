@@ -1618,6 +1618,15 @@ class TenantAdministrationService:
       row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
     return {"profile": super_tenant_profile.profile_dto(row), "changed": changed, "accountId": account.account_id}
 
+  @_endpoint
+  def get_super_tenant_provider(self, actor):
+    """The provider block of every report, for any active account (contract `onboarding-drafts.md`
+    §Branding): the eight profile fields, the empty profile's when no row is stored. A read never
+    writes the row."""
+    self._actor(actor)
+    row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
+    return super_tenant_profile.provider_dto(row if row is not None else super_tenant_profile.empty_profile())
+
   # RM-134: the super-tenant branding, one row per deployment (contract `onboarding-drafts.md`
   # §Branding). Every active account reads it; a full-portfolio Super-Tenant Admin writes it while
   # `edit_branding` allows. The logo's bytes never reach these methods: the plugin stores and deletes
