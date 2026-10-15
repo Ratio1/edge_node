@@ -1,6 +1,5 @@
 from extensions.business.deeploy.tests.support import submit_deployment, capture_deployment_admission
 import unittest
-import threading
 import copy
 from collections import defaultdict
 import sys
@@ -49,7 +48,6 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
   def _make_process_update_plugin(self, discovered_instances, nodes=None, deeploy_specs=None):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin._deployment_admission_lock = threading.RLock()
     plugin.ct = ct
     plugin.cfg_deeploy_verbose = 0
     plugin.deepcopy = copy.deepcopy
@@ -480,7 +478,6 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
   def test_managed_update_actions_serialize_per_job_and_cache_by_kind(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin._deployment_admission_lock = threading.RLock()
     certificate_action = {
       "kind": "cockroachdb_certificate_regeneration",
       "operation_id": "11111111-1111-4111-8111-111111111111",
@@ -775,7 +772,6 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
   def test_cockroachdb_regeneration_rejects_live_duplicate_claim(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin._deployment_admission_lock = threading.RLock()
     regeneration_id = "11111111-1111-4111-8111-111111111111"
     action = {
       "kind": "cockroachdb_certificate_regeneration",
@@ -3767,7 +3763,6 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
   def test_handle_error_redacts_per_node_config_recursively(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin._deployment_admission_lock = threading.RLock()
     plugin.cfg_deeploy_verbose = 0
     log_lines = []
     plugin.Pd = lambda message, **kwargs: log_lines.append(message)
@@ -3793,7 +3788,6 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
   def test_update_pipeline_log_redacts_per_node_config(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin._deployment_admission_lock = threading.RLock()
     log_lines = []
     plugin.P = lambda message, **kwargs: log_lines.append(message)
     plugin.json_dumps = lambda payload, **kwargs: str(payload)

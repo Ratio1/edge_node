@@ -68,7 +68,8 @@ class _DeploymentOperationsMixin:
 
   def _init_deployment_operations(self):
     """Start the independent execution worker and initialize bounded caches."""
-    self._deployment_admission_lock = threading.RLock()
+    self._deployment_preparations = {}
+    self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
     self._deployment_sync_time = 0
@@ -358,28 +359,37 @@ class _DeploymentOperationsMixin:
     # The recovery owner must exist before any plaintext revision is staged.
     # If admission stops here, the worker either confirms complete preparation
     # or revokes its staged references without touching the running revision.
-    self._save_operation(operation, message="Preparing durable deployment data.")
-    if previous_configs:
-      self._store_secret_revision(job_id, previous_secret_revision,
-                                  prior_bundle, previous_configs)
-    self._store_secret_revision(job_id, secret_revision, bundle, configs)
-    self._save_operation(operation, "accepted", "Deployment accepted.")
+    finished = threading.Event()
+    self._deployment_preparations[operation_id] = finished
+    try:
+      self._save_operation(operation, message="Preparing durable deployment data.")
+      if previous_configs:
+        self._store_secret_revision(job_id, previous_secret_revision,
+                                    prior_bundle, previous_configs)
+      self._store_secret_revision(job_id, secret_revision, bundle, configs)
+      self._save_operation(operation, "accepted", "Deployment accepted.")
+    finally:
+      # Keep the marker until the worker discards its old snapshots and reloads
+      # durable state. This also hands interrupted admission to recovery.
+      finished.set()
     self._deployment_operations_event.set()
     return self._accepted_operation_response(operation)
 
   def _load_operation_plan(self, operation):
     """Load immutable redacted execution data without exposing it in polling."""
     cid = operation["plan_cid"]
-    plans = getattr(self, "_deployment_plans", {})
-    if cid not in plans:
+    with self._deployment_plan_cache_lock:
+      plan = self._deployment_plans.get(cid)
+    if plan is None:
       plan = self.r1fs.get_json(cid, timeout=10, show_logs=False)
       if not isinstance(plan, dict) or not isinstance(plan.get("configs"), dict):
         raise RuntimeError("Deployment plan is temporarily unavailable.")
-      if len(plans) >= 32:
-        plans.pop(next(iter(plans)))
-      plans[cid] = plan
-      self._deployment_plans = plans
-    return copy.deepcopy(plans[cid])
+      # Only cache bookkeeping is locked; storage reads never hold this lock.
+      with self._deployment_plan_cache_lock:
+        if cid not in self._deployment_plans and len(self._deployment_plans) >= 32:
+          self._deployment_plans.pop(next(iter(self._deployment_plans)))
+        self._deployment_plans[cid] = plan
+    return copy.deepcopy(plan)
 
   def _node_operation_reports(self, operation, attempt):
     """Read newest signed reports from the planned nodes for this attempt."""
@@ -610,10 +620,16 @@ class _DeploymentOperationsMixin:
 
   def _reconcile_coordinator_operations(self):
     """Advance runtime execution and recovery for this receiving oracle."""
+    # Clear completed handoffs BEFORE reading snapshots. Admissions that finish
+    # during that read keep their marker until the next pass, avoiding a stale
+    # `preparing` snapshot racing the request's final `accepted` write.
+    for operation_id, finished in self._deployment_preparations.copy().items():
+      if finished.is_set():
+        self._deployment_preparations.pop(operation_id)
     own = [copy.deepcopy(operation) for operation in self._operation_records().values()
            if operation["coordinator"] == self.bc.address]
     for operation in own:
-      if operation["phase"] == "completed":
+      if operation["phase"] == "completed" or operation["operation_id"] in self._deployment_preparations:
         continue
       try:
         self._advance_deployment_operation(operation)
@@ -625,8 +641,7 @@ class _DeploymentOperationsMixin:
     while not self._deployment_operations_stop.is_set():
       try:
         self._repair_deployment_records()
-        with self._deployment_admission_lock:
-          self._reconcile_coordinator_operations()
+        self._reconcile_coordinator_operations()
       except Exception:
         self.P("Deployment operation synchronization is temporarily unavailable.", color="y")
       self._deployment_operations_event.wait(2)
