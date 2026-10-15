@@ -281,6 +281,12 @@ Keep canonical metadata consistent with desired intent and observed execution. N
 
 Reuse the paid job identity throughout submission, retry, cleanup, and restoration. A missing deploy response must never trigger another payment.
 
+A deliberate create retry after the latest verified failed create has completed
+cleanup uses the existing paid-job reuse validation, even when independent
+monitoring already recorded that job as started. Owner and resource validation
+still apply. Incomplete cleanup, unrelated jobs/owners, and newer successful
+operations do not grant this reuse permission.
+
 Deployment operations do not prepare, broadcast, reconcile, cancel or track blockchain transactions. Completion and subsequent operation admission depend only on the coordinator's runtime, metadata and recovery state. Polling does not expose settlement fields, and the UI does not show settlement indicators.
 
 The existing ChainDistMonitor continues its independent pending-job confirmation, launch-recovery and closable-job handling. This lifecycle does not promise blockchain reconciliation for arbitrary changes to an already-active job's placement. Payment/ownership/resource validation at admission remains unchanged. Runtime cleanup never implies a refund or payment reversal.
@@ -495,3 +501,46 @@ Implementation and offline verification are complete; all four PRs are open and 
 Implementation commits: Edge `f2ddd91`, Core `4f56e71`, SDK `9b47c02`, dApp `59de055`. No live deployment was performed. Follow-up implementation should start by reading this document and inspecting the current PR heads, preserving the confirmed decisions and verification limits above.
 
 2026-10-14 completion update: removed deployment transaction tracking, prepared-transaction APIs, nonce reservations, settlement polling fields/UI and transaction-based admission gates. Coordinator completion alone is final. Latest checks: Deeploy 371, ChainDistMonitor 12, Core focused 95, SDK async/secrets 25 and baseline EVM 11 passed; frontend lifecycle/UI scripts, TypeScript, ESLint, production build, and desktop/mobile completion preview passed. The earlier broad Core and 48-suite frontend runs above describe the initial implementation; final focused checks cover this removal.
+
+### Fresh whole-stack critic review — 2026-10-15
+
+A new read-only critic reviewed Edge PR #533, Core #226, SDK #184, and dApp #170,
+including admission, replication, recovery, secrets, certificate restoration,
+client retries, and UI finality. Three confirmed issues were fixed:
+
+- Telegram now defers readiness until background polling starts and reports
+  startup failures through safe node lifecycle errors. Shutdown wakes its event
+  loop thread-safely; a subsequent review caught and fixed concurrent loop closure
+  so cleanup still joins the bot thread without hiding unrelated errors.
+- Core journals resolved workload classification and interpreter identity before
+  plugin construction. Known native workloads can complete an aborted stop after
+  their owning process exits. Unknown/external workloads and same-process failures
+  still need cleanup evidence. Retirement preserves this private evidence.
+- A deliberate retry after the latest verified failed create completes cleanup
+  reuses its paid job even if independent monitoring recorded a start timestamp.
+  The existing payment, owner, resource, and active-operation checks still apply.
+
+All three original regressions were reproduced against the pre-review production
+code and pass with the fixes. Two follow-up critic passes reviewed the fixes and
+the loop-close race; the final pass found no remaining P1/P2 issue. No findings
+were rejected and no new product decision was needed.
+
+Verification on Python 3.10 in the network-disabled runtime container, with the
+three sibling source repositories mounted:
+
+- PASS: `python -m unittest discover -s extensions/business/deeploy/tests -p 'test_*.py'`
+  — 376 tests, including four Telegram lifecycle tests and paid-retry admission cases.
+- PASS: `python -m unittest test_deployment_lifecycle test_chain_store_hsync test_runtime_secret_resolution test_deeploy_chainstore_response_mixin`
+  — 99 tests with Core's test directory on `PYTHONPATH`; lifecycle module 49 tests.
+- PASS: changed-file compilation, diff checks, and independent critic reruns of
+  Core lifecycle and Telegram tests. SDK/dApp sources were unchanged in this review;
+  dApp PR lint/build checks were green.
+- FAIL (unchanged baseline): Core broad discovery ran 467 tests with the same eight
+  errors and one skip documented above. No additional failure appeared.
+- BLOCKED / not performed: live multi-node, wallet, broker, and production service
+  validation. Offline evidence does not establish those live-system outcomes.
+
+Local review evidence: `/tmp/deeploy-review-before-regressions.log`,
+`/tmp/deeploy-fresh-review-edge-final.log`, `/tmp/deeploy-fresh-review-core-final.log`,
+and `/tmp/deeploy-fresh-review-core-broad.log`. These temporary logs are not required
+to resume implementation; the regression tests and contract notes are committed.
