@@ -1,9 +1,12 @@
+from extensions.business.deeploy.tests.support import submit_deployment, capture_deployment_admission
 import copy
 import sys
 import threading
 import types
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from naeural_core import constants as ct
 
@@ -58,6 +61,7 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
   def __init__(self):
     self._create_job_claim_lock = threading.Lock()
     self._active_create_job_ids = set()
+    capture_deployment_admission(self, {})
 
   def _DeeployManagerApiPlugin__ensure_eth_balance(self):
     return True
@@ -101,6 +105,9 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
   def _queue_pipeline_persistence(self, persistence_state):
     self.queued_persistence = persistence_state
     return True
+
+  def chainstore_hget(self, hkey, key):
+    return getattr(self, "canonical_record", None)
 
   def chainstore_hset(self, hkey, key, value):
     if not hasattr(self, "chainstore_writes"):
@@ -152,6 +159,47 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
 
 class DeeployProcessRequestTests(unittest.TestCase):
 
+  def test_failed_create_retry_reuses_paid_job_only_after_confirmed_cleanup(self):
+    completed = dict(job_id=97, owner="owner", kind="create", phase="completed",
+                     outcome="failed", recovery="completed", target_revision=1,
+                     request_id="previous-request")
+    cases = [
+      ("cleaned", [completed], "owner", True),
+      ("no-history", [], "owner", False),
+      ("blocked", [dict(completed, recovery="blocked")], "owner", False),
+      ("still-stopping", [dict(completed, phase="stopping_failed_rollout")], "owner", False),
+      ("other-job", [dict(completed, job_id=98)], "owner", False),
+      ("other-owner", [dict(completed, owner="someone-else")], "owner", False),
+      ("changed-paid-owner", [completed], "someone-else", False),
+      ("newer-success", [completed, dict(completed, target_revision=2, outcome="succeeded")], "owner", False),
+    ]
+    for name, records, paid_owner, allowed in cases:
+      with self.subTest(name=name):
+        plugin = _ProcessRequestStub()
+        plugin.ct = ct
+        plugin.deepcopy = copy.deepcopy
+        plugin.uuid = lambda size=7: "retry-id"[:size]
+        plugin.cfg_deeploy_verbose = 0
+        plugin._operation_records = lambda: {str(i): record for i, record in enumerate(records)}
+        plugin.bc = SimpleNamespace(get_evm_network=lambda: "mainnet", get_job_details=lambda **kwargs: {
+          "escrowOwner": paid_owner, "startTimestamp": 1, "jobType": 1,
+        })
+        # Use the real payment/ownership validator, not the fixture's override.
+        plugin.deeploy_check_payment_and_job_owner = (
+          DeeployManagerApiPlugin.deeploy_check_payment_and_job_owner.__get__(plugin)
+        )
+        nodes = Mock(side_effect=ValueError("Reached node selection after payment validation"))
+        plugin._check_nodes_availability = nodes
+        response = submit_deployment(plugin, {
+          "job_id": 97, "app_alias": "native", "job_app_type": "native",
+          "pipeline_input_type": "void", "pipeline_input_uri": None, "pipeline_params": {},
+          "target_nodes": ["node"], "plugins": [{"plugin_signature": "CUSTOM_EXEC_01", "CODE": ""}],
+        })
+        self.assertEqual(nodes.called, allowed, response)
+        self.assertEqual(response["status_code"], 400 if name != "still-stopping" else 409)
+        if allowed:
+          self.assertIn("Reached node selection", response["error"]["message"])
+
   def test_create_pipeline_accepts_ui_cockroach_single_plugin_top_level_per_node_config(self):
     plugin = _ProcessRequestStub()
     plugin.ct = ct
@@ -172,6 +220,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
       }
 
     plugin.check_and_deploy_pipelines = check_and_deploy_pipelines
+    capture_deployment_admission(plugin, captured)
     request = {
       DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
       DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
@@ -209,33 +258,33 @@ class DeeployProcessRequestTests(unittest.TestCase):
 
     invalid_request = copy.deepcopy(request)
     invalid_request[DEEPLOY_KEYS.TARGET_NODES] = ["0xai_node_a", "0xai_node_b"]
-    invalid_res = plugin._process_pipeline_request(invalid_request, is_create=True, async_mode=True)
-    self.assertEqual(invalid_res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertIn("at least 3 target nodes", invalid_res[DEEPLOY_KEYS.ERROR])
+    invalid_res = submit_deployment(plugin, invalid_request, is_create=True)
+    self.assertEqual(invalid_res[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("at least 3 target nodes", invalid_res[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(captured, {})
     self.assertEqual(plugin.bc.submitted, [])
 
     duplicate_request = copy.deepcopy(request)
     duplicate_request[DEEPLOY_KEYS.TARGET_NODES] = ["0xai_node_a", "0xai_node_a", "0xai_node_a"]
-    duplicate_res = plugin._process_pipeline_request(duplicate_request, is_create=True, async_mode=True)
-    self.assertEqual(duplicate_res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertIn("distinct addresses", duplicate_res[DEEPLOY_KEYS.ERROR])
+    duplicate_res = submit_deployment(plugin, duplicate_request, is_create=True)
+    self.assertEqual(duplicate_res[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("distinct addresses", duplicate_res[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(captured, {})
     self.assertEqual(plugin.bc.submitted, [])
 
     plugin._claim_create_job(97)
-    overlapping_result = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
-    self.assertEqual(overlapping_result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertTrue(overlapping_result["dispatch_uncertain"])
-    self.assertIn("already in progress", overlapping_result[DEEPLOY_KEYS.ERROR])
+    overlapping_result = submit_deployment(plugin, request, is_create=True)
+    self.assertEqual(overlapping_result[DEEPLOY_KEYS.STATUS], "error")
+    self.assertEqual(overlapping_result["status_code"], 400)
+    self.assertIn("already in progress", overlapping_result[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(captured, {})
     self.assertEqual(plugin.chainstore_writes, [])
     plugin._release_create_job("97")
 
-    res = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
+    res = submit_deployment(plugin, request, is_create=True)
 
-    self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    self.assertTrue(captured["dispatch_state"]["retain_on_failed_dispatch"])
+    self.assertEqual(res[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(plugin.bc.submitted, [])
     deployed_inputs = captured["inputs"]
     self.assertNotIn("PER_NODE_CONFIG", deployed_inputs)
     deployed_plugin = deployed_inputs[DEEPLOY_KEYS.PLUGINS][0]
@@ -251,17 +300,12 @@ class DeeployProcessRequestTests(unittest.TestCase):
       prepared_plugin["PER_NODE_CONFIG"]["byNode"]["0xai_node_b"]["ENV"]["CRDB_NODE_ID"],
       "2",
     )
-    self.assertEqual(
-      plugin.bc.submitted,
-      [(97, ["eth_0xai_node_a", "eth_0xai_node_b", "eth_0xai_node_c"])],
-    )
-    self.assertNotIn("token-a", str(res[DEEPLOY_KEYS.REQUEST]))
-    self.assertNotIn("token-b", str(res[DEEPLOY_KEYS.REQUEST]))
-    self.assertIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, str(res[DEEPLOY_KEYS.REQUEST]))
-    self.assertIsInstance(res[DEEPLOY_KEYS.REQUEST]["PER_NODE_CONFIG"], dict)
-    self.assertEqual(plugin.chainstore_writes[0]["hkey"], DEEPLOY_DAUTH_JOB_SECRETS_HKEY)
-    self.assertEqual(plugin.chainstore_writes[0]["key"], "97")
-    stored = str(plugin.chainstore_writes[0]["value"])
+    self.assertEqual(plugin.bc.submitted, [])
+    self.assertNotIn("request", res)
+    self.assertNotIn("token-a", str(res))
+    self.assertNotIn("token-b", str(res))
+    self.assertEqual(plugin.chainstore_writes, [])
+    stored = str(captured["bundle"])
     self.assertIn("token-a", stored)
     self.assertIn("token-b", stored)
     self.assertNotIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, stored)
@@ -273,21 +317,23 @@ class DeeployProcessRequestTests(unittest.TestCase):
     plugin.existing_pipeline_cid = "retained-first-attempt-cid"
     captured.clear()
     prior_writes = len(plugin.chainstore_writes)
-    retry_result = plugin._process_pipeline_request(request, is_create=True, async_mode=True)
-    self.assertEqual(retry_result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertTrue(retry_result["dispatch_uncertain"])
-    self.assertIn("may still", retry_result[DEEPLOY_KEYS.ERROR])
+    retry_result = submit_deployment(plugin, request, is_create=True)
+    self.assertEqual(retry_result[DEEPLOY_KEYS.STATUS], "error")
+    self.assertEqual(retry_result["status_code"], 400)
+    self.assertIn("may still", retry_result[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(captured, {})
     self.assertEqual(len(plugin.chainstore_writes), prior_writes)
 
     plugin.existing_pipeline_cid = None
-    def failed_after_dispatch(**kwargs):
-      kwargs["dispatch_state"]["dispatch_attempted"] = True
-      return {}, DEEPLOY_STATUS.FAIL, {}, None
-    plugin.check_and_deploy_pipelines = failed_after_dispatch
-    failed_result = plugin._process_pipeline_request(request, is_create=True, async_mode=False)
-    self.assertEqual(failed_result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertTrue(failed_result["dispatch_uncertain"])
+    def failed_admission(**kwargs):
+      raise RuntimeError("replication unavailable")
+    plugin._admit_prepared_deployment = failed_admission
+    failed_result = submit_deployment(plugin, request, is_create=True)
+    self.assertEqual(failed_result[DEEPLOY_KEYS.STATUS], "error")
+    self.assertEqual(failed_result["status_code"], 503)
+    self.assertTrue(failed_result["error"]["retryable"])
+    self.assertIn("same request_id", failed_result["error"]["message"])
+    self.assertEqual(plugin.bc.submitted, [])
 
   def test_create_rejects_reserved_cockroachdb_user_before_payment_or_node_lookup(self):
     plugin = _ProcessRequestStub()
@@ -311,7 +357,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
       or ({}, DEEPLOY_STATUS.COMMAND_DELIVERED, {}, {})
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
         DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
@@ -334,11 +380,10 @@ class DeeployProcessRequestTests(unittest.TestCase):
         }],
       },
       is_create=True,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(phase_calls, [])
     self.assertEqual(plugin.bc.submitted, [])
 
@@ -364,7 +409,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
       or ({}, DEEPLOY_STATUS.COMMAND_DELIVERED, {}, {})
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
         DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
@@ -392,11 +437,10 @@ class DeeployProcessRequestTests(unittest.TestCase):
         }],
       },
       is_create=True,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertIn("per-node ENV", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("per-node ENV", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(phase_calls, [])
     self.assertEqual(plugin.bc.submitted, [])
 

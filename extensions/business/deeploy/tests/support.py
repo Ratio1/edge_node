@@ -229,3 +229,53 @@ def make_plugin_entry(signature, instance_id=None, **config):
     entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
   entry.update(config)
   return entry
+
+
+def submit_deployment(plugin, request, is_create=True):
+  """Submit a preparation fixture with the mandatory signed intent fields."""
+  request = copy.deepcopy(request)
+  request.setdefault("request_id", "preparation-fixture-request")
+  if not is_create:
+    request.setdefault("expected_revision", 0)
+  return plugin._process_pipeline_request(request, is_create=is_create)
+
+
+def capture_deployment_admission(plugin, captured, counters=None):
+  """Isolate HTTP preparation from durable execution, recording the exact plan.
+
+  Admission persistence and eventual effects are tested independently by
+  test_deployment_operations. These fixtures exercise real normalization,
+  authorization, validation, planning and secret extraction before admission.
+  """
+  plugin._repair_deployment_records = lambda **kwargs: None
+  plugin._operation_records = lambda: {}
+  build = plugin._build_create_pipeline_configs
+  pending = {}
+  def build_and_capture(**kwargs):
+    pending.clear()
+    pending.update(kwargs)
+    return build(**kwargs)
+  plugin._build_create_pipeline_configs = build_and_capture
+  def admit(request, auth_result, app_id, configs, bundle, prior_pipeline, prior_bundle, is_create):
+    captured.update(
+      inputs=copy.deepcopy(dict(pending['inputs'])),
+      job_app_type=pending['inputs'].get(DEEPLOY_KEYS.JOB_APP_TYPE),
+      prepared_create_deploy_plan=copy.deepcopy(pending['prepared_deploy_plan']),
+      prepared_pipeline_configs=copy.deepcopy(configs), new_nodes=list(configs),
+      bundle=copy.deepcopy(bundle),
+    )
+    captured['prepared_create_deploy_plan']['node_plugins_by_addr'] = {
+      node: copy.deepcopy(config['PLUGINS']) for node, config in configs.items()
+    }
+    if counters is not None:
+      assert counters['delete'] == counters['stage'] == counters['bc_update'] == 0
+      counters['admitted'] += 1
+      counters['admission_kwargs'] = captured
+      counters['admitted_pipeline'] = copy.deepcopy(next(iter(configs.values())))
+      counters['admitted_secret_bundle'] = copy.deepcopy(bundle)
+    return {
+      'status_code': 202, 'status': 'accepted', 'operation_id': 'operation-fixture',
+      'request_id': request['request_id'], 'job_id': request['job_id'],
+      'app_id': app_id, 'revision': 1,
+    }
+  plugin._admit_prepared_deployment = admit
