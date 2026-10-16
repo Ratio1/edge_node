@@ -4,10 +4,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
-from ..tenancy.integrations import status_tenant
 from .auth import credentials_missing
-from .config import (get_event_export_config, get_wazuh_export_config,
-                     TENANT_INTEGRATION_NOT_CONFIGURED, tenant_integration_override)
+from .config import IntegrationOverrideUnavailable, get_event_export_config, get_wazuh_export_config
 
 
 SOC_COOLDOWN_ERROR_CLASSES = {
@@ -59,20 +57,14 @@ def retry_after_seconds(cooldown_until, *, now=None):
   return max(0, remaining)
 
 
-def _status_hkey(owner, tenant_id=None):
+def _status_hkey(owner):
   """Must agree with integration_status._status_hkey; the shared shape is pinned by test."""
-  base = f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
-  if tenant_id is None:
-    return base
-  if not isinstance(tenant_id, str) or not tenant_id.strip() or ":" in tenant_id:
-    raise ValueError("Invalid tenant for integration status")
-  return f"{base}:{tenant_id}"
+  return f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
 
 
-def load_integration_status_record(owner, integration_id, tenant_id=None):
+def load_integration_status_record(owner, integration_id):
   try:
-    payload = owner.chainstore_hget(
-      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)), key=integration_id)
+    payload = owner.chainstore_hget(hkey=_status_hkey(owner), key=integration_id)
   except Exception:
     return {}
   return payload if isinstance(payload, dict) else {}
@@ -93,8 +85,8 @@ def redacted_url_host(url):
   return parsed.hostname or ""
 
 
-def wazuh_readiness(owner, tenant_id=None):
-  cfg = get_wazuh_export_config(owner, tenant_id)
+def wazuh_readiness(owner):
+  cfg = get_wazuh_export_config(owner)
   event_cfg = get_event_export_config(owner)
   mode = cfg["MODE"]
   host = cfg["SYSLOG_HOST"] if mode == "syslog" else redacted_url_host(cfg["HTTP_URL"])
@@ -132,7 +124,7 @@ def wazuh_readiness(owner, tenant_id=None):
 
 
 def apply_integration_outcome_policy(owner, integration_id, record, *, outcome, error_class=None,
-                                     previous_error_class=None, now=None, tenant_id=None):
+                                     previous_error_class=None, now=None):
   if now is None:
     now = utc_timestamp()
   if not isinstance(record, dict):
@@ -161,7 +153,11 @@ def apply_integration_outcome_policy(owner, integration_id, record, *, outcome, 
   record["consecutive_failure_count"] = consecutive
 
   if integration_id == "wazuh" and is_soc_cooldown_error(normalized_error) and consecutive >= 2:
-    cfg = get_wazuh_export_config(owner, tenant_id)
+    try:
+      cfg = get_wazuh_export_config(owner)
+    except IntegrationOverrideUnavailable:
+      # Recording a failure must not fail too; the cooldown length is no destination.
+      cfg = {}
     cooldown_seconds = int(cfg.get("FAILURE_COOLDOWN_SECONDS") or 300)
     until = datetime.now(timezone.utc) + timedelta(seconds=max(1, cooldown_seconds))
     record["cooldown_until"] = until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -169,8 +165,8 @@ def apply_integration_outcome_policy(owner, integration_id, record, *, outcome, 
   return record
 
 
-def current_integration_cooldown(owner, integration_id="wazuh", tenant_id=None):
-  record = load_integration_status_record(owner, integration_id, tenant_id)
+def current_integration_cooldown(owner, integration_id="wazuh"):
+  record = load_integration_status_record(owner, integration_id)
   retry_after = retry_after_seconds(record.get("cooldown_until"))
   if retry_after is None or retry_after <= 0:
     return None
@@ -183,38 +179,30 @@ def current_integration_cooldown(owner, integration_id="wazuh", tenant_id=None):
   }
 
 
-def required_soc_launch_error(owner, tenant_id=None):
-  """Gate a launch on required SOC delivery, resolved for the launching tenant when there is one.
-
-  Two decisions live here, both deliberate:
-
-  1. `IS_REQUIRED` is ORed across the node and the tenant. A tenant may opt *in* to required
-     delivery; it may not opt out of a deployment-wide requirement by omitting the record or by
-     overriding the flag to false. Anything else would let a tenant disable the deployment's own
-     "every scan must land in a SOC" policy for itself.
-  2. A bound launch whose tenant has no wazuh record is refused rather than gated on the node's
-     readiness. Passing that gate would mean tenant A launching because the deployment's SOC is
-     healthy, and then either publishing into it or nowhere -- which is the cross-tenant leak this
-     whole task exists to close, in gate form.
+def required_soc_launch_error(owner):
+  """Gate a launch on the deployment's required SOC delivery (RM-139: one destination for every
+  tenant). An unreadable STA override refuses the launch rather than gating it on the Deeploy
+  values.
   """
   event_cfg = get_event_export_config(owner)
-  node_cfg = get_wazuh_export_config(owner)
-  wazuh_cfg = get_wazuh_export_config(owner, tenant_id) if tenant_id else node_cfg
-  if not node_cfg.get("IS_REQUIRED") and not wazuh_cfg.get("IS_REQUIRED"):
+  try:
+    wazuh_cfg = get_wazuh_export_config(owner)
+  except IntegrationOverrideUnavailable:
+    # The override may set IS_REQUIRED: unreadable, the requirement cannot be known to be off.
+    return {
+      "error": "soc_export_required_unavailable",
+      "message": "SOC delivery configuration is unavailable.",
+      "integration_id": "wazuh",
+      "status": "unavailable",
+      "error_class": "integration_config_unavailable",
+      "required": True,
+    }
+  if not wazuh_cfg.get("IS_REQUIRED"):
     return None
   if not event_cfg["ENABLED"] or not wazuh_cfg["ENABLED"]:
     return None
-  if tenant_id and not tenant_integration_override(owner, tenant_id, "wazuh"):
-    return {
-      "error": "soc_export_required_unavailable",
-      "message": "Required SOC export is enabled but this tenant has not configured Wazuh/SOC delivery.",
-      "integration_id": "wazuh",
-      "status": "not_configured",
-      "error_class": TENANT_INTEGRATION_NOT_CONFIGURED,
-      "required": True,
-    }
 
-  readiness = wazuh_readiness(owner, tenant_id)
+  readiness = wazuh_readiness(owner)
   if not readiness["configured"]:
     error_class = readiness.get("error_class") or "not_configured"
     return {
@@ -226,7 +214,7 @@ def required_soc_launch_error(owner, tenant_id=None):
       "required": True,
     }
 
-  cooldown = current_integration_cooldown(owner, "wazuh", tenant_id)
+  cooldown = current_integration_cooldown(owner, "wazuh")
   if cooldown:
     return {
       "error": "soc_export_required_unavailable",

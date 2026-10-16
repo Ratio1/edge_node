@@ -5,12 +5,12 @@ Verification is a local read-back, not a distributed transaction or freshness gu
 import json
 
 from ..ports import TenantStoreError
-from ..integrations import validate_integration
 from ..nodes import validate_node_assignment
 from ..engagements import validate_engagement
 from ..drafts import validate_tenant_draft
 from ..engagement_drafts import validate_engagement_draft
 from ..super_tenant_branding import validate_super_tenant_branding
+from ..super_tenant_integrations import validate_super_tenant_integration
 from ..super_tenant_profile import validate_super_tenant_profile
 from ..tenant_assets import validate_tenant_asset
 from ..tenant_contracts import validate_tenant_contract_draft
@@ -24,9 +24,10 @@ MAX_ENUMERATED_RECORDS = 10000
 # RM-125: `tenant_asset` is keyed by its own id, its parent a field of the row (as `engagement_draft`).
 # RM-133: `tenant_contract_draft` is keyed `(tenant_id, contract_id)`, a further contract of an active tenant.
 # RM-134: `super_tenant_branding` is one row per deployment, keyed `deployment` (as the profile).
+# RM-139: `super_tenant_integration` is the STA override of one deployment integration, keyed by its id.
 _KINDS = frozenset({"tenant", "receipt", "domain", "tenant_node", "integration", "engagement", "tenant_draft",
                     "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                    "super_tenant_branding"})
+                    "super_tenant_branding", "super_tenant_integration"})
 
 
 class CstoreTenantAdministrationStore:
@@ -72,7 +73,9 @@ class CstoreTenantAdministrationStore:
     if kind == "tenant_node":
       validate_node_assignment(raw, ids)
     if kind == "integration":
-      validate_integration(raw, ids)
+      # RM-139: the tenant integration kind is retired. It stays in `_KINDS` only so the start-up
+      # cleanup can address its rows; no row of it is read or written.
+      raise TenantStoreError("Retired tenant storage record")
     if kind == "engagement":
       try:
         validate_engagement(raw, ids)
@@ -104,6 +107,11 @@ class CstoreTenantAdministrationStore:
         validate_super_tenant_branding(raw, ids)
       except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
         raise TenantStoreError("Invalid super-tenant branding storage record") from exc
+    if kind == "super_tenant_integration":
+      try:
+        validate_super_tenant_integration(raw, ids)
+      except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+        raise TenantStoreError("Invalid super-tenant integration storage record") from exc
     if kind == "tenant_contract_draft":
       try:
         validate_tenant_contract_draft(raw, ids)
@@ -153,6 +161,12 @@ class CstoreTenantAdministrationStore:
     rows the current validator refuses (an engagement written by an older release)."""
     self._location(kind, (tenant_id,))
     return [ids for ids, _ in self._fields(kind, tenant_id)]
+
+  def record_ids(self, kind):
+    """RM-139. The ids of every row of one kind in the namespace, without validating them, so a
+    cleanup reaches the rows of deleted tenants too."""
+    self._location(kind, ("enumeration",))
+    return [ids for ids, _ in self._fields(kind)]
 
   def raw_record(self, kind, *ids):
     """RM-107. One row decoded but not validated, for the same reason; None when absent or unreadable."""
@@ -226,11 +240,6 @@ class CstoreTenantAdministrationStore:
   def list_engagements(self, tenant_id):
     self._location("engagement", (tenant_id,))
     return [self._validate(raw, "engagement", ids) for ids, raw in self._fields("engagement", tenant_id)]
-
-  def list_integrations(self, tenant_id):
-    self._location("integration", (tenant_id,))
-    return [self._validate(raw, "integration", ids)
-            for ids, raw in self._fields("integration", tenant_id)]
 
   def list_tenant_drafts(self):
     """RM-109. Every draft of the namespace; a malformed one fails the read closed."""

@@ -1,8 +1,8 @@
 """Tenant MISP configuration visibility without jobs, exports or secret disclosure (RM-084 P1:
-the tenant is required; there is no unscoped half)."""
+the tenant is required; RM-139: only a full-portfolio Super-Tenant Admin reads it unscoped)."""
 import asyncio
 from copy import deepcopy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,7 +12,8 @@ from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExport
 
 
 ENDPOINT = "get_misp_export_config_status"
-DEFAULT = {"enabled": False, "auto_export": False, "misp_configured": False, "min_severity": "LOW"}
+# RM-139: AUTO_EXPORT defaults to true when the Deeploy block leaves it out.
+DEFAULT = {"enabled": False, "auto_export": True, "misp_configured": False, "min_severity": "LOW"}
 SECRET = "mock-only-misp-key-canary"
 URL = "https://mock-only-misp-host.invalid"
 
@@ -24,7 +25,7 @@ def install_config_producer(fixture, config=None):
   owner.config_data = {}
   owner.P = MagicMock()
   owner._get_misp_export_config = MagicMock(
-    side_effect=lambda tenant_id=None: _MispExportMixin._get_misp_export_config(owner, tenant_id))
+    side_effect=lambda: _MispExportMixin._get_misp_export_config(owner))
   original_get = owner.chainstore_hget
   def read(hkey, key):
     assert hkey != owner.cfg_instance_id, "Forbidden job point-read"
@@ -55,7 +56,7 @@ def test_actual_native_tenant_config_read_preserves_defaults_and_no_store(read_n
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
     assert actual == DEFAULT and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with(fixture.tenant_id)
+    fixture.owner._get_misp_export_config.assert_called_once_with()
     assert not any(row[0] == "list" or row[1] == fixture.owner.cfg_instance_id for row in fixture.store.reads)
 
 
@@ -76,7 +77,7 @@ def test_actual_native_rejects_invalid_or_extended_producer_payload_before_wrapp
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
-    fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: deepcopy(produced)
+    fixture.owner._get_misp_export_config.side_effect = lambda: deepcopy(produced)
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 503)
     assert result == {"success": False, "error": "unavailable", "status_code": 503} and calls == 1
@@ -117,36 +118,36 @@ def test_real_configuration_producer_preserves_independent_flags_and_never_expos
     module.eng = scheduler_comms(fixture, response_format)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 200)
     actual = result["result"] if response_format == "WRAPPED" else result
-    # Node URL and key alone never make a tenant "configured": the fixture tenant has no record,
-    # and a push would be refused (RM-093, I-039).
+    # RM-139: every job pushes to the deployment's MISP, so its URL and key make it configured.
     assert actual == {"enabled": enabled, "auto_export": auto_export,
-                      "misp_configured": False, "min_severity": expected}
+                      "misp_configured": configured, "min_severity": expected}
     assert calls == 1 and SECRET not in str(result) and URL not in str(result)
     fixture.owner.P.assert_not_called()
 
 
-@pytest.mark.parametrize("record,node_credentials,expected", (
+@pytest.mark.parametrize("override,deeploy_credentials,expected", (
   ({"MISP_URL": URL, "MISP_API_KEY": SECRET}, False, True),
-  ({"MISP_URL": URL}, False, False),
+  # An overridden destination never borrows the Deeploy key.
+  ({"MISP_URL": URL}, True, False),
   ({"MIN_SEVERITY": "HIGH"}, True, True),
-  (None, True, False),
+  (None, True, True),
+  (None, False, False),
 ))
-def test_misp_configured_reflects_the_tenant_record(record, node_credentials, expected):
-  """RM-093 (I-039): the Push button is enabled from this flag, so it says whether THIS tenant's
-  destination is ready: a record whose merged config has URL and key. Node credentials count only
-  once the tenant has a record of its own."""
+def test_misp_configured_reflects_the_effective_deployment_config(override, deeploy_credentials, expected):
+  """RM-139: the Push button is enabled from this flag, so it says whether the deployment's
+  effective MISP (the Deeploy block, then the STA override) has a URL and a key."""
   from types import SimpleNamespace
 
-  class RecordOwner(SimpleNamespace):
-    def _get_tenant_integration_config(self, tenant_id, integration_id):
-      if record is None or (tenant_id, integration_id) != ("tn-1", "misp"):
+  class OverrideOwner(SimpleNamespace):
+    def _get_super_tenant_integration_override(self, integration_id):
+      if override is None or integration_id != "misp":
         return None
-      return {"tenant_id": tenant_id, "integration_id": integration_id, "enabled": True,
-              "config": deepcopy(record)}
+      return {"integration_id": integration_id, "config": deepcopy(override), "sharing_groups": None,
+              "auto_export": None}
 
-  node = {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET} if node_credentials else {"ENABLED": True}
-  owner = RecordOwner(CONFIG={"MISP_EXPORT": node}, config_data={})
-  actual = _MispExportMixin._get_misp_export_config(owner, "tn-1")
+  node = {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET} if deeploy_credentials else {"ENABLED": True}
+  owner = OverrideOwner(CONFIG={"MISP_EXPORT": node}, config_data={})
+  actual = _MispExportMixin._get_misp_export_config(owner)
   assert actual["misp_configured"] is expected
   assert set(actual) == set(DEFAULT) and SECRET not in str(actual) and URL not in str(actual)
 
@@ -240,14 +241,14 @@ def test_native_each_request_reauthorizes_after_account_revocation(read_native, 
     fixture.store.account("reader", active=False)
     result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT, {"request_actor": fixture.actor, "tenant_id": fixture.tenant_id})), 404)
     assert result == {"success": False, "error": "not_found", "status_code": 404} and calls == 1
-    fixture.owner._get_misp_export_config.assert_called_once_with(fixture.tenant_id)
+    fixture.owner._get_misp_export_config.assert_called_once_with()
 
 
 def test_valid_producer_payload_is_detached_before_publication():
   with read_endpoint_fixture(bound=True) as fixture:
     install_config_producer(fixture)
     payload = dict(DEFAULT)
-    fixture.owner._get_misp_export_config.side_effect = lambda tenant_id=None: payload
+    fixture.owner._get_misp_export_config.side_effect = lambda: payload
     result = getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor=fixture.actor,
                                                tenant_id=fixture.tenant_id)
     assert result == DEFAULT
@@ -269,3 +270,53 @@ def test_native_deployment_metadata_is_separate_from_exact_producer_keys(read_na
       assert result["server_node_addr"] == "fixture-node"
     else:
       assert result == DEFAULT
+
+
+# Review round 2 (RM-139): the MISP config is the deployment's, so the full-portfolio Super-Tenant
+# Admin reads its effective status without a tenant; every other caller still names its tenant.
+
+@pytest.mark.parametrize("response_format", ("RAW", "WRAPPED"))
+def test_a_full_portfolio_sta_reads_the_effective_deployment_status_without_a_tenant(read_native, response_format):
+  module, _ = read_native
+  install(module)
+  with read_endpoint_fixture(bound=True) as fixture:
+    install_config_producer(fixture, {"ENABLED": True, "AUTO_EXPORT": False, "MISP_URL": URL,
+                                      "MISP_API_KEY": SECRET, "MIN_SEVERITY": "HIGH"})
+    # The STA override switches auto export on over the Deeploy block's false.
+    override = {"integration_id": "misp", "config": {}, "sharing_groups": None, "auto_export": True}
+    module.eng = scheduler_comms(fixture, response_format)
+    from extensions.business.cybersec.red_mesh.services import config as config_module
+    with patch.object(config_module, "integration_override",
+                      lambda _owner, integration_id: deepcopy(override) if integration_id == "misp" else None):
+      result, calls = assert_json_response(asyncio.run(request(module, ENDPOINT,
+        {"request_actor": {"account_id": "creator"}})), 200)
+    actual = result["result"] if response_format == "WRAPPED" else result
+    assert actual == {"enabled": True, "auto_export": True, "misp_configured": True, "min_severity": "HIGH"}
+    assert calls == 1 and SECRET not in str(result) and URL not in str(result)
+    fixture.owner._get_misp_export_config.assert_called_once_with()
+
+
+@pytest.mark.parametrize("membership", (
+  [{"role": "tenant_admin", "tenant_id": "TENANT"}], [{"role": "tenant_pentester", "tenant_id": "TENANT"}],
+  [{"role": "super_tenant_admin", "tenant_id": "TENANT"}], [{"role": "super_pentester", "tenant_id": None}],
+))
+def test_without_a_tenant_any_other_caller_is_refused_before_the_producer(membership):
+  with read_endpoint_fixture(bound=True) as fixture:
+    install_config_producer(fixture, {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET})
+    fixture.store.account("reader", memberships=[
+      {**item, "tenant_id": fixture.tenant_id if item["tenant_id"] == "TENANT" else item["tenant_id"]}
+      for item in membership])
+    for tenant_id in (None, "", "  "):
+      assert getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor=fixture.actor,
+                                               tenant_id=tenant_id) == {
+        "success": False, "error": "invalid_request", "status_code": 400}
+    fixture.owner._get_misp_export_config.assert_not_called()
+
+
+def test_the_sta_read_without_a_tenant_fails_closed_when_identity_is_unreadable():
+  with read_endpoint_fixture(bound=True) as fixture:
+    install_config_producer(fixture, {"ENABLED": True, "MISP_URL": URL, "MISP_API_KEY": SECRET})
+    fixture.store.fail_hkey = "auth"
+    assert getattr(fixture.Plugin, ENDPOINT)(fixture.owner, request_actor={"account_id": "creator"}) == {
+      "success": False, "error": "unavailable", "status_code": 503}
+    fixture.owner._get_misp_export_config.assert_not_called()

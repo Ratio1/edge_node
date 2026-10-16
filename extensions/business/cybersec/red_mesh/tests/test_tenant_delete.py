@@ -116,6 +116,19 @@ class TestTenantDelete(unittest.TestCase):
       "nodeAssignments": 0, "documents": 3})])
     self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 404, "not_found")
 
+  def test_a_retired_integration_row_is_left_to_the_start_up_cleanup_and_the_count_stays_zero(self):
+    # RM-139: the kind is retired, so the delete never reads or counts it; the deployed Navigator
+    # still requires `integrations` in the answer, so it stays, always 0.
+    from .test_tenant_integration_records import integration_location, plant
+    plant(self.storage, self.tenant, "misp")
+    self.remove_members()
+    result = self.plugin.delete_tenant(self.actor, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertEqual((result["data"]["integrations"], result["data"]["engagements"]), (0, 1))
+    self.assertIsNotNone(self.storage.data[integration_location(self.tenant, "misp")])
+    self.Plugin._maybe_retire_tenant_integration_records(self.plugin)
+    self.assertIsNone(self.storage.data[integration_location(self.tenant, "misp")])
+
   def test_a_tenant_with_jobs_is_refused_before_anything_changes(self):
     self.remove_members()
     self.put_job("job-1", self.tenant)

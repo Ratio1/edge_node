@@ -12,7 +12,7 @@ from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
 from .auth import AuthError, build_auth_provider, credentials_missing
-from .config import tenant_export_binding, get_opencti_export_config
+from .config import get_opencti_export_config
 from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
@@ -107,18 +107,12 @@ def _bundle_summary(result, artifact_cid=None):
 
 
 def _prepare_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
-  # The job is resolved before the config: which OpenCTI this job publishes to is a property of the
-  # job's tenant, so the destination cannot be read until the job is known.
   job_specs = owner._get_job_from_cstore(job_id) if checked_job is _UNSET else checked_job
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "opencti", outcome="failure", error_class="job_not_found")
     return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
-  tenant_id, binding_error = tenant_export_binding(owner, job_specs, "opencti")
-  if binding_error:
-    record_integration_status(owner, "opencti", outcome="failure", error_class=binding_error,
-                              tenant_id=tenant_id)
-    return None, None, {"status": "not_configured", "error": binding_error, "job_id": job_id}
-  cfg = get_opencti_export_config(owner, tenant_id)
+  # RM-139: the deployment's destination for every job; an unreadable STA override raises.
+  cfg = get_opencti_export_config(owner)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return None, None, {"status": "disabled", "error": "OpenCTI export is disabled", "job_id": job_id}
@@ -127,8 +121,7 @@ def _prepare_opencti_export(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
     # failure is operator visibility. NOT yet true of push_to_opencti/publish_to_taxii, which still
     # call this with no requester -- that is B2's scope, and until then this write is reachable
     # without admission.
-    record_integration_status(owner, "opencti", outcome="failure", error_class=config_error,
-                              tenant_id=tenant_id)
+    record_integration_status(owner, "opencti", outcome="failure", error_class=config_error)
     return None, None, {"status": "not_configured", "error": config_error, "job_id": job_id}
 
   unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "opencti_export")
@@ -326,7 +319,7 @@ def push_to_opencti(owner, job_id, pass_nr=None, *, checked_job=_UNSET, ledger=N
   }
 
 
-def probe_opencti(owner, tenant_id=None):
+def probe_opencti(owner):
   """Read-only connectivity probe for the OpenCTI Test button.
 
   Runs the GraphQL `me {}` query against the configured OpenCTI URL using
@@ -334,7 +327,7 @@ def probe_opencti(owner, tenant_id=None):
   validates that the URL is reachable, credentials are accepted, and the
   GraphQL schema is responsive.
   """
-  cfg = get_opencti_export_config(owner, tenant_id)
+  cfg = get_opencti_export_config(owner)
   config_error = _config_error(cfg)
   if config_error == "disabled":
     return {"status": "disabled", "integration_id": "opencti", "error": "disabled"}

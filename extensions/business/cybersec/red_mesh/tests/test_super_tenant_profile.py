@@ -189,11 +189,43 @@ class TestProfileRoles(_ProfileCase):
 
   def test_no_namespace_means_unavailable_before_any_storage_access(self):
     self.plugin.cfg_tenancy_namespace = None
-    for name in ("get_super_tenant_profile", "update_super_tenant_profile"):
+    for name in ("get_super_tenant_profile", "update_super_tenant_profile", "get_super_tenant_provider"):
       with self.subTest(name):
         self.assertEqual(getattr(self.Plugin, name).__http_method__, "post")
         self.assertEqual(getattr(self.plugin, name)(actor=self.actor)["status_code"], 503)
     self.assertEqual(self.store.writes, [])
+
+
+class TestProviderRead(_ProfileCase):
+  """The provider block printed on every report: the eight profile fields, read by any active account;
+  never the attribution or the deployment's permission flags."""
+
+  def provider(self, actor):
+    return self.plugin.get_super_tenant_provider(actor)
+
+  def test_an_empty_profile_is_answered_to_any_active_account_without_a_write(self):
+    for account_id in ("creator", "initial", "pentester"):
+      with self.subTest(actor=account_id):
+        self.assertEqual(ok(self, self.provider({"account_id": account_id})), {key: "" for key in FIELDS})
+    self.assertEqual((self.store.writes, self.events), ([], []))
+    self.assertNotIn(PROFILE_KEY, self.store.data)
+
+  def test_a_tenant_account_reads_exactly_the_eight_fields(self):
+    ok(self, self.update(dict(PROVIDER)))
+    data = ok(self, self.provider({"account_id": "initial"}))
+    self.assertEqual(data, PROVIDER)
+    for key in ("updated_by", "updated_at", "permissions", "profile"):
+      self.assertNotIn(key, data)
+
+  def test_unknown_inactive_and_no_actor_are_refused(self):
+    ok(self, self.update(dict(PROVIDER)))
+    self.store.account("gone", active=False)
+    for actor in ({"account_id": "nobody"}, {"account_id": "gone"}, {}, None):
+      with self.subTest(actor=actor):
+        result = self.provider(actor)
+        self.assertFalse(result["success"], result)
+        self.assertEqual(result["status_code"], 404)
+        self.assertNotIn("data", result)
 
 
 if __name__ == "__main__":
