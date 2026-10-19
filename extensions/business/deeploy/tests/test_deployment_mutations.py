@@ -20,6 +20,7 @@ class Mutations(_DeploymentMutationsMixin, Admission):
         VOLUMES={"data": "/preserved-" + node}, ENV={"SECRET": "__R1_DAUTH_SECRET__", "NODE_VALUE": node},
       )
     self.pipeline = copy.deepcopy(self.current["A"])
+    self.previous_configs = self.current
     self.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"] = dict(
       job_id="7", revision="previous:deploy", pipelines=copy.deepcopy(self.current), job_secrets={"secret": "protected"},
     )
@@ -39,7 +40,7 @@ class Mutations(_DeploymentMutationsMixin, Admission):
     return self.storage[DEEPLOY_JOBS_CSTORE_HKEY, str(job_id)]
 
   def _load_dauth_job_secret_bundle(self, job_id):
-    return self.storage.get((DAUTH_JOB_SECRETS_CSTORE_HKEY, str(job_id)))
+    raise AssertionError('A mutation coordinator cannot load protected job bundles.')
 
   def _get_pipeline_params_from_deeploy_specs(self, specs):
     return {}
@@ -59,9 +60,6 @@ class Mutations(_DeploymentMutationsMixin, Admission):
       result[node]["PLUGINS"] = copy.deepcopy(base["plugins"])
       result[node]["PLUGINS"][0]["INSTANCES"][0]["INSTANCE_ID"] = "new-" + node
     return result
-
-  def _redact_pipeline_configs_and_build_secret_bundle(self, **kwargs):
-    return kwargs["pipeline_configs"], {"job_secrets": {"secret": "protected"}}
 
   def _admit_prepared_deployment(self, **kwargs):
     self.captured_scale = copy.deepcopy(kwargs)
@@ -199,7 +197,7 @@ class DeploymentMutationTests(unittest.TestCase):
 
   def test_scale_rejects_unmappable_node_plugin_order_before_writing(self):
     plugin = Mutations()
-    plugin.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"]["pipelines"]["B"]["PLUGINS"][0]["SIGNATURE"] = "DIFFERENT_PLUGIN"
+    plugin.previous_configs["B"]["PLUGINS"][0]["SIGNATURE"] = "DIFFERENT_PLUGIN"
     with self.assertRaisesRegex(ValueError, "cannot be mapped safely"):
       plugin._admit_scale_up_operation({"request_id": "scale", "job_id": 7, "expected_revision": 4},
                                       {"escrow_owner": "owner"}, ["C"])

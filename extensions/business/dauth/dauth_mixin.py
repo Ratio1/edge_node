@@ -475,10 +475,12 @@ class _DauthMixin(object):
 
   def process_dauth_reconcile_secrets_request(self, body):
     """Merge and store secrets locally; return only redacted configs and CID."""
-    _, requester_eth = self._verify_signed_dauth_body(body, log_hash_sign_fails=False)
+    requester, requester_eth = self._verify_signed_dauth_body(body, log_hash_sign_fails=False)
     nonce = self._validate_dauth_secret_request_nonce(body)
     if not self._is_protocol_oracle_eth(requester_eth):
       raise ValueError("Secret reconciliation requires a protocol oracle.")
+    if "operation" in body:
+      return self.process_dauth_deployment_secrets_request(body, requester, nonce)
     job_id = self._normalize_dauth_job_id(body.get("job_id"))
     pipeline_cid, prior_pipeline = self._load_dauth_job_pipeline_record(job_id)
     if (
@@ -486,6 +488,8 @@ class _DauthMixin(object):
       or pipeline_cid != body.get("expected_pipeline_cid")
     ):
       raise ValueError("Persisted pipeline changed or is unavailable.")
+    if prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision"):
+      raise ValueError("Versioned jobs require lifecycle secret reconciliation.")
     configs = body.get("pipeline_configs")
     if not isinstance(configs, dict) or not configs:
       raise ValueError("Target pipeline configs are required.")
@@ -522,6 +526,7 @@ class _DauthMixin(object):
       self.const.BASE_CT.dAuth.DAUTH_NONCE: nonce,
       "pipeline_configs": configs, "pipeline_cid": state["staged_cid"],
     }
+
   def _load_unversioned_runner_secret_bundle(self, job_id, requester):
     """Authorize a pre-lifecycle pipeline against its current CID and placement.
 

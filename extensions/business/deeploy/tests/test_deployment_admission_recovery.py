@@ -49,7 +49,7 @@ class DeploymentAdmissionRecoveryTests(unittest.TestCase):
     previous = {node: config(node, revision=4) for node in ['A', 'B']}
     prior_bundle = {'job_id': '7', 'revision': 'previous:deploy',
                     'pipelines': previous, 'job_secrets': {'secret': 'original-secret'}}
-    plugin.storage[SECRET_REVISIONS_HKEY, '7|previous:deploy'] = copy.deepcopy(prior_bundle)
+    plugin.seed_previous(previous, prior_bundle)
     # Local restore copy is written, replication fails, so the new deploy copy is absent.
     plugin.fail_namespace = SECRET_REVISIONS_HKEY
     with self.assertRaises(RuntimeError):

@@ -2,7 +2,7 @@
 import copy
 import unittest
 
-from extensions.business.deeploy.deployment_operations import OPERATIONS_HKEY, SECRET_REVISIONS_HKEY
+from extensions.business.deeploy.deployment_operations import OPERATIONS_HKEY
 from extensions.business.deeploy.tests.test_deployment_admission import Admission, config
 from extensions.business.deeploy.tests.test_deployment_mutations import Mutations
 
@@ -40,9 +40,9 @@ class DeploymentRevisionOrderTests(unittest.TestCase):
           configs = {node: config(node, revision=4) for node in ("A", "B")}
           prior = configs["A"]
           prior_bundle = {"job_secrets": {"secret": "original"}}
-          plugin.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"] = {
+          plugin.seed_previous(configs, {
             **prior_bundle, "pipelines": configs,
-          }
+          })
           request["expected_revision"] = 4
         # The operation persists locally but replica confirmation fails before
         # any protected copy is written. Expiry takes the real cleanup path.

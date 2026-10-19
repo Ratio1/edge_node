@@ -11,6 +11,7 @@ from extensions.business.deeploy.deployment_operations import (
   _DeploymentOperationsMixin, OPERATIONS_HKEY, NODE_OPERATIONS_HKEY,
   SECRET_REVISIONS_HKEY, request_digest, report_is_ready,
 )
+from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
 
 CONFIG = {"NAME": "app", "DEEPLOY_SPECS": {"revision": 1, "secret_revision": "op:deploy"},
@@ -26,6 +27,8 @@ class Coordinator(_DeploymentOperationsMixin):
     self.bc.sign = lambda record, **kw: record.update(EE_SIGN="valid", EE_SENDER=address)
     self.evm_network = "test"
     self.storage = {}
+    self.custody = LifecycleCustodyDouble(self)
+    self.bc.reconcile_dauth_job_secrets = self.custody
     self.replicate = True
     self.commands = []
     self._deployment_operations_stop = threading.Event()
@@ -48,6 +51,8 @@ class Coordinator(_DeploymentOperationsMixin):
     return self.replicate
 
   def chainstore_hget(self, namespace, key):
+    if namespace in (SECRET_REVISIONS_HKEY, 'DAUTH_JOB_SECRETS'):
+      raise AssertionError('Coordinator must use the dAuth RPC for protected storage.')
     return copy.deepcopy(self.storage.get((namespace, key)))
 
   def chainstore_hgetall(self, namespace):

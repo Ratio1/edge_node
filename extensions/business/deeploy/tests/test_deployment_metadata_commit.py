@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from extensions.business.deeploy.deeploy_job_mixin import (
   _DeeployJobMixin, DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY,
 )
+from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
 
 class Metadata(_DeeployJobMixin):
@@ -16,13 +17,21 @@ class Metadata(_DeeployJobMixin):
       address="oracle", get_dauth_oracles=lambda: (["oracle", "replica"], []),
       sign=lambda record, **kwargs: record.update(EE_SIGN="signed", EE_SENDER="oracle"),
     )
+    self.custody = LifecycleCustodyDouble(self)
+    self.bc.reconcile_dauth_job_secrets = self.custody
     self.fail_pointer = False
     self.deleted = []
     self._recursively_sort_pipeline_data = lambda value: value
     self._save_pipeline_to_r1fs = lambda pipeline: "cid-restored"
     self._delete_pipeline_cid_from_r1fs = self.deleted.append
 
+  def _deployment_secret_request(self, action, operation, **payload):
+    # The existing metadata scenario controls the custodian's write failures.
+    return self.bc.reconcile_dauth_job_secrets(dict(action=action, operation=operation, **payload))
+
   def chainstore_hget(self, hkey, key):
+    if hkey in (DAUTH_JOB_SECRETS_CSTORE_HKEY, 'DAUTH_JOB_SECRET_REVISIONS'):
+      raise AssertionError('Coordinator must use the dAuth RPC for protected storage.')
     return copy.deepcopy(self.storage.get((hkey, key)))
 
   def chainstore_hgetall(self, hkey):
@@ -42,23 +51,25 @@ class DeploymentMetadataCommitTests(unittest.TestCase):
     operation = dict(job_id=7, target_revision=6, operation_id="recover", coordinator="oracle")
     pipeline = {"NAME": "app", "DEEPLOY_SPECS": {"revision": 4}, "PLUGINS": []}
     bundle = {"job_id": "7", "revision": "recover:restore", "job_secrets": {"token": "old-value"}}
+    plugin.custody.target_bundle = copy.deepcopy(bundle)
     plugin.fail_pointer = True
     with self.assertRaisesRegex(RuntimeError, "metadata publication"):
-      plugin.commit_deployment_revision(operation, pipeline, bundle)
+      plugin.commit_deployment_revision(operation, pipeline)
     self.assertEqual(plugin.storage[DEEPLOY_JOBS_CSTORE_HKEY, "7"], previous)
     staged = plugin.storage[DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"]
     self.assertEqual(staged["deployment_revision"], 6)
     self.assertEqual(plugin.deleted, [])
 
     restarted = Metadata(plugin.storage)
-    restarted.commit_deployment_revision(operation, pipeline, bundle)
+    restarted.custody.target_bundle = copy.deepcopy(bundle)
+    restarted.commit_deployment_revision(operation, pipeline)
     pointer = restarted.storage[DEEPLOY_JOBS_CSTORE_HKEY, "7"]
     self.assertEqual(pointer["revision"], 6)
     self.assertEqual(pointer["pipeline_cid"], "cid-restored")
     self.assertEqual(restarted.storage[DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"], staged)
     self.assertEqual(restarted.deleted, ["cid-previous"])
     self.assertEqual(pipeline["DEEPLOY_SPECS"]["revision"], 4)
-    restarted.commit_deployment_revision(operation, pipeline, bundle)
+    restarted.commit_deployment_revision(operation, pipeline)
     self.assertEqual(restarted.deleted, ["cid-previous"])
 
   def test_deleted_pointer_is_not_listed_or_loaded_and_higher_revision_can_replace_it(self):
@@ -69,7 +80,7 @@ class DeploymentMetadataCommitTests(unittest.TestCase):
     self.assertEqual(plugin.list_all_deployed_jobs_from_cstore(), {})
     plugin.commit_deployment_revision(
       dict(job_id=7, target_revision=9, operation_id="new", coordinator="oracle"),
-      {"NAME": "new-app", "DEEPLOY_SPECS": {"revision": 9}}, {"job_secrets": {}},
+      {"NAME": "new-app", "DEEPLOY_SPECS": {"revision": 9}},
     )
     self.assertEqual(plugin.list_all_deployed_jobs_from_cstore(), {"7": "cid-restored"})
     self.assertEqual(plugin.storage[DEEPLOY_JOBS_CSTORE_HKEY, "7"]["revision"], 9)

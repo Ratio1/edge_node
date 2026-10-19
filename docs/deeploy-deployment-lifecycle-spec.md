@@ -472,7 +472,7 @@ To resume after compaction:
 - Redacted exact execution plans are stored in R1FS. Local plan persistence/pinning and durable coordinator volume are required; independent remote pinning and coordinator failover are not promised.
 - Edge `deployment_operations.py` owns admission, worker replay, readiness, stop barriers, restoration, canonical commit, secret revocation, and the single owner-authorized polling projection. HTTP400 validation and HTTP503 uncertain admission are separate from HTTP202 acceptance.
 - Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart; interrupted incomplete preparation is revoked after its 120-second deadline without changing the current revision. No dispatch occurs before accepted data is replicated. A local per-operation marker keeps the worker from advancing live admission; completed handoffs are cleared before loading fresh snapshots. Other jobs continue without a global admission lock (decision 15).
-- dAuth stores immutable per-revision secrets with exact authorized node/instance configurations. Revocation is a separate durable marker followed by plaintext erasure. Previous secrets remain available until stop/restoration evidence allows retirement. Ordinary polling oracles cannot read protected secrets; an oracle lacking prior protected revision data rejects update admission safely. Polling from any oracle remains supported.
+- dAuth stores immutable per-revision secrets with exact authorized node/instance configurations. Revocation is a separate durable marker followed by plaintext erasure. Previous secrets remain available until stop/restoration evidence allows retirement. Non-dAuth coordinators prepare and publish revisions through the SDK reconciliation API. dAuth retains all prior and merged bundles; coordinators load only redacted plans and sign public pointers. Polling from any oracle remains supported.
 - Container readiness reports actual health and build/pull failures. Cleanup verifies Docker absence and preserves volumes. Managed CockroachDB additionally verifies planned certificate fingerprints and authenticated verify-full SQL before readiness. Its isolated real-binary old/new/old certificate recovery test passed with data preservation; see the linked recovery document for the exact offline command and limitations.
 - Canonical pointers and current dAuth bundles carry signed monotonic storage generations. A restored runtime retains its previous content revision while its metadata commit advances the storage generation; later creates/updates/deletes advance beyond it. Delete tombstones reject stale repair, and explicit higher generations permit paid job reuse. Every new attempt also advances beyond all verified observed attempts for the job, including failed preparation/create attempts, so clock skew cannot hide a retry in job-only polling. The receiving oracle also coordinates existing CSP owner transfer through the revision lifecycle; rollback preserves the newly authorized owner.
 - Tracked containers pin local Docker image IDs before launch and retain them across restart. Worker sources pin and verify Git commits. Automatic image/source polling is disabled for tracked revisions; restoration uses captured node artifacts with no mutable-tag fallback. Missing local images or historical bindings block restoration. Arbitrary build commands can still depend on mutable external downloads; deterministic application dependencies remain an application build responsibility.
@@ -615,3 +615,37 @@ remaining P1/P2 issue after reviewing both handoff and cache correctness.
 No live deployment was performed. This change updates Edge PR #533; other
 components require no changes. Preserve the separate local 900-second timeout
 edit outside this commit.
+
+### dAuth reconciliation after the non-dAuth update fix (2026-10-20)
+
+The lifecycle uses `BCWrapper.reconcile_dauth_job_secrets` and the SDK-owned
+signed HTTP transport for `prepare`, `status`, `commit`, `revoke`, and `delete`.
+The signed operation, action, network, job, owner, exact node/instance plan and
+plan CID bind each request. Preparation persists immutable target and restoration
+secret records only on dAuth, after the existing durable `preparing` operation.
+It leaves current metadata and the prior R1FS CID available to existing workers.
+Fresh request values are extracted before public plan persistence; neither
+prior nor merged bundles enter the coordinator's memory. Scale-up aliases and
+per-node placeholder validation are reconciled inside dAuth.
+
+After interrupted admission, `status` confirms and replicates existing copies;
+it never generates replacement credentials. Incomplete preparation waits for the
+existing preparation deadline, then revokes only that operation's staged copies.
+Runtime readiness/stop evidence, the coordinator journal and rollback decisions
+remain the lifecycle's responsibility. Owner-transfer restoration retains the
+new owner. No second journal or cross-oracle arbitration is introduced.
+
+Finalization supplies a coordinator-signed canonical pointer. dAuth validates
+its generation and exact plan CID, publishes its signed current secret bundle
+and the original public pointer, then cleans up the prior CID. Repeating the
+same finalization repairs uncertain writes. Only lifecycle-authorized cleanup
+revokes unused revisions; deletion waits for all scoped stop reports. Core
+accepts a registered dAuth signature on the current bundle while still requiring
+a coordinator signature on public pointers. Equal-generation retries ignore
+signature metadata only; altered semantic contents and revoked revisions fail
+closed. These changes require SDK 3.5.59 and Core 7.7.333.
+
+Release order: SDK, Core, then Edge together with the lifecycle dApp. Retain the
+existing journal/secret storage and coordinated rollback requirements above.
+This integration was checked offline with physically separated public/protected
+stores, the real SDK client and Core wrapper; no live node or wallet was changed.

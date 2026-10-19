@@ -4839,21 +4839,24 @@ class _DeeployMixin:
       return False
     return value != DEEPLOY_DAUTH_SECRET_PLACEHOLDER
 
-  def _merge_deeploy_dauth_secret_fragments(self, target, source):
+  def _merge_deeploy_dauth_secret_fragments(self, target, source, reject_conflicts=False):
+    """Merge sparse fragments; lifecycle node copies must agree on shared paths."""
     if source is None:
       return target
     if target is None:
       return self.deepcopy(source)
     if isinstance(target, dict) and isinstance(source, dict):
       for key, value in source.items():
-        target[key] = self._merge_deeploy_dauth_secret_fragments(target.get(key), value)
+        target[key] = self._merge_deeploy_dauth_secret_fragments(target.get(key), value, reject_conflicts)
       return target
     if isinstance(target, list) and isinstance(source, list):
       while len(target) < len(source):
         target.append(None)
       for idx, value in enumerate(source):
-        target[idx] = self._merge_deeploy_dauth_secret_fragments(target[idx], value)
+        target[idx] = self._merge_deeploy_dauth_secret_fragments(target[idx], value, reject_conflicts)
       return target
+    if reject_conflicts and (type(target) is not type(source) or target != source):
+      raise ValueError("Node configurations contain conflicting values at a shared secret path.")
     return self.deepcopy(source)
 
   def _extract_and_redact_deeploy_dauth_secrets(self, payload):

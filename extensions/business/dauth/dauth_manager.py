@@ -33,6 +33,7 @@ from extensions.business.dauth.dauth_registry import (
   load_dauth_registry_snapshot,
 )
 
+from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
@@ -109,6 +110,7 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
+  _DauthDeploymentSecretsMixin,
   _DeeployMixin,
   _DeeployJobMixin,
   _NodeTagsMixin,

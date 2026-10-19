@@ -142,14 +142,17 @@ class ExistingPipelineSecretTests(unittest.TestCase):
     bundle = deepcopy(server._chainstore[DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"])
     coordinator = Admission()
     coordinator.netmon = SimpleNamespace(network_known_pipelines=lambda: {"node-runner": [previous]})
+    coordinator.storage[DEEPLOY_JOBS_CSTORE_HKEY, "7"] = "old-cid"
+    coordinator.custody.previous_bundle = deepcopy(bundle)
+    coordinator.custody.target_bundle = deepcopy(bundle)
     coordinator._redact_pipeline_configs_and_build_secret_bundle = (
       make_deeploy_plugin()._redact_pipeline_configs_and_build_secret_bundle
     )
     accepted = coordinator._admit_prepared_deployment(
       request={"request_id": "first-update", "job_id": 7, "expected_revision": 0},
       auth_result={"escrow_owner": "owner"}, app_id="existing",
-      configs={"node-runner": deepcopy(previous)}, bundle=bundle,
-      prior_pipeline=previous, prior_bundle=bundle, is_create=False,
+      configs={"node-runner": deepcopy(previous)},
+      prior_pipeline=previous, is_create=False,
     )
     restore = coordinator.plans["plan-cid"]["previous_configs"]["node-runner"]
     revision = restore["DEEPLOY_SPECS"]["secret_revision"]

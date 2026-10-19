@@ -11,6 +11,9 @@ import json
 import threading
 import uuid
 
+from ratio1.const.base import dAuth
+from .selected_secrets import inherit_selections
+
 from extensions.business.dauth.dauth_registry import (
   dauth_registry_write_kwargs, get_dauth_registry_internal_peers,
 )
@@ -212,16 +215,44 @@ class _DeploymentOperationsMixin:
       app_id=operation["app_id"], revision=operation["target_revision"],
     ))
 
-  def _store_secret_revision(self, job_id, revision, bundle, pipelines):
-    """Keep an immutable protected secret revision with authorized node scope."""
-    value = copy.deepcopy(bundle)
-    value.update(job_id=str(job_id), revision=revision,
-                 pipelines=copy.deepcopy(pipelines))
-    if not self.chainstore_hset(
-      SECRET_REVISIONS_HKEY, "{}|{}".format(job_id, revision), value,
-      **dauth_registry_write_kwargs(self),
-    ):
-      raise RuntimeError("Could not persist deployment secret revision.")
+  def _deployment_secret_request(self, action, operation, **payload):
+    """Request custody work through the SDK without fetching protected bundles."""
+    return self.bc.reconcile_dauth_job_secrets(dict(
+      job_id=str(operation["job_id"]), operation=copy.deepcopy(operation),
+      action=action, **payload,
+    ))
+
+  def _prepare_deployment_secret_configs(self, configs, prior_pipeline=None, identity_aliases=None):
+    """Extract only fresh input values; reconciliation remains on dAuth."""
+    redacted, fragments = {}, None
+    for node, config in configs.items():
+      config = copy.deepcopy(config)
+      inherit_selections(config, prior_pipeline, dAuth.DAUTH_SECRET_PLACEHOLDER,
+                         identity_aliases=identity_aliases)
+      redacted[node], values = self._extract_and_redact_deeploy_dauth_secrets(config)
+      fragments = self._merge_deeploy_dauth_secret_fragments(fragments, values, reject_conflicts=True)
+    return redacted, fragments
+
+  def _previous_deployment_configs(self, pipeline):
+    """Load exact previous redacted placement from public plans or node metadata."""
+    specs = pipeline["DEEPLOY_SPECS"]
+    reference = specs.get("secret_revision")
+    if reference:
+      previous = self._operation_records().get(reference.split(":", 1)[0])
+      if previous is None:
+        raise ValueError("The previous deployment operation is unavailable.")
+      plan = self._load_operation_plan(previous)
+      return copy.deepcopy(plan["previous_configs" if reference.endswith(":restore") else "configs"])
+    configs = {}
+    known = self.netmon.network_known_pipelines()
+    for node in specs.get("current_target_nodes", []):
+      matches = [config for config in known.get(node, [])
+                 if config.get("NAME") == pipeline["NAME"]
+                 and str(config.get("DEEPLOY_SPECS", {}).get("job_id")) == str(specs["job_id"])]
+      if len(matches) != 1:
+        raise ValueError("The exact previous configuration is unavailable for a target node.")
+      configs[node] = copy.deepcopy(matches[0])
+    return configs
 
   def _next_deployment_revision(self, job_id, previous_revision=0):
     """Advance past canonical content and every verified observed job attempt.
@@ -238,8 +269,8 @@ class _DeploymentOperationsMixin:
     return max([previous_revision, generation] + observed) + 1
 
   def _admit_prepared_deployment(self, request, auth_result, app_id, configs,
-                                 bundle, prior_pipeline, prior_bundle, is_create, mutation=None,
-                                 restore_owner=None):
+                                 prior_pipeline, is_create, mutation=None,
+                                 restore_owner=None, identity_aliases=None):
     """Save exact redacted plans and secret revisions before accepting work.
 
     Parameters
@@ -251,11 +282,10 @@ class _DeploymentOperationsMixin:
     app_id : str
       Stable pipeline identity.
     configs : dict
-      Redacted node-specific pipeline configurations.
-    bundle : dict
-      Protected secret values, stored only in the dAuth registry.
-    prior_pipeline, prior_bundle : dict or None
-      Current canonical configuration and corresponding secrets for restoration.
+      Prepared node-specific configurations; fresh values are extracted before
+      persisting the redacted plan and sent only to dAuth for reconciliation.
+    prior_pipeline : dict or None
+      Current canonical redacted configuration for restoration planning.
     is_create : bool
       Whether this operation creates a previously absent deployment.
 
@@ -269,14 +299,14 @@ class _DeploymentOperationsMixin:
     previous_revision = 0 if is_create else (prior_pipeline or {}).get(
       "DEEPLOY_SPECS", {}).get("revision", 0)
     if not is_create:
-      if not isinstance(prior_pipeline, dict) or not isinstance(prior_bundle, dict):
-        raise ValueError("An update requires a recoverable previous configuration and secret bundle.")
+      if not isinstance(prior_pipeline, dict):
+        raise ValueError("An update requires a recoverable previous configuration.")
       if type(request.get("expected_revision")) is not int or request["expected_revision"] != previous_revision:
         raise DeploymentConflictError("The deployment revision changed; refresh before updating.")
     operation_id = hashlib.sha256(self.bc.address.encode()).hexdigest()[:16] + "-" + uuid.uuid4().hex
     revision = self._next_deployment_revision(job_id, previous_revision)
     secret_revision = operation_id + ":deploy"
-    configs = copy.deepcopy(configs)
+    configs, new_secrets = self._prepare_deployment_secret_configs(configs, prior_pipeline, identity_aliases)
     for config in configs.values():
       config.setdefault("DEEPLOY_SPECS", {}).update(
         revision=revision, secret_revision=secret_revision,
@@ -295,29 +325,12 @@ class _DeploymentOperationsMixin:
         raise ValueError("The previous revision has no recoverable node placement.")
       previous_secret_revision = operation_id + ":restore"
       prior_secret_revision = prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision")
-      if prior_secret_revision:
-        previous_secret_revision_to_release = prior_secret_revision
-        prior_record = self.chainstore_hget(
-          SECRET_REVISIONS_HKEY, "{}|{}".format(job_id, prior_secret_revision),
-        )
-        if not isinstance(prior_record, dict) or not prior_record.get("pipelines"):
-          raise ValueError("The exact previous node configurations are unavailable.")
-        previous_configs = copy.deepcopy(prior_record["pipelines"])
-        previous_operation_id = prior_secret_revision.split(":", 1)[0]
-      else:
-        # Existing jobs have a canonical config with node overlays, but no
-        # historical operation. Capture that configuration before mutation.
-        known = self.netmon.network_known_pipelines()
-        for node in previous_nodes:
-          matches = [pipeline for pipeline in known.get(node, [])
-                     if pipeline.get("NAME") == app_id and str(pipeline.get("DEEPLOY_SPECS", {}).get("job_id")) == str(job_id)]
-          if len(matches) != 1:
-            raise ValueError("The exact previous configuration is unavailable for a target node; update was not admitted.")
-          previous_configs[node] = copy.deepcopy(matches[0])
-        previous_configs, prior_bundle = self._redact_pipeline_configs_and_build_secret_bundle(
-          job_id=job_id, pipeline_configs=previous_configs,
-          prior_bundle=prior_bundle, prior_pipeline=prior_pipeline,
-        )
+      previous_secret_revision_to_release = prior_secret_revision
+      previous_operation_id = prior_secret_revision.split(":", 1)[0] if prior_secret_revision else None
+      previous_configs = self._previous_deployment_configs(prior_pipeline)
+      previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
+        previous_configs, prior_pipeline,
+      )
       if set(previous_configs) != set(previous_nodes) or any(
         config.get("NAME") != app_id or
         str(config.get("DEEPLOY_SPECS", {}).get("job_id")) != str(job_id) or
@@ -347,6 +360,7 @@ class _DeploymentOperationsMixin:
       previous_revision=None if is_create else previous_revision,
       previous_operation_id=previous_operation_id,
       previous_secret_revision=previous_secret_revision_to_release,
+      previous_pipeline_cid=self._get_pipeline_from_cstore(job_id),
       plan_cid=plan_cid, nodes=list(configs), previous_nodes=list(previous_configs),
       instances={node: required_instances(config) for node, config in configs.items()},
       previous_instances={node: required_instances(config) for node, config in previous_configs.items()},
@@ -363,10 +377,11 @@ class _DeploymentOperationsMixin:
     self._deployment_preparations[operation_id] = finished
     try:
       self._save_operation(operation, message="Preparing durable deployment data.")
-      if previous_configs:
-        self._store_secret_revision(job_id, previous_secret_revision,
-                                    prior_bundle, previous_configs)
-      self._store_secret_revision(job_id, secret_revision, bundle, configs)
+      self._deployment_secret_request(
+        "prepare", operation, new_secrets=new_secrets,
+        previous_new_secrets=previous_new_secrets if previous_configs else None,
+        identity_aliases=[[list(current), list(source)] for current, source in (identity_aliases or {}).items()],
+      )
       self._save_operation(operation, "accepted", "Deployment accepted.")
     finally:
       # Keep the marker until the worker discards its old snapshots and reloads
@@ -552,45 +567,27 @@ class _DeploymentOperationsMixin:
 
   def _finish_deployment_preparation(self, operation, plan):
     """Recover interrupted admission without leaving unowned secret copies."""
-    prepared = []
-    for configs in (plan["previous_configs"], plan["configs"]):
-      if not configs:
-        continue
-      revision = next(iter(configs.values()))["DEEPLOY_SPECS"]["secret_revision"]
-      key = "{}|{}".format(operation["job_id"], revision)
-      bundle = self.chainstore_hget(SECRET_REVISIONS_HKEY, key)
-      if (not isinstance(bundle, dict) or bundle.get("revoked") or
-          bundle.get("pipelines") != configs or
-          self.chainstore_hget(SECRET_REVISIONS_HKEY, key + "|revoked")):
-        if self.time() < operation["preparation_deadline"]:
-          return
-        # No start command is permitted during preparation. Only the copies
-        # owned by this operation can be revoked; the prior active one stays.
-        self._release_unused_secret_revisions(operation, plan, active_attempt=None)
-        operation.update(outcome="failed", recovery="completed", error=dict(
-          code="ADMISSION_PREPARATION_FAILED",
-          message="Deployment preparation did not complete; the running revision is unchanged.",
-          retryable=False,
-        ))
-        self._save_operation(operation, "completed", "Incomplete deployment preparation cleaned up.")
+    result = self._deployment_secret_request("status", operation)
+    if not result["prepared"]:
+      if self.time() < operation["preparation_deadline"]:
         return
-      prepared.append((revision, bundle, configs))
-    for revision, bundle, configs in prepared:
-      self._store_secret_revision(operation["job_id"], revision, bundle, configs)
+      # Fresh values lost before custody cannot be regenerated after restart.
+      # Revoke only this operation's partial copies; leave the active job intact.
+      self._release_unused_secret_revisions(operation, plan, active_attempt=None)
+      operation.update(outcome="failed", recovery="completed", error=dict(
+        code="ADMISSION_PREPARATION_FAILED",
+        message="Deployment preparation did not complete; the running revision is unchanged.",
+        retryable=False,
+      ))
+      self._save_operation(operation, "completed", "Incomplete deployment preparation cleaned up.")
+      return
     operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
     self._save_operation(operation, "accepted", "Deployment preparation recovered.")
 
   def _commit_operation_revision(self, operation, configs):
     """Commit canonical metadata only after readiness or restoration evidence."""
     representative = next(iter(configs.values()))
-    secret_revision = representative["DEEPLOY_SPECS"]["secret_revision"]
-    bundle = self.chainstore_hget(SECRET_REVISIONS_HKEY,
-                                  "{}|{}".format(operation["job_id"], secret_revision))
-    if not isinstance(bundle, dict):
-      raise RuntimeError("Active secret revision is not available yet.")
-    bundle = copy.deepcopy(bundle)
-    bundle.pop("pipelines", None)
-    self.commit_deployment_revision(operation, representative, bundle)
+    self.commit_deployment_revision(operation, representative)
 
   def _release_unused_secret_revisions(self, operation, plan, active_attempt):
     """Remove plaintext from unused revisions only after positive stop evidence.
@@ -598,25 +595,7 @@ class _DeploymentOperationsMixin:
     Keep a revoked record rather than deleting the field: CStore repair is
     additive, and a tombstone must survive to reject a delayed secret request.
     """
-    unused = []
-    if active_attempt and operation.get("previous_secret_revision"):
-      unused.append(operation["previous_secret_revision"])
-    for attempt, configs in (("deploy", plan["configs"]), ("restore", plan["previous_configs"])):
-      if attempt == active_attempt or not configs:
-        continue
-      unused.append(next(iter(configs.values()))["DEEPLOY_SPECS"]["secret_revision"])
-    for revision in unused:
-      key = "{}|{}".format(operation["job_id"], revision)
-      # Revocation is a separate immutable field, so stale hsync snapshots
-      # cannot undo it by overwriting the original secret value.
-      if not self.chainstore_hset(SECRET_REVISIONS_HKEY, key + "|revoked",
-                                 {"job_id": str(operation["job_id"]), "revision": revision},
-                                 **dauth_registry_write_kwargs(self)):
-        raise RuntimeError("Secret revocation is pending.")
-      if not self.chainstore_hset(SECRET_REVISIONS_HKEY, key,
-                                 {"job_id": str(operation["job_id"]), "revision": revision, "revoked": True},
-                                 **dauth_registry_write_kwargs(self)):
-        raise RuntimeError("Secret cleanup is pending.")
+    self._deployment_secret_request("revoke", operation, active_attempt=active_attempt)
 
   def _reconcile_coordinator_operations(self):
     """Advance runtime execution and recovery for this receiving oracle."""

@@ -10,6 +10,8 @@ from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS
 from extensions.business.deeploy.deployment_operations import (
   _DeploymentOperationsMixin, OPERATIONS_HKEY, SECRET_REVISIONS_HKEY,
 )
+from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
+from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
 
 def config(node, revision=1, secret_revision="previous:deploy"):
@@ -26,7 +28,7 @@ def config(node, revision=1, secret_revision="previous:deploy"):
   }
 
 
-class Admission(_DeploymentOperationsMixin):
+class Admission(_DeploymentOperationsMixin, _DeeployMixin):
   def __init__(self):
     self.bc = SimpleNamespace(
       address="oracle",
@@ -41,11 +43,15 @@ class Admission(_DeploymentOperationsMixin):
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_preparations = {}
     self.storage = {}
+    self.deepcopy = copy.deepcopy
+    self.previous_configs = None
+    self.custody = LifecycleCustodyDouble(self)
+    self.bc.reconcile_dauth_job_secrets = self.custody
     self.writes = []
     self.plans = {}
     self.fail_namespace = None
     self.fail_blob = False
-    self.r1fs = SimpleNamespace(add_json=self.add_plan)
+    self.r1fs = SimpleNamespace(add_json=self.add_plan, get_json=lambda cid, **kwargs: copy.deepcopy(self.plans[cid]))
     self._get_response = lambda value: value
     self.commands = []
 
@@ -64,6 +70,8 @@ class Admission(_DeploymentOperationsMixin):
     return namespace != self.fail_namespace
 
   def chainstore_hget(self, namespace, key):
+    if namespace in (SECRET_REVISIONS_HKEY, 'DAUTH_JOB_SECRETS'):
+      raise AssertionError('Coordinator must use the dAuth RPC for protected storage.')
     return copy.deepcopy(self.storage.get((namespace, key)))
 
   def chainstore_hgetall(self, namespace):
@@ -78,13 +86,32 @@ class Admission(_DeploymentOperationsMixin):
   def cmdapi_start_pipeline(self, **kwargs):
     self.commands.append(kwargs)
 
+  def _get_pipeline_from_cstore(self, job_id):
+    pointer = self.storage.get(('DEEPLOY_DEPLOYED_JOBS', str(job_id)))
+    return pointer.get('pipeline_cid') if isinstance(pointer, dict) else pointer
+
+  def _previous_deployment_configs(self, pipeline):
+    # Scenario fixtures supply the public plan separately from flat custody data.
+    if pipeline.get('DEEPLOY_SPECS', {}).get('secret_revision'):
+      if self.previous_configs is None:
+        raise ValueError('The exact previous node configurations are unavailable.')
+      return copy.deepcopy(self.previous_configs)
+    return super()._previous_deployment_configs(pipeline)
+
+  def seed_previous(self, configs, bundle):
+    self.previous_configs = configs
+    reference = next(iter(configs.values()))['DEEPLOY_SPECS']['secret_revision']
+    self.storage[SECRET_REVISIONS_HKEY, '7|' + reference] = copy.deepcopy(bundle)
+    self.custody.previous_bundle = copy.deepcopy(bundle)
+
   def admit(self, request=None, prior=None, prior_bundle=None):
     request = request or {"request_id": "stable-request", "job_id": 7}
+    if prior_bundle is not None:
+      self.custody.previous_bundle = copy.deepcopy(prior_bundle)
     return self._admit_prepared_deployment(
       request=request, auth_result={DEEPLOY_KEYS.ESCROW_OWNER: "owner"},
       app_id="app", configs={node: config(node) for node in ["A", "B"]},
-      bundle={"job_id": "7", "job_secrets": {"secret": "protected-value"}},
-      prior_pipeline=prior, prior_bundle=prior_bundle, is_create=prior is None,
+      prior_pipeline=prior, is_create=prior is None,
     )
 
 
@@ -93,13 +120,13 @@ class DeploymentAdmissionTests(unittest.TestCase):
     plugin = Admission()
     staging = threading.Event()
     release = threading.Event()
-    store = plugin._store_secret_revision
-    def pause_staging(*args):
+    store = plugin.custody
+    def pause_staging(payload):
       staging.set()
       if not release.wait(5):
         raise RuntimeError("Test did not release admission")
-      return store(*args)
-    plugin._store_secret_revision = pause_staging
+      return store(payload)
+    plugin.bc.reconcile_dauth_job_secrets = pause_staging
     plugin._advance_deployment_operation = Mock()
     with ThreadPoolExecutor(max_workers=1) as executor:
       admission = executor.submit(plugin.admit)
@@ -140,7 +167,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
 
   def test_failed_admission_hands_preparing_operation_to_recovery(self):
     plugin = Admission()
-    plugin._store_secret_revision = Mock(side_effect=RuntimeError("storage unavailable"))
+    plugin.bc.reconcile_dauth_job_secrets = Mock(side_effect=RuntimeError("storage unavailable"))
     with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
       plugin.admit()
     plugin._advance_deployment_operation = Mock()
@@ -179,7 +206,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
       self.assertEqual(pipeline["DEEPLOY_SPECS"]["revision"], 1)
       self.assertNotIn("CHAINSTORE_RESPONSE_KEY", pipeline["PLUGINS"][0]["INSTANCES"][0])
       revision = pipeline["DEEPLOY_SPECS"]["secret_revision"]
-      stored = plugin.chainstore_hget(SECRET_REVISIONS_HKEY, "7|" + revision)
+      stored = plugin.storage[SECRET_REVISIONS_HKEY, "7|" + revision]
       self.assertEqual(stored["job_secrets"]["secret"], "protected-value")
       self.assertEqual(stored["pipelines"][node], pipeline)
 
@@ -208,9 +235,9 @@ class DeploymentAdmissionTests(unittest.TestCase):
   def test_update_retains_exact_previous_node_configs_and_secret_binding(self):
     plugin = Admission()
     previous = {node: config(node, revision=4) for node in ["A", "B"]}
-    plugin.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"] = {
+    plugin.seed_previous(previous, {
       "pipelines": copy.deepcopy(previous), "job_secrets": {"secret": "old-secret"},
-    }
+    })
     result = plugin.admit(
       {"request_id": "update", "job_id": 7, "expected_revision": 4},
       prior=previous["A"], prior_bundle={"job_secrets": {"secret": "old-secret"}},
@@ -279,9 +306,9 @@ class DeploymentAdmissionTests(unittest.TestCase):
         previous = {node: config(node, revision=4) for node in ("A", "B")}
         canonical = copy.deepcopy(previous["A"])
         mutate(previous)
-        plugin.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"] = {
+        plugin.seed_previous(previous, {
           "pipelines": previous, "job_secrets": {"secret": "original-secret"},
-        }
+        })
         original_storage = copy.deepcopy(plugin.storage)
         with self.assertRaisesRegex(ValueError, "exact complete placement"):
           plugin.admit(

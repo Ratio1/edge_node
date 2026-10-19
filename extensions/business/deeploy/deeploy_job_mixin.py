@@ -135,41 +135,23 @@ class _DeeployJobMixin:
 
     return result
 
-  def commit_deployment_revision(self, operation, pipeline, secret_bundle):
-    """Publish a versioned active revision after every workload is ready.
+  def commit_deployment_revision(self, operation, pipeline):
+    """Ask dAuth to publish an exact ready revision and its bound secrets.
 
-    Metadata generations increase on each mutation, including restoration and
-    deletion. Content revision may return to the previous revision on rollback.
-    A partial write is repaired by replaying these exact signed records; never
-    compensate by writing an older generation over a newer one.
+    The coordinator signs public metadata only. dAuth obtains the secret bundle
+    by its immutable plan reference; neither it nor restoration values are read
+    into coordinator memory. Repeating the same operation repairs partial writes.
     """
-    from .deployment_operations import SIGNATURE_KEYS
-
-    pipeline = self.extract_invariable_data_from_pipeline(pipeline)
+    pipeline = self.deepcopy(self.extract_invariable_data_from_pipeline(pipeline))
     pipeline.pop("DEEPLOY_OPERATION", None)
     cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
     if not cid:
       raise RuntimeError("Deployment metadata persistence is pending.")
-    job_id = str(operation["job_id"])
-    previous_cid = self._get_pipeline_from_cstore(job_id)
-    bundle = self.deepcopy(secret_bundle)
-    for key in SIGNATURE_KEYS:
-      bundle.pop(key, None)
-    bundle.update(job_id=job_id, deployment_revision=operation["target_revision"],
-                  operation_id=operation["operation_id"], coordinator=operation["coordinator"],
-                  deleted=False)
-    bundle[DAUTH_SECRET_PIPELINE_CID_KEY] = cid
-    self.bc.sign(bundle, add_data=True, use_digest=True)
-    pointer = dict(job_id=job_id, revision=operation["target_revision"],
+    pointer = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
                    operation_id=operation["operation_id"], coordinator=operation["coordinator"],
                    pipeline_cid=cid, deleted=False)
     self.bc.sign(pointer, add_data=True, use_digest=True)
-    if not self._write_dauth_job_secret_bundle(job_id, bundle):
-      raise RuntimeError("Deployment secret publication is pending.")
-    if not self._write_job_pipeline_cid(job_id, pointer):
-      raise RuntimeError("Deployment metadata publication is pending.")
-    if previous_cid and previous_cid != cid:
-      self._delete_pipeline_cid_from_r1fs(previous_cid)
+    self._deployment_secret_request("commit", operation, pointer=pointer)
 
   def _load_dauth_job_secret_bundle(self, job_id):
     return self.chainstore_hget(

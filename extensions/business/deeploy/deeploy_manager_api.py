@@ -1083,28 +1083,12 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         prepared_deploy_plan=prepared_create_deploy_plan,
       )
-      prior_bundle = self._load_dauth_job_secret_bundle(job_id)
-      prior_pipeline = None
-      if not is_create or isinstance(prior_bundle, dict):
-        prior_pipeline = self.get_job_pipeline_from_cstore(
-          job_id,
-          timeout=30,
-          pin=False,
-          raise_on_error=False,
-          show_logs=False,
-        )
-      prepared_pipeline_configs, complete_secret_bundle = (
-        self._redact_pipeline_configs_and_build_secret_bundle(
-          job_id=job_id,
-          pipeline_configs=prepared_pipeline_configs,
-          prior_bundle=prior_bundle,
-          prior_pipeline=prior_pipeline,
-        )
+      prior_pipeline = None if is_create else self.get_job_pipeline_from_cstore(
+        job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
       )
       return self._admit_prepared_deployment(
         request=request, auth_result=auth_result, app_id=app_id,
-        configs=prepared_pipeline_configs, bundle=complete_secret_bundle,
-        prior_pipeline=prior_pipeline, prior_bundle=prior_bundle,
+        configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
         is_create=is_create,
       )
     except DeploymentConflictError as exc:

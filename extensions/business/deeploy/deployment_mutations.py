@@ -3,17 +3,16 @@ import copy
 import hashlib
 import uuid
 
-from extensions.business.dauth.dauth_registry import dauth_registry_write_kwargs, pipeline_registry_write_kwargs
 from .deeploy_const import DEEPLOY_KEYS
 from .deeploy_mixin import COCKROACHDB_CERT_ENV_KEYS, COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
-from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY
-from .deployment_operations import SECRET_REVISIONS_HKEY, request_digest, required_instances
+from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY
+from .deployment_operations import request_digest, required_instances
 
 
 class _DeploymentMutationsMixin:
   """Prepare mutations from exact persisted placement, never partial discovery."""
 
-  def _mutation_baseline(self, request, owner, require_secrets=True):
+  def _mutation_baseline(self, request, owner):
     """Load and validate the exact current revision and every prior node config.
 
     Parameters
@@ -22,9 +21,11 @@ class _DeploymentMutationsMixin:
       Authorized request with job_id and expected_revision.
     owner : str
       Authenticated escrow owner.
-    require_secrets : bool
-      Require plaintext recovery material for a rollout; deletion needs only the
-      redacted execution plan and its revision reference.
+
+    Notes
+    -----
+    Only public redacted operation plans are loaded. Secret availability is
+    established on dAuth during lifecycle preparation.
     """
     job_id = request.get("job_id")
     if job_id in (None, ""):
@@ -42,23 +43,7 @@ class _DeploymentMutationsMixin:
     nodes = specs.get("current_target_nodes")
     if not isinstance(nodes, list) or not nodes or len(set(nodes)) != len(nodes):
       raise ValueError("The current deployment has no exact recoverable placement.")
-    reference = specs.get("secret_revision")
-    bundle = self.chainstore_hget(SECRET_REVISIONS_HKEY, "{}|{}".format(job_id, reference)) if reference else None
-    configs = bundle.get("pipelines") if isinstance(bundle, dict) else None
-    if not configs and reference:
-      prior = self._operation_records().get(reference.split(":", 1)[0])
-      if prior is not None:
-        plan = self._load_operation_plan(prior)
-        configs = plan["previous_configs"] if reference.endswith(":restore") else plan["configs"]
-    if not configs and not reference:
-      known = self.netmon.network_known_pipelines()
-      configs = {}
-      for node in nodes:
-        matches = [item for item in known.get(node, []) if item.get("NAME") == pipeline["NAME"]
-                   and str(item.get("DEEPLOY_SPECS", {}).get("job_id")) == str(job_id)]
-        if len(matches) != 1:
-          raise ValueError("An exact current node configuration is unavailable.")
-        configs[node] = matches[0]
+    configs = self._previous_deployment_configs(pipeline)
     if not isinstance(configs, dict) or set(configs) != set(nodes):
       raise ValueError("The current revision does not contain the complete placement.")
     expected_shape = [(plugin["SIGNATURE"], len(plugin["INSTANCES"])) for plugin in pipeline["PLUGINS"]]
@@ -70,11 +55,7 @@ class _DeploymentMutationsMixin:
       if (config.get("NAME") != pipeline["NAME"] or str(current_specs.get("job_id")) != str(job_id)
           or current_specs.get("revision", 0) != revision or not required_instances(config)):
         raise ValueError("A persisted node configuration does not match the current revision.")
-    if not isinstance(bundle, dict):
-      bundle = self._load_dauth_job_secret_bundle(job_id)
-    if require_secrets and (not isinstance(bundle, dict) or bundle.get("revoked") or bundle.get("deleted")):
-      raise ValueError("The protected current revision is unavailable on this oracle.")
-    return copy.deepcopy(pipeline), copy.deepcopy(bundle), {node: copy.deepcopy(configs[node]) for node in nodes}
+    return copy.deepcopy(pipeline), {node: copy.deepcopy(configs[node]) for node in nodes}
 
   def _admit_scale_up_operation(self, request, auth_result, new_nodes):
     """Admit a full-placement update, retaining exact prior configs for recovery.
@@ -87,7 +68,7 @@ class _DeploymentMutationsMixin:
     existing = self._find_request_operation(request, owner, "update")
     if existing:
       return self._accepted_operation_response(existing)
-    pipeline, bundle, previous = self._mutation_baseline(request, owner)
+    pipeline, previous = self._mutation_baseline(request, owner)
     if not isinstance(new_nodes, list) or not new_nodes or len(set(new_nodes)) != len(new_nodes) or set(new_nodes) & set(previous):
       raise ValueError("Scale-up requires distinct new nodes outside the current placement.")
     specs = pipeline["DEEPLOY_SPECS"]
@@ -135,14 +116,10 @@ class _DeploymentMutationsMixin:
             # direct credentials which would otherwise remain as unused secrets.
             for key in COCKROACHDB_CERT_ENV_KEYS + COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS:
               instance.get("ENV", {}).pop(key, None)
-    configs, complete = self._redact_pipeline_configs_and_build_secret_bundle(
-      job_id=request["job_id"], pipeline_configs=configs, prior_bundle=bundle,
-      prior_pipeline=pipeline, current_identity_aliases=aliases,
-    )
     return self._admit_prepared_deployment(
       request=request, auth_result=auth_result, app_id=pipeline["NAME"], configs=configs,
-      bundle=complete, prior_pipeline=pipeline, prior_bundle=bundle, is_create=False,
-      mutation="scale_up",
+      prior_pipeline=pipeline, is_create=False,
+      mutation="scale_up", identity_aliases=aliases,
     )
 
   def _admit_owner_transfer_operation(self, job_id, old_owner, new_owner, transfer_id):
@@ -182,14 +159,14 @@ class _DeploymentMutationsMixin:
     if existing:
       return self._accepted_operation_response(existing)
     self._assert_no_active_deployment(job_id=job_id)
-    prior, bundle, configs = self._mutation_baseline(request, current_owner)
+    prior, configs = self._mutation_baseline(request, current_owner)
     for config in configs.values():
       config["OWNER"] = new_owner
       config["DEEPLOY_SPECS"]["date_updated"] = self.time()
       config.pop("DEEPLOY_OPERATION", None)
     return self._admit_prepared_deployment(
       request=request, auth_result={DEEPLOY_KEYS.ESCROW_OWNER: new_owner}, app_id=prior["NAME"],
-      configs=configs, bundle=bundle, prior_pipeline=prior, prior_bundle=bundle, is_create=False,
+      configs=configs, prior_pipeline=prior, is_create=False,
       mutation="owner_transfer", restore_owner=new_owner,
     )
 
@@ -204,7 +181,7 @@ class _DeploymentMutationsMixin:
     details = self.bc.get_job_details(int(request["job_id"]))
     if str(details.get("escrowOwner", "")).lower() != owner.lower():
       raise ValueError("Only the current escrow owner can delete this deployment.")
-    pipeline, _, configs = self._mutation_baseline(request, owner, require_secrets=False)
+    pipeline, configs = self._mutation_baseline(request, owner)
     if request.get("app_id") not in (None, pipeline["NAME"]):
       raise ValueError("app_id does not match the selected job.")
     targets = request.get("target_nodes")
@@ -229,7 +206,7 @@ class _DeploymentMutationsMixin:
       job_id=request["job_id"], app_id=pipeline["NAME"], owner=owner, network=self.evm_network,
       coordinator=self.bc.address, target_revision=revision,
       previous_revision=specs.get("revision", 0), previous_operation_id=reference.split(":", 1)[0] if reference else None,
-      previous_secret_revision=reference, plan_cid=cid, nodes=[], previous_nodes=list(configs),
+      previous_secret_revision=reference, previous_pipeline_cid=plan["canonical_cid"], plan_cid=cid, nodes=[], previous_nodes=list(configs),
       instances={}, previous_instances={node: required_instances(config) for node, config in configs.items()},
       phase="retiring_previous", outcome=None, recovery=None, created_at=now, updated_at=now,
       deadline=now + self.cfg_deployment_readiness_timeout, sequence=0, events=[], sent_at={},
@@ -254,23 +231,7 @@ class _DeploymentMutationsMixin:
     tombstone = dict(job_id=str(operation["job_id"]), deleted=True, pipeline_cid=None,
                      operation_id=operation["operation_id"], revision=operation["target_revision"],
                      coordinator=operation["coordinator"])
-    current = self.chainstore_hget(DEEPLOY_JOBS_CSTORE_HKEY, str(operation["job_id"]))
-    own_tombstone = isinstance(current, dict) and all(current.get(key) == value for key, value in tombstone.items())
-    if current != plan["canonical_record"] and not own_tombstone:
-      raise RuntimeError("Deletion metadata no longer matches the retired revision.")
-    if operation.get("previous_secret_revision"):
-      self._release_unused_secret_revisions(operation, plan, active_attempt=None)
-    secret_tombstone = dict(tombstone, deployment_revision=tombstone["revision"], job_secrets={})
-    secret_tombstone.pop("revision")
-    self.bc.sign(secret_tombstone, add_data=True, use_digest=True)
     self.bc.sign(tombstone, add_data=True, use_digest=True)
-    if not self.chainstore_hset(DAUTH_JOB_SECRETS_CSTORE_HKEY, str(operation["job_id"]),
-                               secret_tombstone,
-                               **dauth_registry_write_kwargs(self)):
-      raise RuntimeError("Deletion secret cleanup is pending.")
-    if not self.chainstore_hset(DEEPLOY_JOBS_CSTORE_HKEY, str(operation["job_id"]), tombstone,
-                               **pipeline_registry_write_kwargs(self)):
-      raise RuntimeError("Deletion metadata cleanup is pending.")
-    self._delete_pipeline_cid_from_r1fs(plan["canonical_cid"])
+    self._deployment_secret_request("delete", operation, pointer=tombstone)
     operation.update(outcome="succeeded", recovery="completed", error=None)
     self._save_operation(operation, "completed", "Pipeline stopped on all nodes and protected metadata removed.")

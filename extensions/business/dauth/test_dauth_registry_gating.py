@@ -470,7 +470,11 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
           result = plugin.process_dauth_add_secrets_request(body)
         elif operation == "get":
           body.update(EE_SENDER="node-runner", EE_ETH_SENDER="0xRUNNER")
+          plugin.chainstore_hsync = Mock(return_value={"hkey": "synced"})
+          plugin._r1fs_data["cid-7"]["DEEPLOY_SPECS"]["job_id"] = "7"
           result = plugin.process_dauth_get_secret_request(body)
+          self.assertEqual([call.kwargs["hkey"] for call in plugin.chainstore_hsync.call_args_list],
+                           [DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY])
         else:
           result = plugin.process_dauth_reveal_secret_request(body)
         self.assertEqual(result["status"], "success")
