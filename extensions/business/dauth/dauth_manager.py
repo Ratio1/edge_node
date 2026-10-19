@@ -28,14 +28,14 @@ from extensions.business.dauth.dauth_mixin import (
   _DauthMixin,
 )
 from extensions.business.dauth.dauth_registry import (
-  DAUTH_JOB_SECRET_GENERATIONS_HKEY,
-  DAUTH_JOB_UPDATES_HKEY,
   dauth_registry_write_kwargs,
   load_dauth_registry_snapshot,
 )
-from extensions.business.dauth.job_updates import _DauthJobUpdatesMixin
 
-__VER__ = '0.4.0'
+from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
+from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
+
+__VER__ = '0.3.1'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -108,7 +108,8 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
-  _DauthJobUpdatesMixin,
+  _DeeployMixin,
+  _DeeployJobMixin,
   _NodeTagsMixin,
   _RequestTrackingMixin,
   ):
@@ -321,13 +322,14 @@ class DauthManagerPlugin(
       return None
 
     self._last_dauth_job_secrets_hsync = now
-    results = {}
-    for hkey in (DAUTH_JOB_SECRETS_CSTORE_HKEY, DAUTH_JOB_SECRET_GENERATIONS_HKEY, DAUTH_JOB_UPDATES_HKEY):
-      try:
-        results[hkey] = self.chainstore_hsync(hkey=hkey, **dauth_registry_write_kwargs(self))
-      except Exception:
-        self.P(f"Could not sync dAuth namespace {hkey}.", color="y")
-    return results
+    try:
+      return self.chainstore_hsync(
+        hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+        **dauth_registry_write_kwargs(self),
+      )
+    except Exception as exc:
+      self.P(f"Could not sync dAuth job secrets: {exc}", color="y")
+    return None
 
   def __get_current_epoch(self):
     """
@@ -432,21 +434,6 @@ class DauthManagerPlugin(
     return response
 
   @BasePlugin.endpoint(method="post")
-  def stage_job_update(self, body: dict):
-    """Stage or settle an update without returning custodied secret material."""
-    nonce = body.get("nonce") if isinstance(body, dict) else None
-    if not self._is_dauth_server_enabled():
-      return self.__get_response({"error": "dAuth server is not registered", "nonce": nonce})
-    try:
-      data = self.process_dauth_job_update(body)
-    except Exception:
-      # Transport/planning exceptions may embed user-supplied values. Neither
-      # logs nor the public response may include those exceptions or the body.
-      self.P("dAuth job update staging operation rejected.", color='r')
-      data = {"error": "dAuth job update staging operation rejected.", "nonce": nonce}
-    return self.__get_response(data)
-
-  @BasePlugin.endpoint(method="post")
   # /add_secrets
   def add_secrets(self, body: dict):
     """
@@ -476,6 +463,21 @@ class DauthManagerPlugin(
       **data
     })
     return response
+
+  @BasePlugin.endpoint(method="post")
+  def reconcile_job_secrets(self, body: dict):
+    """Reconcile hidden secrets for a signed protocol-oracle pipeline update."""
+    nonce = body.get("nonce") if isinstance(body, dict) else None
+    if not self._is_dauth_server_enabled():
+      data = {'error': 'dAuth server is not registered as a dAuth oracle'}
+    else:
+      try:
+        data = self.process_dauth_reconcile_secrets_request(body)
+      except Exception:
+        # New values can be present in the request or dependency exceptions.
+        self.P("dAuth secret reconciliation failed.", color='r')
+        data = {'error': 'dAuth secret reconciliation failed'}
+    return self.__get_response({'nonce': nonce, **data})
 
   @BasePlugin.endpoint(method="post")
   # /get_secrets

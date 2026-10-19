@@ -9,7 +9,6 @@ from collections import deque
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
-from .dauth_updates import _DeeployDauthUpdatesMixin
 
 from .deeploy_mixin import _DeeployMixin
 from .selected_secrets import compile_request_selections
@@ -28,7 +27,7 @@ from .deeploy_const import (
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.7.0'
+__VER__ = '0.6.0'
 
 
 _CONFIG = {
@@ -66,7 +65,6 @@ class DeeployManagerApiPlugin(
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
   _DeeployJobMixin,
-  _DeeployDauthUpdatesMixin,
   _RequestTrackingMixin,
   ):
   """
@@ -1253,15 +1251,12 @@ class DeeployManagerApiPlugin(
           job_id=job_id, secret_bundle=complete_secret_bundle,
         )
       else:
-        prepared_pipeline_configs, staging_state = self._stage_dauth_pipeline_update(
-          request, prepared_pipeline_configs,
+        prepared_pipeline_configs, staging_state = self._reconcile_dauth_job_secrets(
+          job_id, prepared_pipeline_configs,
         )
-        if staging_state.get("phase") == "committed":
-          return self._get_response({
-            DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
-            DEEPLOY_KEYS.APP_ID: app_id,
-            DEEPLOY_KEYS.REQUEST: {DEEPLOY_KEYS.APP_ALIAS: app_alias},
-          })
+      staging_state["retain_on_failed_dispatch"] = bool(
+        is_create and staging_state.get("prior_cid") is None
+      )
       node_plugins_by_addr = prepared_create_deploy_plan.get("node_plugins_by_addr", {})
       for node, pipeline_config in prepared_pipeline_configs.items():
         if node in node_plugins_by_addr:
@@ -1269,10 +1264,6 @@ class DeeployManagerApiPlugin(
             pipeline_config.get(self.ct.CONFIG_STREAM.K_PLUGINS, [])
           )
       pipeline_to_stage = next(iter(prepared_pipeline_configs.values()))
-      staging_state["retain_on_failed_dispatch"] = bool(
-        is_create and staging_state.get("prior_cid") is None
-      )
-
       if delete_existing_after_stage:
         self.delete_pipeline_from_nodes(
           app_id=app_id,
@@ -1480,9 +1471,7 @@ class DeeployManagerApiPlugin(
       now = self.time()
     if (now - pending['start_time']) > pending['timeout']:
       if pending.get('kind') == 'scale_up':
-        self.settle_failed_staged_job_pipeline_and_secrets(
-          pending.get('staging'), "scale-up timeout", dispatch_uncertain=True,
-        )
+        self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
         result = {
           DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
           DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
@@ -1490,8 +1479,6 @@ class DeeployManagerApiPlugin(
           DEEPLOY_KEYS.REQUEST: pending.get('request'),
           DEEPLOY_KEYS.AUTH: pending.get('auth'),
         }
-        if (pending.get('staging') or {}).get("dispatch_uncertain"):
-          result["dispatch_uncertain"] = True
       else:
         self.settle_failed_staged_job_pipeline_and_secrets(
           pending.get('staging'), "timeout", dispatch_uncertain=True
@@ -1610,7 +1597,10 @@ class DeeployManagerApiPlugin(
     """
     job_id = pending.get('job_id')
     is_confirmable_job = pending.get('is_confirmable_job', False)
-    nodes = pending['staging']['target_nodes']
+    nodes = list(
+      cstore_response.get("node") for cstore_response in dct_status.values()
+      if cstore_response.get("node") is not None
+    )
     self.Pd(f"Nodes to confirm: {self.json_dumps(nodes, indent=2)}")
     self._submit_bc_job_confirmation(
       str_status=str_status,
@@ -1622,19 +1612,14 @@ class DeeployManagerApiPlugin(
     if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
       self.commit_staged_job_pipeline_and_secrets(pending.get('staging'))
     else:
-      self.settle_failed_staged_job_pipeline_and_secrets(
-        pending.get('staging'), str_status, dispatch_uncertain=True,
-      )
-    result = {
+      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
+    return {
       DEEPLOY_KEYS.STATUS: str_status,
       DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
       DEEPLOY_KEYS.JOB_ID: job_id,
       DEEPLOY_KEYS.REQUEST: pending.get('request'),
       DEEPLOY_KEYS.AUTH: pending.get('auth'),
     }
-    if (pending.get('staging') or {}).get("dispatch_uncertain"):
-      result["dispatch_uncertain"] = True
-    return result
 
   def finalize_pending_request(
       self, pending, dct_status, str_status,
@@ -1988,7 +1973,7 @@ class DeeployManagerApiPlugin(
     dict
         A dictionary with the result of the operation
     """
-    staging_state = {}
+    staging_state = None
     try:
       self.__ensure_eth_balance()
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="scale up workers")
@@ -2029,16 +2014,8 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         job_id=job_id,
         running_apps_for_job=running_apps_for_job,
-        wait_for_responses=False,
-        wallet_request=request,
-        dispatch_state=staging_state,
+        wait_for_responses=False
       )
-      if staging_state.get("phase") == "committed":
-        return self._get_response({
-          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
-          DEEPLOY_KEYS.JOB_ID: job_id,
-          DEEPLOY_KEYS.AUTH: auth_result,
-        })
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
@@ -2046,10 +2023,10 @@ class DeeployManagerApiPlugin(
       else:
         dct_request = None
       if len(response_keys) == 0:
-        nodes = staging_state['target_nodes']
         self.commit_staged_job_pipeline_and_secrets(staging_state)
         staging_state = None
         if not is_confirmable_job:
+          nodes = list(set(update_nodes + new_nodes))
           self.Pd(f"Nodes to confirm (non-confirmable job): {self.json_dumps(nodes, indent=2)}")
           self._submit_bc_job_confirmation(str_status=DEEPLOY_STATUS.COMMAND_DELIVERED,
                                            dct_status={},
@@ -2086,11 +2063,9 @@ class DeeployManagerApiPlugin(
       return self._register_pending_deploy_request(pending_state)
 
     except Exception as e:
-      if staging_state:
-        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, "scale-up request error")
+      if staging_state is not None:
+        self.rollback_staged_job_pipeline_and_secrets(staging_state)
       result = self.__handle_error(e, request)
-      if (staging_state or {}).get("dispatch_uncertain"):
-        result["dispatch_uncertain"] = True
     #endtry
     
     response = self._get_response({

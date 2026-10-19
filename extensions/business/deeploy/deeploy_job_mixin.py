@@ -1,12 +1,8 @@
-from naeural_core.config.runtime_secret_resolution import contains_dauth_secret_placeholder
-
 from extensions.business.dauth.dauth_registry import (
   DAUTH_SECRET_PIPELINE_CID_KEY,
   dauth_registry_write_kwargs,
   get_dauth_registry_internal_peers,
   pipeline_registry_write_kwargs,
-  load_job_secret_bundle,
-  save_job_secret_generation,
 )
 
 NONCE = 42
@@ -91,8 +87,6 @@ class _DeeployJobMixin:
     extracted_data.pop("SESSION_ID", None)
     extracted_data.pop("LAST_UPDATE_TIME", None)
     extracted_data.pop("plugins", None)
-    for key in ("INITIATOR_ADDR", "INITIATOR_ID", "MODIFIED_BY_ADDR", "MODIFIED_BY_ID", "VALIDATED"):
-      extracted_data.pop(key, None)
 
     return extracted_data
 
@@ -123,23 +117,7 @@ class _DeeployJobMixin:
         return False
 
       sorted_pipeline = self._recursively_sort_pipeline_data(sanitized_pipeline)
-      prior_cid = self._get_pipeline_from_cstore(job_id)
-      if prior_cid:
-        prior = self.get_pipeline_from_r1fs(
-          prior_cid, pin=False, raise_on_error=False, show_logs=False,
-        )
-        if not isinstance(prior, dict):
-          raise ValueError("Cannot replace unavailable persisted pipeline metadata.")
-        prior = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(prior))
-        if prior == sorted_pipeline:
-          return True
-        if contains_dauth_secret_placeholder(prior):
-          raise ValueError("Secret-bearing pipeline changes require dAuth staging.")
-      if contains_dauth_secret_placeholder(sorted_pipeline):
-        raise ValueError("Secret-bearing pipeline metadata requires dAuth staging.")
       cid = self._save_pipeline_to_r1fs(sorted_pipeline)
-      if not cid:
-        return False
 
       self.P(f"Pipeline {job_id} saved to R1FS with CID: {cid}")
 
@@ -158,12 +136,14 @@ class _DeeployJobMixin:
     return result
 
   def _load_dauth_job_secret_bundle(self, job_id):
-    return load_job_secret_bundle(self, job_id)
+    return self.chainstore_hget(
+      hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+      key=str(job_id),
+    )
 
   def _write_dauth_job_secret_bundle(self, job_id, bundle, write_kwargs=None):
     if write_kwargs is None:
       write_kwargs = dauth_registry_write_kwargs(self)
-    save_job_secret_generation(self, job_id, bundle, write_kwargs=write_kwargs)
     return self.chainstore_hset(
       hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
       key=str(job_id),
@@ -181,7 +161,7 @@ class _DeeployJobMixin:
       **write_kwargs,
     )
 
-  def stage_job_pipeline_and_secrets(self, pipeline, job_id, secret_bundle, before_publish=None):
+  def stage_job_pipeline_and_secrets(self, pipeline, job_id, secret_bundle):
     """Stage redacted pipeline metadata and its complete dAuth bundle."""
     if job_id in [None, ""]:
       raise ValueError("Cannot stage Deeploy metadata without job_id.")
@@ -217,10 +197,7 @@ class _DeeployJobMixin:
       "pipeline_write_kwargs": pipeline_write_kwargs,
       "secret_write_kwargs": secret_write_kwargs,
     }
-    if before_publish is not None:
-      before_publish(state)
     try:
-      save_job_secret_generation(self, job_id, prior_bundle, write_kwargs=secret_write_kwargs)
       if not self._write_dauth_job_secret_bundle(
         job_id,
         self.deepcopy(bound_secret_bundle),
@@ -241,11 +218,12 @@ class _DeeployJobMixin:
     return state
 
   def commit_staged_job_pipeline_and_secrets(self, state):
-    """Verify settlement, retaining prior payloads with versioned secret bundles."""
+    """Commit a staged transaction by removing its superseded R1FS object."""
     if not isinstance(state, dict):
       return False
-    if state.get("dauth_update"):
-      return self._settle_dauth_pipeline_update(state, "commit")
+    if state.get("dauth_reconciled"):
+      # dAuth already published; local metadata replication may still be pending.
+      return True
     staged_cid = state.get("staged_cid")
     try:
       current_cid = self._get_pipeline_from_cstore(state.get("job_id"))
@@ -256,11 +234,10 @@ class _DeeployJobMixin:
     if (
       current_cid != staged_cid
       or current_bundle != state.get("staged_bundle")
-      or self.chainstore_hget(hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY, key=str(state.get("job_id"))) != state.get("staged_bundle")
     ):
       return False
     prior_cid = state.get("prior_cid")
-    if prior_cid and prior_cid != staged_cid and not state.get("prior_bundle"):
+    if prior_cid and prior_cid != staged_cid:
       self._delete_pipeline_cid_from_r1fs(prior_cid)
     return True
 
@@ -268,8 +245,10 @@ class _DeeployJobMixin:
     """Restore matching staged state without disturbing a newer deployment."""
     if not isinstance(state, dict):
       return False
-    if state.get("dauth_update"):
-      return self._settle_dauth_pipeline_update(state, "rollback")
+    # Reconciliation publishes on dAuth. Deployment restoration belongs to the
+    # lifecycle flow; this coordinator has neither prior nor current secrets.
+    if state.get("dauth_reconciled"):
+      return False
     job_id = state.get("job_id")
     staged_cid = state.get("staged_cid")
     restored = False
@@ -283,9 +262,7 @@ class _DeeployJobMixin:
         state.get("staged_bundle") if state.get("bundle_staged")
         else state.get("prior_bundle")
       )
-      legacy_bundle = self.chainstore_hget(hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY, key=str(job_id))
-      expected_generation = state.get("staged_bundle") if state.get("pipeline_staged") else state.get("prior_bundle")
-      if current_cid == expected_cid and current_bundle == expected_generation and legacy_bundle == expected_bundle:
+      if current_cid == expected_cid and current_bundle == expected_bundle:
         try:
           pipeline_ok = True
           if state.get("pipeline_staged"):
@@ -314,12 +291,6 @@ class _DeeployJobMixin:
     """Keep a failed new job's secrets while dispatched configs may still need them."""
     if not isinstance(state, dict):
       return False
-    if state.get("dauth_update") and (
-      dispatch_uncertain or state.get("dispatch_uncertain") or state.get("dispatch_attempted")
-    ):
-      state["dispatch_uncertain"] = True
-      self.P(f"Retaining dAuth update generation for job {state.get('job_id')} after uncertain dispatch.", color='y')
-      return True
     if state.get("retain_on_failed_dispatch") and (
       dispatch_uncertain or state.get("dispatch_attempted")
     ):

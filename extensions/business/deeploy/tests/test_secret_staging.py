@@ -57,6 +57,17 @@ class _SecretStagingPlugin(_DeeployMixin, _DeeployJobMixin):
     self.deepcopy = copy.deepcopy
     self.cfg_deeploy_verbose = 0
 
+  def _reconcile_dauth_job_secrets(self, job_id, pipeline_configs, current_identity_aliases=None):
+    # Simulate the dAuth boundary for these existing secret-selection fixtures.
+    configs, bundle = self._redact_pipeline_configs_and_build_secret_bundle(
+      job_id, pipeline_configs, self._load_dauth_job_secret_bundle(job_id),
+      prior_pipeline=self.get_job_base_pipeline_from_r1fs(job_id),
+      current_identity_aliases=current_identity_aliases,
+    )
+    return configs, self.stage_job_pipeline_and_secrets(
+      next(iter(configs.values())), job_id, bundle,
+    )
+
   def chainstore_hget(self, hkey, key):
     return copy.deepcopy(self.store.get((hkey, str(key))))
 
@@ -147,7 +158,7 @@ class DeeploySecretBundleTests(unittest.TestCase):
         prior_pipeline=_pipeline(),
       )
 
-  def test_reconstruction_follows_instance_identity_after_reordering(self):
+  def test_reconstruction_rejects_prior_value_after_instance_reordering(self):
     prior_pipeline = _pipeline()
     prior_pipeline["PLUGINS"][0]["INSTANCES"].append({
       "INSTANCE_ID": "other",
@@ -165,12 +176,14 @@ class DeeploySecretBundleTests(unittest.TestCase):
       },
     }
 
-    bundle = self.plugin._build_complete_dauth_job_secret_bundle(
-      7, current_pipeline, {}, prior_bundle, prior_pipeline=prior_pipeline,
-    )
-    instances = bundle["job_secrets"]["PLUGINS"][0]["INSTANCES"]
-    self.assertEqual(instances[0]["ENV"]["CF_TUNNEL_TOKEN"], "other-token")
-    self.assertEqual(instances[1]["ENV"]["CF_TUNNEL_TOKEN"], "prior-token")
+    with self.assertRaisesRegex(ValueError, "CF_TUNNEL_TOKEN"):
+      self.plugin._build_complete_dauth_job_secret_bundle(
+        7,
+        current_pipeline,
+        {},
+        prior_bundle,
+        prior_pipeline=prior_pipeline,
+      )
 
   def test_scale_up_reuses_prior_secret_for_generated_instance_identity(self):
     base_pipeline = _pipeline()
@@ -193,8 +206,8 @@ class DeeploySecretBundleTests(unittest.TestCase):
       return {"new-node": {}}, {}, {}
 
     self.plugin.prepare_create_update_pipelines = prepare_create_update_pipelines
-    self.plugin._build_scale_up_pipeline_configs = (
-      lambda pipelines, owner: {"new-node": copy.deepcopy(generated_pipeline)}
+    self.plugin._build_scale_up_create_pipeline_configs = (
+      lambda create_pipelines, owner: {"new-node": copy.deepcopy(generated_pipeline)}
     )
 
     def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
@@ -203,13 +216,6 @@ class DeeploySecretBundleTests(unittest.TestCase):
       return {"job_id": str(job_id), "staged_cid": "staged-cid"}
 
     self.plugin.stage_job_pipeline_and_secrets = stage_job_pipeline_and_secrets
-    def stage_dauth(wallet_request, configs, **kwargs):
-      redacted, bundle = self.plugin._redact_pipeline_configs_and_build_secret_bundle(
-        7, configs, self.plugin._load_dauth_job_secret_bundle(7), prior_pipeline=base_pipeline,
-        current_identity_aliases=kwargs['current_identity_aliases'],
-      )
-      return redacted, stage_job_pipeline_and_secrets(next(iter(redacted.values())), 7, bundle)
-    self.plugin._stage_dauth_pipeline_update = stage_dauth
     self.plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
     self.plugin._start_create_update_pipelines = lambda **kwargs: captured.update(
       dispatched=copy.deepcopy(kwargs["prepared_create_configs"])
@@ -222,7 +228,6 @@ class DeeploySecretBundleTests(unittest.TestCase):
       owner="owner",
       running_apps_for_job={},
       wait_for_responses=False,
-      wallet_request={"job_id": 7},
     )
 
     staged_instance = captured["pipeline"]["PLUGINS"][0]["INSTANCES"][0]
@@ -247,10 +252,9 @@ class DeeploySecretStagingTests(unittest.TestCase):
     state = self.plugin.stage_job_pipeline_and_secrets(_pipeline(), 7, self.bundle)
 
     self.assertEqual(state["prior_cid"], "prior-cid")
-    self.assertEqual([event[0] for event in self.plugin.events[:4]], ["r1fs_add", "hset", "hset", "hset"])
-    self.assertEqual(self.plugin.events[1][1], "DAUTH_JOB_SECRET_GENERATIONS")
-    secret_write = self.plugin.events[2]
-    pipeline_write = self.plugin.events[3]
+    self.assertEqual([event[0] for event in self.plugin.events[:3]], ["r1fs_add", "hset", "hset"])
+    secret_write = self.plugin.events[1]
+    pipeline_write = self.plugin.events[2]
     self.assertEqual(pipeline_write[1], DEEPLOY_JOBS_CSTORE_HKEY)
     self.assertEqual(pipeline_write[4]["extra_peers"], ["dauth-a", "dauth-b"])
     self.assertTrue(pipeline_write[4]["include_default_peers"])
@@ -260,10 +264,10 @@ class DeeploySecretStagingTests(unittest.TestCase):
     self.assertFalse(secret_write[4]["include_default_peers"])
     self.assertFalse(secret_write[4]["include_configured_peers"])
 
-  def test_commit_retains_prior_cid_for_secret_generation_recovery(self):
+  def test_commit_deletes_prior_cid_only_while_stage_is_current(self):
     state = self.plugin.stage_job_pipeline_and_secrets(_pipeline(), 7, self.bundle)
     self.assertTrue(self.plugin.commit_staged_job_pipeline_and_secrets(state))
-    self.assertNotIn(("r1fs_delete", "prior-cid", {
+    self.assertIn(("r1fs_delete", "prior-cid", {
       "show_logs": False,
       "raise_on_error": False,
     }), self.plugin.events)

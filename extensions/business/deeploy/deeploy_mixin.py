@@ -1130,6 +1130,27 @@ class _DeeployMixin:
     )
     return redacted_configs, bundle
 
+  def _reconcile_dauth_job_secrets(self, job_id, pipeline_configs, current_identity_aliases=None):
+    """Reconcile on dAuth without loading secret bundles on this coordinator."""
+    result = self.bc.reconcile_dauth_job_secrets({
+      "job_id": str(job_id),
+      "expected_pipeline_cid": self._get_pipeline_from_cstore(job_id),
+      "pipeline_configs": pipeline_configs,
+      "identity_aliases": [
+        [list(current), list(source)]
+        for current, source in (current_identity_aliases or {}).items()
+      ],
+    })
+    configs = result["pipeline_configs"]
+    for config in configs.values():
+      _, secrets = self._extract_and_redact_deeploy_dauth_secrets(config)
+      if secrets is not None:
+        raise ValueError("dAuth returned pipeline configs containing secret values.")
+    return configs, {
+      "job_id": str(job_id), "staged_cid": result["pipeline_cid"],
+      "dauth_reconciled": True,
+    }
+
   def __update_pipeline_on_nodes(
     self,
     nodes,
@@ -4992,7 +5013,7 @@ class _DeeployMixin:
     prior_pipeline=None,
     current_identity_aliases=None,
   ):
-    """Reconstruct placeholders using unchanged relative paths and instance identities."""
+    """Reconstruct the complete current bundle from exact placeholder paths."""
     prior_job_secrets = {}
     if isinstance(prior_bundle, dict):
       candidate = prior_bundle.get("job_secrets")
@@ -5006,16 +5027,12 @@ class _DeeployMixin:
     for path in self._iter_deeploy_dauth_placeholder_paths(redacted_pipeline):
       found, value = self._get_dauth_secret_fragment_value(new_job_secrets, path)
       if not found:
-        prior_path = self._prior_dauth_secret_path(
-          path, redacted_pipeline, prior_pipeline, current_identity_aliases=current_identity_aliases,
-        )
-        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, prior_path or path)
+        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, path)
         if found and not self._same_dauth_secret_path_identity(
           path,
           redacted_pipeline,
           prior_pipeline,
           current_identity_aliases=current_identity_aliases,
-          prior_path=prior_path,
         ):
           found = False
       if (
@@ -5038,24 +5055,6 @@ class _DeeployMixin:
       "job_id": str(job_id),
       "job_secrets": complete,
     }
-
-  def _prior_dauth_secret_path(self, path, pipeline, prior_pipeline, current_identity_aliases=None):
-    """Follow an unchanged logical instance when plugin arrays are reordered."""
-    identity = self._dauth_secret_path_identity(pipeline, path)
-    identity = (current_identity_aliases or {}).get(identity, identity)
-    if identity is None or identity[1] is None or not isinstance(prior_pipeline, dict):
-      return None
-    matches = []
-    for plugin_index, plugin in enumerate(prior_pipeline.get("PLUGINS", prior_pipeline.get("plugins", []))):
-      if str(plugin.get("SIGNATURE", plugin.get("signature", ""))).upper() != identity[0]:
-        continue
-      for instance_index, instance in enumerate(plugin.get("INSTANCES", plugin.get("instances", []))):
-        if str(instance.get("INSTANCE_ID", instance.get("instance_id", ""))) == identity[1]:
-          pos = path.index("INSTANCES")
-          matches.append(["PLUGINS", plugin_index, "INSTANCES", instance_index] + path[pos + 2:])
-    if len(matches) > 1:
-      raise ValueError("Ambiguous prior dAuth secret instance identity.")
-    return matches[0] if matches else None
 
   def _dauth_secret_path_identity(self, pipeline, path):
     """Return the plugin identity owning a secret path."""
@@ -5106,10 +5105,9 @@ class _DeeployMixin:
     pipeline,
     prior_pipeline,
     current_identity_aliases=None,
-    prior_path=None,
   ):
     current_identity = self._dauth_secret_path_identity(pipeline, path)
-    prior_identity = self._dauth_secret_path_identity(prior_pipeline, prior_path or path)
+    prior_identity = self._dauth_secret_path_identity(prior_pipeline, path)
     if isinstance(current_identity_aliases, dict):
       current_identity = current_identity_aliases.get(
         current_identity,
@@ -5117,7 +5115,7 @@ class _DeeployMixin:
       )
     return (
       current_identity is not None and current_identity == prior_identity
-      and same_dynamic_structure(path, pipeline, prior_pipeline, prior_path=prior_path)
+      and same_dynamic_structure(path, pipeline, prior_pipeline)
     )
 
   def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):
@@ -6050,16 +6048,11 @@ class _DeeployMixin:
 
     return dct_status, str_status, response_keys, pipeline_to_persist
 
-  def scale_up_job(
-    self, new_nodes, update_nodes, job_id, owner, running_apps_for_job,
-    wait_for_responses=True, wallet_request=None, dispatch_state=None,
-  ):
+  def scale_up_job(self, new_nodes, update_nodes, job_id, owner, running_apps_for_job, wait_for_responses=True):
     """
     Scale up the job workers.
     """
 
-    if not isinstance(wallet_request, dict):
-      raise ValueError("Signed wallet request is required for scale-up staging.")
     base_pipeline = self.get_job_base_pipeline_from_r1fs(
       job_id,
       owner=owner,
@@ -6076,23 +6069,19 @@ class _DeeployMixin:
                                               generated_instance_identity_aliases
                                             )))
 
-    prepared_configs = self._build_scale_up_pipeline_configs(
-      pipelines={**create_pipelines, **update_pipelines},
+    prepared_create_configs = self._build_scale_up_create_pipeline_configs(
+      create_pipelines=create_pipelines,
       owner=owner,
     )
-    prepared_configs, staging_state = self._stage_dauth_pipeline_update(
-      wallet_request, prepared_configs, request_type="scale up workers",
-      new_nodes=new_nodes, current_identity_aliases=generated_instance_identity_aliases,
+    prepared_create_configs, staging_state = self._reconcile_dauth_job_secrets(
+      job_id, prepared_create_configs,
+      current_identity_aliases=generated_instance_identity_aliases,
     )
-    if dispatch_state is not None:
-      dispatch_state.update(staging_state)
-      staging_state = dispatch_state
-    if staging_state.get("phase") == "committed":
-      return {}, DEEPLOY_STATUS.SUCCESS, {}, staging_state
     for node, pipeline in update_pipelines.items():
-      pipeline["plugins"] = self.deepcopy(prepared_configs[node]["PLUGINS"])
-    prepared_create_configs = {node: prepared_configs[node] for node in new_nodes}
-
+      redacted_plugins, _ = self._extract_and_redact_deeploy_dauth_secrets(
+        pipeline.get("plugins", [])
+      )
+      pipeline["plugins"] = redacted_plugins
     self.P(f"Prepared create pipelines: {self.json_dumps(self._redact_per_node_config_for_log(create_pipelines))}")
     self.P(f"Prepared update pipelines: {self.json_dumps(self._redact_per_node_config_for_log(update_pipelines))}")
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
@@ -6109,10 +6098,9 @@ class _DeeployMixin:
         update_pipelines=update_pipelines,
         owner=owner,
         prepared_create_configs=prepared_create_configs,
-        dispatch_state=staging_state,
       )
     except Exception:
-      self.settle_failed_staged_job_pipeline_and_secrets(staging_state, "scale-up dispatch error")
+      self.rollback_staged_job_pipeline_and_secrets(staging_state)
       raise
 
     if wait_for_responses:
@@ -6630,7 +6618,6 @@ class _DeeployMixin:
           running_plugin_instances = plugins.get(plugin_signature, [])
           
           for i, instance in enumerate(plugin_instances):
-            source_instance_id = instance.get(self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID)
             instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
             instance["PER_NODE_TARGET_NODES"] = self.deepcopy(chainstore_peers)
             
@@ -6656,10 +6643,6 @@ class _DeeployMixin:
               instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
               instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
             
-            if isinstance(generated_instance_identity_aliases, dict) and source_instance_id not in [None, ""]:
-              generated_instance_identity_aliases[(str(plugin_signature).upper(), str(instance_id))] = (
-                str(plugin_signature).upper(), str(source_instance_id),
-              )
             chainstore_response_keys[node].append(chainstore_response_key)
 
     normalized_existing_map = self._normalize_chainstore_response_mapping(
@@ -6704,9 +6687,9 @@ class _DeeployMixin:
 
     return create_pipelines, update_pipelines, prepared_response_keys
 
-  def _build_scale_up_pipeline_configs(self, pipelines, owner):
+  def _build_scale_up_create_pipeline_configs(self, create_pipelines, owner):
     configs = {}
-    for node, pipeline in pipelines.items():
+    for node, pipeline in create_pipelines.items():
       pipeline_params = pipeline.get('pipeline_params', {})
       if not isinstance(pipeline_params, dict):
         pipeline_params = {}
@@ -6726,7 +6709,7 @@ class _DeeployMixin:
         **pipeline_kwargs,
       )
     if not configs:
-      raise ValueError("Scale-up did not produce a pipeline config.")
+      raise ValueError("Scale-up did not produce a new-node pipeline config.")
     return configs
 
   def _start_create_update_pipelines(
@@ -6735,27 +6718,22 @@ class _DeeployMixin:
     update_pipelines,
     owner,
     prepared_create_configs=None,
-    dispatch_state=None,
   ):
     """
     Start the create and update pipelines.
     """
     if prepared_create_configs is None:
-      prepared_create_configs = self._build_scale_up_pipeline_configs(
+      prepared_create_configs = self._build_scale_up_create_pipeline_configs(
         create_pipelines,
         owner,
       )
     for node, pipeline_config in prepared_create_configs.items():
-      if dispatch_state is not None:
-        dispatch_state["dispatch_attempted"] = True
       dispatch_pipeline_config(self, node, self.deepcopy(pipeline_config))
     for node, pipeline in update_pipelines.items():
       # For update pipelines, we need to iterate through the plugins and instances
       for plugin in pipeline['plugins']:
         plugin_signature = plugin['SIGNATURE']
         for instance in plugin['INSTANCES']:
-          if dispatch_state is not None:
-            dispatch_state["dispatch_attempted"] = True
           self.cmdapi_update_instance_config(
             pipeline=pipeline['app_id'],
             signature=plugin_signature,
@@ -6781,7 +6759,7 @@ class _DeeployMixin:
     """
     try:
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-        if (str_status == DEEPLOY_STATUS.SUCCESS and dct_status is not None) or not is_confirmable_job:
+        if (dct_status is not None and is_confirmable_job and len(nodes) == len(dct_status)) or not is_confirmable_job:
           eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in nodes]
           eth_nodes = sorted(eth_nodes)
           self.bc.submit_node_update(

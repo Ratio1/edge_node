@@ -17,8 +17,6 @@ plugin to provide a complete decentralized authentication solution.
 from .dauth_registry import (
   DAUTH_SECRET_PIPELINE_CID_KEY,
   dauth_registry_write_kwargs,
-  load_job_secret_bundle,
-  save_job_secret_generation,
 )
 from ratio1.const.base import dAuth
 
@@ -176,7 +174,7 @@ class _DauthMixin(object):
         )
     return result, msg
 
-  def _verify_signed_dauth_body(self, body):
+  def _verify_signed_dauth_body(self, body, log_hash_sign_fails=True):
     if not isinstance(body, dict):
       raise ValueError("Invalid request body.")
 
@@ -192,7 +190,9 @@ class _DauthMixin(object):
     if requester_eth.lower() != requester_send_eth.lower():
       raise ValueError("Sender ETH address and recovered ETH address do not match.")
 
-    verify_data = self.bc.verify(body, return_full_info=True)
+    verify_data = self.bc.verify(
+      body, return_full_info=True, log_hash_sign_fails=log_hash_sign_fails,
+    )
     if not verify_data.valid:
       raise ValueError("Invalid request signature: {}".format(verify_data.message))
 
@@ -237,7 +237,6 @@ class _DauthMixin(object):
     }
 
   def _save_dauth_job_secret_bundle(self, job_id, secret_bundle):
-    save_job_secret_generation(self, job_id, secret_bundle)
     result = self.chainstore_hset(
       hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
       key=job_id,
@@ -249,7 +248,10 @@ class _DauthMixin(object):
     return result
 
   def _load_dauth_job_secret_bundle(self, job_id):
-    return load_job_secret_bundle(self, job_id)
+    return self.chainstore_hget(
+      hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+      key=job_id,
+    )
 
   def _load_dauth_job_pipeline_record(self, job_id):
     cid = self.chainstore_hget(
@@ -465,6 +467,53 @@ class _DauthMixin(object):
       "status": "success",
       "job_id": job_id,
       self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
+    }
+
+  def process_dauth_reconcile_secrets_request(self, body):
+    """Merge and store secrets locally; return only redacted configs and CID."""
+    _, requester_eth = self._verify_signed_dauth_body(body, log_hash_sign_fails=False)
+    nonce = self._validate_dauth_secret_request_nonce(body)
+    if not self._is_protocol_oracle_eth(requester_eth):
+      raise ValueError("Secret reconciliation requires a protocol oracle.")
+    job_id = self._normalize_dauth_job_id(body.get("job_id"))
+    pipeline_cid, prior_pipeline = self._load_dauth_job_pipeline_record(job_id)
+    if (
+      not pipeline_cid or not isinstance(prior_pipeline, dict)
+      or pipeline_cid != body.get("expected_pipeline_cid")
+    ):
+      raise ValueError("Persisted pipeline changed or is unavailable.")
+    configs = body.get("pipeline_configs")
+    if not isinstance(configs, dict) or not configs:
+      raise ValueError("Target pipeline configs are required.")
+    for config in configs.values():
+      if (
+        not isinstance(config, dict)
+        or str(config.get("DEEPLOY_SPECS", {}).get("job_id")) != job_id
+        or config.get("NAME") != prior_pipeline.get("NAME")
+        or str(config.get("OWNER", "")).lower() != str(prior_pipeline.get("OWNER", "")).lower()
+      ):
+        raise ValueError("Pipeline job identity does not match persisted metadata.")
+    aliases = {}
+    for current, source in body.get("identity_aliases", []):
+      if len(current) != 2 or len(source) != 2:
+        raise ValueError("Invalid scale-up identity alias.")
+      aliases[tuple(current)] = tuple(source)
+    prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+    if prior_bundle is not None:
+      prior_bundle = self._load_current_dauth_secret_bundle(job_id, pipeline_cid, prior_pipeline)
+    configs, bundle = self._redact_pipeline_configs_and_build_secret_bundle(
+      job_id, configs, prior_bundle, prior_pipeline=prior_pipeline,
+      current_identity_aliases=aliases,
+    )
+    if self._get_pipeline_from_cstore(job_id) != pipeline_cid:
+      raise ValueError("Persisted pipeline changed during secret reconciliation.")
+    state = self.stage_job_pipeline_and_secrets(
+      pipeline=next(iter(configs.values())), job_id=job_id, secret_bundle=bundle,
+    )
+    return {
+      "status": "success", "job_id": job_id,
+      self.const.BASE_CT.dAuth.DAUTH_NONCE: nonce,
+      "pipeline_configs": configs, "pipeline_cid": state["staged_cid"],
     }
 
   def process_dauth_get_secret_request(self, body):
