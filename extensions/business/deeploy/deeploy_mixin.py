@@ -4992,7 +4992,7 @@ class _DeeployMixin:
     prior_pipeline=None,
     current_identity_aliases=None,
   ):
-    """Reconstruct the complete current bundle from exact placeholder paths."""
+    """Reconstruct placeholders using unchanged relative paths and instance identities."""
     prior_job_secrets = {}
     if isinstance(prior_bundle, dict):
       candidate = prior_bundle.get("job_secrets")
@@ -5006,12 +5006,14 @@ class _DeeployMixin:
     for path in self._iter_deeploy_dauth_placeholder_paths(redacted_pipeline):
       found, value = self._get_dauth_secret_fragment_value(new_job_secrets, path)
       if not found:
-        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, path)
+        prior_path = self._prior_dauth_secret_path(path, redacted_pipeline, prior_pipeline)
+        found, value = self._get_dauth_secret_fragment_value(prior_job_secrets, prior_path or path)
         if found and not self._same_dauth_secret_path_identity(
           path,
           redacted_pipeline,
           prior_pipeline,
           current_identity_aliases=current_identity_aliases,
+          prior_path=prior_path,
         ):
           found = False
       if (
@@ -5034,6 +5036,23 @@ class _DeeployMixin:
       "job_id": str(job_id),
       "job_secrets": complete,
     }
+
+  def _prior_dauth_secret_path(self, path, pipeline, prior_pipeline):
+    """Follow an unchanged logical instance when plugin arrays are reordered."""
+    identity = self._dauth_secret_path_identity(pipeline, path)
+    if identity is None or identity[1] is None or not isinstance(prior_pipeline, dict):
+      return None
+    matches = []
+    for plugin_index, plugin in enumerate(prior_pipeline.get("PLUGINS", prior_pipeline.get("plugins", []))):
+      if str(plugin.get("SIGNATURE", plugin.get("signature", ""))).upper() != identity[0]:
+        continue
+      for instance_index, instance in enumerate(plugin.get("INSTANCES", plugin.get("instances", []))):
+        if str(instance.get("INSTANCE_ID", instance.get("instance_id", ""))) == identity[1]:
+          pos = path.index("INSTANCES")
+          matches.append(["PLUGINS", plugin_index, "INSTANCES", instance_index] + path[pos + 2:])
+    if len(matches) > 1:
+      raise ValueError("Ambiguous prior dAuth secret instance identity.")
+    return matches[0] if matches else None
 
   def _dauth_secret_path_identity(self, pipeline, path):
     """Return the plugin identity owning a secret path."""
@@ -5084,9 +5103,10 @@ class _DeeployMixin:
     pipeline,
     prior_pipeline,
     current_identity_aliases=None,
+    prior_path=None,
   ):
     current_identity = self._dauth_secret_path_identity(pipeline, path)
-    prior_identity = self._dauth_secret_path_identity(prior_pipeline, path)
+    prior_identity = self._dauth_secret_path_identity(prior_pipeline, prior_path or path)
     if isinstance(current_identity_aliases, dict):
       current_identity = current_identity_aliases.get(
         current_identity,
@@ -5094,7 +5114,7 @@ class _DeeployMixin:
       )
     return (
       current_identity is not None and current_identity == prior_identity
-      and same_dynamic_structure(path, pipeline, prior_pipeline)
+      and same_dynamic_structure(path, pipeline, prior_pipeline, prior_path=prior_path)
     )
 
   def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):

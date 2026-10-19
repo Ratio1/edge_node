@@ -147,7 +147,7 @@ class DeeploySecretBundleTests(unittest.TestCase):
         prior_pipeline=_pipeline(),
       )
 
-  def test_reconstruction_rejects_prior_value_after_instance_reordering(self):
+  def test_reconstruction_follows_instance_identity_after_reordering(self):
     prior_pipeline = _pipeline()
     prior_pipeline["PLUGINS"][0]["INSTANCES"].append({
       "INSTANCE_ID": "other",
@@ -165,14 +165,12 @@ class DeeploySecretBundleTests(unittest.TestCase):
       },
     }
 
-    with self.assertRaisesRegex(ValueError, "CF_TUNNEL_TOKEN"):
-      self.plugin._build_complete_dauth_job_secret_bundle(
-        7,
-        current_pipeline,
-        {},
-        prior_bundle,
-        prior_pipeline=prior_pipeline,
-      )
+    bundle = self.plugin._build_complete_dauth_job_secret_bundle(
+      7, current_pipeline, {}, prior_bundle, prior_pipeline=prior_pipeline,
+    )
+    instances = bundle["job_secrets"]["PLUGINS"][0]["INSTANCES"]
+    self.assertEqual(instances[0]["ENV"]["CF_TUNNEL_TOKEN"], "other-token")
+    self.assertEqual(instances[1]["ENV"]["CF_TUNNEL_TOKEN"], "prior-token")
 
   def test_scale_up_reuses_prior_secret_for_generated_instance_identity(self):
     base_pipeline = _pipeline()
@@ -241,9 +239,10 @@ class DeeploySecretStagingTests(unittest.TestCase):
     state = self.plugin.stage_job_pipeline_and_secrets(_pipeline(), 7, self.bundle)
 
     self.assertEqual(state["prior_cid"], "prior-cid")
-    self.assertEqual([event[0] for event in self.plugin.events[:3]], ["r1fs_add", "hset", "hset"])
-    secret_write = self.plugin.events[1]
-    pipeline_write = self.plugin.events[2]
+    self.assertEqual([event[0] for event in self.plugin.events[:4]], ["r1fs_add", "hset", "hset", "hset"])
+    self.assertEqual(self.plugin.events[1][1], "DAUTH_JOB_SECRET_GENERATIONS")
+    secret_write = self.plugin.events[2]
+    pipeline_write = self.plugin.events[3]
     self.assertEqual(pipeline_write[1], DEEPLOY_JOBS_CSTORE_HKEY)
     self.assertEqual(pipeline_write[4]["extra_peers"], ["dauth-a", "dauth-b"])
     self.assertTrue(pipeline_write[4]["include_default_peers"])
@@ -253,10 +252,10 @@ class DeeploySecretStagingTests(unittest.TestCase):
     self.assertFalse(secret_write[4]["include_default_peers"])
     self.assertFalse(secret_write[4]["include_configured_peers"])
 
-  def test_commit_deletes_prior_cid_only_while_stage_is_current(self):
+  def test_commit_retains_prior_cid_for_secret_generation_recovery(self):
     state = self.plugin.stage_job_pipeline_and_secrets(_pipeline(), 7, self.bundle)
     self.assertTrue(self.plugin.commit_staged_job_pipeline_and_secrets(state))
-    self.assertIn(("r1fs_delete", "prior-cid", {
+    self.assertNotIn(("r1fs_delete", "prior-cid", {
       "show_logs": False,
       "raise_on_error": False,
     }), self.plugin.events)

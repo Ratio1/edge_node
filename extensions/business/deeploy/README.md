@@ -45,7 +45,8 @@ is required.
 - An explicit list replaces conditional selections. `[]` removes all conditional
   selections only when retained hidden variables have replacement plaintext.
   Removing a variable entirely is allowed.
-- An unchanged placeholder reuses only the same path owned by the same instance.
+- An unchanged placeholder reuses the same relative path owned by the same plugin
+  signature and instance ID, even when plugin or instance arrays are reordered.
   Missing prior values fail closed before deployment changes.
 - Dynamic placeholder reuse additionally requires the entire expression's
   structure, order, types, sources, and runtime references to match. After any
@@ -55,6 +56,88 @@ is required.
 - Logs mask all ENV and DYNAMIC_ENV values, even for invalid requests and innocuous
   variable names. Successful full-request responses redact only effective selected
   and mandatory secret values.
+
+## Updates Through Non-dAuth Protocol Oracles
+
+`update_pipeline` keeps the receiving Deeploy protocol oracle as coordinator.
+It sends the unchanged wallet request and its prepared per-node configs to
+dAuth's signed `POST /stage_job_update` endpoint. Existing hidden values are
+reconstructed only on dAuth; the coordinator receives redacted configs and a
+signed receipt, never the previous plaintext bundle or rollback material.
+Newly supplied values necessarily arrive in the original wallet request.
+
+This follows the existing signed `add_secrets` trust boundary: the prepared
+plan is the responsibility of a trusted protocol oracle. dAuth independently
+checks the node signature, current protocol-oracle membership, a transport
+nonce no older than 120 seconds, the original Deeploy wallet signature and
+nonce policy, active escrow, deployment permission (bit 1), persisted app/owner,
+on-chain job owner, previous CID, and the plan's deployment identity/targets.
+It does not independently regenerate the coordinator's transformed plan.
+Updating does not require view-secrets permission (bit 16). Arbitrary workers
+cannot use this endpoint as coordinators.
+
+The `stage`, `commit`, and `rollback` actions share this endpoint. Stage returns
+`pipeline_configs` and a `receipt` identifying the coordinator, operation, job,
+app, owner, previous/staged CIDs, plan digest and phase. Settlement submits that
+receipt in a fresh node-signed body. Operation IDs bind the coordinator to the
+exact signed wallet request; changing the prepared envelope under the same
+operation is rejected. Endpoint failures intentionally omit exception details
+because planning and transport errors can contain credentials.
+
+dAuth retains immutable `DAUTH_JOB_SECRET_GENERATIONS` entries keyed by
+`job_id:pipeline_cid`, and a private `DAUTH_JOB_UPDATES` operation journal. Both
+replicate exclusively to registered dAuth peers, like `DAUTH_JOB_SECRETS`.
+Readers select the generation matching `DEEPLOY_DEPLOYED_JOBS`, with legacy
+fallback for jobs not yet versioned. The legacy per-job bundle is maintained
+for compatibility. Earlier bundles and their R1FS payloads are retained for
+rollback; there is no automatic pruning protocol.
+
+Bookkeeping-only persistence drops `INITIATOR_ADDR`, `INITIATOR_ID`,
+`MODIFIED_BY_ADDR`, `MODIFIED_BY_ID`, and `VALIDATED`, in addition to existing
+transient fields. Equal canonical configs keep their existing CID. A changed
+config containing hidden values, or replacing one that does, must use staging;
+the metadata writer refuses to publish a new unbound generation.
+
+### Failure and Recovery Contract
+
+The client retries one transport failure with the same prepared envelope and a
+fresh transport nonce. Stage resumes an interrupted journaled operation, and
+commit/rollback are idempotent, including after a terminal journal write fails.
+An old staged operation cannot be replayed once another CID is published.
+No worker is dispatched until a valid dAuth receipt is received. Once any
+dispatch was attempted, failure retains the staged generation because workers
+may already be using it. Inspect those workers before deciding on recovery.
+
+Automatic retry is limited to the exact prepared envelope within that RPC.
+A top-level API retry or coordinator restart can generate different timestamps,
+credentials or response keys, and is deliberately rejected for the same signed
+wallet request. To recover, inspect the published CID, target workers and the
+private operation journal on dAuth. If the original prepared envelope/receipt
+is available, retry stage/settlement with fresh node transport authentication.
+Otherwise, reconcile the running workers and submit a newly signed wallet
+update with a fresh nonce; do not infer that a timeout rolled the operation back.
+Rollback is appropriate only before dispatch, or after separately ensuring no
+worker can use the staged configuration.
+
+ChainStore has no compare-and-swap or distributed lock. Generation checks avoid
+known stale settlements but do not serialize concurrent writers across separate
+oracles. Serialize updates per job operationally. This endpoint does not change
+the separate `scale_up_job_workers` or autonomous replication flows, whose
+secret reconstruction still requires a dAuth-capable coordinator.
+
+### Rollout and Rollback
+
+Deploy the new dAuth endpoint and generation-aware readers to **all dAuth
+servers first**, then update Deeploy coordinators. Mixed old dAuth servers fail
+closed; there is no fallback that reveals secrets to a non-dAuth coordinator.
+Existing wallet request formats and scalar secret paths remain compatible;
+no Core or SDK protocol change is required.
+
+For rollback, pause updates and drain/reconcile staged operations first. Retain
+generation records, journals, legacy bundles and their R1FS payloads. Restore an
+older coordinator only where the legacy bundle matches the published CID and
+the coordinator has the required dAuth data. Rolling back binaries alone cannot
+reconcile an uncertain dispatch or concurrent update.
 
 ## Verification
 

@@ -9,6 +9,7 @@ from collections import deque
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
+from .dauth_updates import _DeeployDauthUpdatesMixin
 
 from .deeploy_mixin import _DeeployMixin
 from .selected_secrets import compile_request_selections
@@ -27,7 +28,7 @@ from .deeploy_const import (
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.6.0'
+__VER__ = '0.7.0'
 
 
 _CONFIG = {
@@ -65,6 +66,7 @@ class DeeployManagerApiPlugin(
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
   _DeeployJobMixin,
+  _DeeployDauthUpdatesMixin,
   _RequestTrackingMixin,
   ):
   """
@@ -1233,24 +1235,33 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         prepared_deploy_plan=prepared_create_deploy_plan,
       )
-      prior_bundle = self._load_dauth_job_secret_bundle(job_id)
-      prior_pipeline = None
-      if not is_create or isinstance(prior_bundle, dict):
-        prior_pipeline = self.get_job_pipeline_from_cstore(
-          job_id,
-          timeout=30,
-          pin=False,
-          raise_on_error=False,
-          show_logs=False,
+      if is_create:
+        prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+        prior_pipeline = None
+        if isinstance(prior_bundle, dict):
+          prior_pipeline = self.get_job_pipeline_from_cstore(
+            job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
+          )
+        prepared_pipeline_configs, complete_secret_bundle = (
+          self._redact_pipeline_configs_and_build_secret_bundle(
+            job_id=job_id, pipeline_configs=prepared_pipeline_configs,
+            prior_bundle=prior_bundle, prior_pipeline=prior_pipeline,
+          )
         )
-      prepared_pipeline_configs, complete_secret_bundle = (
-        self._redact_pipeline_configs_and_build_secret_bundle(
-          job_id=job_id,
-          pipeline_configs=prepared_pipeline_configs,
-          prior_bundle=prior_bundle,
-          prior_pipeline=prior_pipeline,
+        staging_state = self.stage_job_pipeline_and_secrets(
+          pipeline=next(iter(prepared_pipeline_configs.values())),
+          job_id=job_id, secret_bundle=complete_secret_bundle,
         )
-      )
+      else:
+        prepared_pipeline_configs, staging_state = self._stage_dauth_pipeline_update(
+          request, prepared_pipeline_configs,
+        )
+        if staging_state.get("phase") == "committed":
+          return self._get_response({
+            DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+            DEEPLOY_KEYS.APP_ID: app_id,
+            DEEPLOY_KEYS.REQUEST: {DEEPLOY_KEYS.APP_ALIAS: app_alias},
+          })
       node_plugins_by_addr = prepared_create_deploy_plan.get("node_plugins_by_addr", {})
       for node, pipeline_config in prepared_pipeline_configs.items():
         if node in node_plugins_by_addr:
@@ -1258,11 +1269,6 @@ class DeeployManagerApiPlugin(
             pipeline_config.get(self.ct.CONFIG_STREAM.K_PLUGINS, [])
           )
       pipeline_to_stage = next(iter(prepared_pipeline_configs.values()))
-      staging_state = self.stage_job_pipeline_and_secrets(
-        pipeline=pipeline_to_stage,
-        job_id=job_id,
-        secret_bundle=complete_secret_bundle,
-      )
       staging_state["retain_on_failed_dispatch"] = bool(
         is_create and staging_state.get("prior_cid") is None
       )

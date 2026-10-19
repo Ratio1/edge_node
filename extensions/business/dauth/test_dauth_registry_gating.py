@@ -848,6 +848,23 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._DauthManagerPlugin__get_response = lambda data: data
     return plugin
 
+  def test_update_staging_endpoint_requires_registered_dauth_server(self):
+    plugin = self._make_manager(dauth_oracle=False)
+    plugin._dauth_server_enabled = False
+    plugin.process_dauth_job_update = lambda body: self.fail('Disabled server processed an update')
+    result = plugin.stage_job_update({'nonce': REQUEST_NONCE})
+    self.assertEqual(result['nonce'], REQUEST_NONCE)
+    self.assertEqual(result['error'], 'dAuth server is not registered')
+
+  def test_update_staging_endpoint_does_not_expose_exception_secrets(self):
+    plugin = self._make_manager(dauth_oracle=True)
+    plugin._dauth_server_enabled = True
+    plugin.process_dauth_job_update = lambda body: (_ for _ in ()).throw(ValueError('private-token'))
+    result = plugin.stage_job_update({'nonce': REQUEST_NONCE})
+    self.assertEqual(result['nonce'], REQUEST_NONCE)
+    self.assertIn('rejected', result['error'])
+    self.assertNotIn('private-token', str(result) + str(plugin._messages))
+
   def test_secret_endpoint_errors_echo_request_nonce(self):
     plugin = self._make_manager(dauth_oracle=True)
     plugin._dauth_server_enabled = True
@@ -910,9 +927,11 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.process()
 
     self.assertEqual(plugin.bc.calls, 1)
-    self.assertEqual(len(plugin._hsync_calls), 2)
+    self.assertEqual(len(plugin._hsync_calls), 6)
+    self.assertEqual({call["hkey"] for call in plugin._hsync_calls}, {
+      DAUTH_JOB_SECRETS_CSTORE_HKEY, "DAUTH_JOB_SECRET_GENERATIONS", "DAUTH_JOB_UPDATES",
+    })
     for call in plugin._hsync_calls:
-      self.assertEqual(call["hkey"], DAUTH_JOB_SECRETS_CSTORE_HKEY)
       self.assertEqual(call["extra_peers"], ["node-address", "peer-address"])
       self.assertFalse(call["include_default_peers"])
       self.assertFalse(call["include_configured_peers"])
@@ -931,8 +950,8 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._now += 10 * 60
     plugin.process()
 
-    self.assertEqual(len(attempts), 2)
-    self.assertTrue(any("sync unavailable" in message for message in plugin._messages))
+    self.assertEqual(len(attempts), 6)
+    self.assertTrue(any("Could not sync dAuth namespace" in message for message in plugin._messages))
 
   def test_false_startup_lookup_fails_closed_and_tears_down_fastapi(self):
     plugin = self._make_manager(dauth_oracle=False)

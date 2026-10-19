@@ -2,6 +2,42 @@
 
 
 DAUTH_SECRET_PIPELINE_CID_KEY = "pipeline_cid"
+DAUTH_JOB_SECRET_GENERATIONS_HKEY = "DAUTH_JOB_SECRET_GENERATIONS"
+DAUTH_JOB_UPDATES_HKEY = "DAUTH_JOB_UPDATES"
+
+
+def load_job_secret_bundle(plugin, job_id):
+  """Select the immutable bundle for the published generation, then legacy data."""
+  job_id = str(job_id)
+  cid = plugin.chainstore_hget(hkey="DEEPLOY_DEPLOYED_JOBS", key=job_id)
+  if cid:
+    bundle = plugin.chainstore_hget(
+      hkey=DAUTH_JOB_SECRET_GENERATIONS_HKEY, key=f"{job_id}:{cid}",
+    )
+    if isinstance(bundle, dict):
+      return bundle
+  return plugin.chainstore_hget(hkey="DAUTH_JOB_SECRETS", key=job_id)
+
+
+def save_job_secret_generation(plugin, job_id, bundle, write_kwargs=None):
+  """Retain generation-specific secrets without allowing a revision overwrite."""
+  cid = bundle.get(DAUTH_SECRET_PIPELINE_CID_KEY) if isinstance(bundle, dict) else None
+  if not cid:
+    return
+  if str(bundle.get("job_id")) != str(job_id):
+    raise ValueError("dAuth secret generation job ID mismatch.")
+  key = f"{job_id}:{cid}"
+  existing = plugin.chainstore_hget(hkey=DAUTH_JOB_SECRET_GENERATIONS_HKEY, key=key)
+  if existing is not None:
+    if existing != bundle:
+      raise ValueError("dAuth secret generation already exists with different contents.")
+    return
+  if write_kwargs is None:
+    write_kwargs = dauth_registry_write_kwargs(plugin)
+  if not plugin.chainstore_hset(
+    hkey=DAUTH_JOB_SECRET_GENERATIONS_HKEY, key=key, value=bundle, **write_kwargs,
+  ):
+    raise ValueError("Failed to retain dAuth secret generation.")
 
 
 def resolve_dauth_registry_internal_peers(plugin, eth_oracles):

@@ -17,6 +17,8 @@ plugin to provide a complete decentralized authentication solution.
 from .dauth_registry import (
   DAUTH_SECRET_PIPELINE_CID_KEY,
   dauth_registry_write_kwargs,
+  load_job_secret_bundle,
+  save_job_secret_generation,
 )
 from ratio1.const.base import dAuth
 
@@ -235,6 +237,7 @@ class _DauthMixin(object):
     }
 
   def _save_dauth_job_secret_bundle(self, job_id, secret_bundle):
+    save_job_secret_generation(self, job_id, secret_bundle)
     result = self.chainstore_hset(
       hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
       key=job_id,
@@ -246,10 +249,7 @@ class _DauthMixin(object):
     return result
 
   def _load_dauth_job_secret_bundle(self, job_id):
-    return self.chainstore_hget(
-      hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
-      key=job_id,
-    )
+    return load_job_secret_bundle(self, job_id)
 
   def _load_dauth_job_pipeline_record(self, job_id):
     cid = self.chainstore_hget(

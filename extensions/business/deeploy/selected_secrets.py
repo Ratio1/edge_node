@@ -193,7 +193,7 @@ def selected_leaf_paths(payload):
   yield from walk(payload, [])
 
 
-def same_dynamic_structure(path, pipeline, prior_pipeline):
+def same_dynamic_structure(path, pipeline, prior_pipeline, prior_path=None):
   """An old scalar is reusable only if its complete dynamic expression is stable."""
   if "DYNAMIC_ENV" not in path:
     return True
@@ -201,7 +201,7 @@ def same_dynamic_structure(path, pipeline, prior_pipeline):
   root = path[:pos + 2]
   try:
     current = path_value(pipeline, root)
-    prior_root = list(root)
+    prior_root = list((prior_path or path)[:pos + 2])
     if prior_root[:1] == ["PLUGINS"] and isinstance(prior_pipeline, dict) and "PLUGINS" not in prior_pipeline:
       prior_root[0] = "plugins"
     previous = path_value(prior_pipeline, prior_root)
