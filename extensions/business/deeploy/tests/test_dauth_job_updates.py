@@ -96,6 +96,7 @@ class _Custodian(_DauthMixin, _DauthJobUpdatesMixin):
       },
     }
     self.logs = []
+    self.expected_request_type = 'update pipeline'
 
   def P(self, message, **kwargs):
     self.logs.append(message)
@@ -121,7 +122,7 @@ class _Custodian(_DauthMixin, _DauthJobUpdatesMixin):
     return self._get_pipeline_from_cstore(job_id), copy.deepcopy(self.prior_pipeline)
 
   def deeploy_verify_and_get_inputs(self, request, request_type=None):
-    assert request_type == 'update pipeline'
+    assert request_type == self.expected_request_type
     if request.get('wallet_signature') != 'valid':
       raise ValueError('Invalid wallet signature')
     return self.bc.wallet, InputsStub(copy.deepcopy(request))

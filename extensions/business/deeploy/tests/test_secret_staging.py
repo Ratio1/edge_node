@@ -193,8 +193,8 @@ class DeeploySecretBundleTests(unittest.TestCase):
       return {"new-node": {}}, {}, {}
 
     self.plugin.prepare_create_update_pipelines = prepare_create_update_pipelines
-    self.plugin._build_scale_up_create_pipeline_configs = (
-      lambda create_pipelines, owner: {"new-node": copy.deepcopy(generated_pipeline)}
+    self.plugin._build_scale_up_pipeline_configs = (
+      lambda pipelines, owner: {"new-node": copy.deepcopy(generated_pipeline)}
     )
 
     def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
@@ -203,6 +203,13 @@ class DeeploySecretBundleTests(unittest.TestCase):
       return {"job_id": str(job_id), "staged_cid": "staged-cid"}
 
     self.plugin.stage_job_pipeline_and_secrets = stage_job_pipeline_and_secrets
+    def stage_dauth(wallet_request, configs, **kwargs):
+      redacted, bundle = self.plugin._redact_pipeline_configs_and_build_secret_bundle(
+        7, configs, self.plugin._load_dauth_job_secret_bundle(7), prior_pipeline=base_pipeline,
+        current_identity_aliases=kwargs['current_identity_aliases'],
+      )
+      return redacted, stage_job_pipeline_and_secrets(next(iter(redacted.values())), 7, bundle)
+    self.plugin._stage_dauth_pipeline_update = stage_dauth
     self.plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
     self.plugin._start_create_update_pipelines = lambda **kwargs: captured.update(
       dispatched=copy.deepcopy(kwargs["prepared_create_configs"])
@@ -215,6 +222,7 @@ class DeeploySecretBundleTests(unittest.TestCase):
       owner="owner",
       running_apps_for_job={},
       wait_for_responses=False,
+      wallet_request={"job_id": 7},
     )
 
     staged_instance = captured["pipeline"]["PLUGINS"][0]["INSTANCES"][0]

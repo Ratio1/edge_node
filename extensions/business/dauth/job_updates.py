@@ -8,6 +8,7 @@ from ratio1.bc.base import compact_canonical_sha256
 
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
+from extensions.business.deeploy.selected_secrets import iter_instances
 from .dauth_registry import DAUTH_JOB_UPDATES_HKEY, dauth_registry_write_kwargs, save_job_secret_generation
 
 
@@ -24,6 +25,7 @@ class _DauthJobUpdatesMixin(_DeeployMixin, _DeeployJobMixin):
       key: operation[key] for key in (
         "operation_id", "coordinator", "job_id", "app_id", "owner",
         "prior_cid", "staged_cid", "plan_hash", "phase",
+        "request_type", "target_nodes",
       )
     }
 
@@ -84,7 +86,11 @@ class _DauthJobUpdatesMixin(_DeeployMixin, _DeeployJobMixin):
     wallet_request = body.get("wallet_request")
     if not isinstance(wallet_request, dict):
       raise ValueError("Missing signed wallet update request.")
-    sender, inputs = self.deeploy_verify_and_get_inputs(wallet_request, request_type="update pipeline")
+    request_type = body.get("request_type", "update pipeline")
+    if request_type not in ("update pipeline", "scale up workers"):
+      raise ValueError("Invalid dAuth deployment request type.")
+    is_scale_up = request_type == "scale up workers"
+    sender, inputs = self.deeploy_verify_and_get_inputs(wallet_request, request_type=request_type)
     auth = self.deeploy_get_auth_result(inputs)
     owner = auth["escrow_owner"]
     escrow = self.bc.get_user_escrow_details(sender)
@@ -92,20 +98,28 @@ class _DauthJobUpdatesMixin(_DeeployMixin, _DeeployJobMixin):
       raise ValueError("Update sender has no active escrow.")
     if str(escrow.get("escrowOwner", "")).lower() != str(owner).lower():
       raise ValueError("Update escrow owner mismatch.")
-    if sender.lower() != str(owner).lower() and not (int(escrow.get("permissions", 0)) & 1):
+    required_permission = 4 if is_scale_up else 1
+    if sender.lower() != str(owner).lower() and not (int(escrow.get("permissions", 0)) & required_permission):
       raise ValueError("Update sender lacks deployment permission.")
     job_id = self._normalize_dauth_job_id(inputs.get("job_id"))
     app_id = inputs.get("app_id")
     expected_cid = body.get("expected_pipeline_cid")
-    if not isinstance(app_id, str) or not app_id or not isinstance(expected_cid, str) or not expected_cid:
+    if (
+      (not is_scale_up and (not isinstance(app_id, str) or not app_id))
+      or not isinstance(expected_cid, str) or not expected_cid
+    ):
       raise ValueError("Update app identity and previous generation are required.")
-    operation_id = compact_canonical_sha256({"coordinator": coordinator, "wallet_request": wallet_request})
+    operation_id = compact_canonical_sha256({
+      "coordinator": coordinator, "wallet_request": wallet_request, "request_type": request_type,
+    })
     configs = body.get("pipeline_configs")
     if not isinstance(configs, dict) or not configs:
       raise ValueError("Prepared update pipeline configs are required.")
     request_hash = compact_canonical_sha256({
       "wallet_request": wallet_request, "pipeline_configs": configs,
       "expected_pipeline_cid": expected_cid,
+      "request_type": request_type, "new_nodes": body.get("new_nodes", []),
+      "identity_aliases": body.get("identity_aliases", []),
     })
     operation = self.chainstore_hget(hkey=DAUTH_JOB_UPDATES_HKEY, key=operation_id)
     if operation is not None:
@@ -117,20 +131,57 @@ class _DauthJobUpdatesMixin(_DeeployMixin, _DeeployJobMixin):
       pipeline_cid, prior_pipeline = self._load_dauth_job_pipeline_record(job_id)
       if pipeline_cid != expected_cid or not isinstance(prior_pipeline, dict):
         raise ValueError("Persisted pipeline generation changed before dAuth staging.")
+      if is_scale_up and app_id is None:
+        app_id = prior_pipeline.get("NAME")
       if prior_pipeline.get("NAME") != app_id or str(prior_pipeline.get("OWNER", "")).lower() != str(owner).lower():
         raise ValueError("Update does not own the persisted app.")
       job = self.bc.get_job_details(job_id=int(job_id))
       if not isinstance(job, dict) or str(job.get("escrowOwner", "")).lower() != str(owner).lower():
         raise ValueError("Update does not own the on-chain job.")
+      if any(not isinstance(pipeline, dict) for pipeline in configs.values()):
+        raise ValueError("Invalid prepared pipeline config.")
+      target_nodes = next(iter(configs.values())).get("DEEPLOY_SPECS", {}).get("current_target_nodes")
+      aliases = {}
+      if is_scale_up:
+        new_nodes = body.get("new_nodes")
+        prior_nodes = prior_pipeline.get("DEEPLOY_SPECS", {}).get("current_target_nodes")
+        if (
+          not isinstance(new_nodes, list) or not new_nodes
+          or any(not isinstance(node, str) or not node for node in new_nodes)
+          or len(set(new_nodes)) != len(new_nodes)
+          or not isinstance(prior_nodes, list) or not prior_nodes
+          or set(new_nodes) & set(prior_nodes)
+          or not set(new_nodes).issubset(configs)
+          or not set(configs).issubset(set(prior_nodes) | set(new_nodes))
+        ):
+          raise ValueError("Invalid scale-up additions or existing targets.")
+        target_nodes = prior_nodes + new_nodes
+        raw_aliases = body.get("identity_aliases", [])
+        if not isinstance(raw_aliases, list):
+          raise ValueError("Invalid scale-up instance identity aliases.")
+        prior_identities = [identity for identity, _ in iter_instances(prior_pipeline)]
+        destinations = {identity for pipeline in configs.values() for identity, _ in iter_instances(pipeline)}
+        for alias in raw_aliases:
+          if not isinstance(alias, list) or len(alias) != 3 or any(not isinstance(item, str) or not item for item in alias):
+            raise ValueError("Invalid scale-up instance identity alias.")
+          signature, instance_id, source_id = alias
+          identity, source = (signature, instance_id), (signature, source_id)
+          if (
+            identity in aliases or identity not in destinations or prior_identities.count(source) != 1
+            or (identity in prior_identities and identity != source)
+          ):
+            raise ValueError("Unknown or ambiguous scale-up instance identity alias.")
+          aliases[identity] = source
+      elif body.get("new_nodes") or body.get("identity_aliases"):
+        raise ValueError("Instance aliases and additions require a scale-up request.")
       for pipeline in configs.values():
-        if not isinstance(pipeline, dict):
-          raise ValueError("Invalid prepared pipeline config.")
         specs = pipeline.get("DEEPLOY_SPECS", {})
         if (
           pipeline.get("NAME") != app_id
           or str(pipeline.get("OWNER", "")).lower() != str(owner).lower()
           or str(specs.get("job_id")) != job_id
-          or set(specs.get("current_target_nodes") or []) != set(configs)
+          or specs.get("current_target_nodes") != target_nodes
+          or (not is_scale_up and set(target_nodes or []) != set(configs))
         ):
           raise ValueError("Prepared pipeline deployment identity mismatch.")
       prior_bundle = self._load_dauth_job_secret_bundle(job_id)
@@ -138,11 +189,21 @@ class _DauthJobUpdatesMixin(_DeeployMixin, _DeeployJobMixin):
         prior_bundle = self._load_current_dauth_secret_bundle(job_id, pipeline_cid, prior_pipeline)
       redacted, bundle = self._redact_pipeline_configs_and_build_secret_bundle(
         job_id, configs, prior_bundle, prior_pipeline=prior_pipeline,
+        current_identity_aliases=aliases,
       )
+      if is_scale_up:
+        for node, pipeline in configs.items():
+          _, node_bundle = self._redact_pipeline_configs_and_build_secret_bundle(
+            job_id, {node: pipeline}, prior_bundle, prior_pipeline=prior_pipeline,
+            current_identity_aliases=aliases,
+          )
+          if node_bundle != bundle:
+            raise ValueError("Scale-up configs require inconsistent dAuth secret layouts.")
       operation = {
         "operation_id": operation_id, "request_hash": request_hash,
         "coordinator": coordinator, "job_id": job_id, "app_id": app_id,
         "owner": owner, "prior_cid": expected_cid,
+        "request_type": request_type, "target_nodes": target_nodes,
         "plan_hash": compact_canonical_sha256(redacted),
         "pipeline_configs": redacted, "phase": "prepared",
       }

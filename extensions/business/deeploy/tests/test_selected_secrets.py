@@ -213,9 +213,16 @@ class SelectedSecretTests(unittest.TestCase):
       captured.update(pipeline=pipeline, bundle=secret_bundle)
       return {}
     plugin.stage_job_pipeline_and_secrets = stage
+    def stage_dauth(wallet_request, configs, **kwargs):
+      redacted, bundle = plugin._redact_pipeline_configs_and_build_secret_bundle(
+        7, configs, plugin._load_dauth_job_secret_bundle(7), prior_pipeline=base,
+        current_identity_aliases=kwargs['current_identity_aliases'],
+      )
+      return redacted, stage(next(iter(redacted.values())), 7, bundle)
+    plugin._stage_dauth_pipeline_update = stage_dauth
     plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
     plugin._start_create_update_pipelines = lambda **kwargs: captured.update(dispatch=kwargs)
-    plugin.scale_up_job(["new-node"], [], 7, "owner", {}, wait_for_responses=False)
+    plugin.scale_up_job(["new-node"], [], 7, "owner", {}, wait_for_responses=False, wallet_request={"job_id": 7})
     self.assertEqual(instance(captured["pipeline"])["SECRET_PATHS"], instance(source)["SECRET_PATHS"])
     self.assertNotEqual(instance(captured["pipeline"])["INSTANCE_ID"], "current-instance")
     self.assertEqual(instance(captured["bundle"]["job_secrets"])["DYNAMIC_ENV"]["URL"][0]["value"], "dynamic-secret")

@@ -42,21 +42,35 @@ class _DeeployDauthUpdatesMixin:
       raise RuntimeError("dAuth rejected the update staging operation.")
     return result
 
-  def _stage_dauth_pipeline_update(self, wallet_request, pipeline_configs):
+  def _stage_dauth_pipeline_update(
+    self, wallet_request, pipeline_configs, request_type="update pipeline",
+    new_nodes=None, current_identity_aliases=None,
+  ):
     job_id = str(wallet_request["job_id"])
     prior_cid = self._get_pipeline_from_cstore(job_id)
     result = self._request_dauth_pipeline_update({
       "action": "stage", "wallet_request": self.deepcopy(wallet_request),
       "expected_pipeline_cid": prior_cid, "pipeline_configs": pipeline_configs,
+      "request_type": request_type, "new_nodes": list(new_nodes or []),
+      "identity_aliases": [
+        [signature, instance_id, source_id]
+        for (signature, instance_id), (_, source_id) in (current_identity_aliases or {}).items()
+      ],
     })
     receipt = result.get("receipt")
     configs = result.get("pipeline_configs")
-    operation_id = compact_canonical_sha256({"coordinator": self.bc.address, "wallet_request": wallet_request})
+    operation_id = compact_canonical_sha256({
+      "coordinator": self.bc.address, "wallet_request": wallet_request, "request_type": request_type,
+    })
+    representative = next(iter(pipeline_configs.values()))
     if not isinstance(receipt, dict) or (
       receipt.get("operation_id") != operation_id
       or receipt.get("coordinator") != self.bc.address
       or receipt.get("job_id") != job_id
-      or receipt.get("app_id") != wallet_request.get("app_id")
+      or receipt.get("request_type") != request_type
+      or receipt.get("app_id") != representative.get("NAME")
+      or receipt.get("owner") != representative.get("OWNER")
+      or receipt.get("target_nodes") != representative.get("DEEPLOY_SPECS", {}).get("current_target_nodes")
       or receipt.get("prior_cid") != prior_cid
       or receipt.get("phase") not in ("staged", "committed")
       or not receipt.get("staged_cid")

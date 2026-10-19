@@ -59,8 +59,8 @@ is required.
 
 ## Updates Through Non-dAuth Protocol Oracles
 
-`update_pipeline` keeps the receiving Deeploy protocol oracle as coordinator.
-It sends the unchanged wallet request and its prepared per-node configs to
+`update_pipeline` and `scale_up_job_workers` keep the receiving Deeploy protocol
+oracle as coordinator. It sends the unchanged wallet request and its prepared per-node configs to
 dAuth's signed `POST /stage_job_update` endpoint. Existing hidden values are
 reconstructed only on dAuth; the coordinator receives redacted configs and a
 signed receipt, never the previous plaintext bundle or rollback material.
@@ -70,18 +70,21 @@ This follows the existing signed `add_secrets` trust boundary: the prepared
 plan is the responsibility of a trusted protocol oracle. dAuth independently
 checks the node signature, current protocol-oracle membership, a transport
 nonce no older than 120 seconds, the original Deeploy wallet signature and
-nonce policy, active escrow, deployment permission (bit 1), persisted app/owner,
+nonce policy, active escrow, the operation's permission (bit 1 for configuration
+updates, bit 4 / `EXTEND_NODES` for scale-up), persisted app/owner,
 on-chain job owner, previous CID, and the plan's deployment identity/targets.
 It does not independently regenerate the coordinator's transformed plan.
-Updating does not require view-secrets permission (bit 16). Arbitrary workers
+Neither operation requires view-secrets permission (bit 16). Arbitrary workers
 cannot use this endpoint as coordinators.
 
 The `stage`, `commit`, and `rollback` actions share this endpoint. Stage returns
 `pipeline_configs` and a `receipt` identifying the coordinator, operation, job,
 app, owner, previous/staged CIDs, plan digest and phase. Settlement submits that
-receipt in a fresh node-signed body. Operation IDs bind the coordinator to the
-exact signed wallet request; changing the prepared envelope under the same
-operation is rejected. Endpoint failures intentionally omit exception details
+receipt in a fresh node-signed body. The allowlisted `request_type` is
+`update pipeline` or `scale up workers`, including the wallet wrapper's request
+type. Operation IDs bind the coordinator, request type and exact signed wallet
+request; changing the prepared envelope under the same operation is rejected.
+Endpoint failures intentionally omit exception details
 because planning and transport errors can contain credentials.
 
 dAuth retains immutable `DAUTH_JOB_SECRET_GENERATIONS` entries keyed by
@@ -97,6 +100,26 @@ Bookkeeping-only persistence drops `INITIATOR_ADDR`, `INITIATOR_ID`,
 transient fields. Equal canonical configs keep their existing CID. A changed
 config containing hidden values, or replacing one that does, must use staging;
 the metadata writer refuses to publish a new unbound generation.
+
+### Scale-up Plans
+
+Scale-up stages canonical configs for both new nodes and existing online nodes
+before sending new pipelines or instance updates. Every config retains the same
+ordered full target list: the previous fleet (including offline nodes), followed
+by the additions. Both deferred and immediate on-chain confirmation preserve
+that full fleet; multiple plugin responses do not change its node count.
+
+The node-signed envelope includes `new_nodes` and `identity_aliases` triples
+`[signature, destination_instance_id, source_instance_id]`. Aliases bind generated
+and existing worker identities to unique persisted source instances; several
+worker destinations may share one source. Duplicate destinations, unknown or
+ambiguous sources, missing destinations, and cross-signature mappings are
+rejected. Source lookup follows identity before resolving relative secret paths,
+including reordered instances, selected dynamic expressions and per-node values.
+All affected configs must resolve to the same complete scalar secret bundle. The request
+hash binds aliases and additions; the signed receipt includes request type and
+the full target list. Existing signed scale-up requests that omit `app_id` derive
+it from the authenticated persisted job; a supplied mismatching ID is rejected.
 
 ### Failure and Recovery Contract
 
@@ -119,11 +142,16 @@ update with a fresh nonce; do not infer that a timeout rolled the operation back
 Rollback is appropriate only before dispatch, or after separately ensuring no
 worker can use the staged configuration.
 
+Scale-up marks dispatch before each new-node send and existing-worker instance
+update. Exceptions, failed responses and pending timeouts retain the generation
+and report `dispatch_uncertain` once delivery may have occurred. A failure before
+dispatch can roll back safely through the same dAuth settlement flow.
+
 ChainStore has no compare-and-swap or distributed lock. Generation checks avoid
 known stale settlements but do not serialize concurrent writers across separate
-oracles. Serialize updates per job operationally. This endpoint does not change
-the separate `scale_up_job_workers` or autonomous replication flows, whose
-secret reconstruction still requires a dAuth-capable coordinator.
+oracles. Serialize updates and scale-up per job operationally. Autonomous
+replication flows are separate from these signed wallet operations and retain
+their existing secret-custody requirements.
 
 ### Rollout and Rollback
 

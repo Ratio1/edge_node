@@ -1480,7 +1480,9 @@ class DeeployManagerApiPlugin(
       now = self.time()
     if (now - pending['start_time']) > pending['timeout']:
       if pending.get('kind') == 'scale_up':
-        self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
+        self.settle_failed_staged_job_pipeline_and_secrets(
+          pending.get('staging'), "scale-up timeout", dispatch_uncertain=True,
+        )
         result = {
           DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
           DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
@@ -1488,6 +1490,8 @@ class DeeployManagerApiPlugin(
           DEEPLOY_KEYS.REQUEST: pending.get('request'),
           DEEPLOY_KEYS.AUTH: pending.get('auth'),
         }
+        if (pending.get('staging') or {}).get("dispatch_uncertain"):
+          result["dispatch_uncertain"] = True
       else:
         self.settle_failed_staged_job_pipeline_and_secrets(
           pending.get('staging'), "timeout", dispatch_uncertain=True
@@ -1606,10 +1610,7 @@ class DeeployManagerApiPlugin(
     """
     job_id = pending.get('job_id')
     is_confirmable_job = pending.get('is_confirmable_job', False)
-    nodes = list(
-      cstore_response.get("node") for cstore_response in dct_status.values()
-      if cstore_response.get("node") is not None
-    )
+    nodes = pending['staging']['target_nodes']
     self.Pd(f"Nodes to confirm: {self.json_dumps(nodes, indent=2)}")
     self._submit_bc_job_confirmation(
       str_status=str_status,
@@ -1621,14 +1622,19 @@ class DeeployManagerApiPlugin(
     if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
       self.commit_staged_job_pipeline_and_secrets(pending.get('staging'))
     else:
-      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
-    return {
+      self.settle_failed_staged_job_pipeline_and_secrets(
+        pending.get('staging'), str_status, dispatch_uncertain=True,
+      )
+    result = {
       DEEPLOY_KEYS.STATUS: str_status,
       DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
       DEEPLOY_KEYS.JOB_ID: job_id,
       DEEPLOY_KEYS.REQUEST: pending.get('request'),
       DEEPLOY_KEYS.AUTH: pending.get('auth'),
     }
+    if (pending.get('staging') or {}).get("dispatch_uncertain"):
+      result["dispatch_uncertain"] = True
+    return result
 
   def finalize_pending_request(
       self, pending, dct_status, str_status,
@@ -1982,7 +1988,7 @@ class DeeployManagerApiPlugin(
     dict
         A dictionary with the result of the operation
     """
-    staging_state = None
+    staging_state = {}
     try:
       self.__ensure_eth_balance()
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="scale up workers")
@@ -2023,8 +2029,16 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         job_id=job_id,
         running_apps_for_job=running_apps_for_job,
-        wait_for_responses=False
+        wait_for_responses=False,
+        wallet_request=request,
+        dispatch_state=staging_state,
       )
+      if staging_state.get("phase") == "committed":
+        return self._get_response({
+          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.AUTH: auth_result,
+        })
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
@@ -2032,10 +2046,10 @@ class DeeployManagerApiPlugin(
       else:
         dct_request = None
       if len(response_keys) == 0:
+        nodes = staging_state['target_nodes']
         self.commit_staged_job_pipeline_and_secrets(staging_state)
         staging_state = None
         if not is_confirmable_job:
-          nodes = list(set(update_nodes + new_nodes))
           self.Pd(f"Nodes to confirm (non-confirmable job): {self.json_dumps(nodes, indent=2)}")
           self._submit_bc_job_confirmation(str_status=DEEPLOY_STATUS.COMMAND_DELIVERED,
                                            dct_status={},
@@ -2072,9 +2086,11 @@ class DeeployManagerApiPlugin(
       return self._register_pending_deploy_request(pending_state)
 
     except Exception as e:
-      if staging_state is not None:
-        self.rollback_staged_job_pipeline_and_secrets(staging_state)
+      if staging_state:
+        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, "scale-up request error")
       result = self.__handle_error(e, request)
+      if (staging_state or {}).get("dispatch_uncertain"):
+        result["dispatch_uncertain"] = True
     #endtry
     
     response = self._get_response({
