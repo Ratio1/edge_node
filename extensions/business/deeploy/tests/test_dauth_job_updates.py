@@ -3,8 +3,10 @@ import copy
 import json
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from requests import Timeout
+from ratio1.bc.base import BaseBlockEngine
 from naeural_core import constants as ct
 from extensions.business.dauth.dauth_mixin import _DauthMixin
 from extensions.business.dauth.dauth_registry import (
@@ -38,6 +40,7 @@ def wallet_request():
 
 class _BC:
   address = 'coordinator'
+  evm_network = 'devnet'
 
   def __init__(self):
     self.permissions = 1  # Deploy, deliberately without view-secrets permission.
@@ -63,6 +66,9 @@ class _BC:
     return ['dauth'], ['0xDauth']
 
   def is_dauth_oracle(self, **kwargs):
+    return self.dauth_oracle
+
+  def web3_is_dauth_oracle(self, address, network=None):
     return self.dauth_oracle
 
   def get_user_escrow_details(self, sender):
@@ -160,6 +166,11 @@ class _Coordinator(_DeeployMixin, _DeeployDauthUpdatesMixin, _DeeployJobMixin):
     self.requests = _Requests(custodian)
     self.custodian = custodian
     self.logs = []
+    def request_dauth_job_update(payload):
+      # Exercise the real SDK transport with only its HTTP and clock replaced.
+      with mock.patch('ratio1.bc.base.requests.post', self.requests.post), mock.patch('ratio1.bc.base.time', self.time):
+        return BaseBlockEngine.request_dauth_job_update(self.bc, payload)
+    self.bc.request_dauth_job_update = request_dauth_job_update
 
   def _get_pipeline_from_cstore(self, job_id):
     return self.custodian._get_pipeline_from_cstore(job_id)

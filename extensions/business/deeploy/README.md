@@ -155,11 +155,16 @@ their existing secret-custody requirements.
 
 ### Rollout and Rollback
 
+Release the SDK providing `BaseBlockEngine.request_dauth_job_update()`
+(`ratio1>=3.5.58`) before building these Edge images. The SDK owns signing,
+HTTP retry, and authenticated dAuth response validation; Edge validates the
+deployment receipt and plan and coordinates dispatch and settlement.
+
 Deploy the new dAuth endpoint and generation-aware readers to **all dAuth
 servers first**, then update Deeploy coordinators. Mixed old dAuth servers fail
 closed; there is no fallback that reveals secrets to a non-dAuth coordinator.
 Existing wallet request formats and scalar secret paths remain compatible;
-no Core or SDK protocol change is required.
+no Core runtime change is required.
 
 For rollback, pause updates and drain/reconcile staged operations first. Retain
 generation records, journals, legacy bundles and their R1FS payloads. Restore an
