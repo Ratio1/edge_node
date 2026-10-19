@@ -465,6 +465,7 @@ class DauthManagerPlugin(
     return response
 
   @BasePlugin.endpoint(method="post")
+  # /reconcile_job_secrets
   def reconcile_job_secrets(self, body: dict):
     """Reconcile hidden secrets for a signed protocol-oracle pipeline update."""
     nonce = body.get("nonce") if isinstance(body, dict) else None
