@@ -40,7 +40,7 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
-  'DEPLOYMENT_READINESS_TIMEOUT': 600,
+  'DEPLOYMENT_READINESS_TIMEOUT': 900,
 
   'DEEPLOY_VERBOSE' : 10,
   'LOG_REQUESTS': True,
