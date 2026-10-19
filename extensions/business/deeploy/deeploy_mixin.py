@@ -1130,6 +1130,27 @@ class _DeeployMixin:
     )
     return redacted_configs, bundle
 
+  def _reconcile_dauth_job_secrets(self, job_id, pipeline_configs, current_identity_aliases=None):
+    """Reconcile on dAuth without loading secret bundles on this coordinator."""
+    result = self.bc.reconcile_dauth_job_secrets({
+      "job_id": str(job_id),
+      "expected_pipeline_cid": self._get_pipeline_from_cstore(job_id),
+      "pipeline_configs": pipeline_configs,
+      "identity_aliases": [
+        [list(current), list(source)]
+        for current, source in (current_identity_aliases or {}).items()
+      ],
+    })
+    configs = result["pipeline_configs"]
+    for config in configs.values():
+      _, secrets = self._extract_and_redact_deeploy_dauth_secrets(config)
+      if secrets is not None:
+        raise ValueError("dAuth returned pipeline configs containing secret values.")
+    return configs, {
+      "job_id": str(job_id), "staged_cid": result["pipeline_cid"],
+      "dauth_reconciled": True,
+    }
+
   def __update_pipeline_on_nodes(
     self,
     nodes,
@@ -6052,28 +6073,15 @@ class _DeeployMixin:
       create_pipelines=create_pipelines,
       owner=owner,
     )
-    prior_bundle = self._load_dauth_job_secret_bundle(job_id)
-    prepared_create_configs, complete_secret_bundle = (
-      self._redact_pipeline_configs_and_build_secret_bundle(
-        job_id=job_id,
-        pipeline_configs=prepared_create_configs,
-        prior_bundle=prior_bundle,
-        prior_pipeline=base_pipeline,
-        current_identity_aliases=generated_instance_identity_aliases,
-      )
+    prepared_create_configs, staging_state = self._reconcile_dauth_job_secrets(
+      job_id, prepared_create_configs,
+      current_identity_aliases=generated_instance_identity_aliases,
     )
     for node, pipeline in update_pipelines.items():
       redacted_plugins, _ = self._extract_and_redact_deeploy_dauth_secrets(
         pipeline.get("plugins", [])
       )
       pipeline["plugins"] = redacted_plugins
-    pipeline_to_stage = next(iter(prepared_create_configs.values()))
-    staging_state = self.stage_job_pipeline_and_secrets(
-      pipeline=pipeline_to_stage,
-      job_id=job_id,
-      secret_bundle=complete_secret_bundle,
-    )
-
     self.P(f"Prepared create pipelines: {self.json_dumps(self._redact_per_node_config_for_log(create_pipelines))}")
     self.P(f"Prepared update pipelines: {self.json_dumps(self._redact_per_node_config_for_log(update_pipelines))}")
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")

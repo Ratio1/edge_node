@@ -213,6 +213,7 @@ class SelectedSecretTests(unittest.TestCase):
       captured.update(pipeline=pipeline, bundle=secret_bundle)
       return {}
     plugin.stage_job_pipeline_and_secrets = stage
+    plugin._reconcile_dauth_job_secrets = _SecretStagingPlugin._reconcile_dauth_job_secrets.__get__(plugin)
     plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
     plugin._start_create_update_pipelines = lambda **kwargs: captured.update(dispatch=kwargs)
     plugin.scale_up_job(["new-node"], [], 7, "owner", {}, wait_for_responses=False)

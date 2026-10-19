@@ -247,7 +247,7 @@ class _FakeBC:
   def node_address_to_eth_address(self, node_address):
     return self.node_eth[node_address]
 
-  def verify(self, body, return_full_info=False):  # pylint: disable=unused-argument
+  def verify(self, dct_data, return_full_info=False, log_hash_sign_fails=True, signature=None, sender_address=None):  # pylint: disable=unused-argument
     class _VerifyData:
       pass
 
@@ -445,6 +445,33 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       "wallet_request": wallet_request,
     }
     return plugin, body, bundle
+
+  def test_existing_secret_endpoints_work_through_core_blockchain_wrapper(self):
+    from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
+    from unittest.mock import Mock
+
+    for operation in ("add", "get", "reveal"):
+      with self.subTest(operation=operation):
+        plugin, body, bundle = self._prepare_reveal()
+        engine = plugin.bc
+        engine.verify = Mock(wraps=engine.verify)
+        engine.web3_get_oracles = engine.get_eth_oracles
+        engine.web3_get_user_escrow_details = engine.get_user_escrow_details
+        engine.web3_get_job_details = engine.get_job_details
+        engine._add_prefix = engine.maybe_add_prefix
+        engine.encrypt = lambda plaintext, receiver_address: engine.encrypt_str(plaintext, receiver_address)
+        plugin.bc = BCWrapper(engine, owner=plugin)
+        body["job_id"] = "7"
+        if operation == "add":
+          body["job_secrets"] = bundle["job_secrets"]
+          result = plugin.process_dauth_add_secrets_request(body)
+        elif operation == "get":
+          body.update(EE_SENDER="node-runner", EE_ETH_SENDER="0xRUNNER")
+          result = plugin.process_dauth_get_secret_request(body)
+        else:
+          result = plugin.process_dauth_reveal_secret_request(body)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(engine.verify.call_args.kwargs["log_hash_sign_fails"])
 
   def test_reveal_secrets_allows_escrow_owner_and_encrypts_for_relay_oracle(self):
     plugin, body, bundle = self._prepare_reveal()
@@ -847,6 +874,22 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     }
     plugin._DauthManagerPlugin__get_response = lambda data: data
     return plugin
+
+  def test_reconciliation_endpoint_gates_registry_and_masks_secret_errors(self):
+    for enabled in (False, True):
+      with self.subTest(enabled=enabled):
+        plugin = self._make_manager(dauth_oracle=enabled)
+        plugin._refresh_dauth_registry(force=True)
+        calls = []
+        def reconcile(body):
+          calls.append(body)
+          raise ValueError("credential-in-dependency-error")
+        plugin.process_dauth_reconcile_secrets_request = reconcile
+        response = plugin.reconcile_job_secrets({"nonce": REQUEST_NONCE})
+        self.assertEqual(len(calls), int(enabled))
+        self.assertEqual(response["nonce"], REQUEST_NONCE)
+        self.assertIn("error", response)
+        self.assertNotIn("credential-in-dependency-error", str(response) + str(plugin._messages))
 
   def test_secret_endpoint_errors_echo_request_nonce(self):
     plugin = self._make_manager(dauth_oracle=True)
