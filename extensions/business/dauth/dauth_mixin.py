@@ -510,6 +510,9 @@ class _DauthMixin(object):
     state = self.stage_job_pipeline_and_secrets(
       pipeline=next(iter(configs.values())), job_id=job_id, secret_bundle=bundle,
     )
+    # Publication is final in this path; cleanup stays on the node that has
+    # the bound bundle, without waiting for coordinator replica convergence.
+    self.commit_staged_job_pipeline_and_secrets(state)
     return {
       "status": "success", "job_id": job_id,
       self.const.BASE_CT.dAuth.DAUTH_NONCE: nonce,

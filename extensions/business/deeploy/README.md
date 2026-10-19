@@ -104,5 +104,9 @@ write may already have succeeded. Inspect the current metadata and workers befor
 retrying an uncertain request. This change does not introduce distributed locking
 or revision history, or fix pre-existing metadata-only CID drift.
 
-Release SDK 3.5.58 and deploy the dAuth endpoint before using this update path on
-coordinators. New job creation keeps its existing staging flow.
+Release SDK 3.5.58 and Core 7.7.332 (the plugin blockchain wrapper forwarders),
+then deploy the dAuth endpoint before using this update path on coordinators.
+An SDK upgrade alone does not expose the client through older Core wrappers.
+dAuth performs the existing best-effort cleanup of the previous local R1FS
+pipeline object after publishing reconciliation. No deployment restoration is
+added. New job creation keeps its existing staging flow.

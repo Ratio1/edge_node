@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
 from ratio1.bc.base import BaseBlockEngine
 from ratio1.const.base import dAuth
 from extensions.business.dauth.dauth_mixin import _DauthMixin
@@ -23,8 +24,10 @@ class DauthReconciliationTests(unittest.TestCase):
   def setUp(self):
     self.dauth = _DauthReconciliationPlugin()
     self.dauth.const = _FakeConst
-    self.dauth.bc = _FakeBC()
-    self.dauth.bc.verify = Mock(wraps=self.dauth.bc.verify)
+    self.server_engine = _FakeBC()
+    self.server_engine.verify = Mock(wraps=self.server_engine.verify)
+    self.server_engine.web3_get_oracles = self.server_engine.get_eth_oracles
+    self.dauth.bc = BCWrapper(self.server_engine, owner=self.dauth)
     self.dauth.cfg_dauth_verbose = False
     self.dauth.time = lambda: 1000
     self.dauth._dauth_registry_internal_peers = ['dauth-a']
@@ -43,9 +46,8 @@ class DauthReconciliationTests(unittest.TestCase):
     self.client.verify.return_value = SimpleNamespace(valid=True, sender='dauth-a')
     self.client.node_address_to_eth_address.return_value = '0xDAUTH'
     self.client.web3_is_dauth_oracle.return_value = True
-    self.coordinator.bc = SimpleNamespace(
-      reconcile_dauth_job_secrets=lambda payload: BaseBlockEngine.reconcile_dauth_job_secrets(self.client, payload),
-    )
+    self.client.reconcile_dauth_job_secrets = lambda payload, **kwargs: BaseBlockEngine.reconcile_dauth_job_secrets(self.client, payload, **kwargs)
+    self.coordinator.bc = BCWrapper(self.client, owner=self.coordinator)
 
     def post(url, json, timeout):
       self.assertEqual(url, 'https://dauth/reconcile_job_secrets')
@@ -77,7 +79,7 @@ class DauthReconciliationTests(unittest.TestCase):
     self.assertFalse(self.coordinator.rollback_staged_job_pipeline_and_secrets(state))
     self.assertFalse(self.coordinator.settle_failed_staged_job_pipeline_and_secrets(state, 'failed dispatch'))
     self.coordinator._load_dauth_job_secret_bundle.assert_not_called()
-    self.assertFalse(self.dauth.bc.verify.call_args.kwargs["log_hash_sign_fails"])
+    self.assertFalse(self.server_engine.verify.call_args.kwargs["log_hash_sign_fails"])
     self.assertEqual(self.dauth.store[(DEEPLOY_JOBS_CSTORE_HKEY, '7')], 'staged-cid')
     # Reconciliation succeeds even while this coordinator has the old replica.
     self.assertEqual(self.coordinator.store[(DEEPLOY_JOBS_CSTORE_HKEY, "7")], "prior-cid")
@@ -106,7 +108,7 @@ class DauthReconciliationTests(unittest.TestCase):
       lambda: body.update(expected_pipeline_cid='wrong-cid'),
       lambda: self.dauth.store[(DAUTH_JOB_SECRETS_CSTORE_HKEY, '7')].update(pipeline_cid='wrong-cid'),
       lambda: body.update(EE_SENDER='node-other', EE_ETH_SENDER='0xOTHER'),
-      lambda: self.dauth.bc.__setattr__('valid_signature', False),
+      lambda: self.server_engine.__setattr__('valid_signature', False),
       lambda: self.prior['PLUGINS'][0]['INSTANCES'][0]['ENV'].update(CUSTOM_SECRET=HIDDEN),
     ):
       with self.subTest(mutation=mutation):
@@ -114,13 +116,55 @@ class DauthReconciliationTests(unittest.TestCase):
         self.dauth.store.clear()
         self.dauth.store.update(copy.deepcopy(original_store))
         self.prior = copy.deepcopy(original_prior)
-        self.dauth.bc.valid_signature = True
+        self.server_engine.valid_signature = True
         body = {'job_id': '7', 'expected_pipeline_cid': 'prior-cid', 'pipeline_configs': {'worker': self.prior},
                 'nonce': hex(1000000), 'EE_SENDER': 'node-oracle', 'EE_ETH_SENDER': '0xORACLE'}
         mutation()
         with self.assertRaises(ValueError):
           self.dauth.process_dauth_reconcile_secrets_request(body)
         self.assertEqual(self.dauth.events, [])
+
+  def test_repeated_updates_retain_only_the_current_r1fs_object(self):
+    files = {"prior-cid": copy.deepcopy(self.prior)}
+    r1fs = self.dauth.r1fs
+    def add_json(payload, **kwargs):
+      files[r1fs.next_cid] = copy.deepcopy(payload)
+      return r1fs.next_cid
+    r1fs.add_json = add_json
+    r1fs.get_json = lambda cid, **kwargs: copy.deepcopy(files[cid])
+    r1fs.delete_file = lambda cid, **kwargs: files.pop(cid)
+    for update in range(4):
+      prior_cid = self.dauth.store[(DEEPLOY_JOBS_CSTORE_HKEY, "7")]
+      self.coordinator.store[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = prior_cid
+      current = copy.deepcopy(files[prior_cid])
+      current["DIAGNOSTIC_UPDATE"] = update
+      r1fs.next_cid = f"updated-cid-{update}"
+      _, state = self.coordinator._reconcile_dauth_job_secrets(7, {"worker": current})
+      self.assertEqual(list(files), [state["staged_cid"]])
+    self.assertEqual(self.http.call_count, 4)
+    self.coordinator._load_dauth_job_secret_bundle.assert_not_called()
+
+  def test_same_cid_reconciliation_does_not_delete_the_active_object(self):
+    self.dauth.r1fs.next_cid = "prior-cid"
+    _, state = self.coordinator._reconcile_dauth_job_secrets(7, {"worker": self.prior})
+    self.assertEqual(state["staged_cid"], "prior-cid")
+    self.assertFalse(any(event[0] == "r1fs_delete" for event in self.dauth.events))
+
+  def test_failed_staging_preserves_the_active_prior_object(self):
+    prior_bundle = copy.deepcopy(self.dauth.store[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")])
+    self.dauth._write_job_pipeline_cid = Mock(return_value=False)
+    with self.assertRaisesRegex(ValueError, "Failed to stage pipeline CID"):
+      self.coordinator._reconcile_dauth_job_secrets(7, {"worker": self.prior})
+    self.assertEqual(self.dauth.store[(DEEPLOY_JOBS_CSTORE_HKEY, "7")], "prior-cid")
+    self.assertEqual(self.dauth.store[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")], prior_bundle)
+    deleted = [event[1] for event in self.dauth.events if event[0] == "r1fs_delete"]
+    self.assertEqual(deleted, ["staged-cid"])
+
+  def test_cleanup_failure_keeps_successful_publication_successful(self):
+    self.dauth.r1fs.delete_file = Mock(side_effect=RuntimeError("cleanup unavailable"))
+    _, state = self.coordinator._reconcile_dauth_job_secrets(7, {"worker": self.prior})
+    self.assertEqual(self.dauth.store[(DEEPLOY_JOBS_CSTORE_HKEY, "7")], state["staged_cid"])
+    self.dauth.r1fs.delete_file.assert_called_once_with("prior-cid", show_logs=False, raise_on_error=False)
 
   def test_coordinator_rejects_unredacted_reply_before_dispatch(self):
     self.client.verify.return_value = SimpleNamespace(valid=True, sender='dauth-a')
