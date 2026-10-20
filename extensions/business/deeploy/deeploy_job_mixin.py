@@ -221,6 +221,9 @@ class _DeeployJobMixin:
     """Commit a staged transaction by removing its superseded R1FS object."""
     if not isinstance(state, dict):
       return False
+    if state.get("dauth_reconciled"):
+      # dAuth already published; local metadata replication may still be pending.
+      return True
     staged_cid = state.get("staged_cid")
     try:
       current_cid = self._get_pipeline_from_cstore(state.get("job_id"))
@@ -241,6 +244,10 @@ class _DeeployJobMixin:
   def rollback_staged_job_pipeline_and_secrets(self, state):
     """Restore matching staged state without disturbing a newer deployment."""
     if not isinstance(state, dict):
+      return False
+    # Reconciliation publishes on dAuth. Deployment restoration belongs to the
+    # lifecycle flow; this coordinator has neither prior nor current secrets.
+    if state.get("dauth_reconciled"):
       return False
     job_id = state.get("job_id")
     staged_cid = state.get("staged_cid")

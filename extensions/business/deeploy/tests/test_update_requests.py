@@ -144,6 +144,16 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       }
 
     plugin.stage_job_pipeline_and_secrets = stage_job_pipeline_and_secrets
+
+    def reconcile_dauth_job_secrets(job_id, pipeline_configs):
+      # Simulate the remote boundary; transport and dAuth storage have focused tests.
+      configs, bundle = plugin._redact_pipeline_configs_and_build_secret_bundle(
+        job_id, pipeline_configs, plugin._load_dauth_job_secret_bundle(job_id),
+        prior_pipeline=plugin.get_job_pipeline_from_cstore(job_id),
+      )
+      return configs, stage_job_pipeline_and_secrets(next(iter(configs.values())), job_id, bundle)
+
+    plugin._reconcile_dauth_job_secrets = reconcile_dauth_job_secrets
     plugin.commit_staged_job_pipeline_and_secrets = lambda state: True
     plugin.rollback_staged_job_pipeline_and_secrets = lambda state: True
     plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)

@@ -87,3 +87,26 @@ Overlapping creates handled by one manager process are also rejected, but
 ChainStore has no atomic cross-manager claim; independent managers must not
 accept concurrent creates for the same job ID until a distributed claim or
 generation-aware protocol exists.
+
+## Reconciliation through dAuth
+
+Updates and scale-up call the SDK's `reconcile_dauth_job_secrets` client. A registered
+dAuth server authenticates the protocol oracle, checks the expected pipeline CID,
+reuses the existing secret-selection and merge rules, and stores the complete
+bundle bound to the redacted pipeline CID. The response contains redacted configs
+and their CID; the coordinator does not fetch the previous or merged bundle.
+The existing `DAUTH_JOB_SECRETS` and pipeline registry formats remain in use.
+
+Reconciliation publishes before worker dispatch. Deployment failure does not
+restore the previous metadata or secrets in this path; deployment restoration is
+left to the lifecycle flow. The SDK does not retry a transport failure because the
+write may already have succeeded. Inspect the current metadata and workers before
+retrying an uncertain request. This change does not introduce distributed locking
+or revision history, or fix pre-existing metadata-only CID drift.
+
+Release SDK 3.5.58 and Core 7.7.332 (the plugin blockchain wrapper forwarders),
+then deploy the dAuth endpoint before using this update path on coordinators.
+An SDK upgrade alone does not expose the client through older Core wrappers.
+dAuth performs the existing best-effort cleanup of the previous local R1FS
+pipeline object after publishing reconciliation. No deployment restoration is
+added. New job creation keeps its existing staging flow.

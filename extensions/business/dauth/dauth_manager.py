@@ -32,7 +32,10 @@ from extensions.business.dauth.dauth_registry import (
   load_dauth_registry_snapshot,
 )
 
-__VER__ = '0.3.0'
+from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
+from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
+
+__VER__ = '0.3.1'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -105,6 +108,8 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
+  _DeeployMixin,
+  _DeeployJobMixin,
   _NodeTagsMixin,
   _RequestTrackingMixin,
   ):
@@ -458,6 +463,22 @@ class DauthManagerPlugin(
       **data
     })
     return response
+
+  @BasePlugin.endpoint(method="post")
+  # /reconcile_job_secrets
+  def reconcile_job_secrets(self, body: dict):
+    """Reconcile hidden secrets for a signed protocol-oracle pipeline update."""
+    nonce = body.get("nonce") if isinstance(body, dict) else None
+    if not self._is_dauth_server_enabled():
+      data = {'error': 'dAuth server is not registered as a dAuth oracle'}
+    else:
+      try:
+        data = self.process_dauth_reconcile_secrets_request(body)
+      except Exception:
+        # New values can be present in the request or dependency exceptions.
+        self.P("dAuth secret reconciliation failed.", color='r')
+        data = {'error': 'dAuth secret reconciliation failed'}
+    return self.__get_response({'nonce': nonce, **data})
 
   @BasePlugin.endpoint(method="post")
   # /get_secrets
