@@ -1,6 +1,7 @@
 """Offline integration proofs for full-placement scale and confirmed deletion."""
 import copy
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from extensions.business.deeploy.deployment_mutations import _DeploymentMutationsMixin
@@ -79,6 +80,26 @@ class Mutations(_DeploymentMutationsMixin, Admission):
 
 
 class DeploymentMutationTests(unittest.TestCase):
+  def test_delete_accepts_existing_pipeline_without_revision_metadata(self):
+    plugin = Mutations()
+    for pipeline in [plugin.pipeline, *plugin.current.values()]:
+      pipeline["DEEPLOY_SPECS"].pop("revision")
+      pipeline["DEEPLOY_SPECS"].pop("secret_revision")
+    plugin.netmon = SimpleNamespace(network_known_pipelines=lambda: {
+      node: [pipeline] for node, pipeline in plugin.current.items()
+    })
+    result = plugin._admit_delete_operation(
+      dict(request_id="legacy-delete", job_id=7, expected_revision=0),
+      {"escrow_owner": "owner"},
+    )
+    self.assertEqual(result["status_code"], 202)
+    operation = plugin._operation_records()[result["operation_id"]]
+    self.assertEqual(operation["previous_revision"], 0)
+    self.assertEqual(operation["target_revision"], 1)
+    self.assertIsNone(operation["previous_secret_revision"])
+    self.assertEqual(operation["previous_nodes"], ["A", "B"])
+    self.assertEqual(plugin.commands, [])
+
   def test_scale_up_keeps_exact_existing_placement_and_updates_all_certificate_generations(self):
     plugin = Mutations()
     result = plugin._admit_scale_up_operation(

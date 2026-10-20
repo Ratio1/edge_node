@@ -633,9 +633,9 @@ class _DeploymentOperationsMixin:
     envelope = {key: request.get(key) for key in ("nonce", "EE_ETH_SIGN", "EE_ETH_SENDER")}
     try:
       _, inputs = self.deeploy_verify_and_get_inputs(envelope, request_type="get deployment status")
+      auth = self.deeploy_get_auth_result(inputs)
     except (ValueError, AssertionError) as exc:
       raise DeploymentAuthenticationError("Read authorization is invalid or expired; sign in again.") from exc
-    auth = self.deeploy_get_auth_result(inputs)
     if request.get("job_id") is not None:
       inputs[DEEPLOY_KEYS.JOB_ID] = request["job_id"]
     owner = auth[DEEPLOY_KEYS.ESCROW_OWNER]

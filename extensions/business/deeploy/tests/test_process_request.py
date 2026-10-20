@@ -14,6 +14,7 @@ from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS, DEEPLOY_STAT
 from extensions.business.deeploy.deeploy_mixin import (
   DEEPLOY_DAUTH_JOB_SECRETS_HKEY,
   DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+  _DeeployMixin,
 )
 
 
@@ -158,6 +159,32 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
 
 
 class DeeployProcessRequestTests(unittest.TestCase):
+
+  def test_status_auth_expiry_is_401_without_reclassifying_selector_errors(self):
+    plugin = _ProcessRequestStub()
+    plugin.deeploy_get_auth_result = lambda inputs: _DeeployMixin.deeploy_get_auth_result(plugin, inputs)
+    plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: ("sender", _InputsStub({
+      **request, "wallet_escrow": "escrow", "wallet_escrow_owner": "owner",
+    }))
+    plugin.time_to_str = lambda timestamp: str(timestamp)
+    plugin.time = lambda: 100_000
+    request = dict(nonce=hex(100_000_000), EE_ETH_SENDER="sender", EE_ETH_SIGN="signature")
+    for nonce in (hex(1_000_000), "invalid", hex(100_001_000)):
+      with self.subTest(nonce=nonce):
+        result = plugin.get_deployment_status({**request, "nonce": nonce, "job_id": 7})
+        self.assertEqual(result["status_code"], 401)
+        self.assertEqual(result["error"]["code"], "AUTHENTICATION_FAILED")
+    # Valid authorization with missing selectors stays a request error.
+    result = plugin.get_deployment_status(request)
+    self.assertEqual(result["status_code"], 400)
+    self.assertEqual(result["error"]["code"], "INVALID_REQUEST")
+    plugin._repair_deployment_records = Mock(side_effect=RuntimeError("storage unavailable"))
+    self.assertEqual(plugin.get_deployment_status({**request, "job_id": 7})["status_code"], 503)
+    plugin.deeploy_verify_and_get_inputs = Mock(side_effect=ValueError("Invalid signature"))
+    self.assertEqual(plugin.get_deployment_status({**request, "job_id": 7})["status_code"], 401)
+    # Shared nonce validation remains unchanged for other endpoint callers.
+    with self.assertRaisesRegex(ValueError, "Nonce is expired"):
+      plugin.deeploy_get_nonce(hex(1_000_000))
 
   def test_failed_create_retry_reuses_paid_job_only_after_confirmed_cleanup(self):
     completed = dict(job_id=97, owner="owner", kind="create", phase="completed",
