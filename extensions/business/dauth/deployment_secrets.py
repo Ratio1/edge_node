@@ -198,9 +198,11 @@ class _DauthDeploymentSecretsMixin:
       representative = copy.deepcopy(next(iter(configs.values())))
       representative.pop("DEEPLOY_OPERATION", None)
       canonical = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(representative))
-      cid = self.r1fs.calculate_json_cid(canonical, nonce=42, fn="data.json", show_logs=False)
-      if pointer["pipeline_cid"] != cid:
-        raise ValueError("Published CID does not match the operation plan.")
+      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, show_logs=False)
+      if published is None:
+        raise RuntimeError("Published deployment configuration is unavailable.")
+      if published != canonical:
+        raise ValueError("Published configuration does not match the operation plan.")
       reference = representative["DEEPLOY_SPECS"]["secret_revision"]
       record = self._deployment_secret_record(job_id, reference)
       if record is None or record.get("pipelines") != configs:
@@ -232,12 +234,16 @@ class _DauthDeploymentSecretsMixin:
       representative = copy.deepcopy(next(iter(configs.values())))
       representative.pop("DEEPLOY_OPERATION", None)
       canonical = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(representative))
-      active_cid = self.r1fs.calculate_json_cid(canonical, nonce=42, fn="data.json", show_logs=False)
       if (not isinstance(pointer, dict) or pointer.get("deleted")
           or pointer.get("operation_id") != operation["operation_id"]
           or pointer.get("revision") != operation["target_revision"]
-          or pointer.get("pipeline_cid") != active_cid):
+          or not pointer.get("pipeline_cid")):
         raise RuntimeError("Active deployment publication is pending.")
+      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, show_logs=False)
+      if published is None:
+        raise RuntimeError("Published deployment configuration is unavailable.")
+      if published != canonical:
+        raise ValueError("Published configuration does not match the operation plan.")
     elif operation["kind"] != "delete" and isinstance(pointer, dict) and pointer.get("operation_id") == operation["operation_id"]:
       # A stale preparing/failed snapshot must not revoke a revision that has
       # since become active, even if operation repair returned an older peer.

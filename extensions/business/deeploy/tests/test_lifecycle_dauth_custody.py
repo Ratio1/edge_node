@@ -228,6 +228,52 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.state.blobs.deleted.count(cid), 1)
     self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'fresh-token')
 
+  def test_retry_after_pointer_publication_reuses_cid_and_finishes_cleanup(self):
+    previous, cid = self.legacy()
+    self.admit(previous)
+    operation = self.operation()
+    self.state.fail_write = lambda namespace, key: 'before' if key.endswith('|revoked') else None
+    with self.assertRaises(RuntimeError):
+      self.finalize(operation)
+    pointer = copy.deepcopy(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'])
+    uploads = self.state.blobs.uploads
+    self.assertNotEqual(pointer['pipeline_cid'], cid)
+    self.state.fail_write = None
+    self.coordinator = Coordinator(self.state)
+    operation = self.operation()
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'], pointer)
+    self.assertEqual(self.state.blobs.uploads, uploads)
+    self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'fresh-token')
+
+  def test_missing_or_changed_published_content_cannot_publish_or_revoke(self):
+    self.admit()
+    operation = self.operation()
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'deploy', 'ready')
+    self.coordinator._advance_deployment_operation(operation)
+    plan = self.coordinator._load_operation_plan(operation)
+    canonical = copy.deepcopy(plan['configs']['A'])
+    canonical.pop('DEEPLOY_OPERATION', None)
+    canonical = self.dauth._recursively_sort_pipeline_data(
+      self.dauth.extract_invariable_data_from_pipeline(canonical))
+    pointer = dict(job_id='7', revision=operation['target_revision'], operation_id=operation['operation_id'],
+                   coordinator='oracle', deleted=False, pipeline_cid='published-folder')
+    self.coordinator.bc.sign(pointer)
+    for content, error in ((None, RuntimeError), (dict(canonical, unexpected=True), ValueError)):
+      with self.subTest(content_missing=content is None):
+        self.state.blobs.data['published-folder'] = content
+        writes = len(self.state.writes)
+        self.state.public.pop(('DEEPLOY_DEPLOYED_JOBS', '7'), None)
+        with self.assertRaises(error):
+          self.dauth._publish_deployment_secrets('7', operation, plan, pointer)
+        self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'] = pointer
+        with self.assertRaises(error):
+          self.dauth._revoke_deployment_secret_revisions('7', operation, plan, 'deploy')
+        self.assertEqual(len(self.state.writes), writes)
+        self.assertNotIn(('DAUTH_JOB_SECRETS', '7'), self.state.secrets)
+
   def test_invalid_target_is_rejected_before_staging_restoration(self):
     previous, _ = self.legacy()
     target = pipeline(dAuth.DAUTH_SECRET_PLACEHOLDER)

@@ -142,15 +142,20 @@ class _DeeployJobMixin:
     by its immutable plan reference; neither it nor restoration values are read
     into coordinator memory. Repeating the same operation repairs partial writes.
     """
-    pipeline = self.deepcopy(self.extract_invariable_data_from_pipeline(pipeline))
-    pipeline.pop("DEEPLOY_OPERATION", None)
-    cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
-    if not cid:
-      raise RuntimeError("Deployment metadata persistence is pending.")
-    pointer = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
-                   operation_id=operation["operation_id"], coordinator=operation["coordinator"],
-                   pipeline_cid=cid, deleted=False)
-    self.bc.sign(pointer, add_data=True, use_digest=True)
+    expected = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
+                    operation_id=operation["operation_id"], coordinator=operation["coordinator"],
+                    deleted=False)
+    pointer = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=expected["job_id"])
+    # R1FS wraps each upload in a new folder CID. Reuse a published pointer
+    # after partial finalization; dAuth still verifies its signature and content.
+    if not isinstance(pointer, dict) or any(pointer.get(key) != value for key, value in expected.items()):
+      pipeline = self.deepcopy(self.extract_invariable_data_from_pipeline(pipeline))
+      pipeline.pop("DEEPLOY_OPERATION", None)
+      cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
+      if not cid:
+        raise RuntimeError("Deployment metadata persistence is pending.")
+      pointer = dict(expected, pipeline_cid=cid)
+      self.bc.sign(pointer, add_data=True, use_digest=True)
     self._deployment_secret_request("commit", operation, pointer=pointer)
 
   def _load_dauth_job_secret_bundle(self, job_id):
