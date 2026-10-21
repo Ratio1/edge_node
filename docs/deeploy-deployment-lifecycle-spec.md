@@ -645,7 +645,7 @@ revokes unused revisions; deletion waits for all scoped stop reports. Core
 accepts a registered dAuth signature on the current bundle while still requiring
 a coordinator signature on public pointers. Equal-generation retries ignore
 signature metadata only; altered semantic contents and revoked revisions fail
-closed. These changes require SDK 3.5.59 and Core 7.7.333.
+closed. These changes require SDK 3.5.59 and Core 7.7.334 (7.7.333 was released separately before this stack). Edge ships as 2.10.511.
 
 Release order: SDK, Core, then Edge together with the lifecycle dApp. Retain the
 existing journal/secret storage and coordinated rollback requirements above.
