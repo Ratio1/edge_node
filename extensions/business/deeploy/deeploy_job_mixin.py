@@ -135,6 +135,24 @@ class _DeeployJobMixin:
 
     return result
 
+  def commit_deployment_revision(self, operation, pipeline):
+    """Ask dAuth to publish an exact ready revision and its bound secrets.
+
+    The coordinator signs public metadata only. dAuth obtains the secret bundle
+    by its immutable plan reference; neither it nor restoration values are read
+    into coordinator memory. Repeating the same operation repairs partial writes.
+    """
+    pipeline = self.deepcopy(self.extract_invariable_data_from_pipeline(pipeline))
+    pipeline.pop("DEEPLOY_OPERATION", None)
+    cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
+    if not cid:
+      raise RuntimeError("Deployment metadata persistence is pending.")
+    pointer = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
+                   operation_id=operation["operation_id"], coordinator=operation["coordinator"],
+                   pipeline_cid=cid, deleted=False)
+    self.bc.sign(pointer, add_data=True, use_digest=True)
+    self._deployment_secret_request("commit", operation, pointer=pointer)
+
   def _load_dauth_job_secret_bundle(self, job_id):
     return self.chainstore_hget(
       hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
@@ -306,7 +324,10 @@ class _DeeployJobMixin:
     """
     Get all the job pipelines from CSTORE.
     """
-    return self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY)
+    records = self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY) or {}
+    return {key: value.get("pipeline_cid") if isinstance(value, dict) else value
+            for key, value in records.items()
+            if not isinstance(value, dict) or not value.get("deleted")}
 
   def get_job_pipeline_from_cstore(
     self,
@@ -335,7 +356,8 @@ class _DeeployJobMixin:
     """
     Get the pipeline from CSTORE.
     """
-    return self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
+    value = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
+    return value.get("pipeline_cid") if isinstance(value, dict) else value
   
   def get_pipeline_from_r1fs(
     self,
