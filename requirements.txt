@@ -1,6 +1,6 @@
 kmonitor
 ratio1>=3.5.60
-naeural_core>=7.7.334
+naeural_core>=7.7.335
 decentra-vision
 python-telegram-bot[rate-limiter]
 protobuf
