@@ -11,7 +11,7 @@ import json
 import threading
 import uuid
 
-from ratio1.const.base import dAuth
+from ratio1.const.base import BCct, dAuth
 from .selected_secrets import inherit_selections
 
 from extensions.business.dauth.dauth_registry import (
@@ -31,7 +31,7 @@ class DeploymentConflictError(ValueError):
   """A request conflicts with observed operation identity or revision."""
 
 
-SIGNATURE_KEYS = {"EE_SIGN", "EE_SENDER", "EE_HASH", "EE_SIGN_CANON_V"}
+SIGNATURE_KEYS = {"EE_SIGN", "EE_SENDER", "EE_HASH", BCct.SIGN_CANON_V}
 
 
 def request_digest(request):

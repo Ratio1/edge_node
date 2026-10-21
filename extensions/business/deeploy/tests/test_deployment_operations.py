@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
+from ratio1.const.base import BCct
 
 from extensions.business.deeploy.deployment_operations import (
   _DeploymentOperationsMixin, OPERATIONS_HKEY, NODE_OPERATIONS_HKEY,
@@ -148,6 +149,7 @@ class DeploymentOperationTests(unittest.TestCase):
   def test_semantic_retry_ignores_nonce_but_not_payload(self):
     request = {"request_id": "same", "job_id": 1, "nonce": "old", "EE_ETH_SIGN": "sig"}
     self.assertEqual(request_digest(request), request_digest({**request, "nonce": "new", "EE_ETH_SIGN": "new"}))
+    self.assertEqual(request_digest(request), request_digest({**request, BCct.SIGN_CANON_V: "v2"}))
     self.assertNotEqual(request_digest(request), request_digest({**request, "job_id": 2}))
 
   def test_readiness_requires_exact_instances_and_fresh_evidence(self):
