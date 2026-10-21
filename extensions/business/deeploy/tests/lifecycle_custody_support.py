@@ -12,7 +12,7 @@ from unittest.mock import patch
 from naeural_core import constants as ct
 from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
 from ratio1.bc.base import BaseBlockEngine
-from ratio1.const.base import dAuth
+from ratio1.const.base import BCct, dAuth
 from extensions.business.dauth.dauth_mixin import _DauthMixin
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
@@ -21,7 +21,7 @@ from extensions.business.deeploy.deployment_operations import _DeploymentOperati
 from extensions.business.deeploy.deployment_mutations import _DeploymentMutationsMixin
 
 
-AUTH = {'EE_SIGN', 'EE_SENDER', 'EE_ETH_SENDER', 'EE_ETH_SIGN', 'EE_HASH', 'EE_SIGN_CANON_V'}
+AUTH = {'EE_SIGN', 'EE_SENDER', 'EE_ETH_SENDER', 'EE_ETH_SIGN', 'EE_HASH'}
 _cmdapi_spec = importlib.util.spec_from_file_location('custody_cmdapi', Path(ct.__file__).parent / 'business/mixins_base/cmdapi.py')
 _cmdapi = importlib.util.module_from_spec(_cmdapi_spec)
 _cmdapi_spec.loader.exec_module(_cmdapi)
@@ -36,6 +36,7 @@ class Engine:
 
   def sign(self, dct_data, **kwargs):
     value = dct_data
+    value[BCct.SIGN_CANON_V] = BaseBlockEngine.SIGN_CANON_V_CURRENT
     value.update(EE_SENDER=self.address, EE_ETH_SENDER='0x' + self.address)
     value['EE_SIGN'] = self.digest(value)
 
