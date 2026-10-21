@@ -14,7 +14,7 @@ from extensions.business.deeploy.deployment_operations import (
 from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
 
-CONFIG = {"NAME": "app", "DEEPLOY_SPECS": {"revision": 1, "secret_revision": "op:deploy"},
+CONFIG = {"NAME": "app", "TYPE": "Void", "DEEPLOY_SPECS": {"revision": 1, "secret_revision": "op:deploy"},
           "PLUGINS": [{"SIGNATURE": "RUNNER", "INSTANCES": [{"INSTANCE_ID": "worker"}]}]}
 
 

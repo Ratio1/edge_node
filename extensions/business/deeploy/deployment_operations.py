@@ -453,7 +453,9 @@ class _DeploymentOperationsMixin:
         continue
       operation["sent_at"][key] = self.time()
       self._save_operation(operation)
-      payload = copy.deepcopy(config) if action == "start" else {"NAME": operation["app_id"]}
+      payload = copy.deepcopy(config) if action == "start" else {
+        "NAME": operation["app_id"], "TYPE": config["TYPE"],
+      }
       if action == "start" and (attempt == "restore" or operation.get("mutation") == "owner_transfer"):
         bindings = operation.get("retired_runtime", {}).get(node, {})
         for plugin in payload.get("PLUGINS", []):

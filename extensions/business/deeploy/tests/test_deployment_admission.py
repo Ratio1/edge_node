@@ -16,7 +16,7 @@ from extensions.business.deeploy.tests.support import LifecycleCustodyDouble
 
 def config(node, revision=1, secret_revision="previous:deploy"):
   return {
-    "NAME": "app", "OWNER": "owner",
+    "NAME": "app", "TYPE": "Void", "OWNER": "owner",
     "DEEPLOY_SPECS": {"job_id": 7, "revision": revision,
                        "secret_revision": secret_revision,
                        "current_target_nodes": ["A", "B"]},
