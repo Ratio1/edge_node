@@ -65,17 +65,19 @@ class Blobs:
   def __init__(self):
     self.data = {}
     self.deleted = []
+    self.uploads = 0
 
   def calculate_json_cid(self, value, **kwargs):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
   def add_json(self, value, **kwargs):
-    cid = self.calculate_json_cid(value)
+    self.uploads += 1
+    cid = "folder-{}-{}".format(self.uploads, self.calculate_json_cid(value))
     self.data[cid] = copy.deepcopy(value)
     return cid
 
   def get_json(self, cid, **kwargs):
-    return copy.deepcopy(self.data[cid])
+    return copy.deepcopy(self.data.get(cid))
 
   def delete_file(self, cid, **kwargs):
     self.deleted.append(cid)
