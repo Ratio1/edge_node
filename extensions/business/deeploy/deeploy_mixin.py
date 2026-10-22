@@ -1765,7 +1765,7 @@ class _DeeployMixin:
 
   # Repairs Deeploy's off-chain pipeline metadata and live node configs after
   # PoAI Manager moves a CSP escrow to a new owner on-chain.
-  def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner):
+  def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner, transfer_id=None):
     pipeline_cid = self._get_pipeline_from_cstore(job_id)
     if not pipeline_cid:
       return {
@@ -1794,6 +1794,9 @@ class _DeeployMixin:
         DEEPLOY_KEYS.JOB_ID: job_id,
         DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid,
       }
+
+    if pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision"):
+      return self._admit_owner_transfer_operation(job_id, old_owner, new_owner, transfer_id)
 
     migrated_pipeline = self.deepcopy(pipeline)
     previous_owner = migrated_pipeline.get(NetMonCt.OWNER.upper())
@@ -4418,7 +4421,11 @@ class _DeeployMixin:
 
   def _cockroachdb_regeneration_intent_hash(self, inputs):
     payload = self.deepcopy(dict(inputs))
-    for key in (*DEEPLOY_V3_HASH_EXCLUDED_KEYS, DEEPLOY_KEYS.NONCE, COCKROACHDB_CERT_REGENERATION_REQUEST_KEY):
+    for key in (
+      *DEEPLOY_V3_HASH_EXCLUDED_KEYS, DEEPLOY_KEYS.NONCE,
+      COCKROACHDB_CERT_REGENERATION_REQUEST_KEY,
+      "request_id", "expected_revision", DEEPLOY_KEYS.CHAINSTORE_RESPONSE,
+    ):
       payload.pop(key, None)
     pipeline_params = payload.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
     allocation = (
@@ -4455,10 +4462,8 @@ class _DeeployMixin:
     if not regeneration_id:
       return None, None, False
 
-    if not bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False)):
-      raise ValueError(
-        "CockroachDB certificate regeneration requires all-node response confirmation."
-      )
+    # The durable deployment protocol requires node-owned readiness from every
+    # target; the removed plugin response flag cannot weaken this barrier.
     intent_hash = self._cockroachdb_regeneration_intent_hash(inputs)
     if applied_operation:
       applied_id, applied_intent = applied_operation
@@ -4834,21 +4839,24 @@ class _DeeployMixin:
       return False
     return value != DEEPLOY_DAUTH_SECRET_PLACEHOLDER
 
-  def _merge_deeploy_dauth_secret_fragments(self, target, source):
+  def _merge_deeploy_dauth_secret_fragments(self, target, source, reject_conflicts=False):
+    """Merge sparse fragments; lifecycle node copies must agree on shared paths."""
     if source is None:
       return target
     if target is None:
       return self.deepcopy(source)
     if isinstance(target, dict) and isinstance(source, dict):
       for key, value in source.items():
-        target[key] = self._merge_deeploy_dauth_secret_fragments(target.get(key), value)
+        target[key] = self._merge_deeploy_dauth_secret_fragments(target.get(key), value, reject_conflicts)
       return target
     if isinstance(target, list) and isinstance(source, list):
       while len(target) < len(source):
         target.append(None)
       for idx, value in enumerate(source):
-        target[idx] = self._merge_deeploy_dauth_secret_fragments(target[idx], value)
+        target[idx] = self._merge_deeploy_dauth_secret_fragments(target[idx], value, reject_conflicts)
       return target
+    if reject_conflicts and (type(target) is not type(source) or target != source):
+      raise ValueError("Node configurations contain conflicting values at a shared secret path.")
     return self.deepcopy(source)
 
   def _extract_and_redact_deeploy_dauth_secrets(self, payload):

@@ -1,3 +1,4 @@
+from extensions.business.deeploy.tests.support import submit_deployment, capture_deployment_admission
 import unittest
 import copy
 from collections import defaultdict
@@ -78,6 +79,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "nodes": nodes or ["node-1"],
       "deeploy_specs": deeploy_specs or {"job_id": 11},
     }
+    plugin.chainstore_hget = lambda hkey, key: None
     plugin._get_pipeline_from_cstore = lambda job_id: None
     plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: {
       "OWNER": "0xOwner",
@@ -99,15 +101,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     called = {
       "delete": 0,
-      "deploy": 0,
-      "deploy_kwargs": None,
+      "admitted": 0,
+      "admission_kwargs": None,
       "queued": 0,
       "persisted": 0,
       "bc_update": 0,
       "stage": 0,
       "committed": 0,
-      "staged_pipeline": None,
-      "staged_secret_bundle": None,
+      "admitted_pipeline": None,
+      "admitted_secret_bundle": None,
     }
     plugin.bc = types.SimpleNamespace(
       node_addr_to_eth_addr=lambda node: node,
@@ -135,8 +137,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin._load_dauth_job_secret_bundle = lambda job_id: None
     def stage_job_pipeline_and_secrets(pipeline, job_id, secret_bundle):
       called["stage"] += 1
-      called["staged_pipeline"] = copy.deepcopy(pipeline)
-      called["staged_secret_bundle"] = copy.deepcopy(secret_bundle)
+      called["admitted_pipeline"] = copy.deepcopy(pipeline)
+      called["admitted_secret_bundle"] = copy.deepcopy(secret_bundle)
       return {
         "job_id": str(job_id),
         "pipeline": copy.deepcopy(pipeline),
@@ -159,9 +161,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
 
     def check_and_deploy_pipelines(**kwargs):
-      called["deploy"] += 1
-      called["deploy_kwargs"] = kwargs
-      return {}, "success", {}, {"NAME": kwargs.get("app_id")}
+      raise AssertionError("HTTP admission must not dispatch workloads")
 
     plugin.check_and_deploy_pipelines = check_and_deploy_pipelines
     plugin._build_pipeline_persistence_state = lambda **kwargs: {"state": kwargs}
@@ -171,6 +171,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.persist_job_pipeline_metadata = (
       lambda **kwargs: called.__setitem__("persisted", called["persisted"] + 1) or True
     )
+    capture_deployment_admission(plugin, {}, called)
     return plugin, called
 
   def _make_four_replica_cockroach_update_fixture(self, plugin):
@@ -402,7 +403,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -415,15 +416,14 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    self.assertFalse(called["deploy_kwargs"]["dispatch_state"]["retain_on_failed_dispatch"])
-    self.assertEqual(called["deploy_kwargs"]["job_app_type"], JOB_APP_TYPES.SERVICE)
-    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    self.assertEqual(called["stage"], 0)
+    self.assertEqual(called["admission_kwargs"]["job_app_type"], JOB_APP_TYPES.SERVICE)
+    redeploy_inputs = called["admission_kwargs"]["inputs"]
     self.assertEqual(len(redeploy_inputs[DEEPLOY_KEYS.PLUGINS]), 1)
     self.assertEqual(
       redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
@@ -434,7 +434,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "8192m",
     )
 
-    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    prepared_plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
     self.assertEqual(
       prepared_plan["deeploy_specs"][DEEPLOY_KEYS.SERVICE_KIND],
       "cockroachdb",
@@ -463,7 +463,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_legacy_two_nodes",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -476,13 +476,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn("at least 3 target nodes", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("at least 3 target nodes", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
     self.assertEqual(called["persisted"], 0)
     self.assertEqual(called["bc_update"], 0)
@@ -556,7 +555,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -570,14 +569,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("service kind does not match", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("service kind does not match", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
-  def test_process_cockroachdb_regeneration_replay_is_noop_and_intent_bound(self):
+  def test_process_cockroachdb_regeneration_replay_uses_durable_admission(self):
     fixture_plugin = make_deeploy_plugin()
     nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
     regeneration_id = "11111111-1111-4111-8111-111111111111"
@@ -622,28 +620,21 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       deeploy_specs=deeploy_specs,
     )
 
-    response = plugin._process_pipeline_request(request, is_create=False, async_mode=True)
+    response = submit_deployment(plugin, request, is_create=False)
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
-    self.assertEqual(
-      response[DEEPLOY_KEYS.STATUS_DETAILS]["cockroachdb_certificate_regeneration"],
-      "already_applied",
-    )
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted", response)
+    self.assertEqual(response["status_code"], 202)
+    self.assertNotIn(DEEPLOY_KEYS.STATUS_DETAILS, response)
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 1)
     self.assertEqual(called["queued"], 0)
 
     changed_request = copy.deepcopy(request)
     changed_request[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_USER"] = "different_user"
-    changed_response = plugin._process_pipeline_request(
-      changed_request,
-      is_create=False,
-      async_mode=True,
-    )
-
-    self.assertIn("different update intent", changed_response[DEEPLOY_KEYS.ERROR])
-    self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    with self.assertRaisesRegex(ValueError, "different update intent"):
+      fixture_plugin._prepare_cockroachdb_regeneration_lifecycle(
+        make_inputs(**changed_request), deeploy_specs,
+      )
 
   def test_process_normal_cockroachdb_edit_inherits_running_certificates(self):
     fixture_plugin = make_deeploy_plugin()
@@ -680,7 +671,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -694,11 +685,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    prepared = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    prepared = called["admission_kwargs"]["prepared_create_deploy_plan"]
     for index, node in enumerate(nodes):
       emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
       overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
@@ -707,12 +697,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
       )
       stored_env = (
-        called["staged_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
+        called["admitted_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
         ["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
       )
       self.assertEqual(stored_env["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
 
   def test_process_offline_cockroachdb_edit_inherits_persisted_per_node_certificates(self):
     fixture_plugin = make_deeploy_plugin()
@@ -757,7 +747,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "deeploy_specs": deeploy_specs,
     }
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -771,11 +761,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    prepared = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    prepared = called["admission_kwargs"]["prepared_create_deploy_plan"]
     for index, node in enumerate(nodes):
       emitted = prepared["node_plugins_by_addr"][node][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
       overlay = plugin._overlay_for_node(emitted["PER_NODE_CONFIG"], node, index)
@@ -784,12 +773,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
       )
       stored_env = (
-        called["staged_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
+        called["admitted_secret_bundle"]["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]
         ["PER_NODE_CONFIG"]["byNode"][node]["ENV"]
       )
       self.assertEqual(stored_env["CRDB_NODE_KEY"], cert_bundle[node]["CRDB_NODE_KEY"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["admitted"], 1)
 
   def test_cockroachdb_regeneration_rejects_live_duplicate_claim(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
@@ -817,142 +806,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       claim,
     )
 
-  def test_cockroachdb_regeneration_reports_staging_commit_failure(self):
-    plugin, called = self._make_process_update_plugin(discovered_instances=[])
-    plugin.commit_staged_job_pipeline_and_secrets = (
-      lambda state: called.__setitem__("committed", called["committed"] + 1) or False
-    )
-    operation = {
-      "owner": "0xOwner",
-      "app_id": "cockroachdb_422ce92",
-      "kind": "cockroachdb_certificate_regeneration",
-      "operation_id": "11111111-1111-4111-8111-111111111111",
-      "intent_hash": "intent-a",
-      "persistence_failure_error": (
-        "CockroachDB certificate regeneration succeeded but metadata persistence failed."
-      ),
-    }
-    claim_key = plugin._claim_managed_update_action(
-      operation["owner"], operation["app_id"], operation
-    )
 
-    result = plugin.finalize_pending_request_pipeline(
-      pending={
-        "confirm": {"nodes_changed": False},
-        "staging": {"job_id": "11", "staged_cid": "new-cid"},
-        "managed_update_action_claim_key": claim_key,
-        "managed_update_action": operation,
-        "base_result": {},
-      },
-      dct_status={"response-1": {"node": "node-1"}},
-      str_status=DEEPLOY_STATUS.SUCCESS,
-    )
-
-    self.assertEqual(result[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
-    self.assertIn("metadata persistence failed", result[DEEPLOY_KEYS.ERROR])
-    self.assertEqual(called["committed"], 1)
-    self.assertEqual(called["persisted"], 0)
-    self.assertEqual(called["queued"], 0)
-    self.assertEqual(plugin._pending_managed_update_actions, {})
-
-  def test_process_cockroachdb_regeneration_replay_uses_recent_confirmed_success(self):
-    fixture_plugin = make_deeploy_plugin()
-    nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
-    regeneration_id = "11111111-1111-4111-8111-111111111111"
-    allocation = {
-      "version": 1,
-      "service": "cockroachdb",
-      "status": "allocated",
-      "nodeOrder": nodes,
-      "clientTunnel": {"url": "crdb-client.test:26257"},
-      "internalTunnels": [],
-    }
-    request = {
-      DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
-      DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
-      DEEPLOY_KEYS.JOB_ID: 11,
-      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
-      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
-      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
-      DEEPLOY_KEYS.TARGET_NODES: nodes,
-      DEEPLOY_KEYS.TARGET_NODES_COUNT: len(nodes),
-      DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": allocation},
-      DEEPLOY_KEYS.PLUGINS: [request_plugin],
-      "cockroachdb_certificate_regeneration_id": regeneration_id,
-    }
-    intent_hash = fixture_plugin._cockroachdb_regeneration_intent_hash(make_inputs(**request))
-    stale_specs = {
-      DEEPLOY_KEYS.JOB_ID: 11,
-      DEEPLOY_KEYS.JOB_APP_TYPE: JOB_APP_TYPES.SERVICE,
-      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
-      DEEPLOY_KEYS.JOB_CONFIG: {
-        DEEPLOY_KEYS.PIPELINE_PARAMS: {"deeploy_cockroachdb": copy.deepcopy(allocation)},
-      },
-    }
-    plugin, called = self._make_process_update_plugin(
-      discovered_instances=discovered_instances,
-      nodes=nodes,
-      deeploy_specs=stale_specs,
-    )
-    applied_specs = copy.deepcopy(stale_specs)
-    applied_specs[DEEPLOY_KEYS.JOB_CONFIG][DEEPLOY_KEYS.PIPELINE_PARAMS][
-      "deeploy_cockroachdb"
-    ].update({
-      "certificateGenerationId": regeneration_id,
-      "certificateRegenerationIntentSha256": intent_hash,
-    })
-    durable_pipeline = {
-      "OWNER": "0xOwner",
-      "NAME": "cockroachdb_422ce92",
-      "DEEPLOY_SPECS": applied_specs,
-    }
-
-    def commit_regeneration(state):
-      called["committed"] += 1
-      return True
-
-    plugin.commit_staged_job_pipeline_and_secrets = commit_regeneration
-    operation = {
-      "owner": "0xOwner",
-      "app_id": "cockroachdb_422ce92",
-      "kind": "cockroachdb_certificate_regeneration",
-      "operation_id": regeneration_id,
-      "intent_hash": intent_hash,
-      "persistence_failure_error": (
-        "CockroachDB certificate regeneration succeeded but metadata persistence failed."
-      ),
-    }
-    claim_key = plugin._claim_managed_update_action(
-      operation["owner"], operation["app_id"], operation
-    )
-    plugin.finalize_pending_request_pipeline(
-      pending={
-        "confirm": {"nodes_changed": False},
-        "staging": {"job_id": "11", "staged_cid": "new-cid"},
-        "managed_update_action_claim_key": claim_key,
-        "managed_update_action": operation,
-        "base_result": {},
-      },
-      dct_status={f"response-{index}": {"node": node} for index, node in enumerate(nodes)},
-      str_status=DEEPLOY_STATUS.SUCCESS,
-    )
-    self.assertEqual(called["committed"], 1)
-    self.assertEqual(called["persisted"], 0)
-    called["queued"] = 0
-    plugin._applied_managed_update_actions = {}
-    plugin.get_job_pipeline_from_cstore = lambda job_id, **kwargs: copy.deepcopy(durable_pipeline)
-
-    response = plugin._process_pipeline_request(request, is_create=False, async_mode=True)
-
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
-    self.assertEqual(
-      response[DEEPLOY_KEYS.STATUS_DETAILS]["cockroachdb_certificate_regeneration"],
-      "already_applied",
-    )
-    self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
-
-  def test_process_cockroachdb_regeneration_requires_response_keys_for_all_nodes(self):
+  def test_process_cockroachdb_regeneration_accepts_without_dispatching(self):
     fixture_plugin = make_deeploy_plugin()
     nodes, discovered_instances, request_plugin = self._make_four_replica_cockroach_update_fixture(fixture_plugin)
     allocation = {
@@ -1002,17 +857,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "NAME": "cockroachdb_422ce92",
       "DEEPLOY_SPECS": copy.deepcopy(persisted_specs),
     }
-    plugin._prepare_create_pipeline_deploy_plan = lambda **kwargs: {
-      "enable_chainstore_response": True,
-      "response_keys": {node: [f"response-{index}"] for index, node in enumerate(nodes[:-1])},
-      "node_plugins_by_addr": {},
-    }
+    response = submit_deployment(plugin, request, is_create=False)
 
-    response = plugin._process_pipeline_request(request, is_create=False, async_mode=True)
-
-    self.assertIn("response keys for every target node", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response["status"], "accepted", response)
+    self.assertEqual(response["status_code"], 202)
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 1)
+    self.assertEqual(called["stage"], 0)
+    self.assertIn("BEGIN RSA PRIVATE KEY", str(called["admitted_secret_bundle"]))
+    self.assertNotIn("BEGIN RSA PRIVATE KEY", str(called["admitted_pipeline"]))
 
   def test_process_legacy_service_update_preserves_four_replica_identity_and_storage(self):
     fixture_plugin = make_deeploy_plugin()
@@ -1036,23 +889,22 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       top_level_instance_id="CONTAINER_APP_3ab323",
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       request,
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    redeploy_inputs = called["admission_kwargs"]["inputs"]
     self.assertEqual(len(redeploy_inputs[DEEPLOY_KEYS.PLUGINS]), 1)
     self.assertEqual(
       redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
       "CONTAINER_APP_3ab323",
     )
     self.assertEqual(plugin._aggregate_container_resources(redeploy_inputs)["storage"], "8192m")
-    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    prepared_plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
     self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
     prepared_ids = {
       instance[plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
@@ -1093,17 +945,16 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
     request = self._make_legacy_service_update_request(nodes, request_plugin)
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       request,
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(dict(phase_calls), {})
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
 
   def test_process_legacy_service_update_rejects_conflicting_identity_before_discovery(self):
@@ -1142,18 +993,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       nested_instance_id="CONTAINER_APP_other",
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       request,
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
-    self.assertIn("Conflicting legacy instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR]["message"])
+    self.assertIn("Conflicting legacy instance_id", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(dict(phase_calls), {})
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
 
   def test_process_update_without_job_app_type_fails_before_discovery_or_side_effects(self):
@@ -1201,7 +1051,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
           lambda *args, **kwargs: phase_calls.__setitem__("reset", phase_calls["reset"] + 1)
         )
 
-        response = plugin._process_pipeline_request(
+        response = submit_deployment(plugin,
           {
             DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
             DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1213,15 +1063,14 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
             DEEPLOY_KEYS.PLUGINS: [request_plugin],
           },
           is_create=False,
-          async_mode=True,
-        )
+            )
 
-        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
-        self.assertIn("job_app_type is required for update requests", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR]["message"])
+        self.assertIn("job_app_type is required for update requests", response[DEEPLOY_KEYS.ERROR]["message"])
         self.assertEqual(dict(phase_calls), {})
         self.assertEqual(called["delete"], 0)
-        self.assertEqual(called["deploy"], 0)
+        self.assertEqual(called["admitted"], 0)
         self.assertEqual(called["queued"], 0)
 
   def test_process_update_rejects_blank_and_invalid_job_app_type_before_discovery(self):
@@ -1231,7 +1080,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         discovery_calls = []
         plugin._gather_running_pipeline_context = lambda **kwargs: discovery_calls.append(kwargs) or {}
 
-        response = plugin._process_pipeline_request(
+        response = submit_deployment(plugin,
           {
             DEEPLOY_KEYS.APP_ID: "app-123",
             DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -1250,15 +1099,30 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
             ],
           },
           is_create=False,
-          async_mode=True,
-        )
+            )
 
-        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR])
-        self.assertIn("job_app_type", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+        self.assertIn(DEEPLOY_ERRORS.REQUEST3, response[DEEPLOY_KEYS.ERROR]["message"])
+        self.assertIn("job_app_type", response[DEEPLOY_KEYS.ERROR]["message"])
         self.assertEqual(discovery_calls, [])
         self.assertEqual(called["delete"], 0)
-        self.assertEqual(called["deploy"], 0)
+        self.assertEqual(called["admitted"], 0)
+
+  def test_create_after_confirmed_delete_revalidates_owner_and_capacity_without_new_job_precondition(self):
+    plugin, called = self._make_process_update_plugin(discovered_instances=[], nodes=["node-1"])
+    plugin.chainstore_hget = lambda hkey, key: {"revision": 8, "deleted": True, "pipeline_cid": None}
+    payment_checks = []
+    plugin.deeploy_check_payment_and_job_owner = lambda inputs, owner, is_create, debug: payment_checks.append(is_create) or True
+    response = submit_deployment(plugin, {
+      "app_alias": "app", "job_id": 11, "pipeline_input_type": "void", "target_nodes": ["node-1"],
+      "target_nodes_count": 1, "plugins": [make_plugin_entry(
+        "CONTAINER_APP_RUNNER", IMAGE="repo/app:1.0",
+        CONTAINER_RESOURCES={"cpu": 1, "memory": "256m", "storage": "1g"},
+      )],
+    }, is_create=True)
+    self.assertEqual(response["status"], "accepted", response)
+    self.assertEqual(payment_checks, [False])
+    self.assertEqual(called["admitted"], 1)
 
   def test_process_create_without_job_app_type_keeps_inference(self):
     plugin, called = self._make_process_update_plugin(
@@ -1266,7 +1130,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       nodes=["node-1"],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ALIAS: "app",
         DEEPLOY_KEYS.JOB_ID: 11,
@@ -1283,14 +1147,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=True,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    self.assertEqual(called["deploy"], 1)
-    self.assertEqual(called["deploy_kwargs"]["job_app_type"], JOB_APP_TYPES.GENERIC)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["admitted"], 1)
+    self.assertEqual(called["admission_kwargs"]["job_app_type"], JOB_APP_TYPES.GENERIC)
     self.assertEqual(
-      called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.JOB_APP_TYPE],
+      called["admission_kwargs"]["inputs"][DEEPLOY_KEYS.JOB_APP_TYPE],
       JOB_APP_TYPES.GENERIC,
     )
 
@@ -1304,7 +1167,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       plugin,
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ALIAS: "app",
         DEEPLOY_KEYS.JOB_ID: 11,
@@ -1320,14 +1183,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         },
       },
       is_create=True,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["admitted"], 1)
     self.assertNotIn(
       DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
-      called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS][0],
+      called["admission_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS][0],
     )
 
   def test_process_service_update_without_resolved_id_fails_before_side_effects(self):
@@ -1354,7 +1216,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin._reset_chainstore_response_keys = lambda *args, **kwargs: reset_calls.append(args)
     plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: backfill_calls.append(args)
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1367,16 +1229,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR])
-    self.assertIn("Service update plugins must include instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn(DEEPLOY_ERRORS.PLUGINS3, response[DEEPLOY_KEYS.ERROR]["message"])
+    self.assertIn("Service update plugins must include instance_id", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(backfill_calls, [])
     self.assertEqual(payment_calls, [])
     self.assertEqual(reset_calls, [])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_service_update_rejects_reserved_user_before_payment_or_node_lookup(self):
     fixture_plugin = make_deeploy_plugin()
@@ -1401,7 +1262,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       lambda inputs: phase_calls.append("nodes") or nodes
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1414,14 +1275,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(phase_calls, [])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
 
   def test_process_service_update_rejects_per_node_reserved_user_before_payment_or_delete(self):
@@ -1447,7 +1307,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       lambda inputs: phase_calls.append("nodes") or nodes
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1460,14 +1320,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn("per-node ENV", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("per-node ENV", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(phase_calls, [])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
 
   def test_process_legacy_service_update_allows_unchanged_expanded_reserved_user(self):
@@ -1489,7 +1348,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1502,19 +1361,18 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    redeploy_inputs = called["admission_kwargs"]["inputs"]
     self.assertEqual(
       redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0]["IMAGE"],
       "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
     )
     self.assertEqual(redeploy_inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_USER"], "admin")
-    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    prepared_plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
     self.assertEqual(set(prepared_plan["node_plugins_by_addr"]), set(nodes))
 
   def test_legacy_service_compatibility_context_covers_all_expanded_reserved_users(self):
@@ -1572,7 +1430,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       lambda *args, **kwargs: phase_calls.append("payment") or True
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1585,14 +1443,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(phase_calls, [])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
 
   def test_process_legacy_service_update_rejects_any_credential_tuple_change(self):
@@ -1624,7 +1481,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
           lambda *args, **kwargs: phase_calls.append("payment") or True
         )
 
-        response = plugin._process_pipeline_request(
+        response = submit_deployment(plugin,
           {
             DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
             DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1637,14 +1494,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
             DEEPLOY_KEYS.PLUGINS: [request_plugin],
           },
           is_create=False,
-          async_mode=True,
-        )
+            )
 
-        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-        self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR])
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+        self.assertIn("reserved", response[DEEPLOY_KEYS.ERROR]["message"])
         self.assertEqual(phase_calls, [])
         self.assertEqual(called["delete"], 0)
-        self.assertEqual(called["deploy"], 0)
+        self.assertEqual(called["admitted"], 0)
         self.assertEqual(called["queued"], 0)
 
   def test_process_legacy_service_update_rejects_inconsistent_discovered_credentials(self):
@@ -1672,7 +1528,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       lambda *args, **kwargs: phase_calls.append("payment") or True
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "cockroachdb_422ce92",
         DEEPLOY_KEYS.APP_ALIAS: "cockroachdb",
@@ -1685,14 +1541,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         DEEPLOY_KEYS.PLUGINS: [request_plugin],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn("inconsistent", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("inconsistent", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(phase_calls, [])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
 
   def test_prepare_single_plugin_instance_update_falls_back_to_instance_conf(self):
@@ -2092,7 +1947,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2116,14 +1971,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("Circular dependency", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Circular dependency", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
-  def test_process_update_return_request_preserves_config_values(self):
+  def test_process_update_acceptance_omits_configuration_values(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -2144,7 +1998,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.cfg_deeploy_verbose = 2
     plugin.P = lambda message, **kwargs: logs.append(str(message))
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2170,17 +2024,16 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=False,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
-    self.assertEqual(called["deploy"], 1)
-    request_payload = response[DEEPLOY_KEYS.REQUEST]
-    self.assertEqual(request_payload[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["API_TOKEN"], "raw-token")
-    self.assertEqual(
-      request_payload[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["node-1"]["ENV"]["NODE_PASSWORD"],
-      "raw-password",
-    )
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["admitted"], 1)
+    self.assertNotIn(DEEPLOY_KEYS.REQUEST, response)
+    self.assertNotIn("raw-token", str(response))
+    self.assertNotIn("raw-password", str(response))
+    prepared_config = called["admitted_pipeline"]
+    self.assertIn("raw-token", str(prepared_config))
+    self.assertIn("raw-password", str(prepared_config))
     self.assertNotIn("raw-token", "\n".join(logs))
     self.assertNotIn("raw-password", "\n".join(logs))
 
@@ -2213,7 +2066,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2240,12 +2093,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("Duplicate plugin_name", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Duplicate plugin_name", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_rejects_unknown_plugin_instance_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -2265,7 +2117,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2285,12 +2137,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("Unknown plugin instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Unknown plugin instance_id", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_rejects_duplicate_explicit_semaphore_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -2318,7 +2169,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2344,12 +2195,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("Duplicate semaphore key", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Duplicate semaphore key", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_rejects_duplicate_instance_ids_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -2368,7 +2218,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2394,12 +2244,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("Duplicate plugin_instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Duplicate plugin_instance_id", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_omits_unrequested_live_plugins_from_redeploy(self):
     plugin, called = self._make_process_update_plugin(
@@ -2430,7 +2279,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2450,20 +2299,19 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    redeploy_inputs = called["admission_kwargs"]["inputs"]
     redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
     self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(
       {entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] for entry in redeploy_plugins},
       {"api-instance"},
     )
-    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    prepared_plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
     self.assertIsNotNone(prepared_plan)
     prepared_instances = [
       instance
@@ -2536,7 +2384,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.deeploy_check_payment_and_job_owner = check_payment_and_owner
     plugin._check_nodes_availability = check_nodes_availability
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2557,12 +2405,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
     self.assertEqual([context for context, _, _ in validation_calls], ["payment", "nodes"])
 
   def test_process_repeated_target_replacements_do_not_accumulate_old_nodes(self):
@@ -2589,7 +2436,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
           deeploy_specs=specs,
         )
         plugin._check_nodes_availability = lambda inputs: list(targets)
-        response = plugin._process_pipeline_request({
+        response = submit_deployment(plugin, {
           DEEPLOY_KEYS.APP_ID: "app-57",
           DEEPLOY_KEYS.APP_ALIAS: "app",
           DEEPLOY_KEYS.JOB_ID: 57,
@@ -2604,12 +2451,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
             **config,
             "PER_NODE_CONFIG": {"byIndex": {"0": {"ENV": {"ROLE": "primary"}}}},
           }],
-        }, is_create=False, async_mode=True)
+        }, is_create=False)
 
-        self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
-        self.assertEqual(called["delete"], 1)
-        self.assertEqual(called["bc_update"], 1)
-        plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+        self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+        self.assertEqual(called["delete"], 0)
+        self.assertEqual(called["bc_update"], 0)
+        plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
         specs = plan["deeploy_specs"]
         self.assertEqual(specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES], targets)
         self.assertEqual(specs[DEEPLOY_KEYS.NR_TARGET_NODES], 1)
@@ -2671,7 +2518,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     }
     plugin._check_nodes_availability = lambda inputs: ["new-node-1"]
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2693,22 +2540,21 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 1)
-    self.assertEqual(called["stage"], 1)
+    self.assertEqual(called["admitted"], 1)
+    self.assertEqual(called["stage"], 0)
     self.assertEqual(called["queued"], 0)
-    self.assertEqual(called["bc_update"], 1)
-    self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["new-node-1"])
-    plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(called["bc_update"], 0)
+    self.assertEqual(called["admission_kwargs"]["new_nodes"], ["new-node-1"])
+    plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
     self.assertEqual(plan["deeploy_specs"][DEEPLOY_KEYS.CURRENT_TARGET_NODES], ["new-node-1"])
     self.assertEqual(plan["deeploy_specs"][DEEPLOY_KEYS.NR_TARGET_NODES], 1)
     instance = plan["node_plugins_by_addr"]["new-node-1"][0]["INSTANCES"][0]
     self.assertEqual(instance["PER_NODE_TARGET_NODES"], ["new-node-1"])
-    redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+    redeploy_plugins = called["admission_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
     self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(
       redeploy_plugins[0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID],
@@ -2742,7 +2588,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: payment_calls.append(args) or True
     plugin._check_nodes_availability = lambda inputs: node_calls.append(inputs) or ["node-1"]
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2763,15 +2609,14 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
-    self.assertIn("job_app_type cannot be changed", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "error")
+    self.assertIn("job_app_type cannot be changed", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(payment_calls, [])
     self.assertEqual(node_calls, [])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
     self.assertEqual(called["queued"], 0)
 
   def test_process_update_ignores_invalid_omitted_live_plugin_config(self):
@@ -2810,7 +2655,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       lambda inputs: node_calls.append(inputs) or ["node-1"]
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2830,18 +2675,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
     self.assertEqual(len(payment_calls), 1)
     self.assertEqual(len(node_calls), 1)
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
     self.assertEqual(
       [
         entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID]
-        for entry in called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+        for entry in called["admission_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
       ],
       ["api-instance"],
     )
@@ -2877,7 +2721,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       deeploy_specs={DEEPLOY_KEYS.JOB_ID: 11},
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2898,14 +2742,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
     self.assertEqual(
-      called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS][0]["IMAGE"],
+      called["admission_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS][0]["IMAGE"],
       "repo/api:2.0",
     )
 
@@ -2925,7 +2768,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -2944,13 +2787,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    redeploy_inputs = called["admission_kwargs"]["inputs"]
     redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
     self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(redeploy_plugins[0][DEEPLOY_KEYS.PLUGIN_NAME], "legacy")
@@ -3004,7 +2846,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       nodes=["node-1", "node-2"],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3024,14 +2866,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
 
-    redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+    redeploy_plugins = called["admission_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
     self.assertEqual(len(redeploy_plugins), 1)
     api = redeploy_plugins[0]
     self.assertEqual(api["PROCESS_DELAY"], 10)
@@ -3073,7 +2914,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       nodes=["node-1"],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3093,14 +2934,13 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
 
-    redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+    redeploy_plugins = called["admission_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
     self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(redeploy_plugins[0][DEEPLOY_KEYS.PLUGIN_INSTANCE_ID], "api-instance")
     self.assertEqual(redeploy_plugins[0]["PROCESS_DELAY"], 10)
@@ -3159,7 +2999,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       nodes=["node-1", "node-2"],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3179,15 +3019,14 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["node-1", "node-2"])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    self.assertEqual(called["admission_kwargs"]["new_nodes"], ["node-1", "node-2"])
 
-    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    redeploy_inputs = called["admission_kwargs"]["inputs"]
     redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
     self.assertEqual(len(redeploy_plugins), 1)
     self.assertEqual(
@@ -3233,7 +3072,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     log_lines = []
     plugin.P = lambda message, **kwargs: log_lines.append(message)
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3255,13 +3094,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    prepared_plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
     for node_plugins in prepared_plan["node_plugins_by_addr"].values():
       instance = node_plugins[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
       self.assertEqual(instance["ENV"]["API_TOKEN"], "requested-secret")
@@ -3313,7 +3151,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     log_lines = []
     plugin.P = lambda message, **kwargs: log_lines.append(message)
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3333,11 +3171,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(called["delete"], 1)
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(called["delete"], 0)
     self.assertFalse(any("live replica config drift" in line for line in log_lines))
 
   def test_process_update_rejects_instance_id_signature_mismatch_before_delete(self):
@@ -3357,7 +3194,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3377,12 +3214,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("cannot be reused with signature", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("cannot be reused with signature", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_generates_id_for_new_plugin_without_id(self):
     plugin, called = self._make_process_update_plugin(
@@ -3401,7 +3237,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3426,11 +3262,10 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    prepared_plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
     instances = prepared_plan["node_plugins_by_addr"]["node-1"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES]
     by_name = {instance[DEEPLOY_KEYS.PLUGIN_NAME]: instance for instance in instances}
     self.assertEqual(
@@ -3504,7 +3339,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3522,12 +3357,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("Ambiguous no-ID/no-name update request", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("Ambiguous no-ID/no-name update request", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_ensure_plugin_instance_ids_rejects_ambiguous_nameless_config_match(self):
     plugin = make_deeploy_plugin()
@@ -3561,7 +3395,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       )
 
-  def test_process_update_resets_chainstore_response_before_delete_and_reuses_plan(self):
+  def test_process_update_uses_node_reporting_without_reset_or_dispatch(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -3589,7 +3423,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     plugin._reset_chainstore_response_keys = reset_response_keys
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3609,19 +3443,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
-    self.assertEqual(len(reset_calls), 1)
-    self.assertEqual(reset_calls[0]["delete_count"], 0)
-    self.assertEqual(called["delete"], 1)
-    self.assertEqual(called["deploy"], 1)
-    self.assertTrue(called["deploy_kwargs"]["skip_create_response_key_reset"])
-    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
-    self.assertEqual(prepared_plan["response_keys"], reset_calls[0]["response_keys"])
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "accepted")
+    self.assertEqual(reset_calls, [])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["admitted"], 1)
+    prepared_plan = called["admission_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(prepared_plan["response_keys"], {})
+    self.assertFalse(prepared_plan["enable_chainstore_response"])
 
-  def test_process_update_aborts_before_delete_when_chainstore_reset_fails(self):
+  def test_process_update_never_calls_retired_response_reset(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
         {
@@ -3643,7 +3475,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     plugin._reset_chainstore_response_keys = reset_response_keys
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3663,12 +3495,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("reset failed before delete", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(response["status"], "accepted")
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 1)
 
   def test_process_update_rejects_malformed_dynamic_env_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -3688,7 +3519,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3711,12 +3542,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("DYNAMIC_ENV entries for 'API_URL' must be a list", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("DYNAMIC_ENV entries for 'API_URL' must be a list", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_rejects_per_node_malformed_dynamic_env_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -3736,7 +3566,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3764,12 +3594,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("DYNAMIC_ENV entries for 'API_URL' must be a list", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("DYNAMIC_ENV entries for 'API_URL' must be a list", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_rejects_unsupported_dynamic_env_type_before_payment_or_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -3796,7 +3625,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     plugin.deeploy_check_payment_and_job_owner = check_payment
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3821,13 +3650,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("unsupported type 'container_ip'", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("unsupported type 'container_ip'", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["payment"], 0)
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_rejects_per_node_unsupported_dynamic_env_type_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -3854,7 +3682,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     plugin.deeploy_check_payment_and_job_owner = check_payment
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3884,13 +3712,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("unsupported type 'plugin_value'", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("unsupported type 'plugin_value'", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["payment"], 0)
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_process_update_rejects_source_shmem_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -3910,7 +3737,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       ],
     )
 
-    response = plugin._process_pipeline_request(
+    response = submit_deployment(plugin,
       {
         DEEPLOY_KEYS.APP_ID: "app-123",
         DEEPLOY_KEYS.APP_ALIAS: "app",
@@ -3938,12 +3765,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
         ],
       },
       is_create=False,
-      async_mode=True,
     )
 
-    self.assertIn("source='shmem'", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("source='shmem'", response[DEEPLOY_KEYS.ERROR]["message"])
     self.assertEqual(called["delete"], 0)
-    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["admitted"], 0)
 
   def test_handle_error_redacts_per_node_config_recursively(self):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
