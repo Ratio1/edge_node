@@ -5,7 +5,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 from ratio1.const.base import BCct
 
 from extensions.business.deeploy.deployment_operations import (
@@ -43,6 +43,7 @@ class Coordinator(_DeploymentOperationsMixin):
     self.r1fs = SimpleNamespace(get_json=lambda cid, **kw: copy.deepcopy(self.plan))
     self.plan = {"configs": {node: copy.deepcopy(CONFIG) for node in ("A", "B", "C")}, "previous_configs": {}}
     self._commit_operation_revision = Mock()
+    self.chainstore_hsync = Mock(side_effect=AssertionError("Deployment reads must use local replicas"))
 
   def time(self):
     return self.now
@@ -58,9 +59,6 @@ class Coordinator(_DeploymentOperationsMixin):
 
   def chainstore_hgetall(self, namespace):
     return {key: copy.deepcopy(value) for (ns, key), value in self.storage.items() if ns == namespace}
-
-  def chainstore_hsync(self, *args, **kw):
-    return {"success": True}
 
   def cmdapi_start_pipeline(self, config, node_address):
     self.commands.append((node_address, copy.deepcopy(config)))
@@ -123,28 +121,19 @@ class DeploymentStatusTests(unittest.TestCase):
     self.assertEqual(len(result["nodes"]), 3)
     self.assertNotIn("settlement", result)
     self.assertEqual(plugin.commands, [])
+    plugin.chainstore_hsync.assert_not_called()
     plugin.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "someone-else"}
     self.assertEqual(plugin._deployment_status({"operation_id": operation["operation_id"]})["status"], "synchronizing")
 
 
 class DeploymentOperationTests(unittest.TestCase):
-  def test_replica_repair_runs_on_startup_then_every_ten_minutes_or_when_forced(self):
+  def test_worker_reconciles_local_operations_without_peer_repair(self):
     plugin = Coordinator()
-    plugin.now = 0
-    plugin.chainstore_hsync = Mock()
-    with patch("extensions.business.deeploy.deployment_operations.threading.Thread"):
-      plugin._init_deployment_operations()
-    plugin._repair_deployment_records()
-    self.assertEqual(plugin.chainstore_hsync.call_count, 2)
-    plugin.now = 599
-    plugin._repair_deployment_records()
-    self.assertEqual(plugin.chainstore_hsync.call_count, 2)
-    plugin.now = 600
-    plugin._repair_deployment_records()
-    self.assertEqual(plugin.chainstore_hsync.call_count, 4)
-    plugin.now = 601
-    plugin._repair_deployment_records(force=True)
-    self.assertEqual(plugin.chainstore_hsync.call_count, 6)
+    plugin._reconcile_coordinator_operations = Mock(side_effect=plugin._deployment_operations_stop.set)
+    plugin._deployment_operations_event.set()
+    plugin._deployment_operation_worker()
+    plugin._reconcile_coordinator_operations.assert_called_once_with()
+    plugin.chainstore_hsync.assert_not_called()
 
   def test_plan_cache_allows_overlapping_downloads_and_keeps_results_after_eviction(self):
     plugin = Coordinator()

@@ -61,9 +61,6 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
   def _operation_peers(self):
     return ["oracle", "replica"]
 
-  def _repair_deployment_records(self, **kwargs):
-    return
-
   def chainstore_hset(self, namespace, key, value, **kwargs):
     self.writes.append((namespace, key))
     self.storage[namespace, key] = copy.deepcopy(value)

@@ -470,11 +470,10 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
           result = plugin.process_dauth_add_secrets_request(body)
         elif operation == "get":
           body.update(EE_SENDER="node-runner", EE_ETH_SENDER="0xRUNNER")
-          plugin.chainstore_hsync = Mock(return_value={"hkey": "synced"})
+          plugin.chainstore_hsync = Mock(side_effect=AssertionError("Secret requests must use local replicas"))
           plugin._r1fs_data["cid-7"]["DEEPLOY_SPECS"]["job_id"] = "7"
           result = plugin.process_dauth_get_secret_request(body)
-          self.assertEqual([call.kwargs["hkey"] for call in plugin.chainstore_hsync.call_args_list],
-                           [DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY])
+          plugin.chainstore_hsync.assert_not_called()
         else:
           result = plugin.process_dauth_reveal_secret_request(body)
         self.assertEqual(result["status"], "success")
@@ -664,7 +663,8 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       "pipelines": {"node-runner": {"NAME": "app"}},
     }
     plugin._dauth_registry_internal_peers = ["node-oracle"]
-    plugin.chainstore_hsync = lambda **kwargs: {"merged_fields": 0}
+    from unittest.mock import Mock
+    plugin.chainstore_hsync = Mock(side_effect=AssertionError("Secret requests must use local replicas"))
     return plugin
 
   def test_get_secrets_uses_exact_revision_plan_without_current_metadata(self):
@@ -678,6 +678,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     self.assertEqual(encrypted_bundle["job_secrets"]["ENV"]["TOKEN"], "secret")
     self.assertNotIn("pipelines", encrypted_bundle)
     self.assertIn("pipelines", plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")])
+    plugin.chainstore_hsync.assert_not_called()
 
   def test_get_secrets_rejects_missing_revision_without_legacy_fallback(self):
     plugin = self._revision_plugin()
@@ -720,68 +721,38 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       plugin.process_dauth_get_secret_request(self._revision_request(nonce=hex((REQUEST_TIME - 121) * 1000)))
     self.assertEqual(plugin.bc.encrypt_calls, [])
 
-  def test_get_secrets_repairs_missing_revision_only_from_dauth_peers(self):
+  def test_get_secrets_missing_local_revision_is_retryable_without_peer_repair(self):
     plugin = self._revision_plugin()
     key = (DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")
-    record = plugin._chainstore.pop(key)
-    sync_calls = []
-    def sync(**kwargs):
-      sync_calls.append(kwargs)
-      plugin._chainstore[key] = record
-      return {"merged_fields": 1}
-    plugin.chainstore_hsync = sync
-    plugin.process_dauth_get_secret_request(self._revision_request())
-    self.assertEqual(sync_calls, [{
-      "hkey": DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
-      "timeout": 5,
-      "extra_peers": ["node-oracle"],
-      "include_default_peers": False,
-      "include_configured_peers": False,
-    }])
+    plugin._chainstore.pop(key)
+    with self.assertRaisesRegex(RuntimeError, "No dAuth secret bundle"):
+      plugin.process_dauth_get_secret_request(self._revision_request())
+    plugin.chainstore_hsync.assert_not_called()
+    self.assertEqual(plugin.bc.encrypt_calls, [])
 
   def test_get_secrets_revocation_marker_rejects_stale_original_bundle(self):
     plugin = self._revision_plugin()
-    key = (DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")
-    original = deepcopy(plugin._chainstore[key])
-    def sync(**kwargs):
-      plugin._chainstore[key] = original
-      plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy|revoked")] = True
-      return {"merged_fields": 2}
-    plugin.chainstore_hsync = sync
-    with self.assertRaisesRegex(ValueError, "revoked"):
-      plugin.process_dauth_get_secret_request(self._revision_request())
-    self.assertEqual(plugin.bc.encrypt_calls, [])
-
-  def test_get_secrets_sync_exception_is_transient(self):
-    plugin = self._revision_plugin()
-    def unavailable(**kwargs):
-      raise ValueError("No reachable peers")
-    plugin.chainstore_hsync = unavailable
-    with self.assertRaisesRegex(RuntimeError, "synchronization is unavailable"):
-      plugin.process_dauth_get_secret_request(self._revision_request())
-    self.assertEqual(plugin.bc.encrypt_calls, [])
-
-  def test_get_secrets_known_revocation_rejects_before_sync(self):
-    plugin = self._revision_plugin()
     plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy|revoked")] = True
-    def unexpected_sync(**kwargs):
-      raise AssertionError("Known revocation must fail before synchronization")
-    plugin.chainstore_hsync = unexpected_sync
     with self.assertRaisesRegex(ValueError, "revoked"):
       plugin.process_dauth_get_secret_request(self._revision_request())
+    self.assertEqual(plugin.bc.encrypt_calls, [])
+    plugin.chainstore_hsync.assert_not_called()
 
-  def test_get_secrets_rejects_revoked_primary_and_unavailable_sync(self):
+  def test_get_secrets_cached_revision_does_not_require_peer_synchronization(self):
+    plugin = self._revision_plugin()
+    plugin.chainstore_hsync.side_effect = RuntimeError("Peers are unavailable")
+    self.assertEqual(plugin.process_dauth_get_secret_request(self._revision_request())["status"], "success")
+    plugin.chainstore_hsync.assert_not_called()
+
+  def test_get_secrets_rejects_revoked_primary(self):
     plugin = self._revision_plugin()
     plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")] = {
       "job_id": "7", "revision": "op:deploy", "revoked": True,
     }
     with self.assertRaisesRegex(ValueError, "revoked"):
       plugin.process_dauth_get_secret_request(self._revision_request())
-    plugin = self._revision_plugin()
-    plugin.chainstore_hsync = lambda **kwargs: None
-    with self.assertRaisesRegex(RuntimeError, "synchronization is unavailable"):
-      plugin.process_dauth_get_secret_request(self._revision_request())
     self.assertEqual(plugin.bc.encrypt_calls, [])
+    plugin.chainstore_hsync.assert_not_called()
 
   def test_current_reveal_resolves_versioned_pointer_and_rejects_deleted_generation(self):
     plugin = _make_dauth_harness()
