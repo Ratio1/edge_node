@@ -5,7 +5,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from ratio1.const.base import BCct
 
 from extensions.business.deeploy.deployment_operations import (
@@ -128,6 +128,24 @@ class DeploymentStatusTests(unittest.TestCase):
 
 
 class DeploymentOperationTests(unittest.TestCase):
+  def test_replica_repair_runs_on_startup_then_every_ten_minutes_or_when_forced(self):
+    plugin = Coordinator()
+    plugin.now = 0
+    plugin.chainstore_hsync = Mock()
+    with patch("extensions.business.deeploy.deployment_operations.threading.Thread"):
+      plugin._init_deployment_operations()
+    plugin._repair_deployment_records()
+    self.assertEqual(plugin.chainstore_hsync.call_count, 2)
+    plugin.now = 599
+    plugin._repair_deployment_records()
+    self.assertEqual(plugin.chainstore_hsync.call_count, 2)
+    plugin.now = 600
+    plugin._repair_deployment_records()
+    self.assertEqual(plugin.chainstore_hsync.call_count, 4)
+    plugin.now = 601
+    plugin._repair_deployment_records(force=True)
+    self.assertEqual(plugin.chainstore_hsync.call_count, 6)
+
   def test_plan_cache_allows_overlapping_downloads_and_keeps_results_after_eviction(self):
     plugin = Coordinator()
     plugin._deployment_plans = {str(index): {"configs": {}} for index in range(32)}
