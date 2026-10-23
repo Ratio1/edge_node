@@ -14,9 +14,7 @@ import uuid
 from ratio1.const.base import BCct, dAuth
 from .selected_secrets import inherit_selections
 
-from extensions.business.dauth.dauth_registry import (
-  dauth_registry_write_kwargs, get_dauth_registry_internal_peers,
-)
+from extensions.business.dauth.dauth_registry import get_dauth_registry_internal_peers
 from .deeploy_const import DEEPLOY_KEYS, CONTAINERIZED_APPS_SIGNATURES
 
 
@@ -75,7 +73,6 @@ class _DeploymentOperationsMixin:
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
-    self._deployment_sync_time = None
     self._deployment_plans = {}
     self._deployment_operations_thread = threading.Thread(
       target=self._deployment_operation_worker,
@@ -127,23 +124,6 @@ class _DeploymentOperationsMixin:
         latest[operation_id] = record
     return latest
 
-  def _repair_deployment_records(self, force=False):
-    """Bound replica refresh; Core rejects stale sequence values on slot merges."""
-    now = self.time()
-    last_sync = getattr(self, "_deployment_sync_time", None)
-    if not force and last_sync is not None and now - last_sync < 10 * 60:
-      return
-    self._deployment_sync_time = now
-    peers = self._operation_peers()
-    for namespace in (OPERATIONS_HKEY, NODE_OPERATIONS_HKEY):
-      try:
-        self.chainstore_hsync(namespace, extra_peers=peers,
-                             include_default_peers=False,
-                             include_configured_peers=False, timeout=2)
-      except Exception:
-        # A failed repair never proves that an operation does not exist.
-        continue
-
   def _save_operation(self, operation, phase=None, message=None):
     """Replicate a signed snapshot in a bounded sequence slot before side effects."""
     if operation["coordinator"] != self.bc.address:
@@ -178,7 +158,6 @@ class _DeploymentOperationsMixin:
 
   def _assert_no_active_deployment(self, job_id=None, app_id=None):
     """Serialize other job mutations against known deployment/recovery work."""
-    self._repair_deployment_records(force=True)
     if any((str(record["job_id"]) == str(job_id) or (app_id and record["app_id"] == app_id))
            and record["phase"] != "completed"
            for record in self._operation_records().values()):
@@ -191,7 +170,6 @@ class _DeploymentOperationsMixin:
       raise ValueError("A stable request_id of 1 to 128 characters is required.")
     digest = request_digest(request)
     job_id = str(request.get("job_id"))
-    self._repair_deployment_records(force=True)
     records = [record for record in self._operation_records().values()
                if record.get("owner", "").lower() == owner.lower()
                and str(record.get("job_id")) == job_id]
@@ -640,7 +618,6 @@ class _DeploymentOperationsMixin:
     """Resume coordinator-owned work independently of HTTP and UI polling."""
     while not self._deployment_operations_stop.is_set():
       try:
-        self._repair_deployment_records()
         self._reconcile_coordinator_operations()
       except Exception:
         self.P("Deployment operation synchronization is temporarily unavailable.", color="y")
@@ -665,7 +642,6 @@ class _DeploymentOperationsMixin:
       raise ValueError("Choose only one operation selector.")
     if not selector and request.get("job_id") is None:
       raise ValueError("operation_id, request_id, or job_id is required.")
-    self._repair_deployment_records()
     matches = []
     for record in self._operation_records().values():
       if record.get("owner", "").lower() != owner.lower():

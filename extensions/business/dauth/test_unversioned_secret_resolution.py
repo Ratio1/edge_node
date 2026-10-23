@@ -20,7 +20,7 @@ from extensions.business.dauth.test_dauth_registry_gating import (
 
 def existing_job():
   plugin = _make_dauth_harness()
-  plugin.chainstore_hsync = Mock(return_value={"merged_fields": 0})
+  plugin.chainstore_hsync = Mock(side_effect=AssertionError("Secret requests must use local replicas"))
   plugin._chainstore[DEEPLOY_JOBS_CSTORE_HKEY, "7"] = "old-cid"
   plugin._r1fs_data["old-cid"] = {
     "NAME": "existing", "TYPE": "Void", "OWNER": "owner",
@@ -49,8 +49,7 @@ class ExistingPipelineSecretTests(unittest.TestCase):
     bundle = json.loads(plugin.bc.encrypt_calls[-1][0])
     self.assertEqual(bundle["pipeline_cid"], "old-cid")
     self.assertEqual(bundle["job_secrets"]["PLUGINS"][0]["INSTANCES"][0]["ENV"]["TOKEN"], "existing-secret")
-    self.assertEqual([call.kwargs["hkey"] for call in plugin.chainstore_hsync.call_args_list],
-                     [DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY])
+    plugin.chainstore_hsync.assert_not_called()
 
   def test_pre_cid_bundle_uses_existing_structural_binding(self):
     plugin = existing_job()
@@ -117,22 +116,21 @@ class ExistingPipelineSecretTests(unittest.TestCase):
       plugin.process_dauth_get_secret_request(request())
     self.assertEqual(plugin.bc.encrypt_calls, [])
 
-  def test_replica_repair_disables_stale_unversioned_lookup(self):
-    plugin = existing_job()
-    def sync(**kwargs):
-      plugin._chainstore[DEEPLOY_JOBS_CSTORE_HKEY, "7"] = {"revision": 2, "deleted": True}
-      return {"merged_fields": 1}
-    plugin.chainstore_hsync = sync
-    with self.assertRaises(ValueError):
-      plugin.process_dauth_get_secret_request(request())
-    self.assertEqual(plugin.bc.encrypt_calls, [])
+  def test_missing_local_metadata_or_bundle_fails_without_peer_repair(self):
+    for namespace in (DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY):
+      with self.subTest(namespace=namespace):
+        plugin = existing_job()
+        plugin._chainstore.pop((namespace, "7"))
+        with self.assertRaises(ValueError):
+          plugin.process_dauth_get_secret_request(request())
+        plugin.chainstore_hsync.assert_not_called()
+        self.assertEqual(plugin.bc.encrypt_calls, [])
 
-  def test_unavailable_repair_is_retryable_without_serving_cached_secrets(self):
+  def test_cached_bundle_does_not_require_peer_synchronization(self):
     plugin = existing_job()
-    plugin.chainstore_hsync.return_value = None
-    with self.assertRaises(RuntimeError):
-      plugin.process_dauth_get_secret_request(request())
-    self.assertEqual(plugin.bc.encrypt_calls, [])
+    plugin.chainstore_hsync.side_effect = RuntimeError("Peers are unavailable")
+    self.assertEqual(plugin.process_dauth_get_secret_request(request())["status"], "success")
+    plugin.chainstore_hsync.assert_not_called()
 
   def test_first_update_preserves_existing_secrets_in_exact_restore_revision(self):
     from extensions.business.deeploy.tests.test_deployment_admission import Admission
