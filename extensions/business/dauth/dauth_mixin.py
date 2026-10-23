@@ -530,17 +530,10 @@ class _DauthMixin(object):
   def _load_unversioned_runner_secret_bundle(self, job_id, requester):
     """Authorize a pre-lifecycle pipeline against its current CID and placement.
 
-    Only the original raw-CID metadata format qualifies. Refresh metadata and
-    protected bundles before checking, reject versioned/tombstoned records, and
+    Only the original raw-CID metadata format qualifies. Read local metadata and
+    protected bundles, reject versioned/tombstoned records, and
     retain the existing exact-CID binding and generation-change checks.
     """
-    for namespace in (DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY):
-      try:
-        synced = self.chainstore_hsync(hkey=namespace, timeout=5, **dauth_registry_write_kwargs(self))
-      except Exception as exc:
-        raise RuntimeError("Existing pipeline secret synchronization is unavailable.") from exc
-      if not synced:
-        raise RuntimeError("Existing pipeline secret synchronization is unavailable.")
     pipeline_cid = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
     if not isinstance(pipeline_cid, str) or not pipeline_cid:
       raise ValueError("Secret revision is required or the existing pipeline is unavailable.")
@@ -602,25 +595,11 @@ class _DauthMixin(object):
     revoked_key = key + "|revoked"
     if self.chainstore_hget(hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=revoked_key):
       raise ValueError("dAuth secret revision has been revoked.")
-    # Refresh even warm caches so cleanup revocations can be learned. The
-    # immutable marker survives a merge containing an older bundle value.
-    try:
-      sync_result = self.chainstore_hsync(
-        hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
-        timeout=5,
-        **dauth_registry_write_kwargs(self),
-      )
-    except Exception as exc:
-      raise RuntimeError("dAuth secret revision synchronization is unavailable.") from exc
-    if self.chainstore_hget(hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=revoked_key):
-      raise ValueError("dAuth secret revision has been revoked.")
     secret_bundle = self.chainstore_hget(
       hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=key,
     )
     if isinstance(secret_bundle, dict) and secret_bundle.get("revoked"):
       raise ValueError("dAuth secret revision has been revoked.")
-    if not sync_result:
-      raise RuntimeError("dAuth secret revision synchronization is unavailable.")
     if secret_bundle is None:
       raise RuntimeError("No dAuth secret bundle found for the requested revision.")
     if not isinstance(secret_bundle, dict):
