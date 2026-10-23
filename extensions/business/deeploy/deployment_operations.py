@@ -75,7 +75,7 @@ class _DeploymentOperationsMixin:
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
-    self._deployment_sync_time = 0
+    self._deployment_sync_time = None
     self._deployment_plans = {}
     self._deployment_operations_thread = threading.Thread(
       target=self._deployment_operation_worker,
@@ -130,7 +130,8 @@ class _DeploymentOperationsMixin:
   def _repair_deployment_records(self, force=False):
     """Bound replica refresh; Core rejects stale sequence values on slot merges."""
     now = self.time()
-    if not force and now - getattr(self, "_deployment_sync_time", 0) < 5:
+    last_sync = getattr(self, "_deployment_sync_time", None)
+    if not force and last_sync is not None and now - last_sync < 10 * 60:
       return
     self._deployment_sync_time = now
     peers = self._operation_peers()
