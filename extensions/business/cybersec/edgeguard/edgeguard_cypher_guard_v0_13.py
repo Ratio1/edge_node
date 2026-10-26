@@ -15,16 +15,15 @@ from .edgeguard_cypher_guard import (
   _canonical_artifact_sha256,
   _v0_11_closed_vocabulary_lines,
   _v0_11_populated_pattern_lines,
-  _v0_11_topology_pattern_lines,
 )
 
 SCHEMA_VERSION_V0_13 = "edgeguard-cypher-schema-v0.13"
 SCHEMA_ARTIFACT_V0_13_PATH = Path(__file__).resolve().parent / "schema" / "edgeguard_cypher_schema_v0_13.json"
 SCHEMA_ARTIFACT_V0_13_SHA256 = "sha256:c3e0af05d9b1b2795fc5481ac769fddcd49b14322d510f83de3ac3cc619fc775"
-# Contract v0.13 §6.1: the served prompt may be at most this many times the v0.11 prompt (3,289 bytes); 1.4 until
-# v0.13.1 added the sector, sub-technique and last_updated rules (EGM-068, 2026-10-26).
+# Contract v0.13 §6.1: the served prompt may be at most this many times the v0.11 prompt (3,289 bytes). v0.13.2 drops
+# the topology patterns (no data, never asked) to make room for the v0.13.1 rules (EGM-068, 2026-10-26).
 V0_11_PROMPT_BYTES = 3289
-PROMPT_SIZE_FACTOR = 1.5
+PROMPT_SIZE_FACTOR = 1.4
 # Closed vocabularies the served prompt shows, in order; the artifact holds more (contract v0.13 §4).
 PROMPT_VOCABULARIES = (
   "Indicator.indicator_type", "Indicator.aging_tier", "Indicator.url_status", "Sector.name", "Tactic.mitre_id",
@@ -114,8 +113,8 @@ def _v0_13_temporal_rule_text(artifact: dict[str, Any]) -> str:
 def build_v0_13_pattern_schema_system_prompt(artifact: dict[str, Any] | None = None) -> str:
   """Contract v0.13 §6, served prompt for profile `v0_13_pattern_schema`.
 
-  Renders from the v0.13 schema artifact only: typed patterns (populated, then topology), the key properties a
-  question filters or orders on, the closed vocabularies in `PROMPT_VOCABULARIES` plus the source ids, the graph
+  Renders from the v0.13 schema artifact only: typed populated patterns (topology patterns are left out since
+  v0.13.2), the key properties a question filters or orders on, the closed vocabularies in `PROMPT_VOCABULARIES` plus the source ids, the graph
   rules of the cf789b9 graph, both output shapes, literal and temporal rules, and the read-only rule. The guard
   validates against the full flat schema regardless of what the prompt spells out. At most `PROMPT_SIZE_FACTOR`
   times the v0.11 prompt (tested)."""
@@ -127,8 +126,6 @@ def build_v0_13_pattern_schema_system_prompt(artifact: dict[str, Any] | None = N
     *_v0_11_populated_pattern_lines(artifact),
     "Key properties (filter/order by):",
     *_v0_13_key_property_lines(artifact),
-    "Topology patterns, `TYPE To: From1 From2 ...` (no data yet):",
-    *_v0_11_topology_pattern_lines(artifact),
     "Values:",
     *_v0_13_value_lines(artifact),
     "Synonym: Values entries may match wording, not just their text "
