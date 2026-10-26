@@ -69,10 +69,6 @@ def _build_specs(*, config_cid="QmInitial1", config: dict | None = None):
       "asset_exposure": "external",
       "point_of_contact": {"name": "Jane", "email": "jane@acme.example"},
     },
-    "roe": {
-      "strength_of_test": "aggressive",
-      "dos_allowed": True,
-    },
     "authorization": {
       "document_cid": "QmAuthDoc1",
       "document_thumbnail_cid": "QmAuthThumb1",
@@ -112,7 +108,7 @@ class TestHappyPath(unittest.TestCase):
     self.assertTrue(result.ok)
     sanitized = repo.configs[result.new_job_config_cid]
     self.assertIsNone(sanitized["engagement"])
-    self.assertIsNone(sanitized["roe"])
+    self.assertNotIn("roe", sanitized)
     self.assertIsNone(sanitized["authorization"])
 
   def test_legacy_engagement_fields_cleared(self):
@@ -168,7 +164,7 @@ class TestHappyPath(unittest.TestCase):
     result = delete_engagement_data(job_id="abc123", job_specs=specs, artifact_repo=repo)
     self.assertEqual((result.documents_deleted, result.documents_failed, repo.deleted), (0, 0, []))
     sanitized = repo.configs[result.new_job_config_cid]
-    self.assertEqual([sanitized[key] for key in ("engagement", "roe", "authorization")], [None] * 3)
+    self.assertEqual([sanitized[key] for key in ("engagement", "authorization")], [None] * 2)
     self.assertEqual(sanitized["engagement_id"], config["engagement_id"])
 
   def test_job_specs_updated_to_new_cid(self):

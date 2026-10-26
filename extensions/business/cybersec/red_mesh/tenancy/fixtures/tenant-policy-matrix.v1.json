@@ -27,6 +27,7 @@
     "super_tenant_admin": [
       "allow_pentester:update",
       "analysis:run",
+      "assets:manage",
       "attestation_keys:manage",
       "audit:view",
       "authorization:upload",
@@ -35,7 +36,6 @@
       "engagements:documents",
       "engagements:revoke",
       "evidence:read",
-      "integrations:manage",
       "jobs:purge",
       "node_assignments:manage",
       "node_failure_policy:update",
@@ -52,7 +52,6 @@
     "tenant_admin": [
       "attestation_keys:manage",
       "audit:view",
-      "integrations:manage",
       "node_failure_policy:update",
       "reports:export",
       "reports:view",

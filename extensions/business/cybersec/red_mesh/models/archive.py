@@ -71,7 +71,6 @@ class JobConfig:
   # Both shapes serialize alongside each other; consumers prefer the
   # typed shape when present.
   engagement: dict = None        # EngagementContext.to_dict() output
-  roe: dict = None               # RulesOfEngagement.to_dict() output
   authorization: dict = None     # AuthorizationRef.to_dict() output
   # ── graybox fields ──
   scan_type: str = "network"          # "network" | "webapp"
@@ -128,20 +127,16 @@ class JobConfig:
   blockchain_attestation_enabled: bool = False
   start_attestation_required: bool = False
   end_attestation_required: bool = False
-  # {"backend": <version>} of the node that launched the job, so the report and
-  # exports name the scanner release that produced them.
+  # The release that produced the job: {"backend": <version>} of the launching node, plus the
+  # console and report_pipeline versions the console reported at launch (each omitted when not
+  # sent), so the report and exports name the scanner release.
   redmesh_release: dict = None
-  # The engagement's port scope for the asset at launch, and the typed authorization update that
-  # admitted a launch beyond it (reference, signer, out_of_scope_ports, engagement_id). RM-090.
-  authorized_ports: str = None
-  authorization_update: dict = None
-  # The signed engagement the job ran under (RM-095): its id and hash, and the asset's
-  # authorized FEATURE_CATALOG ids. `engagement`, `roe` and `authorization` above are its snapshot.
+  # The signed engagement the job ran under (RM-095): its id and hash. `engagement` and
+  # `authorization` above are its snapshot (RM-128: the rules of engagement are gone).
   # RM-107: the SHA-256 of the tenant contract the engagement extends (the signed basis).
   engagement_id: str = None
   engagement_hash: str = None
   contract_sha256: str = None
-  authorized_tests: list = None
   execution_binding: ExecutionBinding | None = None
 
   def __post_init__(self):
@@ -240,15 +235,11 @@ class JobConfig:
       start_attestation_required=d.get("start_attestation_required", False),
       end_attestation_required=d.get("end_attestation_required", False),
       engagement=d.get("engagement"),
-      roe=d.get("roe"),
       authorization=d.get("authorization"),
       redmesh_release=d.get("redmesh_release"),
-      authorized_ports=d.get("authorized_ports"),
-      authorization_update=d.get("authorization_update"),
       engagement_id=d.get("engagement_id"),
       engagement_hash=d.get("engagement_hash"),
       contract_sha256=d.get("contract_sha256"),
-      authorized_tests=d.get("authorized_tests"),
     )
 
   # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
@@ -262,11 +253,6 @@ class JobConfig:
     from .engagement import EngagementContext
     return EngagementContext.from_dict(self.engagement) if self.engagement else None
 
-  def get_roe(self):
-    """Return RulesOfEngagement or None."""
-    from .engagement import RulesOfEngagement
-    return RulesOfEngagement.from_dict(self.roe) if self.roe else None
-
   def get_authorization(self):
     """Return AuthorizationRef from the typed `authorization` field, or None.
 
@@ -277,18 +263,14 @@ class JobConfig:
     return AuthorizationRef.from_dict(self.authorization) if self.authorization else None
 
   def get_kickoff_questionnaire(self):
-    """Return a KickoffQuestionnaire bundling engagement/roe/authorization
-    or None when none of the three fields carry data."""
+    """Return a KickoffQuestionnaire bundling engagement/authorization
+    or None when neither field carries data."""
     from .engagement import KickoffQuestionnaire
     eng = self.get_engagement()
-    roe = self.get_roe()
     auth = self.get_authorization()
-    if all(x is None or (hasattr(x, 'is_empty') and x.is_empty())
-           for x in (eng, roe, auth)):
+    if all(x is None or (hasattr(x, 'is_empty') and x.is_empty()) for x in (eng, auth)):
       return None
-    return KickoffQuestionnaire(
-      engagement=eng, roe=roe, authorization=auth,
-    )
+    return KickoffQuestionnaire(engagement=eng, authorization=auth)
 
 
 @dataclass(frozen=True)

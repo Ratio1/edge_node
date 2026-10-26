@@ -151,6 +151,27 @@ class TestRedMeshEventSchema(unittest.TestCase):
     self.assertIn("schema must be redmesh.event.v1", errors)
     self.assertTrue(any(error.startswith("missing required field:") for error in errors))
 
+  def test_events_name_the_redmesh_tenant_beside_the_instance_envelope(self):
+    """RM-139: `tenant_id` stays the instance id SOC decoders key on; the job's RedMesh tenant
+    travels as `redmesh_tenant_id`, `super-tenant` for an event without a bound job."""
+    from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
+    binding = binding_payload()
+    bound = {**self.job, "execution_binding": binding}
+    common = {"hmac_secret": self.secret, "tenant_id": "instance-1", "environment": "devnet"}
+    builders = (
+      lambda job: build_lifecycle_event(job, event_type="redmesh.job.started", event_action="started", **common),
+      lambda job: build_service_observed_event(job, service={"port": 22, "protocol": "tcp"}, **common),
+      lambda job: build_finding_event(job, finding={"finding_id": "f1", "severity": "LOW"}, **common),
+      lambda job: build_export_status_event(job, adapter_type="misp", status="completed", **common),
+      lambda job: build_attestation_event(job, state="submitted", **common),
+    )
+    for build in builders:
+      for job, expected in ((bound, binding["tenant_id"]), (self.job, "super-tenant")):
+        event = build(job)
+        self.assert_valid_event(event)
+        self.assertEqual((event["tenant_id"], event["redmesh_tenant_id"]), ("instance-1", expected))
+    self.assertEqual(build_test_event(**common)["redmesh_tenant_id"], "super-tenant")
+
 
 if __name__ == "__main__":
   unittest.main()

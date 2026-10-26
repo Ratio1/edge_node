@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from pydantic import create_model
 
+from .asset_fixture import pick, register_asset
 from .test_tenant_administration import FakeAdministrationStore
 from .contract_fixture import install_contract
 
@@ -45,6 +46,8 @@ class TestTenantEngagementPlugin(unittest.TestCase):
     self.storage.grant("initial", self.tenant)
     self.assertTrue(self.plugin.activate_tenant(self.actor, request)["success"])
     self.documents = self.plugin._document_store()
+    self.asset = register_asset(self.plugin, self.actor, self.tenant, {"kind": "network", "address": "192.0.2.10"})
+    self.events.clear()
     self.storage.account("platform-pentester", memberships=[{"role": "super_pentester", "tenant_id": None}])
     self.storage.account("viewer", memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
 
@@ -71,10 +74,9 @@ class TestTenantEngagementPlugin(unittest.TestCase):
 
   def create(self, actor=None, **changes):
     body = {"actor": actor or self.actor, "tenant_id": self.tenant, "request_id": str(uuid4()),
-            "display_name": "Q4", "allowed_run_modes": ["continuous", "single_pass"], "valid_from": "2026-10-01T00:00:00Z",
-            "valid_until": "2027-10-01T00:00:00Z", "roe": {}, "context": {"client_name": "Example"},
-            "assets": [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
-                        "authorized_ports": "443", "authorized_tests": ["service_info_common"]}]}
+            "display_name": "Q4", "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-10-01T00:00:00Z", "context": {"client_name": "Example"},
+            "assets": [pick(self.asset)]}
     body.update(changes)
     if "document_refs" not in body:
       body["document_refs"] = [self.upload(PNG, "roe.png", title="Rules of engagement (scan)"),

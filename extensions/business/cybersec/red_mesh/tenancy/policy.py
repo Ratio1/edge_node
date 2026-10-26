@@ -15,7 +15,7 @@ _ROLE_OPERATIONS = {
   "super_tenant_admin": frozenset({
     "node_assignments:manage", "node_failure_policy:update",
     "tenants:manage", "tenant_users:manage",
-    "integrations:manage", "attestation_keys:manage", "allow_pentester:update",
+    "attestation_keys:manage", "allow_pentester:update",
     "tasks:launch", "tasks:update", "reports:view", "reports:export", "evidence:read", "audit:view",
     # Owner, 2026-09-30: stopping a job and approving/rejecting its report belong to whoever may
     # launch, under the same Allow Pentester rule (below). Both used to ride on reports:export.
@@ -31,6 +31,8 @@ _ROLE_OPERATIONS = {
     "engagements:create", "engagements:revoke", "engagements:documents",
     # RM-107. Removes a tenant with no members and no jobs (owner, 2026-09-28).
     "tenants:delete",
+    # RM-125. Registers, edits, archives and deletes the tenant's assets (owner, 2026-10-09).
+    "assets:manage",
   }),
   "super_pentester": frozenset({
     "allow_pentester:update", "tasks:launch", "tasks:update",
@@ -41,7 +43,7 @@ _ROLE_OPERATIONS = {
   }),
   "tenant_admin": frozenset({
     "node_failure_policy:update",
-    "tenant_users:manage", "integrations:manage", "attestation_keys:manage",
+    "tenant_users:manage", "attestation_keys:manage",
     "reports:view", "reports:export", "audit:view",
   }),
   "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export",

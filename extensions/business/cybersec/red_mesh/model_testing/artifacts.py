@@ -23,8 +23,8 @@ from .raw_evidence import sanitize_raw_evidence_metadata
 MODEL_TEST_JOB_CONFIG_SCHEMA = "model_test_job_config_v1"
 MODEL_TEST_ARCHIVE_SCHEMA = "model_test_archive_v1"
 MODEL_TEST_WORKER_RESULT_SCHEMA = "model_test_worker_result_v1"
-_ENGAGEMENT_SNAPSHOT_KEYS = ("engagement_id", "engagement_hash", "contract_sha256", "authorized_tests",
-                             "roe", "engagement", "authorization")
+_ENGAGEMENT_SNAPSHOT_KEYS = ("engagement_id", "engagement_hash", "contract_sha256", "engagement",
+                             "authorization")
 
 
 @dataclass(frozen=True)
@@ -61,8 +61,6 @@ class ModelTestJobConfig:
   engagement_id: str | None = None
   engagement_hash: str | None = None
   contract_sha256: str | None = None
-  authorized_tests: list | None = None
-  roe: dict | None = None
   engagement: dict | None = None
   authorization: dict | None = None
 

@@ -10,6 +10,7 @@ from ratio1.const.base import dAuth
 
 from extensions.business.dauth.dauth_mixin import (
   DAUTH_JOB_SECRETS_CSTORE_HKEY,
+  DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
   DAUTH_SECRET_REVEAL_ACTION,
   DAUTH_VIEW_SECRETS_PERMISSION,
   DEEPLOY_JOBS_CSTORE_HKEY,
@@ -139,6 +140,7 @@ def _load_dauth_manager_class():
   source = source.replace(
     "from extensions.business.dauth.dauth_mixin import (\n"
     "  DAUTH_JOB_SECRETS_CSTORE_HKEY,\n"
+    "  DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,\n"
     "  _DauthMixin,\n"
     ")\n",
     "",
@@ -153,6 +155,7 @@ def _load_dauth_manager_class():
   namespace = {
     "BasePlugin": _FakeBasePlugin,
     "DAUTH_JOB_SECRETS_CSTORE_HKEY": DAUTH_JOB_SECRETS_CSTORE_HKEY,
+    "DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY": DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
     "_DauthMixin": _FakeDauthMixin,
     "_NodeTagsMixin": _FakeNodeTagsMixin,
     "_RequestTrackingMixin": _FakeRequestTrackingMixin,
@@ -247,7 +250,7 @@ class _FakeBC:
   def node_address_to_eth_address(self, node_address):
     return self.node_eth[node_address]
 
-  def verify(self, body, return_full_info=False):  # pylint: disable=unused-argument
+  def verify(self, dct_data, return_full_info=False, log_hash_sign_fails=True, signature=None, sender_address=None):  # pylint: disable=unused-argument
     class _VerifyData:
       pass
 
@@ -446,6 +449,37 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     }
     return plugin, body, bundle
 
+  def test_existing_secret_endpoints_work_through_core_blockchain_wrapper(self):
+    from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
+    from unittest.mock import Mock
+
+    for operation in ("add", "get", "reveal"):
+      with self.subTest(operation=operation):
+        plugin, body, bundle = self._prepare_reveal()
+        engine = plugin.bc
+        engine.verify = Mock(wraps=engine.verify)
+        engine.web3_get_oracles = engine.get_eth_oracles
+        engine.web3_get_user_escrow_details = engine.get_user_escrow_details
+        engine.web3_get_job_details = engine.get_job_details
+        engine._add_prefix = engine.maybe_add_prefix
+        engine.encrypt = lambda plaintext, receiver_address: engine.encrypt_str(plaintext, receiver_address)
+        plugin.bc = BCWrapper(engine, owner=plugin)
+        body["job_id"] = "7"
+        if operation == "add":
+          body["job_secrets"] = bundle["job_secrets"]
+          result = plugin.process_dauth_add_secrets_request(body)
+        elif operation == "get":
+          body.update(EE_SENDER="node-runner", EE_ETH_SENDER="0xRUNNER")
+          plugin.chainstore_hsync = Mock(return_value={"hkey": "synced"})
+          plugin._r1fs_data["cid-7"]["DEEPLOY_SPECS"]["job_id"] = "7"
+          result = plugin.process_dauth_get_secret_request(body)
+          self.assertEqual([call.kwargs["hkey"] for call in plugin.chainstore_hsync.call_args_list],
+                           [DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY])
+        else:
+          result = plugin.process_dauth_reveal_secret_request(body)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(engine.verify.call_args.kwargs["log_hash_sign_fails"])
+
   def test_reveal_secrets_allows_escrow_owner_and_encrypts_for_relay_oracle(self):
     plugin, body, bundle = self._prepare_reveal()
 
@@ -610,53 +644,160 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
 
     self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), plugin._chainstore)
 
-  def test_get_secrets_returns_bundle_for_node_running_job_from_r1fs_pipeline(self):
-    plugin = _make_dauth_harness()
-    bundle = {
-      "job_id": "7",
-      "pipeline_cid": "cid-7",
-      "job_secrets": {
-        "plugins": {
-          "CONTAINER_APP_RUNNER": [{
-            "instance_conf": {
-              "ENV": {
-                "API_KEY": "secret",
-              },
-            },
-          }],
-        },
-      },
-    }
-    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = bundle
-    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
-    plugin._r1fs_data["cid-7"] = {
-      "deeploy_specs": {
-        "current_target_nodes": ["node-runner"],
-      },
-    }
-    body = {
+  def _revision_request(self, **overrides):
+    return {
       "EE_SENDER": "node-runner",
       "EE_ETH_SENDER": "0xRUNNER",
       "nonce": REQUEST_NONCE,
       "job_id": "7",
+      "revision": "op:deploy",
+      **overrides,
     }
 
-    response = plugin.process_dauth_get_secret_request(body)
+  def _revision_plugin(self):
+    plugin = _make_dauth_harness()
+    plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")] = {
+      "job_id": "7",
+      "revision": "op:deploy",
+      "job_secrets": {"ENV": {"TOKEN": "secret"}},
+      "pipeline_cid": "cid-7",
+      "pipelines": {"node-runner": {"NAME": "app"}},
+    }
+    plugin._dauth_registry_internal_peers = ["node-oracle"]
+    plugin.chainstore_hsync = lambda **kwargs: {"merged_fields": 0}
+    return plugin
 
+  def test_get_secrets_uses_exact_revision_plan_without_current_metadata(self):
+    plugin = self._revision_plugin()
+    response = plugin.process_dauth_get_secret_request(self._revision_request())
     self.assertEqual(response["status"], "success")
-    self.assertEqual(response["job_id"], "7")
+    self.assertEqual(response["revision"], "op:deploy")
     self.assertEqual(response["nonce"], REQUEST_NONCE)
-    self.assertEqual(
-      response["encrypted_secret_bundle"],
-      "encrypted-secret-bundle",
-    )
-    self.assertNotIn("secret_bundle", response)
-    self.assertEqual(
-      plugin.bc.encrypt_calls,
-      [(json.dumps(bundle), "node-runner")],
-    )
+    encrypted_bundle = json.loads(plugin.bc.encrypt_calls[-1][0])
+    self.assertEqual(encrypted_bundle["revision"], "op:deploy")
+    self.assertEqual(encrypted_bundle["job_secrets"]["ENV"]["TOKEN"], "secret")
+    self.assertNotIn("pipelines", encrypted_bundle)
+    self.assertIn("pipelines", plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")])
 
-  def test_get_secrets_rejects_bundle_bound_to_another_pipeline_generation(self):
+  def test_get_secrets_rejects_missing_revision_without_legacy_fallback(self):
+    plugin = self._revision_plugin()
+    for revision in (None, "", " ", 1, True):
+      with self.subTest(revision=revision):
+        with self.assertRaisesRegex(ValueError, "Secret revision is required"):
+          plugin.process_dauth_get_secret_request(self._revision_request(revision=revision))
+    self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_get_secrets_rejects_wrong_revision_and_stored_identity(self):
+    plugin = self._revision_plugin()
+    with self.assertRaisesRegex(RuntimeError, "No dAuth secret bundle"):
+      plugin.process_dauth_get_secret_request(self._revision_request(revision="op:other"))
+    for field, value in (("revision", "op:restore"), ("job_id", "8")):
+      plugin = self._revision_plugin()
+      plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")][field] = value
+      with self.assertRaisesRegex(ValueError, "identity mismatch"):
+        plugin.process_dauth_get_secret_request(self._revision_request())
+      self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_get_secrets_rejects_node_outside_revision_even_if_current_runner(self):
+    plugin = self._revision_plugin()
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "current-cid"
+    plugin._r1fs_data["current-cid"] = {
+      "DEEPLOY_SPECS": {"current_target_nodes": ["node-other"]},
+    }
+    with self.assertRaisesRegex(ValueError, "not authorized"):
+      plugin.process_dauth_get_secret_request(self._revision_request(
+        EE_SENDER="node-other", EE_ETH_SENDER="0xOTHER",
+      ))
+    self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_get_secrets_preserves_signature_and_nonce_checks(self):
+    plugin = self._revision_plugin()
+    plugin.bc.valid_signature = False
+    with self.assertRaisesRegex(ValueError, "Invalid request signature"):
+      plugin.process_dauth_get_secret_request(self._revision_request())
+    plugin.bc.valid_signature = True
+    with self.assertRaisesRegex(ValueError, "expired"):
+      plugin.process_dauth_get_secret_request(self._revision_request(nonce=hex((REQUEST_TIME - 121) * 1000)))
+    self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_get_secrets_repairs_missing_revision_only_from_dauth_peers(self):
+    plugin = self._revision_plugin()
+    key = (DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")
+    record = plugin._chainstore.pop(key)
+    sync_calls = []
+    def sync(**kwargs):
+      sync_calls.append(kwargs)
+      plugin._chainstore[key] = record
+      return {"merged_fields": 1}
+    plugin.chainstore_hsync = sync
+    plugin.process_dauth_get_secret_request(self._revision_request())
+    self.assertEqual(sync_calls, [{
+      "hkey": DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
+      "timeout": 5,
+      "extra_peers": ["node-oracle"],
+      "include_default_peers": False,
+      "include_configured_peers": False,
+    }])
+
+  def test_get_secrets_revocation_marker_rejects_stale_original_bundle(self):
+    plugin = self._revision_plugin()
+    key = (DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")
+    original = deepcopy(plugin._chainstore[key])
+    def sync(**kwargs):
+      plugin._chainstore[key] = original
+      plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy|revoked")] = True
+      return {"merged_fields": 2}
+    plugin.chainstore_hsync = sync
+    with self.assertRaisesRegex(ValueError, "revoked"):
+      plugin.process_dauth_get_secret_request(self._revision_request())
+    self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_get_secrets_sync_exception_is_transient(self):
+    plugin = self._revision_plugin()
+    def unavailable(**kwargs):
+      raise ValueError("No reachable peers")
+    plugin.chainstore_hsync = unavailable
+    with self.assertRaisesRegex(RuntimeError, "synchronization is unavailable"):
+      plugin.process_dauth_get_secret_request(self._revision_request())
+    self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_get_secrets_known_revocation_rejects_before_sync(self):
+    plugin = self._revision_plugin()
+    plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy|revoked")] = True
+    def unexpected_sync(**kwargs):
+      raise AssertionError("Known revocation must fail before synchronization")
+    plugin.chainstore_hsync = unexpected_sync
+    with self.assertRaisesRegex(ValueError, "revoked"):
+      plugin.process_dauth_get_secret_request(self._revision_request())
+
+  def test_get_secrets_rejects_revoked_primary_and_unavailable_sync(self):
+    plugin = self._revision_plugin()
+    plugin._chainstore[(DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, "7|op:deploy")] = {
+      "job_id": "7", "revision": "op:deploy", "revoked": True,
+    }
+    with self.assertRaisesRegex(ValueError, "revoked"):
+      plugin.process_dauth_get_secret_request(self._revision_request())
+    plugin = self._revision_plugin()
+    plugin.chainstore_hsync = lambda **kwargs: None
+    with self.assertRaisesRegex(RuntimeError, "synchronization is unavailable"):
+      plugin.process_dauth_get_secret_request(self._revision_request())
+    self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_current_reveal_resolves_versioned_pointer_and_rejects_deleted_generation(self):
+    plugin = _make_dauth_harness()
+    pipeline = {"DEEPLOY_SPECS": {"current_target_nodes": ["node-runner"]}}
+    bundle = {"job_id": "7", "pipeline_cid": "cid-active", "job_secrets": {"token": "protected"}, "deployment_revision": 8}
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = bundle
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = {"revision": 8, "pipeline_cid": "cid-active", "deleted": False}
+    plugin._r1fs_data["cid-active"] = pipeline
+    self.assertEqual(plugin._load_dauth_job_pipeline_record("7"), ("cid-active", pipeline))
+    self.assertEqual(plugin._load_current_dauth_secret_bundle("7", "cid-active", pipeline), bundle)
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = {"revision": 9, "pipeline_cid": None, "deleted": True}
+    self.assertEqual(plugin._load_dauth_job_pipeline_record("7"), (None, None))
+    with self.assertRaisesRegex(ValueError, "generation changed"):
+      plugin._load_current_dauth_secret_bundle("7", "cid-active", pipeline)
+
+  def test_current_reveal_bundle_rejects_bundle_bound_to_another_pipeline_generation(self):
     plugin = _make_dauth_harness()
     plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
       "job_id": "7",
@@ -669,14 +810,8 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     }
 
     with self.assertRaisesRegex(ValueError, "generation mismatch"):
-      plugin.process_dauth_get_secret_request({
-        "EE_SENDER": "node-runner",
-        "EE_ETH_SENDER": "0xRUNNER",
-        "nonce": REQUEST_NONCE,
-        "job_id": "7",
-      })
-
-  def test_get_secrets_safely_binds_complete_legacy_bundle(self):
+      plugin._load_current_dauth_secret_bundle("7", "cid-new", plugin._r1fs_data["cid-new"])
+  def test_current_reveal_bundle_safely_binds_complete_legacy_bundle(self):
     plugin = _make_dauth_harness()
     legacy_bundle = {
       "job_id": "7",
@@ -697,17 +832,9 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       "DEEPLOY_SPECS": {"current_target_nodes": ["node-runner"]},
     }
 
-    response = plugin.process_dauth_get_secret_request({
-      "EE_SENDER": "node-runner",
-      "EE_ETH_SENDER": "0xRUNNER",
-      "nonce": REQUEST_NONCE,
-      "job_id": "7",
-    })
+    response = plugin._load_current_dauth_secret_bundle("7", "cid-7", plugin._r1fs_data["cid-7"])
 
-    self.assertEqual(response["nonce"], REQUEST_NONCE)
-    self.assertEqual(response["encrypted_secret_bundle"], "encrypted-secret-bundle")
-    self.assertNotIn("secret_bundle", response)
-    encrypted_bundle = json.loads(plugin.bc.encrypt_calls[-1][0])
+    encrypted_bundle = response
     self.assertEqual(encrypted_bundle["pipeline_cid"], "cid-7")
     migrated_job_secrets = encrypted_bundle["job_secrets"]
     self.assertEqual(
@@ -718,8 +845,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")]["pipeline_cid"],
       "cid-7",
     )
-
-  def test_get_secrets_rejects_incomplete_legacy_bundle(self):
+  def test_current_reveal_bundle_rejects_incomplete_legacy_bundle(self):
     plugin = _make_dauth_harness()
     plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
       "job_id": "7",
@@ -734,14 +860,8 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     }
 
     with self.assertRaisesRegex(ValueError, "incomplete"):
-      plugin.process_dauth_get_secret_request({
-        "EE_SENDER": "node-runner",
-        "EE_ETH_SENDER": "0xRUNNER",
-        "nonce": REQUEST_NONCE,
-        "job_id": "7",
-      })
-
-  def test_get_secrets_does_not_bind_legacy_bundle_without_current_placeholders(self):
+      plugin._load_current_dauth_secret_bundle("7", "cid-7", plugin._r1fs_data["cid-7"])
+  def test_current_reveal_bundle_does_not_bind_legacy_bundle_without_current_placeholders(self):
     plugin = _make_dauth_harness()
     plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
       "job_id": "7",
@@ -756,39 +876,12 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     }
 
     with self.assertRaisesRegex(ValueError, "incomplete"):
-      plugin.process_dauth_get_secret_request({
-        "EE_SENDER": "node-runner",
-        "EE_ETH_SENDER": "0xRUNNER",
-        "nonce": REQUEST_NONCE,
-        "job_id": "7",
-      })
+      plugin._load_current_dauth_secret_bundle("7", "cid-7", plugin._r1fs_data["cid-7"])
 
     self.assertNotIn(
       "pipeline_cid",
       plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")],
     )
-
-  def test_get_secrets_rejects_node_not_running_job(self):
-    plugin = _make_dauth_harness()
-    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
-      "job_id": "7",
-      "job_secrets": {"plugins": {}},
-    }
-    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
-    plugin._r1fs_data["cid-7"] = {
-      "DEEPLOY_SPECS": {
-        "current_target_nodes": ["node-runner"],
-      },
-    }
-    body = {
-      "EE_SENDER": "node-other",
-      "EE_ETH_SENDER": "0xOTHER",
-      "nonce": REQUEST_NONCE,
-      "job_id": "7",
-    }
-
-    with self.assertRaisesRegex(ValueError, "not running job"):
-      plugin.process_dauth_get_secret_request(body)
 
 
 class DauthServerRegistryGateTests(unittest.TestCase):
@@ -848,6 +941,22 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._DauthManagerPlugin__get_response = lambda data: data
     return plugin
 
+  def test_reconciliation_endpoint_gates_registry_and_masks_secret_errors(self):
+    for enabled in (False, True):
+      with self.subTest(enabled=enabled):
+        plugin = self._make_manager(dauth_oracle=enabled)
+        plugin._refresh_dauth_registry(force=True)
+        calls = []
+        def reconcile(body):
+          calls.append(body)
+          raise ValueError("credential-in-dependency-error")
+        plugin.process_dauth_reconcile_secrets_request = reconcile
+        response = plugin.reconcile_job_secrets({"nonce": REQUEST_NONCE})
+        self.assertEqual(len(calls), int(enabled))
+        self.assertEqual(response["nonce"], REQUEST_NONCE)
+        self.assertIn("error", response)
+        self.assertNotIn("credential-in-dependency-error", str(response) + str(plugin._messages))
+
   def test_secret_endpoint_errors_echo_request_nonce(self):
     plugin = self._make_manager(dauth_oracle=True)
     plugin._dauth_server_enabled = True
@@ -872,6 +981,17 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(get_response["error"], "get failed")
     self.assertEqual(reveal_response["nonce"], REQUEST_NONCE)
     self.assertEqual(reveal_response["error"], "reveal failed")
+
+  def test_get_secrets_signed_errors_distinguish_retryability(self):
+    plugin = self._make_manager(dauth_oracle=True)
+    plugin.on_init()
+    for error, retryable in ((ValueError("revoked"), False), (RuntimeError("sync unavailable"), True)):
+      def fail(body):
+        raise error
+      plugin.process_dauth_get_secret_request = fail
+      response = plugin.get_secrets({"nonce": REQUEST_NONCE})
+      self.assertEqual(response["nonce"], REQUEST_NONCE)
+      self.assertIs(response["retryable"], retryable)
 
   def test_registry_lookup_is_cached_between_hourly_lifecycle_refreshes(self):
     plugin = self._make_manager(dauth_oracle=True)
@@ -910,9 +1030,9 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin.process()
 
     self.assertEqual(plugin.bc.calls, 1)
-    self.assertEqual(len(plugin._hsync_calls), 2)
+    self.assertEqual(len(plugin._hsync_calls), 4)
     for call in plugin._hsync_calls:
-      self.assertEqual(call["hkey"], DAUTH_JOB_SECRETS_CSTORE_HKEY)
+      self.assertIn(call["hkey"], (DAUTH_JOB_SECRETS_CSTORE_HKEY, DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY))
       self.assertEqual(call["extra_peers"], ["node-address", "peer-address"])
       self.assertFalse(call["include_default_peers"])
       self.assertFalse(call["include_configured_peers"])
@@ -931,7 +1051,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._now += 10 * 60
     plugin.process()
 
-    self.assertEqual(len(attempts), 2)
+    self.assertEqual(len(attempts), 4)
     self.assertTrue(any("sync unavailable" in message for message in plugin._messages))
 
   def test_false_startup_lookup_fails_closed_and_tears_down_fastapi(self):

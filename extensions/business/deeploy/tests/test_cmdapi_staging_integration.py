@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from naeural_core import constants as core_constants
 
@@ -9,6 +10,7 @@ from extensions.business.deeploy.deeploy_cmdapi_integration import (
   dispatch_pipeline_config,
 )
 from extensions.business.deeploy.tests.support import make_deeploy_plugin
+from extensions.business.deeploy.tests.test_deployment_operations import Coordinator
 
 
 class _CmdApiPluginStub:
@@ -51,6 +53,32 @@ class CmdApiStagingIntegrationTests(unittest.TestCase):
     self.assertEqual(plugin.dispatched, [])
     dispatch_pipeline_config(plugin, "node-a", pipeline)
     self.assertEqual(plugin.dispatched, [("node-a", pipeline)])
+
+  def test_lifecycle_stop_and_retire_pass_core_command_validation(self):
+    cmdapi_path = Path(core_constants.__file__).resolve().parent / "business" / "mixins_base" / "cmdapi.py"
+    spec = importlib.util.spec_from_file_location("edge_test_core_lifecycle_cmdapi", cmdapi_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class CmdApiCoordinator(Coordinator, module._CmdAPIMixin):
+      cmdapi_start_pipeline = module._CmdAPIMixin.cmdapi_start_pipeline
+
+    for attempt, action in (("deploy", "stop"), ("retire", "retire")):
+      with self.subTest(action=action):
+        plugin = CmdApiCoordinator()
+        plugin.cmdapi_register_command = Mock()
+        operation = plugin.operation("update")
+        config = {"NAME": "app", "TYPE": "VideoStream", "PLUGINS": []}
+        plugin._send_operation_commands(operation, {"A": config}, attempt, action, {})
+
+        plugin.cmdapi_register_command.assert_called_once_with(
+          node_address="A", command_type=core_constants.COMMANDS.UPDATE_CONFIG,
+          command_content={
+            "NAME": "app", "TYPE": "VideoStream",
+            "DEEPLOY_OPERATION": plugin._operation_metadata(operation, attempt, action),
+          },
+          send_immediately=True,
+        )
 
   def test_scale_up_base_pipeline_comes_from_r1fs_metadata(self):
     plugin = make_deeploy_plugin()

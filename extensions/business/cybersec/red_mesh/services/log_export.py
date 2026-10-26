@@ -145,7 +145,7 @@ def _persist_failed_payload_sample(owner, integration_id, event, error_class, pa
 
 
 def _record_failure(owner, integration_id, event, error_class, payload_bytes=None, cfg=None,
-                    dry_run=False, tenant_id=None):
+                    dry_run=False):
   artifact_cid = None
   if payload_bytes is not None and cfg is not None:
     artifact_cid = _persist_failed_payload_sample(owner, integration_id, event, error_class, payload_bytes, cfg)
@@ -157,13 +157,12 @@ def _record_failure(owner, integration_id, event, error_class, payload_bytes=Non
     artifact_cid=artifact_cid,
     error_class=error_class,
     dry_run=dry_run,
-    tenant_id=tenant_id,
   )
   return artifact_cid
 
 
-def _cooldown_fields(owner, integration_id, tenant_id=None):
-  cooldown = current_integration_cooldown(owner, integration_id, tenant_id)
+def _cooldown_fields(owner, integration_id):
+  cooldown = current_integration_cooldown(owner, integration_id)
   if not cooldown:
     return {}
   return {
@@ -172,19 +171,19 @@ def _cooldown_fields(owner, integration_id, tenant_id=None):
   }
 
 
-def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
+def deliver_wazuh_event(owner, event, *, dry_run=False):
   """Deliver one canonical RedMesh event to the Wazuh/generic SIEM adapter.
 
-  The destination is the tenant's; the transport policy (redaction, TLP, HMAC signing) stays the
-  node's. One node signs with one key; what differs per tenant is where the event goes.
+  The destination is the deployment's effective wazuh config (RM-139); the transport policy
+  (redaction, TLP, HMAC signing) is the node's.
   """
   integration_id = "wazuh"
-  cfg = get_wazuh_export_config(owner, tenant_id)
+  cfg = get_wazuh_export_config(owner)
   event_cfg = get_event_export_config(owner)
   payload_bytes = _json_bytes(event or {})
 
   if not cfg["ENABLED"]:
-    _record_failure(owner, integration_id, event, "disabled", payload_bytes, cfg, dry_run=dry_run, tenant_id=tenant_id)
+    _record_failure(owner, integration_id, event, "disabled", payload_bytes, cfg, dry_run=dry_run)
     return {
       "status": "disabled",
       "integration_id": integration_id,
@@ -194,7 +193,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
 
   errors = validate_event_dict(event)
   if errors:
-    _record_failure(owner, integration_id, event, "invalid_event", payload_bytes, cfg, dry_run=dry_run, tenant_id=tenant_id)
+    _record_failure(owner, integration_id, event, "invalid_event", payload_bytes, cfg, dry_run=dry_run)
     return {
       "status": "error",
       "integration_id": integration_id,
@@ -205,7 +204,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
 
   signature, sign_error = _sign_payload_if_required(event_cfg, payload_bytes)
   if sign_error:
-    _record_failure(owner, integration_id, event, sign_error, payload_bytes, cfg, dry_run=dry_run, tenant_id=tenant_id)
+    _record_failure(owner, integration_id, event, sign_error, payload_bytes, cfg, dry_run=dry_run)
     return {
       "status": "error",
       "integration_id": integration_id,
@@ -220,19 +219,19 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
   provider = None
   if mode in {"http", "wazuh_api"}:
     if not cfg["HTTP_URL"]:
-      _record_failure(owner, integration_id, event, "missing_http_url", payload_bytes, cfg, dry_run=dry_run, tenant_id=tenant_id)
+      _record_failure(owner, integration_id, event, "missing_http_url", payload_bytes, cfg, dry_run=dry_run)
       return {
         "status": "error",
         "integration_id": integration_id,
         "event_id": _event_id(event),
         "mode": mode,
         "error": "missing_http_url",
-        **_cooldown_fields(owner, integration_id, tenant_id),
+        **_cooldown_fields(owner, integration_id),
       }
     try:
       provider = build_auth_provider(cfg)
     except AuthError as exc:
-      _record_failure(owner, integration_id, event, "invalid_auth_config", payload_bytes, cfg, dry_run=dry_run, tenant_id=tenant_id)
+      _record_failure(owner, integration_id, event, "invalid_auth_config", payload_bytes, cfg, dry_run=dry_run)
       return {
         "status": "error",
         "integration_id": integration_id,
@@ -240,7 +239,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
         "mode": mode,
         "error": "invalid_auth_config",
         "detail": str(exc),
-        **_cooldown_fields(owner, integration_id, tenant_id),
+        **_cooldown_fields(owner, integration_id),
       }
 
     # In wazuh_api mode we re-shape the payload to match Wazuh manager
@@ -257,14 +256,14 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
       return _send_http_json(cfg["HTTP_URL"], send_payload, headers, timeout_seconds)
   else:
     if not cfg["SYSLOG_HOST"]:
-      _record_failure(owner, integration_id, event, "missing_syslog_host", payload_bytes, cfg, dry_run=dry_run, tenant_id=tenant_id)
+      _record_failure(owner, integration_id, event, "missing_syslog_host", payload_bytes, cfg, dry_run=dry_run)
       return {
         "status": "error",
         "integration_id": integration_id,
         "event_id": _event_id(event),
         "mode": mode,
         "error": "missing_syslog_host",
-        **_cooldown_fields(owner, integration_id, tenant_id),
+        **_cooldown_fields(owner, integration_id),
       }
     syslog_line = format_syslog_json_line(event, signature=signature)
     send = lambda: _send_syslog_json(cfg["SYSLOG_HOST"], cfg["SYSLOG_PORT"], syslog_line, timeout_seconds)
@@ -282,7 +281,6 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
         outcome="success",
         event_id=_event_id(event),
         dry_run=dry_run,
-        tenant_id=tenant_id,
       )
       return {
         "status": "sent",
@@ -310,7 +308,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
     except Exception as exc:
       last_error = _error_class_from_exception(exc)
 
-  artifact_cid = _record_failure(owner, integration_id, event, last_error or "delivery_failed", payload_bytes, cfg, dry_run=dry_run, tenant_id=tenant_id)
+  artifact_cid = _record_failure(owner, integration_id, event, last_error or "delivery_failed", payload_bytes, cfg, dry_run=dry_run)
   return {
     "status": "error",
     "integration_id": integration_id,
@@ -320,14 +318,14 @@ def deliver_wazuh_event(owner, event, *, dry_run=False, tenant_id=None):
     "attempts": attempt,
     "error": last_error or "delivery_failed",
     "artifact_cid": artifact_cid,
-    **_cooldown_fields(owner, integration_id, tenant_id),
+    **_cooldown_fields(owner, integration_id),
   }
 
 
-def deliver_redmesh_event(owner, event, *, integration_id="wazuh", dry_run=False, tenant_id=None):
+def deliver_redmesh_event(owner, event, *, integration_id="wazuh", dry_run=False):
   integration_id = str(integration_id or "wazuh").strip().lower()
   if integration_id == "wazuh":
-    return deliver_wazuh_event(owner, event, dry_run=dry_run, tenant_id=tenant_id)
+    return deliver_wazuh_event(owner, event, dry_run=dry_run)
   return {
     "status": "error",
     "integration_id": integration_id,

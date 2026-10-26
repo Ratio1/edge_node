@@ -35,46 +35,35 @@ class TestDefaultCredentialFindings(unittest.TestCase):
     return _default_credential_findings("SSH", ["root:toor"], **kwargs)[0]
 
   def test_a_proof_is_performed(self):
-    f = self._one(control=CONTROL_REJECTED, proofs={"root:toor": "exec id -> uid=0(root)"},
-                  action_permitted=True)
+    f = self._one(control=CONTROL_REJECTED, proofs={"root:toor": "exec id -> uid=0(root)"})
     self.assertEqual(f.authenticated_action, "performed")
 
-  def test_permitted_without_a_proof_is_attempted(self):
-    self.assertEqual(self._one(control=CONTROL_REJECTED, action_permitted=True).authenticated_action,
-                     "attempted")
-
-  def test_withheld_by_the_roe_is_not_permitted(self):
-    self.assertEqual(self._one(control=CONTROL_REJECTED, action_permitted=False).authenticated_action,
-                     "not_permitted")
+  def test_without_a_proof_is_attempted(self):
+    self.assertEqual(self._one(control=CONTROL_REJECTED).authenticated_action, "attempted")
 
   def test_the_inconclusive_variant_follows_the_same_rule(self):
-    f = self._one(control=CONTROL_ACCEPTED, proofs={"root:toor": "exec id -> uid=0(root)"},
-                  action_permitted=True)
+    f = self._one(control=CONTROL_ACCEPTED, proofs={"root:toor": "exec id -> uid=0(root)"})
     self.assertIn("inconclusive", f.title)
     self.assertEqual(f.authenticated_action, "performed")
 
 
 class TestAnonymousFtp(unittest.TestCase):
 
-  def _run(self, permitted):
+  def _run(self):
     dcc._FakeAnonymousFtp.stored = []
-    worker = dcc.TestSshProbeWiring._worker(self, permitted)
+    worker = dcc.TestSshProbeWiring._worker(self)
     base = "extensions.business.cybersec.red_mesh.worker.service.common."
     with patch(base + "ftplib.FTP", dcc._FakeAnonymousFtp), patch(base + "check_cves", return_value=[]):
       return worker._service_info_ftp("example.com", 21)
 
-  def test_login_is_attempted_and_the_upload_performed_when_permitted(self):
-    actions = _actions(self._run(True))
+  def test_login_is_attempted_and_the_upload_performed(self):
+    actions = _actions(self._run())
     self.assertEqual(actions["FTP allows anonymous login."], "attempted")
     self.assertEqual(actions["FTP anonymous write access enabled (file upload possible)."], "performed")
 
-  def test_login_is_not_permitted_when_the_roe_withholds_the_upload(self):
-    actions = _actions(self._run(False))
-    self.assertEqual(actions["FTP allows anonymous login."], "not_permitted")
-
 
 class TestDatabaseLogins(unittest.TestCase):
-  """A database login has no RoE-gated action, so `not_applicable`."""
+  """A database login has no post-login action, so `not_applicable`."""
 
   def _worker(self):
     worker = PentestLocalWorker(

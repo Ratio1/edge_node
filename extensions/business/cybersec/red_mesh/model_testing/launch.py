@@ -7,7 +7,6 @@ from ..constants import JOB_STATUS_RUNNING, RUN_MODE_SINGLEPASS
 from ..models import CStoreJobRunning, WorkerProgress
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
-from ..tenancy.execution import context_tenant_id
 from ..services.soc_export_policy import required_soc_launch_error
 from ..tenancy.effective_targets import resolve_model_launch_provider, validate_model_provider
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
@@ -292,17 +291,6 @@ def _target_label(model_config):
   return label or model or "Model Test"
 
 
-def _single_pass_error(engagement):
-  """RM-107: a model test is a single pass, so its engagement must allow single pass."""
-  if engagement is None or "single_pass" in engagement["allowed_run_modes"]:
-    return None
-  return {
-    "error": "run_mode_not_authorized", "status_code": 400,
-    "message": "The engagement does not allow this run mode.",
-    "allowed_run_modes": list(engagement["allowed_run_modes"]),
-  }
-
-
 def preflight_model_test_provider(
   owner,
   *,
@@ -334,10 +322,6 @@ def preflight_model_test_provider(
   created_by_id, err = _bounded_text(created_by_id, "created_by_id")
   if err:
     return {"ok": False, **err}
-  # Before any outbound call: an engagement that cannot run a model test gets no provider probe.
-  run_mode_err = _single_pass_error(execution_context.to_dict().get("engagement"))
-  if run_mode_err:
-    return {"ok": False, **run_mode_err}
   normalized_limits, err = _normalize_limits(limits, cfg)
   if err:
     return {"ok": False, **err}
@@ -445,7 +429,7 @@ def launch_model_test(
   created_by_id, err = _bounded_text(created_by_id, "created_by_id")
   if err:
     return err
-  soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
+  soc_error = required_soc_launch_error(owner)
   if soc_error:
     return soc_error
   admitted = execution_context.to_dict()
@@ -453,26 +437,12 @@ def launch_model_test(
     # Before the question-set gate, so a model launch on a scan asset is named for what it is.
     return _validation_error("Execution target mismatch", error_class="execution_target_mismatch")
   engagement = admitted.get("engagement")
-  run_mode_err = _single_pass_error(engagement)
-  if run_mode_err:
-    return run_mode_err
-  if engagement is not None and test_sets is None and not test_set_id:
-    # RM-107: no selection means every question set the engagement authorizes for this model.
-    test_sets = [{"id": test_set} for test_set in engagement["authorized_tests"]]
   normalized_test_sets, selection_err = normalize_model_test_selection(
     test_sets,
     legacy_test_set_id=test_set_id if test_sets is None else None,
   )
   if selection_err:
     return _validation_error(selection_err)
-  if engagement is not None:
-    unauthorized = sorted({item["id"] for item in normalized_test_sets} - set(engagement["authorized_tests"]))
-    if unauthorized:
-      return {
-        "error": "tests_exceed_authorization", "status_code": 400,
-        "message": "The selected question sets exceed the engagement's authorized tests for this model.",
-        "unauthorized_features": unauthorized,
-      }
   if _raw_evidence_requested(raw_evidence) and not cfg["RAW_EVIDENCE_ENABLED"]:
     return _validation_error(
       "raw_evidence is disabled by policy",
@@ -553,10 +523,9 @@ def launch_model_test(
   if engagement is not None:
     # The engagement snapshot (RM-107), as a scan JobConfig carries it.
     sanitized_config.update({
-      "engagement": engagement["context"], "roe": engagement["roe"],
+      "engagement": engagement["context"],
       "authorization": engagement["authorization"], "engagement_id": engagement["engagement_id"],
-      "engagement_hash": engagement["engagement_hash"], "contract_sha256": engagement["contract_sha256"],
-      "authorized_tests": engagement["authorized_tests"]})
+      "engagement_hash": engagement["engagement_hash"], "contract_sha256": engagement["contract_sha256"]})
 
   persisted_config, secret_ref = attach_model_test_provider_secret(
     owner,

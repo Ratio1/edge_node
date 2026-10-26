@@ -17,6 +17,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
   setUp_engagements = engagements.TestTenantEngagements.setUp
   new_tenant = engagements.TestTenantEngagements.new_tenant
   fields = engagements.TestTenantEngagements.fields
+  default_assets = engagements.TestTenantEngagements.default_assets
   create = engagements.TestTenantEngagements.create
 
   def setUp(self):
@@ -37,9 +38,9 @@ class TestTenantEngagementLaunch(unittest.TestCase):
       self.admit(**kwargs)
     self.assertEqual((caught.exception.status_code, caught.exception.error), (status, error))
 
-  def test_network_admission_carries_the_engagement_facts_and_its_port_scope(self):
+  def test_network_admission_carries_the_engagement_facts(self):
     context = self.admit().to_dict()
-    self.assertEqual(context["asset_authorized_ports"], "22,443")
+    self.assertNotIn("asset_authorized_ports", context)
     # RM-107: the target is the engagement entry's.
     self.assertEqual((context["engagement_id"], context["engagement_asset_id"], context["engagement_hash"]),
                      (self.engagement["engagementId"], "ea_1", self.engagement["engagementHash"]))
@@ -47,9 +48,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertEqual(context["asset_target_digest"], self.engagement["assets"][0]["targetDigest"])
     self.assertEqual(context["engagement"], {
       "engagement_id": self.engagement["engagementId"], "engagement_hash": self.engagement["engagementHash"],
-      "contract_sha256": CONTRACT_SHA256, "allowed_run_modes": ["continuous", "single_pass"],
-      "authorized_tests": ["active_auth", "service_info_common"], "authorized_scan_modes": ["connect"],
-      "roe": {"authenticated_action": True, "stateful_probes_allowed": False, "ics_safe_mode_required": True},
+      "contract_sha256": CONTRACT_SHA256,
       "context": self.engagement["context"],
       # RM-107: the signed basis is the tenant contract and its legal signer; the consents are
       # named by the titles of the engagement's third-party consent documents.
@@ -80,8 +79,7 @@ class TestTenantEngagementLaunch(unittest.TestCase):
   def test_webapp_admission_has_no_port_scope_or_scan_modes(self):
     context = self.admit(asset="ea_2").to_dict()
     self.assertNotIn("asset_authorized_ports", context)
-    self.assertNotIn("authorized_scan_modes", context["engagement"])
-    self.assertEqual(context["engagement"]["authorized_tests"], ["graybox"])
+    self.assertFalse(set(context["engagement"]) & {"roe", "authorized_tests", "authorized_scan_modes", "allowed_run_modes"})
 
   def test_the_binding_names_the_engagement_asset_and_keeps_policy_out(self):
     binding = self.admit().build_binding("launcher", ["node-a"]).to_dict()
@@ -91,10 +89,30 @@ class TestTenantEngagementLaunch(unittest.TestCase):
     self.assertNotIn("asset_id", binding)
     self.assertFalse(set(binding) & {"engagement", "asset_authorized_ports"})
 
+  def test_admission_carries_the_asset_environment_as_policy(self):
+    # RM-131: the registered asset's environment; the binding never carries it.
+    context = self.admit()
+    self.assertEqual(context.to_dict()["asset_environment"], "dev")
+    self.assertNotIn("asset_environment", context.build_binding("launcher", ["node-a"]).to_dict())
+    # A row written before RM-131 (no environment) or a missing row is None, held to prod at launch.
+    for key, row in list(self.owner.data.items()):
+      if isinstance(row, dict) and row.get("asset_id") == self.net and "environment" in row:
+        self.owner.data[key] = {name: value for name, value in row.items() if name != "environment"}
+    self.assertIsNone(self.admit().to_dict()["asset_environment"])
+
+  def test_the_context_refuses_an_unknown_environment(self):
+    from extensions.business.cybersec.red_mesh.tenancy.execution import ResolvedExecutionContext
+    value = self.admit().to_dict()
+    for bad in ("production", "", 3):
+      with self.subTest(bad=bad), self.assertRaises(ValueError):
+        ResolvedExecutionContext({**value, "asset_environment": bad})
+    # A context without the key (a caller that predates RM-131) still builds; the launch reads it as prod.
+    value.pop("asset_environment")
+    ResolvedExecutionContext(value)
+
   def test_a_model_asset_is_admitted_with_its_question_sets(self):
     context = self.admit(asset="ea_3").to_dict()
     self.assertEqual(context["asset_target"]["kind"], "model")
-    self.assertEqual(context["engagement"]["authorized_tests"], ["prompt_injection_v1"])
     self.assertNotIn("asset_authorized_ports", context)
 
   def test_refusals(self):

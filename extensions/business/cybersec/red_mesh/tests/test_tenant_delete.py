@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from .asset_fixture import pick, register_asset
 from .test_tenant_administration import FakeAdministrationStore
 from .contract_fixture import install_contract
 
@@ -44,11 +45,10 @@ class TestTenantDelete(unittest.TestCase):
     self.documents = self.plugin._document_store()
     self.plugin.configured_peers_reader = None
     refs = [self.upload("Rules of engagement"), self.upload("Scope email", kind="other", raw=PDF + b"2")]
+    asset_id = register_asset(self.plugin, self.actor, self.tenant, {"kind": "network", "address": "192.0.2.10"})
     created = self.plugin.create_engagement(
-      self.actor, self.tenant, str(uuid4()), "Q4", ["single_pass"], "2026-10-01T00:00:00Z",
-      "2027-10-01T00:00:00Z", {}, {"client_name": "Example"},
-      [{"display_name": "Edge", "target": {"kind": "network", "address": "192.0.2.10"},
-        "authorized_ports": "443", "authorized_tests": ["service_info_common"]}], refs)
+      self.actor, self.tenant, str(uuid4()), "Q4", "2026-10-01T00:00:00Z",
+      "2027-10-01T00:00:00Z", {"client_name": "Example"}, [pick(asset_id)], refs)
     self.assertTrue(created["success"], created)
     self.engagement_refs = refs
     self.events.clear()
@@ -84,15 +84,25 @@ class TestTenantDelete(unittest.TestCase):
     self.assertEqual(self.documents.deleted, [])
 
   def test_delete_removes_records_and_documents_keeps_the_domain_and_is_audited(self):
+    # RM-125: two assets (the engagement's and this one), the latter a row the current validator refuses; both go.
+    for address in ("192.0.2.20",):
+      registered = self.plugin.create_tenant_asset(self.actor, self.tenant, str(uuid4()), "Host " + address,
+                                                   {"kind": "network", "address": address}, environment="dev")
+      self.assertTrue(registered["success"], registered)
+    field = json.dumps(["tenant_asset", "deployment", registered["data"]["asset_id"]], separators=(",", ":"))
+    self.storage.data[(TENANCY_HKEY, field)]["target_digest"] = "0" * 64
+    self.events.clear()
     self.remove_members()
     self.put_job("other-job", "tn_" + str(uuid4()))
     result = self.plugin.delete_tenant(self.actor, self.tenant)
     self.assertTrue(result["success"], result)
+    # RM-133: the answer also counts the contract drafts that went with the tenant.
     self.assertEqual(result["data"], {"tenantId": self.tenant, "deleted": True, "engagements": 1,
-                                      "integrations": 0, "nodeAssignments": 0, "documents": 3})
+                                      "integrations": 0, "assets": 2, "nodeAssignments": 0, "contractDrafts": 0,
+                                      "documents": 3})
     self.assertEqual(sorted(self.documents.deleted), sorted(["doc-fixture", *self.engagement_refs]))
     rows = self.tenancy_rows()
-    for kind in ("tenant", "receipt", "engagement", "asset"):
+    for kind in ("tenant", "receipt", "engagement", "asset", "tenant_asset"):
       self.assertNotIn(kind, rows)
     self.assertEqual(len(rows["domain"]), 1)
     self.refused(self.plugin.get_tenant(self.actor, self.tenant), 404, "not_found")
@@ -102,9 +112,22 @@ class TestTenantDelete(unittest.TestCase):
     self.refused(self.plugin.prepare_tenant(self.actor, self.request, "Example", "example", "initial",
                                             **install_contract(self.plugin)), 409, "domain_conflict")
     self.assertEqual(self.events, [("tenant_deleted", {
-      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "integrations": 0,
+      "tenant_id": self.tenant, "actor": "creator", "engagements": 1, "integrations": 0, "assets": 2,
       "nodeAssignments": 0, "documents": 3})])
     self.refused(self.plugin.delete_tenant(self.actor, self.tenant), 404, "not_found")
+
+  def test_a_retired_integration_row_is_left_to_the_start_up_cleanup_and_the_count_stays_zero(self):
+    # RM-139: the kind is retired, so the delete never reads or counts it; the deployed Navigator
+    # still requires `integrations` in the answer, so it stays, always 0.
+    from .test_tenant_integration_records import integration_location, plant
+    plant(self.storage, self.tenant, "misp")
+    self.remove_members()
+    result = self.plugin.delete_tenant(self.actor, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertEqual((result["data"]["integrations"], result["data"]["engagements"]), (0, 1))
+    self.assertIsNotNone(self.storage.data[integration_location(self.tenant, "misp")])
+    self.Plugin._maybe_retire_tenant_integration_records(self.plugin)
+    self.assertIsNone(self.storage.data[integration_location(self.tenant, "misp")])
 
   def test_a_tenant_with_jobs_is_refused_before_anything_changes(self):
     self.remove_members()

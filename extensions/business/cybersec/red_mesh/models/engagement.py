@@ -13,7 +13,6 @@ Three distinct concerns are kept in separate dataclasses so that
 the form, persistence, and API can address each independently:
 
   EngagementContext     — who, why, what data, what classification
-  RulesOfEngagement     — the three RoE flags workers enforce
   AuthorizationRef      — written permission-to-test (R1FS document
                           CID + signer + third-party auth refs)
 
@@ -188,64 +187,6 @@ class EngagementContext:
 
 
 # ---------------------------------------------------------------------
-# RulesOfEngagement — PTES Pre-engagement RoE
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class RulesOfEngagement:
-  """The rules of engagement workers enforce (RM-095: the engagement owns them).
-
-  - authenticated_action: explicit opt-in for one harmless command
-    (`id`, `PWD`, `uname`) over a session opened with an accepted
-    default credential. Default false: without it the probe reports
-    the accepted credential and does nothing with the session (RM-103).
-  - stateful_probes_allowed: whether a webapp job may enable stateful
-    probes (`allow_stateful_probes`). Default false.
-  - ics_safe_mode_required: whether a network job must keep ICS safe
-    mode on. Default true.
-
-  The never-enforced `strength_of_test`, `dos_allowed`,
-  `post_exploit_rules`, `blackout_windows` and `retest_window_end` were
-  dropped in RM-095; `from_dict` ignores them, so archives written
-  before still load. DoS is never permitted.
-  """
-  authenticated_action: bool = False
-  stateful_probes_allowed: bool = False
-  ics_safe_mode_required: bool = True
-
-  def to_dict(self) -> dict:
-    return {
-      "authenticated_action": self.authenticated_action is True,
-      "stateful_probes_allowed": self.stateful_probes_allowed is True,
-      # Fails safe: anything but an explicit false keeps ICS safe mode required.
-      "ics_safe_mode_required": self.ics_safe_mode_required is not False,
-    }
-
-  @classmethod
-  def from_dict(cls, d: dict | None) -> "RulesOfEngagement | None":
-    if not d:
-      return None
-    # Kept as sent, so `validate()` can refuse a non-boolean: these are
-    # consents, and `bool("false")` is True.
-    return cls(
-      authenticated_action=d.get("authenticated_action", False),
-      stateful_probes_allowed=d.get("stateful_probes_allowed", False),
-      ics_safe_mode_required=d.get("ics_safe_mode_required", True),
-    )
-
-  def is_empty(self) -> bool:
-    return self.to_dict() == RulesOfEngagement().to_dict()
-
-  def validate(self) -> list[str]:
-    return [
-      f"{name} must be true or false, got {getattr(self, name)!r}"
-      for name in ("authenticated_action", "stateful_probes_allowed", "ics_safe_mode_required")
-      if not isinstance(getattr(self, name), bool)
-    ]
-
-
-# ---------------------------------------------------------------------
 # AuthorizationRef — PTES Pre-engagement requires written permission
 # ---------------------------------------------------------------------
 
@@ -353,7 +294,6 @@ class KickoffQuestionnaire:
   context even after engagement-context fields are GDPR-deleted.
   """
   engagement: EngagementContext | None = None
-  roe: RulesOfEngagement | None = None
   authorization: AuthorizationRef | None = None
   schema_version: str = "1.0"
   created_at: str = ""
@@ -363,7 +303,6 @@ class KickoffQuestionnaire:
       "schema_version": self.schema_version,
       "created_at": self.created_at,
       "engagement": self.engagement.to_dict() if self.engagement else None,
-      "roe": self.roe.to_dict() if self.roe else None,
       "authorization": self.authorization.to_dict() if self.authorization else None,
     }
 
@@ -373,7 +312,6 @@ class KickoffQuestionnaire:
       return None
     return cls(
       engagement=EngagementContext.from_dict(d.get("engagement")),
-      roe=RulesOfEngagement.from_dict(d.get("roe")),
       authorization=AuthorizationRef.from_dict(d.get("authorization")),
       schema_version=str(d.get("schema_version", "1.0")),
       created_at=str(d.get("created_at", "")),
@@ -382,6 +320,5 @@ class KickoffQuestionnaire:
   def is_empty(self) -> bool:
     return all([
       self.engagement is None or self.engagement.is_empty(),
-      self.roe is None or self.roe.is_empty(),
       self.authorization is None or self.authorization.is_empty(),
     ])

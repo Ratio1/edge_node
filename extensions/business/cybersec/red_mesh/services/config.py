@@ -6,96 +6,92 @@ def _config_attr_name(block_name):
   return f"cfg_{block_name.lower()}"
 
 
-def tenant_integration_override(owner, tenant_id, integration_id):
-  """One tenant's stored integration override, or {} when there is none.
+class IntegrationOverrideUnavailable(Exception):
+  """The STA override of a deployment integration could not be read (RM-139). Raised, never
+  degraded to "no override": exporting with the Deeploy values while an override may exist would
+  send findings, or a deployment credential, somewhere the STA replaced."""
 
-  Internal resolution, not a caller-facing read: admission happened at the endpoint that supplied
-  the tenant. The plugin owns the store, so this duck-types the accessor the way
-  services/secrets.py reaches the artifact repository, keeping this module testable with a fake
-  owner and free of an adapter import.
 
-  Storage being unavailable yields {} rather than raising, matching how every other config source
-  here degrades. It is not a silent fallback to the node's destination: the caller that wants
-  "a bound job with no tenant config exports nowhere" enforces that on the resolved result, because
-  an absent record and an unreachable store are the same empty override to this function and must
-  not be distinguished into an accidental node-level export.
+_STORED = object()
+
+
+def integration_override(owner, integration_id):
+  """The STA override record of one deployment integration, or None when there is none.
+
+  The plugin owns the store, so this duck-types the accessor the way services/secrets.py reaches
+  the artifact repository, keeping this module testable with a fake owner and free of an adapter
+  import. An owner with no accessor has no override store at all.
   """
-  if tenant_id is None or not integration_id:
-    return {}
-  getter = getattr(type(owner), "_get_tenant_integration_config", None)
+  getter = getattr(type(owner), "_get_super_tenant_integration_override", None)
   if not callable(getter):
-    return {}
+    return None
   try:
-    stored = getter(owner, tenant_id, integration_id)
-  except Exception:
-    return {}
-  if not isinstance(stored, dict):
-    return {}
-  config = stored.get("config")
-  return dict(config) if isinstance(config, dict) else {}
+    row = getter(owner, integration_id)
+  except Exception as exc:
+    raise IntegrationOverrideUnavailable(integration_id) from exc
+  if row is not None and not isinstance(row, dict):
+    raise IntegrationOverrideUnavailable(integration_id)
+  return row
 
 
-TENANT_INTEGRATION_NOT_CONFIGURED = "tenant_integration_not_configured"
-
-
-def tenant_export_binding(owner, job_specs, integration_id):
-  """Which tenant's destination this job exports to. Returns (tenant_id, error_code).
-
-  Every production launch is admitted through `_admit_execution`, which never yields a job with no
-  `execution_binding` (RM-108 phase 5); an absent or malformed binding is refused exactly like a
-  bound tenant with no stored record:
-
-  - A bound job whose tenant has a stored record: (tenant_id, None).
-  - Anything else -- no binding, a malformed one, or a bound tenant with no record --:
-    (None or tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED). It exports nowhere rather than falling
-    back to the node's destination, because falling back would publish one tenant's findings into
-    whatever SOC the deployment happens to point at.
-    A JSON download is the exception: it has no destination and renders with the backend defaults
-    (misp_export._json_export_config, RM-093).
-
-  The existence check lives here rather than in config resolution on purpose: to
-  tenant_integration_override an absent record and an unreachable store are the same empty dict, so
-  a resolved destination can never prove a tenant configured one.
-  """
+def job_tenant_id(job_specs):
+  """The tenant a job's execution binding names, or None for an unbound or malformed job. Pure: it
+  selects nothing about the destination, which is the deployment's for every job (RM-139)."""
   # Imported here, not at module scope: test_llm_agent_config loads this file standalone by path,
   # so a package-relative import at the top would break that contract for an unrelated test.
   from ..tenancy.execution import binding_from_record
   try:
     binding = binding_from_record(job_specs) if isinstance(job_specs, dict) else None
   except Exception:
-    binding = None
-  if binding is None:
-    return None, TENANT_INTEGRATION_NOT_CONFIGURED
-  # ExecutionBinding is a frozen snapshot: its fields are reachable through to_dict(), not as
-  # attributes. getattr(binding, "tenant_id") silently yields None and reads as a malformed binding.
-  tenant_id = binding.to_dict().get("tenant_id")
-  if not isinstance(tenant_id, str) or not tenant_id.strip():
-    return None, TENANT_INTEGRATION_NOT_CONFIGURED
-  if not tenant_integration_override(owner, tenant_id, integration_id):
-    return tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED
-  return tenant_id, None
+    return None
+  # ExecutionBinding is a frozen snapshot: its fields are reachable through to_dict() only.
+  tenant_id = binding.to_dict().get("tenant_id") if binding is not None else None
+  return tenant_id if isinstance(tenant_id, str) and tenant_id.strip() else None
 
 
-def resolve_config_block(owner, block_name, defaults, normalizer=None, tenant_override=None):
+def _resolve_integration(owner, integration_id, block_name, defaults, normalizer, override):
+  """The effective config of one deployment integration: the Deeploy block, then the STA override.
+
+  `override` is the stored row, or _STORED to read it. Under an overridden destination every
+  credential comes from the override alone and no environment indirection applies, so a Deeploy
+  credential is never sent to an STA-chosen host (a row whose secrets were withheld from a backup
+  then reads as missing credentials).
+  """
+  from ..tenancy.integrations import CREDENTIAL_KEYS
+  from ..tenancy.super_tenant_integrations import ENV_KEYS, destination_overridden
+  row = integration_override(owner, integration_id) if override is _STORED else override
+  config = (row or {}).get("config") or {}
+  cfg = resolve_config_block(owner, block_name, defaults, normalizer=normalizer, override=config)
+  if destination_overridden(integration_id, config):
+    for key in CREDENTIAL_KEYS[integration_id]:
+      cfg[key] = config.get(key, "")
+    for key in ENV_KEYS:
+      if key in cfg:
+        cfg[key] = ""
+  if integration_id == "misp" and (row or {}).get("auto_export") is not None:
+    cfg["AUTO_EXPORT"] = row["auto_export"]
+  return cfg
+
+
+def resolve_config_block(owner, block_name, defaults, normalizer=None, override=None):
   """Resolve one shallow nested config block with partial override merge.
 
-  A tenant override is applied last: the tenant's destination wins over the node's, which is the
-  whole point of tenant-scoped integrations.
+  `override` (an STA integration override, RM-139) is applied last and wins field by field.
   """
   merged = dict(defaults or {})
-  override = getattr(owner, _config_attr_name(block_name), None)
-  if override is None:
+  block = getattr(owner, _config_attr_name(block_name), None)
+  if block is None:
     config_data = getattr(owner, "config_data", None)
     if isinstance(config_data, dict):
-      override = config_data.get(block_name)
-  if override is None:
+      block = config_data.get(block_name)
+  if block is None:
     config = getattr(owner, "CONFIG", None)
     if isinstance(config, dict):
-      override = config.get(block_name)
+      block = config.get(block_name)
+  if isinstance(block, dict):
+    merged.update(block)
   if isinstance(override, dict):
     merged.update(override)
-  if isinstance(tenant_override, dict):
-    merged.update(tenant_override)
 
   if callable(normalizer):
     normalized = normalizer(dict(merged), dict(defaults or {}))
@@ -124,6 +120,32 @@ DEFAULT_ATTESTATION_CONFIG = {
   "MIN_SECONDS_BETWEEN_SUBMITS": 86400.0,
   "RETRIES": 2,
 }
+
+# The `DEMO` block holds what the edge does on behalf of the Navigator's Demo, one sub-block per
+# capability, so later ones sit beside `ATTESTATION`.
+# RM-141: `DEMO.ATTESTATION`, Demo jobs attested on Base Sepolia through the Navigator bridge. Its own
+# switch and key, never the live ones; `NETWORK` is an SDK network that resolves to Base Sepolia.
+DEMO_ATTESTATION_NETWORKS = ("testnet", "devnet")
+DEFAULT_DEMO_ATTESTATION_CONFIG = {
+  "ENABLED": False,
+  "PRIVATE_KEY": "",
+  "NETWORK": "testnet",
+  "RETRIES": 2,
+  "SETTLE_SECONDS": 5.0,
+}
+DEFAULT_DEMO_CONFIG = {
+  "ATTESTATION": DEFAULT_DEMO_ATTESTATION_CONFIG,
+}
+
+# RM-132: what the super-tenant may still edit about itself (contract: `onboarding-drafts.md`
+# §Contact formats and the Ratio1 lock). Deployment configuration set by Ratio1, read-only in the
+# API, named booleans, every key `True` unless the deployment says otherwise. RM-134 consumes
+# `edit_branding` (the super-tenant branding record).
+DEFAULT_SUPER_TENANT_PERMISSIONS = {
+  "edit_company_details": True,
+  "edit_branding": True,
+}
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off"})
 
 DEFAULT_GRAYBOX_BUDGETS_CONFIG = {
   "AUTH_ATTEMPTS": 10,
@@ -392,6 +414,39 @@ def get_llm_agent_config(owner):
   )
 
 
+def config_flag(value, default):
+  """A boolean deployment flag: the strings `false`, `0`, `no`, `off` (any case, stripped) are
+  `False`, `None` is the default, anything else is `bool(value)`. `bool("false")` is `True`, which
+  would silently unlock a permission typed as a string."""
+  if value is None:
+    return bool(default)
+  if isinstance(value, str):
+    return value.strip().lower() not in _FALSE_STRINGS and bool(value.strip())
+  return bool(value)
+
+
+def get_super_tenant_permissions(owner):
+  """RM-132: `SUPER_TENANT_PERMISSIONS`, the known keys only, each a boolean."""
+  def _normalize(merged, defaults):
+    return {key: config_flag(merged.get(key), default) for key, default in defaults.items()}
+
+  return resolve_config_block(
+    owner,
+    "SUPER_TENANT_PERMISSIONS",
+    DEFAULT_SUPER_TENANT_PERMISSIONS,
+    normalizer=_normalize,
+  )
+
+
+def get_demo_only(owner):
+  """RM-140: `REDMESH_DEMO_ONLY`, the deployment's demo-only lock. A deployment value is JSON, so only
+  None, bool, int and str are read; anything else (a test double) is off."""
+  value = getattr(owner, _config_attr_name("REDMESH_DEMO_ONLY"), None)
+  if value is not None and not isinstance(value, (bool, int, str)):
+    return False
+  return config_flag(value, False)
+
+
 def get_attestation_config(owner):
   """Return normalized attestation config."""
   def _normalize(merged, defaults):
@@ -425,6 +480,43 @@ def get_attestation_config(owner):
     owner,
     "ATTESTATION",
     DEFAULT_ATTESTATION_CONFIG,
+    normalizer=_normalize,
+  )
+
+
+def get_demo_attestation_config(owner):
+  """RM-141: the normalized `DEMO.ATTESTATION` sub-block. The key is for the submit path only."""
+  def _normalize(demo, demo_defaults):
+    defaults = demo_defaults["ATTESTATION"]
+    merged = dict(defaults)
+    if isinstance(demo.get("ATTESTATION"), dict):
+      merged.update(demo["ATTESTATION"])
+    private_key = merged.get("PRIVATE_KEY")
+    private_key = private_key.strip() if isinstance(private_key, str) else ""
+    network = merged.get("NETWORK")
+    network = network.strip().lower() if isinstance(network, str) else ""
+    if network not in DEMO_ATTESTATION_NETWORKS:
+      network = defaults["NETWORK"]
+    try:
+      retries = int(merged.get("RETRIES", defaults["RETRIES"]))
+    except (TypeError, ValueError):
+      retries = defaults["RETRIES"]
+    try:
+      settle_seconds = float(merged.get("SETTLE_SECONDS", defaults["SETTLE_SECONDS"]))
+    except (TypeError, ValueError):
+      settle_seconds = defaults["SETTLE_SECONDS"]
+    return {
+      "ENABLED": config_flag(merged.get("ENABLED"), defaults["ENABLED"]),
+      "PRIVATE_KEY": private_key,
+      "NETWORK": network,
+      "RETRIES": max(retries, 1),
+      "SETTLE_SECONDS": settle_seconds if settle_seconds >= 0 else defaults["SETTLE_SECONDS"],
+    }
+
+  return resolve_config_block(
+    owner,
+    "DEMO",
+    DEFAULT_DEMO_CONFIG,
     normalizer=_normalize,
   )
 
@@ -655,7 +747,7 @@ def get_event_export_config(owner):
   )
 
 
-def get_wazuh_export_config(owner, tenant_id=None):
+def get_wazuh_export_config(owner, *, override=_STORED):
   """Return normalized Wazuh/generic SIEM export config."""
   def _normalize(merged, defaults):
     mode = _normalized_choice(
@@ -730,13 +822,7 @@ def get_wazuh_export_config(owner, tenant_id=None):
       ),
     }
 
-  return resolve_config_block(
-    owner,
-    "WAZUH_EXPORT",
-    DEFAULT_WAZUH_EXPORT_CONFIG,
-    normalizer=_normalize,
-    tenant_override=tenant_integration_override(owner, tenant_id, "wazuh"),
-  )
+  return _resolve_integration(owner, "wazuh", "WAZUH_EXPORT", DEFAULT_WAZUH_EXPORT_CONFIG, _normalize, override)
 
 
 def get_suricata_correlation_config(owner):
@@ -797,7 +883,7 @@ def get_stix_export_config(owner):
   )
 
 
-def get_opencti_export_config(owner, tenant_id=None):
+def get_opencti_export_config(owner, *, override=_STORED):
   """Return normalized OpenCTI export config."""
   def _normalize(merged, defaults):
     return {
@@ -822,16 +908,10 @@ def get_opencti_export_config(owner, tenant_id=None):
       ),
     }
 
-  return resolve_config_block(
-    owner,
-    "OPENCTI_EXPORT",
-    DEFAULT_OPENCTI_EXPORT_CONFIG,
-    normalizer=_normalize,
-    tenant_override=tenant_integration_override(owner, tenant_id, "opencti"),
-  )
+  return _resolve_integration(owner, "opencti", "OPENCTI_EXPORT", DEFAULT_OPENCTI_EXPORT_CONFIG, _normalize, override)
 
 
-def get_taxii_export_config(owner, tenant_id=None):
+def get_taxii_export_config(owner, *, override=_STORED):
   """Return normalized TAXII export config."""
   def _normalize(merged, defaults):
     return {
@@ -863,10 +943,4 @@ def get_taxii_export_config(owner, tenant_id=None):
       ),
     }
 
-  return resolve_config_block(
-    owner,
-    "TAXII_EXPORT",
-    DEFAULT_TAXII_EXPORT_CONFIG,
-    normalizer=_normalize,
-    tenant_override=tenant_integration_override(owner, tenant_id, "taxii"),
-  )
+  return _resolve_integration(owner, "taxii", "TAXII_EXPORT", DEFAULT_TAXII_EXPORT_CONFIG, _normalize, override)

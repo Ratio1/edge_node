@@ -12,7 +12,6 @@ What gets deleted
 
   Typed (PR-3.3):
     JobConfig.engagement       — full EngagementContext dict
-    JobConfig.roe              — full RulesOfEngagement dict
     JobConfig.authorization    — full AuthorizationRef dict
 
   Legacy (pre-Phase-3):
@@ -231,7 +230,7 @@ def delete_engagement_data(
 # Field names on JobConfig that carry engagement-context data.
 # Distinguished into typed (PR-3.3) and legacy (pre-Phase-3) buckets
 # for clarity in the audit message.
-_TYPED_FIELDS = ("engagement", "roe", "authorization")
+_TYPED_FIELDS = ("engagement", "authorization")
 _LEGACY_FIELDS = (
   "engagement_metadata",
   "authorization_ref",

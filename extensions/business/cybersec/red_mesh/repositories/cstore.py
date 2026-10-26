@@ -39,6 +39,11 @@ class JobStateRepository:
   def _live_hkey(self):
     return f"{self.owner.cfg_instance_id}:live"
 
+  # RM-127: each node's self-published public IP, keyed by the node's address.
+  @property
+  def _node_info_hkey(self):
+    return f"{self.owner.cfg_instance_id}:node_info"
+
   @property
   def _triage_hkey(self):
     return f"{self.owner.cfg_instance_id}:triage"
@@ -155,6 +160,14 @@ class JobStateRepository:
   def put_live_progress(self, key, value):
     self.owner.chainstore_hset(hkey=self._live_hkey, key=key, value=value)
     return value
+
+  def list_node_info(self):
+    return self.owner.chainstore_hgetall(hkey=self._node_info_hkey)
+
+  def put_node_info(self, node_address, value):
+    # A short, single attempt: the publish runs inside `process()` and is retried by the caller.
+    # `chainstore_hset` answers False for an unconfirmed write; the caller retries on it.
+    return self.owner.chainstore_hset(hkey=self._node_info_hkey, key=node_address, value=value, timeout=2, max_retries=0)
 
   @staticmethod
   def _safe_int(value, default=0):

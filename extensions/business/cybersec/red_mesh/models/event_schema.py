@@ -72,6 +72,9 @@ class RedMeshEvent:
   destination: dict | None = None
   correlation: dict | None = None
   redaction: dict | None = None
+  # RM-139: the job's RedMesh tenant (`super-tenant` without a bound job). `tenant_id` above is the
+  # instance id SOC decoders already key on and keeps that meaning.
+  redmesh_tenant_id: str | None = None
 
   def to_dict(self) -> dict:
     return asdict(self)
