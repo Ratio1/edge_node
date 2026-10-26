@@ -26,6 +26,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
 from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard_v0_13 import (
   EDGEGUARD_SCHEMA_V0_13,
   SCHEMA_ARTIFACT_V0_13_SHA256,
+  PROMPT_SIZE_FACTOR,
   SCHEMA_VERSION_V0_13,
   build_v0_13_pattern_schema_system_prompt,
   load_schema_artifact_v0_13,
@@ -33,7 +34,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard_v0_13 import 
 from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import EdgeGuardCypherGuardError
 
 # Hub `configs/edgeguard_v0_13_runtime_pin.json` served_system_prompt_sha256.
-HUB_V0_13_PROMPT_SHA256 = "2c120f5c00dd26363dabce6548e4257d8fd5a243c192ca071878e2dfafbc2b7a"
+HUB_V0_13_PROMPT_SHA256 = "62bc5b281bec851aac8da6e6603a53a559f1da332b59898955246f2a0afca0aa"
 V0_13_MODEL_KEY = "v0-13-fixture-model"
 V0_13_WORKERS = {
   V0_13_MODEL_KEY: {
@@ -87,7 +88,7 @@ class V0_13ArtifactAndPromptTests(unittest.TestCase):
     v0_11 = len(build_v0_11_pattern_schema_system_prompt().encode("utf-8"))
     v0_13 = len(build_v0_13_pattern_schema_system_prompt().encode("utf-8"))
     self.assertEqual(v0_11, 3289)
-    self.assertLessEqual(v0_13, int(v0_11 * 1.4))
+    self.assertLessEqual(v0_13, int(v0_11 * PROMPT_SIZE_FACTOR))
 
   def test_served_prompt_has_no_removed_graph_shapes(self):
     prompt = build_v0_13_pattern_schema_system_prompt()

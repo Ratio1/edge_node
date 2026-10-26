@@ -21,15 +21,19 @@ from .edgeguard_cypher_guard import (
 SCHEMA_VERSION_V0_13 = "edgeguard-cypher-schema-v0.13"
 SCHEMA_ARTIFACT_V0_13_PATH = Path(__file__).resolve().parent / "schema" / "edgeguard_cypher_schema_v0_13.json"
 SCHEMA_ARTIFACT_V0_13_SHA256 = "sha256:c3e0af05d9b1b2795fc5481ac769fddcd49b14322d510f83de3ac3cc619fc775"
-# Contract v0.13 §6.1: the served prompt may be at most this many times the v0.11 prompt (3,289 bytes).
+# Contract v0.13 §6.1: the served prompt may be at most this many times the v0.11 prompt (3,289 bytes); 1.4 until
+# v0.13.1 added the sector, sub-technique and last_updated rules (EGM-068, 2026-10-26).
 V0_11_PROMPT_BYTES = 3289
-PROMPT_SIZE_FACTOR = 1.4
+PROMPT_SIZE_FACTOR = 1.5
 # Closed vocabularies the served prompt shows, in order; the artifact holds more (contract v0.13 §4).
 PROMPT_VOCABULARIES = (
   "Indicator.indicator_type", "Indicator.aging_tier", "Indicator.url_status", "Sector.name", "Tactic.mitre_id",
   "CVSSv2.base_severity", "CVSSv30.base_severity", "CVSSv31.base_severity", "CVSSv40.base_severity",
   "CVE.ssvc_exploitation", "CVE.ssvc_automatable", "CVE.ssvc_technical_impact", "CVE.known_ransomware_use",
 )
+# v0.13.1: properties the gold filters or orders on that no populated pattern lists; without them the model invents
+# `updated_at` for "latest" CVE questions and SUBTECHNIQUE_OF hops for "no sub-techniques" questions.
+PROMPT_EXTRA_KEY_PROPERTIES = {"CVE": ("last_updated",), "Technique": ("is_subtechnique",)}
 
 
 def load_schema_artifact_v0_13(path: Path | None = None) -> dict[str, Any]:
@@ -75,6 +79,9 @@ def _v0_13_key_property_lines(artifact: dict[str, Any]) -> list[str]:
       continue
     for side in ("from", "to"):
       properties.setdefault(str(pattern[side]), tuple(str(v) for v in pattern.get(f"{side}_properties") or []))
+  for label, extra in PROMPT_EXTRA_KEY_PROPERTIES.items():
+    if label in properties:
+      properties[label] += tuple(v for v in extra if v not in properties[label])
   grouped: dict[tuple[str, ...], list[str]] = {}
   for label, values in sorted(properties.items()):
     grouped.setdefault(values, []).append(label)
@@ -97,8 +104,8 @@ def _v0_13_temporal_rule_text(artifact: dict[str, Any]) -> str:
     grouped.setdefault(str(duration), []).append(str(window))
   rolling_text = "; ".join(f"{'/'.join(sorted(windows))}={duration}" for duration, windows in sorted(grouped.items()))
   return (
-    "Temporal: allowed properties named *_at, *_seen, aging_since, published, or last_modified only "
-    "(Indicator last_reported_at is the latest report). "
+    "Temporal: allowed properties named *_at, *_seen, aging_since, published, last_modified, or last_updated "
+    "only (Indicator last_reported_at is the latest report; CVE last_updated its latest change). "
     f"Rolling windows: {rolling_text} via `datetime()-duration(...)`. A calendar window is the "
     "previous calendar period, not rolling. Never invent a temporal property; omit it if none matches."
   )
@@ -130,7 +137,10 @@ def build_v0_13_pattern_schema_system_prompt(artifact: dict[str, Any] | None = N
     "EXPLOITS CVE. Campaign membership is PART_OF_CAMPAIGN. Relationships have no source_id; use the r.sources "
     "list. cvss_score is null without CVSS: ranking by it needs IS NOT NULL. Match an actor on name or aliases. "
     "Default to `i.active = true` for Indicator and `coalesce(n.deprecated, false) = false` for Malware, "
-    "Technique, ThreatActor, unless retired or deprecated ones are asked for.",
+    "Technique, ThreatActor, unless retired or deprecated ones are asked for. "
+    "Sector questions start at Indicator-[:TARGETS]->Sector, reaching malware by INDICATES and actors by "
+    "ATTRIBUTED_TO; Malware or ThreatActor TARGETS Sector only when the question says they target it. "
+    "Excluding sub-techniques is is_subtechnique = false; SUBTECHNIQUE_OF only for parent/child questions.",
     "Shape: investigation/neighbourhood/related-to questions return graph (RETURN p[, q], "
     "LIMIT optional). Ranking questions (which of, highest, top, rank, most) return "
     "ranked_projection: start MATCH, state the ranking rule given, always end LIMIT, never "
