@@ -1,0 +1,3108 @@
+{
+  "checksums": {
+    "artifact_sha256": "sha256:c3e0af05d9b1b2795fc5481ac769fddcd49b14322d510f83de3ac3cc619fc775",
+    "schema_surface_sha256": "sha256:e623db87340fc26527c9d201d6415618df286805b3e22a384baaf9494d6e0c99"
+  },
+  "contract": {
+    "path": "docs/resources/edgeguard-models/specs/edgeguard-text-to-cypher-v0.13-contract.md",
+    "sha256": "sha256:1b68fb4be243d9e73abe46316c450d5918f0bd4af5cca0a164ae0b7bc3912d9c"
+  },
+  "counts": {
+    "label_count": 30,
+    "pending_pattern_count": 0,
+    "populated_pattern_count": 30,
+    "property_count": 165,
+    "relationship_type_count": 34,
+    "topology_pattern_count": 26
+  },
+  "curated_layer": {
+    "match_types": [
+      "coreideas_curated",
+      "curated_other"
+    ],
+    "rule": "claims with these relationship sources or match types stay out of shared training data and the prompt",
+    "sources": [
+      "coreideas",
+      "curated_other",
+      "misp_galaxy"
+    ]
+  },
+  "generation": {
+    "command": "uv run --project tools/python python workbooks/edgeguard-cypher-query-catalog/scripts/build_edgeguard_cypher_schema.py --v0-13-snapshot <snapshot_counts.json> --kg-spec-commit <commit>",
+    "deterministic": true,
+    "generated_at": "N/A - deterministic artifact omits wall-clock time"
+  },
+  "graph_snapshot_id": {
+    "frozen_at": "2026-10-25T23:20:57Z",
+    "name": "edgeguard-prodsnap-cf789b9-2026-10-25",
+    "neo4j_database": "neo4j",
+    "neo4j_store_created": "2026-10-25T15:48:03.095Z",
+    "neo4j_store_id": "735D1754B98B0CB66542761ECB85652EBE0668CF4A77CF0A0523899FDF2493F4",
+    "neo4j_version": {
+      "Cypher": [
+        "5",
+        "25"
+      ],
+      "Neo4j Kernel": [
+        "2026.02.2"
+      ]
+    }
+  },
+  "key_properties_unbacked": [],
+  "label_properties": {
+    "Alert": [
+      "alert_id",
+      "cve",
+      "description",
+      "enriched",
+      "enrichment_latency_ms",
+      "indicator",
+      "indicator_type",
+      "last_updated",
+      "malware",
+      "received_at",
+      "severity",
+      "source",
+      "timestamp",
+      "zone"
+    ],
+    "Application": [
+      "first_seen",
+      "last_updated",
+      "name",
+      "tag"
+    ],
+    "CVE": [
+      "active",
+      "affected_products",
+      "attack_vector",
+      "cisa_action_due",
+      "cisa_exploit_add",
+      "cisa_required_action",
+      "cisa_vulnerability_name",
+      "confidence_score",
+      "cpe_type",
+      "cve_id",
+      "cvss_score",
+      "cvss_version",
+      "cwe",
+      "description",
+      "description_source",
+      "edgeguard_managed",
+      "epss_model_version",
+      "epss_percentile",
+      "epss_score",
+      "epss_score_date",
+      "epss_updated_at",
+      "first_imported_at",
+      "known_ransomware_use",
+      "last_imported_from",
+      "last_modified",
+      "last_updated",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "published",
+      "ref_tags",
+      "reference_urls",
+      "result_impacts",
+      "severity",
+      "source",
+      "ssvc_automatable",
+      "ssvc_exploitation",
+      "ssvc_technical_impact",
+      "ssvc_timestamp",
+      "ssvc_version",
+      "status",
+      "tag",
+      "tags",
+      "tlp",
+      "uuid",
+      "zone"
+    ],
+    "CVSSv2": [
+      "ac_insuf_info",
+      "access_complexity",
+      "access_vector",
+      "authentication",
+      "availability_impact",
+      "base_score",
+      "base_severity",
+      "confidentiality_impact",
+      "cve_id",
+      "edgeguard_managed",
+      "exploitability_score",
+      "impact_score",
+      "integrity_impact",
+      "last_updated",
+      "obtain_all_privilege",
+      "obtain_other_privilege",
+      "obtain_user_privilege",
+      "tag",
+      "user_interaction_required",
+      "uuid",
+      "vector_string"
+    ],
+    "CVSSv30": [
+      "attack_complexity",
+      "attack_vector",
+      "availability_impact",
+      "base_score",
+      "base_severity",
+      "confidentiality_impact",
+      "cve_id",
+      "edgeguard_managed",
+      "exploitability_score",
+      "impact_score",
+      "integrity_impact",
+      "last_updated",
+      "privileges_required",
+      "scope",
+      "tag",
+      "user_interaction",
+      "uuid",
+      "vector_string"
+    ],
+    "CVSSv31": [
+      "attack_complexity",
+      "attack_vector",
+      "availability_impact",
+      "base_score",
+      "base_severity",
+      "confidentiality_impact",
+      "cve_id",
+      "edgeguard_managed",
+      "exploitability_score",
+      "impact_score",
+      "integrity_impact",
+      "last_updated",
+      "privileges_required",
+      "scope",
+      "tag",
+      "user_interaction",
+      "uuid",
+      "vector_string"
+    ],
+    "CVSSv40": [
+      "base_score",
+      "base_severity",
+      "cve_id",
+      "edgeguard_managed",
+      "last_updated",
+      "tag",
+      "uuid",
+      "vector_string"
+    ],
+    "Campaign": [
+      "active",
+      "actor_name",
+      "aliases",
+      "created_at",
+      "edgeguard_managed",
+      "first_seen",
+      "indicator_count",
+      "last_seen",
+      "last_updated",
+      "malware_count",
+      "name",
+      "tags",
+      "tlp",
+      "uuid",
+      "zone"
+    ],
+    "Component": [
+      "first_seen",
+      "last_updated",
+      "name",
+      "tag"
+    ],
+    "Device": [
+      "device_id",
+      "first_seen",
+      "last_updated",
+      "tag"
+    ],
+    "Host": [
+      "first_seen",
+      "hostname",
+      "last_updated",
+      "tag"
+    ],
+    "IP": [
+      "address",
+      "first_seen",
+      "last_updated",
+      "status",
+      "tag",
+      "version"
+    ],
+    "Indicator": [
+      "abuse_categories",
+      "active",
+      "aging_basis",
+      "aging_evaluated_at",
+      "aging_factor",
+      "aging_since",
+      "aging_tier",
+      "attack_ids",
+      "confidence_score",
+      "edgeguard_managed",
+      "first_imported_at",
+      "indicator_role",
+      "indicator_type",
+      "last_imported_from",
+      "last_online",
+      "last_recorded_at",
+      "last_reported_at",
+      "last_reported_basis",
+      "last_reported_ref",
+      "last_reported_source",
+      "last_updated",
+      "malware_family",
+      "malware_malpedia",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "pulse_malware_actor_pairs",
+      "pulse_malware_families",
+      "reference",
+      "reporter",
+      "retired_at",
+      "retired_by",
+      "several_actor_pulses",
+      "sigma_rules",
+      "source",
+      "source_confidence",
+      "tags",
+      "targeted_countries",
+      "threat_label",
+      "tlp",
+      "url_status",
+      "uuid",
+      "value",
+      "yara_rules",
+      "zone"
+    ],
+    "Malware": [
+      "active",
+      "aliases",
+      "confidence_score",
+      "deprecated",
+      "description",
+      "description_source",
+      "edgeguard_managed",
+      "first_imported_at",
+      "last_imported_from",
+      "last_updated",
+      "malware_types",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "name",
+      "pulse_ids",
+      "reported_techniques",
+      "source",
+      "tag",
+      "tags",
+      "tlp",
+      "uses_techniques",
+      "uuid",
+      "zone"
+    ],
+    "Mission": [
+      "criticality",
+      "description",
+      "first_seen",
+      "last_updated",
+      "name",
+      "structure",
+      "tag"
+    ],
+    "MissionDependency": [
+      "dependency_id",
+      "first_seen",
+      "last_updated",
+      "tag"
+    ],
+    "NetworkService": [
+      "first_seen",
+      "last_updated",
+      "port",
+      "protocol",
+      "service",
+      "tag"
+    ],
+    "Node": [
+      "degree_centrality",
+      "first_seen",
+      "last_updated",
+      "node_id",
+      "pagerank_centrality",
+      "tag"
+    ],
+    "OrganizationUnit": [
+      "first_seen",
+      "last_updated",
+      "name",
+      "tag"
+    ],
+    "Role": [
+      "first_seen",
+      "last_updated",
+      "permission",
+      "role_name",
+      "tag"
+    ],
+    "Sector": [
+      "created_at",
+      "edgeguard_managed",
+      "last_updated",
+      "name",
+      "updated_at",
+      "uuid"
+    ],
+    "SoftwareVersion": [
+      "cve_timestamp",
+      "first_seen",
+      "last_updated",
+      "tag",
+      "version"
+    ],
+    "Source": [
+      "created_at",
+      "edgeguard_managed",
+      "name",
+      "reliability",
+      "source_id",
+      "type",
+      "updated_at",
+      "uuid"
+    ],
+    "Subnet": [
+      "first_seen",
+      "last_updated",
+      "note",
+      "range",
+      "tag",
+      "version"
+    ],
+    "Tactic": [
+      "active",
+      "attack_domain",
+      "confidence_score",
+      "description",
+      "description_source",
+      "edgeguard_managed",
+      "first_imported_at",
+      "last_imported_from",
+      "last_updated",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "mitre_id",
+      "name",
+      "shortname",
+      "source",
+      "tag",
+      "tags",
+      "tlp",
+      "uuid",
+      "zone"
+    ],
+    "Technique": [
+      "active",
+      "attack_domain",
+      "confidence_score",
+      "deprecated",
+      "description",
+      "description_source",
+      "edgeguard_managed",
+      "first_imported_at",
+      "is_subtechnique",
+      "last_imported_from",
+      "last_updated",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "mitre_id",
+      "name",
+      "source",
+      "tactic_phases",
+      "tag",
+      "tags",
+      "tlp",
+      "uuid",
+      "zone"
+    ],
+    "ThreatActor": [
+      "active",
+      "aliases",
+      "confidence_score",
+      "deprecated",
+      "description",
+      "description_source",
+      "edgeguard_managed",
+      "first_imported_at",
+      "last_imported_from",
+      "last_updated",
+      "merged_from",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "name",
+      "pulse_ids",
+      "reported_techniques",
+      "source",
+      "tag",
+      "tags",
+      "tlp",
+      "uses_malware",
+      "uses_techniques",
+      "uses_tools",
+      "uuid",
+      "zone"
+    ],
+    "Tool": [
+      "active",
+      "confidence_score",
+      "description",
+      "description_source",
+      "edgeguard_managed",
+      "first_imported_at",
+      "last_imported_from",
+      "last_updated",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "mitre_id",
+      "name",
+      "source",
+      "tag",
+      "tags",
+      "tlp",
+      "tool_types",
+      "uses_techniques",
+      "uuid",
+      "zone"
+    ],
+    "User": [
+      "first_seen",
+      "last_updated",
+      "tag",
+      "username"
+    ],
+    "Vulnerability": [
+      "active",
+      "affected_products",
+      "attack_vector",
+      "cisa_action_due",
+      "cisa_exploit_add",
+      "cisa_required_action",
+      "cisa_vulnerability_name",
+      "confidence_score",
+      "cpe_type",
+      "cve_id",
+      "cvss_score",
+      "cvss_version",
+      "cwe",
+      "description",
+      "description_source",
+      "epss_model_version",
+      "epss_percentile",
+      "epss_score",
+      "epss_score_date",
+      "epss_updated_at",
+      "first_imported_at",
+      "first_seen",
+      "known_ransomware_use",
+      "last_updated",
+      "ref_tags",
+      "result_impacts",
+      "severity",
+      "source",
+      "ssvc_automatable",
+      "ssvc_exploitation",
+      "ssvc_technical_impact",
+      "ssvc_timestamp",
+      "ssvc_version",
+      "status",
+      "tag",
+      "vuln_id",
+      "zone"
+    ]
+  },
+  "patterns": [
+    {
+      "count": 9098,
+      "from": "CVE",
+      "from_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Sector",
+      "to_properties": [
+        "name"
+      ],
+      "type": "AFFECTS"
+    },
+    {
+      "count": 2640,
+      "from": "Malware",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "ThreatActor",
+      "to_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "type": "ATTRIBUTED_TO"
+    },
+    {
+      "count": 17582,
+      "from": "ThreatActor",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Technique",
+      "to_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "type": "EMPLOYS_TECHNIQUE"
+    },
+    {
+      "count": 147,
+      "from": "ThreatActor",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "CVE",
+      "to_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "type": "EXPLOITS"
+    },
+    {
+      "count": 13342,
+      "from": "CVE",
+      "from_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "CVSSv2",
+      "to_properties": [
+        "base_score",
+        "base_severity"
+      ],
+      "type": "HAS_CVSS_v2"
+    },
+    {
+      "count": 2357,
+      "from": "CVE",
+      "from_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "CVSSv30",
+      "to_properties": [
+        "base_score",
+        "base_severity"
+      ],
+      "type": "HAS_CVSS_v30"
+    },
+    {
+      "count": 130737,
+      "from": "CVE",
+      "from_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "CVSSv31",
+      "to_properties": [
+        "base_score",
+        "base_severity"
+      ],
+      "type": "HAS_CVSS_v31"
+    },
+    {
+      "count": 40208,
+      "from": "CVE",
+      "from_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "CVSSv40",
+      "to_properties": [
+        "base_score",
+        "base_severity"
+      ],
+      "type": "HAS_CVSS_v40"
+    },
+    {
+      "count": 73762,
+      "from": "Malware",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Technique",
+      "to_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "type": "IMPLEMENTS_TECHNIQUE"
+    },
+    {
+      "count": 869,
+      "from": "Tool",
+      "from_properties": [
+        "mitre_id",
+        "name"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Technique",
+      "to_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "type": "IMPLEMENTS_TECHNIQUE"
+    },
+    {
+      "count": 60482,
+      "from": "Indicator",
+      "from_properties": [
+        "value",
+        "indicator_type",
+        "active",
+        "aging_tier",
+        "url_status",
+        "last_reported_at"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "CVE",
+      "to_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "type": "INDICATES"
+    },
+    {
+      "count": 268171,
+      "from": "Indicator",
+      "from_properties": [
+        "value",
+        "indicator_type",
+        "active",
+        "aging_tier",
+        "url_status",
+        "last_reported_at"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Malware",
+      "to_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "type": "INDICATES"
+    },
+    {
+      "count": 1024,
+      "from": "Technique",
+      "from_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Tactic",
+      "to_properties": [
+        "mitre_id",
+        "name"
+      ],
+      "type": "IN_TACTIC"
+    },
+    {
+      "count": 41512,
+      "from": "Indicator",
+      "from_properties": [
+        "value",
+        "indicator_type",
+        "active",
+        "aging_tier",
+        "url_status",
+        "last_reported_at"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Campaign",
+      "to_properties": [
+        "name",
+        "actor_name",
+        "first_seen",
+        "last_seen",
+        "indicator_count",
+        "malware_count"
+      ],
+      "type": "PART_OF_CAMPAIGN"
+    },
+    {
+      "count": 3175,
+      "from": "Malware",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Campaign",
+      "to_properties": [
+        "name",
+        "actor_name",
+        "first_seen",
+        "last_seen",
+        "indicator_count",
+        "malware_count"
+      ],
+      "type": "PART_OF_CAMPAIGN"
+    },
+    {
+      "count": 540,
+      "from": "ThreatActor",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Campaign",
+      "to_properties": [
+        "name",
+        "actor_name",
+        "first_seen",
+        "last_seen",
+        "indicator_count",
+        "malware_count"
+      ],
+      "type": "RUNS"
+    },
+    {
+      "count": 153294,
+      "from": "CVE",
+      "from_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Source",
+      "to_properties": [
+        "source_id",
+        "name"
+      ],
+      "type": "SOURCED_FROM"
+    },
+    {
+      "count": 231330,
+      "from": "Indicator",
+      "from_properties": [
+        "value",
+        "indicator_type",
+        "active",
+        "aging_tier",
+        "url_status",
+        "last_reported_at"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Source",
+      "to_properties": [
+        "source_id",
+        "name"
+      ],
+      "type": "SOURCED_FROM"
+    },
+    {
+      "count": 3896,
+      "from": "Malware",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Source",
+      "to_properties": [
+        "source_id",
+        "name"
+      ],
+      "type": "SOURCED_FROM"
+    },
+    {
+      "count": 27,
+      "from": "Tactic",
+      "from_properties": [
+        "mitre_id",
+        "name"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Source",
+      "to_properties": [
+        "source_id",
+        "name"
+      ],
+      "type": "SOURCED_FROM"
+    },
+    {
+      "count": 824,
+      "from": "Technique",
+      "from_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Source",
+      "to_properties": [
+        "source_id",
+        "name"
+      ],
+      "type": "SOURCED_FROM"
+    },
+    {
+      "count": 837,
+      "from": "ThreatActor",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Source",
+      "to_properties": [
+        "source_id",
+        "name"
+      ],
+      "type": "SOURCED_FROM"
+    },
+    {
+      "count": 95,
+      "from": "Tool",
+      "from_properties": [
+        "mitre_id",
+        "name"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Source",
+      "to_properties": [
+        "source_id",
+        "name"
+      ],
+      "type": "SOURCED_FROM"
+    },
+    {
+      "count": 506,
+      "from": "Technique",
+      "from_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Technique",
+      "to_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "type": "SUBTECHNIQUE_OF"
+    },
+    {
+      "count": 66400,
+      "from": "Indicator",
+      "from_properties": [
+        "value",
+        "indicator_type",
+        "active",
+        "aging_tier",
+        "url_status",
+        "last_reported_at"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Sector",
+      "to_properties": [
+        "name"
+      ],
+      "type": "TARGETS"
+    },
+    {
+      "count": 1900,
+      "from": "Malware",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Sector",
+      "to_properties": [
+        "name"
+      ],
+      "type": "TARGETS"
+    },
+    {
+      "count": 449,
+      "from": "ThreatActor",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Sector",
+      "to_properties": [
+        "name"
+      ],
+      "type": "TARGETS"
+    },
+    {
+      "count": 719,
+      "from": "ThreatActor",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Malware",
+      "to_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "type": "USES_MALWARE"
+    },
+    {
+      "count": 1521343,
+      "from": "Indicator",
+      "from_properties": [
+        "value",
+        "indicator_type",
+        "active",
+        "aging_tier",
+        "url_status",
+        "last_reported_at"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Technique",
+      "to_properties": [
+        "mitre_id",
+        "name",
+        "deprecated"
+      ],
+      "type": "USES_TECHNIQUE"
+    },
+    {
+      "count": 507,
+      "from": "ThreatActor",
+      "from_properties": [
+        "name",
+        "aliases",
+        "deprecated"
+      ],
+      "populated": true,
+      "surface": "populated",
+      "to": "Tool",
+      "to_properties": [
+        "mitre_id",
+        "name"
+      ],
+      "type": "USES_TOOL"
+    },
+    {
+      "count": 0,
+      "from": "Node",
+      "from_properties": [
+        "node_id"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Node",
+      "to_properties": [
+        "node_id"
+      ],
+      "type": "IS_CONNECTED_TO"
+    },
+    {
+      "count": 0,
+      "from": "Node",
+      "from_properties": [
+        "node_id"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "IP",
+      "to_properties": [
+        "address"
+      ],
+      "type": "HAS_ASSIGNED"
+    },
+    {
+      "count": 0,
+      "from": "IP",
+      "from_properties": [
+        "address"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Node",
+      "to_properties": [
+        "node_id"
+      ],
+      "type": "HAS_ASSIGNED"
+    },
+    {
+      "count": 0,
+      "from": "Node",
+      "from_properties": [
+        "node_id"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Host",
+      "to_properties": [
+        "hostname"
+      ],
+      "type": "IS_A"
+    },
+    {
+      "count": 0,
+      "from": "Host",
+      "from_properties": [
+        "hostname"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Node",
+      "to_properties": [
+        "node_id"
+      ],
+      "type": "IS_A"
+    },
+    {
+      "count": 0,
+      "from": "Device",
+      "from_properties": [
+        "device_id"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Host",
+      "to_properties": [
+        "hostname"
+      ],
+      "type": "HAS_IDENTITY"
+    },
+    {
+      "count": 0,
+      "from": "Host",
+      "from_properties": [
+        "hostname"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Device",
+      "to_properties": [
+        "device_id"
+      ],
+      "type": "HAS_IDENTITY"
+    },
+    {
+      "count": 0,
+      "from": "Component",
+      "from_properties": [
+        "name"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Application",
+      "to_properties": [
+        "name"
+      ],
+      "type": "HAS_IDENTITY"
+    },
+    {
+      "count": 0,
+      "from": "Application",
+      "from_properties": [
+        "name"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Component",
+      "to_properties": [
+        "name"
+      ],
+      "type": "HAS_IDENTITY"
+    },
+    {
+      "count": 0,
+      "from": "NetworkService",
+      "from_properties": [
+        "port",
+        "protocol",
+        "service"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Host",
+      "to_properties": [
+        "hostname"
+      ],
+      "type": "ON"
+    },
+    {
+      "count": 0,
+      "from": "SoftwareVersion",
+      "from_properties": [
+        "version"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Host",
+      "to_properties": [
+        "hostname"
+      ],
+      "type": "ON"
+    },
+    {
+      "count": 0,
+      "from": "Vulnerability",
+      "from_properties": [
+        "vuln_id",
+        "description"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/RESILMESH_INTEROPERABILITY.md#44; edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "SoftwareVersion",
+      "to_properties": [
+        "version"
+      ],
+      "type": "IN"
+    },
+    {
+      "count": 0,
+      "from": "Vulnerability",
+      "from_properties": [
+        "vuln_id",
+        "description"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "CVE",
+      "to_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "type": "REFERS_TO"
+    },
+    {
+      "count": 0,
+      "from": "CVE",
+      "from_properties": [
+        "cve_id",
+        "published",
+        "severity",
+        "cvss_score",
+        "epss_score",
+        "known_ransomware_use",
+        "ssvc_exploitation",
+        "ssvc_automatable",
+        "ssvc_technical_impact",
+        "cisa_exploit_add",
+        "cwe",
+        "status"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Vulnerability",
+      "to_properties": [
+        "vuln_id",
+        "description"
+      ],
+      "type": "REFERS_TO"
+    },
+    {
+      "count": 0,
+      "from": "Mission",
+      "from_properties": [
+        "name",
+        "criticality"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Component",
+      "to_properties": [
+        "name"
+      ],
+      "type": "SUPPORTS"
+    },
+    {
+      "count": 0,
+      "from": "Component",
+      "from_properties": [
+        "name"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Host",
+      "to_properties": [
+        "hostname"
+      ],
+      "type": "PROVIDED_BY"
+    },
+    {
+      "count": 0,
+      "from": "Component",
+      "from_properties": [
+        "name"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "MissionDependency",
+      "to_properties": [
+        "dependency_id"
+      ],
+      "type": "FROM"
+    },
+    {
+      "count": 0,
+      "from": "Component",
+      "from_properties": [
+        "name"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "MissionDependency",
+      "to_properties": [
+        "dependency_id"
+      ],
+      "type": "TO"
+    },
+    {
+      "count": 0,
+      "from": "Mission",
+      "from_properties": [
+        "name",
+        "criticality"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "OrganizationUnit",
+      "to_properties": [
+        "name"
+      ],
+      "type": "FOR"
+    },
+    {
+      "count": 0,
+      "from": "IP",
+      "from_properties": [
+        "address"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Subnet",
+      "to_properties": [
+        "range"
+      ],
+      "type": "PART_OF"
+    },
+    {
+      "count": 0,
+      "from": "Subnet",
+      "from_properties": [
+        "range"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Subnet",
+      "to_properties": [
+        "range"
+      ],
+      "type": "PART_OF"
+    },
+    {
+      "count": 0,
+      "from": "Subnet",
+      "from_properties": [
+        "range"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "OrganizationUnit",
+      "to_properties": [
+        "name"
+      ],
+      "type": "PART_OF"
+    },
+    {
+      "count": 0,
+      "from": "OrganizationUnit",
+      "from_properties": [
+        "name"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "OrganizationUnit",
+      "to_properties": [
+        "name"
+      ],
+      "type": "PART_OF"
+    },
+    {
+      "count": 0,
+      "from": "Role",
+      "from_properties": [
+        "role_name",
+        "permission"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "Device",
+      "to_properties": [
+        "device_id"
+      ],
+      "type": "TO"
+    },
+    {
+      "count": 0,
+      "from": "Role",
+      "from_properties": [
+        "role_name",
+        "permission"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#resilmesh-topology-relationships",
+      "surface": "topology",
+      "to": "User",
+      "to_properties": [
+        "username"
+      ],
+      "type": "ASSIGNED_TO"
+    },
+    {
+      "count": 0,
+      "from": "Alert",
+      "from_properties": [
+        "alert_id",
+        "severity"
+      ],
+      "populated": false,
+      "spec_ref": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md#edgeguard-threatintel-relationships",
+      "surface": "topology",
+      "to": "Indicator",
+      "to_properties": [
+        "value",
+        "indicator_type",
+        "active",
+        "aging_tier",
+        "url_status",
+        "last_reported_at"
+      ],
+      "type": "INVOLVES"
+    }
+  ],
+  "relationship_properties": {
+    "AFFECTS": [
+      "confidence_score",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "ATTRIBUTED_TO": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "EMPLOYS_TECHNIQUE": [
+      "cited_ids",
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "tlp",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "EXPLOITS": [
+      "confidence_score",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "tlp",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "HAS_CVSS_v2": [
+      "edgeguard_managed",
+      "misp_event_ids",
+      "sources",
+      "src_uuid",
+      "trg_uuid"
+    ],
+    "HAS_CVSS_v30": [
+      "edgeguard_managed",
+      "misp_event_ids",
+      "sources",
+      "src_uuid",
+      "trg_uuid"
+    ],
+    "HAS_CVSS_v31": [
+      "edgeguard_managed",
+      "misp_event_ids",
+      "sources",
+      "src_uuid",
+      "trg_uuid"
+    ],
+    "HAS_CVSS_v40": [
+      "edgeguard_managed",
+      "misp_event_ids",
+      "sources",
+      "src_uuid",
+      "trg_uuid"
+    ],
+    "IMPLEMENTS_TECHNIQUE": [
+      "cited_ids",
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "INDICATES": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "IN_TACTIC": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "PART_OF_CAMPAIGN": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "evidence_types",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "tlp",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "RUNS": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "evidence_types",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "tlp",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "SOURCED_FROM": [
+      "confidence",
+      "edgeguard_managed",
+      "imported_at",
+      "last_recorded_at",
+      "last_reported_at",
+      "last_reported_ref",
+      "last_reported_source",
+      "misp_event_ids",
+      "raw_data",
+      "source",
+      "source_refs",
+      "source_reported_first_at",
+      "source_reported_last_at",
+      "src_uuid",
+      "stated_refs",
+      "stated_zones",
+      "trg_uuid",
+      "updated_at",
+      "zones"
+    ],
+    "SUBTECHNIQUE_OF": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "TARGETS": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "USES_MALWARE": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "tlp",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "USES_TECHNIQUE": [
+      "cited_ids",
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "trg_uuid",
+      "updated_at"
+    ],
+    "USES_TOOL": [
+      "confidence_score",
+      "created_at",
+      "edgeguard_managed",
+      "imported_at",
+      "match_type",
+      "misp_event_ids",
+      "source_refs",
+      "sources",
+      "src_uuid",
+      "tlp",
+      "trg_uuid",
+      "updated_at"
+    ]
+  },
+  "relationship_vocabularies": {
+    "match_type": [
+      "advisory_sector",
+      "campaign_grouping",
+      "coreideas_curated",
+      "kill_chain_phase",
+      "malware_family",
+      "mitre_explicit",
+      "otx_attack_ids",
+      "otx_industries",
+      "otx_pulse",
+      "zone_classification"
+    ],
+    "sources": [
+      "alienvault_otx",
+      "cisa_ics",
+      "cisa_kev",
+      "coreideas",
+      "feodo_tracker",
+      "misp_galaxy",
+      "mitre_attck",
+      "nvd",
+      "threatfox"
+    ]
+  },
+  "schema": {
+    "labels": [
+      "Alert",
+      "Application",
+      "CVE",
+      "CVSSv2",
+      "CVSSv30",
+      "CVSSv31",
+      "CVSSv40",
+      "Campaign",
+      "Component",
+      "Device",
+      "Host",
+      "IP",
+      "Indicator",
+      "Malware",
+      "Mission",
+      "MissionDependency",
+      "NetworkService",
+      "Node",
+      "OrganizationUnit",
+      "Role",
+      "Sector",
+      "SoftwareVersion",
+      "Source",
+      "Subnet",
+      "Tactic",
+      "Technique",
+      "ThreatActor",
+      "Tool",
+      "User",
+      "Vulnerability"
+    ],
+    "properties": [
+      "abuse_categories",
+      "ac_insuf_info",
+      "access_complexity",
+      "access_vector",
+      "active",
+      "actor_name",
+      "address",
+      "affected_products",
+      "aging_basis",
+      "aging_evaluated_at",
+      "aging_factor",
+      "aging_since",
+      "aging_tier",
+      "alert_id",
+      "aliases",
+      "attack_complexity",
+      "attack_domain",
+      "attack_ids",
+      "attack_vector",
+      "authentication",
+      "availability_impact",
+      "base_score",
+      "base_severity",
+      "cisa_action_due",
+      "cisa_exploit_add",
+      "cisa_required_action",
+      "cisa_vulnerability_name",
+      "cited_ids",
+      "confidence",
+      "confidence_score",
+      "confidentiality_impact",
+      "cpe_type",
+      "created_at",
+      "criticality",
+      "cve",
+      "cve_id",
+      "cve_timestamp",
+      "cvss_score",
+      "cvss_version",
+      "cwe",
+      "degree_centrality",
+      "dependency_id",
+      "deprecated",
+      "description",
+      "description_source",
+      "device_id",
+      "edgeguard_managed",
+      "enriched",
+      "enrichment_latency_ms",
+      "epss_model_version",
+      "epss_percentile",
+      "epss_score",
+      "epss_score_date",
+      "epss_updated_at",
+      "evidence_types",
+      "exploitability_score",
+      "first_imported_at",
+      "first_seen",
+      "hostname",
+      "impact_score",
+      "imported_at",
+      "indicator",
+      "indicator_count",
+      "indicator_role",
+      "indicator_type",
+      "integrity_impact",
+      "is_subtechnique",
+      "known_ransomware_use",
+      "last_imported_from",
+      "last_modified",
+      "last_online",
+      "last_recorded_at",
+      "last_reported_at",
+      "last_reported_basis",
+      "last_reported_ref",
+      "last_reported_source",
+      "last_seen",
+      "last_updated",
+      "malware",
+      "malware_count",
+      "malware_family",
+      "malware_malpedia",
+      "malware_types",
+      "match_type",
+      "merged_from",
+      "misp_attribute_ids",
+      "misp_event_ids",
+      "mitre_id",
+      "name",
+      "node_id",
+      "note",
+      "obtain_all_privilege",
+      "obtain_other_privilege",
+      "obtain_user_privilege",
+      "pagerank_centrality",
+      "permission",
+      "port",
+      "privileges_required",
+      "protocol",
+      "published",
+      "pulse_ids",
+      "pulse_malware_actor_pairs",
+      "pulse_malware_families",
+      "range",
+      "raw_data",
+      "received_at",
+      "ref_tags",
+      "reference",
+      "reference_urls",
+      "reliability",
+      "reported_techniques",
+      "reporter",
+      "result_impacts",
+      "retired_at",
+      "retired_by",
+      "role_name",
+      "scope",
+      "service",
+      "several_actor_pulses",
+      "severity",
+      "shortname",
+      "sigma_rules",
+      "source",
+      "source_confidence",
+      "source_id",
+      "source_refs",
+      "source_reported_first_at",
+      "source_reported_last_at",
+      "sources",
+      "src_uuid",
+      "ssvc_automatable",
+      "ssvc_exploitation",
+      "ssvc_technical_impact",
+      "ssvc_timestamp",
+      "ssvc_version",
+      "stated_refs",
+      "stated_zones",
+      "status",
+      "structure",
+      "tactic_phases",
+      "tag",
+      "tags",
+      "targeted_countries",
+      "threat_label",
+      "timestamp",
+      "tlp",
+      "tool_types",
+      "trg_uuid",
+      "type",
+      "updated_at",
+      "url_status",
+      "user_interaction",
+      "user_interaction_required",
+      "username",
+      "uses_malware",
+      "uses_techniques",
+      "uses_tools",
+      "uuid",
+      "value",
+      "vector_string",
+      "version",
+      "vuln_id",
+      "yara_rules",
+      "zone",
+      "zones"
+    ],
+    "relationship_types": [
+      "AFFECTS",
+      "ASSIGNED_TO",
+      "ATTRIBUTED_TO",
+      "EMPLOYS_TECHNIQUE",
+      "EXPLOITS",
+      "FOR",
+      "FROM",
+      "HAS_ASSIGNED",
+      "HAS_CVSS_v2",
+      "HAS_CVSS_v30",
+      "HAS_CVSS_v31",
+      "HAS_CVSS_v40",
+      "HAS_IDENTITY",
+      "IMPLEMENTS_TECHNIQUE",
+      "IN",
+      "INDICATES",
+      "INVOLVES",
+      "IN_TACTIC",
+      "IS_A",
+      "IS_CONNECTED_TO",
+      "ON",
+      "PART_OF",
+      "PART_OF_CAMPAIGN",
+      "PROVIDED_BY",
+      "REFERS_TO",
+      "RUNS",
+      "SOURCED_FROM",
+      "SUBTECHNIQUE_OF",
+      "SUPPORTS",
+      "TARGETS",
+      "TO",
+      "USES_MALWARE",
+      "USES_TECHNIQUE",
+      "USES_TOOL"
+    ]
+  },
+  "schema_version": "edgeguard-cypher-schema-v0.13",
+  "snapshot": {
+    "node_counts": {
+      "Alert": 0,
+      "Application": 0,
+      "CVE": 147256,
+      "CVSSv2": 13342,
+      "CVSSv30": 2357,
+      "CVSSv31": 130737,
+      "CVSSv40": 40208,
+      "Campaign": 540,
+      "Device": 0,
+      "Energy": 19635,
+      "Finance": 40563,
+      "Healthcare": 18752,
+      "Host": 0,
+      "IP": 0,
+      "Indicator": 230799,
+      "Malware": 3684,
+      "NetworkService": 0,
+      "Role": 0,
+      "Sector": 3,
+      "SoftwareVersion": 0,
+      "Source": 26,
+      "Subnet": 0,
+      "Tactic": 27,
+      "Technique": 824,
+      "ThreatActor": 764,
+      "Tool": 95,
+      "User": 0,
+      "Vulnerability": 0
+    },
+    "relationship_counts": {
+      "AFFECTS": 9098,
+      "ATTRIBUTED_TO": 2640,
+      "EMPLOYS_TECHNIQUE": 17582,
+      "EXPLOITS": 147,
+      "HAS_CVSS_v2": 26684,
+      "HAS_CVSS_v30": 4714,
+      "HAS_CVSS_v31": 261474,
+      "HAS_CVSS_v40": 80416,
+      "IMPLEMENTS_TECHNIQUE": 74631,
+      "INDICATES": 328653,
+      "IN_TACTIC": 1024,
+      "PART_OF_CAMPAIGN": 44687,
+      "RUNS": 540,
+      "SOURCED_FROM": 390303,
+      "SUBTECHNIQUE_OF": 506,
+      "TARGETS": 68749,
+      "USES_MALWARE": 719,
+      "USES_TECHNIQUE": 1521343,
+      "USES_TOOL": 507
+    },
+    "sector_secondary_labels": [
+      "Finance",
+      "Healthcare",
+      "Energy"
+    ],
+    "storage_notes": [
+      {
+        "count": 13342,
+        "note": "reverse copy of the CVE->CVSS edge; query the directed CVE->CVSS form",
+        "pattern": "(CVSSv2)-[:HAS_CVSS_v2]->(CVE)"
+      },
+      {
+        "count": 2357,
+        "note": "reverse copy of the CVE->CVSS edge; query the directed CVE->CVSS form",
+        "pattern": "(CVSSv30)-[:HAS_CVSS_v30]->(CVE)"
+      },
+      {
+        "count": 130737,
+        "note": "reverse copy of the CVE->CVSS edge; query the directed CVE->CVSS form",
+        "pattern": "(CVSSv31)-[:HAS_CVSS_v31]->(CVE)"
+      },
+      {
+        "count": 40208,
+        "note": "reverse copy of the CVE->CVSS edge; query the directed CVE->CVSS form",
+        "pattern": "(CVSSv40)-[:HAS_CVSS_v40]->(CVE)"
+      }
+    ]
+  },
+  "source": {
+    "kg_spec": {
+      "commit": "cf789b9",
+      "path": "edgeguard-knowledge-graph/docs/TECHNICAL_SPEC.md",
+      "sha256": "sha256:3f403ec1e519f2164a4f4e6266b505d1179ff26940fa4d0c04e2e5c4ef4a60b3"
+    },
+    "snapshot_counts_canonical_sha256": "sha256:91ddc8f85ee95745d04ad64f063ab042d50bec28d64f18394d3c3c8cb983a752",
+    "type": "edgeguard_frozen_snapshot_counts"
+  },
+  "synonyms": [
+    {
+      "property": "Indicator.indicator_type",
+      "values": [
+        "ipv4"
+      ],
+      "wording": [
+        "ip",
+        "ips",
+        "ip address",
+        "ip addresses",
+        "ipv4",
+        "addresses of hosts"
+      ]
+    },
+    {
+      "property": "Indicator.indicator_type",
+      "values": [
+        "domain"
+      ],
+      "wording": [
+        "domain",
+        "domains",
+        "dns name",
+        "dns names"
+      ]
+    },
+    {
+      "property": "Indicator.indicator_type",
+      "values": [
+        "hash"
+      ],
+      "wording": [
+        "hash",
+        "hashes",
+        "file hash",
+        "sha256",
+        "sha1",
+        "md5"
+      ]
+    },
+    {
+      "property": "Indicator.indicator_type",
+      "values": [
+        "url"
+      ],
+      "wording": [
+        "url",
+        "urls",
+        "link",
+        "links"
+      ]
+    },
+    {
+      "property": "Sector.name",
+      "values": [
+        "healthcare"
+      ],
+      "wording": [
+        "hospital",
+        "hospitals",
+        "health care",
+        "healthcare",
+        "medical"
+      ]
+    },
+    {
+      "property": "Sector.name",
+      "values": [
+        "finance"
+      ],
+      "wording": [
+        "bank",
+        "banks",
+        "banking",
+        "financial",
+        "finance"
+      ]
+    },
+    {
+      "property": "Sector.name",
+      "values": [
+        "energy"
+      ],
+      "wording": [
+        "utility",
+        "utilities",
+        "power grid",
+        "oil and gas",
+        "energy"
+      ]
+    },
+    {
+      "property": "*.base_severity",
+      "values": [
+        "CRITICAL"
+      ],
+      "wording": [
+        "critical severity"
+      ]
+    },
+    {
+      "property": "*.base_severity",
+      "values": [
+        "HIGH"
+      ],
+      "wording": [
+        "high severity"
+      ]
+    },
+    {
+      "property": "Indicator.indicator_type",
+      "values": [
+        "ipv6"
+      ],
+      "wording": [
+        "ipv6",
+        "ipv6 address",
+        "ipv6 addresses"
+      ]
+    },
+    {
+      "property": "Indicator.indicator_type",
+      "values": [
+        "email"
+      ],
+      "wording": [
+        "email",
+        "emails",
+        "email address",
+        "email addresses"
+      ]
+    },
+    {
+      "property": "Indicator.indicator_type",
+      "values": [
+        "x509-fingerprint-sha1"
+      ],
+      "wording": [
+        "certificate fingerprint",
+        "certificate fingerprints",
+        "tls fingerprint",
+        "x509 fingerprint"
+      ]
+    },
+    {
+      "property": "Indicator.url_status",
+      "values": [
+        "online"
+      ],
+      "wording": [
+        "online"
+      ]
+    },
+    {
+      "property": "Indicator.url_status",
+      "values": [
+        "offline"
+      ],
+      "wording": [
+        "offline"
+      ]
+    },
+    {
+      "property": "*.base_severity",
+      "values": [
+        "LOW"
+      ],
+      "wording": [
+        "low severity"
+      ]
+    },
+    {
+      "property": "*.base_severity",
+      "values": [
+        "MEDIUM"
+      ],
+      "wording": [
+        "medium severity"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "alienvault_otx"
+      ],
+      "wording": [
+        "alienvault",
+        "alienvault otx",
+        "otx",
+        "open threat exchange"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "cisa_kev"
+      ],
+      "wording": [
+        "cisa kev",
+        "kev",
+        "known exploited vulnerabilities",
+        "known exploited vulnerabilities catalog",
+        "kev catalog"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "cisa_ics"
+      ],
+      "wording": [
+        "cisa ics",
+        "cisa ics advisories",
+        "ics advisories",
+        "ics advisory"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "feodo_tracker"
+      ],
+      "wording": [
+        "feodo",
+        "feodo tracker"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "mitre_attck"
+      ],
+      "wording": [
+        "mitre att&ck",
+        "mitre attack",
+        "att&ck"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "nvd"
+      ],
+      "wording": [
+        "nvd",
+        "national vulnerability database"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "threatfox"
+      ],
+      "wording": [
+        "threatfox"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "malwarebazaar"
+      ],
+      "wording": [
+        "malwarebazaar",
+        "malware bazaar"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "urlhaus"
+      ],
+      "wording": [
+        "urlhaus"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "abuseipdb"
+      ],
+      "wording": [
+        "abuseipdb",
+        "abuse ipdb"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "virustotal"
+      ],
+      "wording": [
+        "virustotal",
+        "virus total"
+      ]
+    },
+    {
+      "property": "Source.source_id",
+      "values": [
+        "coreideas"
+      ],
+      "wording": [
+        "coreideas"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0001"
+      ],
+      "wording": [
+        "initial access"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0002"
+      ],
+      "wording": [
+        "execution"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0003"
+      ],
+      "wording": [
+        "persistence"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0004"
+      ],
+      "wording": [
+        "privilege escalation"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0005"
+      ],
+      "wording": [
+        "stealth"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0006"
+      ],
+      "wording": [
+        "credential access"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0007"
+      ],
+      "wording": [
+        "discovery"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0008"
+      ],
+      "wording": [
+        "lateral movement"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0009"
+      ],
+      "wording": [
+        "collection"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0010"
+      ],
+      "wording": [
+        "exfiltration"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0011"
+      ],
+      "wording": [
+        "command and control"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0040"
+      ],
+      "wording": [
+        "impact"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0042"
+      ],
+      "wording": [
+        "resource development"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0043"
+      ],
+      "wording": [
+        "reconnaissance"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0100"
+      ],
+      "wording": [
+        "collection"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0101"
+      ],
+      "wording": [
+        "command and control"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0102"
+      ],
+      "wording": [
+        "discovery"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0103"
+      ],
+      "wording": [
+        "evasion"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0104"
+      ],
+      "wording": [
+        "execution"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0105"
+      ],
+      "wording": [
+        "impact"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0106"
+      ],
+      "wording": [
+        "impair process control"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0107"
+      ],
+      "wording": [
+        "inhibit response function"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0108"
+      ],
+      "wording": [
+        "initial access"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0109"
+      ],
+      "wording": [
+        "lateral movement"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0110"
+      ],
+      "wording": [
+        "persistence"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0111"
+      ],
+      "wording": [
+        "privilege escalation"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0112"
+      ],
+      "wording": [
+        "defense impairment"
+      ]
+    },
+    {
+      "property": "Tactic.mitre_id",
+      "values": [
+        "TA0005",
+        "TA0112"
+      ],
+      "wording": [
+        "defense evasion"
+      ]
+    }
+  ],
+  "target_dataset_schema_version": "qwen-prompt-cypher-v0.13",
+  "unsupported": {
+    "temporal_predicates": {
+      "allowed_properties": [
+        "aging_evaluated_at",
+        "aging_since",
+        "created_at",
+        "epss_updated_at",
+        "first_imported_at",
+        "first_seen",
+        "imported_at",
+        "last_modified",
+        "last_recorded_at",
+        "last_reported_at",
+        "last_seen",
+        "last_updated",
+        "published",
+        "retired_at",
+        "source_reported_first_at",
+        "source_reported_last_at",
+        "updated_at"
+      ],
+      "known_hallucinated_properties_rejected": [
+        "alert_time",
+        "discovered",
+        "discovered_at",
+        "suspicious_until",
+        "timestamp"
+      ],
+      "node_properties": {
+        "Alert": [
+          "last_updated"
+        ],
+        "Application": [
+          "first_seen",
+          "last_updated"
+        ],
+        "CVE": [
+          "epss_updated_at",
+          "first_imported_at",
+          "last_modified",
+          "last_updated",
+          "published"
+        ],
+        "CVSSv2": [
+          "last_updated"
+        ],
+        "CVSSv30": [
+          "last_updated"
+        ],
+        "CVSSv31": [
+          "last_updated"
+        ],
+        "CVSSv40": [
+          "last_updated"
+        ],
+        "Campaign": [
+          "created_at",
+          "first_seen",
+          "last_seen",
+          "last_updated"
+        ],
+        "Component": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Device": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Host": [
+          "first_seen",
+          "last_updated"
+        ],
+        "IP": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Indicator": [
+          "aging_evaluated_at",
+          "aging_since",
+          "first_imported_at",
+          "last_recorded_at",
+          "last_reported_at",
+          "last_updated",
+          "retired_at"
+        ],
+        "Malware": [
+          "first_imported_at",
+          "last_updated"
+        ],
+        "Mission": [
+          "first_seen",
+          "last_updated"
+        ],
+        "MissionDependency": [
+          "first_seen",
+          "last_updated"
+        ],
+        "NetworkService": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Node": [
+          "first_seen",
+          "last_updated"
+        ],
+        "OrganizationUnit": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Role": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Sector": [
+          "created_at",
+          "last_updated",
+          "updated_at"
+        ],
+        "SoftwareVersion": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Source": [
+          "created_at",
+          "updated_at"
+        ],
+        "Subnet": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Tactic": [
+          "first_imported_at",
+          "last_updated"
+        ],
+        "Technique": [
+          "first_imported_at",
+          "last_updated"
+        ],
+        "ThreatActor": [
+          "first_imported_at",
+          "last_updated"
+        ],
+        "Tool": [
+          "first_imported_at",
+          "last_updated"
+        ],
+        "User": [
+          "first_seen",
+          "last_updated"
+        ],
+        "Vulnerability": [
+          "epss_updated_at",
+          "first_imported_at",
+          "first_seen",
+          "last_updated"
+        ]
+      },
+      "relationship_properties": {
+        "AFFECTS": [
+          "imported_at",
+          "updated_at"
+        ],
+        "ATTRIBUTED_TO": [
+          "created_at",
+          "imported_at",
+          "updated_at"
+        ],
+        "EMPLOYS_TECHNIQUE": [
+          "created_at",
+          "imported_at",
+          "updated_at"
+        ],
+        "EXPLOITS": [
+          "imported_at",
+          "updated_at"
+        ],
+        "IMPLEMENTS_TECHNIQUE": [
+          "created_at",
+          "updated_at"
+        ],
+        "INDICATES": [
+          "created_at",
+          "imported_at",
+          "updated_at"
+        ],
+        "IN_TACTIC": [
+          "created_at",
+          "updated_at"
+        ],
+        "PART_OF_CAMPAIGN": [
+          "created_at",
+          "updated_at"
+        ],
+        "RUNS": [
+          "created_at",
+          "updated_at"
+        ],
+        "SOURCED_FROM": [
+          "imported_at",
+          "last_recorded_at",
+          "last_reported_at",
+          "source_reported_first_at",
+          "source_reported_last_at",
+          "updated_at"
+        ],
+        "SUBTECHNIQUE_OF": [
+          "created_at",
+          "updated_at"
+        ],
+        "TARGETS": [
+          "created_at",
+          "imported_at",
+          "updated_at"
+        ],
+        "USES_MALWARE": [
+          "created_at",
+          "imported_at",
+          "updated_at"
+        ],
+        "USES_TECHNIQUE": [
+          "created_at",
+          "updated_at"
+        ],
+        "USES_TOOL": [
+          "created_at",
+          "imported_at",
+          "updated_at"
+        ]
+      },
+      "rolling_window_defaults": {
+        "last_month": "P30D",
+        "last_week": "P7D",
+        "past_24_hours": "P1D",
+        "past_30_days": "P30D",
+        "past_7_days": "P7D",
+        "recently": "P30D",
+        "today": "P1D"
+      },
+      "status": "supported_for_whitelisted_properties"
+    }
+  },
+  "vocabularies": {
+    "CVE.known_ransomware_use": {
+      "Known": 361,
+      "Unknown": 1395
+    },
+    "CVE.ssvc_automatable": {
+      "no": 98396,
+      "yes": 32565
+    },
+    "CVE.ssvc_exploitation": {
+      "active": 1749,
+      "none": 98761,
+      "poc": 30451
+    },
+    "CVE.ssvc_technical_impact": {
+      "partial": 84836,
+      "total": 46125
+    },
+    "CVE.status": {
+      "['active']": 141991,
+      "['rejected']": 3997
+    },
+    "CVSSv2.base_severity": {
+      "HIGH": 5346,
+      "LOW": 1247,
+      "MEDIUM": 6749
+    },
+    "CVSSv30.base_severity": {
+      "CRITICAL": 230,
+      "HIGH": 1349,
+      "LOW": 152,
+      "MEDIUM": 623,
+      "NONE": 3
+    },
+    "CVSSv31.base_severity": {
+      "CRITICAL": 14005,
+      "HIGH": 53188,
+      "LOW": 5416,
+      "MEDIUM": 58054,
+      "NONE": 74
+    },
+    "CVSSv40.base_severity": {
+      "CRITICAL": 3723,
+      "HIGH": 13594,
+      "LOW": 6525,
+      "MEDIUM": 16305,
+      "NONE": 61
+    },
+    "Indicator.aging_tier": {
+      "0": 96916,
+      "1": 9198,
+      "2": 31008,
+      "3": 93677
+    },
+    "Indicator.indicator_role": {
+      "command_and_control": 15,
+      "phishing": 11,
+      "trojan": 21,
+      "worm": 3
+    },
+    "Indicator.indicator_type": {
+      "domain": 83994,
+      "email": 462,
+      "hash": 63215,
+      "ipv4": 26065,
+      "ipv6": 38,
+      "unknown": 30,
+      "url": 45959,
+      "x509-fingerprint-sha1": 11036
+    },
+    "Indicator.url_status": {
+      "offline": 17306,
+      "online": 16356
+    },
+    "Sector.name": {
+      "energy": 1,
+      "finance": 1,
+      "healthcare": 1
+    },
+    "Source.source_id": {
+      "abusech_ssl": 1,
+      "abuseipdb": 1,
+      "alienvault_otx": 1,
+      "bazaar": 1,
+      "cisa": 1,
+      "cisa-ics": 1,
+      "cisa_ics": 1,
+      "cisa_kev": 1,
+      "coreideas": 1,
+      "feodo": 1,
+      "feodo_tracker": 1,
+      "ics_advisories": 1,
+      "malwarebazaar": 1,
+      "mb": 1,
+      "misp": 1,
+      "misp_galaxy": 1,
+      "mitre": 1,
+      "mitre_attck": 1,
+      "nvd": 1,
+      "otx": 1,
+      "ssl_blacklist": 1,
+      "sslbl": 1,
+      "threatfox": 1,
+      "urlhaus": 1,
+      "virustotal": 1,
+      "vt": 1
+    },
+    "Tactic.mitre_id": {
+      "TA0001": "Initial Access",
+      "TA0002": "Execution",
+      "TA0003": "Persistence",
+      "TA0004": "Privilege Escalation",
+      "TA0005": "Stealth",
+      "TA0006": "Credential Access",
+      "TA0007": "Discovery",
+      "TA0008": "Lateral Movement",
+      "TA0009": "Collection",
+      "TA0010": "Exfiltration",
+      "TA0011": "Command and Control",
+      "TA0040": "Impact",
+      "TA0042": "Resource Development",
+      "TA0043": "Reconnaissance",
+      "TA0100": "Collection",
+      "TA0101": "Command and Control",
+      "TA0102": "Discovery",
+      "TA0103": "Evasion",
+      "TA0104": "Execution",
+      "TA0105": "Impact",
+      "TA0106": "Impair Process Control",
+      "TA0107": "Inhibit Response Function",
+      "TA0108": "Initial Access",
+      "TA0109": "Lateral Movement",
+      "TA0110": "Persistence",
+      "TA0111": "Privilege Escalation",
+      "TA0112": "Defense Impairment"
+    }
+  },
+  "vocabulary_nulls": {
+    "CVE.known_ransomware_use": 145500,
+    "CVE.ssvc_automatable": 16295,
+    "CVE.ssvc_exploitation": 16295,
+    "CVE.ssvc_technical_impact": 16295,
+    "CVE.status": 1268,
+    "Indicator.indicator_role": 230749,
+    "Indicator.url_status": 197137
+  }
+}

@@ -49,6 +49,11 @@ from .edgeguard_cypher_guard import (
   normalize_user_literal_text,
   schema_sets,
 )
+from .edgeguard_cypher_guard_v0_13 import (
+  EDGEGUARD_SCHEMA_V0_13,
+  SCHEMA_VERSION_V0_13,
+  build_v0_13_pattern_schema_system_prompt,
+)
 from . import literal_classes
 
 # Contract §3.2 (review finding 7, S8): "the dataset validator and the guard
@@ -300,6 +305,8 @@ class _BridgeNeo4jDriver:
 GRAPH_PACKET_SCHEMA_VERSION = "edgeguard.graph_evidence_packet.v1"
 QUERY_RESULT_EVIDENCE_SCHEMA_VERSION = "edgeguard.query_result_evidence.v1"
 NEO4J_CONNECTION_STATUS_SCHEMA_VERSION = "edgeguard.neo4j_connection_status.v1"
+NEO4J_CONNECTION_METHODS = frozenset({"native_driver", "bolt_over_wss"})
+NEO4J_PLAINTEXT_SCHEMES = frozenset({"bolt", "neo4j"})
 CASE_EXPLANATION_SCHEMA_VERSION = "edgeguard.case_explanation.v1"
 CASE_EXPLANATION_DRAFT_SCHEMA_VERSION = "edgeguard.case_explanation_draft.v2"
 GRAPH_FIRST_PREPARE_SCHEMA_VERSION = "edgeguard.graph_first_prepare.v1"
@@ -673,6 +680,25 @@ PROMPT_PROFILE_CYBERSEC_SCHEMA_GROUNDED = "cybersec_schema_grounded"
 # `EDGEGUARD_GENERATION_WORKERS` (deployment config), same as
 # `finetuned_v0_10` today wires in `direct_cypher`.
 PROMPT_PROFILE_V0_11_PATTERN_SCHEMA = "v0_11_pattern_schema"
+# EGM-068 contract v0.13 (cf789b9 graph): same output contract and correction
+# turn as v0.11, but its own artifact, served prompt and guard allowlist.
+PROMPT_PROFILE_V0_13_PATTERN_SCHEMA = "v0_13_pattern_schema"
+# Profiles that validate with the v0.11-style rules (optional graph LIMIT, hop
+# bounds, endpoint pairs), each against its own artifact.
+PATTERN_SCHEMA_ARTIFACTS = {
+  PROMPT_PROFILE_V0_11_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_11,
+  PROMPT_PROFILE_V0_13_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_13,
+}
+_ARTIFACTS_BY_SCHEMA_VERSION = {
+  SCHEMA_VERSION_V0_11: EDGEGUARD_SCHEMA_V0_11,
+  SCHEMA_VERSION_V0_13: EDGEGUARD_SCHEMA_V0_13,
+}
+
+
+def _artifact_for_schema_version(schema_version: Any) -> Dict[str, Any]:
+  """The pattern-schema artifact a validation reports; v0.11 for anything else (the pre-v0.13 behaviour)."""
+  return _ARTIFACTS_BY_SCHEMA_VERSION.get(schema_version, EDGEGUARD_SCHEMA_V0_11)
+
 # Fallback profile for a misconfigured/unknown worker declaration (contract
 # does not ask the served default to switch this phase, see `_prompt_profile`
 # below): stays the v0.10 schema-grounded profile.
@@ -714,6 +740,15 @@ PROMPT_PROFILES = {
     "system_prompt_suffix": None,
     "single_user_message": False,
   },
+  PROMPT_PROFILE_V0_13_PATTERN_SCHEMA: {
+    "prompt_profile_id": "edgeguard_v0_13_pattern_schema",
+    "template_version": "edgeguard-v0-13-pattern-schema",
+    "prompt_contract": (
+      "schema-grounded read-only Cypher query string, graph or ranked_projection shape"
+    ),
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+  },
 }
 
 # Contract §5.1/§5.2: which builder renders the system prompt / correction
@@ -726,11 +761,14 @@ PROMPT_PROFILES = {
 # `EDGEGUARD_SCHEMA_V0_11` artifact — it never changes within a process — so
 # it is built once here rather than on every `generate` call.
 _V0_11_SYSTEM_PROMPT = build_v0_11_pattern_schema_system_prompt()
+_V0_13_SYSTEM_PROMPT = build_v0_13_pattern_schema_system_prompt()
 
 
 def _system_prompt_for_profile(profile_name: str) -> str:
   if profile_name == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
     return _V0_11_SYSTEM_PROMPT
+  if profile_name == PROMPT_PROFILE_V0_13_PATTERN_SCHEMA:
+    return _V0_13_SYSTEM_PROMPT
   return build_direct_cypher_system_prompt()
 
 
@@ -743,7 +781,7 @@ def _correction_prompt_for_profile(
   retry_index: int,
   retry_limit: int,
 ) -> str:
-  if profile_name == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
+  if profile_name in PATTERN_SCHEMA_ARTIFACTS:
     return build_v0_11_correction_prompt(
       rejected_cypher=rejected_cypher,
       validation_feedback=validation_feedback,
@@ -1235,6 +1273,7 @@ def _prepare_graph_explanation_plan(
     allow_limit_optional_graph=use_v0_11,
     enforce_hop_bounds=use_v0_11,
     enforce_pattern_endpoints=use_v0_11,
+    schema_artifact=(validation_profile or {}).get("schema_artifact"),
   )
   analysis["schema_version"] = (validation_profile or {}).get("schema_version", SCHEMA_VERSION)
   # Contract §4.3: carried in `plan["validation"]` so the explanation
@@ -3392,6 +3431,9 @@ _CONFIG = {
 
   "NEO4J_DEFAULT_CONNECTION": {
     "scheme": "bolt+s",
+    # Optional transport: "native_driver" or "bolt_over_wss" (the default when
+    # absent). A request's own `method` wins over it.
+    # "method": "bolt_over_wss",
   },
   "NEO4J_MAX_ROWS": 100,
   "NEO4J_QUERY_TIMEOUT_SECONDS": 30,
@@ -3864,7 +3906,7 @@ class EdgeguardApiPlugin(BasePlugin):
         raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace truncation is invalid")
       if isinstance(item["duration_ms"], bool) or not isinstance(item["duration_ms"], (int, float)) or not math.isfinite(item["duration_ms"]) or item["duration_ms"] < 0:
         raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace timing is invalid")
-      if item["method"] not in {"native_driver", "next_route", "unspecified"}:
+      if item["method"] not in {"native_driver", "bolt_over_wss", "next_route", "unspecified"}:
         raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace method is invalid")
       clean.append(dict(item))
     expected_ids = ["primary", "broadening"] if selected == "broadening" else ["primary"]
@@ -3953,7 +3995,7 @@ class EdgeguardApiPlugin(BasePlugin):
       # request and the whole schema itself (`build_schema_correction_prompt`),
       # so a single combined user message stays a faithful conversation.
       return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{correction_prompt}"}]
-    if profile["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
+    if profile["name"] in PATTERN_SCHEMA_ARTIFACTS:
       # Contract §5.2 (review finding 2, S3=Q1): the v0.11 correction turn
       # itself carries only the attempt index, the rejected Cypher, the
       # feedback and the output rule — no schema, no original request — on
@@ -4023,26 +4065,29 @@ class EdgeguardApiPlugin(BasePlugin):
     routes (`_prepare_graph_explanation_plan`, `explain_graph`) all call this
     instead of repeating the `model_key -> profile -> v0.11?` selection.
 
-    A `model_key` that resolves to the `v0_11_pattern_schema` prompt profile
-    gets the v0.11 artifact's derived flat sets, `LIMIT` optional for the
-    `graph` shape, and the tightened hop bounds; every other key (including
+    A `model_key` that resolves to a pattern-schema prompt profile
+    (`v0_11_pattern_schema` or `v0_13_pattern_schema`, see
+    `PATTERN_SCHEMA_ARTIFACTS`) gets that profile's artifact in
+    `schema_artifact`, its derived flat sets, `LIMIT` optional for the
+    `graph` shape, and the tightened hop bounds; `use_v0_11` means exactly
+    "pattern-schema rules" and is true for both. Every other key (including
     `None`, unresolved keys, and v0.10 profiles) keeps today's v0.10
     defaults — `analyze_generated_cypher`'s own `allowed=None`,
     `allow_limit_optional_graph=False`, `enforce_hop_bounds=False`.
     """
-    use_v0_11 = (
-      isinstance(model_key, str)
-      and bool(model_key.strip())
-      and self._prompt_profile(model_key)["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
-    )
+    artifact = None
+    if isinstance(model_key, str) and model_key.strip():
+      artifact = PATTERN_SCHEMA_ARTIFACTS.get(self._prompt_profile(model_key)["name"])
+    use_v0_11 = artifact is not None
     return {
       "use_v0_11": use_v0_11,
-      "schema_allowed": schema_sets(EDGEGUARD_SCHEMA_V0_11) if use_v0_11 else None,
+      "schema_artifact": artifact,
+      "schema_allowed": schema_sets(artifact) if use_v0_11 else None,
       "allow_limit_optional_graph": use_v0_11,
       "enforce_hop_bounds": use_v0_11,
-      "schema_version": SCHEMA_VERSION_V0_11 if use_v0_11 else SCHEMA_VERSION,
+      "schema_version": artifact["schema_version"] if use_v0_11 else SCHEMA_VERSION,
       "schema_surface": (
-        canonical_schema_surface(EDGEGUARD_SCHEMA_V0_11) if use_v0_11
+        canonical_schema_surface(artifact) if use_v0_11
         else canonical_schema_surface()
       ),
     }
@@ -4094,6 +4139,7 @@ class EdgeguardApiPlugin(BasePlugin):
     normalized_request: str,
     retained_closed_vocabulary_literals: Optional[frozenset] = None,
     use_v0_11: bool = True,
+    schema_artifact: Optional[Dict[str, Any]] = None,
   ) -> Dict[str, Any]:
     """Contract §3.2, plus the correction-turn retention rule: a
     closed-vocabulary literal grounded on an earlier attempt (even one the
@@ -4139,7 +4185,7 @@ class EdgeguardApiPlugin(BasePlugin):
       # is not a substring of the request ("IP addresses" -> 'ipv4'); a free
       # literal still needs to appear in the request text.
       grounding = literal_classes.literal_is_grounded(
-        normalized, normalized_request, EDGEGUARD_SCHEMA_V0_11,
+        normalized, normalized_request, schema_artifact or EDGEGUARD_SCHEMA_V0_11,
       )
       if not grounding["grounded"]:
         unrequested.append({"literal": normalized, "class": grounding["class"]})
@@ -4382,6 +4428,7 @@ class EdgeguardApiPlugin(BasePlugin):
             allow_limit_optional_graph=use_v0_11_schema,
             enforce_hop_bounds=use_v0_11_schema,
             enforce_pattern_endpoints=use_v0_11_schema,
+            schema_artifact=validation_profile["schema_artifact"],
           )
 
         validation = _guard(raw_output)
@@ -4424,6 +4471,7 @@ class EdgeguardApiPlugin(BasePlugin):
             normalized_request,
             retained_closed_vocabulary_literals,
             use_v0_11=use_v0_11_schema,
+            schema_artifact=validation_profile["schema_artifact"],
           )
           retained_closed_vocabulary_literals |= set(
             validation.get("grounded_closed_vocabulary_literals") or []
@@ -5566,7 +5614,8 @@ class EdgeguardApiPlugin(BasePlugin):
         retry_index=1,
         retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
       )
-      is_v0_11 = profile["name"] == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA
+      profile_artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile["name"])
+      is_v0_11 = profile_artifact is not None
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],
@@ -5582,9 +5631,9 @@ class EdgeguardApiPlugin(BasePlugin):
         # `literal_classes.py` module sha, since the literal-grounding guard
         # reads it regardless of profile (contract §3.2: "both pin its sha
         # in their reports").
-        "cypher_schema_version": SCHEMA_VERSION_V0_11 if is_v0_11 else SCHEMA_VERSION,
+        "cypher_schema_version": profile_artifact["schema_version"] if is_v0_11 else SCHEMA_VERSION,
         "schema_surface": (
-          canonical_schema_surface(EDGEGUARD_SCHEMA_V0_11) if is_v0_11 else canonical_schema_surface()
+          canonical_schema_surface(profile_artifact) if is_v0_11 else canonical_schema_surface()
         ),
         "literal_classes_sha256": LITERAL_CLASSES_SHA256,
       })
@@ -5701,6 +5750,7 @@ class EdgeguardApiPlugin(BasePlugin):
       allow_limit_optional_graph=validation_profile["use_v0_11"],
       enforce_hop_bounds=validation_profile["use_v0_11"],
       enforce_pattern_endpoints=validation_profile["use_v0_11"],
+      schema_artifact=validation_profile["schema_artifact"],
     )
     return {
       "status": STATUS_ACCEPTED if analysis["accepted"] else STATUS_REJECTED,
@@ -5756,7 +5806,35 @@ class EdgeguardApiPlugin(BasePlugin):
       }
       if any(not isinstance(value, str) or not value.strip() for value in connection.values()):
         return None, "The default Neo4j connection is not configured."
-    return {key: value.strip() for key, value in connection.items()}, None
+      default_method = configured.get("method")
+      if default_method is not None:
+        if default_method not in NEO4J_CONNECTION_METHODS:
+          return None, "The default Neo4j connection `method` must be one of native_driver, bolt_over_wss."
+        if (
+          default_method == "native_driver"
+          and connection["scheme"].strip().lower() in NEO4J_PLAINTEXT_SCHEMES
+          and configured.get("allow_plaintext") is not True
+        ):
+          # `bolt_over_wss` always runs over TLS; `native_driver` honours the scheme, so a
+          # plaintext scheme needs an explicit opt-in on the default connection.
+          return None, (
+            "The default Neo4j connection uses `method: native_driver` with a plaintext scheme; "
+            "set `allow_plaintext: true` on it to allow that."
+          )
+    resolved = {key: value.strip() for key, value in connection.items()}
+    if not supplied and configured.get("method") is not None:
+      resolved["method"] = configured["method"]
+    return resolved, None
+
+  @staticmethod
+  def _effective_neo4j_method(method: Optional[str], connection: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Transport for a Neo4j call: the request's `method`, else the default
+    connection's optional `method` (`_resolve_neo4j_connection` puts it in
+    `connection` only for the default connection, never for a request
+    override), else None (`_neo4j_driver` then uses Bolt over WSS)."""
+    if method is not None:
+      return method
+    return (connection or {}).get("method")
 
   def _neo4j_default_connection_status(self) -> Dict[str, Any]:
     unavailable = {
@@ -5792,7 +5870,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "default_connection": {
         "configured": True,
         "endpoint": endpoint,
-        "method": "bolt_over_wss",
+        "method": self._effective_neo4j_method(None, connection) or "bolt_over_wss",
       },
     }
 
@@ -5941,15 +6019,16 @@ class EdgeguardApiPlugin(BasePlugin):
       return _wrapper_safe_error(self._neo4j_unavailable(), 503)
     driver = None
     try:
+      effective_method = self._effective_neo4j_method(method, connection)
       driver = self._neo4j_driver(
-        normalized_uri, connection["username"], connection["password"], method,
+        normalized_uri, connection["username"], connection["password"], effective_method,
       )
       with driver.session() as session:
         record = session.run("RETURN 1 AS ok").single()
       return {
         "status": STATUS_OK,
         "ok": bool(record and record.get("ok") == 1),
-        "method": "native_driver" if method == "native_driver" else "bolt_over_wss",
+        "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
         "uri": self._redact_url(normalized_uri),
         "metrics": {
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
@@ -6038,6 +6117,7 @@ class EdgeguardApiPlugin(BasePlugin):
       allow_limit_optional_graph=use_v0_11_schema,
       enforce_hop_bounds=use_v0_11_schema,
       enforce_pattern_endpoints=use_v0_11_schema,
+      schema_artifact=validation_profile["schema_artifact"],
     )
     # Contract §4.3: `classify_result_shape` on every `/neo4j_query` response,
     # accepted or rejected — it is a static text classification, not an
@@ -6088,8 +6168,9 @@ class EdgeguardApiPlugin(BasePlugin):
     )
     driver = None
     try:
+      effective_method = self._effective_neo4j_method(method, connection)
       driver = self._neo4j_driver(
-        normalized_uri, connection["username"], connection["password"], method,
+        normalized_uri, connection["username"], connection["password"], effective_method,
       )
       connect_ms = round((time.monotonic() - started) * 1000, 1)
       query_started = time.monotonic()
@@ -6128,7 +6209,9 @@ class EdgeguardApiPlugin(BasePlugin):
       # fallback query, which is deliberately unrelated to the request.
       empty_reason = (
         None if query_result["rows"]
-        else classify_empty_reason(analysis["accepted_cypher"], EDGEGUARD_SCHEMA_V0_11)
+        else classify_empty_reason(
+          analysis["accepted_cypher"], validation_profile["schema_artifact"] or EDGEGUARD_SCHEMA_V0_11,
+        )
       )
       # Contract §4.3: `/neo4j_query` rows are JSON-safe for every shape.
       # `_run_neo4j_query` keeps `rows` as raw driver objects for its other
@@ -6141,7 +6224,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "status": STATUS_OK,
         "ok": True,
         "executed": True,
-        "method": "native_driver" if method == "native_driver" else "bolt_over_wss",
+        "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
         **query_result,
         "rows": json_safe_rows,
         "empty_reason": empty_reason,
@@ -6405,7 +6488,9 @@ class EdgeguardApiPlugin(BasePlugin):
     if isinstance(validation, dict):
       validation["empty_reason"] = (
         None if query_result_evidence.get("rows")
-        else classify_empty_reason(plan["accepted_cypher"], EDGEGUARD_SCHEMA_V0_11)
+        else classify_empty_reason(
+          plan["accepted_cypher"], _artifact_for_schema_version(validation.get("schema_version")),
+        )
       )
     packet_errors, _context = _validate_graph_evidence_packet(packet)
     if packet_errors:
@@ -6575,7 +6660,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation_errors": [_contract_error("invalid_explanation_request", "request must be a non-empty string")],
       }, 400)
     invalid_fields = [str(name) for name in kwargs] if execution_result is None else []
-    if method is not None and method not in {"native_driver", "bolt_over_wss"}:
+    if method is not None and method not in NEO4J_CONNECTION_METHODS:
       invalid_fields.append("method")
     connection_types = {
       "uri": uri,
@@ -6644,6 +6729,7 @@ class EdgeguardApiPlugin(BasePlugin):
       allow_limit_optional_graph=validation_profile["use_v0_11"],
       enforce_hop_bounds=validation_profile["use_v0_11"],
       enforce_pattern_endpoints=validation_profile["use_v0_11"],
+      schema_artifact=validation_profile["schema_artifact"],
     )
     analysis["schema_version"] = validation_profile["schema_version"]
     # Contract §4.3: routes the explanation dispatch below, independent of
@@ -6755,8 +6841,9 @@ class EdgeguardApiPlugin(BasePlugin):
 
     driver = None
     try:
+      effective_method = self._effective_neo4j_method(method, connection)
       driver = self._neo4j_driver(
-        normalized_uri, connection["username"], connection["password"], method,
+        normalized_uri, connection["username"], connection["password"], effective_method,
       )
       primary_started = time.monotonic()
       query_result = self._run_neo4j_query(driver, executed_cypher, transport_row_cap)
@@ -6768,7 +6855,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "row_count": primary_row_count,
         "truncated": bool(query_result.get("truncated")),
         "duration_ms": primary_duration_ms,
-        "method": "native_driver",
+        "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
       }]
       # Contract §6, review finding 6 (S5=Q9): every empty result carries a
       # reason, on explain routes too, not just `/neo4j_query`; classified
@@ -6778,7 +6865,9 @@ class EdgeguardApiPlugin(BasePlugin):
       # branch below returns, so setting it here threads the reason through
       # all of them.
       analysis["empty_reason"] = (
-        None if primary_row_count else classify_empty_reason(plan["accepted_cypher"], EDGEGUARD_SCHEMA_V0_11)
+        None if primary_row_count else classify_empty_reason(
+          plan["accepted_cypher"], _artifact_for_schema_version(analysis.get("schema_version")),
+        )
       )
       live_retry = self._empty_result_broadening_state(enabled=broadening_enabled)
       final_executed_cypher = executed_cypher
@@ -6804,7 +6893,7 @@ class EdgeguardApiPlugin(BasePlugin):
               "row_count": len(query_result["rows"]),
               "truncated": bool(query_result.get("truncated")),
               "duration_ms": broadening_duration_ms,
-              "method": "native_driver",
+              "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
             })
             live_retry = self._empty_result_broadening_state(
               enabled=True,

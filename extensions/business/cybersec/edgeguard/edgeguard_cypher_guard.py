@@ -862,10 +862,24 @@ def _string_literal_values(cypher: str) -> list[str]:
 # Review finding Q8: `classify_empty_reason` is on the per-query hot path
 # and every real caller passes the same module-loaded `EDGEGUARD_SCHEMA_V0_11`
 # object; scanning its full pattern list on every call is wasted work.
-# Single-slot cache keyed by the artifact object's identity — a different
-# artifact object (a test fixture) always recomputes.
-_topology_relationship_types_cache: tuple[Any, set[str]] | None = None
-_topology_labels_cache: tuple[Any, set[str]] | None = None
+# Small per-artifact caches keyed by the artifact object's identity (a few
+# slots, so the v0.11 and v0.13 profiles served by one process do not evict
+# each other); a different artifact object (a test fixture) recomputes.
+_ARTIFACT_CACHE_SLOTS = 8
+_topology_relationship_types_cache: dict[int, tuple[Any, Any]] = {}
+_topology_labels_cache: dict[int, tuple[Any, Any]] = {}
+_pattern_endpoint_pairs_cache: dict[int, tuple[Any, Any]] = {}
+
+
+def _cache_get(cache: dict[int, tuple[Any, Any]], artifact: Any) -> Any:
+  entry = cache.get(id(artifact))
+  return entry[1] if entry is not None and entry[0] is artifact else None
+
+
+def _cache_put(cache: dict[int, tuple[Any, Any]], artifact: Any, value: Any) -> None:
+  if len(cache) >= _ARTIFACT_CACHE_SLOTS:
+    cache.clear()
+  cache[id(artifact)] = (artifact, value)  # holding the artifact keeps its id() unique
 
 
 def _topology_surface_relationship_types(artifact: dict[str, Any]) -> set[str]:
@@ -880,9 +894,9 @@ def _topology_surface_relationship_types(artifact: dict[str, Any]) -> set[str]:
   label-only test flags almost every real query; a relationship type is
   reused across surfaces only once in the v0.11 artifact (`PART_OF`, a known
   imprecise case — a query using it may under- or over-classify)."""
-  global _topology_relationship_types_cache
-  if _topology_relationship_types_cache is not None and _topology_relationship_types_cache[0] is artifact:
-    return _topology_relationship_types_cache[1]
+  cached = _cache_get(_topology_relationship_types_cache, artifact)
+  if cached is not None:
+    return cached
   topology_types: set[str] = set()
   populated_types: set[str] = set()
   for pattern in artifact.get("patterns", []) or []:
@@ -892,7 +906,7 @@ def _topology_surface_relationship_types(artifact: dict[str, Any]) -> set[str]:
     is_topology = pattern.get("surface") == "topology" or pattern.get("populated") is False
     (topology_types if is_topology else populated_types).add(str(rel_type))
   result = topology_types - populated_types
-  _topology_relationship_types_cache = (artifact, result)
+  _cache_put(_topology_relationship_types_cache, artifact, result)
   return result
 
 
@@ -905,9 +919,9 @@ def _topology_surface_labels(artifact: dict[str, Any]) -> set[str]:
   pairs. Keyed on label, mirroring `_topology_surface_relationship_types`;
   a label reused across surfaces (e.g. `CVE`, `Indicator`) is never
   topology-only, so it never triggers this branch."""
-  global _topology_labels_cache
-  if _topology_labels_cache is not None and _topology_labels_cache[0] is artifact:
-    return _topology_labels_cache[1]
+  cached = _cache_get(_topology_labels_cache, artifact)
+  if cached is not None:
+    return cached
   topology_labels: set[str] = set()
   populated_labels: set[str] = set()
   for pattern in artifact.get("patterns", []) or []:
@@ -918,7 +932,7 @@ def _topology_surface_labels(artifact: dict[str, Any]) -> set[str]:
       if label:
         bucket.add(str(label))
   result = topology_labels - populated_labels
-  _topology_labels_cache = (artifact, result)
+  _cache_put(_topology_labels_cache, artifact, result)
   return result
 
 
@@ -1394,9 +1408,7 @@ def _edge_direction(chain: str, bracket_match: re.Match[str]) -> str:
   return "undirected"
 
 
-# Cache keyed on the artifact object's identity, mirroring
-# `_topology_relationship_types_cache` above.
-_pattern_endpoint_pairs_cache: tuple[Any, dict[str, frozenset[tuple[str, str]]]] | None = None
+# Cached per artifact identity in `_pattern_endpoint_pairs_cache` (see `_cache_get`).
 
 
 def _pattern_endpoint_pairs_by_type(artifact: dict[str, Any]) -> dict[str, frozenset[tuple[str, str]]]:
@@ -1405,9 +1417,9 @@ def _pattern_endpoint_pairs_by_type(artifact: dict[str, Any]) -> dict[str, froze
   schema artifact v0.11 `patterns[]` (both surfaces)"). A relationship type
   absent from this dict is unknown to the schema entirely — the caller skips
   it: that is the flat-schema check's rejection, not this one's."""
-  global _pattern_endpoint_pairs_cache
-  if _pattern_endpoint_pairs_cache is not None and _pattern_endpoint_pairs_cache[0] is artifact:
-    return _pattern_endpoint_pairs_cache[1]
+  cached = _cache_get(_pattern_endpoint_pairs_cache, artifact)
+  if cached is not None:
+    return cached
   grouped: dict[str, set[tuple[str, str]]] = {}
   for pattern in artifact.get("patterns", []) or []:
     rel_type, p_from, p_to = pattern.get("type"), pattern.get("from"), pattern.get("to")
@@ -1415,7 +1427,7 @@ def _pattern_endpoint_pairs_by_type(artifact: dict[str, Any]) -> dict[str, froze
       continue
     grouped.setdefault(str(rel_type), set()).add((str(p_from), str(p_to)))
   result = {rel_type: frozenset(pairs) for rel_type, pairs in grouped.items()}
-  _pattern_endpoint_pairs_cache = (artifact, result)
+  _cache_put(_pattern_endpoint_pairs_cache, artifact, result)
   return result
 
 
@@ -1605,6 +1617,44 @@ def _pattern_endpoint_error(stripped: str, artifact: dict[str, Any]) -> str | No
         )
         if error:
           return error
+  return None
+
+
+# Contract v0.13 §3 / Q3: relationships no longer carry `source_id` / `source_ids`
+# (they carry `sources`). The flat schema still allows the name `source_id`
+# because `Source.source_id` is a node property, so the refusal is owner-aware:
+# an access is allowed only on a variable bound to a `(:Source)` node pattern.
+# Any other owner (a relationship variable, an alias such as
+# `WITH r AS x RETURN x.source_id`, a parenthesised expression) is refused.
+# `x['source_id']` bracket access is already refused for every profile by the
+# bracket-projection rule. Applies to the v0.13 artifact only; v0.11 behaviour
+# is unchanged.
+REMOVED_RELATIONSHIP_PROPERTIES_BY_SCHEMA = {
+  "edgeguard-cypher-schema-v0.13": ("source_id", "source_ids"),
+}
+_SOURCE_ID_ACCESS = re.compile(r"(?<![.\w])(\)|" + IDENT + r")\s*\.\s*(source_ids?)\b")
+# Map projection `r{.source_id}` / `r{.*, .source_ids}` reads the same property off `r`.
+_SOURCE_ID_PROJECTION = re.compile(
+  r"(?<![.\w])(" + IDENT + r")\s*\{(?:[^{}]|\{[^{}]*\})*?\.\s*(source_ids?)\b(?:[^{}]|\{[^{}]*\})*\}"
+)  # one nested map level: `r{description: {cve_id: 1}, .source_id}`
+
+
+def _removed_relationship_property_error(stripped: str, artifact: dict[str, Any]) -> str | None:
+  removed = REMOVED_RELATIONSHIP_PROPERTIES_BY_SCHEMA.get(str((artifact or {}).get("schema_version")))
+  if not removed:
+    return None
+  for branch in UNION_SPLIT.split(stripped):
+    var_labels = _global_var_labels(branch)
+    for match in (*_SOURCE_ID_ACCESS.finditer(branch), *_SOURCE_ID_PROJECTION.finditer(branch)):
+      owner, name = match.group(1), match.group(2)
+      if name not in removed:
+        continue
+      if owner != ")" and "Source" in var_labels.get(owner, (frozenset(), False))[0]:
+        continue
+      return (
+        f"`{owner}.{name}` is not allowed: `{name}` exists on Source nodes only (bind the node as "
+        f"`(s:Source)`); relationships carry `sources` (a list), not `{name}`."
+      )
   return None
 
 
@@ -1935,6 +1985,13 @@ def analyze_generated_cypher(
       if pattern_endpoint_error is not None:
         execution_safety_error = pattern_endpoint_error
         execution_safety_error_code = PATTERN_ENDPOINT_MISMATCH_CODE
+      else:
+        removed_property_error = _removed_relationship_property_error(
+          _analysis_text(candidate), schema_artifact or EDGEGUARD_SCHEMA_V0_11,
+        )
+        if removed_property_error is not None:
+          execution_safety_error = removed_property_error
+          execution_safety_error_code = EXECUTION_SAFETY_ERROR_CODE
 
   invented_temporal = sorted(
     set(schema_unknown.get("properties", [])) & set(TEMPORAL_HALLUCINATION_PROPERTIES)
