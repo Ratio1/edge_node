@@ -34,7 +34,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard_v0_13 import 
 from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import EdgeGuardCypherGuardError
 
 # Hub `configs/edgeguard_v0_13_runtime_pin.json` served_system_prompt_sha256.
-HUB_V0_13_PROMPT_SHA256 = "a4f019c28e56b60188e5ac44d92c9214f2460a967caeaa07b805d8a9b94c6f8a"
+HUB_V0_13_PROMPT_SHA256 = "adb5d49a9d806f36d12c76f7c85810c79ce398bbee4b5aff115f0c6687192bcd"
 V0_13_MODEL_KEY = "v0-13-fixture-model"
 V0_13_WORKERS = {
   V0_13_MODEL_KEY: {
@@ -101,6 +101,11 @@ class V0_13ArtifactAndPromptTests(unittest.TestCase):
         self.assertEqual(line, "EXPLOITS CVE: ThreatActor")
     self.assertNotIn("r.source_id", prompt)
     self.assertNotIn("source_ids", prompt)
+
+  def test_served_prompt_shows_only_canonical_sector_sources(self):
+    prompt = build_v0_13_pattern_schema_system_prompt()
+    self.assertIn("TARGETS Sector: Indicator\n", prompt)
+    self.assertIn("also when the question says the malware or actor targets it", prompt)
 
   def test_v0_11_prompt_is_unchanged(self):
     self.assertNotEqual(
