@@ -1,0 +1,271 @@
+{
+  "schema": "edgeguard.misp_event_url_template_cases.v1",
+  "note": "Synthetic hosts only. valid=true means the template is accepted by the backend (MISP_ENRICHMENT_EVENT_URL_TEMPLATE) and every URL it expands with a numeric event id (digits, no leading-zero rule) is accepted by the playground URL check.",
+  "cases": [
+    {
+      "name": "default",
+      "valid": true,
+      "template": "https://misp.edgeguard.org/events/view/{event_id}"
+    },
+    {
+      "name": "custom_host_base",
+      "valid": true,
+      "template": "https://misp.example.test/misp/events/view/{event_id}"
+    },
+    {
+      "name": "host_port",
+      "valid": true,
+      "template": "https://m.test:8443/e/{event_id}"
+    },
+    {
+      "name": "port_max",
+      "valid": true,
+      "template": "https://m.test:65535/{event_id}"
+    },
+    {
+      "name": "port_min",
+      "valid": true,
+      "template": "https://m.test:1/{event_id}"
+    },
+    {
+      "name": "root_path",
+      "valid": true,
+      "template": "https://m.test/{event_id}"
+    },
+    {
+      "name": "ip_literal_v4",
+      "valid": true,
+      "template": "https://203.0.113.7/events/view/{event_id}"
+    },
+    {
+      "name": "segment_chars",
+      "valid": true,
+      "template": "https://m.test/a.b_c~d%20e-f/{event_id}"
+    },
+    {
+      "name": "exactly_200_chars",
+      "valid": true,
+      "template": "https://m.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/{event_id}"
+    },
+    {
+      "name": "over_200_chars",
+      "valid": false,
+      "template": "https://m.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/{event_id}"
+    },
+    {
+      "name": "http",
+      "valid": false,
+      "template": "http://misp.test/events/view/{event_id}"
+    },
+    {
+      "name": "scheme_uppercase",
+      "valid": false,
+      "template": "HTTPS://misp.test/events/view/{event_id}"
+    },
+    {
+      "name": "userinfo",
+      "valid": false,
+      "template": "https://user:pw@misp.test/events/view/{event_id}"
+    },
+    {
+      "name": "at_in_path",
+      "valid": false,
+      "template": "https://misp.test/@x/{event_id}"
+    },
+    {
+      "name": "query",
+      "valid": false,
+      "template": "https://misp.test/events/view/{event_id}?a=1"
+    },
+    {
+      "name": "query_before_placeholder",
+      "valid": false,
+      "template": "https://misp.test/e?x=1/{event_id}"
+    },
+    {
+      "name": "fragment",
+      "valid": false,
+      "template": "https://misp.test/events/view/{event_id}#x"
+    },
+    {
+      "name": "zero_placeholders",
+      "valid": false,
+      "template": "https://misp.test/events/view/"
+    },
+    {
+      "name": "two_placeholders",
+      "valid": false,
+      "template": "https://misp.test/{event_id}/{event_id}"
+    },
+    {
+      "name": "placeholder_not_last",
+      "valid": false,
+      "template": "https://misp.test/{event_id}/view"
+    },
+    {
+      "name": "placeholder_in_host",
+      "valid": false,
+      "template": "https://{event_id}.misp.test/view/{event_id}"
+    },
+    {
+      "name": "placeholder_with_suffix",
+      "valid": false,
+      "template": "https://misp.test/e/{event_id}.json"
+    },
+    {
+      "name": "placeholder_with_prefix",
+      "valid": false,
+      "template": "https://misp.test/e/x{event_id}"
+    },
+    {
+      "name": "stray_open_brace",
+      "valid": false,
+      "template": "https://misp.test/e{/{event_id}"
+    },
+    {
+      "name": "stray_close_brace",
+      "valid": false,
+      "template": "https://misp.test/e}/{event_id}"
+    },
+    {
+      "name": "other_placeholder",
+      "valid": false,
+      "template": "https://misp.test/{other}/{event_id}"
+    },
+    {
+      "name": "whitespace",
+      "valid": false,
+      "template": "https://misp.test/e v/{event_id}"
+    },
+    {
+      "name": "trailing_newline",
+      "valid": false,
+      "template": "https://misp.test/e/{event_id}\n"
+    },
+    {
+      "name": "backslash",
+      "valid": false,
+      "template": "https://misp.test/e\\v/{event_id}"
+    },
+    {
+      "name": "non_ascii_host",
+      "valid": false,
+      "template": "https://mísp.test/e/{event_id}"
+    },
+    {
+      "name": "control_char",
+      "valid": false,
+      "template": "https://misp.test/e\u0001/{event_id}"
+    },
+    {
+      "name": "no_host",
+      "valid": false,
+      "template": "https:///events/{event_id}"
+    },
+    {
+      "name": "no_path",
+      "valid": false,
+      "template": "https://misp.test{event_id}"
+    },
+    {
+      "name": "empty",
+      "valid": false,
+      "template": ""
+    },
+    {
+      "name": "underscore_host",
+      "valid": false,
+      "template": "https://mis_p.test/e/{event_id}"
+    },
+    {
+      "name": "plus_in_path",
+      "valid": false,
+      "template": "https://misp.test/a+b/{event_id}"
+    },
+    {
+      "name": "semicolon_in_path",
+      "valid": false,
+      "template": "https://misp.test/a;b/{event_id}"
+    },
+    {
+      "name": "bang_in_path",
+      "valid": false,
+      "template": "https://misp.test/a!b/{event_id}"
+    },
+    {
+      "name": "double_quote_in_path",
+      "valid": false,
+      "template": "https://misp.test/a\"b/{event_id}"
+    },
+    {
+      "name": "angle_brackets_in_path",
+      "valid": false,
+      "template": "https://misp.test/a<b>/{event_id}"
+    },
+    {
+      "name": "single_quote_in_path",
+      "valid": false,
+      "template": "https://misp.test/a'b/{event_id}"
+    },
+    {
+      "name": "parens_in_path",
+      "valid": false,
+      "template": "https://misp.test/a(b)/{event_id}"
+    },
+    {
+      "name": "star_in_path",
+      "valid": false,
+      "template": "https://misp.test/a*b/{event_id}"
+    },
+    {
+      "name": "empty_path_segment",
+      "valid": false,
+      "template": "https://misp.test/a//{event_id}"
+    },
+    {
+      "name": "empty_port",
+      "valid": false,
+      "template": "https://misp.test:/e/{event_id}"
+    },
+    {
+      "name": "non_numeric_port",
+      "valid": false,
+      "template": "https://misp.test:80a/e/{event_id}"
+    },
+    {
+      "name": "port_zero",
+      "valid": false,
+      "template": "https://misp.test:0/e/{event_id}"
+    },
+    {
+      "name": "port_out_of_range",
+      "valid": false,
+      "template": "https://misp.test:65536/e/{event_id}"
+    },
+    {
+      "name": "port_six_digits",
+      "valid": false,
+      "template": "https://misp.test:123456/e/{event_id}"
+    },
+    {
+      "name": "ipv6_literal",
+      "valid": false,
+      "template": "https://[::1]/e/{event_id}"
+    },
+    {
+      "name": "host_leading_dot",
+      "valid": false,
+      "template": "https://.misp.test/e/{event_id}"
+    },
+    {
+      "name": "port_leading_zero",
+      "valid": false,
+      "template": "https://misp.test:08443/e/{event_id}"
+    },
+    {
+      "name": "port_all_zero_padded",
+      "valid": false,
+      "template": "https://misp.test:00001/e/{event_id}"
+    }
+  ]
+}

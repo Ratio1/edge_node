@@ -7,6 +7,8 @@ entity/path reference, so a model failure cannot erase query-result coverage.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Mapping
 
 from .graph_first_explanation import build_evidence_ir, thaw
@@ -14,6 +16,11 @@ from .graph_first_explanation import build_evidence_ir, thaw
 
 DIGEST_SCHEMA_VERSION = "edgeguard.result_digest.v1"
 DIGEST_COVERAGE_SCHEMA_VERSION = "edgeguard.result_digest_coverage.v2"
+PROJECTION_DIGEST_SCHEMA_VERSION = "edgeguard.projection_digest.v1"
+# Contract §4.3, playground validator (`explanation-contract-v1.ts`): the
+# response transport caps for a `ranked_projection` result.
+PROJECTION_DIGEST_MAX_ROWS = 50
+PROJECTION_DIGEST_MAX_COLUMNS = 64
 
 
 def _properties(entity: Any) -> list[list[Any]]:
@@ -215,3 +222,45 @@ def build_result_digest(
       ],
     },
   }
+
+
+def build_projection_digest(
+  query_result_evidence: Mapping[str, Any],
+  *,
+  ranking_rule: str,
+  truncated: bool = False,
+) -> dict[str, Any]:
+  """Contract §4.2, §4.3: `columns`, tagged rows (the same tagger
+  `_legacy_query_result_value` uses for `result_digest`), `row_count`,
+  `truncated`, `ranking_rule`, `sha256` — emitted beside `result_digest` for
+  `ranked_projection` results only.
+
+  Unlike `result_digest`, rows are kept in their exact returned order and are
+  never grouped or deduplicated: a `ranked_projection`'s row order *is* the
+  ranking. Truncation and column counts stay inside the playground contract
+  validator's caps (`PROJECTION_DIGEST_MAX_ROWS`/`_COLUMNS`).
+  """
+  columns = [str(column) for column in query_result_evidence.get("columns", [])]
+  if len(columns) > PROJECTION_DIGEST_MAX_COLUMNS:
+    raise ValueError("projection_digest columns exceed the playground contract cap")
+  source_rows = list(query_result_evidence.get("rows", []))
+  row_truncated = bool(truncated) or len(source_rows) > PROJECTION_DIGEST_MAX_ROWS
+  rows = []
+  for row in source_rows[:PROJECTION_DIGEST_MAX_ROWS]:
+    values = list(row["values"])
+    if len(values) != len(columns):
+      raise ValueError("projection_digest row values do not match its declared columns")
+    rows.append({"ordinal": len(rows), "values": values})
+  ranking_rule_text = str(ranking_rule or "").strip() or "unranked"
+  payload = {
+    "schema_version": PROJECTION_DIGEST_SCHEMA_VERSION,
+    "columns": columns,
+    "rows": rows,
+    "row_count": len(rows),
+    "truncated": bool(row_truncated),
+    "ranking_rule": ranking_rule_text,
+  }
+  sha256 = hashlib.sha256(
+    json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+  ).hexdigest()
+  return {**payload, "sha256": sha256}

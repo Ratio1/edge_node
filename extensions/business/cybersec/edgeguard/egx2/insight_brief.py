@@ -16,13 +16,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-from typing import Any, Callable, Mapping, Optional
+from collections import Counter
+from typing import Any, Callable, Collection, Mapping, Optional, Sequence
 
 from . import brief_gates
 from . import brief_profile
 from . import field_catalog as fc
 from . import insights
+from .. import misp_enrichment as misp
 from ..graph_first_runtime import GraphFirstRuntimeError
 
 PROFILE_ID = "EGX/2"
@@ -33,6 +36,20 @@ MAX_TOKENS = 768
 TEMPERATURE = 0.7
 TOP_P = 0.8
 MAX_OBSERVATIONS = 4
+# Explanation spec v0.3 §2: public `misp_citations` per observation.
+MAX_PUBLIC_CITATIONS = 8
+CITATION_ENTITY_MAX_CHARS = 256
+CITATION_FIELD_MAX_CHARS = 64
+CITATION_VALUE_MAX_CHARS = 500
+CITATION_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+CITATION_NODE_REF_RE = re.compile(r"^N(?:0|[1-9][0-9]*)$")
+# Explanation spec v0.4: numbered MISP event references (`M1..Mn`).
+MISP_REF_RE = re.compile(r"^M[1-9][0-9]*$")
+MISP_REF_MAX_CHARS = 8
+MISP_REFERENCE_NODE_REFS_MAX = 50
+MISP_REFERENCE_NAMES_MAX = 3
+PUBLIC_REFERENCE_KEYS = frozenset({"id", "event_id", "event_url", "node_refs", "entity_ids"})
+PUBLIC_CITATION_KEYS = frozenset({"entity", "field", "value", "node_ref", "entity_id"})
 MAX_NEXT_CHECKS = 3
 # Mode-scaled prompt budgets (observations, next_checks): thorough reads more
 # rows, so it earns a richer brief. Parse caps above stay the superset the
@@ -40,7 +57,14 @@ MAX_NEXT_CHECKS = 3
 DEFAULT_BRIEF_BUDGET = (2, 2)
 MODE_BRIEF_BUDGETS = {"thorough": (3, 3)}
 TEXT_LIMIT = 1_000
+# Explanation spec v0.2 §5: byte budget of the `misp_enrichment` model view
+# in the user message (the field legend is bounded by the catalog).
+ENRICHMENT_VIEW_MAX_BYTES = 2_048
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# The playground's control-free string rule (`string()` in explanation-contract.ts).
+CITATION_CONTROL_RE = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]")
+# Largest integer a JSON number carries exactly in the browser.
+MAX_CITATION_INTEGER = 2**53
 
 RETRY_NOTE_TEMPLATE = (
   "\n\nRETRY: your previous brief failed these deterministic checks: {failures}. "
@@ -48,6 +72,17 @@ RETRY_NOTE_TEMPLATE = (
   "entities only from an insight's [examples: ...] list, and state only counts "
   "the sheet itself states."
 )
+
+# Operator ruling 2026-10-06 (revised): a length cut (`output_truncated`) is not a
+# gate failure, so it asks for a shorter brief within the request's observation
+# budget, with no MISP citations; each MISP clause is added only when the prompt
+# carries what it names.
+RETRY_NOTE_TRUNCATED = (
+  "\n\nRETRY: your previous brief was cut off at the length limit. Write a shorter brief: "
+  "at most {max_observations} observations, one sentence each"
+)
+RETRY_NOTE_TRUNCATED_CITATIONS = ", with no misp_citations"
+RETRY_NOTE_TRUNCATED_REFS = ", and keep the misp_refs rules above"
 
 PROFILE_MANIFEST = {
   "profile_id": PROFILE_ID,
@@ -62,6 +97,17 @@ PROFILE_MANIFEST = {
   "system_prompt": brief_profile.SYSTEM,
   "user_template": brief_profile.USER_TEMPLATE,
   "retry_note_template": RETRY_NOTE_TEMPLATE,
+  "retry_note_truncated": RETRY_NOTE_TRUNCATED,
+  "retry_note_truncated_citations": RETRY_NOTE_TRUNCATED_CITATIONS,
+  "retry_note_truncated_refs": RETRY_NOTE_TRUNCATED_REFS,
+  "enrichment_template": brief_profile.ENRICHMENT_TEMPLATE,
+  "enrichment_system_sentence": brief_profile.ENRICHMENT_SYSTEM_SENTENCE,
+  "enrichment_view_max_bytes": ENRICHMENT_VIEW_MAX_BYTES,
+  "misp_references_template": brief_profile.MISP_REFERENCES_TEMPLATE,
+  "misp_references_instruction": brief_profile.MISP_REFERENCES_INSTRUCTION,
+  "misp_references_max_lines": brief_profile.MISP_REFERENCES_MAX_LINES,
+  "misp_references_max_bytes": brief_profile.MISP_REFERENCES_MAX_BYTES,
+  "misp_refs_max_per_observation": brief_profile.MISP_REFS_MAX_PER_OBSERVATION,
   "sampling": {"temperature": TEMPERATURE, "top_p": TOP_P, "top_k": 20},
   "max_tokens": MAX_TOKENS,
   "hard_gates": sorted(brief_gates.HARD_GATES),
@@ -81,6 +127,180 @@ def _entity_id_map(graph: Mapping[str, Any]) -> dict[str, str]:
       if isinstance(value, str) and value:
         mapping.setdefault(value.lower(), str(node.get("id")))
   return mapping
+
+
+def _scalar(value: Any) -> bool:
+  return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
+def _parse_citations(raw: Any) -> list[dict[str, Any]]:
+  """Well-formed `misp_citations`, one scalar value each.
+
+  A list value of scalars becomes one citation per item (models often cite a
+  list field whole); anything else malformed is dropped. No cap: every kept
+  citation is graded, so a wrong one can never be cut before the gate (the
+  output itself is bounded by the brief's max_tokens).
+  """
+  if not isinstance(raw, list):
+    return []
+  parsed = []
+  for c in raw:
+    if not (isinstance(c, Mapping) and isinstance(c.get("entity"), str) and isinstance(c.get("field"), str)):
+      continue
+    value = c.get("value")
+    values = value if isinstance(value, list) else [value]
+    parsed += [{"entity": c["entity"], "field": c["field"], "value": v} for v in values if _scalar(v)]
+  return parsed
+
+
+def _enrichment_view(
+  block: Optional[Mapping[str, Any]],
+  graph: Mapping[str, Any],
+  node_ids: Optional[Mapping[str, str]],
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
+) -> Optional[dict[str, Any]]:
+  """Explanation spec v0.2 §5: the compact `misp_enrichment` view for the
+  prompt. Each block node is joined to its packet-graph node through
+  `node_ids` (digest node ref -> packet node id) and named by the same
+  display value the sheet uses; only catalogued fields are kept, and the
+  view is trimmed to `ENRICHMENT_VIEW_MAX_BYTES`. The block is re-validated
+  (`build_model_view`); anything invalid or unjoinable yields `None`."""
+  if block is None or not node_ids:
+    return None
+  nodes_by_id = {str(node.get("id")): node for node in graph.get("nodes", []) or []}
+  entity_by_ref: dict[str, str] = {}
+  for node_ref, node_id in node_ids.items():
+    node = nodes_by_id.get(str(node_id))
+    if node is None:
+      continue
+    view = fc.project(node)
+    for key in ("name", "value", "cve_id", "mitre_id"):
+      value = view.get(key)
+      if isinstance(value, str) and value:
+        entity_by_ref[str(node_ref)] = value
+        break
+  if not entity_by_ref:
+    return None
+  return misp.build_model_view(
+    block,
+    max_bytes=ENRICHMENT_VIEW_MAX_BYTES,
+    entity_by_ref=entity_by_ref,
+    fields_by_label=fc.MISP_ENRICHMENT_CATALOG,
+    event_url_template=event_url_template,
+  )
+
+
+def _render_enrichment(view: Optional[Mapping[str, Any]]) -> Optional[str]:
+  """The view plus the catalog meaning of every field it carries."""
+  if view is None:
+    return None
+  meanings = fc.misp_enrichment_meanings(sorted({node["label"] for node in view["nodes"]}))
+  present = {field for node in view["nodes"] for field in node["fields"]}
+  return brief_profile.render_enrichment(
+    view, {field: meaning for field, meaning in meanings.items() if field in present},
+  )
+
+
+def _misp_references(view: Optional[Mapping[str, Any]], event_url_template: str) -> list[dict[str, Any]]:
+  """Explanation spec v0.4 §2: the numbered MISP events of the admitted model
+  view, one table used for both the prompt lines and the validation. Events are
+  numbered by integer id over the whole view, then cut as a prefix to the line
+  and byte caps, so the numbers left are always `M1..Mk`. Names are the view's
+  display names filtered like the sheet's, printed escaped and never truncated."""
+  nodes_by_event: dict[int, list[Mapping[str, Any]]] = {}
+  for node in (view or {}).get("nodes") or []:
+    for event_id in set(node["misp_event_ids"]):
+      nodes_by_event.setdefault(int(event_id), []).append(node)
+  table: list[dict[str, Any]] = []
+  size = 0
+  for number, event in enumerate(sorted(nodes_by_event), start=1):
+    nodes = nodes_by_event[event]
+    names = [node["entity"] for node in nodes if fc.is_nameable_value(node["entity"])]
+    if names:
+      more = len(nodes) - min(len(names), MISP_REFERENCE_NAMES_MAX)
+      shown = ", ".join(json.dumps(name, ensure_ascii=True) for name in names[:MISP_REFERENCE_NAMES_MAX])
+      listed = f"entities {shown}" + (f" (+{more} more)" if more else "")
+    else:
+      listed = f"{len(nodes)} entities, none nameable"
+    line = f"M{number} = MISP event {event}: {listed}"
+    size += len(line.encode("utf-8")) + (1 if table else 0)
+    if len(table) >= brief_profile.MISP_REFERENCES_MAX_LINES or size > brief_profile.MISP_REFERENCES_MAX_BYTES:
+      break
+    table.append({
+      "id": f"M{number}", "event_id": str(event), "line": line,
+      "entities": [node["entity"] for node in nodes],
+      "node_refs": [node["node_ref"] for node in nodes][:MISP_REFERENCE_NODE_REFS_MAX],
+      "event_url": misp._event_url(event_url_template, str(event)),
+    })
+  return table
+
+
+def _reference_index(table: list[dict[str, Any]], node_ids: Mapping[str, str]) -> list[dict[str, Any]]:
+  return [{
+    "id": ref["id"], "event_id": ref["event_id"], "event_url": ref["event_url"],
+    "node_refs": list(ref["node_refs"]), "entity_ids": [node_ids.get(node_ref) for node_ref in ref["node_refs"]],
+  } for ref in table]
+
+
+def public_references_are_valid(
+  observation_refs: Sequence[Sequence[Any]],
+  index: Any,
+  graph_ids: Collection[str],
+) -> bool:
+  """Explanation spec v0.4 §5.2: the client rules for the observations' `misp_refs`
+  (one list per observation that has any) and the `misp_reference_index`, written
+  once and shared (as `tests/fixtures/misp_ref_cases.json`) with the playground
+  validator, which rejects a whole response on one bad key."""
+  if not (isinstance(index, list) and 1 <= len(index) <= brief_profile.MISP_REFERENCES_MAX_LINES):
+    return False
+  ids: set[str] = set()
+  for entry in index:
+    if not isinstance(entry, Mapping) or set(entry) != PUBLIC_REFERENCE_KEYS:
+      return False
+    ref_id, event_id, node_refs, entity_ids = entry["id"], entry["event_id"], entry["node_refs"], entry["entity_ids"]
+    if not (isinstance(ref_id, str) and len(ref_id) <= MISP_REF_MAX_CHARS and MISP_REF_RE.fullmatch(ref_id)) or ref_id in ids:
+      return False
+    ids.add(ref_id)
+    if not (isinstance(event_id, str) and misp.EVENT_ID_RE.fullmatch(event_id) and misp.event_url_is_valid(entry["event_url"], event_id)):
+      return False
+    if not (isinstance(node_refs, list) and 1 <= len(node_refs) <= MISP_REFERENCE_NODE_REFS_MAX):
+      return False
+    if not all(isinstance(ref, str) and CITATION_NODE_REF_RE.fullmatch(ref) for ref in node_refs) or len(set(node_refs)) != len(node_refs):
+      return False
+    if not (isinstance(entity_ids, list) and len(entity_ids) == len(node_refs) and len(set(entity_ids)) == len(entity_ids)):
+      return False
+    if not all(isinstance(entity_id, str) and entity_id in graph_ids for entity_id in entity_ids):
+      return False
+  return all(
+    isinstance(refs, list) and 1 <= len(refs) <= brief_profile.MISP_REFS_MAX_PER_OBSERVATION
+    and len(set(refs)) == len(refs)
+    and all(isinstance(ref, str) and len(ref) <= MISP_REF_MAX_CHARS and ref in ids for ref in refs)
+    for refs in observation_refs
+  )
+
+
+def _public_refs(
+  item: Mapping[str, Any],
+  table: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[str], Counter]:
+  """Explanation spec v0.4 §4: the observation's surviving `misp_refs` (sorted by
+  number) and a drop count per fixed code. Never raises, never fails the brief."""
+  about = {str(e).strip().lower() for e in item.get("exemplar_entities") or []}
+  drops: Counter = Counter()
+  kept: list[str] = []
+  for token in dict.fromkeys(item.get("misp_refs") or []):
+    ref = table.get(token)
+    if ref is None:
+      code = "ref_unknown"
+    elif not any(name.lower() in about or misp.mentions(item["text"], name) for name in ref["entities"]):
+      code = "ref_entity_not_in_observation"
+    elif len(kept) >= brief_profile.MISP_REFS_MAX_PER_OBSERVATION:
+      code = "ref_over_cap"
+    else:
+      kept.append(token)
+      continue
+    drops[code] += 1
+  return sorted(kept, key=lambda token: int(token[1:])), drops
 
 
 def _entity_ids_for(names: list[str], id_map: Mapping[str, str]) -> list[str]:
@@ -169,11 +389,24 @@ def _parse_brief(content: str, trace: Optional[Mapping[str, Any]]) -> dict[str, 
       raise GraphFirstRuntimeError("invalid_brief_shape", "response_parse", "observation insight_ids are invalid", trace)
     if entities is not None and (not isinstance(entities, list) or not all(isinstance(x, str) for x in entities)):
       raise GraphFirstRuntimeError("invalid_brief_shape", "response_parse", "observation exemplar_entities are invalid", trace)
-    brief["observations"].append({
+    parsed_observation = {
       "text": _validated_text(item.get("text"), "invalid_brief_text", trace),
       "insight_ids": list(ids),
       "exemplar_entities": list(entities or []),
-    })
+    }
+    # Explanation spec v0.2 §5: optional typed enrichment citations, graded
+    # by the `enrichment_grounding` gate; never copied to the public case.
+    # They are optional internal evidence, so a malformed one is dropped
+    # rather than failing the brief; the text itself is still graded.
+    citations = _parse_citations(item.get("misp_citations"))
+    if citations:
+      parsed_observation["misp_citations"] = citations
+    # Spec v0.4 §4: optional `misp_refs`, strings only; checked in `_model_case`.
+    raw_refs = item.get("misp_refs")
+    refs = [ref for ref in raw_refs if isinstance(ref, str)] if isinstance(raw_refs, list) else []
+    if refs:
+      parsed_observation["misp_refs"] = refs
+    brief["observations"].append(parsed_observation)
   brief["next_checks"] = []
   for item in next_checks:
     if not isinstance(item, Mapping):
@@ -195,17 +428,113 @@ def _parse_brief(content: str, trace: Optional[Mapping[str, Any]]) -> dict[str, 
   return brief
 
 
-def _model_case(brief: Mapping[str, Any], sheet: list[Mapping[str, Any]], graph: Mapping[str, Any]) -> dict[str, Any]:
+def public_citation_is_valid(
+  citation: Any,
+  entity_ids: Sequence[str],
+  graph_ids: Collection[str],
+) -> bool:
+  """Explanation spec v0.3 §2.3: the client rules for one public citation,
+  written once and shared (as `tests/fixtures/misp_citation_cases.json`) with
+  the playground validator, which rejects a whole response on one bad key."""
+  if not isinstance(citation, Mapping) or set(citation) != PUBLIC_CITATION_KEYS:
+    return False
+  entity, field, value = citation["entity"], citation["field"], citation["value"]
+  node_ref, entity_id = citation["node_ref"], citation["entity_id"]
+  if not (isinstance(entity, str) and 0 < len(entity) <= CITATION_ENTITY_MAX_CHARS):
+    return False
+  if not (isinstance(field, str) and len(field) <= CITATION_FIELD_MAX_CHARS and CITATION_FIELD_RE.fullmatch(field)):
+    return False
+  if isinstance(value, str):
+    if not 0 < len(value) <= CITATION_VALUE_MAX_CHARS:
+      return False
+  elif isinstance(value, int) and not isinstance(value, bool):
+    if abs(value) > MAX_CITATION_INTEGER:
+      return False
+  elif not (isinstance(value, float) and math.isfinite(value)):
+    return False
+  if any(CITATION_CONTROL_RE.search(text) for text in (entity, field, value) if isinstance(text, str)):
+    return False
+  if not (isinstance(node_ref, str) and CITATION_NODE_REF_RE.fullmatch(node_ref)):
+    return False
+  return isinstance(entity_id, str) and entity_id in graph_ids and entity_id in entity_ids
+
+
+def _public_citations(
+  item: Mapping[str, Any],
+  entity_ids: list[str],
+  view: Optional[Mapping[str, Any]],
+  node_ids: Optional[Mapping[str, str]],
+  graph_ids: set[str],
+) -> tuple[list[dict[str, Any]], int]:
+  """Explanation spec v0.3 §2: the observation's gate-passed citations as
+  public `{entity, field, value, node_ref, entity_id}` objects, plus the count
+  dropped for breaking a client rule (never the values). `node_ref` and
+  `entity_id` come from the model view the gate graded against."""
+  nodes = brief_gates.enrichment_nodes(view)
+  public: list[dict[str, Any]] = []
+  seen: set[tuple[Any, ...]] = set()
+  dropped = 0
+  for citation in item.get("misp_citations") or []:
+    value = citation["value"].strip() if isinstance(citation["value"], str) else citation["value"]
+    node = nodes.get(citation["entity"].strip().lower())
+    node_ref = node.get("node_ref") if node else None
+    candidate = {
+      "entity": citation["entity"], "field": citation["field"], "value": value,
+      "node_ref": node_ref, "entity_id": str((node_ids or {})[node_ref]) if node_ref in (node_ids or {}) else None,
+    }
+    if not public_citation_is_valid(candidate, entity_ids, graph_ids):
+      dropped += 1
+      continue
+    key = (candidate["entity"].lower(), candidate["field"], value.lower() if isinstance(value, str) else value)
+    if key in seen:
+      continue
+    seen.add(key)
+    if len(public) < MAX_PUBLIC_CITATIONS:
+      public.append(candidate)
+  return public, dropped
+
+
+def _model_case(
+  brief: Mapping[str, Any],
+  sheet: list[Mapping[str, Any]],
+  graph: Mapping[str, Any],
+  enrichment_view: Optional[Mapping[str, Any]] = None,
+  node_ids: Optional[Mapping[str, str]] = None,
+  references: Optional[list[dict[str, Any]]] = None,
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
+) -> tuple[dict[str, Any], int, Counter, int]:
+  """The public case, the count of citations dropped for breaking a client
+  rule (a value-free number), the `misp_refs` drop count per fixed code and
+  the number of observations whose refs were withheld for breaking a client rule.
+  With an enrichment view, gate-passed citations are shaped by
+  `_public_citations` and `misp_refs` by `_public_refs` against `references`."""
   id_map = _entity_id_map(graph)
+  graph_ids = {str(node.get("id")) for node in graph.get("nodes", []) or []}
   observations = []
+  dropped = 0
+  ref_drops: Counter = Counter()
+  withheld = 0
+  table = {ref["id"]: ref for ref in references or []}
   for item in brief["observations"]:
-    observations.append({
+    entity_ids = _entity_ids_for(item.get("exemplar_entities") or [], id_map)
+    observation = {
       "text": item["text"],
       "insight_ids": item["insight_ids"],
-      "entity_ids": _entity_ids_for(item.get("exemplar_entities") or [], id_map),
-    })
+      "entity_ids": entity_ids,
+    }
+    if enrichment_view is not None and item.get("misp_citations"):
+      public, count = _public_citations(item, entity_ids, enrichment_view, node_ids, graph_ids)
+      dropped += count
+      if public:
+        observation["misp_citations"] = public
+    if enrichment_view is not None and item.get("misp_refs"):
+      refs, counts = _public_refs(item, table)
+      ref_drops.update(counts)
+      if refs:
+        observation["misp_refs"] = refs
+    observations.append(observation)
   cited = [ids for item in brief["observations"] for ids in item["insight_ids"]]
-  return {
+  case = {
     "schema_version": CASE_EXPLANATION_VERSION,
     "assessment": {"text": brief["assessment"], "insight_ids": sorted(set(cited))[:4]},
     "observations": observations,
@@ -215,6 +544,21 @@ def _model_case(brief: Mapping[str, Any], sheet: list[Mapping[str, Any]], graph:
     "insight_index": _insight_index(sheet),
     "provenance": {"mode": "model", "profile_id": PROFILE_ID, "profile_sha256": PROFILE_SHA256},
   }
+  with_refs = [o["misp_refs"] for o in observations if "misp_refs" in o]
+  if with_refs:
+    # Spec v0.4 §5: the index lists every input reference; a client-rule break
+    # is a bug, so the whole feature is withheld rather than the response rejected.
+    index = _reference_index(references or [], node_ids or {})
+    # `event_url` is a pure function of the template and the id (§5.1).
+    if public_references_are_valid(with_refs, index, graph_ids) and all(
+      entry["event_url"] == misp._event_url(event_url_template, entry["event_id"]) for entry in index
+    ):
+      case["misp_reference_index"] = index
+    else:
+      for observation in observations:
+        if observation.pop("misp_refs", None):
+          withheld += 1
+  return case, dropped, ref_drops, withheld
 
 
 def _trace(calls: list[Mapping[str, Any]], status: str, safe_code: Optional[str]) -> dict[str, Any]:
@@ -255,6 +599,9 @@ def run_insight_brief(
   allow_model: bool = True,
   deterministic_reason: Optional[str] = None,
   mode: Optional[str] = None,
+  misp_enrichment: Optional[Mapping[str, Any]] = None,
+  misp_node_ids: Optional[Mapping[str, str]] = None,
+  event_url_template: str = misp.DEFAULT_EVENT_URL_TEMPLATE,
 ) -> dict[str, Any]:
   sheet = insights.build_insight_sheet(graph)
   substantive = [ins for ins in sheet if ins.get("kind") != "confidence"]
@@ -280,10 +627,14 @@ def run_insight_brief(
     return {"case_explanation": case, "explanation_trace": _trace([], "fallback", "model_not_admitted")}
 
   max_observations, max_next_checks = MODE_BRIEF_BUDGETS.get(mode or "", DEFAULT_BRIEF_BUDGET)
+  enrichment_view = _enrichment_view(misp_enrichment, graph, misp_node_ids, event_url_template)
+  references = _misp_references(enrichment_view, event_url_template)
   prompt = brief_profile.build_brief_prompt(
     sheet, question,
     max_observations=max_observations,
     max_next_checks=max_next_checks,
+    enrichment=_render_enrichment(enrichment_view),
+    misp_references=[ref["line"] for ref in references],
   )
   calls: list[dict[str, Any]] = []
   failure_code: Optional[str] = None
@@ -333,13 +684,15 @@ def run_insight_brief(
       if not isinstance(content, str) or not content:
         raise GraphFirstRuntimeError("missing_content", "completion", "brief content is missing")
       brief = _parse_brief(content, None)
-      results = brief_gates.grade(brief, sheet)
+      results = brief_gates.grade(brief, sheet, enrichment_view)
       hard_failures = {
         name: detail for name, (passed, detail, tier) in results.items()
         if tier == "hard" and not passed
       }
       call["gates"] = {name: passed for name, (passed, _detail, _tier) in results.items()}
       if hard_failures:
+        # Spec v0.3 §5: value-free reason codes beside the gate map.
+        call["gate_failures"] = brief_gates.failure_codes(brief, sheet, enrichment_view)
         failure_code = "deterministic_validation_failed"
         call["status"] = "failed"
         calls.append(call)
@@ -349,10 +702,17 @@ def run_insight_brief(
         continue
       call["status"] = "supported"
       calls.append(call)
-      return {
-        "case_explanation": _model_case(brief, sheet, graph),
-        "explanation_trace": _trace(calls, "supported", None),
-      }
+      case, drops, ref_drops, withheld = _model_case(
+        brief, sheet, graph, enrichment_view, misp_node_ids, references, event_url_template,
+      )
+      result = {"case_explanation": case, "explanation_trace": _trace(calls, "supported", None)}
+      if drops:
+        result["citation_drops"] = drops
+      if ref_drops:
+        result["misp_ref_drops"] = dict(ref_drops)
+      if withheld:
+        result["misp_ref_withheld"] = withheld
+      return result
     except GraphFirstRuntimeError as exc:
       failure_code = exc.code
       if call.get("status") == "started":
@@ -360,7 +720,15 @@ def run_insight_brief(
       calls.append(call)
       if exc.code in {"model_not_configured", "model_not_ready"}:
         break
-      retry_note = RETRY_NOTE_TEMPLATE.format(failures=exc.code)
+      if exc.code == "output_truncated":
+        retry_note = (
+          RETRY_NOTE_TRUNCATED.format(max_observations=max_observations)
+          + (RETRY_NOTE_TRUNCATED_CITATIONS if enrichment_view is not None else "")
+          + (RETRY_NOTE_TRUNCATED_REFS if references else "")
+          + "."
+        )
+      else:
+        retry_note = RETRY_NOTE_TEMPLATE.format(failures=exc.code)
       continue
 
   case = _deterministic_case(

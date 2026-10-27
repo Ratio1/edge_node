@@ -24,7 +24,7 @@ from extensions.business.cybersec.edgeguard.graph_first_explanation import (
   validate_boundary,
   validate_dispatch_budget,
 )
-from extensions.business.cybersec.edgeguard.result_digest import build_result_digest
+from extensions.business.cybersec.edgeguard.result_digest import build_projection_digest, build_result_digest
 
 
 def tagged_map(**values):
@@ -150,6 +150,58 @@ class IrAndBatchTests(unittest.TestCase):
       self.assertEqual(group["relationship_refs"], [])
     values = [group["values"] for group in digest["groups"]]
     self.assertTrue(any("quietsieve" in json.dumps(value) for value in values))
+
+  def test_projection_digest_keeps_exact_row_order_and_is_stable(self):
+    evidence = {
+      "schema_version": "edgeguard.query_result_evidence.v1",
+      "columns": ["cve_id", "cvss_v31", "exploiting_indicators"],
+      "rows": [
+        {"ordinal": 0, "values": [
+          {"type": "string", "value": "CVE-2024-0001"},
+          {"type": "float", "value": 9.8},
+          {"type": "integer", "value": "3"},
+        ]},
+        {"ordinal": 1, "values": [
+          {"type": "string", "value": "CVE-2024-0002"},
+          {"type": "float", "value": 7.5},
+          {"type": "integer", "value": "1"},
+        ]},
+      ],
+    }
+    digest = build_projection_digest(
+      evidence, ranking_rule="exploiting_indicators_desc, cvss_v31_desc", truncated=False,
+    )
+    self.assertEqual(digest["schema_version"], "edgeguard.projection_digest.v1")
+    self.assertEqual(digest["columns"], ["cve_id", "cvss_v31", "exploiting_indicators"])
+    self.assertEqual([row["ordinal"] for row in digest["rows"]], [0, 1])
+    self.assertEqual(digest["rows"][0]["values"][0], {"type": "string", "value": "CVE-2024-0001"})
+    self.assertEqual(digest["row_count"], 2)
+    self.assertFalse(digest["truncated"])
+    self.assertEqual(digest["ranking_rule"], "exploiting_indicators_desc, cvss_v31_desc")
+    self.assertEqual(len(digest["sha256"]), 64)
+    self.assertEqual(
+      digest, build_projection_digest(
+        json.loads(json.dumps(evidence)), ranking_rule="exploiting_indicators_desc, cvss_v31_desc", truncated=False,
+      ),
+    )
+
+  def test_projection_digest_truncates_and_renumbers_ordinals_past_the_row_cap(self):
+    evidence = {
+      "schema_version": "edgeguard.query_result_evidence.v1",
+      "columns": ["name"],
+      "rows": [{"ordinal": i, "values": [{"type": "string", "value": f"n{i}"}]} for i in range(55)],
+    }
+    digest = build_projection_digest(evidence, ranking_rule="name_desc", truncated=False)
+    self.assertEqual(digest["row_count"], 50)
+    self.assertTrue(digest["truncated"])
+    self.assertEqual([row["ordinal"] for row in digest["rows"]], list(range(50)))
+    self.assertEqual(digest["rows"][-1]["values"][0], {"type": "string", "value": "n49"})
+
+  def test_projection_digest_defaults_a_blank_ranking_rule_to_unranked(self):
+    evidence = {"schema_version": "edgeguard.query_result_evidence.v1", "columns": ["name"], "rows": []}
+    digest = build_projection_digest(evidence, ranking_rule="  ", truncated=False)
+    self.assertEqual(digest["ranking_rule"], "unranked")
+    self.assertEqual(digest["row_count"], 0)
 
   def test_result_digest_is_stable_and_accounts_for_every_row(self):
     result, catalog = fixtures(duplicates=True, disconnected=True)
