@@ -6212,3 +6212,335 @@ class GenerationMaxTokensPinTests(unittest.TestCase):
 
   def test_generation_max_tokens_is_384(self):
     self.assertEqual(GENERATION_MAX_TOKENS, 384)
+
+
+class EdgeGuardExplainJobTests(unittest.TestCase):
+  """EG-028: `/explain_graph_start` + `/explain_graph_status`."""
+
+  PATH_CYPHER = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10"
+
+  def _body(self, **overrides):
+    body = {
+      "uri": "example.com:7687",
+      "scheme": "bolt+s",
+      "username": "neo4j",
+      "password": "secret",
+      "request": "Explain the returned graph.",
+      "cypher": self.PATH_CYPHER,
+    }
+    body.update(overrides)
+    return body
+
+  @staticmethod
+  def _without_timings(value):
+    return {key: item for key, item in value.items() if key != "metrics"}
+
+  @staticmethod
+  def _wait_done(plugin, job_id, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+      status = plugin.explain_graph_status(job_id=job_id)
+      if status.get("done"):
+        return status
+      time.sleep(0.01)
+    raise AssertionError("explain job did not finish")
+
+  @staticmethod
+  def _gated_impl(gate, phases=()):
+    """A stand-in for `_explain_graph_impl` that reports `phases`, then waits."""
+    def impl(progress=None, **_body):
+      for phase, detail in phases:
+        progress(phase, detail)
+      assert gate.wait(10)
+      return {"status": "ok", "ok": True, "executed": True, "explained": True}
+    return impl
+
+  def test_start_returns_a_url_safe_job_id_at_once(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    impl = self._gated_impl(gate, [("neo4j", None)])
+    with patch.object(plugin, "_explain_graph_impl", side_effect=impl):
+      started = plugin.explain_graph_start(**self._body())
+      self.assertEqual(set(started), {"job_id"})
+      self.assertRegex(started["job_id"], r"^[A-Za-z0-9_-]{32}$")
+      status = plugin.explain_graph_status(job_id=started["job_id"])
+      self.assertEqual(status, {"phase": "neo4j", "detail": None, "done": False})
+      gate.set()
+      self._wait_done(plugin, started["job_id"])
+
+  def test_status_walks_the_phases_and_ends_with_the_result(self):
+    plugin = _make_api()
+    advance = threading.Event()
+    steps = []
+
+    def impl(progress=None, **_body):
+      progress("neo4j", None)
+      progress("neo4j", {"row_count": 7})
+      assert advance.wait(10)
+      progress("brief", {"attempt": 2})
+      return {"status": "ok", "ok": True, "executed": True, "explained": True}
+
+    with patch.object(plugin, "_explain_graph_impl", side_effect=impl):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      deadline = time.monotonic() + 5
+      while plugin.explain_graph_status(job_id=job_id)["detail"] != {"row_count": 7}:
+        self.assertLess(time.monotonic(), deadline)
+        time.sleep(0.01)
+      steps.append(plugin.explain_graph_status(job_id=job_id))
+      advance.set()
+      final = self._wait_done(plugin, job_id)
+    self.assertEqual(steps[0], {"phase": "neo4j", "detail": {"row_count": 7}, "done": False})
+    self.assertNotIn("result", steps[0])
+    self.assertEqual(final["phase"], "done")
+    self.assertTrue(final["done"])
+    self.assertEqual(final["result_status_code"], 200)
+    self.assertEqual(final["result"]["status"], "ok")
+
+  def test_real_explain_phases_and_result_match_explain_graph(self):
+    calls = []
+
+    def provider(payload):
+      calls.append(payload)
+      return {"content": "not json", "finish_reason": "stop", "completion_tokens": 3}
+
+    def two_failed_attempts(*, provider_call, **_kwargs):
+      # Stands in for `egx2.run_insight_brief`: two model calls whose output
+      # fails the gates, then the deterministic fallback.
+      provider_call({"messages": []})
+      provider_call({"messages": []})
+      return {
+        "case_explanation": {"provenance": {"mode": "deterministic_fallback"}},
+        "explanation_trace": {"outcome": {"status": "fallback", "safe_code": "deterministic_validation_failed"}},
+      }
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    plugin._explanation_url = lambda path=None: ("http://127.0.0.1:1/chat", None)
+    plugin._explanation_worker_ready = lambda: True
+    seen = []
+    original = plugin._set_explain_job_phase
+
+    def record(job_id, phase, detail):
+      seen.append((phase, detail))
+      return original(job_id, phase, detail)
+
+    plugin._set_explain_job_phase = record
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
+        side_effect=two_failed_attempts,
+      ):
+        fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+        with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+          direct = plugin.explain_graph(**self._body())
+        fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+        with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+          job_id = plugin.explain_graph_start(**self._body())["job_id"]
+          final = self._wait_done(plugin, job_id)
+
+    self.assertEqual(seen, [
+      ("guard", None),
+      ("neo4j", None),
+      ("neo4j", {"row_count": 1}),
+      ("evidence", None),
+      ("misp", None),
+      ("brief", {"attempt": 1}), ("checks", {"attempt": 1}),
+      ("brief", {"attempt": 2}), ("checks", {"attempt": 2}),
+      ("fallback", {"reason": "deterministic_validation_failed"}),
+    ])
+    self.assertEqual(len(calls), 4)  # two per run, the direct call included
+    self.assertEqual(final["result_status_code"], 200)
+    self.assertEqual(self._without_timings(final["result"]), self._without_timings(direct))
+    self.assertEqual(final["result"]["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
+
+  def test_error_envelope_status_code_is_split_from_the_result(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _ = _driver_with_results(Neo4jAuthError("unauthorized"))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        direct = plugin.explain_graph(**self._body())
+        fake_driver, _ = _driver_with_results(Neo4jAuthError("unauthorized"))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        errors_before = plugin._error_count
+        job_id = plugin.explain_graph_start(**self._body())["job_id"]
+        final = self._wait_done(plugin, job_id)
+    self.assertEqual(direct["status_code"], 503)
+    self.assertEqual(final["result_status_code"], 503)
+    self.assertEqual(self._without_timings(final["result"]), self._without_timings(direct["result"]))
+    self.assertEqual(plugin._error_count, errors_before + 1)  # the failed job is counted once
+
+  def test_synchronous_rejection_is_returned_by_start_without_a_job(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    direct = plugin.explain_graph(**self._body(cypher="  "))
+    started = plugin.explain_graph_start(**self._body(cypher="  "))
+    self.assertEqual(direct["status_code"], 400)
+    self.assertEqual(started, direct)
+    too_long = "MATCH (n) RETURN n " + "x" * (CYPHER_MAX_CHARS + 1)
+    self.assertEqual(plugin.explain_graph_start(**self._body(cypher=too_long))["status_code"], 413)
+    self.assertEqual(plugin._explain_job_state()["jobs"], {})
+
+  def test_second_start_while_one_runs_gets_429_with_a_retry_hint(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    impl = self._gated_impl(gate, [("neo4j", None)])
+    with patch.object(plugin, "_explain_graph_impl", side_effect=impl):
+      first = plugin.explain_graph_start(**self._body())
+      second = plugin.explain_graph_start(**self._body())
+      self.assertEqual(second["status_code"], 429)
+      self.assertEqual(second["result"]["retry_after_seconds"], 30)
+      self.assertFalse(second["result"]["ok"])
+      gate.set()
+      self._wait_done(plugin, first["job_id"])
+      third = plugin.explain_graph_start(**self._body())
+      self.assertIn("job_id", third)
+      self._wait_done(plugin, third["job_id"])
+
+  def test_unknown_expired_and_malformed_ids_get_404(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    gate.set()
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      self._wait_done(plugin, job_id)
+    for missing in ("A" * 32, "", None):
+      self.assertEqual(plugin.explain_graph_status(job_id=missing)["status_code"], 404)
+    state = plugin._explain_job_state()
+    state["jobs"][job_id]["finished_at"] -= 16 * 60
+    expired = plugin.explain_graph_status(job_id=job_id)
+    self.assertEqual(expired["status_code"], 404)
+    self.assertEqual(expired["result"]["status"], "not_found")
+    self.assertNotIn(job_id, state["jobs"])
+
+  def test_finished_jobs_are_capped_at_twenty_oldest_dropped_first(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    gate.set()
+    ids = []
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      for _ in range(23):
+        job_id = plugin.explain_graph_start(**self._body())["job_id"]
+        self._wait_done(plugin, job_id)
+        ids.append(job_id)
+        time.sleep(0.002)
+    self.assertEqual(len(plugin._explain_job_state()["jobs"]), 20)
+    for dropped in ids[:3]:
+      self.assertEqual(plugin.explain_graph_status(job_id=dropped)["status_code"], 404)
+    self.assertTrue(plugin.explain_graph_status(job_id=ids[-1])["done"])
+
+  def test_a_stuck_job_is_closed_so_it_cannot_hold_the_slot_forever(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      plugin._explain_job_state()["jobs"][job_id]["created"] -= 2 * EDGEGUARD_REQUEST_TIMEOUT_SECONDS + 1
+      status = plugin.explain_graph_status(job_id=job_id)
+      self.assertTrue(status["done"])
+      self.assertEqual(status["result_status_code"], 504)
+      gate.set()
+
+  def test_a_stuck_closed_job_still_holds_the_slot_while_its_thread_lives(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      plugin._explain_job_state()["jobs"][job_id]["created"] -= 2 * EDGEGUARD_REQUEST_TIMEOUT_SECONDS + 1
+      self.assertEqual(plugin.explain_graph_status(job_id=job_id)["result_status_code"], 504)
+      busy = plugin.explain_graph_start(**self._body())
+      self.assertEqual(busy["status_code"], 429)
+      gate.set()
+      deadline = time.monotonic() + 10
+      while plugin._explain_job_state()["jobs"][job_id]["worker_active"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+      # The late finish did not overwrite the 504, and the slot is free again.
+      self.assertEqual(plugin.explain_graph_status(job_id=job_id)["result_status_code"], 504)
+      again = plugin.explain_graph_start(**self._body())
+      self.assertIn("job_id", again)
+      self._wait_done(plugin, again["job_id"])
+
+  def test_thread_start_failure_pops_the_job_and_returns_503(self):
+    plugin = _make_api()
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.threading.Thread") as thread:
+      thread.return_value.start.side_effect = RuntimeError("can't start new thread")
+      response = plugin.explain_graph_start(**self._body())
+    self.assertEqual(response["status_code"], 503)
+    self.assertEqual(plugin._explain_job_state()["jobs"], {})
+
+  def test_unexpected_worker_exception_is_logged_server_side_without_the_password(self):
+    plugin = _make_api()
+    logged = []
+    plugin.P = lambda message, *args, **kwargs: logged.append(str(message))
+
+    def boom(progress=None, **_body):
+      progress("neo4j", None)
+      raise RuntimeError("failed with secret-pw in text")
+
+    with patch.object(plugin, "_explain_graph_impl", side_effect=boom):
+      job_id = plugin.explain_graph_start(**self._body(password="secret-pw"))["job_id"]
+      self._wait_done(plugin, job_id)
+    text = "\n".join(logged)
+    self.assertIn("RuntimeError", text)
+    self.assertIn("Traceback", text)
+    self.assertNotIn("secret-pw", text)
+
+  def test_unexpected_worker_exception_log_redacts_the_configured_password(self):
+    plugin = _make_api(neo4j_default_connection={
+      "uri": "example.com:7687", "username": "neo4j", "password": "cfg-secret-pw", "scheme": "bolt+s",
+    })
+    logged = []
+    plugin.P = lambda message, *args, **kwargs: logged.append(str(message))
+
+    def boom(progress=None, **_body):
+      progress("neo4j", None)
+      raise RuntimeError("failed with cfg-secret-pw in text")
+
+    body = {key: value for key, value in self._body().items() if key not in ("uri", "username", "password", "scheme")}
+    with patch.object(plugin, "_explain_graph_impl", side_effect=boom):
+      job_id = plugin.explain_graph_start(**body)["job_id"]
+      self._wait_done(plugin, job_id)
+    text = "\n".join(logged)
+    self.assertIn("Traceback", text)
+    self.assertNotIn("cfg-secret-pw", text)
+
+  def test_one_call_path_reports_brief_attempt_one_then_done(self):
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    phases = []
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver), \
+          patch.object(plugin, "_explanation_dispatch_strategy", return_value="one_call"), \
+          patch.object(plugin, "_run_digest_analyst_brief", return_value={"status": "ok", "ok": True}):
+        plugin._explain_graph_impl(
+          progress=lambda phase, detail=None: phases.append((phase, detail)), **self._body(),
+        )
+    names = [phase for phase, _ in phases]
+    self.assertEqual(names, ["guard", "neo4j", "neo4j", "evidence", "misp", "brief"])
+    self.assertEqual(phases[-1], ("brief", {"attempt": 1}))
+
+  def test_unexpected_worker_exception_becomes_a_500_result_without_details(self):
+    plugin = _make_api()
+
+    def boom(progress=None, **_body):
+      progress("neo4j", None)
+      raise RuntimeError("secret-host.internal exploded")
+
+    with patch.object(plugin, "_explain_graph_impl", side_effect=boom):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      final = self._wait_done(plugin, job_id)
+    self.assertEqual(final["result_status_code"], 500)
+    self.assertNotIn("secret-host", json.dumps(final))
+
+  def test_explain_graph_passes_no_progress_callback(self):
+    plugin = _make_api()
+    with patch.object(plugin, "_explain_graph_impl", return_value={"ok": True}) as impl:
+      plugin.explain_graph(**self._body())
+    self.assertIsNone(impl.call_args.kwargs["progress"])
+
+  def test_a_failing_progress_callback_cannot_break_the_explain(self):
+    def bad(_phase, _detail=None):
+      raise RuntimeError("boom")
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin._explain_graph_impl(progress=bad, **self._body())
+    self.assertEqual(result["status"], "ok")

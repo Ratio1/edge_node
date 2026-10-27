@@ -17,6 +17,7 @@ import secrets
 import socket
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -995,6 +996,42 @@ def _wrapper_safe_error(result: Dict[str, Any], status_code: int) -> Dict[str, A
 # guard/content/config rejection it can return still resolves to a
 # deliberate status code instead of the wrapper's bare 500.
 _WRAPPER_STATUS_CODE_KEY = "_wrapper_status_code"
+_EXPLAIN_JOBS_INIT_LOCK = threading.Lock()
+
+
+# EG-028: explain job. `/explain_graph_start` runs the `/explain_graph` body on
+# one daemon worker thread; `/explain_graph_status` reports phases and, when
+# done, the exact `/explain_graph` result.
+EXPLAIN_JOB_PHASES = ("guard", "neo4j", "evidence", "misp", "brief", "checks", "fallback", "done")
+EXPLAIN_JOB_MAX_RUNNING = 1
+EXPLAIN_JOB_MAX_FINISHED = 20
+EXPLAIN_JOB_FINISHED_TTL_SECONDS = 15 * 60
+EXPLAIN_JOB_RETRY_AFTER_SECONDS = 30
+# How long `/explain_graph_start` waits for the cheap synchronous validation
+# (400/413/422 branches) before it hands back a job id.
+EXPLAIN_JOB_VALIDATION_WAIT_SECONDS = 5.0
+
+
+def _emit_progress(progress, phase: str, detail: Optional[Dict[str, Any]] = None) -> None:
+  """Report an explain phase; a missing or failing callback never affects the
+  explanation itself."""
+  if progress is None:
+    return
+  try:
+    progress(phase, detail)
+  except Exception:  # noqa: BLE001 - progress is observability only.
+    pass
+
+
+def _unwrap_endpoint_result(response: Any) -> tuple[Any, int]:
+  """Split a `_wrapper_safe_error` envelope into (result, HTTP status); a bare
+  dict is a 200."""
+  if isinstance(response, dict) and "status_code" in response and "result" in response:
+    try:
+      return response["result"], int(response["status_code"])
+    except (TypeError, ValueError):
+      return response["result"], 500
+  return response, 200
 
 
 def _graph_first_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, Any]:
@@ -5007,6 +5044,7 @@ class EdgeguardApiPlugin(BasePlugin):
     misp_enrichment_block: Optional[Mapping[str, Any]] = None,
     misp_node_aliases: Optional[Mapping[str, str]] = None,
     misp_event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
+    progress=None,
   ) -> Dict[str, Any]:
     # Contract §7.3: `misp_enrichment` is a sibling of `result_digest`.
     # Explanation spec v0.2: it reaches `egx2.run_insight_brief` only after
@@ -5032,11 +5070,25 @@ class EdgeguardApiPlugin(BasePlugin):
         admission = getattr(self, "cfg_edgeguard_insight_brief_admission_seconds", 240)
         if deadline - time.monotonic() < admission:
           allow_model = False
+    provider_call = self._call_graph_first_provider
+    if progress is not None:
+      # EG-028: the attempt number comes from counting provider calls, so
+      # `egx2/insight_brief.py` stays untouched. `brief` = model call running,
+      # `checks` = the deterministic gates that follow that call.
+      attempts = [0]
+
+      def provider_call(payload, _call=self._call_graph_first_provider):
+        attempts[0] += 1
+        _emit_progress(progress, "brief", {"attempt": attempts[0]})
+        completion = _call(payload)
+        _emit_progress(progress, "checks", {"attempt": attempts[0]})
+        return completion
+
     result = egx2.run_insight_brief(
       question=request,
       graph=graph,
       model=getattr(self, "cfg_edgeguard_explanation_model", None),
-      provider_call=self._call_graph_first_provider,
+      provider_call=provider_call,
       allow_model=allow_model,
       deterministic_reason=deterministic_reason,
       mode=mode,
@@ -5046,6 +5098,13 @@ class EdgeguardApiPlugin(BasePlugin):
         node_ref: packet_id for packet_id, node_ref in (misp_node_aliases or {}).items()
       },
     )
+    if progress is not None and (
+      (result["case_explanation"].get("provenance") or {}).get("mode") == "deterministic_fallback"
+    ):
+      _emit_progress(
+        progress, "fallback",
+        {"reason": result["explanation_trace"].get("outcome", {}).get("safe_code")},
+      )
     if result.get("citation_drops"):
       with self._metrics_lock:
         self._misp_citation_drop_count += int(result["citation_drops"])
@@ -6453,6 +6512,7 @@ class EdgeguardApiPlugin(BasePlugin):
     request: str,
     mode_plan: ModePlan,
     deadline: float,
+    progress=None,
   ) -> Dict[str, Any]:
     packet, packet_meta, ingestion_errors = _build_graph_evidence_packet_from_execution(
       request=request,
@@ -6525,8 +6585,10 @@ class EdgeguardApiPlugin(BasePlugin):
         request=request,
         deadline=deadline,
         mode=mode_plan.mode if mode_plan is not None else None,
+        progress=progress,
       )
     if effective_strategy == "one_call":
+      _emit_progress(progress, "brief", {"attempt": 1})
       projection_digest = self._projection_digest_for_ranked_result(
         result_shape, query_result_evidence, plan["accepted_cypher"],
         execution_result.get("truncated"),
@@ -6555,6 +6617,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation": plan.get("validation"),
         "live_retry": live_retry,
       }, 422)
+    _emit_progress(progress, "brief", {"attempt": 1})
     try:
       graph_first = self._run_graph_first(
         plan=plan,
@@ -6627,8 +6690,41 @@ class EdgeguardApiPlugin(BasePlugin):
     model_key: Optional[str] = None,
     **kwargs,
   ) -> Dict[str, Any]:
+    return self._explain_graph_impl(
+      cypher=cypher, uri=uri, username=username, password=password, request=request,
+      scheme=scheme, method=method, explanation_mode=explanation_mode,
+      explanation_rows=explanation_rows, max_rows=max_rows,
+      enable_empty_result_broadening=enable_empty_result_broadening,
+      execution_result=execution_result, temperature=temperature, max_tokens=max_tokens,
+      top_p=top_p, model_key=model_key, progress=None, **kwargs,
+    )
+
+  def _explain_graph_impl(
+    self,
+    cypher: str,
+    uri: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    request: str = "Explain the returned investigation graph.",
+    scheme: Optional[str] = None,
+    method: Optional[str] = None,
+    explanation_mode: Optional[str] = None,
+    explanation_rows: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    enable_empty_result_broadening: Optional[bool] = None,
+    execution_result: Optional[Dict[str, Any]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    model_key: Optional[str] = None,
+    progress=None,
+    **kwargs,
+  ) -> Dict[str, Any]:
+    # EG-028: `progress(phase, detail)` is None for `/explain_graph` and set
+    # by the explain job; the deadline starts here, i.e. when the job starts.
     started = time.monotonic()
     deadline = started + EDGEGUARD_REQUEST_TIMEOUT_SECONDS
+    _emit_progress(progress, "guard")
     if not isinstance(cypher, str) or not cypher.strip():
       # Fix round 5: malformed request body (missing/blank `cypher`), 400.
       return _wrapper_safe_error({
@@ -6798,12 +6894,14 @@ class EdgeguardApiPlugin(BasePlugin):
         # `prepare_graph_explanation` for the status-code source.
         status_code = plan.pop(_WRAPPER_STATUS_CODE_KEY, 422)
         return _wrapper_safe_error({**plan, "executed": False, "explained": False}, status_code)
+      _emit_progress(progress, "evidence")
       return self._explain_prepared_execution(
         plan=plan,
         execution_result=execution_result,
         request=request,
         mode_plan=mode_plan,
         deadline=deadline,
+        progress=progress,
       )
 
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
@@ -6841,6 +6939,7 @@ class EdgeguardApiPlugin(BasePlugin):
 
     driver = None
     try:
+      _emit_progress(progress, "neo4j")
       effective_method = self._effective_neo4j_method(method, connection)
       driver = self._neo4j_driver(
         normalized_uri, connection["username"], connection["password"], effective_method,
@@ -6849,6 +6948,7 @@ class EdgeguardApiPlugin(BasePlugin):
       query_result = self._run_neo4j_query(driver, executed_cypher, transport_row_cap)
       primary_duration_ms = round((time.monotonic() - primary_started) * 1000, 1)
       primary_row_count = len(query_result["rows"])
+      _emit_progress(progress, "neo4j", {"row_count": primary_row_count})
       execution_trace_items = [{
         "id": "primary",
         "executed_cypher": executed_cypher,
@@ -6934,6 +7034,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "live_retry": live_retry,
         }, 422)
 
+      _emit_progress(progress, "evidence")
       packet, packet_meta = _build_graph_evidence_packet(
         request=request,
         accepted_cypher=plan["accepted_cypher"],
@@ -7046,6 +7147,8 @@ class EdgeguardApiPlugin(BasePlugin):
       except Exception:  # noqa: BLE001 - fail-open by contract §7.3.
         misp_node_aliases = {}
       misp_event_url_template = self._misp_event_url_template()
+      if getattr(self, "cfg_misp_enrichment_enabled", False):
+        _emit_progress(progress, "misp")
       misp_block = None if misp_event_url_template is None else self._misp_enrichment_for_response(
         driver=driver, records=query_result["rows"], node_source_aliases=misp_node_aliases,
         event_url_template=misp_event_url_template,
@@ -7053,6 +7156,7 @@ class EdgeguardApiPlugin(BasePlugin):
       if misp_event_url_template is None:
         misp_event_url_template = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
       if packet["execution"]["truncated"]:
+        _emit_progress(progress, "fallback", {"reason": "transport_truncated"})
         if self._active_explanation_strategy() == "insight_brief":
           result = egx2.run_insight_brief(
             question=request,
@@ -7115,8 +7219,10 @@ class EdgeguardApiPlugin(BasePlugin):
           misp_enrichment_block=misp_block,
           misp_node_aliases=misp_node_aliases,
           misp_event_url_template=misp_event_url_template,
+          progress=progress,
         )
       if effective_strategy == "one_call":
+        _emit_progress(progress, "brief", {"attempt": 1})
         projection_digest = self._projection_digest_for_ranked_result(
           result_shape, query_result_evidence, plan["accepted_cypher"],
           execution_envelope.get("truncated"),
@@ -7133,6 +7239,7 @@ class EdgeguardApiPlugin(BasePlugin):
           misp_enrichment_block=misp_block,
           misp_event_url_template=misp_event_url_template,
         )
+      _emit_progress(progress, "brief", {"attempt": 1})
       try:
         graph_first = self._run_graph_first(
           plan=plan,
@@ -7211,3 +7318,221 @@ class EdgeguardApiPlugin(BasePlugin):
       return self._explain_graph_error(exc, "explain_internal_error", 500, connection, analysis, started)
     finally:
       self._close_neo4j_driver(driver)
+
+  # ---- EG-028: explain job (start + status) --------------------------------
+  # The plugin loop serves one request at a time, so a running `/explain_graph`
+  # blocks every other call. The job runs the same body on a daemon worker
+  # thread (the `predict_async` / `request_status` pattern of the inference
+  # API) and the loop only answers short start/status calls. One running job
+  # (the LLM worker has capacity 1); finished jobs are capped and expire.
+
+  def _explain_job_state(self) -> Dict[str, Any]:
+    with _EXPLAIN_JOBS_INIT_LOCK:
+      state = self.__dict__.get("_explain_jobs")
+      if state is None:
+        state = {"lock": threading.Lock(), "jobs": {}}
+        self._explain_jobs = state
+    return state
+
+  def _prune_explain_jobs_locked(self, jobs: Dict[str, Dict[str, Any]], now: float) -> None:
+    # A worker stuck past twice the explain deadline would hold the single
+    # running slot forever: close it as a timeout.
+    stuck_after = 2 * EDGEGUARD_REQUEST_TIMEOUT_SECONDS
+    for job in jobs.values():
+      if not job["done"] and now - job["created"] > stuck_after:
+        job.update(
+          phase="done", detail=None, done=True, finished_at=now, status_code=504,
+          result={
+            "status": STATUS_TIMEOUT, "ok": False, "executed": False, "explained": False,
+            "error": "Explain job did not finish in time.",
+          },
+        )
+        job["settled"].set()  # worker_active stays set: the thread still lives.
+    for job_id in [
+      key for key, job in jobs.items()
+      if job["done"] and not job["worker_active"]
+      and now - job["finished_at"] > EXPLAIN_JOB_FINISHED_TTL_SECONDS
+    ]:
+      del jobs[job_id]
+    finished = sorted(
+      (job["finished_at"], key) for key, job in jobs.items() if job["done"] and not job["worker_active"]
+    )
+    for _finished_at, job_id in finished[: max(len(finished) - EXPLAIN_JOB_MAX_FINISHED, 0)]:
+      del jobs[job_id]
+
+  def _set_explain_job_phase(self, job_id: str, phase: str, detail: Optional[Dict[str, Any]]) -> None:
+    state = self._explain_job_state()
+    with state["lock"]:
+      job = state["jobs"].get(job_id)
+      if job is None or job["done"]:
+        return
+      job["phase"] = phase
+      job["detail"] = dict(detail) if detail else None
+      if phase != "guard":
+        job["advanced"] = True
+        job["settled"].set()
+
+  def _run_explain_job(self, job_id: str, params: Dict[str, Any]) -> None:
+    def progress(phase: str, detail: Optional[Dict[str, Any]] = None) -> None:
+      self._set_explain_job_phase(job_id, phase, detail)
+
+    try:
+      response = self._explain_graph_impl(progress=progress, **params)
+    except Exception as exc:  # noqa: BLE001 - /explain_graph would answer 500.
+      # Server-side only: the traceback goes through the sanitiser (the
+      # resolved Neo4j password, supplied or configured, is redacted); the
+      # client sees the generic message.
+      connection, _ = self._resolve_neo4j_connection(
+        params.get("uri"), params.get("username"), params.get("password"), params.get("scheme"),
+      )
+      secret = str((connection or {}).get("password") or params.get("password") or "")
+      self.P(
+        "EdgeGuard explain job failed unexpectedly: "
+        + self._sanitize_error(traceback.format_exc(), secret),
+        color="r",
+      )
+      response = _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": f"Graph explanation failed unexpectedly ({type(exc).__name__}).",
+      }, 500)
+    result, status_code = _unwrap_endpoint_result(response)
+    state = self._explain_job_state()
+    with state["lock"]:
+      job = state["jobs"].get(job_id)
+      if job is None:
+        return
+      job["worker_active"] = False
+      if job["done"]:
+        # Closed as stuck earlier: the late result must not overwrite it.
+        return
+      if status_code >= 400 or _is_failed_endpoint_response(result):
+        with self._metrics_lock:
+          self._error_count += 1
+      job.update(
+        phase="done", detail=None, done=True, result=result, status_code=status_code,
+        finished_at=time.monotonic(),
+      )
+      job["settled"].set()
+      self._prune_explain_jobs_locked(state["jobs"], time.monotonic())
+
+  @BasePlugin.endpoint(method="POST")
+  def explain_graph_start(
+    self,
+    cypher: str,
+    uri: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    request: str = "Explain the returned investigation graph.",
+    scheme: Optional[str] = None,
+    method: Optional[str] = None,
+    explanation_mode: Optional[str] = None,
+    explanation_rows: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    enable_empty_result_broadening: Optional[bool] = None,
+    execution_result: Optional[Dict[str, Any]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    model_key: Optional[str] = None,
+    **kwargs,
+  ) -> Dict[str, Any]:
+    """Start an `/explain_graph` run in the background; returns `{job_id}`.
+
+    Takes the `/explain_graph` body. A request that `/explain_graph` rejects
+    before any Neo4j or model work (400/413/422) is answered here with that
+    same rejection and no job. A second start while one job runs gets 429."""
+    params = dict(
+      cypher=cypher, uri=uri, username=username, password=password, request=request,
+      scheme=scheme, method=method, explanation_mode=explanation_mode,
+      explanation_rows=explanation_rows, max_rows=max_rows,
+      enable_empty_result_broadening=enable_empty_result_broadening,
+      execution_result=execution_result, temperature=temperature, max_tokens=max_tokens,
+      top_p=top_p, model_key=model_key, **kwargs,
+    )
+    with self._metrics_lock:
+      self._request_count += 1
+      self._last_request_time = self.time()
+    state = self._explain_job_state()
+    with state["lock"]:
+      now = time.monotonic()
+      self._prune_explain_jobs_locked(state["jobs"], now)
+      # A job closed as stuck still counts while its worker thread lives.
+      if sum(
+        1 for job in state["jobs"].values() if not job["done"] or job["worker_active"]
+      ) >= EXPLAIN_JOB_MAX_RUNNING:
+        busy = True
+      else:
+        busy = False
+        job_id = secrets.token_urlsafe(24)
+        job = {
+          "phase": "guard", "detail": None, "done": False, "result": None, "status_code": None,
+          "created": now, "finished_at": None, "advanced": False, "settled": threading.Event(),
+          "worker_active": True,
+        }
+        state["jobs"][job_id] = job
+    if busy:
+      with self._metrics_lock:
+        self._error_count += 1
+      return _wrapper_safe_error({
+        "status": "busy",
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Another answer is being written; try again shortly.",
+        "validation_errors": [_contract_error("explain_job_busy", "an explain job is already running")],
+        "retry_after_seconds": EXPLAIN_JOB_RETRY_AFTER_SECONDS,
+      }, 429)
+    try:
+      threading.Thread(
+        target=self._run_explain_job, args=(job_id, params), daemon=True, name=f"edgeguard-explain-{job_id[:6]}",
+      ).start()
+    except Exception as exc:  # noqa: BLE001 - e.g. "can't start new thread".
+      with state["lock"]:
+        state["jobs"].pop(job_id, None)
+      with self._metrics_lock:
+        self._error_count += 1
+      self.P(f"EdgeGuard explain job thread failed to start: {type(exc).__name__}", color="r")
+      return _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Could not start the explanation job; try again shortly.",
+      }, 503)
+    # The synchronous rejections finish before the job leaves `guard`.
+    job["settled"].wait(EXPLAIN_JOB_VALIDATION_WAIT_SECONDS)
+    with state["lock"]:
+      if job["done"] and not job["advanced"]:
+        state["jobs"].pop(job_id, None)
+        if job["status_code"] == 200:
+          return job["result"]
+        return {"status_code": job["status_code"], "result": job["result"], "logged": True}
+    return {"job_id": job_id}
+
+  @BasePlugin.endpoint(method="GET")
+  def explain_graph_status(self, job_id: str = "") -> Dict[str, Any]:
+    """`{phase, detail, done}`; once done also `result` (exactly what
+    `/explain_graph` returned) and `result_status_code` (its HTTP status).
+    Unknown or expired ids get 404."""
+    state = self._explain_job_state()
+    with state["lock"]:
+      self._prune_explain_jobs_locked(state["jobs"], time.monotonic())
+      job = state["jobs"].get(job_id) if isinstance(job_id, str) else None
+      if job is None:
+        snapshot = None
+      else:
+        snapshot = {"phase": job["phase"], "detail": job["detail"], "done": job["done"]}
+        if job["done"]:
+          snapshot["result"] = job["result"]
+          snapshot["result_status_code"] = job["status_code"]
+    if snapshot is None:
+      return _wrapper_safe_error({
+        "status": "not_found",
+        "ok": False,
+        "error": "Unknown or expired explain job id.",
+        "validation_errors": [_contract_error("explain_job_not_found", "unknown or expired job id")],
+      }, 404)
+    return snapshot
