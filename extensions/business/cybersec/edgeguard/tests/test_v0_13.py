@@ -34,7 +34,7 @@ from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard_v0_13 import 
 from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import EdgeGuardCypherGuardError
 
 # Hub `configs/edgeguard_v0_13_runtime_pin.json` served_system_prompt_sha256.
-HUB_V0_13_PROMPT_SHA256 = "adb5d49a9d806f36d12c76f7c85810c79ce398bbee4b5aff115f0c6687192bcd"
+HUB_V0_13_PROMPT_SHA256 = "35cf70e063478275fc9e76a066840886e2c3066ccb735d664abc907ff2e08bfa"
 V0_13_MODEL_KEY = "v0-13-fixture-model"
 V0_13_WORKERS = {
   V0_13_MODEL_KEY: {

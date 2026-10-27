@@ -152,12 +152,14 @@ def build_v0_13_pattern_schema_system_prompt(artifact: dict[str, Any] | None = N
     "Default to `i.active = true` for Indicator and `coalesce(n.deprecated, false) = false` for Malware, "
     "Technique, ThreatActor, unless retired or deprecated ones are asked for. "
     "Sector questions about malware, actors or techniques always start at Indicator-[:TARGETS]->Sector, reaching "
-    "malware by INDICATES and actors by ATTRIBUTED_TO, also when the question says the malware or actor targets it. "
+    "malware by INDICATES, its actors by ATTRIBUTED_TO and its techniques by IMPLEMENTS_TECHNIQUE (never via CVE or "
+    "EXPLOITS), also when the question says the malware or actor targets it. "
+    "KEV or known-exploited CVEs: c.cisa_exploit_add IS NOT NULL. "
     "Excluding sub-techniques is is_subtechnique = false; SUBTECHNIQUE_OF only for parent/child questions.",
     "Shape: investigation/neighbourhood/related-to questions return graph (RETURN p[, q], "
     "LIMIT optional). Ranking questions (which of, highest, top, rank, most) return "
     "ranked_projection: start MATCH, state the ranking rule given, always end LIMIT, never "
-    "collect().",
+    "collect(). After WITH only the listed variables stay in scope: keep every variable a later count or RETURN uses.",
     "Literals: copy IP/CVE/campaign/actor/malware values exactly (keep campaign's trailing "
     "\" Campaign\"); normalise defanged forms; add only literals given or implied by the "
     "wording above.",
