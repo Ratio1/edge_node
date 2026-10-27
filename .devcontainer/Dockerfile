@@ -29,7 +29,7 @@ RUN (wget https://github.com/ipfs/kubo/releases/download/v0.35.0/kubo_v0.35.0_li
 # End Install IPFS
 
 # Install Cloudflared
-ARG CLOUDFLARED_VERSION=2025.7.0
+ARG CLOUDFLARED_VERSION=2026.10.4
 
 RUN set -eux; \
     # --- map architecture names to Cloudflare’s file names -------
