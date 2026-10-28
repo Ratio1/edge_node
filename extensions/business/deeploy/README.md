@@ -124,5 +124,12 @@ metadata namespace.
 Deployment admission, polling, and the coordinator worker also use local persisted
 or pushed operation snapshots and node reports. They do not run namespace repair.
 An oracle missing an operation returns the existing synchronizing response; a
-missed terminal node report is not automatically pulled later. Durable publication,
-peer acknowledgments, and lifecycle secret mutation synchronization are unchanged.
+missed terminal node report is not automatically pulled later.
+
+Lifecycle actions through `reconcile_job_secrets` also read local replicas without
+namespace repair, including preparation status and cleanup. Revocation markers and
+newer operation snapshots are enforced once they reach the receiving custodian;
+the request does not establish globally fresh state. Required local records that
+are missing still fail or report incomplete preparation. Plan validation, durable
+publication, and peer acknowledgments for writes remain in place; cleanup stays
+pending until its writes are confirmed.

@@ -565,7 +565,13 @@ Worker secret requests do not synchronize namespaces, including for warm revisio
 caches. Missing local records fail without peer repair; remote revocation markers
 take effect after reaching the local replica. Existing dAuth maintenance refreshes
 current and revision secret namespaces, not all deployment metadata. Lifecycle
-secret mutation synchronization and durable publication remain unchanged.
+actions through `reconcile_job_secrets` also use local persisted/pushed replicas
+without namespace repair, including preparation status and cleanup. Local
+revocation markers and newer signed operation snapshots remain enforced, but
+remote changes take effect only after reaching the receiving custodian. Requests
+do not prove globally fresh state; missing required local records fail or report
+incomplete preparation. Plan validation, durable publication, write peer
+acknowledgments, and confirmed cleanup requirements remain in place.
 
 Tracked pipelines with a missing secret revision fail closed locally. Explicit
 revision requests retain signature, nonce, oracle, job, revision, and authorized
