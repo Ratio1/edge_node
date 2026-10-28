@@ -335,6 +335,7 @@ def _make_dauth_harness(
     "EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER",
   ]
   plugin.cfg_comms_host_key = "EE_MQTT_HOST"
+  plugin.cfg_comms_hosts_key = "EE_MQTT_HOSTS"
   plugin.cfg_comms_host_seed_key = "EE_MQTT_HOST_SEED"
   plugin.cfg_dauth_log_response = False
   plugin.cfg_dauth_verbose = False
@@ -354,6 +355,42 @@ def _make_dauth_harness(
   ) or True
   plugin.chainstore_hget = lambda hkey, key: plugin._chainstore.get((hkey, str(key)))
   return plugin
+
+
+class DauthBrokerAllocationTests(unittest.TestCase):
+  """Keep legacy primary allocation aligned with ordered failover candidates."""
+
+  def test_response_rotates_all_brokers_with_the_legacy_primary(self):
+    """Each request advances one place, without losing fallback hosts."""
+    plugin = _make_dauth_harness()
+    hosts = ["mqtt-a", "mqtt-b", "mqtt-c", "mqtt-d"]
+    plugin.os_environ["EE_MQTT_HOST_SEED"] = " ".join(hosts)
+    for index in range(5):
+      data = plugin.fill_dauth_data({}, "ordinary-node")
+      start = index % len(hosts)
+      self.assertEqual(data["EE_MQTT_HOSTS"], hosts[start:] + hosts[:start])
+      self.assertEqual(data["EE_MQTT_HOST"], hosts[start])
+      self.assertNotIn("EE_MQTT_HOST_SEED", data)
+
+  def test_seed_ignores_whitespace_and_duplicate_hosts(self):
+    """Blank or duplicate entries must not become connection candidates."""
+    plugin = _make_dauth_harness()
+    plugin.os_environ["EE_MQTT_HOST_SEED"] = " mqtt-a  mqtt-b\tmqtt-a\nmqtt-c "
+    self.assertEqual(plugin.get_comms_hosts(), ["mqtt-a", "mqtt-b", "mqtt-c"])
+    self.assertEqual(plugin.get_comms_hosts(), ["mqtt-b", "mqtt-c", "mqtt-a"])
+
+  def test_empty_or_missing_seed_uses_single_host(self):
+    """Single-host deployments remain usable without a seed list."""
+    for seed in (None, "", " \t\n"):
+      with self.subTest(seed=seed):
+        plugin = _make_dauth_harness()
+        plugin.os_environ["EE_MQTT_HOST"] = "mqtt-fallback"
+        plugin.os_environ.pop("EE_MQTT_HOST_SEED")
+        if seed is not None:
+          plugin.os_environ["EE_MQTT_HOST_SEED"] = seed
+        data = plugin.fill_dauth_data({}, "ordinary-node")
+        self.assertEqual(data["EE_MQTT_HOST"], "mqtt-fallback")
+        self.assertEqual(data["EE_MQTT_HOSTS"], ["mqtt-fallback"])
 
 
 class DauthRegistrySecretGatingTests(unittest.TestCase):

@@ -691,31 +691,33 @@ class _DauthMixin(object):
     )
     return
   
-  def get_comms_host_pair(self):
+  def get_comms_hosts(self):
     """
-    Returns a round-robin key value from the seed_key list.
+    Return broker candidates starting with the next round-robin primary.
+
+    Returns
+    -------
+    list of str
+      Unique hosts in seed order, rotated to distribute primary allocations.
+      An empty seed falls back to the configured single host.
     """
     key = self.cfg_comms_host_key
     seed_key = self.cfg_comms_host_seed_key
     if not hasattr(self, "mqtt_seed_index"):
       self.mqtt_seed_index = -1
-    return_value = None
-
-    raw_comms_seed = self.os_environ.get(seed_key, "")
-    comms_seed = raw_comms_seed.split(" ")
-
+    raw_comms_seed = self.os_environ.get(seed_key, "") or ""
+    comms_seed = list(dict.fromkeys(raw_comms_seed.split()))
 
     if not comms_seed:
-      return_value = self.os_environ.get(key, None)
+      return_value = (self.os_environ.get(key, "") or "").strip()
       self.P(f"No {seed_key} found, returning env {key}: {return_value}", color='r')
-    else:
-      # round-robin selection
-      self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
-      return_value = comms_seed[self.mqtt_seed_index]
-      if self.cfg_dauth_log_response:
-        self.P(f"Comms seed for {seed_key}: {comms_seed} | Raw: '{raw_comms_seed}'. Selected '{return_value}' ({self.mqtt_seed_index})")
-    # end if
-    return key, return_value
+      return [return_value] if return_value else []
+    # Preserve round-robin allocation while exposing the remaining seed order.
+    self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
+    comms_seed = comms_seed[self.mqtt_seed_index:] + comms_seed[:self.mqtt_seed_index]
+    if self.cfg_dauth_log_response:
+      self.P(f"Comms seed for {seed_key}: {comms_seed}. Selected '{comms_seed[0]}' ({self.mqtt_seed_index})")
+    return comms_seed
 
 
   def fill_dauth_data(
@@ -777,11 +779,14 @@ class _DauthMixin(object):
 
     #####  finally prepare the env auth data #####
     
-    comm_key, comm_value = self.get_comms_host_pair()
+    comm_key = self.cfg_comms_host_key
+    comms_hosts = self.get_comms_hosts()
+    comm_value = comms_hosts[0] if comms_hosts else None
     str_allocation_log = None
     if comm_key is not None and comm_value is not None:
       str_allocation_log = f"{comm_key}={comm_value}"
       dauth_data[comm_key] = comm_value
+      dauth_data[self.cfg_comms_hosts_key] = comms_hosts
     else:
       self.P("No comms host pair found!", color='r')
     
@@ -836,7 +841,7 @@ class _DauthMixin(object):
       dauth_data["EE_SUPERVISOR"] = False
     # end set supervisor flag
     if self.cfg_dauth_log_response:
-      self.P(f"DAuth returning comm server {dauth_data[comm_key]}, {str_allocation_log}")
+      self.P(f"DAuth returning comm server {dauth_data.get(comm_key)}, {str_allocation_log}")
     return dauth_data
 
 

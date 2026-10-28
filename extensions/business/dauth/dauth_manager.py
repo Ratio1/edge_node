@@ -75,6 +75,7 @@ _CONFIG = {
   },
   
   "COMMS_HOST_KEY" : "EE_MQTT_HOST",          # key to use for the comms host
+  "COMMS_HOSTS_KEY" : "EE_MQTT_HOSTS",        # ordered connection candidates
   "COMMS_HOST_SEED_KEY" : "EE_MQTT_HOST_SEED", # key to use for the comms host seed
 
   "SUPERVISOR_KEYS" : [
