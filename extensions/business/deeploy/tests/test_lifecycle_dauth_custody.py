@@ -1,6 +1,7 @@
 """Lifecycle preparation and finalization through real SDK and Core wrapper APIs."""
 import copy
 import unittest
+from unittest.mock import Mock
 
 from ratio1.const.base import dAuth
 from extensions.business.deeploy.tests.lifecycle_custody_support import (
@@ -13,6 +14,8 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.state = State()
     self.coordinator = Coordinator(self.state)
     self.dauth = Custodian(self.state)
+    self.dauth.chainstore_hsync = Mock(side_effect=AssertionError('Custody requests must not synchronize namespaces.'))
+    self.addCleanup(self.dauth.chainstore_hsync.assert_not_called)
     self.http = connect(self, self.state, self.dauth)
 
   def legacy(self):

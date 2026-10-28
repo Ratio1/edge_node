@@ -68,11 +68,8 @@ class _DauthDeploymentSecretsMixin:
           raise ValueError("Deployment plan identity or redaction is invalid.")
         if operation["kind"] != "delete" and specs.get("secret_revision") != operation_id + ":" + attempt:
           raise ValueError("Deployment secret reference is invalid.")
-    # Repair before inspecting immutable values or revocation markers. A warm
-    # local copy alone cannot prove that another custodian has not revoked it.
-    for namespace in (REVISIONS, CURRENT, POINTERS, "DEEPLOY_OPERATIONS"):
-      if not self.chainstore_hsync(hkey=namespace, timeout=5, **dauth_registry_write_kwargs(self)):
-        raise RuntimeError("Deployment secret synchronization is unavailable.")
+    # Read persisted/pushed replicas; remote revocations and newer snapshots
+    # take effect after reaching this custodian, without request-time repair.
     for record in (self.chainstore_hgetall(hkey="DEEPLOY_OPERATIONS") or {}).values():
       if (isinstance(record, dict) and record.get("operation_id") == operation_id
           and record.get("coordinator") == requester and record.get("EE_SENDER") == requester
