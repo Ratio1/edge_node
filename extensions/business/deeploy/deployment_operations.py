@@ -383,7 +383,10 @@ class _DeploymentOperationsMixin:
         previous_new_secrets=previous_new_secrets if previous_configs else None,
         identity_aliases=[[list(current), list(source)] for current, source in (identity_aliases or {}).items()],
       )
-      self._save_operation(operation, "accepted", "Deployment accepted.")
+      if self.time() >= operation["preparation_deadline"]:
+        self._expire_deployment_preparation(operation)
+      else:
+        self._save_operation(operation, "accepted", "Deployment accepted.")
     finally:
       # Keep the marker until the worker discards its old snapshots and reloads
       # durable state. This also hands interrupted admission to recovery.
@@ -481,13 +484,20 @@ class _DeploymentOperationsMixin:
       return
     if operation["kind"] == "delete":
       return self._advance_delete_operation(operation)
+    if operation["phase"] == "preparing" and self.time() >= operation["preparation_deadline"]:
+      self._expire_deployment_preparation(operation)
     self._replicate_operation(operation)
+    if operation["phase"] == "cleaning_up_preparation":
+      self._deployment_secret_request("revoke", operation, active_attempt=None)
+      operation["recovery"] = "completed"
+      self._save_operation(operation, "completed", "Incomplete deployment preparation cleaned up.")
+      return
+    if operation["phase"] == "preparing":
+      return self._finish_deployment_preparation(operation)
     plan = self._load_operation_plan(operation)
     configs = plan["configs"]
     reports = self._node_operation_reports(operation, "deploy")
     phase = operation["phase"]
-    if phase == "preparing":
-      return self._finish_deployment_preparation(operation, plan)
     if phase == "accepted":
       next_phase = "retiring_previous" if operation["kind"] == "update" else "waiting_for_readiness"
       self._save_operation(operation, next_phase, "Preparing target nodes.")
@@ -568,21 +578,29 @@ class _DeploymentOperationsMixin:
       self._save_operation(operation, "completed",
                            "Previous revision restored." if restored else "Deployment completed.")
 
-  def _finish_deployment_preparation(self, operation, plan):
-    """Recover interrupted admission without leaving unowned secret copies."""
-    result = self._deployment_secret_request("status", operation)
-    if not result["prepared"]:
+  def _expire_deployment_preparation(self, operation):
+    """Record deadline failure before waiting for plan or secret cleanup."""
+    operation.update(outcome="failed", recovery="in_progress", error=dict(
+      code="ADMISSION_PREPARATION_FAILED",
+      message="Deployment preparation did not complete; the running revision is unchanged.",
+      retryable=False,
+    ))
+    self._save_operation(operation, "cleaning_up_preparation",
+                         "Deployment preparation expired; secret cleanup is pending.")
+
+  def _finish_deployment_preparation(self, operation):
+    """Recover complete preparation only while its deadline still permits it."""
+    try:
+      result = self._deployment_secret_request("status", operation)
+    except Exception:
       if self.time() < operation["preparation_deadline"]:
-        return
-      # Fresh values lost before custody cannot be regenerated after restart.
-      # Revoke only this operation's partial copies; leave the active job intact.
-      self._release_unused_secret_revisions(operation, plan, active_attempt=None)
-      operation.update(outcome="failed", recovery="completed", error=dict(
-        code="ADMISSION_PREPARATION_FAILED",
-        message="Deployment preparation did not complete; the running revision is unchanged.",
-        retryable=False,
-      ))
-      self._save_operation(operation, "completed", "Incomplete deployment preparation cleaned up.")
+        raise
+      self._expire_deployment_preparation(operation)
+      return
+    if self.time() >= operation["preparation_deadline"]:
+      self._expire_deployment_preparation(operation)
+      return
+    if not result["prepared"]:
       return
     operation["deadline"] = self.time() + self.cfg_deployment_readiness_timeout
     self._save_operation(operation, "accepted", "Deployment preparation recovered.")
@@ -680,6 +698,7 @@ class _DeploymentOperationsMixin:
     operation = max(matches, key=lambda record: (record["target_revision"], record["created_at"], record["sequence"]))
     restoring = operation["phase"] in ("restoring_previous", "finalizing_recovery") or (
       operation["outcome"] == "failed" and operation["kind"] == "update"
+      and (operation.get("error") or {}).get("code") != "ADMISSION_PREPARATION_FAILED"
     )
     attempt = "retire" if operation["kind"] == "delete" or operation["phase"] == "retiring_previous" else "restore" if restoring else "deploy"
     reports = self._node_operation_reports(operation, attempt)
