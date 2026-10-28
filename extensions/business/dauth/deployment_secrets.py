@@ -39,7 +39,7 @@ class _DauthDeploymentSecretsMixin:
     phases = {
       "prepare": {"preparing"}, "status": {"preparing"},
       "commit": {"finalizing", "finalizing_recovery"},
-      "revoke": {"preparing", "stopping_failed_rollout", "finalizing", "finalizing_recovery", "retiring_previous"},
+      "revoke": {"preparing", "cleaning_up_preparation", "stopping_failed_rollout", "finalizing", "finalizing_recovery", "retiring_previous"},
       "delete": {"retiring_previous"},
     }
     if action not in phases or phase not in phases[action]:
@@ -225,7 +225,7 @@ class _DauthDeploymentSecretsMixin:
     phase = operation["phase"]
     expected_active = {"finalizing": "deploy", "finalizing_recovery": "restore"}.get(phase)
     if active_attempt != expected_active or (
-      phase == "preparing" and self.time() < operation["preparation_deadline"]
+      phase in ("preparing", "cleaning_up_preparation") and self.time() < operation["preparation_deadline"]
     ) or (phase == "stopping_failed_rollout" and operation["kind"] != "create"):
       raise ValueError("Secret cleanup does not match lifecycle recovery.")
     pointer = self.chainstore_hget(hkey=POINTERS, key=job_id)

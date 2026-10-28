@@ -473,7 +473,7 @@ To resume after compaction:
 - Operations and node observations use eight sequence slots per identity; signed writer/field bindings and monotonic slot merge reject stale or forged snapshots. Operation events are bounded to 128. Abort journals and operation identities are retained; automatic history expiry is not implemented, because deleting abort history could permit replay.
 - Redacted exact execution plans are stored in R1FS. Local plan persistence/pinning and durable coordinator volume are required; independent remote pinning and coordinator failover are not promised.
 - Edge `deployment_operations.py` owns admission, worker replay, readiness, stop barriers, restoration, canonical commit, secret revocation, and the single owner-authorized polling projection. HTTP400 validation and HTTP503 uncertain admission are separate from HTTP202 acceptance.
-- Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart; interrupted incomplete preparation is revoked after its 120-second deadline without changing the current revision. No dispatch occurs before accepted data is replicated. A local per-operation marker keeps the worker from advancing live admission; completed handoffs are cleared before loading fresh snapshots. Other jobs continue without a global admission lock (decision 15).
+- Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart only before its 120-second preparation deadline. Once expiry is observed, the coordinator persists `cleaning_up_preparation`, outcome `failed`, recovery `in_progress`, and `ADMISSION_PREPARATION_FAILED` before plan reads or dAuth cleanup. A bounded RPC already in flight may delay observing expiry; successful late preparation/status replies cannot accept the rollout. Cleanup retries across restarts without dispatching workloads or changing the current revision. Only confirmed secret revocation/erasure permits `completed` with recovery `completed`; other mutations remain blocked until then. A local per-operation marker keeps the worker from advancing live admission; completed handoffs are cleared before loading fresh snapshots. Other jobs continue without a global admission lock (decision 15).
 - dAuth stores immutable per-revision secrets with exact authorized node/instance configurations. Revocation is a separate durable marker followed by plaintext erasure. Previous secrets remain available until stop/restoration evidence allows retirement. Non-dAuth coordinators prepare and publish revisions through the SDK reconciliation API. dAuth retains all prior and merged bundles; coordinators load only redacted plans and sign public pointers. Polling from any oracle remains supported.
 - Container readiness reports actual health and build/pull failures. Cleanup verifies Docker absence and preserves volumes. Managed CockroachDB additionally verifies planned certificate fingerprints and authenticated verify-full SQL before readiness. Its isolated real-binary old/new/old certificate recovery test passed with data preservation; see the linked recovery document for the exact offline command and limitations.
 - Canonical pointers and current dAuth bundles carry signed monotonic storage generations. A restored runtime retains its previous content revision while its metadata commit advances the storage generation; later creates/updates/deletes advance beyond it. Delete tombstones reject stale repair, and explicit higher generations permit paid job reuse. Every new attempt also advances beyond all verified observed attempts for the job, including failed preparation/create attempts, so clock skew cannot hide a retry in job-only polling. The receiving oracle also coordinates existing CSP owner transfer through the revision lifecycle; rollback preserves the newly authorized owner.
@@ -630,9 +630,15 @@ Fresh request values are extracted before public plan persistence; neither
 prior nor merged bundles enter the coordinator's memory. Scale-up aliases and
 per-node placeholder validation are reconciled inside dAuth.
 
-After interrupted admission, `status` confirms and replicates existing copies;
-it never generates replacement credentials. Incomplete preparation waits for the
-existing preparation deadline, then revokes only that operation's staged copies.
+After interrupted admission, `status` confirms and replicates existing copies
+before the preparation deadline; it never generates replacement credentials.
+Expired preparation enters the durable cleanup phase before contacting dAuth,
+then revokes only that operation's staged copies. dAuth permits only `revoke`
+in this phase, requires expiry and no active attempt, and rejects stale
+preparation snapshots when a newer signed operation is known. Failed or
+uncertain cleanup remains nonterminal and is retried rather than reported as
+complete. The UI distinguishes this failure from runtime rollback: an update's
+previous revision is unchanged, not restored.
 Runtime readiness/stop evidence, the coordinator journal and rollback decisions
 remain the lifecycle's responsibility. Owner-transfer restoration retains the
 new owner. No second journal or cross-oracle arbitration is introduced.

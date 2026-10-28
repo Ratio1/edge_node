@@ -126,6 +126,19 @@ class DeploymentStatusTests(unittest.TestCase):
     plugin.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "someone-else"}
     self.assertEqual(plugin._deployment_status({"operation_id": operation["operation_id"]})["status"], "synchronizing")
 
+  def test_preparation_failure_does_not_project_a_restoration(self):
+    plugin = self.prepare()
+    operation = plugin.operation(kind="update")
+    operation.update(phase="cleaning_up_preparation", outcome="failed", recovery="in_progress",
+                     error=dict(code="ADMISSION_PREPARATION_FAILED", message="Cleanup pending.", retryable=False))
+    plugin._save_operation(operation)
+    result = plugin._deployment_status({"operation_id": operation["operation_id"]})
+    self.assertEqual((result["phase"], result["outcome"], result["recovery"]),
+                     ("cleaning_up_preparation", "failed", "in_progress"))
+    self.assertEqual(result["target_nodes"], len(operation["nodes"]))
+    self.assertEqual(result["revision"], operation["previous_revision"])
+    self.assertEqual(plugin.commands, [])
+
 
 class DeploymentOperationTests(unittest.TestCase):
   def test_replica_repair_runs_on_startup_then_every_ten_minutes_or_when_forced(self):
