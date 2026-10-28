@@ -108,8 +108,16 @@ class _DauthDeploymentSecretsMixin:
         prior_bundle = self._deployment_secret_record(job_id, prior_reference)
         if prior_bundle is None:
           raise RuntimeError("The previous secret revision is unavailable.")
-      else:
+      elif (self._load_dauth_job_secret_bundle(job_id) is not None
+            or any(self._iter_deeploy_dauth_placeholder_paths(prior_pipeline))):
         prior_bundle = self._load_current_dauth_secret_bundle(job_id, prior_cid, prior_pipeline, require_unversioned=True)
+      else:
+        # First updates can recover values from the published plaintext
+        # configuration without requiring an already-existing dAuth bundle.
+        _, prior_secrets = self._extract_and_redact_deeploy_dauth_secrets(prior_pipeline)
+        prior_bundle = dict(job_id=job_id, job_secrets=prior_secrets or {})
+        if self._load_dauth_pipeline_cid(job_id) != prior_cid:
+          raise ValueError("The active pipeline changed before preparation.")
     elif prior_cid:
       raise ValueError("A create cannot replace an active pipeline.")
     aliases = {tuple(current): tuple(source) for current, source in body.get("identity_aliases", [])}
