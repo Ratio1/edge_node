@@ -110,3 +110,26 @@ An SDK upgrade alone does not expose the client through older Core wrappers.
 dAuth performs the existing best-effort cleanup of the previous local R1FS
 pipeline object after publishing reconciliation. No deployment restoration is
 added. New job creation keeps its existing staging flow.
+
+## Local Replica Reads
+
+Worker secret requests read local CStore metadata and bundles without synchronizing
+namespaces over the network. Signature, nonce, job identity, runner placement,
+revision, and locally observed revocation checks still apply. A missing local
+record cannot be fetched during the request, and a remote revocation is enforced
+only after it reaches the local replica. Existing dAuth maintenance still refreshes
+current and revision secret namespaces; it does not refresh every deployment
+metadata namespace.
+
+Deployment admission, polling, and the coordinator worker also use local persisted
+or pushed operation snapshots and node reports. They do not run namespace repair.
+An oracle missing an operation returns the existing synchronizing response; a
+missed terminal node report is not automatically pulled later.
+
+Lifecycle actions through `reconcile_job_secrets` also read local replicas without
+namespace repair, including preparation status and cleanup. Revocation markers and
+newer operation snapshots are enforced once they reach the receiving custodian;
+the request does not establish globally fresh state. Required local records that
+are missing still fail or report incomplete preparation. Plan validation, durable
+publication, and peer acknowledgments for writes remain in place; cleanup stays
+pending until its writes are confirmed.

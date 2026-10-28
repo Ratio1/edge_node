@@ -1,0 +1,384 @@
+{
+  "accept": [
+    {
+      "class": "closed_vocabulary",
+      "literal": "ipv4",
+      "note": "synonym wording 'ip' -> Indicator.indicator_type=ipv4",
+      "request": "Show me ip related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "domain",
+      "note": "synonym wording 'domain' -> Indicator.indicator_type=domain",
+      "request": "Show me domain related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "hash",
+      "note": "synonym wording 'hash' -> Indicator.indicator_type=hash",
+      "request": "Show me hash related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "url",
+      "note": "synonym wording 'url' -> Indicator.indicator_type=url",
+      "request": "Show me url related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "healthcare",
+      "note": "synonym wording 'hospital' -> Sector.name=healthcare",
+      "request": "Show me hospital related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "finance",
+      "note": "synonym wording 'bank' -> Sector.name=finance",
+      "request": "Show me bank related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "energy",
+      "note": "synonym wording 'utility' -> Sector.name=energy",
+      "request": "Show me utility related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "CRITICAL",
+      "note": "synonym wording 'critical severity' -> *.base_severity=CRITICAL",
+      "request": "Show me critical severity related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "HIGH",
+      "note": "synonym wording 'high severity' -> *.base_severity=HIGH",
+      "request": "Show me high severity related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0001",
+      "note": "synonym wording 'initial access' -> Tactic.mitre_id=TA0001",
+      "request": "Show me initial access related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0002",
+      "note": "synonym wording 'execution' -> Tactic.mitre_id=TA0002",
+      "request": "Show me execution related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0003",
+      "note": "synonym wording 'persistence' -> Tactic.mitre_id=TA0003",
+      "request": "Show me persistence related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0004",
+      "note": "synonym wording 'privilege escalation' -> Tactic.mitre_id=TA0004",
+      "request": "Show me privilege escalation related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0005",
+      "note": "synonym wording 'stealth' -> Tactic.mitre_id=TA0005",
+      "request": "Show me stealth related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0006",
+      "note": "synonym wording 'credential access' -> Tactic.mitre_id=TA0006",
+      "request": "Show me credential access related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0007",
+      "note": "synonym wording 'discovery' -> Tactic.mitre_id=TA0007",
+      "request": "Show me discovery related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0008",
+      "note": "synonym wording 'lateral movement' -> Tactic.mitre_id=TA0008",
+      "request": "Show me lateral movement related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0009",
+      "note": "synonym wording 'collection' -> Tactic.mitre_id=TA0009",
+      "request": "Show me collection related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0010",
+      "note": "synonym wording 'exfiltration' -> Tactic.mitre_id=TA0010",
+      "request": "Show me exfiltration related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0011",
+      "note": "synonym wording 'command and control' -> Tactic.mitre_id=TA0011",
+      "request": "Show me command and control related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0040",
+      "note": "synonym wording 'impact' -> Tactic.mitre_id=TA0040",
+      "request": "Show me impact related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0042",
+      "note": "synonym wording 'resource development' -> Tactic.mitre_id=TA0042",
+      "request": "Show me resource development related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0043",
+      "note": "synonym wording 'reconnaissance' -> Tactic.mitre_id=TA0043",
+      "request": "Show me reconnaissance related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0112",
+      "note": "synonym wording 'defense impairment' -> Tactic.mitre_id=TA0112",
+      "request": "Show me defense impairment related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0005",
+      "note": "synonym wording 'defense evasion' -> Tactic.mitre_id=TA0005",
+      "request": "Show me defense evasion related indicators from the last month."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0112",
+      "note": "synonym wording 'defense evasion' -> Tactic.mitre_id=TA0112",
+      "request": "Show me defense evasion related indicators from the last month."
+    },
+    {
+      "class": "free",
+      "literal": "CVE-2024-12345",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Tell me about CVE-2024-12345 and what exploits it."
+    },
+    {
+      "class": "free",
+      "literal": "TestMalwareFamily",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "What indicators point to TestMalwareFamily?"
+    },
+    {
+      "class": "free",
+      "literal": "ExampleThreatActor",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Which campaigns does ExampleThreatActor run?"
+    },
+    {
+      "class": "free",
+      "literal": "Operation Sample Campaign",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Tell me about Operation Sample and its indicators."
+    },
+    {
+      "class": "free",
+      "literal": "Operation Sample",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Tell me about Operation Sample Campaign and its indicators."
+    },
+    {
+      "class": "free",
+      "literal": "example.test",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Any indicators for example.test?"
+    },
+    {
+      "class": "free",
+      "literal": "https://example.test/path",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Have we seen https://example.test/path before?"
+    },
+    {
+      "class": "free",
+      "literal": "203.0.113.5",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Investigate 203.0.113.5 please."
+    },
+    {
+      "class": "free",
+      "literal": "ExampleFeed",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "What does ExampleFeed report on this malware?"
+    },
+    {
+      "class": "free",
+      "literal": "ExampleToolName",
+      "note": "literal appears verbatim in the request (with the campaign-suffix rule where relevant)",
+      "request": "Which techniques does ExampleToolName implement?"
+    }
+  ],
+  "reject": [
+    {
+      "class": "closed_vocabulary",
+      "literal": "MEDIUM",
+      "note": "CVSS base_severity=MEDIUM has no synonym row and is absent from the request",
+      "request": "Show me every campaign run by this threat actor this year."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "LOW",
+      "note": "CVSS base_severity=LOW has no synonym row and is absent from the request",
+      "request": "Show me every campaign run by this threat actor this year."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "NONE",
+      "note": "CVSS base_severity=NONE has no synonym row and is absent from the request",
+      "request": "Show me every campaign run by this threat actor this year."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "unknown",
+      "note": "Indicator.indicator_type=unknown has no synonym row and is absent from the request",
+      "request": "Show me malware families attributed to this actor."
+    },
+    {
+      "class": "free",
+      "literal": "CVE-2023-99999",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show me malware families active this quarter."
+    },
+    {
+      "class": "free",
+      "literal": "GhostSampleTrojan",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "List all campaigns from last month."
+    },
+    {
+      "class": "free",
+      "literal": "SampleActorX",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Which techniques are used most often?"
+    },
+    {
+      "class": "free",
+      "literal": "Operation Absent Campaign",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show me indicators only, nothing else."
+    },
+    {
+      "class": "free",
+      "literal": "not-mentioned.example",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show sector exposure data."
+    },
+    {
+      "class": "free",
+      "literal": "198.51.100.7",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show campaign names for this actor."
+    },
+    {
+      "class": "free",
+      "literal": "abc123fakehash",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show sector information for this indicator."
+    },
+    {
+      "class": "free",
+      "literal": "https://absent.example/x",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "List techniques used by this tool."
+    },
+    {
+      "class": "free",
+      "literal": "AbsentFeed",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show malware attributed to this actor."
+    },
+    {
+      "class": "free",
+      "literal": "RareToolName",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show me sector exposure."
+    },
+    {
+      "class": "free",
+      "literal": "2026-01-01",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show me malware families for this actor."
+    },
+    {
+      "class": "free",
+      "literal": "sha256:deadbeef",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show techniques used by this malware."
+    },
+    {
+      "class": "free",
+      "literal": "OperationGhost Campaign",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show sector data only, nothing else."
+    },
+    {
+      "class": "free",
+      "literal": "unspecified.example",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show techniques used by this actor."
+    },
+    {
+      "class": "free",
+      "literal": "T1059",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show sector exposure only."
+    },
+    {
+      "class": "free",
+      "literal": "T1071",
+      "note": "literal (and, for campaigns, neither suffix form) is absent from the request",
+      "request": "Show techniques used by this campaign."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "ipv4",
+      "note": "substring trap: 'relationship' contains 'ip' but does not ask for IP addresses (token-boundary, not substring)",
+      "request": "Show me every relationship between these campaigns."
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "ipv4",
+      "note": "substring trap: 'shipped' contains 'ip' but does not ask for IP addresses",
+      "request": "Which malware families have shipped payloads recently?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "url",
+      "note": "substring trap: 'linked' contains the 'link' synonym wording but is a different word",
+      "request": "Which malware is linked to this campaign?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "LOW",
+      "note": "substring trap: 'allow' contains 'low' but is not a severity request",
+      "request": "Would you allow this indicator through the firewall?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "HIGH",
+      "note": "substring trap: 'highest' contains 'high' but is a different word (superlative, no severity wording)",
+      "request": "Which CVE has the highest CVSS score?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0002",
+      "note": "compound-term trap: 'remote code execution' names a CWE/CVE concept, not the ATT&CK Execution tactic ('execution' immediately preceded by 'code')",
+      "request": "Which CVEs enable remote code execution?"
+    },
+    {
+      "class": "closed_vocabulary",
+      "literal": "TA0040",
+      "note": "substring trap: 'impacted' contains the 'impact' synonym wording but is a different word",
+      "request": "Which sectors were impacted by this campaign?"
+    }
+  ]
+}

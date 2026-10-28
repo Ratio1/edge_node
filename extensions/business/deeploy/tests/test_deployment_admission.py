@@ -61,9 +61,6 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
   def _operation_peers(self):
     return ["oracle", "replica"]
 
-  def _repair_deployment_records(self, **kwargs):
-    return
-
   def chainstore_hset(self, namespace, key, value, **kwargs):
     self.writes.append((namespace, key))
     self.storage[namespace, key] = copy.deepcopy(value)
@@ -143,7 +140,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
         self.assertEqual([call.args[0]["job_id"] for call in advanced], [8])
 
         # Admission finishes AFTER the worker captures `preparing`. It must
-        # still skip that stale snapshot, then reload `accepted` next pass.
+        # still skip that stale snapshot, then reload deadline failure next pass.
         read_records = plugin._operation_records
         def finish_while_reading():
           snapshots = read_records()
@@ -160,7 +157,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
         plugin._reconcile_coordinator_operations()
         phases = {call.args[0]["job_id"]: call.args[0]["phase"] for call in
                   plugin._advance_deployment_operation.call_args_list}
-        self.assertEqual(phases, {7: "accepted", 8: "accepted"})
+        self.assertEqual(phases, {7: "cleaning_up_preparation", 8: "accepted"})
         self.assertEqual(plugin._deployment_preparations, {})
       finally:
         release.set()

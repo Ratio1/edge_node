@@ -104,14 +104,14 @@ Before building the worker, establish an executable storage/coordination contrac
 3. **Receiving oracle ownership:** record the receiving oracle's authenticated identity. Only it advances execution or recovery, including after restart. Other oracles read replicated progress. There is no distributed lock, leader election, stable routing assignment, or automatic takeover. If the coordinator is unavailable, execution/recovery pauses and polling reports freshness honestly.
 4. **Versioned observations:** reject stale state per operation, coordinator identity, node incarnation, and sequence. Use immutable/versioned records or strengthen the relevant merge behavior; do not rely on wall-clock last-write-wins ordering.
 5. **Peer discovery and replication:** explicitly define the authorized oracle/registry peers for intents, indexes, observations, and abort records. Existing initiating-oracle-plus-one-seed response routing alone is insufficient for any-oracle polling and restart recovery.
-6. **Read repair:** synchronize required namespaces on startup and when an operation/index is missing or stale. Fetch authoritative/version-aware state without treating the first available stale snapshot as current. Keep repair bounded so polling does not become a deployment-length request.
+6. **Local replica reads:** deployment admission, polling, and coordinator recovery read locally persisted or pushed operation snapshots and node reports without namespace repair. Missing operation replicas return synchronizing/unavailable. Missed terminal node reports are not automatically pulled later; remote state becomes visible when it reaches the local replica.
 7. **Retention and tombstones:** preserve abort/fencing decisions and revision references long enough to reject delayed commands and repair restarted peers. Prevent stale snapshot merges from resurrecting removed operations or references.
 8. **Recovery:** rebuild active work from durable intents and action records; reconcile node evidence before repeating a side effect whose previous acknowledgment was lost.
 9. **Start versus abort ordering:** define start-authorization validity and synchronization on reconnect/restart. A disconnected node may execute an already authorized start before it learns of an abort; a coordinator-local abort write cannot retroactively prevent that. Require renewed authority where the protocol needs it, and distinguish `abort requested` from `abort enforced everywhere`. Any late execution remains subject to stop/fencing and blocks cleanup completion.
 
 Any Deeploy oracle must serve the polling API without relying on another oracle's Python dictionary. Under a partition, it may return an explicitly stale/unknown view or a retryable availability error; it must not invent fresh state, declare a missing local record nonexistent, or take over another oracle’s operation.
 
-The coordination decision is resolved: receiving-oracle ownership with no takeover and no distributed locking/consensus. Persistence, signed/versioned records, replay, and read repair are implemented and covered by the verification below. Do not expand this into a consensus project. No external database fallback is authorized.
+The coordination decision is resolved: receiving-oracle ownership with no takeover and no distributed locking/consensus. Persistence, signed/versioned records, and replay are implemented and covered by the verification below. The deployment coordinator no longer repairs operation/report namespaces. Do not expand this into a consensus project. No external database fallback is authorized.
 
 ## Submission API contract
 
@@ -195,7 +195,7 @@ Illustrative result body during failure recovery:
 
 The example omits the instance detail and additional freshness fields for brevity; those are required by the implemented schema. The response should be a coherent aggregation with provenance, not an assertion that asynchronously observed nodes were sampled at one instant.
 
-Polling has no deployment side effects. Bounded read repair is permitted, but opening or closing the UI must not start, stop, or advance an operation. A local miss returns synchronizing/unavailable until the service can establish absence under the coordination contract. Return an explicit no-operation result for an authorized existing job with no tracked operation; do not manufacture migration history.
+Polling reads local replicas without namespace repair and has no deployment side effects. Opening or closing the UI must not start, stop, or advance an operation. A local miss returns synchronizing/unavailable until the service can establish absence under the coordination contract. Return an explicit no-operation result for an authorized existing job with no tracked operation; do not manufacture migration history.
 
 ## Node reporting and readiness
 
@@ -240,7 +240,7 @@ Distinguish HTTP request timeout, node observation freshness, rollout readiness 
 - Once aborted, no further forward-deployment retries are allowed for that attempt. Recovery commands take precedence over delayed readiness success.
 - If recovery exceeds its budget, expose the unresolved state and required action. Continue scheduled reconciliation where safe; do not discard the operation or declare unreachable workloads stopped.
 
-Implemented defaults: preparation deadline 120 seconds; deployment/restoration readiness deadline 900 seconds (15 minutes; `DEPLOYMENT_READINESS_TIMEOUT`); worker wake-up 2 seconds; namespace repair immediately on startup and every 10 minutes thereafter (mutations can force an earlier repair); CStore write timeout 5 seconds with one retry; signed ready reports must be at most 30 seconds old and are refreshed every 10 seconds. Cleanup deadlines expose blocked recovery and keep reconciliation running; they never substitute for stop evidence. Operation events retain 128 entries and each signed record uses eight sequence slots. Abort/history identities have no automatic expiry.
+Implemented defaults: preparation deadline 120 seconds; deployment/restoration readiness deadline 900 seconds (15 minutes; `DEPLOYMENT_READINESS_TIMEOUT`); worker wake-up 2 seconds using local operation/report replicas without namespace repair; CStore write timeout 5 seconds with one retry; signed ready reports must be at most 30 seconds old and are refreshed every 10 seconds. Cleanup deadlines expose blocked recovery and keep reconciliation running; they never substitute for stop evidence. Operation events retain 128 entries and each signed record uses eight sequence slots. Abort/history identities have no automatic expiry.
 
 ### Failed create cleanup
 
@@ -332,7 +332,7 @@ No new cancel/retry endpoints are required. A deliberate retry can use the exist
 
 This is one coordinated release across Core, Edge/Deeploy/dAuth, frontend, and affected direct clients/tutorials. Replace the old contracts directly. Delete obsolete pending-request/final-response assumptions when their replacement is integrated.
 
-Do not add migration scripts, legacy operation converters, deployment-response fallbacks, dual publishers, or feature flags whose purpose is old/new API coexistence. The required existing-pipeline secret lookup is the explicit exception: it uses existing CID binding/runner authorization, refreshes registry state, and cannot serve versioned or deleted jobs. Internal schema identifiers for validation are allowed; they must not become a compatibility framework.
+Do not add migration scripts, legacy operation converters, deployment-response fallbacks, dual publishers, or feature flags whose purpose is old/new API coexistence. The required existing-pipeline secret lookup is the explicit exception: it uses existing CID binding/runner authorization against local registry state and rejects locally observed versioned or deleted jobs. Internal schema identifiers for validation are allowed; they must not become a compatibility framework.
 
 Existing running jobs can supply a canonical current configuration when accepting a new update; this is normal operation, not migration of historical operations. If a recoverable prior snapshot cannot be established, reject the update before dispatch. Jobs with no operation history show that fact through the same polling endpoint.
 
@@ -344,7 +344,7 @@ Test the coordinated release in an isolated environment. Verify that no old in-f
 
 - Finalize record schemas, error vocabulary, endpoint payloads, identity scope, signed idempotency fields, and readiness criteria.
 - Inspect Core CStore persistence/merge/replication and establish the coordination mechanism described above.
-- Prove same-key retry reuse after replication, coordinator-only execution, stale-read repair, and crash recovery in focused tests; document the simultaneous cross-oracle admission limitation.
+- Prove same-key retry reuse after replication, coordinator-only execution, local-replica reads, and crash recovery in focused tests; document the simultaneous cross-oracle admission limitation.
 - Define timeout/retry/retention configuration and how unavailable coordination is surfaced.
 - Map dAuth revision lookup and preserve existing paid-job validation.
 
@@ -355,9 +355,9 @@ Exit: written algorithm and tests demonstrate the required guarantees. Do not st
 - Add operation/index/action storage using CStore and immutable payload persistence using R1FS.
 - Add revision-aware secret binding and retain previous snapshots/placements.
 - Implement commit/recovery markers, reference-aware cleanup, and abort retention.
-- Add startup recovery and bounded read repair for any-oracle lookup.
+- Recover from locally persisted operation state on startup and use pushed replicas for any-oracle lookup.
 
-Exit: accepted intents, secret revisions, and aborted attempts survive process restart and peer repair without ambiguous duplication or resurrection.
+Exit: accepted intents, secret revisions, and aborted attempts survive process restart and push replication without ambiguous duplication or resurrection.
 
 ### Work package 3 Core node reporting and command lifecycle
 
@@ -416,7 +416,7 @@ Exit: all acceptance criteria below pass or the feature remains incomplete. An A
 | Crash after commit or mid-dispatch | Recover exact plan/actions; reconcile and resume without duplicate effects. |
 | Same key submitted after replication to another oracle | Existing operation reused, original coordinator retained. Simultaneous unseen admissions are outside the no-lock guarantee. |
 | Two updates conflict with known active state | Reject the conflicting request. Simultaneous admissions before replication have no global exclusion guarantee. |
-| Polling oracle restarted or never saw the original write | Bounded version-aware repair; accurate state or explicit unavailability, not false absence/success. |
+| Polling oracle restarted or never saw the original write | Use local persisted/pushed replicas; report synchronizing/unavailable for missing operation state without request-time or background namespace repair. |
 | Coordinator unavailable | Other oracles continue replicated polling with freshness information; no takeover or new executor for that operation. |
 | Stale peer snapshot and reordered observations | No status regression or resurrection; authority/sequence rules decide applicability. |
 | Plugin cannot load or initialize | Explicit instance failure before the deployment deadline; recovery begins. |
@@ -473,7 +473,7 @@ To resume after compaction:
 - Operations and node observations use eight sequence slots per identity; signed writer/field bindings and monotonic slot merge reject stale or forged snapshots. Operation events are bounded to 128. Abort journals and operation identities are retained; automatic history expiry is not implemented, because deleting abort history could permit replay.
 - Redacted exact execution plans are stored in R1FS. Local plan persistence/pinning and durable coordinator volume are required; independent remote pinning and coordinator failover are not promised.
 - Edge `deployment_operations.py` owns admission, worker replay, readiness, stop barriers, restoration, canonical commit, secret revocation, and the single owner-authorized polling projection. HTTP400 validation and HTTP503 uncertain admission are separate from HTTP202 acceptance.
-- Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart; interrupted incomplete preparation is revoked after its 120-second deadline without changing the current revision. No dispatch occurs before accepted data is replicated. A local per-operation marker keeps the worker from advancing live admission; completed handoffs are cleared before loading fresh snapshots. Other jobs continue without a global admission lock (decision 15).
+- Admission writes a durable `preparing` intent before any revision secret copies. Complete staged data can resume after restart only before its 120-second preparation deadline. Once expiry is observed, the coordinator persists `cleaning_up_preparation`, outcome `failed`, recovery `in_progress`, and `ADMISSION_PREPARATION_FAILED` before plan reads or dAuth cleanup. A bounded RPC already in flight may delay observing expiry; successful late preparation/status replies cannot accept the rollout. Cleanup retries across restarts without dispatching workloads or changing the current revision. Only confirmed secret revocation/erasure permits `completed` with recovery `completed`; other mutations remain blocked until then. A local per-operation marker keeps the worker from advancing live admission; completed handoffs are cleared before loading fresh snapshots. Other jobs continue without a global admission lock (decision 15).
 - dAuth stores immutable per-revision secrets with exact authorized node/instance configurations. Revocation is a separate durable marker followed by plaintext erasure. Previous secrets remain available until stop/restoration evidence allows retirement. Non-dAuth coordinators prepare and publish revisions through the SDK reconciliation API. dAuth retains all prior and merged bundles; coordinators load only redacted plans and sign public pointers. Polling from any oracle remains supported.
 - Container readiness reports actual health and build/pull failures. Cleanup verifies Docker absence and preserves volumes. Managed CockroachDB additionally verifies planned certificate fingerprints and authenticated verify-full SQL before readiness. Its isolated real-binary old/new/old certificate recovery test passed with data preservation; see the linked recovery document for the exact offline command and limitations.
 - Canonical pointers and current dAuth bundles carry signed monotonic storage generations. A restored runtime retains its previous content revision while its metadata commit advances the storage generation; later creates/updates/deletes advance beyond it. Delete tombstones reject stale repair, and explicit higher generations permit paid job reuse. Every new attempt also advances beyond all verified observed attempts for the job, including failed preparation/create attempts, so clock skew cannot hide a retry in job-only polling. The receiving oracle also coordinates existing CSP owner transfer through the revision lifecycle; rollback preserves the newly authorized owner.
@@ -555,11 +555,23 @@ to resume implementation; the regression tests and contract notes are committed.
 
 Implemented decision 14 across Edge dAuth, Core runtime secret resolution, and
 the SDK. An existing persisted pipeline with no secret revision sends a signed
-unversioned request. dAuth refreshes the protected registries and requires an
+unversioned request. dAuth reads local registries and requires an
 unversioned current CID, matching job identity, current runner placement, and a
-CID-bound secret bundle. It rejects deleted/versioned records and generation
+CID-bound secret bundle. It rejects locally observed deleted/versioned records and generation
 changes. Existing pre-CID bundles retain their structural binding procedure.
 No secrets or revision fields are written into the persisted node configuration.
+
+Worker secret requests do not synchronize namespaces, including for warm revision
+caches. Missing local records fail without peer repair; remote revocation markers
+take effect after reaching the local replica. Existing dAuth maintenance refreshes
+current and revision secret namespaces, not all deployment metadata. Lifecycle
+actions through `reconcile_job_secrets` also use local persisted/pushed replicas
+without namespace repair, including preparation status and cleanup. Local
+revocation markers and newer signed operation snapshots remain enforced, but
+remote changes take effect only after reaching the receiving custodian. Requests
+do not prove globally fresh state; missing required local records fail or report
+incomplete preparation. Plan validation, durable publication, write peer
+acknowledgments, and confirmed cleanup requirements remain in place.
 
 Tracked pipelines with a missing secret revision fail closed locally. Explicit
 revision requests retain signature, nonce, oracle, job, revision, and authorized
@@ -630,9 +642,15 @@ Fresh request values are extracted before public plan persistence; neither
 prior nor merged bundles enter the coordinator's memory. Scale-up aliases and
 per-node placeholder validation are reconciled inside dAuth.
 
-After interrupted admission, `status` confirms and replicates existing copies;
-it never generates replacement credentials. Incomplete preparation waits for the
-existing preparation deadline, then revokes only that operation's staged copies.
+After interrupted admission, `status` confirms and replicates existing copies
+before the preparation deadline; it never generates replacement credentials.
+Expired preparation enters the durable cleanup phase before contacting dAuth,
+then revokes only that operation's staged copies. dAuth permits only `revoke`
+in this phase, requires expiry and no active attempt, and rejects stale
+preparation snapshots when a newer signed operation is known. Failed or
+uncertain cleanup remains nonterminal and is retried rather than reported as
+complete. The UI distinguishes this failure from runtime rollback: an update's
+previous revision is unchanged, not restored.
 Runtime readiness/stop evidence, the coordinator journal and rollback decisions
 remain the lifecycle's responsibility. Owner-transfer restoration retains the
 new owner. No second journal or cross-oracle arbitration is introduced.

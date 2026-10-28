@@ -17,6 +17,7 @@ import secrets
 import socket
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -26,20 +27,49 @@ import requests
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 from .edgeguard_cypher_guard import (
+  CYPHER_MAX_CHARS,
   DEFAULT_SCHEMA_RETRY_LIMIT,
   EDGEGUARD_SCHEMA,
+  EDGEGUARD_SCHEMA_V0_11,
+  RESULT_SHAPE_GRAPH,
+  RESULT_SHAPE_OTHER,
+  RESULT_SHAPE_RANKED_PROJECTION,
   SCHEMA_VERSION,
+  SCHEMA_VERSION_V0_11,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,
   build_direct_cypher_system_prompt,
   build_schema_correction_prompt,
+  build_v0_11_correction_prompt,
+  build_v0_11_pattern_schema_system_prompt,
   canonical_schema_surface,
+  classify_empty_reason,
+  classify_result_shape,
+  correct_reversed_relationship_arrows,
+  derive_ranking_rule,
   normalize_user_literal_text,
+  schema_sets,
 )
+from .edgeguard_cypher_guard_v0_13 import (
+  EDGEGUARD_SCHEMA_V0_13,
+  SCHEMA_VERSION_V0_13,
+  build_v0_13_pattern_schema_system_prompt,
+)
+from . import literal_classes
+
+# Contract §3.2 (review finding 7, S8): "the dataset validator and the guard
+# import it, and both pin its sha in their reports" — the API side of that
+# pin, read fresh at import time (never hand-copied) so it always matches
+# the module actually running; a test re-verifies the file has not silently
+# drifted from what `/prompt_contract` reports.
+with open(literal_classes.__file__, "rb") as _literal_classes_fh:
+  LITERAL_CLASSES_SHA256 = hashlib.sha256(_literal_classes_fh.read()).hexdigest()
+
 from .graph_first_explanation import (
   COVERAGE_VERSION,
   GraphFirstContractError,
   ModePlan,
+  node_alias_map,
   resolve_mode,
 )
 from .graph_first_runtime import (
@@ -56,9 +86,11 @@ from .graph_first_runtime import (
   production_token_counter,
   run_graph_first_explanation,
 )
-from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_result_digest
+from .result_digest import DIGEST_COVERAGE_SCHEMA_VERSION, build_projection_digest, build_result_digest
 from .analyst_brief import MAX_TOKENS as ANALYST_BRIEF_MAX_TOKENS, run_analyst_brief
 from . import egx2
+from . import misp_enrichment
+from .misp_enrichment import FORBIDDEN_PACKET_PROPERTY_RE
 
 try:
   from neo4j import GraphDatabase, Query, READ_ACCESS
@@ -66,6 +98,80 @@ except Exception:  # pragma: no cover - exercised through dependency-missing tes
   GraphDatabase = None
   Query = None
   READ_ACCESS = "READ"
+
+try:
+  # Fix round 3, L2a; comment corrected in fix round 4 (re-review-3 finding
+  # 6): `neo4j.exceptions.ClientError` is the Neo4j driver's base class for
+  # every error the *server* raised against the statement as sent — it
+  # covers two distinct families, not one. Most subclasses (`CypherSyntaxError`,
+  # `CypherTypeError`, `ConstraintError`, ...) mean the server rejected the
+  # Cypher itself (syntax, type, constraint) — the caller's fault, not a
+  # connection/timeout failure; `/neo4j_query` and `explain_graph` give that
+  # family the `neo4j_client_error` `error_code` and HTTP 422. A second
+  # family — `AuthError`, `Forbidden`, `TokenExpired` (imported below as
+  # `Neo4jAuthError`/`Neo4jForbidden`/`Neo4jTokenExpired`) — is also a
+  # `ClientError` subclass but means the *driver's own credentials* were
+  # rejected: a server-side misconfiguration, not a bad query, so a
+  # dedicated `except` clause ahead of the generic `ClientError` one gives
+  # it the distinct `neo4j_auth_error` code and HTTP 503 instead.
+  from neo4j.exceptions import ClientError as Neo4jClientError
+except Exception:  # pragma: no cover - exercised through dependency-missing tests.
+  class Neo4jClientError(Exception):
+    """Placeholder when `neo4j` (or its `exceptions` submodule) is not
+    installed: the real driver never raises this placeholder, so the
+    dedicated except clause below simply never matches on such a host."""
+
+try:
+  # Fix round 4 (re-review-3 finding 6): `AuthError`, `Forbidden` and
+  # `TokenExpired` are `ClientError` subclasses that report a rejected
+  # credential or a missing privilege, not a malformed statement — see the
+  # `Neo4jClientError` comment above. Imported with the same
+  # dependency-missing fallback pattern as `Neo4jClientError`.
+  from neo4j.exceptions import (
+    AuthError as Neo4jAuthError,
+    Forbidden as Neo4jForbidden,
+    TokenExpired as Neo4jTokenExpired,
+  )
+except Exception:  # pragma: no cover - exercised through dependency-missing tests.
+  class Neo4jAuthError(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jForbidden(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jTokenExpired(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+# Fix round 4: a single tuple so both `/neo4j_query` and `explain_graph`
+# catch the auth-family subclasses with one `except` clause, ahead of the
+# generic `Neo4jClientError` one (subclass except clauses must be listed
+# before their base class, or they never match).
+NEO4J_AUTH_ERROR_TYPES = (Neo4jAuthError, Neo4jForbidden, Neo4jTokenExpired)
+
+try:
+  # I-076: driver connectivity failures, the only exceptions `explain_graph`
+  # still labels `neo4j_connection_error`.
+  from neo4j.exceptions import (
+    DatabaseUnavailable as Neo4jDatabaseUnavailable,
+    ServiceUnavailable as Neo4jServiceUnavailable,
+    SessionExpired as Neo4jSessionExpired,
+  )
+except Exception:  # pragma: no cover - exercised through dependency-missing tests.
+  class Neo4jServiceUnavailable(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jSessionExpired(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+  class Neo4jDatabaseUnavailable(Exception):
+    """Placeholder when `neo4j` is not installed; see `Neo4jClientError`."""
+
+# DatabaseUnavailable: the database is starting/stopping (transient). OSError
+# covers ConnectionError, TimeoutError and socket/DNS failures; note it also
+# labels any other escaped I/O error as connectivity.
+NEO4J_CONNECTIVITY_ERROR_TYPES = (
+  Neo4jServiceUnavailable, Neo4jSessionExpired, Neo4jDatabaseUnavailable, OSError,
+)
 
 try:
   import websocket
@@ -200,6 +306,8 @@ class _BridgeNeo4jDriver:
 GRAPH_PACKET_SCHEMA_VERSION = "edgeguard.graph_evidence_packet.v1"
 QUERY_RESULT_EVIDENCE_SCHEMA_VERSION = "edgeguard.query_result_evidence.v1"
 NEO4J_CONNECTION_STATUS_SCHEMA_VERSION = "edgeguard.neo4j_connection_status.v1"
+NEO4J_CONNECTION_METHODS = frozenset({"native_driver", "bolt_over_wss"})
+NEO4J_PLAINTEXT_SCHEMES = frozenset({"bolt", "neo4j"})
 CASE_EXPLANATION_SCHEMA_VERSION = "edgeguard.case_explanation.v1"
 CASE_EXPLANATION_DRAFT_SCHEMA_VERSION = "edgeguard.case_explanation_draft.v2"
 GRAPH_FIRST_PREPARE_SCHEMA_VERSION = "edgeguard.graph_first_prepare.v1"
@@ -247,7 +355,10 @@ EXPLANATION_OPTIONAL_NARRATIVE_MAX_WORDS = {
 }
 EXPLANATION_TRUNCATED_MESSAGE = "Graph explanation output was truncated at the safe token limit."
 GENERATION_MAX_REQUEST_CHARS = 4_000
-GENERATION_MAX_TOKENS = 64
+# Contract §5.4: 75 of 76 observed v0.10 attempts stopped under 105 tokens;
+# ranked pipelines estimate 120-200; the one rambling attempt hit 256. 384
+# keeps headroom without letting a runaway completion burn the request budget.
+GENERATION_MAX_TOKENS = 384
 GENERATION_TEMPERATURE = 0.0
 GENERATION_TOP_P = 1.0
 GENERATION_TIMEOUT_SECONDS = 600
@@ -304,11 +415,11 @@ WRITE_OR_ADMIN_RE = re.compile(
   r"START\s+DATABASE|STOP\s+DATABASE)\b",
   re.IGNORECASE,
 )
-FORBIDDEN_PACKET_PROPERTY_RE = re.compile(
-  r"(raw|payload|body|content|header|authorization|cookie|password|secret|token|api_key|"
-  r"credential|log|screenshot|stack|request|response)",
-  re.IGNORECASE,
-)
+# `FORBIDDEN_PACKET_PROPERTY_RE` lives in `misp_enrichment.py` and is
+# imported back above under the same name -- this policy regex is used far
+# beyond MISP enrichment (packet-property sanitisation, projection safety),
+# but the misp_enrichment block validator needs it too, and one definition
+# is easier to keep in sync than two.
 SEVERITY_EVIDENCE_KEYS = {
   "severity",
   "risk",
@@ -563,6 +674,35 @@ def _tracked_endpoint(func):
 PROMPT_PROFILE_DIRECT_CYPHER = "direct_cypher"
 PROMPT_PROFILE_SCHEMA_GROUNDED = "schema_grounded"
 PROMPT_PROFILE_CYBERSEC_SCHEMA_GROUNDED = "cybersec_schema_grounded"
+# Contract §5.1: the v0.11 served prompt, built from the pinned schema
+# artifact (typed patterns, vocabularies, synonym rule, both output shapes).
+# No default public worker declares this profile: it is meant for a
+# deployment's own fine-tuned-on-v0.11 model key, wired in by
+# `EDGEGUARD_GENERATION_WORKERS` (deployment config), same as
+# `finetuned_v0_10` today wires in `direct_cypher`.
+PROMPT_PROFILE_V0_11_PATTERN_SCHEMA = "v0_11_pattern_schema"
+# EGM-068 contract v0.13 (cf789b9 graph): same output contract and correction
+# turn as v0.11, but its own artifact, served prompt and guard allowlist.
+PROMPT_PROFILE_V0_13_PATTERN_SCHEMA = "v0_13_pattern_schema"
+# Profiles that validate with the v0.11-style rules (optional graph LIMIT, hop
+# bounds, endpoint pairs), each against its own artifact.
+PATTERN_SCHEMA_ARTIFACTS = {
+  PROMPT_PROFILE_V0_11_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_11,
+  PROMPT_PROFILE_V0_13_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_13,
+}
+_ARTIFACTS_BY_SCHEMA_VERSION = {
+  SCHEMA_VERSION_V0_11: EDGEGUARD_SCHEMA_V0_11,
+  SCHEMA_VERSION_V0_13: EDGEGUARD_SCHEMA_V0_13,
+}
+
+
+def _artifact_for_schema_version(schema_version: Any) -> Dict[str, Any]:
+  """The pattern-schema artifact a validation reports; v0.11 for anything else (the pre-v0.13 behaviour)."""
+  return _ARTIFACTS_BY_SCHEMA_VERSION.get(schema_version, EDGEGUARD_SCHEMA_V0_11)
+
+# Fallback profile for a misconfigured/unknown worker declaration (contract
+# does not ask the served default to switch this phase, see `_prompt_profile`
+# below): stays the v0.10 schema-grounded profile.
 DEFAULT_PROMPT_PROFILE = PROMPT_PROFILE_SCHEMA_GROUNDED
 PROMPT_PROFILES = {
   PROMPT_PROFILE_DIRECT_CYPHER: {
@@ -592,7 +732,71 @@ PROMPT_PROFILES = {
     ),
     "single_user_message": True,
   },
+  PROMPT_PROFILE_V0_11_PATTERN_SCHEMA: {
+    "prompt_profile_id": "edgeguard_v0_11_pattern_schema",
+    "template_version": "edgeguard-v0-11-pattern-schema",
+    "prompt_contract": (
+      "schema-grounded read-only Cypher query string, graph or ranked_projection shape"
+    ),
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+  },
+  PROMPT_PROFILE_V0_13_PATTERN_SCHEMA: {
+    "prompt_profile_id": "edgeguard_v0_13_pattern_schema",
+    "template_version": "edgeguard-v0-13-pattern-schema",
+    "prompt_contract": (
+      "schema-grounded read-only Cypher query string, graph or ranked_projection shape"
+    ),
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+  },
 }
+
+# Contract §5.1/§5.2: which builder renders the system prompt / correction
+# turn for a profile. Every profile not listed here keeps the unchanged
+# v0.10 builders (`build_direct_cypher_system_prompt`,
+# `build_schema_correction_prompt`) — that is what keeps the v0.10 profile
+# byte-identical.
+#
+# Review finding Q8: the v0.11 prompt renders from the fixed, module-loaded
+# `EDGEGUARD_SCHEMA_V0_11` artifact — it never changes within a process — so
+# it is built once here rather than on every `generate` call.
+_V0_11_SYSTEM_PROMPT = build_v0_11_pattern_schema_system_prompt()
+_V0_13_SYSTEM_PROMPT = build_v0_13_pattern_schema_system_prompt()
+
+
+def _system_prompt_for_profile(profile_name: str) -> str:
+  if profile_name == PROMPT_PROFILE_V0_11_PATTERN_SCHEMA:
+    return _V0_11_SYSTEM_PROMPT
+  if profile_name == PROMPT_PROFILE_V0_13_PATTERN_SCHEMA:
+    return _V0_13_SYSTEM_PROMPT
+  return build_direct_cypher_system_prompt()
+
+
+def _correction_prompt_for_profile(
+  profile_name: str,
+  *,
+  normalized_request: str,
+  rejected_cypher: str,
+  validation_feedback: str,
+  retry_index: int,
+  retry_limit: int,
+) -> str:
+  if profile_name in PATTERN_SCHEMA_ARTIFACTS:
+    return build_v0_11_correction_prompt(
+      rejected_cypher=rejected_cypher,
+      validation_feedback=validation_feedback,
+      retry_index=retry_index,
+      retry_limit=retry_limit,
+    )
+  return build_schema_correction_prompt(
+    original_user_prompt=normalized_request,
+    rejected_cypher=rejected_cypher,
+    validation_feedback=validation_feedback,
+    retry_index=retry_index,
+    retry_limit=retry_limit,
+  )
+
 
 GRAPH_EXPLANATION_PROMPT_CONTRACT = {
   "prompt_version": GRAPH_EXPLANATION_PROMPT_VERSION,
@@ -756,6 +960,11 @@ class _GraphPacketState:
   relationships: Dict[str, Dict[str, Any]] = field(default_factory=dict)
   node_keys: Dict[str, str] = field(default_factory=dict)
   relationship_keys: Dict[str, str] = field(default_factory=dict)
+  # The driver-native element id for every packet node, captured at the one
+  # place packet node ids are assigned, so a caller
+  # (`_collect_misp_candidate_nodes`) never has to re-derive it with a
+  # second, private walk.
+  element_ids: Dict[str, str] = field(default_factory=dict)
   dropped_forbidden_properties: int = 0
   truncated_properties: int = 0
   graph_truncated: bool = False
@@ -763,6 +972,66 @@ class _GraphPacketState:
 
 def _contract_error(code: str, detail: str) -> Dict[str, str]:
   return {"code": code, "detail": detail}
+
+
+def _wrapper_safe_error(result: Dict[str, Any], status_code: int) -> Dict[str, Any]:
+  """Fix round 4 (re-review-3 finding 3): the platform's generated FastAPI
+  wrapper treats any plugin result dict that carries a top-level `error`
+  key, but no `status_code`, as an unhandled failure and raises it as an
+  opaque HTTP 500 (`docs/tasks_manager/_runs/EGM-059/phase-2/re-review-3.md`
+  — edg3 log `20260927_184345_EE_005_log.txt:762-768`). Nesting the
+  structured body under `result` and naming `status_code` explicitly (the
+  same transport already used by `_explanation_failure_transport` and
+  `_graph_first_failure_transport`) lets `/neo4j_query` and `explain_graph`
+  state the intended HTTP status instead of falling into that default."""
+  return {"status_code": status_code, "result": result, "logged": True}
+
+
+# Fix round 5: `_prepare_graph_explanation_plan` is a shared, unwrapped
+# helper — its callers (`prepare_graph_explanation`, `explain_graph`'s two
+# `plan`-consuming branches) each finish the response differently
+# (`_with_active_prepare_contract`, a bare envelope), so it cannot call
+# `_wrapper_safe_error` itself. It instead tags the intended HTTP status on
+# a private key a caller pops before building the final response, so every
+# guard/content/config rejection it can return still resolves to a
+# deliberate status code instead of the wrapper's bare 500.
+_WRAPPER_STATUS_CODE_KEY = "_wrapper_status_code"
+_EXPLAIN_JOBS_INIT_LOCK = threading.Lock()
+
+
+# EG-028: explain job. `/explain_graph_start` runs the `/explain_graph` body on
+# one daemon worker thread; `/explain_graph_status` reports phases and, when
+# done, the exact `/explain_graph` result.
+EXPLAIN_JOB_PHASES = ("guard", "neo4j", "evidence", "misp", "brief", "checks", "fallback", "done")
+EXPLAIN_JOB_MAX_RUNNING = 1
+EXPLAIN_JOB_MAX_FINISHED = 20
+EXPLAIN_JOB_FINISHED_TTL_SECONDS = 15 * 60
+EXPLAIN_JOB_RETRY_AFTER_SECONDS = 30
+# How long `/explain_graph_start` waits for the cheap synchronous validation
+# (400/413/422 branches) before it hands back a job id.
+EXPLAIN_JOB_VALIDATION_WAIT_SECONDS = 5.0
+
+
+def _emit_progress(progress, phase: str, detail: Optional[Dict[str, Any]] = None) -> None:
+  """Report an explain phase; a missing or failing callback never affects the
+  explanation itself."""
+  if progress is None:
+    return
+  try:
+    progress(phase, detail)
+  except Exception:  # noqa: BLE001 - progress is observability only.
+    pass
+
+
+def _unwrap_endpoint_result(response: Any) -> tuple[Any, int]:
+  """Split a `_wrapper_safe_error` envelope into (result, HTTP status); a bare
+  dict is a 200."""
+  if isinstance(response, dict) and "status_code" in response and "result" in response:
+    try:
+      return response["result"], int(response["status_code"])
+    except (TypeError, ValueError):
+      return response["result"], 500
+  return response, 200
 
 
 def _graph_first_prepare_contract(mode_plan: Optional[ModePlan]) -> Dict[str, Any]:
@@ -1012,6 +1281,7 @@ def _prepare_graph_explanation_plan(
   broadening_enabled: bool = False,
   mode_plan: Optional[ModePlan] = None,
   guard_max_limit: Optional[int] = None,
+  validation_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
   try:
     selected_mode = mode_plan or resolve_mode(explanation_rows=requested_limit)
@@ -1021,18 +1291,39 @@ def _prepare_graph_explanation_plan(
       "ok": False,
       "error": "Graph explanation request configuration is invalid.",
       "validation_errors": [_contract_error(exc.code, exc.detail)],
+      _WRAPPER_STATUS_CODE_KEY: 400,
     }
   # CALL/properties()/wildcard/bracket projection safety now lives in the
   # shared guard's execution-safety stage (EG-013), so every execution route
   # rejects them identically; only the packet-property projection policy below
   # remains explanation-specific.
-  analysis = analyze_generated_cypher(cypher, max_limit=guard_max_limit)
+  # Contract §1/§4.1 (review finding 1, round 2): explain routes accept what
+  # `generate` accepts for the v0.11 profile — the caller resolves the
+  # selection once via `EdgeguardApi._cypher_validation_profile` and passes
+  # it down here; `validation_profile=None` (module-level test callers with
+  # no model key) keeps the v0.10 defaults exactly as before.
+  use_v0_11 = bool((validation_profile or {}).get("use_v0_11"))
+  analysis = analyze_generated_cypher(
+    cypher,
+    allowed=(validation_profile or {}).get("schema_allowed"),
+    max_limit=guard_max_limit,
+    allow_limit_optional_graph=use_v0_11,
+    enforce_hop_bounds=use_v0_11,
+    enforce_pattern_endpoints=use_v0_11,
+    schema_artifact=(validation_profile or {}).get("schema_artifact"),
+  )
+  analysis["schema_version"] = (validation_profile or {}).get("schema_version", SCHEMA_VERSION)
+  # Contract §4.3: carried in `plan["validation"]` so the explanation
+  # dispatcher can route `ranked_projection` to the digest analyst brief
+  # regardless of the configured graph-topology explanation strategy.
+  analysis["result_shape"] = classify_result_shape(analysis.get("candidate") or cypher)
   if not analysis["accepted"]:
     return {
       "status": STATUS_REJECTED,
       "ok": False,
       "validation": analysis,
       "error": "Cypher rejected by EdgeGuard guard; graph explanation was not prepared.",
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   accepted_cypher = analysis["accepted_cypher"]
   projected_properties = re.findall(
@@ -1055,6 +1346,7 @@ def _prepare_graph_explanation_plan(
           f"property {forbidden_projection} is excluded by the explanation security policy",
         )
       ],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   return_clause = _top_level_return_clause(accepted_cypher) or ""
   result_functions = re.findall(
@@ -1081,6 +1373,7 @@ def _prepare_graph_explanation_plan(
           f"result-producing function {unsafe_function} is not allowlisted",
         )
       ],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   result_columns = _result_columns_from_cypher(accepted_cypher)
   if result_columns is None:
@@ -1095,6 +1388,7 @@ def _prepare_graph_explanation_plan(
           "every returned expression must have a deterministic unique column name",
         )
       ],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   try:
     projection_descriptors = direct_projection_descriptors(return_clause, result_columns)
@@ -1105,6 +1399,7 @@ def _prepare_graph_explanation_plan(
       "validation": analysis,
       "error": "Cypher result projection is not safe for complete-result explanation.",
       "validation_errors": [_contract_error(exc.code, exc.detail)],
+      _WRAPPER_STATUS_CODE_KEY: 422,
     }
   try:
     primary_cypher, generated_limit, executed_limit, limit_adjusted = _normalize_explanation_cypher_limit(
@@ -1117,6 +1412,7 @@ def _prepare_graph_explanation_plan(
       "ok": False,
       "validation": analysis,
       "error": f"Invalid explanation row limit: {exc}",
+      _WRAPPER_STATUS_CODE_KEY: 400,
     }
 
   broadening = build_empty_result_broadening_cypher(accepted_cypher) if broadening_enabled else None
@@ -1176,11 +1472,18 @@ def _object_items(value: Any) -> Dict[str, Any]:
   return {}
 
 
-def _object_key(value: Any, prefix: str) -> str:
+def _entity_identity(value: Any) -> Optional[str]:
   for attr in ("element_id", "elementId", "id"):
     item = getattr(value, attr, None)
     if item not in (None, ""):
-      return f"{prefix}:{item}"
+      return str(item)
+  return None
+
+
+def _object_key(value: Any, prefix: str) -> str:
+  identity = _entity_identity(value)
+  if identity is not None:
+    return f"{prefix}:{identity}"
   return f"{prefix}:{repr(value)}"
 
 
@@ -1271,6 +1574,9 @@ def _add_graph_node(value: Any, state: _GraphPacketState) -> Optional[str]:
     "caption": _node_caption(labels, properties),
     "properties": properties,
   }
+  identity = _entity_identity(value)
+  if identity is not None:
+    state.element_ids[node_id] = identity
   return node_id
 
 
@@ -1325,6 +1631,46 @@ def _collect_graph(value: Any, state: _GraphPacketState) -> None:
       _collect_graph(item, state)
 
 
+def _has_misp_id_property(properties: Mapping[str, Any]) -> bool:
+  for key in ("misp_event_ids", "misp_attribute_ids"):
+    value = properties.get(key)
+    if isinstance(value, (list, tuple)) and any(item not in (None, "") for item in value):
+      return True
+    if isinstance(value, str) and value.strip():
+      return True
+  return False
+
+
+# Distinct invalid event URL templates logged per process (spec v0.3 §4.1).
+MISP_BAD_TEMPLATE_LOG_CAP = 16
+
+
+def _collect_misp_candidate_nodes(records: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+  """Contract §7.1. Returns `{element_id: {"packet_id": ..., "labels": [...]}}`
+  for every distinct node that carries a non-empty `misp_event_ids` or
+  `misp_attribute_ids` property.
+
+  Reuses `_collect_graph` (the same walk that builds the graph evidence
+  packet, via `_add_graph_node`'s dedup and its `element_ids` tracking)
+  instead of a second, private recursive walker -- packet ids and element
+  ids come from the one place that assigns them. This
+  pre-filter (the probe report: every enrichable label carries both lists at
+  100 % coverage) is also what keeps the one internal read query from firing
+  on graphs with no MISP-taggable nodes at all."""
+  state = _GraphPacketState()
+  for record in records:
+    _collect_graph(record, state)
+  candidates: Dict[str, Dict[str, Any]] = {}
+  for node_id, node in state.nodes.items():
+    element_id = state.element_ids.get(node_id)
+    if element_id is None:
+      continue
+    if not _has_misp_id_property(node["properties"]):
+      continue
+    candidates[element_id] = {"packet_id": node_id, "labels": list(node["labels"])}
+  return candidates
+
+
 def _build_graph_evidence_packet(
   *,
   request: str,
@@ -1368,7 +1714,12 @@ def _build_graph_evidence_packet(
     "redaction": {
       "policy": GRAPH_PACKET_REDACTION_POLICY,
       "contains_customer_evidence": False,
-      "contains_raw_misp_payload": False,
+      # Explanation spec v0.2 §4: computed, never declared. The packet
+      # itself never embeds the block, so the value here is the one for
+      # "no block"; `_admit_misp_enrichment_for_model` recomputes it against
+      # the block that would accompany a model call and runs the redaction
+      # check below on the result.
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(None),
     },
   }
   meta = {
@@ -1530,6 +1881,78 @@ def _legacy_query_result_evidence(
     "columns": resolved_columns,
     "rows": rows,
   }, raw_nodes, raw_relationships
+
+
+_JSON_SAFE_TEMPORAL_CLASS_NAMES = {
+  "date", "datetime", "duration", "localdatetime", "localtime", "time",
+}
+
+
+def _neo4j_row_json_safe(value: Any, depth: int = 0) -> Any:
+  """Convert one `/neo4j_query` row value into a JSON-serializable form.
+
+  Contract §4.3: rows stay complete (PR #477 review, F1 decision — no ref
+  indirection, no property redaction, unlike `_legacy_query_result_value`);
+  this only replaces the structural types stdlib ``json`` cannot encode
+  (`neo4j.graph.Path`, temporal values, points) with plain dict/str forms.
+  A bare node or relationship value is flattened to its property dict so a
+  row's shape for those columns is unchanged from before this fix.
+  """
+  if depth > 8:
+    raise _ResultEvidenceError("result_nesting_limit", "query result nesting exceeds eight levels")
+  if value is None or isinstance(value, (bool, int, str)):
+    return value
+  if isinstance(value, float):
+    if not math.isfinite(value):
+      raise _ResultEvidenceError("invalid_result_number", "query result number must be finite")
+    return value
+  if _is_relationship_like(value):
+    return {
+      key: _neo4j_row_json_safe(item, depth=depth + 1)
+      for key, item in _object_items(value).items()
+    }
+  if _is_node_like(value):
+    return {
+      key: _neo4j_row_json_safe(item, depth=depth + 1)
+      for key, item in _object_items(value).items()
+    }
+  if _is_path_like(value):
+    return {
+      "nodes": [
+        _neo4j_row_json_safe(node, depth=depth + 1)
+        for node in list(getattr(value, "nodes", []) or [])
+      ],
+      "relationships": [
+        _neo4j_row_json_safe(relationship, depth=depth + 1)
+        for relationship in list(getattr(value, "relationships", []) or [])
+      ],
+    }
+  class_name = value.__class__.__name__.lower()
+  if class_name in _JSON_SAFE_TEMPORAL_CLASS_NAMES:
+    return str(value)
+  if hasattr(value, "srid") and hasattr(value, "x") and hasattr(value, "y"):
+    point = {"srid": str(getattr(value, "srid")), "x": getattr(value, "x"), "y": getattr(value, "y")}
+    if getattr(value, "z", None) is not None:
+      point["z"] = getattr(value, "z")
+    return point
+  if hasattr(value, "to_native"):
+    native = value.to_native()
+    if isinstance(native, int):
+      return native
+  if isinstance(value, (bytes, bytearray)):
+    # Review finding Q5: a byte string is a legitimate Neo4j value (e.g. a
+    # raw property); hex is JSON-safe and lossless, unlike falling through to
+    # the catch-all rejection below.
+    return bytes(value).hex()
+  if isinstance(value, (list, tuple)):
+    return [_neo4j_row_json_safe(item, depth=depth + 1) for item in value]
+  if isinstance(value, dict):
+    return {str(key): _neo4j_row_json_safe(item, depth=depth + 1) for key, item in value.items()}
+  # Review finding Q5: `unsupported_query_result_value` is a distinct code
+  # from every other `_ResultEvidenceError` this function raises (nesting,
+  # non-finite numbers) so a caller catching it specifically (`/neo4j_query`)
+  # can surface it as `error_code` instead of a generic driver failure.
+  raise _ResultEvidenceError("unsupported_query_result_value", "query result contains an unsupported value")
 
 
 def _serialized_graph_error(code: str, detail: str) -> tuple[None, None, list[Dict[str, str]]]:
@@ -2289,7 +2712,9 @@ def _build_graph_evidence_packet_from_execution(
     "redaction": {
       "policy": GRAPH_PACKET_REDACTION_POLICY,
       "contains_customer_evidence": False,
-      "contains_raw_misp_payload": False,
+      # Same as `_build_graph_evidence_packet`: computed for "no block";
+      # the prepared-execution path never carries `misp_enrichment`.
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(None),
     },
   }
   meta = {
@@ -2452,18 +2877,25 @@ def _validate_graph_evidence_packet(packet: Any) -> tuple[list[Dict[str, str]], 
       if any(str(key).lower() in SEVERITY_EVIDENCE_KEYS for key in properties):
         context["severity_evidence_ids"].add(rel_id)
 
-  redaction = packet.get("redaction")
-  if not isinstance(redaction, dict):
-    errors.append(_contract_error("redaction_missing", "redaction must be an object"))
-  else:
-    if redaction.get("policy") != GRAPH_PACKET_REDACTION_POLICY:
-      errors.append(_contract_error("redaction_policy", "unexpected redaction policy"))
-    if redaction.get("contains_customer_evidence") is not False:
-      errors.append(_contract_error("customer_evidence_not_allowed", "customer evidence is not allowed in v0.1 model input"))
-    if redaction.get("contains_raw_misp_payload") is not False:
-      errors.append(_contract_error("raw_misp_payload_not_allowed", "raw MISP payloads are not allowed in v0.1 model input"))
+  _validate_packet_redaction(packet.get("redaction"), errors)
 
   return errors, context
+
+
+def _validate_packet_redaction(redaction: Any, errors: list[Dict[str, str]]) -> None:
+  """The packet redaction check, shared by `_validate_graph_evidence_packet`
+  and the `misp_enrichment` model-admission step. Fails closed on a `True`
+  `contains_raw_misp_payload`, which explanation spec v0.2 §4 computes
+  against the block that would accompany the model input."""
+  if not isinstance(redaction, dict):
+    errors.append(_contract_error("redaction_missing", "redaction must be an object"))
+    return
+  if redaction.get("policy") != GRAPH_PACKET_REDACTION_POLICY:
+    errors.append(_contract_error("redaction_policy", "unexpected redaction policy"))
+  if redaction.get("contains_customer_evidence") is not False:
+    errors.append(_contract_error("customer_evidence_not_allowed", "customer evidence is not allowed in v0.1 model input"))
+  if redaction.get("contains_raw_misp_payload") is not False:
+    errors.append(_contract_error("raw_misp_payload_not_allowed", "raw MISP payloads are not allowed in v0.1 model input"))
 
 
 def _unexpected_keys(value: Dict[str, Any], allowed: set[str], where: str, errors: list[Dict[str, str]]) -> None:
@@ -2948,12 +3380,33 @@ _CONFIG = {
   "RESPONSE_FORMAT": "RAW",
   "PORT": None,
 
+  # Contract §7.3: fail-open MISP enrichment block, off switch for an
+  # operator who wants to disable the extra internal Neo4j read query
+  # without a code change (EGM-059 phase 3, slice 3a). Default False -- the
+  # unpatched playground (f545720) rejects unknown top-level keys, so this
+  # stays off until the playground patch (slice 3b) ships alongside it.
+  "MISP_ENRICHMENT_ENABLED": False,
+  # The internal enrichment read's own bounded timeout, independent of
+  # `cfg_neo4j_query_timeout_seconds`.
+  "MISP_ENRICHMENT_TIMEOUT_SECONDS": misp_enrichment.DEFAULT_TIMEOUT_SECONDS,
+  # Explanation spec v0.3 §4: event link template, read once per explain
+  # request; an invalid value turns enrichment off for that request.
+  "MISP_ENRICHMENT_EVENT_URL_TEMPLATE": misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
+
   "API_TITLE": "EdgeGuard API",
   "API_SUMMARY": "Guarded EdgeGuard text-to-Cypher and playground Neo4j API.",
 
   "EDGEGUARD_EXPLANATION_MODEL_URL": None,
   "EDGEGUARD_EXPLANATION_MODEL_HOST": "127.0.0.1",
   "EDGEGUARD_EXPLANATION_MODEL_PORT": None,
+  # v0.11 profile only: before a generated query is rejected for a
+  # relationship written against its only schema direction, flip that arrow
+  # and re-run the full guard (`correct_reversed_relationship_arrows`); the
+  # attempt records the rewrite under `auto_corrected` (also on attempts a later check
+  # rejects, so count rewrites on accepted attempts only). False restores the
+  # plain reject-and-retry behaviour. Off by default so runs pinned to the
+  # plain guard stay comparable; a deployment opts in through its config.
+  "EDGEGUARD_DIRECTION_CORRECTOR": False,
   "EDGEGUARD_EXPLANATION_MODEL_PATH": "/create_chat_completion",
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN": None,
   "EDGEGUARD_EXPLANATION_MODEL_TOKEN_ENV": "EDGEGUARD_EXPLANATION_MODEL_TOKEN",
@@ -3015,10 +3468,17 @@ _CONFIG = {
 
   "NEO4J_DEFAULT_CONNECTION": {
     "scheme": "bolt+s",
+    # Optional transport: "native_driver" or "bolt_over_wss" (the default when
+    # absent). A request's own `method` wins over it.
+    # "method": "bolt_over_wss",
   },
   "NEO4J_MAX_ROWS": 100,
   "NEO4J_QUERY_TIMEOUT_SECONDS": 30,
-  "LIVE_EMPTY_RESULT_BROADENING": True,
+  # Contract §6: broadening is off by default so an empty result is reported
+  # truthfully, with an `empty_reason`, instead of being replaced by an
+  # unrelated deterministic-broadening row. Callers opt in per request with
+  # `enable_empty_result_broadening=True`.
+  "LIVE_EMPTY_RESULT_BROADENING": False,
   "REQUEST_TIMEOUT": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "REQUEST_TIMEOUT_SECONDS": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "EDGEGUARD_VERBOSE": 10,
@@ -3037,6 +3497,17 @@ class EdgeguardApiPlugin(BasePlugin):
     self._request_count = 0
     self._error_count = 0
     self._last_request_time = None
+    # Bounded, value-free observability for a swallowed `misp_enrichment`
+    # error -- a count and the exception class name (or `"validation"`) only,
+    # never the message or any raw data.
+    self._misp_enrichment_error_count = 0
+    self._misp_enrichment_last_error = None
+    # Spec v0.3: distinct bad templates already logged (bounded), and the
+    # value-free count of citations dropped for breaking a client rule.
+    self._misp_bad_templates_logged = set()
+    self._misp_citation_drop_count = 0
+    self._misp_ref_drop_count = 0
+    self._misp_ref_withheld_count = 0
     self._explanation_token = self._resolve_secret(
       explicit=self.cfg_edgeguard_explanation_model_token,
       env_name=self.cfg_edgeguard_explanation_model_token_env,
@@ -3218,6 +3689,23 @@ class EdgeguardApiPlugin(BasePlugin):
     if secret:
       message = message.replace(secret, "<redacted>")
     return message
+
+  def _explain_graph_error(
+    self, exc: Exception, error_code: str, status_code: int,
+    connection: Dict[str, Any], analysis: Dict[str, Any], started: float,
+  ) -> Dict[str, Any]:
+    """Wrapper-safe `/explain_graph` error body shared by the outer chain."""
+    elapsed = round((time.monotonic() - started) * 1000, 1)
+    return _wrapper_safe_error({
+      "status": STATUS_ERROR,
+      "ok": False,
+      "executed": False,
+      "explained": False,
+      "error": self._sanitize_error(exc, connection["password"]),
+      "error_code": error_code,
+      "validation": analysis,
+      "metrics": {"edgeguard_api_ms": elapsed, "server_total_ms": elapsed},
+    }, status_code)
 
   def _extract_explanation_completion(self, response: Any) -> Dict[str, Any]:
     def parse_envelope(value: Any, path: str) -> Optional[Dict[str, Any]]:
@@ -3455,7 +3943,7 @@ class EdgeguardApiPlugin(BasePlugin):
         raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace truncation is invalid")
       if isinstance(item["duration_ms"], bool) or not isinstance(item["duration_ms"], (int, float)) or not math.isfinite(item["duration_ms"]) or item["duration_ms"] < 0:
         raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace timing is invalid")
-      if item["method"] not in {"native_driver", "next_route", "unspecified"}:
+      if item["method"] not in {"native_driver", "bolt_over_wss", "next_route", "unspecified"}:
         raise GraphFirstRuntimeError("execution_trace_shape", "validation", "execution trace method is invalid")
       clean.append(dict(item))
     expected_ids = ["primary", "broadening"] if selected == "broadening" else ["primary"]
@@ -3466,13 +3954,28 @@ class EdgeguardApiPlugin(BasePlugin):
       raise GraphFirstRuntimeError("execution_trace_mismatch", "validation", "selected execution trace does not match evidence")
     return {"selected": selected, "executions": clean}
 
+  @staticmethod
+  def _graph_first_response_byte_size(value: Dict[str, Any]) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+
   def _bounded_graph_first_success(self, value: Dict[str, Any]) -> Dict[str, Any]:
     try:
-      size = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+      size = self._graph_first_response_byte_size(value)
     except (TypeError, ValueError) as exc:
       raise GraphFirstRuntimeError("explanation_response_shape", "internal", "graph-first response is not serializable") from exc
     if size <= RESPONSE_MAX_BYTES:
       return value
+    # Contract §7.3: `misp_enrichment` is dropped first, before
+    # `explanation_trace` is ever touched.
+    if value.get("misp_enrichment") is not None:
+      trimmed = {key: item for key, item in value.items() if key != "misp_enrichment"}
+      try:
+        trimmed_size = self._graph_first_response_byte_size(trimmed)
+      except (TypeError, ValueError) as exc:
+        raise GraphFirstRuntimeError("explanation_response_shape", "internal", "graph-first response is not serializable") from exc
+      if trimmed_size <= RESPONSE_MAX_BYTES:
+        return trimmed
+      value = trimmed
     trace = value.get("explanation_trace")
     safe_trace = None
     if isinstance(trace, dict):
@@ -3505,24 +4008,45 @@ class EdgeguardApiPlugin(BasePlugin):
     retry_limit: int = DEFAULT_SCHEMA_RETRY_LIMIT,
   ) -> list[Dict[str, str]]:
     profile = self._prompt_profile(model_key)
-    system_prompt = build_direct_cypher_system_prompt()
+    system_prompt = _system_prompt_for_profile(profile["name"])
     suffix = profile.get("system_prompt_suffix")
     if isinstance(suffix, str) and suffix:
       system_prompt += suffix
-    user_prompt = normalized_request
-    if retry_index:
-      user_prompt = build_schema_correction_prompt(
-        original_user_prompt=normalized_request,
-        rejected_cypher=rejected_cypher or "",
-        validation_feedback=validation_feedback or "The previous output failed validation.",
-        retry_index=retry_index,
-        retry_limit=retry_limit,
-      )
+    if not retry_index:
+      if profile.get("single_user_message"):
+        return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{normalized_request}"}]
+      return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": normalized_request},
+      ]
+    correction_prompt = _correction_prompt_for_profile(
+      profile["name"],
+      normalized_request=normalized_request,
+      rejected_cypher=rejected_cypher or "",
+      validation_feedback=validation_feedback or "The previous output failed validation.",
+      retry_index=retry_index,
+      retry_limit=retry_limit,
+    )
     if profile.get("single_user_message"):
-      return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{user_prompt}"}]
+      # v0.10 profile, unchanged: the correction turn re-embeds the original
+      # request and the whole schema itself (`build_schema_correction_prompt`),
+      # so a single combined user message stays a faithful conversation.
+      return [{"role": "user", "content": f"{system_prompt}\n\nUser task:\n{correction_prompt}"}]
+    if profile["name"] in PATTERN_SCHEMA_ARTIFACTS:
+      # Contract §5.2 (review finding 2, S3=Q1): the v0.11 correction turn
+      # itself carries only the attempt index, the rejected Cypher, the
+      # feedback and the output rule — no schema, no original request — on
+      # the premise that both are already in the conversation. Restore that
+      # premise: [system, user:request, assistant:rejected, user:correction].
+      return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": normalized_request},
+        {"role": "assistant", "content": rejected_cypher or ""},
+        {"role": "user", "content": correction_prompt},
+      ]
     return [
       {"role": "system", "content": system_prompt},
-      {"role": "user", "content": user_prompt},
+      {"role": "user", "content": correction_prompt},
     ]
 
   def _configured_model_keys(self) -> list[str]:
@@ -3571,6 +4095,40 @@ class EdgeguardApiPlugin(BasePlugin):
       name = DEFAULT_PROMPT_PROFILE
     return {"name": name, **PROMPT_PROFILES[name]}
 
+  def _cypher_validation_profile(self, model_key: Optional[str]) -> Dict[str, Any]:
+    """Contract §1/§4.1 (review finding 1, both rounds): the one place that
+    resolves, from a model key, which schema a Cypher candidate validates
+    against — `generate`, `/neo4j_query`, `check_cypher` and the explain
+    routes (`_prepare_graph_explanation_plan`, `explain_graph`) all call this
+    instead of repeating the `model_key -> profile -> v0.11?` selection.
+
+    A `model_key` that resolves to a pattern-schema prompt profile
+    (`v0_11_pattern_schema` or `v0_13_pattern_schema`, see
+    `PATTERN_SCHEMA_ARTIFACTS`) gets that profile's artifact in
+    `schema_artifact`, its derived flat sets, `LIMIT` optional for the
+    `graph` shape, and the tightened hop bounds; `use_v0_11` means exactly
+    "pattern-schema rules" and is true for both. Every other key (including
+    `None`, unresolved keys, and v0.10 profiles) keeps today's v0.10
+    defaults — `analyze_generated_cypher`'s own `allowed=None`,
+    `allow_limit_optional_graph=False`, `enforce_hop_bounds=False`.
+    """
+    artifact = None
+    if isinstance(model_key, str) and model_key.strip():
+      artifact = PATTERN_SCHEMA_ARTIFACTS.get(self._prompt_profile(model_key)["name"])
+    use_v0_11 = artifact is not None
+    return {
+      "use_v0_11": use_v0_11,
+      "schema_artifact": artifact,
+      "schema_allowed": schema_sets(artifact) if use_v0_11 else None,
+      "allow_limit_optional_graph": use_v0_11,
+      "enforce_hop_bounds": use_v0_11,
+      "schema_version": artifact["schema_version"] if use_v0_11 else SCHEMA_VERSION,
+      "schema_surface": (
+        canonical_schema_surface(artifact) if use_v0_11
+        else canonical_schema_surface()
+      ),
+    }
+
   def _generation_model_entry(self, model_key: str) -> Optional[Dict[str, Any]]:
     """Public catalog view of one configured model: metadata only, no worker addresses."""
     worker, err = self._generation_worker(model_key)
@@ -3616,34 +4174,99 @@ class EdgeguardApiPlugin(BasePlugin):
     validation: Dict[str, Any],
     raw_output: str,
     normalized_request: str,
+    retained_closed_vocabulary_literals: Optional[frozenset] = None,
+    use_v0_11: bool = True,
+    schema_artifact: Optional[Dict[str, Any]] = None,
   ) -> Dict[str, Any]:
+    """Contract §3.2, plus the correction-turn retention rule: a
+    closed-vocabulary literal grounded on an earlier attempt (even one the
+    overall query was later rejected for, on account of an unrelated free
+    literal) may not silently disappear from a later correction attempt.
+    `retained_closed_vocabulary_literals` is the running set the caller
+    (`generate`'s retry loop) accumulates from this method's
+    `grounded_closed_vocabulary_literals` output key across attempts.
+
+    `use_v0_11` (fix round 3, L1): the v0.10 fine-tuned profile was trained
+    on the pre-v0.11 rejection sentence ("The query introduced a literal
+    value or filter that was not present in the user request. Remove
+    unrequested WHERE filters and return the requested unfiltered graph
+    pattern."); dropping it for a bare `Literal 'X' (class) is not in the
+    request.` left the model without an instruction it recognised, and it
+    repeated the same rejected Cypher on every retry. `use_v0_11=False`
+    prepends that sentence verbatim, followed by the named literal(s);
+    `use_v0_11=True` (the v0.11 profile default) appends a concise
+    equivalent instruction after the named literal(s)."""
     if not validation.get("accepted"):
       return validation
     candidate = validation.get("accepted_cypher") or validation.get("candidate") or raw_output
-    request_text = normalized_request.casefold()
     temporal_request = bool(re.search(
       r"\b(last|past|recent|latest|hours?|days?|weeks?|months?|years?)\b",
       normalized_request,
       re.IGNORECASE,
     ))
     unrequested = []
+    grounded_closed_vocabulary: set = set()
+    candidate_literals_cf: set = set()
     for literal in self._cypher_string_literals(str(candidate)):
-      normalized = literal.strip().casefold()
+      normalized = literal.strip()
+      if not normalized:
+        continue
+      candidate_literals_cf.add(normalized.casefold())
       derived_temporal = temporal_request and bool(
         re.fullmatch(r"P(?:\d+[YMWD])*(?:T(?:\d+[HMS])*)?", literal, re.IGNORECASE)
       )
-      if normalized and normalized not in request_text and not derived_temporal:
-        unrequested.append(literal)
-    if not unrequested:
-      return validation
+      if derived_temporal:
+        continue
+      # contract §3.1-§3.2: a closed-vocabulary literal (e.g. `indicator_type
+      # = 'ipv4'`) is grounded by the artifact's synonym table even when it
+      # is not a substring of the request ("IP addresses" -> 'ipv4'); a free
+      # literal still needs to appear in the request text.
+      grounding = literal_classes.literal_is_grounded(
+        normalized, normalized_request, schema_artifact or EDGEGUARD_SCHEMA_V0_11,
+      )
+      if not grounding["grounded"]:
+        unrequested.append({"literal": normalized, "class": grounding["class"]})
+      elif grounding["class"] == literal_classes.CLOSED_VOCABULARY:
+        grounded_closed_vocabulary.add(normalized.casefold())
+    missing_retained = set()
+    if retained_closed_vocabulary_literals:
+      missing_retained = {
+        literal for literal in retained_closed_vocabulary_literals
+        if literal not in candidate_literals_cf
+      }
+    if not unrequested and not missing_retained:
+      return {
+        **validation,
+        "grounded_closed_vocabulary_literals": sorted(grounded_closed_vocabulary),
+      }
+    feedback_lines = [
+      literal_classes.format_literal_rejection(item["literal"], item["class"])
+      for item in unrequested
+    ]
+    feedback_lines.extend(
+      f"Literal '{literal}' (closed_vocabulary) was accepted in a previous attempt and must "
+      "not be removed."
+      for literal in sorted(missing_retained)
+    )
+    if unrequested:
+      if use_v0_11:
+        feedback_lines.append(
+          "Remove the WHERE condition or property filter using each literal named above and "
+          "return the requested pattern without it."
+        )
+      else:
+        feedback_lines.insert(
+          0,
+          "The query introduced a literal value or filter that was not present in the user "
+          "request. Remove unrequested WHERE filters and return the requested unfiltered "
+          "graph pattern.",
+        )
     return {
       **validation,
       "accepted": False,
       "accepted_cypher": None,
-      "validation_feedback": (
-        "The query introduced a literal value or filter that was not present in the user request. "
-        "Remove unrequested WHERE filters and return the requested unfiltered graph pattern."
-      ),
+      "validation_feedback": "\n".join(feedback_lines),
+      "grounded_closed_vocabulary_literals": sorted(grounded_closed_vocabulary),
     }
 
   def _extract_generation_model(self, payload: Any, fallback: Optional[str]) -> Optional[str]:
@@ -3728,7 +4351,12 @@ class EdgeguardApiPlugin(BasePlugin):
     deadline = started + min(GENERATION_TIMEOUT_SECONDS, int(self.cfg_request_timeout_seconds))
     selected_key = model_key or modelKey or self._default_model_key()
     if benchmark_mode:
-      return {
+      # Fix round 6: same `_wrapper_safe_error` convention as `/neo4j_query`
+      # and `explain_graph` (round 4/5) — a top-level `error` key with no
+      # `status_code` is the exact shape the platform's FastAPI wrapper
+      # turns into a bare HTTP 500. 403: the caller asked for a workflow the
+      # API-owned deployment forbids, not a missing/unknown route (404).
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
@@ -3738,35 +4366,40 @@ class EdgeguardApiPlugin(BasePlugin):
           "code": "benchmark_mode_disabled",
           "retryable": False,
         },
-      }
+      }, 403)
     if not isinstance(request, str) or not request.strip():
-      return {
+      # Fix round 6: malformed/absent request body — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
         "error": "Request is required.",
         "diagnostics": {"stage": "request", "code": "invalid_request", "retryable": False},
-      }
+      }, 400)
     if len(request) > GENERATION_MAX_REQUEST_CHARS:
-      return {
+      # Fix round 6: request exceeds the accepted size — 413.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
         "error": f"Request is too long; max {GENERATION_MAX_REQUEST_CHARS} characters.",
         "diagnostics": {"stage": "request", "code": "request_too_large", "retryable": False},
-      }
+      }, 413)
     model = self._generation_model_entry(selected_key)
     if model is None:
-      return {
+      # Fix round 6: unknown/unconfigured model key — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "accepted": False,
         "accepted_cypher": None,
         "error": "Unsupported model key.",
         "diagnostics": {"stage": "request", "code": "unsupported_model", "retryable": False},
-      }
+      }, 400)
     url, worker_error = self._generation_worker_url(selected_key)
     if worker_error or not url:
-      return {
+      # Fix round 6: the worker is not configured/reachable — server-side
+      # dependency, retryable, 503.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "accepted": False,
         "accepted_cypher": None,
@@ -3774,10 +4407,12 @@ class EdgeguardApiPlugin(BasePlugin):
         "model_key": selected_key,
         "error": "The selected model worker is not ready.",
         "diagnostics": {"stage": "worker", "code": "worker_not_ready", "retryable": True},
-      }
+      }, 503)
     worker, _worker_config_error = self._generation_worker(selected_key)
     if not isinstance(worker, Mapping) or not self._worker_runtime_ready(worker):
-      return {
+      # Fix round 6: same as above — the model process itself is still
+      # starting, retryable, 503.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "accepted": False,
         "accepted_cypher": None,
@@ -3785,13 +4420,27 @@ class EdgeguardApiPlugin(BasePlugin):
         "model_key": selected_key,
         "error": "The selected model is still starting. Retry shortly.",
         "diagnostics": {"stage": "worker", "code": "model_not_ready", "retryable": True},
-      }
+      }, 503)
 
     normalized_request = normalize_user_literal_text(request)
     attempts = []
     last_candidate = ""
     last_feedback = ""
+    # Contract §3.2: a closed-vocabulary literal grounded on one attempt is
+    # retained across correction attempts, even if that attempt was rejected
+    # for an unrelated reason.
+    retained_closed_vocabulary_literals: set = set()
     llm_model = model.get("model_file")
+    # Contract §1/§4.1 (review finding 1, both rounds): one shared resolver
+    # (`_cypher_validation_profile`) selects the v0.11 artifact's derived
+    # flat sets and the `graph`-shape optional `LIMIT` for the v0.11 profile;
+    # every other profile keeps `analyze_generated_cypher`'s v0.10 defaults
+    # exactly.
+    validation_profile = self._cypher_validation_profile(selected_key)
+    use_v0_11_schema = validation_profile["use_v0_11"]
+    guard_schema_allowed = validation_profile["schema_allowed"]
+    response_schema_version = validation_profile["schema_version"]
+    response_schema_surface = validation_profile["schema_surface"]
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
         remaining = deadline - time.monotonic()
@@ -3808,7 +4457,40 @@ class EdgeguardApiPlugin(BasePlugin):
         raw_output, llm_model, timing_ms, completion = self._call_generation_model(
           url, messages, model, timeout=remaining,
         )
-        validation = analyze_generated_cypher(raw_output, max_limit=int(self.cfg_neo4j_max_rows))
+        def _guard(cypher_text: str) -> Dict[str, Any]:
+          return analyze_generated_cypher(
+            cypher_text,
+            allowed=guard_schema_allowed,
+            max_limit=int(self.cfg_neo4j_max_rows),
+            allow_limit_optional_graph=use_v0_11_schema,
+            enforce_hop_bounds=use_v0_11_schema,
+            enforce_pattern_endpoints=use_v0_11_schema,
+            schema_artifact=validation_profile["schema_artifact"],
+          )
+
+        validation = _guard(raw_output)
+        guarded_output = raw_output
+        auto_corrected = None
+        if (
+          use_v0_11_schema
+          and self.cfg_edgeguard_direction_corrector
+          and not validation.get("accepted")
+        ):
+          try:
+            correction = correct_reversed_relationship_arrows(validation.get("candidate") or "", _guard)
+          except Exception:
+            # The corrector is an optional repair: a failure inside it must
+            # leave the plain rejection (and its retry) in place, not turn the
+            # request into a `generation_failed` error.
+            correction = None
+          if correction is not None:
+            guarded_output, validation, flips = correction
+            auto_corrected = {
+              "kind": "relationship_direction",
+              "flips": flips,
+              "uncorrected_cypher": str(raw_output or "").strip(),
+            }
+        validation["result_shape"] = classify_result_shape(validation.get("candidate") or raw_output)
         if completion.get("finish_reason") != "stop":
           validation = {
             **validation,
@@ -3822,9 +4504,34 @@ class EdgeguardApiPlugin(BasePlugin):
         else:
           validation = self._apply_literal_grounding_guard(
             validation,
-            raw_output,
+            guarded_output,
             normalized_request,
+            retained_closed_vocabulary_literals,
+            use_v0_11=use_v0_11_schema,
+            schema_artifact=validation_profile["schema_artifact"],
           )
+          retained_closed_vocabulary_literals |= set(
+            validation.get("grounded_closed_vocabulary_literals") or []
+          )
+          # Contract §4.3: `other` (scalar-only, mixed graph and scalar,
+          # unbounded projections) is rejected for model output on the v0.11
+          # profile — the operator `/neo4j_query` route allows it.
+          if (
+            use_v0_11_schema
+            and validation.get("accepted")
+            and validation.get("result_shape") == RESULT_SHAPE_OTHER
+          ):
+            validation = {
+              **validation,
+              "accepted": False,
+              "accepted_cypher": None,
+              "validation_feedback": (
+                "Query shape 'other' (scalar-only, mixed graph and scalar, or an unbounded "
+                "projection) is not accepted for model output; return a graph query "
+                "(MATCH p=... RETURN p [LIMIT k]) or a ranked_projection query "
+                "(MATCH ... ORDER BY ... RETURN ... LIMIT k)."
+              ),
+            }
         attempt = {
           "attempt": attempt_index,
           "kind": "initial" if attempt_index == 0 else "schema_correction",
@@ -3835,8 +4542,16 @@ class EdgeguardApiPlugin(BasePlugin):
           "read_only_static": bool(validation.get("read_only_static")),
           "schema_compatible": bool(validation.get("schema_compatible")),
           "schema_unknown": validation.get("schema_unknown") or {},
+          # The baseline runner reads only `/generate` attempts, so it needs
+          # the rejection code (and message) here too, not only on
+          # `/check_cypher`/`/neo4j_query` (which spread `**analysis`
+          # directly).
+          "execution_safety_error": validation.get("execution_safety_error"),
+          "execution_safety_error_code": validation.get("execution_safety_error_code"),
+          "result_shape": validation.get("result_shape"),
           "invented_temporal_properties": validation.get("invented_temporal_properties") or [],
           "validation_feedback": validation.get("validation_feedback") or "",
+          "auto_corrected": auto_corrected,
           "prompt_messages": messages,
           "model_key": selected_key,
           "model_display_name": model.get("display_name"),
@@ -3861,7 +4576,10 @@ class EdgeguardApiPlugin(BasePlugin):
             "prompt_profile_id": model.get("prompt_profile_id"),
             "prompt_messages": messages,
             "provider": "llm_inference_api",
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": response_schema_version,
+            "cypher_schema_version": response_schema_version,
+            "schema_surface": response_schema_surface,
+            "validation": {"result_shape": validation.get("result_shape")},
             "metrics": {
               "edgeguard_api_ms": round(max(0.0, total_ms - llm_ms), 1),
               "llm_inference_ms": llm_ms,
@@ -3895,7 +4613,10 @@ class EdgeguardApiPlugin(BasePlugin):
         "model_metadata": model,
         "prompt_profile_id": model.get("prompt_profile_id"),
         "provider": "llm_inference_api",
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": response_schema_version,
+        "cypher_schema_version": response_schema_version,
+        "schema_surface": response_schema_surface,
+        "validation": {"result_shape": validation.get("result_shape")},
         "validation_feedback": last_feedback,
         "metrics": {
           "edgeguard_api_ms": round(max(0.0, total_ms - llm_ms), 1),
@@ -3903,7 +4624,11 @@ class EdgeguardApiPlugin(BasePlugin):
           "server_total_ms": total_ms,
         },
       }
-    return {
+    # Fix round 6: the deadline/timeout/unreachable/exception branches above
+    # all land here with a top-level `error` key and no `status_code` — the
+    # generation service (not the caller) failed, 502 via the wrapper-safe
+    # transport.
+    return _wrapper_safe_error({
       "status": STATUS_ERROR,
       "accepted": False,
       "accepted_cypher": None,
@@ -3919,7 +4644,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "llm_inference_ms": round(sum(item["timing_ms"] for item in attempts), 1),
         "server_total_ms": round((time.monotonic() - started) * 1000, 1),
       },
-    }
+    }, 502)
 
   def _run_graph_first(
     self,
@@ -3972,9 +4697,179 @@ class EdgeguardApiPlugin(BasePlugin):
       query_scope="expand" if plan.get("broadening", {}).get("enabled") else "exact",
     )
 
+  def _misp_event_url_template(self) -> Optional[str]:
+    """Explanation spec v0.3 §4.1: the configured event URL template, read
+    and validated once per explain request. `None` means the configured
+    value is invalid: enrichment is off for that request, the error counter
+    moves with the fixed name `invalid_event_url_template`, and one value-free
+    log line is written per distinct bad value (a short hash, never the
+    value, which may carry credentials)."""
+    if not getattr(self, "cfg_misp_enrichment_enabled", False):
+      return misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
+    value = getattr(self, "cfg_misp_enrichment_event_url_template", None)
+    if value is None:
+      return misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
+    if misp_enrichment.validate_event_url_template(value):
+      return value
+    with self._metrics_lock:
+      self._misp_enrichment_error_count += 1
+      self._misp_enrichment_last_error = "invalid_event_url_template"
+      seen = self._misp_bad_templates_logged
+      digest = hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()[:12]
+      first_time = digest not in seen and len(seen) < MISP_BAD_TEMPLATE_LOG_CAP
+      if first_time:
+        seen.add(digest)
+    if first_time:
+      self.P(
+        f"MISP_ENRICHMENT_EVENT_URL_TEMPLATE is invalid (sha256 {digest}); enrichment is off for this request",
+        color="r",
+      )
+    return None
+
+  def _misp_enrichment_for_response(
+    self,
+    *,
+    driver: Any,
+    records: Optional[list[Dict[str, Any]]],
+    node_source_aliases: Optional[Mapping[str, str]] = None,
+    event_url_template: Optional[str] = None,
+  ) -> Optional[Dict[str, Any]]:
+    """Contract §7.1-§7.3: the block returned beside `result_digest`.
+    Explanation models see it only through `_admit_misp_enrichment_for_model`
+    (explanation spec v0.2).
+    Fail-open on any error (Neo4j, parse, validation) and fail fast (no
+    extra latency) when the driver is unavailable; never a partially
+    invalid block.
+
+    `node_source_aliases` maps a packet node id
+    (`_collect_misp_candidate_nodes`' `"packet_id"`) to the digest node ref
+    (`N0`, `N1`, ... -- `node_alias_map`'s output). A candidate node with no
+    entry there never reached the digest and is dropped, not enriched."""
+    if not getattr(self, "cfg_misp_enrichment_enabled", False):
+      return None
+    if driver is None or not records:
+      return None
+    if event_url_template is None:
+      event_url_template = self._misp_event_url_template()
+      if event_url_template is None:
+        return None
+    try:
+      candidates = _collect_misp_candidate_nodes(records)
+      if not candidates:
+        return None
+      aliases = node_source_aliases or {}
+      joined = [
+        (element_id, aliases[info["packet_id"]])
+        for element_id, info in candidates.items()
+        if info["packet_id"] in aliases
+      ]
+      if not joined:
+        return None
+      total_candidates = len(joined)
+      capped_items = joined[: misp_enrichment.MAX_NODES]
+      element_ids = [element_id for element_id, _ref in capped_items]
+      node_ref_by_element_id = dict(capped_items)
+      timeout_seconds = max(1, int(getattr(self, "cfg_misp_enrichment_timeout_seconds", 5)))
+      with driver.session(default_access_mode=READ_ACCESS) as session:
+        rows = misp_enrichment.fetch_misp_enrichment_rows(
+          session, element_ids, timeout_seconds=timeout_seconds,
+        )
+      block = misp_enrichment.build_misp_enrichment_block(
+        rows,
+        node_ref_by_element_id,
+        truncated=total_candidates > misp_enrichment.MAX_NODES,
+        omitted_nodes=max(total_candidates - misp_enrichment.MAX_NODES, 0),
+        event_url_template=event_url_template,
+      )
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract §7.3.
+      # A bounded, value-free observability note -- never the exception
+      # message or any raw data.
+      with self._metrics_lock:
+        self._misp_enrichment_error_count += 1
+        self._misp_enrichment_last_error = type(exc).__name__
+      return None
+    if block is None:
+      return None
+    if not misp_enrichment.validate_misp_enrichment_block(block, event_url_template):
+      # Same counter as the exception path above, with a fixed reason name
+      # instead of an exception class -- never the block content.
+      with self._metrics_lock:
+        self._misp_enrichment_error_count += 1
+        self._misp_enrichment_last_error = "validation"
+      return None
+    return block
+
+  def _admit_misp_enrichment_for_model(
+    self,
+    packet: Mapping[str, Any],
+    block: Optional[Mapping[str, Any]],
+    event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
+  ) -> Optional[Mapping[str, Any]]:
+    """Explanation spec v0.2 §4: runs before any EAB/1 or EGX/2 model call.
+    Re-validates the block that would be admitted, computes
+    `redaction.contains_raw_misp_payload` from it, and runs the packet
+    redaction check on that computed flag. A rejected block is dropped from
+    model input and from the response (fail-closed for the block,
+    fail-open for the response) and counted like any other swallowed
+    enrichment failure; the flag is never taken from the producer."""
+    if block is None:
+      return None
+    redaction = packet.get("redaction") if isinstance(packet.get("redaction"), Mapping) else {}
+    model_redaction = {
+      **dict(redaction),
+      "contains_raw_misp_payload": misp_enrichment.contains_raw_misp_payload(block, event_url_template),
+    }
+    errors: list[Dict[str, str]] = []
+    _validate_packet_redaction(model_redaction, errors)
+    if any(error.get("code") == "raw_misp_payload_not_allowed" for error in errors):
+      with self._metrics_lock:
+        self._misp_enrichment_error_count += 1
+        self._misp_enrichment_last_error = "model_admission"
+      return None
+    return block
+
   def _active_explanation_strategy(self) -> str:
     value = getattr(self, "cfg_edgeguard_explanation_strategy", "one_call")
     return value if value in {"one_call", "eel_compatibility", "insight_brief"} else "one_call"
+
+  def _explanation_dispatch_strategy(self, result_shape: Optional[str]) -> str:
+    """Contract §4.3: a `ranked_projection` result is explained by the digest
+    analyst brief (EAB/1) even when `insight_brief` (EGX/2) is the configured
+    strategy. EGX/2's insight sheet derives everything from `packet.graph`,
+    which is empty for a scalar projection, so routing it there would only
+    ever reach its deterministic no-graph-evidence fallback (`empty_graph`),
+    never the model. `other` (scalar, non-ranked) keeps its existing strategy
+    and fallback behaviour unchanged.
+
+    Review finding Q7: this reroutes `insight_brief` only. The legacy
+    `eel_compatibility` strategy is not rerouted here — its own call sites
+    (`_active_explanation_strategy() == "eel_compatibility"` checks
+    elsewhere) already special-case it independently of this function, and a
+    ranked-projection result reaching it is out of this contract's scope."""
+    strategy = self._active_explanation_strategy()
+    if strategy == "insight_brief" and result_shape == RESULT_SHAPE_RANKED_PROJECTION:
+      return "one_call"
+    return strategy
+
+  @staticmethod
+  def _projection_digest_for_ranked_result(
+    result_shape: Optional[str],
+    query_result_evidence: Mapping[str, Any],
+    accepted_cypher: str,
+    truncated: Any,
+  ) -> Optional[Dict[str, Any]]:
+    """Contract §4.2/§4.3: `projection_digest` is built only for a
+    `ranked_projection` result. Both `one_call` explanation-dispatch call
+    sites duplicated this exact shape check plus `derive_ranking_rule` +
+    `build_projection_digest` pair (review finding Q7); this is the one
+    shared copy."""
+    if result_shape != RESULT_SHAPE_RANKED_PROJECTION:
+      return None
+    return build_projection_digest(
+      query_result_evidence,
+      ranking_rule=derive_ranking_rule(str(accepted_cypher)),
+      truncated=bool(truncated),
+    )
 
   def _run_digest_analyst_brief(
     self,
@@ -3986,7 +4881,20 @@ class EdgeguardApiPlugin(BasePlugin):
     live_retry: Mapping[str, Any],
     request: str,
     deadline: float,
+    projection_digest: Optional[Mapping[str, Any]] = None,
+    misp_enrichment_block: Optional[Mapping[str, Any]] = None,
+    misp_event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
   ) -> Dict[str, Any]:
+    # Contract §4.3/§7.3: siblings of `result_digest`; `projection_digest`
+    # only for `ranked_projection` results, `misp_enrichment` fail-open.
+    # Explanation spec v0.2: the block reaches `run_analyst_brief` only
+    # after the model-admission check.
+    misp_enrichment_block = self._admit_misp_enrichment_for_model(
+      packet, misp_enrichment_block, misp_event_url_template,
+    )
+    digest_siblings = {"projection_digest": dict(projection_digest)} if projection_digest is not None else {}
+    if misp_enrichment_block is not None:
+      digest_siblings["misp_enrichment"] = dict(misp_enrichment_block)
     if digest.get("counts", {}).get("returned_rows") == 0:
       safe_code = "no_graph_evidence"
       diagnostics = {
@@ -4010,6 +4918,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet": dict(packet),
         "packet_meta": dict(packet_meta),
         "result_digest": dict(digest),
+        **digest_siblings,
         "analyst_brief": {
           "schema_version": "edgeguard.analyst_brief_state.v1",
           "status": "unavailable",
@@ -4057,6 +4966,9 @@ class EdgeguardApiPlugin(BasePlugin):
         digest=digest,
         model=getattr(self, "cfg_edgeguard_explanation_model", None),
         provider_call=self._call_graph_first_provider,
+        projection_digest=projection_digest,
+        misp_enrichment=misp_enrichment_block,
+        event_url_template=misp_event_url_template,
       )
       return self._bounded_graph_first_success({
         "status": STATUS_OK,
@@ -4066,6 +4978,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet": dict(packet),
         "packet_meta": dict(packet_meta),
         "result_digest": dict(digest),
+        **digest_siblings,
         **brief,
         "validation": validation,
         "live_retry": dict(live_retry),
@@ -4102,6 +5015,7 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet": dict(packet),
         "packet_meta": dict(packet_meta),
         "result_digest": dict(digest),
+        **digest_siblings,
         "analyst_brief": {
           "schema_version": "edgeguard.analyst_brief_state.v1",
           "status": "unavailable",
@@ -4127,7 +5041,18 @@ class EdgeguardApiPlugin(BasePlugin):
     request: str,
     deadline: float,
     mode: Optional[str] = None,
+    misp_enrichment_block: Optional[Mapping[str, Any]] = None,
+    misp_node_aliases: Optional[Mapping[str, str]] = None,
+    misp_event_url_template: str = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE,
+    progress=None,
   ) -> Dict[str, Any]:
+    # Contract §7.3: `misp_enrichment` is a sibling of `result_digest`.
+    # Explanation spec v0.2: it reaches `egx2.run_insight_brief` only after
+    # the model-admission check; `misp_node_aliases` (packet node id ->
+    # digest node ref) joins block nodes to packet-graph nodes.
+    misp_enrichment_block = self._admit_misp_enrichment_for_model(
+      packet, misp_enrichment_block, misp_event_url_template,
+    )
     graph = packet.get("graph") or {}
     returned_rows = digest.get("counts", {}).get("returned_rows")
     deterministic_reason = None
@@ -4145,15 +5070,50 @@ class EdgeguardApiPlugin(BasePlugin):
         admission = getattr(self, "cfg_edgeguard_insight_brief_admission_seconds", 240)
         if deadline - time.monotonic() < admission:
           allow_model = False
+    provider_call = self._call_graph_first_provider
+    if progress is not None:
+      # EG-028: the attempt number comes from counting provider calls, so
+      # `egx2/insight_brief.py` stays untouched. `brief` = model call running,
+      # `checks` = the deterministic gates that follow that call.
+      attempts = [0]
+
+      def provider_call(payload, _call=self._call_graph_first_provider):
+        attempts[0] += 1
+        _emit_progress(progress, "brief", {"attempt": attempts[0]})
+        completion = _call(payload)
+        _emit_progress(progress, "checks", {"attempt": attempts[0]})
+        return completion
+
     result = egx2.run_insight_brief(
       question=request,
       graph=graph,
       model=getattr(self, "cfg_edgeguard_explanation_model", None),
-      provider_call=self._call_graph_first_provider,
+      provider_call=provider_call,
       allow_model=allow_model,
       deterministic_reason=deterministic_reason,
       mode=mode,
+      misp_enrichment=misp_enrichment_block,
+      event_url_template=misp_event_url_template,
+      misp_node_ids={
+        node_ref: packet_id for packet_id, node_ref in (misp_node_aliases or {}).items()
+      },
     )
+    if progress is not None and (
+      (result["case_explanation"].get("provenance") or {}).get("mode") == "deterministic_fallback"
+    ):
+      _emit_progress(
+        progress, "fallback",
+        {"reason": result["explanation_trace"].get("outcome", {}).get("safe_code")},
+      )
+    if result.get("citation_drops"):
+      with self._metrics_lock:
+        self._misp_citation_drop_count += int(result["citation_drops"])
+    if result.get("misp_ref_drops"):
+      with self._metrics_lock:
+        self._misp_ref_drop_count += sum(result["misp_ref_drops"].values())
+    if result.get("misp_ref_withheld"):
+      with self._metrics_lock:
+        self._misp_ref_withheld_count += int(result["misp_ref_withheld"])
     outcome_status = result["explanation_trace"].get("outcome", {}).get("status")
     return self._bounded_graph_first_success({
       "status": STATUS_OK,
@@ -4163,6 +5123,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "packet": dict(packet),
       "packet_meta": dict(packet_meta),
       "result_digest": dict(digest),
+      **({"misp_enrichment": dict(misp_enrichment_block)} if misp_enrichment_block is not None else {}),
       "case_explanation": result["case_explanation"],
       "explanation_trace": result["explanation_trace"],
       "validation": validation,
@@ -4180,6 +5141,7 @@ class EdgeguardApiPlugin(BasePlugin):
     packet_meta: Mapping[str, Any],
     validation: Optional[Mapping[str, Any]],
     live_retry: Mapping[str, Any],
+    misp_enrichment_block: Optional[Mapping[str, Any]] = None,
   ) -> Dict[str, Any]:
     failed_result = failure.get("result", {}) if isinstance(failure, Mapping) else {}
     return self._bounded_graph_first_success({
@@ -4190,6 +5152,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "packet": dict(packet),
       "packet_meta": dict(packet_meta),
       "result_digest": dict(digest),
+      **({"misp_enrichment": dict(misp_enrichment_block)} if misp_enrichment_block is not None else {}),
       "analyst_brief": {
         "schema_version": "edgeguard.analyst_brief_state.v1",
         "status": "unavailable",
@@ -4633,6 +5596,11 @@ class EdgeguardApiPlugin(BasePlugin):
         "total_requests": self._request_count,
         "failed_requests": self._error_count,
         "last_request_time": self._last_request_time,
+        "misp_enrichment_error_count": self._misp_enrichment_error_count,
+        "misp_enrichment_last_error": self._misp_enrichment_last_error,
+        "misp_citation_drop_count": self._misp_citation_drop_count,
+        "misp_ref_drop_count": self._misp_ref_drop_count,
+        "misp_ref_withheld_count": self._misp_ref_withheld_count,
       }
     explanation_url, explanation_error = self._explanation_url()
     worker_readiness = self._worker_readiness()
@@ -4687,27 +5655,46 @@ class EdgeguardApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="GET")
   @_tracked_endpoint
   def prompt_contract(self) -> Dict[str, Any]:
-    direct_system_prompt = build_direct_cypher_system_prompt()
-    correction_prompt = build_schema_correction_prompt(
-      original_user_prompt="{normalized_request}",
-      rejected_cypher="{candidate_cypher}",
-      validation_feedback="{validation_feedback}",
-      retry_index=1,
-      retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
-    )
     profiles = []
     for key in self._configured_model_keys():
       profile = self._prompt_profile(key)
+      # Contract §5.4: `system_prompt_sha256` per profile, over the prompt
+      # this profile actually serves (builder dispatch + its suffix), not
+      # just the bare v0.10 template — every profile gets a real sha now.
+      system_prompt = _system_prompt_for_profile(profile["name"])
+      suffix = profile.get("system_prompt_suffix")
+      if isinstance(suffix, str) and suffix:
+        system_prompt += suffix
+      correction_prompt = _correction_prompt_for_profile(
+        profile["name"],
+        normalized_request="{normalized_request}",
+        rejected_cypher="{candidate_cypher}",
+        validation_feedback="{validation_feedback}",
+        retry_index=1,
+        retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
+      )
+      profile_artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile["name"])
+      is_v0_11 = profile_artifact is not None
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],
         "model_key": key,
         "template_version": profile["template_version"],
-        # The bare direct-Cypher template is hashed; profiles that append
-        # grounding guidance are described by template_version instead.
-        "system_prompt_sha256": _sha256_text(direct_system_prompt) if not profile.get("system_prompt_suffix") else None,
+        "system_prompt_sha256": _sha256_text(system_prompt),
         "correction_prompt_sha256": _sha256_text(correction_prompt),
         "expected_output": profile["prompt_contract"],
+        # Contract §1/§3.2 (review finding 7, S8): the v0.11 profile reports
+        # the v0.11 artifact's own schema_version/schema_surface here (the
+        # top-level `cypher_schema_version`/`schema_surface` fields below
+        # stay the v0.10 default view); every profile pins the guard's
+        # `literal_classes.py` module sha, since the literal-grounding guard
+        # reads it regardless of profile (contract §3.2: "both pin its sha
+        # in their reports").
+        "cypher_schema_version": profile_artifact["schema_version"] if is_v0_11 else SCHEMA_VERSION,
+        "schema_surface": (
+          canonical_schema_surface(profile_artifact) if is_v0_11 else canonical_schema_surface()
+        ),
+        "literal_classes_sha256": LITERAL_CLASSES_SHA256,
       })
     return {
       "schema_version": "edgeguard.prompt_contract.v1",
@@ -4788,10 +5775,45 @@ class EdgeguardApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="POST")
   @_tracked_endpoint
-  def check_cypher(self, cypher: str, **kwargs) -> Dict[str, Any]:
-    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
+  def check_cypher(self, cypher: str, model_key: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    if not isinstance(cypher, str):
+      # Malformed request body (wrong type) — caller input, 400.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "accepted": False,
+        "accepted_cypher": None,
+        "error": "cypher must be a string.",
+        "diagnostics": {"stage": "request", "code": "invalid_cypher", "retryable": False},
+      }, 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # User-submitted Cypher had no length cap at this route — same
+      # 413-via-`_wrapper_safe_error` convention as `GENERATION_MAX_REQUEST_CHARS`
+      # on `/generate`.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "accepted": False,
+        "accepted_cypher": None,
+        "error": f"cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "diagnostics": {"stage": "request", "code": "cypher_too_large", "retryable": False},
+      }, 413)
+    # Contract §1/§4.1 (review finding 1, round 2): same v0.11-vs-v0.10
+    # selection as `generate` and `/neo4j_query`, via the shared resolver —
+    # a v0.11 `model_key` validates against the v0.11 sets with `LIMIT`
+    # optional for `graph` and the tightened hop bounds; `model_key=None`
+    # keeps this endpoint's v0.10 behaviour exactly as before.
+    validation_profile = self._cypher_validation_profile(model_key)
+    analysis = analyze_generated_cypher(
+      cypher,
+      allowed=validation_profile["schema_allowed"],
+      max_limit=int(self.cfg_neo4j_max_rows),
+      allow_limit_optional_graph=validation_profile["use_v0_11"],
+      enforce_hop_bounds=validation_profile["use_v0_11"],
+      enforce_pattern_endpoints=validation_profile["use_v0_11"],
+      schema_artifact=validation_profile["schema_artifact"],
+    )
     return {
       "status": STATUS_ACCEPTED if analysis["accepted"] else STATUS_REJECTED,
+      "schema_version": validation_profile["schema_version"],
       **analysis,
     }
 
@@ -4843,7 +5865,35 @@ class EdgeguardApiPlugin(BasePlugin):
       }
       if any(not isinstance(value, str) or not value.strip() for value in connection.values()):
         return None, "The default Neo4j connection is not configured."
-    return {key: value.strip() for key, value in connection.items()}, None
+      default_method = configured.get("method")
+      if default_method is not None:
+        if default_method not in NEO4J_CONNECTION_METHODS:
+          return None, "The default Neo4j connection `method` must be one of native_driver, bolt_over_wss."
+        if (
+          default_method == "native_driver"
+          and connection["scheme"].strip().lower() in NEO4J_PLAINTEXT_SCHEMES
+          and configured.get("allow_plaintext") is not True
+        ):
+          # `bolt_over_wss` always runs over TLS; `native_driver` honours the scheme, so a
+          # plaintext scheme needs an explicit opt-in on the default connection.
+          return None, (
+            "The default Neo4j connection uses `method: native_driver` with a plaintext scheme; "
+            "set `allow_plaintext: true` on it to allow that."
+          )
+    resolved = {key: value.strip() for key, value in connection.items()}
+    if not supplied and configured.get("method") is not None:
+      resolved["method"] = configured["method"]
+    return resolved, None
+
+  @staticmethod
+  def _effective_neo4j_method(method: Optional[str], connection: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Transport for a Neo4j call: the request's `method`, else the default
+    connection's optional `method` (`_resolve_neo4j_connection` puts it in
+    `connection` only for the default connection, never for a request
+    override), else None (`_neo4j_driver` then uses Bolt over WSS)."""
+    if method is not None:
+      return method
+    return (connection or {}).get("method")
 
   def _neo4j_default_connection_status(self) -> Dict[str, Any]:
     unavailable = {
@@ -4879,7 +5929,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "default_connection": {
         "configured": True,
         "endpoint": endpoint,
-        "method": "bolt_over_wss",
+        "method": self._effective_neo4j_method(None, connection) or "bolt_over_wss",
       },
     }
 
@@ -4957,6 +6007,12 @@ class EdgeguardApiPlugin(BasePlugin):
       _collect_graph(row, graph_state)
     return {
       "columns": columns,
+      # Raw driver objects (Node/Relationship/Path/temporal): the graph
+      # evidence pipeline (`explain_graph`, `prepare_graph_explanation` ->
+      # `_build_graph_evidence_packet` / `_legacy_query_result_evidence`)
+      # needs these original types to build its own ref-based, redacted
+      # evidence. `/neo4j_query` converts a copy to a JSON-safe form itself
+      # (contract §4.3) rather than this shared helper doing it here.
       "rows": rows,
       "row_count": len(rows),
       "truncated": truncated,
@@ -5002,29 +6058,36 @@ class EdgeguardApiPlugin(BasePlugin):
     started = time.monotonic()
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
     if err:
-      return {
+      # Fix round 6: malformed/absent connection parameters — caller input,
+      # 400, same convention as `/neo4j_query` (round 5) via the
+      # wrapper-safe transport.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "error": err,
         "metrics": {"connect_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     normalized_uri, err = self._normalize_neo4j_uri(connection["uri"], connection["scheme"])
     if err:
-      return {
+      # Fix round 6: malformed URI/scheme — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "error": err,
         "metrics": {"connect_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     if GraphDatabase is None:
-      return self._neo4j_unavailable()
+      # Fix round 6: the Neo4j driver is missing from this runtime — a
+      # server-side dependency, 503.
+      return _wrapper_safe_error(self._neo4j_unavailable(), 503)
     driver = None
     try:
+      effective_method = self._effective_neo4j_method(method, connection)
       driver = self._neo4j_driver(
-        normalized_uri, connection["username"], connection["password"], method,
+        normalized_uri, connection["username"], connection["password"], effective_method,
       )
       with driver.session() as session:
         record = session.run("RETURN 1 AS ok").single()
       return {
         "status": STATUS_OK,
         "ok": bool(record and record.get("ok") == 1),
-        "method": "native_driver" if method == "native_driver" else "bolt_over_wss",
+        "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
         "uri": self._redact_url(normalized_uri),
         "metrics": {
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
@@ -5032,7 +6095,9 @@ class EdgeguardApiPlugin(BasePlugin):
         },
       }
     except Exception as exc:
-      return {
+      # Fix round 6: the driver connected (or attempted to) and failed —
+      # a connection/auth failure at the Neo4j service, 503.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "error": self._sanitize_error(exc, connection["password"]),
@@ -5040,7 +6105,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
           "total_ms": round((time.monotonic() - started) * 1000, 1),
         },
-      }
+      }, 503)
     finally:
       self._close_neo4j_driver(driver)
 
@@ -5073,34 +6138,87 @@ class EdgeguardApiPlugin(BasePlugin):
     method: Optional[str] = None,
     max_rows: Optional[int] = None,
     enable_empty_result_broadening: Optional[bool] = None,
+    model_key: Optional[str] = None,
     **kwargs,
   ) -> Dict[str, Any]:
     started = time.monotonic()
-    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
-    if not analysis["accepted"]:
-      return {
+    if not isinstance(cypher, str):
+      # Malformed request body (wrong type) — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
-        "validation": analysis,
+        "error": "cypher must be a string.",
+        "diagnostics": {"stage": "request", "code": "invalid_cypher", "retryable": False},
+      }, 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # Same length cap as `/check_cypher`.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "error": f"cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "diagnostics": {"stage": "request", "code": "cypher_too_large", "retryable": False},
+      }, 413)
+    # Contract §1 (review finding 1, both rounds): `/neo4j_query` is the
+    # operator route — no profile of its own — so it picks the v0.11
+    # artifact's derived flat sets only when the caller names a configured
+    # v0.11 model/profile (the shared `_cypher_validation_profile`
+    # resolver); otherwise it keeps validating against the v0.10
+    # `EDGEGUARD_SCHEMA` exactly as before. The choice is stated back in
+    # `validation.schema_version`.
+    validation_profile = self._cypher_validation_profile(model_key)
+    use_v0_11_schema = validation_profile["use_v0_11"]
+    analysis = analyze_generated_cypher(
+      cypher,
+      allowed=validation_profile["schema_allowed"],
+      max_limit=int(self.cfg_neo4j_max_rows),
+      allow_limit_optional_graph=use_v0_11_schema,
+      enforce_hop_bounds=use_v0_11_schema,
+      enforce_pattern_endpoints=use_v0_11_schema,
+      schema_artifact=validation_profile["schema_artifact"],
+    )
+    # Contract §4.3: `classify_result_shape` on every `/neo4j_query` response,
+    # accepted or rejected — it is a static text classification, not an
+    # execution-safety verdict, so it does not gate acceptance here.
+    validation = {
+      **analysis,
+      "result_shape": classify_result_shape(analysis.get("candidate") or cypher),
+      "schema_version": validation_profile["schema_version"],
+    }
+    if not analysis["accepted"]:
+      # Fix round 5 (re-review-3 finding 3, remaining gap): the live 38-
+      # question re-run hit this exact branch (guard-rejected Cypher) as an
+      # opaque HTTP 500 — 422 states the query content is at fault, via the
+      # wrapper-safe transport.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "validation": validation,
         "error": "Cypher rejected by EdgeGuard guard; query was not executed.",
-      }
+      }, 422)
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
     if err:
-      return {
+      # Fix round 5: malformed/absent connection parameters — caller input,
+      # 400, via the wrapper-safe transport.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "executed": False, "error": err,
         "metrics": {"connect_ms": 0.0, "query_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     normalized_uri, err = self._normalize_neo4j_uri(connection["uri"], connection["scheme"])
     if err:
-      return {
+      # Fix round 5: malformed URI/scheme — caller input, 400.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR, "ok": False, "executed": False, "error": err,
         "metrics": {"connect_ms": 0.0, "query_ms": 0.0, "total_ms": round((time.monotonic() - started) * 1000, 1)},
-      }
+      }, 400)
     if GraphDatabase is None:
+      # Fix round 5: the Neo4j driver is missing from this runtime — a
+      # server-side dependency, 503.
       unavailable = self._neo4j_unavailable()
       unavailable["executed"] = False
-      return unavailable
+      return _wrapper_safe_error(unavailable, 503)
     row_limit = max(1, min(int(max_rows or self.cfg_neo4j_max_rows), int(self.cfg_neo4j_max_rows)))
     broadening_enabled = (
       bool(self.cfg_live_empty_result_broadening)
@@ -5109,8 +6227,9 @@ class EdgeguardApiPlugin(BasePlugin):
     )
     driver = None
     try:
+      effective_method = self._effective_neo4j_method(method, connection)
       driver = self._neo4j_driver(
-        normalized_uri, connection["username"], connection["password"], method,
+        normalized_uri, connection["username"], connection["password"], effective_method,
       )
       connect_ms = round((time.monotonic() - started) * 1000, 1)
       query_started = time.monotonic()
@@ -5144,33 +6263,138 @@ class EdgeguardApiPlugin(BasePlugin):
               broadening_cypher=broadened["cypher"],
               error=self._sanitize_error(exc, connection["password"]),
             )
+      # Contract §6: every empty result carries a reason, classified from the
+      # accepted (originally requested) Cypher text — not from a broadened
+      # fallback query, which is deliberately unrelated to the request.
+      empty_reason = (
+        None if query_result["rows"]
+        else classify_empty_reason(
+          analysis["accepted_cypher"], validation_profile["schema_artifact"] or EDGEGUARD_SCHEMA_V0_11,
+        )
+      )
+      # Contract §4.3: `/neo4j_query` rows are JSON-safe for every shape.
+      # `_run_neo4j_query` keeps `rows` as raw driver objects for its other
+      # callers (the graph evidence pipeline); this response converts a copy.
+      json_safe_rows = [
+        {key: _neo4j_row_json_safe(value) for key, value in row.items()}
+        for row in query_result["rows"]
+      ]
       return {
         "status": STATUS_OK,
         "ok": True,
         "executed": True,
-        "method": "native_driver" if method == "native_driver" else "bolt_over_wss",
+        "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
         **query_result,
-        "validation": analysis,
+        "rows": json_safe_rows,
+        "empty_reason": empty_reason,
+        "validation": validation,
         "live_retry": live_retry,
         "metrics": {
           "connect_ms": connect_ms,
           "query_ms": round((time.monotonic() - query_started) * 1000, 1),
           "total_ms": round((time.monotonic() - started) * 1000, 1),
+          # Contract §4.1 (review finding 4, round 2): "when [LIMIT is]
+          # absent the runtime bounds rows at NEO4J_MAX_ROWS ... reported in
+          # `metrics`" — `row_limit` is that applied cap (the caller's
+          # `max_rows`, itself capped by the server's `NEO4J_MAX_ROWS`),
+          # reported unconditionally, not only for no-`LIMIT` queries.
+          "row_bound": row_limit,
         },
       }
-    except Exception as exc:
-      return {
+    except _ResultEvidenceError as exc:
+      # Review finding Q5: distinguish "the query executed but one result
+      # value could not be made JSON-safe" from an opaque driver/connection
+      # failure — `exc.code` is a stable, closed set (see
+      # `_neo4j_row_json_safe`), not free text.
+      # Fix round 4 (re-review-3 finding 3): serialization failure stays a
+      # 500 — turning an executed result into JSON-safe rows is entirely
+      # under this runtime's control, so a failure here is a server bug,
+      # not a caller or Neo4j problem — but it now goes through the same
+      # wrapper-safe transport as every other branch below.
+      return _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        # Review finding 3 (round 2): the query executed against Neo4j —
+        # only turning the result rows into a JSON-safe response failed
+        # afterward — so this is not "not executed"; `error_code` already
+        # distinguishes it from a connection/driver failure.
+        "executed": True,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": exc.code,
+        "validation": validation,
+        "metrics": {
+          "connect_ms": round((time.monotonic() - started) * 1000, 1),
+          "query_ms": 0.0,
+          "total_ms": round((time.monotonic() - started) * 1000, 1),
+          "row_bound": row_limit,
+        },
+      }, 500)
+    except NEO4J_AUTH_ERROR_TYPES as exc:
+      # Fix round 4 (re-review-3 findings 3 and 6): `AuthError`/`Forbidden`/
+      # `TokenExpired` are `ClientError` subclasses (see the
+      # `Neo4jClientError` import comment) but report a rejected driver
+      # credential or privilege, not a malformed query — a server-side
+      # misconfiguration, not the caller's fault, so this listens ahead of
+      # the generic `Neo4jClientError` clause and answers 503, not 422.
+      return _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "executed": False,
         "error": self._sanitize_error(exc, connection["password"]),
-        "validation": analysis,
+        "error_code": "neo4j_auth_error",
+        "validation": validation,
+        "metrics": {
+          "connect_ms": round((time.monotonic() - started) * 1000, 1),
+          "query_ms": 0.0,
+          "total_ms": round((time.monotonic() - started) * 1000, 1),
+          "row_bound": row_limit,
+        },
+      }, 503)
+    except Neo4jClientError as exc:
+      # Fix round 3, L2a: a query the guard accepted can still be rejected
+      # by Neo4j itself (syntax, type or constraint error) — the caller's
+      # fault, not a connection/timeout failure. `error_code` names this
+      # family distinctly so the response is never mistaken for one of the
+      # generic driver failures below.
+      # Fix round 4 (re-review-3 finding 3): the platform's FastAPI wrapper
+      # maps any plugin result carrying a top-level `error` key to HTTP 500
+      # unless `status_code` says otherwise — this is the exact defect the
+      # live 38-question re-run hit. 422 (Unprocessable Entity) states that
+      # the *query content* is at fault, not the transport.
+      return _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_client_error",
+        "validation": validation,
+        "metrics": {
+          "connect_ms": round((time.monotonic() - started) * 1000, 1),
+          "query_ms": 0.0,
+          "total_ms": round((time.monotonic() - started) * 1000, 1),
+          "row_bound": row_limit,
+        },
+      }, 422)
+    except Exception as exc:
+      # Fix round 4: everything left here is a connection/timeout/driver
+      # failure below Neo4j's own statement validation (unreachable host,
+      # DNS failure, transaction timeout, ...) — a connectivity or
+      # service-unavailable condition, not the caller's query content, so
+      # 503 rather than the generic-exception 500 the wrapper would
+      # otherwise assign.
+      return _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "error": self._sanitize_error(exc, connection["password"]),
+        "error_code": "neo4j_connection_error",
+        "validation": validation,
         "metrics": {
           "connect_ms": round((time.monotonic() - started) * 1000, 1),
           "query_ms": 0.0,
           "total_ms": round((time.monotonic() - started) * 1000, 1),
         },
-      }
+      }, 503)
     finally:
       self._close_neo4j_driver(driver)
 
@@ -5183,32 +6407,46 @@ class EdgeguardApiPlugin(BasePlugin):
     explanation_rows: Optional[int] = None,
     max_rows: Optional[int] = None,
     enable_empty_result_broadening: Optional[bool] = None,
+    model_key: Optional[str] = None,
     **kwargs,
   ) -> Dict[str, Any]:
     if not isinstance(cypher, str) or not cypher.strip():
-      return self._with_active_prepare_contract({
+      # Fix round 5: malformed request shape (missing/blank `cypher`), not a
+      # rejected query — 400, via the wrapper-safe transport (see
+      # `_wrapper_safe_error`).
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation Cypher must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
-      })
+      }), 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # Same length cap as `/check_cypher`, `/neo4j_query`, `/explain_graph`.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "error": f"Graph explanation Cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "validation_errors": [_contract_error("cypher_too_large", f"cypher must be at most {CYPHER_MAX_CHARS} characters")],
+      }), 413)
     forwarded = sorted(str(name) for name in kwargs)
     if forwarded:
-      return self._with_active_prepare_contract({
+      # Fix round 5: unexpected request fields — malformed request body, 400.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation preparation does not accept Neo4j connection fields.",
         "validation_errors": [
           _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
         ],
-      })
+      }), 400)
     if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
-      return self._with_active_prepare_contract({
+      # Fix round 5: wrong field type — malformed request body, 400.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
-      })
+      }), 400)
     try:
       mode_plan = resolve_mode(
         explanation_mode=explanation_mode,
@@ -5216,35 +6454,54 @@ class EdgeguardApiPlugin(BasePlugin):
         max_rows=max_rows,
       )
     except GraphFirstContractError as exc:
-      return self._with_active_prepare_contract({
+      # Fix round 5: invalid `explanation_mode`/`explanation_rows`/`max_rows`
+      # configuration — caller input, not the guard, 400.
+      return _wrapper_safe_error(self._with_active_prepare_contract({
         "status": STATUS_REJECTED,
         "ok": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error(exc.code, exc.detail)],
-      })
+      }), 400)
     broadening_enabled = bool(enable_empty_result_broadening) if enable_empty_result_broadening is not None else False
-    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
+    # Contract §1/§4.1 (review finding 1, round 2): explain routes accept
+    # what `generate` accepts for the v0.11 profile — same resolver, same
+    # selection.
+    validation_profile = self._cypher_validation_profile(model_key)
+    plan = _prepare_graph_explanation_plan(
+      cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
+      guard_max_limit=int(self.cfg_neo4j_max_rows),
+      validation_profile=validation_profile,
+    )
     if not plan.get("ok"):
-      return self._with_active_prepare_contract(plan, mode_plan)
+      # Fix round 5: `_prepare_graph_explanation_plan` tags the intended
+      # status on `_WRAPPER_STATUS_CODE_KEY` (422 default: guard rejection or
+      # unsafe-result-projection content issue; 400 for a bad mode/row-limit
+      # input) — pop it so it never reaches the response body.
+      status_code = plan.pop(_WRAPPER_STATUS_CODE_KEY, 422)
+      return _wrapper_safe_error(self._with_active_prepare_contract(plan, mode_plan), status_code)
     if self._active_explanation_strategy() == "eel_compatibility":
       try:
         self._graph_first_token_counter()
       except GraphFirstRuntimeError as exc:
-        return self._with_active_prepare_contract({
+        # Fix round 5: the graph-first tokenizer is a server-side dependency,
+        # not caller input — 503 (service unavailable).
+        return _wrapper_safe_error(self._with_active_prepare_contract({
           "status": "config_error",
           "ok": False,
           "validation": plan.get("validation"),
           "error": "Graph-first explanation tokenizer is unavailable.",
           "validation_errors": [_contract_error(exc.code, exc.detail)],
-        }, mode_plan)
+        }, mode_plan), 503)
       _explanation_url, explanation_err = self._explanation_url()
       if explanation_err:
-        return self._with_active_prepare_contract({
+        # Fix round 5: the explanation model endpoint is not configured — a
+        # server-side dependency, 503.
+        return _wrapper_safe_error(self._with_active_prepare_contract({
           "status": "config_error",
           "ok": False,
           "validation": plan.get("validation"),
           "error": explanation_err,
-        }, mode_plan)
+        }, mode_plan), 503)
     return self._with_active_prepare_contract(plan, mode_plan)
 
   def _explain_prepared_execution(
@@ -5255,6 +6512,7 @@ class EdgeguardApiPlugin(BasePlugin):
     request: str,
     mode_plan: ModePlan,
     deadline: float,
+    progress=None,
   ) -> Dict[str, Any]:
     packet, packet_meta, ingestion_errors = _build_graph_evidence_packet_from_execution(
       request=request,
@@ -5280,6 +6538,20 @@ class EdgeguardApiPlugin(BasePlugin):
       query_result_evidence=query_result_evidence,
       evidence_catalog=evidence_catalog,
     )
+    # Contract §6, review finding 6 (S5=Q9), carry-over B: every empty
+    # result carries a reason on this `execution_result=`-supplied path too,
+    # not only the live-connection path (`explain_graph`'s own primary
+    # query) and `/neo4j_query`. `plan["validation"]` is the one object every
+    # response branch below returns as `validation`, so setting it here
+    # threads the reason through all of them.
+    validation = plan.get("validation")
+    if isinstance(validation, dict):
+      validation["empty_reason"] = (
+        None if query_result_evidence.get("rows")
+        else classify_empty_reason(
+          plan["accepted_cypher"], _artifact_for_schema_version(validation.get("schema_version")),
+        )
+      )
     packet_errors, _context = _validate_graph_evidence_packet(packet)
     if packet_errors:
       first_error = packet_errors[0]
@@ -5301,7 +6573,9 @@ class EdgeguardApiPlugin(BasePlugin):
       strategy=plan["broadening"].get("strategy") if broadened else None,
       broadening_cypher=plan["broadening"].get("cypher") if broadened else None,
     )
-    if self._active_explanation_strategy() == "insight_brief":
+    result_shape = (plan.get("validation") or {}).get("result_shape")
+    effective_strategy = self._explanation_dispatch_strategy(result_shape)
+    if effective_strategy == "insight_brief":
       return self._run_insight_brief(
         digest=digest,
         packet=packet,
@@ -5311,8 +6585,14 @@ class EdgeguardApiPlugin(BasePlugin):
         request=request,
         deadline=deadline,
         mode=mode_plan.mode if mode_plan is not None else None,
+        progress=progress,
       )
-    if self._active_explanation_strategy() == "one_call":
+    if effective_strategy == "one_call":
+      _emit_progress(progress, "brief", {"attempt": 1})
+      projection_digest = self._projection_digest_for_ranked_result(
+        result_shape, query_result_evidence, plan["accepted_cypher"],
+        execution_result.get("truncated"),
+      )
       return self._run_digest_analyst_brief(
         digest=digest,
         packet=packet,
@@ -5321,9 +6601,12 @@ class EdgeguardApiPlugin(BasePlugin):
         live_retry=live_retry,
         request=request,
         deadline=deadline,
+        projection_digest=projection_digest,
       )
     if not packet["graph"]["nodes"]:
-      return {
+      # Fix round 5: packet/evidence validation rejection (no explainable
+      # graph nodes in the supplied execution evidence), 422.
+      return _wrapper_safe_error({
         "status": "empty_graph",
         "ok": False,
         "executed": True,
@@ -5333,7 +6616,8 @@ class EdgeguardApiPlugin(BasePlugin):
         "packet_meta": packet_meta,
         "validation": plan.get("validation"),
         "live_retry": live_retry,
-      }
+      }, 422)
+    _emit_progress(progress, "brief", {"attempt": 1})
     try:
       graph_first = self._run_graph_first(
         plan=plan,
@@ -5403,30 +6687,76 @@ class EdgeguardApiPlugin(BasePlugin):
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
+    model_key: Optional[str] = None,
     **kwargs,
   ) -> Dict[str, Any]:
+    return self._explain_graph_impl(
+      cypher=cypher, uri=uri, username=username, password=password, request=request,
+      scheme=scheme, method=method, explanation_mode=explanation_mode,
+      explanation_rows=explanation_rows, max_rows=max_rows,
+      enable_empty_result_broadening=enable_empty_result_broadening,
+      execution_result=execution_result, temperature=temperature, max_tokens=max_tokens,
+      top_p=top_p, model_key=model_key, progress=None, **kwargs,
+    )
+
+  def _explain_graph_impl(
+    self,
+    cypher: str,
+    uri: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    request: str = "Explain the returned investigation graph.",
+    scheme: Optional[str] = None,
+    method: Optional[str] = None,
+    explanation_mode: Optional[str] = None,
+    explanation_rows: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    enable_empty_result_broadening: Optional[bool] = None,
+    execution_result: Optional[Dict[str, Any]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    model_key: Optional[str] = None,
+    progress=None,
+    **kwargs,
+  ) -> Dict[str, Any]:
+    # EG-028: `progress(phase, detail)` is None for `/explain_graph` and set
+    # by the explain job; the deadline starts here, i.e. when the job starts.
     started = time.monotonic()
     deadline = started + EDGEGUARD_REQUEST_TIMEOUT_SECONDS
+    _emit_progress(progress, "guard")
     if not isinstance(cypher, str) or not cypher.strip():
-      return {
+      # Fix round 5: malformed request body (missing/blank `cypher`), 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation Cypher must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_cypher", "cypher must be a non-empty string")],
-      }
+      }, 400)
+    if len(cypher) > CYPHER_MAX_CHARS:
+      # Same length cap as `/check_cypher` and `/neo4j_query`.
+      return _wrapper_safe_error({
+        "status": STATUS_REJECTED,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": f"Graph explanation Cypher is too long; max {CYPHER_MAX_CHARS} characters.",
+        "validation_errors": [_contract_error("cypher_too_large", f"cypher must be at most {CYPHER_MAX_CHARS} characters")],
+      }, 413)
     if not isinstance(request, str) or not request.strip():
-      return {
+      # Fix round 5: malformed request body (missing/blank `request`), 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation request must be a non-empty string.",
         "validation_errors": [_contract_error("invalid_explanation_request", "request must be a non-empty string")],
-      }
+      }, 400)
     invalid_fields = [str(name) for name in kwargs] if execution_result is None else []
-    if method is not None and method not in {"native_driver", "bolt_over_wss"}:
+    if method is not None and method not in NEO4J_CONNECTION_METHODS:
       invalid_fields.append("method")
     connection_types = {
       "uri": uri,
@@ -5438,23 +6768,25 @@ class EdgeguardApiPlugin(BasePlugin):
     if execution_result is not None and not isinstance(execution_result, dict):
       invalid_fields.append("execution_result")
     if invalid_fields:
-      return {
+      # Fix round 5: unexpected/mistyped request fields, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation request contains invalid or unexpected fields.",
         "validation_errors": [_contract_error("invalid_request_fields", "request fields must match the exact contract")],
-      }
+      }, 400)
     if enable_empty_result_broadening is not None and not isinstance(enable_empty_result_broadening, bool):
-      return {
+      # Fix round 5: wrong field type, 400.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph explanation request configuration is invalid.",
         "validation_errors": [_contract_error("invalid_broadening", "enable_empty_result_broadening must be a boolean")],
-      }
+      }, 400)
     try:
       mode_plan = resolve_mode(
         explanation_mode=explanation_mode,
@@ -5469,24 +6801,46 @@ class EdgeguardApiPlugin(BasePlugin):
     except (GraphFirstContractError, GraphFirstRuntimeError) as exc:
       code = exc.code
       detail = exc.detail
-      return {
+      # Fix round 5: `GraphFirstContractError` is `resolve_mode` rejecting bad
+      # mode/row-limit/temperature caller input, 400; `GraphFirstRuntimeError`
+      # here is only `_graph_first_token_counter`'s server-side tokenizer
+      # unavailability (matching the identical branch in
+      # `prepare_graph_explanation`), 503.
+      status_code = 400 if isinstance(exc, GraphFirstContractError) else 503
+      return _wrapper_safe_error({
         "status": "config_error",
         "ok": False,
         "executed": False,
         "explained": False,
         "error": "Graph-first explanation configuration is unavailable.",
         "validation_errors": [_contract_error(code, detail)],
-      }
-    analysis = analyze_generated_cypher(cypher, max_limit=int(self.cfg_neo4j_max_rows))
+      }, status_code)
+    # Contract §1/§4.1 (review finding 1, round 2): `explain_graph` accepts
+    # what `generate` accepts for the v0.11 profile — same shared resolver.
+    validation_profile = self._cypher_validation_profile(model_key)
+    analysis = analyze_generated_cypher(
+      cypher,
+      allowed=validation_profile["schema_allowed"],
+      max_limit=int(self.cfg_neo4j_max_rows),
+      allow_limit_optional_graph=validation_profile["use_v0_11"],
+      enforce_hop_bounds=validation_profile["use_v0_11"],
+      enforce_pattern_endpoints=validation_profile["use_v0_11"],
+      schema_artifact=validation_profile["schema_artifact"],
+    )
+    analysis["schema_version"] = validation_profile["schema_version"]
+    # Contract §4.3: routes the explanation dispatch below, independent of
+    # the configured graph-topology explanation strategy.
+    analysis["result_shape"] = classify_result_shape(analysis.get("candidate") or cypher)
     if not analysis["accepted"]:
-      return {
+      # Fix round 5: same guard-rejection HTTP-500 gap as `/neo4j_query`, 422.
+      return _wrapper_safe_error({
         "status": STATUS_REJECTED,
         "ok": False,
         "executed": False,
         "explained": False,
         "validation": analysis,
         "error": "Cypher rejected by EdgeGuard guard; graph explanation was not executed.",
-      }
+      }, 422)
 
     if self._active_explanation_strategy() == "eel_compatibility":
       try:
@@ -5517,7 +6871,9 @@ class EdgeguardApiPlugin(BasePlugin):
       forwarded = [name for name, value in connection_fields.items() if value not in (None, "")]
       forwarded.extend(str(name) for name in kwargs)
       if forwarded:
-        return {
+        # Fix round 5: unexpected connection fields in execution-evidence
+        # mode — malformed request body, 400.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": False,
@@ -5527,32 +6883,54 @@ class EdgeguardApiPlugin(BasePlugin):
             _contract_error("credential_field_not_allowed", "connection or unexpected fields are not allowed")
           ],
           "validation": analysis,
-        }
-      plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
+        }, 400)
+      plan = _prepare_graph_explanation_plan(
+        cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
+        guard_max_limit=int(self.cfg_neo4j_max_rows),
+        validation_profile=validation_profile,
+      )
       if not plan.get("ok"):
-        return {**plan, "executed": False, "explained": False}
+        # Fix round 5: see the identical `plan.pop(...)` in
+        # `prepare_graph_explanation` for the status-code source.
+        status_code = plan.pop(_WRAPPER_STATUS_CODE_KEY, 422)
+        return _wrapper_safe_error({**plan, "executed": False, "explained": False}, status_code)
+      _emit_progress(progress, "evidence")
       return self._explain_prepared_execution(
         plan=plan,
         execution_result=execution_result,
         request=request,
         mode_plan=mode_plan,
         deadline=deadline,
+        progress=progress,
       )
 
     connection, err = self._resolve_neo4j_connection(uri, username, password, scheme)
     if err:
-      return {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}
+      # Fix round 5: malformed/absent connection parameters, 400.
+      return _wrapper_safe_error(
+        {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}, 400,
+      )
     normalized_uri, err = self._normalize_neo4j_uri(connection["uri"], connection["scheme"])
     if err:
-      return {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}
+      # Fix round 5: malformed URI/scheme, 400.
+      return _wrapper_safe_error(
+        {"status": STATUS_ERROR, "ok": False, "executed": False, "explained": False, "error": err}, 400,
+      )
     if GraphDatabase is None:
+      # Fix round 5: the Neo4j driver is missing from this runtime, 503.
       unavailable = self._neo4j_unavailable()
       unavailable.update({"executed": False, "explained": False})
-      return unavailable
+      return _wrapper_safe_error(unavailable, 503)
 
-    plan = _prepare_graph_explanation_plan(cypher, mode_plan.row_limit, broadening_enabled, mode_plan, guard_max_limit=int(self.cfg_neo4j_max_rows))
+    plan = _prepare_graph_explanation_plan(
+      cypher, mode_plan.row_limit, broadening_enabled, mode_plan,
+      guard_max_limit=int(self.cfg_neo4j_max_rows),
+      validation_profile=validation_profile,
+    )
     if not plan.get("ok"):
-      return {**plan, "executed": False, "explained": False}
+      # Fix round 5: see the identical `plan.pop(...)` above.
+      status_code = plan.pop(_WRAPPER_STATUS_CODE_KEY, 422)
+      return _wrapper_safe_error({**plan, "executed": False, "explained": False}, status_code)
     executed_cypher = plan["executed_cypher"]
     generated_limit = plan["limit_policy"]["generated_limit"]
     executed_limit = plan["limit_policy"]["executed_limit"]
@@ -5561,21 +6939,36 @@ class EdgeguardApiPlugin(BasePlugin):
 
     driver = None
     try:
+      _emit_progress(progress, "neo4j")
+      effective_method = self._effective_neo4j_method(method, connection)
       driver = self._neo4j_driver(
-        normalized_uri, connection["username"], connection["password"], method,
+        normalized_uri, connection["username"], connection["password"], effective_method,
       )
       primary_started = time.monotonic()
       query_result = self._run_neo4j_query(driver, executed_cypher, transport_row_cap)
       primary_duration_ms = round((time.monotonic() - primary_started) * 1000, 1)
       primary_row_count = len(query_result["rows"])
+      _emit_progress(progress, "neo4j", {"row_count": primary_row_count})
       execution_trace_items = [{
         "id": "primary",
         "executed_cypher": executed_cypher,
         "row_count": primary_row_count,
         "truncated": bool(query_result.get("truncated")),
         "duration_ms": primary_duration_ms,
-        "method": "native_driver",
+        "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
       }]
+      # Contract §6, review finding 6 (S5=Q9): every empty result carries a
+      # reason, on explain routes too, not just `/neo4j_query`; classified
+      # from the requested (accepted) Cypher — so it still names *why the
+      # primary attempt was empty* even when opt-in broadening goes on to
+      # find rows. `analysis` is the one `validation` object every response
+      # branch below returns, so setting it here threads the reason through
+      # all of them.
+      analysis["empty_reason"] = (
+        None if primary_row_count else classify_empty_reason(
+          plan["accepted_cypher"], _artifact_for_schema_version(analysis.get("schema_version")),
+        )
+      )
       live_retry = self._empty_result_broadening_state(enabled=broadening_enabled)
       final_executed_cypher = executed_cypher
       broadened_applied = False
@@ -5600,7 +6993,7 @@ class EdgeguardApiPlugin(BasePlugin):
               "row_count": len(query_result["rows"]),
               "truncated": bool(query_result.get("truncated")),
               "duration_ms": broadening_duration_ms,
-              "method": "native_driver",
+              "method": "native_driver" if effective_method == "native_driver" else "bolt_over_wss",
             })
             live_retry = self._empty_result_broadening_state(
               enabled=True,
@@ -5626,7 +7019,8 @@ class EdgeguardApiPlugin(BasePlugin):
       # input construction, so no response artifact carries the values.
       forbidden_field = _forbidden_execution_field(query_result)
       if forbidden_field:
-        return {
+        # Fix round 5: executed-result / packet validation rejection, 422.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -5638,8 +7032,9 @@ class EdgeguardApiPlugin(BasePlugin):
           )],
           "validation": analysis,
           "live_retry": live_retry,
-        }
+        }, 422)
 
+      _emit_progress(progress, "evidence")
       packet, packet_meta = _build_graph_evidence_packet(
         request=request,
         accepted_cypher=plan["accepted_cypher"],
@@ -5654,7 +7049,8 @@ class EdgeguardApiPlugin(BasePlugin):
       )
       packet_errors, _context = _validate_graph_evidence_packet(packet)
       if packet_errors:
-        return {
+        # Fix round 5: packet validation rejection, 422.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -5664,9 +7060,10 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet": packet,
           "packet_meta": packet_meta,
           "live_retry": live_retry,
-        }
+        }, 422)
       if packet_meta.get("truncated_properties"):
-        return {
+        # Fix round 5: packet validation rejection, 422.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -5679,7 +7076,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet_meta": packet_meta,
           "validation": analysis,
           "live_retry": live_retry,
-        }
+        }, 422)
       try:
         raw_query_result, raw_nodes, raw_relationships = _legacy_query_result_evidence(
           query_result["rows"],
@@ -5706,7 +7103,11 @@ class EdgeguardApiPlugin(BasePlugin):
           raw_relationships=raw_relationships,
         )
       except _ResultEvidenceError as exc:
-        return {
+        # Fix round 4 (re-review-3 finding 3): same serialization-failure
+        # class as `/neo4j_query`'s `_ResultEvidenceError` branch — a
+        # server bug in this runtime, not a caller or Neo4j problem — kept
+        # at 500 but through the wrapper-safe transport.
+        return _wrapper_safe_error({
           "status": STATUS_REJECTED,
           "ok": False,
           "executed": True,
@@ -5717,7 +7118,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet_meta": packet_meta,
           "validation": analysis,
           "live_retry": live_retry,
-        }
+        }, 500)
       execution_envelope = {
         "executed_cypher": final_executed_cypher,
         "primary_row_count": primary_row_count,
@@ -5735,7 +7136,27 @@ class EdgeguardApiPlugin(BasePlugin):
         query_result_evidence=query_result_evidence,
         evidence_catalog=evidence_catalog,
       )
+      # Contract §7.3: produced after the digest, before the EAB/1 admission
+      # check below; fails open (never raises) and stays `None` when the
+      # driver is unavailable. `node_alias_map` re-derives the same node-ref
+      # assignment the digest just used, from the identical evidence inputs
+      # -- any failure here still fails open (block absent), never the
+      # request.
+      try:
+        misp_node_aliases = node_alias_map(query_result_evidence, evidence_catalog)
+      except Exception:  # noqa: BLE001 - fail-open by contract §7.3.
+        misp_node_aliases = {}
+      misp_event_url_template = self._misp_event_url_template()
+      if getattr(self, "cfg_misp_enrichment_enabled", False):
+        _emit_progress(progress, "misp")
+      misp_block = None if misp_event_url_template is None else self._misp_enrichment_for_response(
+        driver=driver, records=query_result["rows"], node_source_aliases=misp_node_aliases,
+        event_url_template=misp_event_url_template,
+      )
+      if misp_event_url_template is None:
+        misp_event_url_template = misp_enrichment.DEFAULT_EVENT_URL_TEMPLATE
       if packet["execution"]["truncated"]:
+        _emit_progress(progress, "fallback", {"reason": "transport_truncated"})
         if self._active_explanation_strategy() == "insight_brief":
           result = egx2.run_insight_brief(
             question=request,
@@ -5754,6 +7175,7 @@ class EdgeguardApiPlugin(BasePlugin):
             "packet": dict(packet),
             "packet_meta": dict(packet_meta),
             "result_digest": dict(digest),
+            **({"misp_enrichment": dict(misp_block)} if misp_block is not None else {}),
             "case_explanation": result["case_explanation"],
             "explanation_trace": result["explanation_trace"],
             "validation": analysis,
@@ -5780,8 +7202,11 @@ class EdgeguardApiPlugin(BasePlugin):
           packet_meta=packet_meta,
           validation=analysis,
           live_retry=live_retry,
+          misp_enrichment_block=misp_block,
         )
-      if self._active_explanation_strategy() == "insight_brief":
+      result_shape = analysis.get("result_shape")
+      effective_strategy = self._explanation_dispatch_strategy(result_shape)
+      if effective_strategy == "insight_brief":
         return self._run_insight_brief(
           digest=digest,
           packet=packet,
@@ -5791,8 +7216,17 @@ class EdgeguardApiPlugin(BasePlugin):
           request=request,
           deadline=deadline,
           mode=mode_plan.mode if mode_plan is not None else None,
+          misp_enrichment_block=misp_block,
+          misp_node_aliases=misp_node_aliases,
+          misp_event_url_template=misp_event_url_template,
+          progress=progress,
         )
-      if self._active_explanation_strategy() == "one_call":
+      if effective_strategy == "one_call":
+        _emit_progress(progress, "brief", {"attempt": 1})
+        projection_digest = self._projection_digest_for_ranked_result(
+          result_shape, query_result_evidence, plan["accepted_cypher"],
+          execution_envelope.get("truncated"),
+        )
         return self._run_digest_analyst_brief(
           digest=digest,
           packet=packet,
@@ -5801,7 +7235,11 @@ class EdgeguardApiPlugin(BasePlugin):
           live_retry=live_retry,
           request=request,
           deadline=deadline,
+          projection_digest=projection_digest,
+          misp_enrichment_block=misp_block,
+          misp_event_url_template=misp_event_url_template,
         )
+      _emit_progress(progress, "brief", {"attempt": 1})
       try:
         graph_first = self._run_graph_first(
           plan=plan,
@@ -5821,6 +7259,7 @@ class EdgeguardApiPlugin(BasePlugin):
           "packet": packet,
           "packet_meta": packet_meta,
           "result_digest": digest,
+          **({"misp_enrichment": dict(misp_block)} if misp_block is not None else {}),
           "analyst_brief": {
             "schema_version": "edgeguard.analyst_brief_state.v1",
             "status": "available",
@@ -5849,20 +7288,251 @@ class EdgeguardApiPlugin(BasePlugin):
           packet_meta=packet_meta,
           validation=analysis,
           live_retry=live_retry,
+          misp_enrichment_block=misp_block,
         )
       return success
+    except NEO4J_AUTH_ERROR_TYPES as exc:
+      # Fix round 4 (re-review-3 findings 1 and 6): auth/credential family,
+      # same as `/neo4j_query` — a server-side misconfiguration, not the
+      # caller's fault, so this listens ahead of the generic
+      # `Neo4jClientError` clause and answers 503, not 422.
+      return self._explain_graph_error(exc, "neo4j_auth_error", 503, connection, analysis, started)
+    except Neo4jClientError as exc:
+      # Fix round 3, L2a / round 4: a query the guard accepted can still be
+      # rejected by Neo4j itself (syntax, type or constraint error) — the
+      # caller's fault, 422 like `/neo4j_query`.
+      return self._explain_graph_error(exc, "neo4j_client_error", 422, connection, analysis, started)
+    except GraphFirstRuntimeError as exc:
+      # I-076: a graph-first failure that escaped the inner handler (e.g. the
+      # EGX/2 truncated path, `explanation_response_size`) is a server-side
+      # explanation failure, not a Neo4j connectivity problem.
+      return self._explain_graph_error(
+        exc, str(getattr(exc, "code", None) or "explain_internal_error"), 500, connection, analysis, started,
+      )
+    except NEO4J_CONNECTIVITY_ERROR_TYPES as exc:
+      # Driver connectivity failure (unreachable host, DNS, expired session,
+      # database starting, timeout): service unavailable, not the query.
+      return self._explain_graph_error(exc, "neo4j_connection_error", 503, connection, analysis, started)
     except Exception as exc:
-      return {
+      # I-076: anything else is an unexpected server-side failure.
+      return self._explain_graph_error(exc, "explain_internal_error", 500, connection, analysis, started)
+    finally:
+      self._close_neo4j_driver(driver)
+
+  # ---- EG-028: explain job (start + status) --------------------------------
+  # The plugin loop serves one request at a time, so a running `/explain_graph`
+  # blocks every other call. The job runs the same body on a daemon worker
+  # thread (the `predict_async` / `request_status` pattern of the inference
+  # API) and the loop only answers short start/status calls. One running job
+  # (the LLM worker has capacity 1); finished jobs are capped and expire.
+
+  def _explain_job_state(self) -> Dict[str, Any]:
+    with _EXPLAIN_JOBS_INIT_LOCK:
+      state = self.__dict__.get("_explain_jobs")
+      if state is None:
+        state = {"lock": threading.Lock(), "jobs": {}}
+        self._explain_jobs = state
+    return state
+
+  def _prune_explain_jobs_locked(self, jobs: Dict[str, Dict[str, Any]], now: float) -> None:
+    # A worker stuck past twice the explain deadline would hold the single
+    # running slot forever: close it as a timeout.
+    stuck_after = 2 * EDGEGUARD_REQUEST_TIMEOUT_SECONDS
+    for job in jobs.values():
+      if not job["done"] and now - job["created"] > stuck_after:
+        job.update(
+          phase="done", detail=None, done=True, finished_at=now, status_code=504,
+          result={
+            "status": STATUS_TIMEOUT, "ok": False, "executed": False, "explained": False,
+            "error": "Explain job did not finish in time.",
+          },
+        )
+        job["settled"].set()  # worker_active stays set: the thread still lives.
+    for job_id in [
+      key for key, job in jobs.items()
+      if job["done"] and not job["worker_active"]
+      and now - job["finished_at"] > EXPLAIN_JOB_FINISHED_TTL_SECONDS
+    ]:
+      del jobs[job_id]
+    finished = sorted(
+      (job["finished_at"], key) for key, job in jobs.items() if job["done"] and not job["worker_active"]
+    )
+    for _finished_at, job_id in finished[: max(len(finished) - EXPLAIN_JOB_MAX_FINISHED, 0)]:
+      del jobs[job_id]
+
+  def _set_explain_job_phase(self, job_id: str, phase: str, detail: Optional[Dict[str, Any]]) -> None:
+    state = self._explain_job_state()
+    with state["lock"]:
+      job = state["jobs"].get(job_id)
+      if job is None or job["done"]:
+        return
+      job["phase"] = phase
+      job["detail"] = dict(detail) if detail else None
+      if phase != "guard":
+        job["advanced"] = True
+        job["settled"].set()
+
+  def _run_explain_job(self, job_id: str, params: Dict[str, Any]) -> None:
+    def progress(phase: str, detail: Optional[Dict[str, Any]] = None) -> None:
+      self._set_explain_job_phase(job_id, phase, detail)
+
+    try:
+      response = self._explain_graph_impl(progress=progress, **params)
+    except Exception as exc:  # noqa: BLE001 - /explain_graph would answer 500.
+      # Server-side only: the traceback goes through the sanitiser (the
+      # resolved Neo4j password, supplied or configured, is redacted); the
+      # client sees the generic message.
+      connection, _ = self._resolve_neo4j_connection(
+        params.get("uri"), params.get("username"), params.get("password"), params.get("scheme"),
+      )
+      secret = str((connection or {}).get("password") or params.get("password") or "")
+      self.P(
+        "EdgeGuard explain job failed unexpectedly: "
+        + self._sanitize_error(traceback.format_exc(), secret),
+        color="r",
+      )
+      response = _wrapper_safe_error({
         "status": STATUS_ERROR,
         "ok": False,
         "executed": False,
         "explained": False,
-        "error": self._sanitize_error(exc, connection["password"]),
-        "validation": analysis,
-        "metrics": {
-          "edgeguard_api_ms": round((time.monotonic() - started) * 1000, 1),
-          "server_total_ms": round((time.monotonic() - started) * 1000, 1),
-        },
-      }
-    finally:
-      self._close_neo4j_driver(driver)
+        "error": f"Graph explanation failed unexpectedly ({type(exc).__name__}).",
+      }, 500)
+    result, status_code = _unwrap_endpoint_result(response)
+    state = self._explain_job_state()
+    with state["lock"]:
+      job = state["jobs"].get(job_id)
+      if job is None:
+        return
+      job["worker_active"] = False
+      if job["done"]:
+        # Closed as stuck earlier: the late result must not overwrite it.
+        return
+      if status_code >= 400 or _is_failed_endpoint_response(result):
+        with self._metrics_lock:
+          self._error_count += 1
+      job.update(
+        phase="done", detail=None, done=True, result=result, status_code=status_code,
+        finished_at=time.monotonic(),
+      )
+      job["settled"].set()
+      self._prune_explain_jobs_locked(state["jobs"], time.monotonic())
+
+  @BasePlugin.endpoint(method="POST")
+  def explain_graph_start(
+    self,
+    cypher: str,
+    uri: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    request: str = "Explain the returned investigation graph.",
+    scheme: Optional[str] = None,
+    method: Optional[str] = None,
+    explanation_mode: Optional[str] = None,
+    explanation_rows: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    enable_empty_result_broadening: Optional[bool] = None,
+    execution_result: Optional[Dict[str, Any]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    model_key: Optional[str] = None,
+    **kwargs,
+  ) -> Dict[str, Any]:
+    """Start an `/explain_graph` run in the background; returns `{job_id}`.
+
+    Takes the `/explain_graph` body. A request that `/explain_graph` rejects
+    before any Neo4j or model work (400/413/422) is answered here with that
+    same rejection and no job. A second start while one job runs gets 429."""
+    params = dict(
+      cypher=cypher, uri=uri, username=username, password=password, request=request,
+      scheme=scheme, method=method, explanation_mode=explanation_mode,
+      explanation_rows=explanation_rows, max_rows=max_rows,
+      enable_empty_result_broadening=enable_empty_result_broadening,
+      execution_result=execution_result, temperature=temperature, max_tokens=max_tokens,
+      top_p=top_p, model_key=model_key, **kwargs,
+    )
+    with self._metrics_lock:
+      self._request_count += 1
+      self._last_request_time = self.time()
+    state = self._explain_job_state()
+    with state["lock"]:
+      now = time.monotonic()
+      self._prune_explain_jobs_locked(state["jobs"], now)
+      # A job closed as stuck still counts while its worker thread lives.
+      if sum(
+        1 for job in state["jobs"].values() if not job["done"] or job["worker_active"]
+      ) >= EXPLAIN_JOB_MAX_RUNNING:
+        busy = True
+      else:
+        busy = False
+        job_id = secrets.token_urlsafe(24)
+        job = {
+          "phase": "guard", "detail": None, "done": False, "result": None, "status_code": None,
+          "created": now, "finished_at": None, "advanced": False, "settled": threading.Event(),
+          "worker_active": True,
+        }
+        state["jobs"][job_id] = job
+    if busy:
+      with self._metrics_lock:
+        self._error_count += 1
+      return _wrapper_safe_error({
+        "status": "busy",
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Another answer is being written; try again shortly.",
+        "validation_errors": [_contract_error("explain_job_busy", "an explain job is already running")],
+        "retry_after_seconds": EXPLAIN_JOB_RETRY_AFTER_SECONDS,
+      }, 429)
+    try:
+      threading.Thread(
+        target=self._run_explain_job, args=(job_id, params), daemon=True, name=f"edgeguard-explain-{job_id[:6]}",
+      ).start()
+    except Exception as exc:  # noqa: BLE001 - e.g. "can't start new thread".
+      with state["lock"]:
+        state["jobs"].pop(job_id, None)
+      with self._metrics_lock:
+        self._error_count += 1
+      self.P(f"EdgeGuard explain job thread failed to start: {type(exc).__name__}", color="r")
+      return _wrapper_safe_error({
+        "status": STATUS_ERROR,
+        "ok": False,
+        "executed": False,
+        "explained": False,
+        "error": "Could not start the explanation job; try again shortly.",
+      }, 503)
+    # The synchronous rejections finish before the job leaves `guard`.
+    job["settled"].wait(EXPLAIN_JOB_VALIDATION_WAIT_SECONDS)
+    with state["lock"]:
+      if job["done"] and not job["advanced"]:
+        state["jobs"].pop(job_id, None)
+        if job["status_code"] == 200:
+          return job["result"]
+        return {"status_code": job["status_code"], "result": job["result"], "logged": True}
+    return {"job_id": job_id}
+
+  @BasePlugin.endpoint(method="GET")
+  def explain_graph_status(self, job_id: str = "") -> Dict[str, Any]:
+    """`{phase, detail, done}`; once done also `result` (exactly what
+    `/explain_graph` returned) and `result_status_code` (its HTTP status).
+    Unknown or expired ids get 404."""
+    state = self._explain_job_state()
+    with state["lock"]:
+      self._prune_explain_jobs_locked(state["jobs"], time.monotonic())
+      job = state["jobs"].get(job_id) if isinstance(job_id, str) else None
+      if job is None:
+        snapshot = None
+      else:
+        snapshot = {"phase": job["phase"], "detail": job["detail"], "done": job["done"]}
+        if job["done"]:
+          snapshot["result"] = job["result"]
+          snapshot["result_status_code"] = job["status_code"]
+    if snapshot is None:
+      return _wrapper_safe_error({
+        "status": "not_found",
+        "ok": False,
+        "error": "Unknown or expired explain job id.",
+        "validation_errors": [_contract_error("explain_job_not_found", "unknown or expired job id")],
+      }, 404)
+    return snapshot

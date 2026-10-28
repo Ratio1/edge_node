@@ -39,7 +39,7 @@ class _DauthDeploymentSecretsMixin:
     phases = {
       "prepare": {"preparing"}, "status": {"preparing"},
       "commit": {"finalizing", "finalizing_recovery"},
-      "revoke": {"preparing", "stopping_failed_rollout", "finalizing", "finalizing_recovery", "retiring_previous"},
+      "revoke": {"preparing", "cleaning_up_preparation", "stopping_failed_rollout", "finalizing", "finalizing_recovery", "retiring_previous"},
       "delete": {"retiring_previous"},
     }
     if action not in phases or phase not in phases[action]:
@@ -68,11 +68,8 @@ class _DauthDeploymentSecretsMixin:
           raise ValueError("Deployment plan identity or redaction is invalid.")
         if operation["kind"] != "delete" and specs.get("secret_revision") != operation_id + ":" + attempt:
           raise ValueError("Deployment secret reference is invalid.")
-    # Repair before inspecting immutable values or revocation markers. A warm
-    # local copy alone cannot prove that another custodian has not revoked it.
-    for namespace in (REVISIONS, CURRENT, POINTERS, "DEEPLOY_OPERATIONS"):
-      if not self.chainstore_hsync(hkey=namespace, timeout=5, **dauth_registry_write_kwargs(self)):
-        raise RuntimeError("Deployment secret synchronization is unavailable.")
+    # Read persisted/pushed replicas; remote revocations and newer snapshots
+    # take effect after reaching this custodian, without request-time repair.
     for record in (self.chainstore_hgetall(hkey="DEEPLOY_OPERATIONS") or {}).values():
       if (isinstance(record, dict) and record.get("operation_id") == operation_id
           and record.get("coordinator") == requester and record.get("EE_SENDER") == requester
@@ -225,7 +222,7 @@ class _DauthDeploymentSecretsMixin:
     phase = operation["phase"]
     expected_active = {"finalizing": "deploy", "finalizing_recovery": "restore"}.get(phase)
     if active_attempt != expected_active or (
-      phase == "preparing" and self.time() < operation["preparation_deadline"]
+      phase in ("preparing", "cleaning_up_preparation") and self.time() < operation["preparation_deadline"]
     ) or (phase == "stopping_failed_rollout" and operation["kind"] != "create"):
       raise ValueError("Secret cleanup does not match lifecycle recovery.")
     pointer = self.chainstore_hget(hkey=POINTERS, key=job_id)

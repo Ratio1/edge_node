@@ -178,7 +178,7 @@ class DeeployProcessRequestTests(unittest.TestCase):
     result = plugin.get_deployment_status(request)
     self.assertEqual(result["status_code"], 400)
     self.assertEqual(result["error"]["code"], "INVALID_REQUEST")
-    plugin._repair_deployment_records = Mock(side_effect=RuntimeError("storage unavailable"))
+    plugin._operation_records = Mock(side_effect=RuntimeError("storage unavailable"))
     self.assertEqual(plugin.get_deployment_status({**request, "job_id": 7})["status_code"], 503)
     plugin.deeploy_verify_and_get_inputs = Mock(side_effect=ValueError("Invalid signature"))
     self.assertEqual(plugin.get_deployment_status({**request, "job_id": 7})["status_code"], 401)

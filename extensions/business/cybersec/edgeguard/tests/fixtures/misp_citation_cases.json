@@ -1,0 +1,466 @@
+{
+  "schema": "edgeguard.misp_citation_cases.v1",
+  "note": "Synthetic ids only. Each case is one citation checked against graph_node_ids and the observation entity_ids (spec v0.3 s2.3). valid=false means the server drops it and the client rejects the response.",
+  "graph_node_ids": [
+    "n:a",
+    "n:b",
+    "n:c"
+  ],
+  "observation_entity_ids": [
+    "n:a",
+    "n:b"
+  ],
+  "cases": [
+    {
+      "name": "valid_string_value",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_numeric_value",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cvss_v2_base_score",
+        "value": 7.5,
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_integer_value",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "ioc_id",
+        "value": 42,
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_event_ids_field",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "misp_event_ids",
+        "value": "35",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_entity_max_length",
+      "valid": true,
+      "citation": {
+        "entity": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_value_max_length",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_field_max_length",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_node_ref_zero",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N0",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_node_ref_absent_from_block",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N999",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_second_graph_node_in_entity_ids",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:b"
+      }
+    },
+    {
+      "name": "reject_entity_too_long",
+      "valid": false,
+      "citation": {
+        "entity": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "entity"
+    },
+    {
+      "name": "reject_field_too_long",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "field"
+    },
+    {
+      "name": "reject_field_uppercase",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "Cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "field"
+    },
+    {
+      "name": "reject_field_leading_digit",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "1cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "field"
+    },
+    {
+      "name": "reject_field_hyphen",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe-id",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "field"
+    },
+    {
+      "name": "reject_field_empty",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "field"
+    },
+    {
+      "name": "reject_value_too_long",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "value"
+    },
+    {
+      "name": "reject_value_boolean",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": true,
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "value"
+    },
+    {
+      "name": "reject_value_null",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": null,
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "value"
+    },
+    {
+      "name": "reject_value_list",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": [
+          "CWE-79"
+        ],
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "value"
+    },
+    {
+      "name": "reject_node_ref_lowercase",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "n3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "node_ref"
+    },
+    {
+      "name": "reject_node_ref_leading_zero",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N03",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "node_ref"
+    },
+    {
+      "name": "reject_node_ref_no_digits",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "node_ref"
+    },
+    {
+      "name": "reject_node_ref_not_string",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": 3,
+        "entity_id": "n:a"
+      },
+      "reject_reason": "node_ref"
+    },
+    {
+      "name": "reject_entity_id_outside_graph",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:zzz"
+      },
+      "reject_reason": "entity_id"
+    },
+    {
+      "name": "reject_entity_id_in_graph_not_in_observation",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:c"
+      },
+      "reject_reason": "entity_id"
+    },
+    {
+      "name": "reject_extra_key",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a",
+        "extra": "x"
+      },
+      "reject_reason": "keys"
+    },
+    {
+      "name": "reject_missing_node_ref",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "keys"
+    },
+    {
+      "name": "reject_missing_entity_id",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3"
+      },
+      "reject_reason": "keys"
+    },
+    {
+      "name": "valid_value_tab_and_newline",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE\t-79\n",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "valid_entity_no_break_space",
+      "valid": true,
+      "citation": {
+        "entity": "Alpha\u00a0Beta",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      }
+    },
+    {
+      "name": "reject_entity_c1_control",
+      "valid": false,
+      "citation": {
+        "entity": "\u0085Alpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "entity"
+    },
+    {
+      "name": "reject_entity_vertical_tab",
+      "valid": false,
+      "citation": {
+        "entity": "\u000bAlpha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "entity"
+    },
+    {
+      "name": "reject_entity_nul",
+      "valid": false,
+      "citation": {
+        "entity": "Alp\u0000ha",
+        "field": "cwe",
+        "value": "CWE-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "entity"
+    },
+    {
+      "name": "reject_value_delete_char",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE-79\u007f",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "value"
+    },
+    {
+      "name": "reject_value_c1_control",
+      "valid": false,
+      "citation": {
+        "entity": "Alpha",
+        "field": "cwe",
+        "value": "CWE\u009f-79",
+        "node_ref": "N3",
+        "entity_id": "n:a"
+      },
+      "reject_reason": "value"
+    }
+  ],
+  "same_name_case": {
+    "name": "same_name_view_node_not_in_entity_ids",
+    "note": "Two packet nodes share the display name Alpha. entity_ids holds the first graph node (n:a); the view resolved the name to the other (n:c). The citation is dropped, the observation stays.",
+    "valid": false,
+    "reject_reason": "entity_id",
+    "citation": {
+      "entity": "Alpha",
+      "field": "cwe",
+      "value": "CWE-79",
+      "node_ref": "N3",
+      "entity_id": "n:c"
+    }
+  },
+  "list_cases": [
+    {
+      "name": "valid_eight_citations",
+      "valid": true,
+      "count": 8
+    },
+    {
+      "name": "reject_nine_citations",
+      "valid": false,
+      "count": 9
+    },
+    {
+      "name": "reject_empty_list",
+      "valid": false,
+      "count": 0
+    }
+  ]
+}

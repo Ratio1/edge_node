@@ -1,6 +1,7 @@
 """Lifecycle preparation and finalization through real SDK and Core wrapper APIs."""
 import copy
 import unittest
+from unittest.mock import Mock
 
 from ratio1.const.base import dAuth
 from extensions.business.deeploy.tests.lifecycle_custody_support import (
@@ -13,6 +14,8 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.state = State()
     self.coordinator = Coordinator(self.state)
     self.dauth = Custodian(self.state)
+    self.dauth.chainstore_hsync = Mock(side_effect=AssertionError('Custody requests must not synchronize namespaces.'))
+    self.addCleanup(self.dauth.chainstore_hsync.assert_not_called)
     self.http = connect(self, self.state, self.dauth)
 
   def legacy(self):
@@ -368,6 +371,8 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.state.now = operation['preparation_deadline'] + 1
     with self.assertRaises(RuntimeError):
       self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome'], operation['recovery']),
+                     ('cleaning_up_preparation', 'failed', 'in_progress'))
     marker = '7|' + operation['operation_id'] + ':deploy|revoked'
     self.assertIn(('DAUTH_JOB_SECRET_REVISIONS', marker), self.state.secrets)
     self.state.fail_write = None
@@ -375,6 +380,30 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     operation = self.operation()
     self.coordinator._advance_deployment_operation(operation)
     self.assertEqual((operation['phase'], operation['outcome']), ('completed', 'failed'))
+    self.assertEqual(self.coordinator.commands, [])
+
+  def test_preparation_cleanup_rejects_delayed_preparation_and_requires_expiry(self):
+    self.state.fail_write = lambda namespace, key: 'before' if namespace == 'DAUTH_JOB_SECRET_REVISIONS' and key.endswith(':deploy') else None
+    with self.assertRaises(RuntimeError):
+      self.admit()
+    stale = self.operation()
+    operation = copy.deepcopy(stale)
+    self.state.now = operation['preparation_deadline']
+    with self.assertRaises(RuntimeError):
+      self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual(operation['phase'], 'cleaning_up_preparation')
+    writes = len(self.state.writes)
+    for snapshot in (stale, operation):
+      for action in ('prepare', 'status'):
+        with self.subTest(phase=snapshot['phase'], action=action):
+          with self.assertRaises(RuntimeError):
+            self.coordinator._deployment_secret_request(action, snapshot)
+    with self.assertRaises(RuntimeError):
+      self.coordinator._deployment_secret_request('revoke', operation, active_attempt='deploy')
+    self.state.now = operation['preparation_deadline'] - 1
+    with self.assertRaises(RuntimeError):
+      self.coordinator._deployment_secret_request('revoke', operation, active_attempt=None)
+    self.assertEqual(len(self.state.writes), writes)
     self.assertEqual(self.coordinator.commands, [])
 
   def test_conflicting_values_at_shared_secret_path_fail_before_persistence(self):

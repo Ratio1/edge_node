@@ -1,8 +1,11 @@
 """Fault injection at the real admission persistence and protected-copy boundaries."""
 import copy
 import unittest
+from unittest.mock import Mock
 
-from extensions.business.deeploy.deployment_operations import OPERATIONS_HKEY, SECRET_REVISIONS_HKEY
+from extensions.business.deeploy.deployment_operations import (
+  DeploymentConflictError, OPERATIONS_HKEY, SECRET_REVISIONS_HKEY,
+)
 from extensions.business.deeploy.tests.test_deployment_admission import Admission, config
 
 
@@ -82,12 +85,90 @@ class DeploymentAdmissionRecoveryTests(unittest.TestCase):
     plugin.fail_namespace = SECRET_REVISIONS_HKEY
     with self.assertRaisesRegex(RuntimeError, 'revocation is pending'):
       self.recover(plugin)
-    self.assertEqual(next(iter(plugin._operation_records().values()))['phase'], 'preparing')
+    self.assertEqual(next(iter(plugin._operation_records().values()))['phase'], 'cleaning_up_preparation')
     self.assertEqual(plugin.commands, [])
     plugin.fail_namespace = None
     operation = self.recover(plugin)
     self.assertEqual(operation['phase'], 'completed')
     self.assertEqual(plugin.storage[SECRET_REVISIONS_HKEY, '7|previous:deploy'], prior)
+
+  def test_expired_preparation_is_durable_before_unavailable_cleanup_and_plan_reads(self):
+    plugin, prior = self.partial_update()
+    operation = next(iter(plugin._operation_records().values()))
+    plugin.time = lambda: operation['preparation_deadline']
+    plugin._load_operation_plan = Mock(side_effect=AssertionError('Cleanup needs no coordinator plan read.'))
+    plugin.bc.reconcile_dauth_job_secrets = Mock(side_effect=RuntimeError('dAuth unavailable'))
+    with self.assertRaisesRegex(RuntimeError, 'dAuth unavailable'):
+      plugin._advance_deployment_operation(operation)
+    pending = next(iter(plugin._operation_records().values()))
+    self.assertEqual((pending['phase'], pending['outcome'], pending['recovery']),
+                     ('cleaning_up_preparation', 'failed', 'in_progress'))
+    self.assertEqual(pending['error']['code'], 'ADMISSION_PREPARATION_FAILED')
+    self.assertEqual(plugin.bc.reconcile_dauth_job_secrets.call_args.args[0]['action'], 'revoke')
+    plugin._load_operation_plan.assert_not_called()
+    with self.assertRaises(DeploymentConflictError):
+      plugin._assert_no_active_deployment(job_id=7)
+    # Resume from the durable snapshot, as a restarted coordinator would.
+    plugin.bc.reconcile_dauth_job_secrets = plugin.custody
+    plugin._advance_deployment_operation(copy.deepcopy(pending))
+    completed = next(iter(plugin._operation_records().values()))
+    self.assertEqual((completed['phase'], completed['recovery']), ('completed', 'completed'))
+    plugin._assert_no_active_deployment(job_id=7)
+    self.assertEqual(plugin.storage[SECRET_REVISIONS_HKEY, '7|previous:deploy'], prior)
+    self.assertEqual(plugin.commands, [])
+
+  def test_status_timeout_crossing_deadline_records_failure_before_cleanup(self):
+    plugin, _ = self.partial_update()
+    operation = next(iter(plugin._operation_records().values()))
+    def timeout(payload):
+      self.assertEqual(payload['action'], 'status')
+      plugin.time = lambda: operation['preparation_deadline'] + 1
+      raise RuntimeError('dAuth unavailable')
+    plugin.bc.reconcile_dauth_job_secrets = timeout
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome'], operation['recovery']),
+                     ('cleaning_up_preparation', 'failed', 'in_progress'))
+    self.assertEqual(plugin.commands, [])
+
+  def test_late_status_and_live_preparation_cannot_become_accepted(self):
+    for action in ('prepare', 'status'):
+      with self.subTest(action=action):
+        plugin = Admission()
+        custody = plugin.custody
+        def delayed(payload):
+          result = custody(payload)
+          plugin.time = lambda: payload['operation']['preparation_deadline']
+          return result
+        if action == 'status':
+          plugin.fail_namespace = SECRET_REVISIONS_HKEY
+          with self.assertRaises(RuntimeError):
+            plugin.admit()
+          plugin.fail_namespace = None
+        plugin.bc.reconcile_dauth_job_secrets = delayed
+        if action == 'prepare':
+          plugin.admit()
+        else:
+          self.recover(plugin)
+        operation = next(iter(plugin._operation_records().values()))
+        self.assertEqual((operation['phase'], operation['outcome']), ('cleaning_up_preparation', 'failed'))
+        self.assertFalse(any(record.get('phase') == 'accepted'
+                             for (namespace, _), record in plugin.storage.items() if namespace == OPERATIONS_HKEY))
+        self.assertEqual(plugin.commands, [])
+
+  def test_already_expired_complete_preparation_is_cleaned_up_without_status(self):
+    plugin = Admission()
+    plugin.fail_namespace = SECRET_REVISIONS_HKEY
+    with self.assertRaises(RuntimeError):
+      plugin.admit()
+    operation = next(iter(plugin._operation_records().values()))
+    plugin.fail_namespace = None
+    plugin.time = lambda: operation['preparation_deadline'] + 1
+    plugin.bc.reconcile_dauth_job_secrets = Mock(wraps=plugin.custody)
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome'], operation['recovery']),
+                     ('completed', 'failed', 'completed'))
+    self.assertEqual([call.args[0]['action'] for call in plugin.bc.reconcile_dauth_job_secrets.call_args_list], ['revoke'])
+    self.assertEqual(plugin.commands, [])
 
   def test_mismatched_complete_bundle_cannot_become_accepted(self):
     plugin = Admission()
