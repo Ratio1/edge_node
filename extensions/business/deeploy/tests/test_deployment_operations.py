@@ -44,6 +44,10 @@ class Coordinator(_DeploymentOperationsMixin):
     self.plan = {"configs": {node: copy.deepcopy(CONFIG) for node in ("A", "B", "C")}, "previous_configs": {}}
     self._commit_operation_revision = Mock()
     self.chainstore_hsync = Mock(side_effect=AssertionError("Deployment reads must use local replicas"))
+    self.offline = set()
+
+  def _netmon_node_is_online_for_control(self, node):
+    return node not in self.offline
 
   def time(self):
     return self.now
@@ -125,6 +129,19 @@ class DeploymentStatusTests(unittest.TestCase):
     plugin.deeploy_get_auth_result = lambda inputs: {"escrow_owner": "someone-else"}
     self.assertEqual(plugin._deployment_status({"operation_id": operation["operation_id"]})["status"], "synchronizing")
 
+  def test_status_uses_netmon_liveness_instead_of_report_age(self):
+    plugin = self.prepare()
+    operation = plugin.operation()
+    operation["phase"] = "waiting_for_readiness"
+    plugin._save_operation(operation)
+    for node in operation["nodes"]:
+      plugin.report(operation, node, "ready")
+    plugin.now += 3600
+    plugin.offline = {"B"}
+    result = plugin._deployment_status({"operation_id": operation["operation_id"]})
+    self.assertEqual(result["ready_nodes"], 2)
+    self.assertEqual({node["node_id"]: node["stale"] for node in result["nodes"]}, {"A": False, "B": True, "C": False})
+
   def test_preparation_failure_does_not_project_a_restoration(self):
     plugin = self.prepare()
     operation = plugin.operation(kind="update")
@@ -172,12 +189,27 @@ class DeploymentOperationTests(unittest.TestCase):
     self.assertEqual(request_digest(request), request_digest({**request, BCct.SIGN_CANON_V: "v2"}))
     self.assertNotEqual(request_digest(request), request_digest({**request, "job_id": 2}))
 
-  def test_readiness_requires_exact_instances_and_fresh_evidence(self):
+  def test_readiness_requires_exact_instances_but_not_recent_reports(self):
     report = dict(status="ready", updated_at=100, instances=[dict(signature="RUNNER", instance_id="worker", status="ready")])
-    self.assertTrue(report_is_ready(report, CONFIG, 110))
-    self.assertFalse(report_is_ready(report, CONFIG, 131))
-    self.assertFalse(report_is_ready({**report, "instances": []}, CONFIG, 110))
-    self.assertFalse(report_is_ready({**report, "updated_at": 200}, CONFIG, 110))
+    self.assertTrue(report_is_ready(report, CONFIG))
+    self.assertTrue(report_is_ready({**report, "updated_at": 0}, CONFIG))
+    self.assertFalse(report_is_ready({**report, "instances": []}, CONFIG))
+    self.assertFalse(report_is_ready({**report, "status": "starting"}, CONFIG))
+
+  def test_one_time_ready_reports_finalize_only_while_nodes_are_online(self):
+    plugin = Coordinator()
+    operation = plugin.operation()
+    plugin._save_operation(operation)
+    plugin._advance_deployment_operation(operation)
+    for node in operation["nodes"]:
+      plugin.report(operation, node, "ready")
+    plugin.now += 50
+    plugin.offline = {"B"}
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "waiting_for_readiness")
+    plugin.offline = set()
+    plugin._advance_deployment_operation(operation)
+    self.assertEqual(operation["phase"], "finalizing")
 
   def test_no_dispatch_until_uncertain_snapshot_replicates(self):
     plugin = Coordinator()

@@ -50,11 +50,13 @@ def required_instances(config):
   ]
 
 
-def report_is_ready(report, config, now=None):
-  """Require an explicit ready report for every planned plugin instance."""
+def report_is_ready(report, config):
+  """Require an explicit ready report for every planned plugin instance.
+
+  Nodes publish a ready report once per attempt and never refresh it, so its
+  age is not a liveness signal; callers pair it with NetMon liveness.
+  """
   if not report or report.get("status") != "ready":
-    return False
-  if now is not None and not 0 <= now - report.get("updated_at", 0) <= 30:
     return False
   actual = {
     (item.get("signature"), item.get("instance_id")): item.get("status")
@@ -388,6 +390,10 @@ class _DeploymentOperationsMixin:
         self._deployment_plans[cid] = plan
     return copy.deepcopy(plan)
 
+  def _node_is_ready(self, node, report, config):
+    """Pair the attempt's one-time ready report with current NetMon liveness."""
+    return report_is_ready(report, config) and self._netmon_node_is_online_for_control(node)
+
   def _node_operation_reports(self, operation, attempt):
     """Read newest signed reports from the planned nodes for this attempt."""
     reports = {}
@@ -428,7 +434,7 @@ class _DeploymentOperationsMixin:
       report = reports.get(node, {})
       if action in ("stop", "retire") and report.get("status") == "stopped":
         continue
-      if action == "start" and report_is_ready(report, config, self.time()):
+      if action == "start" and report_is_ready(report, config):
         continue
       key = "{}|{}|{}".format(attempt, action, node)
       if self.time() - operation["sent_at"].get(key, 0) < 10:
@@ -514,7 +520,7 @@ class _DeploymentOperationsMixin:
         operation["recovery"] = "in_progress"
         operation["recovery_started_at"] = self.time()
         self._save_operation(operation, "stopping_failed_rollout", "Stopping the failed rollout on all targets.")
-      elif all(report_is_ready(reports.get(node), config, self.time()) for node, config in configs.items()):
+      elif all(self._node_is_ready(node, reports.get(node), config) for node, config in configs.items()):
         self._save_operation(operation, "finalizing", "All required instances are ready.")
       else:
         self._send_operation_commands(operation, configs, "deploy", "start", reports)
@@ -537,7 +543,7 @@ class _DeploymentOperationsMixin:
     if phase == "restoring_previous":
       previous_configs = plan["previous_configs"]
       previous_reports = self._node_operation_reports(operation, "restore")
-      if all(report_is_ready(previous_reports.get(node), config, self.time()) for node, config in previous_configs.items()):
+      if all(self._node_is_ready(node, previous_reports.get(node), config) for node, config in previous_configs.items()):
         self._save_operation(operation, "finalizing_recovery", "Previous revision is ready on all required nodes.")
       else:
         if self.time() >= operation["restore_deadline"] or any(
@@ -695,7 +701,8 @@ class _DeploymentOperationsMixin:
       nodes.append(dict(
         node_id=node, observed_revision=report.get("revision"),
         workload_state=report.get("status", "unknown"),
-        updated_at=updated_at, stale=report.get("status") != "stopped" and (updated_at is None or now - updated_at > 30),
+        updated_at=updated_at, stale=report.get("status") != "stopped" and (
+          updated_at is None or not self._netmon_node_is_online_for_control(node)),
         instances=instances, error=copy.deepcopy(report.get("error")),
         action=operation["phase"],
       ))
@@ -712,7 +719,7 @@ class _DeploymentOperationsMixin:
     events = [event for event in operation["events"] if event["sequence"] > after]
     result.update(
       status=operation["phase"], nodes=nodes, target_nodes=len(configs),
-      ready_nodes=sum(report_is_ready(reports.get(node), config, self.time()) for node, config in configs.items()),
+      ready_nodes=sum(self._node_is_ready(node, reports.get(node), config) for node, config in configs.items()),
       observation_stale=operation["phase"] != "completed" and now - operation["updated_at"] > 30,
       poll_after_ms=2000, events=events[:limit],
       next_event_cursor=events[limit - 1]["sequence"] if len(events) > limit else None,
