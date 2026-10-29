@@ -120,7 +120,8 @@ class Node:
     self._deployment_operations_stop = threading.Event()
     self._get_response = lambda value: value
     self._operation_peers = lambda: ['oracle', 'dauth']
-    self.netmon = SimpleNamespace(network_known_pipelines=lambda: self.known)
+    self.netmon = SimpleNamespace(network_known_pipelines=lambda: self.known,
+                                  network_node_is_online_for_control=lambda addr: True)
     self.known = {}
     self.commands = []
     self.engine.web3_get_job_details = lambda job_id: {'escrowOwner': 'owner'}
