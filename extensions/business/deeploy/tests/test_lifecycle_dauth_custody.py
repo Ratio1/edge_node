@@ -18,14 +18,15 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.addCleanup(self.dauth.chainstore_hsync.assert_not_called)
     self.http = connect(self, self.state, self.dauth)
 
-  def legacy(self):
-    canonical = pipeline(dAuth.DAUTH_SECRET_PLACEHOLDER)
+  def legacy(self, secret=dAuth.DAUTH_SECRET_PLACEHOLDER, with_bundle=True):
+    canonical = pipeline(secret)
     cid = self.state.blobs.add_json(canonical)
     self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'] = cid
-    self.state.secrets['DAUTH_JOB_SECRETS', '7'] = dict(
-      job_id='7', pipeline_cid=cid,
-      job_secrets={'PLUGINS': [{'INSTANCES': [{'ENV': {'CF_TUNNEL_TOKEN': 'old-token'}}]}]},
-    )
+    if with_bundle:
+      self.state.secrets['DAUTH_JOB_SECRETS', '7'] = dict(
+        job_id='7', pipeline_cid=cid,
+        job_secrets={'PLUGINS': [{'INSTANCES': [{'ENV': {'CF_TUNNEL_TOKEN': 'old-token'}}]}]},
+      )
     self.coordinator.known = {'A': [canonical]}
     return canonical, cid
 
@@ -103,6 +104,63 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(len(self.state.writes), writes)
     restored_ref = '7|' + operation['operation_id'] + ':restore'
     self.assertNotIn('revoked', self.state.secrets['DAUTH_JOB_SECRET_REVISIONS', restored_ref])
+
+  def test_first_update_without_bundle_preserves_plaintext_values(self):
+    previous, cid = self.legacy('old-token', with_bundle=False)
+    self.admit(previous, secret=dAuth.DAUTH_SECRET_PLACEHOLDER)
+    operation = self.operation()
+    self.assertNotIn(('DAUTH_JOB_SECRETS', '7'), self.state.secrets)
+    self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'], cid)
+    self.assertNotIn('old-token', str(self.state.public))
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'old-token')
+
+  def test_failed_first_update_without_bundle_restores_plaintext_values(self):
+    previous, _ = self.legacy('old-token', with_bundle=False)
+    self.admit(previous)
+    operation = self.operation()
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'retire', 'stopped')
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'deploy', 'failed')
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'deploy', 'stopped')
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'restore', 'ready')
+    self.coordinator._advance_deployment_operation(operation)
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['outcome'], operation['recovery']), ('failed', 'completed'))
+    self.assertEqual(self.active()['DEEPLOY_SPECS']['revision'], 0)
+    self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'old-token')
+
+  def test_first_update_with_missing_required_bundle_fails_before_staging(self):
+    previous, _ = self.legacy(with_bundle=False)
+    with self.assertRaises(RuntimeError):
+      self.admit(previous)
+    self.assertFalse(any(namespace == 'DAUTH_JOB_SECRET_REVISIONS' for namespace, _ in self.state.secrets))
+
+  def test_plaintext_previous_pipeline_does_not_bypass_existing_bundle_guards(self):
+    previous, cid = self.legacy('old-token')
+    for changed in ({'pipeline_cid': 'other'}, {'revoked': True}, {'deleted': True},
+                    {'revision': 'other'}, {'deployment_revision': 1}, {'operation_id': 'other'}):
+      with self.subTest(changed=changed):
+        self.state.secrets['DAUTH_JOB_SECRETS', '7'] = dict(job_id='7', pipeline_cid=cid)
+        self.state.secrets['DAUTH_JOB_SECRETS', '7'].update(changed)
+        with self.assertRaises(RuntimeError):
+          self.admit(previous)
+        self.assertFalse(any(namespace == 'DAUTH_JOB_SECRET_REVISIONS' for namespace, _ in self.state.secrets))
+
+  def test_first_update_without_bundle_rejects_changed_pipeline_generation(self):
+    previous, _ = self.legacy('old-token', with_bundle=False)
+    original = self.dauth._load_dauth_job_secret_bundle
+    def load(job_id):
+      self.state.public['DEEPLOY_DEPLOYED_JOBS', '7'] = 'changed-cid'
+      return original(job_id)
+    self.dauth._load_dauth_job_secret_bundle = load
+    with self.assertRaises(RuntimeError):
+      self.admit(previous)
+    self.assertFalse(any(namespace == 'DAUTH_JOB_SECRET_REVISIONS' for namespace, _ in self.state.secrets))
 
   def test_lost_fresh_values_leave_partial_preparation_until_deadline_then_cleanup(self):
     previous, cid = self.legacy()

@@ -133,3 +133,10 @@ the request does not establish globally fresh state. Required local records that
 are missing still fail or report incomplete preparation. Plan validation, durable
 publication, and peer acknowledgments for writes remain in place; cleanup stays
 pending until its writes are confirmed.
+
+The first update of an existing pipeline does not require a current dAuth bundle
+when its published configuration contains no secret placeholders. dAuth extracts
+the available values into a temporary bundle and stages immutable target and
+restoration revisions through the normal custody path. Existing bundles still
+require the exact current CID and unversioned state; missing bundles needed to
+resolve placeholders remain an error.
