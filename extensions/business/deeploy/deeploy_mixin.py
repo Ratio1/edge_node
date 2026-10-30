@@ -4526,7 +4526,7 @@ class _DeeployMixin:
 
     now = datetime.now(timezone.utc)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ca_subject = self._cockroachdb_name("deeploy-cockroachdb-ca")
+    ca_subject = self._cockroachdb_name("deeploy-r1db-ca")
     ca_cert = (
       x509.CertificateBuilder()
       .subject_name(ca_subject)
