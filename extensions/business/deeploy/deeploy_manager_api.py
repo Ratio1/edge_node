@@ -1277,11 +1277,11 @@ class DeeployManagerApiPlugin(
           The provided keys are merged into the pipeline configuration at the top level.
 
       service_kind : str, optional
-          Stable managed-service identity. Existing legacy CockroachDB jobs are detected and backfilled on update.
+          Stable managed-service identity. Existing legacy R1DB jobs are detected and backfilled on update.
 
       cockroachdb_certificate_regeneration_id : str, optional
-          UUIDv4 operation id for an explicit full-fleet CockroachDB TLS certificate regeneration.
-          Valid only for CockroachDB service updates with all-node response confirmation enabled.
+          UUIDv4 operation id for an explicit full-fleet R1DB TLS certificate regeneration.
+          Valid only for R1DB service updates with all-node response confirmation enabled.
 
       nonce : str
           The nonce used for signing the request

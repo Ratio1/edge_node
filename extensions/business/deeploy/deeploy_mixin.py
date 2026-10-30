@@ -4002,7 +4002,7 @@ class _DeeployMixin:
         continue
       if not all(cockroachdb_flags):
         raise ValueError(
-          "CockroachDB runtime configuration is inconsistent across existing service replicas."
+          "R1DB runtime configuration is inconsistent across existing service replicas."
         )
 
       first = configs[0]
@@ -4014,7 +4014,7 @@ class _DeeployMixin:
         for config in configs[1:]
       ):
         raise ValueError(
-          "CockroachDB image or cluster-global credentials are inconsistent across existing service replicas."
+          "R1DB image or cluster-global credentials are inconsistent across existing service replicas."
         )
 
       reserved_user = self._cockroachdb_reserved_user_from_env(first.get("ENV"))
@@ -4053,14 +4053,14 @@ class _DeeployMixin:
       if env is None:
         continue
       if not isinstance(env, dict):
-        raise ValueError("CockroachDB per-node ENV must be a dictionary.")
+        raise ValueError("R1DB per-node ENV must be a dictionary.")
       forbidden = sorted(
         key for key in env
         if isinstance(key, str) and key.upper() in forbidden_keys
       )
       if forbidden:
         raise ValueError(
-          "CockroachDB per-node ENV cannot override cluster-global credential fields: {}.".format(
+          "R1DB per-node ENV cannot override cluster-global credential fields: {}.".format(
             forbidden
           )
         )
@@ -4088,7 +4088,7 @@ class _DeeployMixin:
           cockroachdb_legacy_compat_contexts,
         )
       ):
-        raise ValueError("CockroachDB CRDB_USER is reserved.")
+        raise ValueError("R1DB CRDB_USER is reserved.")
     return True
 
   def _validate_managed_service_target_change(
@@ -4147,7 +4147,7 @@ class _DeeployMixin:
     return {
       "kind": COCKROACHDB_CERT_REGENERATION_ACTION_KIND,
       "operation_id": regeneration_id,
-      "label": "CockroachDB certificate regeneration",
+      "label": "R1DB certificate regeneration",
     }
 
   def _prepare_managed_service_update_action(
@@ -4176,9 +4176,9 @@ class _DeeployMixin:
         "cockroachdb_certificate_regeneration": "already_applied",
       },
       "persistence_failure_error": (
-        "CockroachDB certificate regeneration succeeded but metadata persistence failed."
+        "R1DB certificate regeneration succeeded but metadata persistence failed."
       ),
-      "label": "CockroachDB certificate regeneration",
+      "label": "R1DB certificate regeneration",
     }
 
   def _prepare_managed_service_secure_config_for_pipeline(self, pipeline, target_nodes):
@@ -4208,18 +4208,18 @@ class _DeeployMixin:
     current_nodes = list(current_nodes or [])
     requested_nodes = self._require_cockroachdb_min_target_nodes(requested_nodes)
     if current_nodes and len(requested_nodes) < len(current_nodes):
-      raise ValueError("CockroachDB scale-down is not supported in v1.")
+      raise ValueError("R1DB scale-down is not supported in v1.")
     same_count_changed = (
       current_nodes
       and len(requested_nodes) == len(current_nodes)
       and requested_nodes != current_nodes
     )
     if same_count_changed:
-      raise ValueError("CockroachDB node replacement or reordering is not supported in v1.")
+      raise ValueError("R1DB node replacement or reordering is not supported in v1.")
     if current_nodes and len(requested_nodes) > len(current_nodes):
       existing_prefix = requested_nodes[:len(current_nodes)]
       if existing_prefix != current_nodes:
-        raise ValueError("CockroachDB scale-up must append new nodes after the existing node order in v1.")
+        raise ValueError("R1DB scale-up must append new nodes after the existing node order in v1.")
     return True
 
   def _require_cockroachdb_min_target_nodes(self, target_nodes):
@@ -4229,21 +4229,21 @@ class _DeeployMixin:
       or len(set(target_nodes)) != len(target_nodes)
     ):
       raise ValueError(
-        f"CockroachDB requires at least {COCKROACHDB_MIN_TARGET_NODES} target nodes "
+        f"R1DB requires at least {COCKROACHDB_MIN_TARGET_NODES} target nodes "
         "with distinct addresses."
       )
     return target_nodes
 
   def _validate_cockroachdb_auth_env(self, env, allow_legacy_reserved_user=False):
     if not isinstance(env, dict):
-      raise ValueError("CockroachDB service requires ENV configuration.")
+      raise ValueError("R1DB service requires ENV configuration.")
     missing = [
       key for key in COCKROACHDB_REQUIRED_AUTH_ENV_KEYS
       if not isinstance(env.get(key), str) or not env.get(key).strip()
     ]
     if missing:
       raise ValueError(
-        "CockroachDB service requires non-empty database, user, and password fields: {}.".format(missing)
+        "R1DB service requires non-empty database, user, and password fields: {}.".format(missing)
       )
 
     identifier_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
@@ -4251,14 +4251,14 @@ class _DeeployMixin:
       value = env.get(key)
       if not identifier_re.fullmatch(value):
         raise ValueError(
-          "CockroachDB {} must be a SQL identifier: letters, digits, and underscores, not starting with a digit.".format(key)
+          "R1DB {} must be a SQL identifier: letters, digits, and underscores, not starting with a digit.".format(key)
         )
     user = env.get("CRDB_USER", "").lower()
     if user in COCKROACHDB_RESERVED_USERS and not (
       allow_legacy_reserved_user
       and user in COCKROACHDB_LEGACY_COMPAT_RESERVED_USERS
     ):
-      raise ValueError("CockroachDB CRDB_USER is reserved.")
+      raise ValueError("R1DB CRDB_USER is reserved.")
     return True
 
   def _cockroachdb_cert_bundle_complete(self, instance, target_nodes):
@@ -4350,22 +4350,22 @@ class _DeeployMixin:
 
   def _cockroachdb_client_hostname(self, endpoint):
     if not isinstance(endpoint, str) or not endpoint.strip():
-      raise ValueError("CockroachDB client tunnel endpoint is missing.")
+      raise ValueError("R1DB client tunnel endpoint is missing.")
     value = endpoint.strip()
     parsed = urlsplit(value if "://" in value else f"//{value}")
     if "://" in value and parsed.scheme.lower() != "tcp":
-      raise ValueError("CockroachDB client tunnel endpoint must use the tcp scheme.")
+      raise ValueError("R1DB client tunnel endpoint must use the tcp scheme.")
     if parsed.username or parsed.password:
-      raise ValueError("CockroachDB client tunnel endpoint must not include credentials.")
+      raise ValueError("R1DB client tunnel endpoint must not include credentials.")
     if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-      raise ValueError("CockroachDB client tunnel endpoint must not include a path, query, or fragment.")
+      raise ValueError("R1DB client tunnel endpoint must not include a path, query, or fragment.")
     try:
       parsed.port
     except ValueError as exc:
-      raise ValueError("CockroachDB client tunnel endpoint contains an invalid port.") from exc
+      raise ValueError("R1DB client tunnel endpoint contains an invalid port.") from exc
     hostname = parsed.hostname
     if not hostname or "*" in hostname:
-      raise ValueError("CockroachDB client tunnel endpoint must contain an exact hostname or IP address.")
+      raise ValueError("R1DB client tunnel endpoint must contain an exact hostname or IP address.")
     hostname = hostname.rstrip(".").lower()
     try:
       ipaddress.ip_address(hostname)
@@ -4373,7 +4373,7 @@ class _DeeployMixin:
     except ValueError:
       pass
     if len(hostname) > 253:
-      raise ValueError("CockroachDB client tunnel hostname is too long.")
+      raise ValueError("R1DB client tunnel hostname is too long.")
     labels = hostname.split(".")
     if any(
       not label
@@ -4381,7 +4381,7 @@ class _DeeployMixin:
       or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
       for label in labels
     ):
-      raise ValueError("CockroachDB client tunnel endpoint contains an invalid hostname.")
+      raise ValueError("R1DB client tunnel endpoint contains an invalid hostname.")
     return hostname
 
   def _get_cockroachdb_allocation(self, inputs, required=True):
@@ -4390,12 +4390,12 @@ class _DeeployMixin:
     if not isinstance(allocation, dict):
       if not required:
         return None, None
-      raise ValueError("CockroachDB client tunnel allocation is missing.")
+      raise ValueError("R1DB client tunnel allocation is missing.")
     client_tunnel = allocation.get("clientTunnel")
     if not isinstance(client_tunnel, dict):
       if not required:
         return allocation, None
-      raise ValueError("CockroachDB client tunnel allocation is missing.")
+      raise ValueError("R1DB client tunnel allocation is missing.")
     endpoint = client_tunnel.get("url")
     if not endpoint and not required:
       return allocation, None
@@ -4411,7 +4411,7 @@ class _DeeployMixin:
       value,
       flags=re.IGNORECASE,
     ):
-      raise ValueError("CockroachDB certificate regeneration id must be a UUIDv4 string.")
+      raise ValueError("R1DB certificate regeneration id must be a UUIDv4 string.")
     return value.lower()
 
   def _get_cockroachdb_allocation_from_specs(self, deeploy_specs):
@@ -4470,7 +4470,7 @@ class _DeeployMixin:
       if applied_id == regeneration_id:
         if applied_intent != intent_hash:
           raise ValueError(
-            "CockroachDB certificate regeneration id was already applied to a different update intent."
+            "R1DB certificate regeneration id was already applied to a different update intent."
           )
         return regeneration_id, intent_hash, True
     if isinstance(current_allocation, dict) and current_allocation.get(
@@ -4479,7 +4479,7 @@ class _DeeployMixin:
       current_intent = current_allocation.get(COCKROACHDB_CERT_REGENERATION_INTENT_KEY)
       if current_intent != intent_hash:
         raise ValueError(
-          "CockroachDB certificate regeneration id was already applied to a different update intent."
+          "R1DB certificate regeneration id was already applied to a different update intent."
         )
       return regeneration_id, intent_hash, True
 
@@ -4508,7 +4508,7 @@ class _DeeployMixin:
 
   def _generate_cockroachdb_cert_bundle(self, target_nodes, client_hostname=None):
     """
-    Generate a temporary CA and per-node CockroachDB certificates.
+    Generate a temporary CA and per-node R1DB certificates.
 
     The CA private key is intentionally kept only in memory for this call. The
     returned payload contains the CA certificate, per-node cert/key pairs, and
@@ -4521,7 +4521,7 @@ class _DeeployMixin:
       from cryptography.x509.oid import ExtendedKeyUsageOID
     except Exception as exc:
       raise ValueError(
-        "CockroachDB secure deployment requires the Python 'cryptography' package."
+        "R1DB secure deployment requires the Python 'cryptography' package."
       ) from exc
 
     now = datetime.now(timezone.utc)
@@ -4768,7 +4768,7 @@ class _DeeployMixin:
         ]
         if len(hostnames) != len(target_nodes):
           raise ValueError(
-            "CockroachDB legacy scale-up requires CRDB_HOSTNAMES to contain "
+            "R1DB legacy scale-up requires CRDB_HOSTNAMES to contain "
             f"{len(target_nodes)} hostnames before redeploying the cluster."
           )
         env["CRDB_SECURE"] = "true"
