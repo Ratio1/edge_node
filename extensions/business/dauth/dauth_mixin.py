@@ -164,10 +164,11 @@ class _DauthMixin(object):
       msg = "Version check failed: {}".format(version_check_data.message)
     else:
       try:
-        if version_check_data.requester_type != self.const.BASE_CT.dAuth.DAUTH_SENDER_TYPE_SDK:
-          result = self.bc.is_node_licensed(node_address_eth=node_address_eth)
-          str_allowed = "allowed" if result else "not allowed"
-          msg = f"node {node_address_eth} {str_allowed} on {self.evm_network}"
+        # TEMP (incident response): SDK requesters are license-gated as well,
+        # previously only non-SDK requesters were checked.
+        result = self.bc.is_node_licensed(node_address_eth=node_address_eth)
+        str_allowed = "allowed" if result else "not allowed"
+        msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
       except Exception as e:
         result = False
         msg = "Error checking if node is allowed ({} on {}): {} ".format(
