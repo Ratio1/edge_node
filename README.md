@@ -87,6 +87,10 @@ Key groups in `.env.template`:
 - MQTT: `EE_MQTT_*`
 - Tunnel/auth/token settings: `EE_NGROK_*`, `EE_GITVER`, `EE_OPENAI`, `EE_HF_TOKEN`
 
+dAuth distributes an ordered broker list alongside the legacy single host.
+See [MQTT broker failover](docs/mqtt-broker-failover.md) for allocation order,
+receiver dependencies, validation, and rollout/rollback guidance.
+
 #### Startup and app config files
 - `.config_startup.json`: default startup behavior.
 - `.config_app.json`: communication/upload configuration.

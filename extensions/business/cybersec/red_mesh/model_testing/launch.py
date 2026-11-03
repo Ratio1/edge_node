@@ -7,7 +7,6 @@ from ..constants import JOB_STATUS_RUNNING, RUN_MODE_SINGLEPASS
 from ..models import CStoreJobRunning, WorkerProgress
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
-from ..tenancy.execution import context_tenant_id
 from ..services.soc_export_policy import required_soc_launch_error
 from ..tenancy.effective_targets import resolve_model_launch_provider, validate_model_provider
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
@@ -430,7 +429,7 @@ def launch_model_test(
   created_by_id, err = _bounded_text(created_by_id, "created_by_id")
   if err:
     return err
-  soc_error = required_soc_launch_error(owner, context_tenant_id(execution_context))
+  soc_error = required_soc_launch_error(owner)
   if soc_error:
     return soc_error
   admitted = execution_context.to_dict()

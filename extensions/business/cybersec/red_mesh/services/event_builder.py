@@ -11,7 +11,9 @@ from ..models.event_schema import (
   RedMeshEvent,
 )
 from ..credential_redaction import redact_credential_strings, redact_credential_text
+from .config import job_tenant_id
 from .event_redaction import redact_event_payload, stable_hmac_pseudonym
+from .tenant_labels import tenant_label_value
 from ..models.finding_schema import is_coverage_result as _is_coverage_result
 
 
@@ -255,6 +257,7 @@ def build_redmesh_event(
   producer_version=None,
   labels=None,
   dedupe_fingerprint="",
+  redmesh_tenant_id=None,
 ):
   event = RedMeshEvent(
     schema=REDMESH_EVENT_SCHEMA,
@@ -295,6 +298,7 @@ def build_redmesh_event(
       "raw_responses_excluded": True,
       "exploit_payloads_excluded": True,
     },
+    redmesh_tenant_id=tenant_label_value(redmesh_tenant_id),
   ).to_dict()
   return redact_event_payload(event, hmac_secret=hmac_secret)
 
@@ -353,6 +357,7 @@ def build_lifecycle_event(
     tenant_id=tenant_id,
     environment=environment,
     hmac_secret=hmac_secret,
+    redmesh_tenant_id=job_tenant_id(job_specs),
   )
 
 
@@ -395,6 +400,7 @@ def build_service_observed_event(
     tenant_id=tenant_id,
     environment=environment,
     hmac_secret=hmac_secret,
+    redmesh_tenant_id=job_tenant_id(job_specs),
     dedupe_fingerprint=fingerprint,
   )
 
@@ -455,6 +461,7 @@ def build_finding_event(
     tenant_id=tenant_id,
     environment=environment,
     hmac_secret=hmac_secret,
+    redmesh_tenant_id=job_tenant_id(job_specs),
     dedupe_fingerprint=finding_payload.get("fingerprint") or "",
   )
 
@@ -488,6 +495,7 @@ def build_export_status_event(
     tenant_id=tenant_id,
     environment=environment,
     hmac_secret=hmac_secret,
+    redmesh_tenant_id=job_tenant_id(job_specs),
   )
 
 
@@ -518,5 +526,6 @@ def build_attestation_event(
     tenant_id=tenant_id,
     environment=environment,
     hmac_secret=hmac_secret,
+    redmesh_tenant_id=job_tenant_id(job_specs),
     dedupe_fingerprint=tx_hash or state,
   )

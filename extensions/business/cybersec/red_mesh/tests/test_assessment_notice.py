@@ -41,20 +41,8 @@ def _job_specs():
   }
 
 
-class _TenantEventOwner(MagicMock):
-  """A `_get_tenant_integration_config` lookup goes through the class, not the instance.
-
-  RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this fixture's
-  tenant needs one on file to still exercise delivery.
-  """
-  def _get_tenant_integration_config(self, tenant_id, integration_id):
-    if integration_id == "wazuh":
-      return {"config": dict(self.cfg_wazuh_export)}
-    return None
-
-
 def _owner():
-  owner = _TenantEventOwner()
+  owner = MagicMock()
   owner.cfg_instance_id = "tenant-a"
   owner.cfg_ee_node_network = "devnet"
   owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}

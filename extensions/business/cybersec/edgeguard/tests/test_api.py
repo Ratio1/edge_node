@@ -7,6 +7,7 @@ import threading
 import unittest
 import sys
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 def mock_plugin_modules():
@@ -55,8 +56,27 @@ from extensions.business.cybersec.edgeguard.edgeguard_api import _valid_temporal
 from extensions.business.cybersec.edgeguard.edgeguard_api import EDGEGUARD_REQUEST_TIMEOUT_SECONDS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_PROMPT_USER_BYTES  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_MAX_OUTPUT_TOKENS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import EXPLANATION_SERVER_MAX_ROWS  # noqa: E402
 from extensions.business.cybersec.edgeguard.edgeguard_api import _ResultEvidenceError  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jAuthError  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import Neo4jClientError  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _neo4j_row_json_safe  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_TOKENS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import GENERATION_MAX_REQUEST_CHARS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import CYPHER_MAX_CHARS  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import PROMPT_PROFILE_V0_11_PATTERN_SCHEMA  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _prepare_graph_explanation_plan  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import _WRAPPER_STATUS_CODE_KEY  # noqa: E402
 from extensions.business.cybersec.edgeguard.graph_first_runtime import GraphFirstRuntimeError, render_chat  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (  # noqa: E402
+  build_direct_cypher_system_prompt,
+  build_schema_correction_prompt,
+  build_v0_11_correction_prompt,
+  build_v0_11_pattern_schema_system_prompt,
+  canonical_schema_surface,
+  SCHEMA_VERSION,
+)
+from extensions.business.cybersec.edgeguard import literal_classes  # noqa: E402
 
 
 class _Response:
@@ -617,6 +637,31 @@ TEST_GENERATION_WORKERS = {
   **EdgeguardApiPlugin.CONFIG["EDGEGUARD_GENERATION_WORKERS"],
 }
 
+# A second deployment-supplied fixture, fine-tuned on the v0.11 artifact
+# (EGM-059 phase 2 slice C). Kept out of `TEST_GENERATION_WORKERS` so the
+# existing "exactly three models" catalog pin is untouched; tests that need
+# it pass `edgeguard_generation_workers=` explicitly.
+V0_11_MODEL_KEY = "v0-11-fixture-model"
+V0_11_WORKER_SEMAPHORE = "edgeguard_llm_v0_11"
+TEST_GENERATION_WORKERS_WITH_V0_11 = {
+  V0_11_MODEL_KEY: {
+    "SEMAPHORE": V0_11_WORKER_SEMAPHORE,
+    "PATH": "/create_chat_completion",
+    "PROMPT_PROFILE": PROMPT_PROFILE_V0_11_PATTERN_SCHEMA,
+    "DISPLAY_NAME": "Private v0.11 fixture model",
+    "DESCRIPTION": "Deployment-supplied fine-tuned-on-v0.11 GGUF fixture.",
+    "MODEL_REPO": "example-org/private-v0-11-fixture-gguf",
+    "MODEL_FILE": "private-v0-11-fixture.Q4_K_M.gguf",
+    "FORMAT": "GGUF",
+    "QUANTIZATION": "Q4_K_M",
+    "BASE_MODEL": "Qwen/Qwen3-4B-Instruct-2507",
+    "ARTIFACT_SHA256": "1" * 64,
+    "SOURCE": "private_deployment",
+    "MODEL_CARD": {"method": "QLoRA SFT"},
+  },
+  **TEST_GENERATION_WORKERS,
+}
+
 
 def _make_api(**overrides):
   plugin = EdgeguardApiPlugin.__new__(EdgeguardApiPlugin)
@@ -640,6 +685,7 @@ def _make_api(**overrides):
     1024,
   )
   plugin.cfg_edgeguard_explanation_temperature = overrides.get("edgeguard_explanation_temperature", 0.1)
+  plugin.cfg_edgeguard_direction_corrector = overrides.get("edgeguard_direction_corrector", True)
   plugin.cfg_edgeguard_explanation_top_p = overrides.get("edgeguard_explanation_top_p", 1.0)
   plugin.cfg_edgeguard_explanation_output_mode = overrides.get(
     "edgeguard_explanation_output_mode",
@@ -663,8 +709,15 @@ def _make_api(**overrides):
   )
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
   plugin.cfg_neo4j_query_timeout_seconds = overrides.get("neo4j_query_timeout_seconds", 30)
+  # Ruling R4: the production default is `False` (unsafe with an unpatched
+  # playground); tests that need the `misp_enrichment` machinery keep the
+  # old effective default explicitly.
+  plugin.cfg_misp_enrichment_enabled = overrides.get("misp_enrichment_enabled", True)
+  plugin.cfg_misp_enrichment_timeout_seconds = overrides.get("misp_enrichment_timeout_seconds", 5)
   plugin.cfg_neo4j_default_connection = overrides.get("neo4j_default_connection", {})
-  plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", True)
+  # Contract §6: broadening is off by default from EGM-059 phase 2; tests
+  # that exercise the old True default now pass it explicitly.
+  plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", False)
   plugin.cfg_request_timeout_seconds = overrides.get("request_timeout_seconds", 120)
   plugin.cfg_edgeguard_verbose = 0
   plugin.os_environ = overrides.get("os_environ", {})
@@ -673,6 +726,12 @@ def _make_api(**overrides):
   plugin._request_count = 0
   plugin._error_count = 0
   plugin._last_request_time = None
+  plugin._misp_enrichment_error_count = 0
+  plugin._misp_citation_drop_count = 0
+  plugin._misp_ref_drop_count = 0
+  plugin._misp_ref_withheld_count = 0
+  plugin._misp_bad_templates_logged = set()
+  plugin._misp_enrichment_last_error = None
   plugin.time = lambda: 1000
   plugin.P = lambda *_args, **_kwargs: None
   plugin.Pd = lambda *_args, **_kwargs: None
@@ -815,7 +874,10 @@ class EdgeGuardApiTests(unittest.TestCase):
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post") as post:
       result = plugin.generate(request="Show indicators", model_key="not-configured")
 
-    self.assertEqual(result["diagnostics"]["code"], "unsupported_model")
+    # Fix round 6: unsupported model key is now a deliberate 400 via the
+    # wrapper-safe transport, not a bare top-level `error` key.
+    self.assertEqual(result["status_code"], 400)
+    self.assertEqual(_graph_first_payload(result)["diagnostics"]["code"], "unsupported_model")
     post.assert_not_called()
 
   def test_edgeguard_api_owns_generation_endpoint(self):
@@ -834,8 +896,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post") as post:
       result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
 
-    self.assertEqual(result["status"], "error")
-    self.assertEqual(result["diagnostics"]["code"], "worker_not_ready")
+    # Fix round 6: the worker not being ready is now a deliberate 503 via
+    # the wrapper-safe transport, not a bare top-level `error` key.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertEqual(payload["diagnostics"]["code"], "worker_not_ready")
     post.assert_not_called()
 
   def test_generate_uses_semaphore_worker_and_validates_model_output(self):
@@ -870,7 +936,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertIn("edgeguard_api_ms", result["metrics"])
     self.assertEqual(session.post.call_args.args[0], "http://127.0.0.1:53001/create_chat_completion")
     self.assertEqual(session.post.call_args.kwargs["json"]["temperature"], 0.0)
-    self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 64)
+    self.assertEqual(session.post.call_args.kwargs["json"]["max_tokens"], 384)
     self.assertEqual(session.post.call_args.kwargs["json"]["model"], PRIVATE_MODEL_KEY)
     self.assertEqual(result["attempts"][0]["finish_reason"], "stop")
     self.assertEqual(result["attempts"][0]["completion_tokens"], 10)
@@ -987,13 +1053,17 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     result, session, timeouts = self._generate_with_fake_clock(plugin, [truncated, truncated], 119.5)
 
+    # Fix round 6: exhausting the budget is a generation-service failure,
+    # 502 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 502)
+    payload = _graph_first_payload(result)
     self.assertEqual(session.post.call_count, 1)
-    self.assertEqual(result["status"], "error")
+    self.assertEqual(payload["status"], "error")
     self.assertEqual(
-      result["diagnostics"],
+      payload["diagnostics"],
       {"stage": "worker", "code": "generation_deadline_exceeded", "retryable": True},
     )
-    self.assertEqual(len(result["attempts"]), 1)
+    self.assertEqual(len(payload["attempts"]), 1)
     self.assertEqual(timeouts, [120.0])
 
   def test_generate_passes_remaining_budget_as_http_timeout(self):
@@ -1019,8 +1089,11 @@ class EdgeGuardApiTests(unittest.TestCase):
     result, session, timeouts = self._generate_with_fake_clock(plugin, [], 0.0)
 
     session.post.assert_not_called()
-    self.assertEqual(result["diagnostics"]["code"], "generation_deadline_exceeded")
-    self.assertEqual(result["attempts"], [])
+    # Fix round 6: same generation-service-failure transport, 502.
+    self.assertEqual(result["status_code"], 502)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "generation_deadline_exceeded")
+    self.assertEqual(payload["attempts"], [])
     self.assertEqual(timeouts, [])
 
   def test_generate_fails_fast_while_model_process_is_starting(self):
@@ -1036,8 +1109,12 @@ class EdgeGuardApiTests(unittest.TestCase):
     ):
       result = plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
 
-    self.assertEqual(result["diagnostics"]["code"], "model_not_ready")
-    self.assertTrue(result["diagnostics"]["retryable"])
+    # Fix round 6: the model still starting is a deliberate 503 via the
+    # wrapper-safe transport.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "model_not_ready")
+    self.assertTrue(payload["diagnostics"]["retryable"])
     session.post.assert_not_called()
 
   def test_neo4j_connection_uses_complete_default_or_complete_override(self):
@@ -1165,7 +1242,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     bridge.close.assert_called_once_with()
 
   def test_api_model_metadata_describes_the_configured_default_model(self):
-    plugin = _make_api()
+    plugin = _make_api(live_empty_result_broadening=True)
 
     model = plugin.model()
 
@@ -1240,6 +1317,11 @@ class EdgeGuardApiTests(unittest.TestCase):
       "edgeguard-cybersec-schema-grounded-v0.10",
     )
     self.assertRegex(profiles[PRIVATE_MODEL_KEY]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
+    # Contract §5.4: every profile gets a real `system_prompt_sha256`, not
+    # just the profile without a suffix — `base_qwen3_4b` and
+    # `cybersec_qwen_4b` used to report `None` here.
+    self.assertRegex(profiles["base_qwen3_4b"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
+    self.assertRegex(profiles["cybersec_qwen_4b"]["system_prompt_sha256"], r"^[0-9a-f]{64}$")
     explanation = contract["graph_explanation"]
     self.assertEqual(explanation["prompt_version"], "edgeguard-graph-first-v1")
     self.assertEqual(explanation["profile_id"], "EEL/1")
@@ -1650,6 +1732,23 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["status"], "accepted")
     self.assertTrue(result["accepted"])
 
+  def test_check_cypher_accepts_v0_11_sets_and_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: `check_cypher` must accept what `generate`
+    # accepts for the v0.11 profile — v0.11-only sets, `LIMIT` optional for
+    # the `graph` shape — via the same shared resolver `/neo4j_query` uses.
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+    cypher = "MATCH p=(c:CVE)-[:HAS_CVSS_v2]->(s:CVSSv2) RETURN p"
+
+    with_v0_11 = plugin.check_cypher(cypher=cypher, model_key=V0_11_MODEL_KEY)
+    without_model_key = plugin.check_cypher(cypher=cypher)
+
+    self.assertEqual(with_v0_11["status"], "accepted")
+    self.assertTrue(with_v0_11["accepted"], with_v0_11["validation_feedback"])
+    self.assertEqual(with_v0_11["schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertEqual(without_model_key["status"], "rejected")
+    self.assertFalse(without_model_key["accepted"])
+    self.assertEqual(without_model_key["schema_version"], SCHEMA_VERSION)
+
   def test_neo4j_query_rejects_invalid_cypher_without_driver(self):
     plugin = _make_api()
 
@@ -1662,8 +1761,15 @@ class EdgeGuardApiTests(unittest.TestCase):
         cypher="MATCH (i:InternetFacing) RETURN i.hostname AS hostname",
       )
 
-    self.assertFalse(result["executed"])
-    self.assertEqual(result["status"], "rejected")
+    # Fix round 5: a guard rejection is a deliberate 422 via the
+    # wrapper-safe transport, not a bare 500.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertFalse(payload["executed"])
+    self.assertEqual(payload["status"], "rejected")
+    # Contract §4.3: `validation.result_shape` is set even on a rejected
+    # query — it is a static text classification, not an acceptance gate.
+    self.assertEqual(payload["validation"]["result_shape"], "other")
     mocked_driver.assert_not_called()
 
   def test_neo4j_query_uses_driver_for_accepted_cypher(self):
@@ -1786,6 +1892,99 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(graph_properties, {"value": "example.org"})
     self.assertNotIn("sentinel", json.dumps(result["graph"]))
 
+  def test_neo4j_query_returns_json_safe_rows_for_a_path_with_temporal_properties(self):
+    """Regression for the HTTP 500 in
+    `.no-commit/edgeguard-t2c-resilmesh-2026-09-26/ip_crashed_run.log` (query
+    [13]/[14]): a `RETURN p` path whose node carries a Neo4j temporal
+    property crashed JSON serialization because `_run_neo4j_query` put the
+    raw `neo4j.graph.Path` / `neo4j.time.DateTime` driver objects straight
+    into `rows`. Synthetic values only, per contract §4.3 (no prod CVE ids,
+    no prod dates); the two fixture node/relationship types below already
+    stand in for the real driver's `Node`/`Relationship`/`Path` classes
+    elsewhere in this file (`_graph_path_record`, `test_graph_packet_...`)."""
+    plugin = _make_api()
+    cve = _GraphNode(
+      "cve-1",
+      ["CVE"],
+      {"cve_id": "CVE-2021-00000", "cisa_action_due": DateTime()},
+    )
+    cvss = _GraphNode("cvss-1", ["CVSSv31"], {"base_score": 9.8})
+    relationship = _GraphRelationship("rel-1", "HAS_CVSS_v31", cve, cvss)
+    path = _GraphPath([cve, cvss], [relationship])
+    record = _DriverRecord({"p": path}, {"p": "unused"})
+    fake_driver, _session = _driver_with_results(_Result([record], keys=["p"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher=(
+            "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) "
+            "WHERE c.cve_id = 'CVE-2021-00000' RETURN p LIMIT 5"
+          ),
+        )
+
+    self.assertTrue(result["executed"])
+    # Before the fix this line raised TypeError ("Object of type _GraphPath /
+    # DateTime is not JSON serializable") — the exact shape of the crash.
+    encoded = json.dumps(result)
+    row_path = result["rows"][0]["p"]
+    self.assertEqual(
+      {node["cve_id"] for node in row_path["nodes"] if "cve_id" in node},
+      {"CVE-2021-00000"},
+    )
+    self.assertEqual(
+      next(node for node in row_path["nodes"] if "cve_id" in node)["cisa_action_due"],
+      "2026-08-03T17:00:00Z",
+    )
+    self.assertEqual(row_path["relationships"], [{}])
+    # The graph packet (redacted, ref-based) still builds from the same raw
+    # Path unaffected by the row conversion.
+    self.assertEqual(result["graph"]["nodes"][0]["properties"]["cisa_action_due"], "2026-08-03T17:00:00Z")
+    self.assertIn("CVE-2021-00000", encoded)
+
+  def test_neo4j_row_json_safe_converts_bytes_to_hex(self):
+    # Review finding Q5: a single `bytes` value used to fall through to the
+    # generic "unsupported" rejection and turn an executed query into
+    # `status: error, executed: false`.
+    self.assertEqual(_neo4j_row_json_safe(b"\x00\x01\xff"), "0001ff")
+    self.assertEqual(_neo4j_row_json_safe(bytearray(b"\xab\xcd")), "abcd")
+    self.assertEqual(_neo4j_row_json_safe({"payload": b"\x01"}), {"payload": "01"})
+
+  def test_neo4j_row_json_safe_raises_a_distinct_code_for_a_truly_unsupported_value(self):
+    with self.assertRaises(_ResultEvidenceError) as raised:
+      _neo4j_row_json_safe({1, 2, 3})
+    self.assertEqual(raised.exception.code, "unsupported_query_result_value")
+
+  def test_neo4j_query_surfaces_a_distinct_error_code_for_an_unsupported_result_value(self):
+    plugin = _make_api()
+    record = _DriverRecord({"blob": {1, 2, 3}}, {"blob": "unused"})
+    fake_driver, _session = _driver_with_results(_Result([record], keys=["blob"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator) RETURN i.value AS blob LIMIT 5",
+        )
+
+    # Fix round 4 (re-review-3 finding 3): serialization failure stays a
+    # 500, but through the wrapper-safe transport, not a raw `error` key.
+    self.assertEqual(result["status_code"], 500)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    # Review finding 3, round 2: the query ran against Neo4j — only turning
+    # its rows into a JSON-safe response failed afterward — so `executed`
+    # is `True`; `error_code` is what tells the caller the row was unusable.
+    self.assertTrue(payload["executed"])
+    self.assertEqual(payload["error_code"], "unsupported_query_result_value")
+
   def test_neo4j_query_broadens_empty_result_once(self):
     plugin = _make_api()
     fake_record = MagicMock()
@@ -1806,6 +2005,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           username="neo4j",
           password="secret",
           cypher="MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+          enable_empty_result_broadening=True,
         )
 
     self.assertTrue(result["executed"])
@@ -1839,7 +2039,7 @@ class EdgeGuardApiTests(unittest.TestCase):
           scheme="bolt+s",
           username="neo4j",
           password="secret",
-          cypher="MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+          cypher="MATCH (i:Indicator)-[:INDICATES]->(m:Malware) RETURN i.value AS value LIMIT 10",
           enable_empty_result_broadening=False,
         )
 
@@ -1847,11 +2047,74 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["rows"], [])
     self.assertFalse(result["live_retry"]["enabled"])
     self.assertFalse(result["live_retry"]["attempted"])
+    # Contract §6: every empty result carries a reason; INDICATES, Indicator
+    # and Malware are all populated-surface (review finding 4 gives `Alert` a
+    # topology-only label classification of its own, so this test uses
+    # `Malware` to keep exercising the plain `no_match` branch), so this is a
+    # legitimate no-match, not a topology gap.
+    self.assertEqual(result["empty_reason"], "no_match")
     self.assertEqual(fake_session.run.call_count, 1)
     self.assertEqual(
       _run_text(fake_session.run.call_args),
-      "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+      "MATCH (i:Indicator)-[:INDICATES]->(m:Malware) RETURN i.value AS value LIMIT 10",
     )
+
+  def test_neo4j_query_empty_topology_surface_result_carries_the_contract_reason(self):
+    """Contract §6's own acceptance query: `MATCH p=(c:CVE)-[:AFFECTS]->
+    (m:Mission) ... RETURN p`, with no `LIMIT` (contract §4.1: optional for
+    the `graph` shape once the caller names the v0.11 profile) — `Mission`
+    is a topology-only label the v0.10 schema does not even know, so this
+    also exercises review finding 1 (the v0.11 flat sets)."""
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+    empty_result = _Result([], keys=["p"])
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = empty_result
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p",
+          model_key=V0_11_MODEL_KEY,
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["executed"])
+    self.assertEqual(result["rows"], [])
+    self.assertEqual(result["empty_reason"], "topology_surface_no_data")
+    self.assertFalse(result["live_retry"]["enabled"])
+    self.assertEqual(result["validation"]["result_shape"], "graph")
+    self.assertEqual(result["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
+    # Review finding 4, round 2: with no `LIMIT`, the runtime bounds rows at
+    # `NEO4J_MAX_ROWS` (contract §4.1) — the applied bound is reported back
+    # in `metrics`, not left implicit.
+    self.assertEqual(result["metrics"]["row_bound"], plugin.cfg_neo4j_max_rows)
+
+  def test_neo4j_query_without_a_v0_11_model_key_still_requires_limit_on_v0_10_sets(self):
+    """The same no-`LIMIT`, `Mission`-labelled query is rejected by default
+    (no `model_key`): `/neo4j_query` states the choice by falling back to
+    the v0.10 schema, which does not even know the `Mission` label."""
+    plugin = _make_api()
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687",
+      scheme="bolt+s",
+      username="neo4j",
+      password="secret",
+      cypher="MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p",
+    )
+
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertFalse(payload["executed"])
+    self.assertEqual(payload["validation"]["schema_version"], "edgeguard-cypher-schema-v0.10")
 
   def test_neo4j_query_returns_structured_error_when_driver_fails(self):
     plugin = _make_api()
@@ -1869,10 +2132,16 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
         )
 
-    self.assertEqual(result["status"], "error")
-    self.assertFalse(result["ok"])
-    self.assertFalse(result["executed"])
-    self.assertNotIn("secret", result["error"])
+    # Fix round 4 (re-review-3 finding 3): a driver/connection failure below
+    # Neo4j's own statement validation is connectivity/service-unavailable,
+    # not the caller's query content — 503 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertFalse(payload["executed"])
+    self.assertEqual(payload["error_code"], "neo4j_connection_error")
+    self.assertNotIn("secret", payload["error"])
 
   def test_legacy_query_marks_truncation_only_after_observing_an_extra_row(self):
     plugin = _make_api()
@@ -2221,6 +2490,29 @@ class EdgeGuardApiTests(unittest.TestCase):
       },
     })
 
+  def test_prepare_graph_explanation_accepts_v0_11_sets_and_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: `prepare_graph_explanation` (through
+    # `_prepare_graph_explanation_plan`) must accept what `generate` accepts
+    # for the v0.11 profile — v0.11-only sets, `LIMIT` optional for `graph`.
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+    )
+    cypher = "MATCH p=(c:CVE)-[:HAS_CVSS_v2]->(s:CVSSv2) RETURN p"
+
+    with_v0_11 = plugin.prepare_graph_explanation(cypher=cypher, model_key=V0_11_MODEL_KEY)
+    without_model_key = plugin.prepare_graph_explanation(cypher=cypher)
+
+    self.assertEqual(with_v0_11["status"], "accepted")
+    self.assertTrue(with_v0_11["ok"], with_v0_11.get("error"))
+    self.assertEqual(with_v0_11["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
+    # Fix round 5: the guard rejection on the v0.10 fallback profile is now a
+    # deliberate 422 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(without_model_key["status_code"], 422)
+    without_model_key_payload = _graph_first_payload(without_model_key)
+    self.assertEqual(without_model_key_payload["status"], "rejected")
+    self.assertFalse(without_model_key_payload["ok"])
+
   def test_one_call_prepare_contract_has_distinct_identity_and_cap(self):
     plugin = _make_api(edgeguard_explanation_strategy="one_call")
     result = plugin.prepare_graph_explanation(
@@ -2318,6 +2610,73 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["analyst_brief"]["diagnostics"]["reason"], "no_graph_evidence")
     self.assertEqual(result["explanation_trace"]["outcome"]["attempted_calls"], 0)
     self.assertEqual(fake_session.run.call_count, 1)
+    # Contract §6, review finding 6 (S5=Q9): explain routes carry an
+    # `empty_reason` too, not just `/neo4j_query`. SOURCED_FROM is a
+    # populated-surface relationship type, so this is a legitimate no-match.
+    self.assertEqual(result["validation"]["empty_reason"], "no_match")
+
+  def test_explain_graph_topology_surface_empty_result_carries_the_contract_reason(self):
+    """Contract §6's own acceptance query, through `/explain_graph`: `Mission`
+    is a topology-only label (review finding 4), so the zero-row result is
+    `topology_surface_no_data`, not `no_match` (review finding 6, S5=Q9)."""
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    fake_driver, fake_session = _driver_with_results(
+      _Result([], keys=["p"]),
+    )
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["result_digest"]["counts"]["returned_rows"], 0)
+    self.assertEqual(result["validation"]["empty_reason"], "topology_surface_no_data")
+
+  def test_explain_graph_accepts_v0_11_sets_and_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: `explain_graph`'s live-connection path
+    # must accept what `generate` accepts for the v0.11 profile — the same
+    # no-`LIMIT` `CVSSv2`/`HAS_CVSS_v2` query `/neo4j_query` already covers.
+    plugin = _make_api(
+      edgeguard_explanation_strategy="one_call",
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+    )
+    cypher = "MATCH p=(c:CVE)-[:HAS_CVSS_v2]->(s:CVSSv2) RETURN p"
+    fake_driver, fake_session = _driver_with_results(_Result([], keys=["p"]))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        with_v0_11 = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher=cypher,
+          model_key=V0_11_MODEL_KEY,
+        )
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        without_model_key = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher=cypher,
+        )
+
+    self.assertEqual(with_v0_11["status"], "ok")
+    self.assertTrue(with_v0_11["executed"])
+    self.assertEqual(with_v0_11["validation"]["schema_version"], "edgeguard-cypher-schema-v0.11")
+    # Fix round 5: the guard rejection on the v0.10 fallback profile is now a
+    # deliberate 422 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(without_model_key["status_code"], 422)
+    without_model_key_payload = _graph_first_payload(without_model_key)
+    self.assertEqual(without_model_key_payload["status"], "rejected")
+    self.assertFalse(without_model_key_payload["executed"])
 
   def test_explain_graph_scalar_only_result_succeeds_under_insight_brief(self):
     plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
@@ -2353,6 +2712,206 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
     self.assertIn("tabular/scalar", result["case_explanation"]["assessment"]["text"])
     self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_explain_graph_ranked_projection_calls_the_model_under_insight_brief(self):
+    # Contract §4.2-§4.4: a `ranked_projection` result has no graph nodes
+    # either, but must call the model (no `tabular_result` fallback) and
+    # ground the brief against `projection_digest`.
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {
+        "content": json.dumps({"text": "CVE-2024-0001 ranks highest under cvss_v31_desc."}),
+        "finish_reason": "stop",
+        "completion_tokens": 14,
+      }
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    fake_driver, fake_session = _driver_with_results(_Result(
+      [
+        _DriverRecord({"cve_id": "CVE-2024-0001", "cvss_v31": 9.8}, {"cve_id": "CVE-2024-0001", "cvss_v31": 9.8}),
+        _DriverRecord({"cve_id": "CVE-2024-0002", "cvss_v31": 7.5}, {"cve_id": "CVE-2024-0002", "cvss_v31": 7.5}),
+      ],
+      keys=["cve_id", "cvss_v31"],
+    ))
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Which CVE ranks highest by CVSS?",
+          cypher=(
+            "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s "
+            "ORDER BY s.base_score DESC "
+            "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+          ),
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["executed"])
+    self.assertTrue(result["explained"])
+    self.assertEqual(result["validation"]["result_shape"], "ranked_projection")
+    self.assertEqual(len(payloads), 1)
+    self.assertNotIn("case_explanation", result)
+    self.assertEqual(result["analyst_brief"]["strategy"], "one_call")
+    self.assertEqual(result["explanation_trace"]["outcome"]["status"], "supported")
+    self.assertNotEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
+    self.assertEqual(result["result_digest"]["counts"]["nodes"], 0)
+    projection_digest = result["projection_digest"]
+    self.assertEqual(projection_digest["schema_version"], "edgeguard.projection_digest.v1")
+    self.assertEqual(projection_digest["columns"], ["cve_id", "cvss_v31"])
+    self.assertEqual(projection_digest["ranking_rule"], "cvss_v31_desc")
+    self.assertEqual(projection_digest["rows"][0]["values"][0], {"type": "string", "value": "CVE-2024-0001"})
+    self.assertEqual(fake_session.run.call_count, 1)
+
+  def test_explain_prepared_execution_ranked_projection_calls_the_model_under_insight_brief(self):
+    # Same fix on the `execution_result=`-supplied dispatch path
+    # (`_explain_prepared_execution`), used by the JSON-execution-evidence
+    # contract and its own harnesses.
+    from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode
+
+    payloads = []
+
+    def provider(payload):
+      payloads.append(payload)
+      return {
+        "content": json.dumps({"text": "CVE-2024-0001 ranks highest under cvss_v31_desc."}),
+        "finish_reason": "stop",
+        "completion_tokens": 12,
+      }
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    cypher = (
+      "MATCH (c:CVE)-[:HAS_CVSS_v31]->(s:CVSSv31) WITH c, s "
+      "ORDER BY s.base_score DESC "
+      "RETURN c.cve_id AS cve_id, s.base_score AS cvss_v31 LIMIT 5"
+    )
+    plan = {
+      "accepted_cypher": cypher,
+      "executed_cypher": cypher,
+      "result_columns": ["cve_id", "cvss_v31"],
+      "projection_descriptors": [],
+      "limit_policy": {
+        "generated_limit": 5,
+        "executed_limit": 5,
+        "transport_row_cap": 25,
+        "server_max_rows": EXPLANATION_SERVER_MAX_ROWS,
+        "limit_adjusted": False,
+        "query_rewritten": False,
+      },
+      "broadening": {"enabled": False, "cypher": None, "strategy": None, "result_columns": None},
+      "validation": {"result_shape": "ranked_projection"},
+    }
+    execution_result = {
+      "executed_cypher": cypher,
+      "primary_row_count": 2,
+      "row_count": 2,
+      "truncated": False,
+      "broadened": False,
+      "graph": {"nodes": [], "relationships": [], "truncated": False},
+      "query_result_evidence": {
+        "schema_version": "edgeguard.query_result_evidence.v1",
+        "columns": ["cve_id", "cvss_v31"],
+        "rows": [
+          {"ordinal": 0, "values": [{"type": "string", "value": "CVE-2024-0001"}, {"type": "float", "value": 9.8}]},
+          {"ordinal": 1, "values": [{"type": "string", "value": "CVE-2024-0002"}, {"type": "float", "value": 7.5}]},
+        ],
+      },
+      "execution_trace": {"selected": "primary", "executions": []},
+    }
+
+    result = plugin._explain_prepared_execution(
+      plan=plan,
+      execution_result=execution_result,
+      request="Which CVE ranks highest by CVSS?",
+      mode_plan=resolve_mode("balanced"),
+      deadline=1e20,
+    )
+
+    self.assertTrue(result["explained"])
+    self.assertEqual(len(payloads), 1)
+    self.assertEqual(result["analyst_brief"]["strategy"], "one_call")
+    self.assertIn("projection_digest", result)
+    self.assertEqual(result["projection_digest"]["ranking_rule"], "cvss_v31_desc")
+    self.assertEqual(result["projection_digest"]["row_count"], 2)
+
+  def test_explain_prepared_execution_carries_empty_reason_for_zero_rows(self):
+    # Carry-over from review finding 6 (S5=Q9): the `execution_result=`
+    # supplied-evidence path (`_explain_prepared_execution`) never set
+    # `empty_reason` at all, unlike the live-connection path
+    # (`test_explain_graph_topology_surface_empty_result_carries_the_contract_reason`).
+    # `Mission` is the same topology-only label used there.
+    from extensions.business.cybersec.edgeguard.graph_first_explanation import resolve_mode
+
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    cypher = "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p LIMIT 10"
+    plan = {
+      "accepted_cypher": cypher,
+      "executed_cypher": cypher,
+      "result_columns": ["p"],
+      "projection_descriptors": [],
+      "limit_policy": {
+        "generated_limit": 10,
+        "executed_limit": 10,
+        "transport_row_cap": 25,
+        "server_max_rows": EXPLANATION_SERVER_MAX_ROWS,
+        "limit_adjusted": False,
+        "query_rewritten": False,
+      },
+      "broadening": {"enabled": False, "cypher": None, "strategy": None, "result_columns": None},
+      "validation": {"result_shape": "graph"},
+    }
+    execution_result = {
+      "executed_cypher": cypher,
+      "primary_row_count": 0,
+      "row_count": 0,
+      "truncated": False,
+      "broadened": False,
+      "graph": {"nodes": [], "relationships": [], "truncated": False},
+      "query_result_evidence": {
+        "schema_version": "edgeguard.query_result_evidence.v1",
+        "columns": ["p"],
+        "rows": [],
+      },
+      "execution_trace": {"selected": "primary", "executions": []},
+    }
+
+    result = plugin._explain_prepared_execution(
+      plan=plan,
+      execution_result=execution_result,
+      request="Explain the returned investigation graph.",
+      mode_plan=resolve_mode("balanced"),
+      deadline=1e20,
+    )
+
+    self.assertEqual(result["validation"]["empty_reason"], "topology_surface_no_data")
+
+  def test_explain_graph_scalar_only_non_ranked_result_still_falls_back_under_insight_brief(self):
+    # `other` (scalar, non-ranked) keeps today's deterministic fallback: only
+    # `ranked_projection` is rerouted to the digest analyst brief.
+    fake_driver, _fake_session = _driver_with_results(_Result(
+      [_DriverRecord({"name": "quietsieve"}, {"name": "quietsieve"})], keys=["name"],
+    ))
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="List malware names.",
+          cypher="MATCH (m:Malware) RETURN m.name AS name LIMIT 10",
+        )
+
+    self.assertEqual(result["validation"]["result_shape"], "other")
+    self.assertEqual(result["explanation_trace"]["outcome"]["safe_code"], "tabular_result")
+    self.assertNotIn("projection_digest", result)
 
   def test_explain_graph_scalar_only_result_succeeds_under_one_call(self):
     payloads = []
@@ -2459,13 +3018,17 @@ class EdgeGuardApiTests(unittest.TestCase):
         cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
       )
 
-    self.assertEqual(result["status"], "config_error")
+    # Fix round 5: the explanation model endpoint is a server-side
+    # dependency, 503 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "config_error")
     self.assertEqual(
-      result["explanation_contract"]["schema_version"],
+      payload["explanation_contract"]["schema_version"],
       "edgeguard.graph_first_prepare.v1",
     )
     self.assertEqual(
-      result["explanation_contract"]["resolved_mode"]["effective"],
+      payload["explanation_contract"]["resolved_mode"]["effective"],
       "balanced",
     )
     mocked_driver.assert_not_called()
@@ -2564,7 +3127,10 @@ class EdgeGuardApiTests(unittest.TestCase):
       for kwargs in invalid_requests:
         with self.subTest(kwargs=kwargs):
           result = plugin.explain_graph(**kwargs)
-          self.assertFalse(result["ok"])
+          # Fix round 5: malformed request shape/type is now a deliberate
+          # 400 via the wrapper-safe transport, not a bare 500.
+          self.assertEqual(result["status_code"], 400)
+          self.assertFalse(_graph_first_payload(result)["ok"])
     mocked_driver.assert_not_called()
     provider.assert_not_called()
 
@@ -2595,21 +3161,31 @@ class EdgeGuardApiTests(unittest.TestCase):
       password="test-password",
     )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+    # Fix round 5: unexpected/forwarded connection fields are malformed
+    # request bodies, 400 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertIn("credential_field_not_allowed", {item["code"] for item in payload["validation_errors"]})
 
     authorization = plugin.prepare_graph_explanation(
       cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
       authorization="Bearer should-not-cross",
     )
-    self.assertEqual(authorization["status"], "rejected")
-    self.assertIn("credential_field_not_allowed", {item["code"] for item in authorization["validation_errors"]})
+    self.assertEqual(authorization["status_code"], 400)
+    authorization_payload = _graph_first_payload(authorization)
+    self.assertEqual(authorization_payload["status"], "rejected")
+    self.assertIn(
+      "credential_field_not_allowed",
+      {item["code"] for item in authorization_payload["validation_errors"]},
+    )
 
     mixed_case = plugin.prepare_graph_explanation(
       cypher="MATCH (i:Indicator) RETURN i LIMIT 25",
       Authorization="Bearer should-not-cross",
     )
-    self.assertEqual(mixed_case["status"], "rejected")
+    self.assertEqual(mixed_case["status_code"], 400)
+    self.assertEqual(_graph_first_payload(mixed_case)["status"], "rejected")
     self.assertNotIn("should-not-cross", json.dumps(mixed_case))
 
   def test_prepare_graph_explanation_rejects_dynamic_properties_procedures_and_ambiguous_columns(self):
@@ -2636,18 +3212,23 @@ class EdgeGuardApiTests(unittest.TestCase):
             "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post"
           ) as mocked_post:
             result = plugin.prepare_graph_explanation(cypher=cypher)
-        self.assertEqual(result["status"], "rejected")
+        # Fix round 5: every rejection this plan builder returns (guard
+        # content rejection or the unsafe-result-projection checks) is a
+        # deliberate 422 via the wrapper-safe transport, not a bare 500.
+        self.assertEqual(result["status_code"], 422)
+        payload = _graph_first_payload(result)
+        self.assertEqual(payload["status"], "rejected")
         # Projection safety moved into the shared guard (EG-013): guard-level
         # rejections carry execution_safety_error/read_only_error in the
         # validation verdict; the remaining plan-only checks keep the
         # unsafe_result_projection validation_errors code.
-        codes = {item["code"] for item in result.get("validation_errors", [])}
-        validation = result.get("validation") or {}
+        codes = {item["code"] for item in payload.get("validation_errors", [])}
+        validation = payload.get("validation") or {}
         self.assertTrue(
           "unsafe_result_projection" in codes
           or validation.get("execution_safety_error")
           or validation.get("read_only_error"),
-          f"no rejection mechanism recorded for {cypher!r}: {result}",
+          f"no rejection mechanism recorded for {cypher!r}: {payload}",
         )
         mocked_driver.assert_not_called()
         mocked_post.assert_not_called()
@@ -2665,10 +3246,14 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher='MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
         )
 
-    self.assertEqual(result["status"], "rejected")
+    # Fix round 5: guard rejection is a deliberate 422 via the wrapper-safe
+    # transport, not a bare 500.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
     self.assertIn(
       "dynamic or bracket property access",
-      str((result.get("validation") or {}).get("execution_safety_error")),
+      str((payload.get("validation") or {}).get("execution_safety_error")),
     )
     mocked_driver.assert_not_called()
 
@@ -2708,6 +3293,47 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(result["packet_meta"]["dropped_forbidden_properties"], 1)
     self.assertTrue(all(node["id"].startswith("n:") for node in packet["graph"]["nodes"]))
     self.assertTrue(all(rel["id"].startswith("r:") for rel in packet["graph"]["relationships"]))
+
+  def test_explain_graph_supplied_execution_result_accepts_optional_limit_with_a_v0_11_model_key(self):
+    # Review finding 1, round 2: the `execution_result=`-supplied path
+    # (`_explain_prepared_execution`) must accept what `generate` accepts
+    # for the v0.11 profile too, not only the live-connection path above.
+    plugin = _make_api(
+      edgeguard_explanation_model_port=5091,
+      edgeguard_explanation_model="base_qwen3_4b",
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+    )
+    cypher = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p"
+    execution_result = _serialized_execution(cypher)
+
+    def provider_side_effect(*_args, **kwargs):
+      packet = _packet_from_provider_kwargs(kwargs)
+      return _provider_response_for_packet(packet, caveat_types=[])
+
+    with patch.object(plugin, "_neo4j_driver") as mocked_driver:
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post",
+        side_effect=provider_side_effect,
+      ):
+        with_v0_11 = plugin.explain_graph(
+          cypher=cypher,
+          execution_result=execution_result,
+          model_key=V0_11_MODEL_KEY,
+        )
+        without_model_key = plugin.explain_graph(
+          cypher=cypher,
+          execution_result=execution_result,
+        )
+
+    self.assertEqual(with_v0_11["status"], "ok")
+    self.assertTrue(with_v0_11["explained"])
+    mocked_driver.assert_not_called()
+    # Fix round 5: the guard rejection on the v0.10 fallback profile is now a
+    # deliberate 422 via the wrapper-safe transport, not a bare 500.
+    self.assertEqual(without_model_key["status_code"], 422)
+    without_model_key_payload = _graph_first_payload(without_model_key)
+    self.assertEqual(without_model_key_payload["status"], "rejected")
+    self.assertFalse(without_model_key_payload["explained"])
 
   def test_explain_graph_rejects_result_columns_that_do_not_match_return_projection(self):
     plugin = _make_api(edgeguard_explanation_model_port=5091)
@@ -2879,8 +3505,12 @@ class EdgeGuardApiTests(unittest.TestCase):
         execution_result=_serialized_execution(cypher),
       )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+    # Fix round 5: unexpected connection fields in execution-evidence mode
+    # are a malformed request body, 400 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertIn("credential_field_not_allowed", {item["code"] for item in payload["validation_errors"]})
     mocked_driver.assert_not_called()
 
   def test_explain_graph_evidence_mode_rejects_inconsistent_query_and_broadening_flags(self):
@@ -3134,8 +3764,12 @@ class EdgeGuardApiTests(unittest.TestCase):
           execution_result=_serialized_execution(cypher),
           **{field: "should-not-cross"},
         )
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("credential_field_not_allowed", {item["code"] for item in result["validation_errors"]})
+        # Fix round 5: unexpected connection/credential fields in
+        # execution-evidence mode are a malformed request body, 400.
+        self.assertEqual(result["status_code"], 400)
+        payload = _graph_first_payload(result)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertIn("credential_field_not_allowed", {item["code"] for item in payload["validation_errors"]})
       mocked_driver.assert_not_called()
 
   def test_explain_graph_rejects_invalid_cypher_before_provider_or_driver(self):
@@ -3151,8 +3785,12 @@ class EdgeGuardApiTests(unittest.TestCase):
           cypher="MATCH (i:InternetFacing) RETURN i.hostname AS hostname",
         )
 
-    self.assertEqual(result["status"], "rejected")
-    self.assertFalse(result["executed"])
+    # Fix round 5: guard rejection is a deliberate 422 via the wrapper-safe
+    # transport, not a bare 500.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertFalse(payload["executed"])
     mocked_driver.assert_not_called()
     mocked_post.assert_not_called()
 
@@ -3414,6 +4052,10 @@ class EdgeGuardApiTests(unittest.TestCase):
       _run_text(fake_session.run.call_args_list[1]),
       "MATCH p=(n:Indicator)-[:SOURCED_FROM]-() RETURN p LIMIT 25",
     )
+    # Contract §6, review finding 6 (S5=Q9): with opt-in broadening, the
+    # requested (primary) query's `empty_reason` is still reported even
+    # though the broadened query went on to return rows.
+    self.assertEqual(result["validation"]["empty_reason"], "no_match")
 
   def test_explain_graph_returns_truthful_truncated_digest_without_model_call(self):
     plugin = _make_api()
@@ -4031,8 +4673,86 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
           password="secret",
         )
 
-    self.assertFalse(result["ok"])
+    # Fix round 4 (re-review-3 finding 3): a driver/connection failure is
+    # connectivity/service-unavailable — 503 via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_connection_error")
     self.assertNotIn("secret", json.dumps(result))
+
+  def test_neo4j_client_error_returns_structured_status_error_not_a_500(self):
+    # Fix round 3, L2a: a Neo4j client/syntax error (accepted by the guard,
+    # rejected by Neo4j itself) must come back as a structured `status:
+    # error` with a distinct `error_code`, never let the driver's exception
+    # escape `/neo4j_query` uncaught.
+    plugin = _make_api()
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = Neo4jClientError(
+      "{code: Neo.ClientError.Statement.SyntaxError} {message: PatternExpressions are not "
+      "allowed to introduce new variables: 'i'.}"
+    )
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          cypher=(
+            "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(cvss:CVSSv31) WHERE c.cve_id IN ['CVE-2024-99999'] "
+            "AND EXISTS { MATCH (c)-[:EXPLOITS]->(i:Indicator) WHERE i.value STARTS WITH '203.0.113.' } "
+            "RETURN p ORDER BY cvss.base_score DESC LIMIT 5"
+          ),
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+        )
+
+    # Fix round 4 (re-review-3 finding 3): the platform's FastAPI wrapper
+    # maps any plugin result carrying a top-level `error` key to HTTP 500
+    # unless `status_code` says otherwise — 422 states the query content is
+    # at fault, via the wrapper-safe transport.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_client_error")
+    self.assertIn("PatternExpressions", payload["error"])
+
+  def test_neo4j_auth_error_returns_service_unavailable_not_a_500(self):
+    # Fix round 4 (re-review-3 finding 6): `AuthError`/`Forbidden`/
+    # `TokenExpired` are `ClientError` subclasses but report a rejected
+    # driver credential, not a malformed query — a server-side
+    # misconfiguration, so this must be 503 with a distinct `error_code`,
+    # never the 422 given to a Cypher syntax/type/constraint error.
+    plugin = _make_api()
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = Neo4jAuthError(
+      "{code: Neo.ClientError.Security.Unauthorized} {message: The client is unauthorized due to "
+      "authentication failure.}"
+    )
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 5",
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+        )
+
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_auth_error")
+    self.assertIn("Unauthorized", payload["error"])
 
   def test_prepared_execution_rejects_nested_connection_fields(self):
     plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
@@ -4090,6 +4810,520 @@ class EdgeGuardExecutionBoundaryTests(unittest.TestCase):
     self.assertEqual(provider_calls, [])
     self.assertFalse(result.get("explained"))
     self.assertIn("credential_field_not_allowed", serialized)
+
+  def test_explain_graph_neo4j_client_error_returns_structured_status_error(self):
+    # Fix round 3, L2a: the explain route shares `_run_neo4j_query` with
+    # `/neo4j_query` and must give the same distinct `error_code` for a
+    # Neo4j client/syntax error, never let it escape as an unhandled 500.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _fake_session = _driver_with_results(
+      Neo4jClientError(
+        "{code: Neo.ClientError.Statement.SyntaxError} {message: PatternExpressions are not "
+        "allowed to introduce new variables: 'i'.}"
+      ),
+    )
+
+    provider_calls = []
+    plugin._graph_first_provider_for_tests = lambda payload: provider_calls.append(payload)
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Explain the returned graph.",
+          cypher=(
+            "MATCH p=(c:CVE)-[:HAS_CVSS_v31]->(cvss:CVSSv31) WHERE c.cve_id IN ['CVE-2024-99999'] "
+            "AND EXISTS { MATCH (c)-[:EXPLOITS]->(i:Indicator) WHERE i.value STARTS WITH '203.0.113.' } "
+            "RETURN p ORDER BY cvss.base_score DESC LIMIT 5"
+          ),
+        )
+
+    # Fix round 4 (re-review-3 finding 3): same wrapper-safe transport and
+    # 422 as `/neo4j_query`'s identical branch.
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_client_error")
+    self.assertEqual(provider_calls, [])
+
+  def test_explain_graph_neo4j_auth_error_returns_service_unavailable(self):
+    # Fix round 4 (re-review-3 finding 6): same auth/credential family as
+    # `/neo4j_query` — 503 with a distinct `error_code`, not 422.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _fake_session = _driver_with_results(
+      Neo4jAuthError(
+        "{code: Neo.ClientError.Security.Unauthorized} {message: The client is unauthorized due to "
+        "authentication failure.}"
+      ),
+    )
+
+    provider_calls = []
+    plugin._graph_first_provider_for_tests = lambda payload: provider_calls.append(payload)
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.explain_graph(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          request="Explain the returned graph.",
+          cypher="MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10",
+        )
+
+    self.assertEqual(result["status_code"], 503)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "error")
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error_code"], "neo4j_auth_error")
+    self.assertEqual(provider_calls, [])
+
+  @staticmethod
+  def _simulated_wrapper_status(result):
+    # Fix round 4 (re-review-3 finding 3): the platform's generated FastAPI
+    # wrapper (`/tmp/tmp*/main.py:229-245` inside the edg3 container; see
+    # `docs/tasks_manager/_runs/EGM-059/phase-2/re-review-3.md`) does, for
+    # each plugin endpoint result dict: if `status_code` is present and not
+    # 2xx, raise an HTTP error with that code; elif `"error" in result`,
+    # raise HTTP 500; else respond 200. This four-line replica proves the
+    # actual `neo4j_query`/`explain_graph` return values never fall into the
+    # bare-500 branch for a client- or auth-class Neo4j failure.
+    status_code = result.get("status_code")
+    if status_code is not None and not (200 <= status_code < 300):
+      return status_code
+    if "error" in result:
+      return 500
+    return 200
+
+  def test_neo4j_client_and_auth_errors_never_reach_the_wrappers_bare_500(self):
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+    cypher = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5"
+
+    cases = (
+      (Neo4jClientError("{code: Neo.ClientError.Statement.SyntaxError} {message: bad}"), 422),
+      (Neo4jAuthError("{code: Neo.ClientError.Security.Unauthorized} {message: bad}"), 503),
+      (RuntimeError("connection failed"), 503),
+    )
+    for exc, expected_status in cases:
+      with self.subTest(exc=type(exc).__name__):
+        plugin = _make_api()
+        fake_session.run.side_effect = exc
+        with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+          with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+            result = plugin.neo4j_query(
+              cypher=cypher,
+              uri="example.com:7687",
+              scheme="bolt+s",
+              username="neo4j",
+              password="secret",
+            )
+        self.assertIn("error", _graph_first_payload(result))
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  # Fix round 5: extends the round-4 wrapper-rule replica
+  # (`_simulated_wrapper_status`) to every remaining `/neo4j_query`,
+  # `prepare_graph_explanation` and `explain_graph` error/rejection path
+  # that carries a top-level `error` key without `status_code` — the exact
+  # shape the platform's FastAPI wrapper turns into a bare HTTP 500.
+
+  ACCEPTED_ROWS_CYPHER = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 5"
+  GUARD_REJECTED_CYPHER = "MATCH (i:InternetFacing) RETURN i.hostname AS hostname"
+
+  def test_neo4j_query_every_error_path_resolves_to_a_deliberate_status_code(self):
+    def guard_rejection(plugin):
+      return plugin.neo4j_query(cypher=self.GUARD_REJECTED_CYPHER)
+
+    def bad_connection_override(plugin):
+      # `_resolve_neo4j_connection`: an incomplete override (missing
+      # username/password) is caller input, not a driver failure.
+      return plugin.neo4j_query(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687",
+        scheme="neo4j+s",
+      )
+
+    def bad_uri_scheme(plugin):
+      # `_normalize_neo4j_uri`: a scheme outside `NEO4J_SCHEMES`.
+      return plugin.neo4j_query(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687",
+        username="neo4j",
+        password="secret",
+        scheme="ftp",
+      )
+
+    def driver_missing(plugin):
+      # `GraphDatabase is None` (the neo4j driver package is not installed
+      # in this runtime) — unpatched, matching the module's own default.
+      return plugin.neo4j_query(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687",
+        username="neo4j",
+        password="secret",
+        scheme="bolt+s",
+      )
+
+    cases = (
+      ("guard_rejection", guard_rejection, 422),
+      ("bad_connection_override", bad_connection_override, 400),
+      ("bad_uri_scheme", bad_uri_scheme, 400),
+      ("driver_missing", driver_missing, 503),
+    )
+    for name, make_result, expected_status in cases:
+      with self.subTest(case=name):
+        plugin = _make_api()
+        result = make_result(plugin)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_prepare_graph_explanation_every_error_path_resolves_to_a_deliberate_status_code(self):
+    def empty_cypher(plugin):
+      return plugin.prepare_graph_explanation(cypher="")
+
+    def forwarded_connection_field(plugin):
+      return plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER, username="neo4j")
+
+    def invalid_broadening_type(plugin):
+      return plugin.prepare_graph_explanation(
+        cypher=self.ACCEPTED_ROWS_CYPHER, enable_empty_result_broadening="nope",
+      )
+
+    def invalid_mode_config(plugin):
+      return plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER, explanation_mode="bogus")
+
+    def guard_rejection(plugin):
+      return plugin.prepare_graph_explanation(cypher=self.GUARD_REJECTED_CYPHER)
+
+    def unsafe_projection(plugin):
+      # Reaches the plan's own projection-safety checks (contract §4.3) via
+      # a bracket-property-access candidate the shared guard's own
+      # execution-safety stage may also independently reject; either
+      # mechanism resolves to the same deliberate 422.
+      return plugin.prepare_graph_explanation(
+        cypher='MATCH (n:Indicator) WITH n, "value" AS k RETURN n[k] AS safe LIMIT 5',
+      )
+
+    def tokenizer_unavailable(plugin_factory):
+      plugin = plugin_factory(
+        graph_first_token_counter=None,
+        edgeguard_explanation_tokenizer_path=None,
+      )
+      return plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER)
+
+    cases = (
+      ("empty_cypher", lambda factory: empty_cypher(factory()), 400),
+      ("forwarded_connection_field", lambda factory: forwarded_connection_field(factory()), 400),
+      ("invalid_broadening_type", lambda factory: invalid_broadening_type(factory()), 400),
+      ("invalid_mode_config", lambda factory: invalid_mode_config(factory()), 400),
+      ("guard_rejection", lambda factory: guard_rejection(factory()), 422),
+      ("unsafe_projection", lambda factory: unsafe_projection(factory()), 422),
+      ("tokenizer_unavailable", tokenizer_unavailable, 503),
+    )
+    for name, run, expected_status in cases:
+      with self.subTest(case=name):
+        result = run(_make_api)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_every_early_error_path_resolves_to_a_deliberate_status_code(self):
+    def empty_cypher(plugin):
+      return plugin.explain_graph(cypher="")
+
+    def empty_request(plugin):
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER, request="")
+
+    def invalid_fields(plugin):
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER, method="carrier-pigeon")
+
+    def invalid_broadening_type(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER, enable_empty_result_broadening="nope",
+      )
+
+    def invalid_mode_config(plugin):
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER, explanation_mode="bogus")
+
+    def guard_rejection(plugin):
+      return plugin.explain_graph(cypher=self.GUARD_REJECTED_CYPHER)
+
+    def tokenizer_unavailable(factory):
+      plugin = factory(graph_first_token_counter=None, edgeguard_explanation_tokenizer_path=None)
+      return plugin.explain_graph(cypher=self.ACCEPTED_ROWS_CYPHER)
+
+    cases = (
+      ("empty_cypher", lambda: empty_cypher(_make_api()), 400),
+      ("empty_request", lambda: empty_request(_make_api()), 400),
+      ("invalid_fields", lambda: invalid_fields(_make_api()), 400),
+      ("invalid_broadening_type", lambda: invalid_broadening_type(_make_api()), 400),
+      ("invalid_mode_config", lambda: invalid_mode_config(_make_api()), 400),
+      ("guard_rejection", lambda: guard_rejection(_make_api()), 422),
+      ("tokenizer_unavailable", lambda: tokenizer_unavailable(_make_api), 503),
+    )
+    for name, run, expected_status in cases:
+      with self.subTest(case=name):
+        result = run()
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_live_connection_error_paths_resolve_to_a_deliberate_status_code(self):
+    # Fix round 5: the `insight_brief` strategy skips the `eel_compatibility`
+    # explanation-model gate (already wrapper-safe, untouched by this round)
+    # so these cases isolate the live-connection branches this round fixed.
+    def bad_connection_override(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER, uri="override.example:7687", scheme="neo4j+s",
+      )
+
+    def bad_uri_scheme(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687", username="neo4j", password="secret", scheme="ftp",
+      )
+
+    def driver_missing(plugin):
+      return plugin.explain_graph(
+        cypher=self.ACCEPTED_ROWS_CYPHER,
+        uri="override.example:7687", username="neo4j", password="secret", scheme="bolt+s",
+      )
+
+    cases = (
+      ("bad_connection_override", bad_connection_override, 400),
+      ("bad_uri_scheme", bad_uri_scheme, 400),
+      ("driver_missing", driver_missing, 503),
+    )
+    for name, make_result, expected_status in cases:
+      with self.subTest(case=name):
+        plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+        result = make_result(plugin)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_execution_result_forwarded_connection_field_is_400(self):
+    plugin = _make_api(
+      edgeguard_explanation_model_port=5091,
+      edgeguard_explanation_model="base_qwen3_4b",
+    )
+    result = plugin.explain_graph(
+      cypher=self.ACCEPTED_ROWS_CYPHER,
+      execution_result=_serialized_execution(self.ACCEPTED_ROWS_CYPHER),
+      username="neo4j",
+    )
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertIn("error", payload)
+    self.assertEqual(self._simulated_wrapper_status(result), 400)
+
+  def test_plan_not_ok_status_code_is_popped_from_the_plan_and_never_leaks(self):
+    # Fix round 5: `_prepare_graph_explanation_plan` tags the intended HTTP
+    # status on `_WRAPPER_STATUS_CODE_KEY`; every one of its three callers
+    # (`prepare_graph_explanation`, `explain_graph`'s execution-result and
+    # live branches) must pop it — both when the plan supplies one and when
+    # it falls back to the 422 default — and never let the key reach the
+    # response body.
+    tagged_plan = {
+      "ok": False,
+      "status": "rejected",
+      "error": "forced test rejection",
+      _WRAPPER_STATUS_CODE_KEY: 400,
+    }
+    untagged_plan = {"ok": False, "status": "rejected", "error": "forced test rejection"}
+
+    for plan, expected_status in ((tagged_plan, 400), (untagged_plan, 422)):
+      with self.subTest(tagged=(_WRAPPER_STATUS_CODE_KEY in plan)):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api._prepare_graph_explanation_plan",
+          # Fix round 5 test note: a fresh dict per call — each of the three
+          # call sites below pops `_WRAPPER_STATUS_CODE_KEY` from its own
+          # plan, and a shared `return_value` dict would let the first pop
+          # silently strip it before the next call site ever sees it.
+          side_effect=lambda *args, **kwargs: dict(plan),
+        ):
+          plugin = _make_api(
+            edgeguard_explanation_model_port=5091,
+            edgeguard_explanation_model="base_qwen3_4b",
+          )
+          prepare_result = plugin.prepare_graph_explanation(cypher=self.ACCEPTED_ROWS_CYPHER)
+          execution_result_call = plugin.explain_graph(
+            cypher=self.ACCEPTED_ROWS_CYPHER,
+            execution_result=_serialized_execution(self.ACCEPTED_ROWS_CYPHER),
+          )
+          live_plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+          with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+            with patch.object(live_plugin, "_neo4j_driver"):
+              live_call = live_plugin.explain_graph(
+                cypher=self.ACCEPTED_ROWS_CYPHER,
+                uri="override.example:7687",
+                username="neo4j",
+                password="secret",
+                scheme="bolt+s",
+              )
+
+        for result in (prepare_result, execution_result_call, live_call):
+          self.assertEqual(result["status_code"], expected_status)
+          payload = _graph_first_payload(result)
+          self.assertIn("error", payload)
+          self.assertNotIn(_WRAPPER_STATUS_CODE_KEY, payload)
+          self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+
+  def test_explain_graph_live_forbidden_execution_field_is_422_not_a_bare_500(self):
+    # Fix round 5: EG-013's recursive no-connection-data invariant on the
+    # live-query path — forcing `_forbidden_execution_field` to fire proves
+    # the branch resolves to the deliberate 422 (packet/evidence validation
+    # rejection), not the wrapper's bare 500, without depending on a
+    # specific Cypher shape to organically trigger it.
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = _Result([], keys=["value"])
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        with patch(
+          "extensions.business.cybersec.edgeguard.edgeguard_api._forbidden_execution_field",
+          return_value="password",
+        ):
+          result = plugin.explain_graph(
+            cypher=self.ACCEPTED_ROWS_CYPHER,
+            uri="override.example:7687",
+            username="neo4j",
+            password="secret",
+            scheme="bolt+s",
+          )
+
+    self.assertEqual(result["status_code"], 422)
+    payload = _graph_first_payload(result)
+    self.assertIn("error", payload)
+    self.assertEqual(
+      {item["code"] for item in payload["validation_errors"]},
+      {"credential_field_not_allowed"},
+    )
+    self.assertEqual(self._simulated_wrapper_status(result), 422)
+
+  # Fix round 6: extends the round-4/5 wrapper-rule replica
+  # (`_simulated_wrapper_status`) to `/generate` and `/neo4j_test` —
+  # every remaining error path that carried a top-level `error` key without
+  # `status_code`, the exact shape the platform's FastAPI wrapper turns
+  # into a bare HTTP 500.
+
+  def test_generate_every_early_error_path_resolves_to_a_deliberate_status_code(self):
+    def benchmark_mode_disabled():
+      plugin = _make_api()
+      return plugin.generate(request="Show indicators", benchmark_mode=True)
+
+    def invalid_request():
+      plugin = _make_api()
+      return plugin.generate(request="")
+
+    def request_too_large():
+      plugin = _make_api()
+      return plugin.generate(request="x" * (GENERATION_MAX_REQUEST_CHARS + 1))
+
+    def unsupported_model():
+      plugin = _make_api()
+      return plugin.generate(request="Show indicators", model_key="not-configured")
+
+    def worker_not_ready():
+      # No `worker_semaphore_env` configured for `PRIVATE_MODEL_KEY` — the
+      # worker URL itself cannot be resolved, distinct from `model_not_ready`
+      # below (a configured worker that has not finished starting).
+      plugin = _make_api()
+      with patch("extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session.post"):
+        return plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
+
+    def model_not_ready():
+      plugin = _make_api(worker_semaphore_env={
+        PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+      })
+      session = MagicMock()
+      session.get.return_value = _Response(payload={"result": {"serving_ready": False}})
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+        return_value=session,
+      ):
+        return plugin.generate(request="Show indicators", model_key=PRIVATE_MODEL_KEY)
+
+    cases = (
+      ("benchmark_mode_disabled", benchmark_mode_disabled, 403),
+      ("invalid_request", invalid_request, 400),
+      ("request_too_large", request_too_large, 413),
+      ("unsupported_model", unsupported_model, 400),
+      ("worker_not_ready", worker_not_ready, 503),
+      ("model_not_ready", model_not_ready, 503),
+    )
+    for name, run, expected_status in cases:
+      with self.subTest(case=name):
+        result = run()
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
+    # `worker_not_ready` and `model_not_ready` both resolve to 503 but are
+    # distinct diagnostics codes — pin that they are not silently collapsed
+    # into the same branch.
+    self.assertEqual(
+      _graph_first_payload(worker_not_ready())["diagnostics"]["code"], "worker_not_ready",
+    )
+    self.assertEqual(
+      _graph_first_payload(model_not_ready())["diagnostics"]["code"], "model_not_ready",
+    )
+
+  def test_neo4j_test_every_error_path_resolves_to_a_deliberate_status_code(self):
+    def bad_connection_override(plugin):
+      # `_resolve_neo4j_connection`: an incomplete override (missing
+      # username/password) is caller input, not a driver failure.
+      return plugin.neo4j_test(uri="override.example:7687", scheme="neo4j+s")
+
+    def bad_uri_scheme(plugin):
+      # `_normalize_neo4j_uri`: a scheme outside `NEO4J_SCHEMES`.
+      return plugin.neo4j_test(
+        uri="override.example:7687", username="neo4j", password="secret", scheme="ftp",
+      )
+
+    def driver_missing(plugin):
+      # `GraphDatabase is None` (the neo4j driver package is not installed
+      # in this runtime) — unpatched, matching the module's own default.
+      return plugin.neo4j_test(
+        uri="override.example:7687", username="neo4j", password="secret", scheme="bolt+s",
+      )
+
+    def connection_failure(plugin):
+      # The driver is present but the connection attempt itself fails —
+      # a Neo4j-service-side failure, not caller input.
+      with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+        with patch.object(plugin, "_neo4j_driver", side_effect=RuntimeError("connection failed")):
+          return plugin.neo4j_test(
+            uri="override.example:7687", username="neo4j", password="secret", scheme="bolt+s",
+          )
+
+    cases = (
+      ("bad_connection_override", bad_connection_override, 400),
+      ("bad_uri_scheme", bad_uri_scheme, 400),
+      ("driver_missing", driver_missing, 503),
+      ("connection_failure", connection_failure, 503),
+    )
+    for name, make_result, expected_status in cases:
+      with self.subTest(case=name):
+        plugin = _make_api()
+        result = make_result(plugin)
+        self.assertEqual(result["status_code"], expected_status)
+        payload = _graph_first_payload(result)
+        self.assertIn("error", payload)
+        self.assertEqual(self._simulated_wrapper_status(result), expected_status)
 
 
 class EdgeGuardHealthMetricsTests(unittest.TestCase):
@@ -4194,3 +5428,1119 @@ class EdgeGuardModeBudgetThreadingTests(unittest.TestCase):
           )
 
     self.assertEqual(run_brief.call_args.kwargs["mode"], "thorough")
+
+
+def _literal_class_vectors():
+  path = Path(__file__).parent / "fixtures" / "literal_class_vectors.json"
+  with open(path, "r", encoding="utf-8") as handle:
+    return json.load(handle)
+
+
+class LiteralGroundingGuardTests(unittest.TestCase):
+  """Contract §3: `_apply_literal_grounding_guard` accepts closed-vocabulary
+  filters implied by request wording (not just a request substring) and
+  rejects a free literal absent from the request, naming it."""
+
+  def _accepted_validation(self, cypher):
+    return {"accepted": True, "accepted_cypher": cypher, "candidate": cypher}
+
+  def test_ip_synonym_filter_is_accepted_on_the_first_attempt(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' RETURN i.value AS value LIMIT 10"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Which IP addresses are indicators of compromise?",
+    )
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(result["accepted_cypher"], cypher)
+
+  def test_free_literal_absent_from_request_is_rejected_with_the_literal_named(self):
+    plugin = _make_api()
+    cypher = "MATCH (c:CVE) WHERE c.cisa_vulnerability_name = 'CISA Vuls' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me CVE details for this vulnerability.",
+    )
+
+    self.assertFalse(result["accepted"])
+    self.assertIsNone(result["accepted_cypher"])
+    self.assertEqual(
+      result["validation_feedback"],
+      "Literal 'CISA Vuls' (free) is not in the request.\n"
+      "Remove the WHERE condition or property filter using each literal named above and "
+      "return the requested pattern without it.",
+    )
+
+  def test_v0_11_profile_names_the_literal_and_gives_an_actionable_instruction(self):
+    # Fix round 3, L1: naming the literal alone is not actionable enough —
+    # the v0.11 profile gets a concise instruction appended after the named
+    # literal(s), same default as the call above with `use_v0_11` explicit.
+    plugin = _make_api()
+    cypher = "MATCH (c:CVE) WHERE c.cisa_vulnerability_name = 'CISA Vuls' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me CVE details for this vulnerability.",
+      use_v0_11=True,
+    )
+
+    self.assertFalse(result["accepted"])
+    self.assertIn("Literal 'CISA Vuls' (free) is not in the request.", result["validation_feedback"])
+    self.assertIn("Remove the WHERE condition or property filter", result["validation_feedback"])
+
+  def test_v0_10_profile_keeps_the_pre_v0_11_instruction_sentence_verbatim(self):
+    # Fix round 3, L1 (2 of 20 questions regressed live on edg3): the v0.10
+    # fine-tuned model was trained on this exact sentence; the bare
+    # `Literal 'X' (class) is not in the request.` left it without an
+    # instruction it recognised and it repeated the same rejected Cypher on
+    # every retry attempt. `use_v0_11=False` restores the sentence verbatim,
+    # followed by the named literal(s).
+    plugin = _make_api()
+    cypher = "MATCH (c:CVE) WHERE c.cisa_vulnerability_name = 'CISA Vuls' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me CVE details for this vulnerability.",
+      use_v0_11=False,
+    )
+
+    self.assertFalse(result["accepted"])
+    self.assertEqual(
+      result["validation_feedback"],
+      "The query introduced a literal value or filter that was not present in the user "
+      "request. Remove unrequested WHERE filters and return the requested unfiltered "
+      "graph pattern.\n"
+      "Literal 'CISA Vuls' (free) is not in the request.",
+    )
+
+  def test_v0_10_profile_names_every_literal_after_the_verbatim_sentence(self):
+    plugin = _make_api()
+    cypher = (
+      "MATCH (i:Indicator) WHERE i.value = '203.0.113.5' AND i.source = 'CISA Vuls' "
+      "RETURN i LIMIT 5"
+    )
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Show me indicators.",
+      use_v0_11=False,
+    )
+
+    self.assertFalse(result["accepted"])
+    lines = result["validation_feedback"].splitlines()
+    self.assertEqual(
+      lines[0],
+      "The query introduced a literal value or filter that was not present in the user "
+      "request. Remove unrequested WHERE filters and return the requested unfiltered "
+      "graph pattern.",
+    )
+    self.assertIn("Literal '203.0.113.5' (free) is not in the request.", lines[1:])
+    self.assertIn("Literal 'CISA Vuls' (free) is not in the request.", lines[1:])
+
+  def test_shared_vector_file_accept_and_reject_cases(self):
+    plugin = _make_api()
+    vectors = _literal_class_vectors()
+    self.assertGreaterEqual(len(vectors["accept"]), 20)
+    self.assertGreaterEqual(len(vectors["reject"]), 20)
+
+    for vector in vectors["accept"]:
+      with self.subTest(literal=vector["literal"], request=vector["request"]):
+        cypher = f"MATCH (i:Indicator) WHERE i.value = '{vector['literal']}' RETURN i.value AS value LIMIT 5"
+        result = plugin._apply_literal_grounding_guard(
+          self._accepted_validation(cypher), cypher, vector["request"],
+        )
+        self.assertTrue(result["accepted"], f"{vector}: {result.get('validation_feedback')}")
+
+    for vector in vectors["reject"]:
+      with self.subTest(literal=vector["literal"], request=vector["request"]):
+        cypher = f"MATCH (i:Indicator) WHERE i.value = '{vector['literal']}' RETURN i.value AS value LIMIT 5"
+        result = plugin._apply_literal_grounding_guard(
+          self._accepted_validation(cypher), cypher, vector["request"],
+        )
+        self.assertFalse(result["accepted"], vector)
+        self.assertIn(vector["literal"], result["validation_feedback"])
+        self.assertIn(vector["class"], result["validation_feedback"])
+
+  def test_accepted_attempt_reports_its_grounded_closed_vocabulary_literals(self):
+    plugin = _make_api()
+    cypher = "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' RETURN i.value AS value LIMIT 10"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(cypher), cypher, "Which IP addresses are indicators of compromise?",
+    )
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(result["grounded_closed_vocabulary_literals"], ["ipv4"])
+
+  def test_retained_closed_vocabulary_literal_missing_from_a_later_attempt_is_rejected(self):
+    # Contract §3.2: a correction attempt may not remove a closed-vocabulary
+    # literal that was accepted (grounded) on an earlier attempt, even if
+    # that earlier attempt was rejected overall for an unrelated reason.
+    plugin = _make_api()
+    first_cypher = (
+      "MATCH (c:CVE) WHERE c.indicator_type = 'ipv4' AND c.cisa_vulnerability_name = 'CISA Vuls' "
+      "RETURN c LIMIT 5"
+    )
+    first = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(first_cypher), first_cypher,
+      "Which IP addresses relate to this CVE?",
+    )
+    self.assertFalse(first["accepted"])
+    self.assertIn("CISA Vuls", first["validation_feedback"])
+    retained = set(first["grounded_closed_vocabulary_literals"])
+    self.assertEqual(retained, {"ipv4"})
+
+    corrected_cypher = "MATCH (c:CVE) RETURN c LIMIT 5"
+    second = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(corrected_cypher), corrected_cypher,
+      "Which IP addresses relate to this CVE?",
+      frozenset(retained),
+    )
+
+    self.assertFalse(second["accepted"])
+    self.assertIn("ipv4", second["validation_feedback"])
+    self.assertIn("must not be removed", second["validation_feedback"])
+
+  def test_retained_closed_vocabulary_literal_kept_is_accepted(self):
+    plugin = _make_api()
+    retained = frozenset({"ipv4"})
+    corrected_cypher = "MATCH (c:CVE) WHERE c.indicator_type = 'ipv4' RETURN c LIMIT 5"
+
+    result = plugin._apply_literal_grounding_guard(
+      self._accepted_validation(corrected_cypher), corrected_cypher,
+      "Which IP addresses relate to this CVE?",
+      retained,
+    )
+
+    self.assertTrue(result["accepted"])
+
+  def test_generate_retry_loop_rejects_a_correction_that_drops_the_grounded_literal(self):
+    # End-to-end through `generate()`'s retry loop (not just the guard
+    # method directly): attempt 1 is rejected for the free literal, attempt
+    # 2 drops the grounded closed-vocabulary filter too and is rejected
+    # again (naming the dropped filter), attempt 3 restores it and accepts.
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+
+    def _response(cypher):
+      return _Response(payload={
+        "result": {
+          "TEXT_RESPONSE": cypher,
+          "FULL_OUTPUT": {
+            "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 12},
+          },
+        },
+      })
+
+    attempt_1 = (
+      "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' AND i.source = 'CISA Vuls' "
+      "RETURN i.value AS value LIMIT 10"
+    )
+    attempt_2 = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10"
+    attempt_3 = "MATCH (i:Indicator) WHERE i.indicator_type = 'ipv4' RETURN i.value AS value LIMIT 10"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [_response(attempt_1), _response(attempt_2), _response(attempt_3)]
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(
+        request="Which IP addresses are indicators of compromise?", model_key=PRIVATE_MODEL_KEY,
+      )
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 3)
+    self.assertFalse(result["attempts"][0]["accepted"])
+    self.assertIn("CISA Vuls", result["attempts"][0]["validation_feedback"])
+    self.assertFalse(result["attempts"][1]["accepted"])
+    self.assertIn("ipv4", result["attempts"][1]["validation_feedback"])
+    self.assertIn("must not be removed", result["attempts"][1]["validation_feedback"])
+    self.assertTrue(result["attempts"][2]["accepted"])
+
+  def test_generate_rejection_feedback_keeps_the_pre_v0_11_sentence_on_the_v0_10_profile(self):
+    # Fix round 3, L1: through `generate()`'s retry loop, not just the guard
+    # method directly, the v0.10 (`direct_cypher`) profile's rejection
+    # feedback must include the verbatim pre-v0.11 instruction sentence the
+    # fine-tuned model was trained on, not just the bare literal name.
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53001"},
+    })
+
+    def _response(cypher):
+      return _Response(payload={
+        "result": {
+          "TEXT_RESPONSE": cypher,
+          "FULL_OUTPUT": {
+            "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 12},
+          },
+        },
+      })
+
+    rejected_cypher = (
+      "MATCH (i:Indicator) WHERE i.value = '203.0.113.5' AND m.name = 'Fixture Malware' "
+      "RETURN i.value AS value LIMIT 10"
+    )
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [_response(rejected_cypher)] * 4
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(
+        request="Show me indicators.", model_key=PRIVATE_MODEL_KEY,
+      )
+
+    self.assertFalse(result["accepted"])
+    feedback = result["attempts"][0]["validation_feedback"]
+    self.assertIn(
+      "The query introduced a literal value or filter that was not present in the user "
+      "request. Remove unrequested WHERE filters and return the requested unfiltered "
+      "graph pattern.",
+      feedback,
+    )
+    self.assertIn("Literal '203.0.113.5' (free) is not in the request.", feedback)
+    self.assertIn("Literal 'Fixture Malware' (free) is not in the request.", feedback)
+
+
+class V0_11GenerateRuntimeTests(unittest.TestCase):
+  """Review findings 1, 5, 7: `generate()` on the v0.11 profile validates
+  against the v0.11 flat sets, allows a `graph`-shape candidate to omit
+  `LIMIT`, rejects an `other`-shape candidate with feedback, and reports
+  v0.11 `schema_version`/`cypher_schema_version`/`schema_surface`."""
+
+  def _make_v0_11_api(self):
+    return _make_api(
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+      worker_semaphore_env={V0_11_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53002"}},
+    )
+
+  def _response(self, cypher):
+    return _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": cypher,
+        "FULL_OUTPUT": {
+          "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+          "usage": {"completion_tokens": 12},
+        },
+      },
+    })
+
+  def test_graph_shape_without_limit_is_accepted_against_the_v0_11_flat_sets(self):
+    plugin = self._make_v0_11_api()
+    # `Mission` is a topology-only label the v0.10 schema does not know, and
+    # there is no `LIMIT` (contract §4.1, optional for `graph` on this
+    # profile).
+    cypher = "MATCH p=(c:CVE)-[:AFFECTS]->(m:Mission) RETURN p"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.return_value = self._response(cypher)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show CVEs affecting missions.", model_key=V0_11_MODEL_KEY)
+
+    self.assertTrue(result["accepted"], result)
+    self.assertEqual(result["accepted_cypher"], cypher)
+    self.assertEqual(result["validation"]["result_shape"], "graph")
+    self.assertEqual(result["schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertEqual(result["cypher_schema_version"], "edgeguard-cypher-schema-v0.11")
+    self.assertIn("Mission", result["schema_surface"]["labels"])
+
+  def test_other_shape_is_rejected_with_feedback_naming_the_two_accepted_shapes(self):
+    plugin = self._make_v0_11_api()
+    # Schema-compatible, has `LIMIT`, read-only — the guard would accept it —
+    # but it mixes a pattern-variable and a scalar projection: `other`
+    # (contract §4.3), rejected for model output on this profile.
+    cypher = "MATCH (i:Indicator) RETURN i, i.value AS value LIMIT 10"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [self._response(cypher)] * 3
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show indicators.", model_key=V0_11_MODEL_KEY)
+
+    self.assertFalse(result["accepted"])
+    self.assertIsNone(result["accepted_cypher"])
+    self.assertEqual(result["validation"]["result_shape"], "other")
+    for attempt in result["attempts"]:
+      self.assertFalse(attempt["accepted"])
+      self.assertEqual(attempt["result_shape"], "other")
+    self.assertIn("graph", result["validation_feedback"])
+    self.assertIn("ranked_projection", result["validation_feedback"])
+
+  def _generate_v0_11(self, outputs, **overrides):
+    plugin = _make_api(
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+      worker_semaphore_env={V0_11_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53002"}},
+      **overrides,
+    )
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [self._response(cypher) for cypher in outputs]
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Which tactics do techniques belong to?", model_key=V0_11_MODEL_KEY)
+    return result, session
+
+  def test_reversed_arrow_is_corrected_in_place_without_a_correction_turn(self):
+    reversed_cypher = "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    result, session = self._generate_v0_11([reversed_cypher])
+
+    self.assertTrue(result["accepted"], result)
+    self.assertEqual(result["accepted_cypher"], "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5")
+    self.assertEqual(len(result["attempts"]), 1)
+    self.assertEqual(session.post.call_count, 1)
+    attempt = result["attempts"][0]
+    self.assertEqual(attempt["raw_output"], reversed_cypher)
+    self.assertEqual(attempt["auto_corrected"], {
+      "kind": "relationship_direction", "flips": 1, "uncorrected_cypher": reversed_cypher,
+    })
+
+  def test_direction_corrector_off_keeps_reject_and_retry(self):
+    reversed_cypher = "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    fixed = "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5"
+    result, _ = self._generate_v0_11([reversed_cypher, fixed], edgeguard_direction_corrector=False)
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 2)
+    self.assertIn("reverse the arrow", result["attempts"][0]["validation_feedback"])
+    self.assertIsNone(result["attempts"][0]["auto_corrected"])
+
+  def test_corrected_query_still_goes_through_literal_grounding(self):
+    # The flip fixes the arrow, but the literal is not in the request, so the
+    # attempt stays rejected and the corrected text is what the retry sees.
+    reversed_cypher = (
+      "MATCH p=(ta:Tactic {name: 'Nowhere Tactic'})-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    )
+    good = "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5"
+    result, _ = self._generate_v0_11([reversed_cypher, good])
+
+    first = result["attempts"][0]
+    self.assertFalse(first["accepted"])
+    self.assertIn("Nowhere Tactic", first["validation_feedback"])
+    self.assertNotIn("reverse the arrow", first["validation_feedback"])
+    self.assertIn("<-[:IN_TACTIC]-", first["candidate_cypher"])
+    self.assertTrue(result["accepted"])
+
+  def test_corrector_failure_keeps_the_plain_rejection(self):
+    reversed_cypher = "MATCH p=(ta:Tactic)-[:IN_TACTIC]->(t:Technique) RETURN p LIMIT 5"
+    fixed = "MATCH p=(ta:Tactic)<-[:IN_TACTIC]-(t:Technique) RETURN p LIMIT 5"
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.correct_reversed_relationship_arrows",
+      side_effect=RuntimeError("boom"),
+    ):
+      result, _ = self._generate_v0_11([reversed_cypher, fixed])
+    self.assertTrue(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 2)
+    self.assertIn("reverse the arrow", result["attempts"][0]["validation_feedback"])
+
+  def test_wrong_relationship_type_is_not_corrected(self):
+    # `EMPLOYS_TECHNIQUE` from an Indicator is a wrong type, not a reversed
+    # arrow: no flip makes it valid, so the guard's feedback stands.
+    wrong = "MATCH p=(i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN p LIMIT 5"
+    result, _ = self._generate_v0_11([wrong] * 3)
+
+    self.assertFalse(result["accepted"])
+    for attempt in result["attempts"]:
+      self.assertIsNone(attempt["auto_corrected"])
+
+  def test_v0_10_profile_generate_response_is_unaffected(self):
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53003"},
+    })
+    cypher = "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10"
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.return_value = self._response(cypher)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Show indicators.", model_key=PRIVATE_MODEL_KEY)
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(result["schema_version"], "edgeguard-cypher-schema-v0.10")
+    self.assertEqual(result["cypher_schema_version"], "edgeguard-cypher-schema-v0.10")
+    self.assertEqual(result["schema_surface"], canonical_schema_surface())
+
+
+class PatternEndpointFixRound1ApiTests(unittest.TestCase):
+  """EGM-059 phase 4 slice 4b, fix round 1 (findings-4b-1.md items 2, 10,
+  11): `execution_safety_error`/`execution_safety_error_code` on `/generate`
+  attempts, the `enforce_pattern_endpoints` flag actually wired at the
+  `/generate` and `/neo4j_query` call sites, and the Cypher length cap at
+  `/check_cypher`, `/neo4j_query`, `/explain_graph`."""
+
+  SEEDED_CYPHER = "MATCH (i:Indicator)-[:EMPLOYS_TECHNIQUE]->(t:Technique) RETURN i, t LIMIT 5"
+
+  def _make_v0_11_api(self):
+    return _make_api(
+      edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11,
+      worker_semaphore_env={V0_11_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53002"}},
+    )
+
+  def _response(self, cypher):
+    return _Response(payload={
+      "result": {
+        "TEXT_RESPONSE": cypher,
+        "FULL_OUTPUT": {
+          "choices": [{"message": {"content": cypher}, "finish_reason": "stop"}],
+          "usage": {"completion_tokens": 12},
+        },
+      },
+    })
+
+  def test_generate_v0_11_rejects_the_seeded_case_with_the_code_on_every_attempt(self):
+    plugin = self._make_v0_11_api()
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.side_effect = [self._response(self.SEEDED_CYPHER)] * 3
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Which techniques does this indicator use?", model_key=V0_11_MODEL_KEY)
+
+    self.assertFalse(result["accepted"])
+    self.assertEqual(len(result["attempts"]), 3)
+    for attempt in result["attempts"]:
+      self.assertFalse(attempt["accepted"])
+      self.assertEqual(attempt["execution_safety_error_code"], "pattern_endpoint_mismatch")
+      self.assertIn("USES_TECHNIQUE", attempt["execution_safety_error"])
+
+  def test_generate_v0_10_accepts_the_same_candidate(self):
+    plugin = _make_api(worker_semaphore_env={
+      PRIVATE_WORKER_SEMAPHORE: {"API_HOST": "127.0.0.1", "API_PORT": "53004"},
+    })
+    session = MagicMock()
+    session.get.return_value = _Response(payload={"result": {"serving_ready": True}})
+    session.post.return_value = self._response(self.SEEDED_CYPHER)
+
+    with patch(
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.Session",
+      return_value=session,
+    ):
+      result = plugin.generate(request="Which techniques does this indicator use?", model_key=PRIVATE_MODEL_KEY)
+
+    self.assertTrue(result["accepted"], result)
+    self.assertEqual(result["accepted_cypher"], self.SEEDED_CYPHER)
+
+  def test_neo4j_query_v0_11_rejects_the_seeded_case(self):
+    plugin = self._make_v0_11_api()
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+      cypher=self.SEEDED_CYPHER, model_key=V0_11_MODEL_KEY,
+    )
+
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["status"], "rejected")
+    self.assertFalse(payload["executed"])
+    self.assertEqual(
+      payload["validation"]["execution_safety_error_code"], "pattern_endpoint_mismatch",
+    )
+
+  def test_neo4j_query_v0_10_accepts_the_same_candidate(self):
+    plugin = _make_api()
+    empty_result = _Result([], keys=["i", "t"])
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = empty_result
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+          cypher=self.SEEDED_CYPHER,
+        )
+
+    self.assertEqual(result["status"], "ok")
+    self.assertTrue(result["executed"])
+
+  def test_check_cypher_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.check_cypher(cypher=oversized)
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "cypher_too_large")
+
+  def test_neo4j_query_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+      cypher=oversized,
+    )
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "cypher_too_large")
+
+  def test_explain_graph_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.explain_graph(cypher=oversized, request="Explain this.")
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(
+      {item["code"] for item in payload["validation_errors"]}, {"cypher_too_large"},
+    )
+
+
+class PatternEndpointFixRound2ApiTests(unittest.TestCase):
+  """EGM-059 phase 4 slice 4b, fix round 2 (findings-4b-2.md items 2, 3)."""
+
+  def test_prepare_graph_explanation_rejects_a_cypher_string_over_the_length_cap(self):
+    plugin = _make_api()
+    oversized = "MATCH (i:Indicator) RETURN i LIMIT 5" + " " * CYPHER_MAX_CHARS
+
+    result = plugin.prepare_graph_explanation(cypher=oversized)
+
+    self.assertEqual(result["status_code"], 413)
+    payload = _graph_first_payload(result)
+    self.assertEqual(
+      {item["code"] for item in payload["validation_errors"]}, {"cypher_too_large"},
+    )
+
+  def test_check_cypher_rejects_a_non_string_cypher_with_400(self):
+    plugin = _make_api()
+
+    result = plugin.check_cypher(cypher=["not", "a", "string"])
+
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "invalid_cypher")
+
+  def test_neo4j_query_rejects_a_non_string_cypher_with_400(self):
+    plugin = _make_api()
+
+    result = plugin.neo4j_query(
+      uri="example.com:7687", scheme="bolt+s", username="neo4j", password="secret",
+      cypher={"not": "a string"},
+    )
+
+    self.assertEqual(result["status_code"], 400)
+    payload = _graph_first_payload(result)
+    self.assertEqual(payload["diagnostics"]["code"], "invalid_cypher")
+
+
+class PromptProfileDispatchTests(unittest.TestCase):
+  """Contract §5.1/§5.2: `_generation_messages` dispatches the system prompt
+  and the correction turn per profile."""
+
+  def test_v0_10_profile_served_system_prompt_is_unchanged(self):
+    plugin = _make_api()
+
+    messages = plugin._generation_messages(PRIVATE_MODEL_KEY, "Show indicators")
+
+    self.assertEqual(messages[0]["role"], "system")
+    self.assertEqual(messages[0]["content"], build_direct_cypher_system_prompt())
+
+  def test_v0_10_profile_correction_turn_still_re_embeds_the_schema(self):
+    plugin = _make_api()
+
+    messages = plugin._generation_messages(
+      PRIVATE_MODEL_KEY, "Show indicators",
+      rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+      validation_feedback="unknown property 'bogus'",
+      retry_index=1,
+      retry_limit=2,
+    )
+
+    self.assertEqual(
+      messages[1]["content"],
+      build_schema_correction_prompt(
+        original_user_prompt="Show indicators",
+        rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+        validation_feedback="unknown property 'bogus'",
+        retry_index=1,
+        retry_limit=2,
+      ),
+    )
+    self.assertIn("Allowed EdgeGuard Cypher schema:", messages[1]["content"])
+
+  def test_v0_11_profile_served_system_prompt_is_the_pattern_schema_builder(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    messages = plugin._generation_messages(V0_11_MODEL_KEY, "Show indicators")
+
+    self.assertEqual(messages[0]["content"], build_v0_11_pattern_schema_system_prompt())
+
+  def test_v0_11_profile_correction_turn_preserves_the_original_request_and_rejected_attempt(self):
+    """Contract §5.2 (review finding 2, S3=Q1): the v0.11 retry conversation
+    is [system, user:request, assistant:rejected, user:correction] — the
+    correction *turn itself* still carries no schema and no re-embedded
+    request (both are already earlier turns in the same conversation)."""
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    messages = plugin._generation_messages(
+      V0_11_MODEL_KEY, "Show indicators",
+      rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+      validation_feedback="unknown property 'bogus'",
+      retry_index=1,
+      retry_limit=2,
+    )
+
+    self.assertEqual(
+      [message["role"] for message in messages],
+      ["system", "user", "assistant", "user"],
+    )
+    self.assertEqual(messages[1]["content"], "Show indicators")
+    self.assertEqual(messages[2]["content"], "MATCH (i:Indicator) RETURN i.bogus")
+    self.assertEqual(
+      messages[3]["content"],
+      build_v0_11_correction_prompt(
+        rejected_cypher="MATCH (i:Indicator) RETURN i.bogus",
+        validation_feedback="unknown property 'bogus'",
+        retry_index=1,
+        retry_limit=2,
+      ),
+    )
+    self.assertNotIn("Allowed EdgeGuard Cypher schema:", messages[3]["content"])
+    self.assertNotIn("Populated graph patterns:", messages[3]["content"])
+    self.assertNotIn("Original user request:", messages[3]["content"])
+
+
+class PromptContractProfileShaTests(unittest.TestCase):
+  """Contract §5.4: `/prompt_contract` exposes `system_prompt_sha256` per
+  profile, including profiles that append a suffix (previously `None`)."""
+
+  def test_every_profile_gets_a_real_system_prompt_sha256(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    for model_key in (V0_11_MODEL_KEY, PRIVATE_MODEL_KEY, "base_qwen3_4b", "cybersec_qwen_4b"):
+      self.assertRegex(
+        profiles[model_key]["system_prompt_sha256"], r"^[0-9a-f]{64}$", model_key,
+      )
+
+  def test_v0_10_profile_sha_matches_the_pinned_builder_output(self):
+    plugin = _make_api()
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertEqual(
+      profiles[PRIVATE_MODEL_KEY]["system_prompt_sha256"],
+      _sha256_text(build_direct_cypher_system_prompt()),
+    )
+
+  def test_v0_11_profile_sha_matches_the_pattern_schema_builder_output(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertEqual(
+      profiles[V0_11_MODEL_KEY]["system_prompt_sha256"],
+      _sha256_text(build_v0_11_pattern_schema_system_prompt()),
+    )
+
+  def test_v0_11_profile_correction_sha_does_not_match_the_v0_10_correction_sha(self):
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertNotEqual(
+      profiles[V0_11_MODEL_KEY]["correction_prompt_sha256"],
+      profiles[PRIVATE_MODEL_KEY]["correction_prompt_sha256"],
+    )
+
+  def test_v0_11_profile_reports_v0_11_schema_version_and_surface(self):
+    """Review finding 7 (S8): the v0.11 profile's `/prompt_contract` entry
+    names the v0.11 artifact's schema_version and schema_surface, not the
+    v0.10 defaults every other profile still reports."""
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    profiles = {item["model_key"]: item for item in contract["profiles"]}
+    self.assertEqual(
+      profiles[V0_11_MODEL_KEY]["cypher_schema_version"], "edgeguard-cypher-schema-v0.11",
+    )
+    self.assertIn("Mission", profiles[V0_11_MODEL_KEY]["schema_surface"]["labels"])
+    self.assertEqual(
+      profiles[PRIVATE_MODEL_KEY]["cypher_schema_version"], "edgeguard-cypher-schema-v0.10",
+    )
+    self.assertEqual(
+      profiles[PRIVATE_MODEL_KEY]["schema_surface"], canonical_schema_surface(),
+    )
+
+  def test_every_profile_pins_the_literal_classes_module_sha(self):
+    """Contract §3.2 (review finding 7, S8): "both [the guard and the
+    validator] pin its sha in their reports" — every profile reports the
+    same, freshly-recomputed `literal_classes.py` sha (the guard applies
+    the literal-grounding fix regardless of profile)."""
+    plugin = _make_api(edgeguard_generation_workers=TEST_GENERATION_WORKERS_WITH_V0_11)
+
+    contract = plugin.prompt_contract()
+
+    with open(literal_classes.__file__, "rb") as handle:
+      expected = hashlib.sha256(handle.read()).hexdigest()
+    for profile in contract["profiles"]:
+      self.assertEqual(profile["literal_classes_sha256"], expected, profile["model_key"])
+    self.assertRegex(expected, r"^[0-9a-f]{64}$")
+
+
+class GenerationMaxTokensPinTests(unittest.TestCase):
+  """Contract §5.4/§6 (code half): `GENERATION_MAX_TOKENS = 384`."""
+
+  def test_generation_max_tokens_is_384(self):
+    self.assertEqual(GENERATION_MAX_TOKENS, 384)
+
+
+class EdgeGuardExplainJobTests(unittest.TestCase):
+  """EG-028: `/explain_graph_start` + `/explain_graph_status`."""
+
+  PATH_CYPHER = "MATCH p=(i:Indicator)-[:SOURCED_FROM]->(s:Source) RETURN p LIMIT 10"
+
+  def _body(self, **overrides):
+    body = {
+      "uri": "example.com:7687",
+      "scheme": "bolt+s",
+      "username": "neo4j",
+      "password": "secret",
+      "request": "Explain the returned graph.",
+      "cypher": self.PATH_CYPHER,
+    }
+    body.update(overrides)
+    return body
+
+  @staticmethod
+  def _without_timings(value):
+    return {key: item for key, item in value.items() if key != "metrics"}
+
+  @staticmethod
+  def _wait_done(plugin, job_id, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+      status = plugin.explain_graph_status(job_id=job_id)
+      if status.get("done"):
+        return status
+      time.sleep(0.01)
+    raise AssertionError("explain job did not finish")
+
+  @staticmethod
+  def _gated_impl(gate, phases=()):
+    """A stand-in for `_explain_graph_impl` that reports `phases`, then waits."""
+    def impl(progress=None, **_body):
+      for phase, detail in phases:
+        progress(phase, detail)
+      assert gate.wait(10)
+      return {"status": "ok", "ok": True, "executed": True, "explained": True}
+    return impl
+
+  def test_start_returns_a_url_safe_job_id_at_once(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    impl = self._gated_impl(gate, [("neo4j", None)])
+    with patch.object(plugin, "_explain_graph_impl", side_effect=impl):
+      started = plugin.explain_graph_start(**self._body())
+      self.assertEqual(set(started), {"job_id"})
+      self.assertRegex(started["job_id"], r"^[A-Za-z0-9_-]{32}$")
+      status = plugin.explain_graph_status(job_id=started["job_id"])
+      self.assertEqual(status, {"phase": "neo4j", "detail": None, "done": False})
+      gate.set()
+      self._wait_done(plugin, started["job_id"])
+
+  def test_status_walks_the_phases_and_ends_with_the_result(self):
+    plugin = _make_api()
+    advance = threading.Event()
+    steps = []
+
+    def impl(progress=None, **_body):
+      progress("neo4j", None)
+      progress("neo4j", {"row_count": 7})
+      assert advance.wait(10)
+      progress("brief", {"attempt": 2})
+      return {"status": "ok", "ok": True, "executed": True, "explained": True}
+
+    with patch.object(plugin, "_explain_graph_impl", side_effect=impl):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      deadline = time.monotonic() + 5
+      while plugin.explain_graph_status(job_id=job_id)["detail"] != {"row_count": 7}:
+        self.assertLess(time.monotonic(), deadline)
+        time.sleep(0.01)
+      steps.append(plugin.explain_graph_status(job_id=job_id))
+      advance.set()
+      final = self._wait_done(plugin, job_id)
+    self.assertEqual(steps[0], {"phase": "neo4j", "detail": {"row_count": 7}, "done": False})
+    self.assertNotIn("result", steps[0])
+    self.assertEqual(final["phase"], "done")
+    self.assertTrue(final["done"])
+    self.assertEqual(final["result_status_code"], 200)
+    self.assertEqual(final["result"]["status"], "ok")
+
+  def test_real_explain_phases_and_result_match_explain_graph(self):
+    calls = []
+
+    def provider(payload):
+      calls.append(payload)
+      return {"content": "not json", "finish_reason": "stop", "completion_tokens": 3}
+
+    def two_failed_attempts(*, provider_call, **_kwargs):
+      # Stands in for `egx2.run_insight_brief`: two model calls whose output
+      # fails the gates, then the deterministic fallback.
+      provider_call({"messages": []})
+      provider_call({"messages": []})
+      return {
+        "case_explanation": {"provenance": {"mode": "deterministic_fallback"}},
+        "explanation_trace": {"outcome": {"status": "fallback", "safe_code": "deterministic_validation_failed"}},
+      }
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief", graph_first_provider=provider)
+    plugin._explanation_url = lambda path=None: ("http://127.0.0.1:1/chat", None)
+    plugin._explanation_worker_ready = lambda: True
+    seen = []
+    original = plugin._set_explain_job_phase
+
+    def record(job_id, phase, detail):
+      seen.append((phase, detail))
+      return original(job_id, phase, detail)
+
+    plugin._set_explain_job_phase = record
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch(
+        "extensions.business.cybersec.edgeguard.edgeguard_api.egx2.run_insight_brief",
+        side_effect=two_failed_attempts,
+      ):
+        fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+        with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+          direct = plugin.explain_graph(**self._body())
+        fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+        with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+          job_id = plugin.explain_graph_start(**self._body())["job_id"]
+          final = self._wait_done(plugin, job_id)
+
+    self.assertEqual(seen, [
+      ("guard", None),
+      ("neo4j", None),
+      ("neo4j", {"row_count": 1}),
+      ("evidence", None),
+      ("misp", None),
+      ("brief", {"attempt": 1}), ("checks", {"attempt": 1}),
+      ("brief", {"attempt": 2}), ("checks", {"attempt": 2}),
+      ("fallback", {"reason": "deterministic_validation_failed"}),
+    ])
+    self.assertEqual(len(calls), 4)  # two per run, the direct call included
+    self.assertEqual(final["result_status_code"], 200)
+    self.assertEqual(self._without_timings(final["result"]), self._without_timings(direct))
+    self.assertEqual(final["result"]["case_explanation"]["provenance"]["mode"], "deterministic_fallback")
+
+  def test_error_envelope_status_code_is_split_from_the_result(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    fake_driver, _ = _driver_with_results(Neo4jAuthError("unauthorized"))
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        direct = plugin.explain_graph(**self._body())
+        fake_driver, _ = _driver_with_results(Neo4jAuthError("unauthorized"))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        errors_before = plugin._error_count
+        job_id = plugin.explain_graph_start(**self._body())["job_id"]
+        final = self._wait_done(plugin, job_id)
+    self.assertEqual(direct["status_code"], 503)
+    self.assertEqual(final["result_status_code"], 503)
+    self.assertEqual(self._without_timings(final["result"]), self._without_timings(direct["result"]))
+    self.assertEqual(plugin._error_count, errors_before + 1)  # the failed job is counted once
+
+  def test_synchronous_rejection_is_returned_by_start_without_a_job(self):
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    direct = plugin.explain_graph(**self._body(cypher="  "))
+    started = plugin.explain_graph_start(**self._body(cypher="  "))
+    self.assertEqual(direct["status_code"], 400)
+    self.assertEqual(started, direct)
+    too_long = "MATCH (n) RETURN n " + "x" * (CYPHER_MAX_CHARS + 1)
+    self.assertEqual(plugin.explain_graph_start(**self._body(cypher=too_long))["status_code"], 413)
+    self.assertEqual(plugin._explain_job_state()["jobs"], {})
+
+  def test_second_start_while_one_runs_gets_429_with_a_retry_hint(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    impl = self._gated_impl(gate, [("neo4j", None)])
+    with patch.object(plugin, "_explain_graph_impl", side_effect=impl):
+      first = plugin.explain_graph_start(**self._body())
+      second = plugin.explain_graph_start(**self._body())
+      self.assertEqual(second["status_code"], 429)
+      self.assertEqual(second["result"]["retry_after_seconds"], 30)
+      self.assertFalse(second["result"]["ok"])
+      gate.set()
+      self._wait_done(plugin, first["job_id"])
+      third = plugin.explain_graph_start(**self._body())
+      self.assertIn("job_id", third)
+      self._wait_done(plugin, third["job_id"])
+
+  def test_unknown_expired_and_malformed_ids_get_404(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    gate.set()
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      self._wait_done(plugin, job_id)
+    for missing in ("A" * 32, "", None):
+      self.assertEqual(plugin.explain_graph_status(job_id=missing)["status_code"], 404)
+    state = plugin._explain_job_state()
+    state["jobs"][job_id]["finished_at"] -= 16 * 60
+    expired = plugin.explain_graph_status(job_id=job_id)
+    self.assertEqual(expired["status_code"], 404)
+    self.assertEqual(expired["result"]["status"], "not_found")
+    self.assertNotIn(job_id, state["jobs"])
+
+  def test_finished_jobs_are_capped_at_twenty_oldest_dropped_first(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    gate.set()
+    ids = []
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      for _ in range(23):
+        job_id = plugin.explain_graph_start(**self._body())["job_id"]
+        self._wait_done(plugin, job_id)
+        ids.append(job_id)
+        time.sleep(0.002)
+    self.assertEqual(len(plugin._explain_job_state()["jobs"]), 20)
+    for dropped in ids[:3]:
+      self.assertEqual(plugin.explain_graph_status(job_id=dropped)["status_code"], 404)
+    self.assertTrue(plugin.explain_graph_status(job_id=ids[-1])["done"])
+
+  def test_a_stuck_job_is_closed_so_it_cannot_hold_the_slot_forever(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      plugin._explain_job_state()["jobs"][job_id]["created"] -= 2 * EDGEGUARD_REQUEST_TIMEOUT_SECONDS + 1
+      status = plugin.explain_graph_status(job_id=job_id)
+      self.assertTrue(status["done"])
+      self.assertEqual(status["result_status_code"], 504)
+      gate.set()
+
+  def test_a_stuck_closed_job_still_holds_the_slot_while_its_thread_lives(self):
+    plugin = _make_api()
+    gate = threading.Event()
+    with patch.object(plugin, "_explain_graph_impl", side_effect=self._gated_impl(gate, [("neo4j", None)])):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      plugin._explain_job_state()["jobs"][job_id]["created"] -= 2 * EDGEGUARD_REQUEST_TIMEOUT_SECONDS + 1
+      self.assertEqual(plugin.explain_graph_status(job_id=job_id)["result_status_code"], 504)
+      busy = plugin.explain_graph_start(**self._body())
+      self.assertEqual(busy["status_code"], 429)
+      gate.set()
+      deadline = time.monotonic() + 10
+      while plugin._explain_job_state()["jobs"][job_id]["worker_active"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+      # The late finish did not overwrite the 504, and the slot is free again.
+      self.assertEqual(plugin.explain_graph_status(job_id=job_id)["result_status_code"], 504)
+      again = plugin.explain_graph_start(**self._body())
+      self.assertIn("job_id", again)
+      self._wait_done(plugin, again["job_id"])
+
+  def test_thread_start_failure_pops_the_job_and_returns_503(self):
+    plugin = _make_api()
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.threading.Thread") as thread:
+      thread.return_value.start.side_effect = RuntimeError("can't start new thread")
+      response = plugin.explain_graph_start(**self._body())
+    self.assertEqual(response["status_code"], 503)
+    self.assertEqual(plugin._explain_job_state()["jobs"], {})
+
+  def test_unexpected_worker_exception_is_logged_server_side_without_the_password(self):
+    plugin = _make_api()
+    logged = []
+    plugin.P = lambda message, *args, **kwargs: logged.append(str(message))
+
+    def boom(progress=None, **_body):
+      progress("neo4j", None)
+      raise RuntimeError("failed with secret-pw in text")
+
+    with patch.object(plugin, "_explain_graph_impl", side_effect=boom):
+      job_id = plugin.explain_graph_start(**self._body(password="secret-pw"))["job_id"]
+      self._wait_done(plugin, job_id)
+    text = "\n".join(logged)
+    self.assertIn("RuntimeError", text)
+    self.assertIn("Traceback", text)
+    self.assertNotIn("secret-pw", text)
+
+  def test_unexpected_worker_exception_log_redacts_the_configured_password(self):
+    plugin = _make_api(neo4j_default_connection={
+      "uri": "example.com:7687", "username": "neo4j", "password": "cfg-secret-pw", "scheme": "bolt+s",
+    })
+    logged = []
+    plugin.P = lambda message, *args, **kwargs: logged.append(str(message))
+
+    def boom(progress=None, **_body):
+      progress("neo4j", None)
+      raise RuntimeError("failed with cfg-secret-pw in text")
+
+    body = {key: value for key, value in self._body().items() if key not in ("uri", "username", "password", "scheme")}
+    with patch.object(plugin, "_explain_graph_impl", side_effect=boom):
+      job_id = plugin.explain_graph_start(**body)["job_id"]
+      self._wait_done(plugin, job_id)
+    text = "\n".join(logged)
+    self.assertIn("Traceback", text)
+    self.assertNotIn("cfg-secret-pw", text)
+
+  def test_one_call_path_reports_brief_attempt_one_then_done(self):
+    plugin = _make_api(edgeguard_explanation_strategy="one_call")
+    phases = []
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver), \
+          patch.object(plugin, "_explanation_dispatch_strategy", return_value="one_call"), \
+          patch.object(plugin, "_run_digest_analyst_brief", return_value={"status": "ok", "ok": True}):
+        plugin._explain_graph_impl(
+          progress=lambda phase, detail=None: phases.append((phase, detail)), **self._body(),
+        )
+    names = [phase for phase, _ in phases]
+    self.assertEqual(names, ["guard", "neo4j", "neo4j", "evidence", "misp", "brief"])
+    self.assertEqual(phases[-1], ("brief", {"attempt": 1}))
+
+  def test_unexpected_worker_exception_becomes_a_500_result_without_details(self):
+    plugin = _make_api()
+
+    def boom(progress=None, **_body):
+      progress("neo4j", None)
+      raise RuntimeError("secret-host.internal exploded")
+
+    with patch.object(plugin, "_explain_graph_impl", side_effect=boom):
+      job_id = plugin.explain_graph_start(**self._body())["job_id"]
+      final = self._wait_done(plugin, job_id)
+    self.assertEqual(final["result_status_code"], 500)
+    self.assertNotIn("secret-host", json.dumps(final))
+
+  def test_explain_graph_passes_no_progress_callback(self):
+    plugin = _make_api()
+    with patch.object(plugin, "_explain_graph_impl", return_value={"ok": True}) as impl:
+      plugin.explain_graph(**self._body())
+    self.assertIsNone(impl.call_args.kwargs["progress"])
+
+  def test_a_failing_progress_callback_cannot_break_the_explain(self):
+    def bad(_phase, _detail=None):
+      raise RuntimeError("boom")
+
+    plugin = _make_api(edgeguard_explanation_strategy="insight_brief")
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
+      fake_driver, _ = _driver_with_results(_Result([_graph_path_record()], keys=["p"]))
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin._explain_graph_impl(progress=bad, **self._body())
+    self.assertEqual(result["status"], "ok")

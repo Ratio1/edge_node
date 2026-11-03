@@ -11,7 +11,8 @@ from ..repositories import ArtifactRepository, JobStateRepository
 from ..tenancy.administration import AdministrationDenied
 from ..tenancy.job_artifacts import checked_job_snapshot, validate_snapshot_mode
 from ..tenancy.ports import TenantStoreError
-from .config import get_stix_export_config
+from .config import get_stix_export_config, job_tenant_id
+from .tenant_labels import tenant_id_label
 from ..tenancy.effects import EffectState
 from .event_hooks import emit_export_status_event
 from .event_redaction import stable_hmac_pseudonym, stable_sha256, strip_sensitive_fields
@@ -23,6 +24,8 @@ _UNSET = object()
 
 
 STIX_EXPORT_SCHEMA_VERSION = "1.0.0"
+
+_TENANT_LABELLED_TYPES = frozenset({"report", "vulnerability", "indicator", "observed-data"})
 
 _IPV4_RE = re.compile(
   r"(?<![\w.])"
@@ -486,6 +489,12 @@ def build_stix_bundle(owner, job_id, pass_nr=None, *, checked_job=_UNSET):
     "x_redmesh_report_cid": pass_data.get("aggregated_report_cid"),
     "x_redmesh_finding_count": len(vulnerabilities),
   })
+  # RM-139: every SDO names the job's tenant, the filter key OpenCTI and TAXII consumers share with
+  # MISP. The marking definition and the custom service observation carry no labels.
+  tenant_label = tenant_id_label(job_tenant_id(job_specs))
+  for obj in [report] + referenced:
+    if obj["type"] in _TENANT_LABELLED_TYPES:
+      obj["labels"] = sorted(set(obj.get("labels") or ()) | {tenant_label})
 
   objects = [marking, report] + referenced
   bundle = {

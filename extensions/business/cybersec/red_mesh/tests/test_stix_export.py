@@ -189,6 +189,29 @@ class TestStixExport(unittest.TestCase):
     self.assertIn("target:", serialized)
     self.assertIn("x_redmesh_banner_hash", serialized)
 
+  def test_every_sdo_carries_the_job_tenant_label(self):
+    """RM-139: the label OpenCTI and TAXII consumers filter one tenant's objects by."""
+    from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
+    binding = binding_payload()
+    owner = _owner(job_specs={**_owner().job_specs, "execution_binding": binding})
+
+    bundle = build_stix_bundle(owner, "job-1")["bundle"]
+
+    label = f"redmesh:tenant_id={binding['tenant_id']}"
+    labelled = [obj for obj in bundle["objects"]
+                if obj["type"] in ("report", "vulnerability", "indicator", "observed-data")]
+    self.assertEqual({obj["type"] for obj in labelled}, {"report", "vulnerability", "indicator", "observed-data"})
+    for obj in labelled:
+      self.assertIn(label, obj["labels"], obj["type"])
+    vulnerability = next(obj for obj in labelled if obj["type"] == "vulnerability")
+    self.assertIn("redmesh", vulnerability["labels"])
+    self.assertNotIn("labels", next(obj for obj in bundle["objects"] if obj["type"] == "marking-definition"))
+
+  def test_unbound_job_is_labelled_super_tenant(self):
+    bundle = build_stix_bundle(_owner(), "job-1")["bundle"]
+    report = next(obj for obj in bundle["objects"] if obj["type"] == "report")
+    self.assertEqual(report["labels"], ["redmesh:tenant_id=super-tenant"])
+
   def test_model_test_job_rejected_before_scan_archive_mapping(self):
     owner = _owner(job_specs={
       "job_id": "job-1",

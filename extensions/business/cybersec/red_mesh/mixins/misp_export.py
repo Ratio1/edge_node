@@ -3,12 +3,11 @@ MISP export mixin for PentesterApi01Plugin.
 
 Exposes four endpoints:
   - export_misp        — push scan results to a configured MISP server
-  - export_misp_json   — download MISP-format JSON (no server, tenant record or ENABLED flag needed)
+  - export_misp_json   — download MISP-format JSON (no server or ENABLED flag needed)
   - get_misp_export_status  — check if a job has been exported
   - get_misp_export_config_status — check if MISP is enabled/configured (no secrets)
 """
 
-from ..services.config import tenant_integration_override
 from ..services.misp_config import get_misp_export_config
 from ..services.misp_export import (
   _UNSET,
@@ -19,24 +18,21 @@ from ..services.misp_export import (
 
 class _MispExportMixin:
 
-  def _get_misp_export_config(self, tenant_id=None):
-    """Return MISP config status (no secrets exposed)."""
-    cfg = get_misp_export_config(self, tenant_id)
-    # A tenant's destination is its own record, never the node's: with no record the push would be
-    # refused, so the status says "not configured" even when node values would merge in (RM-093, I-039).
-    has_destination = tenant_id is None or bool(tenant_integration_override(self, tenant_id, "misp"))
+  def _get_misp_export_config(self):
+    """Return the deployment's effective MISP config status (no secrets exposed). RM-139: the same
+    for every caller, since every job exports to the deployment's MISP."""
+    cfg = get_misp_export_config(self)
     return {
       "enabled": cfg["ENABLED"],
       "auto_export": cfg["AUTO_EXPORT"],
-      "misp_configured": has_destination and bool(cfg["MISP_URL"] and cfg["MISP_API_KEY"]),
+      "misp_configured": bool(cfg["MISP_URL"] and cfg["MISP_API_KEY"]),
       "min_severity": cfg["MIN_SEVERITY"],
     }
 
   def _build_misp_json(self, job_id, pass_nr=None, *, checked_job=_UNSET, snapshot_mode="tenant_bound"):
     """Build MISP JSON for download.
 
-    A download has no destination: it needs no MISP server, no tenant MISP record and not the node
-    ENABLED flag (RM-093). A bound tenant without a record renders with the backend defaults.
+    A download has no destination: it needs no MISP server and not the ENABLED flag (RM-093).
     """
     if checked_job is not _UNSET:
       from ..tenancy.administration import AdministrationDenied

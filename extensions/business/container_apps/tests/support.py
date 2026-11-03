@@ -97,6 +97,18 @@ class _DummyBasePlugin:
   def chainstore_set(self, *args, **kwargs):
     return
 
+  def get_stream_id(self):
+    return self._stream_id
+
+  def get_instance_id(self):
+    return self.cfg_instance_id
+
+  def report_deployment_status(self, status, error_code=None):
+    return
+
+  def set_deployment_stopped(self):
+    return
+
   def set_plugin_ready(self, ready):
     return
 

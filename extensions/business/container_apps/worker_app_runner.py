@@ -11,6 +11,7 @@ This plugin:
 """
 
 import shlex
+import re
 
 import requests
 from urllib.parse import urlsplit
@@ -99,6 +100,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     """
     super()._after_reset()
     self.current_commit = None
+    self._deployment_git_captured = False
     self.branch = None
     self.repo_url = None
     self._last_git_check = 0
@@ -216,12 +218,49 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   def _build_git_clone_command(self, repo_path):
     repo_url = shlex.quote(self.repo_url)
     repo_path = shlex.quote(repo_path)
+    commit = self._get_pinned_deployment_artifacts().get("git_commit")
+    if commit:
+      # A moved branch must never change the source restored for this revision.
+      return (f"git clone --no-checkout {repo_url} {repo_path} && "
+              f"git -C {repo_path} fetch origin {shlex.quote(commit)} && "
+              f"git -C {repo_path} checkout --detach {shlex.quote(commit)}")
     if self.branch:
       branch = shlex.quote(self.branch)
       # Fetch only the configured branch; this keeps startup clones smaller
       # and avoids accidentally running code from a different branch.
       return f"git clone --branch {branch} --single-branch {repo_url} {repo_path}"
     return f"git clone {repo_url} {repo_path}"
+
+  def _confirm_app_readiness(self):
+    if getattr(self, "_deployment_git_captured", False):
+      return super()._confirm_app_readiness()
+    try:
+      result = self.container.exec_run(
+        ["timeout", "5", "git", "-C", REPO_CLONE_PATH, "rev-parse", "HEAD"],
+        stdout=True, stderr=True,
+      )
+      if result.exit_code != 0:
+        # The clone/build command may still be running when a permissive generic
+        # health mode first reports readiness. Keep waiting for the source proof.
+        self._app_ready = False
+        return False
+      commit = result.output.decode("ascii").strip() if result.exit_code == 0 else ""
+      if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError("The running source revision is unavailable")
+      artifacts = self._get_pinned_deployment_artifacts()
+      if artifacts.get("git_commit") and artifacts["git_commit"] != commit:
+        raise RuntimeError("The running source does not match its immutable binding")
+      artifacts.update(self.get_deployment_runtime_artifacts())
+      artifacts["git_commit"] = commit
+      self._save_deployment_artifacts(artifacts)
+      self._deployment_git_captured = True
+      return super()._confirm_app_readiness()
+    except Exception:
+      self._app_ready = False
+      self.set_plugin_ready(False)
+      if self._deployment_tracks_runtime():
+        self.report_deployment_status("failed", error_code="WORKLOAD_START_FAILED")
+      return False
 
   def _collect_exec_commands(self):
     """
@@ -292,6 +331,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       StopReason.EXTERNAL_UPDATE if a new commit was detected and restart is required,
       None otherwise.
     """
+    if self._deployment_tracks_runtime():
+      return None
     if not current_time:
       current_time = self.time()
 
@@ -353,8 +394,14 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     if self._repo_configured and not initial:
       return
 
-    self._set_default_branch()
     self._configure_repo_url()
+    artifacts = self._get_pinned_deployment_artifacts()
+    if artifacts.get("git_commit"):
+      self._repo_configured = True
+      return
+    if getattr(self, "cfg_deeploy_runtime_artifacts", None) is not None:
+      raise ValueError("Restoring a worker requires its exact previous Git commit")
+    self._set_default_branch()
 
     latest_commit = self._get_latest_commit()
     self._last_git_check = self.time()
@@ -363,6 +410,12 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       self.P(f"Latest commit on {self.branch}: {latest_commit}", color='d')
     else:
       self.P("Unable to determine latest commit during initialization", color='y')
+
+    if self._deployment_tracks_runtime():
+      if not isinstance(latest_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", latest_commit):
+        raise ValueError("The deployment Git commit could not be resolved")
+      artifacts["git_commit"] = latest_commit
+      self._save_deployment_artifacts(artifacts)
 
     self._repo_configured = True
     return

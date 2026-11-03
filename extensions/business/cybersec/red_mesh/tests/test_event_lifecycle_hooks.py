@@ -12,21 +12,8 @@ from extensions.business.cybersec.red_mesh.services.integration_status import ge
 from extensions.business.cybersec.red_mesh.tests.test_execution_binding_models import binding_payload
 
 
-class _TenantEventOwner(MagicMock):
-  """A `_get_tenant_integration_config` lookup goes through the class, not the instance.
-
-  RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this fixture's
-  tenant needs its own wazuh record on file -- the same effective config as node-level, since
-  these tests are about event delivery, not tenant destination resolution.
-  """
-  def _get_tenant_integration_config(self, tenant_id, integration_id):
-    if integration_id == "wazuh":
-      return {"config": dict(self.cfg_wazuh_export)}
-    return None
-
-
 def _owner(event_export=None, wazuh_export=None):
-  owner = _TenantEventOwner()
+  owner = MagicMock()
   owner.cfg_instance_id = "tenant-a"
   owner.cfg_ee_node_network = "devnet"
   owner.cfg_event_export = {
@@ -102,6 +89,9 @@ class TestEventLifecycleHooks(unittest.TestCase):
     delivered_event = deliver.call_args.args[1]
     self.assertEqual(delivered_event["target"]["display"], None)
     self.assertNotIn("198.51.100.10", str(delivered_event))
+    # RM-139: the instance envelope is unchanged; the job's tenant is a field of its own.
+    self.assertEqual(delivered_event["tenant_id"], "tenant-a")
+    self.assertEqual(delivered_event["redmesh_tenant_id"], job_specs["execution_binding"]["tenant_id"])
 
   @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
   def test_disabled_event_export_records_skipped_without_delivery(self, deliver):
@@ -185,8 +175,7 @@ class TestEventLifecycleHooks(unittest.TestCase):
     self.assertEqual(result["status"], "error")
     self.assertEqual(result["error"], "RuntimeError")
     self.assertEqual(job_specs["soc_event_status"]["last_status"], "error")
-    tenant_id = job_specs["execution_binding"]["tenant_id"]
-    status = get_integration_status(owner, tenant_id=tenant_id)["integrations"]["wazuh"]
+    status = get_integration_status(owner)["integrations"]["wazuh"]
     self.assertEqual(status["last_error_class"], "RuntimeError")
     self.assertIsNotNone(status["last_failure_at"])
 

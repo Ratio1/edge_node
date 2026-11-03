@@ -48,17 +48,6 @@ PUBLIC_TEST_IP = "93.184.216.34"
 EVALUATOR_TEST_IP = "1.1.1.1"
 
 
-class _Owner(SimpleNamespace):
-  """RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so a tenant
-  integration lookup here mirrors whatever node-level `cfg_<integration>_export` block the test
-  already set -- same effective config, since these tests are about launch/export behavior, not
-  tenant destination resolution."""
-
-  def _get_tenant_integration_config(self, tenant_id, integration_id):
-    config = getattr(self, f"cfg_{integration_id}_export", None)
-    return {"config": dict(config)} if isinstance(config, dict) else None
-
-
 def _owner(**kwargs):
   defaults = {
     "CONFIG": {},
@@ -74,7 +63,7 @@ def _owner(**kwargs):
     "chainstore_hgetall": MagicMock(return_value={}),
   }
   defaults.update(kwargs)
-  return _Owner(**defaults)
+  return SimpleNamespace(**defaults)
 
 
 def _provider(base_url=f"https://{PUBLIC_TEST_IP}/v1", credential_ref=""):

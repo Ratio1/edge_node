@@ -467,12 +467,6 @@ def _make_integration_owner(misp_config=None, archive=None, aggregated=None, job
       return FakeArtifactRepo()
     def _write_job_record(self, job_key, job_specs, context=""):
       return job_specs
-    def _get_tenant_integration_config(self, tenant_id, integration_id):
-      # RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so a bound
-      # fixture's tenant needs its own record on file -- the same effective config as node-level,
-      # since these tests are about MISP behavior, not tenant destination resolution.
-      return {"config": dict(config)} if integration_id == "misp" else None
-
   return IntegrationOwner()
 
 
@@ -540,7 +534,9 @@ class TestExportMispJson(unittest.TestCase):
   def test_invalid_explicit_snapshot_and_mode_never_fall_back_to_unchecked_lookup(self):
     from extensions.business.cybersec.red_mesh.mixins.misp_export import _MispExportMixin
     from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
-    for builder in (export_misp_json, _MispExportMixin._build_misp_json):
+    # RM-139: build_misp_event's bare call resolves no tenant any more, so it reaches the same
+    # checked-snapshot validation and refuses the same way.
+    for builder in (export_misp_json, _MispExportMixin._build_misp_json, build_misp_event):
       for kwargs in ({"checked_job": None}, {"checked_job": {}},
                      {"snapshot_mode": "legacy_unbound"}, {"snapshot_mode": "invalid"}):
         with self.subTest(builder=builder.__name__, kwargs=kwargs):
@@ -549,19 +545,6 @@ class TestExportMispJson(unittest.TestCase):
             with self.assertRaises(TenantStoreError):
               builder(owner, "test_job_1", **kwargs)
             lookup.assert_not_called()
-    # build_misp_event's own bare call (no export_config) resolves the tenant from checked_job
-    # before ever reaching the checked-snapshot validation. RM-108 phase 5 made that resolution
-    # refuse an absent or malformed binding outright (services.config.tenant_export_binding), so
-    # it still never performs the unchecked lookup -- it reports the refusal as a result instead
-    # of raising, since a bare call has no snapshot-shape contract of its own to violate.
-    for kwargs in ({"checked_job": None}, {"checked_job": {}},
-                   {"snapshot_mode": "legacy_unbound"}, {"snapshot_mode": "invalid"}):
-      with self.subTest(builder=build_misp_event.__name__, kwargs=kwargs):
-        owner = _make_integration_owner({"ENABLED": False})
-        with patch.object(owner, "_get_job_from_cstore", side_effect=AssertionError("unchecked lookup")) as lookup:
-          result = build_misp_event(owner, "test_job_1", **kwargs)
-          self.assertEqual(result["status"], "error")
-          lookup.assert_not_called()
 
   def test_returns_misp_dict(self):
     owner = _make_integration_owner({"ENABLED": True})
@@ -819,6 +802,300 @@ class TestPushToMisp(unittest.TestCase):
     self.assertEqual(result["status"], "error")
     emit_export_status.assert_called_once()
     self.assertEqual(emit_export_status.call_args.kwargs["status"], "failed")
+
+
+# ── RM-139 phase 3: tenant tags and MISP sharing groups ──
+
+class TestTenantNameSanitising(unittest.TestCase):
+
+  def test_quotes_equals_and_control_characters_are_stripped(self):
+    from extensions.business.cybersec.red_mesh.services.tenant_labels import sanitized_tenant_name
+    self.assertEqual(sanitized_tenant_name('Acme "Blue"\'s = Team\x00\x1f\x7f'), "Acme Blues  Team")
+    self.assertEqual(sanitized_tenant_name("  Acme  "), "Acme")
+
+  def test_truncated_to_64_characters(self):
+    from extensions.business.cybersec.red_mesh.services.tenant_labels import sanitized_tenant_name
+    self.assertEqual(sanitized_tenant_name("x" * 100), "x" * 64)
+
+  def test_nothing_usable_left_is_no_name(self):
+    from extensions.business.cybersec.red_mesh.services.tenant_labels import sanitized_tenant_name
+    for value in ("", "  ", "\"='\x01", None, 7):
+      with self.subTest(value=value):
+        self.assertIsNone(sanitized_tenant_name(value))
+
+
+class TestMispTenantSeparation(unittest.TestCase):
+  """The tenant id tag on every event, the name tag when readable, and the STA sharing-group map."""
+
+  def _owner(self, *, misp_config=None, sharing_groups=None, tenant_name="Acme Corp",
+             existing_export=None, name_error=None):
+    binding = binding_payload()
+    self.tenant_id = binding["tenant_id"]
+    job_specs = {"job_id": "test_job_1", "job_cid": "archive_cid_123", "execution_binding": binding}
+    if existing_export is not None:
+      job_specs["misp_export"] = existing_export
+    owner = _make_integration_owner({"ENABLED": True, "MISP_URL": "https://misp.test",
+                                     "MISP_API_KEY": "testkey123", **(misp_config or {})},
+                                    job_specs=job_specs)
+    row = None if sharing_groups is None else {
+      "integration_id": "misp", "config": None, "sharing_groups": sharing_groups, "auto_export": None}
+    self.name_reads = []
+
+    def _display_name(_self, tenant_id):
+      self.name_reads.append(tenant_id)
+      if name_error is not None:
+        raise name_error
+      return tenant_name
+
+    type(owner)._get_super_tenant_integration_override = lambda _self, integration_id: row
+    type(owner)._get_tenant_display_name = _display_name
+    return owner
+
+  def _mapped_owner(self, **kwargs):
+    owner = self._owner(**kwargs)
+    type(owner)._get_super_tenant_integration_override = lambda _self, integration_id: {
+      "integration_id": "misp", "config": None, "sharing_groups": {self.tenant_id: 7}, "auto_export": None}
+    return owner
+
+  @staticmethod
+  def _accepted(uuid="new-uuid-456", event_id=99):
+    from pymisp import MISPEvent
+    event = MISPEvent()
+    event.uuid = uuid
+    event.id = event_id
+    return event
+
+  @staticmethod
+  def _existing():
+    from pymisp import MISPEvent
+    existing = MISPEvent()
+    existing.uuid = "existing-uuid"
+    existing.id = 50
+    existing.distribution = 0
+    return existing
+
+  _EXPORTED = {"event_uuid": "existing-uuid", "event_id": 50, "passes_exported": [1]}
+
+  def _sent_event(self, mock_misp):
+    mock_misp.add_event.assert_called_once()
+    return mock_misp.add_event.call_args.args[0]
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_created_event_carries_tenant_id_and_name_tags(self, MockPyMISP):
+    mock_misp = MockPyMISP.return_value
+    mock_misp.add_event.return_value = self._accepted()
+    owner = self._owner(tenant_name='Acme "Corp"=\x07')
+
+    result = push_to_misp(owner, "test_job_1")
+
+    self.assertEqual(result["status"], "ok")
+    names = [tag.name for tag in self._sent_event(mock_misp).tags]
+    self.assertIn(f"redmesh:tenant_id={self.tenant_id}", names)
+    self.assertIn("redmesh:tenant_name=Acme Corp", names)
+    self.assertEqual(self.name_reads, [self.tenant_id])
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_unreadable_or_empty_name_keeps_the_id_tag_and_exports(self, MockPyMISP):
+    for kwargs in ({"name_error": RuntimeError("store down")}, {"tenant_name": "\"'="},
+                   {"tenant_name": None}):
+      with self.subTest(kwargs=kwargs):
+        MockPyMISP.reset_mock()
+        mock_misp = MockPyMISP.return_value
+        mock_misp.add_event.return_value = self._accepted()
+        owner = self._owner(**kwargs)
+
+        result = push_to_misp(owner, "test_job_1")
+
+        self.assertEqual(result["status"], "ok")
+        names = [tag.name for tag in self._sent_event(mock_misp).tags]
+        self.assertIn(f"redmesh:tenant_id={self.tenant_id}", names)
+        self.assertFalse([name for name in names if name.startswith("redmesh:tenant_name=")])
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_unmapped_tenant_uses_the_configured_distribution(self, MockPyMISP):
+    mock_misp = MockPyMISP.return_value
+    mock_misp.add_event.return_value = self._accepted()
+    owner = self._owner(misp_config={"MISP_DISTRIBUTION": 2},
+                        sharing_groups={"tn_00000000-0000-4000-8000-000000000000": 9})
+
+    self.assertEqual(push_to_misp(owner, "test_job_1")["status"], "ok")
+
+    sent = self._sent_event(mock_misp)
+    self.assertEqual(sent.distribution, 2)
+    self.assertNotIn("sharing_group_id", sent.to_dict())
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_mapped_tenant_creates_with_distribution_4_and_its_group(self, MockPyMISP):
+    mock_misp = MockPyMISP.return_value
+    mock_misp.add_event.return_value = self._accepted()
+    owner = self._mapped_owner(misp_config={"MISP_DISTRIBUTION": 1})
+
+    self.assertEqual(push_to_misp(owner, "test_job_1")["status"], "ok")
+
+    sent = self._sent_event(mock_misp)
+    self.assertEqual((sent.distribution, sent.sharing_group_id), (4, 7))
+
+  def test_configured_distribution_never_selects_4(self):
+    self.assertEqual(get_misp_export_config(_make_owner({"MISP_DISTRIBUTION": 4}))["MISP_DISTRIBUTION"],
+                     DEFAULT_MISP_EXPORT_CONFIG["MISP_DISTRIBUTION"])
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_update_sets_tags_distribution_and_group_on_the_existing_event(self, MockPyMISP):
+    mock_misp = MockPyMISP.return_value
+    mock_misp.get_event.return_value = self._existing()
+    mock_misp.update_event.side_effect = lambda event, pythonify=True: event
+    mock_misp.add_object.return_value = MagicMock()
+    owner = self._mapped_owner(existing_export=dict(self._EXPORTED))
+
+    result = push_to_misp(owner, "test_job_1")
+
+    self.assertEqual(result["status"], "ok")
+    mock_misp.add_event.assert_not_called()
+    updated = mock_misp.update_event.call_args.args[0]
+    self.assertEqual((updated.distribution, updated.sharing_group_id), (4, 7))
+    names = [tag.name for tag in updated.tags]
+    self.assertIn(f"redmesh:tenant_id={self.tenant_id}", names)
+    self.assertIn("redmesh:tenant_name=Acme Corp", names)
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_update_of_an_unmapped_tenant_leaves_the_event_distribution(self, MockPyMISP):
+    # Coordinator decision (RM-139 phase 4): resetting to the configured distribution would widen
+    # an event once its tenant's mapping is removed, so an unmapped update keeps what the event has.
+    mock_misp = MockPyMISP.return_value
+    mock_misp.get_event.return_value = self._existing()
+    mock_misp.update_event.side_effect = lambda event, pythonify=True: event
+    mock_misp.add_object.return_value = MagicMock()
+    owner = self._owner(misp_config={"MISP_DISTRIBUTION": 3}, existing_export=dict(self._EXPORTED))
+
+    self.assertEqual(push_to_misp(owner, "test_job_1")["status"], "ok")
+
+    updated = mock_misp.update_event.call_args.args[0]
+    self.assertEqual(updated.distribution, 0)
+    self.assertNotIn("sharing_group_id", updated.to_dict())
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_rejected_group_on_create_fails_without_a_wider_retry(self, MockPyMISP):
+    from pymisp.exceptions import MISPServerError, PyMISPError
+    # Review E5: only MISP's refusal of the write is the group's rejection; a server error or an
+    # authentication failure is a failed push. Neither is ever retried wider.
+    for rejection, error, retryable in (
+        ({"errors": [403, {"message": "Invalid sharing group"}]}, "sharing_group_rejected", False),
+        ({"errors": [401, {"message": "Authentication failed"}]}, "push_failed", False),
+        (MISPServerError("Error code 500"), "push_failed", True),
+        (PyMISPError("Unexpected response"), "push_failed", True)):
+      with self.subTest(rejection=rejection):
+        MockPyMISP.reset_mock()
+        mock_misp = MockPyMISP.return_value
+        if isinstance(rejection, Exception):
+          mock_misp.add_event.side_effect = rejection
+        else:
+          mock_misp.add_event.side_effect = None
+          mock_misp.add_event.return_value = rejection
+        owner = self._mapped_owner()
+        written = []
+        type(owner)._write_job_record = lambda _self, job_key, job_specs, context="": (
+          written.append(dict(job_specs)) or job_specs)
+
+        result = push_to_misp(owner, "test_job_1")
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], error)
+        self.assertIs(result["retryable"], retryable)
+        mock_misp.add_event.assert_called_once()
+        self.assertEqual(mock_misp.add_event.call_args.args[0].distribution, 4)
+        mock_misp.update_event.assert_not_called()
+        self.assertTrue(all("misp_export" not in job for job in written))
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_rejected_group_on_update_fails_and_creates_no_new_event(self, MockPyMISP):
+    from pymisp.exceptions import MISPServerError
+    for rejection, error in (({"errors": [403, {"message": "Invalid sharing group"}]}, "sharing_group_rejected"),
+                             (MISPServerError("Error code 500"), "push_failed")):
+      with self.subTest(rejection=rejection):
+        MockPyMISP.reset_mock()
+        mock_misp = MockPyMISP.return_value
+        mock_misp.get_event.return_value = self._existing()
+        mock_misp.add_object.return_value = MagicMock()
+        if isinstance(rejection, Exception):
+          mock_misp.update_event.side_effect = rejection
+        else:
+          mock_misp.update_event.side_effect = None
+          mock_misp.update_event.return_value = rejection
+        owner = self._mapped_owner(existing_export=dict(self._EXPORTED))
+
+        result = push_to_misp(owner, "test_job_1")
+
+        self.assertEqual(result["error"], error)
+        if error == "sharing_group_rejected":
+          self.assertFalse(result["retryable"])
+        mock_misp.update_event.assert_called_once()
+        mock_misp.add_event.assert_not_called()
+        # Review E2: the event moves into its group first; refused, nothing is added to the event
+        # still at its old, wider distribution.
+        mock_misp.add_object.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_mapped_update_moves_the_event_before_adding_objects_that_inherit(self, MockPyMISP):
+    mock_misp = MockPyMISP.return_value
+    mock_misp.get_event.return_value = self._existing()
+    mock_misp.update_event.side_effect = lambda event, pythonify=True: event
+    mock_misp.add_object.return_value = MagicMock()
+    owner = self._mapped_owner(existing_export=dict(self._EXPORTED))
+
+    self.assertEqual(push_to_misp(owner, "test_job_1")["status"], "ok")
+
+    calls = [name for name, _, _ in mock_misp.method_calls if name in ("update_event", "add_object")]
+    self.assertIn("add_object", calls)
+    self.assertEqual(calls[0], "update_event")
+    moved = mock_misp.update_event.call_args_list[0].args[0]
+    self.assertEqual((moved.distribution, moved.sharing_group_id), (4, 7))
+    for call in mock_misp.add_object.call_args_list:
+      obj = call.args[1]
+      self.assertEqual(obj.distribution, 5)
+      self.assertTrue(all(attribute.distribution == 5 for attribute in obj.attributes))
+
+  def test_a_mapped_event_carries_nothing_with_a_distribution_of_its_own(self):
+    event = export_misp_json(self._mapped_owner(), "test_job_1")["misp_event"]
+    self.assertTrue(event["Object"])
+    for item in event["Object"] + event.get("Attribute", []):
+      self.assertEqual(int(item["distribution"]), 5)
+      for attribute in item.get("Attribute", []):
+        self.assertEqual(int(attribute["distribution"]), 5)
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_transport_failure_with_a_group_stays_push_failed(self, MockPyMISP):
+    import requests
+    mock_misp = MockPyMISP.return_value
+    mock_misp.add_event.side_effect = requests.exceptions.ConnectionError("down")
+    owner = self._mapped_owner()
+
+    result = push_to_misp(owner, "test_job_1")
+
+    self.assertEqual(result["error"], "push_failed")
+    mock_misp.add_event.assert_called_once()
+
+  def test_rejection_code_is_publishable(self):
+    from extensions.business.cybersec.red_mesh.tenancy.effects import public_effect_result
+    projected = public_effect_result({"status": "error", "error": "sharing_group_rejected", "retryable": False})
+    self.assertEqual(projected, {"status": "error", "configuration_error": "sharing_group_rejected"})
+
+  def test_json_download_carries_the_tenant_tags_and_group(self):
+    owner = self._mapped_owner()
+    result = export_misp_json(owner, "test_job_1")
+    self.assertEqual(result["status"], "ok")
+    event = result["misp_event"]
+    names = [tag["name"] for tag in event["Tag"]]
+    self.assertIn(f"redmesh:tenant_id={self.tenant_id}", names)
+    self.assertIn("redmesh:tenant_name=Acme Corp", names)
+    self.assertEqual((int(event["distribution"]), int(event["sharing_group_id"])), (4, 7))
+
+  def test_unbound_json_download_is_tagged_super_tenant(self):
+    owner = _make_integration_owner({"ENABLED": False})
+    type(owner)._get_tenant_display_name = lambda _self, tenant_id: self.fail("no tenant to name")
+    result = export_misp_json(owner, "test_job_1")
+    names = [tag["name"] for tag in result["misp_event"]["Tag"]]
+    self.assertIn("redmesh:tenant_id=super-tenant", names)
+    self.assertFalse([name for name in names if name.startswith("redmesh:tenant_name=")])
 
 
 if __name__ == "__main__":

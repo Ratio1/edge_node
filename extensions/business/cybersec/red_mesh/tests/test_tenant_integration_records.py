@@ -1,4 +1,9 @@
-"""Per-tenant SOC/CTI destination config records through the real storage boundary (RM-081 Phase 1)."""
+"""The integration config table, and the retirement of per-tenant integration records (RM-139).
+
+RM-081 stored one destination config per tenant; RM-139 moved integrations to the deployment (Deeploy
+config plus an STA override), so the tenant rows are deleted once at plugin start and the kind can no
+longer be read or written.
+"""
 import json
 import unittest
 from unittest.mock import patch
@@ -16,12 +21,60 @@ from extensions.business.cybersec.red_mesh.services.misp_config import DEFAULT_M
 from .contract_fixture import contract_terms
 
 
-def integration_location(tenant_id, integration_id):
-  return ('["redmesh","tenancy",1,"deployment"]',
-          json.dumps(["integration", "deployment", tenant_id, integration_id], separators=(",", ":")))
+TENANCY_HKEY = '["redmesh","tenancy",1,"deployment"]'
+SECRET = "legacy-tenant-misp-secret"
 
 
-class IntegrationRecordCase(unittest.TestCase):
+def integration_location(tenant_id, integration_id, namespace="deployment"):
+  return (json.dumps(["redmesh", "tenancy", 1, namespace], separators=(",", ":")),
+          json.dumps(["integration", namespace, tenant_id, integration_id], separators=(",", ":")))
+
+
+def plant(owner, tenant_id, integration_id="misp", namespace="deployment"):
+  """A row as RM-081 `put_tenant_integration` wrote it, credential included."""
+  owner.data[integration_location(tenant_id, integration_id, namespace)] = {
+    "schemaVersion": 1, "namespace": namespace, "kind": "integration",
+    "ids": [tenant_id, integration_id], "tenant_id": tenant_id, "integration_id": integration_id,
+    "enabled": True, "config": {"MISP_URL": "https://misp.example", "MISP_API_KEY": SECRET},
+    "updated_by": "creator", "updated_at": "2026-09-20T00:00:00+00:00"}
+
+
+class TestConfigTableMatchesDeployment(unittest.TestCase):
+  """The override's keys are the deployment block's own keys. A rename there must fail here."""
+
+  def test_every_override_key_exists_in_the_deployment_default(self):
+    defaults = {"misp": DEFAULT_MISP_EXPORT_CONFIG, "opencti": DEFAULT_OPENCTI_EXPORT_CONFIG,
+                "taxii": DEFAULT_TAXII_EXPORT_CONFIG, "wazuh": DEFAULT_WAZUH_EXPORT_CONFIG}
+    self.assertEqual(set(defaults), set(integrations.INTEGRATION_IDS))
+    for integration_id, block in defaults.items():
+      allowed = integrations._CONFIG_KEYS[integration_id]
+      self.assertEqual(set(allowed) - set(block), set(),
+                       f"{integration_id} declares keys the deployment block does not have")
+      for key, types in allowed.items():
+        self.assertIsInstance(block[key], types,
+                              f"{integration_id}.{key} type disagrees with the deployment default")
+
+  def test_every_credential_key_is_a_declared_config_key(self):
+    for integration_id, keys in integrations.CREDENTIAL_KEYS.items():
+      self.assertIn(integration_id, integrations.INTEGRATION_IDS)
+      for key in keys:
+        self.assertIn(key, integrations._CONFIG_KEYS[integration_id])
+
+  def test_the_node_level_three_are_not_configurable_integrations(self):
+    for integration_id in ("stix", "event_export", "suricata"):
+      self.assertFalse(integrations.valid_integration_id(integration_id))
+      with self.assertRaises(ValueError):
+        integrations.normalize_integration_config(integration_id, {})
+
+  def test_unknown_keys_and_wrong_types_are_refused(self):
+    for config in ({"NOT_A_KEY": "x"}, {"MISP_URL": 7}, {"MISP_VERIFY_TLS": "yes"},
+                   {"MISP_DISTRIBUTION": True}, {"MISP_URL": "https://e" + chr(0) + "x"},
+                   "not-a-dict"):
+      with self.assertRaises(ValueError, msg=config):
+        integrations.normalize_integration_config("misp", config)
+
+
+class RetirementCase(unittest.TestCase):
   def setUp(self):
     env = patch.dict("os.environ", {"R1EN_CSTORE_AUTH_HKEY": "auth"})
     env.start()
@@ -35,159 +88,111 @@ class IntegrationRecordCase(unittest.TestCase):
       self.actor, request, "Tenant", "tenant", "initial", **contract_terms())["data"]["tenantId"]
     self.owner.grant("initial", self.tenant)
     self.assertTrue(self.service.activate_tenant(self.actor, request)["success"])
+    # A tenant deleted before RM-139 left its rows behind: the cleanup must not need the tenant.
+    self.orphan = "tn_" + str(uuid4())
+    plant(self.owner, self.tenant, "misp")
+    plant(self.owner, self.tenant, "opencti")
+    plant(self.owner, self.orphan, "taxii")
+    # Another namespace's row on the same hkey family is never this deployment's to delete.
+    plant(self.owner, self.tenant, "misp", namespace="other")
 
-  def put(self, **changes):
-    fields = {"actor": self.actor, "tenant_id": self.tenant, "integration_id": "misp",
-              "enabled": True, "config": {"MISP_URL": "https://misp.example", "MISP_API_KEY": "k"}}
-    return self.service.put_tenant_integration(**{**fields, **changes})
-
-
-class TestConfigTableMatchesDeployment(unittest.TestCase):
-  """The record's keys are the deployment block's own keys. A rename there must fail here."""
-
-  def test_every_tenant_key_exists_in_the_deployment_default(self):
-    defaults = {"misp": DEFAULT_MISP_EXPORT_CONFIG, "opencti": DEFAULT_OPENCTI_EXPORT_CONFIG,
-                "taxii": DEFAULT_TAXII_EXPORT_CONFIG, "wazuh": DEFAULT_WAZUH_EXPORT_CONFIG}
-    self.assertEqual(set(defaults), set(integrations.TENANT_INTEGRATION_IDS))
-    for integration_id, block in defaults.items():
-      allowed = integrations._CONFIG_KEYS[integration_id]
-      self.assertEqual(set(allowed) - set(block), set(),
-                       f"{integration_id} declares keys the deployment block does not have")
-      for key, types in allowed.items():
-        self.assertIsInstance(block[key], types,
-                              f"{integration_id}.{key} type disagrees with the deployment default")
-
-  def test_every_credential_key_is_a_declared_config_key(self):
-    for integration_id, keys in integrations.CREDENTIAL_KEYS.items():
-      self.assertIn(integration_id, integrations.TENANT_INTEGRATION_IDS)
-      for key in keys:
-        self.assertIn(key, integrations._CONFIG_KEYS[integration_id])
-
-  def test_the_node_level_three_are_disjoint_and_explained(self):
-    self.assertEqual(set(integrations.NODE_LEVEL_INTEGRATION_IDS)
-                     & set(integrations.TENANT_INTEGRATION_IDS), set())
-    for reason in integrations.NODE_LEVEL_INTEGRATION_IDS.values():
-      self.assertTrue(reason.strip())
+  def live_rows(self, namespace="deployment"):
+    hkey = integration_location("x", "misp", namespace)[0]
+    return sorted(json.loads(key)[2:] for (bucket, key), value in self.owner.data.items()
+                  if bucket == hkey and value is not None and json.loads(key)[0] == "integration")
 
 
-class TestTenantIntegrationRecords(IntegrationRecordCase):
-  def test_first_write_roundtrips_as_a_persisted_authorized_record(self):
-    result = self.put()
-    self.assertTrue(result["success"], result)
-    row = result["data"]
-    self.assertEqual((row["tenantId"], row["integrationId"], row["enabled"]),
-                     (self.tenant, "misp", True))
-    self.assertEqual(row["updatedBy"], "creator")
-    stored = self.owner.data[integration_location(self.tenant, "misp")]
-    self.assertEqual(stored["config"]["MISP_API_KEY"], "k")
-    self.assertEqual(self.service.get_tenant_integration(
-      self.actor, self.tenant, "misp")["data"]["integration"], row)
+class TestRetiredTenantIntegrationKind(RetirementCase):
+  def test_the_tenant_integration_endpoints_are_gone(self):
+    for name in ("list_tenant_integrations", "get_tenant_integration", "put_tenant_integration"):
+      self.assertFalse(hasattr(TenantAdministrationService, name), name)
 
-  def test_no_projection_returns_a_credential_value(self):
-    for integration_id, config in (
-        ("misp", {"MISP_API_KEY": "misp-secret"}),
-        ("opencti", {"TOKEN": "opencti-secret"}),
-        ("taxii", {"TOKEN": "taxii-secret", "PASSWORD": "taxii-password"}),
-        ("wazuh", {"TOKEN": "wazuh-secret", "PASSWORD": "wazuh-password"})):
-      self.assertTrue(self.put(integration_id=integration_id, config=config)["success"])
-    rendered = json.dumps([self.service.list_tenant_integrations(self.actor, self.tenant),
-                           *(self.service.get_tenant_integration(self.actor, self.tenant, name)
-                             for name in integrations.TENANT_INTEGRATION_IDS)])
-    for secret in ("misp-secret", "opencti-secret", "taxii-secret", "taxii-password",
-                   "wazuh-secret", "wazuh-password"):
-      self.assertNotIn(secret, rendered)
-    projected = self.service.get_tenant_integration(
-      self.actor, self.tenant, "taxii")["data"]["integration"]["config"]
-    self.assertTrue(projected["credentialsConfigured"])
-    self.assertNotIn("TOKEN", projected)
-    self.assertNotIn("PASSWORD", projected)
-
-  def test_blank_credential_reads_as_not_configured(self):
-    self.assertTrue(self.put(integration_id="opencti",
-                             config={"URL": "https://octi.example", "TOKEN": "  "})["success"])
-    projected = self.service.get_tenant_integration(
-      self.actor, self.tenant, "opencti")["data"]["integration"]["config"]
-    self.assertFalse(projected["credentialsConfigured"])
-
-  def test_listing_shows_every_tenant_id_including_unconfigured_ones(self):
-    self.assertTrue(self.put()["success"])
-    listed = self.service.list_tenant_integrations(self.actor, self.tenant)["data"]["integrations"]
-    self.assertEqual([row["integrationId"] for row in listed],
-                     list(integrations.TENANT_INTEGRATION_IDS))
-    unset = [row for row in listed if row["integrationId"] == "opencti"][0]
-    self.assertEqual((unset["enabled"], unset["config"], unset["version"]), (False, None, None))
-
-  def test_node_level_ids_are_refused_with_their_own_reason(self):
-    for integration_id in ("stix", "event_export", "suricata"):
-      for call in (lambda name=integration_id: self.put(integration_id=name, config={}),
-                   lambda name=integration_id: self.service.get_tenant_integration(
-                     self.actor, self.tenant, name)):
-        result = call()
-        self.assertEqual((result["status_code"], result["error"]),
-                         (400, "integration_not_tenant_scoped"), integration_id)
-      self.assertNotIn(integration_location(self.tenant, integration_id), self.owner.data)
-
-  def test_unknown_id_is_not_found_rather_than_a_node_level_refusal(self):
-    result = self.service.get_tenant_integration(self.actor, self.tenant, "splunk")
-    self.assertEqual((result["status_code"], result["error"]), (404, "not_found"))
-
-  def test_unknown_keys_and_wrong_types_never_write(self):
-    for config in ({"NOT_A_KEY": "x"}, {"MISP_URL": 7}, {"MISP_VERIFY_TLS": "yes"},
-                   {"MISP_DISTRIBUTION": True}, {"MISP_URL": "https://e" + chr(0) + "x"},
-                   "not-a-dict"):
-      before = len(self.owner.writes)
-      result = self.put(config=config)
-      self.assertEqual(result["status_code"], 400, config)
-      self.assertEqual(len(self.owner.writes), before, config)
-
-  def test_a_second_write_needs_the_current_version_and_a_first_one_needs_none(self):
-    first = self.put()["data"]
-    self.assertEqual(self.put()["status_code"], 409)
-    self.assertEqual(self.put(expected_version=first["version"],
-                              config={"MISP_URL": "https://other.example"})["data"]["config"]["MISP_URL"],
-                     "https://other.example")
-    stale = self.put(expected_version=first["version"], config={"MISP_URL": "https://third.example"})
-    self.assertEqual(stale["status_code"], 409)
-
-  def test_a_version_for_a_record_that_does_not_exist_never_creates_one(self):
+  def test_a_stored_row_is_neither_read_nor_written(self):
+    with self.assertRaises(TenantStoreError):
+      self.store.get("integration", self.tenant, "misp")
     before = len(self.owner.writes)
-    absent = self.put(expected_version="a" * 64)
-    self.assertEqual(absent["status_code"], 409)
-    self.assertEqual(len(self.owner.writes), before)
-    self.assertNotIn(integration_location(self.tenant, "misp"), self.owner.data)
-
-  def test_an_unchanged_rewrite_is_a_noop_that_still_returns_the_row(self):
-    first = self.put()["data"]
-    before = len(self.owner.writes)
-    again = self.put(expected_version=first["version"])
-    self.assertEqual(again["data"], first)
+    with self.assertRaises(TenantStoreError):
+      self.store.put("integration", self.tenant, "wazuh", record={
+        "tenant_id": self.tenant, "integration_id": "wazuh", "enabled": True, "config": {},
+        "updated_by": "creator", "updated_at": "2026-10-14T00:00:00+00:00"})
     self.assertEqual(len(self.owner.writes), before)
 
-  def test_a_tenant_admin_manages_and_a_tenant_user_never_reads(self):
-    self.owner.account("member", memberships=[{"role": "tenant_user", "tenant_id": self.tenant}])
-    self.assertEqual(self.service.list_tenant_integrations(
-      {"account_id": "member"}, self.tenant)["status_code"], 403)
-    self.assertTrue(self.service.list_tenant_integrations(
-      {"account_id": "initial"}, self.tenant)["success"])
+  def test_record_ids_lists_every_row_of_the_namespace_orphans_included(self):
+    self.assertEqual(sorted(self.store.record_ids("integration")),
+                     sorted([[self.tenant, "misp"], [self.tenant, "opencti"], [self.orphan, "taxii"]]))
 
-  def test_a_foreign_tenant_admin_reads_nothing(self):
-    other = str(uuid4())
-    self.owner.account("initial-other")
-    foreign = self.service.prepare_tenant(self.actor, other, "Other", "other", "initial-other", **contract_terms())["data"]["tenantId"]
-    self.owner.account("outsider", memberships=[{"role": "tenant_admin", "tenant_id": foreign}])
-    self.assertIn(self.service.list_tenant_integrations(
-      {"account_id": "outsider"}, self.tenant)["status_code"], (403, 404))
+  def test_the_cleanup_deletes_every_row_once_and_leaves_the_rest(self):
+    tenant_row = self.store.get("tenant", self.tenant)
+    self.assertEqual(integrations.retire_tenant_integration_records(self.store), 3)
+    self.assertEqual(self.live_rows(), [])
+    self.assertEqual(self.live_rows("other"), [[self.tenant, "misp"]])
+    self.assertEqual(self.store.get("tenant", self.tenant), tenant_row)
+    writes = len(self.owner.writes)
+    self.assertEqual(integrations.retire_tenant_integration_records(self.store), 0)
+    self.assertEqual(len(self.owner.writes), writes)
 
-  def test_a_corrupted_stored_record_is_refused_rather_than_projected(self):
-    self.assertTrue(self.put()["success"])
-    location = integration_location(self.tenant, "misp")
-    for corruption in ({"enabled": "yes"}, {"integration_id": "suricata"}, {"updated_by": ""},
-                       {"updated_at": "not-a-time"}, {"config": {"NOT_A_KEY": 1}}):
-      saved = dict(self.owner.data[location])
-      self.owner.data[location] = {**saved, **corruption}
-      with self.assertRaises(TenantStoreError, msg=corruption):
-        self.store.get("integration", self.tenant, "misp")
-      self.owner.data[location] = saved
+
+class TestPluginStartCleanup(RetirementCase):
+  @classmethod
+  def setUpClass(cls):
+    from .conftest import mock_plugin_modules
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    cls.Plugin = PentesterApi01Plugin
+
+  def setUp(self):
+    super().setUp()
+    self.plugin = object.__new__(self.Plugin)
+    self.plugin.cfg_tenancy_namespace = "deployment"
+    self.logs = []
+    self.plugin.P = lambda *args, **kwargs: self.logs.append(" ".join(str(arg) for arg in args))
+    self.enumerations = 0
+    self.unavailable = False
+
+    def hgetall(*, hkey):
+      self.enumerations += 1
+      if self.unavailable:
+        raise RuntimeError("cstore down " + SECRET)
+      return self.owner.chainstore_hgetall(hkey=hkey)
+    self.plugin.chainstore_hgetall = hgetall
+    self.plugin.chainstore_hget = self.owner.chainstore_hget
+    self.plugin.chainstore_hset = self.owner.chainstore_hset
+
+  def run_cleanup(self):
+    self.Plugin._maybe_retire_tenant_integration_records(self.plugin)
+
+  def test_it_runs_once_and_logs_only_the_count(self):
+    self.run_cleanup()
+    self.assertEqual(self.live_rows(), [])
+    self.assertEqual(self.live_rows("other"), [[self.tenant, "misp"]])
+    rendered = "\n".join(self.logs)
+    self.assertRegex(rendered, r"\b3\b")
+    for content in (SECRET, "misp.example", self.tenant, self.orphan):
+      self.assertNotIn(content, rendered)
+    enumerations = self.enumerations
+    plant(self.owner, self.tenant, "wazuh")
+    self.run_cleanup()
+    self.assertEqual(self.enumerations, enumerations)
+    self.assertEqual(self.live_rows(), [[self.tenant, "wazuh"]])
+
+  def test_an_unavailable_store_is_retried_on_a_later_tick(self):
+    self.unavailable = True
+    self.run_cleanup()
+    self.run_cleanup()
+    self.assertEqual(len(self.live_rows()), 3)
+    self.assertNotIn(SECRET, "\n".join(self.logs))
+    self.unavailable = False
+    self.run_cleanup()
+    self.assertEqual(self.live_rows(), [])
+    enumerations = self.enumerations
+    self.run_cleanup()
+    self.assertEqual(self.enumerations, enumerations)
+
+  def test_a_node_without_a_tenancy_namespace_has_nothing_to_clean(self):
+    self.plugin.cfg_tenancy_namespace = None
+    self.run_cleanup()
+    self.assertEqual(self.enumerations, 0)
+    self.assertEqual(len(self.live_rows()), 3)
 
 
 if __name__ == "__main__":

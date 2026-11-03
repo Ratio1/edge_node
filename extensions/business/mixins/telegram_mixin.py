@@ -228,6 +228,7 @@ class _TelegramChatbotMixin(object):
       self.__asyncio_loop.run_until_complete(self.__run_bot())
       self.bot_log("Bot main coroutine finished.")
     except Exception as e:
+      self.report_deployment_status("failed", "WORKLOAD_START_FAILED")
       self.bot_log(f"Error in bot_runner: {e}", color='r')
     finally:
       self._teardown_asyncio_loop()
@@ -258,9 +259,11 @@ class _TelegramChatbotMixin(object):
 
     # Start polling without installing signal handlers
     await self.__app.updater.start_polling(poll_interval=1)
+    self.report_deployment_status("ready")
 
     # Wait until the stop event is set
     await self.__stop_event.wait()
+    self.report_deployment_status("stopping")
 
     # Stop the updater and the application
     await self.__app.updater.stop()
@@ -306,9 +309,15 @@ class _TelegramChatbotMixin(object):
   
   def bot_stop(self):
     self.bot_log("Stopping bot...", color='r')
-    if self.__asyncio_loop is not None and self.__stop_event is not None:
+    if self.__asyncio_loop is not None and not self.__asyncio_loop.is_closed() and self.__stop_event is not None:
       self.bot_log("Signaling bot to stop...")
-      self.__stop_event.set()
+      try:
+        self.__asyncio_loop.call_soon_threadsafe(self.__stop_event.set)
+      except RuntimeError:
+        # A failing runner can close its loop after the check above. Its
+        # thread still needs joining; unrelated scheduling errors must surface.
+        if not self.__asyncio_loop.is_closed():
+          raise
     if self.__bot_thread is not None:
       self.bot_log("Waiting for bot thread to join...")
       self.__bot_thread.join()
@@ -360,9 +369,11 @@ class _TelegramChatbotMixin(object):
       If True, the bot will run in a separate thread as it is recommended in the plugin system.    
     
     """
-    self.__app : Application = None    
+    self.report_deployment_status("starting")
+    self.__app : Application = None
     self.__bot_thread = None
     self.__asyncio_loop = None
+    self.__stop_event = None
     self.__stats = {}
     self.bot_debug = bot_debug
     self.__token = token

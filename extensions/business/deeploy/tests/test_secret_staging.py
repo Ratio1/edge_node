@@ -57,6 +57,17 @@ class _SecretStagingPlugin(_DeeployMixin, _DeeployJobMixin):
     self.deepcopy = copy.deepcopy
     self.cfg_deeploy_verbose = 0
 
+  def _reconcile_dauth_job_secrets(self, job_id, pipeline_configs, current_identity_aliases=None):
+    # Simulate the dAuth boundary for these existing secret-selection fixtures.
+    configs, bundle = self._redact_pipeline_configs_and_build_secret_bundle(
+      job_id, pipeline_configs, self._load_dauth_job_secret_bundle(job_id),
+      prior_pipeline=self.get_job_base_pipeline_from_r1fs(job_id),
+      current_identity_aliases=current_identity_aliases,
+    )
+    return configs, self.stage_job_pipeline_and_secrets(
+      next(iter(configs.values())), job_id, bundle,
+    )
+
   def chainstore_hget(self, hkey, key):
     return copy.deepcopy(self.store.get((hkey, str(key))))
 

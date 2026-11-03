@@ -77,6 +77,36 @@ CATALOG = {
     },
 }
 
+# Explanation spec v0.2 §3/§5: the `misp_enrichment` block's fields, per
+# node label, with the meaning the model narrates. Mirrors
+# `misp_enrichment.FIELD_WHITELIST` (a test pins the two together); the
+# model view omits `last_imported_from` (ingest bookkeeping), so it is not
+# catalogued. Every value here is quoted third-party feed data (spec §6).
+MISP_ENRICHMENT_CATALOG = {
+    "CVE": {
+        "cwe": ("weakness", "CWE weakness class(es) named by the vulnerability feed"),
+        "reference_urls": ("reference", "advisory/reference links listed by the feed"),
+        "affected_products": ("scope", "products the feed lists as affected"),
+        "cisa_exploit_add": ("exploited", "date CISA added the CVE to its Known Exploited Vulnerabilities list"),
+        "cisa_action_due": ("deadline", "CISA remediation due date for federal agencies"),
+        "cisa_vulnerability_name": ("identity", "CISA's name for the vulnerability"),
+        "source": ("provenance", "the feed that supplied the record"),
+    },
+    "Indicator": {
+        "pulse_name": ("context", "name of the AlienVault OTX pulse that lists the indicator"),
+        "pulse_references": ("reference", "reference links of that OTX pulse"),
+        "pulse_tlp": ("sharing", "TLP sharing level of that OTX pulse"),
+        "otx_industries": ("targets", "industries the OTX pulse associates with it"),
+        "indicator_role": ("kind", "the indicator's role according to OTX"),
+        "threat_type": ("kind", "ThreatFox/URLhaus threat type"),
+        "threat_type_desc": ("kind", "ThreatFox/URLhaus description of the threat type"),
+        "tf_tags": ("context", "ThreatFox/URLhaus tags"),
+        "reference": ("reference", "ThreatFox/URLhaus reference link"),
+        "malware_alias": ("aliases", "malware aliases named by ThreatFox/URLhaus"),
+        "source": ("provenance", "the feed that supplied the record"),
+    },
+}
+
 # Fields the catalog derives from the `description` blob, per label. Derived
 # values only fill in when the same field is absent from the real properties.
 DERIVED = {
@@ -240,6 +270,23 @@ def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def misp_enrichment_meanings(labels_present):
+    """The {field: meaning} legend for the enrichment fields of the labels
+    in a model view."""
+    out = {}
+    for label in labels_present:
+        for field, (_role, meaning) in MISP_ENRICHMENT_CATALOG.get(label, {}).items():
+            out.setdefault(field, meaning)
+    return out
+
+
+# Explanation spec v0.2 §5: the catalog sha covers the enrichment catalog
+# too (re-pinned with it). The node-label part keeps its v0.1 canonical form.
 CATALOG_SHA256 = hashlib.sha256(
-    _canonical({label: {f: list(v) for f, v in spec.items()} for label, spec in CATALOG.items()}).encode()
+    _canonical({
+        **{label: {f: list(v) for f, v in spec.items()} for label, spec in CATALOG.items()},
+        "misp_enrichment": {
+            label: {f: list(v) for f, v in spec.items()} for label, spec in MISP_ENRICHMENT_CATALOG.items()
+        },
+    }).encode()
 ).hexdigest()

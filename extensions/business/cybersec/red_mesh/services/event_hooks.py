@@ -3,9 +3,8 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from .config import (TENANT_INTEGRATION_NOT_CONFIGURED, get_event_export_config,
-                     get_suricata_correlation_config, get_wazuh_export_config,
-                     tenant_export_binding)
+from .config import (IntegrationOverrideUnavailable, get_event_export_config,
+                     get_suricata_correlation_config, get_wazuh_export_config)
 from .event_builder import (
   build_assessment_window,
   build_attestation_event,
@@ -59,18 +58,8 @@ def _job_specs_for_event(owner, job_specs):
   return specs
 
 
-def _emission_tenant(owner, job_specs):
-  """Which tenant this automatic emission belongs to, and whether it may proceed.
-
-  Returns (tenant_id, skip_reason). The automatic path has no caller to admit: the tenant comes
-  from the job's own execution binding, which the launcher already authorized when the job was
-  created. A bound job whose tenant configured no wazuh destination is skipped rather than emitted
-  to the node's, for the same reason an operator-triggered export is refused.
-  """
-  tenant_id, error = tenant_export_binding(owner, job_specs, "wazuh")
-  if error == TENANT_INTEGRATION_NOT_CONFIGURED:
-    return tenant_id, TENANT_INTEGRATION_NOT_CONFIGURED
-  return tenant_id, None
+# RM-139: an unreadable STA override stops the emission; it never falls back to the Deeploy values.
+INTEGRATION_CONFIG_UNAVAILABLE = "integration_config_unavailable"
 
 
 def _event_export_secret(owner):
@@ -83,9 +72,12 @@ def _event_export_secret(owner):
   return "redmesh-event-redaction-fallback", None
 
 
-def _automatic_export_enabled(owner, tenant_id=None):
+def _automatic_export_enabled(owner):
   event_cfg = get_event_export_config(owner)
-  wazuh_cfg = get_wazuh_export_config(owner, tenant_id)
+  try:
+    wazuh_cfg = get_wazuh_export_config(owner)
+  except IntegrationOverrideUnavailable:
+    return False, INTEGRATION_CONFIG_UNAVAILABLE
   if not event_cfg["ENABLED"]:
     return False, "event_export_disabled"
   if not wazuh_cfg["ENABLED"]:
@@ -185,12 +177,11 @@ def _record_job_soc_status(owner, job_specs, event, result):
     status["last_attestation_event_status"] = result.get("status")
     status["last_attestation_event_id"] = event.get("event_id")
 
-  # A tenant that has not configured a destination is a configuration state, not a delivery
-  # failure: recording it as one would accrue a failure signature and eventually a cooldown for
-  # something that never attempted to send.
+  # An unreadable override is a storage state, not a delivery failure: recording it as one would
+  # accrue a failure signature and eventually a cooldown for something that never attempted to send.
   if (result.get("status") == "skipped"
-      and result.get("error") == TENANT_INTEGRATION_NOT_CONFIGURED):
-    status["integration_status"] = "not_configured"
+      and result.get("error") == INTEGRATION_CONFIG_UNAVAILABLE):
+    status["integration_status"] = "unavailable"
     job_specs["soc_event_status"] = status
     return
 
@@ -285,20 +276,16 @@ def _assessment_window(
 
 
 def emit_redmesh_event(owner, job_specs, event):
-  """Best-effort automatic SOC event delivery. Never raises into scan paths."""
-  tenant_id, unconfigured = _emission_tenant(owner, job_specs)
-  if unconfigured:
-    result = _skip_result(unconfigured)
-    _record_job_soc_status(owner, job_specs, event, result)
-    return result
-  enabled, reason = _automatic_export_enabled(owner, tenant_id)
+  """Best-effort automatic SOC event delivery to the deployment's wazuh (RM-139: every job, bound
+  or not). Never raises into scan paths."""
+  enabled, reason = _automatic_export_enabled(owner)
   if not enabled:
     result = _skip_result(reason)
     _record_job_soc_status(owner, job_specs, event, result)
     return result
 
   try:
-    cooldown = current_integration_cooldown(owner, "wazuh", tenant_id)
+    cooldown = current_integration_cooldown(owner, "wazuh")
     if cooldown:
       result = {
         "status": "error",
@@ -311,7 +298,7 @@ def emit_redmesh_event(owner, job_specs, event):
       }
       _record_job_soc_status(owner, job_specs, event, result)
       return result
-    result = deliver_redmesh_event(owner, event, integration_id="wazuh", tenant_id=tenant_id)
+    result = deliver_redmesh_event(owner, event, integration_id="wazuh")
   except Exception as exc:
     result = {
       "status": "error",
@@ -325,7 +312,6 @@ def emit_redmesh_event(owner, job_specs, event):
       outcome="failure",
       event_id=result.get("event_id"),
       error_class=result["error"],
-      tenant_id=tenant_id,
     )
 
   _record_job_soc_status(owner, job_specs, event, result)

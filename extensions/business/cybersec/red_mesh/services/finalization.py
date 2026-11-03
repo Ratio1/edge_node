@@ -34,6 +34,7 @@ from .event_hooks import (
   emit_finding_event as _emit_finding_event,
   emit_lifecycle_event as _emit_lifecycle_event,
 )
+from .misp_auto_push import enqueue_misp_auto_push, poll_misp_auto_push
 from .rulebook_assessment import ensure_rulebook_assessment
 from .scan_strategy import coerce_scan_type, get_scan_strategy
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
@@ -438,6 +439,9 @@ def maybe_finalize_pass(owner):
   """
   Launcher finalizes completed passes and orchestrates continuous monitoring.
   """
+  # RM-139: merge finished automatic MISP pushes first, before the job list is read and whatever
+  # the analysis slot says, so no loop write below can start from a record without the merge.
+  poll_misp_auto_push(owner)
   all_jobs = _job_repo(owner).list_jobs()
   artifacts = _artifact_repo(owner)
   automatic_completion, should_yield = _poll_automatic_analysis(
@@ -867,6 +871,7 @@ def maybe_finalize_pass(owner):
         owner.P(f"[SINGLEPASS] Job {job_id} complete. Status set to FINALIZED.")
         owner._emit_timeline_event(job_specs, "finalized", "Job finalized")
         owner._build_job_archive(job_key, job_specs)
+        enqueue_misp_auto_push(owner, job_specs, job_pass)
         owner._clear_live_progress(job_id, list(workers.keys()))
         continue
 
@@ -895,6 +900,7 @@ def maybe_finalize_pass(owner):
         owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Status set to STOPPED (soft stop was scheduled)")
         owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
         owner._build_job_archive(job_key, job_specs)
+        enqueue_misp_auto_push(owner, job_specs, job_pass)
         owner._clear_live_progress(job_id, list(workers.keys()))
         continue
 
@@ -937,6 +943,7 @@ def maybe_finalize_pass(owner):
         )
         owner._emit_timeline_event(job_specs, "stopped", "Job stopped")
         owner._build_job_archive(job_key, job_specs)
+        enqueue_misp_auto_push(owner, job_specs, job_pass)
         owner._clear_live_progress(job_id, list(workers.keys()))
         continue
 
@@ -955,6 +962,7 @@ def maybe_finalize_pass(owner):
 
       owner.P(f"[CONTINUOUS] Pass {job_pass} complete for job {job_id}. Next pass in {interval}s (+{jitter:.1f}s jitter)")
       _write_job_record(owner, job_key, job_specs, context="continuous_next_pass")
+      enqueue_misp_auto_push(owner, job_specs, job_pass)
       owner._clear_live_progress(job_id, list(workers.keys()))
 
       owner.completed_jobs_reports.pop(job_id, None)

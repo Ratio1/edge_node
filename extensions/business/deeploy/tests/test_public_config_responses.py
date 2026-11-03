@@ -39,6 +39,7 @@ class _InputsStub(dict):
 
 def make_api_plugin(request_inputs=None):
   plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
+  plugin._assert_no_active_deployment = lambda *args: None
   plugin.ct = ct
   plugin.cfg_deeploy_verbose = 0
   plugin.P = lambda *args, **kwargs: None
@@ -114,31 +115,14 @@ class DeeployPublicConfigResponseTests(unittest.TestCase):
     self.assertIn("cf-token", serialized)
     self.assertIn("node-key", serialized)
 
-  def test_delete_pipeline_returns_discovered_targets_without_public_redaction(self):
-    plugin = make_api_plugin({
-      DEEPLOY_KEYS.APP_ID: "app-1",
-      DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a"],
-    })
-    targets = [{
-      "node": "0xai_node_a",
-      "instance_conf": {
-        "ENV": {"API_KEY": "service-key"},
-        "PER_NODE_CONFIG": {"byNode": {"0xai_node_a": {"ENV": {"TOKEN": "node-token"}}}},
-      },
-    }]
-    plugin.delete_pipeline_from_nodes = lambda **kwargs: targets
-
-    response = plugin.delete_pipeline({
-      DEEPLOY_KEYS.APP_ID: "app-1",
-      DEEPLOY_KEYS.TARGET_NODES: ["0xai_node_a"],
-    })
-
-    request_payload = response[DEEPLOY_KEYS.REQUEST]
-    self.assertEqual(request_payload[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
-    self.assertEqual(request_payload[DEEPLOY_KEYS.TARGETS], targets)
-    serialized = str(response)
-    self.assertIn("service-key", serialized)
-    self.assertIn("node-token", serialized)
+  def test_delete_pipeline_returns_only_operation_acceptance(self):
+    plugin = make_api_plugin({DEEPLOY_KEYS.JOB_ID: 42})
+    accepted = {"status_code": 202, "status": "accepted", "operation_id": "delete-op", "job_id": 42}
+    plugin._admit_delete_operation = lambda request, auth: accepted
+    response = plugin.delete_pipeline({"job_id": 42, "request_id": "delete", "expected_revision": 1})
+    self.assertEqual(response, accepted)
+    self.assertNotIn("targets", response)
+    self.assertNotIn("request", response)
 
 
 if __name__ == "__main__":

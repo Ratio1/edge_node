@@ -32,9 +32,7 @@ def as_tenant_user(fixture):
 def test_effects_no_longer_use_the_unscoped_global_job_lookup(name):
   with read_endpoint_fixture(bound=True) as fixture, \
        patch.object(opencti_export, "_config_error", return_value=None), \
-       patch.object(taxii_export, "_config_error", return_value=None), \
-       patch.object(opencti_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
-       patch.object(taxii_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)):
+       patch.object(taxii_export, "_config_error", return_value=None):
     # Without this the integrations resolve to `disabled` and _prepare_* returns before the job
     # read, so the canary would pass without exercising the scoping it names.
     # create=True because the fixture owner does not define it at all -- which is itself the
@@ -133,26 +131,28 @@ def test_a_landed_persist_is_never_reported_as_nothing_happened():
     assert SECRET not in repr(result)
 
 
-def test_test_event_export_requires_the_export_authority():
+@pytest.mark.parametrize("role", ("tenant_user", "tenant_pentester", "tenant_admin"))
+def test_test_event_export_is_refused_to_every_tenant_role(role):
+  """RM-139: the destinations are the deployment's, so only a full-portfolio STA may test them."""
   with read_endpoint_fixture(bound=True) as fixture:
-    as_tenant_user(fixture)
-    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
+    fixture.store.data[("auth", "reader")]["memberships"] = [{"role": role, "tenant_id": fixture.tenant_id}]
+    with patch("extensions.business.cybersec.red_mesh.pentester_api_01.test_event_export",
+               side_effect=AssertionError(SECRET)) as probe:
+      result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor,
+                                                tenant_id=fixture.tenant_id)
     assert result == {"success": False, "error": "forbidden", "status_code": 403}
-
-
-def test_test_event_export_admits_a_tenant_pentester():
-  with read_endpoint_fixture(bound=True) as fixture:
-    fixture.store.data[("auth", "reader")]["memberships"] = [
-      {"role": "tenant_pentester", "tenant_id": fixture.tenant_id}]
-    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor, tenant_id=fixture.tenant_id)
-    assert not (result.get("success") is False and result.get("status_code") in (400, 403, 404))
+    probe.assert_not_called()
 
 
 @pytest.mark.parametrize("tenant", (None, "", "tn_00000000-0000-4000-8000-000000000000"))
-def test_test_event_export_requires_the_callers_tenant(tenant):
+def test_test_event_export_admits_a_full_portfolio_sta_whatever_the_tenant_id(tenant):
   with read_endpoint_fixture(bound=True) as fixture:
-    result = fixture.Plugin.test_event_export(fixture.owner, request_actor=fixture.actor, tenant_id=tenant)
-    assert result["success"] is False and result["status_code"] == (404 if tenant else 400)
+    with patch("extensions.business.cybersec.red_mesh.pentester_api_01.test_event_export",
+               return_value={"status": "ok", "integration_id": "stix", "dry_run": True}) as probe:
+      result = fixture.Plugin.test_event_export(fixture.owner, "stix", request_actor={"account_id": "creator"},
+                                                tenant_id=tenant)
+    assert result["status"] == "ok", result
+    probe.assert_called_once()
 
 
 def test_a_delivered_soc_event_is_never_reported_as_nothing_happened():
@@ -207,7 +207,6 @@ def test_revalidation_denies_before_the_effect_when_the_account_is_deactivated()
       return "artifact-cid"
 
     with patch.object(opencti_export, "_config_error", return_value=None), \
-         patch.object(opencti_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(opencti_export, "build_stix_bundle",
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
@@ -262,7 +261,6 @@ def test_a_dry_run_that_mutates_the_job_record_never_reports_nothing_happened(na
   service = opencti_export if module == "opencti" else taxii_export
   with read_endpoint_fixture(bound=True) as fixture:
     with patch.object(service, "_config_error", return_value=None), \
-         patch.object(service, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(service, "build_stix_bundle",
                       return_value={"status": "ok", "bundle": {}, "bundle_id": "b1", "pass_nr": 1,
                                     "object_count": 0, "finding_count": 0,
@@ -287,7 +285,6 @@ def test_revalidation_between_admission_and_the_effect_denies_the_effect():
               "object_count": 0, "finding_count": 0, "observed_data_count": 0}
 
     with patch.object(opencti_export, "_config_error", return_value=None), \
-         patch.object(opencti_export, "tenant_export_binding", return_value=(fixture.tenant_id, None)), \
          patch.object(opencti_export, "build_stix_bundle", build_then_revoke), \
          patch.object(opencti_export, "_persist_bundle",
                       side_effect=lambda *a, **k: landed.append("persisted") or "cid"):

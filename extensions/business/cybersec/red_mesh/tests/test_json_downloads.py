@@ -223,7 +223,6 @@ def _push_patches():
   cfg = {**misp_export.DEFAULT_MISP_EXPORT_CONFIG,
          "ENABLED": True, "MISP_URL": "https://misp.invalid", "MISP_API_KEY": "k"}
   return (
-    patch.object(misp_export, "tenant_export_binding", return_value=("tenant", None)),
     patch.object(misp_export, "get_misp_export_config", return_value=cfg),
     patch.object(misp_export, "PyMISP", side_effect=AssertionError("must not contact MISP")),
     patch.object(misp_export, "emit_export_status_event",
@@ -236,8 +235,8 @@ def _push_patches():
 class TestPushWithNothingToExport:
 
   def _push(self, fixture, pass_nr):
-    binding, config, pymisp, emit, write = _push_patches()
-    with binding, config, pymisp, emit, write:
+    config, pymisp, emit, write = _push_patches()
+    with config, pymisp, emit, write:
       return fixture.Plugin.export_misp(fixture.owner, "job-1", pass_nr, fixture.actor,
                                         fixture.tenant_id)
 
@@ -254,9 +253,9 @@ class TestPushWithNothingToExport:
   def test_the_codes_survive_the_guard(self, read_native, response_format):
     module, _ = read_native
     install(module)
-    binding, config, pymisp, emit, write = _push_patches()
+    config, pymisp, emit, write = _push_patches()
     with read_endpoint_fixture(bound=True, archived=False) as fixture, \
-         binding, config, pymisp, emit, write:
+         config, pymisp, emit, write:
       module.eng = scheduler_comms(fixture, response_format)
       body = {"job_id": "job-1", "request_actor": fixture.actor, "tenant_id": fixture.tenant_id}
       status, headers, raw, _calls = asyncio.run(request(module, "export_misp", {**body, "pass_nr": 5}))

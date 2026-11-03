@@ -127,8 +127,9 @@ class JobConfig:
   blockchain_attestation_enabled: bool = False
   start_attestation_required: bool = False
   end_attestation_required: bool = False
-  # {"backend": <version>} of the node that launched the job, so the report and
-  # exports name the scanner release that produced them.
+  # The release that produced the job: {"backend": <version>} of the launching node, plus the
+  # console and report_pipeline versions the console reported at launch (each omitted when not
+  # sent), so the report and exports name the scanner release.
   redmesh_release: dict = None
   # The signed engagement the job ran under (RM-095): its id and hash. `engagement` and
   # `authorization` above are its snapshot (RM-128: the rules of engagement are gone).

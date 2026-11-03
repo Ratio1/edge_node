@@ -71,16 +71,6 @@ def _owner(opencti_config=None, job_specs=None):
       self.job_specs = updated
       return updated
 
-    def _get_tenant_integration_config(self, tenant_id, integration_id):
-      # RM-108 phase 5: a bound job with no stored tenant record exports nowhere, so this
-      # fixture's tenant needs its own record on file -- the same effective config as node-level,
-      # since these tests are about export behavior, not tenant destination resolution.
-      if integration_id == "opencti":
-        return {"config": dict(self.cfg_opencti_export)}
-      if integration_id == "stix":
-        return {"config": dict(self.cfg_stix_export)}
-      return None
-
     def chainstore_hget(self, hkey, key):
       return records.get((hkey, key))
 
@@ -154,6 +144,9 @@ class TestOpenCtiExport(unittest.TestCase):
     uploaded = kwargs["files"]["0"][1].decode("utf-8")
     self.assertNotIn("10.0.0.1", uploaded)
     self.assertIn('"type": "bundle"', uploaded)
+    # RM-139: the uploaded report names the job's tenant, for filtering in OpenCTI.
+    report = next(obj for obj in json.loads(uploaded)["objects"] if obj["type"] == "report")
+    self.assertIn(f"redmesh:tenant_id={owner.job_specs['execution_binding']['tenant_id']}", report["labels"])
     emit_status.assert_called_once()
     self.assertEqual(emit_status.call_args.kwargs["adapter_type"], "opencti")
 

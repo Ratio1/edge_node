@@ -644,8 +644,13 @@ def get_job_report(owner, job_id: str, cid: str, *, checked_job, snapshot_mode="
   return result
 
 
-def get_job_audit(owner, limit: int = 100, *, checked_jobs, snapshot_mode="tenant_bound"):
-  """The caller supplies audit-authorized jobs; filter copied events before totals and limits."""
+def get_job_audit(owner, limit: int = 100, *, checked_jobs, snapshot_mode="tenant_bound", tenant_id=None):
+  """The caller supplies audit-authorized jobs; filter copied events before totals and limits.
+
+  `tenant_id` additionally admits that tenant's `launch_refused` rows, which belong to no job. The
+  deque is shared by all tenants, so this is safe only because the caller already admitted
+  `audit:view` on exactly that tenant.
+  """
   validate_snapshot_mode(snapshot_mode)
   jobs = _checked_jobs_snapshot(checked_jobs, snapshot_mode)
   permitted = {job["job_id"] for job in jobs.values()}
@@ -660,6 +665,9 @@ def get_job_audit(owner, limit: int = 100, *, checked_jobs, snapshot_mode="tenan
       copied = deepcopy(entry)
       if (isinstance(copied, dict) and isinstance(copied.get("job_id"), str)
           and copied["job_id"] in permitted):
+        result.append(copied)
+      elif (tenant_id and isinstance(copied, dict) and copied.get("event") == "launch_refused"
+            and copied.get("tenant_id") == tenant_id):
         result.append(copied)
     return {"audit_log": result[-limit:] if limit > 0 else result, "total": len(result)}
   except Exception:

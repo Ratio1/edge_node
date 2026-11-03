@@ -135,6 +135,29 @@ class _DeeployJobMixin:
 
     return result
 
+  def commit_deployment_revision(self, operation, pipeline):
+    """Ask dAuth to publish an exact ready revision and its bound secrets.
+
+    The coordinator signs public metadata only. dAuth obtains the secret bundle
+    by its immutable plan reference; neither it nor restoration values are read
+    into coordinator memory. Repeating the same operation repairs partial writes.
+    """
+    expected = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
+                    operation_id=operation["operation_id"], coordinator=operation["coordinator"],
+                    deleted=False)
+    pointer = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=expected["job_id"])
+    # R1FS wraps each upload in a new folder CID. Reuse a published pointer
+    # after partial finalization; dAuth still verifies its signature and content.
+    if not isinstance(pointer, dict) or any(pointer.get(key) != value for key, value in expected.items()):
+      pipeline = self.deepcopy(self.extract_invariable_data_from_pipeline(pipeline))
+      pipeline.pop("DEEPLOY_OPERATION", None)
+      cid = self._save_pipeline_to_r1fs(self._recursively_sort_pipeline_data(pipeline))
+      if not cid:
+        raise RuntimeError("Deployment metadata persistence is pending.")
+      pointer = dict(expected, pipeline_cid=cid)
+      self.bc.sign(pointer, add_data=True, use_digest=True)
+    self._deployment_secret_request("commit", operation, pointer=pointer)
+
   def _load_dauth_job_secret_bundle(self, job_id):
     return self.chainstore_hget(
       hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
@@ -221,6 +244,9 @@ class _DeeployJobMixin:
     """Commit a staged transaction by removing its superseded R1FS object."""
     if not isinstance(state, dict):
       return False
+    if state.get("dauth_reconciled"):
+      # dAuth already published; local metadata replication may still be pending.
+      return True
     staged_cid = state.get("staged_cid")
     try:
       current_cid = self._get_pipeline_from_cstore(state.get("job_id"))
@@ -241,6 +267,10 @@ class _DeeployJobMixin:
   def rollback_staged_job_pipeline_and_secrets(self, state):
     """Restore matching staged state without disturbing a newer deployment."""
     if not isinstance(state, dict):
+      return False
+    # Reconciliation publishes on dAuth. Deployment restoration belongs to the
+    # lifecycle flow; this coordinator has neither prior nor current secrets.
+    if state.get("dauth_reconciled"):
       return False
     job_id = state.get("job_id")
     staged_cid = state.get("staged_cid")
@@ -299,7 +329,10 @@ class _DeeployJobMixin:
     """
     Get all the job pipelines from CSTORE.
     """
-    return self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY)
+    records = self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY) or {}
+    return {key: value.get("pipeline_cid") if isinstance(value, dict) else value
+            for key, value in records.items()
+            if not isinstance(value, dict) or not value.get("deleted")}
 
   def get_job_pipeline_from_cstore(
     self,
@@ -328,7 +361,8 @@ class _DeeployJobMixin:
     """
     Get the pipeline from CSTORE.
     """
-    return self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
+    value = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
+    return value.get("pipeline_cid") if isinstance(value, dict) else value
   
   def get_pipeline_from_r1fs(
     self,

@@ -425,7 +425,7 @@ def test_actual_scheduler_and_real_authority_succeed_without_changing_wire_ident
   with read_endpoint_fixture(bound=bound) as fixture:
     if name == "get_misp_export_config_status":
       fixture.owner._get_misp_export_config = (
-        lambda tenant_id=None: fixture.Plugin._get_misp_export_config(fixture.owner, tenant_id))
+        lambda: fixture.Plugin._get_misp_export_config(fixture.owner))
     module.eng = scheduler_comms(fixture, response_format)
     payload = body_for(name)
     payload["request_actor"] = fixture.actor

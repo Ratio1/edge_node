@@ -234,6 +234,37 @@ class TestBrandingGates(_BrandingCase):
     self.assertEqual((self.store.writes, self.documents.puts), ([], []))
 
 
+class TestPublicBranding(_BrandingCase):
+  """The sign-in page's reads: no actor, the same answers as the actor-bound reads."""
+
+  def test_the_default_is_read_without_an_actor_or_a_write_and_no_logo_is_not_found(self):
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), EMPTY)
+    refused(self, self.plugin.download_public_branding_logo(), 404, "not_found")
+    self.assertEqual((self.store.writes, self.events), ([], []))
+
+  def test_a_set_theme_and_logo_read_as_the_actor_bound_reads_do(self):
+    raw = png()
+    data = ok(self, self.update({"logo": upload(raw), "theme": "light"}))
+    self.assertEqual(ok(self, self.plugin.get_public_branding()), data)
+    got = ok(self, self.plugin.download_public_branding_logo())
+    self.assertEqual(got, ok(self, self.download()))
+    self.assertEqual(base64.b64decode(got["content_b64"]), raw)
+
+  def test_a_tampered_file_answers_integrity_and_a_lost_one_not_found(self):
+    ok(self, self.update({"logo": upload(png())}))
+    self.documents.envelopes["doc-1"]["content_b64"] = base64.b64encode(png(size=4096)).decode("ascii")
+    refused(self, self.plugin.download_public_branding_logo(), 409, "contract_integrity")
+    del self.documents.envelopes["doc-1"]
+    refused(self, self.plugin.download_public_branding_logo(), 404, "not_found")
+
+  def test_no_namespace_means_unavailable(self):
+    self.plugin.cfg_tenancy_namespace = None
+    for name in ("get_public_branding", "download_public_branding_logo"):
+      with self.subTest(name):
+        self.assertEqual(getattr(self.Plugin, name).__http_method__, "post")
+        self.assertEqual(getattr(self.plugin, name)()["status_code"], 503)
+
+
 class TestBrandingStoredRow(unittest.TestCase):
   def test_the_validator_refuses_rows_the_operations_could_not_write(self):
     from extensions.business.cybersec.red_mesh.tenancy.super_tenant_branding import validate_super_tenant_branding

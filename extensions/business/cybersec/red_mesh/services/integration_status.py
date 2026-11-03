@@ -4,7 +4,6 @@ import os
 from datetime import datetime, timezone
 
 from ..tenancy.effects import EffectState
-from ..tenancy.integrations import status_tenant
 from .auth import credentials_missing
 from .config import (
   get_event_export_config,
@@ -12,9 +11,7 @@ from .config import (
   get_stix_export_config,
   get_suricata_correlation_config,
   get_taxii_export_config,
-  TENANT_INTEGRATION_NOT_CONFIGURED,
   get_wazuh_export_config,
-  tenant_integration_override,
 )
 from .event_builder import build_test_event
 from .soc_export_policy import (
@@ -41,35 +38,23 @@ def _utc_timestamp():
   return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _status_hkey(owner, tenant_id=None):
-  """Node history keeps its original key; a tenant's history lives beside it, never merged.
-
-  Callers pass an integration id through status_tenant() first, so the three node-level ids keep
-  the node key even under a tenant-scoped call. Existing deployment history is therefore never
-  stranded or re-attributed to whichever tenant happens to read first.
-  """
-  base = f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
-  if tenant_id is None:
-    return base
-  if not isinstance(tenant_id, str) or not tenant_id.strip() or ":" in tenant_id:
-    raise ValueError("Invalid tenant for integration status")
-  return f"{base}:{tenant_id}"
+def _status_hkey(owner):
+  """RM-139: delivery history is the deployment's, as its destinations are. Per-tenant hkeys left by
+  RM-081 are not read or written any more."""
+  return f"{getattr(owner, 'cfg_instance_id', 'redmesh')}:integrations"
 
 
-def _load_status_record(owner, integration_id, tenant_id=None):
+def _load_status_record(owner, integration_id):
   try:
-    payload = owner.chainstore_hget(
-      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)), key=integration_id)
+    payload = owner.chainstore_hget(hkey=_status_hkey(owner), key=integration_id)
   except Exception:
     return {}
   return payload if isinstance(payload, dict) else {}
 
 
-def _save_status_record(owner, integration_id, record, tenant_id=None):
+def _save_status_record(owner, integration_id, record):
   try:
-    owner.chainstore_hset(
-      hkey=_status_hkey(owner, status_tenant(integration_id, tenant_id)),
-      key=integration_id, value=record)
+    owner.chainstore_hset(hkey=_status_hkey(owner), key=integration_id, value=record)
   except Exception:
     return False
   return True
@@ -150,7 +135,7 @@ def _merge_record(base, record):
   return merged
 
 
-def _event_export_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
+def _event_export_status(owner):
   cfg = get_event_export_config(owner)
   missing_secret = cfg["SIGN_PAYLOADS"] and not _has_env_secret(cfg["HMAC_SECRET_ENV"])
   configured = bool(cfg["ENABLED"]) and not missing_secret
@@ -171,9 +156,9 @@ def _event_export_status(owner, tenant_id=None):  # node-level: tenant_id is alw
   )
 
 
-def _wazuh_status(owner, tenant_id=None):
-  cfg = get_wazuh_export_config(owner, tenant_id)
-  readiness = wazuh_readiness(owner, tenant_id)
+def _wazuh_status(owner):
+  cfg = get_wazuh_export_config(owner)
+  readiness = wazuh_readiness(owner)
   mode = readiness["mode"]
   host = readiness["host"]
   return _base_status(
@@ -200,7 +185,7 @@ def _wazuh_status(owner, tenant_id=None):
   )
 
 
-def _suricata_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
+def _suricata_status(owner):
   cfg = get_suricata_correlation_config(owner)
   return _base_status(
     "suricata",
@@ -216,7 +201,7 @@ def _suricata_status(owner, tenant_id=None):  # node-level: tenant_id is always 
   )
 
 
-def _stix_status(owner, tenant_id=None):  # node-level: tenant_id is always None here
+def _stix_status(owner):
   cfg = get_stix_export_config(owner)
   return _base_status(
     "stix",
@@ -232,8 +217,8 @@ def _stix_status(owner, tenant_id=None):  # node-level: tenant_id is always None
   )
 
 
-def _opencti_status(owner, tenant_id=None):
-  cfg = get_opencti_export_config(owner, tenant_id)
+def _opencti_status(owner):
+  cfg = get_opencti_export_config(owner)
   host = _redacted_url_host(cfg["URL"])
   credentials_error = credentials_missing(cfg)
   configured = bool(cfg["ENABLED"]) and bool(host) and credentials_error is None
@@ -254,8 +239,8 @@ def _opencti_status(owner, tenant_id=None):
   )
 
 
-def _taxii_status(owner, tenant_id=None):
-  cfg = get_taxii_export_config(owner, tenant_id)
+def _taxii_status(owner):
+  cfg = get_taxii_export_config(owner)
   host = _redacted_url_host(cfg["SERVER_URL"])
   credentials_error = credentials_missing(cfg)
   configured = (
@@ -419,27 +404,16 @@ def _public_config_item(integration_id, base):
   }
 
 
-def get_public_integration_config(owner, tenant_id=None):
+def get_public_integration_config(owner):
   """Configuration/readiness only: no history, counts, cooldown or stored errors.
 
-  A scoped call resolves the four tenant ids from that tenant's records; the three node-level ids
-  keep coming from node config, so what they report is identical either way and the payload's key
-  set still equals _STATUS_BUILDERS.
+  RM-139: the deployment's effective config for every caller; a tenant reads the same readiness,
+  because every job exports to the deployment's destinations. An unreadable STA override raises.
   """
   integrations = {}
   for integration_id, builder in _STATUS_BUILDERS.items():
     # Detached per integration; never _merge_record and never _load_status_record.
-    # status_tenant() here is a guard, not a behaviour: the three node-level builders ignore the
-    # argument today (pinned by test_node_level_builders_ignore_the_tenant), so passing the raw
-    # tenant would currently be equivalent. It stays so that a builder which starts reading it
-    # cannot silently acquire tenant scope it was never granted.
-    scoped_tenant = status_tenant(integration_id, tenant_id)
-    base = builder(owner, scoped_tenant)
-    if scoped_tenant is not None and not tenant_integration_override(owner, scoped_tenant, integration_id):
-      # A tenant with no record of its own pushes nowhere (tenant_export_binding), so the node's
-      # destination merged in by the builder must not read as this tenant's readiness (RM-093).
-      base = {**base, "configured": False, "last_error_class": None}
-    integrations[integration_id] = _public_config_item(integration_id, base)
+    integrations[integration_id] = _public_config_item(integration_id, builder(owner))
   if set(integrations) != set(_STATUS_BUILDERS):
     raise IntegrationConfigUnavailable("integrations")
   generated_at = _utc_timestamp()
@@ -452,7 +426,7 @@ def get_public_integration_config(owner, tenant_id=None):
   }
 
 
-def get_integration_status(owner, tenant_id=None):
+def get_integration_status(owner):
   """Historical producer: configuration merged with persisted delivery outcomes.
 
   Deliberately retained with no production caller as of RM-026 I1a.3c.8. The public
@@ -463,9 +437,7 @@ def get_integration_status(owner, tenant_id=None):
   """
   integrations = {}
   for integration_id, builder in _STATUS_BUILDERS.items():
-    base = builder(owner, status_tenant(integration_id, tenant_id))
-    integrations[integration_id] = _merge_record(
-      base, _load_status_record(owner, integration_id, tenant_id))
+    integrations[integration_id] = _merge_record(builder(owner), _load_status_record(owner, integration_id))
   return {
     "schema_version": INTEGRATION_STATUS_SCHEMA_VERSION,
     "generated_at": _utc_timestamp(),
@@ -474,11 +446,11 @@ def get_integration_status(owner, tenant_id=None):
 
 
 def record_integration_status(owner, integration_id, *, outcome, event_id=None,
-                              artifact_cid=None, error_class=None, dry_run=False, tenant_id=None):
+                              artifact_cid=None, error_class=None, dry_run=False):
   if integration_id not in _STATUS_BUILDERS:
     return False
   now = _utc_timestamp()
-  record = _load_status_record(owner, integration_id, tenant_id)
+  record = _load_status_record(owner, integration_id)
   previous_error_class = record.get("last_error_class")
   if dry_run:
     record["last_dry_run_at"] = now
@@ -498,16 +470,15 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
     error_class=record.get("last_error_class") or error_class,
     previous_error_class=previous_error_class,
     now=now,
-    tenant_id=tenant_id,
   )
   if event_id:
     record["last_event_id"] = event_id
   if artifact_cid:
     record["last_artifact_cid"] = artifact_cid
-  return _save_status_record(owner, integration_id, record, tenant_id)
+  return _save_status_record(owner, integration_id, record)
 
 
-def test_event_export(owner, integration_id="event_export", *, ledger=None, tenant_id=None):
+def test_event_export(owner, integration_id="event_export", *, ledger=None):
   """Probe or deliver a synthetic event. `ledger` records what actually left the node."""
   integration_id = str(integration_id or "event_export").strip().lower()
   if integration_id not in _STATUS_BUILDERS:
@@ -516,13 +487,6 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None, tena
       "error": "unknown_integration",
       "integration_id": integration_id,
     }
-
-  scoped_tenant = status_tenant(integration_id, tenant_id)
-  if scoped_tenant is not None and not tenant_integration_override(owner, scoped_tenant, integration_id):
-    # A tenant with no record of its own has no destination to test. Probing would reach the
-    # node's destination, with the node's credentials, on the tenant's behalf (RM-093).
-    return {"status": "not_configured", "integration_id": integration_id,
-            "error": TENANT_INTEGRATION_NOT_CONFIGURED}
 
   if integration_id == "wazuh":
     cfg = get_event_export_config(owner)
@@ -536,8 +500,7 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None, tena
     if ledger is not None:
       # A real send follows: dry_run only affects the status stamp, not the transmission.
       ledger.checkpoint()
-    delivered = deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True,
-                                      tenant_id=tenant_id)
+    delivered = deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
     # deliver_redmesh_event returns "sent" | "disabled" | "error" -- never "skipped". Gating on
     # "not skipped" recorded a delivery when the integration was disabled and nothing left the node.
     if ledger is not None and isinstance(delivered, dict) and delivered.get("status") == "sent":
@@ -546,11 +509,11 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None, tena
 
   if integration_id == "opencti":
     from .opencti_export import probe_opencti
-    return probe_opencti(owner, tenant_id)
+    return probe_opencti(owner)
 
   if integration_id == "taxii":
     from .taxii_export import probe_taxii
-    return probe_taxii(owner, tenant_id)
+    return probe_taxii(owner)
 
   if integration_id == "suricata":
     # Suricata correlation is pull-based — the operator uploads EVE JSONL
@@ -580,7 +543,6 @@ def test_event_export(owner, integration_id="event_export", *, ledger=None, tena
     outcome="success",
     event_id=event["event_id"],
     dry_run=True,
-    tenant_id=tenant_id,
   )
   return {
     "status": "ok",

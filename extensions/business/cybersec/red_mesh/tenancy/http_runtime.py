@@ -201,8 +201,10 @@ _TYPED_READ_ERRORS = {
   # can act on; collapsed to `unavailable` it read as an outage. MISP push resolves the pass through
   # the same checked resolver, so it answers the same codes.
   **{path: {(409, "no_completed_passes"), (404, "pass_not_found")}
-     for path in ("/export_misp", "/export_misp_json", "/export_stix_json",
-                  "/export_siem_events_json")},
+     for path in ("/export_misp_json", "/export_stix_json", "/export_siem_events_json")},
+  # RM-139: a manual push waits while the automatic push for the job is in flight or queued.
+  "/export_misp": {(409, "no_completed_passes"), (404, "pass_not_found"),
+                   (409, "misp_auto_export_in_flight")},
 }
 _TYPED_READ_PAIRS = frozenset(pair for pairs in _TYPED_READ_ERRORS.values() for pair in pairs)
 READ_LIST_CAPSULE = "__redmesh_checked_job_list_v1"

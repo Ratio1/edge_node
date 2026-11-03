@@ -91,7 +91,7 @@ def _stub_launch_actor(plugin, kind="network", target="192.0.2.10", engagement=_
   from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView, TenantMembership
   account = AccountView("tester", True, tenant_memberships=(TenantMembership("super_tenant_admin", None),))
 
-  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None):
+  def admit(actor, tenant_id=None, engagement_id=None, engagement_asset_id=None, selected_peers=None, **_audit):
     # Through the actor seam, as the real admission does, so a suite that swaps the account in
     # (attribution tests) is admitted as that account.
     resolved, denial = plugin._resolve_launch_actor(actor)
@@ -384,9 +384,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self._launch(plugin)
     from extensions.business.cybersec.red_mesh.models import JobConfig
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.13.1"})
+    self.assertEqual(config_dict["redmesh_release"], {"backend": "0.13.2"})
     restored = JobConfig.from_dict(config_dict).to_dict()
-    self.assertEqual(restored["redmesh_release"], {"backend": "0.13.1"})
+    self.assertEqual(restored["redmesh_release"], {"backend": "0.13.2"})
 
   def test_launch_records_the_console_and_report_pipeline_it_was_sent(self):
     """RM-103 item 12: the release names all three deployables. Only the
@@ -1589,12 +1589,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     result = self._launch_network(plugin)
 
-    # RM-084 P6: every launch is tenant-bound, and a bound job exports only to its tenant's own
-    # destination (RM-081). This tenant has none, so the required export is unavailable for that
-    # reason -- before the deployment credentials are ever consulted.
+    # RM-139: every launch gates on the deployment's effective wazuh destination, whose credential
+    # is missing here, so the required export is unavailable for that reason.
     self.assertEqual(result["error"], "soc_export_required_unavailable")
     self.assertEqual(result["integration_id"], "wazuh")
-    self.assertEqual(result["error_class"], "tenant_integration_not_configured")
+    self.assertEqual(result["error_class"], "missing_token")
     plugin.r1fs.add_json.assert_not_called()
     plugin.chainstore_hset.assert_not_called()
 
@@ -1632,11 +1631,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     result = self._launch_webapp(plugin)
 
-    # RM-084 P6: every launch is tenant-bound, and a bound job exports only to its tenant's own
-    # destination (RM-081). This tenant has none, so the required export is unavailable for that
-    # reason -- before the deployment credentials are ever consulted.
+    # RM-139: every launch gates on the deployment's effective wazuh destination, whose credential
+    # is missing here, so the required export is unavailable for that reason.
     self.assertEqual(result["error"], "soc_export_required_unavailable")
-    self.assertEqual(result["error_class"], "tenant_integration_not_configured")
+    self.assertEqual(result["error_class"], "missing_credentials")
     plugin.r1fs.add_json.assert_not_called()
     plugin.chainstore_hset.assert_not_called()
 

@@ -87,3 +87,56 @@ Overlapping creates handled by one manager process are also rejected, but
 ChainStore has no atomic cross-manager claim; independent managers must not
 accept concurrent creates for the same job ID until a distributed claim or
 generation-aware protocol exists.
+
+## Reconciliation through dAuth
+
+Updates and scale-up call the SDK's `reconcile_dauth_job_secrets` client. A registered
+dAuth server authenticates the protocol oracle, checks the expected pipeline CID,
+reuses the existing secret-selection and merge rules, and stores the complete
+bundle bound to the redacted pipeline CID. The response contains redacted configs
+and their CID; the coordinator does not fetch the previous or merged bundle.
+The existing `DAUTH_JOB_SECRETS` and pipeline registry formats remain in use.
+
+Reconciliation publishes before worker dispatch. Deployment failure does not
+restore the previous metadata or secrets in this path; deployment restoration is
+left to the lifecycle flow. The SDK does not retry a transport failure because the
+write may already have succeeded. Inspect the current metadata and workers before
+retrying an uncertain request. This change does not introduce distributed locking
+or revision history, or fix pre-existing metadata-only CID drift.
+
+Release SDK 3.5.58 and Core 7.7.332 (the plugin blockchain wrapper forwarders),
+then deploy the dAuth endpoint before using this update path on coordinators.
+An SDK upgrade alone does not expose the client through older Core wrappers.
+dAuth performs the existing best-effort cleanup of the previous local R1FS
+pipeline object after publishing reconciliation. No deployment restoration is
+added. New job creation keeps its existing staging flow.
+
+## Local Replica Reads
+
+Worker secret requests read local CStore metadata and bundles without synchronizing
+namespaces over the network. Signature, nonce, job identity, runner placement,
+revision, and locally observed revocation checks still apply. A missing local
+record cannot be fetched during the request, and a remote revocation is enforced
+only after it reaches the local replica. Existing dAuth maintenance still refreshes
+current and revision secret namespaces; it does not refresh every deployment
+metadata namespace.
+
+Deployment admission, polling, and the coordinator worker also use local persisted
+or pushed operation snapshots and node reports. They do not run namespace repair.
+An oracle missing an operation returns the existing synchronizing response; a
+missed terminal node report is not automatically pulled later.
+
+Lifecycle actions through `reconcile_job_secrets` also read local replicas without
+namespace repair, including preparation status and cleanup. Revocation markers and
+newer operation snapshots are enforced once they reach the receiving custodian;
+the request does not establish globally fresh state. Required local records that
+are missing still fail or report incomplete preparation. Plan validation, durable
+publication, and peer acknowledgments for writes remain in place; cleanup stays
+pending until its writes are confirmed.
+
+The first update of an existing pipeline does not require a current dAuth bundle
+when its published configuration contains no secret placeholders. dAuth extracts
+the available values into a temporary bundle and stages immutable target and
+restoration revisions through the normal custody path. Existing bundles still
+require the exact current CID and unversioned state; missing bundles needed to
+resolve placeholders remain an error.

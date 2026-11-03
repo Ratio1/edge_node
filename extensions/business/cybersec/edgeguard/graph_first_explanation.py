@@ -555,6 +555,17 @@ def build_evidence_ir(
   )
 
 
+def node_alias_map(query_result_evidence: Any, evidence_catalog: Any) -> dict[str, str]:
+  """The digest node ref (`N0`,
+  `N1`, ...) for every node that reaches `build_result_digest`'s own alias
+  assignment, keyed by the packet node id (`EvidenceNode.source_id`) so a
+  caller can join a packet-derived node to its digest ref -- one place
+  assigns aliases, this just exposes that assignment. A node absent from
+  `evidence_catalog` (never reaches the digest) has no entry here."""
+  ir = build_evidence_ir(query_result_evidence, evidence_catalog)
+  return {item.source_id: item.alias for item in ir.nodes}
+
+
 def _slot_band(key: str, value: Any, projected: bool) -> int:
   normalized = key.casefold()
   if projected or normalized in IDENTITY_KEYS:

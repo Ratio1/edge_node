@@ -1,7 +1,8 @@
 """RM-084 P1: every export endpoint (E1) is tenant-scoped with no unscoped half.
 
-One matrix over all sixteen endpoints, through real admission against the stored account, tenant
-and job: the caller's tenant is required (400), a job owned by another tenant is indistinguishable
+One matrix over fifteen endpoints, through real admission against the stored account, tenant
+and job (RM-139 moved the sixteenth, `test_event_export`, to the full-portfolio STA:
+test_effect_admission_b1 covers it): the caller's tenant is required (400), a job owned by another tenant is indistinguishable
 from a missing one (404), and a role without the operation is refused (403) before any artifact or
 destination is touched.
 """
@@ -13,8 +14,7 @@ from .read_endpoint_fixtures import read_endpoint_fixture
 from .contract_fixture import contract_terms
 
 # (endpoint, extra kwargs). Effects and the MISP/STIX/SIEM downloads need reports:export; the
-# per-job status reads need reports:view; the job-less reads and the synthetic delivery need
-# reports:export.
+# per-job status reads need reports:view; the job-less reads need reports:export.
 JOB_EXPORTS = (
   ("export_misp", {}), ("export_misp_json", {}), ("export_stix_bundle", {}),
   ("export_stix_json", {}), ("export_siem_events_json", {}),
@@ -26,7 +26,7 @@ JOB_STATUS_READS = (
   ("get_opencti_export_status", {}), ("get_taxii_export_status", {}),
 )
 JOBLESS = (
-  ("get_integration_status", {}), ("get_misp_export_config_status", {}), ("test_event_export", {}),
+  ("get_integration_status", {}), ("get_misp_export_config_status", {}),
 )
 JOB_ENDPOINTS = JOB_EXPORTS + JOB_STATUS_READS
 ALL = JOB_ENDPOINTS + JOBLESS

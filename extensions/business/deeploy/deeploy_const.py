@@ -249,6 +249,7 @@ JOB_APP_TYPES_ALL = (
 DEEPLOY_FORBIDDEN_SIGNATURES = ['ADMIN_CONTAINER_APP_RUNNER']
 
 DEEPLOY_CREATE_REQUEST = {
+  "request_id": "CLIENT_GENERATED_STABLE_UUID",
   "app_alias" : "some_app_name", 
   "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
   "project_name": "human-readable-project-name",
@@ -556,6 +557,7 @@ DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
 ###################################################################################################################
 # Multi-plugin request format (NEW - recommended for multiple plugins)
 DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
+  "request_id": "CLIENT_GENERATED_STABLE_UUID",
   # Pipeline-level configuration
   "app_alias" : "EdgeNodeApiTest",
   "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
@@ -621,6 +623,8 @@ DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
 
 ###################################################################################################################
 DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST = {
+  "request_id": "CLIENT_GENERATED_STABLE_UUID",
+  "expected_revision": 1,
   "job_id" : 1, # The job ID to extend the workers for
   "app_id" : "app_id_returned_by_get_apps_or_create_pipeline", # interchange app_id with job_id
   "target_nodes" : [
@@ -665,13 +669,12 @@ DEEPLOY_NODE_SPECS_REQUEST = {
 }
 
 DEEPLOY_DELETE_REQUEST = {
-  "app_id" : "target_app_name_id_returned_by_get_apps_or_create_pipeline",
-  "target_nodes" : [
-    "0xai_target_node_1",
-    "0xai_target_node_2",
-  ],
-  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
-}  
+  "request_id": "CLIENT_GENERATED_STABLE_UUID",
+  "expected_revision": 1,
+  "job_id": "DELIVERED_BY_UI_FROM_SC",
+  "app_id": "target_app_name_id_returned_by_get_apps_or_create_pipeline",
+  "nonce": hex(int(time() * 1000)),
+}
 
 DEEPLOY_INSTANCE_COMMAND_REQUEST = {
   "app_id" : "target_app_name_id_returned_by_get_apps_or_create_pipeline",

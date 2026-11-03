@@ -22,6 +22,7 @@ from ratio1.const.base import dAuth
 
 
 DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
+DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY = "DAUTH_JOB_SECRET_REVISIONS"
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
 DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
 DAUTH_SECRET_REVEAL_ACTION = "reveal_job_secrets"
@@ -174,7 +175,7 @@ class _DauthMixin(object):
         )
     return result, msg
 
-  def _verify_signed_dauth_body(self, body):
+  def _verify_signed_dauth_body(self, body, log_hash_sign_fails=True):
     if not isinstance(body, dict):
       raise ValueError("Invalid request body.")
 
@@ -190,7 +191,9 @@ class _DauthMixin(object):
     if requester_eth.lower() != requester_send_eth.lower():
       raise ValueError("Sender ETH address and recovered ETH address do not match.")
 
-    verify_data = self.bc.verify(body, return_full_info=True)
+    verify_data = self.bc.verify(
+      body, return_full_info=True, log_hash_sign_fails=log_hash_sign_fails,
+    )
     if not verify_data.valid:
       raise ValueError("Invalid request signature: {}".format(verify_data.message))
 
@@ -251,11 +254,13 @@ class _DauthMixin(object):
       key=job_id,
     )
 
+  def _load_dauth_pipeline_cid(self, job_id):
+    """Read the active CID from the versioned canonical deployment pointer."""
+    record = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
+    return record.get("pipeline_cid") if isinstance(record, dict) else record
+
   def _load_dauth_job_pipeline_record(self, job_id):
-    cid = self.chainstore_hget(
-      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
-      key=job_id,
-    )
+    cid = self._load_dauth_pipeline_cid(job_id)
     if not cid:
       return None, None
     return cid, self.r1fs.get_json(cid, show_logs=False)
@@ -264,10 +269,20 @@ class _DauthMixin(object):
     _, pipeline = self._load_dauth_job_pipeline_record(job_id)
     return pipeline
 
-  def _load_current_dauth_secret_bundle(self, job_id, pipeline_cid, pipeline):
+  def _load_current_dauth_secret_bundle(self, job_id, pipeline_cid, pipeline, require_unversioned=False):
+    """Load the exact current CID's secrets, binding pre-CID records if needed.
+
+    ``require_unversioned`` rejects lifecycle bundles before that binding can
+    remove their version metadata. Wallet reveal retains its existing behavior.
+    """
     secret_bundle = self._load_dauth_job_secret_bundle(job_id)
     if not isinstance(secret_bundle, dict):
       raise ValueError(f"No dAuth secret bundle found for job {job_id}.")
+    if require_unversioned and (
+      any(key in secret_bundle for key in ("revision", "deployment_revision", "operation_id"))
+      or secret_bundle.get("deleted") or secret_bundle.get("revoked")
+    ):
+      raise ValueError("Secret revision is required for this job.")
     if DAUTH_SECRET_PIPELINE_CID_KEY not in secret_bundle:
       secret_bundle = self._bind_legacy_secret_bundle(
         job_id=job_id,
@@ -277,10 +292,7 @@ class _DauthMixin(object):
       )
     if secret_bundle.get(DAUTH_SECRET_PIPELINE_CID_KEY) != pipeline_cid:
       raise ValueError(f"dAuth secret bundle generation mismatch for job {job_id}.")
-    current_pipeline_cid = self.chainstore_hget(
-      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
-      key=job_id,
-    )
+    current_pipeline_cid = self._load_dauth_pipeline_cid(job_id)
     if current_pipeline_cid != pipeline_cid:
       raise ValueError(f"dAuth pipeline generation changed for job {job_id}.")
     return secret_bundle
@@ -425,10 +437,7 @@ class _DauthMixin(object):
       raise ValueError(
         f"Legacy dAuth secret bundle is incomplete for job {job_id}."
       ) from exc
-    current_pipeline_cid = self.chainstore_hget(
-      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
-      key=job_id,
-    )
+    current_pipeline_cid = self._load_dauth_pipeline_cid(job_id)
     if current_pipeline_cid != pipeline_cid:
       raise ValueError(f"dAuth pipeline generation changed for job {job_id}.")
     bound_bundle = {
@@ -448,10 +457,7 @@ class _DauthMixin(object):
     job_id = self._normalize_dauth_job_id(body.get("job_id"))
     if not isinstance(body.get("job_secrets"), dict):
       raise ValueError("job_secrets must be a dictionary.")
-    pipeline_cid = self.chainstore_hget(
-      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
-      key=job_id,
-    )
+    pipeline_cid = self._load_dauth_pipeline_cid(job_id)
     if not pipeline_cid:
       raise ValueError(f"No persisted pipeline found for job {job_id}.")
     secret_bundle = self._build_secret_bundle_from_request(
@@ -467,39 +473,148 @@ class _DauthMixin(object):
       self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
     }
 
+  def process_dauth_reconcile_secrets_request(self, body):
+    """Merge and store secrets locally; return only redacted configs and CID."""
+    requester, requester_eth = self._verify_signed_dauth_body(body, log_hash_sign_fails=False)
+    nonce = self._validate_dauth_secret_request_nonce(body)
+    if not self._is_protocol_oracle_eth(requester_eth):
+      raise ValueError("Secret reconciliation requires a protocol oracle.")
+    if "operation" in body:
+      return self.process_dauth_deployment_secrets_request(body, requester, nonce)
+    job_id = self._normalize_dauth_job_id(body.get("job_id"))
+    pipeline_cid, prior_pipeline = self._load_dauth_job_pipeline_record(job_id)
+    if (
+      not pipeline_cid or not isinstance(prior_pipeline, dict)
+      or pipeline_cid != body.get("expected_pipeline_cid")
+    ):
+      raise ValueError("Persisted pipeline changed or is unavailable.")
+    if prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision"):
+      raise ValueError("Versioned jobs require lifecycle secret reconciliation.")
+    configs = body.get("pipeline_configs")
+    if not isinstance(configs, dict) or not configs:
+      raise ValueError("Target pipeline configs are required.")
+    for config in configs.values():
+      if (
+        not isinstance(config, dict)
+        or str(config.get("DEEPLOY_SPECS", {}).get("job_id")) != job_id
+        or config.get("NAME") != prior_pipeline.get("NAME")
+        or str(config.get("OWNER", "")).lower() != str(prior_pipeline.get("OWNER", "")).lower()
+      ):
+        raise ValueError("Pipeline job identity does not match persisted metadata.")
+    aliases = {}
+    for current, source in body.get("identity_aliases", []):
+      if len(current) != 2 or len(source) != 2:
+        raise ValueError("Invalid scale-up identity alias.")
+      aliases[tuple(current)] = tuple(source)
+    prior_bundle = self._load_dauth_job_secret_bundle(job_id)
+    if prior_bundle is not None:
+      prior_bundle = self._load_current_dauth_secret_bundle(job_id, pipeline_cid, prior_pipeline)
+    configs, bundle = self._redact_pipeline_configs_and_build_secret_bundle(
+      job_id, configs, prior_bundle, prior_pipeline=prior_pipeline,
+      current_identity_aliases=aliases,
+    )
+    if self._get_pipeline_from_cstore(job_id) != pipeline_cid:
+      raise ValueError("Persisted pipeline changed during secret reconciliation.")
+    state = self.stage_job_pipeline_and_secrets(
+      pipeline=next(iter(configs.values())), job_id=job_id, secret_bundle=bundle,
+    )
+    # Publication is final in this path; cleanup stays on the node that has
+    # the bound bundle, without waiting for coordinator replica convergence.
+    self.commit_staged_job_pipeline_and_secrets(state)
+    return {
+      "status": "success", "job_id": job_id,
+      self.const.BASE_CT.dAuth.DAUTH_NONCE: nonce,
+      "pipeline_configs": configs, "pipeline_cid": state["staged_cid"],
+    }
+
+  def _load_unversioned_runner_secret_bundle(self, job_id, requester):
+    """Authorize a pre-lifecycle pipeline against its current CID and placement.
+
+    Only the original raw-CID metadata format qualifies. Read local metadata and
+    protected bundles, reject versioned/tombstoned records, and
+    retain the existing exact-CID binding and generation-change checks.
+    """
+    pipeline_cid = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
+    if not isinstance(pipeline_cid, str) or not pipeline_cid:
+      raise ValueError("Secret revision is required or the existing pipeline is unavailable.")
+    pipeline = self.r1fs.get_json(pipeline_cid, show_logs=False)
+    if not isinstance(pipeline, dict):
+      raise RuntimeError("Existing pipeline configuration is unavailable.")
+    specs = pipeline.get("DEEPLOY_SPECS", {})
+    if (not isinstance(specs, dict) or str(specs.get("job_id")) != job_id
+        or "secret_revision" in specs or specs.get("revision", 0) != 0
+        or pipeline.get("DEEPLOY_OPERATION") is not None):
+      raise ValueError("Secret revision is required for this pipeline.")
+    nodes = [self._normalize_node_address_for_compare(node) for node in self._pipeline_runner_nodes(pipeline)]
+    if self._normalize_node_address_for_compare(requester) not in nodes:
+      raise ValueError("Sender is not running the existing job.")
+    bundle = self._load_current_dauth_secret_bundle(
+      job_id, pipeline_cid, pipeline, require_unversioned=True,
+    )
+    if bundle.get("job_id") != job_id:
+      raise ValueError("Existing secret bundle job identity mismatch.")
+    # A versioned pointer must not become eligible merely by retaining its CID.
+    if self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id) != pipeline_cid:
+      raise RuntimeError("Existing pipeline generation changed during secret resolution.")
+    return bundle
+
   def process_dauth_get_secret_request(self, body):
     requester, _ = self._verify_signed_dauth_body(body)
     request_nonce = self._validate_dauth_secret_request_nonce(body)
     job_id = self._normalize_dauth_job_id(body.get("job_id"))
 
-    pipeline_cid, pipeline = self._load_dauth_job_pipeline_record(job_id)
-    runner_nodes = self._pipeline_runner_nodes(pipeline)
-    normalized_requester = self._normalize_node_address_for_compare(requester)
-    normalized_runner_nodes = [
-      self._normalize_node_address_for_compare(node)
-      for node in runner_nodes
-    ]
-    if normalized_requester not in normalized_runner_nodes:
-      raise ValueError(f"Sender {requester} is not running job {job_id}.")
-
-    secret_bundle = self._load_current_dauth_secret_bundle(
-      job_id=job_id,
-      pipeline_cid=pipeline_cid,
-      pipeline=pipeline,
-    )
+    if "revision" not in body:
+      secret_bundle = self._load_unversioned_runner_secret_bundle(job_id, requester)
+      revision = None
+    else:
+      revision = body["revision"]
+      secret_bundle = self._load_revision_runner_secret_bundle(job_id, revision, requester)
+      revision = revision.strip()
     encrypted_secret_bundle = self.bc.encrypt_str(
       str_data=self.json_dumps(secret_bundle),
       str_recipient=requester,
     )
     if not isinstance(encrypted_secret_bundle, str) or not encrypted_secret_bundle:
       raise ValueError(f"Failed to encrypt dAuth secrets for job {job_id}.")
-
-    return {
+    result = {
       "status": "success",
       "job_id": job_id,
       self.const.BASE_CT.dAuth.DAUTH_NONCE: request_nonce,
       "encrypted_secret_bundle": encrypted_secret_bundle,
     }
+    if revision is not None:
+      result["revision"] = revision
+    return result
+
+  def _load_revision_runner_secret_bundle(self, job_id, revision, requester):
+    """Authorize one exact immutable revision without a current-bundle fallback."""
+    if not isinstance(revision, str) or not revision.strip():
+      raise ValueError("Secret revision is required.")
+    revision = revision.strip()
+    key = "{}|{}".format(job_id, revision)
+    revoked_key = key + "|revoked"
+    if self.chainstore_hget(hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=revoked_key):
+      raise ValueError("dAuth secret revision has been revoked.")
+    secret_bundle = self.chainstore_hget(
+      hkey=DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY, key=key,
+    )
+    if isinstance(secret_bundle, dict) and secret_bundle.get("revoked"):
+      raise ValueError("dAuth secret revision has been revoked.")
+    if secret_bundle is None:
+      raise RuntimeError("No dAuth secret bundle found for the requested revision.")
+    if not isinstance(secret_bundle, dict):
+      raise ValueError("Invalid dAuth secret revision record.")
+    if secret_bundle.get("job_id") != job_id or secret_bundle.get("revision") != revision:
+      raise ValueError("dAuth secret bundle revision identity mismatch.")
+    pipelines = secret_bundle.get("pipelines")
+    if not isinstance(pipelines, dict):
+      raise ValueError("dAuth secret revision has no authorized pipeline plan.")
+    normalized_requester = self._normalize_node_address_for_compare(requester)
+    if normalized_requester not in [
+      self._normalize_node_address_for_compare(node) for node in pipelines
+    ]:
+      raise ValueError("Sender is not authorized for the requested job revision.")
+    return {key: value for key, value in secret_bundle.items() if key != "pipelines"}
 
   def process_dauth_reveal_secret_request(self, body):
     requester, requester_eth = self._verify_signed_dauth_body(body)
@@ -555,31 +670,33 @@ class _DauthMixin(object):
     )
     return
   
-  def get_comms_host_pair(self):
+  def get_comms_hosts(self):
     """
-    Returns a round-robin key value from the seed_key list.
+    Return broker candidates starting with the next round-robin primary.
+
+    Returns
+    -------
+    list of str
+      Unique hosts in seed order, rotated to distribute primary allocations.
+      An empty seed falls back to the configured single host.
     """
     key = self.cfg_comms_host_key
     seed_key = self.cfg_comms_host_seed_key
     if not hasattr(self, "mqtt_seed_index"):
       self.mqtt_seed_index = -1
-    return_value = None
-
-    raw_comms_seed = self.os_environ.get(seed_key, "")
-    comms_seed = raw_comms_seed.split(" ")
-
+    raw_comms_seed = self.os_environ.get(seed_key, "") or ""
+    comms_seed = list(dict.fromkeys(raw_comms_seed.split()))
 
     if not comms_seed:
-      return_value = self.os_environ.get(key, None)
+      return_value = (self.os_environ.get(key, "") or "").strip()
       self.P(f"No {seed_key} found, returning env {key}: {return_value}", color='r')
-    else:
-      # round-robin selection
-      self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
-      return_value = comms_seed[self.mqtt_seed_index]
-      if self.cfg_dauth_log_response:
-        self.P(f"Comms seed for {seed_key}: {comms_seed} | Raw: '{raw_comms_seed}'. Selected '{return_value}' ({self.mqtt_seed_index})")
-    # end if
-    return key, return_value
+      return [return_value] if return_value else []
+    # Preserve round-robin allocation while exposing the remaining seed order.
+    self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
+    comms_seed = comms_seed[self.mqtt_seed_index:] + comms_seed[:self.mqtt_seed_index]
+    if self.cfg_dauth_log_response:
+      self.P(f"Comms seed for {seed_key}: {comms_seed}. Selected '{comms_seed[0]}' ({self.mqtt_seed_index})")
+    return comms_seed
 
 
   def fill_dauth_data(
@@ -641,11 +758,14 @@ class _DauthMixin(object):
 
     #####  finally prepare the env auth data #####
     
-    comm_key, comm_value = self.get_comms_host_pair()
+    comm_key = self.cfg_comms_host_key
+    comms_hosts = self.get_comms_hosts()
+    comm_value = comms_hosts[0] if comms_hosts else None
     str_allocation_log = None
     if comm_key is not None and comm_value is not None:
       str_allocation_log = f"{comm_key}={comm_value}"
       dauth_data[comm_key] = comm_value
+      dauth_data[self.cfg_comms_hosts_key] = comms_hosts
     else:
       self.P("No comms host pair found!", color='r')
     
@@ -700,7 +820,7 @@ class _DauthMixin(object):
       dauth_data["EE_SUPERVISOR"] = False
     # end set supervisor flag
     if self.cfg_dauth_log_response:
-      self.P(f"DAuth returning comm server {dauth_data[comm_key]}, {str_allocation_log}")
+      self.P(f"DAuth returning comm server {dauth_data.get(comm_key)}, {str_allocation_log}")
     return dauth_data
 
 

@@ -94,6 +94,9 @@ _PUBLIC_DISABLED_REASONS = frozenset({"misp_export_disabled"})
 _EFFECT_DENIALS = {
   "job_not_found": (404, "not_found"),
   "unsupported_job_type": (400, "unsupported_job_type"),
+  # RM-139: an automatic MISP push for the job is in flight or queued; a manual export now could
+  # create a second event. The caller retries once it has landed.
+  "misp_auto_export_in_flight": (409, "misp_auto_export_in_flight"),
 }
 
 
@@ -133,13 +136,13 @@ _PUBLIC_CONFIGURATION_ERRORS = frozenset({
   # showed the panels' generic fallback.
   "timeout", "graphql_error", "artifact_write_failed", "connection_failed", "api_error",
   "push_failed",
+  # RM-139: MISP refused the tenant's sharing group; the export is never retried wider.
+  "sharing_group_rejected",
   # B3 ingest parse and write outcomes. Structured, bounded, no caller content.
   "eve_jsonl_too_large", "eve_payload_rejected", "job_record_not_written",
   # authorization_upload outcome codes: structured, and the prose that accompanied them embedded
   # R1FS and virus-scan exception text.
   "invalid_base64", "empty", "too_large", "bad_mime", "virus_detected", "storage_failed",
-  # tenant_export_binding: a bound tenant with no record for this integration pushes nowhere (RM-093).
-  "tenant_integration_not_configured",
 })
 
 # invalid_jsonl_line_<n> carries a bounded line index, not caller text.

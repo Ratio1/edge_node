@@ -4,12 +4,15 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
 import threading
-from collections import deque
 
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
+from .deployment_operations import (
+  _DeploymentOperationsMixin, DeploymentAuthenticationError, DeploymentConflictError,
+)
 
+from .deployment_mutations import _DeploymentMutationsMixin
 from .deeploy_mixin import _DeeployMixin
 from .selected_secrets import compile_request_selections
 from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
@@ -37,7 +40,7 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
-  'POSTPONED_POLL_INTERVAL': 0.5,
+  'DEPLOYMENT_READINESS_TIMEOUT': 900,
 
   'DEEPLOY_VERBOSE' : 10,
   'LOG_REQUESTS': True,
@@ -65,6 +68,8 @@ class DeeployManagerApiPlugin(
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
   _DeeployJobMixin,
+  _DeploymentOperationsMixin,
+  _DeploymentMutationsMixin,
   _RequestTrackingMixin,
   ):
   """
@@ -101,140 +106,18 @@ class DeeployManagerApiPlugin(
       )
       self.maybe_stop_tunnel_engine()
     self._init_request_tracking()
-    self.__pending_deploy_requests = {}
     self._pending_managed_update_actions = {}
     self._applied_managed_update_actions = {}
     self._managed_update_action_lock = threading.Lock()
-    self.__pipeline_persistence_queue = deque()
-    self.__pipeline_persistence_lock = threading.Lock()
-    self.__pipeline_persistence_event = threading.Event()
-    self._start_pipeline_persistence_worker()
+    self._init_deployment_operations()
     return
 
-  def _start_pipeline_persistence_worker(self):
-    """
-    Start a background worker that persists deployed pipeline metadata outside the
-    request critical path.
-    """
-    def _worker():
-      while not getattr(self, 'done_loop', False):
-        job = None
-        wait_timeout = 0.5
-        now = self.time()
-
-        with self.__pipeline_persistence_lock:
-          if self.__pipeline_persistence_queue:
-            queue_len = len(self.__pipeline_persistence_queue)
-            for _ in range(queue_len):
-              candidate = self.__pipeline_persistence_queue.popleft()
-              next_retry_ts = candidate.get('next_retry_ts', 0)
-              if job is None and next_retry_ts <= now:
-                job = candidate
-                continue
-              self.__pipeline_persistence_queue.append(candidate)
-            if job is None and len(self.__pipeline_persistence_queue) > 0:
-              soonest_retry = min(
-                max(0.5, candidate.get('next_retry_ts', now) - now)
-                for candidate in self.__pipeline_persistence_queue
-              )
-              wait_timeout = min(soonest_retry, 5.0)
-
-        if job is None:
-          self.__pipeline_persistence_event.wait(timeout=wait_timeout)
-          self.__pipeline_persistence_event.clear()
-          continue
-
-        try:
-          ok = self.persist_job_pipeline_metadata(
-            pipeline=job['pipeline'],
-            job_id=job['job_id'],
-            previous_cid=job.get('previous_cid'),
-            delete_previous=job.get('delete_previous', False),
-          )
-        except Exception as exc:
-          ok = False
-          self.P(
-            f"Pipeline metadata persistence crashed for job {job.get('job_id')}: {exc}",
-            color='r'
-          )
-
-        if ok:
-          self._mark_managed_update_action_applied(
-            job.get('managed_update_action')
-          )
-          self._release_managed_update_action(
-            job.get('managed_update_action_claim_key')
-          )
-          self.P(
-            f"Persisted deployed pipeline metadata for job {job.get('job_id')}"
-            f"{' (' + job.get('app_id') + ')' if job.get('app_id') else ''}."
-          )
-          continue
-
-        attempts = int(job.get('attempts', 0)) + 1
-        if attempts >= 3:
-          self._release_managed_update_action(
-            job.get('managed_update_action_claim_key')
-          )
-          self.P(
-            f"Failed to persist deployed pipeline metadata for job {job.get('job_id')} after {attempts} attempts.",
-            color='r'
-          )
-          continue
-
-        job['attempts'] = attempts
-        job['next_retry_ts'] = self.time() + min(60.0, 5.0 * (2 ** (attempts - 1)))
-        with self.__pipeline_persistence_lock:
-          self.__pipeline_persistence_queue.append(job)
-        self.__pipeline_persistence_event.set()
-
-    self.__pipeline_persistence_thread = threading.Thread(
-      target=_worker,
-      name="DeeployPipelinePersistence",
-      daemon=True,
-    )
-    self.__pipeline_persistence_thread.start()
-    return
-
-  def _build_pipeline_persistence_state(
-    self,
-    job_id,
-    pipeline,
-    app_id=None,
-    previous_cid=None,
-    delete_previous=False,
-  ):
-    """
-    Build a persistence payload for background metadata commit.
-    """
-    if job_id is None or not isinstance(pipeline, dict):
-      return None
-
-    return {
-      'job_id': job_id,
-      'app_id': app_id,
-      'pipeline': self.deepcopy(pipeline),
-      'previous_cid': previous_cid,
-      'delete_previous': delete_previous,
-      'attempts': 0,
-      'next_retry_ts': self.time(),
-    }
-
-  def _queue_pipeline_persistence(self, persistence_state):
-    """
-    Queue a deployed pipeline metadata commit for background execution.
-    """
-    if not persistence_state:
-      return False
-
-    with self.__pipeline_persistence_lock:
-      self.__pipeline_persistence_queue.append(persistence_state)
-    self.__pipeline_persistence_event.set()
-    self.Pd(
-      f"Queued pipeline metadata persistence for job {persistence_state.get('job_id')}"
-      f"{' (' + persistence_state.get('app_id') + ')' if persistence_state.get('app_id') else ''}."
-    )
-    return True
+  def on_close(self):
+    """Stop deployment dispatch before shutting down this API instance."""
+    self._deployment_operations_stop.set()
+    self._deployment_operations_event.set()
+    self._deployment_operations_thread.join()
+    super(DeeployManagerApiPlugin, self).on_close()
 
   def _claim_managed_update_action(self, owner, app_id, action):
     if not action:
@@ -587,6 +470,7 @@ class DeeployManagerApiPlugin(
             job_id=job_id,
             old_owner=old_owner,
             new_owner=new_owner,
+            transfer_id="{}:{}".format(transfer["tx_hash"], transfer["log_index"]),
           )
         except Exception as exc:
           job_results[str(job_id)] = {
@@ -817,7 +701,6 @@ class DeeployManagerApiPlugin(
     self,
     request: dict,
     is_create: bool = True,
-    async_mode: bool = False,
   ):
     """
     Common logic for processing pipeline create/update requests.
@@ -829,8 +712,6 @@ class DeeployManagerApiPlugin(
         service updates must also include `instance_id` for every plugin.
     is_create : bool
         True for create operations, False for update operations
-    async_mode : bool
-        When True, return a pending state for PostponedRequest polling.
 
     Returns
     -------
@@ -838,12 +719,9 @@ class DeeployManagerApiPlugin(
         The response dictionary
     """
     managed_action_claim_key = None
-    keep_managed_action_claim = False
     managed_action = None
     service_kind = None
     cockroachdb_legacy_compat_contexts = None
-    staging_state = None
-    retry_has_staged_pipeline = False
     create_job_claim_key = None
     try:
       self.__ensure_eth_balance()
@@ -871,7 +749,15 @@ class DeeployManagerApiPlugin(
         job_app_type = submitted_job_app_type
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
-      is_confirmable_job = inputs.chainstore_response
+      existing_operation = self._find_request_operation(
+        request, auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+        "create" if is_create else "update",
+      )
+      if existing_operation:
+        return self._accepted_operation_response(existing_operation)
+      # Readiness is always reported by the node lifecycle service.
+      inputs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE] = False
+      inputs.chainstore_response = False
 
       pipeline_params = self._extract_pipeline_params(inputs)
       inputs[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
@@ -915,27 +801,35 @@ class DeeployManagerApiPlugin(
       # Get nodes based on operation type
       discovered_plugin_instances = []
       deployment_nodes = []
-      confirmation_nodes = []
-      nodes_changed = False
       deeploy_specs_for_update = None
       deeploy_specs_payload = None
       prepared_create_deploy_plan = None
       prepared_pipeline_configs = None
-      skip_create_response_key_reset = False
       update_context_from_persisted_pipeline = False
-      delete_existing_after_stage = False
       if is_create:
-        is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
+        canonical = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(job_id))
+        reusing_deleted_job = isinstance(canonical, dict) and canonical.get("deleted") is True
+        # Independent monitoring may mark a partially started create on chain.
+        # Confirmed lifecycle cleanup still permits reuse of that paid job.
+        previous = max(
+          (record for record in self._operation_records().values()
+           if str(record.get("job_id")) == str(job_id)
+           and record.get("owner", "").lower() == auth_result[DEEPLOY_KEYS.ESCROW_OWNER].lower()),
+          key=lambda record: record["target_revision"], default=None,
+        )
+        reusing_failed_create = previous is not None and (
+          previous["kind"] == "create" and previous["phase"] == "completed"
+          and previous.get("outcome") == "failed" and previous.get("recovery") == "completed"
+        )
+        is_valid = self.deeploy_check_payment_and_job_owner(
+          inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+          is_create=not (reusing_deleted_job or reusing_failed_create), debug=self.cfg_deeploy_verbose > 1,
+        )
         if not is_valid:
           msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
           raise ValueError(msg)
-        try:
-          create_job_claim_key = self._claim_create_job(job_id)
-        except ValueError:
-          retry_has_staged_pipeline = True
-          raise
+        create_job_claim_key = self._claim_create_job(job_id)
         if self._get_pipeline_from_cstore(job_id):
-          retry_has_staged_pipeline = True
           raise ValueError(
             f"A previous create for job {job_id} may still be running. "
             "Its staged metadata must be resolved before another create."
@@ -949,8 +843,6 @@ class DeeployManagerApiPlugin(
           requested_nodes=deployment_nodes,
           inputs=inputs,
         )
-        confirmation_nodes = list(deployment_nodes)
-        nodes_changed = True
       else:
         # Discover the live deployment so we can validate node affinity and reuse existing specs.
         try:
@@ -1121,21 +1013,6 @@ class DeeployManagerApiPlugin(
           action_specs,
           applied_operation=applied_operation,
         )
-        if managed_action and managed_action.get("already_applied"):
-          return self._get_response({
-            DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
-            DEEPLOY_KEYS.STATUS_DETAILS: self.deepcopy(
-              managed_action.get("already_applied_status_details", {})
-            ),
-            DEEPLOY_KEYS.APP_ID: app_id,
-            DEEPLOY_KEYS.REQUEST: {
-              DEEPLOY_KEYS.APP_ALIAS: app_alias,
-              DEEPLOY_KEYS.TARGET_NODES: deployment_targets,
-              DEEPLOY_KEYS.TARGET_NODES_COUNT: len(deployment_targets),
-              DEEPLOY_KEYS.JOB_APP_TYPE: job_app_type,
-            },
-            DEEPLOY_KEYS.AUTH: auth_result,
-          })
         managed_action_claim_key = self._claim_managed_update_action(
           auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
           app_id,
@@ -1166,34 +1043,7 @@ class DeeployManagerApiPlugin(
           service_kind=service_kind,
           cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
         )
-        if managed_action and managed_action.get("requires_all_target_responses"):
-          response_key_nodes = set(prepared_create_deploy_plan.get("response_keys") or {})
-          if (
-            not prepared_create_deploy_plan.get("enable_chainstore_response")
-            or response_key_nodes != set(validated_nodes)
-          ):
-            raise ValueError(
-              f"{managed_action.get('label', 'Managed service update')} requires response keys for every target node."
-            )
-        if prepared_create_deploy_plan.get("enable_chainstore_response"):
-          self._reset_chainstore_response_keys(
-            prepared_create_deploy_plan.get("response_keys", {}),
-            context=f"replacement create pipeline '{app_alias}'",
-          )
-          skip_create_response_key_reset = True
-
-        if update_context_from_persisted_pipeline:
-          # TODO: stop stale offline old-node pipelines through ChainDist reconciliation when they return.
-          self.Pd(
-            f"Skipping live pipeline stop for offline update fallback on job_id={job_id}; "
-            "new pipeline will be deployed to validated target nodes.",
-            color='y',
-          )
-        else:
-          delete_existing_after_stage = True
         deployment_nodes = list(validated_nodes)
-        confirmation_nodes = list(validated_nodes)
-        nodes_changed = set(current_nodes) != set(deployment_nodes)
 
       inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_nodes
       inputs.target_nodes = deployment_nodes
@@ -1233,494 +1083,35 @@ class DeeployManagerApiPlugin(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         prepared_deploy_plan=prepared_create_deploy_plan,
       )
-      prior_bundle = self._load_dauth_job_secret_bundle(job_id)
-      prior_pipeline = None
-      if not is_create or isinstance(prior_bundle, dict):
-        prior_pipeline = self.get_job_pipeline_from_cstore(
-          job_id,
-          timeout=30,
-          pin=False,
-          raise_on_error=False,
-          show_logs=False,
-        )
-      prepared_pipeline_configs, complete_secret_bundle = (
-        self._redact_pipeline_configs_and_build_secret_bundle(
-          job_id=job_id,
-          pipeline_configs=prepared_pipeline_configs,
-          prior_bundle=prior_bundle,
-          prior_pipeline=prior_pipeline,
-        )
+      prior_pipeline = None if is_create else self.get_job_pipeline_from_cstore(
+        job_id, timeout=30, pin=False, raise_on_error=False, show_logs=False,
       )
-      node_plugins_by_addr = prepared_create_deploy_plan.get("node_plugins_by_addr", {})
-      for node, pipeline_config in prepared_pipeline_configs.items():
-        if node in node_plugins_by_addr:
-          node_plugins_by_addr[node] = self.deepcopy(
-            pipeline_config.get(self.ct.CONFIG_STREAM.K_PLUGINS, [])
-          )
-      pipeline_to_stage = next(iter(prepared_pipeline_configs.values()))
-      staging_state = self.stage_job_pipeline_and_secrets(
-        pipeline=pipeline_to_stage,
-        job_id=job_id,
-        secret_bundle=complete_secret_bundle,
+      return self._admit_prepared_deployment(
+        request=request, auth_result=auth_result, app_id=app_id,
+        configs=prepared_pipeline_configs, prior_pipeline=prior_pipeline,
+        is_create=is_create,
       )
-      staging_state["retain_on_failed_dispatch"] = bool(
-        is_create and staging_state.get("prior_cid") is None
-      )
-
-      if delete_existing_after_stage:
-        self.delete_pipeline_from_nodes(
-          app_id=app_id,
-          job_id=job_id,
-          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-          discovered_instances=discovered_plugin_instances,
-        )
-        discovered_plugin_instances = []
-
-      dct_status, str_status, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
-        owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-        inputs=inputs,
-        app_id=app_id,
-        app_alias=app_alias,
-        app_type=app_type,
-        new_nodes=deployment_nodes,
-        update_nodes=[],
-        discovered_plugin_instances=discovered_plugin_instances,
-        dct_deeploy_specs_create=deeploy_specs_payload,
-        prepared_create_deploy_plan=prepared_create_deploy_plan,
-        prepared_pipeline_configs=prepared_pipeline_configs,
-        skip_create_response_key_reset=skip_create_response_key_reset,
-        job_app_type=job_app_type,
-        wait_for_responses=not async_mode,
-        cockroachdb_legacy_compat_contexts=cockroachdb_legacy_compat_contexts,
-        dispatch_state=staging_state,
-      )
-      return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
-      if return_request:
-        dct_request = self._redact_deeploy_dauth_secrets_for_response(
-          request, pipeline=pipeline_to_stage,
-          normalized_plugins=inputs.get(DEEPLOY_KEYS.PLUGINS),
-        )
-        dct_request.pop(DEEPLOY_KEYS.APP_PARAMS, None)
-      else:
-        # Build simplified request summary (no app_params - data is in plugins array now)
-        dct_request = {
-          DEEPLOY_KEYS.APP_ALIAS: app_alias,
-          DEEPLOY_KEYS.TARGET_NODES: inputs.target_nodes,
-          DEEPLOY_KEYS.TARGET_NODES_COUNT: inputs.target_nodes_count,
-          DEEPLOY_KEYS.JOB_APP_TYPE: job_app_type,
-        }
-
-        # Include plugins count summary
-        plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
-        if plugins_array:
-          dct_request['plugins_count'] = len(plugins_array)
-        # if pipeline_params:
-        #   dct_request[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
-      if async_mode:
-        if len(response_keys) == 0:
-          self.commit_staged_job_pipeline_and_secrets(staging_state)
-          staging_state = None
-          if nodes_changed and not is_confirmable_job:
-            eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
-            eth_nodes = sorted(eth_nodes)
-            try:
-              self.P("Submitting blockchain update for job {} with nodes: {}".format(job_id, eth_nodes))
-              self.bc.submit_node_update(
-                job_id=job_id,
-                nodes=eth_nodes,
-              )
-            except Exception as e:
-              self.P(f"An error occurred while submitting node update for job {job_id}: {e}", color='r')
-          result = {
-            DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.COMMAND_DELIVERED,
-            DEEPLOY_KEYS.STATUS_DETAILS: {},
-            DEEPLOY_KEYS.APP_ID: app_id,
-            DEEPLOY_KEYS.REQUEST: dct_request,
-            DEEPLOY_KEYS.AUTH: auth_result,
-          }
-          response = self._get_response({
-            **result
-          })
-          return response
-
-        pending_state = {
-          'kind': 'pipeline',
-          'response_keys': response_keys,
-          'dct_status': dct_status,
-          'start_time': self.time(),
-          'timeout': self.cfg_request_timeout,
-          'next_check_ts': self.time() + self.cfg_postponed_poll_interval,
-          'base_result': {
-            DEEPLOY_KEYS.APP_ID: app_id,
-            DEEPLOY_KEYS.REQUEST: dct_request,
-            DEEPLOY_KEYS.AUTH: auth_result,
-          },
-          'confirm': {
-            'nodes_changed': nodes_changed,
-            'confirmation_nodes': confirmation_nodes,
-            'is_confirmable_job': is_confirmable_job,
-            'job_id': job_id,
-          },
-          'staging': staging_state,
-          'managed_update_action_claim_key': managed_action_claim_key,
-          'managed_update_action': ({
-            **managed_action,
-            "owner": auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-            "app_id": app_id,
-          } if managed_action else None),
-        }
-        keep_managed_action_claim = managed_action_claim_key is not None
-        return {'__pending__': pending_state}
-
-      if nodes_changed and str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-        if (dct_status is not None and is_confirmable_job and len(confirmation_nodes) == len(dct_status)) or not is_confirmable_job:
-          eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
-          eth_nodes = sorted(eth_nodes)
-          try:
-            self.P("Submitting blockchain update for job {} with nodes: {}".format(job_id, eth_nodes))
-            self.bc.submit_node_update(
-              job_id=job_id,
-              nodes=eth_nodes,
-            )
-          except Exception as e:
-            self.P(f"An error occurred while submitting node update for job {job_id}: {e}", color='r')
-            raise e
-        #endif
-      #endif
-
-      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-        self.commit_staged_job_pipeline_and_secrets(staging_state)
-      else:
-        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, str_status)
-      dispatch_uncertain = bool(staging_state.get("dispatch_uncertain"))
-      staging_state = None
-
-      result = {
-        DEEPLOY_KEYS.STATUS: str_status,
-        DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
-        DEEPLOY_KEYS.APP_ID: app_id,
-        DEEPLOY_KEYS.REQUEST: dct_request,
-        DEEPLOY_KEYS.AUTH: auth_result,
-      }
-      if dispatch_uncertain:
-        result["dispatch_uncertain"] = True
-
-      if self.cfg_deeploy_verbose > 1:
-        self.P(f"Request Result: status={str_status}, app_id={app_id}")
-    except Exception as e:
-      if staging_state is not None:
-        self.settle_failed_staged_job_pipeline_and_secrets(staging_state, "dispatch error")
-      result = self.__handle_error(e, request)
-      if retry_has_staged_pipeline or (
-        staging_state is not None and staging_state.get("dispatch_uncertain")
-      ):
-        result["dispatch_uncertain"] = True
+    except DeploymentConflictError as exc:
+      result = {"status_code": 409, "status": "error",
+                "error": {"code": "DEPLOYMENT_CONFLICT", "message": str(exc), "retryable": False}}
+    except ValueError as exc:
+      result = {"status_code": 400, "status": "error",
+                "error": {"code": "INVALID_DEPLOYMENT_REQUEST", "message": str(exc), "retryable": False}}
+    except Exception:
+      result = {"status_code": 503, "status": "error",
+                "error": {"code": "ADMISSION_UNAVAILABLE",
+                          "message": "Deployment acceptance is uncertain. Retry with the same request_id.",
+                          "retryable": True}}
     #endtry
     finally:
       self._release_create_job(create_job_claim_key)
-      if managed_action_claim_key is not None and not keep_managed_action_claim:
+      if managed_action_claim_key is not None:
         self._release_managed_update_action(managed_action_claim_key)
     
     response = self._get_response({
       **result
     })
     return response
-
-  def _register_pending_deploy_request(self, pending_state):
-    """
-    Register a pending deploy request and return a PostponedRequest handle.
-
-    Parameters
-    ----------
-    pending_state : dict
-        State payload containing response keys, timeout, and metadata.
-
-    Returns
-    -------
-    PostponedRequest
-        Deferred request handle for polling in the plugin loop.
-    """
-    pending_id = self.uuid()
-    pending_state['pending_id'] = pending_id
-    self.__pending_deploy_requests[pending_id] = pending_state
-    return self.create_postponed_request(
-      solver_method=self.solve_postponed_deploy_request,
-      method_kwargs={
-        'pending_id': pending_id
-      }
-    )
-
-  def maybe_mark_timed_out_request(self, pending_id: str, pending, now: float = None):
-    """
-    Check a pending request for timeout and return a response when expired.
-
-    Parameters
-    ----------
-    pending_id : str
-        Identifier of the pending deeploy request.
-    pending : dict
-        State payload containing response keys, timeout, and metadata.
-    now : float
-        Current timestamp.
-
-    Returns
-    -------
-    dict or None
-        Response dictionary if the request timed out, or None if still valid.
-
-    """
-    res = None
-    if now is None:
-      now = self.time()
-    if (now - pending['start_time']) > pending['timeout']:
-      if pending.get('kind') == 'scale_up':
-        self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
-        result = {
-          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
-          DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
-          DEEPLOY_KEYS.JOB_ID: pending.get('job_id'),
-          DEEPLOY_KEYS.REQUEST: pending.get('request'),
-          DEEPLOY_KEYS.AUTH: pending.get('auth'),
-        }
-      else:
-        self.settle_failed_staged_job_pipeline_and_secrets(
-          pending.get('staging'), "timeout", dispatch_uncertain=True
-        )
-        result = {
-          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.TIMEOUT,
-          DEEPLOY_KEYS.STATUS_DETAILS: pending.get('dct_status', {}),
-          **pending.get('base_result', {})
-        }
-        if (pending.get('staging') or {}).get("dispatch_uncertain"):
-          result["dispatch_uncertain"] = True
-      self.__pending_deploy_requests.pop(pending_id, None)
-      self._release_managed_update_action(
-        pending.get('managed_update_action_claim_key')
-      )
-      res = self._get_response({
-        **result
-      })
-    # endif pending request timed out
-    return res
-
-  def finalize_pending_request_pipeline(
-      self, pending, dct_status, str_status
-  ):
-    """
-    Finalize a pending pipeline request and optionally submit BC updates.
-
-    Parameters
-    ----------
-    pending : dict
-        Pending request state.
-    dct_status : dict
-        Collected response details keyed by response key.
-    str_status : str
-        Aggregate status string.
-
-    Returns
-    -------
-    dict
-        Final response payload for the pipeline request.
-    """
-    confirm = pending.get('confirm', {})
-    nodes_changed = confirm.get('nodes_changed', False)
-    is_confirmable_job = confirm.get('is_confirmable_job', False)
-    confirmation_nodes = confirm.get('confirmation_nodes', [])
-    job_id = confirm.get('job_id', None)
-    if nodes_changed and str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-      if (dct_status is not None and is_confirmable_job and len(confirmation_nodes) == len(
-              dct_status)) or not is_confirmable_job:
-        eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
-        eth_nodes = sorted(eth_nodes)
-        try:
-          self.P("Submitting blockchain update for job {} with nodes: {}".format(job_id, eth_nodes))
-          self.bc.submit_node_update(
-            job_id=job_id,
-            nodes=eth_nodes,
-          )
-        except Exception as e:
-          self.P(f"An error occurred while submitting node update for job {job_id}: {e}", color='r')
-    # endif nodes changed and success or delivered
-
-    managed_action = pending.get('managed_update_action')
-    if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-      committed = self.commit_staged_job_pipeline_and_secrets(pending.get('staging'))
-      if str_status == DEEPLOY_STATUS.SUCCESS and managed_action and not committed:
-        self._release_managed_update_action(
-          pending.get('managed_update_action_claim_key')
-        )
-        return {
-          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL,
-          DEEPLOY_KEYS.ERROR: managed_action.get(
-            "persistence_failure_error",
-            "Managed service update succeeded but metadata persistence failed.",
-          ),
-          DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
-          **pending.get('base_result', {})
-        }
-      if str_status == DEEPLOY_STATUS.SUCCESS and managed_action:
-        self._mark_managed_update_action_applied(managed_action)
-    else:
-      self.settle_failed_staged_job_pipeline_and_secrets(
-        pending.get('staging'), str_status, dispatch_uncertain=True
-      )
-
-    self._release_managed_update_action(
-      pending.get('managed_update_action_claim_key')
-    )
-    result = {
-      DEEPLOY_KEYS.STATUS: str_status,
-      DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
-      **pending.get('base_result', {})
-    }
-    if (pending.get('staging') or {}).get("dispatch_uncertain"):
-      result["dispatch_uncertain"] = True
-    return result
-
-  def finalize_pending_request_scale_up(
-      self, pending, dct_status, str_status
-  ):
-    """
-    Finalize a pending scale-up request and submit BC confirmation.
-
-    Parameters
-    ----------
-    pending : dict
-        Pending request state.
-    dct_status : dict
-        Collected response details keyed by response key.
-    str_status : str
-        Aggregate status string.
-
-    Returns
-    -------
-    dict
-        Final response payload for the scale-up request.
-    """
-    job_id = pending.get('job_id')
-    is_confirmable_job = pending.get('is_confirmable_job', False)
-    nodes = list(
-      cstore_response.get("node") for cstore_response in dct_status.values()
-      if cstore_response.get("node") is not None
-    )
-    self.Pd(f"Nodes to confirm: {self.json_dumps(nodes, indent=2)}")
-    self._submit_bc_job_confirmation(
-      str_status=str_status,
-      dct_status=dct_status,
-      nodes=nodes,
-      job_id=job_id,
-      is_confirmable_job=is_confirmable_job,
-    )
-    if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-      self.commit_staged_job_pipeline_and_secrets(pending.get('staging'))
-    else:
-      self.rollback_staged_job_pipeline_and_secrets(pending.get('staging'))
-    return {
-      DEEPLOY_KEYS.STATUS: str_status,
-      DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
-      DEEPLOY_KEYS.JOB_ID: job_id,
-      DEEPLOY_KEYS.REQUEST: pending.get('request'),
-      DEEPLOY_KEYS.AUTH: pending.get('auth'),
-    }
-
-  def finalize_pending_request(
-      self, pending, dct_status, str_status,
-    ):
-    """
-    Finalize a pending request based on its kind.
-
-    Parameters
-    ----------
-    pending : dict
-        Pending request state.
-    dct_status : dict
-        Collected response details keyed by response key.
-    str_status : str
-        Aggregate status string.
-
-    Returns
-    -------
-    dict
-        Final response payload.
-    """
-    # Finalize pending request
-    if pending.get('kind') == 'pipeline':
-      result = self.finalize_pending_request_pipeline(
-        pending=pending,
-        dct_status=dct_status,
-        str_status=str_status,
-      )
-    elif pending.get('kind') == 'scale_up':
-      result = self.finalize_pending_request_scale_up(
-        pending=pending,
-        dct_status=dct_status,
-        str_status=str_status,
-      )
-    else:
-      result = {
-        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL,
-        DEEPLOY_KEYS.ERROR: f"Unknown pending request kind: {pending.get('kind')}"
-      }
-    return result
-
-  def solve_postponed_deploy_request(self, pending_id: str):
-    """
-    Resolve a pending deploy request by polling for chainstore responses.
-
-    Parameters
-    ----------
-    pending_id : str
-        Identifier of the pending deploy request.
-
-    Returns
-    -------
-    dict or PostponedRequest
-        Final response when complete or a PostponedRequest to continue polling.
-    """
-    pending = self.__pending_deploy_requests.get(pending_id)
-    if not pending:
-      result = {
-        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL,
-        DEEPLOY_KEYS.ERROR: f"Pending request {pending_id} not found.",
-      }
-      return self._get_response({
-        **result
-      })
-
-    now = self.time()
-    # Not all requests are processed every iteration in order to lighten the load on the CPU
-    postponed_kwargs = {
-      'solver_method': self.solve_postponed_deploy_request,
-      'method_kwargs': {'pending_id': pending_id},
-    }
-    if now < pending.get('next_check_ts', 0):
-      return self.create_postponed_request(**postponed_kwargs)
-
-    timeout_response = self.maybe_mark_timed_out_request(pending_id=pending_id, pending=pending, now=now)
-    if timeout_response:
-      return timeout_response
-
-    dct_status, str_status, done = self._check_pipeline_responses_once(
-      response_keys=pending['response_keys'],
-      dct_status=pending.get('dct_status'),
-    )
-    pending['dct_status'] = dct_status
-
-    if not done:
-      pending['next_check_ts'] = now + self.cfg_postponed_poll_interval
-      return self.create_postponed_request(**postponed_kwargs)
-
-    result = self.finalize_pending_request(
-      pending=pending,
-      dct_status=dct_status,
-      str_status=str_status,
-    )
-
-    self.__pending_deploy_requests.pop(pending_id, None)
-    return self._get_response({
-      **result
-    })
 
   @BasePlugin.endpoint(method="post")
   # /create_pipeline
@@ -1838,17 +1229,11 @@ class DeeployManagerApiPlugin(
 
     TODO: (Vitalii)
       - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
-    TODO: (Vitalii)
-      - Change from sync to async.
-        Sending the jobs to nodes, while UI will do pooling for the job status.
-        1. Request comes in. Response command sent.
-        2. Move while checker for chainstore keys in process.
+    Requires a signed stable request_id. Returns HTTP 202 after durable
+    acceptance; get_deployment_status reports execution and recovery.
     """
     self.Pd(f"Called Deeploy create_pipeline endpoint")
-    result = self._process_pipeline_request(request, is_create=True, async_mode=True)
-    if isinstance(result, dict) and result.get('__pending__') is not None:
-      return self._register_pending_deploy_request(result['__pending__'])
-    return result
+    return self._process_pipeline_request(request, is_create=True)
 
   @BasePlugin.endpoint(method="post")
   # /update_pipeline
@@ -1857,7 +1242,10 @@ class DeeployManagerApiPlugin(
     request: dict = DEEPLOY_CREATE_REQUEST
   ):
     """
-    Update a pipeline on node(s) with support for multiple plugins.
+    Accept an asynchronous pipeline update with multiple plugins.
+
+    The signed request requires request_id and integer expected_revision.
+    HTTP 202 acknowledges durable acceptance; polling reports completion.
 
     Supports the same formats as create_pipeline:
     1. **Plugin instances array**: Use 'plugins' array for pipelines with multiple plugins
@@ -1943,199 +1331,71 @@ class DeeployManagerApiPlugin(
         self.json_dumps(self._redact_failed_request_payload(request))
       )
     )
-    result = self._process_pipeline_request(request, is_create=False, async_mode=True)
-    if isinstance(result, dict) and result.get('__pending__') is not None:
-      return self._register_pending_deploy_request(result['__pending__'])
-    return result
+    return self._process_pipeline_request(request, is_create=False)
 
   @BasePlugin.endpoint(method="post")
-  def scale_up_job_workers(self,
-    request: dict = DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST
-  ):
+  def get_deployment_status(self, request: dict):
+    """Read authorized deployment progress from this oracle's durable replica."""
+    try:
+      return self._get_response(self._deployment_status(request))
+    except DeploymentAuthenticationError as exc:
+      return self._get_response({"status_code": 401, "status": "error",
+                                 "error": {"code": "AUTHENTICATION_FAILED", "message": str(exc), "retryable": False}})
+    except ValueError as exc:
+      return self._get_response({"status_code": 400, "status": "error",
+                                 "error": {"code": "INVALID_REQUEST", "message": str(exc)}})
+    except Exception:
+      return self._get_response({"status_code": 503, "status": "synchronizing",
+                                 "observation_stale": True, "poll_after_ms": 2000})
+
+  def _deployment_admission_error(self, exc):
+    """Return stable mutation errors without exposing protected request data."""
+    if isinstance(exc, DeploymentConflictError):
+      code, name, message, retryable = 409, "DEPLOYMENT_CONFLICT", str(exc), False
+    elif isinstance(exc, ValueError):
+      code, name, message, retryable = 400, "INVALID_DEPLOYMENT_REQUEST", str(exc), False
+    else:
+      code, name, message, retryable = 503, "ADMISSION_UNAVAILABLE", "Acceptance is uncertain. Retry with the same request_id.", True
+    return self._get_response(dict(status_code=code, status="error",
+                                  error=dict(code=name, message=message, retryable=retryable)))
+
+  @BasePlugin.endpoint(method="post")
+  def scale_up_job_workers(self, request: dict = DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST):
+    """Accept a full revision rollout to a larger placement with automatic rollback.
+
+    The signed request requires job_id, request_id, expected_revision, and the
+    existing node-selection/resource fields. Poll get_deployment_status for the
+    accepted operation; HTTP202 does not assert readiness.
     """
-    Scales up the number of workers for a given job (pipeline) on target node(s)
-    This endpoint does the next job:
-    1. Get nodes on which the job is running
-    2. Update the config, chainstore_allowed, etc.
-    3. Send update command to the nodes, on which it was running and send create command to the new nodes.
-    4. Wait until all the responses are received via CSTORE and compose status response
-    5. Return the status response
-    Parameters
-    ----------
-    request: dict containing next fields:
-      job_id : int
-      app_id : str
-      target_nodes : list[str]
-      target_nodes_count : int
-      node_res_req : dict
-      nonce : str
-      EE_ETH_SIGN : str
-      EE_ETH_SENDER : str
-    Returns
-    -------
-    dict
-        A dictionary with the result of the operation
-    """
-    staging_state = None
     try:
       self.__ensure_eth_balance()
-      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="scale up workers")
-      auth_result = self.deeploy_get_auth_result(inputs)
-      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
-      if not job_id:
-        msg = f"{DEEPLOY_ERRORS.REQUEST13}: Job ID is required."
-        raise ValueError(msg)
-
-      is_confirmable_job = inputs.chainstore_response
-
-      # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=False, debug=self.cfg_deeploy_verbose > 1)
-      if not is_valid:
-        msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
-        raise ValueError(msg)
-      
-      running_apps_for_job = self._get_online_apps(job_id=job_id, owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
-
-      # todo: check the count of running workers and compare with the amount of allowed workers count from blockchain.
-      
-      self.P(
-        "Discovered running apps for job: {}".format(
-          self.json_dumps(self._redact_per_node_config_for_log(running_apps_for_job))
-        )
-      )
-
-      if not running_apps_for_job or not len(running_apps_for_job):
-        msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided job_id and owner '{auth_result[DEEPLOY_KEYS.ESCROW_OWNER]}'."
-        raise ValueError(msg)
-      
-      update_nodes = list(running_apps_for_job.keys())
+      _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="scale up workers")
+      auth = self.deeploy_get_auth_result(inputs)
+      owner = auth[DEEPLOY_KEYS.ESCROW_OWNER]
+      existing = self._find_request_operation(request, owner, "update")
+      if existing:
+        return self._accepted_operation_response(existing)
+      if not self.deeploy_check_payment_and_job_owner(inputs, owner, is_create=False, debug=False):
+        raise ValueError("The job is not paid or the request is not from its owner.")
       new_nodes = self._check_nodes_availability(inputs)
-      
-      dct_status, str_status, response_keys, staging_state = self.scale_up_job(
-        new_nodes=new_nodes,
-        update_nodes=update_nodes,
-        owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-        job_id=job_id,
-        running_apps_for_job=running_apps_for_job,
-        wait_for_responses=False
-      )
-
-      return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
-      if return_request:
-        dct_request = self.deepcopy(request)
-      else:
-        dct_request = None
-      if len(response_keys) == 0:
-        self.commit_staged_job_pipeline_and_secrets(staging_state)
-        staging_state = None
-        if not is_confirmable_job:
-          nodes = list(set(update_nodes + new_nodes))
-          self.Pd(f"Nodes to confirm (non-confirmable job): {self.json_dumps(nodes, indent=2)}")
-          self._submit_bc_job_confirmation(str_status=DEEPLOY_STATUS.COMMAND_DELIVERED,
-                                           dct_status={},
-                                           nodes=nodes,
-                                           job_id=job_id,
-                                           is_confirmable_job=is_confirmable_job)
-        result = {
-          DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.COMMAND_DELIVERED,
-          DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
-          DEEPLOY_KEYS.JOB_ID: job_id,
-          DEEPLOY_KEYS.REQUEST: dct_request,
-          DEEPLOY_KEYS.AUTH: auth_result,
-        }
-        if self.cfg_deeploy_verbose > 1:
-          self.P(f"Request Result: {result}")
-        response = self._get_response({
-          **result
-        })
-        return response
-
-      pending_state = {
-        'kind': 'scale_up',
-        'response_keys': response_keys,
-        'dct_status': {},
-        'start_time': self.time(),
-        'timeout': self.cfg_request_timeout,
-        'next_check_ts': self.time() + self.cfg_postponed_poll_interval,
-        'job_id': job_id,
-        'is_confirmable_job': is_confirmable_job,
-        'request': dct_request,
-        'auth': auth_result,
-        'staging': staging_state,
-      }
-      return self._register_pending_deploy_request(pending_state)
-
-    except Exception as e:
-      if staging_state is not None:
-        self.rollback_staged_job_pipeline_and_secrets(staging_state)
-      result = self.__handle_error(e, request)
-    #endtry
-    
-    response = self._get_response({
-      **result
-    })
-    return response
+      return self._admit_scale_up_operation(request, auth, new_nodes)
+    except Exception as exc:
+      return self._deployment_admission_error(exc)
 
   @BasePlugin.endpoint(method="post")
-  def delete_pipeline(self,
-    request: dict = DEEPLOY_DELETE_REQUEST
-  ):
-    """
-    Deletes a given app (pipeline) on target node(s)
+  def delete_pipeline(self, request: dict = DEEPLOY_DELETE_REQUEST):
+    """Accept whole-job deletion; retain credentials until all nodes prove stop.
 
-    Parameters
-    ----------
-    request: dict containing next fields:
-      app_id : str
-      job_id: int
-        app_id and job_id are interchangeable identifiers of job / pipeline
-      target_nodes : list[str]
-      nonce : str
-      EE_ETH_SIGN : str
-      EE_ETH_SENDER : str
-    Returns
-    -------
-    dict
-        A dictionary with the result of the operation
+    The signed request requires job_id, request_id and expected_revision.
+    Partial placement deletion is unsupported. Completion is reported through
+    the same deployment polling endpoint, independently of the HTTP connection.
     """
     try:
-      self.__ensure_eth_balance()
-      self.Pd(f"Called Deeploy delete_pipeline endpoint")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="delete pipeline")
-      auth_result = self.deeploy_get_auth_result(inputs)
-      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
-      app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
-      target_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None)
-
-      discovered_instances = self.delete_pipeline_from_nodes(
-        app_id=app_id,
-        job_id=job_id,
-        owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-        target_nodes=target_nodes,
-      )
-      request_payload = {
-        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
-        DEEPLOY_KEYS.TARGETS: discovered_instances,
-      }
-
-      if job_id is not None:
-        request_payload[DEEPLOY_KEYS.JOB_ID] = job_id
-      elif app_id is not None:
-        request_payload[DEEPLOY_KEYS.APP_ID] = app_id
-
-      result = {
-        DEEPLOY_KEYS.REQUEST : request_payload,
-        DEEPLOY_KEYS.AUTH : auth_result,
-      }
-    
-    except Exception as e:
-      result = self.__handle_error(e, request)
-    #endtry
-    
-    response = self._get_response({
-      **result
-    })
-    return response
+      _, inputs = self.deeploy_verify_and_get_inputs(request, request_type="delete pipeline")
+      auth = self.deeploy_get_auth_result(inputs)
+      return self._admit_delete_operation(request, auth)
+    except Exception as exc:
+      return self._deployment_admission_error(exc)
 
 
   @BasePlugin.endpoint(method="post")
@@ -2169,6 +1429,7 @@ class DeeployManagerApiPlugin(
       self.Pd(f"Called Deeploy send_instance_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="send instance command")
       auth_result = self.deeploy_get_auth_result(inputs)
+      self._assert_no_active_deployment(inputs.get(DEEPLOY_KEYS.JOB_ID), inputs.get(DEEPLOY_KEYS.APP_ID))
 
       # Validate the request fields.
       self._validate_send_instance_command_request(inputs)
@@ -2223,6 +1484,7 @@ class DeeployManagerApiPlugin(
       self.Pd(f"Called Deeploy send_app_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type="send app command")
       auth_result = self.deeploy_get_auth_result(inputs)
+      self._assert_no_active_deployment(inputs.get(DEEPLOY_KEYS.JOB_ID), inputs.get(DEEPLOY_KEYS.APP_ID))
 
       # Validate the request fields.
       self._validate_send_app_command_request(inputs)
@@ -2435,7 +1697,8 @@ class DeeployManagerApiPlugin(
 
     if (self.time() - self.__last_pipelines_check_time) > self.cfg_pipelines_check_delay:
       try:
-        self.check_running_pipelines_and_add_to_r1fs()
+        if not any(operation["phase"] != "completed" for operation in self._operation_records().values()):
+          self.check_running_pipelines_and_add_to_r1fs()
       except Exception as e:
         self.P(f"Error checking running pipelines: {e}", color='r')
       self.__last_pipelines_check_time = self.time()
