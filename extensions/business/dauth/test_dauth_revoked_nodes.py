@@ -136,8 +136,8 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.plugin.bc.is_node_licensed.return_value = False
     self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
     self.plugin.bc.is_node_licensed.assert_called_once_with(node_address_eth=ETH[REVOKED])
-    key = f"{REVOKED.removeprefix('0xai_')}|{SERVER.removeprefix('0xai_')}"
     records, _ = self._records()
+    key = f"{REVOKED.removeprefix('0xai_')}|{SERVER.removeprefix('0xai_')}|{records[0]['time_utc']}|1"
     self.assertEqual(self._unlicensed_cstore(), {key: records[0]})
     self.assertEqual(set(records[0]), RECORD_KEYS)
     self.assertEqual(
@@ -153,7 +153,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.assertEqual(len(self._records()[0]), 1)
     self.assertNotIn("no license", self._refusals()[-1])
 
-  def test_license_check_and_cstore_write_are_throttled_per_address(self):
+  def test_every_unlicensed_try_gets_its_own_key_and_license_is_reused_per_address(self):
     now = [1000.0]
     self.plugin.time = lambda: now[0]
     self.plugin.bc.is_node_licensed.return_value = False
@@ -161,13 +161,16 @@ class DauthRevokedNodeTests(unittest.TestCase):
       self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
     self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body("0xai_" + REVOKED_UNPREFIXED)))
     self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 2)
-    tries = lambda: sorted(record["tries_since_start"] for record in self._unlicensed_cstore().values())
-    self.assertEqual(tries(), [1, 1])
+    tries = lambda: sorted(
+      (record["node_address"], record["tries_since_start"]) for record in self._unlicensed_cstore().values()
+    )
+    self.assertEqual(tries(), [(REVOKED, 1), (REVOKED, 2), (REVOKED, 3), ("0xai_" + REVOKED_UNPREFIXED, 1)])
 
     now[0] += DAUTH_REVOKED_LICENSE_CHECK_INTERVAL
+    self.plugin.bc.is_node_licensed.return_value = True
     self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
     self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 3)
-    self.assertEqual(tries(), [1, 4])
+    self.assertEqual(len(self._unlicensed_cstore()), 4)
     self.assertEqual(len(self._records()[0]), 5)
 
   def test_license_or_cstore_failure_keeps_refusing_without_broadcast(self):
