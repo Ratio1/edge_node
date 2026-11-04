@@ -158,12 +158,6 @@ class _DauthMixin(object):
     Check if the node address is allowed to request authentication data.
     """
     self.Pd(f"Checking if node {node_address} (ETH: {node_address_eth}) is allowed")
-    revoked_msg = self._dauth_revoked_refusal(
-      endpoint="get_auth_data", node_address=node_address, node_address_eth=node_address_eth,
-      requester_type=version_check_data.requester_type, body=body,
-    )
-    if revoked_msg is not None:
-      return False, revoked_msg
     msg = ""
     result = True    
     if not version_check_data.result:
@@ -171,7 +165,10 @@ class _DauthMixin(object):
       msg = "Version check failed: {}".format(version_check_data.message)
     else:
       try:
-        result = self.bc.is_node_licensed(node_address_eth=node_address_eth)
+        result = not self._is_dauth_node_revoked(
+          endpoint="get_auth_data", node_address=node_address, node_address_eth=node_address_eth,
+          requester_type=version_check_data.requester_type, body=body,
+        ) and self.bc.is_node_licensed(node_address_eth=node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
         msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
       except Exception as e:
@@ -203,11 +200,10 @@ class _DauthMixin(object):
     if not verify_data.valid:
       raise ValueError("Invalid request signature: {}".format(verify_data.message))
 
-    revoked_msg = self._dauth_revoked_refusal(
+    if self._is_dauth_node_revoked(
       endpoint=endpoint, node_address=requester, node_address_eth=requester_eth, body=body,
-    )
-    if revoked_msg is not None:
-      raise ValueError(revoked_msg)
+    ):
+      raise ValueError(f"Sender {requester_eth} not allowed on {self.evm_network}.")
     return requester, requester_eth
 
   def _is_protocol_oracle_eth(self, node_address_eth):

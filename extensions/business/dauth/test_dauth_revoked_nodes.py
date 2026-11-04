@@ -17,7 +17,6 @@ from extensions.business.dauth.dauth_mixin import (
   VersionCheckData,
 )
 from extensions.business.dauth.dauth_revoked_nodes import (
-  DAUTH_REVOKED_NODE_MESSAGE,
   DAUTH_REVOKED_NODES_ENV_KEY,
   DAUTH_REVOKED_TRIES_FILE,
 )
@@ -103,7 +102,8 @@ class DauthRevokedNodeTests(unittest.TestCase):
 
   def _assert_auth_refused(self, data):
     dauth_data = data[dAuth.DAUTH_SUBKEY]
-    self.assertIn(DAUTH_REVOKED_NODE_MESSAGE, dauth_data["error"])
+    self.assertIn("not allowed on mainnet", dauth_data["error"])
+    self.assertNotIn("revoked", dauth_data["error"])
     self.assertNotIn("EE_MQTT_HOST", dauth_data)
     self.plugin.bc.is_node_licensed.assert_not_called()
 
@@ -112,6 +112,12 @@ class DauthRevokedNodeTests(unittest.TestCase):
     records, _ = self._records()
     self.assertEqual(records[0]["requester_type"], dAuth.DAUTH_SENDER_TYPE_NODE)
     self.assertEqual(records[0]["endpoint"], "get_auth_data")
+
+  def test_rejection_is_the_same_as_for_an_unlinked_node(self):
+    revoked_error = self.plugin.process_dauth_request(_auth_body(REVOKED))[dAuth.DAUTH_SUBKEY]["error"]
+    self.plugin.bc.is_node_licensed.return_value = False
+    unlinked_error = self.plugin.process_dauth_request(_auth_body(ALLOWED))[dAuth.DAUTH_SUBKEY]["error"]
+    self.assertEqual(revoked_error.replace(ETH[REVOKED], ETH[ALLOWED]), unlinked_error)
 
   def test_listed_sdk_requester_is_refused(self):
     body = _auth_body(REVOKED, sender_app_ver=None, sender_core_ver=None)
@@ -129,7 +135,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
       with self.subTest(sender=sender):
         allowed, msg = self.plugin.check_if_node_allowed(sender, "0x" + "d" * 40, version_data)
         self.assertFalse(allowed)
-        self.assertEqual(msg, DAUTH_REVOKED_NODE_MESSAGE)
+        self.assertEqual(msg, f"node 0x{'d' * 40} not allowed on mainnet")
 
   def test_licensed_unlisted_node_is_still_allowed(self):
     data = self.plugin.process_dauth_request(_auth_body(ALLOWED))
@@ -158,7 +164,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
           "nonce": REQUEST_NONCE, "job_id": "7", "job_secrets": {"TOKEN": "super-secret"},
           "wallet_request": {"job_id": "7"},
         }
-        with self.assertRaisesRegex(ValueError, "revoked after the November 2026"):
+        with self.assertRaisesRegex(ValueError, f"Sender {ETH[REVOKED]} not allowed on mainnet"):
           process(body)
     self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), self.plugin._chainstore)
     self.assertEqual(self.plugin.bc.encrypt_calls, [])
@@ -202,8 +208,9 @@ class DauthRevokedNodeTests(unittest.TestCase):
   def test_unloaded_denylist_fails_closed(self):
     del self.plugin._dauth_revoked_nodes
     version_data = VersionCheckData(result=True, requester_type=dAuth.DAUTH_SENDER_TYPE_NODE)
-    with self.assertRaisesRegex(RuntimeError, "not loaded"):
-      self.plugin.check_if_node_allowed(ALLOWED, ETH[ALLOWED], version_data)
+    allowed, msg = self.plugin.check_if_node_allowed(ALLOWED, ETH[ALLOWED], version_data)
+    self.assertFalse(allowed)
+    self.assertIn("not loaded", msg)
     with self.assertRaisesRegex(RuntimeError, "not loaded"):
       self.plugin.process_dauth_get_secret_request({
         "EE_SENDER": ALLOWED, "EE_ETH_SENDER": ETH[ALLOWED], "nonce": REQUEST_NONCE, "job_id": "7",

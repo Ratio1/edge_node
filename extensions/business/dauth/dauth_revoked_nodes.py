@@ -9,7 +9,7 @@ license state, and appends each refused try to a local JSONL registry so we can 
 which revoked keys are still in use. The list is deployed privately in the dAuth
 servers' .env and is never part of this repository.
 
-Remove this module and the `_dauth_revoked_refusal` calls in `dauth_mixin.py` once
+Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` once
 on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
 key-rotation update are live.
 """
@@ -28,10 +28,6 @@ DAUTH_REVOKED_TRIES_FILE = "dauth_revoked_node_tries.jsonl"
 # Holders of stolen keys can sign as many requests as they like: stop appending
 # (but keep refusing and counting) once the registry reaches this size.
 DAUTH_REVOKED_TRIES_MAX_BYTES = 64 * 1024 * 1024
-DAUTH_REVOKED_NODE_MESSAGE = (
-  "Node address revoked after the November 2026 security incident: its key is treated "
-  "as compromised. Generate a new node key and relink the license to the new node address."
-)
 
 _INTERNAL_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
 _REPORTED_KEYS = (
@@ -105,22 +101,22 @@ class _DauthRevokedNodesMixin(object):
       raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} holds no node addresses.")
     return revoked
 
-  def _dauth_revoked_refusal(
+  def _is_dauth_node_revoked(
     self, endpoint, node_address, node_address_eth, requester_type=None, body=None
   ):
     """
-    Return the refusal message if the signed requester's internal address is revoked,
-    else None. Call only after the request signature was verified. Every refusal is
-    counted, logged and appended to the local registry of tries.
+    Return True if the signed requester's internal address is revoked. Call only after
+    the request signature was verified. Every refusal is counted, logged and appended
+    to the local registry of tries.
     """
     revoked = getattr(self, "_dauth_revoked_nodes", None)
     if revoked is None:
       raise RuntimeError("dAuth revoked-node denylist is not loaded.")
     if not revoked:
-      return None
+      return False
     internal = self.bc.maybe_remove_prefix(node_address)
     if internal not in revoked:
-      return None
+      return False
 
     tries = self._dauth_revoked_tries.get(internal, 0) + 1
     self._dauth_revoked_tries[internal] = tries
@@ -147,7 +143,7 @@ class _DauthRevokedNodesMixin(object):
       ),
       color='r',
     )
-    return DAUTH_REVOKED_NODE_MESSAGE
+    return True
 
   def _dauth_revoked_first_seen(self, node_address):
     """NetMon first-seen date of the node, for the registry only (never used to decide)."""
