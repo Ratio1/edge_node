@@ -2,7 +2,7 @@
 dauth_revoked_nodes.py
 ======================
 
-TEMPORARY (November 2026 incident response): every node key that existed before the
+After the November 2026 security incident, every node key that existed before the
 2026-11-03 key rotations is treated as stolen. dAuth refuses any request signed by one
 of the internal node addresses listed in `EE_REVOKED_NODE_ADDRESSES`, whatever the
 license state, and appends each refused try to a local JSONL registry so we can see
@@ -44,7 +44,7 @@ _REPORTED_MAX_LEN = 64
 
 
 class _DauthRevokedNodesMixin(object):
-  """Temporary denylist of node addresses revoked after the November 2026 incident."""
+  """Denylist of node addresses revoked after the November 2026 incident."""
 
   def _load_dauth_revoked_nodes(self):
     """

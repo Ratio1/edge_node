@@ -158,8 +158,6 @@ class _DauthMixin(object):
     Check if the node address is allowed to request authentication data.
     """
     self.Pd(f"Checking if node {node_address} (ETH: {node_address_eth}) is allowed")
-    # TEMP (incident response): revoked pre-rotation node keys are refused for every
-    # requester type before the license check, see dauth_revoked_nodes.py.
     revoked_msg = self._dauth_revoked_refusal(
       endpoint="get_auth_data", node_address=node_address, node_address_eth=node_address_eth,
       requester_type=version_check_data.requester_type, body=body,
@@ -173,8 +171,6 @@ class _DauthMixin(object):
       msg = "Version check failed: {}".format(version_check_data.message)
     else:
       try:
-        # TEMP (incident response): SDK requesters are license-gated as well,
-        # previously only non-SDK requesters were checked.
         result = self.bc.is_node_licensed(node_address_eth=node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
         msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
@@ -207,7 +203,6 @@ class _DauthMixin(object):
     if not verify_data.valid:
       raise ValueError("Invalid request signature: {}".format(verify_data.message))
 
-    # TEMP (incident response): see dauth_revoked_nodes.py.
     revoked_msg = self._dauth_revoked_refusal(
       endpoint=endpoint, node_address=requester, node_address_eth=requester_eth, body=body,
     )

@@ -1,4 +1,4 @@
-"""TEMP (incident response): dAuth refuses node addresses revoked after the November 2026 incident."""
+"""dAuth refuses node addresses revoked after the November 2026 incident."""
 import hashlib
 import json
 import os

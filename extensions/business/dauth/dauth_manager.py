@@ -112,7 +112,7 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
-  _DauthRevokedNodesMixin, # TEMP (incident response)
+  _DauthRevokedNodesMixin,
   _DauthDeploymentSecretsMixin,
   _DeeployMixin,
   _DeeployJobMixin,
@@ -140,8 +140,6 @@ class DauthManagerPlugin(
   
 
   def on_init(self):
-    # TEMP (incident response): a mainnet dAuth server raises on a missing or
-    # malformed revoked-node list, so the web app never starts without the check.
     self._load_dauth_revoked_nodes()
     self._check_dauth_server_enabled_on_start()
     if self._is_dauth_server_enabled():
@@ -291,7 +289,7 @@ class DauthManagerPlugin(
     if not self._dauth_pause_teardown_succeeded:
       raise RuntimeError("Cannot resume after an incomplete web app teardown")
     # endif
-    self._require_dauth_revoked_nodes() # TEMP (incident response)
+    self._require_dauth_revoked_nodes()
 
     self.failed = False
     self._stop_request_monitor.clear()
