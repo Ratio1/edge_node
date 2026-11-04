@@ -1,4 +1,5 @@
 """dAuth refuses revoked node addresses."""
+import hashlib
 import json
 import os
 import tempfile
@@ -337,10 +338,13 @@ class DauthRevokedNodeStartupTests(unittest.TestCase):
     "eth address": f"{REVOKED},0x{'a' * 40}",
   }
 
-  def test_startup_log_has_count_but_no_addresses(self):
+  def test_startup_log_has_count_and_hash_but_no_addresses(self):
     messages = []
     _harness(messages)._load_dauth_revoked_nodes()
-    self.assertIn(f"{DAUTH_REVOKED_NODES_ENV_KEY}: 2 node addresses", messages[-1])
+    expected_hash = hashlib.sha256(
+      ",".join(sorted([REVOKED.removeprefix("0xai_"), REVOKED_UNPREFIXED])).encode()
+    ).hexdigest()
+    self.assertIn(f"{DAUTH_REVOKED_NODES_ENV_KEY}: 2 node addresses, sha256 {expected_hash}", messages[-1])
     for address in (REVOKED.removeprefix("0xai_"), REVOKED_UNPREFIXED):
       self.assertNotIn(address, "".join(messages))
 

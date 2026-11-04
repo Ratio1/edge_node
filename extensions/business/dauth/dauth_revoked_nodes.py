@@ -14,6 +14,7 @@ Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` on
 on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
 key-rotation update are live.
 """
+import hashlib
 import json
 import os
 import re
@@ -57,8 +58,8 @@ class _DauthRevokedNodesMixin(object):
     """
     Read the denylist once from `EE_REVOKED_NODE_ADDRESSES` (called from `on_init` on
     every node). A missing or malformed list is kept as an error for
-    `_require_dauth_revoked_nodes`, since only dAuth servers need it. Addresses are
-    never logged.
+    `_require_dauth_revoked_nodes`, since only dAuth servers need it. Only the count
+    and a hash are logged, never the addresses.
     """
     self._dauth_revoked_license_checks = {}
     try:
@@ -71,8 +72,10 @@ class _DauthRevokedNodesMixin(object):
       self._dauth_revoked_error = str(exc)
       return
     self.P(
-      f"dAuth revoked-node denylist loaded from {DAUTH_REVOKED_NODES_ENV_KEY}: "
-      f"{len(self._dauth_revoked_nodes)} node addresses",
+      "dAuth revoked-node denylist loaded from {}: {} node addresses, sha256 {}".format(
+        DAUTH_REVOKED_NODES_ENV_KEY, len(self._dauth_revoked_nodes),
+        hashlib.sha256(",".join(sorted(self._dauth_revoked_nodes)).encode()).hexdigest(),
+      ),
       boxed=True,
     )
     return
