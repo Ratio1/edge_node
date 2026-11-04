@@ -151,7 +151,8 @@ class _DauthMixin(object):
     self, 
     node_address : str, 
     node_address_eth : str, 
-    version_check_data : VersionCheckData
+    version_check_data : VersionCheckData,
+    body : dict = None,
   ):
     """
     Check if the node address is allowed to request authentication data.
@@ -164,9 +165,10 @@ class _DauthMixin(object):
       msg = "Version check failed: {}".format(version_check_data.message)
     else:
       try:
-        # TEMP (incident response): SDK requesters are license-gated as well,
-        # previously only non-SDK requesters were checked.
-        result = self.bc.is_node_licensed(node_address_eth=node_address_eth)
+        result = not self._is_dauth_node_revoked(
+          endpoint="get_auth_data", node_address=node_address, node_address_eth=node_address_eth,
+          requester_type=version_check_data.requester_type, body=body,
+        ) and self.bc.is_node_licensed(node_address_eth=node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
         msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
       except Exception as e:
@@ -176,7 +178,7 @@ class _DauthMixin(object):
         )
     return result, msg
 
-  def _verify_signed_dauth_body(self, body, log_hash_sign_fails=True):
+  def _verify_signed_dauth_body(self, body, endpoint, log_hash_sign_fails=True):
     if not isinstance(body, dict):
       raise ValueError("Invalid request body.")
 
@@ -198,6 +200,10 @@ class _DauthMixin(object):
     if not verify_data.valid:
       raise ValueError("Invalid request signature: {}".format(verify_data.message))
 
+    if self._is_dauth_node_revoked(
+      endpoint=endpoint, node_address=requester, node_address_eth=requester_eth, body=body,
+    ):
+      raise ValueError(f"Sender {requester_eth} not allowed on {self.evm_network}.")
     return requester, requester_eth
 
   def _is_protocol_oracle_eth(self, node_address_eth):
@@ -450,7 +456,7 @@ class _DauthMixin(object):
     return bound_bundle
 
   def process_dauth_add_secrets_request(self, body):
-    requester, requester_eth = self._verify_signed_dauth_body(body)
+    requester, requester_eth = self._verify_signed_dauth_body(body, endpoint="add_secrets")
     request_nonce = self._validate_dauth_secret_request_nonce(body)
     if not self._is_protocol_oracle_eth(requester_eth):
       raise ValueError(f"Sender {requester_eth} is not an oracle.")
@@ -476,7 +482,9 @@ class _DauthMixin(object):
 
   def process_dauth_reconcile_secrets_request(self, body):
     """Merge and store secrets locally; return only redacted configs and CID."""
-    requester, requester_eth = self._verify_signed_dauth_body(body, log_hash_sign_fails=False)
+    requester, requester_eth = self._verify_signed_dauth_body(
+      body, endpoint="reconcile_job_secrets", log_hash_sign_fails=False,
+    )
     nonce = self._validate_dauth_secret_request_nonce(body)
     if not self._is_protocol_oracle_eth(requester_eth):
       raise ValueError("Secret reconciliation requires a protocol oracle.")
@@ -560,7 +568,7 @@ class _DauthMixin(object):
     return bundle
 
   def process_dauth_get_secret_request(self, body):
-    requester, _ = self._verify_signed_dauth_body(body)
+    requester, _ = self._verify_signed_dauth_body(body, endpoint="get_secrets")
     request_nonce = self._validate_dauth_secret_request_nonce(body)
     job_id = self._normalize_dauth_job_id(body.get("job_id"))
 
@@ -618,7 +626,7 @@ class _DauthMixin(object):
     return {key: value for key, value in secret_bundle.items() if key != "pipelines"}
 
   def process_dauth_reveal_secret_request(self, body):
-    requester, requester_eth = self._verify_signed_dauth_body(body)
+    requester, requester_eth = self._verify_signed_dauth_body(body, endpoint="reveal_job_secrets")
     request_nonce = self._validate_dauth_secret_request_nonce(body)
     if not self._is_protocol_oracle_eth(requester_eth):
       raise ValueError(f"Sender {requester_eth} is not an oracle.")
@@ -921,7 +929,7 @@ class _DauthMixin(object):
     if error is None:
       allowed_to_dauth, message = self.check_if_node_allowed(
         node_address=requester, node_address_eth=requester_eth, 
-        version_check_data=version_check_data
+        version_check_data=version_check_data, body=body,
       )
       if not allowed_to_dauth:
         error = 'Node not allowed to request auth data. ' + message

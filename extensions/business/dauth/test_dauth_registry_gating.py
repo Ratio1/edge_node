@@ -17,6 +17,7 @@ from extensions.business.dauth.dauth_mixin import (
   _DauthMixin,
 )
 from extensions.business.dauth.dauth_registry import load_dauth_registry_snapshot
+from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -264,6 +265,9 @@ class _FakeBC:
       return node_address
     return "0xai_" + node_address
 
+  def maybe_remove_prefix(self, node_address):
+    return node_address.removeprefix("0xai_")
+
   def encrypt_str(self, str_data, str_recipient):
     self.encrypt_calls.append((str_data, str_recipient))
     return "encrypted-secret-bundle"
@@ -297,7 +301,7 @@ class _FakeR1FS:
     return self.data[cid]
 
 
-class _DauthHarness(_DauthMixin):
+class _DauthHarness(_DauthMixin, _DauthRevokedNodesMixin):
   pass
 
 
@@ -354,6 +358,7 @@ def _make_dauth_harness(
     deepcopy(value),
   ) or True
   plugin.chainstore_hget = lambda hkey, key: plugin._chainstore.get((hkey, str(key)))
+  plugin._load_dauth_revoked_nodes()
   return plugin
 
 
@@ -917,6 +922,8 @@ class DauthServerRegistryGateTests(unittest.TestCase):
 
     plugin = DauthManagerPlugin.__new__(DauthManagerPlugin)
     plugin.bc = _ManagerBC(dauth_oracle)
+    plugin.os_environ = {}
+    plugin.evm_network = "devnet"
     plugin._dauth_server_enabled = None
     plugin._dauth_server_enabled_message = None
     plugin._dauth_web_app_initialized = False
