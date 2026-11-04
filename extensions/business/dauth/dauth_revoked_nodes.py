@@ -4,11 +4,11 @@ dauth_revoked_nodes.py
 
 dAuth refuses any request signed by one of the internal node addresses listed in
 `EE_REVOKED_NODE_ADDRESSES`, whatever the license state. Each refused try is appended
-to a local JSONL registry. When the node also has no on-chain license, the time of the
-try is kept in the `DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash (one timestamp per
-node address, rewritten at most every `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL`
-seconds, dAuth servers only). The list is deployed privately in the dAuth servers'
-.env and is never part of this repository.
+to a local JSONL registry. When the node address is also not linked to any ND or MND
+license, the time of the try is kept in the `DAUTH_REVOKED_UNLICENSED_NODES` ChainStore
+hash (one timestamp per node address, rewritten at most every
+`DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` seconds, dAuth servers only). The list is
+deployed privately in the dAuth servers' .env and is never part of this repository.
 
 Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` once
 on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
@@ -31,14 +31,15 @@ DAUTH_REVOKED_TRIES_FILE = "dauth_revoked_node_tries.jsonl"
 # A revoked key can sign as many requests as it likes: stop appending (but keep
 # refusing) once the registry reaches this size.
 DAUTH_REVOKED_TRIES_MAX_BYTES = 64 * 1024 * 1024
-# Field = internal node address, value = unix time of the last recorded unlicensed try.
+# Field = internal node address, value = unix time of the last recorded try from a node
+# address that no ND or MND license is linked to.
 DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY = "DAUTH_REVOKED_UNLICENSED_NODES"
 # A node's timestamp is rewritten only when the stored (replicated) one is older than
 # this many seconds, so the gate holds across all dAuth servers.
 DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL = 600
 # The dAuth request loop never waits longer than this for peer confirmations.
 DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT = 3
-# The on-chain license result (or its failure) is reused for this many seconds.
+# The on-chain license-link result (or its failure) is reused for this many seconds.
 DAUTH_REVOKED_LICENSE_CHECK_INTERVAL = 60
 
 _INTERNAL_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
@@ -165,12 +166,13 @@ class _DauthRevokedNodesMixin(object):
 
   def _maybe_publish_dauth_revoked_unlicensed_try(self, internal, node_address_eth):
     """
-    Keep one timestamp per unlicensed revoked node in ChainStore, rewritten at most
-    once per `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` across all dAuth servers. The
+    Keep one timestamp per revoked node address that no ND or MND license is linked
+    to, rewritten at most once per `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` across all
+    dAuth servers. A linked node (banned or not) or a failed lookup writes nothing. The
     write goes to dAuth registry peers only, like job secrets. Never raises.
     """
     try:
-      if self._is_dauth_revoked_node_licensed(internal, node_address_eth) is not False:
+      if self._is_dauth_revoked_node_linked(internal, node_address_eth) is not False:
         return False
       now = self.time()
       last = self.chainstore_hget(hkey=DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY, key=internal)
@@ -190,16 +192,22 @@ class _DauthRevokedNodesMixin(object):
       self.P(f"Could not check or write unlicensed revoked dAuth try: {exc}", color='r')
     return False
 
-  def _is_dauth_revoked_node_licensed(self, internal, node_address_eth):
-    """True or False from the chain, None when the lookup failed; reused per interval."""
+  def _is_dauth_revoked_node_linked(self, internal, node_address_eth):
+    """
+    True if an ND or MND license is linked to the node address, banned or not; False
+    only when the Reader reports no license (`LicenseType.None` = 0); None when the
+    lookup failed. Not `is_node_licensed`: Controller `isNodeActive` is also False for
+    a node linked to a banned ND license. The result is reused per interval.
+    """
     now = self.time()
     checked = self._dauth_revoked_license_checks.get(internal)
     if checked is None or now - checked[0] >= DAUTH_REVOKED_LICENSE_CHECK_INTERVAL:
       try:
-        licensed = self.bc.is_node_licensed(node_address_eth=node_address_eth)
+        license_info = self.bc.get_node_license_info(node_address_eth=node_address_eth)
+        linked = license_info["licenseType"] != 0
       except Exception as exc:
         self.P(f"Could not check the license of a revoked dAuth node: {exc}", color='r')
-        licensed = None
-      checked = (now, licensed)
+        linked = None
+      checked = (now, linked)
       self._dauth_revoked_license_checks[internal] = checked
     return checked[1]

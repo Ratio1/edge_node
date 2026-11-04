@@ -38,7 +38,7 @@ from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecrets
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
-__VER__ = '0.3.4'
+__VER__ = '0.3.5'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
