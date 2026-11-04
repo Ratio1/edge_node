@@ -814,8 +814,8 @@ class _DauthMixin(object):
       try:
         requester_eth = self.bc.node_address_to_eth_address(requester_node_address)
         requester_is_oracle = self._is_protocol_oracle_eth(requester_eth)
-      except Exception as e:
-        self.P(f"Protocol oracle check failed for {requester_node_address}; not a supervisor: {e}", color='r')
+      except Exception:
+        pass  # chain read errors are already logged by get_oracles() above
     if requester_is_oracle:
       requester_is_dauth_oracle = False
       try:
