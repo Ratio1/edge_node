@@ -3,20 +3,17 @@ dauth_revoked_nodes.py
 ======================
 
 dAuth refuses any request signed by one of the internal node addresses listed in
-`EE_REVOKED_NODE_ADDRESSES`, whatever the license state, and appends each refused try
-to a local JSONL registry so we can see which revoked keys are still in use. When the
-on-chain license check finds no license for the node, the time of the try is also kept
-in the `DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash, one timestamp per node address,
-which only dAuth servers receive and which is rewritten at most every
-`DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` seconds.
-The list is deployed privately in the dAuth servers' .env and is never part of this
-repository.
+`EE_REVOKED_NODE_ADDRESSES`, whatever the license state. Each refused try is appended
+to a local JSONL registry. When the node also has no on-chain license, the time of the
+try is kept in the `DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash (one timestamp per
+node address, rewritten at most every `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL`
+seconds, dAuth servers only). The list is deployed privately in the dAuth servers'
+.env and is never part of this repository.
 
 Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` once
 on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
 key-rotation update are live.
 """
-import hashlib
 import json
 import os
 import re
@@ -31,18 +28,16 @@ from .dauth_registry import dauth_registry_write_kwargs
 DAUTH_REVOKED_NODES_ENV_KEY = "EE_REVOKED_NODE_ADDRESSES"
 DAUTH_REVOKED_TRIES_FILE = "dauth_revoked_node_tries.jsonl"
 # A revoked key can sign as many requests as it likes: stop appending (but keep
-# refusing and counting) once the registry reaches this size.
+# refusing) once the registry reaches this size.
 DAUTH_REVOKED_TRIES_MAX_BYTES = 64 * 1024 * 1024
-# One field per unlicensed revoked node: field = internal node address, value = unix
-# time of the last recorded try. The hash is bounded by the number of revoked addresses.
+# Field = internal node address, value = unix time of the last recorded unlicensed try.
 DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY = "DAUTH_REVOKED_UNLICENSED_NODES"
-# A node's timestamp is rewritten only when the stored one is older than this many
-# seconds. The stored value is replicated, so the gate holds across all dAuth servers.
+# A node's timestamp is rewritten only when the stored (replicated) one is older than
+# this many seconds, so the gate holds across all dAuth servers.
 DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL = 600
 # The dAuth request loop never waits longer than this for peer confirmations.
 DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT = 3
-# The on-chain license of a revoked address is reused for this many seconds, including
-# when the lookup failed.
+# The on-chain license result (or its failure) is reused for this many seconds.
 DAUTH_REVOKED_LICENSE_CHECK_INTERVAL = 60
 
 _INTERNAL_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
@@ -60,37 +55,30 @@ class _DauthRevokedNodesMixin(object):
 
   def _load_dauth_revoked_nodes(self):
     """
-    Read the denylist once from `EE_REVOKED_NODE_ADDRESSES`, called from `on_init` on
-    every node. An unusable value is kept as an error for `_require_dauth_revoked_nodes`,
-    since only nodes that serve dAuth need the list. Only the count and a hash are
-    logged, never the addresses.
+    Read the denylist once from `EE_REVOKED_NODE_ADDRESSES` (called from `on_init` on
+    every node). A missing or malformed list is kept as an error for
+    `_require_dauth_revoked_nodes`, since only dAuth servers need it. Addresses are
+    never logged.
     """
-    self._dauth_revoked_tries = {}
     self._dauth_revoked_license_checks = {}
     try:
-      revoked = self._parse_dauth_revoked_nodes(self.os_environ.get(DAUTH_REVOKED_NODES_ENV_KEY))
+      self._dauth_revoked_nodes = self._parse_dauth_revoked_nodes(
+        self.os_environ.get(DAUTH_REVOKED_NODES_ENV_KEY)
+      )
+      self._dauth_revoked_error = None
     except ValueError as exc:
       self._dauth_revoked_nodes = frozenset()
       self._dauth_revoked_error = str(exc)
       return
-
-    self._dauth_revoked_nodes = frozenset(revoked)
-    self._dauth_revoked_error = None
     self.P(
-      "dAuth revoked-node denylist loaded from {}: {} node addresses, sha256 {}".format(
-        DAUTH_REVOKED_NODES_ENV_KEY, len(revoked),
-        hashlib.sha256(",".join(sorted(revoked)).encode()).hexdigest(),
-      ),
+      f"dAuth revoked-node denylist loaded from {DAUTH_REVOKED_NODES_ENV_KEY}: "
+      f"{len(self._dauth_revoked_nodes)} node addresses",
       boxed=True,
     )
     return
 
   def _require_dauth_revoked_nodes(self):
-    """
-    Call before this node starts serving dAuth. A mainnet server raises when the list
-    is unset, empty or malformed, so it never runs without the check; on other
-    networks it warns and runs with the check off.
-    """
+    """A mainnet dAuth server never starts without the list; other networks warn."""
     error = self._dauth_revoked_error
     if error is None:
       return
@@ -105,10 +93,9 @@ class _DauthRevokedNodesMixin(object):
       raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} is not set.")
     revoked = set()
     for position, item in enumerate(value.split(","), start=1):
-      item = item.strip()
-      if not item:
+      if not item.strip():
         continue
-      internal = self.bc.maybe_remove_prefix(item)
+      internal = self.bc.maybe_remove_prefix(item.strip())
       if not _INTERNAL_ADDRESS_RE.match(internal):
         raise ValueError(
           f"{DAUTH_REVOKED_NODES_ENV_KEY} item #{position} is not a well-formed internal node address."
@@ -116,16 +103,14 @@ class _DauthRevokedNodesMixin(object):
       revoked.add(internal)
     if not revoked:
       raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} holds no node addresses.")
-    return revoked
+    return frozenset(revoked)
 
   def _is_dauth_node_revoked(
     self, endpoint, node_address, node_address_eth, requester_type=None, body=None
   ):
     """
-    Return True if the signed requester's internal address is revoked. Call only after
-    the request signature was verified. Every refusal is counted, logged and appended
-    to the local registry of tries; for unlicensed nodes the time of the try is also
-    kept in ChainStore. The refusal never depends on the license.
+    True if the signed requester's internal address is revoked. Call only after the
+    signature was verified. The refusal never depends on the license.
     """
     revoked = getattr(self, "_dauth_revoked_nodes", None)
     if revoked is None:
@@ -136,29 +121,23 @@ class _DauthRevokedNodesMixin(object):
     if internal not in revoked:
       return False
 
-    tries = self._dauth_revoked_tries.get(internal, 0) + 1
-    self._dauth_revoked_tries[internal] = tries
     body = body if isinstance(body, dict) else {}
-    reported = {
-      key: body[key][:_REPORTED_MAX_LEN] if isinstance(body.get(key), str) else None
-      for key in _REPORTED_KEYS
-    }
     record = {
       "time_utc": datetime.now(timezone.utc).isoformat(),
       "endpoint": endpoint,
       "node_address": node_address,
       "eth_address": node_address_eth,
       "requester_type": requester_type,
-      "first_seen": self._dauth_revoked_first_seen(node_address),
-      "tries_since_start": tries,
-      **reported,
+      **{
+        key: body[key][:_REPORTED_MAX_LEN] if isinstance(body.get(key), str) else None
+        for key in _REPORTED_KEYS
+      },
     }
     recorded = self._record_dauth_revoked_try(record)
-    published = self._maybe_publish_dauth_revoked_unlicensed_try(internal, record)
+    published = self._maybe_publish_dauth_revoked_unlicensed_try(internal, node_address_eth)
     self.P(
-      "dAuth refused revoked {} {} ({}) on /{}: try #{} since start, {} tries from {} revoked addresses{}{}".format(
-        requester_type or "requester", node_address, node_address_eth, endpoint, tries,
-        sum(self._dauth_revoked_tries.values()), len(self._dauth_revoked_tries),
+      "dAuth refused revoked {} {} ({}) on /{}{}{}".format(
+        requester_type or "requester", node_address, node_address_eth, endpoint,
         "" if recorded else " (not recorded in registry)",
         f" (no license, written to {DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY})" if published else "",
       ),
@@ -166,14 +145,29 @@ class _DauthRevokedNodesMixin(object):
     )
     return True
 
-  def _maybe_publish_dauth_revoked_unlicensed_try(self, internal, record):
+  def _record_dauth_revoked_try(self, record):
+    """Append one record to the plugin-local JSONL registry. Never raises."""
+    try:
+      folder = os.path.join(self.get_data_folder(), self._resolve_data_subfolder())
+      os.makedirs(folder, exist_ok=True)
+      path = os.path.join(folder, DAUTH_REVOKED_TRIES_FILE)
+      if os.path.exists(path) and os.path.getsize(path) >= DAUTH_REVOKED_TRIES_MAX_BYTES:
+        return False
+      with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+      return True
+    except Exception as exc:
+      self.P(f"Could not record revoked dAuth try: {exc}", color='r')
+      return False
+
+  def _maybe_publish_dauth_revoked_unlicensed_try(self, internal, node_address_eth):
     """
-    Keep one timestamp per unlicensed revoked node in ChainStore, rewritten at most once
-    per `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` across all dAuth servers. The write
-    goes to dAuth registry peers only, like job secrets. Never raises.
+    Keep one timestamp per unlicensed revoked node in ChainStore, rewritten at most
+    once per `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` across all dAuth servers. The
+    write goes to dAuth registry peers only, like job secrets. Never raises.
     """
     try:
-      if self._is_dauth_revoked_node_licensed(internal, record["eth_address"]) is not False:
+      if self._is_dauth_revoked_node_licensed(internal, node_address_eth) is not False:
         return False
       now = self.time()
       last = self.chainstore_hget(hkey=DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY, key=internal)
@@ -194,10 +188,7 @@ class _DauthRevokedNodesMixin(object):
     return False
 
   def _is_dauth_revoked_node_licensed(self, internal, node_address_eth):
-    """
-    On-chain license of a revoked node, reused for `DAUTH_REVOKED_LICENSE_CHECK_INTERVAL`.
-    True or False from the chain; None when the last lookup in the interval failed.
-    """
+    """True or False from the chain, None when the lookup failed; reused per interval."""
     now = self.time()
     checked = self._dauth_revoked_license_checks.get(internal)
     if checked is None or now - checked[0] >= DAUTH_REVOKED_LICENSE_CHECK_INTERVAL:
@@ -209,26 +200,3 @@ class _DauthRevokedNodesMixin(object):
       checked = (now, licensed)
       self._dauth_revoked_license_checks[internal] = checked
     return checked[1]
-
-  def _dauth_revoked_first_seen(self, node_address):
-    """NetMon first-seen date of the node, for the registry only (never used to decide)."""
-    try:
-      node_data = self.netmon.epoch_manager.data.get(self.bc.maybe_add_prefix(node_address), {})
-      return node_data.get("first_seen")
-    except Exception:
-      return None
-
-  def _record_dauth_revoked_try(self, record):
-    """Append one record to the plugin-local JSONL registry. Never raises."""
-    try:
-      folder = os.path.join(self.get_data_folder(), self._resolve_data_subfolder())
-      os.makedirs(folder, exist_ok=True)
-      path = os.path.join(folder, DAUTH_REVOKED_TRIES_FILE)
-      if os.path.exists(path) and os.path.getsize(path) >= DAUTH_REVOKED_TRIES_MAX_BYTES:
-        return False
-      with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\n")
-      return True
-    except Exception as exc:
-      self.P(f"Could not record revoked dAuth try: {exc}", color='r')
-      return False

@@ -1,10 +1,8 @@
 """dAuth refuses revoked node addresses."""
-import hashlib
 import json
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
@@ -42,8 +40,8 @@ DENYLIST = f" {REVOKED} ,, {REVOKED_UNPREFIXED},"
 ETH = {REVOKED: "0x" + "a" * 40, "0xai_" + REVOKED_UNPREFIXED: "0x" + "b" * 40, ALLOWED: "0x" + "c" * 40}
 VERSIONS = {"sender_app_ver": "2.10.621", "sender_core_ver": "7.7.1", "sender_sdk_ver": "3.4.90"}
 RECORD_KEYS = {
-  "time_utc", "endpoint", "node_address", "eth_address", "requester_type", "first_seen",
-  "tries_since_start", "sender_app_ver", "sender_core_ver", "sender_sdk_ver", "sender_alias",
+  "time_utc", "endpoint", "node_address", "eth_address", "requester_type",
+  "sender_app_ver", "sender_core_ver", "sender_sdk_ver", "sender_alias",
 }
 
 
@@ -90,9 +88,6 @@ class DauthRevokedNodeTests(unittest.TestCase):
     plugin = _harness(self.messages)
     plugin.get_data_folder = lambda: self.tmp.name
     plugin._resolve_data_subfolder = lambda subfolder=None: "pipelines_data/admin/dauth/plugin_data"
-    plugin.netmon = SimpleNamespace(epoch_manager=SimpleNamespace(data={
-      REVOKED: {"first_seen": "2026-05-01 10:00:00"},
-    }))
     plugin._load_dauth_revoked_nodes()
     self.plugin = plugin
 
@@ -299,11 +294,9 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.assertEqual(set(records[1]), RECORD_KEYS)
     self.assertEqual(records[1]["node_address"], REVOKED)
     self.assertEqual(records[1]["eth_address"], ETH[REVOKED])
-    self.assertEqual(records[1]["first_seen"], "2026-05-01 10:00:00")
-    self.assertEqual(records[1]["tries_since_start"], 2)
     for leaked in ("super-secret", "signature-value", "job_secrets", "EE_SIGN", REQUEST_NONCE):
       self.assertNotIn(leaked, raw)
-    self.assertIn("try #2 since start, 2 tries from 1 revoked addresses", self.messages[-1])
+    self.assertTrue(self.messages[-1].startswith("dAuth refused revoked"))
 
   def test_unsigned_requests_are_not_recorded(self):
     self.plugin.bc.valid_signature = False
@@ -319,7 +312,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
         self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
     self.assertEqual(len(self._records()[0]), 1)
     refusals = [msg for msg in self.messages if msg.startswith("dAuth refused revoked")]
-    self.assertIn("try #2", refusals[-1])
+    self.assertEqual(len(refusals), 2)
     self.assertIn("(not recorded in registry)", refusals[-1])
 
   def test_unloaded_denylist_fails_closed(self):
@@ -344,13 +337,10 @@ class DauthRevokedNodeStartupTests(unittest.TestCase):
     "eth address": f"{REVOKED},0x{'a' * 40}",
   }
 
-  def test_startup_log_has_count_and_hash_but_no_addresses(self):
+  def test_startup_log_has_count_but_no_addresses(self):
     messages = []
     _harness(messages)._load_dauth_revoked_nodes()
-    expected_hash = hashlib.sha256(
-      ",".join(sorted([REVOKED.removeprefix("0xai_"), REVOKED_UNPREFIXED])).encode()
-    ).hexdigest()
-    self.assertIn(f"{DAUTH_REVOKED_NODES_ENV_KEY}: 2 node addresses, sha256 {expected_hash}", messages[-1])
+    self.assertIn(f"{DAUTH_REVOKED_NODES_ENV_KEY}: 2 node addresses", messages[-1])
     for address in (REVOKED.removeprefix("0xai_"), REVOKED_UNPREFIXED):
       self.assertNotIn(address, "".join(messages))
 
