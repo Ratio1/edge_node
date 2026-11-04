@@ -21,6 +21,8 @@ from extensions.business.dauth.dauth_revoked_nodes import (
   DAUTH_REVOKED_NODES_ENV_KEY,
   DAUTH_REVOKED_TRIES_FILE,
   DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY,
+  DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL,
+  DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT,
 )
 from extensions.business.dauth import test_dauth_registry_gating as gating
 from extensions.business.dauth.test_dauth_registry_gating import (
@@ -124,25 +126,34 @@ class DauthRevokedNodeTests(unittest.TestCase):
       with self.subTest(licensed=licensed):
         self.plugin.bc.is_node_licensed.return_value = licensed
         self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(sender)))
+    with self.subTest(licensed="lookup raises"):
+      self.plugin._dauth_revoked_license_checks.clear()
+      self.plugin.bc.is_node_licensed = Mock(side_effect=RuntimeError("rpc down"))
+      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
     records, _ = self._records()
-    self.assertEqual([record["node_address"] for record in records], [REVOKED, "0xai_" + REVOKED_UNPREFIXED])
+    self.assertEqual(
+      [record["node_address"] for record in records], [REVOKED, "0xai_" + REVOKED_UNPREFIXED, REVOKED],
+    )
     self.assertEqual(records[0]["requester_type"], dAuth.DAUTH_SENDER_TYPE_NODE)
     self.assertEqual(records[0]["endpoint"], "get_auth_data")
 
-  def test_unlicensed_revoked_try_is_written_to_cstore_for_dauth_peers_only(self):
+  def test_unlicensed_revoked_try_writes_one_timestamp_per_node_for_dauth_peers_only(self):
     writes = []
     store = self.plugin.chainstore_hset
     self.plugin.chainstore_hset = lambda **kwargs: writes.append(kwargs) or store(**kwargs)
+    self.plugin.time = lambda: 1000.0
     self.plugin.bc.is_node_licensed.return_value = False
     self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
     self.plugin.bc.is_node_licensed.assert_called_once_with(node_address_eth=ETH[REVOKED])
     records, _ = self._records()
-    key = f"{REVOKED.removeprefix('0xai_')}|{SERVER.removeprefix('0xai_')}|{records[0]['time_utc']}|1"
-    self.assertEqual(self._unlicensed_cstore(), {key: records[0]})
     self.assertEqual(set(records[0]), RECORD_KEYS)
+    self.assertEqual(self._unlicensed_cstore(), {REVOKED.removeprefix("0xai_"): 1000.0})
     self.assertEqual(
       {name: value for name, value in writes[0].items() if name not in ("hkey", "key", "value")},
-      {"extra_peers": ["node-oracle"], "include_default_peers": False, "include_configured_peers": False},
+      {
+        "extra_peers": ["node-oracle"], "include_default_peers": False, "include_configured_peers": False,
+        "timeout": DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT, "max_retries": 0,
+      },
     )
     self.assertIn(f"(no license, written to {DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY})", self._refusals()[-1])
 
@@ -153,7 +164,10 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.assertEqual(len(self._records()[0]), 1)
     self.assertNotIn("no license", self._refusals()[-1])
 
-  def test_every_unlicensed_try_gets_its_own_key_and_license_is_reused_per_address(self):
+  def test_unlicensed_tries_within_the_interval_rewrite_nothing(self):
+    writes = []
+    store = self.plugin.chainstore_hset
+    self.plugin.chainstore_hset = lambda **kwargs: writes.append(kwargs) or store(**kwargs)
     now = [1000.0]
     self.plugin.time = lambda: now[0]
     self.plugin.bc.is_node_licensed.return_value = False
@@ -161,17 +175,41 @@ class DauthRevokedNodeTests(unittest.TestCase):
       self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
     self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body("0xai_" + REVOKED_UNPREFIXED)))
     self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 2)
-    tries = lambda: sorted(
-      (record["node_address"], record["tries_since_start"]) for record in self._unlicensed_cstore().values()
+    self.assertEqual(len(writes), 2)
+    self.assertEqual(
+      self._unlicensed_cstore(), {REVOKED.removeprefix("0xai_"): 1000.0, REVOKED_UNPREFIXED: 1000.0},
     )
-    self.assertEqual(tries(), [(REVOKED, 1), (REVOKED, 2), (REVOKED, 3), ("0xai_" + REVOKED_UNPREFIXED, 1)])
+    self.assertNotIn("no license", self._refusals()[1])
 
-    now[0] += DAUTH_REVOKED_LICENSE_CHECK_INTERVAL
-    self.plugin.bc.is_node_licensed.return_value = True
+    now[0] += DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL
     self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
-    self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 3)
-    self.assertEqual(len(self._unlicensed_cstore()), 4)
+    self.assertEqual(len(writes), 3)
+    self.assertEqual(self._unlicensed_cstore()[REVOKED.removeprefix("0xai_")], now[0])
     self.assertEqual(len(self._records()[0]), 5)
+
+  def test_timestamp_written_by_another_server_suppresses_the_write(self):
+    self.plugin.time = lambda: 1000.0
+    self.plugin._chainstore[(DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY, REVOKED.removeprefix("0xai_"))] = 900.0
+    self.plugin.chainstore_hset = Mock(side_effect=AssertionError("must not write"))
+    self.plugin.bc.is_node_licensed.return_value = False
+    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self.plugin.chainstore_hset.assert_not_called()
+    self.assertNotIn("no license", self._refusals()[-1])
+    self.assertEqual(len(self._records()[0]), 1)
+
+  def test_failed_license_lookup_is_reused_for_the_interval(self):
+    now = [1000.0]
+    self.plugin.time = lambda: now[0]
+    self.plugin.bc.is_node_licensed = Mock(side_effect=RuntimeError("rpc down"))
+    for _ in range(2):
+      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 1)
+    self.assertEqual(self._unlicensed_cstore(), {})
+    now[0] += DAUTH_REVOKED_LICENSE_CHECK_INTERVAL
+    self.plugin.bc.is_node_licensed = Mock(return_value=False)
+    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self.assertEqual(self._unlicensed_cstore(), {REVOKED.removeprefix("0xai_"): now[0]})
+    self.assertEqual(len(self._records()[0]), 3)
 
   def test_license_or_cstore_failure_keeps_refusing_without_broadcast(self):
     failures = {

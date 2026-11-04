@@ -5,8 +5,10 @@ dauth_revoked_nodes.py
 dAuth refuses any request signed by one of the internal node addresses listed in
 `EE_REVOKED_NODE_ADDRESSES`, whatever the license state, and appends each refused try
 to a local JSONL registry so we can see which revoked keys are still in use. When the
-on-chain license check finds no license for the node, the try is also written to the
-`DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash, which only dAuth servers receive.
+on-chain license check finds no license for the node, the time of the try is also kept
+in the `DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash, one timestamp per node address,
+which only dAuth servers receive and which is rewritten at most every
+`DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` seconds.
 The list is deployed privately in the dAuth servers' .env and is never part of this
 repository.
 
@@ -31,11 +33,16 @@ DAUTH_REVOKED_TRIES_FILE = "dauth_revoked_node_tries.jsonl"
 # A revoked key can sign as many requests as it likes: stop appending (but keep
 # refusing and counting) once the registry reaches this size.
 DAUTH_REVOKED_TRIES_MAX_BYTES = 64 * 1024 * 1024
-# One record per refused try of an unlicensed revoked node, keyed
-# `<node address>|<server address>|<time_utc>|<try>`. Nothing caps this hash: every
-# such try is one write to the dAuth servers.
+# One field per unlicensed revoked node: field = internal node address, value = unix
+# time of the last recorded try. The hash is bounded by the number of revoked addresses.
 DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY = "DAUTH_REVOKED_UNLICENSED_NODES"
-# The on-chain license of a revoked address is reused for this many seconds.
+# A node's timestamp is rewritten only when the stored one is older than this many
+# seconds. The stored value is replicated, so the gate holds across all dAuth servers.
+DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL = 600
+# The dAuth request loop never waits longer than this for peer confirmations.
+DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT = 3
+# The on-chain license of a revoked address is reused for this many seconds, including
+# when the lookup failed.
 DAUTH_REVOKED_LICENSE_CHECK_INTERVAL = 60
 
 _INTERNAL_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
@@ -117,8 +124,8 @@ class _DauthRevokedNodesMixin(object):
     """
     Return True if the signed requester's internal address is revoked. Call only after
     the request signature was verified. Every refusal is counted, logged and appended
-    to the local registry of tries; tries from unlicensed nodes also go to ChainStore.
-    The refusal never depends on the license.
+    to the local registry of tries; for unlicensed nodes the time of the try is also
+    kept in ChainStore. The refusal never depends on the license.
     """
     revoked = getattr(self, "_dauth_revoked_nodes", None)
     if revoked is None:
@@ -161,17 +168,23 @@ class _DauthRevokedNodesMixin(object):
 
   def _maybe_publish_dauth_revoked_unlicensed_try(self, internal, record):
     """
-    Write the try to ChainStore when the revoked node has no on-chain license. The
-    write goes to dAuth registry peers only, like job secrets. Never raises.
+    Keep one timestamp per unlicensed revoked node in ChainStore, rewritten at most once
+    per `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` across all dAuth servers. The write
+    goes to dAuth registry peers only, like job secrets. Never raises.
     """
     try:
-      if self._is_dauth_revoked_node_licensed(internal, record["eth_address"]):
+      if self._is_dauth_revoked_node_licensed(internal, record["eth_address"]) is not False:
         return False
-      server = self.bc.maybe_remove_prefix(self.bc.address)
+      now = self.time()
+      last = self.chainstore_hget(hkey=DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY, key=internal)
+      if isinstance(last, (int, float)) and now - last < DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL:
+        return False
       if self.chainstore_hset(
         hkey=DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY,
-        key=f"{internal}|{server}|{record['time_utc']}|{record['tries_since_start']}",
-        value=record,
+        key=internal,
+        value=now,
+        timeout=DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT,
+        max_retries=0,
         **dauth_registry_write_kwargs(self),
       ):
         return True
@@ -181,11 +194,19 @@ class _DauthRevokedNodesMixin(object):
     return False
 
   def _is_dauth_revoked_node_licensed(self, internal, node_address_eth):
-    """On-chain license of a revoked node, reused for `DAUTH_REVOKED_LICENSE_CHECK_INTERVAL`."""
+    """
+    On-chain license of a revoked node, reused for `DAUTH_REVOKED_LICENSE_CHECK_INTERVAL`.
+    True or False from the chain; None when the last lookup in the interval failed.
+    """
     now = self.time()
     checked = self._dauth_revoked_license_checks.get(internal)
     if checked is None or now - checked[0] >= DAUTH_REVOKED_LICENSE_CHECK_INTERVAL:
-      checked = (now, self.bc.is_node_licensed(node_address_eth=node_address_eth))
+      try:
+        licensed = self.bc.is_node_licensed(node_address_eth=node_address_eth)
+      except Exception as exc:
+        self.P(f"Could not check the license of a revoked dAuth node: {exc}", color='r')
+        licensed = None
+      checked = (now, licensed)
       self._dauth_revoked_license_checks[internal] = checked
     return checked[1]
 
