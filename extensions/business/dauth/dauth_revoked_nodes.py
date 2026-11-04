@@ -2,12 +2,13 @@
 dauth_revoked_nodes.py
 ======================
 
-After the November 2026 security incident, every node key that existed before the
-2026-11-03 key rotations is treated as stolen. dAuth refuses any request signed by one
-of the internal node addresses listed in `EE_REVOKED_NODE_ADDRESSES`, whatever the
-license state, and appends each refused try to a local JSONL registry so we can see
-which revoked keys are still in use. The list is deployed privately in the dAuth
-servers' .env and is never part of this repository.
+dAuth refuses any request signed by one of the internal node addresses listed in
+`EE_REVOKED_NODE_ADDRESSES`, whatever the license state, and appends each refused try
+to a local JSONL registry so we can see which revoked keys are still in use. When the
+on-chain license check finds no license for the node, the try is also written to the
+`DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash, which only dAuth servers receive.
+The list is deployed privately in the dAuth servers' .env and is never part of this
+repository.
 
 Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` once
 on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
@@ -21,13 +22,21 @@ from datetime import datetime, timezone
 
 from ratio1.const.base import dAuth
 
+from .dauth_registry import dauth_registry_write_kwargs
+
 
 # Comma-separated internal node addresses (with or without the `0xai_` prefix).
 DAUTH_REVOKED_NODES_ENV_KEY = "EE_REVOKED_NODE_ADDRESSES"
 DAUTH_REVOKED_TRIES_FILE = "dauth_revoked_node_tries.jsonl"
-# Holders of stolen keys can sign as many requests as they like: stop appending
-# (but keep refusing and counting) once the registry reaches this size.
+# A revoked key can sign as many requests as it likes: stop appending (but keep
+# refusing and counting) once the registry reaches this size.
 DAUTH_REVOKED_TRIES_MAX_BYTES = 64 * 1024 * 1024
+# One record per refused try of an unlicensed revoked node, keyed
+# `<node address>|<server address>|<time_utc>|<try>`. Nothing caps this hash: every
+# such try is one write to the dAuth servers.
+DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY = "DAUTH_REVOKED_UNLICENSED_NODES"
+# The on-chain license of a revoked address is reused for this many seconds.
+DAUTH_REVOKED_LICENSE_CHECK_INTERVAL = 60
 
 _INTERNAL_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
 _REPORTED_KEYS = (
@@ -40,7 +49,7 @@ _REPORTED_MAX_LEN = 64
 
 
 class _DauthRevokedNodesMixin(object):
-  """Denylist of node addresses revoked after the November 2026 incident."""
+  """Denylist of revoked node addresses."""
 
   def _load_dauth_revoked_nodes(self):
     """
@@ -50,6 +59,7 @@ class _DauthRevokedNodesMixin(object):
     logged, never the addresses.
     """
     self._dauth_revoked_tries = {}
+    self._dauth_revoked_license_checks = {}
     try:
       revoked = self._parse_dauth_revoked_nodes(self.os_environ.get(DAUTH_REVOKED_NODES_ENV_KEY))
     except ValueError as exc:
@@ -107,7 +117,8 @@ class _DauthRevokedNodesMixin(object):
     """
     Return True if the signed requester's internal address is revoked. Call only after
     the request signature was verified. Every refusal is counted, logged and appended
-    to the local registry of tries.
+    to the local registry of tries; tries from unlicensed nodes also go to ChainStore.
+    The refusal never depends on the license.
     """
     revoked = getattr(self, "_dauth_revoked_nodes", None)
     if revoked is None:
@@ -125,7 +136,7 @@ class _DauthRevokedNodesMixin(object):
       key: body[key][:_REPORTED_MAX_LEN] if isinstance(body.get(key), str) else None
       for key in _REPORTED_KEYS
     }
-    recorded = self._record_dauth_revoked_try({
+    record = {
       "time_utc": datetime.now(timezone.utc).isoformat(),
       "endpoint": endpoint,
       "node_address": node_address,
@@ -134,16 +145,49 @@ class _DauthRevokedNodesMixin(object):
       "first_seen": self._dauth_revoked_first_seen(node_address),
       "tries_since_start": tries,
       **reported,
-    })
+    }
+    recorded = self._record_dauth_revoked_try(record)
+    published = self._maybe_publish_dauth_revoked_unlicensed_try(internal, record)
     self.P(
-      "dAuth refused revoked {} {} ({}) on /{}: try #{} since start, {} tries from {} revoked addresses{}".format(
+      "dAuth refused revoked {} {} ({}) on /{}: try #{} since start, {} tries from {} revoked addresses{}{}".format(
         requester_type or "requester", node_address, node_address_eth, endpoint, tries,
         sum(self._dauth_revoked_tries.values()), len(self._dauth_revoked_tries),
         "" if recorded else " (not recorded in registry)",
+        f" (no license, written to {DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY})" if published else "",
       ),
       color='r',
     )
     return True
+
+  def _maybe_publish_dauth_revoked_unlicensed_try(self, internal, record):
+    """
+    Write the try to ChainStore when the revoked node has no on-chain license. The
+    write goes to dAuth registry peers only, like job secrets. Never raises.
+    """
+    try:
+      if self._is_dauth_revoked_node_licensed(internal, record["eth_address"]):
+        return False
+      server = self.bc.maybe_remove_prefix(self.bc.address)
+      if self.chainstore_hset(
+        hkey=DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY,
+        key=f"{internal}|{server}|{record['time_utc']}|{record['tries_since_start']}",
+        value=record,
+        **dauth_registry_write_kwargs(self),
+      ):
+        return True
+      self.P(f"Could not write unlicensed revoked dAuth try to {DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY}.", color='r')
+    except Exception as exc:
+      self.P(f"Could not check or write unlicensed revoked dAuth try: {exc}", color='r')
+    return False
+
+  def _is_dauth_revoked_node_licensed(self, internal, node_address_eth):
+    """On-chain license of a revoked node, reused for `DAUTH_REVOKED_LICENSE_CHECK_INTERVAL`."""
+    now = self.time()
+    checked = self._dauth_revoked_license_checks.get(internal)
+    if checked is None or now - checked[0] >= DAUTH_REVOKED_LICENSE_CHECK_INTERVAL:
+      checked = (now, self.bc.is_node_licensed(node_address_eth=node_address_eth))
+      self._dauth_revoked_license_checks[internal] = checked
+    return checked[1]
 
   def _dauth_revoked_first_seen(self, node_address):
     """NetMon first-seen date of the node, for the registry only (never used to decide)."""
