@@ -32,12 +32,13 @@ from extensions.business.dauth.dauth_registry import (
   dauth_registry_write_kwargs,
   load_dauth_registry_snapshot,
 )
+from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
-__VER__ = '0.3.1'
+__VER__ = '0.3.2'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -111,6 +112,7 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
+  _DauthRevokedNodesMixin, # TEMP (incident response)
   _DauthDeploymentSecretsMixin,
   _DeeployMixin,
   _DeeployJobMixin,
@@ -138,7 +140,12 @@ class DauthManagerPlugin(
   
 
   def on_init(self):
+    # TEMP (incident response): a mainnet dAuth server raises on a missing or
+    # malformed revoked-node list, so the web app never starts without the check.
+    self._load_dauth_revoked_nodes()
     self._check_dauth_server_enabled_on_start()
+    if self._is_dauth_server_enabled():
+      self._require_dauth_revoked_nodes()
     super(DauthManagerPlugin, self).on_init()
     self._dauth_web_app_initialized = True
     if not self._is_dauth_server_enabled():
@@ -284,6 +291,7 @@ class DauthManagerPlugin(
     if not self._dauth_pause_teardown_succeeded:
       raise RuntimeError("Cannot resume after an incomplete web app teardown")
     # endif
+    self._require_dauth_revoked_nodes() # TEMP (incident response)
 
     self.failed = False
     self._stop_request_monitor.clear()
