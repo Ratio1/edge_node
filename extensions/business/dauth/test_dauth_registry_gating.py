@@ -444,6 +444,35 @@ class DauthRegistrySecretGatingTests(unittest.TestCase):
     self.assertNotIn("EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER", data)
     self.assertNotIn("EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER", data)
 
+  def test_supervisor_role_comes_from_chain_even_before_first_heartbeat(self):
+    # A freshly keyed oracle is on-chain but unknown to the heartbeat-derived
+    # eth->node map, so get_oracles() cannot convert it yet.
+    plugin = _make_dauth_harness(dauth_oracle=True)
+    plugin.bc.get_oracles = lambda include_eth_addrs=False: ([], [], [])
+
+    data = plugin.fill_dauth_data(
+      dauth_data={},
+      requester_node_address="node-oracle",
+      is_node=True,
+      sender_eth_address="0xORACLE",
+    )
+
+    self.assertTrue(data["EE_SUPERVISOR"])
+
+  def test_supervisor_role_fails_closed_when_chain_oracles_are_unavailable(self):
+    plugin = _make_dauth_harness(dauth_oracle=True)
+    plugin.bc.get_eth_oracles = lambda: []
+
+    data = plugin.fill_dauth_data(
+      dauth_data={},
+      requester_node_address="node-oracle",
+      is_node=True,
+      sender_eth_address="0xORACLE",
+    )
+
+    self.assertFalse(data["EE_SUPERVISOR"])
+    self.assertNotIn("EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER", data)
+
   def test_dauth_token_fails_closed_when_dauth_registry_check_fails(self):
     plugin = _make_dauth_harness(dauth_oracle=RuntimeError("registry unavailable"))
 
