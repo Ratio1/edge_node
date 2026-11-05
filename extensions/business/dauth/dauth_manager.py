@@ -435,7 +435,7 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_request(body)
     except Exception as e:
-      self.P("Error processing request: {}".format(e), color='r')
+      self.P("Error processing request from {}: {}".format(self.get_request_client_ip(), e), color='r')
       data = {
         'error' : str(e)
       }
@@ -465,7 +465,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_add_secrets_request(body)
     except Exception as e:
-      self.P("Error processing add_secrets request: {}".format(e), color='r')
+      self.P("Error processing add_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {
         'error' : str(e)
       }
@@ -488,7 +490,7 @@ class DauthManagerPlugin(
         data = self.process_dauth_reconcile_secrets_request(body)
       except Exception:
         # New values can be present in the request or dependency exceptions.
-        self.P("dAuth secret reconciliation failed.", color='r')
+        self.P(f"dAuth secret reconciliation failed for request from {self.get_request_client_ip()}.", color='r')
         data = {'error': 'dAuth secret reconciliation failed'}
     return self.__get_response({'nonce': nonce, **data})
 
@@ -513,7 +515,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_get_secret_request(body)
     except Exception as e:
-      self.P("Error processing get_secrets request: {}".format(e), color='r')
+      self.P("Error processing get_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {
         'error': str(e),
         'retryable': not isinstance(e, ValueError),
@@ -539,7 +543,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_reveal_secret_request(body)
     except Exception as e:
-      self.P("Error processing reveal_job_secrets request: {}".format(e), color='r')
+      self.P("Error processing reveal_job_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {'error': str(e)}
     return self.__get_response({
       'nonce': request_nonce,

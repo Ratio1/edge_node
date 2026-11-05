@@ -26,6 +26,7 @@ from extensions.business.dauth.dauth_revoked_nodes import (
 from extensions.business.dauth import test_dauth_registry_gating as gating
 from extensions.business.dauth.test_dauth_registry_gating import (
   REQUEST_NONCE,
+  SOURCE_IP,
   _FakeBCBaseConst,
   _FakeConst,
   _make_dauth_harness,
@@ -41,7 +42,7 @@ DENYLIST = f" {REVOKED} ,, {REVOKED_UNPREFIXED},"
 ETH = {REVOKED: "0x" + "a" * 40, "0xai_" + REVOKED_UNPREFIXED: "0x" + "b" * 40, ALLOWED: "0x" + "c" * 40}
 VERSIONS = {"sender_app_ver": "2.10.621", "sender_core_ver": "7.7.1", "sender_sdk_ver": "3.4.90"}
 RECORD_KEYS = {
-  "time_utc", "endpoint", "node_address", "eth_address", "requester_type",
+  "time_utc", "endpoint", "source_ip", "node_address", "eth_address", "requester_type",
   "sender_app_ver", "sender_core_ver", "sender_sdk_ver", "sender_alias",
 }
 
@@ -132,6 +133,10 @@ class DauthRevokedNodeTests(unittest.TestCase):
     )
     self.assertEqual(records[0]["requester_type"], dAuth.DAUTH_SENDER_TYPE_NODE)
     self.assertEqual(records[0]["endpoint"], "get_auth_data")
+    self.assertEqual(records[0]["source_ip"], SOURCE_IP)
+    self.assertIn(f"({ETH[REVOKED]}) from {SOURCE_IP} on /get_auth_data", self._refusals()[0])
+    failed = [msg for msg in self.messages if msg.startswith("dAuth request ")]
+    self.assertIn(f"(ETH: {ETH[REVOKED][:6]}...{ETH[REVOKED][-4:]}) from {SOURCE_IP}: ", failed[0])
 
   def test_unlicensed_revoked_try_writes_one_timestamp_per_node_for_dauth_peers_only(self):
     writes = []
@@ -252,6 +257,11 @@ class DauthRevokedNodeTests(unittest.TestCase):
 
   def test_licensed_unlisted_node_is_still_allowed(self):
     data = self.plugin.process_dauth_request(_auth_body(ALLOWED))
+    self.assertIn(
+      f"dAuth req 'a1b2' success for <{ALLOWED[:8]}...{ALLOWED[-4:]}> 'node-1' "
+      f"(ETH: {ETH[ALLOWED][:6]}...{ETH[ALLOWED][-4:]}) from {SOURCE_IP}",
+      self.messages,
+    )
     # Successful requests carry the non-critical version note in `error`.
     self.assertNotIn("revoked", data[dAuth.DAUTH_SUBKEY]["error"])
     self.assertEqual(data[dAuth.DAUTH_SUBKEY]["EE_MQTT_HOST"], "mqtt-a")
