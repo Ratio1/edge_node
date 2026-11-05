@@ -48,9 +48,8 @@ _CONFIG = {
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
   # Requests that waited longer in the queue are answered with a 503 without running:
-  # SDK clients stop reading after 120 s, the Cloudflare tunnel after 100 s, and
-  # get_secrets nonces expire after 120 s.
-  'MAX_QUEUE_WAIT': 90,
+  # SDK clients stop reading after 120 s and get_secrets nonces expire after 120 s.
+  'MAX_QUEUE_WAIT': 120,
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
