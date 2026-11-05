@@ -2,8 +2,10 @@
 dauth_revoked_nodes.py
 ======================
 
-dAuth refuses any request signed by one of the internal node addresses listed in
-`EE_REVOKED_NODE_ADDRESSES`, whatever the license state. Each refused try is appended
+dAuth refuses any request signed by one of the node keys listed in
+`EE_REVOKED_NODE_ADDRESSES`, whatever the license state. Requests are matched on the
+ETH address derived from the signing key, never on the address text: one key has more
+than one valid internal-address spelling. Each refused try is appended
 to a local JSONL registry. When the node also has no on-chain license, the time of the
 try is kept in the `DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash (one timestamp per
 node address, rewritten at most every `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL`
@@ -68,13 +70,13 @@ class _DauthRevokedNodesMixin(object):
       )
       self._dauth_revoked_error = None
     except ValueError as exc:
-      self._dauth_revoked_nodes = frozenset()
+      self._dauth_revoked_nodes = {}
       self._dauth_revoked_error = str(exc)
       return
     self.P(
       "dAuth revoked-node denylist loaded from {}: {} node addresses, sha256 {}".format(
         DAUTH_REVOKED_NODES_ENV_KEY, len(self._dauth_revoked_nodes),
-        hashlib.sha256(",".join(sorted(self._dauth_revoked_nodes)).encode()).hexdigest(),
+        hashlib.sha256(",".join(sorted(self._dauth_revoked_nodes.values())).encode()).hexdigest(),
       ),
       boxed=True,
     )
@@ -91,10 +93,15 @@ class _DauthRevokedNodesMixin(object):
     return
 
   def _parse_dauth_revoked_nodes(self, value):
-    """Return the unprefixed internal addresses; errors never echo an address."""
+    """
+    Return {lowercase ETH address: unprefixed internal address}. The ETH address is
+    the key's identity: the compressed and uncompressed point, or the address with
+    characters the base64 decoder skips, all resolve to the same one. Errors never
+    echo an address.
+    """
     if not isinstance(value, str) or not value.strip():
       raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} is not set.")
-    revoked = set()
+    revoked = {}
     for position, item in enumerate(value.split(","), start=1):
       if not item.strip():
         continue
@@ -103,25 +110,31 @@ class _DauthRevokedNodesMixin(object):
         raise ValueError(
           f"{DAUTH_REVOKED_NODES_ENV_KEY} item #{position} is not a well-formed internal node address."
         )
-      revoked.add(internal)
+      try:
+        eth = self.bc.node_address_to_eth_address(self.bc.maybe_add_prefix(internal))
+      except Exception:
+        raise ValueError(
+          f"{DAUTH_REVOKED_NODES_ENV_KEY} item #{position} is not a valid node public key."
+        ) from None
+      revoked[eth.lower()] = internal
     if not revoked:
       raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} holds no node addresses.")
-    return frozenset(revoked)
+    return revoked
 
-  def _is_dauth_node_revoked(
-    self, endpoint, node_address, node_address_eth, requester_type=None, body=None
-  ):
+  def _is_dauth_node_revoked(self, endpoint, node_address, requester_type=None, body=None):
     """
-    True if the signed requester's internal address is revoked. Call only after the
-    signature was verified. The refusal never depends on the license.
+    True if the signed requester's key is revoked. Call only after the signature was
+    verified. The ETH address is derived here from `node_address` (the key that signed),
+    so every spelling of a revoked key matches. The refusal never depends on the license.
     """
     revoked = getattr(self, "_dauth_revoked_nodes", None)
     if revoked is None:
       raise RuntimeError("dAuth revoked-node denylist is not loaded.")
     if not revoked:
       return False
-    internal = self.bc.maybe_remove_prefix(node_address)
-    if internal not in revoked:
+    node_address_eth = self.bc.node_address_to_eth_address(node_address)
+    internal = revoked.get(node_address_eth.lower())
+    if internal is None:
       return False
 
     body = body if isinstance(body, dict) else {}

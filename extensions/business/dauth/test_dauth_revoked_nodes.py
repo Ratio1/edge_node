@@ -1,4 +1,5 @@
 """dAuth refuses revoked node addresses."""
+import base64
 import hashlib
 import json
 import os
@@ -6,8 +7,12 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
 from ratio1.bc.base import BaseBlockEngine
+from ratio1.bc.ec import BaseBCEllipticCurveEngine
+from ratio1.bc.evm import _EVMMixin
 from ratio1.const.base import dAuth
 
 from extensions.business.dauth.dauth_mixin import (
@@ -58,6 +63,33 @@ class _PrefixEngine:
   _remove_prefix = BaseBlockEngine._remove_prefix
   maybe_add_prefix = BaseBlockEngine.maybe_add_prefix
   _add_prefix = BaseBlockEngine._add_prefix
+
+
+class _KeyEngine(_PrefixEngine):
+  """The SDK's own address decoding and ETH derivation, without a node identity."""
+  _text_to_binary = staticmethod(BaseBlockEngine._text_to_binary)
+  _address_to_pk = BaseBCEllipticCurveEngine._address_to_pk
+  _get_eth_address = _EVMMixin._get_eth_address
+  node_address_to_eth_address = _EVMMixin.node_address_to_eth_address
+
+  def P(self, *args, **kwargs):  # pylint: disable=unused-argument
+    return
+
+
+def _key_spellings():
+  """One secp256k1 key written as the canonical address and as other valid spellings."""
+  public_key = ec.generate_private_key(ec.SECP256K1()).public_key()
+  def encode(point_format):
+    raw = public_key.public_bytes(serialization.Encoding.X962, point_format)
+    return base64.urlsafe_b64encode(raw).decode()
+  canonical = encode(serialization.PublicFormat.CompressedPoint)
+  return canonical, {
+    "canonical": "0xai_" + canonical,
+    "unprefixed": canonical,
+    "old prefix": "aixp_" + canonical,
+    "uncompressed point": "0xai_" + encode(serialization.PublicFormat.UncompressedPoint),
+    "skipped characters": "0xai_" + canonical[:10] + ".!" + canonical[10:],
+  }
 
 
 def _auth_body(sender, **overrides):
@@ -242,18 +274,27 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self._assert_auth_refused(self.plugin.process_dauth_request(body))
     self.assertEqual(self._records()[0][0]["requester_type"], dAuth.DAUTH_SENDER_TYPE_SDK)
 
-  def test_internal_address_prefix_is_normalized_with_bc_helpers(self):
-    self.plugin.bc = BCWrapper(_PrefixEngine(), owner=self.plugin)
+  def test_every_spelling_of_a_revoked_key_is_refused(self):
+    revoked, spellings = _key_spellings()
+    other, _ = _key_spellings()
+    self.plugin.bc = BCWrapper(_KeyEngine(), owner=self.plugin)
+    self.plugin.os_environ[DAUTH_REVOKED_NODES_ENV_KEY] = revoked
     self.plugin._load_dauth_revoked_nodes()
+    self.plugin._maybe_publish_dauth_revoked_unlicensed_try = Mock(return_value=False)
     version_data = VersionCheckData(result=True, requester_type=dAuth.DAUTH_SENDER_TYPE_NODE)
-    for sender in (
-      REVOKED, REVOKED.removeprefix("0xai_"), "aixp_" + REVOKED.removeprefix("0xai_"),
-      REVOKED_UNPREFIXED, "0xai_" + REVOKED_UNPREFIXED,
-    ):
-      with self.subTest(sender=sender):
+    for name, sender in spellings.items():
+      with self.subTest(spelling=name):
         allowed, msg = self.plugin.check_if_node_allowed(sender, "0x" + "d" * 40, version_data)
         self.assertFalse(allowed)
         self.assertEqual(msg, f"node 0x{'d' * 40} not allowed on mainnet")
+    records, _ = self._records()
+    self.assertEqual([record["node_address"] for record in records], list(spellings.values()))
+    self.assertEqual(len({record["eth_address"] for record in records}), 1)
+    self.assertEqual(
+      {call.args[0] for call in self.plugin._maybe_publish_dauth_revoked_unlicensed_try.call_args_list},
+      {revoked},
+    )
+    self.assertFalse(self.plugin._is_dauth_node_revoked("get_auth_data", "0xai_" + other))
 
   def test_licensed_unlisted_node_is_still_allowed(self):
     data = self.plugin.process_dauth_request(_auth_body(ALLOWED))
@@ -346,6 +387,7 @@ class DauthRevokedNodeStartupTests(unittest.TestCase):
     "only separators": " , ,",
     "malformed item": f"{REVOKED},not-an-address",
     "eth address": f"{REVOKED},0x{'a' * 40}",
+    "not a public key": f"{REVOKED},0xai_{'Z' * 44}",
   }
 
   def test_startup_log_has_count_and_hash_but_no_addresses(self):
