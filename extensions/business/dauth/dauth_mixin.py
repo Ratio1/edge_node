@@ -947,10 +947,11 @@ class _DauthMixin(object):
     ####### now we prepare env variables ########
     short_requester = requester[:8] + '...' + requester[-4:]
     short_eth = requester_eth[:6] + '...' + requester_eth[-4:]
+    source_ip = self.get_request_client_ip()
     if error is not None:
       dct_dauth['error'] = error
-      self.P("dAuth request '{}' failed for <{}>  '{}' (ETH: {}): {}".format(
-        sender_nonce, short_requester, requester_alias, short_eth, error), color='r'
+      self.P("dAuth request '{}' failed for <{}>  '{}' (ETH: {}) from {}: {}".format(
+        sender_nonce, short_requester, requester_alias, short_eth, source_ip, error), color='r'
       )
     else:
       if _non_critical_error is not None:
@@ -961,8 +962,8 @@ class _DauthMixin(object):
         dauth_data=dct_dauth, requester_node_address=requester, is_node=is_requester_a_node,
         sender_eth_address=requester_eth
       )
-      self.P("dAuth req '{}' success for <{}> '{}' (ETH: {})".format(
-        sender_nonce, short_eth, requester_alias, short_eth)
+      self.P("dAuth req '{}' success for <{}> '{}' (ETH: {}) from {}".format(
+        sender_nonce, short_requester, requester_alias, short_eth, source_ip)
       )
       ### end fill data
               

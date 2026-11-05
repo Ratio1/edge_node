@@ -125,9 +125,11 @@ class _DauthRevokedNodesMixin(object):
       return False
 
     body = body if isinstance(body, dict) else {}
+    source_ip = self.get_request_client_ip()
     record = {
       "time_utc": datetime.now(timezone.utc).isoformat(),
       "endpoint": endpoint,
+      "source_ip": source_ip,
       "node_address": node_address,
       "eth_address": node_address_eth,
       "requester_type": requester_type,
@@ -139,8 +141,8 @@ class _DauthRevokedNodesMixin(object):
     recorded = self._record_dauth_revoked_try(record)
     published = self._maybe_publish_dauth_revoked_unlicensed_try(internal, node_address_eth)
     self.P(
-      "dAuth refused revoked {} {} ({}) on /{}{}{}".format(
-        requester_type or "requester", node_address, node_address_eth, endpoint,
+      "dAuth refused revoked {} {} ({}) from {} on /{}{}{}".format(
+        requester_type or "requester", node_address, node_address_eth, source_ip, endpoint,
         "" if recorded else " (not recorded in registry)",
         f" (no license, written to {DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY})" if published else "",
       ),
