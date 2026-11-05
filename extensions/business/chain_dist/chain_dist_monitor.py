@@ -38,7 +38,7 @@ from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 
 
-__VER__ = '0.2.1'
+__VER__ = '0.3.0'
 
 _CONFIG = {
   # mandatory area
@@ -62,9 +62,21 @@ _CONFIG = {
   'MAX_THRESHOLD_CLOSE_JOB' : 250,
   # Observe an unstarted pending job without a visible pipeline before voting zero.
   'PENDING_EMPTY_OBSERVATION_SECONDS' : 3600,
+
+  # Move running jobs from a relinked ND node to the node now linked to the same
+  # license. Each oracle checks at a random interval in this range.
+  'RELINK_CHECK_MIN_SECONDS' : 300,
+  'RELINK_CHECK_MAX_SECONDS' : 900,
+  # Each check reads at most this many blocks with one eth_getLogs call. Older
+  # blocks are skipped (logged) and must be filled manually.
+  'ND_LINK_LOGS_MAX_BLOCKS' : 10_000,
+  # Read below the head so load-balanced RPC backends agree on the range.
+  'ND_LINK_LOGS_CONFIRMATIONS' : 20,
 }
 
 class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
+  # Never a proposer, so get_unvalidated_job_ids returns every pending job for it.
+  ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 
   def Pd(self, s, *args, verbosity=0, **kwargs):
     """
@@ -82,6 +94,12 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
     self.pending_empty_since = {}
     self.positive_recovery_since = {}
     self.last_positive_recovery_check = 0
+    self.next_relink_check = 0
+    # cursor: last block read; unlinked: old node -> (license_id, owner);
+    # links: license_id -> (node, owner) for links seen since the cursor started.
+    self.relink_state = self.cacheapi_load_pickle(default=None, verbose=False) or {
+      'cursor': 0, 'unlinked': {}, 'links': {},
+    }
     self.chainstore_hset(
       hkey='chain_dist_monitor',
       key=self.node_addr,
@@ -93,9 +111,10 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
     return
   
   
-  def check_all_jobs(self):
-    unvalidated_job_ids = self.bc.get_unvalidated_job_ids(oracle_address=self.bc.eth_address) or []
-    known_apps = self.netmon.network_known_apps()
+  def _get_running_nodes_by_job(self, known_apps):
+    """
+    Map each Deeploy job ID to the nodes that NetMon shows running it.
+    """
     running_nodes_by_job = {}
     for node, apps in known_apps.items():
       for pipeline_name, pipeline in apps.items():
@@ -109,6 +128,13 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
             f"Skipping invalid metadata for pipeline {pipeline_name} on node {node}: {type(e).__name__}",
             color='r',
           )
+    return running_nodes_by_job
+
+
+  def check_all_jobs(self):
+    unvalidated_job_ids = self.bc.get_unvalidated_job_ids(oracle_address=self.bc.eth_address) or []
+    known_apps = self.netmon.network_known_apps()
+    running_nodes_by_job = self._get_running_nodes_by_job(known_apps)
 
     now = self.time()
     first_closable_job_id = self.bc.get_first_closable_job_id() if unvalidated_job_ids else None
@@ -170,7 +196,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
       if recovery_job_ids:
         # The zero address cannot be a proposer, so this returns every pending job.
         all_pending_job_ids = set(self.bc.get_unvalidated_job_ids(
-          oracle_address='0x0000000000000000000000000000000000000000',
+          oracle_address=self.ZERO_ADDRESS,
         ))
         recovery_job_ids -= all_pending_job_ids
       self.positive_recovery_since = {
@@ -191,6 +217,95 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
     return
     
     
+  def _update_nd_links(self):
+    """
+    Read the ND LinkNode/UnlinkNode events since the last check (one eth_getLogs call).
+    """
+    head = self.bc.get_block_number() - self.cfg_nd_link_logs_confirmations
+    cursor = self.relink_state['cursor']
+    from_block = max(cursor + 1, head - self.cfg_nd_link_logs_max_blocks + 1)
+    if from_block > head:
+      return
+    if cursor and from_block > cursor + 1:
+      self.P(f"ND link events in blocks {cursor + 1}..{from_block - 1} were not read.", color='r')
+
+    unlinked, links = self.relink_state['unlinked'], self.relink_state['links']
+    for event in self.bc.get_nd_link_events(from_block=from_block, to_block=head):
+      node, license_id, owner = event['node_address'], event['license_id'], event['owner']
+      if event['event'] == 'UnlinkNode':
+        unlinked[node] = (license_id, owner)
+        if links.get(license_id, (None, None))[0] == node:
+          links.pop(license_id)
+      else:
+        links[license_id] = (node, owner)
+        unlinked.pop(node, None)
+    self.relink_state['cursor'] = head
+    self.cacheapi_save_pickle(self.relink_state, verbose=False)
+    return
+
+
+  def _get_relink_successors(self):
+    """
+    Map each unlinked node to the node its license was linked to next by the same owner.
+
+    A sold license is linked by a different owner, so it does not count.
+    """
+    successors = {}
+    for node, (license_id, owner) in self.relink_state['unlinked'].items():
+      new_node, new_owner = self.relink_state['links'].get(license_id, (None, None))
+      if new_node is not None and new_node != node and new_owner == owner:
+        successors[node] = new_node
+    return successors
+
+
+  def maybe_swap_relinked_nodes(self):
+    """
+    Move running jobs from a relinked ND node to its new node, so rewards follow the license.
+
+    A job node is replaced only when its ND license is now linked to another node by the
+    same owner and NetMon shows that node running the job. The job keeps its node count.
+    A check costs a block-number call and one eth_getLogs; the job reads run only when a
+    relinked node's new node already runs a job.
+    """
+    if self.time() < self.next_relink_check:
+      return
+    self.next_relink_check = self.time() + self.np.random.randint(
+      self.cfg_relink_check_min_seconds, self.cfg_relink_check_max_seconds + 1,
+    )
+    self._update_nd_links()
+    successors = self._get_relink_successors()
+    if not successors:
+      return
+
+    new_nodes = set(successors.values())
+    running_nodes_by_job = {
+      job_id: {self.bc.node_address_to_eth_address(node) for node in nodes}
+      for job_id, nodes in self._get_running_nodes_by_job(self.netmon.network_known_apps()).items()
+    }
+    if not any(nodes & new_nodes for nodes in running_nodes_by_job.values()):
+      return
+
+    # Pending jobs are voted by check_all_jobs; closable ones are closed by check_closable_jobs.
+    skipped_job_ids = set(self.bc.get_unvalidated_job_ids(oracle_address=self.ZERO_ADDRESS) or [])
+    skipped_job_ids.add(self.bc.get_first_closable_job_id())
+    for job in self.bc.get_all_active_jobs():
+      job_id, active_nodes = job['jobId'], list(job['activeNodes'])
+      if job_id in skipped_job_ids or not active_nodes:
+        continue
+      running_nodes = running_nodes_by_job.get(job_id, set())
+      nodes = []
+      for node in active_nodes:
+        new_node = successors.get(node)
+        if new_node in running_nodes and new_node not in active_nodes and new_node not in nodes:
+          node = new_node
+        nodes.append(node)
+      if nodes != active_nodes:
+        nodes = sorted(nodes)
+        self.P(f"Job {job_id}: moving relinked node(s) {sorted(set(active_nodes) - set(nodes))} to {nodes}")
+        self.bc.submit_node_update(job_id=job_id, nodes=nodes)
+    return
+
+
   def maybe_distribute_rewards(self):
     # v1
     # check if epoch has been closed > 10m < 1h
@@ -268,6 +383,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
       self.check_all_jobs()
       self.check_closable_jobs()
       self.maybe_distribute_rewards()
+      self.maybe_swap_relinked_nodes()
     except Exception as e:
       self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {self.cfg_sleep_period} seconds.", color='r')
       self.sleep(self.cfg_sleep_period)

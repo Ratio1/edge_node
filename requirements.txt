@@ -1,5 +1,5 @@
 kmonitor
-ratio1>=3.5.60
+ratio1>=3.5.67
 naeural_core>=7.7.350
 decentra-vision
 python-telegram-bot[rate-limiter]

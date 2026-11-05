@@ -30,6 +30,10 @@ class FakeBlockchain:
     self.first_closable = None
     self.jobs = {}
     self.submissions = []
+    self.block_number = 50_020
+    self.link_events = []
+    self.log_ranges = []
+    self.active_job_reads = 0
 
   def get_unvalidated_job_ids(self, oracle_address):
     if oracle_address == '0x0000000000000000000000000000000000000000':
@@ -43,7 +47,16 @@ class FakeBlockchain:
     return self.jobs[job_id]
 
   def get_all_active_jobs(self):
+    self.active_job_reads += 1
     return list(self.jobs.values())
+
+  def get_block_number(self):
+    return self.block_number
+
+  def get_nd_link_events(self, from_block, to_block):
+    self.log_ranges.append((from_block, to_block))
+    events = [event for event in self.link_events if from_block <= event['block_number'] <= to_block]
+    return events
 
   def node_address_to_eth_address(self, node):
     return f'0x{node}'
@@ -68,6 +81,13 @@ class ChainDistMonitorTests(unittest.TestCase):
     self.monitor.pending_empty_since = {}
     self.monitor.positive_recovery_since = {}
     self.monitor.last_positive_recovery_check = 0
+    for key in ('RELINK_CHECK_MIN_SECONDS', 'RELINK_CHECK_MAX_SECONDS', 'ND_LINK_LOGS_MAX_BLOCKS', 'ND_LINK_LOGS_CONFIRMATIONS'):
+      setattr(self.monitor, 'cfg_' + key.lower(), config[key])
+    self.monitor.next_relink_check = 0
+    self.monitor.relink_state = {'cursor': 0, 'unlinked': {}, 'links': {}}
+    self.monitor.np = SimpleNamespace(random=SimpleNamespace(randint=lambda low, high: low))
+    self.saved_states = []
+    self.monitor.cacheapi_save_pickle = lambda obj, verbose=True: self.saved_states.append(obj)
 
   def job(self, job_id=1, start=0, nodes=None, requested=1000):
     return {
@@ -79,6 +99,22 @@ class ChainDistMonitorTests(unittest.TestCase):
 
   def visible(self, job_id=1):
     self.apps['node1'] = {'pipeline': {'deeploy_specs': {'job_id': job_id}}}
+
+  def link_event(self, event, node, license_id=7, owner='0xOwner', block_number=50_000):
+    return {
+      'event': event, 'license_id': license_id, 'owner': owner,
+      'node_address': f'0x{node}', 'block_number': block_number, 'log_index': 0,
+    }
+
+  def relink(self, old='old', new='new', owner='0xOwner', new_owner=None):
+    self.bc.link_events += [
+      self.link_event('UnlinkNode', old, owner=owner),
+      self.link_event('LinkNode', new, owner=new_owner or owner),
+    ]
+
+  def run_relink_check(self):
+    self.monitor.P = Mock()
+    self.monitor.maybe_swap_relinked_nodes()
 
   def test_malformed_pipelines_do_not_stop_process_without_pending_jobs(self):
     self.monitor.maybe_update_liveness = Mock()
@@ -233,6 +269,66 @@ class ChainDistMonitorTests(unittest.TestCase):
     self.now += 300
     self.monitor.check_all_jobs()
     self.assertEqual(self.bc.submissions, [])
+
+  def test_relinked_node_is_replaced_by_its_new_node_running_the_job(self):
+    self.relink()
+    self.bc.jobs[5] = self.job(job_id=5, start=2000, nodes=['0xold', '0xother'])
+    self.apps = {'new': {'p': {'deeploy_specs': {'job_id': 5}}}, 'other': {'p': {'deeploy_specs': {'job_id': 5}}}}
+    self.run_relink_check()
+    self.assertEqual(self.bc.submissions, [(5, ['0xnew', '0xother'])])
+    self.assertEqual(self.bc.log_ranges, [(40_001, 50_000)])
+    self.assertEqual(self.saved_states[-1]['cursor'], 50_000)
+
+  def test_relink_in_two_transactions_is_matched_across_checks(self):
+    self.bc.link_events = [self.link_event('UnlinkNode', 'old', block_number=49_000)]
+    self.bc.jobs[5] = self.job(job_id=5, start=2000, nodes=['0xold'])
+    self.apps = {'new': {'p': {'deeploy_specs': {'job_id': 5}}}}
+    self.run_relink_check()
+    self.assertEqual(self.bc.submissions, [])
+
+    self.bc.link_events.append(self.link_event('LinkNode', 'new', block_number=50_100))
+    self.bc.block_number = 50_200
+    self.now += 300
+    self.run_relink_check()
+    self.assertEqual(self.bc.log_ranges[-1], (50_001, 50_180))
+    self.assertEqual(self.bc.submissions, [(5, ['0xnew'])])
+
+  def test_license_linked_by_another_owner_is_not_a_relink(self):
+    self.relink(new_owner='0xBuyer')
+    self.bc.jobs[5] = self.job(job_id=5, start=2000, nodes=['0xold'])
+    self.apps = {'new': {'p': {'deeploy_specs': {'job_id': 5}}}}
+    self.run_relink_check()
+    self.assertEqual(self.bc.submissions, [])
+    self.assertEqual(self.bc.active_job_reads, 0)
+
+  def test_new_node_not_running_the_job_reads_no_jobs(self):
+    self.relink()
+    self.bc.jobs[5] = self.job(job_id=5, start=2000, nodes=['0xold'])
+    self.apps = {'new': {}}
+    self.run_relink_check()
+    self.assertEqual(self.bc.submissions, [])
+    self.assertEqual(self.bc.active_job_reads, 0)
+
+  def test_pending_and_closable_jobs_are_left_to_their_own_checks(self):
+    self.relink()
+    self.bc.all_pending = [5]
+    self.bc.first_closable = 6
+    self.bc.jobs[5] = self.job(job_id=5, start=2000, nodes=['0xold'])
+    self.bc.jobs[6] = self.job(job_id=6, start=2000, nodes=['0xold'])
+    self.apps = {'new': {'a': {'deeploy_specs': {'job_id': 5}}, 'b': {'deeploy_specs': {'job_id': 6}}}}
+    self.run_relink_check()
+    self.assertEqual(self.bc.submissions, [])
+
+  def test_check_waits_for_its_random_interval_and_reports_unread_blocks(self):
+    self.run_relink_check()
+    self.bc.block_number = 80_020
+    self.now += 299
+    self.run_relink_check()
+    self.assertEqual(len(self.bc.log_ranges), 1)
+    self.now += 1
+    self.run_relink_check()
+    self.assertEqual(self.bc.log_ranges[-1], (70_001, 80_000))
+    self.assertIn('50001..70000', self.monitor.P.call_args.args[0])
 
 
 if __name__ == '__main__':
