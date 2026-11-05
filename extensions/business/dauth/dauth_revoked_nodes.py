@@ -9,8 +9,9 @@ than one valid internal-address spelling. Each refused try is appended
 to a local JSONL registry. When the node also has no on-chain license, the time of the
 try is kept in the `DAUTH_REVOKED_UNLICENSED_NODES` ChainStore hash (one timestamp per
 node address, rewritten at most every `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL`
-seconds, dAuth servers only). The list is deployed privately in the dAuth servers'
-.env and is never part of this repository.
+seconds, dAuth servers only). The list is deployed privately in the seeds' .env and
+is never part of this repository; dAuth hands it to the other dAuth registry oracles
+as a dAuth-oracle-only supervisor key (see `dauth_manager.py`).
 
 Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` once
 on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
