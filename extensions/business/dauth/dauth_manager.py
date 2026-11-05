@@ -98,11 +98,15 @@ _CONFIG = {
     "EE_CLOUDFLARE_TOKEN_TUNNELS_MANAGER",
     "EE_CLOUDFLARE_TOKEN_LIVENESS_API",
     
-    "EE_MQTT_HOST_SEED" # this generates dynamically the EE_MQTT_HOST
+    "EE_MQTT_HOST_SEED", # this generates dynamically the EE_MQTT_HOST
+
+    "EE_REVOKED_NODE_ADDRESSES",
   ],
 
+  # subset of SUPERVISOR_KEYS sent only to oracles listed in the dAuth registry
   "DAUTH_ORACLE_ONLY_SUPERVISOR_KEYS": [
     "EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER",
+    "EE_REVOKED_NODE_ADDRESSES",
   ],
 
   'VALIDATION_RULES': {

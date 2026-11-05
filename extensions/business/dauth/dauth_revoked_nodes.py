@@ -14,7 +14,9 @@ rewritten at most every `DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL` seconds, dAuth
 only). ChainStore calls stay on the plugin thread because they use the plugin's timers,
 which are not safe across threads. Revoked keys retry often, and doing this work in the
 request would hold the single dAuth request thread for every refusal. The list is
-deployed privately in the dAuth servers' .env and is never part of this repository.
+deployed privately in the seeds' .env and is never part of this repository; dAuth hands
+it to the other dAuth registry oracles as a dAuth-oracle-only supervisor key (see
+`dauth_manager.py`).
 
 Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` once
 on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
