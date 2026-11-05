@@ -38,7 +38,7 @@ from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecrets
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
-__VER__ = '0.3.4'
+__VER__ = '0.3.5'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -47,6 +47,10 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
+  # Requests that waited longer in the queue are answered with a 503 without running:
+  # SDK clients stop reading after 120 s, the Cloudflare tunnel after 100 s, and
+  # get_secrets nonces expire after 120 s.
+  'MAX_QUEUE_WAIT': 90,
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
@@ -144,6 +148,7 @@ class DauthManagerPlugin(
     self._check_dauth_server_enabled_on_start()
     if self._is_dauth_server_enabled():
       self._require_dauth_revoked_nodes()
+      self._start_dauth_revoked_recorder()
     super(DauthManagerPlugin, self).on_init()
     self._dauth_web_app_initialized = True
     if not self._is_dauth_server_enabled():
@@ -290,10 +295,16 @@ class DauthManagerPlugin(
       raise RuntimeError("Cannot resume after an incomplete web app teardown")
     # endif
     self._require_dauth_revoked_nodes()
+    self._start_dauth_revoked_recorder()
 
     self.failed = False
     self._stop_request_monitor.clear()
     self._start_request_monitor_thread()
+    return
+
+  def on_close(self):
+    self._stop_dauth_revoked_recorder()
+    super(DauthManagerPlugin, self).on_close()
     return
 
   def on_log_handler(self, text, key=None):

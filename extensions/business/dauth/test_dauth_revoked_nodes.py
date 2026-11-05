@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -22,6 +23,7 @@ from extensions.business.dauth.dauth_mixin import (
 )
 from extensions.business.dauth.dauth_revoked_nodes import (
   DAUTH_REVOKED_LICENSE_CHECK_INTERVAL,
+  DAUTH_REVOKED_LICENSE_RETRY_INTERVAL,
   DAUTH_REVOKED_NODES_ENV_KEY,
   DAUTH_REVOKED_TRIES_FILE,
   DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY,
@@ -125,7 +127,13 @@ class DauthRevokedNodeTests(unittest.TestCase):
     plugin._load_dauth_revoked_nodes()
     self.plugin = plugin
 
+  def _refuse(self, body):
+    """Refuse one request, then run the recorder pass the background thread would run."""
+    self._assert_auth_refused(self.plugin.process_dauth_request(body))
+    self.plugin._flush_dauth_revoked_tries()
+
   def _records(self):
+    self.plugin._flush_dauth_revoked_tries()
     path = os.path.join(
       self.tmp.name, "pipelines_data/admin/dauth/plugin_data", DAUTH_REVOKED_TRIES_FILE,
     )
@@ -144,7 +152,11 @@ class DauthRevokedNodeTests(unittest.TestCase):
   def _refusals(self):
     return [msg for msg in self.messages if msg.startswith("dAuth refused revoked")]
 
+  def _unlicensed_writes_logged(self):
+    return [msg for msg in self.messages if "has no license: try written to" in msg]
+
   def _unlicensed_cstore(self):
+    self.plugin._flush_dauth_revoked_tries()
     return {
       key: value for (hkey, key), value in self.plugin._chainstore.items()
       if hkey == DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY
@@ -154,11 +166,11 @@ class DauthRevokedNodeTests(unittest.TestCase):
     for sender, licensed in ((REVOKED, True), ("0xai_" + REVOKED_UNPREFIXED, False)):
       with self.subTest(licensed=licensed):
         self.plugin.bc.is_node_licensed.return_value = licensed
-        self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(sender)))
+        self._refuse(_auth_body(sender))
     with self.subTest(licensed="lookup raises"):
       self.plugin._dauth_revoked_license_checks.clear()
       self.plugin.bc.is_node_licensed = Mock(side_effect=RuntimeError("rpc down"))
-      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+      self._refuse(_auth_body(REVOKED))
     records, _ = self._records()
     self.assertEqual(
       [record["node_address"] for record in records], [REVOKED, "0xai_" + REVOKED_UNPREFIXED, REVOKED],
@@ -176,7 +188,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.plugin.chainstore_hset = lambda **kwargs: writes.append(kwargs) or store(**kwargs)
     self.plugin.time = lambda: 1000.0
     self.plugin.bc.is_node_licensed.return_value = False
-    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self._refuse(_auth_body(REVOKED))
     self.plugin.bc.is_node_licensed.assert_called_once_with(node_address_eth=ETH[REVOKED])
     records, _ = self._records()
     self.assertEqual(set(records[0]), RECORD_KEYS)
@@ -188,14 +200,14 @@ class DauthRevokedNodeTests(unittest.TestCase):
         "timeout": DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT, "max_retries": 0,
       },
     )
-    self.assertIn(f"(no license, written to {DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY})", self._refusals()[-1])
+    self.assertEqual(len(self._unlicensed_writes_logged()), 1)
 
   def test_licensed_revoked_try_stays_local(self):
-    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self._refuse(_auth_body(REVOKED))
     self.plugin.bc.is_node_licensed.assert_called_once_with(node_address_eth=ETH[REVOKED])
     self.assertEqual(self._unlicensed_cstore(), {})
     self.assertEqual(len(self._records()[0]), 1)
-    self.assertNotIn("no license", self._refusals()[-1])
+    self.assertEqual(self._unlicensed_writes_logged(), [])
 
   def test_unlicensed_tries_within_the_interval_rewrite_nothing(self):
     writes = []
@@ -205,17 +217,17 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.plugin.time = lambda: now[0]
     self.plugin.bc.is_node_licensed.return_value = False
     for _ in range(3):
-      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
-    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body("0xai_" + REVOKED_UNPREFIXED)))
+      self._refuse(_auth_body(REVOKED))
+    self._refuse(_auth_body("0xai_" + REVOKED_UNPREFIXED))
     self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 2)
     self.assertEqual(len(writes), 2)
     self.assertEqual(
       self._unlicensed_cstore(), {REVOKED.removeprefix("0xai_"): 1000.0, REVOKED_UNPREFIXED: 1000.0},
     )
-    self.assertNotIn("no license", self._refusals()[1])
+    self.assertEqual(len(self._unlicensed_writes_logged()), 2)
 
     now[0] += DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL
-    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self._refuse(_auth_body(REVOKED))
     self.assertEqual(len(writes), 3)
     self.assertEqual(self._unlicensed_cstore()[REVOKED.removeprefix("0xai_")], now[0])
     self.assertEqual(len(self._records()[0]), 5)
@@ -225,22 +237,33 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.plugin._chainstore[(DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY, REVOKED.removeprefix("0xai_"))] = 900.0
     self.plugin.chainstore_hset = Mock(side_effect=AssertionError("must not write"))
     self.plugin.bc.is_node_licensed.return_value = False
-    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self._refuse(_auth_body(REVOKED))
     self.plugin.chainstore_hset.assert_not_called()
-    self.assertNotIn("no license", self._refusals()[-1])
+    self.assertEqual(self._unlicensed_writes_logged(), [])
     self.assertEqual(len(self._records()[0]), 1)
 
-  def test_failed_license_lookup_is_reused_for_the_interval(self):
+  def test_license_result_is_reused_for_an_hour(self):
+    now = [1000.0]
+    self.plugin.time = lambda: now[0]
+    for _ in range(2):
+      self._refuse(_auth_body(REVOKED))
+      now[0] += DAUTH_REVOKED_LICENSE_RETRY_INTERVAL
+    self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 1)
+    now[0] = 1000.0 + DAUTH_REVOKED_LICENSE_CHECK_INTERVAL
+    self._refuse(_auth_body(REVOKED))
+    self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 2)
+
+  def test_failed_license_lookup_is_retried_after_a_minute(self):
     now = [1000.0]
     self.plugin.time = lambda: now[0]
     self.plugin.bc.is_node_licensed = Mock(side_effect=RuntimeError("rpc down"))
     for _ in range(2):
-      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+      self._refuse(_auth_body(REVOKED))
     self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 1)
     self.assertEqual(self._unlicensed_cstore(), {})
-    now[0] += DAUTH_REVOKED_LICENSE_CHECK_INTERVAL
+    now[0] += DAUTH_REVOKED_LICENSE_RETRY_INTERVAL
     self.plugin.bc.is_node_licensed = Mock(return_value=False)
-    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self._refuse(_auth_body(REVOKED))
     self.assertEqual(self._unlicensed_cstore(), {REVOKED.removeprefix("0xai_"): now[0]})
     self.assertEqual(len(self._records()[0]), 3)
 
@@ -257,11 +280,11 @@ class DauthRevokedNodeTests(unittest.TestCase):
         self.setUp()
         self.plugin.bc.is_node_licensed.return_value = False
         fail()
-        self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+        self._refuse(_auth_body(REVOKED))
         self.assertEqual(self._unlicensed_cstore(), {})
         self.assertEqual(len(self._records()[0]), 1)
         self.assertTrue(any(msg.startswith("Could not") for msg in self.messages))
-        self.assertNotIn("no license", self._refusals()[-1])
+        self.assertEqual(self._unlicensed_writes_logged(), [])
 
   def test_rejection_is_the_same_as_for_an_unlinked_node(self):
     revoked_error = self.plugin.process_dauth_request(_auth_body(REVOKED))[dAuth.DAUTH_SUBKEY]["error"]
@@ -271,7 +294,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
 
   def test_listed_sdk_requester_is_refused(self):
     body = _auth_body(REVOKED, sender_app_ver=None, sender_core_ver=None)
-    self._assert_auth_refused(self.plugin.process_dauth_request(body))
+    self._refuse(body)
     self.assertEqual(self._records()[0][0]["requester_type"], dAuth.DAUTH_SENDER_TYPE_SDK)
 
   def test_every_spelling_of_a_revoked_key_is_refused(self):
@@ -361,11 +384,50 @@ class DauthRevokedNodeTests(unittest.TestCase):
   def test_registry_stops_growing_at_size_cap_but_keeps_refusing(self):
     with patch("extensions.business.dauth.dauth_revoked_nodes.DAUTH_REVOKED_TRIES_MAX_BYTES", 1):
       for _ in range(2):
-        self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+        self._refuse(_auth_body(REVOKED))
     self.assertEqual(len(self._records()[0]), 1)
     refusals = [msg for msg in self.messages if msg.startswith("dAuth refused revoked")]
     self.assertEqual(len(refusals), 2)
-    self.assertIn("(not recorded in registry)", refusals[-1])
+    self.assertIn("registry is full: 1 tries not recorded", self.messages[-1])
+
+  def test_refusal_does_no_lookup_write_or_file_io_in_the_request(self):
+    self.plugin.bc.is_node_licensed.return_value = False
+    self.plugin.chainstore_hget = Mock(side_effect=AssertionError("not in the request"))
+    self.plugin.chainstore_hset = Mock(side_effect=AssertionError("not in the request"))
+    self.plugin.get_data_folder = Mock(side_effect=AssertionError("not in the request"))
+    for _ in range(2):
+      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self.plugin.bc.is_node_licensed.assert_not_called()
+    self.assertEqual(len(self._refusals()), 2)
+    self.assertEqual(len(self.plugin._dauth_revoked_pending), 2)
+
+  def test_recorder_pass_checks_each_node_once(self):
+    self.plugin.bc.is_node_licensed.return_value = False
+    for sender in (REVOKED, REVOKED, "0xai_" + REVOKED_UNPREFIXED, REVOKED):
+      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(sender)))
+    self.assertEqual(len(self._records()[0]), 4)
+    self.assertEqual(self.plugin.bc.is_node_licensed.call_count, 2)
+    self.assertEqual(len(self._unlicensed_cstore()), 2)
+
+  def test_full_backlog_keeps_refusing_without_recording(self):
+    with patch("extensions.business.dauth.dauth_revoked_nodes.DAUTH_REVOKED_PENDING_MAX", 1):
+      for _ in range(3):
+        self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    self.assertEqual(len(self._records()[0]), 1)
+    self.assertIn("backlog was full: 2 tries not recorded", "".join(self.messages))
+
+  def test_recorder_thread_records_tries_and_flushes_on_stop(self):
+    self.plugin._start_dauth_revoked_recorder()
+    self.addCleanup(self.plugin._stop_dauth_revoked_recorder)
+    self.assertEqual(self.plugin._dauth_revoked_thread.name, "dauth-revoked-recorder")
+    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    deadline = time.time() + 5
+    while self.plugin._dauth_revoked_pending and time.time() < deadline:
+      time.sleep(0.01)
+    self.plugin._stop_dauth_revoked_recorder()
+    self.assertFalse(self.plugin._dauth_revoked_thread.is_alive())
+    self.assertEqual(len(self._records()[0]), 1)
+    self.plugin.bc.is_node_licensed.assert_called_once_with(node_address_eth=ETH[REVOKED])
 
   def test_unloaded_denylist_fails_closed(self):
     del self.plugin._dauth_revoked_nodes
