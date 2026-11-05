@@ -324,6 +324,8 @@ class DauthManagerPlugin(
 
   def process(self):
     self._maybe_hsync_dauth_job_secrets()
+    if self._is_dauth_server_enabled():
+      self._maybe_publish_dauth_revoked_unlicensed_tries()
     # TODO: this will be re-enabled in the future.
     if False:
       self._maybe_log_and_save_tracked_requests()

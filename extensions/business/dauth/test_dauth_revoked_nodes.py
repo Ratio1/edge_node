@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -127,13 +128,19 @@ class DauthRevokedNodeTests(unittest.TestCase):
     plugin._load_dauth_revoked_nodes()
     self.plugin = plugin
 
-  def _refuse(self, body):
-    """Refuse one request, then run the recorder pass the background thread would run."""
-    self._assert_auth_refused(self.plugin.process_dauth_request(body))
+  def _bookkeeping(self):
+    """Run the recorder pass, then the plugin-loop writes until none is pending."""
     self.plugin._flush_dauth_revoked_tries()
+    while self.plugin._dauth_revoked_unlicensed_pending:
+      self.plugin._maybe_publish_dauth_revoked_unlicensed_tries()
+
+  def _refuse(self, body):
+    """Refuse one request, then run the bookkeeping the recorder and plugin loop would run."""
+    self._assert_auth_refused(self.plugin.process_dauth_request(body))
+    self._bookkeeping()
 
   def _records(self):
-    self.plugin._flush_dauth_revoked_tries()
+    self._bookkeeping()
     path = os.path.join(
       self.tmp.name, "pipelines_data/admin/dauth/plugin_data", DAUTH_REVOKED_TRIES_FILE,
     )
@@ -156,7 +163,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
     return [msg for msg in self.messages if "has no license: try written to" in msg]
 
   def _unlicensed_cstore(self):
-    self.plugin._flush_dauth_revoked_tries()
+    self._bookkeeping()
     return {
       key: value for (hkey, key), value in self.plugin._chainstore.items()
       if hkey == DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY
@@ -303,6 +310,7 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.plugin.bc = BCWrapper(_KeyEngine(), owner=self.plugin)
     self.plugin.os_environ[DAUTH_REVOKED_NODES_ENV_KEY] = revoked
     self.plugin._load_dauth_revoked_nodes()
+    self.plugin._is_dauth_revoked_node_licensed = Mock(return_value=False)
     self.plugin._maybe_publish_dauth_revoked_unlicensed_try = Mock(return_value=False)
     version_data = VersionCheckData(result=True, requester_type=dAuth.DAUTH_SENDER_TYPE_NODE)
     for name, sender in spellings.items():
@@ -313,10 +321,10 @@ class DauthRevokedNodeTests(unittest.TestCase):
     records, _ = self._records()
     self.assertEqual([record["node_address"] for record in records], list(spellings.values()))
     self.assertEqual(len({record["eth_address"] for record in records}), 1)
-    self.assertEqual(
-      {call.args[0] for call in self.plugin._maybe_publish_dauth_revoked_unlicensed_try.call_args_list},
-      {revoked},
-    )
+    for checked in (
+      self.plugin._is_dauth_revoked_node_licensed, self.plugin._maybe_publish_dauth_revoked_unlicensed_try,
+    ):
+      self.assertEqual({call.args[0] for call in checked.call_args_list}, {revoked})
     self.assertFalse(self.plugin._is_dauth_node_revoked("get_auth_data", "0xai_" + other))
 
   def test_licensed_unlisted_node_is_still_allowed(self):
@@ -428,6 +436,53 @@ class DauthRevokedNodeTests(unittest.TestCase):
     self.assertFalse(self.plugin._dauth_revoked_thread.is_alive())
     self.assertEqual(len(self._records()[0]), 1)
     self.plugin.bc.is_node_licensed.assert_called_once_with(node_address_eth=ETH[REVOKED])
+
+  def test_chainstore_is_used_only_from_the_plugin_thread(self):
+    callers = []
+    get, store = self.plugin.chainstore_hget, self.plugin.chainstore_hset
+    def track(func):
+      return lambda **kwargs: callers.append(threading.current_thread().name) or func(**kwargs)
+    self.plugin.chainstore_hget, self.plugin.chainstore_hset = track(get), track(store)
+    self.plugin.bc.is_node_licensed.return_value = False
+    self.plugin._start_dauth_revoked_recorder()
+    self.addCleanup(self.plugin._stop_dauth_revoked_recorder)
+    self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(REVOKED)))
+    deadline = time.time() + 5
+    while not self.plugin._dauth_revoked_unlicensed_pending and time.time() < deadline:
+      time.sleep(0.01)
+    self.plugin._stop_dauth_revoked_recorder()
+    self.assertEqual(callers, [])
+    self.plugin._maybe_publish_dauth_revoked_unlicensed_tries()
+    self.assertEqual(callers, [threading.current_thread().name] * 2)
+    self.assertEqual(set(self._unlicensed_cstore()), {REVOKED.removeprefix("0xai_")})
+
+  def test_plugin_loop_makes_at_most_one_write_per_call(self):
+    self.plugin.time = lambda: 1000.0
+    self.plugin.bc.is_node_licensed.return_value = False
+    unprefixed_revoked = REVOKED.removeprefix("0xai_")
+    for sender in (REVOKED, "0xai_" + REVOKED_UNPREFIXED):
+      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(sender)))
+    self.plugin._flush_dauth_revoked_tries()
+    stored = lambda: {
+      key for (hkey, key) in self.plugin._chainstore if hkey == DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY
+    }
+    self.plugin._maybe_publish_dauth_revoked_unlicensed_tries()
+    self.assertEqual(stored(), {unprefixed_revoked})
+    self.plugin._maybe_publish_dauth_revoked_unlicensed_tries()
+    self.assertEqual(stored(), {unprefixed_revoked, REVOKED_UNPREFIXED})
+
+  def test_recent_timestamps_do_not_use_up_the_write_of_a_call(self):
+    self.plugin.time = lambda: 1000.0
+    self.plugin._chainstore[(DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY, REVOKED.removeprefix("0xai_"))] = 900.0
+    self.plugin.bc.is_node_licensed.return_value = False
+    for sender in (REVOKED, "0xai_" + REVOKED_UNPREFIXED):
+      self._assert_auth_refused(self.plugin.process_dauth_request(_auth_body(sender)))
+    self.plugin._flush_dauth_revoked_tries()
+    self.plugin._maybe_publish_dauth_revoked_unlicensed_tries()
+    self.assertEqual(self.plugin._dauth_revoked_unlicensed_pending, {})
+    self.assertEqual(
+      self.plugin._chainstore[(DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY, REVOKED_UNPREFIXED)], 1000.0,
+    )
 
   def test_unloaded_denylist_fails_closed(self):
     del self.plugin._dauth_revoked_nodes
