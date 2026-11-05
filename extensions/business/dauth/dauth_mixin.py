@@ -166,7 +166,7 @@ class _DauthMixin(object):
     else:
       try:
         result = not self._is_dauth_node_revoked(
-          endpoint="get_auth_data", node_address=node_address, node_address_eth=node_address_eth,
+          endpoint="get_auth_data", node_address=node_address,
           requester_type=version_check_data.requester_type, body=body,
         ) and self.bc.is_node_licensed(node_address_eth=node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
@@ -201,7 +201,7 @@ class _DauthMixin(object):
       raise ValueError("Invalid request signature: {}".format(verify_data.message))
 
     if self._is_dauth_node_revoked(
-      endpoint=endpoint, node_address=requester, node_address_eth=requester_eth, body=body,
+      endpoint=endpoint, node_address=requester, body=body,
     ):
       raise ValueError(f"Sender {requester_eth} not allowed on {self.evm_network}.")
     return requester, requester_eth
