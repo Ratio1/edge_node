@@ -166,7 +166,7 @@ class _DauthMixin(object):
     else:
       try:
         result = not self._is_dauth_node_revoked(
-          endpoint="get_auth_data", node_address=node_address, node_address_eth=node_address_eth,
+          endpoint="get_auth_data", node_address=node_address,
           requester_type=version_check_data.requester_type, body=body,
         ) and self.bc.is_node_licensed(node_address_eth=node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
@@ -201,7 +201,7 @@ class _DauthMixin(object):
       raise ValueError("Invalid request signature: {}".format(verify_data.message))
 
     if self._is_dauth_node_revoked(
-      endpoint=endpoint, node_address=requester, node_address_eth=requester_eth, body=body,
+      endpoint=endpoint, node_address=requester, body=body,
     ):
       raise ValueError(f"Sender {requester_eth} not allowed on {self.evm_network}.")
     return requester, requester_eth
@@ -947,10 +947,11 @@ class _DauthMixin(object):
     ####### now we prepare env variables ########
     short_requester = requester[:8] + '...' + requester[-4:]
     short_eth = requester_eth[:6] + '...' + requester_eth[-4:]
+    source_ip = self.get_request_client_ip()
     if error is not None:
       dct_dauth['error'] = error
-      self.P("dAuth request '{}' failed for <{}>  '{}' (ETH: {}): {}".format(
-        sender_nonce, short_requester, requester_alias, short_eth, error), color='r'
+      self.P("dAuth request '{}' failed for <{}>  '{}' (ETH: {}) from {}: {}".format(
+        sender_nonce, short_requester, requester_alias, short_eth, source_ip, error), color='r'
       )
     else:
       if _non_critical_error is not None:
@@ -961,8 +962,8 @@ class _DauthMixin(object):
         dauth_data=dct_dauth, requester_node_address=requester, is_node=is_requester_a_node,
         sender_eth_address=requester_eth
       )
-      self.P("dAuth req '{}' success for <{}> '{}' (ETH: {})".format(
-        sender_nonce, short_eth, requester_alias, short_eth)
+      self.P("dAuth req '{}' success for <{}> '{}' (ETH: {}) from {}".format(
+        sender_nonce, short_requester, requester_alias, short_eth, source_ip)
       )
       ### end fill data
               
