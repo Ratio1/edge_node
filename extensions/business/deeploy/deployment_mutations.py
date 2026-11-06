@@ -54,8 +54,7 @@ class _DeploymentMutationsMixin:
     nodes = specs.get("current_target_nodes")
     if not isinstance(nodes, list) or not nodes or len(set(nodes)) != len(nodes):
       raise ValueError("The current deployment has no exact recoverable placement.")
-    # An unversioned relinked job reads the new node's running config from NetMon;
-    # a versioned one reads the old node's stored config, renamed here.
+    # For a relink the new node reports the config it inherited, still naming the old node.
     configs = replace_nodes(self._previous_deployment_configs(pipeline), node_aliases or {})
     if not isinstance(configs, dict) or set(configs) != set(nodes):
       raise ValueError("The current revision does not contain the complete placement.")

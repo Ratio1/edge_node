@@ -51,6 +51,12 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     report(self.state, operation, 'deploy', 'ready')
     self.coordinator._advance_deployment_operation(operation)
     self.coordinator._advance_deployment_operation(operation)
+    self.running(operation)
+
+  def running(self, operation, attempt='configs'):
+    # NetMon stand-in: each node now reports the config it was sent.
+    plan = self.coordinator._load_operation_plan(operation)
+    self.coordinator.known = {node: [copy.deepcopy(config)] for node, config in plan[attempt].items()}
 
   def active(self):
     pointer = self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']
@@ -282,6 +288,7 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
       prior_pipeline=None, is_create=True,
     )
     self.finalize(self.operation())
+    self.coordinator.known = {'N': self.coordinator.known['A']}  # same machine, new key
     accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
     operation = self.coordinator._operation_records()[accepted['operation_id']]
     self.assertEqual((operation['nodes'], operation['previous_nodes']), (['N'], ['N']))
@@ -298,6 +305,20 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(node_env['NODE_KEY'], 'node-secret')
     with self.assertRaises(ValueError):
       self.dauth._load_revision_runner_secret_bundle('7', reference, 'A')
+
+  def test_update_does_not_need_the_record_of_whoever_deployed_the_running_revision(self):
+    self.admit()
+    self.finalize(self.operation())
+    # The deploying oracle was revoked: its operation records are no longer trusted.
+    for key in [key for key in self.state.public if key[0] == 'DEEPLOY_OPERATIONS']:
+      del self.state.public[key]
+    self.coordinator._deployment_plans.clear()
+    accepted = self.coordinator._admit_owner_transfer_operation(7, 'owner', 'new-owner', 'tx|0')
+    operation = self.coordinator._operation_records()[accepted['operation_id']]
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    self.assertEqual(self.active()['OWNER'], 'new-owner')
+    self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'fresh-token')
 
   def test_unversioned_node_relink_reads_the_new_node_and_keeps_secrets(self):
     canonical, _ = self.legacy()

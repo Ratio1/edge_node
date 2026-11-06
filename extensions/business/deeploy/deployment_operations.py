@@ -230,15 +230,13 @@ class _DeploymentOperationsMixin:
     return redacted, fragments
 
   def _previous_deployment_configs(self, pipeline):
-    """Load exact previous redacted placement from public plans or node metadata."""
+    """Load the exact redacted config each target node reports running.
+
+    The baseline is what runs, not who deployed it: an oracle that wrote the
+    current revision can later be revoked. Callers reject any config whose
+    revision or instances differ from the stored job.
+    """
     specs = pipeline["DEEPLOY_SPECS"]
-    reference = specs.get("secret_revision")
-    if reference:
-      previous = self._operation_records().get(reference.split(":", 1)[0])
-      if previous is None:
-        raise ValueError("The previous deployment operation is unavailable.")
-      plan = self._load_operation_plan(previous)
-      return copy.deepcopy(plan["previous_configs" if reference.endswith(":restore") else "configs"])
     configs = {}
     known = self.netmon.network_known_pipelines()
     for node in specs.get("current_target_nodes", []):
@@ -323,7 +321,7 @@ class _DeploymentOperationsMixin:
       prior_secret_revision = prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision")
       previous_secret_revision_to_release = prior_secret_revision
       previous_operation_id = prior_secret_revision.split(":", 1)[0] if prior_secret_revision else None
-      # A node relink stores the old node's previous config under the new node.
+      # For a relink the new node reports the config it inherited, still naming the old node.
       previous_configs = replace_nodes(self._previous_deployment_configs(prior_pipeline), node_aliases or {})
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
