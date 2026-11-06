@@ -236,7 +236,8 @@ class _DauthDeploymentSecretsMixin:
     expected_active = {"finalizing": "deploy", "finalizing_recovery": "restore"}.get(phase)
     if active_attempt != expected_active or (
       phase in ("preparing", "cleaning_up_preparation") and self.time() < operation["preparation_deadline"]
-    ) or (phase == "stopping_failed_rollout" and operation["kind"] != "create"):
+    ) or (phase == "stopping_failed_rollout" and operation["kind"] != "create" and operation.get("previous_nodes")):
+    # A failed update with no previous node left to restore is cleaned up like a failed create.
       raise ValueError("Secret cleanup does not match lifecycle recovery.")
     pointer = self.chainstore_hget(hkey=POINTERS, key=job_id)
     if active_attempt:

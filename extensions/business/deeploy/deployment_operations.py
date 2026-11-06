@@ -229,12 +229,13 @@ class _DeploymentOperationsMixin:
       fragments = self._merge_deeploy_dauth_secret_fragments(fragments, values, reject_conflicts=True)
     return redacted, fragments
 
-  def _previous_deployment_configs(self, pipeline):
+  def _previous_deployment_configs(self, pipeline, optional_nodes=()):
     """Load the exact redacted config each target node reports running.
 
     The baseline is what runs, not who deployed it: an oracle that wrote the
     current revision can later be revoked. Callers reject any config whose
-    revision or instances differ from the stored job.
+    revision or instances differ from the stored job. Nodes in
+    ``optional_nodes`` that report nothing for the job are left out.
     """
     specs = pipeline["DEEPLOY_SPECS"]
     configs = {}
@@ -243,6 +244,8 @@ class _DeploymentOperationsMixin:
       matches = [config for config in known.get(node, [])
                  if config.get("NAME") == pipeline["NAME"]
                  and str(config.get("DEEPLOY_SPECS", {}).get("job_id")) == str(specs["job_id"])]
+      if not matches and node in optional_nodes:
+        continue
       if len(matches) != 1:
         raise ValueError("The exact previous configuration is unavailable for a target node.")
       configs[node] = copy.deepcopy(matches[0])
@@ -321,12 +324,18 @@ class _DeploymentOperationsMixin:
       prior_secret_revision = prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision")
       previous_secret_revision_to_release = prior_secret_revision
       previous_operation_id = prior_secret_revision.split(":", 1)[0] if prior_secret_revision else None
+      # A node leaving the placement that no longer reports the job (e.g. offline)
+      # is skipped: there is nothing to stop or restore on it.
+      removed = set(previous_nodes) - set(configs)
       # For a relink the new node reports the config it inherited, still naming the old node.
-      previous_configs = replace_nodes(self._previous_deployment_configs(prior_pipeline), node_aliases or {})
+      previous_configs = replace_nodes(
+        self._previous_deployment_configs(prior_pipeline, optional_nodes=removed), node_aliases or {},
+      )
+      skipped = removed - set(previous_configs)
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
       )
-      if set(previous_configs) != set(previous_nodes) or any(
+      if set(previous_configs) != set(previous_nodes) - skipped or any(
         config.get("NAME") != app_id or
         str(config.get("DEEPLOY_SPECS", {}).get("job_id")) != str(job_id) or
         config.get("DEEPLOY_SPECS", {}).get("revision", 0) != previous_revision or
@@ -543,7 +552,7 @@ class _DeploymentOperationsMixin:
     if phase == "stopping_failed_rollout":
       # Requiring all stop acknowledgments provides the stateful restoration barrier.
       if all(reports.get(node, {}).get("status") == "stopped" for node in configs):
-        if operation["kind"] == "update":
+        if operation["kind"] == "update" and operation["previous_nodes"]:
           operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
           self._save_operation(operation, "restoring_previous", "Restoring the previous revision.")
         else:

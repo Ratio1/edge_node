@@ -87,7 +87,7 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     pointer = self.storage.get(('DEEPLOY_DEPLOYED_JOBS', str(job_id)))
     return pointer.get('pipeline_cid') if isinstance(pointer, dict) else pointer
 
-  def _previous_deployment_configs(self, pipeline):
+  def _previous_deployment_configs(self, pipeline, optional_nodes=()):
     # Scenario fixtures supply the public plan separately from flat custody data.
     if pipeline.get('DEEPLOY_SPECS', {}).get('secret_revision'):
       if self.previous_configs is None:
