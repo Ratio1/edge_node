@@ -182,6 +182,53 @@ class DeploymentMutationTests(unittest.TestCase):
       plugin._admit_owner_transfer_operation(7, "owner", "new-owner", None)
     self.assertIsNone(plugin.captured_scale)
 
+  def test_node_relink_renames_the_old_node_everywhere_and_keeps_its_settings(self):
+    plugin = Mutations()
+    plugin.current["A"]["PLUGINS"][0]["INSTANCES"][0].update(CHAINSTORE_PEERS=["A", "B"])
+    result = plugin._admit_node_relink_operation(7, "A", "N")
+    self.assertEqual(result["status_code"], 202)
+    admitted = plugin.captured_scale
+    self.assertEqual((admitted["mutation"], admitted["node_aliases"]), ("node_relink", {"A": "N"}))
+    self.assertEqual(admitted["prior_pipeline"]["DEEPLOY_SPECS"]["current_target_nodes"], ["N", "B"])
+    self.assertEqual(set(admitted["configs"]), {"N", "B"})
+    moved = admitted["configs"]["N"]["PLUGINS"][0]["INSTANCES"][0]
+    self.assertEqual((moved["INSTANCE_ID"], moved["ENV"]["NODE_VALUE"]), ("instance-A", "N"))
+    self.assertEqual(moved["CHAINSTORE_PEERS"], ["N", "B"])
+    self.assertEqual(moved["VOLUMES"], {"data": "/preserved-A"})
+
+  def test_node_relink_requires_the_old_node_and_not_the_new_one_in_placement(self):
+    plugin = Mutations()
+    for old_node, new_node in (("C", "N"), ("A", "B")):
+      with self.assertRaises(ValueError):
+        plugin._admit_node_relink_operation(7, old_node, new_node)
+    self.assertIsNone(plugin.captured_scale)
+
+  def test_node_relinks_run_on_one_oracle_per_job_in_hash_order(self):
+    plugin = Mutations()
+    plugin.plugins_shmem = {"CHAIN_DIST_NODE_RELINKS": {7: ("A", "N")}}
+    plugin._operation_peers = lambda: ["oracle", "other", "offline"]
+    plugin.netmon = SimpleNamespace(network_node_is_online=lambda peer: peer != "offline")
+    plugin._admit_node_relink_operation = Mock()
+    plugin.P = Mock()
+    rank = sorted(["oracle", "other"], key=lambda peer: __import__("hashlib").sha256(
+      "7|{}".format(peer).encode()).hexdigest()).index("oracle")
+    calls = []
+    for _ in range(4):
+      plugin._maybe_admit_node_relinks()
+      calls.append(plugin._admit_node_relink_operation.call_count)
+      plugin.now += 300
+    # A ranked oracle waits 900 s per rank, then retries every 300 s until the job moves.
+    self.assertEqual(calls, [sum(1 for look in range(i + 1) if look * 300 >= 900 * rank) for i in range(4)])
+    plugin._admit_node_relink_operation.assert_called_with(7, "A", "N")
+    online_checks = plugin.netmon.network_node_is_online
+    plugin.netmon.network_node_is_online = Mock(side_effect=AssertionError("checked between looks"))
+    plugin.now -= 1
+    plugin._maybe_admit_node_relinks()
+    plugin.netmon.network_node_is_online = online_checks
+    plugin.plugins_shmem["CHAIN_DIST_NODE_RELINKS"] = {}
+    plugin._maybe_admit_node_relinks()
+    self.assertEqual(plugin._node_relinks_seen, {})
+
   def test_delete_generation_advances_after_previous_content_was_restored(self):
     plugin = Mutations()
     plugin.storage[DEEPLOY_JOBS_CSTORE_HKEY, "7"] = dict(revision=9, pipeline_cid="canonical-cid", deleted=False)

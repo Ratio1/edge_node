@@ -1703,5 +1703,10 @@ class DeeployManagerApiPlugin(
         self.P(f"Error checking running pipelines: {e}", color='r')
       self.__last_pipelines_check_time = self.time()
 
+    try:
+      self._maybe_admit_node_relinks()
+    except Exception as e:
+      self.P(f"Error moving jobs from relinked nodes: {e}", color='r')
+
     self._maybe_log_and_save_tracked_requests()
     return

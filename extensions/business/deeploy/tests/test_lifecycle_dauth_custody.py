@@ -271,6 +271,45 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.active()['DEEPLOY_SPECS']['revision'], 1)
     self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'fresh-token')
 
+  def test_node_relink_moves_job_and_per_node_secret_without_the_old_node(self):
+    config = pipeline()
+    instance = config['PLUGINS'][0]['INSTANCES'][0]
+    instance.update(CHAINSTORE_PEERS=['A'], SECRET_PATHS=[['PER_NODE_CONFIG', 'byNode', 'A', 'ENV', 'NODE_KEY']],
+                    PER_NODE_CONFIG={'byNode': {'A': {'ENV': {'NODE_KEY': 'node-secret'}}}})
+    self.coordinator._admit_prepared_deployment(
+      request={'job_id': 7, 'request_id': 'request', 'expected_revision': 0},
+      auth_result={'escrow_owner': 'owner'}, app_id='app', configs={'A': config},
+      prior_pipeline=None, is_create=True,
+    )
+    self.finalize(self.operation())
+    accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    operation = self.coordinator._operation_records()[accepted['operation_id']]
+    self.assertEqual((operation['nodes'], operation['previous_nodes']), (['N'], ['N']))
+    self.assertNotIn('node-secret', str(self.state.public) + str(self.state.blobs.data))
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    active = self.active()['PLUGINS'][0]['INSTANCES'][0]
+    self.assertEqual(self.active()['DEEPLOY_SPECS']['current_target_nodes'], ['N'])
+    self.assertEqual((active['CHAINSTORE_PEERS'], list(active['PER_NODE_CONFIG']['byNode'])), (['N'], ['N']))
+    reference = operation['operation_id'] + ':deploy'
+    requested = self.dauth._load_revision_runner_secret_bundle('7', reference, 'N')
+    self.assertEqual(self.token(requested), 'fresh-token')
+    node_env = requested['job_secrets']['PLUGINS'][0]['INSTANCES'][0]['PER_NODE_CONFIG']['byNode']['N']['ENV']
+    self.assertEqual(node_env['NODE_KEY'], 'node-secret')
+    with self.assertRaises(ValueError):
+      self.dauth._load_revision_runner_secret_bundle('7', reference, 'A')
+
+  def test_unversioned_node_relink_reads_the_new_node_and_keeps_secrets(self):
+    canonical, _ = self.legacy()
+    self.coordinator.known = {'N': [canonical]}
+    accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    operation = self.coordinator._operation_records()[accepted['operation_id']]
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    self.assertEqual(self.active()['DEEPLOY_SPECS']['current_target_nodes'], ['N'])
+    requested = self.dauth._load_revision_runner_secret_bundle('7', operation['operation_id'] + ':deploy', 'N')
+    self.assertEqual(self.token(requested), 'old-token')
+
   def test_partial_publication_replays_before_old_cid_cleanup(self):
     previous, cid = self.legacy()
     self.admit(previous)

@@ -36,6 +36,8 @@ Epoch-end:
 """
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
+from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
+from extensions.business.deeploy.deployment_mutations import NODE_RELINKS_SHMEM_KEY
 
 
 __VER__ = '0.3.0'
@@ -63,8 +65,9 @@ _CONFIG = {
   # Observe an unstarted pending job without a visible pipeline before voting zero.
   'PENDING_EMPTY_OBSERVATION_SECONDS' : 3600,
 
-  # Move running jobs from a relinked ND node to the node now linked to the same
-  # license. Each oracle checks at a random interval in this range.
+  # Move jobs from a relinked ND node to the node now linked to the same license:
+  # Deeploy moves the stored job first, then the chain follows. Each oracle checks
+  # at a random interval in this range.
   'RELINK_CHECK_MIN_SECONDS' : 300,
   'RELINK_CHECK_MAX_SECONDS' : 900,
   # Each check reads at most this many blocks with one eth_getLogs call. Older
@@ -74,7 +77,7 @@ _CONFIG = {
   'ND_LINK_LOGS_CONFIRMATIONS' : 20,
 }
 
-class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
+class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin, _DeeployJobMixin):
   # Never a proposer, so get_unvalidated_job_ids returns every pending job for it.
   ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 
@@ -220,6 +223,9 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
   def _update_nd_links(self):
     """
     Read the ND LinkNode/UnlinkNode events since the last check (one eth_getLogs call).
+
+    Events are kept unpaired: an UnlinkNode waits for a later LinkNode on the same license,
+    which may never come (a transfer or burn unlinks with no link).
     """
     head = self.bc.get_block_number() - self.cfg_nd_link_logs_confirmations
     cursor = self.relink_state['cursor']
@@ -248,7 +254,10 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
     """
     Map each unlinked node to the node its license was linked to next by the same owner.
 
-    A sold license is linked by a different owner, so it does not count.
+    An UnlinkNode with no later LinkNode by the same sender has no successor: a license
+    transfer or burn, or a plain unlink. Jobs on such a node have no new node to move
+    to, so they are neither handed to Deeploy nor voted here. A sold license is linked
+    by a different owner, so it does not count either.
     """
     successors = {}
     for node, (license_id, owner) in self.relink_state['unlinked'].items():
@@ -260,12 +269,13 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
 
   def maybe_swap_relinked_nodes(self):
     """
-    Move running jobs from a relinked ND node to its new node, so rewards follow the license.
+    Move jobs from a relinked ND node to its new node, so rewards follow the license.
 
-    A job node is replaced only when its ND license is now linked to another node by the
-    same owner and NetMon shows that node running the job. The job keeps its node count.
-    A check costs a block-number call and one eth_getLogs; the job reads run only when a
-    relinked node's new node already runs a job.
+    Deeploy moves the stored job (R1FS) first, which also moves the job's secrets:
+    jobs whose stored placement still names the old node are handed to it through
+    plugins_shmem. The chain vote replaces the old node only once the stored placement
+    names the new node instead. A check costs a block-number call and one eth_getLogs;
+    the job reads run only for jobs whose active nodes include a relinked node.
     """
     if self.time() < self.next_relink_check:
       return
@@ -274,35 +284,32 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
     )
     self._update_nd_links()
     successors = self._get_relink_successors()
-    if not successors:
-      return
-
-    new_nodes = set(successors.values())
-    running_nodes_by_job = {
-      job_id: {self.bc.node_address_to_eth_address(node) for node in nodes}
-      for job_id, nodes in self._get_running_nodes_by_job(self.netmon.network_known_apps()).items()
-    }
-    if not any(nodes & new_nodes for nodes in running_nodes_by_job.values()):
-      return
-
-    # Pending jobs are voted by check_all_jobs; closable ones are closed by check_closable_jobs.
-    skipped_job_ids = set(self.bc.get_unvalidated_job_ids(oracle_address=self.ZERO_ADDRESS) or [])
-    skipped_job_ids.add(self.bc.get_first_closable_job_id())
-    for job in self.bc.get_all_active_jobs():
-      job_id, active_nodes = job['jobId'], list(job['activeNodes'])
-      if job_id in skipped_job_ids or not active_nodes:
-        continue
-      running_nodes = running_nodes_by_job.get(job_id, set())
-      nodes = []
-      for node in active_nodes:
-        new_node = successors.get(node)
-        if new_node in running_nodes and new_node not in active_nodes and new_node not in nodes:
-          node = new_node
-        nodes.append(node)
-      if nodes != active_nodes:
-        nodes = sorted(nodes)
-        self.P(f"Job {job_id}: moving relinked node(s) {sorted(set(active_nodes) - set(nodes))} to {nodes}")
-        self.bc.submit_node_update(job_id=job_id, nodes=nodes)
+    relinks = {}
+    if successors:
+      # Pending jobs are voted by check_all_jobs; closable ones are closed by check_closable_jobs.
+      skipped_job_ids = set(self.bc.get_unvalidated_job_ids(oracle_address=self.ZERO_ADDRESS) or [])
+      skipped_job_ids.add(self.bc.get_first_closable_job_id())
+      for job in self.bc.get_all_active_jobs():
+        job_id, active_nodes = job['jobId'], list(job['activeNodes'])
+        if job_id in skipped_job_ids or not set(active_nodes) & set(successors):
+          continue
+        pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=10, pin=False)
+        placement = (pipeline or {}).get('DEEPLOY_SPECS', {}).get('current_target_nodes', [])
+        nodes = []
+        for node in active_nodes:
+          new_node = successors.get(node)
+          if new_node and new_node not in active_nodes and new_node not in nodes:
+            old, new = self.bc.eth_addr_to_internal_addr(node), self.bc.eth_addr_to_internal_addr(new_node)
+            if new in placement and old not in placement:
+              node = new_node
+            elif old in placement and new not in placement:
+              relinks[job_id] = (old, new)
+          nodes.append(node)
+        if nodes != active_nodes:
+          nodes = sorted(nodes)
+          self.P(f"Job {job_id}: moving relinked node(s) {sorted(set(active_nodes) - set(nodes))} to {nodes}")
+          self.bc.submit_node_update(job_id=job_id, nodes=nodes)
+    self.plugins_shmem[NODE_RELINKS_SHMEM_KEY] = relinks
     return
 
 

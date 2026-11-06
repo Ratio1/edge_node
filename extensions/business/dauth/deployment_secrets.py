@@ -3,7 +3,7 @@ import copy
 import hashlib
 
 from .dauth_registry import dauth_registry_write_kwargs
-from extensions.business.deeploy.deployment_operations import required_instances, SIGNATURE_KEYS
+from extensions.business.deeploy.deployment_operations import replace_nodes, required_instances, SIGNATURE_KEYS
 
 
 REVISIONS = "DAUTH_JOB_SECRET_REVISIONS"
@@ -120,6 +120,11 @@ class _DauthDeploymentSecretsMixin:
           raise ValueError("The active pipeline changed before preparation.")
     elif prior_cid:
       raise ValueError("A create cannot replace an active pipeline.")
+    # A relinked node takes over the old node's values, including its per-node secret paths.
+    node_aliases = dict(body.get("node_aliases") or [])
+    if node_aliases:
+      prior_bundle = replace_nodes(prior_bundle, node_aliases)
+      prior_pipeline = replace_nodes(prior_pipeline, node_aliases)
     aliases = {tuple(current): tuple(source) for current, source in body.get("identity_aliases", [])}
     records = []
     for attempt, key, fragments in (

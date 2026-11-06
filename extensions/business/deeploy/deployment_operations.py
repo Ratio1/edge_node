@@ -66,6 +66,21 @@ def report_is_ready(report, config):
   return bool(expected) and all(actual.get(identity) == "ready" for identity in expected)
 
 
+def replace_nodes(value, node_aliases):
+  """Rename node addresses used as dict keys or whole string values.
+
+  A relinked node keeps its job, so everything naming the old address
+  (placement, peers, per-node settings and their secret paths) moves to the new one.
+  """
+  if isinstance(value, dict):
+    return {node_aliases.get(key, key): replace_nodes(item, node_aliases) for key, item in value.items()}
+  if isinstance(value, list):
+    return [replace_nodes(item, node_aliases) for item in value]
+  if isinstance(value, str):
+    return node_aliases.get(value, value)
+  return value
+
+
 class _DeploymentOperationsMixin:
   """Persist, execute, recover, and present asynchronous deployment operations."""
 
@@ -251,7 +266,7 @@ class _DeploymentOperationsMixin:
 
   def _admit_prepared_deployment(self, request, auth_result, app_id, configs,
                                  prior_pipeline, is_create, mutation=None,
-                                 restore_owner=None, identity_aliases=None):
+                                 restore_owner=None, identity_aliases=None, node_aliases=None):
     """Save exact redacted plans and secret revisions before accepting work.
 
     Parameters
@@ -308,7 +323,8 @@ class _DeploymentOperationsMixin:
       prior_secret_revision = prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision")
       previous_secret_revision_to_release = prior_secret_revision
       previous_operation_id = prior_secret_revision.split(":", 1)[0] if prior_secret_revision else None
-      previous_configs = self._previous_deployment_configs(prior_pipeline)
+      # A node relink stores the old node's previous config under the new node.
+      previous_configs = replace_nodes(self._previous_deployment_configs(prior_pipeline), node_aliases or {})
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
       )
@@ -362,6 +378,7 @@ class _DeploymentOperationsMixin:
         "prepare", operation, new_secrets=new_secrets,
         previous_new_secrets=previous_new_secrets if previous_configs else None,
         identity_aliases=[[list(current), list(source)] for current, source in (identity_aliases or {}).items()],
+        node_aliases=[[old, new] for old, new in (node_aliases or {}).items()],
       )
       if self.time() >= operation["preparation_deadline"]:
         self._expire_deployment_preparation(operation)

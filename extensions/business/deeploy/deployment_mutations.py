@@ -6,13 +6,21 @@ import uuid
 from .deeploy_const import DEEPLOY_KEYS
 from .deeploy_mixin import COCKROACHDB_CERT_ENV_KEYS, COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
 from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY
-from .deployment_operations import request_digest, required_instances
+from .deployment_operations import request_digest, replace_nodes, required_instances
+
+# ChainDist publishes {job_id: (old_node, new_node)} here for jobs whose stored placement
+# still names a node whose license its owner relinked to another node.
+NODE_RELINKS_SHMEM_KEY = "CHAIN_DIST_NODE_RELINKS"
+# Oracles take each job in hash order; a later one acts after waiting this long per rank.
+NODE_RELINK_RANK_SECONDS = 900
+# Each oracle looks at a job at most this often.
+NODE_RELINK_RETRY_SECONDS = 300
 
 
 class _DeploymentMutationsMixin:
   """Prepare mutations from exact persisted placement, never partial discovery."""
 
-  def _mutation_baseline(self, request, owner):
+  def _mutation_baseline(self, request, owner, node_aliases=None):
     """Load and validate the exact current revision and every prior node config.
 
     Parameters
@@ -21,6 +29,8 @@ class _DeploymentMutationsMixin:
       Authorized request with job_id and expected_revision.
     owner : str
       Authenticated escrow owner.
+    node_aliases : dict, optional
+      Old node -> new node for a relink; both the job and its node configs use the new node.
 
     Notes
     -----
@@ -34,6 +44,7 @@ class _DeploymentMutationsMixin:
                                                 raise_on_error=False, show_logs=False)
     if not isinstance(pipeline, dict):
       raise ValueError("The current deployment configuration is unavailable.")
+    pipeline = replace_nodes(pipeline, node_aliases or {})
     specs = pipeline.get("DEEPLOY_SPECS", {})
     if str(specs.get("job_id")) != str(job_id) or str(pipeline.get("OWNER", "")).lower() != owner.lower():
       raise ValueError("The current deployment does not belong to this job owner.")
@@ -43,7 +54,9 @@ class _DeploymentMutationsMixin:
     nodes = specs.get("current_target_nodes")
     if not isinstance(nodes, list) or not nodes or len(set(nodes)) != len(nodes):
       raise ValueError("The current deployment has no exact recoverable placement.")
-    configs = self._previous_deployment_configs(pipeline)
+    # An unversioned relinked job reads the new node's running config from NetMon;
+    # a versioned one reads the old node's stored config, renamed here.
+    configs = replace_nodes(self._previous_deployment_configs(pipeline), node_aliases or {})
     if not isinstance(configs, dict) or set(configs) != set(nodes):
       raise ValueError("The current revision does not contain the complete placement.")
     expected_shape = [(plugin["SIGNATURE"], len(plugin["INSTANCES"])) for plugin in pipeline["PLUGINS"]]
@@ -169,6 +182,80 @@ class _DeploymentMutationsMixin:
       configs=configs, prior_pipeline=prior, is_create=False,
       mutation="owner_transfer", restore_owner=new_owner,
     )
+
+  def _admit_node_relink_operation(self, job_id, old_node, new_node):
+    """Move a job from a relinked node to its owner's new node through a revision rollout.
+
+    Parameters
+    ----------
+    job_id : int
+      Job whose stored placement still names the old node.
+    old_node, new_node : str
+      Internal addresses; ChainDist found the new node linked to the old node's
+      license by the same owner.
+
+    Notes
+    -----
+    The new node is the same machine with a new key, so it keeps the old node's
+    settings, including per-node secrets, which dAuth moves with the same aliases.
+    The old node is never contacted; the new node stops its current copy first.
+    """
+    pipeline = self.get_job_pipeline_from_cstore(job_id, timeout=30, pin=False,
+                                                raise_on_error=False, show_logs=False)
+    if not isinstance(pipeline, dict):
+      raise ValueError("The current deployment configuration is unavailable.")
+    specs = pipeline.get("DEEPLOY_SPECS", {})
+    nodes = specs.get("current_target_nodes", [])
+    if old_node not in nodes or new_node in nodes:
+      raise ValueError("The stored placement does not name only the relinked node.")
+    owner = pipeline.get("OWNER", "")
+    request_id = "node-relink-" + hashlib.sha256("{}|{}|{}".format(job_id, old_node, new_node).encode()).hexdigest()
+    request = dict(request_id=request_id, job_id=job_id, expected_revision=specs.get("revision", 0),
+                   old_node=old_node, new_node=new_node)
+    existing = self._find_request_operation(request, owner, "update")
+    if existing:
+      return self._accepted_operation_response(existing)
+    self._assert_no_active_deployment(job_id=job_id)
+    node_aliases = {old_node: new_node}
+    prior, configs = self._mutation_baseline(request, owner, node_aliases=node_aliases)
+    for config in configs.values():
+      config["DEEPLOY_SPECS"]["date_updated"] = self.time()
+      config.pop("DEEPLOY_OPERATION", None)
+    return self._admit_prepared_deployment(
+      request=request, auth_result={DEEPLOY_KEYS.ESCROW_OWNER: owner}, app_id=prior["NAME"],
+      configs=configs, prior_pipeline=prior, is_create=False,
+      mutation="node_relink", node_aliases=node_aliases,
+    )
+
+  def _maybe_admit_node_relinks(self):
+    """Admit the relinks ChainDist found, one oracle per job.
+
+    Online oracles are ranked per job by hash. The first acts at once and each
+    later one only after waiting its rank, so a stopped oracle delays a job
+    instead of blocking it, and overlaps resolve to the same request.
+    """
+    relinks = self.plugins_shmem.get(NODE_RELINKS_SHMEM_KEY) or {}
+    now = self.time()
+    seen = getattr(self, "_node_relinks_seen", {})
+    self._node_relinks_seen = {job_id: seen.get(job_id, [now, now - NODE_RELINK_RETRY_SECONDS]) for job_id in relinks}
+    due = [job_id for job_id, (_, last_check) in self._node_relinks_seen.items()
+           if now - last_check >= NODE_RELINK_RETRY_SECONDS]
+    if not due:
+      return
+    peers = [peer for peer in self._operation_peers()
+             if peer == self.bc.address or self.netmon.network_node_is_online(peer)]
+    for job_id in due:
+      self._node_relinks_seen[job_id][1] = now
+      ranked = sorted(peers, key=lambda peer: hashlib.sha256("{}|{}".format(job_id, peer).encode()).hexdigest())
+      if now - self._node_relinks_seen[job_id][0] < ranked.index(self.bc.address) * NODE_RELINK_RANK_SECONDS:
+        continue
+      old_node, new_node = relinks[job_id]
+      try:
+        self._admit_node_relink_operation(job_id, old_node, new_node)
+        self.P(f"Job {job_id}: moving relinked node {old_node} to {new_node}.")
+      except Exception as exc:
+        self.P(f"Job {job_id}: relinked node move not admitted: {exc}", color='y')
+    return
 
   def _admit_delete_operation(self, request, auth_result):
     """Persist a whole-job scoped retirement before dispatching any stop."""
