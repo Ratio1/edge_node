@@ -54,6 +54,9 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     self.r1fs = SimpleNamespace(add_json=self.add_plan, get_json=lambda cid, **kwargs: copy.deepcopy(self.plans[cid]))
     self._get_response = lambda value: value
     self.commands = []
+    # Every node still reports the job unless a test says otherwise.
+    self.netmon = SimpleNamespace(network_known_pipelines=lambda: {
+      node: [{"NAME": "app", "DEEPLOY_SPECS": {"job_id": 7}}] for node in ("A", "B", "C", "N")})
 
   def time(self):
     return 100
@@ -87,7 +90,7 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     pointer = self.storage.get(('DEEPLOY_DEPLOYED_JOBS', str(job_id)))
     return pointer.get('pipeline_cid') if isinstance(pointer, dict) else pointer
 
-  def _previous_deployment_configs(self, pipeline, optional_nodes=()):
+  def _previous_deployment_configs(self, pipeline):
     # Scenario fixtures supply the public plan separately from flat custody data.
     if pipeline.get('DEEPLOY_SPECS', {}).get('secret_revision'):
       if self.previous_configs is None:

@@ -81,6 +81,18 @@ def replace_nodes(value, node_aliases):
   return value
 
 
+def list_order_differs(stored, running):
+  """Whether some list holds the same items in both configs, in another order."""
+  if isinstance(stored, dict) and isinstance(running, dict):
+    return any(list_order_differs(stored[key], running[key]) for key in stored.keys() & running.keys())
+  if isinstance(stored, list) and isinstance(running, list):
+    items = lambda values: sorted(json.dumps(value, sort_keys=True) for value in values)
+    if stored != running and items(stored) == items(running):
+      return True
+    return any(list_order_differs(a, b) for a, b in zip(stored, running))
+  return False
+
+
 class _DeploymentOperationsMixin:
   """Persist, execute, recover, and present asynchronous deployment operations."""
 
@@ -229,27 +241,25 @@ class _DeploymentOperationsMixin:
       fragments = self._merge_deeploy_dauth_secret_fragments(fragments, values, reject_conflicts=True)
     return redacted, fragments
 
-  def _previous_deployment_configs(self, pipeline, optional_nodes=()):
-    """Load the exact redacted config each target node reports running.
+  def _previous_deployment_configs(self, pipeline):
+    """Rebuild each target node's config from the stored job in R1FS.
 
-    The baseline is what runs, not who deployed it: an oracle that wrote the
-    current revision can later be revoked. Callers reject any config whose
-    revision or instances differ from the stored job. Nodes in
-    ``optional_nodes`` that report nothing for the job are left out.
+    Every node of a revision runs the same redacted config, which the stored
+    job keeps exactly; neither the oracle that wrote it nor what nodes report
+    is trusted. Each node owns its response key, so the stored one is dropped.
     """
-    specs = pipeline["DEEPLOY_SPECS"]
-    configs = {}
-    known = self.netmon.network_known_pipelines()
-    for node in specs.get("current_target_nodes", []):
-      matches = [config for config in known.get(node, [])
-                 if config.get("NAME") == pipeline["NAME"]
-                 and str(config.get("DEEPLOY_SPECS", {}).get("job_id")) == str(specs["job_id"])]
-      if not matches and node in optional_nodes:
-        continue
-      if len(matches) != 1:
-        raise ValueError("The exact previous configuration is unavailable for a target node.")
-      configs[node] = copy.deepcopy(matches[0])
-    return configs
+    config = copy.deepcopy(pipeline)
+    for plugin in config.get("PLUGINS", []):
+      for instance in plugin.get("INSTANCES", []):
+        instance.pop("CHAINSTORE_RESPONSE_KEY", None)
+    return {node: copy.deepcopy(config) for node in pipeline["DEEPLOY_SPECS"].get("current_target_nodes", [])}
+
+  def _job_reports(self, pipeline):
+    """Configs NetMon reports for this job, by node: used to decide, never as content."""
+    job_id = str(pipeline["DEEPLOY_SPECS"]["job_id"])
+    return {node: [config for config in configs if config.get("NAME") == pipeline["NAME"]
+                   and str(config.get("DEEPLOY_SPECS", {}).get("job_id")) == job_id]
+            for node, configs in self.netmon.network_known_pipelines().items()}
 
   def _next_deployment_revision(self, job_id, previous_revision=0):
     """Advance past canonical content and every verified observed job attempt.
@@ -326,12 +336,10 @@ class _DeploymentOperationsMixin:
       previous_operation_id = prior_secret_revision.split(":", 1)[0] if prior_secret_revision else None
       # A node leaving the placement that no longer reports the job (e.g. offline)
       # is skipped: there is nothing to stop or restore on it.
-      removed = set(previous_nodes) - set(configs)
-      # For a relink the new node reports the config it inherited, still naming the old node.
-      previous_configs = replace_nodes(
-        self._previous_deployment_configs(prior_pipeline, optional_nodes=removed), node_aliases or {},
-      )
-      skipped = removed - set(previous_configs)
+      reports = self._job_reports(prior_pipeline)
+      skipped = {node for node in set(previous_nodes) - set(configs) if not reports.get(node)}
+      previous_configs = {node: config for node, config in self._previous_deployment_configs(prior_pipeline).items()
+                          if node not in skipped}
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
       )

@@ -288,7 +288,7 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
       prior_pipeline=None, is_create=True,
     )
     self.finalize(self.operation())
-    self.coordinator.known = {'N': self.coordinator.known['A']}  # same machine, new key
+    self.coordinator.known = {}  # A is gone and N is new hardware: nothing reports the job
     accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
     operation = self.coordinator._operation_records()[accepted['operation_id']]
     self.assertEqual((operation['nodes'], operation['previous_nodes']), (['N'], ['N']))
@@ -357,11 +357,15 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     with self.assertRaises(ValueError):
       self.dauth._load_revision_runner_secret_bundle('7', self.active()['DEEPLOY_SPECS']['secret_revision'], 'A')
 
-  def test_update_keeping_an_offline_node_is_still_refused(self):
+  def test_update_baseline_is_the_stored_job_not_what_nodes_report(self):
     self.two_node_job()
-    del self.coordinator.known['A']
-    with self.assertRaises(ValueError):
-      self.move(['A', 'C'])
+    forged = copy.deepcopy(self.coordinator.known['A'][0])
+    forged['PLUGINS'][0]['INSTANCES'][0]['IMAGE'] = 'forged-image'
+    self.coordinator.known['A'] = [forged]
+    operation = self.move(['A', 'C'])
+    restore = self.coordinator._load_operation_plan(operation)['previous_configs']
+    self.assertEqual(set(restore), {'A', 'B'})
+    self.assertNotIn('forged-image', str(restore))
 
   def test_failed_move_off_only_offline_nodes_keeps_the_stored_job(self):
     self.admit()
@@ -380,9 +384,9 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.active(), before)
     self.dauth._load_revision_runner_secret_bundle('7', before['DEEPLOY_SPECS']['secret_revision'], 'A')
 
-  def test_unversioned_node_relink_reads_the_new_node_and_keeps_secrets(self):
-    canonical, _ = self.legacy()
-    self.coordinator.known = {'N': [canonical]}
+  def test_unversioned_node_relink_keeps_secrets(self):
+    self.legacy()
+    self.coordinator.known = {}
     accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
     operation = self.coordinator._operation_records()[accepted['operation_id']]
     self.finalize(operation)

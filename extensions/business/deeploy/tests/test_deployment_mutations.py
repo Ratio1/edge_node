@@ -5,23 +5,29 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from extensions.business.deeploy.deployment_mutations import _DeploymentMutationsMixin
-from extensions.business.deeploy.deployment_operations import NODE_OPERATIONS_HKEY, SECRET_REVISIONS_HKEY
+from extensions.business.deeploy.deployment_operations import (
+  NODE_OPERATIONS_HKEY, SECRET_REVISIONS_HKEY, _DeploymentOperationsMixin,
+)
 from extensions.business.deeploy.deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY
 from extensions.business.deeploy.tests.test_deployment_admission import Admission, config
 
 
 class Mutations(_DeploymentMutationsMixin, Admission):
+  # Node configs are rebuilt from the stored job, as in production.
+  _previous_deployment_configs = _DeploymentOperationsMixin._previous_deployment_configs
+
   def __init__(self):
     super().__init__()
     self.now = 100
     self.bc.get_job_details = lambda job_id: {"escrowOwner": "owner"}
-    self.current = {node: config(node, revision=4) for node in ("A", "B")}
-    for node, pipeline in self.current.items():
-      pipeline["PLUGINS"][0]["INSTANCES"][0].update(
-        VOLUMES={"data": "/preserved-" + node}, ENV={"SECRET": "__R1_DAUTH_SECRET__", "NODE_VALUE": node},
-      )
-    self.pipeline = copy.deepcopy(self.current["A"])
-    self.previous_configs = self.current
+    # The stored job; every node of a revision runs this same config.
+    self.pipeline = config("A", revision=4)
+    self.pipeline["PLUGINS"][0]["INSTANCES"][0].update(
+      VOLUMES={"data": "/preserved"}, ENV={"SECRET": "__R1_DAUTH_SECRET__", "NODE_VALUE": "shared"},
+    )
+    self.current = {node: copy.deepcopy(self.pipeline) for node in ("A", "B")}
+    self.netmon = SimpleNamespace(network_known_pipelines=lambda: {
+      node: [copy.deepcopy(running)] for node, running in self.current.items()})
     self.storage[SECRET_REVISIONS_HKEY, "7|previous:deploy"] = dict(
       job_id="7", revision="previous:deploy", pipelines=copy.deepcopy(self.current), job_secrets={"secret": "protected"},
     )
@@ -85,9 +91,6 @@ class DeploymentMutationTests(unittest.TestCase):
     for pipeline in [plugin.pipeline, *plugin.current.values()]:
       pipeline["DEEPLOY_SPECS"].pop("revision")
       pipeline["DEEPLOY_SPECS"].pop("secret_revision")
-    plugin.netmon = SimpleNamespace(network_known_pipelines=lambda: {
-      node: [pipeline] for node, pipeline in plugin.current.items()
-    })
     result = plugin._admit_delete_operation(
       dict(request_id="legacy-delete", job_id=7, expected_revision=0),
       {"escrow_owner": "owner"},
@@ -112,14 +115,14 @@ class DeploymentMutationTests(unittest.TestCase):
     self.assertEqual(list(admitted["configs"]), ["A", "B", "C"])
     for node in ("A", "B"):
       instance = admitted["configs"][node]["PLUGINS"][0]["INSTANCES"][0]
-      self.assertEqual(instance["INSTANCE_ID"], "instance-" + node)
-      self.assertEqual(instance["VOLUMES"], {"data": "/preserved-" + node})
-      self.assertEqual(instance["ENV"]["NODE_VALUE"], node)
+      self.assertEqual(instance["INSTANCE_ID"], "instance-A")
+      self.assertEqual(instance["VOLUMES"], {"data": "/preserved"})
+      self.assertEqual(instance["ENV"]["NODE_VALUE"], "shared")
       self.assertEqual(instance["ENV"]["CRDB_CA_CERT"], "new-ca")
       self.assertIn("C", instance["PER_NODE_CONFIG"]["byNode"])
       self.assertEqual(admitted["configs"][node]["DEEPLOY_SPECS"]["current_target_nodes"], ["A", "B", "C"])
     self.assertEqual(admitted["prior_pipeline"], plugin.pipeline)
-    self.assertEqual(plugin.current["B"]["PLUGINS"][0]["INSTANCES"][0]["ENV"], {"SECRET": "__R1_DAUTH_SECRET__", "NODE_VALUE": "B"})
+    self.assertEqual(plugin.pipeline["PLUGINS"][0]["INSTANCES"][0]["ENV"], {"SECRET": "__R1_DAUTH_SECRET__", "NODE_VALUE": "shared"})
     self.assertEqual(plugin.commands, [])
 
   def test_real_managed_scale_preparation_shares_one_new_ca_across_all_nodes(self):
@@ -133,7 +136,7 @@ class DeploymentMutationTests(unittest.TestCase):
       instance = pipeline["PLUGINS"][0]["INSTANCES"][0]
       instance.update(IMAGE="ghcr.io/ratio1/r1db:stable", ENV={
         "CRDB_DATABASE": "appdb", "CRDB_USER": "app_user", "CRDB_PASSWORD": "password",
-        "CRDB_HOSTNAMES": "roach1,roach2,roach3,roach4", "NODE_VALUE": node,
+        "CRDB_HOSTNAMES": "roach1,roach2,roach3,roach4", "NODE_VALUE": "shared",
         "CRDB_CA_CRT": "old-ca", "CRDB_NODE_KEY": "old-private-key",
       })
     plugin.pipeline = copy.deepcopy(plugin.current["A"])
@@ -153,7 +156,7 @@ class DeploymentMutationTests(unittest.TestCase):
       certificates.append(env["CRDB_CA_CRT"])
       if node in plugin.current:
         self.assertEqual(materialized[0]["INSTANCES"][0]["VOLUMES"], plugin.current[node]["PLUGINS"][0]["INSTANCES"][0]["VOLUMES"])
-        self.assertEqual(env["NODE_VALUE"], node)
+        self.assertEqual(env["NODE_VALUE"], "shared")
     self.assertEqual(len(set(certificates)), 1)
     self.assertNotIn("old-private-key", str(configs))
     self.assertNotIn("old-ca", str(configs))
@@ -167,9 +170,11 @@ class DeploymentMutationTests(unittest.TestCase):
     self.assertEqual(admitted["restore_owner"], "new-owner")
     self.assertEqual(admitted["prior_pipeline"]["OWNER"], "owner")
     self.assertEqual(set(admitted["configs"]), {"A", "B"})
-    for node, config in admitted["configs"].items():
+    expected = copy.deepcopy(plugin.pipeline["PLUGINS"])
+    expected[0]["INSTANCES"][0].pop("CHAINSTORE_RESPONSE_KEY")  # each node owns its response key
+    for config in admitted["configs"].values():
       self.assertEqual(config["OWNER"], "new-owner")
-      self.assertEqual(config["PLUGINS"], plugin.current[node]["PLUGINS"])
+      self.assertEqual(config["PLUGINS"], expected)
     first_request_id = admitted["request"]["request_id"]
     plugin._admit_owner_transfer_operation(7, "owner", "new-owner", "later-transaction|4")
     self.assertNotEqual(first_request_id, plugin.captured_scale["request"]["request_id"])
@@ -184,17 +189,51 @@ class DeploymentMutationTests(unittest.TestCase):
 
   def test_node_relink_renames_the_old_node_everywhere_and_keeps_its_settings(self):
     plugin = Mutations()
-    plugin.current["A"]["PLUGINS"][0]["INSTANCES"][0].update(CHAINSTORE_PEERS=["A", "B"])
+    plugin.pipeline["PLUGINS"][0]["INSTANCES"][0].update(
+      CHAINSTORE_PEERS=["A", "B"], PER_NODE_CONFIG={"byNode": {"A": {"ENV": {"ROLE": "first"}}}})
+    plugin.current = {}  # the new node is new hardware: nothing reports the job yet
     result = plugin._admit_node_relink_operation(7, "A", "N")
     self.assertEqual(result["status_code"], 202)
     admitted = plugin.captured_scale
     self.assertEqual((admitted["mutation"], admitted["node_aliases"]), ("node_relink", {"A": "N"}))
     self.assertEqual(admitted["prior_pipeline"]["DEEPLOY_SPECS"]["current_target_nodes"], ["N", "B"])
-    self.assertEqual(set(admitted["configs"]), {"N", "B"})
+    self.assertEqual(list(admitted["configs"]), ["N", "B"])
+    self.assertEqual(admitted["configs"]["N"], admitted["configs"]["B"])
     moved = admitted["configs"]["N"]["PLUGINS"][0]["INSTANCES"][0]
-    self.assertEqual((moved["INSTANCE_ID"], moved["ENV"]["NODE_VALUE"]), ("instance-A", "N"))
     self.assertEqual(moved["CHAINSTORE_PEERS"], ["N", "B"])
-    self.assertEqual(moved["VOLUMES"], {"data": "/preserved-A"})
+    self.assertEqual(moved["PER_NODE_CONFIG"], {"byNode": {"N": {"ENV": {"ROLE": "first"}}}})
+    self.assertEqual(moved["VOLUMES"], {"data": "/preserved"})
+
+  def test_node_relink_retries_as_a_new_request_an_hour_after_a_failed_attempt(self):
+    plugin = Mutations()
+    plugin._admit_node_relink_operation(7, "A", "N")
+    first = plugin.captured_scale["request"]
+    failed = dict(operation_id="0" * 16 + "-x", sequence=1, request_id=first["request_id"],
+                  request_hash="h", kind="update", mutation="node_relink", job_id=7, app_id="app",
+                  owner="owner", network="test", coordinator="oracle", target_revision=first["attempt"],
+                  phase="completed", outcome="failed", updated_at=plugin.now, EE_SIGN="valid", EE_SENDER="oracle")
+    plugin._operation_records = lambda: {failed["operation_id"]: failed}
+    plugin.captured_scale = None
+    plugin.now += 3599
+    self.assertIsNone(plugin._admit_node_relink_operation(7, "A", "N"))
+    self.assertIsNone(plugin.captured_scale)
+    plugin.now += 1
+    plugin._admit_node_relink_operation(7, "A", "N")
+    retry = plugin.captured_scale["request"]
+    self.assertEqual(retry["attempt"], first["attempt"] + 1)
+    self.assertNotEqual(retry["request_id"], first["request_id"])
+
+  def test_rebuilding_refuses_a_job_whose_stored_copy_lost_list_order(self):
+    plugin = Mutations()
+    plugin.pipeline["DEEPLOY_SPECS"]["current_target_nodes"] = ["A", "B"]
+    for running in plugin.current.values():
+      running["DEEPLOY_SPECS"]["current_target_nodes"] = ["B", "A"]
+    for admit in (lambda: plugin._admit_node_relink_operation(7, "A", "N"),
+                  lambda: plugin._admit_owner_transfer_operation(7, "owner", "new-owner", "tx|1")):
+      with self.assertRaisesRegex(ValueError, "ordered differently"):
+        admit()
+    self.assertIsNone(plugin.captured_scale)
+    self.assertEqual(plugin.delete()["status_code"], 202)  # stopping needs no rebuilt config
 
   def test_node_relink_requires_the_old_node_and_not_the_new_one_in_placement(self):
     plugin = Mutations()
@@ -261,14 +300,6 @@ class DeploymentMutationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "current escrow owner"):
       plugin.delete()
     self.assertEqual(plugin.commands, [])
-    self.assertEqual(plugin.writes, [])
-
-  def test_scale_rejects_unmappable_node_plugin_order_before_writing(self):
-    plugin = Mutations()
-    plugin.previous_configs["B"]["PLUGINS"][0]["SIGNATURE"] = "DIFFERENT_PLUGIN"
-    with self.assertRaisesRegex(ValueError, "cannot be mapped safely"):
-      plugin._admit_scale_up_operation({"request_id": "scale", "job_id": 7, "expected_revision": 4},
-                                      {"escrow_owner": "owner"}, ["C"])
     self.assertEqual(plugin.writes, [])
 
   def test_delete_is_durable_async_and_rejects_partial_targets(self):
