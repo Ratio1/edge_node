@@ -142,9 +142,11 @@ class _DeeployJobMixin:
     by its immutable plan reference; neither it nor restoration values are read
     into coordinator memory. Repeating the same operation repairs partial writes.
     """
+    # The plan holds every node's exact config of this revision; later updates
+    # rebuild from it, since configs can differ per node (scale-up instance IDs).
     expected = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
                     operation_id=operation["operation_id"], coordinator=operation["coordinator"],
-                    deleted=False)
+                    deleted=False, plan_cid=operation["plan_cid"])
     pointer = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=expected["job_id"])
     # R1FS wraps each upload in a new folder CID. Reuse a published pointer
     # after partial finalization; dAuth still verifies its signature and content.
@@ -516,39 +518,15 @@ class _DeeployJobMixin:
 
     return True
 
-  def _recursively_sort_pipeline_data(self, data, preserve_list_order=False):
-    """
-    Recursively sort pipeline data including items within arrays.
-    
-    Args:
-        data: The data to sort (dict, list, or primitive)
-        
-    Returns:
-        Sorted data with the same structure
+  def _recursively_sort_pipeline_data(self, data):
+    """Sort dict keys at every level for a stable CID; keep every list's order.
+
+    The stored job is the baseline later updates rebuild node configs from, so it
+    must be exact: list order is meaningful (commands run in order, node order
+    selects per-node settings).
     """
     if isinstance(data, dict):
-      # Sort dictionary by keys and recursively sort values
-      sorted_dict = {}
-      for key in sorted(data.keys()):
-        sorted_dict[key] = self._recursively_sort_pipeline_data(
-          data[key],
-          preserve_list_order=preserve_list_order or key in ("SECRET_PATHS", "DYNAMIC_ENV"),
-        )
-      return sorted_dict
-    elif isinstance(data, list):
-      # Sort list items recursively
-      sorted_list = []
-      for item in data:
-        sorted_list.append(self._recursively_sort_pipeline_data(item, preserve_list_order=preserve_list_order))
-      if preserve_list_order:
-        return sorted_list
-      # Sort the list items themselves if they are comparable
-      try:
-        sorted_list.sort()
-      except TypeError:
-        # If items can't be compared (e.g., different types), keep original order
-        pass
-      return sorted_list
-    else:
-      # Return primitive values as-is
-      return data
+      return {key: self._recursively_sort_pipeline_data(data[key]) for key in sorted(data)}
+    if isinstance(data, list):
+      return [self._recursively_sort_pipeline_data(item) for item in data]
+    return data
