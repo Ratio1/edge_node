@@ -142,9 +142,11 @@ class _DeeployJobMixin:
     by its immutable plan reference; neither it nor restoration values are read
     into coordinator memory. Repeating the same operation repairs partial writes.
     """
+    # The plan holds every node's exact config of this revision; later updates
+    # rebuild from it, since configs can differ per node (scale-up instance IDs).
     expected = dict(job_id=str(operation["job_id"]), revision=operation["target_revision"],
                     operation_id=operation["operation_id"], coordinator=operation["coordinator"],
-                    deleted=False)
+                    deleted=False, plan_cid=operation["plan_cid"])
     pointer = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=expected["job_id"])
     # R1FS wraps each upload in a new folder CID. Reuse a published pointer
     # after partial finalization; dAuth still verifies its signature and content.

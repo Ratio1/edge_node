@@ -344,6 +344,29 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     )
     return self.coordinator._operation_records()[accepted['operation_id']]
 
+  def test_nodes_keep_their_own_instance_ids_across_updates(self):
+    configs = {}
+    for node in ('A', 'B'):  # as after a scale-up: each node has its own instance
+      configs[node] = pipeline()
+      configs[node]['DEEPLOY_SPECS']['current_target_nodes'] = ['A', 'B']
+      configs[node]['PLUGINS'][0]['INSTANCES'][0]['INSTANCE_ID'] = 'worker-' + node
+    self.coordinator._admit_prepared_deployment(
+      request={'job_id': 7, 'request_id': 'request', 'expected_revision': 0},
+      auth_result={'escrow_owner': 'owner'}, app_id='app', configs=configs,
+      prior_pipeline=None, is_create=True,
+    )
+    self.finalize(self.operation())
+    self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']['plan_cid'], self.operation()['plan_cid'])
+    for owner, transfer in (('new-owner', 'tx|1'), ('third-owner', 'tx|2')):
+      accepted = self.coordinator._admit_owner_transfer_operation(7, self.active()['OWNER'], owner, transfer)
+      operation = self.coordinator._operation_records()[accepted['operation_id']]
+      plan = self.coordinator._load_operation_plan(operation)
+      for key in ('configs', 'previous_configs'):
+        self.assertEqual({node: config['PLUGINS'][0]['INSTANCES'][0]['INSTANCE_ID'] for node, config in plan[key].items()},
+                         {'A': 'worker-A', 'B': 'worker-B'})
+      self.finalize(operation)
+      self.assertEqual(operation['outcome'], 'succeeded')
+
   def test_update_removing_an_offline_node_skips_it(self):
     self.two_node_job()
     del self.coordinator.known['A']  # A is offline
@@ -444,7 +467,8 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     canonical = self.dauth._recursively_sort_pipeline_data(
       self.dauth.extract_invariable_data_from_pipeline(canonical))
     pointer = dict(job_id='7', revision=operation['target_revision'], operation_id=operation['operation_id'],
-                   coordinator='oracle', deleted=False, pipeline_cid='published-folder')
+                   coordinator='oracle', deleted=False, pipeline_cid='published-folder',
+                   plan_cid=operation['plan_cid'])
     self.coordinator.bc.sign(pointer)
     for content, error in ((None, RuntimeError), (dict(canonical, unexpected=True), ValueError)):
       with self.subTest(content_missing=content is None):
@@ -497,7 +521,8 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     report(self.state, operation, 'deploy', 'ready')
     self.coordinator._advance_deployment_operation(operation)
     pointer = dict(job_id='7', revision=operation['target_revision'], operation_id=operation['operation_id'],
-                   coordinator='oracle', deleted=False, pipeline_cid='wrong-cid')
+                   coordinator='oracle', deleted=False, pipeline_cid='wrong-cid',
+                   plan_cid=operation['plan_cid'])
     self.coordinator.bc.sign(pointer)
     for value in (dict(pointer, EE_SIGN='forged'), pointer):
       writes = len(self.state.writes)

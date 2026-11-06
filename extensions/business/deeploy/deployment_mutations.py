@@ -6,7 +6,7 @@ import uuid
 from .deeploy_const import DEEPLOY_KEYS
 from .deeploy_mixin import COCKROACHDB_CERT_ENV_KEYS, COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
 from .deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY
-from .deployment_operations import list_order_differs, request_digest, replace_nodes, required_instances
+from .deployment_operations import request_digest, replace_nodes, required_instances
 
 # ChainDist publishes {job_id: (old_node, new_node)} here for jobs whose stored placement
 # still names a node whose license its owner relinked to another node.
@@ -22,7 +22,7 @@ NODE_RELINK_FAILURE_WAIT_SECONDS = 3600
 class _DeploymentMutationsMixin:
   """Prepare mutations from exact persisted placement, never partial discovery."""
 
-  def _mutation_baseline(self, request, owner, node_aliases=None, rebuild=True):
+  def _mutation_baseline(self, request, owner):
     """Load and validate the exact current revision and every prior node config.
 
     Parameters
@@ -31,17 +31,11 @@ class _DeploymentMutationsMixin:
       Authorized request with job_id and expected_revision.
     owner : str
       Authenticated escrow owner.
-    node_aliases : dict, optional
-      Old node -> new node for a relink; both the job and its node configs use the new node.
-    rebuild : bool
-      Whether the new revision is built from these configs. A job stored before
-      R1FS kept list order may have lost it; while a node runs the job with
-      lists in another order, rebuilding is refused until the job is repaired.
 
     Notes
     -----
-    Node configs come only from the stored job in R1FS. Secret availability is
-    established on dAuth during lifecycle preparation.
+    Node configs come only from R1FS (see ``_previous_deployment_configs``).
+    Secret availability is established on dAuth during lifecycle preparation.
     """
     job_id = request.get("job_id")
     if job_id in (None, ""):
@@ -50,10 +44,6 @@ class _DeploymentMutationsMixin:
                                                 raise_on_error=False, show_logs=False)
     if not isinstance(pipeline, dict):
       raise ValueError("The current deployment configuration is unavailable.")
-    if rebuild and any(list_order_differs(pipeline, config)
-                       for configs in self._job_reports(pipeline).values() for config in configs):
-      raise ValueError("A node runs this job with lists ordered differently from its stored copy.")
-    pipeline = replace_nodes(pipeline, node_aliases or {})
     specs = pipeline.get("DEEPLOY_SPECS", {})
     if str(specs.get("job_id")) != str(job_id) or str(pipeline.get("OWNER", "")).lower() != owner.lower():
       raise ValueError("The current deployment does not belong to this job owner.")
@@ -63,9 +53,17 @@ class _DeploymentMutationsMixin:
     nodes = specs.get("current_target_nodes")
     if not isinstance(nodes, list) or not nodes or len(set(nodes)) != len(nodes):
       raise ValueError("The current deployment has no exact recoverable placement.")
-    if not required_instances(pipeline):
-      raise ValueError("The current revision has no plugin instances.")
-    return copy.deepcopy(pipeline), self._previous_deployment_configs(pipeline)
+    configs = self._previous_deployment_configs(pipeline)
+    expected_shape = [(plugin["SIGNATURE"], len(plugin["INSTANCES"])) for plugin in pipeline["PLUGINS"]]
+    for config in configs.values():
+      shape = [(plugin["SIGNATURE"], len(plugin["INSTANCES"])) for plugin in config.get("PLUGINS", [])]
+      if shape != expected_shape:
+        raise ValueError("The current node plugin layouts cannot be mapped safely for this mutation.")
+      current_specs = config.get("DEEPLOY_SPECS", {})
+      if (config.get("NAME") != pipeline["NAME"] or str(current_specs.get("job_id")) != str(job_id)
+          or current_specs.get("revision", 0) != revision or not required_instances(config)):
+        raise ValueError("A persisted node configuration does not match the current revision.")
+    return copy.deepcopy(pipeline), configs
 
   def _admit_scale_up_operation(self, request, auth_result, new_nodes):
     """Admit a full-placement update, retaining exact prior configs for recovery.
@@ -228,7 +226,8 @@ class _DeploymentMutationsMixin:
       return self._accepted_operation_response(existing)
     self._assert_no_active_deployment(job_id=job_id)
     node_aliases = {old_node: new_node}
-    prior, configs = self._mutation_baseline(request, owner, node_aliases=node_aliases)
+    prior, configs = self._mutation_baseline(request, owner)
+    configs = replace_nodes(configs, node_aliases)
     for config in configs.values():
       config["DEEPLOY_SPECS"]["date_updated"] = self.time()
       config.pop("DEEPLOY_OPERATION", None)
@@ -279,8 +278,7 @@ class _DeploymentMutationsMixin:
     details = self.bc.get_job_details(int(request["job_id"]))
     if str(details.get("escrowOwner", "")).lower() != owner.lower():
       raise ValueError("Only the current escrow owner can delete this deployment.")
-    # Stopping every node needs no rebuilt config.
-    pipeline, configs = self._mutation_baseline(request, owner, rebuild=False)
+    pipeline, configs = self._mutation_baseline(request, owner)
     if request.get("app_id") not in (None, pipeline["NAME"]):
       raise ValueError("app_id does not match the selected job.")
     targets = request.get("target_nodes")

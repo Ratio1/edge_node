@@ -188,6 +188,8 @@ class _DauthDeploymentSecretsMixin:
     expected = dict(job_id=job_id, revision=operation["target_revision"],
                     operation_id=operation["operation_id"], coordinator=operation["coordinator"],
                     deleted=deleted, pipeline_cid=None if deleted else pointer.get("pipeline_cid"))
+    if not deleted:
+      expected["plan_cid"] = operation["plan_cid"]
     if ({key: value for key, value in pointer.items() if key not in AUTH_FIELDS} != expected
         or pointer.get("EE_SENDER") != operation["coordinator"]
         or not self.bc.verify(pointer, return_full_info=True, log_hash_sign_fails=False).valid):

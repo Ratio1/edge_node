@@ -54,9 +54,7 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     self.r1fs = SimpleNamespace(add_json=self.add_plan, get_json=lambda cid, **kwargs: copy.deepcopy(self.plans[cid]))
     self._get_response = lambda value: value
     self.commands = []
-    # Every node still reports the job unless a test says otherwise.
-    self.netmon = SimpleNamespace(network_known_pipelines=lambda: {
-      node: [{"NAME": "app", "DEEPLOY_SPECS": {"job_id": 7}}] for node in ("A", "B", "C", "N")})
+    self.netmon = SimpleNamespace(network_known_pipelines=lambda: {})
 
   def time(self):
     return 100

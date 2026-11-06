@@ -242,17 +242,41 @@ class _DeploymentOperationsMixin:
     return redacted, fragments
 
   def _previous_deployment_configs(self, pipeline):
-    """Rebuild each target node's config from the stored job in R1FS.
+    """Load each target node's exact config of the stored revision from R1FS.
 
-    Every node of a revision runs the same redacted config, which the stored
-    job keeps exactly; neither the oracle that wrote it nor what nodes report
-    is trusted. Each node owns its response key, so the stored one is dropped.
+    A revision committed by a deployment operation names its plan in the job's
+    stored pointer. The plan holds every node's config, which can differ per
+    node (scale-up gives each new node its own instance IDs). A job stored
+    before that has only its stored copy, so every node gets that copy; it is
+    refused while a node runs the job with other instances or list order.
+    Neither the oracle that deployed the job nor what nodes report is used as
+    content. Each node owns its response key, so it is dropped.
+
+    Parameters
+    ----------
+    pipeline : dict
+      The job's stored copy in R1FS, with its original node names.
     """
-    config = copy.deepcopy(pipeline)
-    for plugin in config.get("PLUGINS", []):
-      for instance in plugin.get("INSTANCES", []):
-        instance.pop("CHAINSTORE_RESPONSE_KEY", None)
-    return {node: copy.deepcopy(config) for node in pipeline["DEEPLOY_SPECS"].get("current_target_nodes", [])}
+    specs = pipeline["DEEPLOY_SPECS"]
+    nodes = specs.get("current_target_nodes", [])
+    pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(specs["job_id"]))
+    if isinstance(pointer, dict) and pointer.get("plan_cid"):
+      plan = self.r1fs.get_json(pointer["plan_cid"], timeout=10, show_logs=False) or {}
+      restored = str(specs.get("secret_revision", "")).endswith(":restore")
+      configs = plan.get("previous_configs" if restored else "configs")
+      if not isinstance(configs, dict) or set(configs) != set(nodes):
+        raise ValueError("The stored deployment plan is unavailable.")
+    else:
+      if any(required_instances(config) != required_instances(pipeline) or list_order_differs(pipeline, config)
+             for reports in self._job_reports(pipeline).values() for config in reports):
+        raise ValueError("A node runs this job differently from its stored copy; repair the stored job first.")
+      configs = {node: pipeline for node in nodes}
+    configs = {node: copy.deepcopy(configs[node]) for node in nodes}
+    for config in configs.values():
+      for plugin in config.get("PLUGINS", []):
+        for instance in plugin.get("INSTANCES", []):
+          instance.pop("CHAINSTORE_RESPONSE_KEY", None)
+    return configs
 
   def _job_reports(self, pipeline):
     """Configs NetMon reports for this job, by node: used to decide, never as content."""
@@ -292,9 +316,12 @@ class _DeploymentOperationsMixin:
       Prepared node-specific configurations; fresh values are extracted before
       persisting the redacted plan and sent only to dAuth for reconciliation.
     prior_pipeline : dict or None
-      Current canonical redacted configuration for restoration planning.
+      The job's stored copy in R1FS, for restoration planning.
     is_create : bool
       Whether this operation creates a previously absent deployment.
+    node_aliases : dict, optional
+      Old node -> new node for a relink. ``prior_pipeline`` still names the old
+      node; its previous configs and placement are renamed here.
 
     Returns
     -------
@@ -310,6 +337,8 @@ class _DeploymentOperationsMixin:
         raise ValueError("An update requires a recoverable previous configuration.")
       if type(request.get("expected_revision")) is not int or request["expected_revision"] != previous_revision:
         raise DeploymentConflictError("The deployment revision changed; refresh before updating.")
+    stored_pipeline = prior_pipeline
+    prior_pipeline = replace_nodes(prior_pipeline, node_aliases or {})
     operation_id = hashlib.sha256(self.bc.address.encode()).hexdigest()[:16] + "-" + uuid.uuid4().hex
     revision = self._next_deployment_revision(job_id, previous_revision)
     secret_revision = operation_id + ":deploy"
@@ -338,8 +367,11 @@ class _DeploymentOperationsMixin:
       # is skipped: there is nothing to stop or restore on it.
       reports = self._job_reports(prior_pipeline)
       skipped = {node for node in set(previous_nodes) - set(configs) if not reports.get(node)}
-      previous_configs = {node: config for node, config in self._previous_deployment_configs(prior_pipeline).items()
-                          if node not in skipped}
+      previous_configs = {
+        node: config for node, config in
+        replace_nodes(self._previous_deployment_configs(stored_pipeline), node_aliases or {}).items()
+        if node not in skipped
+      }
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
       )
