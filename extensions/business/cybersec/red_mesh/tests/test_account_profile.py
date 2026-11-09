@@ -238,6 +238,22 @@ class TestEditPermissions(_ProfileCase):
     self.assertTrue(profile["profile_complete"])
     self.assertTrue(ok(self, self.get("tuser"))["profile_complete"])
 
+  def test_only_the_holder_sets_their_signature_line(self):
+    # Owner 2026-11-09: each user signs for themself. An admin may fill in everything else.
+    for admin in ("tadmin", "creator"):
+      with self.subTest(admin=admin):
+        events = len(self.events)
+        refused(self, self.update(admin, "tuser", {"signature": "Una User, Forged"}), 403, "signature_holder_only")
+        refused(self, self.update(admin, "tuser", {"full_name": "Una User", "signature": "X"}), 403,
+                "signature_holder_only")
+        self.assertEqual(len(self.events), events)
+        self.assertEqual(ok(self, self.get("tuser"))["full_name"], "")
+    ok(self, self.update("tuser", None, {"full_name": "Una User", "signature": "Una User, Analyst"}))
+    # An admin's form that sends the stored value back unchanged is not a change.
+    ok(self, self.update("tadmin", "tuser", {"position": "Analyst", "signature": "Una User, Analyst"}))
+    self.assertEqual(ok(self, self.get("tuser"))["signature"], "Una User, Analyst")
+    refused(self, self.update("creator", "tuser", {"signature": ""}), 403, "signature_holder_only")
+
   def test_a_deactivated_account_can_still_be_filled_in_by_its_admin_but_a_deleting_one_is_gone(self):
     self.store.account("tuser", memberships=[{"role": "tenant_user", "tenant_id": self.tenant_id}], state="deactivated")
     ok(self, self.update("tadmin", "tuser", {"position": "Analyst"}))

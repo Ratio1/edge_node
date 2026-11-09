@@ -1717,6 +1717,8 @@ class TenantAdministrationService:
         row if row is not None else account_profile.new_row(target.created_at), changes)
     except drafts.DraftInvalid as exc:
       raise AdministrationDenied(400, exc.code) from None
+    if "signature" in changed and caller.account_id != target.account_id:
+      raise AdministrationDenied(403, "signature_holder_only")  # owner 2026-11-09: each user signs for themself
     if changed or stale is not None:
       row = self._write_profile(target, updated, caller.account_id)
     leftovers = account_profile.certificate_refs(stale) if stale is not None else []
