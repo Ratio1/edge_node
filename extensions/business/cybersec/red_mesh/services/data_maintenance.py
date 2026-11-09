@@ -63,7 +63,7 @@ _PER_JOB = (
 # RM-139: the tenant `integration` kind is retired: its rows classify old and are never restored.
 _TENANCY_KINDS = ("tenant", "receipt", "domain", "tenant_node", "engagement", "tenant_draft",
                   "engagement_draft", "super_tenant_profile", "tenant_asset", "tenant_contract_draft",
-                  "super_tenant_branding", "super_tenant_integration")
+                  "super_tenant_branding", "super_tenant_integration", "account_profile")
 # Graybox credentials that job configs held inline before they moved to an encrypted secret file.
 # Such a config is stored under the engine's fixed default secret, so its bytes are as good as
 # plaintext: it is withheld from the backup (owner, 2026-09-29: no plaintext credential leaves the node).
@@ -348,11 +348,12 @@ class Inventory:
       row = self._store._validate(value, kind, ids)
     except Exception:
       return OLD, "unrecognized"
-    if kind in ("tenant_draft", "super_tenant_profile", "super_tenant_branding", "super_tenant_integration"):
+    if kind in ("tenant_draft", "super_tenant_profile", "super_tenant_branding", "super_tenant_integration",
+                "account_profile"):
       # RM-109: a draft has no tenant; its id is not one, so the related-tenant check below would
       # call every draft an orphan. Current while the store reads it, never orphan or old_tenant.
       # RM-110: the same for the deployment's one super-tenant profile row; RM-134 its branding row;
-      # RM-139 its integration overrides.
+      # RM-139 its integration overrides; RM-155 an account profile (keyed by an account, not a tenant).
       return CURRENT, ""
     if kind in ("engagement_draft", "tenant_asset"):
       # RM-109 phase 4: current while its parent exists (a tenant draft row, or a live tenant); a

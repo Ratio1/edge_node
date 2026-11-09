@@ -24,6 +24,10 @@ def _int_at_least_zero(value) -> int:
     return 0
 
 
+def _optional_text(value):
+  return value[:200] if isinstance(value, str) else None
+
+
 def _submission_ref(value):
   """`{profile_id, revision, cid}` of the NIS2 submission an approval rested on, or ""."""
   if not isinstance(value, dict) or not value.get("cid"):
@@ -46,6 +50,12 @@ class ReportReviewState:
   decided_at: str = ""
   nis2_submission_ref: object = ""
   contract_version: str = REPORT_REVIEW_CONTRACT_VERSION
+  # RM-155, optional within 2.0.0: the reviewer as they were when they decided. A row written
+  # before them has none (None, left out of the dict); a later profile edit never rewrites them.
+  reviewer_name: str | None = None
+  reviewer_signature: str | None = None
+  reviewer_org: str | None = None
+  self_approved: bool | None = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -71,6 +81,10 @@ class ReportReviewState:
       decided_at=str(payload.get("decided_at") or "")[:40],
       nis2_submission_ref=_submission_ref(payload.get("nis2_submission_ref")),
       contract_version=version,
+      reviewer_name=_optional_text(payload.get("reviewer_name")),
+      reviewer_signature=_optional_text(payload.get("reviewer_signature")),
+      reviewer_org=_optional_text(payload.get("reviewer_org")),
+      self_approved=payload["self_approved"] if type(payload.get("self_approved")) is bool else None,
     )
 
 

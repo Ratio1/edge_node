@@ -11,6 +11,7 @@ import math as _math
 import struct as _struct
 
 from ..worker import PentestLocalWorker
+from .live_progress import _LiveProgressMixin
 from ..models import UiAggregate
 from ..models.finding_identity import (
   worker_attribution_fields as _worker_attribution_fields,
@@ -605,6 +606,15 @@ class _ReportMixin:
         # can be found on its node report. The first-wins `local_worker_id`
         # named one arbitrary thread (job 6d342bab: findings said RM-9-cfaa,
         # the node report said RM-1-*), so it goes.
+        # Counts and metrics describe the merged report, not the first
+        # worker's: `nr_open_ports` is not an aggregation field, and the
+        # deep merge kept one worker's `scan_metrics` coverage (RM-154, job
+        # e2eba7e5: 0 open next to [22, 80, 443], 102 of 1024 scanned).
+        if "open_ports" in dct_aggregated_report:
+          dct_aggregated_report["nr_open_ports"] = len(dct_aggregated_report["open_ports"])
+        metrics = [s["scan_metrics"] for s in local_jobs.values() if s.get("scan_metrics")]
+        if len(metrics) > 1:
+          dct_aggregated_report["scan_metrics"] = _LiveProgressMixin._merge_worker_metrics(metrics)
         dct_aggregated_report["local_worker_ids"] = sorted(
           str(status.get("local_worker_id") or key) for key, status in local_jobs.items()
         )

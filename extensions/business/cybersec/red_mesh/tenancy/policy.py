@@ -49,6 +49,9 @@ _ROLE_OPERATIONS = {
     "tenant_users:manage", "attestation_keys:manage",
     "reports:view", "reports:export", "audit:view",
     "compliance_assessments:view", "compliance_assessments:manage",
+    # RM-155 (owner, 2026-11-03): a Tenant Admin may review under the same conditions as the others:
+    # the Super-Tenant Admin's designation and the tenant's Allow Pentester switch.
+    "reports:review",
   }),
   "tenant_pentester": frozenset({"tasks:launch", "tasks:update", "reports:view", "reports:export",
                                  "analysis:run", "authorization:upload", "tasks:stop",
@@ -158,11 +161,14 @@ def authorize_tenant_operation(
   tenant: TenantPolicyContext | None,
   *,
   asset_tenant_ids: tuple[str | None, ...] = (),
+  report_reviewer: bool = False,
 ) -> PolicyDecision:
   """Evaluate supplied facts; use ``decision.allowed``, not the decision object's truthiness.
 
   For task launch/update, ``asset_tenant_ids`` must contain the owner of every server-resolved
   existing/preset asset. Empty/unknown owners deny; never build this tuple from request claims.
+  ``report_reviewer`` is the actor's server-read designation (RM-155): ``reports:review`` also needs
+  it, for every role, and fails closed without it.
   No lifecycle, capability-grant or arbitrary object/CID authorization is provided here.
   """
   roles, denial = resolve_operation_roles(actor, operation, tenant)
@@ -177,6 +183,9 @@ def authorize_tenant_operation(
   if (operation in _LAUNCH_BOUND_OPERATIONS and not roles & _PLATFORM_ROLES
       and tenant.allow_pentester is not True):
     return PolicyDecision(False, 403, "pentesting_disabled")
+  # RM-155: the role and the switch are not enough; the account must also be designated a reviewer.
+  if operation == "reports:review" and report_reviewer is not True:
+    return PolicyDecision(False, 403, "reviewer_not_designated")
   # RM-084 P3 binds authorization:upload for every role: the document exists to authorize a pentest,
   # so a tenant with pentesting off has nothing to file one against.
   if operation == "authorization:upload" and tenant.allow_pentester is not True:

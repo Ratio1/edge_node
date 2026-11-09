@@ -54,6 +54,7 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     self.r1fs = SimpleNamespace(add_json=self.add_plan, get_json=lambda cid, **kwargs: copy.deepcopy(self.plans[cid]))
     self._get_response = lambda value: value
     self.commands = []
+    self.netmon = SimpleNamespace(network_known_pipelines=lambda: {})
 
   def time(self):
     return 100

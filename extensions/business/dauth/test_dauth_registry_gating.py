@@ -17,11 +17,13 @@ from extensions.business.dauth.dauth_mixin import (
   _DauthMixin,
 )
 from extensions.business.dauth.dauth_registry import load_dauth_registry_snapshot
+from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
 
 ROOT = Path(__file__).resolve().parents[3]
 REQUEST_TIME = 1_700_000_000
 REQUEST_NONCE = hex(REQUEST_TIME * 1000)
+SOURCE_IP = "203.0.113.7"
 
 
 class _FakeProcess:
@@ -74,6 +76,9 @@ class _FakeBasePlugin:
 
   def get_start_commands(self):
     return ["uvicorn", "cloudflared"]
+
+  def get_request_client_ip(self):
+    return SOURCE_IP
 
   def _maybe_close_start_commands(self):
     self._lifecycle_events.append("stop_commands")
@@ -264,6 +269,9 @@ class _FakeBC:
       return node_address
     return "0xai_" + node_address
 
+  def maybe_remove_prefix(self, node_address):
+    return node_address.removeprefix("0xai_")
+
   def encrypt_str(self, str_data, str_recipient):
     self.encrypt_calls.append((str_data, str_recipient))
     return "encrypted-secret-bundle"
@@ -297,7 +305,7 @@ class _FakeR1FS:
     return self.data[cid]
 
 
-class _DauthHarness(_DauthMixin):
+class _DauthHarness(_DauthMixin, _DauthRevokedNodesMixin):
   pass
 
 
@@ -346,6 +354,7 @@ def _make_dauth_harness(
     "EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER": "deeploy-secret",
   }
   plugin.fetch_node_tags = lambda node_address_eth=None: {}
+  plugin.get_request_client_ip = lambda: SOURCE_IP
   plugin.P = lambda *args, **kwargs: None
   plugin.Pd = lambda *args, **kwargs: None
   plugin._dauth_registry_internal_peers = ["node-oracle"]
@@ -354,6 +363,7 @@ def _make_dauth_harness(
     deepcopy(value),
   ) or True
   plugin.chainstore_hget = lambda hkey, key: plugin._chainstore.get((hkey, str(key)))
+  plugin._load_dauth_revoked_nodes()
   return plugin
 
 
@@ -917,6 +927,8 @@ class DauthServerRegistryGateTests(unittest.TestCase):
 
     plugin = DauthManagerPlugin.__new__(DauthManagerPlugin)
     plugin.bc = _ManagerBC(dauth_oracle)
+    plugin.os_environ = {}
+    plugin.evm_network = "devnet"
     plugin._dauth_server_enabled = None
     plugin._dauth_server_enabled_message = None
     plugin._dauth_web_app_initialized = False
@@ -964,6 +976,8 @@ class DauthServerRegistryGateTests(unittest.TestCase):
         self.assertEqual(response["nonce"], REQUEST_NONCE)
         self.assertIn("error", response)
         self.assertNotIn("credential-in-dependency-error", str(response) + str(plugin._messages))
+        if enabled:
+          self.assertIn(f"failed for request from {SOURCE_IP}", plugin._messages[-1])
 
   def test_secret_endpoint_errors_echo_request_nonce(self):
     plugin = self._make_manager(dauth_oracle=True)
@@ -989,6 +1003,11 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     self.assertEqual(get_response["error"], "get failed")
     self.assertEqual(reveal_response["nonce"], REQUEST_NONCE)
     self.assertEqual(reveal_response["error"], "reveal failed")
+    self.assertEqual(plugin._messages[-3:], [
+      f"Error processing add_secrets request from {SOURCE_IP}: add failed",
+      f"Error processing get_secrets request from {SOURCE_IP}: get failed",
+      f"Error processing reveal_job_secrets request from {SOURCE_IP}: reveal failed",
+    ])
 
   def test_get_secrets_signed_errors_distinguish_retryability(self):
     plugin = self._make_manager(dauth_oracle=True)

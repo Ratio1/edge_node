@@ -47,7 +47,6 @@ _CONFIG = {
 
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   'WARMUP_DELAY' : 300,
-  'PIPELINES_CHECK_DELAY' : 300,
   'MIN_ETH_BALANCE' : 0.0003,
 
   'REQUESTS_CSTORE_HKEY': 'DEEPLOY_REQUESTS',
@@ -97,7 +96,6 @@ class DeeployManagerApiPlugin(
       )
     )
     self.__warmup_start_time = self.time()
-    self.__last_pipelines_check_time = 0
     if not self.__check_eth_balance():
       self.P(
         f"Shutting down tunnel engine for {self.__class__.__name__} due to insufficient ETH balance "
@@ -1695,13 +1693,10 @@ class DeeployManagerApiPlugin(
     if not self.is_deeploy_warmed_up():
       return
 
-    if (self.time() - self.__last_pipelines_check_time) > self.cfg_pipelines_check_delay:
-      try:
-        if not any(operation["phase"] != "completed" for operation in self._operation_records().values()):
-          self.check_running_pipelines_and_add_to_r1fs()
-      except Exception as e:
-        self.P(f"Error checking running pipelines: {e}", color='r')
-      self.__last_pipelines_check_time = self.time()
+    try:
+      self._maybe_admit_node_relinks()
+    except Exception as e:
+      self.P(f"Error moving jobs from relinked nodes: {e}", color='r')
 
     self._maybe_log_and_save_tracked_requests()
     return

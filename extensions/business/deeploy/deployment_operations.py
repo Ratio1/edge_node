@@ -66,6 +66,33 @@ def report_is_ready(report, config):
   return bool(expected) and all(actual.get(identity) == "ready" for identity in expected)
 
 
+def replace_nodes(value, node_aliases):
+  """Rename node addresses used as dict keys or whole string values.
+
+  A relinked node keeps its job, so everything naming the old address
+  (placement, peers, per-node settings and their secret paths) moves to the new one.
+  """
+  if isinstance(value, dict):
+    return {node_aliases.get(key, key): replace_nodes(item, node_aliases) for key, item in value.items()}
+  if isinstance(value, list):
+    return [replace_nodes(item, node_aliases) for item in value]
+  if isinstance(value, str):
+    return node_aliases.get(value, value)
+  return value
+
+
+def list_order_differs(stored, running):
+  """Whether some list holds the same items in both configs, in another order."""
+  if isinstance(stored, dict) and isinstance(running, dict):
+    return any(list_order_differs(stored[key], running[key]) for key in stored.keys() & running.keys())
+  if isinstance(stored, list) and isinstance(running, list):
+    items = lambda values: sorted(json.dumps(value, sort_keys=True) for value in values)
+    if stored != running and items(stored) == items(running):
+      return True
+    return any(list_order_differs(a, b) for a, b in zip(stored, running))
+  return False
+
+
 class _DeploymentOperationsMixin:
   """Persist, execute, recover, and present asynchronous deployment operations."""
 
@@ -215,25 +242,48 @@ class _DeploymentOperationsMixin:
     return redacted, fragments
 
   def _previous_deployment_configs(self, pipeline):
-    """Load exact previous redacted placement from public plans or node metadata."""
+    """Load each target node's exact config of the stored revision from R1FS.
+
+    A revision committed by a deployment operation names its plan in the job's
+    stored pointer. The plan holds every node's config, which can differ per
+    node (scale-up gives each new node its own instance IDs). A job stored
+    before that has only its stored copy, so every node gets that copy; it is
+    refused while a node runs the job with other instances or list order.
+    Neither the oracle that deployed the job nor what nodes report is used as
+    content. Each node owns its response key, so it is dropped.
+
+    Parameters
+    ----------
+    pipeline : dict
+      The job's stored copy in R1FS, with its original node names.
+    """
     specs = pipeline["DEEPLOY_SPECS"]
-    reference = specs.get("secret_revision")
-    if reference:
-      previous = self._operation_records().get(reference.split(":", 1)[0])
-      if previous is None:
-        raise ValueError("The previous deployment operation is unavailable.")
-      plan = self._load_operation_plan(previous)
-      return copy.deepcopy(plan["previous_configs" if reference.endswith(":restore") else "configs"])
-    configs = {}
-    known = self.netmon.network_known_pipelines()
-    for node in specs.get("current_target_nodes", []):
-      matches = [config for config in known.get(node, [])
-                 if config.get("NAME") == pipeline["NAME"]
-                 and str(config.get("DEEPLOY_SPECS", {}).get("job_id")) == str(specs["job_id"])]
-      if len(matches) != 1:
-        raise ValueError("The exact previous configuration is unavailable for a target node.")
-      configs[node] = copy.deepcopy(matches[0])
+    nodes = specs.get("current_target_nodes", [])
+    pointer = self.chainstore_hget("DEEPLOY_DEPLOYED_JOBS", str(specs["job_id"]))
+    if isinstance(pointer, dict) and pointer.get("plan_cid"):
+      plan = self.r1fs.get_json(pointer["plan_cid"], timeout=10, show_logs=False) or {}
+      restored = str(specs.get("secret_revision", "")).endswith(":restore")
+      configs = plan.get("previous_configs" if restored else "configs")
+      if not isinstance(configs, dict) or set(configs) != set(nodes):
+        raise ValueError("The stored deployment plan is unavailable.")
+    else:
+      if any(required_instances(config) != required_instances(pipeline) or list_order_differs(pipeline, config)
+             for reports in self._job_reports(pipeline).values() for config in reports):
+        raise ValueError("A node runs this job differently from its stored copy; repair the stored job first.")
+      configs = {node: pipeline for node in nodes}
+    configs = {node: copy.deepcopy(configs[node]) for node in nodes}
+    for config in configs.values():
+      for plugin in config.get("PLUGINS", []):
+        for instance in plugin.get("INSTANCES", []):
+          instance.pop("CHAINSTORE_RESPONSE_KEY", None)
     return configs
+
+  def _job_reports(self, pipeline):
+    """Configs NetMon reports for this job, by node: used to decide, never as content."""
+    job_id = str(pipeline["DEEPLOY_SPECS"]["job_id"])
+    return {node: [config for config in configs if config.get("NAME") == pipeline["NAME"]
+                   and str(config.get("DEEPLOY_SPECS", {}).get("job_id")) == job_id]
+            for node, configs in self.netmon.network_known_pipelines().items()}
 
   def _next_deployment_revision(self, job_id, previous_revision=0):
     """Advance past canonical content and every verified observed job attempt.
@@ -251,7 +301,7 @@ class _DeploymentOperationsMixin:
 
   def _admit_prepared_deployment(self, request, auth_result, app_id, configs,
                                  prior_pipeline, is_create, mutation=None,
-                                 restore_owner=None, identity_aliases=None):
+                                 restore_owner=None, identity_aliases=None, node_aliases=None):
     """Save exact redacted plans and secret revisions before accepting work.
 
     Parameters
@@ -266,9 +316,12 @@ class _DeploymentOperationsMixin:
       Prepared node-specific configurations; fresh values are extracted before
       persisting the redacted plan and sent only to dAuth for reconciliation.
     prior_pipeline : dict or None
-      Current canonical redacted configuration for restoration planning.
+      The job's stored copy in R1FS, for restoration planning.
     is_create : bool
       Whether this operation creates a previously absent deployment.
+    node_aliases : dict, optional
+      Old node -> new node for a relink. ``prior_pipeline`` still names the old
+      node; its previous configs and placement are renamed here.
 
     Returns
     -------
@@ -284,6 +337,8 @@ class _DeploymentOperationsMixin:
         raise ValueError("An update requires a recoverable previous configuration.")
       if type(request.get("expected_revision")) is not int or request["expected_revision"] != previous_revision:
         raise DeploymentConflictError("The deployment revision changed; refresh before updating.")
+    stored_pipeline = prior_pipeline
+    prior_pipeline = replace_nodes(prior_pipeline, node_aliases or {})
     operation_id = hashlib.sha256(self.bc.address.encode()).hexdigest()[:16] + "-" + uuid.uuid4().hex
     revision = self._next_deployment_revision(job_id, previous_revision)
     secret_revision = operation_id + ":deploy"
@@ -308,11 +363,19 @@ class _DeploymentOperationsMixin:
       prior_secret_revision = prior_pipeline.get("DEEPLOY_SPECS", {}).get("secret_revision")
       previous_secret_revision_to_release = prior_secret_revision
       previous_operation_id = prior_secret_revision.split(":", 1)[0] if prior_secret_revision else None
-      previous_configs = self._previous_deployment_configs(prior_pipeline)
+      # A node leaving the placement that no longer reports the job (e.g. offline)
+      # is skipped: there is nothing to stop or restore on it.
+      reports = self._job_reports(prior_pipeline)
+      skipped = {node for node in set(previous_nodes) - set(configs) if not reports.get(node)}
+      previous_configs = {
+        node: config for node, config in
+        replace_nodes(self._previous_deployment_configs(stored_pipeline), node_aliases or {}).items()
+        if node not in skipped
+      }
       previous_configs, previous_new_secrets = self._prepare_deployment_secret_configs(
         previous_configs, prior_pipeline,
       )
-      if set(previous_configs) != set(previous_nodes) or any(
+      if set(previous_configs) != set(previous_nodes) - skipped or any(
         config.get("NAME") != app_id or
         str(config.get("DEEPLOY_SPECS", {}).get("job_id")) != str(job_id) or
         config.get("DEEPLOY_SPECS", {}).get("revision", 0) != previous_revision or
@@ -362,6 +425,7 @@ class _DeploymentOperationsMixin:
         "prepare", operation, new_secrets=new_secrets,
         previous_new_secrets=previous_new_secrets if previous_configs else None,
         identity_aliases=[[list(current), list(source)] for current, source in (identity_aliases or {}).items()],
+        node_aliases=[[old, new] for old, new in (node_aliases or {}).items()],
       )
       if self.time() >= operation["preparation_deadline"]:
         self._expire_deployment_preparation(operation)
@@ -528,7 +592,7 @@ class _DeploymentOperationsMixin:
     if phase == "stopping_failed_rollout":
       # Requiring all stop acknowledgments provides the stateful restoration barrier.
       if all(reports.get(node, {}).get("status") == "stopped" for node in configs):
-        if operation["kind"] == "update":
+        if operation["kind"] == "update" and operation["previous_nodes"]:
           operation["restore_deadline"] = self.time() + self.cfg_deployment_readiness_timeout
           self._save_operation(operation, "restoring_previous", "Restoring the previous revision.")
         else:

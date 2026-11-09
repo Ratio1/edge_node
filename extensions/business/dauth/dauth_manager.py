@@ -32,12 +32,13 @@ from extensions.business.dauth.dauth_registry import (
   dauth_registry_write_kwargs,
   load_dauth_registry_snapshot,
 )
+from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
-__VER__ = '0.3.1'
+__VER__ = '0.3.5'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -46,6 +47,10 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   'REQUEST_TIMEOUT': 600,
+  # Requests that waited longer in the queue are answered with a 503 without running:
+  # SDK clients stop reading after 120 s, the Cloudflare tunnel after 100 s, and
+  # get_secrets nonces expire after 120 s. 90 s leaves the handler time to answer.
+  'MAX_QUEUE_WAIT': 90,
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
@@ -94,11 +99,15 @@ _CONFIG = {
     "EE_CLOUDFLARE_TOKEN_TUNNELS_MANAGER",
     "EE_CLOUDFLARE_TOKEN_LIVENESS_API",
     
-    "EE_MQTT_HOST_SEED" # this generates dynamically the EE_MQTT_HOST
+    "EE_MQTT_HOST_SEED", # this generates dynamically the EE_MQTT_HOST
+
+    "EE_REVOKED_NODE_ADDRESSES",
   ],
 
+  # subset of SUPERVISOR_KEYS sent only to oracles listed in the dAuth registry
   "DAUTH_ORACLE_ONLY_SUPERVISOR_KEYS": [
     "EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER",
+    "EE_REVOKED_NODE_ADDRESSES",
   ],
 
   'VALIDATION_RULES': {
@@ -111,6 +120,7 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
+  _DauthRevokedNodesMixin,
   _DauthDeploymentSecretsMixin,
   _DeeployMixin,
   _DeeployJobMixin,
@@ -138,7 +148,11 @@ class DauthManagerPlugin(
   
 
   def on_init(self):
+    self._load_dauth_revoked_nodes()
     self._check_dauth_server_enabled_on_start()
+    if self._is_dauth_server_enabled():
+      self._require_dauth_revoked_nodes()
+      self._start_dauth_revoked_recorder()
     super(DauthManagerPlugin, self).on_init()
     self._dauth_web_app_initialized = True
     if not self._is_dauth_server_enabled():
@@ -284,10 +298,17 @@ class DauthManagerPlugin(
     if not self._dauth_pause_teardown_succeeded:
       raise RuntimeError("Cannot resume after an incomplete web app teardown")
     # endif
+    self._require_dauth_revoked_nodes()
+    self._start_dauth_revoked_recorder()
 
     self.failed = False
     self._stop_request_monitor.clear()
     self._start_request_monitor_thread()
+    return
+
+  def on_close(self):
+    self._stop_dauth_revoked_recorder()
+    super(DauthManagerPlugin, self).on_close()
     return
 
   def on_log_handler(self, text, key=None):
@@ -308,6 +329,8 @@ class DauthManagerPlugin(
 
   def process(self):
     self._maybe_hsync_dauth_job_secrets()
+    if self._is_dauth_server_enabled():
+      self._maybe_publish_dauth_revoked_unlicensed_tries()
     # TODO: this will be re-enabled in the future.
     if False:
       self._maybe_log_and_save_tracked_requests()
@@ -429,7 +452,7 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_request(body)
     except Exception as e:
-      self.P("Error processing request: {}".format(e), color='r')
+      self.P("Error processing request from {}: {}".format(self.get_request_client_ip(), e), color='r')
       data = {
         'error' : str(e)
       }
@@ -459,7 +482,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_add_secrets_request(body)
     except Exception as e:
-      self.P("Error processing add_secrets request: {}".format(e), color='r')
+      self.P("Error processing add_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {
         'error' : str(e)
       }
@@ -482,7 +507,7 @@ class DauthManagerPlugin(
         data = self.process_dauth_reconcile_secrets_request(body)
       except Exception:
         # New values can be present in the request or dependency exceptions.
-        self.P("dAuth secret reconciliation failed.", color='r')
+        self.P(f"dAuth secret reconciliation failed for request from {self.get_request_client_ip()}.", color='r')
         data = {'error': 'dAuth secret reconciliation failed'}
     return self.__get_response({'nonce': nonce, **data})
 
@@ -507,7 +532,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_get_secret_request(body)
     except Exception as e:
-      self.P("Error processing get_secrets request: {}".format(e), color='r')
+      self.P("Error processing get_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {
         'error': str(e),
         'retryable': not isinstance(e, ValueError),
@@ -533,7 +560,9 @@ class DauthManagerPlugin(
     try:
       data = self.process_dauth_reveal_secret_request(body)
     except Exception as e:
-      self.P("Error processing reveal_job_secrets request: {}".format(e), color='r')
+      self.P("Error processing reveal_job_secrets request from {}: {}".format(
+        self.get_request_client_ip(), e), color='r'
+      )
       data = {'error': str(e)}
     return self.__get_response({
       'nonce': request_nonce,
