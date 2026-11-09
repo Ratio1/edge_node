@@ -14,7 +14,7 @@ import pytest
 
 from extensions.business.cybersec.red_mesh.services import rulebook_assessment
 from extensions.business.cybersec.red_mesh.tenancy.effects import EffectState
-from .read_endpoint_fixtures import as_role, read_endpoint_fixture
+from .read_endpoint_fixtures import as_reviewer, as_role, read_endpoint_fixture
 from .test_tenant_read_native import (  # noqa: F401  (read_native is a fixture)
   assert_json_response, install, read_native, request, scheduler_comms,
 )
@@ -70,7 +70,7 @@ def test_denials_never_build_persist_or_write_metadata(fault, status):
 def test_the_assessment_builder_no_longer_reads_the_job_unscoped():
   """The B4-to-B5 seam: build_rulebook_assessment descends to _resolve_scan_context."""
   with read_endpoint_fixture(bound=True) as fixture:
-    tenant_id = as_role(fixture, "super_pentester")
+    tenant_id = as_reviewer(fixture, "super_pentester")
     with patch.object(fixture.owner, "_get_job_from_cstore", create=True,
                       side_effect=AssertionError(SECRET)) as unscoped:
       fixture.Plugin.generate_rulebook_assessment(
@@ -81,7 +81,7 @@ def test_the_assessment_builder_no_longer_reads_the_job_unscoped():
 def test_a_persisted_assessment_is_not_reported_as_nothing_happened():
   """The artifact is content-addressed; a later failure must not claim no trace."""
   with read_endpoint_fixture(bound=True) as fixture:
-    tenant_id = as_role(fixture, "super_pentester")
+    tenant_id = as_reviewer(fixture, "super_pentester")
     fixture.owner.r1fs.add_json = lambda payload, show_logs=False: "assessment-cid"
     with patch.object(rulebook_assessment, "_write_assessment_meta",
                       side_effect=RuntimeError(SECRET)):
@@ -99,7 +99,7 @@ def test_the_assessment_payload_survives_the_wire(read_native, response_format):
   install(module)
   with read_endpoint_fixture(bound=True) as fixture:
     module.eng = scheduler_comms(fixture, response_format)
-    tenant_id = as_role(fixture, "super_pentester")
+    tenant_id = as_reviewer(fixture, "super_pentester")
     # persist=False: the fixture's fake r1fs has no add_json, so a persisting call fails with
     # nothing landed and correctly reports 503. The response shape is what this test is about.
     result, calls = assert_json_response(asyncio.run(request(module,

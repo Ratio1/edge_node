@@ -269,8 +269,13 @@ def _write(owner, repo, state, event_type, ledger):
 
 
 def _decide(owner, job_id, verdict, *, expected_review_revision, note, actor,
-            checked_job, snapshot_mode, ledger):
-  """Write `verdict` for the latest pass under the fence; shared by approve and reject."""
+            checked_job, snapshot_mode, ledger, reviewer):
+  """Write `verdict` for the latest pass under the fence; shared by approve and reject.
+
+  `reviewer` is the actor's profile as of now (`{full_name, signature, organization}`, the plugin
+  reads it). Required: an empty `full_name` refuses with `reviewer_profile_incomplete` and the row
+  stores it as the snapshot, with `self_approved`. `None` (tests only) skips the gate and the
+  snapshot: the row reads as one written before RM-155."""
   hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-report-review")
   safe_note = _safe_text(note or "", hmac_secret=hmac_secret, max_len=1000).strip()
   if verdict == "rejected" and not safe_note:
@@ -279,6 +284,9 @@ def _decide(owner, job_id, verdict, *, expected_review_revision, note, actor,
     owner, job_id, expected_review_revision, actor, checked_job, snapshot_mode)
   if err:
     return err
+  if reviewer is not None and not reviewer.get("full_name"):
+    return _error("reviewer_profile_incomplete", job_id,
+                  "Save your full name in your profile before approving or rejecting a report.")
   with _submission_lock(owner, job_id, _LOCK_SCOPE):
     repo = _job_repo(owner)
     latest = _latest_pass_nr(job_specs)
@@ -318,14 +326,25 @@ def _decide(owner, job_id, verdict, *, expected_review_revision, note, actor,
       note=safe_note,
       decided_at=_utc_timestamp(_owner_time(owner)),
       nis2_submission_ref=submission_ref,
+      **_snapshot(reviewer, signer, job_specs),
     )
     _write(owner, repo, state, EVENT_APPROVED if verdict == "approved" else EVENT_REJECTED, ledger)
     rows[latest] = state
     return _view(owner, job_id, job_specs, rows)
 
 
+def _snapshot(reviewer, signer, job_specs):
+  """The row's reviewer fields: the profile as of this decision, and whether the signer launched the scan."""
+  if reviewer is None:
+    return {}
+  binding = job_specs.get("execution_binding")
+  launcher = binding.get("actor_id") if isinstance(binding, dict) else None
+  return {"reviewer_name": reviewer["full_name"], "reviewer_signature": reviewer["signature"],
+          "reviewer_org": reviewer["organization"], "self_approved": launcher == signer}
+
+
 def approve_report(owner, job_id, *, expected_review_revision=None, note="", actor="",
-                   checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None):
+                   checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None, reviewer):
   """Approve the report for the latest pass. Refused with `approve_blocked` while the gate says no.
 
   An approve over an existing approval at the current revision is a replay and
@@ -333,15 +352,15 @@ def approve_report(owner, job_id, *, expected_review_revision=None, note="", act
   """
   return _decide(owner, job_id, "approved", expected_review_revision=expected_review_revision,
                  note=note, actor=actor, checked_job=checked_job, snapshot_mode=snapshot_mode,
-                 ledger=ledger)
+                 ledger=ledger, reviewer=reviewer)
 
 
 def reject_report(owner, job_id, *, expected_review_revision=None, note="", actor="",
-                  checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None):
+                  checked_job=_UNSET, snapshot_mode="tenant_bound", ledger=None, reviewer):
   """Reject the report for the latest pass; the note saying why is required."""
   return _decide(owner, job_id, "rejected", expected_review_revision=expected_review_revision,
                  note=note, actor=actor, checked_job=checked_job, snapshot_mode=snapshot_mode,
-                 ledger=ledger)
+                 ledger=ledger, reviewer=reviewer)
 
 
 def review_summaries(owner, jobs):

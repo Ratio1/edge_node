@@ -90,7 +90,7 @@ class TestNoLegacyAdmission(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.tenancy.identity import AccountView
     from dataclasses import fields
     self.assertEqual({field.name for field in fields(AccountView)},
-                     {"account_id", "active", "state", "tenant_memberships", "account_generation"})
+                     {"account_id", "active", "state", "tenant_memberships", "account_generation", "created_at"})
 
 
 if __name__ == "__main__":
