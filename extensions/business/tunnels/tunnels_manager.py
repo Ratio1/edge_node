@@ -1,8 +1,10 @@
+import base64
+import secrets
 from typing import Optional
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.3.0'
+__VER__ = '0.4.0'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
 MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
@@ -771,4 +773,58 @@ class TunnelsManagerPlugin(BasePlugin):
     )
     return {
       "success": True
+    }
+
+  @BasePlugin.endpoint(method="post")
+  def rotate_tunnel_token(self, tunnel_id: str, cloudflare_account_id: str, cloudflare_api_key: str):
+    """
+    Rotate the tunnel secret, store the new token in the tunnel metadata and
+    disconnect every connector.
+
+    Connectors using the old token are dropped and cannot reconnect, so every
+    workload using this tunnel stops until it is updated with the new token.
+    Calling it again after a partial failure generates a new secret and
+    completes the remaining steps.
+    """
+    value = self.get_tunnel(tunnel_id, cloudflare_account_id, cloudflare_api_key)
+    tunnel_url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel/{tunnel_id}"
+    headers = {
+      "Authorization": f"Bearer {cloudflare_api_key}",
+      "Accept": "application/json",
+    }
+
+    tunnel_secret = base64.b64encode(secrets.token_bytes(32)).decode()
+    response = self.requests.patch(tunnel_url, headers=headers, json={"tunnel_secret": tunnel_secret}).json()
+    self._require_cloudflare_result(response, "Error rotating tunnel secret")
+
+    # Every step below runs after the old token stopped working; a retry rotates again.
+    response = self.requests.get(f"{tunnel_url}/token", headers=headers).json()
+    tunnel_token = self._require_cloudflare_result(
+      response, "Tunnel secret rotated, but reading the new token failed. Rotate again"
+    )
+    if not isinstance(tunnel_token, str) or not tunnel_token:
+      raise Exception("Tunnel secret rotated, but Cloudflare returned no token. Rotate again")
+
+    metadata = value.get("metadata") or {}
+    metadata["tunnel_token"] = tunnel_token
+    response = self._cloudflare_update_metadata(
+      tunnel_id=tunnel_id,
+      metadata=metadata,
+      cloudflare_account_id=cloudflare_account_id,
+      cloudflare_api_key=cloudflare_api_key,
+    )
+    self._require_cloudflare_result(
+      response, "Tunnel secret rotated, but saving the new token failed. Rotate again"
+    )
+
+    response = self.requests.delete(f"{tunnel_url}/connections", headers=headers).json()
+    self._require_cloudflare_result(
+      response, "Tunnel secret rotated, but disconnecting old connectors failed. Rotate again",
+      require_result=False,
+    )
+
+    return {
+      "success": True,
+      "tunnel_id": tunnel_id,
+      "tunnel_token": tunnel_token,
     }

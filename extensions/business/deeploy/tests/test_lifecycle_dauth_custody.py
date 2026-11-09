@@ -51,6 +51,12 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     report(self.state, operation, 'deploy', 'ready')
     self.coordinator._advance_deployment_operation(operation)
     self.coordinator._advance_deployment_operation(operation)
+    self.running(operation)
+
+  def running(self, operation, attempt='configs'):
+    # NetMon stand-in: each node now reports the config it was sent.
+    plan = self.coordinator._load_operation_plan(operation)
+    self.coordinator.known = {node: [copy.deepcopy(config)] for node, config in plan[attempt].items()}
 
   def active(self):
     pointer = self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']
@@ -271,6 +277,147 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.active()['DEEPLOY_SPECS']['revision'], 1)
     self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'fresh-token')
 
+  def test_node_relink_moves_job_and_per_node_secret_without_the_old_node(self):
+    config = pipeline()
+    instance = config['PLUGINS'][0]['INSTANCES'][0]
+    instance.update(CHAINSTORE_PEERS=['A'], SECRET_PATHS=[['PER_NODE_CONFIG', 'byNode', 'A', 'ENV', 'NODE_KEY']],
+                    PER_NODE_CONFIG={'byNode': {'A': {'ENV': {'NODE_KEY': 'node-secret'}}}})
+    self.coordinator._admit_prepared_deployment(
+      request={'job_id': 7, 'request_id': 'request', 'expected_revision': 0},
+      auth_result={'escrow_owner': 'owner'}, app_id='app', configs={'A': config},
+      prior_pipeline=None, is_create=True,
+    )
+    self.finalize(self.operation())
+    self.coordinator.known = {}  # A is gone and N is new hardware: nothing reports the job
+    accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    operation = self.coordinator._operation_records()[accepted['operation_id']]
+    self.assertEqual((operation['nodes'], operation['previous_nodes']), (['N'], ['N']))
+    self.assertNotIn('node-secret', str(self.state.public) + str(self.state.blobs.data))
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    active = self.active()['PLUGINS'][0]['INSTANCES'][0]
+    self.assertEqual(self.active()['DEEPLOY_SPECS']['current_target_nodes'], ['N'])
+    self.assertEqual((active['CHAINSTORE_PEERS'], list(active['PER_NODE_CONFIG']['byNode'])), (['N'], ['N']))
+    reference = operation['operation_id'] + ':deploy'
+    requested = self.dauth._load_revision_runner_secret_bundle('7', reference, 'N')
+    self.assertEqual(self.token(requested), 'fresh-token')
+    node_env = requested['job_secrets']['PLUGINS'][0]['INSTANCES'][0]['PER_NODE_CONFIG']['byNode']['N']['ENV']
+    self.assertEqual(node_env['NODE_KEY'], 'node-secret')
+    with self.assertRaises(ValueError):
+      self.dauth._load_revision_runner_secret_bundle('7', reference, 'A')
+
+  def test_update_does_not_need_the_record_of_whoever_deployed_the_running_revision(self):
+    self.admit()
+    self.finalize(self.operation())
+    # The deploying oracle was revoked: its operation records are no longer trusted.
+    for key in [key for key in self.state.public if key[0] == 'DEEPLOY_OPERATIONS']:
+      del self.state.public[key]
+    self.coordinator._deployment_plans.clear()
+    accepted = self.coordinator._admit_owner_transfer_operation(7, 'owner', 'new-owner', 'tx|0')
+    operation = self.coordinator._operation_records()[accepted['operation_id']]
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    self.assertEqual(self.active()['OWNER'], 'new-owner')
+    self.assertEqual(self.token(self.state.secrets['DAUTH_JOB_SECRETS', '7']), 'fresh-token')
+
+  def two_node_job(self):
+    configs = {}
+    for node in ('A', 'B'):
+      configs[node] = pipeline()
+      configs[node]['DEEPLOY_SPECS']['current_target_nodes'] = ['A', 'B']
+    self.coordinator._admit_prepared_deployment(
+      request={'job_id': 7, 'request_id': 'request', 'expected_revision': 0},
+      auth_result={'escrow_owner': 'owner'}, app_id='app', configs=configs,
+      prior_pipeline=None, is_create=True,
+    )
+    self.finalize(self.operation())
+
+  def move(self, nodes, request_id='move'):
+    configs = {}
+    for node in nodes:
+      configs[node] = pipeline()
+      configs[node]['DEEPLOY_SPECS']['current_target_nodes'] = list(nodes)
+    accepted = self.coordinator._admit_prepared_deployment(
+      request={'job_id': 7, 'request_id': request_id, 'expected_revision': self.active()['DEEPLOY_SPECS']['revision']},
+      auth_result={'escrow_owner': 'owner'}, app_id='app', configs=configs,
+      prior_pipeline=self.active(), is_create=False,
+    )
+    return self.coordinator._operation_records()[accepted['operation_id']]
+
+  def test_nodes_keep_their_own_instance_ids_across_updates(self):
+    configs = {}
+    for node in ('A', 'B'):  # as after a scale-up: each node has its own instance
+      configs[node] = pipeline()
+      configs[node]['DEEPLOY_SPECS']['current_target_nodes'] = ['A', 'B']
+      configs[node]['PLUGINS'][0]['INSTANCES'][0]['INSTANCE_ID'] = 'worker-' + node
+    self.coordinator._admit_prepared_deployment(
+      request={'job_id': 7, 'request_id': 'request', 'expected_revision': 0},
+      auth_result={'escrow_owner': 'owner'}, app_id='app', configs=configs,
+      prior_pipeline=None, is_create=True,
+    )
+    self.finalize(self.operation())
+    self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']['plan_cid'], self.operation()['plan_cid'])
+    for owner, transfer in (('new-owner', 'tx|1'), ('third-owner', 'tx|2')):
+      accepted = self.coordinator._admit_owner_transfer_operation(7, self.active()['OWNER'], owner, transfer)
+      operation = self.coordinator._operation_records()[accepted['operation_id']]
+      plan = self.coordinator._load_operation_plan(operation)
+      for key in ('configs', 'previous_configs'):
+        self.assertEqual({node: config['PLUGINS'][0]['INSTANCES'][0]['INSTANCE_ID'] for node, config in plan[key].items()},
+                         {'A': 'worker-A', 'B': 'worker-B'})
+      self.finalize(operation)
+      self.assertEqual(operation['outcome'], 'succeeded')
+
+  def test_update_removing_an_offline_node_skips_it(self):
+    self.two_node_job()
+    del self.coordinator.known['A']  # A is offline
+    operation = self.move(['B', 'C'])
+    self.assertEqual(operation['previous_nodes'], ['B'])
+    sent = len(self.coordinator.commands)
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    self.assertNotIn('A', [node for node, _ in self.coordinator.commands[sent:]])
+    self.assertEqual(sorted(self.active()['DEEPLOY_SPECS']['current_target_nodes']), ['B', 'C'])
+    with self.assertRaises(ValueError):
+      self.dauth._load_revision_runner_secret_bundle('7', self.active()['DEEPLOY_SPECS']['secret_revision'], 'A')
+
+  def test_update_baseline_is_the_stored_job_not_what_nodes_report(self):
+    self.two_node_job()
+    forged = copy.deepcopy(self.coordinator.known['A'][0])
+    forged['PLUGINS'][0]['INSTANCES'][0]['IMAGE'] = 'forged-image'
+    self.coordinator.known['A'] = [forged]
+    operation = self.move(['A', 'C'])
+    restore = self.coordinator._load_operation_plan(operation)['previous_configs']
+    self.assertEqual(set(restore), {'A', 'B'})
+    self.assertNotIn('forged-image', str(restore))
+
+  def test_failed_move_off_only_offline_nodes_keeps_the_stored_job(self):
+    self.admit()
+    self.finalize(self.operation())
+    before = self.active()
+    self.coordinator.known = {}  # the job's only node is offline
+    operation = self.move(['C'])
+    self.assertEqual(operation['previous_nodes'], [])
+    self.coordinator._advance_deployment_operation(operation)
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'deploy', 'failed')
+    self.coordinator._advance_deployment_operation(operation)
+    report(self.state, operation, 'deploy', 'stopped')
+    self.coordinator._advance_deployment_operation(operation)
+    self.assertEqual((operation['phase'], operation['outcome']), ('completed', 'failed'))
+    self.assertEqual(self.active(), before)
+    self.dauth._load_revision_runner_secret_bundle('7', before['DEEPLOY_SPECS']['secret_revision'], 'A')
+
+  def test_unversioned_node_relink_keeps_secrets(self):
+    self.legacy()
+    self.coordinator.known = {}
+    accepted = self.coordinator._admit_node_relink_operation(7, 'A', 'N')
+    operation = self.coordinator._operation_records()[accepted['operation_id']]
+    self.finalize(operation)
+    self.assertEqual(operation['outcome'], 'succeeded')
+    self.assertEqual(self.active()['DEEPLOY_SPECS']['current_target_nodes'], ['N'])
+    requested = self.dauth._load_revision_runner_secret_bundle('7', operation['operation_id'] + ':deploy', 'N')
+    self.assertEqual(self.token(requested), 'old-token')
+
   def test_partial_publication_replays_before_old_cid_cleanup(self):
     previous, cid = self.legacy()
     self.admit(previous)
@@ -320,7 +467,8 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     canonical = self.dauth._recursively_sort_pipeline_data(
       self.dauth.extract_invariable_data_from_pipeline(canonical))
     pointer = dict(job_id='7', revision=operation['target_revision'], operation_id=operation['operation_id'],
-                   coordinator='oracle', deleted=False, pipeline_cid='published-folder')
+                   coordinator='oracle', deleted=False, pipeline_cid='published-folder',
+                   plan_cid=operation['plan_cid'])
     self.coordinator.bc.sign(pointer)
     for content, error in ((None, RuntimeError), (dict(canonical, unexpected=True), ValueError)):
       with self.subTest(content_missing=content is None):
@@ -373,7 +521,8 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     report(self.state, operation, 'deploy', 'ready')
     self.coordinator._advance_deployment_operation(operation)
     pointer = dict(job_id='7', revision=operation['target_revision'], operation_id=operation['operation_id'],
-                   coordinator='oracle', deleted=False, pipeline_cid='wrong-cid')
+                   coordinator='oracle', deleted=False, pipeline_cid='wrong-cid',
+                   plan_cid=operation['plan_cid'])
     self.coordinator.bc.sign(pointer)
     for value in (dict(pointer, EE_SIGN='forged'), pointer):
       writes = len(self.state.writes)

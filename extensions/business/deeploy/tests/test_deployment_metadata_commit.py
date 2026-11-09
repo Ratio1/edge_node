@@ -48,7 +48,7 @@ class DeploymentMetadataCommitTests(unittest.TestCase):
   def test_partial_secret_commit_is_repaired_after_restart_without_old_generation_write(self):
     previous = dict(job_id="7", revision=5, pipeline_cid="cid-previous", deleted=False)
     plugin = Metadata({(DEEPLOY_JOBS_CSTORE_HKEY, "7"): previous})
-    operation = dict(job_id=7, target_revision=6, operation_id="recover", coordinator="oracle")
+    operation = dict(job_id=7, target_revision=6, operation_id="recover", coordinator="oracle", plan_cid="plan")
     pipeline = {"NAME": "app", "DEEPLOY_SPECS": {"revision": 4}, "PLUGINS": []}
     bundle = {"job_id": "7", "revision": "recover:restore", "job_secrets": {"token": "old-value"}}
     plugin.custody.target_bundle = copy.deepcopy(bundle)
@@ -79,7 +79,7 @@ class DeploymentMetadataCommitTests(unittest.TestCase):
     self.assertIsNone(plugin._get_pipeline_from_cstore(7))
     self.assertEqual(plugin.list_all_deployed_jobs_from_cstore(), {})
     plugin.commit_deployment_revision(
-      dict(job_id=7, target_revision=9, operation_id="new", coordinator="oracle"),
+      dict(job_id=7, target_revision=9, operation_id="new", coordinator="oracle", plan_cid="plan"),
       {"NAME": "new-app", "DEEPLOY_SPECS": {"revision": 9}},
     )
     self.assertEqual(plugin.list_all_deployed_jobs_from_cstore(), {"7": "cid-restored"})

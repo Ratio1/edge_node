@@ -8,6 +8,7 @@ from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
 from ratio1.bc.base import BaseBlockEngine
 from ratio1.const.base import dAuth
 from extensions.business.dauth.dauth_mixin import _DauthMixin
+from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 from extensions.business.dauth.test_dauth_registry_gating import _FakeBC, _FakeConst
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin, DEEPLOY_DAUTH_SECRET_PLACEHOLDER as HIDDEN
 from extensions.business.deeploy.tests.test_secret_staging import (
@@ -16,7 +17,7 @@ from extensions.business.deeploy.tests.test_secret_staging import (
 )
 
 
-class _DauthReconciliationPlugin(_DauthMixin, _SecretStagingPlugin):
+class _DauthReconciliationPlugin(_DauthMixin, _DauthRevokedNodesMixin, _SecretStagingPlugin):
   pass
 
 
@@ -28,6 +29,8 @@ class DauthReconciliationTests(unittest.TestCase):
     self.server_engine.verify = Mock(wraps=self.server_engine.verify)
     self.server_engine.web3_get_oracles = self.server_engine.get_eth_oracles
     self.dauth.bc = BCWrapper(self.server_engine, owner=self.dauth)
+    self.dauth.os_environ, self.dauth.evm_network = {}, 'testnet'
+    self.dauth._load_dauth_revoked_nodes()
     self.dauth.cfg_dauth_verbose = False
     self.dauth.time = lambda: 1000
     self.dauth._dauth_registry_internal_peers = ['dauth-a']

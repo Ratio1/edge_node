@@ -75,7 +75,7 @@ class DeploymentRevisionOrderTests(unittest.TestCase):
     observed._save_operation(failed, "completed")
     plugin.storage.update({key: copy.deepcopy(value) for key, value in observed.storage.items()
                            if key[0] == OPERATIONS_HKEY})
-    plugin.storage["DEEPLOY_DEPLOYED_JOBS", "7"] = {"revision": 9, "pipeline_cid": "canonical-cid"}
+    plugin.storage["DEEPLOY_DEPLOYED_JOBS", "7"] = {"revision": 9, "pipeline_cid": "canonical-cid", "plan_cid": "current-plan"}
     plugin.now = 50
     result = plugin.delete()
     self.assertEqual(result["revision"], 11)

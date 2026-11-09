@@ -14,6 +14,7 @@ from naeural_core.utils.plugins_base.bc_wrapper import BCWrapper
 from ratio1.bc.base import BaseBlockEngine
 from ratio1.const.base import BCct, dAuth
 from extensions.business.dauth.dauth_mixin import _DauthMixin
+from extensions.business.dauth.dauth_revoked_nodes import _DauthRevokedNodesMixin
 from extensions.business.dauth.deployment_secrets import _DauthDeploymentSecretsMixin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
@@ -169,9 +170,11 @@ class Coordinator(Node, _DeploymentMutationsMixin, _DeploymentOperationsMixin, _
     self.configure(state, 'oracle')
 
 
-class Custodian(Node, _DauthMixin, _DauthDeploymentSecretsMixin, _DeeployMixin, _DeeployJobMixin):
+class Custodian(Node, _DauthMixin, _DauthRevokedNodesMixin, _DauthDeploymentSecretsMixin, _DeeployMixin, _DeeployJobMixin):
   def __init__(self, state):
     self.configure(state, 'dauth', True)
+    self.os_environ = {}
+    self._load_dauth_revoked_nodes()
 
 
 def pipeline(secret='fresh-token', revision=0):

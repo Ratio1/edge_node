@@ -3,7 +3,7 @@ import copy
 import hashlib
 
 from .dauth_registry import dauth_registry_write_kwargs
-from extensions.business.deeploy.deployment_operations import required_instances, SIGNATURE_KEYS
+from extensions.business.deeploy.deployment_operations import replace_nodes, required_instances, SIGNATURE_KEYS
 
 
 REVISIONS = "DAUTH_JOB_SECRET_REVISIONS"
@@ -120,6 +120,11 @@ class _DauthDeploymentSecretsMixin:
           raise ValueError("The active pipeline changed before preparation.")
     elif prior_cid:
       raise ValueError("A create cannot replace an active pipeline.")
+    # A relinked node takes over the old node's values, including its per-node secret paths.
+    node_aliases = dict(body.get("node_aliases") or [])
+    if node_aliases:
+      prior_bundle = replace_nodes(prior_bundle, node_aliases)
+      prior_pipeline = replace_nodes(prior_pipeline, node_aliases)
     aliases = {tuple(current): tuple(source) for current, source in body.get("identity_aliases", [])}
     records = []
     for attempt, key, fragments in (
@@ -183,6 +188,8 @@ class _DauthDeploymentSecretsMixin:
     expected = dict(job_id=job_id, revision=operation["target_revision"],
                     operation_id=operation["operation_id"], coordinator=operation["coordinator"],
                     deleted=deleted, pipeline_cid=None if deleted else pointer.get("pipeline_cid"))
+    if not deleted:
+      expected["plan_cid"] = operation["plan_cid"]
     if ({key: value for key, value in pointer.items() if key not in AUTH_FIELDS} != expected
         or pointer.get("EE_SENDER") != operation["coordinator"]
         or not self.bc.verify(pointer, return_full_info=True, log_hash_sign_fails=False).valid):
@@ -231,7 +238,8 @@ class _DauthDeploymentSecretsMixin:
     expected_active = {"finalizing": "deploy", "finalizing_recovery": "restore"}.get(phase)
     if active_attempt != expected_active or (
       phase in ("preparing", "cleaning_up_preparation") and self.time() < operation["preparation_deadline"]
-    ) or (phase == "stopping_failed_rollout" and operation["kind"] != "create"):
+    ) or (phase == "stopping_failed_rollout" and operation["kind"] != "create" and operation.get("previous_nodes")):
+    # A failed update with no previous node left to restore is cleaned up like a failed create.
       raise ValueError("Secret cleanup does not match lifecycle recovery.")
     pointer = self.chainstore_hget(hkey=POINTERS, key=job_id)
     if active_attempt:
