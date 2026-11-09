@@ -91,29 +91,65 @@ class TestTenantEffectAuthority(unittest.TestCase):
           PolicyDecision(False, 403, "pentesting_disabled") if bound
           else PolicyDecision(True, 200, None))
 
-  def test_stop_and_review_follow_the_launch_rule(self):
-    """`tasks:stop` and `reports:review` belong to whoever may launch, under launch's Allow Pentester
-    rule: the Tenant Pentester is bound, the platform roles are exempt, and a Tenant Admin or Tenant
-    User holds neither (owner, 2026-09-30). Both used to ride on `reports:export`, which a Tenant
-    Admin holds for downloads."""
-    for operation in ("tasks:stop", "reports:review"):
-      for role, holds, bound in (("super_tenant_admin", True, False), ("super_pentester", True, False),
-                                 ("tenant_pentester", True, True), ("tenant_admin", False, False),
-                                 ("tenant_user", False, False)):
-        with self.subTest(operation=operation, role=role):
-          actor = account(in_tenant(role, "a"))
-          on = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, True))
-          off = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, False))
-          if not holds:
-            self.assertEqual(on, PolicyDecision(False, 403, "forbidden"))
-            self.assertEqual(off, PolicyDecision(False, 403, "forbidden"))
-            continue
-          self.assertTrue(on.allowed)
-          self.assertEqual(off, PolicyDecision(False, 403, "pentesting_disabled") if bound
-                           else PolicyDecision(True, 200, None))
-          self.assertEqual(
-            authorize_tenant_operation(actor, operation, TenantPolicyContext("b", True, True)).status_code,
-            200 if role == "super_tenant_admin" else 404)
+  def test_stop_follows_the_launch_rule(self):
+    """`tasks:stop` belongs to whoever may launch, under launch's Allow Pentester rule: the Tenant
+    Pentester is bound, the platform roles are exempt, and a Tenant Admin or Tenant User holds
+    neither (owner, 2026-09-30). It used to ride on `reports:export`, which a Tenant Admin holds for
+    downloads. `reports:review` has its own test below (RM-155)."""
+    operation = "tasks:stop"
+    for role, holds, bound in (("super_tenant_admin", True, False), ("super_pentester", True, False),
+                               ("tenant_pentester", True, True), ("tenant_admin", False, False),
+                               ("tenant_user", False, False)):
+      with self.subTest(operation=operation, role=role):
+        actor = account(in_tenant(role, "a"))
+        on = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, True))
+        off = authorize_tenant_operation(actor, operation, TenantPolicyContext("a", True, False))
+        if not holds:
+          self.assertEqual(on, PolicyDecision(False, 403, "forbidden"))
+          self.assertEqual(off, PolicyDecision(False, 403, "forbidden"))
+          continue
+        self.assertTrue(on.allowed)
+        self.assertEqual(off, PolicyDecision(False, 403, "pentesting_disabled") if bound
+                         else PolicyDecision(True, 200, None))
+        self.assertEqual(
+          authorize_tenant_operation(actor, operation, TenantPolicyContext("b", True, True)).status_code,
+          200 if role == "super_tenant_admin" else 404)
+
+  def test_review_needs_an_eligible_role_the_designation_and_allow_pentester(self):
+    """RM-155 (owner, 2026-11-03): `reports:review` -- approve, reject and the NIS2 review mutations --
+    needs an eligible role (a Tenant Admin now counts, a Tenant User never), the Super-Tenant Admin's
+    designation, and for a tenant role the tenant's Allow Pentester switch."""
+    for role, eligible, bound in (("super_tenant_admin", True, False), ("super_pentester", True, False),
+                                  ("tenant_admin", True, True), ("tenant_pentester", True, True),
+                                  ("tenant_user", False, False)):
+      for flag in (True, False):
+        for allow in (True, False):
+          with self.subTest(role=role, designated=flag, allow_pentester=allow):
+            actor = account(in_tenant(role, "a"))
+            decision = authorize_tenant_operation(actor, "reports:review", TenantPolicyContext("a", True, allow),
+                                                  report_reviewer=flag)
+            if not eligible:
+              expected = PolicyDecision(False, 403, "forbidden")
+            elif bound and not allow:
+              expected = PolicyDecision(False, 403, "pentesting_disabled")
+            elif not flag:
+              expected = PolicyDecision(False, 403, "reviewer_not_designated")
+            else:
+              expected = PolicyDecision(True, 200, None)
+            self.assertEqual(decision, expected)
+    # Fails closed: no designation passed is no designation.
+    self.assertEqual(authorize_tenant_operation(account(("super_tenant_admin", None)), "reports:review",
+                                                TenantPolicyContext("a", True, True)),
+                     PolicyDecision(False, 403, "reviewer_not_designated"))
+    # The designation grants nothing else.
+    self.assertEqual(authorize_tenant_operation(account(("tenant_user", "a")), "tasks:launch",
+                                                TenantPolicyContext("a", True, True), report_reviewer=True,
+                                                asset_tenant_ids=("a",)),
+                     PolicyDecision(False, 403, "forbidden"))
+    # Scope stays the membership's.
+    self.assertEqual(authorize_tenant_operation(account(("tenant_admin", "a")), "reports:review",
+                                                TenantPolicyContext("b", True, True), report_reviewer=True),
+                     PolicyDecision(False, 404, "not_found"))
 
   def test_deletion_and_purge_do_not_depend_on_the_pentesting_switch(self):
     """They are administrative, not operator, actions. A tenant that disabled pentesting has not

@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 
-from .read_endpoint_fixtures import allow_pentester, as_role, read_endpoint_fixture
+from .read_endpoint_fixtures import allow_pentester, as_role, designate_reviewer, read_endpoint_fixture
 from .contract_fixture import contract_terms
 
 PROFILE = "nis2.eu_baseline.v1"
@@ -48,7 +48,9 @@ VIEW_ROLES = ("tenant_user", "tenant_pentester", "tenant_admin", "super_penteste
 EXPORT_ROLES = ("tenant_pentester", "tenant_admin", "super_pentester", "super_tenant_admin")
 # Owner, 2026-09-30: the review mutations run as `reports:review`, held by the launch roles under the
 # launch Allow Pentester rule. `correlate_suricata_eve` is an ingest and stays `reports:export`.
-REVIEW_ROLES = ("tenant_pentester", "super_pentester", "super_tenant_admin")
+# RM-155 (owner, 2026-11-03): a Tenant Admin holds it too, and every role needs the Super-Tenant
+# Admin's reviewer designation (the `designate_reviewer` fixture) beside it.
+REVIEW_ROLES = ("tenant_admin", "tenant_pentester", "super_pentester", "super_tenant_admin")
 REVIEW = tuple(row for row in MUTATIONS if row[0] != "correlate_suricata_eve")
 EXPORT_MUTATIONS = tuple(row for row in MUTATIONS if row[0] == "correlate_suricata_eve")
 EVIDENCE_ROLES = ("super_pentester", "super_tenant_admin")
@@ -123,6 +125,7 @@ def test_a_job_owned_by_another_tenant_is_not_found(name, extra):
             "tenant_id": other}]
     if (name, extra) in REVIEW:
       allow_pentester_in(fixture, other)
+      designate_reviewer(fixture)
     record_artifact(fixture, name)
     result = invoke(fixture, name, extra, tenant_id=other)
     assert_denied(result, 404, "not_found")
@@ -207,28 +210,47 @@ def test_every_launch_role_is_admitted_to_the_review_mutations(name, extra, role
   with read_endpoint_fixture(bound=True) as fixture:
     tenant_id = as_role(fixture, role)
     allow_pentester(fixture)
+    designate_reviewer(fixture)
     assert_admitted(invoke(fixture, name, extra, tenant_id=tenant_id))
 
 
 @pytest.mark.parametrize("name,extra", REVIEW)
-def test_a_tenant_admin_cannot_mutate_a_review(name, extra):
-  """A Tenant Admin downloads reports (`reports:export`) but does not sign them off."""
+@pytest.mark.parametrize("role", REVIEW_ROLES)
+def test_an_undesignated_account_cannot_mutate_a_review(name, extra, role):
+  """RM-155: the role and the Allow Pentester switch are not enough; without the Super-Tenant
+  Admin's designation (no profile row, or the box unticked) every review mutation is refused
+  `reviewer_not_designated` before any record or artifact is touched."""
+  for state in ("no_profile", "unticked"):
+    with read_endpoint_fixture(bound=True) as fixture:
+      tenant_id = as_role(fixture, role)
+      allow_pentester(fixture)
+      if state == "unticked":
+        designate_reviewer(fixture, enabled=False)
+      writes = list(fixture.store.writes)
+      result = invoke(fixture, name, extra, tenant_id=tenant_id)
+      assert_denied(result, 403, "reviewer_not_designated")
+      assert fixture.artifact_reads == [] and fixture.store.writes == writes
+
+
+@pytest.mark.parametrize("name,extra", REVIEW)
+def test_designation_does_not_make_a_tenant_user_a_reviewer(name, extra):
   with read_endpoint_fixture(bound=True) as fixture:
-    tenant_id = as_role(fixture, "tenant_admin")
+    tenant_id = as_role(fixture, "tenant_user")
     allow_pentester(fixture)
+    designate_reviewer(fixture)
     writes = list(fixture.store.writes)
-    result = invoke(fixture, name, extra, tenant_id=tenant_id)
-    assert_denied(result, 403, "forbidden")
+    assert_denied(invoke(fixture, name, extra, tenant_id=tenant_id), 403, "forbidden")
     assert fixture.artifact_reads == [] and fixture.store.writes == writes
 
 
 @pytest.mark.parametrize("name,extra", REVIEW)
-@pytest.mark.parametrize("role,bound", (("tenant_pentester", True), ("super_pentester", False),
-                                        ("super_tenant_admin", False)))
+@pytest.mark.parametrize("role,bound", (("tenant_admin", True), ("tenant_pentester", True),
+                                        ("super_pentester", False), ("super_tenant_admin", False)))
 def test_the_review_mutations_follow_the_launch_pentesting_rule(name, extra, role, bound):
   with read_endpoint_fixture(bound=True) as fixture:
     tenant_id = as_role(fixture, role)
     allow_pentester(fixture, False)
+    designate_reviewer(fixture)
     writes = list(fixture.store.writes)
     result = invoke(fixture, name, extra, tenant_id=tenant_id)
     if bound:
@@ -262,8 +284,37 @@ def test_a_typed_review_conflict_code_survives_the_tenant_path(name, extra, code
   with read_endpoint_fixture(bound=True) as fixture:
     tenant_id = as_role(fixture, "tenant_pentester")
     allow_pentester(fixture)
+    designate_reviewer(fixture)
     result = invoke(fixture, name, dict(extra, expected_review_revision=999), tenant_id=tenant_id)
     assert result.get("error") != "effect_incomplete", result
     assert result.get("error_code") == code, result
     # The rich payload the fence UX reads is still there, not a bare denial.
     assert set(result) - {"status", "job_id", "error_code"}, result
+
+
+@pytest.mark.parametrize("name,extra", (("approve_report", {}), ("reject_report", {"note": "no"})))
+def test_a_designated_account_without_a_full_name_cannot_approve_or_reject(name, extra):
+  """RM-155: designated is not enough to sign; the reviewer is named by full name in the report."""
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, "tenant_pentester")
+    allow_pentester(fixture)
+    designate_reviewer(fixture, full_name="")
+    writes = list(fixture.store.writes)
+    result = invoke(fixture, name, dict(extra, expected_review_revision=0), tenant_id=tenant_id)
+    assert result.get("error_code") == "reviewer_profile_incomplete", result
+    assert fixture.store.writes == writes
+
+
+def test_the_snapshot_is_written_from_the_admitted_signers_profile_only():
+  """The signer's full name, signature line and organization reach the row from the profile row the
+  service reads, and the row says whether the signer launched the scan."""
+  with read_endpoint_fixture(bound=True) as fixture:
+    tenant_id = as_role(fixture, "tenant_pentester")
+    allow_pentester(fixture)
+    designate_reviewer(fixture)
+    result = invoke(fixture, "approve_report", {"expected_review_revision": 0}, tenant_id=tenant_id)
+    review = result["review"]
+    assert (review["reviewer"], review["reviewer_name"], review["reviewer_signature"]) == (
+      "reader", "Rita Reader", "Rita Reader")
+    assert review["reviewer_org"] == "Example Holdings SRL"  # the tenant's company: nothing saved, so the prefill
+    assert review["self_approved"] is False

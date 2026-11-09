@@ -54,6 +54,7 @@
       "audit:view",
       "node_failure_policy:update",
       "reports:export",
+      "reports:review",
       "reports:view",
       "tenant_users:manage"
     ],

@@ -86,11 +86,12 @@ class CstoreAuthAccountReader:
     parsed = parse_account_record(raw, account_id)
     if parsed is None:
       return None
-    state, generation, memberships = parsed
+    state, generation, memberships, created_at = parsed
     return AccountView(
       account_id=account_id,
       active=(state == ACTIVE_STATE),
       state=state,
       tenant_memberships=tuple(TenantMembership(role, tenant_id) for role, tenant_id in memberships),
       account_generation=generation,
+      created_at=created_at,
     )

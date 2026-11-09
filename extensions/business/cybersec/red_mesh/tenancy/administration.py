@@ -14,7 +14,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .identity import IdentityStoreError, TenantMembership, canonical_account_id, holds_platform_role, resolve_actor
-from .policy import (TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles,
+from .policy import (PLATFORM_ROLES, TENANT_LOCAL_ROLES, TenantPolicyContext, authorize_tenant_operation, resolve_tenant_roles,
                      resolve_operation_roles, valid_account_scope)
 from .execution import CurrentExecutionFacts, ExecutionBinding, ResolvedExecutionContext
 from .ports import TenantStoreError
@@ -25,7 +25,7 @@ from .integrations import integration_ids, valid_integration_id
 from .engagements import (MAX_ENGAGEMENT_DOCUMENTS, EngagementInvalid, document_id_for, engagement_hash,
                           engagement_id_for, normalize_asset_requests, normalize_context,
                           build_engagement_assets, normalize_engagement_assets, normalize_window, valid_doc_ref, valid_engagement_id)
-from . import (drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
+from . import (account_profile, drafts, engagement_drafts, super_tenant_branding, super_tenant_integrations, super_tenant_profile,
                tenant_assets, tenant_contracts)
 
 
@@ -563,8 +563,10 @@ class TenantAdministrationService:
     if tenant is None or tenant.get("active") is not True:
       raise AdministrationDenied(404, "not_found")
     self._validate_tenant(tenant)
+    # RM-155: `reports:review` also needs the Super-Tenant Admin's designation, read here beside the matrix.
+    reviewer = operation == "reports:review" and self._report_reviewer(account)
     decision = authorize_tenant_operation(account, operation, TenantPolicyContext(
-      tenant_id, tenant["active"], tenant["allow_pentester"]))
+      tenant_id, tenant["active"], tenant["allow_pentester"]), report_reviewer=reviewer)
     if not decision.allowed:
       raise AdministrationDenied(decision.status_code, decision.error)
     return tenant, account
@@ -1626,6 +1628,226 @@ class TenantAdministrationService:
     self._actor(actor)
     row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
     return super_tenant_profile.provider_dto(row if row is not None else super_tenant_profile.empty_profile())
+
+  # RM-155 phase 1: the account profile, one row per account (`tenancy/account_profile.py`). The
+  # holder, a Super-Tenant Admin and a Tenant Admin of one of the holder's tenants may read and edit
+  # it; only a Super-Tenant Admin sets `report_reviewer`. Certificate bytes never pass through
+  # these methods: the plugin stores and deletes the files outside this lock.
+
+  def _report_reviewer(self, account):
+    """Whether the account is designated a report reviewer: false without a row of this
+    incarnation of the account (fails closed)."""
+    row = account_profile.row_for(self.store.get(account_profile.KIND, account.account_id), account.created_at)
+    return row is not None and row["report_reviewer"] is True
+
+  def _can_manage_profile(self, caller, target):
+    if caller.account_id == target.account_id or holds_platform_role(caller):
+      return True
+    admin_of = {m.tenant_id for m in caller.tenant_memberships if m.role == "tenant_admin"}
+    for membership in target.tenant_memberships:
+      if membership.role in _MEMBER_ROLES and membership.tenant_id in admin_of:
+        try:
+          self.authorize_tenant_for_account(caller, membership.tenant_id, "tenant_users:manage")
+          return True
+        except AdministrationDenied:
+          continue
+    return False
+
+  def _profile_target(self, actor, account_id, *, states=(_ACTIVE_STATE, _DEACTIVATED_STATE)):
+    """`(caller, target)`: the caller may manage the target's profile and the target is in `states`.
+    Anything else is `not_found`, so a profile cannot be probed for."""
+    caller = self._actor(actor)
+    target_id = caller.account_id if account_id is None else canonical_account_id(account_id)
+    if not target_id:
+      raise AdministrationDenied(400, "invalid_request")
+    target = caller if target_id == caller.account_id else self.accounts.get_account(target_id)
+    if target is None or target.state not in states or not self._can_manage_profile(caller, target):
+      raise AdministrationDenied(404, "not_found")
+    return caller, target
+
+  def _own_profile_row(self, target):
+    return account_profile.row_for(self.store.get(account_profile.KIND, target.account_id), target.created_at)
+
+  def _stale_profile(self, target):
+    """The row left by an earlier incarnation of this account id, else None. The next write
+    overwrites it, so its certificate files go back to the plugin to delete."""
+    if self._own_profile_row(target) is not None:
+      return None
+    return self.store.get(account_profile.KIND, target.account_id)
+
+  def _organization_default(self, target):
+    """The prefill: the super-tenant company for a platform account, else the tenant's `legal.name`."""
+    try:
+      if any(m.role in PLATFORM_ROLES for m in target.tenant_memberships):
+        row = self.store.get("super_tenant_profile", super_tenant_profile.RECORD_ID)
+        return row["legal_name"] if row else ""
+      for membership in target.tenant_memberships:
+        legal = (self.store.raw_record("tenant", membership.tenant_id) or {}).get("legal")
+        if isinstance(legal, dict) and isinstance(legal.get("name"), str):
+          return legal["name"]
+    except TenantStoreError:
+      pass
+    return ""
+
+  def _profile_dto(self, target, row):
+    row = row if row is not None else account_profile.new_row(target.created_at)
+    return {"account_id": target.account_id,
+            **account_profile.profile_dto(row, self.clock().date(), self._organization_default(target))}
+
+  def _write_profile(self, target, row, actor_id):
+    row = {**row, "updated_by": actor_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+    self.store.put(account_profile.KIND, target.account_id, record=row)
+    return self._own_profile_row(target)
+
+  @_endpoint
+  def get_account_profile(self, actor, account_id=None):
+    """The profile of `account_id` (the caller's own when omitted); an empty one without a row."""
+    _, target = self._profile_target(actor, account_id)
+    return self._profile_dto(target, self._own_profile_row(target))
+
+  @_endpoint
+  def update_account_profile(self, actor, account_id=None, changes=None):
+    """Partial `changes` (`account_profile.apply_changes`). Answers the profile and the keys that
+    changed (the plugin audits those, never the values) and the files of removed qualifications."""
+    caller, target = self._profile_target(actor, account_id)
+    row = self._own_profile_row(target)
+    stale = self._stale_profile(target)
+    try:
+      updated, changed, dropped = account_profile.apply_changes(
+        row if row is not None else account_profile.new_row(target.created_at), changes)
+    except drafts.DraftInvalid as exc:
+      raise AdministrationDenied(400, exc.code) from None
+    if changed or stale is not None:
+      row = self._write_profile(target, updated, caller.account_id)
+    leftovers = account_profile.certificate_refs(stale) if stale is not None else []
+    return {"profile": self._profile_dto(target, row),
+            "changed": changed, "accountId": caller.account_id, "targetId": target.account_id,
+            "dropped": [cert["ref"] for cert in dropped] + leftovers}
+
+  @_endpoint
+  def set_report_reviewer(self, actor, account_id=None, enabled=None):
+    """Tick or untick the reviewer designation. A full-portfolio Super-Tenant Admin only, on any
+    account that exists (active or archived); a change is written and reported, a repeat is not."""
+    caller = self._actor(actor, creator=True)
+    target_id = canonical_account_id(account_id)
+    if not target_id or type(enabled) is not bool:
+      raise AdministrationDenied(400, "invalid_request")
+    target = caller if target_id == caller.account_id else self.accounts.get_account(target_id)
+    if target is None or target.state not in (_ACTIVE_STATE, _DEACTIVATED_STATE):
+      raise AdministrationDenied(404, "not_found")
+    row = self._own_profile_row(target)
+    if (row["report_reviewer"] if row is not None else False) is enabled:
+      return {"profile": self._profile_dto(target, row), "changed": False, "accountId": caller.account_id,
+              "targetId": target.account_id, "dropped": []}
+    stale = self._stale_profile(target)
+    row = self._write_profile(target, {**(row or account_profile.new_row(target.created_at)),
+                                       "report_reviewer": enabled}, caller.account_id)
+    return {"profile": self._profile_dto(target, row), "changed": True, "accountId": caller.account_id,
+            "targetId": target.account_id,
+            "dropped": account_profile.certificate_refs(stale) if stale is not None else []}
+
+  def _qualification_row(self, target, qualification_id):
+    row = self._own_profile_row(target)
+    if row is None or not any(q["qualification_id"] == qualification_id for q in row["qualifications"]):
+      raise AdministrationDenied(404, "not_found")
+    return row
+
+  @_endpoint
+  def authorize_account_certificate(self, actor, account_id=None, qualification_id=None):
+    """Before an upload: the caller may edit this profile and the qualification exists."""
+    caller, target = self._profile_target(actor, account_id)
+    self._qualification_row(target, qualification_id)
+    return {"accountId": caller.account_id, "targetId": target.account_id}
+
+  @_endpoint
+  def attach_account_certificate(self, actor, account_id=None, qualification_id=None, certificate=None):
+    """Bind the stored file to the qualification; answers the profile and the file it replaced."""
+    caller, target = self._profile_target(actor, account_id)
+    row = self._qualification_row(target, qualification_id)
+    replaced = None
+    qualifications = []
+    for q in row["qualifications"]:
+      if q["qualification_id"] == qualification_id:
+        replaced = q["certificate"]["ref"] if q["certificate"] is not None else None
+        q = {**q, "certificate": certificate}
+      qualifications.append(q)
+    row = self._write_profile(target, {**row, "qualifications": qualifications}, caller.account_id)
+    return {"profile": self._profile_dto(target, row), "replaced": replaced, "accountId": caller.account_id,
+            "targetId": target.account_id, "documentId": certificate["document_id"]}
+
+  @_endpoint
+  def account_certificate_ref(self, actor, account_id=None, document_id=None):
+    """The stored reference of one certificate, for the download; the same access as the profile."""
+    _, target = self._profile_target(actor, account_id)
+    row = self._own_profile_row(target)
+    _, certificate = account_profile.find_certificate(row, document_id) if row is not None else (None, None)
+    if certificate is None:
+      raise AdministrationDenied(404, "not_found")
+    return dict(certificate)
+
+  @_endpoint
+  def remove_account_certificate(self, actor, account_id=None, document_id=None):
+    """Detach one certificate; answers the profile and the file to delete."""
+    caller, target = self._profile_target(actor, account_id)
+    row = self._own_profile_row(target)
+    qualification, certificate = account_profile.find_certificate(row, document_id) if row is not None else (None, None)
+    if certificate is None:
+      raise AdministrationDenied(404, "not_found")
+    qualifications = [{**q, "certificate": None} if q is qualification else q for q in row["qualifications"]]
+    row = self._write_profile(target, {**row, "qualifications": qualifications}, caller.account_id)
+    return {"profile": self._profile_dto(target, row), "removed": certificate["ref"],
+            "accountId": caller.account_id, "targetId": target.account_id}
+
+  def _purge_target(self, actor, account_id):
+    """The account being deleted (state `deleting`), or one already gone, which only a full-portfolio
+    Super-Tenant Admin may purge: nobody else's authority over it can be shown any more."""
+    caller = self._actor(actor)
+    target_id = canonical_account_id(account_id)
+    if not target_id:
+      raise AdministrationDenied(400, "invalid_request")
+    target = self.accounts.get_account(target_id)
+    if target is None:
+      if not holds_platform_role(caller):
+        raise AdministrationDenied(404, "not_found")
+    elif not self._can_manage_profile(caller, target):
+      raise AdministrationDenied(404, "not_found")
+    elif target.state != "deleting":
+      raise AdministrationDenied(409, "account_not_deleting")
+    return caller, target_id
+
+  @_endpoint
+  def begin_account_profile_purge(self, actor, account_id=None):
+    """The certificate files of the account's profile row, whichever incarnation wrote it; the
+    row stays until `finish_account_profile_purge`, so a failed file delete can be repeated."""
+    caller, target_id = self._purge_target(actor, account_id)
+    raw = self.store.raw_record(account_profile.KIND, target_id)
+    refs = []
+    for q in (raw or {}).get("qualifications") or []:
+      cert = q.get("certificate") if isinstance(q, dict) else None
+      if isinstance(cert, dict) and isinstance(cert.get("ref"), str) and cert["ref"]:
+        refs.append(cert["ref"])
+    return {"accountId": caller.account_id, "targetId": target_id, "refs": refs, "present": raw is not None}
+
+  @_endpoint
+  def finish_account_profile_purge(self, actor, account_id=None):
+    """Remove the row (idempotent: an absent row is already purged)."""
+    caller, target_id = self._purge_target(actor, account_id)
+    present = self.store.raw_record(account_profile.KIND, target_id) is not None
+    if present:
+      self.store.delete(account_profile.KIND, target_id)
+    return {"accountId": caller.account_id, "targetId": target_id, "deleted": present}
+
+  def reviewer_snapshot(self, account_id):
+    """The reviewer's name, signature line and organization as of now, for a review row: empty
+    `full_name` when the account has no profile of this incarnation. Not an endpoint."""
+    account = self.accounts.get_account(account_id)
+    if account is None:
+      return {"full_name": "", "signature": "", "organization": ""}
+    row = self._own_profile_row(account)
+    if row is None:
+      return {"full_name": "", "signature": "", "organization": ""}
+    dto = account_profile.profile_dto(row, self.clock().date(), self._organization_default(account))
+    return {"full_name": dto["full_name"], "signature": dto["signature"], "organization": dto["organization"]}
 
   # RM-134: the super-tenant branding, one row per deployment (contract `onboarding-drafts.md`
   # §Branding). Every active account reads it; a full-portfolio Super-Tenant Admin writes it while
