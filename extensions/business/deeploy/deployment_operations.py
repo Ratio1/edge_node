@@ -30,6 +30,8 @@ class DeploymentConflictError(ValueError):
 
 
 SIGNATURE_KEYS = {"EE_SIGN", "EE_SENDER", "EE_HASH", BCct.SIGN_CANON_V}
+# Signing and retry bookkeeping: a snapshot that differs only here is not new state.
+VOLATILE_OPERATION_FIELDS = SIGNATURE_KEYS | {"EE_ETH_SENDER", "EE_ETH_SIGN", "sequence", "updated_at", "sent_at"}
 
 
 def request_digest(request):
@@ -96,6 +98,46 @@ def list_order_differs(stored, running):
 class _DeploymentOperationsMixin:
   """Persist, execute, recover, and present asynchronous deployment operations."""
 
+  # Coordinator write discipline. Each value has an "off" setting that restores
+  # the previous behaviour, noted in brackets.
+  # Retry bookkeeping (sent_at, a repeated event) creates no snapshot [False].
+  OPERATION_SKIP_UNCHANGED_SAVES = True
+  # Re-publish an unchanged, already confirmed snapshot at most this often [0].
+  OPERATION_REPUBLISH_SECONDS = 300
+  # Back-off of a failed or blocked operation, doubling to the ceiling [0].
+  OPERATION_RETRY_MIN_SECONDS = 10
+  OPERATION_RETRY_MAX_SECONDS = 600
+  # Snapshot writes per rolling hour once an operation has written this many;
+  # phase changes (completion, operator release) are exempt [None].
+  OPERATION_FREE_WRITES = 100
+  OPERATION_HOURLY_WRITES = 30
+  # Repeat one operation's identical error or budget log at most this often.
+  OPERATION_LOG_SECONDS = 600
+  # Signature verdicts kept for unchanged operation records [0].
+  OPERATION_VERIFY_CACHE_SIZE = 4096
+
+  def _operation_runtime(self, operation_id):
+    """Return this process's non-replicated bookkeeping for one operation.
+
+    Parameters
+    ----------
+    operation_id : str
+      Operation identity.
+
+    Returns
+    -------
+    dict
+      Last confirmed snapshot (``replicated``, ``replicated_at``), command
+      throttle (``sent_at``), back-off (``seen``, ``delay``, ``next_attempt``),
+      recent snapshot write times (``writes``) and log throttles (``logged``).
+      A restart loses it, which repeats at most one replication or command.
+    """
+    states = vars(self).setdefault("_deployment_operation_runtime", {})
+    return states.setdefault(operation_id, dict(
+      replicated=None, replicated_at=0, sent_at={}, seen=None, delay=0, next_attempt=0,
+      writes=[], logged={},
+    ))
+
   def _init_deployment_operations(self):
     """Start the independent execution worker and initialize bounded caches."""
     self._deployment_preparations = {}
@@ -133,11 +175,27 @@ class _DeploymentOperationsMixin:
       return False
 
   def _operation_records(self):
-    """Select the newest verified snapshot per operation from local replicas."""
+    """Select the newest verified snapshot per operation from local replicas.
+
+    A signature verdict is reused while the record under the same storage key
+    keeps its sequence, signature and hash. CStore verifies every write to this
+    namespace, so changed content cannot keep them. Only records present in
+    this read are kept, which bounds the cache by the namespace size.
+    """
     latest = {}
     trusted = set(self._operation_peers())
-    for record in (self.chainstore_hgetall(OPERATIONS_HKEY) or {}).values():
-      if not self._verify_operation_record(record, "coordinator"):
+    cache = vars(self).get("_operation_verdicts", {}) if self.OPERATION_VERIFY_CACHE_SIZE else {}
+    verdicts = {}
+    for key, record in (self.chainstore_hgetall(OPERATIONS_HKEY) or {}).items():
+      marker = (key,) + tuple(record.get(field) for field in ("sequence", "EE_SIGN", "EE_HASH")) \
+        if isinstance(record, dict) else None
+      cacheable = marker is not None and all(isinstance(item, (str, int, type(None))) for item in marker)
+      valid = cache.get(marker) if cacheable else None
+      if valid is None:
+        valid = self._verify_operation_record(record, "coordinator")
+      if cacheable and len(verdicts) < self.OPERATION_VERIFY_CACHE_SIZE:
+        verdicts[marker] = valid
+      if not valid:
         continue
       if record.get("coordinator") not in trusted or record.get("network") != self.evm_network:
         continue
@@ -151,12 +209,28 @@ class _DeploymentOperationsMixin:
       previous = latest.get(operation_id)
       if previous is None or sequence > previous["sequence"]:
         latest[operation_id] = record
+    self._operation_verdicts = verdicts
     return latest
 
   def _save_operation(self, operation, phase=None, message=None):
-    """Replicate a signed snapshot in a bounded sequence slot before side effects."""
+    """Replicate a signed snapshot in a bounded sequence slot before side effects.
+
+    Nothing is written when the phase stays, no new event is added and the
+    content equals the confirmed snapshot apart from VOLATILE_OPERATION_FIELDS.
+    A write that keeps the phase counts against the operation's write budget.
+    """
     if operation["coordinator"] != self.bc.address:
       raise ValueError("Only the accepting oracle can advance this operation.")
+    runtime = self._operation_runtime(operation["operation_id"])
+    next_phase = operation.get("phase") if phase is None else phase
+    last = (operation.get("events") or [{}])[-1]
+    repeated = (self.OPERATION_SKIP_UNCHANGED_SAVES and bool(message)
+                and last.get("message") == message and last.get("phase") == next_phase)
+    if (self.OPERATION_SKIP_UNCHANGED_SAVES and next_phase == operation.get("phase")
+        and (not message or repeated) and self._operation_is_confirmed(operation, runtime)):
+      return operation
+    if next_phase == operation.get("phase"):
+      self._check_operation_write_budget(operation, runtime)
     snapshot = copy.deepcopy(operation)
     for key in SIGNATURE_KEYS:
       snapshot.pop(key, None)
@@ -164,26 +238,94 @@ class _DeploymentOperationsMixin:
     snapshot["updated_at"] = self.time()
     if phase is not None:
       snapshot["phase"] = phase
-    if message:
+    if message and not repeated:
       events = snapshot.setdefault("events", [])
       events.append(dict(sequence=snapshot["sequence"], time=self.time(),
                          phase=snapshot["phase"], message=message))
       snapshot["events"] = events[-128:]
     self.bc.sign(snapshot, add_data=True, use_digest=True)
     key = "{}|{}".format(snapshot["operation_id"], snapshot["sequence"] % 8)
+    runtime["writes"].append(self.time())
     if not self.chainstore_hset(OPERATIONS_HKEY, key, snapshot, readonly=True,
                                **self._operation_write_kwargs()):
       raise RuntimeError("Deployment state replication is pending.")
+    runtime.update(replicated=(snapshot["sequence"], snapshot.get("EE_SIGN")), replicated_at=self.time())
     operation.clear()
     operation.update(snapshot)
     return operation
 
+  def _operation_is_confirmed(self, operation, runtime):
+    """Whether this exact content is the snapshot this process confirmed.
+
+    Parameters
+    ----------
+    operation : dict
+      Working copy, possibly changed in memory since it was loaded.
+    runtime : dict
+      The operation's bookkeeping from ``_operation_runtime``.
+
+    Returns
+    -------
+    bool
+      True when its sequence was confirmed and the stored snapshot of that
+      sequence has the same content apart from VOLATILE_OPERATION_FIELDS.
+    """
+    sequence, confirmed = operation.get("sequence", 0), runtime["replicated"]
+    if not sequence or confirmed is None or confirmed[0] != sequence:
+      return False
+    stored = self.chainstore_hget(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], sequence % 8))
+    content = lambda record: {key: value for key, value in record.items() if key not in VOLATILE_OPERATION_FIELDS}
+    return isinstance(stored, dict) and stored.get("sequence") == sequence and content(stored) == content(operation)
+
+  def _check_operation_write_budget(self, operation, runtime):
+    """Refuse a same-phase snapshot write beyond the operation's hourly budget.
+
+    A safety ceiling independent of why an operation keeps writing. Writes
+    that change the phase, including completion or an operator release to
+    ``completed``, never reach this check.
+
+    Parameters
+    ----------
+    operation : dict
+      Operation about to be saved; its sequence counts its lifetime writes.
+    runtime : dict
+      The operation's bookkeeping from ``_operation_runtime``.
+
+    Raises
+    ------
+    RuntimeError
+      When the budget is exhausted; the worker then keeps it in back-off.
+    """
+    now = self.time()
+    runtime["writes"] = [moment for moment in runtime["writes"] if 0 <= now - moment < 3600]
+    if (self.OPERATION_HOURLY_WRITES is None or operation.get("sequence", 0) < self.OPERATION_FREE_WRITES
+        or len(runtime["writes"]) < self.OPERATION_HOURLY_WRITES):
+      return
+    logged_at = runtime["logged"].get("budget")
+    if logged_at is None or not 0 <= now - logged_at < self.OPERATION_LOG_SECONDS:
+      runtime["logged"]["budget"] = now
+      self.P("Deployment operation {} in phase {} exceeded its snapshot write budget: {} writes in the "
+             "last hour at sequence {}. Same-phase writes are paused; completion and release still apply.".format(
+               operation["operation_id"], operation.get("phase"), len(runtime["writes"]),
+               operation.get("sequence")), color="r")
+    raise RuntimeError("Deployment operation snapshot write budget is exhausted.")
+
   def _replicate_operation(self, operation):
-    """Retry the exact durable snapshot, including after an uncertain write."""
+    """Retry the exact durable snapshot, including after an uncertain write.
+
+    A snapshot this process already confirmed is re-published only every
+    OPERATION_REPUBLISH_SECONDS, which still repairs peers that missed it.
+    A failed attempt is not remembered, so the next attempt retries it.
+    """
+    runtime = self._operation_runtime(operation["operation_id"])
+    marker = (operation["sequence"], operation.get("EE_SIGN"))
+    if runtime["replicated"] == marker and 0 <= self.time() - runtime["replicated_at"] < self.OPERATION_REPUBLISH_SECONDS:
+      return
     key = "{}|{}".format(operation["operation_id"], operation["sequence"] % 8)
     if not self.chainstore_hset(OPERATIONS_HKEY, key, operation, readonly=True,
                                **self._operation_write_kwargs()):
       raise RuntimeError("Deployment state replication is pending.")
+    runtime.update(replicated=marker, replicated_at=self.time())
 
   def _assert_no_active_deployment(self, job_id=None, app_id=None):
     """Serialize other job mutations against known deployment/recovery work."""
@@ -501,9 +643,13 @@ class _DeploymentOperationsMixin:
       if action == "start" and report_is_ready(report, config):
         continue
       key = "{}|{}|{}".format(attempt, action, node)
-      if self.time() - operation["sent_at"].get(key, 0) < 10:
+      # The resend throttle is process memory; the save below journals only a
+      # pending state change (such as blocked recovery) before dispatch.
+      sent_at = (self._operation_runtime(operation["operation_id"])["sent_at"]
+                 if self.OPERATION_SKIP_UNCHANGED_SAVES else operation["sent_at"])
+      if self.time() - sent_at.get(key, 0) < 10:
         continue
-      operation["sent_at"][key] = self.time()
+      sent_at[key] = self.time()
       self._save_operation(operation)
       payload = copy.deepcopy(config) if action == "start" else {
         "NAME": operation["app_id"], "TYPE": config["TYPE"],
@@ -667,22 +813,102 @@ class _DeploymentOperationsMixin:
     self._deployment_secret_request("revoke", operation, active_attempt=active_attempt)
 
   def _reconcile_coordinator_operations(self):
-    """Advance runtime execution and recovery for this receiving oracle."""
+    """Advance runtime execution and recovery for this receiving oracle.
+
+    An operation whose attempt raised or left recovery blocked waits with an
+    exponential back-off; a new snapshot or node report ends the wait.
+    """
     # Clear completed handoffs BEFORE reading snapshots. Admissions that finish
     # during that read keep their marker until the next pass, avoiding a stale
     # `preparing` snapshot racing the request's final `accepted` write.
     for operation_id, finished in self._deployment_preparations.copy().items():
       if finished.is_set():
         self._deployment_preparations.pop(operation_id)
-    own = [copy.deepcopy(operation) for operation in self._operation_records().values()
+    own = [operation for operation in self._operation_records().values()
            if operation["coordinator"] == self.bc.address]
-    for operation in own:
-      if operation["phase"] == "completed" or operation["operation_id"] in self._deployment_preparations:
+    states = vars(self).setdefault("_deployment_operation_runtime", {})
+    active = {operation["operation_id"] for operation in own if operation["phase"] != "completed"}
+    for operation_id in set(states) - active - set(self._deployment_preparations):
+      states.pop(operation_id, None)
+    for record in own:
+      if record["phase"] == "completed" or record["operation_id"] in self._deployment_preparations:
         continue
+      runtime = self._operation_runtime(record["operation_id"])
+      if self.time() < runtime["next_attempt"]:
+        # Waiting ends early on progress made elsewhere: a new snapshot or node report.
+        if runtime["seen"] == (record["sequence"], self._operation_evidence(record["operation_id"])):
+          continue
+        runtime["delay"] = 0
+      operation = copy.deepcopy(record)
+      phase, failure = operation["phase"], None
       try:
         self._advance_deployment_operation(operation)
-      except Exception:
-        self.P("Deployment operation waiting for storage or transport recovery.", color="y")
+      except Exception as exc:
+        failure = exc
+      if failure is None and (operation["phase"] != phase or operation.get("recovery") != "blocked"):
+        runtime.update(delay=0, next_attempt=0)
+      else:
+        self._back_off_operation(operation, runtime, phase, failure)
+
+  def _operation_evidence(self, operation_id):
+    """Fingerprint one operation's node reports, to end a back-off early.
+
+    Reports are not verified here: decisions still read verified reports. The
+    namespace is scanned at most once per OPERATION_RETRY_MIN_SECONDS.
+
+    Parameters
+    ----------
+    operation_id : str
+      Operation identity.
+
+    Returns
+    -------
+    frozenset or None
+      (storage key, sequence, status) of each report naming the operation.
+    """
+    now = self.time()
+    scanned_at, evidence = vars(self).get("_operation_evidence_scan", (None, {}))
+    if scanned_at is None or not 0 <= now - scanned_at < self.OPERATION_RETRY_MIN_SECONDS:
+      evidence = {}
+      for key, report in (self.chainstore_hgetall(NODE_OPERATIONS_HKEY) or {}).items():
+        if isinstance(report, dict) and isinstance(report.get("operation_id"), str):
+          evidence.setdefault(report["operation_id"], set()).add(
+            (key, str(report.get("sequence")), str(report.get("status"))))
+      evidence = {key: frozenset(items) for key, items in evidence.items()}
+      self._operation_evidence_scan = (now, evidence)
+    return evidence.get(operation_id)
+
+  def _back_off_operation(self, operation, runtime, phase, failure):
+    """Delay the next attempt of a failed or blocked operation.
+
+    Parameters
+    ----------
+    operation : dict
+      The operation as the attempt left it.
+    runtime : dict
+      Its bookkeeping from ``_operation_runtime``.
+    phase : str
+      Phase at the start of the attempt; a change resets the delay.
+    failure : Exception or None
+      What the attempt raised. Each distinct message is logged at most once
+      per OPERATION_LOG_SECONDS for this operation.
+    """
+    delay = 0 if operation["phase"] != phase else runtime["delay"]
+    delay = min(max(2 * delay, self.OPERATION_RETRY_MIN_SECONDS), self.OPERATION_RETRY_MAX_SECONDS)
+    now = self.time()
+    runtime.update(delay=delay, next_attempt=now + delay,
+                   seen=(operation.get("sequence"), self._operation_evidence(operation["operation_id"])))
+    if failure is None:
+      return
+    text = "{}: {}".format(type(failure).__name__, failure)[:300]
+    logged_at = runtime["logged"].get(text)
+    if logged_at is not None and 0 <= now - logged_at < self.OPERATION_LOG_SECONDS:
+      return
+    if len(runtime["logged"]) > 32:
+      runtime["logged"].clear()
+    runtime["logged"][text] = now
+    self.P("Deployment operation waiting for storage or transport recovery: {} in phase {}: {} "
+           "Next attempt in {:.0f}s.".format(operation["operation_id"], operation["phase"], text, delay), color="y")
 
   def _deployment_operation_worker(self):
     """Resume coordinator-owned work independently of HTTP and UI polling."""

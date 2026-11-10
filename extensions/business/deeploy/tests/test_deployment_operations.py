@@ -307,7 +307,8 @@ class DeploymentOperationTests(unittest.TestCase):
     plugin = Coordinator()
     operation = plugin.operation()
     for index in range(30):
-      plugin._save_operation(operation)
+      # Each save carries new state; an unchanged save writes nothing.
+      plugin._save_operation(operation, message="step {}".format(index))
     self.assertEqual(len(plugin.chainstore_hgetall(OPERATIONS_HKEY)), 8)
     self.assertEqual(plugin._operation_records()[operation["operation_id"]]["sequence"], 30)
 
