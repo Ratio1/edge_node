@@ -354,13 +354,14 @@ class TunnelsManagerPlugin(BasePlugin):
     # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
       raise Exception("No secrets found for sender: " + sender)
-    return secrets
+    return {k: v for k, v in secrets.items() if k != "cs_rev"} if isinstance(secrets, dict) else secrets
 
   @BasePlugin.endpoint(method="post")
   def add_secrets(self, payload: dict):
     """
     Endpoint for CSP addresses to add their own Cloudflare secrets.
     """
+    self._verify_nonce(payload['nonce'])  # a captured signed update cannot be replayed later
     sender = self.bc.eth_verify_payload_signature(
       payload=payload,
       no_hash=True,
@@ -372,8 +373,16 @@ class TunnelsManagerPlugin(BasePlugin):
       "cloudflare_account_id": payload['cloudflare_account_id'],
       "cloudflare_zone_id": payload['cloudflare_zone_id'],
       "cloudflare_domain": payload['cloudflare_domain'],
+      # The signed client time orders updates: a replica keeps the newest one, whatever order
+      # writes, restarts and syncs reach it in (chain store "cs_rev").
+      "cs_rev": int(payload['nonce'].replace("0x", ""), 16),
     }
-    self.chainstore_hset(hkey="tunnels_manager_secrets", key=sender, value=secrets)
+    stored = self.chainstore_hset(hkey="tunnels_manager_secrets", key=sender, value=secrets)
+    # The only trace of a secrets update: who, and whether other oracles confirmed it. Never the values.
+    self.P(f"Tunnel secrets update by {sender}: {'confirmed' if stored else 'NOT confirmed'} by other oracles",
+           color=None if stored else 'r')
+    if not stored:
+      raise Exception("Secrets were not saved: other oracles did not confirm the update. Please try again.")
     return {
       "success": True
     }
