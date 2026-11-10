@@ -46,7 +46,7 @@ class _DauthDeploymentSecretsMixin:
       raise ValueError("Secret action does not match the deployment phase.")
     if (operation.get("kind") == "delete") != (action == "delete" or (action == "revoke" and phase == "retiring_previous")):
       raise ValueError("Secret action does not match the deployment kind.")
-    plan = self.r1fs.get_json(operation["plan_cid"], timeout=10, show_logs=False)
+    plan = self._dauth_r1fs_get_json(operation["plan_cid"])
     if not isinstance(plan, dict):
       raise RuntimeError("Deployment plan is unavailable.")
     for attempt, key, node_key, instance_key, revision_key in (
@@ -210,7 +210,7 @@ class _DauthDeploymentSecretsMixin:
       representative = copy.deepcopy(next(iter(configs.values())))
       representative.pop("DEEPLOY_OPERATION", None)
       canonical = self._recursively_sort_pipeline_data(self.extract_invariable_data_from_pipeline(representative))
-      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, show_logs=False)
+      published = self._dauth_r1fs_get_json(pointer["pipeline_cid"])
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
       if published != canonical:
@@ -252,7 +252,7 @@ class _DauthDeploymentSecretsMixin:
           or pointer.get("revision") != operation["target_revision"]
           or not pointer.get("pipeline_cid")):
         raise RuntimeError("Active deployment publication is pending.")
-      published = self.r1fs.get_json(pointer["pipeline_cid"], timeout=10, show_logs=False)
+      published = self._dauth_r1fs_get_json(pointer["pipeline_cid"])
       if published is None:
         raise RuntimeError("Published deployment configuration is unavailable.")
       if published != canonical:

@@ -20,6 +20,9 @@ WHITELIST (oracles)
 
 
 """
+import os
+import threading
+
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
@@ -39,6 +42,11 @@ from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_job_mixin import _DeeployJobMixin
 
 __VER__ = '0.3.5'
+
+DAUTH_SECRETS_SYNC_WARN_INTERVAL = 5 * 60
+DAUTH_SECRETS_SYNCING_ERROR = "dAuth secret custody is syncing; retry later."
+# Custody exceptions raised in these files carry fixed texts; others may quote request values.
+DAUTH_CUSTODY_MESSAGE_SOURCES = ("dauth_mixin.py", "deployment_secrets.py")
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -61,6 +69,16 @@ _CONFIG = {
   'REQUESTS_LOG_INTERVAL': 5 * 60,
 
   'DAUTH_JOB_SECRETS_HSYNC_INTERVAL': 10 * 60,
+  # Until both secret namespaces synced once (and again after 2 intervals without a
+  # successful sync) secret requests are refused as retryable and the sync is retried.
+  'DAUTH_JOB_SECRETS_HSYNC_RETRY_INTERVAL': 15,
+  'DAUTH_JOB_SECRETS_HSYNC_TIMEOUT': 30,
+  'DAUTH_SECRETS_SYNC_FAIL_OPEN_AFTER': 0,  # seconds unsynced before serving anyway; 0 = never
+  'DAUTH_R1FS_READ_TIMEOUT': 15,
+  'DAUTH_R1FS_BACKGROUND_PIN': True,  # pin CIDs read with pin=False on a background thread
+  'DAUTH_PIPELINE_CACHE_TTL': 60 * 60,
+  'DAUTH_PIPELINE_CACHE_MAX_ENTRIES': 512,
+  'DAUTH_PIPELINE_CACHE_NEGATIVE_TTL': 5 * 60,
   'DAUTH_REGISTRY_REFRESH_INTERVAL': 60 * 60,
   'DAUTH_REGISTRY_REFRESH_RETRY_INTERVAL': 60,
 
@@ -141,6 +159,13 @@ class DauthManagerPlugin(
     self._last_dauth_registry_refresh = None
     self._dauth_registry_refresh_failed = False
     self._last_dauth_job_secrets_hsync = None
+    self._dauth_secrets_synced = False
+    self._dauth_secrets_last_sync = None
+    self._dauth_secrets_unsynced_since = None
+    self._dauth_secrets_sync_generation = 0
+    self._dauth_secrets_sync_thread = None
+    self._dauth_secrets_sync_warned = None
+    self._dauth_hsync_all_peers = True
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
     return
@@ -148,6 +173,7 @@ class DauthManagerPlugin(
   
 
   def on_init(self):
+    self._mark_dauth_secrets_unsynced()
     self._load_dauth_revoked_nodes()
     self._check_dauth_server_enabled_on_start()
     if self._is_dauth_server_enabled():
@@ -300,6 +326,8 @@ class DauthManagerPlugin(
     # endif
     self._require_dauth_revoked_nodes()
     self._start_dauth_revoked_recorder()
+    # Protected writes were refused while this node was outside the registry.
+    self._mark_dauth_secrets_unsynced()
 
     self.failed = False
     self._stop_request_monitor.clear()
@@ -308,6 +336,7 @@ class DauthManagerPlugin(
 
   def on_close(self):
     self._stop_dauth_revoked_recorder()
+    self._stop_dauth_r1fs_pinner()
     super(DauthManagerPlugin, self).on_close()
     return
 
@@ -336,29 +365,116 @@ class DauthManagerPlugin(
       self._maybe_log_and_save_tracked_requests()
     return
 
+  def _mark_dauth_secrets_unsynced(self):
+    """Close the secret gate until both namespaces sync again, and retry at once."""
+    self._dauth_secrets_synced = False
+    self._dauth_secrets_unsynced_since = self.time()
+    self._dauth_secrets_sync_generation = getattr(self, "_dauth_secrets_sync_generation", 0) + 1
+    self._last_dauth_job_secrets_hsync = None
+    return
+
+  def _require_dauth_secrets_synced(self):
+    """Refuse secret serving (retryable) while the local secret replica may be stale."""
+    if getattr(self, "_dauth_secrets_synced", False):
+      return
+    fail_open_after = self.cfg_dauth_secrets_sync_fail_open_after
+    since = getattr(self, "_dauth_secrets_unsynced_since", None)
+    if fail_open_after and since is not None and self.time() - since >= fail_open_after:
+      return
+    raise RuntimeError(DAUTH_SECRETS_SYNCING_ERROR)
+
   def _maybe_hsync_dauth_job_secrets(self):
+    """Start a secret sync pass when due: every retry interval while unsynced, else every interval."""
     if not self._is_dauth_server_enabled():
       return None
 
     now = self.time()
+    interval = self.cfg_dauth_job_secrets_hsync_interval
+    last_ok = getattr(self, "_dauth_secrets_last_sync", None)
+    if getattr(self, "_dauth_secrets_synced", False) and (last_ok is None or now - last_ok > 2 * interval):
+      self.P(f"dAuth secret custody is stale: no successful sync for {2 * interval}s; refusing secrets until synced.", color='r')
+      self._mark_dauth_secrets_unsynced()
+    if not getattr(self, "_dauth_secrets_synced", False):
+      interval = self.cfg_dauth_job_secrets_hsync_retry_interval
     last_sync = getattr(self, "_last_dauth_job_secrets_hsync", None)
-    if (
-      last_sync is not None
-      and now - last_sync < self.cfg_dauth_job_secrets_hsync_interval
-    ):
+    thread = getattr(self, "_dauth_secrets_sync_thread", None)
+    if (last_sync is not None and now - last_sync < interval) or (thread is not None and thread.is_alive()):
       return None
 
     self._last_dauth_job_secrets_hsync = now
-    for hkey in (DAUTH_JOB_SECRETS_CSTORE_HKEY, DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY):
-      try:
-        self.chainstore_hsync(
-          hkey=hkey,
-          timeout=5,
-          **dauth_registry_write_kwargs(self),
-        )
-      except Exception as exc:
-        self.P(f"Could not sync dAuth job secrets: {exc}", color="y")
+    generation = getattr(self, "_dauth_secrets_sync_generation", 0)
+    try:
+      routing = dauth_registry_write_kwargs(self)
+    except Exception as exc:
+      self._record_dauth_secrets_sync(generation, now, f"no dAuth registry peers: {exc}")
+      return None
+    self._run_dauth_secrets_sync(lambda: self._sync_dauth_job_secrets(generation, routing))
     return None
+
+  def _run_dauth_secrets_sync(self, target):
+    """Run one sync pass off the request thread (tests replace this to run inline)."""
+    self._dauth_secrets_sync_thread = threading.Thread(target=target, name="dauth-secrets-sync", daemon=True)
+    self._dauth_secrets_sync_thread.start()
+    return
+
+  def _sync_dauth_job_secrets(self, generation, routing):
+    """Merge both secret namespaces from every answering dAuth peer; never raises."""
+    started = self.time()
+    registry = getattr(self, "_dauth_registry_eth_oracles", None)
+    others = [eth for eth in registry or [] if eth.lower() != self.bc.eth_address.lower()]
+    errors = []
+    if registry is None:
+      errors.append("the dAuth registry is not loaded")
+    elif not others:
+      pass  # single-member registry: there is nobody to learn from
+    elif not [peer for peer in routing["extra_peers"] if peer != self.bc.address]:
+      errors.append("no other dAuth registry peer is resolvable")
+    else:
+      for hkey in (DAUTH_JOB_SECRETS_CSTORE_HKEY, DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY):
+        try:
+          result = self._dauth_hsync(hkey, routing)
+          if isinstance(result, dict) and result.get("responses") == 0:
+            errors.append(f"{hkey}: no peer answered")
+        except Exception as exc:
+          errors.append(f"{hkey}: {exc}")
+    self._record_dauth_secrets_sync(generation, started, "; ".join(errors) or None)
+    return
+
+  def _dauth_hsync(self, hkey, routing):
+    kwargs = dict(hkey=hkey, timeout=self.cfg_dauth_job_secrets_hsync_timeout, **routing)
+    if getattr(self, "_dauth_hsync_all_peers", True):
+      try:
+        return self.chainstore_hsync(all_peers=True, **kwargs)
+      except TypeError as exc:
+        if "all_peers" not in str(exc):
+          raise
+        self._dauth_hsync_all_peers = False
+        self.P("chainstore_hsync has no all_peers option on this core; using first-answer sync.", color='y')
+    return self.chainstore_hsync(**kwargs)
+
+  def _record_dauth_secrets_sync(self, generation, started, error):
+    if generation != getattr(self, "_dauth_secrets_sync_generation", 0):
+      return  # the gate was reset while this pass ran
+    if error is None:
+      if not getattr(self, "_dauth_secrets_synced", False):
+        self.P("dAuth secret custody synced from dAuth peers; serving secrets.")
+      self._dauth_secrets_last_sync = started
+      self._dauth_secrets_synced = True
+      return
+    now = self.time()
+    last_warned = getattr(self, "_dauth_secrets_sync_warned", None)
+    if last_warned is not None and now - last_warned < DAUTH_SECRETS_SYNC_WARN_INTERVAL:
+      return
+    self._dauth_secrets_sync_warned = now
+    last_ok = getattr(self, "_dauth_secrets_last_sync", None)
+    age = "never" if last_ok is None else f"{now - last_ok:.0f}s ago"
+    try:
+      self._require_dauth_secrets_synced()
+      state = "serving from the local replica"
+    except RuntimeError:
+      state = "refusing secret requests"
+    self.P(f"Could not sync dAuth job secrets: {error}. Last successful sync: {age}; {state}.", color="y")
+    return
 
   def __get_current_epoch(self):
     """
@@ -505,11 +621,36 @@ class DauthManagerPlugin(
     else:
       try:
         data = self.process_dauth_reconcile_secrets_request(body)
-      except Exception:
+      except Exception as exc:
         # New values can be present in the request or dependency exceptions.
-        self.P(f"dAuth secret reconciliation failed for request from {self.get_request_client_ip()}.", color='r')
+        self.P(
+          f"dAuth secret reconciliation failed for request from {self.get_request_client_ip()}: "
+          f"{self._dauth_custody_failure_reason(body, exc)}", color='r'
+        )
         data = {'error': 'dAuth secret reconciliation failed'}
     return self.__get_response({'nonce': nonce, **data})
+
+  @staticmethod
+  def _dauth_custody_failure_reason(body, exc):
+    """Name a custody failure without request or secret values.
+
+    Always the exception type, raise site and operation reference; the message
+    only when dAuth custody code raised it (those texts are fixed).
+    """
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+      tb = tb.tb_next
+    source = "unknown"
+    if tb is not None:
+      source = "{}:{}".format(os.path.basename(tb.tb_frame.f_code.co_filename), tb.tb_lineno)
+    reason = f"{type(exc).__name__} at {source}"
+    if source.split(":")[0] in DAUTH_CUSTODY_MESSAGE_SOURCES:
+      reason += f": {str(exc)[:200]}"
+    body = body if isinstance(body, dict) else {}
+    operation = body.get("operation") if isinstance(body.get("operation"), dict) else {}
+    return "{} (operation={}, action={}, job={})".format(
+      reason, str(operation.get("operation_id"))[:80], str(body.get("action"))[:16], str(body.get("job_id"))[:16],
+    )
 
   @BasePlugin.endpoint(method="post")
   # /get_secrets
@@ -530,6 +671,7 @@ class DauthManagerPlugin(
       return response
 
     try:
+      self._require_dauth_secrets_synced()
       data = self.process_dauth_get_secret_request(body)
     except Exception as e:
       self.P("Error processing get_secrets request from {}: {}".format(
@@ -558,6 +700,7 @@ class DauthManagerPlugin(
       })
 
     try:
+      self._require_dauth_secrets_synced()
       data = self.process_dauth_reveal_secret_request(body)
     except Exception as e:
       self.P("Error processing reveal_job_secrets request from {}: {}".format(

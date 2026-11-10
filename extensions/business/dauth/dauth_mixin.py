@@ -14,6 +14,10 @@ plugin to provide a complete decentralized authentication solution.
 
 """
 
+import os
+import threading
+from collections import OrderedDict, deque
+
 from .dauth_registry import (
   DAUTH_SECRET_PIPELINE_CID_KEY,
   dauth_registry_write_kwargs,
@@ -25,6 +29,17 @@ DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
 DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY = "DAUTH_JOB_SECRET_REVISIONS"
 DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
 DAUTH_SECRET_REQUEST_MAX_AGE_SECONDS = 120
+# Defaults for the manager's config keys of the same name (mixin users without config get these).
+DAUTH_R1FS_READ_TIMEOUT = 15  # total budget of one dAuth R1FS read, in seconds
+DAUTH_PIPELINE_CACHE_TTL = 60 * 60
+DAUTH_PIPELINE_CACHE_MAX_ENTRIES = 512
+DAUTH_PIPELINE_CACHE_NEGATIVE_TTL = 300
+# The manager config enables it; mixin users without config (test harnesses) start no thread.
+DAUTH_R1FS_BACKGROUND_PIN = False
+DAUTH_R1FS_PIN_QUEUE_MAX = 256
+DAUTH_R1FS_PINNED_MAX = 2048
+DAUTH_R1FS_PIN_RETRY_DELAY = 10 * 60
+DAUTH_R1FS_PIN_IDLE_WAIT = 30
 DAUTH_SECRET_REVEAL_ACTION = "reveal_job_secrets"
 DAUTH_VIEW_SECRETS_PERMISSION = 1 << 4
 DEEPLOY_WALLET_MESSAGE_PREFIX = "Please sign this message for Deeploy: "
@@ -266,11 +281,146 @@ class _DauthMixin(object):
     record = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
     return record.get("pipeline_cid") if isinstance(record, dict) else record
 
+  def _dauth_setting(self, name, default):
+    return getattr(self, "cfg_" + name.lower(), default)
+
+  def _dauth_r1fs_get_json(self, cid):
+    """Read an R1FS JSON document on the dAuth request thread, without pinning.
+
+    With ``pin=True`` R1FS first runs ``ipfs pin add`` under a fixed 90 s timeout
+    that ignores ``timeout``. ``ipfs get`` is retried once after a relay
+    self-heal, so each attempt gets half of the read budget.
+    """
+    budget = self._dauth_setting("DAUTH_R1FS_READ_TIMEOUT", DAUTH_R1FS_READ_TIMEOUT)
+    document = self.r1fs.get_json(cid, timeout=max(1, budget / 2), pin=False, show_logs=False)
+    if document is not None:
+      self._queue_dauth_r1fs_pin(cid)
+    return document
+
+  def _queue_dauth_r1fs_pin(self, cid):
+    """Hand a successfully read CID to the background pinner, which keeps it retrievable. Never raises."""
+    try:
+      if not self._dauth_setting("DAUTH_R1FS_BACKGROUND_PIN", DAUTH_R1FS_BACKGROUND_PIN):
+        return
+      pinner = getattr(self, "_dauth_r1fs_pinner", None)
+      if pinner is None:
+        pinner = self._dauth_r1fs_pinner = {
+          "lock": threading.Lock(), "wake": threading.Event(), "stop": threading.Event(), "thread": None,
+          "queue": deque(maxlen=DAUTH_R1FS_PIN_QUEUE_MAX),  # drops the oldest CID when full
+          "pinned": OrderedDict(), "failed": OrderedDict(),  # failed: CID -> retry time, None once retried
+        }
+      with pinner["lock"]:
+        if cid in pinner["pinned"] or cid in pinner["failed"] or cid in pinner["queue"]:
+          return
+        pinner["queue"].append(cid)
+        if pinner["thread"] is None or not pinner["thread"].is_alive():
+          pinner["thread"] = threading.Thread(target=self._dauth_r1fs_pin_loop, args=(pinner,),
+                                              name="dauth-r1fs-pin", daemon=True)
+          pinner["thread"].start()
+      pinner["wake"].set()
+    except Exception:
+      pass
+    return
+
+  def _stop_dauth_r1fs_pinner(self):
+    pinner = getattr(self, "_dauth_r1fs_pinner", None)
+    if pinner is not None:
+      pinner["stop"].set()
+      pinner["wake"].set()
+    return
+
+  def _dauth_r1fs_pin_loop(self, pinner):
+    """Pin each queued CID once; a failure is logged once and retried once after 10 min."""
+    while not pinner["stop"].is_set():
+      with pinner["lock"]:
+        now = self.time()
+        for cid, retry_at in list(pinner["failed"].items()):
+          if retry_at is not None and now >= retry_at:
+            pinner["failed"][cid] = None
+            pinner["queue"].append(cid)
+        cid = pinner["queue"].popleft() if pinner["queue"] else None
+      if cid is None:
+        pinner["wake"].wait(DAUTH_R1FS_PIN_IDLE_WAIT)
+        pinner["wake"].clear()
+        continue
+      try:
+        # The content is local by now, so only `ipfs pin add` does real work. A separate
+        # folder keeps this download apart from request-thread reads of the same CID.
+        folder = getattr(self.r1fs, "download_folder", None)
+        kwargs = {"local_folder": os.path.join(folder, "_dauth_pin")} if isinstance(folder, str) else {}
+        pinned = self.r1fs.get_json(cid, pin=True, show_logs=False, **kwargs) is not None
+      except Exception:
+        pinned = False
+      first_failure = False
+      with pinner["lock"]:
+        if pinned:
+          pinner["failed"].pop(cid, None)
+          pinner["pinned"][cid] = True
+          while len(pinner["pinned"]) > DAUTH_R1FS_PINNED_MAX:
+            pinner["pinned"].popitem(last=False)
+        elif cid not in pinner["failed"]:
+          first_failure = True
+          pinner["failed"][cid] = self.time() + DAUTH_R1FS_PIN_RETRY_DELAY
+          while len(pinner["failed"]) > DAUTH_R1FS_PINNED_MAX:
+            pinner["failed"].popitem(last=False)
+      if first_failure:
+        try:
+          self.P(f"dAuth could not pin R1FS CID {cid}; retrying once in {DAUTH_R1FS_PIN_RETRY_DELAY}s.", color='y')
+        except Exception:
+          pass
+    return
+
+  def _load_legacy_pipeline_facts(self, pipeline_cid):
+    """Return ``(facts, pipeline)`` for a raw-CID pipeline; ``pipeline`` is None on a cache hit.
+
+    Only the authorization facts are cached, never the document, which may carry
+    plaintext values. CIDs are content-addressed and both the key and the content
+    come from this node's pointer and R1FS, never from the request, so an entry
+    cannot go stale or be poisoned. Failed fetches are cached briefly so a dead
+    CID cannot stall the serial request thread on every retry.
+    """
+    cache = getattr(self, "_dauth_legacy_pipeline_cache", None)
+    if cache is None:
+      cache = self._dauth_legacy_pipeline_cache = OrderedDict()
+    entry = cache.get(pipeline_cid)
+    if entry is not None and self.time() < entry[0]:
+      if entry[1] is None:
+        raise RuntimeError("Existing pipeline configuration is unavailable.")
+      cache.move_to_end(pipeline_cid)
+      return entry[1], None
+    try:
+      pipeline = self._dauth_r1fs_get_json(pipeline_cid)
+    except Exception:
+      pipeline = None
+    facts = None
+    if isinstance(pipeline, dict):
+      specs = pipeline.get("DEEPLOY_SPECS", {})
+      is_dict = isinstance(specs, dict)
+      facts = {
+        "job_id": str(specs.get("job_id")) if is_dict else None,
+        "legacy": (is_dict and "secret_revision" not in specs and specs.get("revision", 0) == 0
+                   and pipeline.get("DEEPLOY_OPERATION") is None),
+        "nodes": frozenset(
+          self._normalize_node_address_for_compare(node) for node in self._pipeline_runner_nodes(pipeline)
+        ),
+      }
+    if facts is None:
+      ttl = self._dauth_setting("DAUTH_PIPELINE_CACHE_NEGATIVE_TTL", DAUTH_PIPELINE_CACHE_NEGATIVE_TTL)
+    else:
+      ttl = self._dauth_setting("DAUTH_PIPELINE_CACHE_TTL", DAUTH_PIPELINE_CACHE_TTL)
+    cache[pipeline_cid] = (self.time() + ttl, facts)
+    cache.move_to_end(pipeline_cid)
+    while len(cache) > self._dauth_setting("DAUTH_PIPELINE_CACHE_MAX_ENTRIES", DAUTH_PIPELINE_CACHE_MAX_ENTRIES):
+      cache.popitem(last=False)
+    if facts is None:
+      raise RuntimeError("Existing pipeline configuration is unavailable.")
+    return facts, pipeline
+
   def _load_dauth_job_pipeline_record(self, job_id):
     cid = self._load_dauth_pipeline_cid(job_id)
     if not cid:
       return None, None
-    return cid, self.r1fs.get_json(cid, show_logs=False)
+    return cid, self._dauth_r1fs_get_json(cid)
 
   def _load_dauth_job_pipeline(self, job_id):
     _, pipeline = self._load_dauth_job_pipeline_record(job_id)
@@ -546,17 +696,18 @@ class _DauthMixin(object):
     pipeline_cid = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
     if not isinstance(pipeline_cid, str) or not pipeline_cid:
       raise ValueError("Secret revision is required or the existing pipeline is unavailable.")
-    pipeline = self.r1fs.get_json(pipeline_cid, show_logs=False)
-    if not isinstance(pipeline, dict):
-      raise RuntimeError("Existing pipeline configuration is unavailable.")
-    specs = pipeline.get("DEEPLOY_SPECS", {})
-    if (not isinstance(specs, dict) or str(specs.get("job_id")) != job_id
-        or "secret_revision" in specs or specs.get("revision", 0) != 0
-        or pipeline.get("DEEPLOY_OPERATION") is not None):
+    facts, pipeline = self._load_legacy_pipeline_facts(pipeline_cid)
+    if not facts["legacy"] or facts["job_id"] != job_id:
       raise ValueError("Secret revision is required for this pipeline.")
-    nodes = [self._normalize_node_address_for_compare(node) for node in self._pipeline_runner_nodes(pipeline)]
-    if self._normalize_node_address_for_compare(requester) not in nodes:
+    if self._normalize_node_address_for_compare(requester) not in facts["nodes"]:
       raise ValueError("Sender is not running the existing job.")
+    if pipeline is None:
+      current = self._load_dauth_job_secret_bundle(job_id)
+      if isinstance(current, dict) and DAUTH_SECRET_PIPELINE_CID_KEY not in current:
+        # Only binding a pre-CID bundle needs the document itself.
+        pipeline = self._dauth_r1fs_get_json(pipeline_cid)
+        if not isinstance(pipeline, dict):
+          raise RuntimeError("Existing pipeline configuration is unavailable.")
     bundle = self._load_current_dauth_secret_bundle(
       job_id, pipeline_cid, pipeline, require_unversioned=True,
     )

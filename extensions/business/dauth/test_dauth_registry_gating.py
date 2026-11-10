@@ -127,7 +127,7 @@ class _FakeRequestTrackingMixin:
   pass
 
 
-def _load_dauth_manager_class():
+def _load_dauth_manager_class(dauth_mixin=_FakeDauthMixin):
   source_path = ROOT / "extensions" / "business" / "dauth" / "dauth_manager.py"
   source = source_path.read_text(encoding="utf-8")
   source = source.replace(
@@ -161,7 +161,7 @@ def _load_dauth_manager_class():
     "BasePlugin": _FakeBasePlugin,
     "DAUTH_JOB_SECRETS_CSTORE_HKEY": DAUTH_JOB_SECRETS_CSTORE_HKEY,
     "DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY": DAUTH_JOB_SECRET_REVISIONS_CSTORE_HKEY,
-    "_DauthMixin": _FakeDauthMixin,
+    "_DauthMixin": dauth_mixin,
     "_NodeTagsMixin": _FakeNodeTagsMixin,
     "_RequestTrackingMixin": _FakeRequestTrackingMixin,
     "dauth_registry_write_kwargs": (
@@ -301,7 +301,7 @@ class _FakeR1FS:
   def __init__(self, data):
     self.data = data
 
-  def get_json(self, cid, show_logs=False):  # pylint: disable=unused-argument
+  def get_json(self, cid, show_logs=False, **kwargs):  # pylint: disable=unused-argument
     return self.data[cid]
 
 
@@ -951,6 +951,10 @@ class DauthServerRegistryGateTests(unittest.TestCase):
     plugin._dauth_registry_refresh_failed = False
     plugin._last_dauth_job_secrets_hsync = None
     plugin.cfg_dauth_job_secrets_hsync_interval = 10 * 60
+    plugin.cfg_dauth_job_secrets_hsync_retry_interval = 15
+    plugin.cfg_dauth_job_secrets_hsync_timeout = 30
+    plugin.cfg_dauth_secrets_sync_fail_open_after = 0
+    plugin._run_dauth_secrets_sync = lambda target: target()  # inline, deterministic
     plugin.cfg_dauth_registry_refresh_interval = 60 * 60
     plugin.cfg_dauth_registry_refresh_retry_interval = 60
     plugin._is_plugin_ready = None
@@ -982,6 +986,7 @@ class DauthServerRegistryGateTests(unittest.TestCase):
   def test_secret_endpoint_errors_echo_request_nonce(self):
     plugin = self._make_manager(dauth_oracle=True)
     plugin._dauth_server_enabled = True
+    plugin._dauth_secrets_synced = True
     plugin.process_dauth_add_secrets_request = lambda body: (_ for _ in ()).throw(
       ValueError("add failed")
     )
