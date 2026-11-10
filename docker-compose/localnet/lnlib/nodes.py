@@ -36,6 +36,11 @@ WEB_PLUGINS = {
   'ORACLE_API': 31303,
 }
 NO_TUNNEL_PLUGINS = ('NAEURAL_RELEASE_APP', 'TUNNELS_MANAGER', 'LIVENESS_API')
+# Each web plugin of a node is two more processes of about 650 MB. A "headless" node runs the whole node
+# (messaging, network monitor, chain store, oracle sync) without them, so that a workstation can hold a
+# mainnet-sized set of chain-store peers. Requests are served by the full oracles only.
+WEB_PLUGIN_SIGNATURES = ('DAUTH_MANAGER', 'DEEPLOY_MANAGER_API', 'ORACLE_API', 'NAEURAL_RELEASE_APP',
+                         'TUNNELS_MANAGER', 'LIVENESS_API', 'CSTORE_MANAGER_API', 'R1FS_MANAGER_API')
 
 # Mainnet oracles share one Cloudflare tunnel token per web plugin. A plugin refuses to start without a
 # token, so the localnet supplies a marker; no tunnel is started (TUNNEL_ENGINE_ENABLED is false).
@@ -61,9 +66,14 @@ def volume(name):
   return '{}_{}_cache'.format(PROJECT, name)
 
 
-def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet'):
-  """Return the list of real nodes. ``arms`` maps node name to the source tree it runs."""
+def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet', full_oracles=None, full_workers=1):
+  """
+  Return the list of real nodes. ``arms`` maps node name to the source tree it runs. The first
+  ``full_oracles`` oracles (never fewer than the seeds) and the first ``full_workers`` workers run their
+  web plugins; the others are headless.
+  """
   arms = arms or {}
+  full_oracles = max(len(SEEDS), oracles if full_oracles is None else full_oracles)
   if oracles < len(SEEDS):
     raise LocalnetError('a localnet needs at least the {} seed oracles'.format(len(SEEDS)))
   if oracles - len(SEEDS) > len(ORACLE_NAMES):
@@ -72,9 +82,11 @@ def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet')
   for idx, (name, broker, relay) in enumerate(SEEDS):
     nodes.append({'name': name, 'role': 'seed', 'supervisor': True, 'broker': broker, 'relay': relay, 'ip': ip(51 + idx)})
   for idx, name in enumerate(ORACLE_NAMES[:oracles - len(SEEDS)]):
-    nodes.append({'name': name, 'role': 'oracle', 'supervisor': True, 'ip': ip(55 + idx)})
+    nodes.append({'name': name, 'role': 'oracle', 'supervisor': True, 'ip': ip(55 + idx),
+                  'headless': len(SEEDS) + idx >= full_oracles})
   for idx in range(workers):
-    nodes.append({'name': 'r1w-{:02d}'.format(idx + 1), 'role': 'worker', 'supervisor': False, 'ip': ip(81 + idx)})
+    nodes.append({'name': 'r1w-{:02d}'.format(idx + 1), 'role': 'worker', 'supervisor': False, 'ip': ip(81 + idx),
+                  'headless': idx >= full_workers})
   for node in nodes:
     node['arm'] = arms.get(node['name'], default_arm)
     node['evm_net'] = evm_net
@@ -129,6 +141,25 @@ def create_fleet_identities(home, arm, evm_net, licensed=216, revoked=40):
   return [dict(keys[name], name=name, revoked=name.startswith('x')) for name in names]
 
 
+def seed_chain_store(home, nodes, keys=3657, value_bytes=1400, legacy_jobs=30, legacy_first=101):
+  """Write the same production-sized synthetic replica into every oracle's data folder (nodes must be stopped)."""
+  oracles = [node for node in nodes if node['role'] in ('seed', 'oracle')]
+  if keys <= 0 or not oracles:
+    return None
+  mounts = [(HERE, '/opt/localnet', 'ro')] + [
+    (node['volume'], '/nodes/{}/_local_cache'.format(node['name']), 'rw') for node in oracles]
+  out = tool_run(
+    '{} -I /opt/localnet/ctl/seed_cstore.py /nodes {} {} {} {} {} {}'.format(
+      PYTHON, keys, value_bytes, oracles[0]['address'], legacy_jobs, legacy_first,
+      ' '.join(node['name'] for node in oracles)),
+    mounts=mounts, timeout=600,
+  )
+  line = [item for item in out.stdout.splitlines() if item.startswith('SEEDED ')]
+  if not line:
+    raise LocalnetError('chain-store seeding failed:\n' + out.stdout[-2000:])
+  return json.loads(line[-1][7:])
+
+
 def wallet(index):
   """A made-up licence owner wallet."""
   return '0x' + '{:040x}'.format(0xA11CE00000 + index)
@@ -159,13 +190,22 @@ def build_chain_state(nodes, fleet=None):
   return state
 
 
-def _startup_overrides():
+def _startup_overrides(node):
   admin = {}
   for signature, port in WEB_PLUGINS.items():
     admin[signature] = {'PORT': port, 'TUNNEL_ENGINE_ENABLED': False}
   for signature in NO_TUNNEL_PLUGINS:
     admin[signature] = {'TUNNEL_ENGINE_ENABLED': False}
-  return {'ADMIN_PIPELINE': admin}
+  if node.get('headless'):
+    for signature in WEB_PLUGIN_SIGNATURES:
+      admin.setdefault(signature, {})['DISABLED'] = True
+  return {
+    'ADMIN_PIPELINE': admin,
+    # A node restarts itself when the host runs low on memory. Here one host holds the whole network,
+    # so that check would stop every node at once; it is switched off.
+    'MIN_AVAIL_MEM_THR': -1,
+    'CRITICAL_RESTART_LOW_MEM': -1,
+  }
 
 
 def node_env(node, manifest, secrets):
@@ -174,8 +214,6 @@ def node_env(node, manifest, secrets):
     'EE_EVM_NET': node['evm_net'],
     'EE_DD': '0',  # no docker-in-docker: the image entrypoint then execs python as PID 1, as in production
     'EE_ID': node['name'],
-    'EE_SUPERVISOR': 'true' if node['supervisor'] else 'false',
-    'EE_TUNNEL_ENGINE': 'cloudflare',
     'PYTHONPATH': '/opt/r1src/sdk:/opt/r1src/core',
     'SSL_CERT_FILE': '/run/localnet/mqtt-ca.crt',
     'R1_LOCALNET_NODE': node['name'],
@@ -185,6 +223,8 @@ def node_env(node, manifest, secrets):
     env.update(PLACEHOLDER_ENV)
     env.update({key: 'localnet-no-tunnel' for key in TUNNEL_TOKEN_KEYS})
     env.update({
+      'EE_SUPERVISOR': 'true',
+      'EE_TUNNEL_ENGINE': 'cloudflare',
       'EE_DAUTH_URL': 'seed_node',  # the marker mainnet seeds carry: do not ask dAuth, serve it
       'EE_REVOKED_NODE_ADDRESSES': ','.join(manifest.get('revoked_addresses') or []),
       'EE_MQTT_HOST': mesh['brokers'][node['broker']]['ip'],
@@ -214,7 +254,7 @@ def write_node_files(home, manifest, secrets):
     os.chmod(ndir / 'env', 0o600)
     (ndir / 'node.json').write_text(json.dumps({
       'name': node['name'], 'role': node['role'], 'arm': node['arm'],
-      'startup': dict(_startup_overrides(), **(node.get('startup') or {})),
+      'startup': dict(_startup_overrides(node), **(node.get('startup') or {})),
     }, indent=1, sort_keys=True))
   return
 
@@ -242,7 +282,12 @@ def node_services(home, manifest):
         '{}:/edge_node/_local_cache'.format(node['volume']),
       ],
       'stop_grace_period': '90s',
+      # Production restarts a node that exits (systemd for the seeds, the container runtime elsewhere).
+      # A node that cannot get its settings from dAuth exits and tries again, as it does there.
+      'restart': 'unless-stopped',
     }
+    if (home.root / 'tools' / 'py-spy').exists():
+      service['volumes'].append('{}:/opt/tools/py-spy:ro'.format(home.root / 'tools' / 'py-spy'))
     if node.get('cpus'):
       service['cpus'] = node['cpus']
     if node.get('cpuset'):
@@ -259,7 +304,9 @@ def node_volumes(manifest):
 
 def describe(nodes):
   for node in nodes:
-    log('  {:<10} {:<7} {:<5} {:<13} {}'.format(node['name'], node['role'], node['arm'], node['ip'], node.get('address', '')))
+    log('  {:<10} {:<7} {:<8} {:<5} {:<13} {}'.format(
+      node['name'], node['role'], 'headless' if node.get('headless') else 'full', node['arm'], node['ip'],
+      node.get('address', '')))
   return
 
 
@@ -303,9 +350,17 @@ def wait_dauth(manifest, names, timeout=420):
 
 
 def supervisor_state(name):
-  """True / False as the node resolved its role after asking dAuth, or None while it has not got there."""
-  found = re.findall(r'SUPERVISOR = (True|False) \(', node_log(name))
-  return None if not found else found[-1] == 'True'
+  """
+  True / False as the node resolved its role in its current run, or None while it is not connected yet.
+  Only a run that reached its broker counts: a node that could not reach dAuth exits and starts again.
+  """
+  text = node_log(name)
+  start = text.rfind('[launch] isolation check passed')
+  text = text[start:] if start >= 0 else text
+  found = re.findall(r'SUPERVISOR = (True|False) \(', text)
+  if not found or 'MQTT conn ok' not in text:
+    return None
+  return found[-1] == 'True'
 
 
 def settle_oracles(home, manifest, names, timeout=600):

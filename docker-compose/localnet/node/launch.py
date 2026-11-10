@@ -144,12 +144,15 @@ def run():
   import chain_shim
   chain_shim.install()
 
+  # The first node import is the one device.py makes, so that modules load in the production order.
+  import naeural_core.main.entrypoint as entrypoint
+  chain_shim.verify()
+
   import probe
   sampler = probe.Probe(out_path=os.path.join(OUT, 'probe.jsonl'), period=float(os.environ.get('R1_LOCALNET_PROBE_PERIOD', '5')))
   sampler.install_counters()
   sampler.start()
 
-  import naeural_core.main.entrypoint as entrypoint
   real_orchestrator = entrypoint.Orchestrator
 
   def orchestrator(*args, **kwargs):

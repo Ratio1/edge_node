@@ -281,9 +281,8 @@ def fn_getActiveJobs(to, args):
 
 
 def fn_getUnvalidatedJobIds(to, args):
-  oracle = str(args[0]).lower()
-  return [[int(job_id) for job_id in sorted(STATE['jobs'], key=int)
-           if oracle in [str(x).lower() for x in STATE['jobs'][job_id].get('unvalidated_for', [])]]]
+  # A bought job stays unvalidated until an oracle reports the nodes that run it (submitNodeUpdate).
+  return [[int(job_id) for job_id in sorted(STATE['jobs'], key=int) if not int(STATE['jobs'][job_id].get('start_ts', 0))]]
 
 
 def fn_getIsLastEpochAllocated(to, args):
@@ -307,6 +306,8 @@ def tx_submitNodeUpdate(sender, args):
   if job is not None:
     job['active_nodes'] = [checksum(addr) for addr in args[1]]
     job['last_nodes_change_ts'] = int(time.time())
+    if job['active_nodes'] and not int(job.get('start_ts', 0)):
+      job['start_ts'] = int(time.time())
     job.setdefault('node_updates', []).append({'by': sender, 'at': time.time(), 'nodes': job['active_nodes']})
   return
 
@@ -498,7 +499,7 @@ def admin(request):
       job = STATE['jobs'].setdefault(str(request['job_id']), {})
       job.update({key: val for key, val in request.items() if key not in ('op', 'job_id')})
       job.setdefault('request_ts', int(time.time()))
-      job.setdefault('start_ts', int(time.time()))
+      job.setdefault('start_ts', 0)  # not started: Deeploy accepts a first deployment only for such a job
     elif op == 'remove_job':
       STATE['jobs'].pop(str(request['job_id']), None)
     else:

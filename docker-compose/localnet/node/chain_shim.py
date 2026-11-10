@@ -1,25 +1,30 @@
 """
-Local stand-in for everything a node looks up outside itself (test bed only).
+Point a node's hard-coded network addresses at the localnet (test bed only).
 
-A production node reads three kinds of facts from outside:
+The SDK hard-codes, per network, the web addresses of the services a node
+talks to (dAuth, the oracle and Deeploy APIs, the blockchain RPC) and the
+list of seed nodes. None of the real ones is reachable from a localnet, and
+none may be reached. ``install`` replaces them with the localnet's own
+services and seed nodes. Nothing else changes: contract addresses, epoch
+length and thresholds stay those of the chosen network, and blockchain
+questions are answered over JSON-RPC by ``infra/chain_rpc.py``, so the SDK
+and the node run unmodified.
 
-  * web addresses of network services (dAuth, the oracle and Deeploy APIs,
-    the blockchain RPC), which the SDK hard-codes per network;
-  * the network's seed nodes and thresholds, also hard-coded per network;
-  * blockchain state: who is an oracle, which node is licensed, which job
-    belongs to whom.
-
-None of these exist inside a localnet. ``install`` points the addresses at
-localnet services, replaces the seed list with the localnet seeds and answers
-the blockchain questions from ``registry.json``, a file generated with the
-localnet. It runs before the node code is imported and changes only SDK
-tables and SDK blockchain methods, never node logic.
+The table lives in ``ratio1/const/evm_net.py``, a file without imports. It is
+loaded by path and registered under its real module name before anything
+else is imported. Importing the ``ratio1`` package here instead would change
+the import order of production (core first, then SDK), and the SDK would
+then fail to detect the core version it reports to dAuth.
 """
 
+import importlib.util
 import json
 import os
+import sys
 
 REGISTRY_PATH = os.environ.get('R1_LOCALNET_REGISTRY', '/run/localnet/registry.json')
+SRC = os.environ.get('R1_LOCALNET_SRC', '/opt/r1src')
+MODULE_NAME = 'ratio1.const.evm_net'
 PUBLIC_MARKERS = ('ratio1.ai', 'publicnode.com', 'pocket.network', 'naeural.ai', 'github')
 
 SERVICES = {
@@ -39,36 +44,68 @@ def say(msg):
   return
 
 
-def load_registry():
+def refuse(msg):
+  say('REFUSING TO START: ' + msg)
+  sys.stdout.flush()
+  os._exit(95)
+
+
+def load_tables():
+  if MODULE_NAME in sys.modules:
+    return sys.modules[MODULE_NAME]
+  if 'ratio1' in sys.modules or 'naeural_core' in sys.modules:
+    refuse('node code was imported before the network tables were replaced')
+  path = os.path.join(SRC, 'sdk', 'ratio1', 'const', 'evm_net.py')
+  spec = importlib.util.spec_from_file_location(MODULE_NAME, path)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  sys.modules[MODULE_NAME] = module
+  return module
+
+
+def leaks(module, net):
+  table = module.EVM_NET_DATA[net]
+  return ['{}={}'.format(key, value) for key, value in table.items()
+          if isinstance(value, str) and any(marker in value for marker in PUBLIC_MARKERS)]
+
+
+def install():
   with open(REGISTRY_PATH, 'rt') as fh:
-    return json.load(fh)
-
-
-def rewrite_network_tables(registry):
-  from ratio1.const import evm_net
+    registry = json.load(fh)
+  module = load_tables()
   net = os.environ['EE_EVM_NET']
-  table = evm_net.EVM_NET_DATA[net]
+  table = module.EVM_NET_DATA[net]
   for key, value in SERVICES.items():
     if key in table:
       table[key] = value
   for key, value in (registry.get('network') or {}).items():
     if key in table:
       table[key] = value
-  consts = evm_net.EVM_NET_CONSTANTS[net]
-  consts[evm_net.EvmNetConstants.SEED_NODES_ADDRESSES_KEY] = list(registry.get('seed_addresses') or [])
+  consts = module.EVM_NET_CONSTANTS[net]
+  seeds = consts[module.EvmNetConstants.SEED_NODES_ADDRESSES_KEY]
+  seeds[:] = list(registry.get('seed_addresses') or [])  # in place: code that copied the list sees it too
   for key, value in (registry.get('constants') or {}).items():
     if key in consts:
       consts[key] = value
-  leaks = ['{}={}'.format(key, value) for key, value in table.items()
-           if isinstance(value, str) and any(marker in value for marker in PUBLIC_MARKERS)]
-  if leaks:
-    say('REFUSING TO START: public addresses left in the {} table: {}'.format(net, leaks))
-    os._exit(95)
+  left = leaks(module, net)
+  if left:
+    refuse('public addresses left in the {} table: {}'.format(net, left))
   say('network {}: service addresses and seed list now point at the localnet'.format(net))
-  return
-
-
-def install():
-  registry = load_registry()
-  rewrite_network_tables(registry)
   return registry
+
+
+def verify(need_versions=True):
+  """Call after the node code is imported: the tables in use must be the replaced ones."""
+  import ratio1.const.evm_net as in_use
+  net = os.environ['EE_EVM_NET']
+  if in_use is not sys.modules[MODULE_NAME] or leaks(in_use, net):
+    refuse('the node imported its own copy of the network tables')
+  if in_use.EVM_NET_DATA[net]['EE_DAUTH_URL'] != SERVICES['EE_DAUTH_URL']:
+    refuse('the dAuth address in use is {}'.format(in_use.EVM_NET_DATA[net]['EE_DAUTH_URL']))
+  if need_versions:
+    import ratio1.bc.base as bc_base
+    if not bc_base.app_version or not bc_base.core_version:
+      refuse('the SDK did not detect the node versions (app {}, core {}): dAuth would reject this node'.format(
+        bc_base.app_version, bc_base.core_version))
+    say('versions reported to dAuth: app {}, core {}'.format(bc_base.app_version, bc_base.core_version))
+  return True

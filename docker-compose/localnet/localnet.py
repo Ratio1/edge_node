@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lnlib import infra, load as loadlib, nodes as nodelib  # noqa: E402
+from lnlib import infra, load as loadlib, metrics, nodes as nodelib, profile as profilelib  # noqa: E402
 from lnlib.common import (  # noqa: E402
   HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, SUBNET, Home, LocalnetError,
   compose, container, ctl_exec, die, ip, log, sh,
@@ -131,14 +131,19 @@ def cmd_init(args):
   relays, relay_secrets = infra.init_relays(home)
   secrets = {'mesh': mesh.pop('secrets'), 'relay': relay_secrets}
   log('creating node identities')
-  plan = nodelib.plan(oracles=args.oracles, workers=args.workers, arms=arms, default_arm=args.arm, evm_net=args.evm_net)
+  plan = nodelib.plan(oracles=args.oracles, workers=args.workers, arms=arms, default_arm=args.arm, evm_net=args.evm_net,
+                      full_oracles=args.full_oracles, full_workers=args.full_workers)
   nodelib.create_identities(home, plan)
   nodelib.describe(plan)
+  seeded = nodelib.seed_chain_store(home, plan, keys=args.cstore_keys, legacy_jobs=args.legacy_jobs)
+  if seeded:
+    log('chain store of every oracle seeded: {} records, {:.1f} MB, {} old-style job pointers'.format(
+      seeded['keys'], seeded['bytes'] / 1e6, len(seeded['legacy_jobs'])))
   log('creating {} emulated node identities ({} of them revoked)'.format(args.fleet + args.revoked, args.revoked))
   fleet = nodelib.create_fleet_identities(home, args.arm, args.evm_net, licensed=args.fleet, revoked=args.revoked)
   manifest = {
     'created': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'mesh': mesh, 'relays': relays, 'nodes': plan,
-    'evm_net': args.evm_net, 'fleet': fleet,
+    'evm_net': args.evm_net, 'fleet': fleet, 'legacy_jobs': (seeded or {}).get('legacy_jobs', []),
     'cpus': {'infra': args.infra_cpus, 'nodes': args.node_cpus} if args.infra_cpus or args.node_cpus else {},
     'revoked_addresses': [item['address'] for item in fleet if item['revoked']],
   }
@@ -232,6 +237,31 @@ def cmd_load(args):
   return 0
 
 
+def cmd_collect(args):
+  home = Home(args.home)
+  end = time.time() if args.end is None else args.end
+  start = end - args.last if args.start is None else args.start
+  result = metrics.collect(home, start, end, logs=not args.no_logs)
+  if args.out:
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(result, indent=1, sort_keys=True))
+    log('measurements written to {}'.format(args.out))
+  print(metrics.table(result))
+  return 0
+
+
+def cmd_profile(args):
+  home = Home(args.home)
+  manifest = home.manifest()
+  names = args.nodes or [node['name'] for node in manifest['nodes'] if node['role'] == 'seed']
+  report = profilelib.profile(names, seconds=args.seconds, rate=args.rate)
+  if args.out:
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(profilelib.text(report))
+  return 0
+
+
 def cmd_ctl(args):
   proc = ctl_exec(*args.cmd, check=False, timeout=args.timeout)
   sys.stdout.write(proc.stdout or '')
@@ -256,8 +286,15 @@ def main():
   one.add_argument('--broker-nofile', type=int, default=1024, help='broker file-descriptor limit (mainnet: 1024)')
   one.add_argument('--oracles', type=int, default=11, help='real oracle nodes, the first four are the seeds (mainnet: 11)')
   one.add_argument('--workers', type=int, default=2, help='real non-oracle nodes')
+  one.add_argument('--full-oracles', type=int, default=None,
+                   help='oracles that run their web plugins (about 5.4 GB each); the rest are headless (about 1 GB)')
+  one.add_argument('--full-workers', type=int, default=1, help='workers that run their web plugins (about 3 GB each)')
   one.add_argument('--fleet', type=int, default=216, help='emulated ordinary nodes (mainnet: about 216)')
   one.add_argument('--revoked', type=int, default=40, help='emulated nodes on the dAuth revoked list')
+  one.add_argument('--cstore-keys', type=int, default=3657,
+                   help='records of the synthetic chain-store replica given to every oracle (mainnet: 3,657; 0: empty)')
+  one.add_argument('--legacy-jobs', type=int, default=30,
+                   help='old-style deployed-job pointers in the seeded replica (their documents are not in R1FS)')
   one.add_argument('--infra-cpus', help='CPU list for brokers, relays, chain and load generators, for example "0,6"')
   one.add_argument('--node-cpus', help='CPU list shared by the real nodes, for example "1-5,7-11"')
   one.add_argument('--arm', default='new', help='source tree every node runs unless --arm-of says otherwise')
@@ -287,6 +324,21 @@ def main():
   one.add_argument('--timeout', type=float, default=3600)
   one.add_argument('args', nargs=argparse.REMAINDER, help='arguments of the generator, after --')
   one.set_defaults(func=cmd_load)
+
+  one = sub.add_parser('collect', help='measure a time window of the running localnet')
+  one.add_argument('--last', type=float, default=300, help='window length in seconds, ending now (default 300)')
+  one.add_argument('--start', type=float, help='window start (epoch seconds)')
+  one.add_argument('--end', type=float, help='window end (epoch seconds)')
+  one.add_argument('--out', help='write the full measurements as JSON to this file')
+  one.add_argument('--no-logs', action='store_true', help='skip the node log scan')
+  one.set_defaults(func=cmd_collect)
+
+  one = sub.add_parser('profile', help='sample which threads and functions hold the interpreter lock of running nodes')
+  one.add_argument('nodes', nargs='*', help='node names (default: the seed oracles)')
+  one.add_argument('--seconds', type=int, default=30)
+  one.add_argument('--rate', type=int, default=20, help='samples per second')
+  one.add_argument('--out', help='write the report as JSON to this file')
+  one.set_defaults(func=cmd_profile)
 
   one = sub.add_parser('ctl', help='run a command in the control container (on the isolated network)')
   one.add_argument('--timeout', type=float, default=600)

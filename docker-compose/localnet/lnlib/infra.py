@@ -316,8 +316,6 @@ http {
   access_log /out/access.log timed;
   error_log /dev/stderr warn;
   client_max_body_size 64m;
-  proxy_http_version 1.1;
-  proxy_set_header Connection "";
   proxy_set_header Host $host;
   proxy_set_header X-Forwarded-For $remote_addr;
   proxy_connect_timeout 3s;
@@ -353,11 +351,11 @@ def chain_service(home, arm, evm_net):
 
 def edge_service(home, nodes):
   """nginx in the role Cloudflare plays on mainnet: one public name per web plugin, spread over the oracles."""
-  oracles = [node for node in nodes if node['role'] in ('seed', 'oracle')]
+  oracles = [node for node in nodes if node['role'] in ('seed', 'oracle') and not node.get('headless')]
   conf = [EDGE_CONF_HEAD]
   for name, port in EDGE_NAMES.items():
     upstream = name.split('.')[0].replace('-', '_')
-    conf.append('  upstream {} {{\n    random;\n{}\n    keepalive 16;\n  }}'.format(
+    conf.append('  upstream {} {{\n    random;\n{}\n  }}'.format(
       upstream, '\n'.join('    server {}:{} max_fails=1 fail_timeout=5s;'.format(node['ip'], port) for node in oracles)))
     conf.append('  server {{ listen 80; server_name {}; location / {{ proxy_pass http://{}; }} }}'.format(name, upstream))
   conf.append('  server {{ listen 80; server_name dapp-api.localnet; location / {{ proxy_pass http://{}:8545; }} }}'.format(CHAIN_IP))
