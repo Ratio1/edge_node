@@ -29,6 +29,7 @@ import os
 import random
 import threading
 import time
+import urllib.request
 import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -149,6 +150,12 @@ def main():
   parser.add_argument('--dauth-restart-hours', type=float, default=12.0,
                       help='a licensed node asks dAuth for its settings about this often (0: never)')
   parser.add_argument('--no-revoked-retries', action='store_true', help='revoked nodes stay silent')
+  parser.add_argument('--unlicensed', type=int, default=0,
+                      help='emulated nodes without an active licence: they send no heartbeats, ask dAuth and are refused '
+                           'after a licence lookup on the chain (about half of the refusals on mainnet)')
+  parser.add_argument('--refused-rate', type=float, default=0,
+                      help='dAuth requests per second from all refused nodes together (0: each retries after 15 s plus '
+                           '1-15 s as a node does; mainnet 2026-11-10: about 2.4 per second per serving oracle)')
   parser.add_argument('--ctrl-subscribers', type=int, default=8,
                       help='extra sessions subscribed to the heartbeat topic (mainnet: 19 supervisors, 11 of them oracles)')
   parser.add_argument('--versions', default='2.10.690,7.7.352,3.5.67', help='app,core,sdk versions the nodes report')
@@ -163,6 +170,12 @@ def main():
   revoked = [item for item in fleet if item['revoked']]
   licensed = licensed[:args.nodes] if args.nodes is not None else licensed
   revoked = revoked[:args.revoked] if args.revoked is not None else revoked
+  unlicensed = licensed[len(licensed) - args.unlicensed:] if args.unlicensed > 0 else []
+  licensed = licensed[:len(licensed) - len(unlicensed)]
+  for info in unlicensed:
+    request = urllib.request.Request('http://rpc.localnet:8545/_admin', headers={'Content-Type': 'application/json'},
+                                     data=json.dumps({'op': 'set_node', 'eth_address': info['eth_address'], 'licensed': False}).encode())
+    urllib.request.urlopen(request, timeout=20).read()
   brokers = [info['ip'] for _name, info in sorted(manifest['mesh']['brokers'].items())]
   supervisors = [node['address'].replace('0xai_', '') for node in manifest['nodes'] if node['supervisor']]
 
@@ -175,9 +188,12 @@ def main():
   placement = [broker for broker, share in zip(brokers, shares) for _ in range(share)]
   for info, broker_ip in zip(licensed, placement):
     nodes.append(Node(info, broker_ip, common.engine(args.keys, info['name']), template, secrets, supervisors))
-  refused = [Node(info, random.choice(brokers), common.engine(args.keys, info['name']), template, secrets, supervisors)
-             for info in revoked]
-  common.say(WHO, '{} licensed nodes on brokers {}, {} revoked nodes'.format(len(nodes), dict(zip(brokers, shares)), len(refused)))
+  refused = [Node(dict(info, revoked=True), random.choice(brokers), common.engine(args.keys, info['name']), template,
+                  secrets, supervisors) for info in revoked + unlicensed]
+  for node, info in zip(refused, revoked + unlicensed):
+    node.kind = 'revoked' if info['revoked'] else 'unlicensed'
+  common.say(WHO, '{} licensed nodes on brokers {}, {} revoked and {} unlicensed nodes'.format(
+    len(nodes), dict(zip(brokers, shares)), len(revoked), len(unlicensed)))
 
   counters = {'hb_sent': 0, 'hb_bytes': 0, 'hb_late': 0, 'dauth_ok': 0, 'dauth_refused': 0, 'dauth_failed': 0,
               'ctrl_received': 0}
@@ -215,7 +231,8 @@ def main():
     took = time.time() - started
     with lock:
       counters['dauth_' + outcome] += 1
-    dauth_file.write(node=node.name, revoked=node.revoked, outcome=outcome, s=round(took, 3), detail=detail)
+    dauth_file.write(node=node.name, revoked=node.revoked, kind=getattr(node, 'kind', 'licensed'), outcome=outcome,
+                     s=round(took, 3), detail=detail)
     return outcome
 
   # (time, tie-breaker, kind, node)
@@ -237,7 +254,9 @@ def main():
       outcome = future.result()
     except Exception:
       outcome = 'failed'
-    if node.revoked or outcome != 'ok':
+    if node.revoked and args.refused_rate > 0:
+      delay = random.expovariate(args.refused_rate / max(1, len(refused)))
+    elif node.revoked or outcome != 'ok':
       delay = 15 + random.randint(1, 15)
     else:
       delay = random.uniform(0.5, 1.5) * args.dauth_restart_hours * 3600

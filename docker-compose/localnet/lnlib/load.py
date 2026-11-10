@@ -2,10 +2,12 @@
 
 import os
 
-from .common import HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, LocalnetError, container, sh
+from .common import HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, LocalnetError, container, ip, sh
 from .nodes import FLEET_VOLUME
 
 GENERATORS = ('fleet', 'cstore', 'dauth', 'deeploy', 'probe')
+# Fixed addresses: the front can then send one generator's requests to a chosen oracle (see "pin").
+ADDRESS = {'fleet': ip(211), 'cstore': ip(212), 'dauth': ip(213), 'deeploy': ip(214)}
 
 
 def name_of(generator, tag=None):
@@ -39,6 +41,8 @@ def start(home, generator, args=(), tag=None, cpuset=None, detach=True, timeout=
     '-v', '{}:/out'.format(out),
     '--entrypoint', PYTHON,
   ]
+  if generator in ADDRESS and tag in (None, 'run'):
+    cmd += ['--ip', ADDRESS[generator]]
   if cpuset or manifest.get('cpus', {}).get('infra'):
     cmd += ['--cpuset-cpus', cpuset or manifest['cpus']['infra']]
   cmd.insert(2, '-d' if detach else '--rm')

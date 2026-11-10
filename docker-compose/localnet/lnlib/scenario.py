@@ -18,6 +18,8 @@ chain     change the behaviour of the local chain or dApp API: any of
           latency_ms, jitter_ms, fail, hang_s, dapp_latency_ms, dapp_hang_s
 profile   sample the interpreter lock of nodes: nodes, seconds
 replicas  compare the chain-store replicas of all oracles
+pin       send the dAuth requests of one load generator to one oracle: generator, node
+          (mainnet keeps a client on one oracle's tunnel); node null clears it
 note      write a line into the run log
 
 Every phase is measured with ``metrics.collect`` when it ends; the result goes
@@ -28,7 +30,7 @@ import json
 import time
 from pathlib import Path
 
-from . import load as loadlib, metrics, profile as profilelib, replicas as replicalib
+from . import infra, load as loadlib, metrics, profile as profilelib, replicas as replicalib
 from .common import PYTHON, LocalnetError, container, ctl_exec, log, sh
 
 
@@ -131,6 +133,9 @@ def run(home, path, tag=None):
       (out / ('profile_' + label + '.json')).write_text(json.dumps(report, indent=1, sort_keys=True))
       (out / ('profile_' + label + '.txt')).write_text(profilelib.text(report))
       note('profile {} taken'.format(label))
+    elif do == 'pin':
+      infra.pin_dauth(home, loadlib.ADDRESS[step['generator']] if step.get('node') else None, step.get('node'))
+      note('dAuth requests of {} go to {}'.format(step['generator'], step.get('node') or 'any oracle'))
     elif do == 'replicas':
       report = replicalib.compare(manifest)
       label = step.get('name') or (phase['name'] or 'replicas')

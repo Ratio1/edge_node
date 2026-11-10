@@ -59,6 +59,10 @@ def _phase_rows(result, focus):
       total = sum(item['status'].values())
       rows.append(('{}: answered with 200'.format(name), '{}/{}'.format(item['status'].get('200', 0), total)))
       rows.append(('{}: seconds (p50 / p95)'.format(name), '{} / {}'.format(item['s']['p50'], item['s']['p95'])))
+  probe = (result.get('dauth_probe') or {}).get('get_auth_data')
+  if probe:
+    rows.append(('start-up request of a licensed node: answered / sent', '{}/{}'.format(probe['ok'], probe['sent'])))
+    rows.append(('start-up request: seconds when answered (p50 / p95)', '{} / {}'.format(probe['ok_s']['p50'], probe['ok_s']['p95'])))
   dauth = [(nodes[name].get('plugins') or {}).get('DAUTH_MANAGER', {}).get('loop_hz_p50') for name in seeds]
   rows.append(('dAuth plugin loop rate on seeds, Hz (median)', _med(dauth)))
   return rows

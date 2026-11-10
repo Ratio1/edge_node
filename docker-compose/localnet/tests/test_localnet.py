@@ -123,7 +123,7 @@ class TestSeeding(unittest.TestCase):
 
 class TestScenarios(unittest.TestCase):
 
-  STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'note'}
+  STEPS = {'load', 'run', 'unload', 'wait', 'phase', 'node', 'chain', 'profile', 'replicas', 'pin', 'note'}
 
   def test_shipped_scenarios_use_known_steps_and_generators(self):
     files = glob.glob(str(HERE / 'scenarios' / '*.json'))

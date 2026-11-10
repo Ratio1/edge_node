@@ -349,19 +349,41 @@ def chain_service(home, arm, evm_net):
   }
 
 
+def pin_upstream(node_name):
+  return 'dauth_only_' + node_name.replace('-', '_')
+
+
+def pin_dauth(home, client_ip=None, node_name=None):
+  """Send every dAuth request of one client address to one oracle (or clear all pins) and reload the front."""
+  path = home.run / 'edge' / 'pins_dauth.conf'
+  path.write_text('{} {};\n'.format(client_ip, pin_upstream(node_name)) if client_ip and node_name else '')
+  sh('docker', 'exec', container('edge'), 'nginx', '-s', 'reload')
+  return
+
+
 def edge_service(home, nodes):
   """nginx in the role Cloudflare plays on mainnet: one public name per web plugin, spread over the oracles."""
   oracles = [node for node in nodes if node['role'] in ('seed', 'oracle') and not node.get('headless')]
   conf = [EDGE_CONF_HEAD]
+  edir = home.run / 'edge'
+  edir.mkdir(parents=True, exist_ok=True)
   for name, port in EDGE_NAMES.items():
     upstream = name.split('.')[0].replace('-', '_')
     conf.append('  upstream {} {{\n    random;\n{}\n  }}'.format(
       upstream, '\n'.join('    server {}:{} max_fails=0;'.format(node['ip'], port) for node in oracles)))
-    conf.append('  server {{ listen 80; server_name {}; location / {{ proxy_pass http://{}; }} }}'.format(name, upstream))
+    if name != 'dauth.localnet':
+      conf.append('  server {{ listen 80; server_name {}; location / {{ proxy_pass http://{}; }} }}'.format(name, upstream))
+      continue
+    # Mainnet observation (2026-11-10): Cloudflare kept every request of one client on the same oracle's
+    # tunnel. "pins" reproduces that for chosen clients: client address -> one oracle. Others stay spread.
+    for node in oracles:
+      conf.append('  upstream {} {{ server {}:{} max_fails=0; }}'.format(pin_upstream(node['name']), node['ip'], port))
+    if not (edir / 'pins_dauth.conf').exists():
+      (edir / 'pins_dauth.conf').write_text('')
+    conf.append('  map $remote_addr $dauth_target {{ default {}; include /etc/nginx/localnet/pins_dauth.conf; }}'.format(upstream))
+    conf.append('  server {{ listen 80; server_name {}; location / {{ proxy_pass http://$dauth_target; }} }}'.format(name))
   conf.append('  server {{ listen 80; server_name dapp-api.localnet; location / {{ proxy_pass http://{}:8545; }} }}'.format(CHAIN_IP))
   conf.append('  server { listen 80 default_server; return 404; }\n}\n')
-  edir = home.run / 'edge'
-  edir.mkdir(parents=True, exist_ok=True)
   (edir / 'nginx.conf').write_text('\n'.join(conf))
   out = home.run / 'out' / 'edge'
   out.mkdir(parents=True, exist_ok=True)
@@ -374,7 +396,8 @@ def edge_service(home, nodes):
       'labels': {LABEL: 'edge'},
       'networks': {PROJECT: {'ipv4_address': EDGE_IP, 'aliases': list(EDGE_NAMES) + [
         'dapp-api.localnet', 'app.localnet', 'explorer.localnet', 'deeploy.localnet']}},
-      'volumes': ['{}:/etc/nginx/nginx.conf:ro'.format(edir / 'nginx.conf'), '{}:/out'.format(out)],
+      'volumes': ['{}:/etc/nginx/nginx.conf:ro'.format(edir / 'nginx.conf'), '{}:/etc/nginx/localnet:ro'.format(edir),
+                  '{}:/out'.format(out)],
       'stop_grace_period': '2s',
     },
   }

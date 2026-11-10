@@ -169,6 +169,18 @@ def fleet_load(home, start, end):
   return result
 
 
+def dauth_probe(home, start, end):
+  """What the dAuth load generator saw: the start-up probe of a licensed node and the secret requests."""
+  rows = read_jsonl(home.run / 'out' / 'load-dauth' / 'dauth.jsonl', start, end)
+  result = {}
+  for kind in sorted({row.get('kind') for row in rows if row.get('kind')}):
+    mine = [row for row in rows if row.get('kind') == kind]
+    result[kind] = {'sent': len(mine), 'ok': sum(1 for row in mine if row['outcome'] == 'ok'),
+                    'ok_s': dist([row['s'] for row in mine if row['outcome'] == 'ok' and row.get('s') is not None]),
+                    'outcomes': {key: sum(1 for row in mine if row['outcome'] == key) for key in sorted({row['outcome'] for row in mine})}}
+  return result
+
+
 def edge_log(home, start, end):
   path = home.run / 'out' / 'edge' / 'access.log'
   groups = {}
@@ -254,6 +266,7 @@ def collect(home, start, end, logs=True):
     result['nodes'][node['name']] = entry
   result['chain_store_users'] = cstore_load(home, start, end)
   result['fleet'] = fleet_load(home, start, end)
+  result['dauth_probe'] = dauth_probe(home, start, end)
   result['front'] = edge_log(home, start, end)
   result['chain'] = chain_stats()
   result['brokers'] = broker_stats(manifest)
