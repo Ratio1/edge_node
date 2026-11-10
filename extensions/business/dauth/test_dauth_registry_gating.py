@@ -1344,5 +1344,17 @@ class NodeTagsKybTests(unittest.TestCase):
     self.assertEqual(plugin.requests.get.call_args.kwargs.get("timeout"), (3, 15))
 
 
+class DauthRequestBookkeepingConfigTests(unittest.TestCase):
+
+  def test_dauth_thread_skips_per_request_ipc_and_log_bookkeeping(self):
+    from constants import ADMIN_PIPELINE
+
+    self.assertIs(DauthManagerPlugin.CONFIG["LOG_REQUESTS"], False)
+    self.assertEqual(DauthManagerPlugin.CONFIG["PROFILE_RATE"], 0.1)
+    # The admin pipeline instance config must not put the defaults back.
+    for key in ("LOG_REQUESTS", "PROFILE_RATE"):
+      self.assertNotIn(key, ADMIN_PIPELINE["DAUTH_MANAGER"])
+
+
 if __name__ == "__main__":
   unittest.main()

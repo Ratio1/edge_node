@@ -54,7 +54,11 @@ _CONFIG = {
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
-  'LOG_REQUESTS' : True,
+  # One thread answers dAuth. Each generic "Received"/"processed" line also asks the IPC manager
+  # process for its queue size, and each profiled request sends a timing report that takes its
+  # own place in the request FIFO. Keep a 10 % timing sample.
+  'LOG_REQUESTS' : False,
+  'PROFILE_RATE' : 0.1,
   
   'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
   'REQUESTS_MAX_RECORDS': 2,
