@@ -41,7 +41,8 @@ ADMIN_PIPELINE = {
     "NGROK_EDGE_LABEL": "$EE_NGROK_EDGE_LABEL_RELEASE_APP",
     "CLOUDFLARE_TOKEN": "$EE_CLOUDFLARE_TOKEN_RELEASE_APP",
     "TUNNEL_ENGINE": "$EE_TUNNEL_ENGINE",
-    "PROCESS_DELAY": 0,
+    # No endpoints (uvicorn serves the page) and process() only checks a 10-minute timer.
+    "PROCESS_DELAY": 5,
   },
   
   "DAUTH_MANAGER" : {
