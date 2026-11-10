@@ -2,7 +2,6 @@
 import inspect
 import json
 import os
-import subprocess
 import threading
 import time
 import types
@@ -50,6 +49,8 @@ class _TimedR1FS:
     self.calls.append({"cid": cid, "timeout": timeout, "pin": pin})
     if cid in self.dead:
       spent = 2 * COMMAND_TIMEOUT if pin else 2 * min(timeout or COMMAND_TIMEOUT, COMMAND_TIMEOUT)
+      if kwargs.get("max_seconds"):
+        spent = min(spent, kwargs["max_seconds"])  # an SDK with an overall budget stops there
       result = None
     else:
       spent, result = LIVE_COST, deepcopy(self.docs[cid])
@@ -59,16 +60,12 @@ class _TimedR1FS:
 
 
 def _baseline_mixin_class():
-  """The dAuth mixin as committed at HEAD, or None when it cannot be loaded."""
-  try:
-    source = subprocess.run(
-      ["git", "show", "HEAD:" + MIXIN_PATH], cwd=ROOT, capture_output=True, text=True, check=True,
-    ).stdout
-  except Exception:
-    path = os.environ.get(BASELINE_ENV)
-    if not path or not os.path.isfile(path):
-      return None
-    source = Path(path).read_text(encoding="utf-8")
+  """The dAuth mixin before this change, from the file named by the environment, or None."""
+  # Only an explicitly named older copy is a baseline: HEAD already contains the change under test.
+  path = os.environ.get(BASELINE_ENV)
+  if not path or not os.path.isfile(path):
+    return None
+  source = Path(path).read_text(encoding="utf-8")
   module = types.ModuleType("extensions.business.dauth._baseline_dauth_mixin")
   module.__package__ = "extensions.business.dauth"
   exec(compile(source, "baseline:" + MIXIN_PATH, "exec"), module.__dict__)  # noqa: S102
@@ -137,7 +134,8 @@ class LegacySecretFloodTests(unittest.TestCase):
     self.assertEqual(live_fetches, 24)
     self.assertLessEqual(after["dead_fetches"], after["duration"] // DAUTH_PIPELINE_CACHE_NEGATIVE_TTL + 1)
     self.assertLessEqual(after["busy"], 24 * LIVE_COST + after["dead_fetches"] * 15)
-    self.assertTrue(all(call["pin"] is False and call["timeout"] == 7.5 for call in plugin.r1fs.calls))
+    # The fake SDK accepts the overall read budget, so each read gets it whole and never pins.
+    self.assertTrue(all(call["pin"] is False and call["timeout"] == 15 for call in plugin.r1fs.calls))
 
     # A listed runner is still served, from the cached facts and the bound bundle.
     fetches = len(plugin.r1fs.calls)
@@ -351,9 +349,31 @@ class DauthR1FSReadTests(unittest.TestCase):
     plugin._load_dauth_job_pipeline_record("7")
     plugin.cfg_dauth_r1fs_read_timeout = 10
     plugin._dauth_r1fs_get_json("cid-7")
-    self.assertEqual(calls, [{"timeout": 7.5, "pin": False, "show_logs": False},
-                             {"timeout": 5.0, "pin": False, "show_logs": False}])
+    self.assertEqual(calls, [{"timeout": 15, "pin": False, "show_logs": False, "max_seconds": 15},
+                             {"timeout": 10, "pin": False, "show_logs": False, "max_seconds": 10}])
     self.assertNotIn("r1fs.get_json", inspect.getsource(deployment_secrets))
+
+  def test_sdk_without_a_read_budget_gets_half_the_budget_per_attempt(self):
+    plugin = _make_dauth_harness()
+    calls = []
+
+    def old_get_json(cid, timeout=None, pin=True, show_logs=True):
+      calls.append({"timeout": timeout, "pin": pin})
+      return {}
+    plugin.r1fs = types.SimpleNamespace(get_json=old_get_json)
+    plugin._dauth_r1fs_get_json("cid-7")
+    plugin._dauth_r1fs_get_json("cid-8")
+    self.assertEqual(calls, [{"timeout": 7.5, "pin": False}, {"timeout": 7.5, "pin": False}])
+    self.assertFalse(plugin._dauth_r1fs_has_max_seconds)
+
+  def test_type_error_from_the_read_itself_is_not_swallowed(self):
+    plugin = _make_dauth_harness()
+
+    def broken(cid, **kwargs):
+      raise TypeError("unsupported operand")
+    plugin.r1fs = types.SimpleNamespace(get_json=broken)
+    with self.assertRaises(TypeError):
+      plugin._dauth_r1fs_get_json("cid-7")
 
   def test_installed_r1fs_engine_accepts_pin_and_timeout(self):
     from ratio1.ipfs.r1fs import R1FSEngine

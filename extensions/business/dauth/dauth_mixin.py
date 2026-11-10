@@ -288,11 +288,23 @@ class _DauthMixin(object):
     """Read an R1FS JSON document on the dAuth request thread, without pinning.
 
     With ``pin=True`` R1FS first runs ``ipfs pin add`` under a fixed 90 s timeout
-    that ignores ``timeout``. ``ipfs get`` is retried once after a relay
+    that ignores ``timeout``. An SDK that accepts ``max_seconds`` bounds the
+    whole read. On an older SDK ``ipfs get`` is retried once after a relay
     self-heal, so each attempt gets half of the read budget.
     """
     budget = self._dauth_setting("DAUTH_R1FS_READ_TIMEOUT", DAUTH_R1FS_READ_TIMEOUT)
-    document = self.r1fs.get_json(cid, timeout=max(1, budget / 2), pin=False, show_logs=False)
+    document, done = None, False
+    if getattr(self, "_dauth_r1fs_has_max_seconds", True):
+      try:
+        # An SDK with an overall read budget enforces it itself (no relay retries, no self-heal).
+        document = self.r1fs.get_json(cid, timeout=budget, pin=False, show_logs=False, max_seconds=budget)
+        done = True
+      except TypeError as exc:
+        if "max_seconds" not in str(exc):
+          raise
+        self._dauth_r1fs_has_max_seconds = False
+    if not done:
+      document = self.r1fs.get_json(cid, timeout=max(1, budget / 2), pin=False, show_logs=False)
     if document is not None:
       self._queue_dauth_r1fs_pin(cid)
     return document
