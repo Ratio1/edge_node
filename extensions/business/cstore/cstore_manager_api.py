@@ -1,8 +1,17 @@
+import hashlib
+import hmac
+import inspect
+import os
+import types
 from typing import Any
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 __VER__ = '0.2.3'
+
+API_TOKEN_ENV = "EE_CSTORE_API_TOKEN"
+WRITE_ENDPOINTS = ("set", "hset", "hsync")
+HASH_KEY_PREFIX = "hs:"  # composed hash field keys: hs:<sha256(hkey)[:10]>:<b64(key)>
 
 
 _CONFIG = {
@@ -16,6 +25,13 @@ _CONFIG = {
 
   'DEBUG': False,
   'FORCE_DEBUG_EACH_NTH_API_CALL': 50,
+  
+  # Namespace policy of this local, unauthenticated API (any process on the host can call it).
+  'DENIED_HKEYS': ['DAUTH_JOB_SECRETS', 'DAUTH_JOB_SECRET_REVISIONS'],  # no read, no write
+  'WRITE_DENIED_HKEY_PREFIXES': ['DEEPLOY_', 'DAUTH_'],
+  'ALLOW_RAW_HASH_WRITES': False,  # `set` on composed hs:<hash>:<field> keys bypasses the hkey policy
+  # Shared Bearer token required on every endpoint when set (here or in $EE_CSTORE_API_TOKEN).
+  'API_TOKEN': None,
   
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -32,7 +48,68 @@ class CstoreManagerApiPlugin(BasePlugin):
   def __init__(self, **kwargs):
     super(CstoreManagerApiPlugin, self).__init__(**kwargs)
     self.__forced_debug_window = None
+    self.__policy_logged = {}
     return
+
+  def _cfg(self, name):
+    return getattr(self, "cfg_" + name.lower(), self.CONFIG.get(name))
+
+  def _get_api_token(self):
+    token = self._cfg("API_TOKEN") or os.environ.get(API_TOKEN_ENV)
+    return token.strip() if isinstance(token, str) and token.strip() else None
+
+  def _maybe_require_api_token(self):
+    """Re-register every endpoint behind the shared Bearer token when one is configured."""
+    expected = self._get_api_token()
+    if expected is None:
+      return
+    for name, func in inspect.getmembers(type(self), predicate=inspect.isfunction):
+      if getattr(func, "__endpoint__", False) and not getattr(func, "__require_token__", False):
+        setattr(self, name, types.MethodType(self._token_guarded(func, expected), self))
+    return
+
+  @staticmethod
+  def _token_guarded(func, expected):
+    def guarded(self, token, *args, **kwargs):
+      if not isinstance(token, str) or not hmac.compare_digest(token.encode(), expected.encode()):
+        return {"error": "Unauthorized token", "status_code": 401}
+      return func(self, *args, **kwargs)
+    params = list(inspect.signature(func).parameters.values())
+    token_param = inspect.Parameter("token", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str)
+    guarded.__signature__ = inspect.Signature([params[0], token_param, *params[1:]])
+    guarded.__name__, guarded.__doc__ = func.__name__, func.__doc__
+    return BasePlugin.endpoint(method=getattr(func, "__http_method__", "get"), require_token=True)(guarded)
+
+  def _policy_namespace(self, endpoint_name, key=None, hkey=None):
+    """Namespace a call touches: the hkey, a denied hkey behind a composed key, or the flat key."""
+    if endpoint_name in ("hset", "hget", "hgetall", "hsync"):
+      return hkey
+    if isinstance(key, str) and key.startswith(HASH_KEY_PREFIX):
+      for denied in self._cfg("DENIED_HKEYS") or []:
+        if key.startswith(HASH_KEY_PREFIX + hashlib.sha256(denied.encode()).hexdigest()[:10] + ":"):
+          return denied
+      return key[:len(HASH_KEY_PREFIX) + 11]
+    return key
+
+  def _policy_denial(self, endpoint_name, key=None, hkey=None):
+    """Return the error response for a call the namespace policy forbids, else None."""
+    namespace = self._policy_namespace(endpoint_name, key=key, hkey=hkey)
+    if not isinstance(namespace, str):
+      return None
+    write = endpoint_name in WRITE_ENDPOINTS
+    if namespace in (self._cfg("DENIED_HKEYS") or []):
+      reason = "is not accessible through the local CStore API"
+    elif write and any(namespace.startswith(prefix) for prefix in self._cfg("WRITE_DENIED_HKEY_PREFIXES") or []):
+      reason = "is read-only through the local CStore API"
+    elif write and endpoint_name == "set" and namespace.startswith(HASH_KEY_PREFIX) and not self._cfg("ALLOW_RAW_HASH_WRITES"):
+      reason = "is a hash field; write it with hset"
+    else:
+      return None
+    now = self.time()
+    if now - self.__policy_logged.get((endpoint_name, namespace), -60) >= 60:
+      self.__policy_logged[(endpoint_name, namespace)] = now
+      self.P(f"CStore API denied {endpoint_name} on '{namespace}' (policy).", color='r')
+    return {"error": f"Namespace '{namespace}' {reason}.", "status_code": 403}
   
   
   def Pd(self, s, *args,  **kwargs):
@@ -308,6 +385,10 @@ class CstoreManagerApiPlugin(BasePlugin):
       recorded in the forced-summary window.
     """
     start_timer = self.time()
+    denial = self._policy_denial(endpoint_name, key=key, hkey=hkey)
+    if denial is not None:
+      self._record_forced_debug_call(endpoint_name=endpoint_name, duration_s=0.0, ok=False, key=key, hkey=hkey)
+      return denial
     try:
       result = operation()
     except Exception:
@@ -335,11 +416,12 @@ class CstoreManagerApiPlugin(BasePlugin):
 
 
   def on_init(self):
+    self._maybe_require_api_token()  # before the base class registers the endpoints
     super(CstoreManagerApiPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
-    self.P("Started {} plugin on {} / {}".format(
-      self.__class__.__name__, my_address, my_eth_address,
+    self.P("Started {} plugin on {} / {} (token required: {})".format(
+      self.__class__.__name__, my_address, my_eth_address, self._get_api_token() is not None,
     ))
     return
 
