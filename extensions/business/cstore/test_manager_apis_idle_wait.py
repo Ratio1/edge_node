@@ -25,6 +25,7 @@ def _make_probe(plugin_class):
     instance_hash = "probe"
     plugins_shared_mem = mock.Mock()
     uvicorn_server_started = True
+    start_commands_finished = [True]
     upstream_inputs_deque = deque()  # a read-only property on the plugin; this class is new per probe
 
     def __init__(self):  # pylint: disable=super-init-not-called
@@ -62,6 +63,9 @@ class ManagerApisWakeUpTests(unittest.TestCase):
         probe._incoming_requests.clear()
         probe.postponed_requests.append(object())
         self.assertEqual(probe._idle_loop_wait(), 0)
+        probe.postponed_requests.clear()
+        probe.start_commands_finished = [False]  # the server is being restarted
+        self.assertEqual(probe._idle_loop_wait(), 0)
 
   def test_inputs_wake_the_loop(self):
     for plugin_class in API_PLUGINS.values():
@@ -79,6 +83,7 @@ class ManagerApisWakeUpTests(unittest.TestCase):
         probe.on_request = mock.Mock()
         probe.get_request_timeout = mock.Mock(return_value=None)
         probe.get_max_incoming_requests = mock.Mock(return_value=10)
+        probe.get_max_queue_wait = mock.Mock(return_value=None)
         server_queue = queue.Queue()
         server_queue.put({"id": "r1", "value": ["get_value"]})
 
