@@ -157,6 +157,11 @@ class _DeploymentOperationsMixin:
     """Replicate a signed snapshot in a bounded sequence slot before side effects."""
     if operation["coordinator"] != self.bc.address:
       raise ValueError("Only the accepting oracle can advance this operation.")
+    # Same phase, no new event, same content as the stored snapshot: nothing durable changed.
+    if phase in (None, operation["phase"]) and (not message or message == (operation.get("events") or [{}])[-1].get("message")):
+      stored = self.chainstore_hget(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation.get("sequence", 0) % 8))
+      if json.dumps(stored, sort_keys=True) == json.dumps(operation, sort_keys=True):
+        return operation
     snapshot = copy.deepcopy(operation)
     for key in SIGNATURE_KEYS:
       snapshot.pop(key, None)
@@ -176,14 +181,22 @@ class _DeploymentOperationsMixin:
       raise RuntimeError("Deployment state replication is pending.")
     operation.clear()
     operation.update(snapshot)
+    vars(self).setdefault("_operations_confirmed", {})[snapshot["operation_id"]] = (
+      snapshot["sequence"], snapshot.get("EE_SIGN"), self.time())
     return operation
 
   def _replicate_operation(self, operation):
-    """Retry the exact durable snapshot, including after an uncertain write."""
+    """Retry the exact snapshot until confirmed; once confirmed, re-send it every 300 s as repair only."""
+    confirmed = vars(self).setdefault("_operations_confirmed", {})
+    marker, last = (operation["sequence"], operation.get("EE_SIGN")), confirmed.get(operation["operation_id"])
+    if last and last[:2] == marker and 0 <= self.time() - last[2] < 300:
+      return
     key = "{}|{}".format(operation["operation_id"], operation["sequence"] % 8)
     if not self.chainstore_hset(OPERATIONS_HKEY, key, operation, readonly=True,
                                **self._operation_write_kwargs()):
-      raise RuntimeError("Deployment state replication is pending.")
+      if not last or last[:2] != marker:
+        raise RuntimeError("Deployment state replication is pending.")
+    confirmed[operation["operation_id"]] = marker + (self.time(),)
 
   def _assert_no_active_deployment(self, job_id=None, app_id=None):
     """Serialize other job mutations against known deployment/recovery work."""
@@ -500,10 +513,12 @@ class _DeploymentOperationsMixin:
         continue
       if action == "start" and report_is_ready(report, config):
         continue
-      key = "{}|{}|{}".format(attempt, action, node)
-      if self.time() - operation["sent_at"].get(key, 0) < 10:
+      # Resend throttle in process memory, not in the signed snapshot; nodes de-duplicate by operation_id|attempt.
+      sent_at = vars(self).setdefault("_operations_sent_at", {})
+      key = "{}|{}|{}|{}".format(operation["operation_id"], attempt, action, node)
+      if 0 <= self.time() - sent_at.get(key, 0) < 10:
         continue
-      operation["sent_at"][key] = self.time()
+      sent_at[key] = self.time()
       self._save_operation(operation)
       payload = copy.deepcopy(config) if action == "start" else {
         "NAME": operation["app_id"], "TYPE": config["TYPE"],
@@ -784,7 +799,9 @@ class _DeploymentOperationsMixin:
     result.update(
       status=operation["phase"], nodes=nodes, target_nodes=len(configs),
       ready_nodes=sum(self._node_is_ready(node, reports.get(node), config) for node, config in configs.items()),
-      observation_stale=operation["phase"] != "completed" and now - operation["updated_at"] > 30,
+      # Snapshots now change only with state: an old one is stale only while its coordinator is away.
+      observation_stale=operation["phase"] != "completed" and now - operation["updated_at"] > 30
+        and not self._netmon_node_is_online_for_control(operation["coordinator"]),
       poll_after_ms=2000, events=events[:limit],
       next_event_cursor=events[limit - 1]["sequence"] if len(events) > limit else None,
       revision=operation["target_revision"] if operation["outcome"] == "succeeded" else operation["previous_revision"] or 0,

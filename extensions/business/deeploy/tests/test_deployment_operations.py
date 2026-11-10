@@ -141,6 +141,10 @@ class DeploymentStatusTests(unittest.TestCase):
     result = plugin._deployment_status({"operation_id": operation["operation_id"]})
     self.assertEqual(result["ready_nodes"], 2)
     self.assertEqual({node["node_id"]: node["stale"] for node in result["nodes"]}, {"A": False, "B": True, "C": False})
+    # An old snapshot is stale only while its coordinator is away.
+    self.assertFalse(result["observation_stale"])
+    plugin.offline.add("oracle")
+    self.assertTrue(plugin._deployment_status({"operation_id": operation["operation_id"]})["observation_stale"])
 
   def test_preparation_failure_does_not_project_a_restoration(self):
     plugin = self.prepare()
@@ -307,7 +311,8 @@ class DeploymentOperationTests(unittest.TestCase):
     plugin = Coordinator()
     operation = plugin.operation()
     for index in range(30):
-      plugin._save_operation(operation)
+      # Each save carries new state; an unchanged save writes nothing.
+      plugin._save_operation(operation, message="step {}".format(index))
     self.assertEqual(len(plugin.chainstore_hgetall(OPERATIONS_HKEY)), 8)
     self.assertEqual(plugin._operation_records()[operation["operation_id"]]["sequence"], 30)
 
