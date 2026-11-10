@@ -1,0 +1,259 @@
+{
+ "name": "incident",
+ "about": "The mainnet incident of 2026-11-08: a Deeploy operation that cannot finish. First some history is made (16 jobs deployed, 3 updated, 4 deleted), because the oracles re-read every past operation and the secret revisions on each pass. Then a job of production size is deployed on worker r1w-02, the worker disappears and the job is deleted: the operation stays open. What matters is how much chain-store traffic the open operation makes every oracle carry and whether ordinary chain-store users still get their writes confirmed. In the last phase one seed oracle also loses most of its CPU, as r1s-04 had on mainnet.",
+ "steps": [
+  {
+   "do": "load",
+   "generator": "fleet"
+  },
+  {
+   "do": "load",
+   "generator": "cstore",
+   "args": [
+    "--period",
+    "10",
+    "--hsync",
+    "120"
+   ]
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "setup",
+    "--jobs",
+    "40"
+   ]
+  },
+  {
+   "do": "wait",
+   "seconds": 60
+  },
+  {
+   "do": "phase",
+   "name": "0_history"
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "load",
+    "--first-job",
+    "1002",
+    "--jobs",
+    "16",
+    "--nodes",
+    "r1w-01",
+    "--config-bytes",
+    "16000"
+   ],
+   "timeout": 1800
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "update",
+    "--job",
+    "1002",
+    "--config-bytes",
+    "16000"
+   ],
+   "timeout": 600
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "update",
+    "--job",
+    "1003",
+    "--config-bytes",
+    "16000"
+   ],
+   "timeout": 600
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "update",
+    "--job",
+    "1004",
+    "--config-bytes",
+    "16000"
+   ],
+   "timeout": 600
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "delete",
+    "--job",
+    "1005"
+   ],
+   "timeout": 600
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "delete",
+    "--job",
+    "1006"
+   ],
+   "timeout": 600
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "delete",
+    "--job",
+    "1007"
+   ],
+   "timeout": 600
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "delete",
+    "--job",
+    "1008"
+   ],
+   "timeout": 600
+  },
+  {
+   "do": "phase",
+   "name": "1_healthy"
+  },
+  {
+   "do": "wait",
+   "seconds": 180
+  },
+  {
+   "do": "phase",
+   "name": "2_job_running"
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "create",
+    "--job",
+    "1001",
+    "--nodes",
+    "r1w-02",
+    "--config-bytes",
+    "16000"
+   ],
+   "timeout": 900
+  },
+  {
+   "do": "wait",
+   "seconds": 90
+  },
+  {
+   "do": "phase",
+   "name": "3_operation_stuck"
+  },
+  {
+   "do": "node",
+   "node": "r1w-02",
+   "action": "kill"
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "delete",
+    "--job",
+    "1001",
+    "--no-wait"
+   ],
+   "timeout": 300
+  },
+  {
+   "do": "wait",
+   "seconds": 330
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "watch",
+    "--job",
+    "1001",
+    "--count",
+    "1"
+   ],
+   "timeout": 120
+  },
+  {
+   "do": "profile",
+   "seconds": 30,
+   "name": "stuck"
+  },
+  {
+   "do": "wait",
+   "seconds": 120
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "watch",
+    "--job",
+    "1001",
+    "--count",
+    "1"
+   ],
+   "timeout": 120
+  },
+  {
+   "do": "phase",
+   "name": "4_stuck_and_one_oracle_starved"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 0.35
+  },
+  {
+   "do": "wait",
+   "seconds": 420
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "watch",
+    "--job",
+    "1001",
+    "--count",
+    "1"
+   ],
+   "timeout": 120
+  },
+  {
+   "do": "profile",
+   "seconds": 30,
+   "name": "starved",
+   "nodes": [
+    "r1s-04",
+    "r1s-03"
+   ]
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 12
+  },
+  {
+   "do": "unload",
+   "generator": "all"
+  }
+ ]
+}

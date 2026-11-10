@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lnlib import infra, load as loadlib, metrics, nodes as nodelib, profile as profilelib  # noqa: E402
+from lnlib import compare as comparelib, infra, load as loadlib, metrics, nodes as nodelib, profile as profilelib, replicas as replicalib, scenario as scenariolib  # noqa: E402
 from lnlib.common import (  # noqa: E402
   HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, SUBNET, Home, LocalnetError,
   compose, container, ctl_exec, die, ip, log, sh,
@@ -262,6 +262,33 @@ def cmd_profile(args):
   return 0
 
 
+def cmd_scenario(args):
+  home = Home(args.home)
+  out = scenariolib.run(home, args.file, tag=args.tag)
+  print((out / 'summary.txt').read_text() if (out / 'summary.txt').exists() else '')
+  return 0
+
+
+def cmd_replicas(args):
+  home = Home(args.home)
+  report = replicalib.compare(home.manifest())
+  if args.out:
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(report, indent=1, sort_keys=True))
+  print(replicalib.text(report))
+  return 0
+
+
+def cmd_compare(args):
+  home = Home(args.home)
+  text = comparelib.compare(home, args.scenario, args.tags, focus=args.focus)
+  if args.out:
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(text + '\n')
+  print(text)
+  return 0
+
+
 def cmd_ctl(args):
   proc = ctl_exec(*args.cmd, check=False, timeout=args.timeout)
   sys.stdout.write(proc.stdout or '')
@@ -339,6 +366,22 @@ def main():
   one.add_argument('--rate', type=int, default=20, help='samples per second')
   one.add_argument('--out', help='write the report as JSON to this file')
   one.set_defaults(func=cmd_profile)
+
+  one = sub.add_parser('scenario', help='run a scripted experiment and measure each of its phases')
+  one.add_argument('file', help='scenario JSON file (see scenarios/)')
+  one.add_argument('--tag', help='label of this run in the results folder (default: the code version of the nodes)')
+  one.set_defaults(func=cmd_scenario)
+
+  one = sub.add_parser('replicas', help='compare the chain-store replicas of the oracles')
+  one.add_argument('--out', help='write the comparison as JSON to this file')
+  one.set_defaults(func=cmd_replicas)
+
+  one = sub.add_parser('compare', help='put runs of one scenario on different code versions side by side')
+  one.add_argument('scenario', help='scenario name, for example incident')
+  one.add_argument('tags', nargs='+', help='run labels to compare, for example base new')
+  one.add_argument('--focus', default='r1s-04', help='node reported in detail (default: r1s-04, the one scenarios starve)')
+  one.add_argument('--out', help='also write the tables to this file')
+  one.set_defaults(func=cmd_compare)
 
   one = sub.add_parser('ctl', help='run a command in the control container (on the isolated network)')
   one.add_argument('--timeout', type=float, default=600)

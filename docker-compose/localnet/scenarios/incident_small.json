@@ -1,0 +1,152 @@
+{
+ "name": "incident_small",
+ "about": "The incident scenario without operation history and with a small job (the first version, kept so that runs stay comparable): a job on worker r1w-02, the worker disappears, the job is deleted, the operation stays open; in the last phase one seed oracle is limited to 0.35 CPU.",
+ "steps": [
+  {
+   "do": "load",
+   "generator": "fleet"
+  },
+  {
+   "do": "load",
+   "generator": "cstore",
+   "args": [
+    "--period",
+    "10",
+    "--hsync",
+    "120"
+   ]
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "setup",
+    "--jobs",
+    "20"
+   ]
+  },
+  {
+   "do": "wait",
+   "seconds": 90
+  },
+  {
+   "do": "phase",
+   "name": "1_healthy"
+  },
+  {
+   "do": "wait",
+   "seconds": 180
+  },
+  {
+   "do": "phase",
+   "name": "2_job_running"
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "create",
+    "--job",
+    "1001",
+    "--nodes",
+    "r1w-02"
+   ],
+   "timeout": 900
+  },
+  {
+   "do": "wait",
+   "seconds": 120
+  },
+  {
+   "do": "phase",
+   "name": "3_operation_stuck"
+  },
+  {
+   "do": "node",
+   "node": "r1w-02",
+   "action": "kill"
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "delete",
+    "--job",
+    "1001",
+    "--no-wait"
+   ],
+   "timeout": 300
+  },
+  {
+   "do": "wait",
+   "seconds": 420
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "watch",
+    "--job",
+    "1001",
+    "--count",
+    "1"
+   ],
+   "timeout": 120
+  },
+  {
+   "do": "profile",
+   "seconds": 30,
+   "name": "stuck"
+  },
+  {
+   "do": "wait",
+   "seconds": 150
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "watch",
+    "--job",
+    "1001",
+    "--count",
+    "1"
+   ],
+   "timeout": 120
+  },
+  {
+   "do": "phase",
+   "name": "4_stuck_and_one_oracle_starved"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 0.35
+  },
+  {
+   "do": "wait",
+   "seconds": 420
+  },
+  {
+   "do": "run",
+   "generator": "deeploy",
+   "args": [
+    "watch",
+    "--job",
+    "1001",
+    "--count",
+    "1"
+   ],
+   "timeout": 120
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 12
+  },
+  {
+   "do": "unload",
+   "generator": "all"
+  }
+ ]
+}

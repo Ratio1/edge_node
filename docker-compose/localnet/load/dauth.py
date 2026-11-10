@@ -74,10 +74,7 @@ def main():
         request_timeout=(10, args.timeout), sender_alias='probe',
         sender_app_ver=app_ver, sender_core_ver=core_ver, sender_sdk_ver=sdk_ver,
       )
-      if isinstance(result, dict) and any(key.startswith('EE_') for key in result):
-        outcome = 'ok'
-      elif isinstance(result, dict):
-        outcome, detail = 'refused', str(result)[:140]
+      outcome, detail = common.auth_outcome(result)
     except Exception as exc:
       detail = '{}: {}'.format(type(exc).__name__, exc)[:140]
     out.write(kind='get_auth_data', outcome=outcome, s=round(time.time() - started, 3), detail=detail)

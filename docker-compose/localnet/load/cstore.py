@@ -116,7 +116,8 @@ def main():
   stop = threading.Event()
   threads = []
   for idx, node in enumerate(writers):
-    others = [other for other in serving if other['name'] != node['name']]
+    # Records are replicated to oracles. A normal node keeps only what it wrote itself.
+    others = [other for other in serving if other['name'] != node['name'] and other['role'] != 'worker']
     thread = threading.Thread(target=writer, args=(node, others, args, out, stop), daemon=True)
     threads.append(thread)
     thread.start()

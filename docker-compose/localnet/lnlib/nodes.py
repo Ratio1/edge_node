@@ -385,7 +385,10 @@ def settle_oracles(home, manifest, names, timeout=600):
         if time.time() - first > 45 and restarts[name] < 4:
           restarts[name] += 1
           seen_plain.pop(name)
-          compose(home, 'restart', '-t', '60', name, check=False)
+          # Kill, do not stop: a node that stops through its exception path is treated as offline by the
+          # others for an hour, which must not be the state a test starts from.
+          sh('docker', 'kill', container(name), check=False)
+          sh('docker', 'start', container(name), check=False)
     time.sleep(5)
   if pending:
     raise LocalnetError('oracles without their role after {} s: {}'.format(timeout, sorted(pending)))

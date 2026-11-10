@@ -356,7 +356,7 @@ def edge_service(home, nodes):
   for name, port in EDGE_NAMES.items():
     upstream = name.split('.')[0].replace('-', '_')
     conf.append('  upstream {} {{\n    random;\n{}\n  }}'.format(
-      upstream, '\n'.join('    server {}:{} max_fails=1 fail_timeout=5s;'.format(node['ip'], port) for node in oracles)))
+      upstream, '\n'.join('    server {}:{} max_fails=0;'.format(node['ip'], port) for node in oracles)))
     conf.append('  server {{ listen 80; server_name {}; location / {{ proxy_pass http://{}; }} }}'.format(name, upstream))
   conf.append('  server {{ listen 80; server_name dapp-api.localnet; location / {{ proxy_pass http://{}:8545; }} }}'.format(CHAIN_IP))
   conf.append('  server { listen 80 default_server; return 404; }\n}\n')

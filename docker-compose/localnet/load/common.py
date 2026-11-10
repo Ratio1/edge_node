@@ -80,3 +80,18 @@ def percentile(values, pct):
     return None
   ordered = sorted(values)
   return ordered[min(len(ordered) - 1, int(round((pct / 100.0) * (len(ordered) - 1))))]
+
+
+def auth_outcome(result):
+  """Classify what ``dauth_autocomplete(return_full_data=True)`` returned: ('ok' | 'refused' | 'failed', detail)."""
+  if not isinstance(result, dict) or not result:
+    return 'failed', 'no answer'
+  inner = result.get('result') if isinstance(result.get('result'), dict) else result
+  auth = inner.get('auth') if isinstance(inner.get('auth'), dict) else inner
+  if any(str(key).startswith('EE_') and str(key) not in ('EE_SIGN', 'EE_SENDER', 'EE_ETH_SENDER', 'EE_ETH_SIGN', 'EE_HASH')
+         for key in auth):
+    return 'ok', ''
+  error = auth.get('error') or inner.get('error')
+  if error:
+    return 'refused', str(error)[:120]
+  return 'failed', str(result)[:120]

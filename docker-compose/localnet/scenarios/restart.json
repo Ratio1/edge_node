@@ -1,0 +1,109 @@
+{
+ "name": "restart",
+ "about": "What a restart costs an oracle. Three headless oracles leave in three ways and come back 30 s later: r1s-db by docker stop (SIGTERM), r1s-ai01 by SIGKILL, r1s-smart by SIGINT. Writers keep writing records that are never written again, so every record an oracle did not get stays visible. Measured: chain-store inputs each oracle receives per phase (is it still a replication target?) and, at the end of each phase, how many records each oracle lacks.",
+ "steps": [
+  {
+   "do": "load",
+   "generator": "fleet"
+  },
+  {
+   "do": "load",
+   "generator": "cstore",
+   "args": [
+    "--period",
+    "5",
+    "--hsync",
+    "120",
+    "--keys",
+    "100000000"
+   ]
+  },
+  {
+   "do": "wait",
+   "seconds": 60
+  },
+  {
+   "do": "phase",
+   "name": "1_before"
+  },
+  {
+   "do": "wait",
+   "seconds": 120
+  },
+  {
+   "do": "replicas",
+   "name": "1_before"
+  },
+  {
+   "do": "phase",
+   "name": "2_restarting"
+  },
+  {
+   "do": "node",
+   "node": "r1s-ai01",
+   "action": "kill"
+  },
+  {
+   "do": "node",
+   "node": "r1s-smart",
+   "action": "interrupt"
+  },
+  {
+   "do": "node",
+   "node": "r1s-db",
+   "action": "stop",
+   "grace": 60
+  },
+  {
+   "do": "wait",
+   "seconds": 30
+  },
+  {
+   "do": "node",
+   "node": "r1s-db",
+   "action": "start"
+  },
+  {
+   "do": "node",
+   "node": "r1s-ai01",
+   "action": "start"
+  },
+  {
+   "do": "node",
+   "node": "r1s-smart",
+   "action": "start"
+  },
+  {
+   "do": "wait",
+   "seconds": 150
+  },
+  {
+   "do": "phase",
+   "name": "3_first_minutes_back"
+  },
+  {
+   "do": "wait",
+   "seconds": 240
+  },
+  {
+   "do": "replicas",
+   "name": "3_first_minutes_back"
+  },
+  {
+   "do": "phase",
+   "name": "4_later"
+  },
+  {
+   "do": "wait",
+   "seconds": 420
+  },
+  {
+   "do": "replicas",
+   "name": "4_later"
+  },
+  {
+   "do": "unload",
+   "generator": "all"
+  }
+ ]
+}

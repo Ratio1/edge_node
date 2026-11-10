@@ -209,14 +209,7 @@ def main():
         request_timeout=(10, 120), sender_alias=node.name,
         sender_app_ver=app_ver, sender_core_ver=core_ver, sender_sdk_ver=sdk_ver,
       )
-      if isinstance(result, dict) and any(key.startswith('EE_') for key in result):
-        outcome = 'ok'
-      elif isinstance(result, dict):
-        auth = (result.get('result') or {}).get('auth') if 'result' in result else result.get('auth')
-        outcome = 'refused'
-        detail = str((auth or {}).get('error') or result.get('error') or '')[:120]
-      else:
-        outcome = 'failed'
+      outcome, detail = common.auth_outcome(result)
     except Exception as exc:
       detail = '{}: {}'.format(type(exc).__name__, exc)[:160]
     took = time.time() - started

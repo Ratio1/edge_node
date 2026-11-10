@@ -87,18 +87,24 @@ def node_probe(home, name, start, end):
     series = [row['plugins'][key] for row in rows if key in (row.get('plugins') or {})]
     if len(series) < 2:
       continue
-    a, b = series[0], series[-1]
+    b = series[-1]
     rates = [item['hz'] for item in series if isinstance(item.get('hz'), (int, float))]
+
+    def grown(field):
+      # Counters start again from zero when the node restarts: add up the increases only.
+      return sum(max(0, later[field] - earlier[field]) if later[field] >= earlier[field] else later[field]
+                 for earlier, later in zip(series, series[1:]))
+
     result['plugins'][signature] = {
-      'received': b['recv'] - a['recv'],
-      'handled': b['handled'] - a['handled'],
-      'dropped': b['dropped'] - a['dropped'],
+      'received': grown('recv'),
+      'handled': grown('handled'),
+      'dropped': grown('dropped'),
       'queue_end': b['queue'],
       'queue_max': max(item['queue'] for item in series),
       'queue_cap': b['qmax'],
       'loop_hz_p50': rnd(pct(rates, 50), 1),
       'loop_hz_min': rnd(min(rates), 1) if rates else None,
-      'errors': (b.get('errors') or 0) - (a.get('errors') or 0),
+      'errors': (b.get('errors') or 0) - (series[0].get('errors') or 0),
     }
   return result
 

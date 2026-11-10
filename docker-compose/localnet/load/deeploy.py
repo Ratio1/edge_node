@@ -145,7 +145,14 @@ class Client:
     return row
 
 
-def create_payload(job_id, nodes, alias, delay=5):
+def padding(size):
+  """Settings that make the job as large as a production container job (the operation record grows with it)."""
+  if size <= 0:
+    return {}
+  return {'LOCALNET_SETTINGS': {'SETTING_%03d' % idx: 'v' * 56 for idx in range(max(1, size // 76))}}
+
+
+def create_payload(job_id, nodes, alias, delay=5, config_bytes=0):
   return {
     'request_id': 'create-{}-{}'.format(job_id, uuid.uuid4().hex[:12]),
     'app_alias': alias,
@@ -154,7 +161,7 @@ def create_payload(job_id, nodes, alias, delay=5):
     'pipeline_input_type': 'void',
     'target_nodes': list(nodes),
     'target_nodes_count': len(nodes),
-    'plugins': [{'plugin_signature': PLUGIN, 'PROCESS_DELAY': delay}],
+    'plugins': [dict({'plugin_signature': PLUGIN, 'PROCESS_DELAY': delay}, **padding(config_bytes))],
   }
 
 
@@ -185,10 +192,12 @@ def main():
     one.add_argument('--no-wait', action='store_true')
     one.add_argument('--every', type=float, default=15.0)
     one.add_argument('--count', type=int, default=0, help='watch: stop after this many polls (0: forever)')
+    one.add_argument('--config-bytes', type=int, default=0, help='create: size of the job settings (production jobs: about 16000)')
   one = sub.add_parser('load')
   one.add_argument('--first-job', type=int, default=1001)
   one.add_argument('--jobs', type=int, default=5)
   one.add_argument('--nodes', nargs='*')
+  one.add_argument('--config-bytes', type=int, default=0)
   args = parser.parse_args()
 
   manifest, _secrets = common.start(WHO)
@@ -210,7 +219,8 @@ def main():
     jobs = [args.job] if args.cmd == 'create' else list(range(args.first_job, args.first_job + args.jobs))
     for idx, job_id in enumerate(jobs):
       nodes = workers if args.cmd == 'create' else [workers[idx % len(workers)]]
-      accepted = client.submit('create_pipeline', create_payload(job_id, nodes, 'lnet{}'.format(job_id)))
+      accepted = client.submit('create_pipeline', create_payload(job_id, nodes, 'lnet{}'.format(job_id),
+                                                                config_bytes=args.config_bytes))
       body = accepted['body'] if isinstance(accepted['body'], dict) else {}
       final = None
       if body.get('status') == 'accepted' and not getattr(args, 'no_wait', False):
@@ -232,7 +242,8 @@ def main():
       'request_id': 'update-{}-{}'.format(args.job, uuid.uuid4().hex[:12]), 'app_id': current.get('app_id'),
       'app_alias': 'lnet{}'.format(args.job), 'job_id': int(args.job), 'job_app_type': 'native',
       'expected_revision': int(current.get('revision') or 0), 'pipeline_input_type': 'void',
-      'plugins': [{'plugin_signature': PLUGIN, 'instance_id': first_instance(current), 'PROCESS_DELAY': 7}],
+      'plugins': [dict({'plugin_signature': PLUGIN, 'instance_id': first_instance(current), 'PROCESS_DELAY': 7},
+                       **padding(args.config_bytes))],
     }
     accepted = client.submit('update_pipeline', payload)
     body = accepted['body'] if isinstance(accepted['body'], dict) else {}
