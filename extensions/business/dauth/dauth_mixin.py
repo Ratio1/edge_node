@@ -284,7 +284,7 @@ class _DauthMixin(object):
     The CID comes from this node's own pointer and names immutable content; callers only
     read the document. The read runs on a helper thread; the request waits at most 0.25 s,
     otherwise fails as retryable, and the retry is answered from memory. A document that
-    could not be read is read again 300 s after that read ended.
+    could not be read is read again 30 s after that read ended.
     """
     cache = getattr(self, "_dauth_legacy_pipelines", None)
     if cache is None:
@@ -296,7 +296,7 @@ class _DauthMixin(object):
           doc = self.r1fs.get_json(cid, show_logs=False)
         except Exception:
           doc = None
-        cache[cid] = (self.time() + 300, doc if isinstance(doc, dict) else None)
+        cache[cid] = (self.time() + 30, doc if isinstance(doc, dict) else None)
       reader = threading.Thread(target=read, name="dauth-r1fs-read", daemon=True)
       cache[cid] = (None, None)
       try:

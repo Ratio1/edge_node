@@ -186,10 +186,14 @@ class _DeploymentOperationsMixin:
     return operation
 
   def _replicate_operation(self, operation):
-    """Retry the exact snapshot until confirmed; once confirmed, re-send it every 300 s as repair only."""
+    """Retry the exact snapshot until confirmed; once confirmed, re-send it every 30 s as repair.
+
+    A confirmation needs only part of the peers, and nothing else brings an oracle that missed the write
+    up to date. The re-sent snapshot is the same record: peers that hold it store nothing.
+    """
     confirmed = vars(self).setdefault("_operations_confirmed", {})
     marker, last = (operation["sequence"], operation.get("EE_SIGN")), confirmed.get(operation["operation_id"])
-    if last and last[:2] == marker and 0 <= self.time() - last[2] < 300:
+    if last and last[:2] == marker and 0 <= self.time() - last[2] < 30:
       return
     key = "{}|{}".format(operation["operation_id"], operation["sequence"] % 8)
     if not self.chainstore_hset(OPERATIONS_HKEY, key, operation, readonly=True,

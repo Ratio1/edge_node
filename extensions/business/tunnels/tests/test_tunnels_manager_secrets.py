@@ -78,16 +78,14 @@ class TunnelSecretsTests(unittest.TestCase):
 
   def test_an_update_other_oracles_did_not_confirm_is_reported_as_a_failure(self):
     manager = _Manager(confirmed=False)
-    with self.assertRaisesRegex(Exception, "not saved"):
-      manager.add_secrets(_payload())
+    result = manager.add_secrets(_payload())
+    self.assertFalse(result["success"])
+    self.assertIn("did not confirm", result["error"])
 
   def test_the_update_leaves_a_log_line_without_the_secret(self):
     for confirmed, word in ((True, "confirmed by other oracles"), (False, "NOT confirmed by other oracles")):
       manager = _Manager(confirmed=confirmed)
-      try:
-        manager.add_secrets(_payload())
-      except Exception:
-        pass
+      manager.add_secrets(_payload())
       [line] = manager.logged
       self.assertIn(WALLET, line)
       self.assertIn(word, line)
@@ -95,9 +93,28 @@ class TunnelSecretsTests(unittest.TestCase):
 
   def test_an_old_signed_update_cannot_be_replayed(self):
     manager = _Manager()
-    with self.assertRaisesRegex(ValueError, "expired"):
-      manager.add_secrets(_payload(age_s=13 * 3600))
+    result = manager.add_secrets(_payload(age_s=13 * 3600))
+    self.assertEqual((result["success"], "expired" in result["error"]), (False, True))
     self.assertEqual(manager.store, {})
+
+  def test_no_failure_raises_because_a_raising_endpoint_gets_its_arguments_logged(self):
+    """The web-app base logs the arguments of an endpoint that raises; here that is the credential."""
+    unsigned = _Manager()
+    unsigned.bc.eth_verify_payload_signature = lambda **kwargs: None
+    broken = _Manager()
+    broken.bc.eth_verify_payload_signature = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad signature"))
+    cases = [
+      (_Manager(), {k: v for k, v in _payload().items() if k != "nonce"}),      # no nonce
+      (_Manager(), dict(_payload(), nonce="not-hex")),                             # malformed nonce
+      (_Manager(), dict(_payload(), nonce=hex(int((time.time() + 600) * 1000)))),  # client clock ahead
+      (_Manager(), {k: v for k, v in _payload().items() if k != "cloudflare_zone_id"}),  # missing field
+      (unsigned, _payload()), (broken, _payload()), (_Manager(confirmed=False), _payload()),
+    ]
+    for manager, payload in cases:
+      result = manager.add_secrets(payload)  # must not raise
+      self.assertFalse(result["success"])
+      self.assertTrue(result["error"].startswith("Secrets were not saved"))
+      self.assertNotIn(TOKEN, " ".join(manager.logged) + result["error"])
 
 
 if __name__ == "__main__":

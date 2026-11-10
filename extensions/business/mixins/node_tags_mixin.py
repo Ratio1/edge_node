@@ -60,7 +60,8 @@ class _NodeTagsMixin(object):
 
     self.P(f"Fetching is_kyb for wallet {node_owner}", color='y')
 
-    response = self.requests.get(url, params=params, timeout=(3, 5))
+    # A time-out drops the tag until the node next starts, so allow a slow answer; still bounded.
+    response = self.requests.get(url, params=params, timeout=(3, 15))
     is_kyb = False
     if response.status_code == 200:
       try:

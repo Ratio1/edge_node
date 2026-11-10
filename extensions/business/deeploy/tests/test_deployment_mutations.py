@@ -387,7 +387,9 @@ class DeploymentMutationTests(unittest.TestCase):
     # One snapshot at admission and one for the blocked transition; command retries write none.
     self.assertEqual(set(sequences), {1, 2})
     self.assertEqual(sequences[-100:], [2] * 100)
-    self.assertEqual(sum(namespace == OPERATIONS_HKEY for namespace, _ in plugin.writes), 2)
+    # Repair re-sends repeat a confirmed snapshot; they never produce a new one.
+    self.assertEqual(len({key for namespace, key in plugin.writes if namespace == OPERATIONS_HKEY}), 2)
+    self.assertLessEqual(sum(namespace == OPERATIONS_HKEY for namespace, _ in plugin.writes), 2 + 300 // 30 + 1)
     self.assertEqual((operation["recovery"], operation["error"]["code"]), ("blocked", "STOP_UNCONFIRMED"))
     retires = [command for command in plugin.commands if command["node_address"] == "B"]
     self.assertGreaterEqual(len(retires), 29)

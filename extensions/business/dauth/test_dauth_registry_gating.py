@@ -1340,7 +1340,7 @@ class NodeTagsKybTests(unittest.TestCase):
 
     self.assertTrue(plugin.get_ee_nt_is_kyb("0xnode"))
     # Runs on the dAuth request thread: an unanswered dApp API must not hold it.
-    self.assertEqual(plugin.requests.get.call_args.kwargs.get("timeout"), (3, 5))
+    self.assertEqual(plugin.requests.get.call_args.kwargs.get("timeout"), (3, 15))
 
 
 if __name__ == "__main__":

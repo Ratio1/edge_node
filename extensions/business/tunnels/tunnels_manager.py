@@ -360,29 +360,37 @@ class TunnelsManagerPlugin(BasePlugin):
   def add_secrets(self, payload: dict):
     """
     Endpoint for CSP addresses to add their own Cloudflare secrets.
+
+    Failures are returned, not raised: the web-app base logs the arguments of an endpoint that
+    raises, and the argument here is the credential.
     """
-    self._verify_nonce(payload['nonce'])  # a captured signed update cannot be replayed later
-    sender = self.bc.eth_verify_payload_signature(
-      payload=payload,
-      no_hash=True,
-      indent=1,
-      verify_safe=True,
-    )
-    secrets = {
-      "cloudflare_api_key": payload['cloudflare_api_key'],
-      "cloudflare_account_id": payload['cloudflare_account_id'],
-      "cloudflare_zone_id": payload['cloudflare_zone_id'],
-      "cloudflare_domain": payload['cloudflare_domain'],
-      # The signed client time orders updates: a replica keeps the newest one, whatever order
-      # writes, restarts and syncs reach it in (chain store "cs_rev").
-      "cs_rev": int(payload['nonce'].replace("0x", ""), 16),
-    }
+    try:
+      self._verify_nonce(payload.get('nonce') or '')  # a captured signed update cannot be replayed later
+      sender = self.bc.eth_verify_payload_signature(
+        payload=payload,
+        no_hash=True,
+        indent=1,
+        verify_safe=True,
+      )
+      if not sender:
+        raise ValueError("Signature verification failed.")
+      secrets = {
+        "cloudflare_api_key": payload['cloudflare_api_key'],
+        "cloudflare_account_id": payload['cloudflare_account_id'],
+        "cloudflare_zone_id": payload['cloudflare_zone_id'],
+        "cloudflare_domain": payload['cloudflare_domain'],
+        # Signed client time, recorded as the record's revision ("cs_rev"). Nothing orders by it yet:
+        # until the chain store does, a restart sync can still replace this copy with an older one.
+        "cs_rev": int(payload['nonce'].replace("0x", ""), 16),
+      }
+    except Exception as exc:
+      return {"success": False, "error": "Secrets were not saved: {}".format(exc)}
     stored = self.chainstore_hset(hkey="tunnels_manager_secrets", key=sender, value=secrets)
     # The only trace of a secrets update: who, and whether other oracles confirmed it. Never the values.
     self.P(f"Tunnel secrets update by {sender}: {'confirmed' if stored else 'NOT confirmed'} by other oracles",
            color=None if stored else 'r')
     if not stored:
-      raise Exception("Secrets were not saved: other oracles did not confirm the update. Please try again.")
+      return {"success": False, "error": "Secrets were not saved: other oracles did not confirm the update. Please try again."}
     return {
       "success": True
     }
