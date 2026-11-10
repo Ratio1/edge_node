@@ -1,0 +1,144 @@
+"""
+In-process metrics sampler for localnet nodes (test bed only).
+
+The sampler measures the same things in the same way on every code version,
+so an old and a new node can be compared without relying on log lines that
+only one of them prints. It never changes what the node does: it counts the
+inputs handed to each plugin, reads public counters of the plugins and of
+the process, and appends one JSON line per period to a file.
+
+What is recorded per plugin instance
+------------------------------------
+recv      inputs handed to the plugin by the dispatcher (``add_inputs`` calls)
+dropped   inputs that pushed the oldest queued input out of a full queue
+queue     inputs waiting right now
+qmax      queue capacity
+handled   recv - dropped - queue
+hz        plugin loop rate as the plugin reports it
+iter      loop iterations so far
+errors    plugin loop exceptions so far
+"""
+
+import json
+import os
+import threading
+import time
+
+
+def _read_proc_status():
+  res = {}
+  try:
+    with open('/proc/self/status', 'rt') as fh:
+      for line in fh:
+        if line.startswith(('VmRSS:', 'VmHWM:', 'Threads:')):
+          key, val = line.split(':', 1)
+          res[key] = int(val.strip().split()[0])
+  except Exception:
+    pass
+  return res
+
+
+def _open_fds():
+  try:
+    return len(os.listdir('/proc/self/fd'))
+  except Exception:
+    return None
+
+
+class Probe(threading.Thread):
+  def __init__(self, out_path, period=5.0):
+    super().__init__(name='localnet_probe', daemon=True)
+    self.out_path = out_path
+    self.period = float(period)
+    self.eng = None
+    self._errors = 0
+    self._t0 = time.time()
+    return
+
+  # -- wiring ---------------------------------------------------------------
+
+  def install_counters(self):
+    """Count dispatcher hand-offs per plugin instance at class level."""
+    from naeural_core.business.base.base_plugin_biz import BasePluginExecutor
+    original = BasePluginExecutor.add_inputs
+    if getattr(original, '_localnet_wrapped', False):
+      return
+
+    def add_inputs(plugin, inp):
+      try:
+        if inp:
+          queue = plugin.__dict__.get('_BasePluginExecutor__upstream_inputs_deque')
+          if queue is not None and not plugin.is_outside_working_hours:
+            stats = plugin.__dict__.get('_localnet_stats')
+            if stats is None:
+              stats = plugin.__dict__['_localnet_stats'] = [0, 0]
+            stats[0] += 1
+            if queue.maxlen is not None and len(queue) >= queue.maxlen:
+              stats[1] += 1
+      except Exception:
+        pass
+      return original(plugin, inp)
+
+    add_inputs._localnet_wrapped = True
+    BasePluginExecutor.add_inputs = add_inputs
+    return
+
+  def attach(self, eng):
+    self.eng = eng
+    return
+
+  # -- sampling -------------------------------------------------------------
+
+  def _plugins(self):
+    res = {}
+    manager = getattr(self.eng, '_business_manager', None)
+    if manager is None:
+      return res
+    instances = getattr(manager, '_dct_current_instances', None) or {}
+    for _hash, plugin in list(instances.items()):
+      try:
+        signature = str(getattr(plugin, '_signature', None) or plugin.__class__.__name__)
+        instance = str(getattr(plugin, 'cfg_instance_id', '') or '')
+        stream = str(getattr(plugin, '_stream_id', '') or '')
+        stats = plugin.__dict__.get('_localnet_stats') or [0, 0]
+        queue = plugin.__dict__.get('_BasePluginExecutor__upstream_inputs_deque')
+        qlen = len(queue) if queue is not None else 0
+        row = {
+          'recv': stats[0],
+          'dropped': stats[1],
+          'queue': qlen,
+          'qmax': queue.maxlen if queue is not None else None,
+          'handled': max(0, stats[0] - stats[1] - qlen),
+          'hz': getattr(plugin, 'actual_plugin_resolution', None),
+          'iter': getattr(plugin, 'current_process_iteration', None),
+          'errors': getattr(plugin, 'n_plugin_exceptions', None),
+        }
+        res['{}|{}|{}'.format(stream, signature, instance)] = row
+      except Exception:
+        self._errors += 1
+    return res
+
+  def sample(self):
+    row = {
+      't': round(time.time(), 3),
+      'up': round(time.time() - self._t0, 1),
+      'cpu': round(time.process_time(), 2),
+      'fds': _open_fds(),
+      'probe_errors': self._errors,
+    }
+    row.update(_read_proc_status())
+    if self.eng is not None:
+      row['plugins'] = self._plugins()
+    return row
+
+  def run(self):
+    os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
+    while True:
+      time.sleep(self.period)
+      try:
+        row = self.sample()
+        with open(self.out_path, 'at') as fh:
+          fh.write(json.dumps(row, separators=(',', ':')) + '\n')
+      except Exception:
+        self._errors += 1
+    return

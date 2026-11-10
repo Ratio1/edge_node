@@ -1,0 +1,337 @@
+"""
+Real nodes of a localnet: topology, identities, registry, environment and
+compose services.
+
+The topology follows mainnet. Four seed oracles each sit next to one broker
+and hold the whole configuration in their environment, as the mainnet seeds
+do in ``/var/cache/edge_node/.env``. Every other node knows only its name
+and role and receives the rest from dAuth when it starts.
+"""
+
+import json
+import os
+import re
+import time
+
+from .common import (
+  HERE, LABEL, NODE_IMAGE, PROJECT, PYTHON, LocalnetError, compose, container, ctl_exec, ip, log, sh, tool_run,
+)
+from .infra import BROKERS
+
+# name, broker next to it, relay it uses (mainnet: r1s-01 / r1s-03 use relay r03, r1s-02 / r1s-04 use relay r04)
+SEEDS = (
+  ('r1s-01', 'emqx-a', 'relay-03'),
+  ('r1s-02', 'emqx-b', 'relay-04'),
+  ('r1s-03', 'emqx-c', 'relay-03'),
+  ('r1s-04', 'emqx-d', 'relay-04'),
+)
+ORACLE_NAMES = ('r1s-db', 'r1s-ai01', 'r1s-smart', 'r1s-cap', 'r1o-09', 'r1o-10', 'r1o-11',
+                'r1o-12', 'r1o-13', 'r1o-14', 'r1o-15', 'r1o-16', 'r1o-17', 'r1o-18', 'r1o-19')
+
+# Fixed ports for the web plugins that mainnet publishes through Cloudflare tunnels. The localnet
+# front (``edge``) forwards to them instead of a tunnel.
+WEB_PLUGINS = {
+  'DAUTH_MANAGER': 31301,
+  'DEEPLOY_MANAGER_API': 31302,
+  'ORACLE_API': 31303,
+}
+NO_TUNNEL_PLUGINS = ('NAEURAL_RELEASE_APP', 'TUNNELS_MANAGER', 'LIVENESS_API')
+
+# Mainnet oracles share one Cloudflare tunnel token per web plugin. A plugin refuses to start without a
+# token, so the localnet supplies a marker; no tunnel is started (TUNNEL_ENGINE_ENABLED is false).
+TUNNEL_TOKEN_KEYS = (
+  'EE_CLOUDFLARE_TOKEN_EPOCH_MANAGER', 'EE_CLOUDFLARE_TOKEN_RELEASE_APP', 'EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER',
+  'EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER', 'EE_CLOUDFLARE_TOKEN_TUNNELS_MANAGER', 'EE_CLOUDFLARE_TOKEN_LIVENESS_API',
+)
+
+PLACEHOLDER_ENV = {
+  # Values mainnet keeps in the seed .env that have no service behind them here.
+  'EE_GITVER': 'localnet',
+  'EE_MINIO_ENDPOINT': 'minio.localnet:9000',
+  'EE_MINIO_ACCESS_KEY': 'localnet',
+  'EE_MINIO_SECRET_KEY': 'localnet-not-a-secret',
+  'EE_MINIO_SECURE': 'false',
+  'EE_MINIO_MODEL_BUCKET': 'localnet-models',
+  'EE_MINIO_UPLOAD_BUCKET': 'localnet-uploads',
+  'EE_NGROK_AUTH_TOKEN': '',
+}
+
+
+def volume(name):
+  return '{}_{}_cache'.format(PROJECT, name)
+
+
+def plan(oracles=11, workers=2, arms=None, default_arm='new', evm_net='mainnet'):
+  """Return the list of real nodes. ``arms`` maps node name to the source tree it runs."""
+  arms = arms or {}
+  if oracles < len(SEEDS):
+    raise LocalnetError('a localnet needs at least the {} seed oracles'.format(len(SEEDS)))
+  if oracles - len(SEEDS) > len(ORACLE_NAMES):
+    raise LocalnetError('at most {} oracles are supported'.format(len(SEEDS) + len(ORACLE_NAMES)))
+  nodes = []
+  for idx, (name, broker, relay) in enumerate(SEEDS):
+    nodes.append({'name': name, 'role': 'seed', 'supervisor': True, 'broker': broker, 'relay': relay, 'ip': ip(51 + idx)})
+  for idx, name in enumerate(ORACLE_NAMES[:oracles - len(SEEDS)]):
+    nodes.append({'name': name, 'role': 'oracle', 'supervisor': True, 'ip': ip(55 + idx)})
+  for idx in range(workers):
+    nodes.append({'name': 'r1w-{:02d}'.format(idx + 1), 'role': 'worker', 'supervisor': False, 'ip': ip(81 + idx)})
+  for node in nodes:
+    node['arm'] = arms.get(node['name'], default_arm)
+    node['evm_net'] = evm_net
+    node['volume'] = volume(node['name'])
+  return nodes
+
+
+def create_identities(home, nodes):
+  """Create one cache volume and one fresh key per node. Adds 'address' and 'eth_address' to each node."""
+  mounts = [(HERE, '/opt/localnet', 'ro'), (home.src / nodes[0]['arm'], '/opt/r1src', 'ro')]
+  for node in nodes:
+    sh('docker', 'volume', 'rm', '-f', node['volume'], check=False)
+    sh('docker', 'volume', 'create', '--label', LABEL + '=volume', node['volume'])
+    mounts.append((node['volume'], '/nodes/{}/_local_cache'.format(node['name']), 'rw'))
+  out = tool_run(
+    '{} /opt/localnet/ctl/keygen.py /nodes {}'.format(PYTHON, ' '.join(node['name'] for node in nodes)),
+    mounts=mounts, env={'PYTHONPATH': '/opt/r1src/sdk', 'EE_EVM_NET': nodes[0]['evm_net'], 'R1_LOCALNET': '1'},
+    timeout=900,
+  )
+  line = [item for item in out.stdout.splitlines() if item.startswith('KEYS ')]
+  if not line:
+    raise LocalnetError('key generation failed:\n' + out.stdout[-2000:])
+  keys = json.loads(line[-1][5:])
+  for node in nodes:
+    node.update(keys[node['name']])
+  return nodes
+
+
+FLEET_VOLUME = PROJECT + '_fleet_keys'
+
+
+def create_fleet_identities(home, arm, evm_net, licensed=216, revoked=40):
+  """
+  Keys of the emulated part of the network: ``licensed`` ordinary nodes that only send heartbeats and
+  ask dAuth for their settings, and ``revoked`` nodes that dAuth must refuse (mainnet carries such a
+  list in EE_REVOKED_NODE_ADDRESSES and most dAuth requests come from nodes on it).
+  """
+  names = ['f{:04d}'.format(idx + 1) for idx in range(licensed)] + ['x{:04d}'.format(idx + 1) for idx in range(revoked)]
+  sh('docker', 'volume', 'rm', '-f', FLEET_VOLUME, check=False)
+  sh('docker', 'volume', 'create', '--label', LABEL + '=volume', FLEET_VOLUME)
+  if not names:
+    return []
+  out = tool_run(
+    '{} /opt/localnet/ctl/keygen.py /fleet {}'.format(PYTHON, ' '.join(names)),
+    mounts=[(HERE, '/opt/localnet', 'ro'), (home.src / arm, '/opt/r1src', 'ro'), (FLEET_VOLUME, '/fleet', 'rw')],
+    env={'PYTHONPATH': '/opt/r1src/sdk', 'EE_EVM_NET': evm_net, 'R1_LOCALNET': '1'}, timeout=1800,
+  )
+  line = [item for item in out.stdout.splitlines() if item.startswith('KEYS ')]
+  if not line:
+    raise LocalnetError('fleet key generation failed:\n' + out.stdout[-2000:])
+  keys = json.loads(line[-1][5:])
+  return [dict(keys[name], name=name, revoked=name.startswith('x')) for name in names]
+
+
+def wallet(index):
+  """A made-up licence owner wallet."""
+  return '0x' + '{:040x}'.format(0xA11CE00000 + index)
+
+
+def build_registry(nodes):
+  """What ``node/chain_shim.py`` puts into the SDK's per-network tables: the localnet seed nodes."""
+  return {'seed_addresses': [node['address'] for node in nodes if node['role'] == 'seed']}
+
+
+def build_chain_state(nodes, fleet=None):
+  """Initial state of the local blockchain (``infra/chain_rpc.py``): licences and the oracle registries."""
+  state = {'nodes': {}, 'escrows': {}, 'jobs': {}, 'logs': []}
+  entries = [dict(node, oracle=node['role'] in ('seed', 'oracle')) for node in nodes]
+  entries += [dict(item, oracle=False) for item in (fleet or [])]
+  for index, node in enumerate(entries):
+    state['nodes'][node['eth_address']] = {
+      'name': node['name'],
+      'address': node['address'],
+      'oracle': node['oracle'],
+      'dauth_oracle': node['oracle'],
+      'licensed': node.get('licensed', True),
+      'banned': False,
+      'license_id': index + 1,
+      'license_type': 1,
+      'owner': wallet(index // 3),  # owners hold a few licences each
+    }
+  return state
+
+
+def _startup_overrides():
+  admin = {}
+  for signature, port in WEB_PLUGINS.items():
+    admin[signature] = {'PORT': port, 'TUNNEL_ENGINE_ENABLED': False}
+  for signature in NO_TUNNEL_PLUGINS:
+    admin[signature] = {'TUNNEL_ENGINE_ENABLED': False}
+  return {'ADMIN_PIPELINE': admin}
+
+
+def node_env(node, manifest, secrets):
+  env = {
+    'R1_LOCALNET': '1',
+    'EE_EVM_NET': node['evm_net'],
+    'EE_DD': '0',  # no docker-in-docker: the image entrypoint then execs python as PID 1, as in production
+    'EE_ID': node['name'],
+    'EE_SUPERVISOR': 'true' if node['supervisor'] else 'false',
+    'EE_TUNNEL_ENGINE': 'cloudflare',
+    'PYTHONPATH': '/opt/r1src/sdk:/opt/r1src/core',
+    'SSL_CERT_FILE': '/run/localnet/mqtt-ca.crt',
+    'R1_LOCALNET_NODE': node['name'],
+  }
+  if node['role'] == 'seed':
+    mesh, relay = manifest['mesh'], manifest['relays'][node['relay']]
+    env.update(PLACEHOLDER_ENV)
+    env.update({key: 'localnet-no-tunnel' for key in TUNNEL_TOKEN_KEYS})
+    env.update({
+      'EE_DAUTH_URL': 'seed_node',  # the marker mainnet seeds carry: do not ask dAuth, serve it
+      'EE_REVOKED_NODE_ADDRESSES': ','.join(manifest.get('revoked_addresses') or []),
+      'EE_MQTT_HOST': mesh['brokers'][node['broker']]['ip'],
+      'EE_MQTT_HOST_SEED': ' '.join(mesh['brokers'][broker]['ip'] for broker in BROKERS),
+      'EE_MQTT_PORT': '8883',
+      'EE_MQTT_USER': secrets['mesh']['client_username'],
+      'EE_MQTT': secrets['mesh']['client_password'],
+      'EE_MQTT_SUBTOPIC': 'address',
+      'EE_MQTT_CERT': '',
+      'EE_IPFS_RELAY': relay['multiaddr'],
+      'EE_IPFS_RELAY_API': relay['api'],
+      'EE_IPFS_API_KEY_BASE64': secrets['relay']['relay_api_key_b64'],
+      'EE_IPFS_CERTIFICATE_BASE64': relay['cert_b64'],
+      'EE_SWARM_KEY_CONTENT_BASE64': secrets['relay']['swarm_key_b64'],
+    })
+  env.update(node.get('env') or {})
+  return env
+
+
+def write_node_files(home, manifest, secrets):
+  for node in manifest['nodes']:
+    ndir = home.run / 'nodes' / node['name']
+    ndir.mkdir(parents=True, exist_ok=True)
+    (home.run / 'out' / node['name']).mkdir(parents=True, exist_ok=True)
+    env = node_env(node, manifest, secrets)
+    (ndir / 'env').write_text(''.join('{}={}\n'.format(key, val) for key, val in sorted(env.items())))
+    os.chmod(ndir / 'env', 0o600)
+    (ndir / 'node.json').write_text(json.dumps({
+      'name': node['name'], 'role': node['role'], 'arm': node['arm'],
+      'startup': dict(_startup_overrides(), **(node.get('startup') or {})),
+    }, indent=1, sort_keys=True))
+  return
+
+
+def node_services(home, manifest):
+  services = {}
+  for node in manifest['nodes']:
+    ndir = home.run / 'nodes' / node['name']
+    service = {
+      'image': NODE_IMAGE,
+      'container_name': container(node['name']),
+      'hostname': node['name'],
+      'labels': {LABEL: 'node', LABEL + '.role': node['role'], LABEL + '.arm': node['arm']},
+      'command': ['python3', '/opt/localnet/node/launch.py'],
+      'env_file': [str(ndir / 'env')],
+      'networks': {PROJECT: {'ipv4_address': node['ip']}},
+      'cap_add': ['SYS_PTRACE'],  # lets a sampling profiler attach from inside the container
+      'volumes': [
+        '{}:/opt/localnet:ro'.format(HERE),
+        '{}:/opt/r1src:ro'.format(home.src / node['arm']),
+        '{}:/run/localnet/registry.json:ro'.format(home.run / 'registry.json'),
+        '{}:/run/localnet/node.json:ro'.format(ndir / 'node.json'),
+        '{}:/run/localnet/mqtt-ca.crt:ro'.format(home.run / 'brokers' / 'mqtt-ca.crt'),
+        '{}:/out'.format(home.run / 'out' / node['name']),
+        '{}:/edge_node/_local_cache'.format(node['volume']),
+      ],
+      'stop_grace_period': '90s',
+    }
+    if node.get('cpus'):
+      service['cpus'] = node['cpus']
+    if node.get('cpuset'):
+      service['cpuset'] = node['cpuset']
+    if node.get('mem_limit'):
+      service['mem_limit'] = node['mem_limit']
+    services[node['name']] = service
+  return services
+
+
+def node_volumes(manifest):
+  return {node['volume']: {'external': True} for node in manifest['nodes']}
+
+
+def describe(nodes):
+  for node in nodes:
+    log('  {:<10} {:<7} {:<5} {:<13} {}'.format(node['name'], node['role'], node['arm'], node['ip'], node.get('address', '')))
+  return
+
+
+# ---------------------------------------------------------------- start-up sequencing
+
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def node_log(name, tail=None):
+  cmd = ['docker', 'logs']
+  if tail:
+    cmd += ['--tail', str(tail)]
+  out = sh(*cmd, container(name), check=False, timeout=120).stdout or ''
+  return ANSI.sub('', out)
+
+
+def wait_dauth(manifest, names, timeout=420):
+  """Wait until the dAuth plugin of each named oracle accepts requests."""
+  ips = [node['ip'] for node in manifest['nodes'] if node['name'] in names]
+  probe = (
+    "import json,sys,urllib.request\n"
+    "bad=[]\n"
+    "for ip in sys.argv[1:]:\n"
+    "  try:\n"
+    "    req=urllib.request.Request('http://%s:{port}/get_auth_data'%ip,data=b'{{\"body\":{{}}}}',headers={{'Content-Type':'application/json'}})\n"
+    "    urllib.request.urlopen(req,timeout=10).read()\n"
+    "  except Exception as exc:\n"
+    "    bad.append(ip)\n"
+    "print('BAD',' '.join(bad))\n"
+  ).format(port=WEB_PLUGINS['DAUTH_MANAGER'])
+  end = time.time() + timeout
+  bad = ips
+  while time.time() < end:
+    out = ctl_exec(PYTHON, '-c', probe, *ips, check=False, timeout=120).stdout or ''
+    line = [item for item in out.splitlines() if item.startswith('BAD')]
+    bad = line[-1].split()[1:] if line else ips
+    if not bad:
+      return True
+    time.sleep(5)
+  raise LocalnetError('dAuth did not come up on {} within {} s'.format(bad, timeout))
+
+
+def supervisor_state(name):
+  """True / False as the node resolved its role after asking dAuth, or None while it has not got there."""
+  found = re.findall(r'SUPERVISOR = (True|False) \(', node_log(name))
+  return None if not found else found[-1] == 'True'
+
+
+def settle_oracles(home, manifest, names, timeout=600):
+  """
+  A node that is not a seed learns its role from dAuth. dAuth recognises an oracle only after the seeds
+  have seen that node's heartbeats, so an oracle that joins a fresh network first comes up as an ordinary
+  node and takes its oracle role on the next start. Restart such oracles until they have it.
+  """
+  oracles = [node['name'] for node in manifest['nodes'] if node['role'] == 'oracle' and node['name'] in names]
+  pending = set(oracles)
+  restarts = {name: 0 for name in oracles}
+  seen_plain = {}
+  end = time.time() + timeout
+  while pending and time.time() < end:
+    for name in sorted(pending):
+      state = supervisor_state(name)
+      if state is True:
+        pending.discard(name)
+        log('  {} is an oracle (after {} restart(s))'.format(name, restarts[name]))
+      elif state is False:
+        first = seen_plain.setdefault(name, time.time())
+        if time.time() - first > 45 and restarts[name] < 4:
+          restarts[name] += 1
+          seen_plain.pop(name)
+          compose(home, 'restart', '-t', '60', name, check=False)
+    time.sleep(5)
+  if pending:
+    raise LocalnetError('oracles without their role after {} s: {}'.format(timeout, sorted(pending)))
+  return restarts
