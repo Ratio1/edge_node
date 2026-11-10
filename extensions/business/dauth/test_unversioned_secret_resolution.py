@@ -1,6 +1,8 @@
 """Existing persisted pipelines survive restart without weakening revision auth."""
 import json
 import tempfile
+import threading
+import time
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -125,6 +127,30 @@ class ExistingPipelineSecretTests(unittest.TestCase):
           plugin.process_dauth_get_secret_request(request())
         plugin.chainstore_hsync.assert_not_called()
         self.assertEqual(plugin.bc.encrypt_calls, [])
+
+  def test_slow_pipeline_read_runs_off_the_request_thread_once_per_cid(self):
+    plugin = existing_job()
+    released, calls = threading.Event(), []
+    def get_json(cid, show_logs=False):
+      calls.append(cid)
+      released.wait(5)
+      return plugin._r1fs_data[cid]
+    plugin.r1fs.get_json = get_json
+    with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+      with self.assertRaises(RuntimeError):
+        plugin.process_dauth_get_secret_request(request())
+    started = time.monotonic()
+    with self.assertRaisesRegex(RuntimeError, "unavailable"):
+      plugin.process_dauth_get_secret_request(request())
+    self.assertLess(time.monotonic() - started, 2)
+    released.set()
+    for thread in threading.enumerate():
+      if thread.name == "dauth-r1fs-read":
+        thread.join(5)
+    self.assertEqual(plugin.process_dauth_get_secret_request(request())["status"], "success")
+    with self.assertRaisesRegex(ValueError, "not running"):
+      plugin.process_dauth_get_secret_request(request(EE_SENDER="node-other", EE_ETH_SENDER="0xOTHER"))
+    self.assertEqual(calls, ["old-cid"])
 
   def test_cached_bundle_does_not_require_peer_synchronization(self):
     plugin = existing_job()

@@ -14,6 +14,8 @@ plugin to provide a complete decentralized authentication solution.
 
 """
 
+import threading
+
 from .dauth_registry import (
   DAUTH_SECRET_PIPELINE_CID_KEY,
   dauth_registry_write_kwargs,
@@ -275,6 +277,38 @@ class _DauthMixin(object):
   def _load_dauth_job_pipeline(self, job_id):
     _, pipeline = self._load_dauth_job_pipeline_record(job_id)
     return pipeline
+
+  def _load_legacy_pipeline(self, cid):
+    """Return the R1FS document `cid`, read once per CID and never on the request thread.
+
+    The CID comes from this node's own pointer and names immutable content; callers only
+    read the document. The read runs on a helper thread; the request waits at most 0.25 s,
+    otherwise fails as retryable, and the retry is answered from memory. A document that
+    could not be read is read again 300 s after that read ended.
+    """
+    cache = getattr(self, "_dauth_legacy_pipelines", None)
+    if cache is None:
+      cache = self._dauth_legacy_pipelines = {}  # cid -> (retry_at, document); retry_at None while reading
+    retry_at, document = cache.get(cid, (0, None))
+    if document is None and retry_at is not None and self.time() >= retry_at:
+      def read():
+        try:
+          doc = self.r1fs.get_json(cid, show_logs=False)
+        except Exception:
+          doc = None
+        cache[cid] = (self.time() + 300, doc if isinstance(doc, dict) else None)
+      reader = threading.Thread(target=read, name="dauth-r1fs-read", daemon=True)
+      cache[cid] = (None, None)
+      try:
+        reader.start()
+      except RuntimeError:
+        cache.pop(cid, None)
+        raise
+      reader.join(0.25)
+      retry_at, document = cache[cid]
+    if document is None:
+      raise RuntimeError("Existing pipeline configuration is unavailable.")
+    return document
 
   def _load_current_dauth_secret_bundle(self, job_id, pipeline_cid, pipeline, require_unversioned=False):
     """Load the exact current CID's secrets, binding pre-CID records if needed.
@@ -546,9 +580,7 @@ class _DauthMixin(object):
     pipeline_cid = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id)
     if not isinstance(pipeline_cid, str) or not pipeline_cid:
       raise ValueError("Secret revision is required or the existing pipeline is unavailable.")
-    pipeline = self.r1fs.get_json(pipeline_cid, show_logs=False)
-    if not isinstance(pipeline, dict):
-      raise RuntimeError("Existing pipeline configuration is unavailable.")
+    pipeline = self._load_legacy_pipeline(pipeline_cid)
     specs = pipeline.get("DEEPLOY_SPECS", {})
     if (not isinstance(specs, dict) or str(specs.get("job_id")) != job_id
         or "secret_revision" in specs or specs.get("revision", 0) != 0
