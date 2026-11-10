@@ -60,7 +60,7 @@ class _NodeTagsMixin(object):
 
     self.P(f"Fetching is_kyb for wallet {node_owner}", color='y')
 
-    response = self.requests.get(url, params=params)
+    response = self.requests.get(url, params=params, timeout=(3, 5))
     is_kyb = False
     if response.status_code == 200:
       try:
