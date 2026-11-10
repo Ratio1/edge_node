@@ -301,7 +301,7 @@ class _FakeR1FS:
   def __init__(self, data):
     self.data = data
 
-  def get_json(self, cid, show_logs=False):  # pylint: disable=unused-argument
+  def get_json(self, cid, show_logs=False, **kwargs):  # pylint: disable=unused-argument
     return self.data[cid]
 
 

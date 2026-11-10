@@ -272,7 +272,7 @@ class _DauthMixin(object):
     cid = self._load_dauth_pipeline_cid(job_id)
     if not cid:
       return None, None
-    return cid, self.r1fs.get_json(cid, show_logs=False)
+    return cid, self.r1fs.get_json(cid, timeout=10, pin=False, show_logs=False)
 
   def _load_dauth_job_pipeline(self, job_id):
     _, pipeline = self._load_dauth_job_pipeline_record(job_id)

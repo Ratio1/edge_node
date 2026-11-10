@@ -77,6 +77,15 @@ class LifecycleDauthCustodyTests(unittest.TestCase):
     self.assertEqual(self.state.secrets['DAUTH_JOB_SECRETS', '7']['EE_SENDER'], 'dauth')
     self.assertEqual(self.state.public['DEEPLOY_DEPLOYED_JOBS', '7']['EE_SENDER'], 'oracle')
 
+  def test_custody_reads_do_not_pin_so_their_timeout_bounds_them(self):
+    previous, _ = self.legacy()
+    self.dauth.r1fs = Mock(wraps=self.state.blobs)
+    self.admit(previous)
+    self.finalize(self.operation())
+    reads = self.dauth.r1fs.get_json.call_args_list
+    self.assertGreaterEqual(len(reads), 3)
+    self.assertTrue(all(read.kwargs.get('pin') is False and read.kwargs.get('timeout') == 10 for read in reads))
+
   def test_failed_first_update_restores_old_secrets_with_new_generation(self):
     previous, cid = self.legacy()
     self.admit(previous)
