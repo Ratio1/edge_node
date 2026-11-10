@@ -69,6 +69,10 @@ class Simulation:
         self.record(namespace, key, value, False)
         raise RuntimeError("CStore is unavailable.")
       plugin.replicate = self.outage is None
+      # The real chainstore_set stores the JSON form of every value (tuples become lists,
+      # integer keys become strings); the store double must do the same or an
+      # "unchanged" comparison is checked against the wrong representation.
+      value = json.loads(json.dumps(value))
       accepted = store(namespace, key, value, **kwargs)
       self.record(namespace, key, value, accepted)
       return accepted
