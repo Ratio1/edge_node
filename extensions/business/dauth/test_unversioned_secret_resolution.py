@@ -219,6 +219,7 @@ class ExistingPipelineSecretTests(unittest.TestCase):
         node = Orchestrator.__new__(Orchestrator)
         node._blockchain_manager = engine
         node._current_dct_config_streams = {"existing": json.loads(saved.read_text())}
+        node._runtime_secret_settled_streams = None  # as Orchestrator.__init__ leaves it
         messages = []
         node.P = lambda message, **kwargs: messages.append(message)
         node._ensure_runtime_secret_resolution_state()
