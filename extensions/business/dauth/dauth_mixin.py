@@ -389,12 +389,13 @@ class _DauthMixin(object):
     # An unknown CID reads as "no document, retry time already passed", so the first
     # request starts the read.
     retry_at, document = cache.get(cid, (0, None))
-    # Reads running right now (their retry time is None). The sender can only be checked against
-    # the document, so the number of downloads a caller can start must be limited here.
-    reading = sum(1 for at, _ in cache.values() if at is None)
-    # At most four reads at once: a request over the limit starts nothing, leaves no entry in the
-    # memo and gets the retryable error below, so its read starts on a later try.
-    if document is None and retry_at is not None and self.time() >= retry_at and reading < 4:
+    # At most four reads at once (the sender can only be checked against the document, so the
+    # number of downloads a caller can start is limited here): a request over the limit starts
+    # nothing, leaves no entry in the memo and gets the retryable error below, so its read starts
+    # on a later try. The running reads (their retry time is None) are counted last, only when
+    # this request would start one: a request answered from the memo never scans it.
+    if (document is None and retry_at is not None and self.time() >= retry_at
+        and sum(1 for at, _ in cache.values() if at is None) < 4):
       def read():
         """
         Read the pipeline document on the helper thread and record the result in the memo.
