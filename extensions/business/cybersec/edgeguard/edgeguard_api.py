@@ -54,6 +54,7 @@ from .edgeguard_cypher_guard_v0_13 import (
   EDGEGUARD_SCHEMA_V0_13,
   SCHEMA_VERSION_V0_13,
   build_v0_13_pattern_schema_system_prompt,
+  load_v0_13_p6_system_prompt,
 )
 from .edgeguard_cypher_decision_json import (
   DECISION_JSON_SCHEMA,
@@ -694,11 +695,14 @@ PROMPT_PROFILE_V0_11_PATTERN_SCHEMA = "v0_11_pattern_schema"
 # EGM-068 contract v0.13 (cf789b9 graph): same output contract and correction
 # turn as v0.11, but its own artifact, served prompt and guard allowlist.
 PROMPT_PROFILE_V0_13_PATTERN_SCHEMA = "v0_13_pattern_schema"
+# Same v0.13 weights and validation, prompt-only revision p6 (vendored, pinned).
+PROMPT_PROFILE_V0_13_P6 = "v0_13_pattern_schema_p6"
 # Profiles that validate with the v0.11-style rules (optional graph LIMIT, hop
 # bounds, endpoint pairs), each against its own artifact.
 PATTERN_SCHEMA_ARTIFACTS = {
   PROMPT_PROFILE_V0_11_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_11,
   PROMPT_PROFILE_V0_13_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_13,
+  PROMPT_PROFILE_V0_13_P6: EDGEGUARD_SCHEMA_V0_13,
 }
 _ARTIFACTS_BY_SCHEMA_VERSION = {
   SCHEMA_VERSION_V0_11: EDGEGUARD_SCHEMA_V0_11,
@@ -760,6 +764,15 @@ PROMPT_PROFILES = {
     "system_prompt_suffix": None,
     "single_user_message": False,
   },
+  PROMPT_PROFILE_V0_13_P6: {
+    "prompt_profile_id": "edgeguard_v0_13_pattern_schema_p6",
+    "template_version": "edgeguard-v0-13-pattern-schema-p6-7b9abcfddf4d",
+    "prompt_contract": (
+      "schema-grounded read-only Cypher query string, graph or ranked_projection shape"
+    ),
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+  },
   # IICT-BAS adapter (2026-11-08): its own vendored system prompt, a JSON
   # reply with a `decision`, no correction turns (see
   # `edgeguard_cypher_decision_json`).
@@ -784,6 +797,7 @@ PROMPT_PROFILES = {
 # it is built once here rather than on every `generate` call.
 _V0_11_SYSTEM_PROMPT = build_v0_11_pattern_schema_system_prompt()
 _V0_13_SYSTEM_PROMPT = build_v0_13_pattern_schema_system_prompt()
+_V0_13_P6_SYSTEM_PROMPT = load_v0_13_p6_system_prompt()
 _DECISION_JSON_SYSTEM_PROMPT = load_decision_json_system_prompt()
 
 
@@ -792,6 +806,8 @@ def _system_prompt_for_profile(profile_name: str) -> str:
     return _V0_11_SYSTEM_PROMPT
   if profile_name == PROMPT_PROFILE_V0_13_PATTERN_SCHEMA:
     return _V0_13_SYSTEM_PROMPT
+  if profile_name == PROMPT_PROFILE_V0_13_P6:
+    return _V0_13_P6_SYSTEM_PROMPT
   if profile_name == PROMPT_PROFILE_DECISION_JSON_2026_11_08:
     return _DECISION_JSON_SYSTEM_PROMPT
   return build_direct_cypher_system_prompt()
@@ -4127,7 +4143,7 @@ class EdgeguardApiPlugin(BasePlugin):
     instead of repeating the `model_key -> profile -> v0.11?` selection.
 
     A `model_key` that resolves to a pattern-schema prompt profile
-    (`v0_11_pattern_schema` or `v0_13_pattern_schema`, see
+    (`v0_11_pattern_schema`, `v0_13_pattern_schema` or `v0_13_pattern_schema_p6`, see
     `PATTERN_SCHEMA_ARTIFACTS`) gets that profile's artifact in
     `schema_artifact`, its derived flat sets, `LIMIT` optional for the
     `graph` shape, and the tightened hop bounds; `use_v0_11` means exactly
