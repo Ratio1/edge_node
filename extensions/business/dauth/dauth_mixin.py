@@ -159,22 +159,28 @@ class _DauthMixin(object):
     node_address_eth : str, 
     version_check_data : VersionCheckData,
     body : dict = None,
+    dauth_data : dict = None,
   ):
     """
-    Check if the node address is allowed to request authentication data.
+    Check if the node address is allowed to request authentication data. A revoked
+    requester is also named in `dauth_data[dAuth.DAUTH_REVOKED]`, which tells the node
+    to replace its key.
     """
     self.Pd(f"Checking if node {node_address} (ETH: {node_address_eth}) is allowed")
     msg = ""
-    result = True    
+    result = True
     if not version_check_data.result:
       result = False
       msg = "Version check failed: {}".format(version_check_data.message)
     else:
       try:
-        result = not self._is_dauth_node_revoked(
+        revoked = self._is_dauth_node_revoked(
           endpoint="get_auth_data", node_address=node_address,
           requester_type=version_check_data.requester_type, body=body,
-        ) and self.bc.is_node_licensed(node_address_eth=node_address_eth)
+        )
+        if revoked and dauth_data is not None:
+          dauth_data[self.const.BASE_CT.dAuth.DAUTH_REVOKED] = node_address
+        result = not revoked and self.bc.is_node_licensed(node_address_eth=node_address_eth)
         str_allowed = "allowed" if result else "not allowed"
         msg = f"{version_check_data.requester_type} {node_address_eth} {str_allowed} on {self.evm_network}"
       except Exception as e:
@@ -1132,7 +1138,7 @@ class _DauthMixin(object):
     if error is None:
       allowed_to_dauth, message = self.check_if_node_allowed(
         node_address=requester, node_address_eth=requester_eth, 
-        version_check_data=version_check_data, body=body,
+        version_check_data=version_check_data, body=body, dauth_data=dct_dauth,
       )
       if not allowed_to_dauth:
         error = 'Node not allowed to request auth data. ' + message

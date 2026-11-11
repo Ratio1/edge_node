@@ -107,7 +107,6 @@ _CONFIG = {
   # subset of SUPERVISOR_KEYS sent only to oracles listed in the dAuth registry
   "DAUTH_ORACLE_ONLY_SUPERVISOR_KEYS": [
     "EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER",
-    "EE_REVOKED_NODE_ADDRESSES",
   ],
 
   'VALIDATION_RULES': {
@@ -492,6 +491,25 @@ class DauthManagerPlugin(
       **data
     })
     return response
+
+  @BasePlugin.endpoint(method="post")
+  # /announce_node_key
+  def announce_node_key(self, body: dict):
+    """
+    A node whose key dAuth reported as revoked announces its new key. The request is
+    signed by the new key and carries the announcement signed by the revoked key; only
+    the first new key per revoked key is kept (see `dauth_revoked_nodes.py`).
+    """
+    if not self._is_dauth_server_enabled():
+      return self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle'
+      })
+    try:
+      data = self._announce_node_key(body)
+    except Exception as e:
+      self.P("Node key announcement from {} refused: {}".format(self.get_request_client_ip(), e), color='r')
+      data = {'error': str(e)}
+    return self.__get_response(data)
 
   @BasePlugin.endpoint(method="post")
   # /add_secrets

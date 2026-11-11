@@ -36,8 +36,25 @@ TODO LEDGER :
 """
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
+from ratio1.const.base import dAuth
 
-__VER__ = '0.3.3'
+from extensions.business.dauth.dauth_revoked_nodes import (
+  DAUTH_REVOKED_NODES_ENV_KEY,
+  NODE_KEY_ROTATIONS_CSTORE_HKEY,
+  parse_revoked_node_addresses,
+)
+
+__VER__ = '0.3.4'
+
+# Mainnet nodes whose key is in `EE_REVOKED_NODE_ADDRESSES` and that had any availability
+# in the eligibility epochs are signed full availability in the floor epochs.
+# The floor ends by itself at relink: the license then points to a key that is not revoked.
+REVOKED_FLOOR_ELIGIBLE_EPOCHS = range(521, 528)
+REVOKED_FLOOR_FIRST_EPOCH = 528
+REVOKED_FLOOR_LAST_EPOCH = 557
+REVOKED_FLOOR_VALUE = 255
+# Most addresses `node_key_rotations` answers per request.
+NODE_KEY_ROTATIONS_MAX_ADDRESSES = 1000
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -63,6 +80,14 @@ class OracleApiPlugin(BasePlugin):
   
 
   def on_init(self):
+    # Mainnet signs no availability without the revoked-node list: a revoked node's
+    # claim signed without the floor cannot be redone.
+    self.__revoked_nodes = {}
+    if self.evm_network == dAuth.EvmNetData.MAINNET:
+      self.__revoked_nodes = parse_revoked_node_addresses(
+        self.bc, self.os_environ.get(DAUTH_REVOKED_NODES_ENV_KEY)
+      )
+      self.P(f"Revoked-node list loaded: {len(self.__revoked_nodes)} node addresses.")
     super(OracleApiPlugin, self).on_init()
     my_address = self.bc.address
     current_epoch = self.__get_current_epoch()
@@ -250,6 +275,22 @@ class OracleApiPlugin(BasePlugin):
     return data
   
   
+  def __apply_revoked_floor(self, node_eth_address, epochs, epochs_vals):
+    """
+    Return the values of `epochs` from `epochs_vals` ({epoch: value}), raised to
+    `REVOKED_FLOOR_VALUE` in the floor epochs when `node_eth_address` is a
+    revoked node key that had availability in the eligibility epochs.
+    """
+    selected = [epochs_vals[epoch] for epoch in epochs]
+    if not isinstance(node_eth_address, str) or node_eth_address.lower() not in self.__revoked_nodes:
+      return selected
+    if not any((epochs_vals.get(epoch) or 0) > 0 for epoch in REVOKED_FLOOR_ELIGIBLE_EPOCHS):
+      return selected
+    return [
+      max(val, REVOKED_FLOOR_VALUE) if REVOKED_FLOOR_FIRST_EPOCH <= epoch <= REVOKED_FLOOR_LAST_EPOCH else val
+      for epoch, val in zip(epochs, selected)
+    ]
+
   def __get_node_epochs(self, node_addr: str, start_epoch: int = 1, end_epoch: int = None, include_bc_info: bool = False):
     """
     Get the epochs availabilities for a given node.
@@ -351,7 +392,7 @@ class OracleApiPlugin(BasePlugin):
       epochs = list(range(start_epoch, end_epoch + 1)) 
       if unknown_address:
         epochs_vals = {x : 0 for x in epochs}
-      epochs_vals_selected = [epochs_vals[x] for x in epochs]
+      epochs_vals_selected = self.__apply_revoked_floor(node_eth_address, epochs, epochs_vals)
       # end try
       oracle_state = self.netmon.epoch_manager.get_oracle_state(
         start_epoch=start_epoch, end_epoch=end_epoch
@@ -757,6 +798,38 @@ class OracleApiPlugin(BasePlugin):
     request_elapsed = self.time() - request_start
     response = self.__get_response(all_nodes, query_time=request_elapsed)
     return response
+
+
+  @BasePlugin.endpoint(method='POST')
+  # /node_key_rotations
+  def node_key_rotations(self, eth_node_addresses: list):
+    """
+    Returns the new node key announced for each given revoked node key.
+
+    Parameters
+    ----------
+    eth_node_addresses : list
+        ETH addresses of node keys (the addresses linked to licenses).
+
+    Returns
+    -------
+    dict
+        `rotations`: {given ETH address: {node, node_eth_address}} for each address
+        that has an announced new key; addresses without one are left out.
+    """
+    if not isinstance(eth_node_addresses, list) or len(eth_node_addresses) > NODE_KEY_ROTATIONS_MAX_ADDRESSES:
+      raise ValueError(f"Please provide a list of at most {NODE_KEY_ROTATIONS_MAX_ADDRESSES} ETH node addresses.")
+    rotations = {}
+    for eth_node_addr in eth_node_addresses:
+      if not isinstance(eth_node_addr, str):
+        continue
+      new_node = self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=eth_node_addr.lower())
+      if isinstance(new_node, str):
+        rotations[eth_node_addr] = {
+          'node': new_node,
+          'node_eth_address': self.bc.node_address_to_eth_address(new_node),
+        }
+    return self.__get_response({'rotations': rotations})
 
 
   @BasePlugin.endpoint

@@ -15,12 +15,15 @@ only). ChainStore calls stay on the plugin thread because they use the plugin's 
 which are not safe across threads. Revoked keys retry often, and doing this work in the
 request would hold the single dAuth request thread for every refusal. The list is
 deployed privately in the seeds' .env and is never part of this repository; dAuth hands
-it to the other dAuth registry oracles as a dAuth-oracle-only supervisor key (see
-`dauth_manager.py`).
+it to every oracle as a supervisor key (see `dauth_manager.py`), since the oracle API
+also reads it.
 
-Remove this module and the `_is_dauth_node_revoked` calls in `dauth_mixin.py` once
-on-chain node address revocation (`revokeNodeAddresses` in ND/MND) and the node
-key-rotation update are live.
+Key rotation: dAuth's refusal of a revoked node carries `dAuth.DAUTH_REVOKED`, and the
+node then creates a new key and announces it on `/announce_node_key`, signed by both
+keys. dAuth keeps only the first new key announced for each revoked key, in the
+`NODE_KEY_ROTATIONS` ChainStore hash (field = revoked key's ETH address, value = new node
+address), written read-only so other writers cannot replace it. The oracle API serves
+that hash to the dApp, where the license owner links the new key.
 """
 import hashlib
 import json
@@ -48,6 +51,10 @@ DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL = 600
 # The plugin loop never waits longer than this for peer confirmations of one write, and
 # makes at most one such write per `process` call.
 DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT = 3
+# Field = revoked key's lowercase ETH address, value = first new node address announced.
+NODE_KEY_ROTATIONS_CSTORE_HKEY = "NODE_KEY_ROTATIONS"
+# The announcement request waits at most this long for peer confirmations (seconds).
+NODE_KEY_ROTATION_WRITE_TIMEOUT = 3
 # The on-chain license result is reused for this many seconds; a revoked node's license
 # rarely changes, and its timestamp is rewritten at most every 600 seconds anyway.
 DAUTH_REVOKED_LICENSE_CHECK_INTERVAL = 60 * 60
@@ -68,6 +75,36 @@ _REPORTED_KEYS = (
   dAuth.DAUTH_SENDER_ALIAS,
 )
 _REPORTED_MAX_LEN = 64
+
+
+def parse_revoked_node_addresses(bc, value):
+  """
+  Return {lowercase ETH address: unprefixed internal address}. The ETH address is
+  the key's identity: the compressed and uncompressed point, or the address with
+  characters the base64 decoder skips, all resolve to the same one. Errors never
+  echo an address.
+  """
+  if not isinstance(value, str) or not value.strip():
+    raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} is not set.")
+  revoked = {}
+  for position, item in enumerate(value.split(","), start=1):
+    if not item.strip():
+      continue
+    internal = bc.maybe_remove_prefix(item.strip())
+    if not _INTERNAL_ADDRESS_RE.match(internal):
+      raise ValueError(
+        f"{DAUTH_REVOKED_NODES_ENV_KEY} item #{position} is not a well-formed internal node address."
+      )
+    try:
+      eth = bc.node_address_to_eth_address(bc.maybe_add_prefix(internal))
+    except Exception:
+      raise ValueError(
+        f"{DAUTH_REVOKED_NODES_ENV_KEY} item #{position} is not a valid node public key."
+      ) from None
+    revoked[eth.lower()] = internal
+  if not revoked:
+    raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} holds no node addresses.")
+  return revoked
 
 
 class _DauthRevokedNodesMixin(object):
@@ -111,33 +148,56 @@ class _DauthRevokedNodesMixin(object):
     return
 
   def _parse_dauth_revoked_nodes(self, value):
+    return parse_revoked_node_addresses(self.bc, value)
+
+  def _announce_node_key(self, body):
     """
-    Return {lowercase ETH address: unprefixed internal address}. The ETH address is
-    the key's identity: the compressed and uncompressed point, or the address with
-    characters the base64 decoder skips, all resolve to the same one. Errors never
-    echo an address.
+    Keep the first new key announced for a revoked node key.
+
+    The request is signed by the new key and carries the announcement
+    (`dAuth.DAUTH_KEY_ROTATION`) signed by the revoked key, naming the new key. The
+    first new key stored for a revoked key is final; later announcements only read it.
+    A matching announcement rewrites the same value so a write lost the first time is
+    replicated on retry.
+
+    Returns
+    -------
+    dict
+      `old_node`, `new_node` (the address stored for the revoked key) and `confirmed`
+      (True when the stored address is this request's and peers confirmed it).
     """
-    if not isinstance(value, str) or not value.strip():
-      raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} is not set.")
-    revoked = {}
-    for position, item in enumerate(value.split(","), start=1):
-      if not item.strip():
-        continue
-      internal = self.bc.maybe_remove_prefix(item.strip())
-      if not _INTERNAL_ADDRESS_RE.match(internal):
-        raise ValueError(
-          f"{DAUTH_REVOKED_NODES_ENV_KEY} item #{position} is not a well-formed internal node address."
-        )
-      try:
-        eth = self.bc.node_address_to_eth_address(self.bc.maybe_add_prefix(internal))
-      except Exception:
-        raise ValueError(
-          f"{DAUTH_REVOKED_NODES_ENV_KEY} item #{position} is not a valid node public key."
-        ) from None
-      revoked[eth.lower()] = internal
-    if not revoked:
-      raise ValueError(f"{DAUTH_REVOKED_NODES_ENV_KEY} holds no node addresses.")
-    return revoked
+    new_node, new_eth = self._verify_signed_dauth_body(body, endpoint="announce_node_key")
+    announcement = body.get(dAuth.DAUTH_KEY_ROTATION)
+    if not isinstance(announcement, dict) or not self.bc.verify(announcement, return_full_info=True).valid:
+      raise ValueError("Invalid node key announcement signature.")
+    if (
+      announcement.get("purpose") != dAuth.DAUTH_KEY_ROTATION_PURPOSE
+      or announcement.get("network") != self.evm_network
+      or not isinstance(announcement.get("new_node"), str)
+      or self.bc.node_address_to_eth_address(announcement["new_node"]).lower() != new_eth.lower()
+    ):
+      raise ValueError("Invalid node key announcement.")
+    old_node = announcement.get(self.const.BASE_CT.BCctbase.SENDER)
+    old_eth = self.bc.node_address_to_eth_address(old_node).lower()
+    if old_eth not in self._dauth_revoked_nodes:
+      raise ValueError("Only a revoked node key can announce a new key.")
+
+    stored = self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth)
+    confirmed = False
+    if stored in (None, new_node):
+      confirmed = bool(self.chainstore_hset(
+        hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth, value=new_node,
+        readonly=True, timeout=NODE_KEY_ROTATION_WRITE_TIMEOUT, max_retries=0,
+      ))
+      stored = self.chainstore_hget(hkey=NODE_KEY_ROTATIONS_CSTORE_HKEY, key=old_eth)
+    self.P("Node key announcement for revoked {} -> {}: stored {}, confirmed {}".format(
+      old_eth, new_eth, stored, confirmed and stored == new_node,
+    ), color='y')
+    return {
+      "old_node": old_node,
+      "new_node": stored,
+      "confirmed": confirmed and stored == new_node,
+    }
 
   def _is_dauth_node_revoked(self, endpoint, node_address, requester_type=None, body=None):
     """

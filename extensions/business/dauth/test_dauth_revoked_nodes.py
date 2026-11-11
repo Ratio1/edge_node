@@ -30,6 +30,7 @@ from extensions.business.dauth.dauth_revoked_nodes import (
   DAUTH_REVOKED_UNLICENSED_CSTORE_HKEY,
   DAUTH_REVOKED_UNLICENSED_WRITE_INTERVAL,
   DAUTH_REVOKED_UNLICENSED_WRITE_TIMEOUT,
+  NODE_KEY_ROTATIONS_CSTORE_HKEY,
 )
 from extensions.business.dauth import test_dauth_registry_gating as gating
 from extensions.business.dauth.test_dauth_registry_gating import (
@@ -560,6 +561,80 @@ class DauthRevokedNodeStartupTests(unittest.TestCase):
     self.assertTrue(plugin.should_resume())
     with self.assertRaisesRegex(ValueError, f"{DAUTH_REVOKED_NODES_ENV_KEY} is not set"):
       plugin.on_resume()
+
+
+
+NEW = "0xai_" + "Enewkey".ljust(44, "4")
+OTHER_NEW = "0xai_" + "Fothernew".ljust(44, "5")
+ETH.update({NEW: "0x" + "e" * 40, OTHER_NEW: "0x" + "f" * 40})
+
+
+def _announce_body(new_key, old_node=REVOKED, **announcement_overrides):
+  """A request signed by `new_key` carrying the announcement signed by `old_node`."""
+  announcement = {
+    "purpose": dAuth.DAUTH_KEY_ROTATION_PURPOSE, "network": "mainnet", "new_node": new_key,
+    "EE_SENDER": old_node, "EE_SIGN": "old-key-signature", **announcement_overrides,
+  }
+  return {
+    "EE_SENDER": new_key, "EE_ETH_SENDER": ETH[new_key], "EE_SIGN": "new-key-signature",
+    "nonce": "a1b2", dAuth.DAUTH_KEY_ROTATION: announcement,
+  }
+
+
+class NodeKeyRotationTests(unittest.TestCase):
+
+  def setUp(self):
+    self.messages = []
+    self.plugin = _harness(self.messages)
+    self.plugin._load_dauth_revoked_nodes()
+    self.plugin._queue_dauth_revoked_try = Mock()
+
+  def _stored(self):
+    return self.plugin._chainstore.get((NODE_KEY_ROTATIONS_CSTORE_HKEY, ETH[REVOKED].lower()))
+
+  def test_revoked_node_is_named_in_the_auth_response(self):
+    revoked = self.plugin.process_dauth_request(_auth_body(REVOKED))[dAuth.DAUTH_SUBKEY]
+    allowed = self.plugin.process_dauth_request(_auth_body(ALLOWED))[dAuth.DAUTH_SUBKEY]
+    self.assertEqual(revoked[dAuth.DAUTH_REVOKED], REVOKED)
+    self.assertNotIn(dAuth.DAUTH_REVOKED, allowed)
+
+  def test_first_announced_key_is_kept(self):
+    first = self.plugin._announce_node_key(_announce_body(NEW))
+    second = self.plugin._announce_node_key(_announce_body(OTHER_NEW))
+    self.assertEqual(first, {"old_node": REVOKED, "new_node": NEW, "confirmed": True})
+    self.assertEqual(second, {"old_node": REVOKED, "new_node": NEW, "confirmed": False})
+    self.assertEqual(self._stored(), NEW)
+
+  def test_repeated_announcement_rewrites_the_same_key(self):
+    writes = []
+    self.plugin.chainstore_hset = lambda hkey, key, value, **kwargs: writes.append((value, kwargs)) or False
+    self.assertFalse(self.plugin._announce_node_key(_announce_body(NEW))["confirmed"])
+    self.plugin._chainstore[(NODE_KEY_ROTATIONS_CSTORE_HKEY, ETH[REVOKED].lower())] = NEW
+    self.plugin.chainstore_hset = lambda hkey, key, value, **kwargs: writes.append((value, kwargs)) or True
+    self.assertTrue(self.plugin._announce_node_key(_announce_body(NEW))["confirmed"])
+    self.assertEqual([value for value, _ in writes], [NEW, NEW])
+    self.assertTrue(all(kwargs["readonly"] for _, kwargs in writes))
+
+  def test_invalid_announcements_are_refused(self):
+    cases = {
+      "old key not revoked": _announce_body(NEW, old_node=ALLOWED),
+      "names another new key": _announce_body(NEW, new_node=OTHER_NEW),
+      "other network": _announce_body(NEW, network="devnet"),
+      "other purpose": _announce_body(NEW, purpose="something-else"),
+      "new key is revoked": _announce_body(REVOKED),
+      "no announcement": {**_announce_body(NEW), dAuth.DAUTH_KEY_ROTATION: None},
+    }
+    for name, body in cases.items():
+      with self.subTest(name):
+        with self.assertRaises(ValueError):
+          self.plugin._announce_node_key(body)
+    self.assertIsNone(self._stored())
+
+  def test_bad_signature_is_refused(self):
+    self.plugin.bc.valid_signature = False
+    with self.assertRaises(ValueError):
+      self.plugin._announce_node_key(_announce_body(NEW))
+    self.assertIsNone(self._stored())
 
 
 if __name__ == "__main__":
