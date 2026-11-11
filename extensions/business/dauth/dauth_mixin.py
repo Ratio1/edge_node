@@ -327,7 +327,9 @@ class _DauthMixin(object):
     The CID comes from this node's own pointer and names immutable content; callers only
     read the document. The read runs on a helper thread; the request waits at most 0.25 s,
     otherwise fails as retryable, and the retry is answered from memory. A document that
-    could not be read is read again 30 s after that read ended.
+    could not be read is read again 30 s after that read ended. At most four documents are
+    read at the same time; a request that would start a fifth read fails as retryable and
+    starts it on a later try.
 
     Before this memo every refused old-style ``get_secrets`` request fetched and pinned
     the same immutable document on the single dAuth thread (0.25-0.9 s when the document
@@ -351,7 +353,8 @@ class _DauthMixin(object):
     RuntimeError
       "Existing pipeline configuration is unavailable." when the helper read is still
       running after 0.25 s, when the last read failed or did not return a dict and its
-      30 s retry delay has not passed yet, or when this request's read failed. The
+      30 s retry delay has not passed yet, when this request's read failed, or when four
+      reads of other documents are already running. The
       ``RuntimeError`` from ``Thread.start`` is re-raised when the helper thread cannot
       start; the cache entry is removed first so a later request tries again.
 
@@ -363,6 +366,13 @@ class _DauthMixin(object):
     read is kept for the life of the plugin. The helper read is bounded like the other
     dAuth reads (``timeout=10``, ``pin=False``): with the SDK defaults a missing document
     held a thread and an ``ipfs pin add`` for minutes, once per missing CID.
+
+    The limit of four reads exists because the nodes that run a job are listed inside its
+    document: the read has to start before the sender can be checked, so any signed request
+    that names an existing old-style job starts one. Without the limit a caller asking for
+    many such jobs whose documents are slow or missing ran one ``ipfs get`` per job at the
+    same time. A document that reads quickly ends within the 0.25 s wait and frees its place
+    before the next request, so only slow or missing documents ever reach the limit.
 
     Examples
     --------
@@ -379,7 +389,12 @@ class _DauthMixin(object):
     # An unknown CID reads as "no document, retry time already passed", so the first
     # request starts the read.
     retry_at, document = cache.get(cid, (0, None))
-    if document is None and retry_at is not None and self.time() >= retry_at:
+    # Reads running right now (their retry time is None). The sender can only be checked against
+    # the document, so the number of downloads a caller can start must be limited here.
+    reading = sum(1 for at, _ in cache.values() if at is None)
+    # At most four reads at once: a request over the limit starts nothing, leaves no entry in the
+    # memo and gets the retryable error below, so its read starts on a later try.
+    if document is None and retry_at is not None and self.time() >= retry_at and reading < 4:
       def read():
         """
         Read the pipeline document on the helper thread and record the result in the memo.

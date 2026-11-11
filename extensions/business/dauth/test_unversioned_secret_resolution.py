@@ -157,6 +157,32 @@ class ExistingPipelineSecretTests(unittest.TestCase):
     self.assertEqual([existed for _folder, existed in folders], [True])
     self.assertFalse(os.path.exists(folders[0][0]))
 
+  def test_at_most_four_old_style_documents_are_read_at_once(self):
+    # The nodes that run a job are listed in its document, so the read starts before the sender can
+    # be checked: a caller naming many old-style jobs must not get one download per job at once.
+    plugin = existing_job()
+    released, calls = threading.Event(), []
+    def get_json(cid, local_folder=None, timeout=None, pin=True, show_logs=False):
+      calls.append(cid)
+      released.wait(5)
+      return {"NAME": cid}
+    plugin.r1fs.get_json = get_json
+    for index in range(6):
+      with self.assertRaisesRegex(RuntimeError, "unavailable"):
+        plugin._load_legacy_pipeline("cid-%d" % index)
+    deadline = time.monotonic() + 5
+    while len(calls) < 4 and time.monotonic() < deadline:
+      time.sleep(0.01)
+    self.assertEqual(sorted(calls), ["cid-0", "cid-1", "cid-2", "cid-3"])
+    released.set()
+    for thread in threading.enumerate():
+      if thread.name == "dauth-r1fs-read":
+        thread.join(5)
+    # A refused document was not marked as failed: its read starts on the next try.
+    self.assertEqual(plugin._load_legacy_pipeline("cid-4"), {"NAME": "cid-4"})
+    self.assertEqual(plugin._load_legacy_pipeline("cid-0"), {"NAME": "cid-0"})  # read meanwhile, from the memo
+    self.assertEqual(sorted(calls), ["cid-0", "cid-1", "cid-2", "cid-3", "cid-4"])
+
   def test_cached_bundle_does_not_require_peer_synchronization(self):
     plugin = existing_job()
     plugin.chainstore_hsync.side_effect = RuntimeError("Peers are unavailable")
