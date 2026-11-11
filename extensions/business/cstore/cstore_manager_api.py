@@ -27,7 +27,8 @@ _CONFIG = {
   'FORCE_DEBUG_EACH_NTH_API_CALL': 50,
   
   # Namespace policy of this local, unauthenticated API (any process on the host can call it).
-  'DENIED_HKEYS': ['DAUTH_JOB_SECRETS', 'DAUTH_JOB_SECRET_REVISIONS'],  # no read, no write
+  # no read, no write: job secrets and the CSPs' Cloudflare credentials
+  'DENIED_HKEYS': ['DAUTH_JOB_SECRETS', 'DAUTH_JOB_SECRET_REVISIONS', 'tunnels_manager_secrets'],
   'WRITE_DENIED_HKEY_PREFIXES': ['DEEPLOY_', 'DAUTH_'],
   'ALLOW_RAW_HASH_WRITES': False,  # `set` on composed hs:<hash>:<field> keys bypasses the hkey policy
   # Shared Bearer token required on every endpoint when set (here or in $EE_CSTORE_API_TOKEN).

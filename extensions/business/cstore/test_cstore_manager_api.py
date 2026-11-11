@@ -151,6 +151,7 @@ def _core_hash_key(hkey, key):
 
 
 SECRET, DEEPLOY, APP = "DAUTH_JOB_SECRET_REVISIONS", "DEEPLOY_DEPLOYED_JOBS", "app:demo"
+TUNNEL = "tunnels_manager_secrets"  # Cloudflare credentials of the CSPs
 STORE_METHODS = ("chainstore_set", "chainstore_get", "chainstore_hset", "chainstore_hget",
                  "chainstore_hgetall", "chainstore_hsync")
 
@@ -173,7 +174,7 @@ def _endpoint_args(endpoint, namespace):
 def _expected_denied(endpoint, namespace):
   if endpoint == "get_status" or namespace == APP:
     return False
-  if namespace == SECRET:
+  if namespace in (SECRET, TUNNEL):
     return True
   return endpoint in ("set", "hset", "hsync")  # DEEPLOY_: read-only
 
@@ -196,7 +197,7 @@ class CstoreManagerApiPolicyTests(unittest.TestCase):
   def test_policy_matrix_for_every_endpoint_namespace_and_token_mode(self):
     for token_mode in ("unset", "set", "wrong", "missing"):
       for endpoint in ("get_status", "set", "get", "hset", "hget", "hgetall", "hsync"):
-        for namespace in (SECRET, DEEPLOY, APP):
+        for namespace in (SECRET, TUNNEL, DEEPLOY, APP):
           with self.subTest(token=token_mode, endpoint=endpoint, namespace=namespace):
             plugin = self._plugin(token=None if token_mode == "unset" else "s3cret")
             kwargs = _endpoint_args(endpoint, namespace)
