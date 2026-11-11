@@ -28,6 +28,7 @@ from ..references.framework_packs import (
   load_framework_text,
 )
 from ..services.framework_scoring import AXES, CAPS, NA, SCORE_VALUES, score, validate_for_submit, validate_scores
+from . import account_profile
 from .ports import TenantStoreError
 
 KIND = "framework_assessment"
@@ -399,16 +400,41 @@ def _verdict_summary(computed):
           "total_failed": verdict["total_failed"]}
 
 
-def _history(row):
+def name_resolver(service):
+  """Account id -> the person's full name, read at view time and never stored (a renamed person
+  shows the new name). One lookup per distinct id. None when the account or its profile is missing,
+  the name is empty, or the store fails: a name is a courtesy and never fails a read."""
+  cache = {}
+
+  def resolve(account_id):
+    if account_id not in cache:
+      name = None
+      try:
+        account = service.accounts.get_account(account_id)
+        if account is not None:
+          profile = account_profile.row_for(service.store.get(account_profile.KIND, account_id), account.created_at)
+          name = (profile or {}).get("full_name") or None
+      except Exception:  # noqa: BLE001 - any lookup failure leaves the id as the only label
+        name = None
+      cache[account_id] = name
+    return cache[account_id]
+  return resolve
+
+
+def _no_names(account_id):
+  return None
+
+
+def _history(row, names):
   return [{"revision": sub["revision"], "submittedAt": sub["submitted_at"], "actor": sub["actor"],
-           "assuranceLevel": sub["assurance_level"], "verdict": sub["verdict"],
+           "actorName": names(sub["actor"]), "assuranceLevel": sub["assurance_level"], "verdict": sub["verdict"],
            "packActs": sub["pack_acts"]} for sub in reversed(row["submissions"])]
 
 
-def _pending_view(pending):
+def _pending_view(pending, names=_no_names):
   if pending is None:
     return None
-  return {"requestId": pending["request_id"], "actor": pending["actor"],
+  return {"requestId": pending["request_id"], "actor": pending["actor"], "actorName": names(pending["actor"]),
           "ageSeconds": max(0, _epoch() - pending["started_at"]), "revision": pending["revision"]}
 
 
@@ -433,7 +459,7 @@ def pack_view(pack, text, level):
   }
 
 
-def assessment_view(row, pack, *, can_manage, text=None):
+def assessment_view(row, pack, *, can_manage, text=None, names=_no_names):
   """The DTO. Never a document reference. With `text`, the pack view rides along (reads only)."""
   level = row.get("assurance_level")
   computed = score(pack, level, row.get("scores") or {}) if level else None
@@ -448,12 +474,12 @@ def assessment_view(row, pack, *, can_manage, text=None):
     "remediation": list(row.get("remediation") or []),
     "state": row["state"], "assessmentRevision": row["assessment_revision"],
     "reopenedFrom": row.get("reopened_from"), "latestRevision": latest_revision(row),
-    "pending": _pending_view(row.get("pending")),
+    "pending": _pending_view(row.get("pending"), names),
     "scores": row.get("scores") or {},
     "computed": computed, "submitErrors": submit_errors,
-    "history": _history(row),
+    "history": _history(row, names),
     "canManage": can_manage,
-    "updatedBy": row["updated_by"], "updatedAt": row["updated_at"],
+    "updatedBy": row["updated_by"], "updatedByName": names(row["updated_by"]), "updatedAt": row["updated_at"],
   }
 
 
@@ -496,7 +522,8 @@ def get_assessment(service, actor, tenant_id, pack_id, include_pack=True):
     except FrameworkPackError as exc:
       raise TenantStoreError("Framework pack text unavailable") from exc
   row = _row(service, tenant_id, pack_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
-  return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE), text=text)
+  return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE), text=text,
+                         names=name_resolver(service))
 
 
 def authorize_manage(service, actor, tenant_id, pack_id):
@@ -517,14 +544,14 @@ def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_re
   if row["state"] != "draft":
     raise _denied(409, "conflict")
   if row.get("pending") is not None:
-    raise _denied(409, "assessment_submit_pending", pending=_pending_view(row["pending"]))
+    raise _denied(409, "assessment_submit_pending", pending=_pending_view(row["pending"], name_resolver(service)))
   try:
     updated = apply_patch(row, patch, pack, actor=account.account_id, now=now)
   except AssessmentInvalid as exc:
     raise _denied(400, "assessment_invalid", errors=[exc.as_error()]) from None
   updated = _stamp({**updated, "assessment_revision": row["assessment_revision"] + 1}, account.account_id)
   stored = _put(service, updated)
-  return assessment_view(stored, pack, can_manage=True)
+  return assessment_view(stored, pack, can_manage=True, names=name_resolver(service))
 
 
 def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revision, request_id):
@@ -561,7 +588,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
     raise _denied(409, "conflict")
   _expected_revision(row, expected_assessment_revision)
   if pending is not None:
-    raise _denied(409, "assessment_submit_pending", pending=_pending_view(pending))
+    raise _denied(409, "assessment_submit_pending", pending=_pending_view(pending, name_resolver(service)))
   level = row.get("assurance_level")
   if level is None:
     raise _denied(400, "assessment_invalid", errors=[{"code": "level_missing"}])
@@ -637,7 +664,7 @@ def clear_pending(service, actor, tenant_id, pack_id):
     return {"cleared": False, "assessmentRevision": row["assessment_revision"]}
   age = _epoch() - pending["started_at"]
   if age < PENDING_TTL_SECONDS:
-    raise _denied(409, "assessment_submit_pending", pending=_pending_view(pending))
+    raise _denied(409, "assessment_submit_pending", pending=_pending_view(pending, name_resolver(service)))
   stored = _put(service, _stamp({**row, "pending": None}, account.account_id))
   return {"cleared": True, "clearedRequestId": pending["request_id"], "clearedActor": pending["actor"],
           "assessmentRevision": stored["assessment_revision"], "actor": account.account_id}
@@ -655,7 +682,7 @@ def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, req
     raise _denied(404, "assessment_not_found")
   last = row["submissions"][-1]
   if last.get("reopen_request_id") == request_id and row["state"] == "draft" and row["reopened_from"] == last["revision"]:
-    return {**assessment_view(row, pack, can_manage=True), "replayed": True}
+    return {**assessment_view(row, pack, can_manage=True, names=name_resolver(service)), "replayed": True}
   if row["state"] != "submitted":
     raise _denied(409, "conflict")
   _expected_revision(row, expected_assessment_revision)
@@ -665,7 +692,7 @@ def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, req
                     "assessment_revision": row["assessment_revision"] + 1, "submissions": submissions},
                    account.account_id)
   stored = _put(service, updated)
-  return {**assessment_view(stored, pack, can_manage=True), "replayed": False}
+  return {**assessment_view(stored, pack, can_manage=True, names=name_resolver(service)), "replayed": False}
 
 
 def artifact_ref(service, actor, tenant_id, pack_id, revision):

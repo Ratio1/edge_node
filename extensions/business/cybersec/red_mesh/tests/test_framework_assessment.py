@@ -133,6 +133,60 @@ class FrameworkAssessmentFixture(unittest.TestCase):
 class TestFrameworkAssessment(FrameworkAssessmentFixture):
   # -- reads and roles --------------------------------------------------------------------------
 
+  # -- names (phase 8): resolved at read time, never stored ------------------------------------
+
+  def name_admin(self, full_name="Ana Admin"):
+    self.ok(self.plugin.update_account_profile(self.admin, "initial", {"full_name": full_name}))
+
+  def test_updated_by_name_history_and_pending_names_resolve_from_the_profile(self):
+    self.name_admin()
+    revision = self.complete_basic_draft()
+    self.assertEqual(self.ok(self.get())["updatedByName"], "Ana Admin")
+    self.assertEqual(self.ok(self.get(self.viewer))["updatedByName"], "Ana Admin")
+    request = str(uuid4())
+    self.documents.fail = True
+    self.refused(self.submit(revision, request), 503, "unavailable")
+    self.documents.fail = False
+    pending = self.ok(self.get())["pending"]
+    self.assertEqual((pending["actor"], pending["actorName"]), ("initial", "Ana Admin"))
+    young = self.submit(None, None, self.creator, action="clear_pending")
+    self.refused(young, 409, "assessment_submit_pending")
+    self.assertEqual(young["pending"]["actorName"], "Ana Admin")
+    self.ok(self.submit(revision, request))
+    entry = self.ok(self.get())["history"][0]
+    self.assertEqual((entry["actor"], entry["actorName"]), ("initial", "Ana Admin"))
+    self.assertNotIn("Ana Admin", json.dumps(self.stored_row()))  # read-time only
+    self.name_admin("Ana Renamed")
+    self.assertEqual(self.ok(self.get())["history"][0]["actorName"], "Ana Renamed")
+
+  def test_names_are_none_without_a_profile_or_with_an_empty_name_or_a_missing_account(self):
+    revision = self.complete_basic_draft()
+    view = self.ok(self.get())
+    self.assertIsNone(view["updatedByName"])
+    self.name_admin("")
+    self.assertIsNone(self.ok(self.get())["updatedByName"])
+    self.ok(self.submit(revision, str(uuid4())))
+    self.assertIsNone(self.ok(self.get())["history"][0]["actorName"])
+    row = self.stored_row()
+    self.write_row({**row, "updated_by": "gone", "submissions": [{**row["submissions"][0], "actor": "gone"}]})
+    view = self.ok(self.get())
+    self.assertEqual((view["updatedBy"], view["updatedByName"], view["history"][0]["actorName"]), ("gone", None, None))
+
+  def test_a_profile_store_failure_leaves_the_names_none_and_the_read_succeeds(self):
+    self.name_admin()
+    self.complete_basic_draft()
+    from extensions.business.cybersec.red_mesh.tenancy import account_profile
+    from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+    original_hget = self.storage.chainstore_hget
+
+    def hget(*args, **kwargs):
+      if account_profile.KIND in str(args) + str(kwargs):  # only the profile read is broken
+        raise TenantStoreError("down")
+      return original_hget(*args, **kwargs)
+    self.plugin.chainstore_hget = hget
+    view = self.ok(self.get())
+    self.assertEqual((view["updatedBy"], view["updatedByName"]), ("initial", None))
+
   def test_get_returns_an_empty_draft_without_writing(self):
     writes = len(self.storage.writes)
     data = self.ok(self.get())
