@@ -301,7 +301,7 @@ class _FakeR1FS:
   def __init__(self, data):
     self.data = data
 
-  def get_json(self, cid, show_logs=False):  # pylint: disable=unused-argument
+  def get_json(self, cid, show_logs=False, **kwargs):  # pylint: disable=unused-argument
     return self.data[cid]
 
 
@@ -328,6 +328,7 @@ def _make_dauth_harness(
   plugin.json_dumps = json.dumps
   plugin.time = lambda: REQUEST_TIME
   plugin._chainstore = {}
+  plugin._dauth_legacy_pipelines = {}
   plugin._r1fs_data = {}
   plugin.r1fs = _FakeR1FS(plugin._r1fs_data)
   plugin.evm_network = "devnet"
@@ -1317,6 +1318,30 @@ class DauthServerRegistryGateTests(unittest.TestCase):
       {"error": "dAuth server is not registered as a dAuth oracle"},
     )
     self.assertEqual(plugin.bc.calls, 1)
+
+
+class NodeTagsKybTests(unittest.TestCase):
+
+  def test_kyb_lookup_is_bounded_by_a_timeout(self):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from naeural_core import constants as ct
+    from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
+
+    plugin = _NodeTagsMixin()
+    plugin.const = ct
+    plugin.P = lambda *args, **kwargs: None
+    plugin.bc = SimpleNamespace(
+      get_network_data=lambda: {ct.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY: "https://dapp-api"},
+      get_node_license_info=lambda node_address_eth: {"owner": "0xowner"},
+    )
+    plugin.requests = SimpleNamespace(get=Mock(return_value=SimpleNamespace(
+      status_code=200, json=lambda: {"data": True},
+    )))
+
+    self.assertTrue(plugin.get_ee_nt_is_kyb("0xnode"))
+    # Runs on the dAuth request thread: an unanswered dApp API must not hold it.
+    self.assertEqual(plugin.requests.get.call_args.kwargs.get("timeout"), (3, 15))
 
 
 if __name__ == "__main__":

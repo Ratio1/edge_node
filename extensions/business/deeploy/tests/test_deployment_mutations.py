@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from extensions.business.deeploy.deployment_mutations import _DeploymentMutationsMixin
 from extensions.business.deeploy.deployment_operations import (
-  NODE_OPERATIONS_HKEY, SECRET_REVISIONS_HKEY, _DeploymentOperationsMixin,
+  NODE_OPERATIONS_HKEY, OPERATIONS_HKEY, SECRET_REVISIONS_HKEY, _DeploymentOperationsMixin,
 )
 from extensions.business.deeploy.deeploy_job_mixin import DEEPLOY_JOBS_CSTORE_HKEY, DAUTH_JOB_SECRETS_CSTORE_HKEY
 from extensions.business.deeploy.tests.test_deployment_admission import Admission, config
@@ -373,6 +373,30 @@ class DeploymentMutationTests(unittest.TestCase):
     self.assertEqual(plugin.storage[DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"]["job_secrets"], {})
     self.assertTrue(plugin.storage[DEEPLOY_JOBS_CSTORE_HKEY, "7"]["deleted"])
     plugin._delete_pipeline_cid_from_r1fs.assert_called_with("canonical-cid")
+
+  def test_stuck_delete_writes_no_snapshot_per_pass_and_completes_when_the_node_stops(self):
+    plugin = Mutations()
+    operation_id = plugin.delete()["operation_id"]
+    plugin.stop_report(plugin._operation_records()[operation_id], "A")
+    sequences = []
+    for _ in range(150):  # 300 s of 2 s worker passes; B never answers, the 60 s deadline passes
+      plugin.now += 2
+      operation = plugin._operation_records()[operation_id]
+      plugin._advance_delete_operation(operation)
+      sequences.append(operation["sequence"])
+    # One snapshot at admission and one for the blocked transition; command retries write none.
+    self.assertEqual(set(sequences), {1, 2})
+    self.assertEqual(sequences[-100:], [2] * 100)
+    # Repair re-sends repeat a confirmed snapshot; they never produce a new one.
+    self.assertEqual(len({key for namespace, key in plugin.writes if namespace == OPERATIONS_HKEY}), 2)
+    self.assertLessEqual(sum(namespace == OPERATIONS_HKEY for namespace, _ in plugin.writes), 2 + 300 // 30 + 1)
+    self.assertEqual((operation["recovery"], operation["error"]["code"]), ("blocked", "STOP_UNCONFIRMED"))
+    retires = [command for command in plugin.commands if command["node_address"] == "B"]
+    self.assertGreaterEqual(len(retires), 29)
+    plugin.stop_report(operation, "B")
+    plugin.now += 2
+    plugin._advance_delete_operation(plugin._operation_records()[operation_id])
+    self.assertEqual(plugin._operation_records()[operation_id]["phase"], "completed")
 
   def test_delete_retries_metadata_cleanup_after_a_partial_write(self):
     plugin = Mutations()
