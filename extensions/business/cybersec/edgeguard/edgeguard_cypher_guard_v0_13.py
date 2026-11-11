@@ -6,6 +6,7 @@ Sits beside `edgeguard_cypher_guard.py` (contract v0.11) and reuses its helpers;
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -168,3 +169,24 @@ def build_v0_13_pattern_schema_system_prompt(artifact: dict[str, Any] | None = N
     "query, nothing else (no JSON, markdown, comments, explanations, query_id, params).",
   ]
   return "\n".join(lines)
+
+
+# Prompt-only revision p6 for the v0.13 weights (no retrain, 2026-11-11): the same guard, correction turn and literal
+# grounding as `v0_13_pattern_schema`, with a hand-written prompt instead of the rendered one. It adds the direct
+# Malware/ThreatActor TARGETS Sector links, the value conventions of graph v2026.11.6, answer shapes that pass the
+# shape rule (counts and lookups end ORDER BY ... LIMIT), ISO durations, and worked examples. Vendored and pinned:
+# a modified file is refused. Measured on the sealed set in project_r1_redmesh
+# `docs/resources/edgeguard-models/evals/`.
+V0_13_P6_SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "edgeguard_v0_13_p6_system_prompt.txt"
+V0_13_P6_SYSTEM_PROMPT_SHA256 = "7b9abcfddf4dd794b7381a2efc98c4a7da1ebdbb518f8559af87c110e343e650"
+
+
+def load_v0_13_p6_system_prompt(path: Path | None = None) -> str:
+  """The vendored p6 prompt, unchanged; refuses a modified file."""
+  data = (path or V0_13_P6_SYSTEM_PROMPT_PATH).read_bytes()
+  digest = hashlib.sha256(data).hexdigest()
+  if digest != V0_13_P6_SYSTEM_PROMPT_SHA256:
+    raise EdgeGuardCypherGuardError(
+      f"v0.13 p6 system prompt sha256 {digest} does not match the pinned {V0_13_P6_SYSTEM_PROMPT_SHA256}"
+    )
+  return data.decode("utf-8")
