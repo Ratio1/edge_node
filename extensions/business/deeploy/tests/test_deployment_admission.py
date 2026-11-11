@@ -44,6 +44,7 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     self._deployment_preparations = {}
     self._operations_confirmed = {}
     self._operations_sent_at = {}
+    self._verified_operation_records = set()  # as _init_deployment_operations creates it
     self.storage = {}
     self.deepcopy = copy.deepcopy
     self.previous_configs = None

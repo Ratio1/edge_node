@@ -119,6 +119,7 @@ class Node:
     self._deployment_preparations = {}
     self._operations_confirmed = {}
     self._operations_sent_at = {}
+    self._verified_operation_records = set()  # as _init_deployment_operations creates it
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
     self._get_response = lambda value: value

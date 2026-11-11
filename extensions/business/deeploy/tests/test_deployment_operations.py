@@ -39,6 +39,7 @@ class Coordinator(_DeploymentOperationsMixin):
     self._deployment_preparations = {}
     self._operations_confirmed = {}
     self._operations_sent_at = {}
+    self._verified_operation_records = set()  # as _init_deployment_operations creates it
     self.cfg_deployment_readiness_timeout = 60
     self._get_response = lambda result: result
     self.P = lambda *args, **kw: None
@@ -359,6 +360,45 @@ class RuntimeCompletionTests(unittest.TestCase):
     plugin._assert_no_active_deployment(job_id=1, app_id="app")
     self.assertIsNone(plugin._find_request_operation(
       {"job_id": 1, "request_id": "retry-update"}, "owner", "update"))
+
+  def test_each_signed_record_is_checked_once_and_a_changed_one_again(self):
+    # The worker reads every operation record every 2 s on every oracle, and every status poll reads them
+    # again. Each read checked every signature: about 1 ms a record, a few hundred records, all the time.
+    plugin = Coordinator()
+    checked = []
+    verify = plugin.bc.verify
+    plugin.bc.verify = lambda record, return_full_info=True: checked.append(record["operation_id"]) or verify(record)
+    for index in range(3):
+      record = plugin.operation()
+      record["operation_id"] += str(index)
+      plugin.bc.sign(record)
+      plugin.chainstore_hset(OPERATIONS_HKEY, record["operation_id"] + "|0", record)
+    for _ in range(5):
+      self.assertEqual(len(plugin._operation_records()), 3)
+    self.assertEqual(len(checked), 3)  # once per record, not once per record and pass
+    # A record that differs in any byte is another record: it is checked in full.
+    key = next(key for namespace, key in plugin.storage if namespace == OPERATIONS_HKEY)
+    plugin.storage[OPERATIONS_HKEY, key]["phase"] = "completed"
+    plugin._operation_records()
+    plugin._operation_records()
+    self.assertEqual(len(checked), 4)
+    # A record that fails the check is never answered from memory, and never returned.
+    plugin.storage[OPERATIONS_HKEY, key]["EE_SIGN"] = "forged"
+    for _ in range(3):
+      self.assertEqual(len(plugin._operation_records()), 2)
+    self.assertEqual(len(checked), 7)
+    # The writer field is part of what is remembered: valid as a coordinator's record says nothing
+    # about the same bytes read as a node's report.
+    record = plugin.operation()
+    record.update(node_addr="other")
+    plugin.bc.sign(record)
+    self.assertTrue(plugin._verify_operation_record(record, "coordinator"))
+    self.assertFalse(plugin._verify_operation_record(record, "node_addr"))
+    # The memory is bounded: at 10,000 fingerprints it starts again.
+    plugin._verified_operation_records = set(range(10000))
+    record["sequence"] = 9
+    self.assertTrue(plugin._verify_operation_record(record, "coordinator"))
+    self.assertEqual(len(plugin._verified_operation_records), 1)
 
   def test_completed_snapshot_is_resent_as_repair_for_ten_minutes(self):
     # One confirmation is enough for a write, so an oracle can miss the final snapshot; nothing else sends it again.

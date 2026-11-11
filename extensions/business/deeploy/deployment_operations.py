@@ -141,6 +141,9 @@ class _DeploymentOperationsMixin:
     # Last command time per "operation id|attempt|action|node": the 10 s resend throttle lives in process
     # memory, so a command retry no longer writes a new signed snapshot that every oracle re-stores.
     self._operations_sent_at = {}
+    # Fingerprints of the signed records already checked and found valid. A signed record never changes,
+    # so its signature is checked once and not on every 2 s worker pass and every status poll again.
+    self._verified_operation_records = set()
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
@@ -165,12 +168,72 @@ class _DeploymentOperationsMixin:
                 include_configured_peers=False, timeout=5, max_retries=1)
 
   def _verify_operation_record(self, record, signer_key):
-    """Accept only signed records whose claimed writer matches their signer."""
+    """
+    Accept only signed records whose claimed writer matches their signer, checking each record once.
+
+    Operation snapshots and node reports are read from the local replica and their signatures are
+    checked before use. The readers go over every record on every call: the `deeploy-operations`
+    worker every 2 s on every oracle, and every `get_deployment_status` request. One signature check
+    costs about 1 ms, so with a few hundred records each pass cost a few hundred milliseconds of CPU,
+    all the time, and more with every operation ever created (records are never removed).
+
+    A signed record never changes, and the result of the check depends only on the record's bytes and
+    on which field names its writer. So a record that was found valid is remembered by a fingerprint of
+    exactly those bytes, and the signature of a remembered record is not checked again. A record that
+    differs in any byte has another fingerprint and is checked in full. Records that fail are not
+    remembered: they are checked again each time.
+
+    Parameters
+    ----------
+    record : dict
+      A signed operation snapshot or node report as read from the chain store.
+    signer_key : str
+      Name of the field that holds the address of the record's writer ("coordinator" for an operation
+      snapshot, "node_addr" for a node report). The record is accepted only if its signer is that address.
+
+    Returns
+    -------
+    bool
+      True when the signature is valid and the signer is the claimed writer; False otherwise, also when
+      the record is not a dict, the writer field is missing or the check raises.
+
+    Notes
+    -----
+    The remembered set lives in process memory, so after a restart every record is checked once more.
+    It is emptied when it reaches 10,000 fingerprints (about 1 MB): records that were replaced leave
+    their fingerprints behind, and emptying it costs one full pass of checks, once. It is read and
+    written from the worker thread and the plugin thread; each operation on it is a single set call.
+
+    Examples
+    --------
+    >>> plugin._verify_operation_record(snapshot, "coordinator")   # first time: the signature is checked
+    True
+    >>> plugin._verify_operation_record(snapshot, "coordinator")   # same bytes: answered from memory
+    True
+    >>> plugin._verify_operation_record({**snapshot, "phase": "completed"}, "coordinator")   # changed: checked, fails
+    False
+    """
     if not isinstance(record, dict) or not record.get(signer_key):
       return False
     try:
+      # Fingerprint of everything the result depends on: the writer field's name and the whole record,
+      # signature fields included. About 30 times cheaper than the signature check it replaces.
+      fingerprint = hashlib.sha256((signer_key + json.dumps(record, sort_keys=True)).encode()).digest()
+      if fingerprint in self._verified_operation_records:
+        # These exact bytes were checked before and were valid: no second signature check.
+        return True
       verification = self.bc.verify(record, return_full_info=True)
-      return bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
+      # The full check, as before: a valid signature made by the address the record names as its writer.
+      valid = bool(verification.valid and record.get("EE_SENDER") == record[signer_key])
+      if valid:
+        if len(self._verified_operation_records) >= 10000:
+          # Bound the memory: fingerprints of replaced records are never looked up again. Emptying the
+          # set only means that the current records are checked once more.
+          self._verified_operation_records.clear()
+        # Remember only records that passed, so a bad record is never accepted from memory.
+        self._verified_operation_records.add(fingerprint)
+      # The outcome of the full check; a record that failed it was not remembered above.
+      return valid
     except Exception:
       return False
 
