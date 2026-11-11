@@ -10,7 +10,10 @@ _CONFIG = {
   'PORT': 31235, # dynamic
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
-  'IDLE_LOOP_WAIT' : 0.25, # request-driven: wait for requests instead of polling ~30 times a second
+  # Request-driven API with no process() of its own, running on every node: instead of lapping ~30 times a
+  # second while idle, a lap with nothing queued blocks up to 0.25 s on the core wake-up event, which a
+  # request, an input, an instance command or a stop ends at once. A core without this key ignores it.
+  'IDLE_LOOP_WAIT' : 0.25,
   
   'R1FS_VERBOSE' : 11,
   

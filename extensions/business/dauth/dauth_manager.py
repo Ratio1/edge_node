@@ -55,9 +55,10 @@ _CONFIG = {
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
   # One thread answers dAuth. Each generic "Received"/"processed" line also asks the IPC manager
-  # process for its queue size, and each profiled request sends a timing report that takes its
-  # own place in the request FIFO. Keep a 10 % timing sample.
+  # process for its queue size, so it is turned off; dAuth's own per-sender log lines stay.
   'LOG_REQUESTS' : False,
+  # Each profiled request sends a timing report that takes its own place in the request FIFO,
+  # competing with real dAuth requests. Profile only a 10 % sample so the timing logs keep working.
   'PROFILE_RATE' : 0.1,
   
   'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
