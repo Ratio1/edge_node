@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 
 from ..references.framework_packs import (
@@ -45,6 +46,15 @@ LEVEL_PROVENANCE_KINDS = ("risk_score", "declared")
 REMEDIATION_ITEM_MAX = 32
 TEXT_MAX = 200
 DNSC_ID_MAX = 64
+NAME_MAX = 120
+
+
+def normalize_name(value, *, required):
+  """An assessment name: bounded text without control or format characters (bidi overrides, zero-width, BOM)."""
+  name = _text(value, NAME_MAX, required=required)
+  if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in name):
+    raise AssessmentInvalid("invalid_request")
+  return name
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 # The `job:` grammar is one object: the evidence-ref validator and the ownership check in
 # `services/framework_evidence.py` share it, so a ref one accepts the other always sees.
@@ -244,7 +254,7 @@ def apply_patch(row, patch, pack, *, actor, now):
     raise AssessmentInvalid("invalid_request")
   allowed = {"assurance_level", "level_provenance", "sectoral_requirements", "completion_date",
              "management_signoff", "remediation", "scores",
-             "dnsc_unique_id", "external_supplier"}
+             "dnsc_unique_id", "external_supplier", "name"}
   unknown = set(patch) - allowed
   if unknown:
     raise AssessmentInvalid("invalid_request", unknown_fields=sorted(unknown))
@@ -266,6 +276,8 @@ def apply_patch(row, patch, pack, *, actor, now):
         out[key] = value
       else:
         out.pop(key, None)
+  if "name" in patch:  # an `fa_*` assessment always has a name; only the legacy default may be nameless
+    out["name"] = normalize_name(patch["name"], required=bool(row.get("assessment_id")))
   if "remediation" in patch:
     out["remediation"] = normalize_remediation(patch["remediation"])
   if "scores" in patch:
@@ -503,7 +515,8 @@ def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant
   submit_errors = validate_for_submit(pack, level, row)[0] if level else [{"code": "level_missing"}]
   return {
     "pack": pack_view(pack, text, level) if text is not None else None,
-    "tenantId": row["tenant_id"], "packId": row["pack_id"], "packActs": list(row["pack_acts"]),
+    "tenantId": row["tenant_id"], "packId": row["pack_id"], "assessmentId": row.get("assessment_id") or DEFAULT_ID,
+    "name": row.get("name") or "", "archived": bool(row.get("archived")), "packActs": list(row["pack_acts"]),
     "currentPackActs": list(pack["acts"]), "stale": {"newerPackActs": list(row["pack_acts"]) != list(pack["acts"])},
     "assuranceLevel": level, "levelProvenance": row.get("level_provenance"),
     "sectoralRequirements": row.get("sectoral_requirements", ""),
@@ -563,6 +576,11 @@ def _expected_revision(row, expected):
     raise _denied(409, "assessment_stale", current_assessment_revision=row["assessment_revision"])
 
 
+def _not_archived(row):
+  if row.get("archived"):
+    raise _denied(409, "assessment_archived")
+
+
 def get_assessment(service, actor, tenant_id, pack_id, include_pack=True, assessment_id=DEFAULT_ID):
   """The current row as the DTO; with `include_pack` the official text rides along (a console read)."""
   tenant, account = service._authorized_tenant(actor, tenant_id, VIEW)
@@ -592,6 +610,7 @@ def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_re
   row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None:
     row = new_row(tenant_id, pack, actor=account.account_id, now=now)
+  _not_archived(row)
   _expected_revision(row, expected_assessment_revision)
   if row["state"] != "draft":
     raise _denied(409, "conflict")
@@ -601,6 +620,9 @@ def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_re
     updated = apply_patch(row, patch, pack, actor=account.account_id, now=now)
   except AssessmentInvalid as exc:
     raise _denied(400, "assessment_invalid", errors=[exc.as_error()]) from None
+  if "name" in patch:
+    from .compliance_catalogue import name_taken
+    name_taken(service, tenant_id, pack_id, updated["name"], exclude_id=assessment_id)
   updated = _stamp({**updated, "assessment_revision": row["assessment_revision"] + 1}, account.account_id)
   stored = _put(service, updated)
   return assessment_view(stored, pack, can_manage=True, names=name_resolver(service), tenant=tenant)
@@ -621,6 +643,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
   row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None:
     raise _denied(404, "assessment_not_found")
+  _not_archived(row)
   digest = intent_digest(row)
   for sub in row["submissions"]:
     if sub["request_id"] == request_id:
@@ -734,6 +757,7 @@ def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, req
   row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None or not row["submissions"]:
     raise _denied(404, "assessment_not_found")
+  _not_archived(row)
   last = row["submissions"][-1]
   if last.get("reopen_request_id") == request_id and row["state"] == "draft" and row["reopened_from"] == last["revision"]:
     return {**assessment_view(row, pack, can_manage=True, names=name_resolver(service), tenant=tenant), "replayed": True}

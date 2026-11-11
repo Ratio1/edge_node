@@ -1589,6 +1589,22 @@ class TenantAdministrationService:
                                      assessment_id=assessment_id)
 
   @_endpoint
+  def list_framework_assessments(self, actor, tenant_id, pack_id="", include_archived=False):
+    return compliance_catalogue.list_assessments(self, actor, tenant_id, pack_id, include_archived)
+
+  @_endpoint
+  def create_framework_assessment(self, actor, tenant_id, pack_id, request_id, name, assurance_level=None,
+                                  level_provenance=None):
+    return compliance_catalogue.create_assessment(self, actor, tenant_id, pack_id, request_id, name,
+                                                  assurance_level, level_provenance)
+
+  @_endpoint
+  def archive_framework_assessment(self, actor, tenant_id, pack_id, assessment_id, archived,
+                                   expected_assessment_revision):
+    return compliance_catalogue.archive_assessment(self, actor, tenant_id, pack_id, assessment_id, archived,
+                                                   expected_assessment_revision)
+
+  @_endpoint
   def authorize_framework_assessment_manage(self, actor, tenant_id, pack_id):
     return compliance.authorize_manage(self, actor, tenant_id, pack_id)
 
@@ -3081,4 +3097,4 @@ class TenantAdministrationService:
 
 # RM-120: imported last on purpose. `compliance` pulls in `services/`, whose package init imports
 # this module for `AdministrationDenied`; by here that name exists, so the cycle resolves.
-from . import compliance  # noqa: E402
+from . import compliance, compliance_catalogue  # noqa: E402

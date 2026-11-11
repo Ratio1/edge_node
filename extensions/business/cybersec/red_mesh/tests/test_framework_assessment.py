@@ -213,7 +213,8 @@ class TestFrameworkAssessment(FrameworkAssessmentFixture):
     # A refused save is not audited (contract: get, submit, reopen, artifact and clear-pending are).
     self.assertEqual([e for e, _ in self.events], ["framework_assessment_refused"] * 3)
     self.assertEqual(self.events[0][1], {"operation": "get", "actor": "pentester", "tenant_id": self.tenant,
-                                         "pack_id": PACK, "status_code": 403, "error": "forbidden"})
+                                         "pack_id": PACK, "status_code": 403, "error": "forbidden",
+                                         "assessment_id": "default"})
     self.assertEqual(self.events[1][1]["status_code"], 404)
     self.assertEqual(self.events[2][1]["operation"], "artifact")
 
@@ -232,7 +233,8 @@ class TestFrameworkAssessment(FrameworkAssessmentFixture):
     self.assertIn("unscored", [e["code"] for e in data["submitErrors"]])
     self.assertEqual(data["computed"]["unscored"][:2], ["GV.PO-01.1", "GV.RM-03.1"])
     self.assertEqual(self.events[-1][0], "framework_assessment_saved")
-    self.assertEqual(self.events[-1][1], {"tenant_id": self.tenant, "pack_id": PACK, "actor": "initial", "assessment_revision": 2})
+    self.assertEqual(self.events[-1][1], {"tenant_id": self.tenant, "pack_id": PACK, "actor": "initial",
+                                          "assessment_id": "default", "assessment_revision": 2})
     stale = self.save({"sectoral_requirements": "x"}, 1)
     self.refused(stale, 409, "assessment_stale")
     self.assertEqual(stale["current_assessment_revision"], 2)
@@ -325,7 +327,7 @@ class TestFrameworkAssessment(FrameworkAssessmentFixture):
     _no_refs(envelope["snapshot"])
     self.assertEqual(self.events[-1][0], "framework_assessment_submitted")
     self.assertEqual(self.events[-1][1], {"tenant_id": self.tenant, "pack_id": PACK, "actor": "initial",
-                                          "revision": 1, "passed": True})
+                                          "assessment_id": "default", "revision": 1, "passed": True})
     puts = len(self.documents.puts)
     replay = self.ok(self.submit(revision, request))
     self.assertEqual((replay["revision"], replay["replayed"]), (1, True))
