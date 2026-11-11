@@ -189,7 +189,9 @@ def init_relays(home):
   swarm_key = '/key/swarm/psk/1.0.0/\n/base16/\n{}\n'.format(pysecrets.token_hex(32))
   (rdir / 'swarm.key').write_text(swarm_key)
   os.chmod(rdir / 'swarm.key', 0o600)
-  api_password = pysecrets.token_urlsafe(18)
+  # Hex only: a url-safe token can start with '-', which `openssl passwd` below reads as an option
+  # (init then failed about once in 64 runs).
+  api_password = pysecrets.token_hex(18)
   relays = {}
   for name in RELAYS:
     one = rdir / name
