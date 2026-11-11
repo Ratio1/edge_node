@@ -360,6 +360,25 @@ class RuntimeCompletionTests(unittest.TestCase):
     self.assertIsNone(plugin._find_request_operation(
       {"job_id": 1, "request_id": "retry-update"}, "owner", "update"))
 
+  def test_completed_snapshot_is_resent_as_repair_for_ten_minutes(self):
+    # One confirmation is enough for a write, so an oracle can miss the final snapshot; nothing else sends it again.
+    plugin = Coordinator()
+    operation = plugin.operation("update")
+    operation.update(phase="completed", outcome="failed", recovery="completed")
+    plugin._save_operation(operation)
+    stored, sent = dict(plugin.storage), []
+    store = plugin.chainstore_hset
+    plugin.chainstore_hset = lambda namespace, key, value, **kw: sent.append((namespace, key)) or store(namespace, key, value, **kw)
+    plugin._reconcile_coordinator_operations()  # just confirmed: nothing to send
+    self.assertEqual(sent, [])
+    plugin.now += 31
+    plugin._reconcile_coordinator_operations()  # 30 s later: the same record once more
+    self.assertEqual(sent, [(OPERATIONS_HKEY, "{}|{}".format(operation["operation_id"], operation["sequence"] % 8))])
+    plugin.now += 600
+    plugin._reconcile_coordinator_operations()  # past the window: left alone
+    self.assertEqual(len(sent), 1)
+    self.assertEqual(plugin.storage, stored)
+
 
 if __name__ == "__main__":
   unittest.main()

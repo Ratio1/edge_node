@@ -697,10 +697,13 @@ class _DeploymentOperationsMixin:
     own = [copy.deepcopy(operation) for operation in self._operation_records().values()
            if operation["coordinator"] == self.bc.address]
     for operation in own:
-      if operation["phase"] == "completed" or operation["operation_id"] in self._deployment_preparations:
+      if operation["operation_id"] in self._deployment_preparations:
         continue
       try:
-        self._advance_deployment_operation(operation)
+        if operation["phase"] != "completed":
+          self._advance_deployment_operation(operation)
+        elif self.time() - operation["updated_at"] < 600:  # oracles that missed the final snapshot get it too
+          self._replicate_operation(operation)
       except Exception:
         self.P("Deployment operation waiting for storage or transport recovery.", color="y")
 
