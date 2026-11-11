@@ -54,6 +54,14 @@ from .edgeguard_cypher_guard_v0_13 import (
   EDGEGUARD_SCHEMA_V0_13,
   SCHEMA_VERSION_V0_13,
   build_v0_13_pattern_schema_system_prompt,
+  load_v0_13_p6_system_prompt,
+)
+from .edgeguard_cypher_decision_json import (
+  DECISION_JSON_SCHEMA,
+  PROMPT_PROFILE_DECISION_JSON_2026_11_08,
+  SCHEMA_VERSION_DECISION_JSON,
+  load_system_prompt as load_decision_json_system_prompt,
+  parse_decision_reply,
 )
 from . import literal_classes
 
@@ -627,6 +635,9 @@ STATUS_ERROR = "error"
 STATUS_ACCEPTED = "accepted"
 STATUS_REJECTED = "rejected"
 STATUS_TIMEOUT = "timeout"
+# The model chose not to write a query (decision-JSON profile: clarify,
+# out_of_scope, refuse); `decision_message` carries its question or reason.
+STATUS_DECLINED = "declined"
 
 EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
 
@@ -684,11 +695,14 @@ PROMPT_PROFILE_V0_11_PATTERN_SCHEMA = "v0_11_pattern_schema"
 # EGM-068 contract v0.13 (cf789b9 graph): same output contract and correction
 # turn as v0.11, but its own artifact, served prompt and guard allowlist.
 PROMPT_PROFILE_V0_13_PATTERN_SCHEMA = "v0_13_pattern_schema"
+# Same v0.13 weights and validation, prompt-only revision p6 (vendored, pinned).
+PROMPT_PROFILE_V0_13_P6 = "v0_13_pattern_schema_p6"
 # Profiles that validate with the v0.11-style rules (optional graph LIMIT, hop
 # bounds, endpoint pairs), each against its own artifact.
 PATTERN_SCHEMA_ARTIFACTS = {
   PROMPT_PROFILE_V0_11_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_11,
   PROMPT_PROFILE_V0_13_PATTERN_SCHEMA: EDGEGUARD_SCHEMA_V0_13,
+  PROMPT_PROFILE_V0_13_P6: EDGEGUARD_SCHEMA_V0_13,
 }
 _ARTIFACTS_BY_SCHEMA_VERSION = {
   SCHEMA_VERSION_V0_11: EDGEGUARD_SCHEMA_V0_11,
@@ -750,6 +764,26 @@ PROMPT_PROFILES = {
     "system_prompt_suffix": None,
     "single_user_message": False,
   },
+  PROMPT_PROFILE_V0_13_P6: {
+    "prompt_profile_id": "edgeguard_v0_13_pattern_schema_p6",
+    "template_version": "edgeguard-v0-13-pattern-schema-p6-7b9abcfddf4d",
+    "prompt_contract": (
+      "schema-grounded read-only Cypher query string, graph or ranked_projection shape"
+    ),
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+  },
+  # IICT-BAS adapter (2026-11-08): its own vendored system prompt, a JSON
+  # reply with a `decision`, no correction turns (see
+  # `edgeguard_cypher_decision_json`).
+  PROMPT_PROFILE_DECISION_JSON_2026_11_08: {
+    "prompt_profile_id": "edgeguard_decision_json_2026_11_08",
+    "template_version": "edgeguard-decision-json-5e12777d5a",
+    "prompt_contract": "one JSON line with a decision; a read-only Cypher query for answer and partial",
+    "system_prompt_suffix": None,
+    "single_user_message": False,
+    "max_tokens": 512,  # the adapter's trained decoding budget
+  },
 }
 
 # Contract §5.1/§5.2: which builder renders the system prompt / correction
@@ -763,6 +797,8 @@ PROMPT_PROFILES = {
 # it is built once here rather than on every `generate` call.
 _V0_11_SYSTEM_PROMPT = build_v0_11_pattern_schema_system_prompt()
 _V0_13_SYSTEM_PROMPT = build_v0_13_pattern_schema_system_prompt()
+_V0_13_P6_SYSTEM_PROMPT = load_v0_13_p6_system_prompt()
+_DECISION_JSON_SYSTEM_PROMPT = load_decision_json_system_prompt()
 
 
 def _system_prompt_for_profile(profile_name: str) -> str:
@@ -770,6 +806,10 @@ def _system_prompt_for_profile(profile_name: str) -> str:
     return _V0_11_SYSTEM_PROMPT
   if profile_name == PROMPT_PROFILE_V0_13_PATTERN_SCHEMA:
     return _V0_13_SYSTEM_PROMPT
+  if profile_name == PROMPT_PROFILE_V0_13_P6:
+    return _V0_13_P6_SYSTEM_PROMPT
+  if profile_name == PROMPT_PROFILE_DECISION_JSON_2026_11_08:
+    return _DECISION_JSON_SYSTEM_PROMPT
   return build_direct_cypher_system_prompt()
 
 
@@ -4103,7 +4143,7 @@ class EdgeguardApiPlugin(BasePlugin):
     instead of repeating the `model_key -> profile -> v0.11?` selection.
 
     A `model_key` that resolves to a pattern-schema prompt profile
-    (`v0_11_pattern_schema` or `v0_13_pattern_schema`, see
+    (`v0_11_pattern_schema`, `v0_13_pattern_schema` or `v0_13_pattern_schema_p6`, see
     `PATTERN_SCHEMA_ARTIFACTS`) gets that profile's artifact in
     `schema_artifact`, its derived flat sets, `LIMIT` optional for the
     `graph` shape, and the tightened hop bounds; `use_v0_11` means exactly
@@ -4113,8 +4153,22 @@ class EdgeguardApiPlugin(BasePlugin):
     `allow_limit_optional_graph=False`, `enforce_hop_bounds=False`.
     """
     artifact = None
+    profile_name = None
     if isinstance(model_key, str) and model_key.strip():
-      artifact = PATTERN_SCHEMA_ARTIFACTS.get(self._prompt_profile(model_key)["name"])
+      profile_name = self._prompt_profile(model_key)["name"]
+      artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile_name)
+    if profile_name == PROMPT_PROFILE_DECISION_JSON_2026_11_08:
+      # v0.10 rules (LIMIT required, no pattern-schema checks) against the
+      # schema the adapter's own system prompt describes.
+      return {
+        "use_v0_11": False,
+        "schema_artifact": None,
+        "schema_allowed": DECISION_JSON_SCHEMA,
+        "allow_limit_optional_graph": False,
+        "enforce_hop_bounds": False,
+        "schema_version": SCHEMA_VERSION_DECISION_JSON,
+        "schema_surface": {key: sorted(values) for key, values in DECISION_JSON_SCHEMA.items()},
+      }
     use_v0_11 = artifact is not None
     return {
       "use_v0_11": use_v0_11,
@@ -4292,7 +4346,7 @@ class EdgeguardApiPlugin(BasePlugin):
       "model": model.get("model_key"),
       "messages": messages,
       "temperature": GENERATION_TEMPERATURE,
-      "max_tokens": GENERATION_MAX_TOKENS,
+      "max_tokens": self._prompt_profile(model.get("model_key")).get("max_tokens", GENERATION_MAX_TOKENS),
       "top_p": GENERATION_TOP_P,
       "metadata": {
         "task": "edgeguard_direct_cypher",
@@ -4441,6 +4495,7 @@ class EdgeguardApiPlugin(BasePlugin):
     guard_schema_allowed = validation_profile["schema_allowed"]
     response_schema_version = validation_profile["schema_version"]
     response_schema_surface = validation_profile["schema_surface"]
+    decision_json = self._prompt_profile(selected_key)["name"] == PROMPT_PROFILE_DECISION_JSON_2026_11_08
     try:
       for attempt_index in range(DEFAULT_SCHEMA_RETRY_LIMIT + 1):
         remaining = deadline - time.monotonic()
@@ -4457,6 +4512,44 @@ class EdgeguardApiPlugin(BasePlugin):
         raw_output, llm_model, timing_ms, completion = self._call_generation_model(
           url, messages, model, timeout=remaining,
         )
+        model_reply = raw_output
+        reply = None
+        if decision_json and completion.get("finish_reason") == "stop":
+          reply = parse_decision_reply(raw_output)
+          if reply["ok"] and reply["cypher"] is None:
+            total_ms = round((time.monotonic() - started) * 1000, 1)
+            return {
+              "status": STATUS_DECLINED,
+              "accepted": False,
+              "accepted_cypher": None,
+              "decision": reply["decision"],
+              "decision_message": reply["message"],
+              "attempts": [{
+                "attempt": attempt_index,
+                "kind": "initial",
+                "raw_output": raw_output,
+                "decision": reply["decision"],
+                "prompt_messages": messages,
+                "model_key": selected_key,
+                "model": llm_model,
+                "timing_ms": timing_ms,
+                "finish_reason": completion.get("finish_reason"),
+                "completion_tokens": completion.get("completion_tokens"),
+              }],
+              "model": llm_model,
+              "model_key": selected_key,
+              "model_metadata": model,
+              "prompt_profile_id": model.get("prompt_profile_id"),
+              "provider": "llm_inference_api",
+              "metrics": {
+                "edgeguard_api_ms": round(max(0.0, total_ms - timing_ms), 1),
+                "llm_inference_ms": timing_ms,
+                "server_total_ms": total_ms,
+              },
+            }
+          if reply["ok"]:
+            # Only the query is validated and run; the decision rides along.
+            raw_output = reply["cypher"]
         def _guard(cypher_text: str) -> Dict[str, Any]:
           return analyze_generated_cypher(
             cypher_text,
@@ -4501,7 +4594,10 @@ class EdgeguardApiPlugin(BasePlugin):
               "within the output limit."
             ),
           }
-        else:
+        elif not decision_json:
+          # The decision-JSON adapter maps question words to stored values its
+          # own prompt teaches ('Known', 'x509-fingerprint-sha1'); the v0.11
+          # synonym table does not know them, so literal grounding is skipped.
           validation = self._apply_literal_grounding_guard(
             validation,
             guarded_output,
@@ -4532,10 +4628,17 @@ class EdgeguardApiPlugin(BasePlugin):
                 "(MATCH ... ORDER BY ... RETURN ... LIMIT k)."
               ),
             }
+        if reply is not None and not reply["ok"]:
+          validation = {
+            **validation,
+            "accepted": False,
+            "accepted_cypher": None,
+            "validation_feedback": reply["error"],
+          }
         attempt = {
           "attempt": attempt_index,
           "kind": "initial" if attempt_index == 0 else "schema_correction",
-          "raw_output": raw_output,
+          "raw_output": model_reply,
           "candidate_cypher": validation.get("candidate") or raw_output,
           "accepted": bool(validation.get("accepted")),
           "query_only": bool(validation.get("query_only")),
@@ -4565,7 +4668,11 @@ class EdgeguardApiPlugin(BasePlugin):
         if attempt["accepted"]:
           total_ms = round((time.monotonic() - started) * 1000, 1)
           llm_ms = round(sum(item["timing_ms"] for item in attempts), 1)
+          decision_fields = (
+            {"decision": reply["decision"], "decision_note": reply["note"]} if reply else {}
+          )
           return {
+            **decision_fields,
             "status": STATUS_ACCEPTED,
             "accepted": True,
             "accepted_cypher": validation.get("accepted_cypher") or attempt["candidate_cypher"],
@@ -4588,6 +4695,9 @@ class EdgeguardApiPlugin(BasePlugin):
           }
         last_candidate = attempt["candidate_cypher"]
         last_feedback = attempt["validation_feedback"] or "The previous output failed validation."
+        if decision_json:
+          # The adapter was trained without correction turns: one attempt only.
+          break
     except _GenerationDeadlineExceeded:
       code = "generation_deadline_exceeded"
       message = "Generation request budget was exhausted before another model call could start."
@@ -5673,15 +5783,17 @@ class EdgeguardApiPlugin(BasePlugin):
         retry_index=1,
         retry_limit=DEFAULT_SCHEMA_RETRY_LIMIT,
       )
-      profile_artifact = PATTERN_SCHEMA_ARTIFACTS.get(profile["name"])
-      is_v0_11 = profile_artifact is not None
+      # The schema each profile actually validates against (v0.11/v0.13
+      # artifacts, the decision-JSON prompt schema, or the v0.10 default).
+      validation_profile = self._cypher_validation_profile(key)
+      single_attempt = profile["name"] == PROMPT_PROFILE_DECISION_JSON_2026_11_08
       profiles.append({
         "prompt_profile_id": profile["prompt_profile_id"],
         "prompt_profile": profile["name"],
         "model_key": key,
         "template_version": profile["template_version"],
         "system_prompt_sha256": _sha256_text(system_prompt),
-        "correction_prompt_sha256": _sha256_text(correction_prompt),
+        "correction_prompt_sha256": None if single_attempt else _sha256_text(correction_prompt),
         "expected_output": profile["prompt_contract"],
         # Contract §1/§3.2 (review finding 7, S8): the v0.11 profile reports
         # the v0.11 artifact's own schema_version/schema_surface here (the
@@ -5690,10 +5802,8 @@ class EdgeguardApiPlugin(BasePlugin):
         # `literal_classes.py` module sha, since the literal-grounding guard
         # reads it regardless of profile (contract §3.2: "both pin its sha
         # in their reports").
-        "cypher_schema_version": profile_artifact["schema_version"] if is_v0_11 else SCHEMA_VERSION,
-        "schema_surface": (
-          canonical_schema_surface(profile_artifact) if is_v0_11 else canonical_schema_surface()
-        ),
+        "cypher_schema_version": validation_profile["schema_version"],
+        "schema_surface": validation_profile["schema_surface"],
         "literal_classes_sha256": LITERAL_CLASSES_SHA256,
       })
     return {
