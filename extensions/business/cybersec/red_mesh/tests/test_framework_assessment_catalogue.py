@@ -320,7 +320,7 @@ class TestAssessmentCatalogue(FrameworkAssessmentFixture):
   def test_list_statuses_not_started_draft_submitted_pending(self):
     fresh = self.made("fresh")["assessmentId"]
     drafted = self.made("drafted")
-    self.ok(self.save_fa(drafted["assessmentId"], {"sectoral_requirements": "x"}, 1))
+    self.ok(self.save_fa(drafted["assessmentId"], {"scores": dict(list(self.basic_scores().items())[:1])}, 1))
     submitted = self.submitted_fa("submitted")
     pending = self.made("pending")
     revision = self.complete_fa(pending["assessmentId"], 1)
@@ -336,6 +336,12 @@ class TestAssessmentCatalogue(FrameworkAssessmentFixture):
     self.ok(self.reopen_fa(submitted, row["assessmentRevision"], str(uuid4())))
     self.assertEqual({r["name"]: r["status"] for r in self.rows()}["submitted"], "draft")
     self.assertIn(fresh, [r["assessmentId"] for r in self.rows()])
+
+  def test_archive_and_unarchive_of_an_untouched_assessment_still_list_not_started(self):
+    a = self.made("A")["assessmentId"]
+    self.ok(self.archive(a, True, 1))
+    self.ok(self.archive(a, False, 2))
+    self.assertEqual({r["name"]: (r["status"], r["assessmentRevision"]) for r in self.rows()}, {"A": ("not_started", 3)})
 
   def test_list_hides_archived_unless_asked_and_orders_by_update_time_descending(self):
     a, b, c = self.made("A"), self.made("B"), self.made("C")

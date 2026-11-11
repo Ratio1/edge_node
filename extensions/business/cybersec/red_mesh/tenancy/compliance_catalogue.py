@@ -40,12 +40,13 @@ def _name_key(name):
   return " ".join(unicodedata.normalize("NFKC", name).split()).casefold()
 
 
-def name_taken(service, tenant_id, pack_id, name, *, exclude_id=None):
-  """409 `assessment_name_taken` when a non-archived assessment of the pack already carries the name."""
+def name_taken(service, tenant_id, pack_id, name, *, exclude_id=None, rows=None):
+  """409 `assessment_name_taken` when a non-archived assessment of the pack already carries the name.
+  `rows` are the pack's stored rows when the caller has read them already."""
   wanted = _name_key(name)
   if not wanted:
     return
-  for row in _stored_rows(service, tenant_id, pack_id):
+  for row in _stored_rows(service, tenant_id, pack_id) if rows is None else rows:
     if ((row.get("assessment_id") or compliance.DEFAULT_ID) != exclude_id and not row.get("archived")
         and _name_key(row.get("name") or "") == wanted):
       raise compliance._denied(409, "assessment_name_taken")
@@ -56,7 +57,7 @@ def status_of(row):
     return "pending"
   if row["state"] == "submitted":
     return "submitted"
-  return "not_started" if not row["submissions"] and row["assessment_revision"] == 1 else "draft"
+  return "draft" if row.get("scores") or row["submissions"] else "not_started"
 
 
 def _summary(row, names, can_manage):
@@ -107,9 +108,10 @@ def create_assessment(service, actor, tenant_id, pack_id, request_id, name, assu
       raise compliance._denied(409, "conflict")
     return {**compliance.assessment_view(existing, pack, can_manage=True, names=names, tenant=tenant),
             "replayed": True}
-  if len(_stored_rows(service, tenant_id, pack_id)) >= MAX_ASSESSMENTS:
+  stored_rows = _stored_rows(service, tenant_id, pack_id)
+  if len(stored_rows) >= MAX_ASSESSMENTS:
     raise compliance._denied(409, "assessment_limit", limit=MAX_ASSESSMENTS)
-  name_taken(service, tenant_id, pack_id, name)
+  name_taken(service, tenant_id, pack_id, name, rows=stored_rows)
   now = compliance._now_iso()
   row = {**compliance.new_row(tenant_id, pack, actor=account.account_id, now=now), "assessment_id": assessment_id,
          "name": name, "assurance_level": level, "level_provenance": provenance,
