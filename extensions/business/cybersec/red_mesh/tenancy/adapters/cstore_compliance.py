@@ -1,14 +1,15 @@
 """RM-120: the compliance key space, apart from the tenancy hkey.
 
 `["redmesh","tenancy-compliance",1,<namespace>]` holds the framework maturity self-assessment
-rows (`framework_assessment`, keyed `[kind, namespace, tenant_id, pack_id]`). They are large
+rows (`framework_assessment`, keyed `[kind, namespace, tenant_id, pack_id]` for the default assessment
+and `[kind, namespace, tenant_id, pack_id, "fa_<uuid>"]` for every other). They are large
 (hundreds of kilobytes at the caps) and must never be pulled by the tenancy enumeration that backs
 tenant, engagement and node listings. Same envelope and read-back verification as
 `cstore_administration.py`; same enumeration cap.
 """
 import json
 
-from ..compliance import KIND as ASSESSMENT_KIND, validate_framework_assessment
+from ..compliance import ASSESSMENT_ID, KIND as ASSESSMENT_KIND, validate_framework_assessment
 from ..ports import TenantStoreError
 from .cstore_administration import MAX_ENUMERATED_RECORDS
 
@@ -30,8 +31,9 @@ class CstoreComplianceStore:
 
   def _location(self, kind, ids):
     if (not isinstance(self._namespace, str) or not self._namespace.strip()
-        or kind not in _KINDS or len(ids) != 2
-        or any(not isinstance(value, str) or not value.strip() for value in ids)):
+        or kind not in _KINDS or len(ids) not in (2, 3)
+        or any(not isinstance(value, str) or not value.strip() for value in ids)
+        or (len(ids) == 3 and not ASSESSMENT_ID.match(ids[2]))):
       raise TenantStoreError("Invalid compliance storage binding")
     return self.hkey, json.dumps([kind, self._namespace, *ids], separators=(",", ":"))
 
@@ -107,31 +109,33 @@ class CstoreComplianceStore:
       raise TenantStoreError("Compliance storage cannot be read") from exc
     return raw if isinstance(raw, dict) else None
 
-  def _records(self):
-    try:
-      records = self._owner.chainstore_hgetall(hkey=self.hkey)
-    except Exception as exc:
-      raise TenantStoreError("Compliance storage cannot be enumerated") from exc
-    if records is None:
-      return {}
-    if not isinstance(records, dict) or len(records) > MAX_ENUMERATED_RECORDS:
-      raise TenantStoreError("Compliance storage enumeration is unavailable")
-    return records
-
   def tenant_record_ids(self, kind, tenant_id):
     """The ids of a tenant's rows of one kind, without validating them (a delete must clear rows
-    the current validator refuses)."""
+    the current validator refuses). Field names come from `chainstore_hkeys` (local memory, no
+    network); each row is then read once, because a tombstone still lists. Both key shapes."""
     if kind not in _KINDS or not isinstance(tenant_id, str) or not tenant_id.strip():
       raise TenantStoreError("Invalid compliance storage binding")
+    try:
+      keys = self._owner.chainstore_hkeys(hkey=self.hkey)
+    except Exception as exc:
+      raise TenantStoreError("Compliance storage cannot be enumerated") from exc
+    keys = [] if keys is None else keys
+    if not isinstance(keys, (list, tuple, set)) or len(keys) > MAX_ENUMERATED_RECORDS:
+      raise TenantStoreError("Compliance storage enumeration is unavailable")
     found = []
-    for key, raw in self._records().items():
-      if raw is None:
-        continue
+    for key in keys:
       try:
         field = json.loads(key) if isinstance(key, str) else None
-      except (ValueError, RecursionError):
+        valid = (isinstance(field, list) and len(field) in (4, 5) and field[:3] == [kind, self._namespace, tenant_id]
+                 and key == self._location(kind, field[2:])[1])
+      except (ValueError, RecursionError, TenantStoreError):
         continue
-      if (isinstance(field, list) and len(field) == 4 and field[:3] == [kind, self._namespace, tenant_id]
-          and key == self._location(kind, field[2:])[1]):
+      if not valid:
+        continue
+      try:
+        value = self._owner.chainstore_hget(hkey=self.hkey, key=key)
+      except Exception as exc:
+        raise TenantStoreError("Compliance storage cannot be read") from exc
+      if value is not None:
         found.append(field[2:])
     return found

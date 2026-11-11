@@ -53,7 +53,7 @@ class FrameworkAssessmentFixture(unittest.TestCase):
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.cfg_instance_id = "jobs"
     self.plugin.P = lambda *args, **kwargs: None
-    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.events = []
     self.plugin._log_audit_event = lambda event, details: self.events.append((event, details))
@@ -614,6 +614,216 @@ class TestEntityFieldsAndSignoffNames(FrameworkAssessmentFixture):
     legal = {"legal": {"name": "N", "registration_id": "R", "signer_name": "S", "signer_role": "T"}}
     self.assertEqual(compliance.assessment_view(row, self.pack, can_manage=True, tenant=legal)["claimant"],
                      {"legal_name": "N", "registration_id": "R"})
+
+
+
+
+FA = "fa_11111111-1111-4111-8111-111111111111"
+FB = "fa_22222222-2222-4222-8222-222222222222"
+
+
+class TestSeveralAssessments(FrameworkAssessmentFixture):
+  """RM-120 phase 10a: the default assessment keeps the 4-element key; `fa_<uuid>` rows take a 5th element."""
+
+  def store(self):
+    from extensions.business.cybersec.red_mesh.tenancy.adapters.cstore_compliance import CstoreComplianceStore
+    return CstoreComplianceStore(self.plugin, "deployment")
+
+  def put_fa(self, assessment_id=FA, **extra):
+    row = compliance.new_row(self.tenant, self.pack, actor="initial", now="2026-11-11T00:00:00+00:00")
+    row.update(assessment_id=assessment_id, name="Evaluare 2026", create_request_id=str(uuid4()), **extra)
+    return self.store().put(compliance.KIND, self.tenant, PACK, assessment_id, record=row)
+
+  def call(self, operation, assessment_id, actor=None, **kwargs):
+    return self.plugin._call_tenant_administration(operation, actor or self.admin, tenant_id=self.tenant,
+                                                    pack_id=PACK, assessment_id=assessment_id, **kwargs)
+
+  def fa_key(self, assessment_id=FA):
+    return json.dumps([compliance.KIND, "deployment", self.tenant, PACK, assessment_id], separators=(",", ":"))
+
+  def fa_draft(self, assessment_id=FA):
+    row = self.put_fa(assessment_id)
+    data = self.ok(self.call("save_framework_assessment_draft", assessment_id, patch={
+      "assurance_level": "basic", "level_provenance": {"kind": "risk_score", "score": 42, "declared_by": "initial"},
+      "scores": self.basic_scores(), "completion_date": "2026-10-06",
+      "management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-10-06"}},
+      expected_assessment_revision=row["assessment_revision"]))
+    return data["assessmentRevision"]
+
+  # -- storage ----------------------------------------------------------------------------------
+
+  def test_fa_row_is_stored_on_a_five_element_field_and_default_stays_on_four(self):
+    revision = self.complete_basic_draft()
+    self.put_fa()
+    keys = sorted(k for k, v in self.compliance_rows().items() if v is not None)
+    self.assertEqual(sorted(len(json.loads(k)) for k in keys), [4, 5])
+    self.assertIn(self.fa_key(), keys)
+    self.assertEqual(self.ok(self.get())["assessmentRevision"], revision)
+    self.assertEqual(self.ok(self.call("get_framework_assessment", FA))["assessmentRevision"], 1)
+
+  def test_location_refuses_a_third_id_that_is_not_fa_uuid(self):
+    from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+    for bad in ("default", "fa_x", "fa_" + "G" * 36, "fa_" + "-" * 36, "fa_ABCDEF12-1111-4111-8111-111111111111", FA + "\n", FA + "0", "xx_" + FA[3:]):
+      with self.assertRaises(TenantStoreError, msg=bad):
+        self.store().get(compliance.KIND, self.tenant, PACK, bad)
+    with self.assertRaises(TenantStoreError):
+      self.store().get(compliance.KIND, self.tenant, PACK, FA, "extra")
+
+  def test_validator_binds_the_assessment_id_and_refuses_it_on_a_four_element_row(self):
+    from extensions.business.cybersec.red_mesh.tenancy.ports import TenantStoreError
+    row = compliance.new_row(self.tenant, self.pack, actor="initial", now="2026-11-11T00:00:00+00:00")
+    with self.assertRaises(TenantStoreError):  # assessment_id on the default row
+      self.store().put(compliance.KIND, self.tenant, PACK, record={**row, "assessment_id": FA})
+    with self.assertRaises(TenantStoreError):  # even a null assessment_id on the default row
+      self.store().put(compliance.KIND, self.tenant, PACK, record={**row, "assessment_id": None})
+    with self.assertRaises(TenantStoreError):  # fa row without its id
+      self.store().put(compliance.KIND, self.tenant, PACK, FA, record=row)
+    with self.assertRaises(TenantStoreError):  # fa row naming another id
+      self.store().put(compliance.KIND, self.tenant, PACK, FA, record={**row, "assessment_id": FB})
+    self.assertEqual(self.put_fa()["assessment_id"], FA)
+
+  def test_tenant_record_ids_lists_both_shapes_skips_tombstones_and_other_tenants(self):
+    self.complete_basic_draft()
+    self.put_fa(FA)
+    self.put_fa(FB)
+    self.store().delete(compliance.KIND, self.tenant, PACK, FB)  # tombstone: listed by hkeys, skipped
+    other = json.dumps([compliance.KIND, "deployment", "tn_other", PACK, FA], separators=(",", ":"))
+    self.storage.data[(COMPLIANCE_HKEY, other)] = {"raw": True}
+    self.storage.data[(COMPLIANCE_HKEY, "not json")] = {"raw": True}
+    self.storage.data[(COMPLIANCE_HKEY, json.dumps([compliance.KIND, "deployment", self.tenant, PACK, "bad"]))] = {"x": 1}
+    ids = sorted(self.store().tenant_record_ids(compliance.KIND, self.tenant))
+    self.assertEqual(ids, sorted([[self.tenant, PACK], [self.tenant, PACK, FA]]))
+
+  def test_tenant_record_ids_does_not_hgetall(self):
+    self.put_fa()
+    self.plugin.chainstore_hgetall = lambda **kwargs: self.fail("hgetall on enumeration")
+    self.assertEqual(self.store().tenant_record_ids(compliance.KIND, self.tenant), [[self.tenant, PACK, FA]])
+
+  # -- legacy row unchanged ---------------------------------------------------------------------
+
+  def test_legacy_row_reads_saves_submits_and_reopens_unchanged_end_to_end(self):
+    revision = self.complete_basic_draft()
+    self.ok(self.submit(revision, str(uuid4())))
+    envelope = self.documents.envelopes["doc-1"]
+    self.assertNotIn("assessment_id", envelope)
+    self.assertNotIn("assessment_id", envelope["snapshot"])
+    self.assertNotIn("name", envelope["snapshot"])
+    self.assertEqual(self.ok(self.artifact(1))["snapshot"], envelope["snapshot"])
+    data = self.ok(self.reopen(self.ok(self.get())["assessmentRevision"], str(uuid4())))
+    self.assertEqual(data["state"], "draft")
+    self.assertNotIn("assessment_id", self.stored_row())
+
+  def test_golden_digest_of_a_legacy_row_with_9b_fields_unset(self):
+    row = {"tenant_id": "tn_x", "pack_id": "p", "pack_acts": ["a"], "assurance_level": "basic",
+           "level_provenance": None, "sectoral_requirements": "s", "completion_date": "2026-10-06",
+           "management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-10-06"},
+           "remediation": [], "scores": {}}
+    self.assertEqual(compliance.intent_digest(row), PRE_UPGRADE_DIGEST)
+    self.assertEqual(compliance.intent_digest({**row, "name": "", "assessment_id": None}), PRE_UPGRADE_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "name": "A"}), PRE_UPGRADE_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "assessment_id": FA}), PRE_UPGRADE_DIGEST)
+
+  # -- fa rows through every operation ----------------------------------------------------------
+
+  def test_fa_row_save_submit_artifact_reopen_and_envelope_carries_the_id(self):
+    revision = self.fa_draft()
+    request = str(uuid4())
+    prepared = self.ok(self.call("prepare_framework_assessment_submit", FA, expected_assessment_revision=revision,
+                                 request_id=request))
+    self.assertEqual(prepared["outcome"], "prepared")
+    envelope = prepared["envelope"]
+    self.assertEqual(envelope["assessment_id"], FA)
+    self.assertEqual(envelope["snapshot"]["assessment_id"], FA)
+    self.assertEqual(envelope["snapshot"]["name"], "Evaluare 2026")
+    ref = {"store": self.documents.name, "ref": self.documents.put(envelope)}
+    recorded = self.ok(self.call("record_framework_assessment_submit", FA, request_id=request, ref=ref,
+                                 expected_assessment_revision=prepared["assessment_revision"]))
+    self.assertEqual(recorded["revision"], 1)
+    resolved = self.ok(self.call("framework_assessment_artifact_ref", FA, revision=1))
+    stored = self.documents.get(resolved["ref"]["ref"])
+    self.assertIsNotNone(compliance.verify_snapshot_envelope(stored, tenant_id=self.tenant, pack_id=PACK,
+                                                              revision=1, assessment_id=FA))
+    reopened = self.ok(self.call("reopen_framework_assessment", FA,
+                                 expected_assessment_revision=recorded["assessmentRevision"], request_id=str(uuid4())))
+    self.assertEqual(reopened["state"], "draft")
+    self.assertEqual(self.storage.data[(COMPLIANCE_HKEY, self.fa_key())]["assessment_id"], FA)
+
+  def test_cross_id_envelope_is_refused(self):
+    revision = self.fa_draft()
+    request = str(uuid4())
+    envelope = self.ok(self.call("prepare_framework_assessment_submit", FA, expected_assessment_revision=revision,
+                                 request_id=request))["envelope"]
+    verify = lambda env, aid: compliance.verify_snapshot_envelope(env, tenant_id=self.tenant, pack_id=PACK,
+                                                                  revision=1, assessment_id=aid)
+    self.assertIsNotNone(verify(envelope, FA))
+    self.assertIsNone(verify(envelope, FB))        # another assessment's artifact
+    self.assertIsNone(verify(envelope, "default"))  # fa envelope read as the default
+    legacy = {k: v for k, v in envelope.items() if k != "assessment_id"}
+    self.assertIsNone(verify(legacy, FA))           # default envelope read as an fa row
+    self.assertIsNotNone(verify(legacy, "default"))
+
+  def test_pending_resume_on_an_fa_row(self):
+    revision = self.fa_draft()
+    request = str(uuid4())
+    first = self.ok(self.call("prepare_framework_assessment_submit", FA, expected_assessment_revision=revision,
+                              request_id=request))
+    again = self.ok(self.call("prepare_framework_assessment_submit", FA, expected_assessment_revision=revision,
+                              request_id=request))
+    self.assertEqual(again["outcome"], "resume")
+    self.assertEqual(again["envelope"], first["envelope"])
+    self.assertEqual(self.ok(self.call("get_framework_assessment", FA))["pending"]["requestId"], request)
+    self.refused(self.call("save_framework_assessment_draft", FA, patch={}, expected_assessment_revision=first["assessment_revision"]),
+                 409, "assessment_submit_pending")
+    self.refused(self.call("clear_framework_assessment_pending", FA), 409, "assessment_submit_pending")
+
+  def test_missing_fa_row_is_404_for_every_operation(self):
+    ops = {
+      "get_framework_assessment": {},
+      "save_framework_assessment_draft": {"patch": {}, "expected_assessment_revision": 1},
+      "prepare_framework_assessment_submit": {"expected_assessment_revision": 1, "request_id": str(uuid4())},
+      "record_framework_assessment_submit": {"request_id": str(uuid4()), "ref": {"store": "fake", "ref": "r"},
+                                             "expected_assessment_revision": 1},
+      "clear_framework_assessment_pending": {},
+      "reopen_framework_assessment": {"expected_assessment_revision": 1, "request_id": str(uuid4())},
+      "framework_assessment_artifact_ref": {"revision": 1},
+    }
+    for operation, kwargs in ops.items():
+      for aid in (FA, "fa_bad"):
+        self.refused(self.call(operation, aid, **kwargs), 404, "assessment_not_found")
+    self.assertEqual(self.compliance_rows(), {})  # nothing created lazily
+
+  def test_default_still_creates_lazily_on_first_save(self):
+    self.assertEqual(self.ok(self.get())["assessmentRevision"], 1)
+    self.ok(self.save({"sectoral_requirements": "x"}, 1))
+    self.assertEqual(len(self.compliance_rows()), 1)
+
+  def test_fa_rows_are_independent_of_the_default_row(self):
+    self.complete_basic_draft()
+    self.fa_draft(FA)
+    self.assertEqual(self.ok(self.call("get_framework_assessment", FA))["assuranceLevel"], "basic")
+    self.assertEqual(self.ok(self.call("get_framework_assessment", "default"))["assuranceLevel"], "basic")
+    self.refused(self.call("get_framework_assessment", FB), 404, "assessment_not_found")
+
+  # -- purge ------------------------------------------------------------------------------------
+
+  def test_delete_tenant_clears_both_shapes_and_their_snapshots(self):
+    revision = self.complete_basic_draft()
+    self.ok(self.submit(revision, str(uuid4())))
+    fa_revision = self.fa_draft()
+    request = str(uuid4())
+    prepared = self.ok(self.call("prepare_framework_assessment_submit", FA, expected_assessment_revision=fa_revision,
+                                 request_id=request))
+    ref = {"store": self.documents.name, "ref": self.documents.put(prepared["envelope"])}
+    self.ok(self.call("record_framework_assessment_submit", FA, request_id=request, ref=ref,
+                      expected_assessment_revision=prepared["assessment_revision"]))
+    self.storage.account("initial", memberships=[])
+    self.storage.account("viewer", memberships=[])
+    self.storage.account("pentester", memberships=[])
+    result = self.plugin.delete_tenant(self.creator, self.tenant)
+    self.assertTrue(result["success"], result)
+    self.assertEqual(result["data"]["assessments"], 2)
+    self.assertTrue({"doc-1", "doc-2"} <= set(self.documents.deleted))
+    self.assertEqual([v for v in self.compliance_rows().values() if v is not None], [])
 
 
 if __name__ == "__main__":

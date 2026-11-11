@@ -30,7 +30,7 @@ class TestTenantDelete(unittest.TestCase):
     self.plugin.cfg_tenancy_namespace = "deployment"
     self.plugin.cfg_instance_id = "jobs"
     self.plugin.P = lambda *args, **kwargs: None
-    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hset"):
+    for name in ("chainstore_hget", "chainstore_hgetall", "chainstore_hkeys", "chainstore_hset"):
       setattr(self.plugin, name, getattr(self.storage, name))
     self.events = []
     self.plugin._log_audit_event = lambda event, details: self.events.append((event, details))

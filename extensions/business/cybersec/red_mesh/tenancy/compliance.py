@@ -32,6 +32,8 @@ from . import account_profile
 from .ports import TenantStoreError
 
 KIND = "framework_assessment"
+DEFAULT_ID = "default"  # the legacy 4-element row; any other assessment is `fa_<uuid>` (5th element)
+ASSESSMENT_ID = re.compile(r"fa_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 SNAPSHOT_SCHEMA = "redmesh.framework_assessment.v1"
 SNAPSHOT_ENVELOPE_KIND = "redmesh_framework_assessment"
 SNAPSHOT_ENVELOPE_VERSION = "1.0"
@@ -320,7 +322,9 @@ def _valid_ref(value):
 
 def validate_framework_assessment(row, ids):
   """Refuse a stored row the operations could not have written. Unknown fields are kept."""
-  if (not isinstance(row, dict) or len(ids) != 2 or row.get("tenant_id") != ids[0]
+  if (not isinstance(row, dict) or len(ids) not in (2, 3) or row.get("tenant_id") != ids[0]
+      or row.get("assessment_id") != (ids[2] if len(ids) == 3 else None)
+      or ("assessment_id" in row and len(ids) == 2)
       or row.get("pack_id") != ids[1] or not valid_pack_id(ids[1])
       or not isinstance(row.get("pack_acts"), list)
       or (row.get("assurance_level") is not None and row["assurance_level"] not in FRAMEWORK_LEVELS)
@@ -369,7 +373,7 @@ def _draft_fields(row):
                                           "sectoral_requirements", "completion_date", "management_signoff",
                                           "remediation", "scores")}
   # Entity fields join the digest only when set, so a pre-upgrade row hashes as it always did.
-  fields.update({key: row[key] for key in ("dnsc_unique_id", "external_supplier") if row.get(key)})
+  fields.update({key: row[key] for key in ("dnsc_unique_id", "external_supplier", "name", "assessment_id") if row.get(key)})
   return fields
 
 
@@ -406,16 +410,20 @@ def build_snapshot(row, tenant, computed, pending):
                    "actor": pending["actor"], "request_id": pending["request_id"],
                    "fingerprint": pending["intent_digest"], "pack_acts": list(row["pack_acts"])},
   }
-  return {"kind": SNAPSHOT_ENVELOPE_KIND, "schema_version": SNAPSHOT_ENVELOPE_VERSION,
-          "schema": SNAPSHOT_SCHEMA, "tenant_id": row["tenant_id"], "pack_id": row["pack_id"],
-          "revision": pending["revision"], "snapshot": snapshot}
+  envelope = {"kind": SNAPSHOT_ENVELOPE_KIND, "schema_version": SNAPSHOT_ENVELOPE_VERSION,
+              "schema": SNAPSHOT_SCHEMA, "tenant_id": row["tenant_id"], "pack_id": row["pack_id"],
+              "revision": pending["revision"], "snapshot": snapshot}
+  if row.get("assessment_id"):  # top level on `fa_*` envelopes only; the default stays byte-identical
+    envelope["assessment_id"] = row["assessment_id"]
+  return envelope
 
 
-def verify_snapshot_envelope(envelope, *, tenant_id, pack_id, revision):
+def verify_snapshot_envelope(envelope, *, tenant_id, pack_id, revision, assessment_id=DEFAULT_ID):
   """The stored snapshot, only while it is the one the row names."""
   if (not isinstance(envelope, dict) or envelope.get("kind") != SNAPSHOT_ENVELOPE_KIND
       or envelope.get("schema") != SNAPSHOT_SCHEMA or envelope.get("tenant_id") != tenant_id
       or envelope.get("pack_id") != pack_id or envelope.get("revision") != revision
+      or envelope.get("assessment_id") != (None if assessment_id == DEFAULT_ID else assessment_id)
       or not isinstance(envelope.get("snapshot"), dict)):
     return None
   return envelope["snapshot"]
@@ -524,13 +532,26 @@ def _store(service):
   return store
 
 
-def _row(service, tenant_id, pack_id):
-  return _store(service).get(KIND, tenant_id, pack_id)
+def _ids(tenant_id, pack_id, assessment_id):
+  if assessment_id == DEFAULT_ID:
+    return (tenant_id, pack_id)
+  if not isinstance(assessment_id, str) or not ASSESSMENT_ID.match(assessment_id):
+    raise _denied(404, "assessment_not_found")
+  return (tenant_id, pack_id, assessment_id)
+
+
+def _row(service, tenant_id, pack_id, assessment_id=DEFAULT_ID):
+  """The stored row; None only for the default (lazy first save). A missing `fa_*` row is a 404."""
+  row = _store(service).get(KIND, *_ids(tenant_id, pack_id, assessment_id))
+  if row is None and assessment_id != DEFAULT_ID:
+    raise _denied(404, "assessment_not_found")
+  return row
 
 
 def _put(service, row):
   # The adapter verifies the write by reading it back and returns that row: no third read.
-  return _store(service).put(KIND, row["tenant_id"], row["pack_id"], record=row)
+  return _store(service).put(KIND, *_ids(row["tenant_id"], row["pack_id"], row.get("assessment_id") or DEFAULT_ID),
+                             record=row)
 
 
 def _stamp(row, actor):
@@ -542,7 +563,7 @@ def _expected_revision(row, expected):
     raise _denied(409, "assessment_stale", current_assessment_revision=row["assessment_revision"])
 
 
-def get_assessment(service, actor, tenant_id, pack_id, include_pack=True):
+def get_assessment(service, actor, tenant_id, pack_id, include_pack=True, assessment_id=DEFAULT_ID):
   """The current row as the DTO; with `include_pack` the official text rides along (a console read)."""
   tenant, account = service._authorized_tenant(actor, tenant_id, VIEW)
   pack = pack_for(pack_id)
@@ -552,7 +573,7 @@ def get_assessment(service, actor, tenant_id, pack_id, include_pack=True):
       text = load_framework_text(pack_id)
     except FrameworkPackError as exc:
       raise TenantStoreError("Framework pack text unavailable") from exc
-  row = _row(service, tenant_id, pack_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
+  row = _row(service, tenant_id, pack_id, assessment_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
   return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE), text=text,
                          names=name_resolver(service), tenant=tenant)
 
@@ -564,11 +585,11 @@ def authorize_manage(service, actor, tenant_id, pack_id):
   return {"accountId": account.account_id}
 
 
-def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_revision):
+def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_revision, assessment_id=DEFAULT_ID):
   tenant, account = service._authorized_tenant(actor, tenant_id, MANAGE)
   pack = pack_for(pack_id)
   now = _now_iso()
-  row = _row(service, tenant_id, pack_id)
+  row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None:
     row = new_row(tenant_id, pack, actor=account.account_id, now=now)
   _expected_revision(row, expected_assessment_revision)
@@ -585,7 +606,8 @@ def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_re
   return assessment_view(stored, pack, can_manage=True, names=name_resolver(service), tenant=tenant)
 
 
-def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revision, request_id):
+def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                   assessment_id=DEFAULT_ID):
   """Step 1 of a submit: replay check first, then compare-and-set, validation and the pending mark.
 
   Returns `outcome` `replayed` (with the recorded revision), `resume` or `prepared` (both with the
@@ -596,7 +618,7 @@ def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revis
   tenant, account = service._authorized_tenant(actor, tenant_id, MANAGE)
   pack = pack_for(pack_id)
   request_id = _request_id(request_id)
-  row = _row(service, tenant_id, pack_id)
+  row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None:
     raise _denied(404, "assessment_not_found")
   digest = intent_digest(row)
@@ -653,7 +675,8 @@ def _authorized_unless_deleting(service, actor, tenant_id):
   return service.authorize_tenant_for_account(account, tenant_id, MANAGE)
 
 
-def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision):
+def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision,
+                  assessment_id=DEFAULT_ID):
   """Step 3 of a submit: bind the written snapshot to revision N, or 409 `assessment_submit_superseded`."""
   from .administration import _request_id
   _, account = _authorized_unless_deleting(service, actor, tenant_id)
@@ -661,7 +684,7 @@ def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_
   request_id = _request_id(request_id)
   if not _valid_ref(ref):
     raise _denied(400, "invalid_request")
-  row = _row(service, tenant_id, pack_id)
+  row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None:
     raise _denied(404, "assessment_not_found")
   pending = row.get("pending")
@@ -683,11 +706,11 @@ def record_submit(service, actor, tenant_id, pack_id, request_id, ref, expected_
           "assessmentRevision": stored["assessment_revision"], "actor": account.account_id}
 
 
-def clear_pending(service, actor, tenant_id, pack_id):
+def clear_pending(service, actor, tenant_id, pack_id, assessment_id=DEFAULT_ID):
   """Any manager may remove a pending marker older than PENDING_TTL_SECONDS."""
   _, account = service._authorized_tenant(actor, tenant_id, MANAGE)
   pack_for(pack_id)
-  row = _row(service, tenant_id, pack_id)
+  row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None:
     raise _denied(404, "assessment_not_found")
   pending = row.get("pending")
@@ -701,14 +724,14 @@ def clear_pending(service, actor, tenant_id, pack_id):
           "assessmentRevision": stored["assessment_revision"], "actor": account.account_id}
 
 
-def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, request_id):
+def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, request_id, assessment_id=DEFAULT_ID):
   """Only the latest submitted revision reopens: a state flip with `reopened_from`, sign-off and
   completion date cleared; `reopen_request_id` on the submission answers a replay."""
   from .administration import _request_id
   tenant, account = service._authorized_tenant(actor, tenant_id, MANAGE)
   pack = pack_for(pack_id)
   request_id = _request_id(request_id)
-  row = _row(service, tenant_id, pack_id)
+  row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None or not row["submissions"]:
     raise _denied(404, "assessment_not_found")
   last = row["submissions"][-1]
@@ -726,12 +749,12 @@ def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, req
   return {**assessment_view(stored, pack, can_manage=True, names=name_resolver(service), tenant=tenant), "replayed": False}
 
 
-def artifact_ref(service, actor, tenant_id, pack_id, revision):
+def artifact_ref(service, actor, tenant_id, pack_id, revision, assessment_id=DEFAULT_ID):
   """The stored reference of revision N, resolved under the lock after the policy check, for the
   plugin to read outside it. Never returned to a caller."""
   service._authorized_tenant(actor, tenant_id, VIEW)
   pack_for(pack_id)
-  row = _row(service, tenant_id, pack_id)
+  row = _row(service, tenant_id, pack_id, assessment_id)
   if row is None or type(revision) is not int:
     raise _denied(404, "assessment_not_found")
   for sub in row["submissions"]:

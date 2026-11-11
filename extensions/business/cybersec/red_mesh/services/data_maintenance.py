@@ -430,7 +430,7 @@ class Inventory:
       ids = json.loads(field) if isinstance(field, str) else None
     except (ValueError, RecursionError):
       ids = None
-    if not (isinstance(ids, list) and len(ids) == 4 and ids[0] == ASSESSMENT_KIND
+    if not (isinstance(ids, list) and len(ids) in (4, 5) and ids[0] == ASSESSMENT_KIND
             and ids[1] == self._namespace):
       return OLD, "unrecognized"
     try:

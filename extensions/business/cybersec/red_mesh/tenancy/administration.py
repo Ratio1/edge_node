@@ -1584,36 +1584,45 @@ class TenantAdministrationService:
   # `framework_assessment_artifact_ref` resolved it under the lock.
 
   @_endpoint
-  def get_framework_assessment(self, actor, tenant_id, pack_id, include_pack=True):
-    return compliance.get_assessment(self, actor, tenant_id, pack_id, include_pack=include_pack)
+  def get_framework_assessment(self, actor, tenant_id, pack_id, include_pack=True, assessment_id="default"):
+    return compliance.get_assessment(self, actor, tenant_id, pack_id, include_pack=include_pack,
+                                     assessment_id=assessment_id)
 
   @_endpoint
   def authorize_framework_assessment_manage(self, actor, tenant_id, pack_id):
     return compliance.authorize_manage(self, actor, tenant_id, pack_id)
 
   @_endpoint
-  def save_framework_assessment_draft(self, actor, tenant_id, pack_id, patch, expected_assessment_revision):
-    return compliance.save_draft(self, actor, tenant_id, pack_id, patch, expected_assessment_revision)
+  def save_framework_assessment_draft(self, actor, tenant_id, pack_id, patch, expected_assessment_revision,
+                                      assessment_id="default"):
+    return compliance.save_draft(self, actor, tenant_id, pack_id, patch, expected_assessment_revision,
+                                 assessment_id=assessment_id)
 
   @_endpoint
-  def prepare_framework_assessment_submit(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id):
-    return compliance.prepare_submit(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id)
+  def prepare_framework_assessment_submit(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                                          assessment_id="default"):
+    return compliance.prepare_submit(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                                     assessment_id=assessment_id)
 
   @_endpoint
-  def record_framework_assessment_submit(self, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision):
-    return compliance.record_submit(self, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision)
+  def record_framework_assessment_submit(self, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision,
+                                         assessment_id="default"):
+    return compliance.record_submit(self, actor, tenant_id, pack_id, request_id, ref, expected_assessment_revision,
+                                    assessment_id=assessment_id)
 
   @_endpoint
-  def clear_framework_assessment_pending(self, actor, tenant_id, pack_id):
-    return compliance.clear_pending(self, actor, tenant_id, pack_id)
+  def clear_framework_assessment_pending(self, actor, tenant_id, pack_id, assessment_id="default"):
+    return compliance.clear_pending(self, actor, tenant_id, pack_id, assessment_id=assessment_id)
 
   @_endpoint
-  def reopen_framework_assessment(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id):
-    return compliance.reopen(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id)
+  def reopen_framework_assessment(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                                  assessment_id="default"):
+    return compliance.reopen(self, actor, tenant_id, pack_id, expected_assessment_revision, request_id,
+                             assessment_id=assessment_id)
 
   @_endpoint
-  def framework_assessment_artifact_ref(self, actor, tenant_id, pack_id, revision):
-    return compliance.artifact_ref(self, actor, tenant_id, pack_id, revision)
+  def framework_assessment_artifact_ref(self, actor, tenant_id, pack_id, revision, assessment_id="default"):
+    return compliance.artifact_ref(self, actor, tenant_id, pack_id, revision, assessment_id=assessment_id)
 
   @_endpoint
   def authorize_platform(self, actor):
