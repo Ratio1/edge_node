@@ -14,6 +14,8 @@ plugin to provide a complete decentralized authentication solution.
 
 """
 
+# A private download folder for the helper-thread read of an old-style document (see _load_legacy_pipeline).
+import tempfile
 # Old-style pipeline documents are read on a helper thread (see _load_legacy_pipeline), so a
 # slow or missing R1FS document no longer holds the single dAuth request thread.
 import threading
@@ -383,9 +385,10 @@ class _DauthMixin(object):
         Read the pipeline document on the helper thread and record the result in the memo.
 
         Runs off the request thread so a slow or missing R1FS document cannot queue the
-        other dAuth requests behind it. Any read error, or a result that is not a dict, is
-        recorded as unavailable; either way the next read is allowed 30 s after this one
-        ended.
+        other dAuth requests behind it. The document is downloaded into a private temporary
+        folder, because the default download folder is one per CID and shared by every
+        reader on the node. Any read error, or a result that is not a dict, is recorded as
+        unavailable; either way the next read is allowed 30 s after this one ended.
 
         Returns
         -------
@@ -400,9 +403,13 @@ class _DauthMixin(object):
         (1731320430.0, {'NAME': 'app', 'DEEPLOY_SPECS': {'job_id': 7}, ...})
         """
         try:
-          # Bounded like the other dAuth reads: pin=False keeps the fixed 90 s `ipfs pin add`
-          # out, so a missing document no longer holds this thread for minutes.
-          doc = self.r1fs.get_json(cid, timeout=10, pin=False, show_logs=False)
+          # A private folder for this read, removed when it ends. Now that this read runs beside the
+          # request thread, a reveal or reconcile of the same job could read the same CID at the same
+          # time, and in the shared per-CID folder each read deletes the other's files.
+          with tempfile.TemporaryDirectory() as folder:
+            # Bounded like the other dAuth reads: pin=False keeps the fixed 90 s `ipfs pin add`
+            # out, so a missing document no longer holds this thread for minutes.
+            doc = self.r1fs.get_json(cid, local_folder=folder, timeout=10, pin=False, show_logs=False)
         except Exception:
           # Any read error means "not available"; it is retried after the delay below.
           doc = None

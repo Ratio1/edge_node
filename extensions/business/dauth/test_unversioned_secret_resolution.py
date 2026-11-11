@@ -1,5 +1,6 @@
 """Existing persisted pipelines survive restart without weakening revision auth."""
 import json
+import os
 import tempfile
 import threading
 import time
@@ -130,9 +131,10 @@ class ExistingPipelineSecretTests(unittest.TestCase):
 
   def test_slow_pipeline_read_runs_off_the_request_thread_once_per_cid(self):
     plugin = existing_job()
-    released, calls = threading.Event(), []
-    def get_json(cid, timeout=None, pin=True, show_logs=False):
+    released, calls, folders = threading.Event(), [], []
+    def get_json(cid, local_folder=None, timeout=None, pin=True, show_logs=False):
       calls.append((cid, timeout, pin))
+      folders.append((local_folder, os.path.isdir(local_folder)))
       released.wait(5)
       return plugin._r1fs_data[cid]
     plugin.r1fs.get_json = get_json
@@ -151,6 +153,9 @@ class ExistingPipelineSecretTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "not running"):
       plugin.process_dauth_get_secret_request(request(EE_SENDER="node-other", EE_ETH_SENDER="0xOTHER"))
     self.assertEqual(calls, [("old-cid", 10, False)])  # one read, bounded and without a pin
+    # In a folder of its own (not the per-CID one that other readers share), gone once the read ended.
+    self.assertEqual([existed for _folder, existed in folders], [True])
+    self.assertFalse(os.path.exists(folders[0][0]))
 
   def test_cached_bundle_does_not_require_peer_synchronization(self):
     plugin = existing_job()
