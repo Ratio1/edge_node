@@ -78,6 +78,12 @@ def node_probe(home, name, start, end):
     'cpu_cores': rnd((last['cpu'] - first['cpu']) / span) if not restarted else None,
     'rss_mb': rnd(last.get('VmRSS', 0) / 1024.0, 0),
     'threads': last.get('Threads'),
+    # Whole container, from its control group: what the host has to provide for this node.
+    'container_mb': rnd(last['cg_mem'] / 1048576.0, 0) if 'cg_mem' in last else None,
+    'container_cores': rnd((last['cg_usage_usec'] - first['cg_usage_usec']) / 1e6 / span)
+                       if 'cg_usage_usec' in last and 'cg_usage_usec' in first and not restarted else None,
+    'throttled_share': rnd((last['cg_throttled_usec'] - first['cg_throttled_usec']) / 1e6 / span)
+                       if 'cg_throttled_usec' in last and 'cg_throttled_usec' in first and not restarted else None,
     'plugins': {},
   }
   for key in sorted(last.get('plugins') or {}):

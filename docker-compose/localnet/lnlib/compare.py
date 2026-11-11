@@ -31,6 +31,10 @@ def _phase_rows(result, focus):
   users = result.get('chain_store_users') or {}
   rows = []
   rows.append(('seed oracles: CPU cores used by the node process (median)', _med([nodes[name].get('cpu_cores') for name in seeds])))
+  rows.append(('seed oracles: CPU cores used by the whole container (median)', _med([nodes[name].get('container_cores') for name in seeds])))
+  rows.append(('seed oracles: memory of the whole container, MB (median)', _med([nodes[name].get('container_mb') for name in seeds])))
+  rows.append(('other oracles: CPU cores used by the whole container (median)', _med([nodes[name].get('container_cores') for name in headless])))
+  rows.append(('other oracles: memory of the whole container, MB (median)', _med([nodes[name].get('container_mb') for name in headless])))
   rows.append(('seed oracles: main loop rate, Hz (median; target 10)', _med([(nodes[name].get('log') or {}).get('main_loop_hz_p50') for name in seeds])))
   rates = sorted((store(name).get('received') or 0) / seconds for name in seeds)
   rows.append(('chain-store inputs per second: busiest seed', round(rates[-1], 2) if rates else None))
@@ -105,4 +109,43 @@ def compare(home, scenario, tags, focus='r1s-04'):
     for line in text.splitlines():
       if 'replicas ' in line and 'compared' in line:
         out.append('{}: {}'.format(tag, line.split(' ', 1)[1]))
+  return '\n'.join(out)
+
+
+CURVE = ('cores', 'main Hz', 'store Hz', 'store drop', 'writes', 'write s', 'refresh', 'dAuth Hz', 'start-up', 'p50 s', 'p95 s')
+
+
+def _curve_row(result, focus):
+  node = result['nodes'].get(focus) or {}
+  plugins = node.get('plugins') or {}
+  store = plugins.get('CHAIN_STORE_BASE') or {}
+  user = (result.get('chain_store_users') or {}).get(focus) or {}
+  probe = (result.get('dauth_probe') or {}).get('get_auth_data') or {}
+  cores = node.get('container_cores')
+  return (
+    node.get('cpu_cores') if cores is None else cores,
+    (node.get('log') or {}).get('main_loop_hz_p50'),
+    store.get('loop_hz_p50'), store.get('dropped'),
+    '{}/{}'.format(user['writes_confirmed'], user['writes']) if user else '-',
+    (user.get('write_s') or {}).get('p50'),
+    '{}/{}'.format(user['refresh_ok'], user['refresh']) if user else '-',
+    (plugins.get('DAUTH_MANAGER') or {}).get('loop_hz_p50'),
+    '{}/{}'.format(probe['ok'], probe['sent']) if probe else '-',
+    (probe.get('ok_s') or {}).get('p50'), (probe.get('ok_s') or {}).get('p95'),
+  )
+
+
+def curve(home, scenario, tags, focus='r1s-04'):
+  """One line per phase and code version for the focus node: how it degrades as a scenario squeezes it."""
+  out = ['scenario {}, node {}: CPU cores used, main and chain-store loop rate, chain-store inputs dropped, writes and'.format(scenario, focus),
+         'refreshes through it (confirmed/sent, median seconds), dAuth loop rate, start-up requests pinned to it (answered/sent, seconds)']
+  for tag in tags:
+    run = latest(home, scenario, tag)
+    if run is None:
+      out += ['', '{}: no run found'.format(tag)]
+      continue
+    out += ['', '## {} ({})'.format(tag, run.name), '{:<18}'.format('phase') + ''.join('{:>11}'.format(name) for name in CURVE)]
+    for path in sorted(run.glob('[0-9]*_*.json')):
+      row = _curve_row(json.loads(path.read_text()), focus)
+      out.append('{:<18}'.format(path.stem) + ''.join('{:>11}'.format('-' if value is None else str(value)) for value in row))
   return '\n'.join(out)

@@ -159,7 +159,8 @@ class TestMetrics(unittest.TestCase):
       out.mkdir(parents=True)
       rows = []
       for idx in range(4):
-        rows.append({'t': 100 + 5 * idx, 'up': 10 + 5 * idx, 'cpu': 2.0 * idx, 'VmRSS': 1024 * 900, 'Threads': 90, 'plugins': {
+        rows.append({'t': 100 + 5 * idx, 'up': 10 + 5 * idx, 'cpu': 2.0 * idx, 'VmRSS': 1024 * 900, 'Threads': 90,
+                     'cg_mem': 2048 * 1048576, 'cg_usage_usec': 3000000 * idx, 'cg_throttled_usec': 1500000 * idx, 'plugins': {
           'admin_pipeline|CHAIN_STORE_BASE|X': {'recv': 10 * idx, 'dropped': idx, 'queue': 3 - idx, 'qmax': 1024,
                                                'handled': 10 * idx - idx - (3 - idx), 'hz': 20.0 - idx, 'iter': idx, 'errors': 0}}})
       (out / 'probe.jsonl').write_text('\n'.join(json.dumps(row) for row in rows))
@@ -168,6 +169,33 @@ class TestMetrics(unittest.TestCase):
     self.assertEqual((store['received'], store['dropped'], store['queue_max'], store['queue_end']), (30, 3, 3, 0))
     self.assertEqual(result['cpu_cores'], 0.4)
     self.assertFalse(result['restarted'])
+    # The whole container: 3 s of CPU and 1.5 s of throttling in every 5 s sample, 2 GiB.
+    self.assertEqual((result['container_cores'], result['throttled_share'], result['container_mb']), (0.6, 0.3, 2048))
+
+  def test_curve_gives_one_line_per_phase_for_the_squeezed_node(self):
+    from lnlib import compare
+
+    class Home:
+      results = None
+
+    def phase(cores, answered):
+      return {'window': {'seconds': 240}, 'nodes': {'r1s-04': {'role': 'seed', 'cpu_cores': 9.9, 'container_cores': cores, 'log': {'main_loop_hz_p50': 9.5},
+              'plugins': {'CHAIN_STORE_BASE': {'loop_hz_p50': 20.0, 'dropped': 0}, 'DAUTH_MANAGER': {'loop_hz_p50': 5.0}}}},
+              'chain_store_users': {'r1s-04': {'writes': 24, 'writes_confirmed': 24, 'write_s': {'p50': 0.3}, 'refresh': 2, 'refresh_ok': 2}},
+              'dauth_probe': {'get_auth_data': {'sent': 24, 'ok': answered, 'ok_s': {'p50': 1.5, 'p95': 4.0}}}}
+
+    with tempfile.TemporaryDirectory() as folder:
+      Home.results = Path(folder)
+      run = Path(folder) / '20260101T000000_resource_floor_base'
+      run.mkdir()
+      (run / '1_cpu_unlimited.json').write_text(json.dumps(phase(0.55, 24)))
+      (run / '2_cpu_0.25.json').write_text(json.dumps(phase(0.2, 3)))
+      lines = compare.curve(Home, 'resource_floor', ['base', 'absent']).splitlines()
+    rows = {line.split()[0]: line.split() for line in lines if line[:1].isdigit()}
+    self.assertEqual(sorted(rows), ['1_cpu_unlimited', '2_cpu_0.25'])
+    self.assertEqual((rows['1_cpu_unlimited'][1], rows['1_cpu_unlimited'][9]), ('0.55', '24/24'))
+    self.assertEqual((rows['2_cpu_0.25'][1], rows['2_cpu_0.25'][9]), ('0.2', '3/24'))
+    self.assertIn('absent: no run found', lines)
 
 
 @unittest.skipUnless(HAS_SDK, 'SDK source tree not available')

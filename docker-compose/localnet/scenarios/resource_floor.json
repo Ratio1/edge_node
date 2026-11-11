@@ -1,0 +1,153 @@
+{
+ "name": "resource_floor",
+ "about": "How little CPU an oracle can work with. No fault is injected: the network carries its normal load (216 nodes, refusals at the mainnet rate) and one seed oracle, r1s-04, is given less and less CPU: unlimited, then 2, 1, 0.7, 0.5, 0.35 and 0.25 cores, four minutes each. A licensed node pinned to that oracle keeps asking for its settings and a writer keeps writing through it. The result is a curve: at which allocation the oracle stops answering in time, stops confirming writes, and starts losing chain-store inputs.",
+ "steps": [
+  {
+   "do": "load",
+   "generator": "fleet",
+   "args": [
+    "--unlicensed",
+    "40",
+    "--refused-rate",
+    "9.6"
+   ]
+  },
+  {
+   "do": "load",
+   "generator": "cstore",
+   "args": [
+    "--period",
+    "10",
+    "--hsync",
+    "120"
+   ]
+  },
+  {
+   "do": "pin",
+   "generator": "dauth",
+   "node": "r1s-04"
+  },
+  {
+   "do": "load",
+   "generator": "dauth",
+   "args": [
+    "--secrets-rate",
+    "0",
+    "--probe-period",
+    "10"
+   ]
+  },
+  {
+   "do": "wait",
+   "seconds": 60
+  },
+  {
+   "do": "phase",
+   "name": "1_cpu_unlimited"
+  },
+  {
+   "do": "wait",
+   "seconds": 180
+  },
+  {
+   "do": "phase",
+   "name": "2_cpu_2.0"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 2.0
+  },
+  {
+   "do": "wait",
+   "seconds": 240
+  },
+  {
+   "do": "phase",
+   "name": "3_cpu_1.0"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 1.0
+  },
+  {
+   "do": "wait",
+   "seconds": 240
+  },
+  {
+   "do": "phase",
+   "name": "4_cpu_0.7"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 0.7
+  },
+  {
+   "do": "wait",
+   "seconds": 240
+  },
+  {
+   "do": "phase",
+   "name": "5_cpu_0.5"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 0.5
+  },
+  {
+   "do": "wait",
+   "seconds": 240
+  },
+  {
+   "do": "phase",
+   "name": "6_cpu_0.35"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 0.35
+  },
+  {
+   "do": "wait",
+   "seconds": 240
+  },
+  {
+   "do": "phase",
+   "name": "7_cpu_0.25"
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 0.25
+  },
+  {
+   "do": "wait",
+   "seconds": 240
+  },
+  {
+   "do": "profile",
+   "seconds": 30,
+   "name": "cpu_0.25",
+   "nodes": [
+    "r1s-04"
+   ]
+  },
+  {
+   "do": "node",
+   "node": "r1s-04",
+   "cpus": 12
+  },
+  {
+   "do": "pin",
+   "generator": "dauth",
+   "node": null
+  },
+  {
+   "do": "unload",
+   "generator": "all"
+  }
+ ]
+}

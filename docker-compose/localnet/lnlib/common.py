@@ -31,7 +31,7 @@ def log(msg):
 
 def sh(*args, check=True, timeout=600, capture=True, stdin=None, env=None):
   proc = subprocess.run(
-    [str(arg) for arg in args], check=False, timeout=timeout, text=True, input=stdin,
+    [str(arg) for arg in args], check=False, timeout=timeout, text=True, errors='replace', input=stdin,
     stdout=subprocess.PIPE if capture else None, stderr=subprocess.STDOUT if capture else None, env=env,
   )
   if check and proc.returncode != 0:

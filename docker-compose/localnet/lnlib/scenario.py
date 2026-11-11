@@ -100,6 +100,28 @@ def run(home, path, tag=None):
     return
 
   note('scenario {} on code {} -> {}'.format(spec['name'], arms, out))
+  # A scenario that stops or kills nodes leaves the cluster changed: start each one on a cluster where all nodes run.
+  down = [node['name'] for node in manifest['nodes']
+          if sh('docker', 'inspect', '-f', '{{.State.Running}}', container(node['name']), check=False).stdout.strip() != 'true']
+  if down:
+    note('scenario not started: nodes not running: {}'.format(', '.join(down)))
+    journal.close()
+    raise LocalnetError('scenario {} needs every node running; not running: {} (start them or initialise the cluster again)'.format(
+      spec['name'], ', '.join(down)))
+  try:
+    _steps(home, spec, manifest, out, phase, note, close_phase)
+  except BaseException as exc:
+    note('scenario failed: {}'.format(str(exc)[:300]))
+    loadlib.stop(None)
+    journal.close()
+    raise
+  close_phase()
+  note('scenario finished: {}'.format(out))
+  journal.close()
+  return out
+
+
+def _steps(home, spec, manifest, out, phase, note, close_phase):
   for step in spec['steps']:
     do = step['do']
     if do == 'load':
@@ -147,7 +169,4 @@ def run(home, path, tag=None):
       note(step['text'])
     else:
       raise LocalnetError('unknown scenario step {}'.format(do))
-  close_phase()
-  note('scenario finished: {}'.format(out))
-  journal.close()
-  return out
+  return

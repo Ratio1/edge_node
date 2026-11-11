@@ -38,6 +38,22 @@ def _read_proc_status():
   return res
 
 
+def _read_cgroup():
+  # The whole container (node process, web servers, managers), not only this process.
+  res = {}
+  try:
+    with open('/sys/fs/cgroup/memory.current', 'rt') as fh:
+      res['cg_mem'] = int(fh.read().strip())
+    with open('/sys/fs/cgroup/cpu.stat', 'rt') as fh:
+      for line in fh:
+        key, _, val = line.partition(' ')
+        if key in ('usage_usec', 'throttled_usec'):
+          res['cg_' + key] = int(val)
+  except Exception:
+    pass
+  return res
+
+
 def _open_fds():
   try:
     return len(os.listdir('/proc/self/fd'))
@@ -127,6 +143,7 @@ class Probe(threading.Thread):
       'probe_errors': self._errors,
     }
     row.update(_read_proc_status())
+    row.update(_read_cgroup())
     if self.eng is not None:
       row['plugins'] = self._plugins()
     return row

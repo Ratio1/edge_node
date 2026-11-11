@@ -281,7 +281,7 @@ def cmd_replicas(args):
 
 def cmd_compare(args):
   home = Home(args.home)
-  text = comparelib.compare(home, args.scenario, args.tags, focus=args.focus)
+  text = (comparelib.curve if args.curve else comparelib.compare)(home, args.scenario, args.tags, focus=args.focus)
   if args.out:
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(text + '\n')
@@ -380,6 +380,7 @@ def main():
   one.add_argument('scenario', help='scenario name, for example incident')
   one.add_argument('tags', nargs='+', help='run labels to compare, for example base new')
   one.add_argument('--focus', default='r1s-04', help='node reported in detail (default: r1s-04, the one scenarios starve)')
+  one.add_argument('--curve', action='store_true', help='one line per phase for the focus node (for stepped scenarios such as resource_floor)')
   one.add_argument('--out', help='also write the tables to this file')
   one.set_defaults(func=cmd_compare)
 

@@ -87,8 +87,10 @@ $LN scenario docker-compose/localnet/scenarios/incident.json
 `--arm-of NODE=TREE` on `init` gives single nodes another version (mixed fleets).
 
 Other commands: `status`, `collect` (measure the last minutes by hand), `profile` (which threads and
-functions hold the interpreter lock), `replicas` (records each oracle lacks compared with the others), `load start|run|stop|logs <generator>`, `ctl` (run a command on the
-isolated network), `down [--purge]`.
+functions hold the interpreter lock), `replicas` (records each oracle lacks compared with the others),
+`compare <scenario> <version> ...` (runs of one scenario side by side; `--curve` prints one line per
+phase for the node a scenario squeezes), `load start|run|stop|logs <generator>`, `ctl` (run a command on
+the isolated network), `down [--purge]`.
 
 ## Scenarios
 
@@ -96,6 +98,8 @@ isolated network), `down [--purge]`.
 |---|---|
 | `scenarios/incident.json` | A Deeploy operation that cannot finish (its target node is gone), then one oracle short of CPU: the mainnet incident of 2026-11-08 |
 | `scenarios/restart.json` | Oracles leaving by SIGTERM, SIGKILL and SIGINT and coming back: whether each stays a replication target and how many records it lacks afterwards |
+| `scenarios/pinned_client.json` | A licensed node whose dAuth requests always reach one oracle, and that oracle is saturated (mainnet, 2026-11-10) |
+| `scenarios/resource_floor.json` | One oracle given less and less CPU under normal load: where it stops answering in time |
 | `scenarios/secret_flood.json` | Secret requests for old-style jobs whose documents cannot be read, and what a starting node sees meanwhile |
 
 A scenario is a list of steps (start a load, wait, begin a measurement phase, stop or throttle a node,
@@ -107,7 +111,8 @@ Each phase of a scenario produces one JSON file. Everything is measured the same
 version:
 
 - per node, from a sampler inside the node (`node/probe.py`): inputs received, handled and dropped per
-  plugin, queue depth, plugin loop rate, CPU time, memory;
+  plugin, queue depth, plugin loop rate, CPU time and memory of the node process, and CPU time, throttled
+  time and memory of the whole container (node process, web servers, managers) from its control group;
 - what users saw, from the load generators: chain-store writes confirmed and their latency, replication
   delay to every other serving node, refresh outcomes, dAuth outcomes and latency, Deeploy admission time
   and operation timeline;
