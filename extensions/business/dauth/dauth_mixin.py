@@ -291,7 +291,7 @@ class _DauthMixin(object):
     if document is None and retry_at is not None and self.time() >= retry_at:
       def read():
         try:
-          doc = self.r1fs.get_json(cid, show_logs=False)
+          doc = self.r1fs.get_json(cid, timeout=10, pin=False, show_logs=False)
         except Exception:
           doc = None
         cache[cid] = (self.time() + 30, doc if isinstance(doc, dict) else None)

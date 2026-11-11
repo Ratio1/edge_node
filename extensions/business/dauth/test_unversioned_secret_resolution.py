@@ -131,8 +131,8 @@ class ExistingPipelineSecretTests(unittest.TestCase):
   def test_slow_pipeline_read_runs_off_the_request_thread_once_per_cid(self):
     plugin = existing_job()
     released, calls = threading.Event(), []
-    def get_json(cid, show_logs=False):
-      calls.append(cid)
+    def get_json(cid, timeout=None, pin=True, show_logs=False):
+      calls.append((cid, timeout, pin))
       released.wait(5)
       return plugin._r1fs_data[cid]
     plugin.r1fs.get_json = get_json
@@ -150,7 +150,7 @@ class ExistingPipelineSecretTests(unittest.TestCase):
     self.assertEqual(plugin.process_dauth_get_secret_request(request())["status"], "success")
     with self.assertRaisesRegex(ValueError, "not running"):
       plugin.process_dauth_get_secret_request(request(EE_SENDER="node-other", EE_ETH_SENDER="0xOTHER"))
-    self.assertEqual(calls, ["old-cid"])
+    self.assertEqual(calls, [("old-cid", 10, False)])  # one read, bounded and without a pin
 
   def test_cached_bundle_does_not_require_peer_synchronization(self):
     plugin = existing_job()
