@@ -62,6 +62,11 @@ _CONFIG = {
   'PROFILE_RATE' : 0.1,
   
   'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
+  # No dAuth endpoint is recorded: dAuth answers requests continuously and the write of its record is
+  # switched off in process(). An empty list also stops the bookkeeping in memory for every request.
+  'REQUESTS_TRACKED_ENDPOINTS': [],
+  # Same bound as in Deeploy, for the day the record is switched on again: at most one write every 30 s.
+  'REQUESTS_SAVE_INTERVAL': 30,
   'REQUESTS_MAX_RECORDS': 2,
   'REQUESTS_LOG_INTERVAL': 5 * 60,
 

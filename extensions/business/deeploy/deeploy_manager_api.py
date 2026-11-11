@@ -50,6 +50,13 @@ _CONFIG = {
   'MIN_ETH_BALANCE' : 0.0003,
 
   'REQUESTS_CSTORE_HKEY': 'DEEPLOY_REQUESTS',
+  # Only the requests that start something are recorded, so that every oracle knows which one received
+  # a deployment request and whether it answered. Reads are never recorded: the status poll that a client
+  # repeats every 2 s used to be one chain-store write per poll, stored and saved again by every oracle.
+  'REQUESTS_TRACKED_ENDPOINTS': ['create_pipeline', 'update_pipeline', 'scale_up_job_workers', 'delete_pipeline'],
+  # At most one write of the record every 30 s (two a minute), whatever the callers do. The first request
+  # after a quiet period is still written at once.
+  'REQUESTS_SAVE_INTERVAL': 30,
   'REQUESTS_LOG_INTERVAL' : 5 * 60,
   'REQUESTS_MAX_RECORDS' : 2,
 
