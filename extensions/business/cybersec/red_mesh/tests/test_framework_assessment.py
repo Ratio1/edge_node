@@ -514,6 +514,107 @@ class TestFrameworkAssessment(FrameworkAssessmentFixture):
     self.assertIn("doc-1", self.documents.deleted)
     self.assertEqual([v for v in self.compliance_rows().values() if v is not None], [])
 
+# The digest of a pre-RM-120-9b row (sign-off name/role/date only), computed before the entity fields existed.
+PRE_UPGRADE_DIGEST = "873bb5be735899fb4a7033292635fd70d30936793f5322f4e218edc3d7a4c7e7"
+
+
+class TestEntityFieldsAndSignoffNames(FrameworkAssessmentFixture):
+  """RM-120 phase 9b: first/last name sign-off, DNSC id, external supplier, claimant in the view."""
+
+  SIGN = {"role": "Director", "date": "2026-10-06"}
+
+  def fixture_row(self):
+    return {"tenant_id": "tn_x", "pack_id": "p", "pack_acts": ["a"], "assurance_level": "basic",
+            "level_provenance": None, "sectoral_requirements": "s", "completion_date": "2026-10-06",
+            "management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-10-06"},
+            "remediation": [], "scores": {}}
+
+  def test_signoff_first_and_last_compose_the_name_and_store_both(self):
+    data = self.ok(self.save({"management_signoff": {"name": "ignored", "first_name": " Ana ", "last_name": "Pop", **self.SIGN}}, 1))
+    expected = {"name": "Ana Pop", "first_name": "Ana", "last_name": "Pop", **self.SIGN}
+    self.assertEqual(data["managementSignoff"], expected)
+    self.assertEqual(self.stored_row()["management_signoff"], expected)
+
+  def test_signoff_with_only_one_of_first_and_last_is_invalid(self):
+    for part in ({"first_name": "Ana"}, {"last_name": "Pop"}, {"first_name": "Ana", "last_name": "  "}):
+      result = self.save({"management_signoff": {"name": "Ana Pop", **part, **self.SIGN}}, 1)
+      self.refused(result, 400, "assessment_invalid")
+
+  def test_signoff_name_length_caps(self):
+    long = "x" * (compliance.TEXT_MAX + 1)
+    self.refused(self.save({"management_signoff": {"first_name": long, "last_name": "Pop", **self.SIGN}}, 1),
+                 400, "assessment_invalid")
+    half = "x" * (compliance.TEXT_MAX // 2)  # each part fits, the composed name does not
+    self.refused(self.save({"management_signoff": {"first_name": half, "last_name": half, **self.SIGN}}, 1),
+                 400, "assessment_invalid")
+
+  def test_legacy_name_only_signoff_is_stored_unchanged(self):
+    self.ok(self.save({"management_signoff": {"name": "Ana Pop", "role": "Director", "date": "2026-10-06"}}, 1))
+    self.assertEqual(self.stored_row()["management_signoff"], {"name": "Ana Pop", "role": "Director", "date": "2026-10-06"})
+    self.refused(self.save({"management_signoff": {"role": "Director", "date": "2026-10-06"}}, 2), 400, "assessment_invalid")
+
+  def test_entity_fields_set_cap_and_clear(self):
+    data = self.ok(self.save({"dnsc_unique_id": " ID-123 ", "external_supplier": "Furnizor SRL"}, 1))
+    self.assertEqual((data["dnscUniqueId"], data["externalSupplier"]), ("ID-123", "Furnizor SRL"))
+    row = self.stored_row()
+    self.assertEqual((row["dnsc_unique_id"], row["external_supplier"]), ("ID-123", "Furnizor SRL"))
+    self.refused(self.save({"dnsc_unique_id": "x" * 65}, 2), 400, "assessment_invalid")
+    self.refused(self.save({"external_supplier": "x" * (compliance.TEXT_MAX + 1)}, 2), 400, "assessment_invalid")
+    self.ok(self.save({"dnsc_unique_id": "x" * 64}, 2))
+    data = self.ok(self.save({"dnsc_unique_id": "", "external_supplier": ""}, 3))
+    row = self.stored_row()
+    self.assertNotIn("dnsc_unique_id", row)
+    self.assertNotIn("external_supplier", row)
+    self.assertEqual((data["dnscUniqueId"], data["externalSupplier"]), ("", ""))
+
+  def test_unknown_patch_key_is_still_rejected(self):
+    result = self.save({"dnsc_unique": "x"}, 1)
+    self.refused(result, 400, "assessment_invalid")
+
+  def test_digest_is_unchanged_for_a_pre_upgrade_row_and_changes_with_a_new_field(self):
+    row = self.fixture_row()
+    self.assertEqual(compliance.intent_digest(row), PRE_UPGRADE_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "dnsc_unique_id": "ID-1"}), PRE_UPGRADE_DIGEST)
+    self.assertNotEqual(compliance.intent_digest({**row, "external_supplier": "S"}), PRE_UPGRADE_DIGEST)
+    self.assertEqual(compliance.intent_digest({**row, "dnsc_unique_id": "", "external_supplier": ""}), PRE_UPGRADE_DIGEST)
+
+  def test_snapshot_and_reopen_carry_the_entity_fields(self):
+    self.ok(self.save({"dnsc_unique_id": "ID-123", "external_supplier": "Furnizor SRL"}, 1))
+    revision = self.ok(self.save({"assurance_level": "basic",
+                                  "level_provenance": {"kind": "risk_score", "score": 42, "declared_by": "initial"},
+                                  "scores": self.basic_scores(), "completion_date": "2026-10-06",
+                                  "management_signoff": {"first_name": "Ana", "last_name": "Pop", **self.SIGN}}, 2))["assessmentRevision"]
+    self.ok(self.submit(revision, str(uuid4())))
+    snapshot = self.documents.envelopes["doc-1"]["snapshot"]
+    self.assertEqual((snapshot["dnsc_unique_id"], snapshot["external_supplier"]), ("ID-123", "Furnizor SRL"))
+    self.assertEqual(snapshot["management_signoff"]["last_name"], "Pop")
+    data = self.ok(self.reopen(self.ok(self.get())["assessmentRevision"], str(uuid4())))
+    self.assertEqual((data["dnscUniqueId"], data["externalSupplier"], data["managementSignoff"]),
+                     ("ID-123", "Furnizor SRL", None))
+
+  def test_snapshot_of_a_row_without_the_fields_has_empty_strings(self):
+    revision = self.complete_basic_draft()
+    self.ok(self.submit(revision, str(uuid4())))
+    snapshot = self.documents.envelopes["doc-1"]["snapshot"]
+    self.assertEqual((snapshot["dnsc_unique_id"], snapshot["external_supplier"]), ("", ""))
+
+  def test_view_carries_empty_defaults_and_a_two_key_claimant(self):
+    data = self.ok(self.get())
+    self.assertEqual((data["dnscUniqueId"], data["externalSupplier"]), ("", ""))
+    self.assertEqual(set(data["claimant"]), {"legal_name", "registration_id"})
+    self.assertEqual(data["claimant"]["legal_name"], "Example Holdings SRL")
+    self.assertIsNotNone(data["claimant"]["registration_id"])
+
+  def test_view_claimant_is_null_without_a_legal_record(self):
+    row = {**self.fixture_row(), "state": "draft", "assessment_revision": 1, "reopened_from": None, "pending": None,
+           "submissions": [], "updated_by": "u", "updated_at": "now"}
+    row.update(tenant_id=self.tenant, pack_id=PACK, pack_acts=list(self.pack["acts"]))
+    for tenant in (None, {}, {"legal": None}):
+      self.assertIsNone(compliance.assessment_view(row, self.pack, can_manage=True, tenant=tenant)["claimant"])
+    legal = {"legal": {"name": "N", "registration_id": "R", "signer_name": "S", "signer_role": "T"}}
+    self.assertEqual(compliance.assessment_view(row, self.pack, can_manage=True, tenant=legal)["claimant"],
+                     {"legal_name": "N", "registration_id": "R"})
+
 
 if __name__ == "__main__":
   unittest.main()

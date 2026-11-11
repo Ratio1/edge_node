@@ -42,6 +42,7 @@ PENDING_TTL_SECONDS = 15 * 60
 LEVEL_PROVENANCE_KINDS = ("risk_score", "declared")
 REMEDIATION_ITEM_MAX = 32
 TEXT_MAX = 200
+DNSC_ID_MAX = 64
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 # The `job:` grammar is one object: the evidence-ref validator and the ownership check in
 # `services/framework_evidence.py` share it, so a ref one accepts the other always sees.
@@ -151,7 +152,15 @@ def normalize_signoff(value):
     return None
   if not isinstance(value, dict):
     raise AssessmentInvalid("invalid_request")
-  return {"name": _text(value.get("name"), TEXT_MAX, required=True),
+  first = _text(value.get("first_name"), TEXT_MAX)
+  last = _text(value.get("last_name"), TEXT_MAX)
+  if first or last:
+    if not (first and last):
+      raise AssessmentInvalid("invalid_request")
+    names = {"name": _text(f"{first} {last}", TEXT_MAX), "first_name": first, "last_name": last}
+  else:
+    names = {"name": _text(value.get("name"), TEXT_MAX, required=True)}
+  return {**names,
           "role": _text(value.get("role"), TEXT_MAX, required=True),
           "date": _date(value.get("date"), required=True)}
 
@@ -232,7 +241,8 @@ def apply_patch(row, patch, pack, *, actor, now):
   if not isinstance(patch, dict):
     raise AssessmentInvalid("invalid_request")
   allowed = {"assurance_level", "level_provenance", "sectoral_requirements", "completion_date",
-             "management_signoff", "remediation", "scores"}
+             "management_signoff", "remediation", "scores",
+             "dnsc_unique_id", "external_supplier"}
   unknown = set(patch) - allowed
   if unknown:
     raise AssessmentInvalid("invalid_request", unknown_fields=sorted(unknown))
@@ -247,6 +257,13 @@ def apply_patch(row, patch, pack, *, actor, now):
     out["completion_date"] = _date(patch["completion_date"])
   if "management_signoff" in patch:
     out["management_signoff"] = normalize_signoff(patch["management_signoff"])
+  for key, limit in (("dnsc_unique_id", DNSC_ID_MAX), ("external_supplier", TEXT_MAX)):
+    if key in patch:
+      value = _text(patch[key], limit)
+      if value:
+        out[key] = value
+      else:
+        out.pop(key, None)
   if "remediation" in patch:
     out["remediation"] = normalize_remediation(patch["remediation"])
   if "scores" in patch:
@@ -348,9 +365,12 @@ def latest_revision(row):
 
 
 def _draft_fields(row):
-  return {key: row.get(key) for key in ("tenant_id", "pack_id", "pack_acts", "assurance_level", "level_provenance",
-                                        "sectoral_requirements", "completion_date", "management_signoff",
-                                        "remediation", "scores")}
+  fields = {key: row.get(key) for key in ("tenant_id", "pack_id", "pack_acts", "assurance_level", "level_provenance",
+                                          "sectoral_requirements", "completion_date", "management_signoff",
+                                          "remediation", "scores")}
+  # Entity fields join the digest only when set, so a pre-upgrade row hashes as it always did.
+  fields.update({key: row[key] for key in ("dnsc_unique_id", "external_supplier") if row.get(key)})
+  return fields
 
 
 def intent_digest(row):
@@ -367,10 +387,19 @@ def claimant_for(tenant):
           "signer_name": legal.get("signer_name"), "signer_role": legal.get("signer_role")}
 
 
+def _view_claimant(tenant):
+  """The view's claimant: the two public identity fields only, never the signer."""
+  claimant = claimant_for(tenant)
+  if claimant is None:
+    return None
+  return {"legal_name": claimant["legal_name"], "registration_id": claimant["registration_id"]}
+
+
 def build_snapshot(row, tenant, computed, pending):
   snapshot = {
     "schema": SNAPSHOT_SCHEMA, "artifact_kind": "self_assessment",
     **_draft_fields(row),
+    "dnsc_unique_id": row.get("dnsc_unique_id") or "", "external_supplier": row.get("external_supplier") or "",
     "claimant": claimant_for(tenant),
     "computed": computed,
     "submission": {"revision": pending["revision"], "submitted_at": pending["submitted_at"],
@@ -459,7 +488,7 @@ def pack_view(pack, text, level):
   }
 
 
-def assessment_view(row, pack, *, can_manage, text=None, names=_no_names):
+def assessment_view(row, pack, *, can_manage, text=None, names=_no_names, tenant=None):
   """The DTO. Never a document reference. With `text`, the pack view rides along (reads only)."""
   level = row.get("assurance_level")
   computed = score(pack, level, row.get("scores") or {}) if level else None
@@ -471,6 +500,8 @@ def assessment_view(row, pack, *, can_manage, text=None, names=_no_names):
     "assuranceLevel": level, "levelProvenance": row.get("level_provenance"),
     "sectoralRequirements": row.get("sectoral_requirements", ""),
     "completionDate": row.get("completion_date", ""), "managementSignoff": row.get("management_signoff"),
+    "dnscUniqueId": row.get("dnsc_unique_id") or "", "externalSupplier": row.get("external_supplier") or "",
+    "claimant": _view_claimant(tenant),
     "remediation": list(row.get("remediation") or []),
     "state": row["state"], "assessmentRevision": row["assessment_revision"],
     "reopenedFrom": row.get("reopened_from"), "latestRevision": latest_revision(row),
@@ -523,7 +554,7 @@ def get_assessment(service, actor, tenant_id, pack_id, include_pack=True):
       raise TenantStoreError("Framework pack text unavailable") from exc
   row = _row(service, tenant_id, pack_id) or new_row(tenant_id, pack, actor=account.account_id, now=_now_iso())
   return assessment_view(row, pack, can_manage=service._permission(account, tenant, MANAGE), text=text,
-                         names=name_resolver(service))
+                         names=name_resolver(service), tenant=tenant)
 
 
 def authorize_manage(service, actor, tenant_id, pack_id):
@@ -551,7 +582,7 @@ def save_draft(service, actor, tenant_id, pack_id, patch, expected_assessment_re
     raise _denied(400, "assessment_invalid", errors=[exc.as_error()]) from None
   updated = _stamp({**updated, "assessment_revision": row["assessment_revision"] + 1}, account.account_id)
   stored = _put(service, updated)
-  return assessment_view(stored, pack, can_manage=True, names=name_resolver(service))
+  return assessment_view(stored, pack, can_manage=True, names=name_resolver(service), tenant=tenant)
 
 
 def prepare_submit(service, actor, tenant_id, pack_id, expected_assessment_revision, request_id):
@@ -682,7 +713,7 @@ def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, req
     raise _denied(404, "assessment_not_found")
   last = row["submissions"][-1]
   if last.get("reopen_request_id") == request_id and row["state"] == "draft" and row["reopened_from"] == last["revision"]:
-    return {**assessment_view(row, pack, can_manage=True, names=name_resolver(service)), "replayed": True}
+    return {**assessment_view(row, pack, can_manage=True, names=name_resolver(service), tenant=tenant), "replayed": True}
   if row["state"] != "submitted":
     raise _denied(409, "conflict")
   _expected_revision(row, expected_assessment_revision)
@@ -692,7 +723,7 @@ def reopen(service, actor, tenant_id, pack_id, expected_assessment_revision, req
                     "assessment_revision": row["assessment_revision"] + 1, "submissions": submissions},
                    account.account_id)
   stored = _put(service, updated)
-  return {**assessment_view(stored, pack, can_manage=True, names=name_resolver(service)), "replayed": False}
+  return {**assessment_view(stored, pack, can_manage=True, names=name_resolver(service), tenant=tenant), "replayed": False}
 
 
 def artifact_ref(service, actor, tenant_id, pack_id, revision):
