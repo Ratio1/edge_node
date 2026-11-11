@@ -143,6 +143,7 @@ class DauthManagerPlugin(
     self._last_dauth_job_secrets_hsync = None
     self._dauth_web_app_initialized = False
     self._dauth_pause_teardown_succeeded = True
+    self._dauth_legacy_pipelines = {}  # cid -> (retry_at, document); retry_at None while reading
     return
   
   

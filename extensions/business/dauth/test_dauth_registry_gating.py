@@ -328,6 +328,7 @@ def _make_dauth_harness(
   plugin.json_dumps = json.dumps
   plugin.time = lambda: REQUEST_TIME
   plugin._chainstore = {}
+  plugin._dauth_legacy_pipelines = {}
   plugin._r1fs_data = {}
   plugin.r1fs = _FakeR1FS(plugin._r1fs_data)
   plugin.evm_network = "devnet"

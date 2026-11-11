@@ -286,9 +286,7 @@ class _DauthMixin(object):
     otherwise fails as retryable, and the retry is answered from memory. A document that
     could not be read is read again 30 s after that read ended.
     """
-    cache = getattr(self, "_dauth_legacy_pipelines", None)
-    if cache is None:
-      cache = self._dauth_legacy_pipelines = {}  # cid -> (retry_at, document); retry_at None while reading
+    cache = self._dauth_legacy_pipelines
     retry_at, document = cache.get(cid, (0, None))
     if document is None and retry_at is not None and self.time() >= retry_at:
       def read():
