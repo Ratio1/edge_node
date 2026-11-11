@@ -42,6 +42,8 @@ class Admission(_DeploymentOperationsMixin, _DeeployMixin):
     self._deployment_plans = {}
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_preparations = {}
+    self._operations_confirmed = {}
+    self._operations_sent_at = {}
     self.storage = {}
     self.deepcopy = copy.deepcopy
     self.previous_configs = None

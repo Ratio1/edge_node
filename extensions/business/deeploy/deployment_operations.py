@@ -99,6 +99,8 @@ class _DeploymentOperationsMixin:
   def _init_deployment_operations(self):
     """Start the independent execution worker and initialize bounded caches."""
     self._deployment_preparations = {}
+    self._operations_confirmed = {}  # operation id -> (sequence, signature, time of the last confirmed send)
+    self._operations_sent_at = {}  # operation id|attempt|action|node -> time of the last command
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_operations_event = threading.Event()
     self._deployment_operations_stop = threading.Event()
@@ -181,8 +183,7 @@ class _DeploymentOperationsMixin:
       raise RuntimeError("Deployment state replication is pending.")
     operation.clear()
     operation.update(snapshot)
-    vars(self).setdefault("_operations_confirmed", {})[snapshot["operation_id"]] = (
-      snapshot["sequence"], snapshot.get("EE_SIGN"), self.time())
+    self._operations_confirmed[snapshot["operation_id"]] = (snapshot["sequence"], snapshot.get("EE_SIGN"), self.time())
     return operation
 
   def _replicate_operation(self, operation):
@@ -191,7 +192,7 @@ class _DeploymentOperationsMixin:
     A confirmation needs only part of the peers, and nothing else brings an oracle that missed the write
     up to date. The re-sent snapshot is the same record: peers that hold it store nothing.
     """
-    confirmed = vars(self).setdefault("_operations_confirmed", {})
+    confirmed = self._operations_confirmed
     marker, last = (operation["sequence"], operation.get("EE_SIGN")), confirmed.get(operation["operation_id"])
     if last and last[:2] == marker and 0 <= self.time() - last[2] < 30:
       return
@@ -518,7 +519,7 @@ class _DeploymentOperationsMixin:
       if action == "start" and report_is_ready(report, config):
         continue
       # Resend throttle in process memory, not in the signed snapshot; nodes de-duplicate by operation_id|attempt.
-      sent_at = vars(self).setdefault("_operations_sent_at", {})
+      sent_at = self._operations_sent_at
       key = "{}|{}|{}|{}".format(operation["operation_id"], attempt, action, node)
       if 0 <= self.time() - sent_at.get(key, 0) < 10:
         continue

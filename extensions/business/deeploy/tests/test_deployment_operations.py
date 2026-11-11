@@ -37,6 +37,8 @@ class Coordinator(_DeploymentOperationsMixin):
     self._deployment_plans = {}
     self._deployment_plan_cache_lock = threading.Lock()
     self._deployment_preparations = {}
+    self._operations_confirmed = {}
+    self._operations_sent_at = {}
     self.cfg_deployment_readiness_timeout = 60
     self._get_response = lambda result: result
     self.P = lambda *args, **kw: None
